@@ -1470,6 +1470,17 @@ async fn collect_blob_limited(
             if expected_len.is_some_and(|len| len as u64 > limit) {
                 return Err(s3s::s3_error!(EntityTooLarge));
             }
+            // Require x-amz-decoded-content-length for chunked bodies: without it
+            // the decoder can only frame-check, and a body truncated at a chunk
+            // boundary (with a surviving/crafted 0\r\n\r\n terminator) would pass
+            // framing yet store short. AWS SDKs always send this header for
+            // streaming uploads, so requiring it rejects only malformed inputs.
+            if expected_len.is_none() {
+                return Err(s3s::s3_error!(
+                    InvalidArgument,
+                    "aws-chunked transfer encoding requires x-amz-decoded-content-length"
+                ));
+            }
             return crate::api::aws_chunked::decode_aws_chunked(&body, expected_len).ok_or_else(
                 || {
                     s3s::s3_error!(

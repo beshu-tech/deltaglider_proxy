@@ -300,8 +300,11 @@ impl UsageScanner {
 
         for (key, meta) in objects.iter().take(MAX_SCAN_OBJECTS) {
             let obj_size = meta.file_size;
-            total_size += obj_size;
-            total_objects += 1;
+            // saturating: a corrupt/adversarial file_size near u64::MAX must not
+            // WRAP total_size to a tiny value — that would silently disable the
+            // quota gate (check_quota compares against this total). Clamp instead.
+            total_size = total_size.saturating_add(obj_size);
+            total_objects = total_objects.saturating_add(1);
 
             // Determine the immediate child prefix.
             // If prefix is "builds/" and key is "builds/v1/foo.zip",
@@ -318,8 +321,8 @@ impl UsageScanner {
                     size: 0,
                     objects: 0,
                 });
-                child.size += obj_size;
-                child.objects += 1;
+                child.size = child.size.saturating_add(obj_size);
+                child.objects = child.objects.saturating_add(1);
             }
             // Objects directly under the prefix (no slash in relative) are counted
             // in total but don't form a child prefix — they're leaf objects.

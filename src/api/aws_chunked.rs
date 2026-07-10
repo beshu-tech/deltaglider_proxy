@@ -372,6 +372,26 @@ mod tests {
     }
 
     #[test]
+    fn decode_without_length_accepts_frame_valid_short_body() {
+        // A body truncated at a chunk boundary but followed by a valid
+        // terminator is frame-valid: with no expected_length the decoder CANNOT
+        // tell it's short and returns the partial payload. This is exactly why
+        // the s3s call site now REQUIRES x-amz-decoded-content-length for
+        // aws-chunked bodies — the length reconciliation is the only truncation
+        // guard at a chunk boundary. This test pins that rationale.
+        let body = Bytes::from("5\r\nhello\r\n0\r\n\r\n"); // one 5-byte chunk, then terminator
+        let decoded = decode_aws_chunked(&body, None).expect("frame-valid → decodes");
+        assert_eq!(&decoded[..], b"hello");
+        // With the true length it would still pass; with a LARGER expected length
+        // (the real object was bigger, body was truncated) it is rejected.
+        assert!(decode_aws_chunked(&body, Some(5)).is_some());
+        assert!(
+            decode_aws_chunked(&body, Some(100)).is_none(),
+            "a length mismatch (truncation) must be rejected when the header IS present"
+        );
+    }
+
+    #[test]
     fn decode_rejects_missing_crlf_after_chunk() {
         // 5 bytes of data but no trailing CRLF before the terminator.
         let body = Bytes::from("5\r\nhello0\r\n\r\n");
