@@ -352,29 +352,40 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let prior_for_counter = self.prior_for_counter(bucket, key).await;
         let mpe = multipart_etag.clone().unwrap_or_default();
 
-        // (1) Hash the body by streaming the spool — bounded memory.
-        let (sha256, md5) = {
+        // (1) Hash the body by streaming the spool — bounded memory. Also count
+        // the observed bytes and reject a spool that doesn't match the declared
+        // `size` (source overwritten mid-stream, or a stale/corrupt xattr
+        // file_size on a filesystem source) — else we'd stamp file_size=declared
+        // over a sha256 of DIFFERENT bytes. Matches the multipart-relay guard.
+        let (sha256, md5, observed) = {
             let path = body.path().to_path_buf();
-            tokio::task::spawn_blocking(move || -> std::io::Result<(String, String)> {
+            tokio::task::spawn_blocking(move || -> std::io::Result<(String, String, u64)> {
                 use std::io::Read;
                 let mut f = std::fs::File::open(&path)?;
                 let mut sh = Sha256::new();
                 let mut mh = Md5::new();
+                let mut observed: u64 = 0;
                 let mut buf = vec![0u8; 256 * 1024];
                 loop {
                     let n = f.read(&mut buf)?;
                     if n == 0 {
                         break;
                     }
+                    observed = observed.saturating_add(n as u64);
                     sh.update(&buf[..n]);
                     mh.update(&buf[..n]);
                 }
-                Ok((hex::encode(sh.finalize()), hex::encode(mh.finalize())))
+                Ok((hex::encode(sh.finalize()), hex::encode(mh.finalize()), observed))
             })
             .await
             .map_err(|e| EngineError::Storage(StorageError::Other(format!("hash task: {e}"))))?
             .map_err(|e| EngineError::Storage(StorageError::from(e)))?
         };
+        if observed != size {
+            return Err(EngineError::Storage(StorageError::Other(format!(
+                "Spooled object size mismatch: declared {size}, observed {observed}"
+            ))));
+        }
 
         let etag = if mpe.is_empty() {
             format!("\"{md5}\"")

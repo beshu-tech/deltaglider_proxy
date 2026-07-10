@@ -172,8 +172,29 @@ fn pipe_stdin_stdout_stderr(
         let done_clone = done.clone();
         s.spawn(move || {
             let (ref flag, ref condvar, ref mutex) = *done_clone;
-            let guard = mutex.lock().unwrap();
-            let _result = condvar.wait_timeout(guard, timeout).unwrap();
+            // Loop against a real deadline: Condvar::wait_timeout is subject to
+            // SPURIOUS wakeups, and a single wait that treats any wakeup as
+            // "timeout expired" would SIGKILL a healthy xdelta3 mid-encode (a
+            // sporadic, unreproducible 5xx). Re-check the done flag and the
+            // remaining time on every wakeup; only proceed to kill once the flag
+            // is still unset AND the wait genuinely timed out.
+            let deadline = std::time::Instant::now() + timeout;
+            let mut guard = mutex.lock().unwrap();
+            loop {
+                if flag.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (g, res) = condvar.wait_timeout(guard, remaining).unwrap();
+                guard = g;
+                if res.timed_out() {
+                    break;
+                }
+            }
+            drop(guard);
             if !flag.load(std::sync::atomic::Ordering::Acquire) {
                 // Timeout expired and I/O hasn't finished — kill the child.
                 // Use raw kill(pid, SIGKILL) since we don't own the Child handle
