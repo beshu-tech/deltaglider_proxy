@@ -340,9 +340,7 @@ impl HttpWebhookDeliveryClient {
         let mut urls = Vec::with_capacity(endpoints.len());
         for endpoint in &endpoints {
             self.check_ssrf(endpoint, "slack webhook URL")?;
-            urls.push(
-                Url::parse(endpoint).map_err(|e| format!("invalid slack webhook URL: {e}"))?,
-            );
+            urls.push(Url::parse(endpoint).map_err(|e| format!("invalid slack webhook URL: {e}"))?);
         }
         // Attempt EVERY endpoint (don't abort on the first failure) so a
         // transient error on one doesn't skip the rest, then fail if any failed.

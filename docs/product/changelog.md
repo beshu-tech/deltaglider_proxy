@@ -70,6 +70,23 @@ rejected config applies); every one is fixed with a regression test.
   sync bucket now take effect (or clearly warn a restart is required)** instead
   of being reported as applied while silently doing nothing.
 
+### Fixed — additional hardening
+
+- **A backend rate-limiting with HTTP 429** (Backblaze B2, Cloudflare R2) is now
+  treated as a transient throttle (back off and retry) instead of a permanent
+  500.
+- **The event-notification dispatcher no longer crashes** on a backend error
+  message that happened to contain a multi-byte character at a truncation point.
+- **Applying a redacted config export to a fresh instance** now fails clearly if
+  a new user or OIDC provider has no secret, instead of creating identities that
+  can never authenticate.
+- **Objects addressed with an extra leading slash** (`/key` vs `key`) no longer
+  leave stale cached metadata after a delete.
+- **Streaming delta transfers account for their temporary disk correctly**, so
+  many concurrent large transfers can't exhaust the spool area.
+- Editing a masked webhook/Slack URL list no longer risks restoring the wrong
+  saved secret, and internal object keys no longer trigger user webhooks.
+
 ## v1.12.4 — 2026-07-09
 
 The "plays nice with throttled backends" release: batched HEAD sweeps with

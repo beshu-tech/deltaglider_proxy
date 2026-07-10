@@ -2720,8 +2720,7 @@ mod tests {
                 .code("TooManyRequests")
                 .build(),
         );
-        let err: SdkError<_> =
-            SdkError::service_error(inner, http_response(429, Some("req-429")));
+        let err: SdkError<_> = SdkError::service_error(inner, http_response(429, Some("req-429")));
         let classified = S3Backend::classify_s3_error("bucket", &err, S3Op::GetObject);
         assert!(
             matches!(classified, StorageError::Throttled(_)),
