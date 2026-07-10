@@ -8,7 +8,19 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-07-09_
+_Last updated: 2026-07-10_
+
+## v1.13.0 — 2026-07-10
+
+### Fixed
+
+- **A run whose process died within its lease TTL no longer shows "running"
+  forever.** The boot-time zombie scan spared any `running` row whose leader
+  lease still looked live — but a process that dies right before a restart
+  leaves exactly such a lease behind, so its run dodged the (boot-only) scan
+  permanently. Boot now lapses every local lease first: the coordination
+  tables are node-local, so a lease found at boot can only belong to a dead
+  process of this node. Applies to replication and lifecycle.
 
 ## v1.12.4 — 2026-07-09
 

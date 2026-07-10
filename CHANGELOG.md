@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.13.0 — 2026-07-10
+
 ### Fixed
 
 - **A run whose process died within its lease TTL no longer shows "running"
