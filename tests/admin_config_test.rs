@@ -644,6 +644,131 @@ async fn test_config_apply_rejects_bad_yaml_without_state_change() {
     );
 }
 
+/// X-ray H8/H19: a config-apply that would PUBLISH a public prefix AND fails a
+/// declarative-IAM gate must publish NEITHER. Before the pre-commit gate,
+/// apply_config_transition published the new public-prefix + admission snapshot
+/// (step 4) BEFORE the declarative reconcile gate (step 4c) could fail — so a
+/// "rejected" apply left the just-refused prefix LIVE and anonymously readable,
+/// while cfg/disk reverted (a security-relevant split-brain reported as "no
+/// state changed"). Here the applied doc marks a prefix public AND flips
+/// iam_mode→declarative with empty IAM against a non-empty DB (trips the
+/// empty-YAML gate). The apply must be rejected AND an anonymous GET under the
+/// would-be-public prefix must STILL be denied — proving the snapshot never
+/// published.
+#[tokio::test]
+async fn test_config_apply_rejected_iam_gate_does_not_publish_public_prefix() {
+    let bucket = "h8bucket";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .auth("H8KEY", "H8SECRETKEY1234567890")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // Seed an object under the prefix we'll try to make public, using signed creds.
+    let signed = aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::Config::builder()
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "H8KEY",
+                "H8SECRETKEY1234567890",
+                None,
+                None,
+                "test",
+            ))
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(server.endpoint())
+            .force_path_style(true)
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .build(),
+    );
+    signed
+        .put_object()
+        .bucket(bucket)
+        .key("downloads/pub.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"secret-bytes"))
+        .send()
+        .await
+        .expect("seed PUT");
+
+    // Seed a GUI user so the DB is non-empty — the empty-YAML gate only fires
+    // when a gui→declarative flip would wipe existing rows.
+    let resp = admin
+        .post(format!("{}/_/api/admin/users", server.endpoint()))
+        .json(&json!({
+            "name": "seed-user",
+            "access_key_id": "AKIASEED00001",
+            "secret_access_key": "seed-secret",
+            "permissions": [{ "effect": "Allow", "actions": ["read"], "resources": ["*"] }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "seed user must be created");
+
+    // Export the canonical doc, then mutate it: mark downloads/ public on the
+    // bucket AND flip access.iam_mode→declarative with NO iam_users.
+    let exported = admin
+        .get(format!("{}/_/api/admin/config/export", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&exported).unwrap();
+    let map = doc.as_mapping_mut().unwrap();
+    let storage = map
+        .entry(serde_yaml::Value::String("storage".into()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    let buckets = storage
+        .as_mapping_mut()
+        .unwrap()
+        .entry(serde_yaml::Value::String("buckets".into()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    let mut policy = serde_yaml::Mapping::new();
+    policy.insert(
+        "public_prefixes".into(),
+        serde_yaml::Value::Sequence(vec![serde_yaml::Value::String("downloads/".into())]),
+    );
+    buckets
+        .as_mapping_mut()
+        .unwrap()
+        .insert(bucket.into(), serde_yaml::Value::Mapping(policy));
+    let access = map
+        .entry(serde_yaml::Value::String("access".into()))
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    access
+        .as_mapping_mut()
+        .unwrap()
+        .insert("iam_mode".into(), serde_yaml::Value::String("declarative".into()));
+    let modified = serde_yaml::to_string(&doc).unwrap();
+
+    let resp = admin
+        .post(format!("{}/_/api/admin/config/apply", server.endpoint()))
+        .json(&json!({ "yaml": modified }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !resp.status().is_success(),
+        "apply must be rejected by the empty-YAML declarative gate"
+    );
+
+    // The would-be-public prefix must NOT be live: an anonymous GET is denied.
+    let anon = reqwest::Client::new();
+    let resp = anon
+        .get(format!("{}/{}/downloads/pub.txt", server.endpoint(), bucket))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().as_u16() == 401 || resp.status().as_u16() == 403,
+        "a rejected apply must not publish the public prefix — anonymous GET must \
+         stay denied (H8/H19), got {}",
+        resp.status()
+    );
+}
+
 #[tokio::test]
 async fn test_config_export_apply_export_is_idempotent() {
     // Plan's Phase 1 acceptance criterion: export → apply → export must

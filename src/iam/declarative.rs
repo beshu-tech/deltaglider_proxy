@@ -1160,6 +1160,17 @@ pub fn reconcile_declarative_iam(
         .map_err(|e| format!("apply reconcile: {e}"))
 }
 
+/// Validate a declarative-IAM YAML snapshot against the current DB WITHOUT
+/// writing anything — runs the same load + diff (which validates unique names,
+/// group refs, permissions, and access-key collisions) as
+/// `reconcile_declarative_iam` but discards the diff. Used as a pre-commit gate
+/// so a config-apply that will fail its IAM reconcile is rejected BEFORE any
+/// runtime side effect (engine rebuild, snapshot publish) is committed (H8/H19).
+pub fn validate_declarative_iam(db: &ConfigDb, yaml: &DeclarativeIam) -> Result<(), String> {
+    let current = load_current_iam(db)?;
+    diff_iam(yaml, &current).map(|_| ())
+}
+
 // ───── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]

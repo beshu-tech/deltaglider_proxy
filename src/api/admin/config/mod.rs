@@ -254,6 +254,16 @@ pub(crate) async fn apply_config_transition(
     )
     .await?;
 
+    // 0b. Declarative-IAM PRE-COMMIT validation gate (H8/H19). The full
+    //     reconcile at step 4c runs AFTER the engine rebuild + IAM swap +
+    //     snapshot publish (steps 1-4); if it fails there, those side effects
+    //     are already live but the caller reports "no state changed" and reverts
+    //     cfg/disk — a runtime-vs-config split-brain that can leave a rejected
+    //     public prefix anonymously readable. Run the SAME fallible checks
+    //     (empty-YAML gate, config-DB presence, diff_iam validation) here FIRST,
+    //     write-free, so a doomed apply is refused before anything is committed.
+    declarative_iam_precommit_gate(state, old_cfg, new_cfg).await?;
+
     // 1. Engine rebuild — only on fields the engine reads. Bail early on
     //    failure so callers can roll back their in-memory mutation
     //    without having side-effected anything downstream.
@@ -482,6 +492,63 @@ pub(crate) async fn apply_config_transition(
     }
 
     Ok((warnings, requires_restart))
+}
+
+/// Pre-commit gate for the declarative-IAM reconcile (H8/H19). Runs the SAME
+/// fallible checks as step 4c — empty-YAML gate, config-DB presence, and
+/// `diff_iam` validation — but WITHOUT writing anything, so a config-apply that
+/// would fail its reconcile is rejected before any runtime side effect (engine
+/// rebuild, IAM swap, snapshot publish) is committed. The condition set MUST
+/// stay identical to 4c's, or the gate and the real reconcile can disagree.
+async fn declarative_iam_precommit_gate(
+    state: &Arc<AdminState>,
+    old_cfg: &crate::config::Config,
+    new_cfg: &crate::config::Config,
+) -> Result<(), String> {
+    if !matches!(
+        new_cfg.iam_mode,
+        crate::config_sections::IamMode::Declarative
+    ) {
+        return Ok(());
+    }
+
+    let old_iam_unchanged = matches!(
+        old_cfg.iam_mode,
+        crate::config_sections::IamMode::Declarative
+    ) && old_cfg.iam_users == new_cfg.iam_users
+        && old_cfg.iam_groups == new_cfg.iam_groups
+        && old_cfg.auth_providers == new_cfg.auth_providers
+        && old_cfg.group_mapping_rules == new_cfg.group_mapping_rules;
+    if old_iam_unchanged {
+        return Ok(());
+    }
+
+    let yaml_snapshot = crate::iam::snapshot_from_access(
+        &new_cfg.iam_users,
+        &new_cfg.iam_groups,
+        &new_cfg.auth_providers,
+        &new_cfg.group_mapping_rules,
+    );
+
+    if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui) && yaml_snapshot.is_empty() {
+        return Err(
+            "Refusing to flip to iam_mode: declarative with empty IAM in YAML — \
+             this would wipe the existing users/groups in the encrypted config DB. \
+             Add access.iam_users / access.iam_groups to the YAML first, or keep \
+             iam_mode: gui to preserve the DB as source of truth."
+                .to_string(),
+        );
+    }
+
+    let Some(db_arc) = state.config_db.as_ref() else {
+        return Err("iam_mode: declarative requires an encrypted config DB; \
+             this instance has none initialised (check DGP_BOOTSTRAP_PASSWORD_HASH \
+             and that the DB was successfully opened at startup)."
+            .to_string());
+    };
+    let db = db_arc.lock().await;
+    crate::iam::validate_declarative_iam(&db, &yaml_snapshot)
+        .map_err(|e| format!("declarative IAM reconcile failed (no state changed): {e}"))
 }
 
 /// Return one warning per restart-required field that changed between
