@@ -859,7 +859,12 @@ async fn copy_one_object(
     if object_skip_after_failures > 0 {
         let skipped = {
             let db = db.lock().await;
-            db.replication_object_skipped(rule_name, src_key, object_skip_after_failures)?
+            db.replication_object_skipped(
+                rule_name,
+                src_key,
+                object_skip_after_failures,
+                current_unix_seconds(),
+            )?
         };
         if skipped {
             out.objects_skipped = 1;
@@ -941,7 +946,12 @@ async fn copy_one_object(
             out.errors = 1;
             out.had_error = true;
             let err_msg = format!("{}", e);
-            {
+            // A backend THROTTLE is not an object-specific fault — do not count
+            // it toward the poison-skip ledger, or a throttling backend would
+            // mass-poison a whole page of healthy objects into permanent skip.
+            // (The page-level throttle-abort already stops the run.)
+            out.throttled = is_backend_throttled(&err_msg);
+            if !out.throttled {
                 let db = db.lock().await;
                 db.replication_record_object_failure(
                     rule_name,
@@ -965,7 +975,7 @@ async fn copy_one_object(
                 rule_name, src_key, dest_key, e
             );
             out.dest_fatal = is_destination_fatal(&err_msg);
-            out.throttled = is_backend_throttled(&err_msg);
+            // out.throttled already set above (gates the poison-ledger record).
         }
     }
     Ok(out)

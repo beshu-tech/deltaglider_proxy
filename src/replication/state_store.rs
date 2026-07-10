@@ -105,6 +105,10 @@ pub fn current_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
+/// A poisoned object is retried once per this window so a transient cause can
+/// recover automatically (1 hour).
+pub(crate) const POISON_RETRY_SECS: i64 = 3600;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Monotonic counters bumped when a replication run settles (scheduled path) or
@@ -655,28 +659,41 @@ impl ConfigDb {
         Ok(())
     }
 
-    /// True when this (rule, source_key) has reached the skip threshold:
-    /// `consecutive_failures >= threshold AND threshold > 0` (0 = never skip).
+    /// Skip a poisoned object — but NOT forever. Once an object crosses
+    /// `threshold` consecutive failures we skip it on most runs, yet allow ONE
+    /// retry every `POISON_RETRY_SECS` (via `last_failed_at` age at `now`) so a
+    /// transient cause (a backend outage that mass-poisoned a page, a since-
+    /// fixed permission) recovers automatically: the retry either succeeds and
+    /// clears the ledger, or re-fails and re-arms the backoff. Without the age
+    /// window a poisoned object was skipped permanently.
     pub fn replication_object_skipped(
         &self,
         rule: &str,
         key: &str,
         threshold: u32,
+        now: i64,
     ) -> Result<bool, ConfigDbError> {
         if threshold == 0 {
             return Ok(false);
         }
-        let count: i64 = self
+        let row: Option<(i64, i64)> = self
             .conn
             .query_row(
-                "SELECT consecutive_failures FROM replication_object_failures
-                 WHERE rule_name = ? AND source_key = ?",
+                "SELECT consecutive_failures, last_failed_at
+                   FROM replication_object_failures
+                  WHERE rule_name = ? AND source_key = ?",
                 params![rule, key],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
-            .optional()?
-            .unwrap_or(0);
-        Ok(count >= threshold as i64)
+            .optional()?;
+        let Some((count, last_failed_at)) = row else {
+            return Ok(false);
+        };
+        if count < threshold as i64 {
+            return Ok(false);
+        }
+        // Poisoned — but give it a retry once the backoff window has elapsed.
+        Ok(now - last_failed_at < POISON_RETRY_SECS)
     }
 
     /// Bounded join over the per-object failure ledger for a fixed set of
@@ -1473,23 +1490,43 @@ mod tests {
     #[test]
     fn object_skipped_honours_threshold_and_zero_never() {
         let db = db();
+        // last_failed_at will be 102; probe "now" just after it (within window).
+        let now = 103;
         // No row yet → never skipped.
-        assert!(!db.replication_object_skipped("r", "k", 3).unwrap());
+        assert!(!db.replication_object_skipped("r", "k", 3, now).unwrap());
 
         for i in 0..3 {
             db.replication_record_object_failure("r", "k", "boom", 100 + i)
                 .unwrap();
         }
-        // 3 >= 3 → skipped; 3 < 4 → not yet.
-        assert!(db.replication_object_skipped("r", "k", 3).unwrap());
-        assert!(!db.replication_object_skipped("r", "k", 4).unwrap());
+        // 3 >= 3 AND still within the retry backoff → skipped; 3 < 4 → not yet.
+        assert!(db.replication_object_skipped("r", "k", 3, now).unwrap());
+        assert!(!db.replication_object_skipped("r", "k", 4, now).unwrap());
 
         // threshold 0 = never skip, even with failures recorded.
-        assert!(!db.replication_object_skipped("r", "k", 0).unwrap());
+        assert!(!db.replication_object_skipped("r", "k", 0, now).unwrap());
 
         // Clearing resets the predicate.
         db.replication_clear_object_failure("r", "k").unwrap();
-        assert!(!db.replication_object_skipped("r", "k", 3).unwrap());
+        assert!(!db.replication_object_skipped("r", "k", 3, now).unwrap());
+    }
+
+    /// X-ray H4: a poisoned object must NOT be skipped forever — once the retry
+    /// backoff elapses it gets one attempt (so a transient/mass-poison cause
+    /// recovers). Without the age window it was permanently skipped.
+    #[test]
+    fn poisoned_object_is_retried_after_backoff() {
+        let db = db();
+        for i in 0..3 {
+            db.replication_record_object_failure("r", "k", "boom", 100 + i)
+                .unwrap();
+        }
+        // Just after the last failure (t=102): still within backoff → skipped.
+        assert!(db.replication_object_skipped("r", "k", 3, 200).unwrap());
+        // Past POISON_RETRY_SECS (3600s) → retry allowed (not skipped).
+        assert!(!db
+            .replication_object_skipped("r", "k", 3, 102 + POISON_RETRY_SECS + 1)
+            .unwrap());
     }
 
     #[test]

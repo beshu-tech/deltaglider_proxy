@@ -698,9 +698,9 @@ async fn resolve_logical(
     failures: Option<&tokio::sync::Mutex<ConfigDb>>,
     progress: Option<&ParityProgress<'_>>,
     progress_base: u64,
-) -> usize {
+) -> Vec<String> {
     if raw_keys.is_empty() {
-        return 0;
+        return Vec::new();
     }
     let dest_keys: Vec<String> = raw_keys
         .iter()
@@ -726,7 +726,7 @@ async fn resolve_logical(
     }
     let fresh = head_burst(engine, bucket, &miss_raw, progress, progress_base + hits).await;
     let mut to_cache: Vec<(String, ParityCacheEntry)> = Vec::new();
-    let mut unresolved = 0usize;
+    let mut unresolved_keys: Vec<String> = Vec::new();
     for (raw, outcome) in fresh {
         let Ok(dk) = rewrite_key(src_prefix, dst_prefix, &raw) else {
             continue;
@@ -743,16 +743,18 @@ async fn resolve_logical(
                 source.remove(&dk);
             }
             // Transient HEAD failure → drop from the compare (a false verdict on
-            // the untrusted lite size is worse, #16) but COUNT it so the audit
-            // is reported partial, not silently in_sync (#3 regression).
+            // the untrusted lite size is worse, #16) and RETURN the key so the
+            // driver also drops it from the OTHER side — else a one-sided drop
+            // becomes a false missing/extra finding (#H5). The count still
+            // marks the audit partial (#3).
             HeadOutcome::Unresolved => {
                 source.remove(&dk);
-                unresolved += 1;
+                unresolved_keys.push(dk);
             }
         }
     }
     cache_put(failures, &rule.name, ParitySide::Source, &to_cache).await;
-    unresolved
+    unresolved_keys
 }
 
 /// Dest-side logical resolution: dest is keyed by its own raw key (== cache key).
@@ -768,9 +770,9 @@ async fn resolve_logical_dest(
     failures: Option<&tokio::sync::Mutex<ConfigDb>>,
     progress: Option<&ParityProgress<'_>>,
     progress_base: u64,
-) -> usize {
+) -> Vec<String> {
     if raw_keys.is_empty() {
-        return 0;
+        return Vec::new();
     }
     let keys: Vec<String> = raw_keys.to_vec();
     // When the lite list can't carry provenance (S3 / encrypting dest),
@@ -802,7 +804,7 @@ async fn resolve_logical_dest(
     }
     let fresh = head_burst(engine, bucket, &miss, progress, progress_base + hits).await;
     let mut to_cache: Vec<(String, ParityCacheEntry)> = Vec::new();
-    let mut unresolved = 0usize;
+    let mut unresolved_keys: Vec<String> = Vec::new();
     for (k, outcome) in fresh {
         match outcome {
             HeadOutcome::Resolved(meta) => {
@@ -819,17 +821,17 @@ async fn resolve_logical_dest(
             HeadOutcome::Gone => {
                 dest.remove(&k);
             }
-            // Transient HEAD failure → drop (a false verdict is worse) but COUNT
-            // so the audit is partial — a dropped dest orphan would otherwise
-            // vanish and yield a false in_sync (#3 regression).
+            // Transient HEAD failure → drop and RETURN so the driver also drops
+            // it from the source side (#H5: a one-sided drop is a false
+            // orphan/missing). Count still marks the audit partial (#3).
             HeadOutcome::Unresolved => {
                 dest.remove(&k);
-                unresolved += 1;
+                unresolved_keys.push(k);
             }
         }
     }
     cache_put(failures, &rule.name, ParitySide::Dest, &to_cache).await;
-    unresolved
+    unresolved_keys
 }
 
 /// Outcome of one HEAD in the burst. A NotFound is a raced delete (the object
@@ -1248,7 +1250,7 @@ pub async fn parity_audit(
     if let Some(p) = progress {
         p.check_cancel().await?;
     }
-    let src_unresolved = resolve_logical(
+    let src_unresolved_keys = resolve_logical(
         engine,
         rule,
         &rule.source.bucket,
@@ -1264,7 +1266,7 @@ pub async fn parity_audit(
     if let Some(p) = progress {
         p.check_cancel().await?;
     }
-    let dst_unresolved = resolve_logical_dest(
+    let dst_unresolved_keys = resolve_logical_dest(
         engine,
         rule,
         &rule.destination.bucket,
@@ -1275,6 +1277,16 @@ pub async fn parity_audit(
         listed + src_needs_logical.len() as u64,
     )
     .await;
+
+    // A key left unresolved on EITHER side must be dropped from BOTH maps
+    // before the diff, or the merge-walk reports it as a false missing/orphan
+    // (it exists on both, one side just couldn't HEAD it). #H5.
+    for k in src_unresolved_keys.iter().chain(dst_unresolved_keys.iter()) {
+        source.remove(k);
+        dest.remove(k);
+    }
+    let src_unresolved = src_unresolved_keys.len();
+    let dst_unresolved = dst_unresolved_keys.len();
 
     // Everything examined — land the counter exactly on the denominator.
     if let Some(p) = progress {
@@ -1635,6 +1647,40 @@ mod tests {
         assert_eq!(r.matched, 1);
         assert_eq!(r.orphan_on_dest, 1);
         assert_eq!(r.orphan_samples[0].key, "z");
+    }
+
+    /// X-ray H5: an object present on both sides whose HEAD couldn't resolve
+    /// must be removed from BOTH maps (the driver does this) so it yields NO
+    /// finding. Removing it from only one side — the pre-fix behavior — would
+    /// fabricate a missing_on_dest / orphan_on_dest. This asserts the diff
+    /// invariant the driver's both-sides removal upholds.
+    #[test]
+    fn diff_unresolved_key_removed_from_both_sides_is_no_finding() {
+        // "b" present on both; simulate the driver dropping it from both after
+        // an unresolved HEAD.
+        let mut s = map(&[
+            ("a", st(Some("h"), 1, None, None)),
+            ("b", st(Some("h2"), 2, None, None)),
+        ]);
+        let mut d = s.clone();
+        s.remove("b");
+        d.remove("b");
+        let r = diff_parity(&s, &d);
+        assert_eq!(r.matched, 1);
+        assert_eq!(r.missing_on_dest, 0, "no false missing from a both-sides drop");
+        assert_eq!(r.orphan_on_dest, 0, "no false orphan from a both-sides drop");
+        // Contrast: a ONE-sided drop (the bug) WOULD have fabricated an orphan.
+        let mut s_bug = map(&[
+            ("a", st(Some("h"), 1, None, None)),
+            ("b", st(Some("h2"), 2, None, None)),
+        ]);
+        let d_bug = s_bug.clone();
+        s_bug.remove("b"); // dropped from source only
+        let r_bug = diff_parity(&s_bug, &d_bug);
+        assert_eq!(
+            r_bug.orphan_on_dest, 1,
+            "one-sided drop fabricates a false orphan (the bug this fix prevents)"
+        );
     }
 
     #[test]

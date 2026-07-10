@@ -1263,6 +1263,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         router.is_delta_eligible(filename)
     }
 
+    /// A delta entry built from LIST data alone (no HEAD) — the `delta_stub`
+    /// shape with empty `ref_sha256`. Its `file_size` is the STORED (delta)
+    /// size, not the original, so it must never be cached as authoritative.
+    fn is_unresolved_delta_stub(meta: &FileMetadata) -> bool {
+        matches!(
+            &meta.storage_info,
+            crate::types::StorageInfo::Delta { ref_sha256, .. } if ref_sha256.is_empty()
+        )
+    }
+
     pub async fn head(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {
         // Note: we do NOT use the metadata cache for HEAD. The cache is used for
         // LIST enrichment and file_size correction, but HEAD must always verify
@@ -1401,9 +1411,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .storage
                     .enrich_list_metadata(bucket, cache_misses)
                     .await?;
-                // Cache the newly enriched metadata
+                // Cache ONLY genuinely HEAD-resolved metadata. When a HEAD
+                // sweep aborts under backend throttling, enrich_list_metadata
+                // returns unresolved delta STUBS (empty ref_sha256, delta_size
+                // = stored size) as a serviceable listing fallback — but those
+                // must NOT poison the cache, or a later HEAD/GET would serve
+                // the stub's wrong (stored, not original) size. A stub is
+                // identifiable by an empty ref_sha256 on a Delta entry.
                 for (key, meta) in &enriched {
-                    self.metadata_cache.insert(bucket, key, meta.clone());
+                    if !Self::is_unresolved_delta_stub(meta) {
+                        self.metadata_cache.insert(bucket, key, meta.clone());
+                    }
                 }
                 cache_hits.extend(enriched);
             }
@@ -2512,5 +2530,52 @@ legacy_key_id: "old-kid"
                 &delta(),
             )
         );
+    }
+
+    /// X-ray H3: a throttle-aborted HEAD sweep returns delta STUBS (empty
+    /// ref_sha256, stored delta_size). Those must be detected so the caller
+    /// skips caching them — else a later HEAD/GET serves the stub's wrong
+    /// (stored, not original) size from the poisoned cache.
+    #[test]
+    fn unresolved_delta_stub_is_detected() {
+        use crate::types::StorageInfo;
+        let stub = {
+            let mut m = FileMetadata::fallback(
+                "app.zip".to_string(),
+                123,
+                "etag".to_string(),
+                chrono::Utc::now(),
+                None,
+                StorageInfo::delta_stub(123),
+            );
+            m.storage_info = StorageInfo::delta_stub(123);
+            m
+        };
+        assert!(
+            DeltaGliderEngine::<FilesystemBackend>::is_unresolved_delta_stub(&stub),
+            "empty-ref_sha256 delta must be recognised as an unresolved stub"
+        );
+        // A genuinely HEAD-resolved delta (populated ref_sha256) is cacheable.
+        let mut resolved = stub.clone();
+        resolved.storage_info = StorageInfo::Delta {
+            ref_path: "reference.bin".into(),
+            ref_sha256: "realsha".into(),
+            delta_size: 123,
+            delta_cmd: "xdelta3".into(),
+        };
+        assert!(
+            !DeltaGliderEngine::<FilesystemBackend>::is_unresolved_delta_stub(&resolved),
+            "resolved delta must be cacheable"
+        );
+        // Passthrough is never a stub.
+        let pt = FileMetadata::fallback(
+            "x.png".into(),
+            10,
+            "e".into(),
+            chrono::Utc::now(),
+            None,
+            StorageInfo::Passthrough,
+        );
+        assert!(!DeltaGliderEngine::<FilesystemBackend>::is_unresolved_delta_stub(&pt));
     }
 }
