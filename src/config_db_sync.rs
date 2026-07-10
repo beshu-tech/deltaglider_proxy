@@ -879,16 +879,22 @@ pub async fn reopen_and_rebuild_iam(
     // against real OIDC providers.
     if let Some(ref ext_auth) = external_auth {
         let providers = db.load_auth_providers().unwrap_or_default();
-        if !providers.is_empty() {
-            ext_auth.rebuild(&providers);
-            drop(db);
+        // ALWAYS rebuild — an EMPTY list means every provider was deleted on the
+        // peer, and skipping the rebuild would leave the deleted provider's live
+        // discovery/client config in memory, so OAuth logins through it keep
+        // succeeding here indefinitely. Only the async discovery round is skipped
+        // when empty (nothing to discover).
+        let is_empty = providers.is_empty();
+        ext_auth.rebuild(&providers);
+        drop(db);
+        if !is_empty {
             ext_auth.discover_all().await;
-            info!(
-                "External auth providers rebuilt from S3-synced DB ({} providers) [{}]",
-                ext_auth.provider_names().len(),
-                context
-            );
         }
+        info!(
+            "External auth providers rebuilt from S3-synced DB ({} providers) [{}]",
+            ext_auth.provider_names().len(),
+            context
+        );
     }
     true
 }

@@ -2211,21 +2211,47 @@ impl Config {
             }
         }
 
-        fn walk(v: &mut serde_yaml::Value, inverse: &std::collections::BTreeMap<&str, String>) {
+        // Count how many string scalars in the whole tree hold each env value.
+        // A value that appears in MORE THAN ONE field is ambiguous — rewriting
+        // either into `${env:NAME}` would COUPLE an unrelated field to that env
+        // var (a later env change would propagate to the wrong field). Only
+        // rewrite values that occur exactly once; leave ambiguous ones
+        // materialized (the comment's "expanded is better than wrong" contract).
+        fn count_values<'a>(
+            v: &'a serde_yaml::Value,
+            counts: &mut std::collections::HashMap<&'a str, u32>,
+        ) {
+            match v {
+                serde_yaml::Value::String(s) => *counts.entry(s.as_str()).or_insert(0) += 1,
+                serde_yaml::Value::Sequence(seq) => seq.iter().for_each(|i| count_values(i, counts)),
+                serde_yaml::Value::Mapping(map) => {
+                    map.iter().for_each(|(_, val)| count_values(val, counts))
+                }
+                _ => {}
+            }
+        }
+
+        fn walk(
+            v: &mut serde_yaml::Value,
+            inverse: &std::collections::BTreeMap<&str, String>,
+            counts: &std::collections::HashMap<String, u32>,
+        ) {
             match v {
                 serde_yaml::Value::String(s) => {
-                    if let Some(reference) = inverse.get(s.as_str()) {
-                        *s = reference.clone();
+                    if counts.get(s.as_str()).copied().unwrap_or(0) == 1 {
+                        if let Some(reference) = inverse.get(s.as_str()) {
+                            *s = reference.clone();
+                        }
                     }
                 }
                 serde_yaml::Value::Sequence(seq) => {
                     for item in seq {
-                        walk(item, inverse);
+                        walk(item, inverse, counts);
                     }
                 }
                 serde_yaml::Value::Mapping(map) => {
                     for (_, value) in map.iter_mut() {
-                        walk(value, inverse);
+                        walk(value, inverse, counts);
                     }
                 }
                 _ => {}
@@ -2235,7 +2261,14 @@ impl Config {
         let substituted = serde_yaml::to_value(self)
             .map_err(|e| e.to_string())
             .and_then(|mut tree| {
-                walk(&mut tree, &inverse);
+                let mut counts_borrowed: std::collections::HashMap<&str, u32> =
+                    std::collections::HashMap::new();
+                count_values(&tree, &mut counts_borrowed);
+                let counts: std::collections::HashMap<String, u32> = counts_borrowed
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect();
+                walk(&mut tree, &inverse, &counts);
                 serde_yaml::from_value::<Config>(tree).map_err(|e| e.to_string())
             });
         match substituted {
@@ -5036,6 +5069,37 @@ storage:
     fn no_refs_is_a_plain_clone() {
         let cfg = Config::default();
         assert_eq!(cfg.with_env_refs_reinserted(), cfg);
+    }
+
+    #[test]
+    fn ambiguous_value_in_two_fields_is_not_reinserted() {
+        // A value that appears in TWO distinct fields is ambiguous — rewriting
+        // either into ${env:NAME} would couple the unrelated field to that env
+        // var. Both must stay materialized. (X-ray M55.)
+        let mut cfg = Config {
+            access_key_id: Some("hunter2".into()),
+            secret_access_key: Some("hunter2".into()),
+            ..Default::default()
+        };
+        cfg.env_refs.insert("SHARED".into(), "hunter2".into());
+        let out = cfg.with_env_refs_reinserted();
+        assert_eq!(
+            out.access_key_id.as_deref(),
+            Some("hunter2"),
+            "ambiguous value must NOT be rewritten"
+        );
+        assert_eq!(out.secret_access_key.as_deref(), Some("hunter2"));
+
+        // But a value appearing exactly ONCE is still re-inserted.
+        let mut cfg2 = Config {
+            access_key_id: Some("only-here".into()),
+            ..Default::default()
+        };
+        cfg2.env_refs.insert("UNIQ".into(), "only-here".into());
+        assert_eq!(
+            cfg2.with_env_refs_reinserted().access_key_id.as_deref(),
+            Some("${env:UNIQ}")
+        );
     }
 
     #[test]
