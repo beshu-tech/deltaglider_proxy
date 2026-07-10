@@ -424,10 +424,11 @@ impl SessionStore {
 
     /// Remove all expired sessions.
     pub fn cleanup_expired(&self) {
-        let ttl = self.ttl;
-        self.sessions
-            .write()
-            .retain(|_, info| info.created_at.elapsed() < ttl);
+        // Drop both TTL-expired AND revoked sessions. entry_live checks both, so
+        // a revoked-but-not-yet-TTL-expired session is evicted here rather than
+        // lingering in memory until its TTL — defense in depth so no future
+        // epoch-handling bug can resurrect a session revoked long ago.
+        self.sessions.write().retain(|_, info| self.entry_live(info));
     }
 }
 
@@ -477,6 +478,35 @@ mod tests {
             store.revoked_epoch("iam:alice"),
             Some(2000),
             "a lower incoming epoch must not regress a revocation"
+        );
+    }
+
+    /// Session-cleanup critic-gap: cleanup_expired must EVICT a revoked session,
+    /// not just leave entry_live to reject it — so no future epoch-handling bug
+    /// can resurrect a long-revoked session lingering in the map.
+    #[test]
+    fn cleanup_expired_evicts_revoked_sessions() {
+        let store = SessionStore::new();
+        let token = store.create_session(
+            None,
+            AuthMethod::IamLoginAs {
+                access_key_id: "AKIACOMPROMISED".into(),
+            },
+            SessionKind::AdminGui,
+        );
+        assert!(store.validate(&token, None), "fresh session is valid");
+        assert_eq!(store.sessions.read().len(), 1);
+
+        // Revoke the identity at a high epoch (>= the session's created_unix).
+        store.note_revocation("AKIACOMPROMISED", i64::MAX);
+        assert!(!store.validate(&token, None), "revoked session is invalid");
+
+        // cleanup_expired must physically remove it, not just keep it invalid.
+        store.cleanup_expired();
+        assert_eq!(
+            store.sessions.read().len(),
+            0,
+            "a revoked session must be evicted by cleanup, not linger until TTL"
         );
     }
 
