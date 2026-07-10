@@ -163,10 +163,19 @@ impl SessionStore {
         }
     }
 
-    /// Replace the revocation snapshot (from the synced `session_revocations`
-    /// table). Called on startup, after each revoke, and after a config sync.
+    /// MERGE a revocation snapshot (from the synced `session_revocations`
+    /// table) monotonically. Called on startup, after each revoke, and after a
+    /// config sync. A wholesale replace would un-revoke a compromised session:
+    /// a revocation recorded locally via `note_revocation` but not yet in the
+    /// incoming snapshot would be wiped, resurrecting the session (X-ray H20).
+    /// So we keep the MAX epoch per identity and never DROP an identity the
+    /// snapshot omits — revocations only ever advance, never regress.
     pub fn set_revocations(&self, rows: Vec<(String, i64)>) {
-        *self.revocations.write() = rows.into_iter().collect();
+        let mut map = self.revocations.write();
+        for (identity, revoked_since) in rows {
+            let e = map.entry(identity).or_insert(revoked_since);
+            *e = (*e).max(revoked_since);
+        }
     }
 
     /// Record a local revocation immediately (so the current instance rejects the
@@ -434,6 +443,42 @@ fn ip_ok(stored: Option<IpAddr>, caller: Option<IpAddr>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl SessionStore {
+        /// Test accessor: the revocation epoch for an identity, if any.
+        fn revoked_epoch(&self, identity: &str) -> Option<i64> {
+            self.revocations.read().get(identity).copied()
+        }
+    }
+
+    /// X-ray H20: a config-sync snapshot must MERGE monotonically, never
+    /// replace. A locally-recorded revocation that the incoming snapshot omits
+    /// must survive — else a compromised session is silently un-revoked.
+    #[test]
+    fn set_revocations_merges_monotonically_and_never_unrevokes() {
+        let store = SessionStore::new();
+        // Local revocation (e.g. operator revoked a compromised key here).
+        store.note_revocation("iam:alice", 1000);
+        // A sync snapshot arrives that does NOT contain alice (stale peer / not
+        // yet propagated) but adds bob.
+        store.set_revocations(vec![("iam:bob".into(), 500)]);
+        assert_eq!(
+            store.revoked_epoch("iam:alice"),
+            Some(1000),
+            "local revocation must NOT be wiped by a snapshot that omits it"
+        );
+        assert_eq!(store.revoked_epoch("iam:bob"), Some(500));
+        // A later snapshot with a HIGHER epoch for alice advances it; a lower
+        // one never regresses it.
+        store.set_revocations(vec![("iam:alice".into(), 2000)]);
+        assert_eq!(store.revoked_epoch("iam:alice"), Some(2000));
+        store.set_revocations(vec![("iam:alice".into(), 100)]);
+        assert_eq!(
+            store.revoked_epoch("iam:alice"),
+            Some(2000),
+            "a lower incoming epoch must not regress a revocation"
+        );
+    }
 
     #[test]
     fn test_create_and_validate() {
