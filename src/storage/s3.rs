@@ -963,16 +963,9 @@ impl S3Backend {
         Ok(())
     }
 
-    /// Check if an object exists in S3
-    async fn object_exists(&self, bucket: &str, key: &str) -> bool {
-        self.client
-            .head_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-            .is_ok()
-    }
+    // (object_exists removed: it mapped every HEAD error to `false`, which is
+    // the has_reference transient-error corruption bug. has_reference now
+    // classifies the error directly — NotFound → absent, else propagate.)
 
     // === Listing classification helpers ===
     //
@@ -1430,9 +1423,25 @@ impl StorageBackend for S3Backend {
     }
 
     #[instrument(skip(self))]
-    async fn has_reference(&self, bucket: &str, prefix: &str) -> bool {
+    async fn has_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
         let key = self.reference_key(prefix);
-        self.object_exists(bucket, &key).await
+        match self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            // A genuine object-level 404 → absent. Anything else (503 SlowDown,
+            // timeout, 5xx, connection reset) must NOT read as absent — else a
+            // write path overwrites a live reference.bin on a backend hiccup.
+            Err(e) => match Self::classify_s3_error(bucket, &e, S3Op::HeadObject) {
+                StorageError::NotFound(_) => Ok(false),
+                other => Err(other),
+            },
+        }
     }
 
     #[instrument(skip(self))]
@@ -2659,6 +2668,29 @@ mod tests {
                 assert!(!msg.is_empty(), "S3 error message must not be empty");
             }
             other => panic!("expected S3, got {:?}", other),
+        }
+    }
+
+    /// has_reference corruption guard: a transient HEAD failure (503 SlowDown,
+    /// 500, timeout) must NOT classify as NotFound. has_reference maps only
+    /// NotFound → Ok(false); everything else → Err. If a 503 ever mapped to
+    /// NotFound the write path would read "no reference" on a backend hiccup
+    /// and overwrite a live reference.bin, orphaning every sibling delta.
+    #[test]
+    fn transient_head_errors_do_not_classify_as_not_found() {
+        for status in [503u16, 500, 429] {
+            let inner = aws_sdk_s3::operation::head_object::HeadObjectError::generic(
+                aws_smithy_types::error::ErrorMetadata::builder()
+                    .code("SlowDown")
+                    .build(),
+            );
+            let err: SdkError<_> =
+                SdkError::service_error(inner, http_response(status, Some("req-t")));
+            let classified = S3Backend::classify_s3_error("bucket", &err, S3Op::HeadObject);
+            assert!(
+                !matches!(classified, StorageError::NotFound(_)),
+                "transient status {status} must NOT be NotFound (would corrupt reference.bin), got {classified:?}"
+            );
         }
     }
 

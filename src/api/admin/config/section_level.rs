@@ -1092,7 +1092,7 @@ fn probe_enc_body(enc: &serde_json::Value) -> BackendKeyPresence {
 ///
 /// No-op on variants that don't carry the field (e.g. SseS3 has no
 /// primary `key`).
-fn preserve_backend_encryption_secrets(
+pub(crate) fn preserve_backend_encryption_secrets(
     new: &mut crate::config::BackendEncryptionConfig,
     old: &crate::config::BackendEncryptionConfig,
     probe: BackendKeyPresence,

@@ -183,11 +183,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             multipart_etag,
         };
 
-        // Check if deltaspace already has a reference (existing deltaspace)
+        // Check if deltaspace already has a reference (existing deltaspace).
+        // A backend error here must ABORT the PUT — never fall through to the
+        // "create baseline" branch, which would overwrite a reference.bin that
+        // may exist and orphan every sibling delta.
         let has_existing_reference = self
             .storage
             .has_reference(ctx.bucket, ctx.deltaspace_id)
-            .await;
+            .await?;
 
         // Ensure deltaspace has an internal reference baseline.
         //
@@ -400,7 +403,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // B1 (open): this lock is IN-PROCESS only — two instances writing the
         // same deltaspace can corrupt reference.bin (see CLAUDE.md HA contract).
         let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
-        let has_existing_reference = self.storage.has_reference(bucket, &deltaspace_id).await;
+        // Write path: a backend error must abort, not read as "no reference".
+        let has_existing_reference = self.storage.has_reference(bucket, &deltaspace_id).await?;
 
         // No reference yet → this object becomes the deltaspace baseline. Stream
         // the reference into place from the spool (put_reference_from_file: no
@@ -1316,7 +1320,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         deltaspace_id: &str,
         filename: &str,
     ) -> Result<bool, EngineError> {
-        if !self.storage.has_reference(bucket, deltaspace_id).await {
+        if !self.storage.has_reference(bucket, deltaspace_id).await? {
             return Ok(false);
         }
 
@@ -1383,7 +1387,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         for ds in &deltaspaces {
             // Check if reference exists and needs migration
-            if !self.storage.has_reference(bucket, ds).await {
+            if !self.storage.has_reference(bucket, ds).await? {
                 skipped += 1;
                 continue;
             }

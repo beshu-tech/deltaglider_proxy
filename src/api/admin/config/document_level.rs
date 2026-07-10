@@ -352,8 +352,41 @@ pub async fn validate_config_doc(
 fn preserve_runtime_secrets(
     incoming: &mut crate::config::Config,
     current: &crate::config::Config,
+    raw_yaml: &str,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
+
+    // Per-backend AES encryption keys are masked to None on export
+    // (redact_for_export). A full-document export→edit→apply round-trip must
+    // preserve them exactly as the section-PUT path does — otherwise the
+    // rebuilt engine gets `key: None`, writes plaintext, and every historical
+    // object encrypted with the now-gone key becomes unreadable. This is the
+    // same class as the OAuth/SigV4 preservation above, on the doc write path
+    // the original fix missed. The probe distinguishes absent (preserve) from
+    // explicit-null (operator disabling encryption); a redacted export always
+    // yields absent, so the common case preserves.
+    let storage_body = serde_yaml::from_str::<serde_json::Value>(raw_yaml)
+        .ok()
+        .and_then(|v| v.get("storage").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    let probe = super::section_level::BackendEncryptionKeyProbe::from_section(
+        super::SectionName::Storage,
+        &storage_body,
+    );
+    super::section_level::preserve_backend_encryption_secrets(
+        &mut incoming.backend_encryption,
+        &current.backend_encryption,
+        probe.for_singleton(),
+    );
+    for new_named in &mut incoming.backends {
+        if let Some(old_named) = current.backends.iter().find(|n| n.name == new_named.name) {
+            super::section_level::preserve_backend_encryption_secrets(
+                &mut new_named.encryption,
+                &old_named.encryption,
+                probe.for_named(&new_named.name),
+            );
+        }
+    }
 
     // Top-level infra secrets. The bootstrap hash is the only
     // top-level infra secret left after the per-backend encryption
@@ -497,7 +530,7 @@ pub(crate) async fn apply_config_inner(
     // 3. Merge runtime secrets into the incoming doc. `preserve_runtime_secrets`
     //    emits its own warnings for credential transitions that would
     //    silently clear state — surface them to the caller.
-    let preserve_warnings = preserve_runtime_secrets(&mut incoming, &cfg);
+    let preserve_warnings = preserve_runtime_secrets(&mut incoming, &cfg, &body.yaml);
 
     // 3b. Carry forward env-ref provenance from the running config. A doc
     //     applied via the CLI arrives pre-expanded (operator-side env), so
@@ -1009,5 +1042,76 @@ access:
         assert_eq!(s.groups_deleted, 1);
         assert_eq!(s.mapping_rules_replaced, 3);
         assert!(!s.no_changes);
+    }
+
+    /// Doc-apply CRITICAL: a redacted export→apply (backend key masked to
+    /// None, no `key:` in the YAML) must PRESERVE the running key, not wipe it
+    /// (which would make historical objects unreadable + write plaintext).
+    #[test]
+    fn doc_apply_preserves_redacted_backend_encryption_key() {
+        use crate::config::BackendEncryptionConfig as E;
+        let real_key = "a".repeat(64);
+        let current = crate::config::Config {
+            backend_encryption: E::Aes256GcmProxy {
+                key: Some(real_key.clone()),
+                key_id: Some("k1".into()),
+                legacy_key: None,
+                legacy_key_id: None,
+            },
+            ..Default::default()
+        };
+        // Incoming: same mode, key redacted to None; YAML has no `key:` field.
+        let mut incoming = crate::config::Config {
+            backend_encryption: E::Aes256GcmProxy {
+                key: None,
+                key_id: Some("k1".into()),
+                legacy_key: None,
+                legacy_key_id: None,
+            },
+            ..Default::default()
+        };
+        let yaml = "storage:\n  backend_encryption:\n    mode: aes256-gcm-proxy\n    key_id: k1\n";
+        preserve_runtime_secrets(&mut incoming, &current, yaml);
+        match incoming.backend_encryption {
+            E::Aes256GcmProxy { key, .. } => assert_eq!(
+                key,
+                Some(real_key),
+                "redacted key must be restored from the running config"
+            ),
+            other => panic!("mode changed unexpectedly: {other:?}"),
+        }
+    }
+
+    /// The escape hatch still works: explicit `key: null` in the YAML DISABLES
+    /// preservation (operator intent to clear), not a redacted-absent.
+    #[test]
+    fn doc_apply_explicit_null_key_is_not_preserved() {
+        use crate::config::BackendEncryptionConfig as E;
+        let current = crate::config::Config {
+            backend_encryption: E::Aes256GcmProxy {
+                key: Some("b".repeat(64)),
+                key_id: None,
+                legacy_key: None,
+                legacy_key_id: None,
+            },
+            ..Default::default()
+        };
+        let mut incoming = crate::config::Config {
+            backend_encryption: E::Aes256GcmProxy {
+                key: None,
+                key_id: None,
+                legacy_key: None,
+                legacy_key_id: None,
+            },
+            ..Default::default()
+        };
+        let yaml = "storage:\n  backend_encryption:\n    mode: aes256-gcm-proxy\n    key: null\n";
+        preserve_runtime_secrets(&mut incoming, &current, yaml);
+        match incoming.backend_encryption {
+            E::Aes256GcmProxy { key, .. } => {
+                assert_eq!(key, None, "explicit null must NOT be preserved")
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

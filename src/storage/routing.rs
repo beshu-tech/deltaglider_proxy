@@ -702,7 +702,7 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, get_reference_metadata, prefix)
     }
 
-    async fn has_reference(&self, bucket: &str, prefix: &str) -> bool {
+    async fn has_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
         let (backend, real_bucket) = self.resolve_existing(bucket).await;
         backend.has_reference(&real_bucket, prefix).await
     }
@@ -1174,8 +1174,8 @@ mod tests {
             Err(StorageError::NotFound("metadata".to_string()))
         }
 
-        async fn has_reference(&self, _: &str, _: &str) -> bool {
-            false
+        async fn has_reference(&self, _: &str, _: &str) -> Result<bool, StorageError> {
+            Ok(false)
         }
 
         async fn delete_reference(&self, _: &str, _: &str) -> Result<(), StorageError> {

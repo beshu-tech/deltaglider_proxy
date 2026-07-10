@@ -84,6 +84,19 @@ pub fn is_pre_flip(phase: &str) -> bool {
     matches!(phase, "stage" | "copy" | "verify")
 }
 
+/// Should the write gate be ARMED while resuming a migrate at this phase?
+///
+/// Armed for every phase up to AND INCLUDING `flip`: a crash can persist
+/// `phase="flip"` BEFORE the atomic flip actually runs (migrate.rs persists
+/// the phase, then executes the flip), so a resume at `flip` may still route
+/// the bucket to the SOURCE — client writes there must be gated, or they land
+/// on the soon-abandoned backend and are lost (permanently, with
+/// delete_source). Only `cleanup` is truly post-flip: the bucket is live on
+/// the new backend and gating it would 503 clients during the source sweep.
+pub fn gate_armed_during(phase: &str) -> bool {
+    phase != "cleanup"
+}
+
 /// Should a job that FAILED in `phase` unwind its staging route?
 /// Pre-flip phases: yes (source untouched). The flip itself: also yes —
 /// `mutate_and_apply_strict` is atomic (rollback on rebuild OR persist
@@ -619,6 +632,14 @@ mod tests {
             "atomic flip failure = source authoritative"
         );
         assert!(!unwinds_on_failure("cleanup"));
+        // Gate-arming is distinct from is_pre_flip: the gate stays armed
+        // through `flip` (a resume there may still route to source), and is
+        // cleared ONLY for `cleanup`. Conflating this with is_pre_flip was the
+        // pre-flip-gate-clear CRITICAL.
+        for p in ["stage", "copy", "verify", "flip"] {
+            assert!(gate_armed_during(p), "{p} must stay gated");
+        }
+        assert!(!gate_armed_during("cleanup"), "cleanup is post-flip, live");
         assert_eq!(PHASES.len(), 5);
     }
 

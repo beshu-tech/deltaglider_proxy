@@ -1081,8 +1081,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Reference metadata for a deltaspace, or `None` when no reference exists.
+    /// A backend error is treated as "no reference" here (read-only reporting
+    /// path — the write paths propagate the error instead).
     pub async fn reference_meta(&self, bucket: &str, prefix: &str) -> Option<FileMetadata> {
-        if !self.storage.has_reference(bucket, prefix).await {
+        if !self
+            .storage
+            .has_reference(bucket, prefix)
+            .await
+            .unwrap_or(false)
+        {
             return None;
         }
         self.storage
@@ -1641,7 +1648,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Bytes of a reclaimed reference.bin (stored-only) — subtracted from the
         // counter so stored_bytes stays exact when the last delta is removed.
         let mut reclaimed_ref_bytes = 0u64;
-        if !has_objects && self.storage.has_reference(bucket, &deltaspace_id).await {
+        if !has_objects && self.storage.has_reference(bucket, &deltaspace_id).await? {
             reclaimed_ref_bytes = remaining
                 .iter()
                 .find(|m| matches!(m.storage_info, StorageInfo::Reference { .. }))
@@ -1772,8 +1779,8 @@ mod tests {
         async fn head_bucket(&self, _: &str) -> Result<bool, crate::storage::StorageError> {
             Ok(true)
         }
-        async fn has_reference(&self, _: &str, _: &str) -> bool {
-            false
+        async fn has_reference(&self, _: &str, _: &str) -> Result<bool, StorageError> {
+            Ok(false)
         }
         async fn put_reference(
             &self,

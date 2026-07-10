@@ -878,8 +878,10 @@ impl StorageBackend for FilesystemBackend {
         }
     }
 
-    async fn has_reference(&self, bucket: &str, prefix: &str) -> bool {
-        path_exists(&self.reference_path(bucket, prefix)).await
+    async fn has_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
+        // Local disk: a stat is either present or not; there is no transient
+        // remote-throttle case to disambiguate.
+        Ok(path_exists(&self.reference_path(bucket, prefix)).await)
     }
 
     #[instrument(skip(self))]

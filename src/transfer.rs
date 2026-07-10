@@ -1540,8 +1540,8 @@ mod multipart_abort_tests {
         ) -> Result<FileMetadata, StorageError> {
             Err(nope())
         }
-        async fn has_reference(&self, _: &str, _: &str) -> bool {
-            false
+        async fn has_reference(&self, _: &str, _: &str) -> Result<bool, StorageError> {
+            Ok(false)
         }
         async fn delete_reference(&self, _: &str, _: &str) -> Result<(), StorageError> {
             Err(nope())
@@ -1730,7 +1730,7 @@ mod multipart_abort_tests {
         ) -> Result<FileMetadata, StorageError> {
             self.0.get_reference_metadata(b, p).await
         }
-        async fn has_reference(&self, b: &str, p: &str) -> bool {
+        async fn has_reference(&self, b: &str, p: &str) -> Result<bool, StorageError> {
             self.0.has_reference(b, p).await
         }
         async fn delete_reference(&self, b: &str, p: &str) -> Result<(), StorageError> {

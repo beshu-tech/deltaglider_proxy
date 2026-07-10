@@ -204,7 +204,10 @@ impl ConfigDb {
         let mut keys = Vec::new();
         for (bucket, kind, phase, params) in rows {
             if kind == "migrate" {
-                if !super::migrate::is_pre_flip(&phase) {
+                // Only `cleanup` is post-flip (bucket live on the new backend);
+                // `flip` STAYS gated (a crash can persist phase="flip" before the
+                // flip runs, leaving the bucket routed to source).
+                if !super::migrate::gate_armed_during(&phase) {
                     continue;
                 }
                 if let Some(t) = params
@@ -581,11 +584,23 @@ mod tests {
         let mut keys = db.maintenance_gate_arm_keys().unwrap();
         keys.sort();
         assert_eq!(keys, vec!["__dgmigrate_m_0", "m"]);
-        // Post-flip (cleanup): the flipped bucket is live — gate NOTHING.
-        // (progress updates require a claimed job, mirroring the worker)
         db.maintenance_claim_next_job("w", current_unix_seconds(), 60)
             .unwrap()
             .unwrap();
+        // FLIP phase MUST stay gated: a crash can persist phase="flip" BEFORE
+        // the flip runs (bucket still routed to source), so a resume must gate
+        // the bucket or client writes land on the abandoned backend and are
+        // lost. Regression for the pre-flip-gate-clear CRITICAL.
+        db.maintenance_update_progress(m, "flip", None, 0, 0, 0, 0, None)
+            .unwrap();
+        let mut fkeys = db.maintenance_gate_arm_keys().unwrap();
+        fkeys.sort();
+        assert_eq!(
+            fkeys,
+            vec!["__dgmigrate_m_0", "m"],
+            "flip phase must keep the bucket gated"
+        );
+        // Post-flip (cleanup): the flipped bucket is live — gate NOTHING.
         db.maintenance_update_progress(m, "cleanup", None, 0, 0, 0, 0, None)
             .unwrap();
         assert!(db.maintenance_gate_arm_keys().unwrap().is_empty());

@@ -190,8 +190,14 @@ pub trait StorageBackend: Send + Sync {
         prefix: &str,
     ) -> Result<FileMetadata, StorageError>;
 
-    /// Check if reference exists
-    async fn has_reference(&self, bucket: &str, prefix: &str) -> bool;
+    /// Check if a reference exists for this deltaspace.
+    ///
+    /// `Ok(true)` = present, `Ok(false)` = genuinely absent (a real 404),
+    /// `Err(_)` = the backend could not answer (503/timeout/5xx). Callers on
+    /// the WRITE path MUST propagate the error — treating "couldn't check" as
+    /// "absent" would overwrite a live `reference.bin` and orphan every
+    /// sibling delta (the has_reference transient-error corruption class).
+    async fn has_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError>;
 
     /// Delete a reference file and its metadata
     async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError>;
@@ -722,7 +728,11 @@ macro_rules! impl_storage_backend_for_box {
             ) -> Result<FileMetadata, StorageError> {
                 (**self).get_reference_metadata(bucket, prefix).await
             }
-            async fn has_reference(&self, bucket: &str, prefix: &str) -> bool {
+            async fn has_reference(
+                &self,
+                bucket: &str,
+                prefix: &str,
+            ) -> Result<bool, StorageError> {
                 (**self).has_reference(bucket, prefix).await
             }
             async fn delete_reference(

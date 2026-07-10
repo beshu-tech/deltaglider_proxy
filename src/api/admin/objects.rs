@@ -310,10 +310,17 @@ async fn copy_one(
 ) -> Result<(), String> {
     // Engine-level retrieve+store so encryption/compression stays
     // transparent (matches replication's copy_one design).
-    let (data, meta) = engine
+    let (data, mut meta) = engine
         .retrieve(src_bucket, src_key)
         .await
         .map_err(|e| format!("retrieve {}/{}: {}", src_bucket, src_key, e))?;
+
+    // retrieve() returns PLAINTEXT but the metadata still carries the source's
+    // `dg-encrypted` / `dg-encryption-key-id` markers. Storing them onto the
+    // destination makes its read path think the (now-plaintext) bytes are
+    // encrypted → unreadable — and bulk-MOVE then deletes the source, so the
+    // only readable copy is gone. Strip them, exactly like transfer.rs.
+    crate::storage::encrypting::strip_encryption_markers(&mut meta.user_metadata);
 
     if let Some(mp_etag) = meta.multipart_etag.clone() {
         engine

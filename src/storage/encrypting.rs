@@ -1670,7 +1670,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     async fn head_bucket(&self, b: &str) -> Result<bool, StorageError> {
         self.inner.head_bucket(b).await
     }
-    async fn has_reference(&self, b: &str, p: &str) -> bool {
+    async fn has_reference(&self, b: &str, p: &str) -> Result<bool, StorageError> {
         self.inner.has_reference(b, p).await
     }
     async fn get_reference_metadata(&self, b: &str, p: &str) -> Result<FileMetadata, StorageError> {
@@ -1757,6 +1757,29 @@ mod tests {
     fn test_key() -> EncryptionKey {
         EncryptionKey::from_hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
             .unwrap()
+    }
+
+    /// strip_encryption_markers must remove BOTH proxy-encryption markers and
+    /// leave user metadata otherwise intact. Copy/move paths (transfer.rs, s3s
+    /// CopyObject, admin bulk copy/move) rely on this to avoid stamping stale
+    /// "this is encrypted" markers onto a decrypted body — which would make the
+    /// destination unreadable (and, for move, unrecoverable after source delete).
+    #[test]
+    fn strip_encryption_markers_removes_both_and_preserves_rest() {
+        let mut md = std::collections::HashMap::new();
+        md.insert(ENCRYPTION_MARKER_KEY.to_string(), "aes256-gcm-proxy".into());
+        md.insert(ENCRYPTION_KEY_ID_KEY.to_string(), "k1".into());
+        md.insert("user-tag".to_string(), "keep-me".into());
+        strip_encryption_markers(&mut md);
+        assert!(
+            !md.contains_key(ENCRYPTION_MARKER_KEY),
+            "dg-encrypted removed"
+        );
+        assert!(
+            !md.contains_key(ENCRYPTION_KEY_ID_KEY),
+            "dg-encryption-key-id removed"
+        );
+        assert_eq!(md.get("user-tag").map(String::as_str), Some("keep-me"));
     }
 
     /// The streaming `put_passthrough_file` must produce a chunked object that
@@ -2452,8 +2475,8 @@ mod tests {
         async fn head_bucket(&self, _: &str) -> Result<bool, StorageError> {
             Err(cb_err())
         }
-        async fn has_reference(&self, _: &str, _: &str) -> bool {
-            false
+        async fn has_reference(&self, _: &str, _: &str) -> Result<bool, StorageError> {
+            Ok(false)
         }
         async fn put_reference(
             &self,

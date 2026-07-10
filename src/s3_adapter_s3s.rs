@@ -932,7 +932,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             .as_ref()
             .map(|d| d.as_str())
             .unwrap_or(s3s::dto::MetadataDirective::COPY);
-        let (content_type, user_metadata) = if directive.eq_ignore_ascii_case("REPLACE") {
+        let (content_type, mut user_metadata) = if directive.eq_ignore_ascii_case("REPLACE") {
             (input.content_type, input.metadata.unwrap_or_default())
         } else if directive.eq_ignore_ascii_case("COPY") {
             (
@@ -945,6 +945,10 @@ impl s3s::S3 for DeltaGliderS3Service {
                 "metadata-directive must be COPY or REPLACE"
             ));
         };
+        // retrieve() decrypted the body; the source metadata still carries the
+        // source's dg-encryption markers. Storing them onto a decrypted body
+        // makes the destination unreadable (read path thinks it's encrypted).
+        crate::storage::encrypting::strip_encryption_markers(&mut user_metadata);
         let result = engine
             .store(
                 &input.bucket,
