@@ -522,7 +522,8 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let multipart_completing_timeout =
         Duration::from_secs(multipart_completing_timeout_secs.max(1));
     let startup_sweep_begin = Instant::now();
-    let startup_sweep = multipart.sweep_orphan_relay_artifacts();
+    // Startup: no concurrent uploads yet → no age guard needed.
+    let startup_sweep = multipart.sweep_orphan_relay_artifacts(Duration::ZERO);
     metrics
         .multipart_sweep_runs_total
         .with_label_values(&["startup"])
@@ -550,7 +551,11 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         move || {
             let begin = Instant::now();
             let report = mp.cleanup_expired(multipart_sweep_max_age, multipart_completing_timeout);
-            let orphan_report = mp.sweep_orphan_relay_artifacts();
+            // Periodic: only delete orphans older than the completing timeout, so
+            // a concurrent UploadPart's freshly-promoted relay dir (not in the
+            // active-set snapshot) is never swept out from under it (H19).
+            let orphan_report =
+                mp.sweep_orphan_relay_artifacts(multipart_completing_timeout);
             metrics
                 .multipart_sweep_runs_total
                 .with_label_values(&["periodic"])

@@ -1016,9 +1016,11 @@ impl MultipartStore {
         report
     }
 
-    /// Startup hardening: remove orphan relay temp artifacts that don't belong
-    /// to currently tracked relayed uploads.
-    pub fn sweep_orphan_relay_artifacts(&self) -> MultipartSweepReport {
+    /// Remove orphan relay temp artifacts that don't belong to a currently-
+    /// tracked relayed upload. `min_age` guards the promotion race for the
+    /// PERIODIC sweep (H19) — pass a grace period there; startup passes ZERO
+    /// (no concurrent uploads exist yet).
+    pub fn sweep_orphan_relay_artifacts(&self, min_age: std::time::Duration) -> MultipartSweepReport {
         let active_relay_dirs: HashSet<PathBuf> = self
             .uploads
             .read()
@@ -1029,7 +1031,7 @@ impl MultipartStore {
             })
             .collect();
         let (dirs_removed, files_removed) =
-            cleanup_orphan_relay_entries_at(&relay_root_dir(), &active_relay_dirs);
+            cleanup_orphan_relay_entries_at(&relay_root_dir(), &active_relay_dirs, min_age);
         MultipartSweepReport {
             orphan_relay_dirs_removed: dirs_removed,
             orphan_relay_files_removed: files_removed,
@@ -1142,9 +1144,17 @@ fn take_upload_for_cleanup(upload: &mut MultipartUpload) -> MultipartUpload {
     }
 }
 
+/// Remove relay artifacts under `relay_root` that don't belong to a currently-
+/// tracked upload. `min_age` guards the promotion race (H19): the periodic sweep
+/// snapshots active dirs then scans without the lock, so a concurrent
+/// UploadPart's freshly-created relay dir isn't in the snapshot — deleting it
+/// would destroy an active upload's parts. Only entries whose mtime is older than
+/// `min_age` are eligible, so a just-created dir is always spared. Startup passes
+/// `Duration::ZERO` (no concurrent uploads exist yet).
 fn cleanup_orphan_relay_entries_at(
     relay_root: &Path,
     active_relay_dirs: &HashSet<PathBuf>,
+    min_age: std::time::Duration,
 ) -> (u64, u64) {
     let mut dirs_removed = 0u64;
     let mut files_removed = 0u64;
@@ -1154,6 +1164,20 @@ fn cleanup_orphan_relay_entries_at(
 
     for entry in entries.flatten() {
         let path = entry.path();
+        // Skip entries younger than min_age — they may be an in-flight upload's
+        // relay dir created after the active-set snapshot.
+        if !min_age.is_zero() {
+            let recent = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mt| mt.elapsed().ok())
+                .map(|age| age < min_age)
+                .unwrap_or(false);
+            if recent {
+                continue;
+            }
+        }
         if path.is_dir() {
             if active_relay_dirs.contains(&path) {
                 continue;
@@ -1911,13 +1935,34 @@ mod tests {
 
         let mut active = HashSet::new();
         active.insert(active_dir.clone());
-        let (dirs_removed, files_removed) = cleanup_orphan_relay_entries_at(dir.path(), &active);
+        let (dirs_removed, files_removed) =
+            cleanup_orphan_relay_entries_at(dir.path(), &active, std::time::Duration::ZERO);
 
         assert_eq!(dirs_removed, 1);
         assert_eq!(files_removed, 1);
         assert!(active_dir.exists(), "active relay dir must be preserved");
         assert!(!orphan_dir.exists(), "orphan relay dir must be removed");
         assert!(!orphan_file.exists(), "orphan relay file must be removed");
+    }
+
+    #[test]
+    fn orphan_sweep_min_age_spares_recent_entries() {
+        // H19: a freshly-created (untracked) relay dir — as a concurrent
+        // promotion would produce after the active-set snapshot — must NOT be
+        // deleted by the periodic sweep when a min_age guard is set.
+        let dir = tempfile::tempdir().unwrap();
+        let fresh_orphan = dir.path().join("fresh");
+        fs::create_dir_all(&fresh_orphan).unwrap();
+        fs::write(fresh_orphan.join("part-00001.bin"), b"in-flight").unwrap();
+
+        let active = HashSet::new(); // nothing tracked yet (mid-promotion)
+        let (dirs_removed, _files) = cleanup_orphan_relay_entries_at(
+            dir.path(),
+            &active,
+            std::time::Duration::from_secs(3600),
+        );
+        assert_eq!(dirs_removed, 0, "a recent dir must be spared by min_age");
+        assert!(fresh_orphan.exists(), "the in-flight relay dir must survive");
     }
 
     #[test]
