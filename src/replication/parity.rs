@@ -638,6 +638,13 @@ fn apply_logical(map: &mut BTreeMap<String, ObjState>, map_key: &str, e: &Parity
         st.sha256 = e.sha256.clone();
         st.size = e.size;
         st.etag = e.etag.clone();
+        // Overlay the TRUE created_at from the resolving HEAD, replacing the lite
+        // list's value (S3 last_modified) so remediation's newer-wins conflict
+        // resolution compares real creation times (H49). Keep the existing value
+        // if the HEAD didn't carry one.
+        if e.created_at.is_some() {
+            st.created_at = e.created_at;
+        }
         st.multipart_parts = e
             .etag
             .as_deref()
@@ -661,6 +668,7 @@ fn cache_entry_from_meta(m: &FileMetadata, stored_etag: Option<String>) -> Parit
         size: m.file_size,
         etag,
         stored_etag,
+        created_at: Some(m.created_at.timestamp_millis()),
     }
 }
 
@@ -1407,6 +1415,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn apply_logical_overlays_true_created_at() {
+        // H49: the HEAD's real created_at must overlay the lite list's value
+        // (S3 last_modified) so remediation's newer-wins compares correct times.
+        let mut map = BTreeMap::new();
+        map.insert(
+            "k".to_string(),
+            ObjState {
+                created_at: Some(1000), // lite value (e.g. S3 last_modified)
+                ..st(Some("old"), 1, None, None)
+            },
+        );
+        let e = ParityCacheEntry {
+            sha256: Some("new".into()),
+            size: 2,
+            etag: None,
+            stored_etag: None,
+            created_at: Some(5000), // true creation time from HEAD
+        };
+        apply_logical(&mut map, "k", &e);
+        assert_eq!(map["k"].created_at, Some(5000), "true created_at overlaid");
+        // A HEAD without created_at keeps the existing value.
+        let e2 = ParityCacheEntry {
+            created_at: None,
+            ..e
+        };
+        apply_logical(&mut map, "k", &e2);
+        assert_eq!(map["k"].created_at, Some(5000), "kept when HEAD has none");
+    }
+
     // ─────────────── cache freshness guard (false-"in-sync" defence) ───────────
 
     fn entry(stored: Option<&str>) -> ParityCacheEntry {
@@ -1415,6 +1453,7 @@ mod tests {
             size: 1,
             etag: Some("logical-etag".into()),
             stored_etag: stored.map(str::to_string),
+            created_at: None,
         }
     }
 

@@ -25,7 +25,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 22;
+const SCHEMA_VERSION: i32 = 23;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -773,6 +773,22 @@ impl ConfigDb {
             )?;
             info!(
                 "Migrated config DB schema from v{} to v22 (replication_parity.progress_total)",
+                version
+            );
+        }
+
+        if version < 23 {
+            // v23: parity object created_at (epoch millis). Without it, the cache
+            // fell back to the lite list's created_at, which on S3 is
+            // last_modified — wrong for parity remediation's newer-wins conflict
+            // resolution on Transforming rules (H49). Additive, node-local.
+            conn.execute(
+                "ALTER TABLE replication_parity_objects ADD COLUMN \
+                 created_at INTEGER",
+                [],
+            )?;
+            info!(
+                "Migrated config DB schema from v{} to v23 (replication_parity_objects.created_at)",
                 version
             );
         }

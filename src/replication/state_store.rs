@@ -832,7 +832,7 @@ impl ConfigDb {
         for chunk in dest_keys.chunks(500) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
-                "SELECT dest_key, sha256, size, etag, stored_etag
+                "SELECT dest_key, sha256, size, etag, stored_etag, created_at
                  FROM replication_parity_objects
                  WHERE rule_name = ? AND side = ? AND dest_key IN ({placeholders})"
             );
@@ -851,6 +851,7 @@ impl ConfigDb {
                         size: r.get::<_, i64>(2)? as u64,
                         etag: r.get(3)?,
                         stored_etag: r.get(4)?,
+                        created_at: r.get(5)?,
                     },
                 ))
             })?;
@@ -882,13 +883,14 @@ impl ConfigDb {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO replication_parity_objects
-                    (rule_name, side, dest_key, sha256, size, etag, stored_etag, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (rule_name, side, dest_key, sha256, size, etag, stored_etag, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(rule_name, side, dest_key) DO UPDATE SET
                     sha256 = excluded.sha256,
                     size = excluded.size,
                     etag = excluded.etag,
                     stored_etag = excluded.stored_etag,
+                    created_at = excluded.created_at,
                     updated_at = excluded.updated_at",
             )?;
             for (key, e) in entries {
@@ -900,6 +902,7 @@ impl ConfigDb {
                     e.size as i64,
                     e.etag,
                     e.stored_etag,
+                    e.created_at,
                     now
                 ])?;
             }
@@ -1259,6 +1262,9 @@ pub struct ParityCacheEntry {
     pub size: u64,
     pub etag: Option<String>,
     pub stored_etag: Option<String>,
+    /// True object creation time (epoch millis) from the resolving HEAD — NOT the
+    /// lite list's created_at, which on S3 is last_modified (H49).
+    pub created_at: Option<i64>,
 }
 
 #[cfg(test)]
@@ -1769,6 +1775,7 @@ mod tests {
             size,
             etag: etag.map(str::to_string),
             stored_etag: Some("blob-etag".to_string()),
+            created_at: None,
         };
         let src = ParitySide::Source;
         db.parity_cache_put_many(
@@ -1818,6 +1825,7 @@ mod tests {
             size: 1,
             etag: None,
             stored_etag: Some("blob".into()),
+            created_at: None,
         };
         db.parity_cache_put_many("r", ParitySide::Source, &[("k".into(), mk("SRC"))], 1)
             .unwrap();
@@ -1848,6 +1856,7 @@ mod tests {
             size: 1,
             etag: None,
             stored_etag: None,
+            created_at: None,
         };
         let s = ParitySide::Source;
         db.parity_cache_put_many(
@@ -1889,6 +1898,7 @@ mod tests {
             size,
             etag: None,
             stored_etag: None,
+            created_at: None,
         };
         let s = ParitySide::Source;
         db.parity_cache_put_many("r", s, &[("k".into(), mk(10))], 1)
@@ -1907,6 +1917,7 @@ mod tests {
             size: 1,
             etag: None,
             stored_etag: None,
+            created_at: None,
         };
         let s = ParitySide::Source;
         db.parity_cache_put_many("r", s, &[("k".into(), e)], 1)
