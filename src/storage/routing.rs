@@ -56,6 +56,13 @@ struct BackendHealth {
     /// Skipped by `gather_listings` until the deadline, so one dead backend
     /// doesn't tax every listing with a connect timeout.
     cooldown: HashMap<String, (std::time::Instant, String)>,
+    /// Bumped by every `invalidate_listing_freshness` (create/delete_bucket).
+    /// A probe snapshots it before its upstream LIST and only stamps the result
+    /// `fresh` if it's unchanged afterward — otherwise an invalidation that
+    /// landed DURING the probe would be undone by re-arming freshness on a
+    /// roster fetched before the mutation, serving a just-created bucket as
+    /// absent for `list_fresh` (read-after-write break).
+    freshness_epoch: u64,
 }
 
 pub struct RoutingBackend {
@@ -295,6 +302,10 @@ impl RoutingBackend {
         // cooldown period.
         let mut to_probe: Vec<&String> = Vec::new();
         let mut cooling: Vec<BackendListing> = Vec::new();
+        // Snapshot the freshness epoch before probing: if a create/delete_bucket
+        // invalidates DURING our upstream LIST, the epoch changes and we refuse
+        // to re-stamp the (now-stale) roster as fresh below (H18 read-after-write).
+        let probe_epoch = self.health.lock().freshness_epoch;
         {
             let mut h = self.health.lock();
             for name in names {
@@ -354,10 +365,20 @@ impl RoutingBackend {
         // roster; failure (re)arms cooldown with the real error.
         {
             let mut h = self.health.lock();
+            // If an invalidation landed while we probed, the probe's roster may
+            // predate the mutation — store it as stale-but-usable (None) so the
+            // next request re-probes, never as fresh (which would serve a just-
+            // created bucket as absent for list_fresh).
+            let invalidated_during_probe = h.freshness_epoch != probe_epoch;
             for (name, res) in &probed {
                 match res {
                     Ok(list) => {
-                        h.last_known.insert(name.clone(), (Some(now), list.clone()));
+                        let stamp = if invalidated_during_probe {
+                            None
+                        } else {
+                            Some(now)
+                        };
+                        h.last_known.insert(name.clone(), (stamp, list.clone()));
                         h.cooldown.remove(name);
                     }
                     Err(e) => {
@@ -381,6 +402,7 @@ impl RoutingBackend {
     /// must see the change immediately, not after the freshness window.
     fn invalidate_listing_freshness(&self) {
         let mut h = self.health.lock();
+        h.freshness_epoch = h.freshness_epoch.wrapping_add(1);
         for entry in h.last_known.values_mut() {
             entry.0 = None;
         }
@@ -1112,6 +1134,10 @@ mod tests {
         fail_list: Arc<StdMutex<bool>>,
         /// Count of list_buckets calls — asserts the cooldown skips a backend.
         list_calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// Optional gate awaited INSIDE list_buckets after the call is counted:
+        /// lets a test hold a probe "in flight" while it mutates state, to
+        /// reproduce the invalidate-during-probe race deterministically.
+        list_gate: Arc<StdMutex<Option<Arc<tokio::sync::Notify>>>>,
     }
 
     impl TestBackend {
@@ -1123,6 +1149,7 @@ mod tests {
                 create_calls: Arc::new(StdMutex::new(Vec::new())),
                 fail_list: Arc::new(StdMutex::new(false)),
                 list_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                list_gate: Arc::new(StdMutex::new(None)),
             }
         }
 
@@ -1159,7 +1186,15 @@ mod tests {
             if *self.fail_list.lock().unwrap() {
                 return Err(StorageError::S3("simulated backend outage".into()));
             }
-            Ok(self.buckets.lock().unwrap().iter().cloned().collect())
+            // Snapshot the roster NOW (models "fetched before the mutation"),
+            // then, if a gate is installed, block until the test releases it —
+            // giving the test a window to invalidate freshness mid-probe.
+            let snapshot: Vec<String> = self.buckets.lock().unwrap().iter().cloned().collect();
+            let gate = self.list_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            Ok(snapshot)
         }
 
         async fn head_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
@@ -1634,6 +1669,49 @@ mod tests {
             probes.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "create_bucket must invalidate the fresh roster"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_during_probe_does_not_resurrect_stale_freshness() {
+        // H18 read-after-write: a probe whose upstream LIST ran BEFORE a
+        // concurrent create_bucket must not stamp its now-stale roster as fresh
+        // (that would serve the just-created bucket as absent for list_fresh).
+        let backend = TestBackend::with_buckets(&["b1"]);
+        let probes = backend.list_calls.clone();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *backend.list_gate.lock().unwrap() = Some(gate.clone());
+        let gate_field = backend.list_gate.clone();
+
+        let mut backends: HashMap<String, Arc<Box<dyn StorageBackend>>> = HashMap::new();
+        backends.insert("primary".into(), Arc::new(Box::new(backend)));
+        let routing =
+            Arc::new(routing_with_fresh(backends, "primary", std::time::Duration::from_secs(30)));
+
+        // Start a listing whose probe blocks mid-LIST (snapshot = {b1}).
+        let r1 = routing.clone();
+        let probe = tokio::spawn(async move { r1.list_buckets().await });
+        // Wait until the probe has been counted (it's now parked on the gate).
+        while probes.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        // A create lands DURING the probe: it inserts b2 into the backend AND
+        // invalidates freshness — after the parked probe already snapshotted {b1}.
+        routing.create_bucket("b2").await.expect("create b2");
+        // Release the parked probe; it completes with the stale {b1} snapshot.
+        gate.notify_one();
+        let racing = probe.await.unwrap().expect("racing listing");
+        // The racing listing itself began before b2 — it may lack b2, that's ok.
+        let _ = racing;
+
+        // The next listing MUST re-probe and see b2 — the stale roster must not
+        // have been cached as fresh. Clear the gate so this probe doesn't block.
+        *gate_field.lock().unwrap() = None;
+        let after = routing.list_buckets().await.expect("post-race listing");
+        assert!(
+            after.contains(&"b2".to_string()),
+            "b2 must be visible after an invalidate-during-probe race: {after:?}"
         );
     }
 
