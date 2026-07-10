@@ -1593,11 +1593,14 @@ impl Config {
             match Self::from_file(&path) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!(
-                        "WARNING: Failed to parse config file '{}': {} — using defaults",
-                        path, e
-                    );
-                    Self::default()
+                    // An operator who set DGP_CONFIG intends THAT config.
+                    // Falling back to full defaults on a parse error (a typo,
+                    // an unset ${env:VAR}, malformed YAML) would silently boot
+                    // with default auth/backends — a security downgrade the
+                    // operator never asked for. Fail loud instead. (X-ray H7.)
+                    eprintln!("ERROR: DGP_CONFIG='{path}' failed to parse: {e}");
+                    eprintln!("Refusing to start with default config the operator did not intend.");
+                    std::process::exit(1);
                 }
             }
         } else {
@@ -1610,9 +1613,21 @@ impl Config {
                         eprintln!("ERROR: found legacy TOML config '{path}': {TOML_REMOVED_MSG}");
                         std::process::exit(1);
                     }
-                    if let Ok(config) = Self::from_file(path) {
-                        found = Some(config);
-                        break;
+                    // A config file that EXISTS on the search path but fails to
+                    // parse must be fatal, not silently skipped → defaults
+                    // (X-ray H7). The operator placed it there intentionally.
+                    match Self::from_file(path) {
+                        Ok(config) => {
+                            found = Some(config);
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("ERROR: config file '{path}' failed to parse: {e}");
+                            eprintln!(
+                                "Refusing to start with default config the operator did not intend."
+                            );
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
@@ -3053,6 +3068,29 @@ backend:
         std::fs::write(&other_path, "listen_addr: \"127.0.0.1:9400\"\n").unwrap();
         let cfg = Config::from_file(other_path.to_str().unwrap()).unwrap();
         assert_eq!(cfg.listen_addr.port(), 9400);
+    }
+
+    /// X-ray H7: a malformed config file must return Err from from_file so
+    /// load() fails loud (exit 1) instead of silently booting full defaults —
+    /// which would be a security downgrade (default auth/backends) the operator
+    /// never intended. This asserts the error contract load() relies on.
+    #[test]
+    fn test_from_file_malformed_yaml_is_error_not_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        // Invalid YAML (unclosed bracket / bad structure).
+        let bad = dir.path().join("bad.yaml");
+        std::fs::write(&bad, "listen_addr: [unterminated\n  nonsense: : :\n").unwrap();
+        assert!(
+            Config::from_file(bad.to_str().unwrap()).is_err(),
+            "malformed YAML must be an error, not a silent default"
+        );
+        // A wrong-typed field is also an error, not defaulted-away.
+        let wrong = dir.path().join("wrong.yaml");
+        std::fs::write(&wrong, "listen_addr: 12345\n").unwrap();
+        assert!(
+            Config::from_file(wrong.to_str().unwrap()).is_err(),
+            "type-mismatched field must be an error"
+        );
     }
 
     #[test]
