@@ -360,8 +360,13 @@ async fn drain_once(
         let dbg = db.lock().await;
         match dbg.listener_cursor_load_full(REPLICATION_LISTENER) {
             Ok(Some(row)) => {
-                // Heartbeat: bump updated_at even on zero-advance ticks so a stalled
-                // consumer keeps pinning the purge floor (MAX-upsert keeps last_event_id).
+                // Re-assert the cursor (MAX-upsert keeps last_event_id). NOTE:
+                // updated_at only moves on a REAL advance (H65) — a zero-advance
+                // tick here is intentionally a no-op for updated_at, so a consumer
+                // WEDGED on a poison key ages out of the active-floor and stops
+                // pinning the prune floor forever. A caught-up (idle) consumer
+                // aging out is safe: it already consumed everything below its
+                // cursor, and the operator purge floor still guards manual purges.
                 let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, row.last_event_id, now);
                 row.last_event_id
             }

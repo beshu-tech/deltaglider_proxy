@@ -764,12 +764,22 @@ impl ConfigDb {
         new_id: i64,
         now: i64,
     ) -> Result<(), ConfigDbError> {
+        // `updated_at` tracks when the cursor last ADVANCED, not when it was last
+        // touched: only bump it when last_event_id actually increases. A listener
+        // that heartbeats every tick without moving its high-water mark (wedged on
+        // a poison key) must NOT keep looking "active" — otherwise it pins the
+        // webhook prune floor at the wedged id forever and the outbox grows
+        // unbounded (H65). A stalled cursor's updated_at ages past
+        // LISTENER_CURSOR_STALE_SECS and stops pinning the floor.
         self.conn.execute(
             "INSERT INTO listener_cursors (listener_name, last_event_id, updated_at)
                   VALUES (?, ?, ?)
              ON CONFLICT(listener_name) DO UPDATE SET
-                  last_event_id = MAX(last_event_id, excluded.last_event_id),
-                  updated_at    = excluded.updated_at",
+                  updated_at    = CASE
+                      WHEN excluded.last_event_id > last_event_id THEN excluded.updated_at
+                      ELSE updated_at
+                  END,
+                  last_event_id = MAX(last_event_id, excluded.last_event_id)",
             params![listener, new_id, now],
         )?;
         Ok(())
@@ -1226,17 +1236,31 @@ mod tests {
     }
 
     #[test]
-    fn cursor_heartbeat_bumps_updated_at_without_advancing() {
+    fn cursor_updated_at_tracks_advance_not_heartbeat() {
+        // H65: updated_at marks when the cursor last ADVANCED, not when it was
+        // touched. A zero-advance heartbeat must NOT move updated_at, or a wedged
+        // listener looks perpetually "active" and pins the prune floor forever.
         let db = ConfigDb::in_memory("test-pass").unwrap();
         db.listener_cursor_advance("replication", 5, 100).unwrap();
-        // Zero-advance heartbeat: same id, later now → updated_at moves, id doesn't.
+        // Zero-advance heartbeat: same id, later now → updated_at stays at 100.
         db.listener_cursor_advance("replication", 5, 5000).unwrap();
         let full = db
             .listener_cursor_load_full("replication")
             .unwrap()
             .unwrap();
         assert_eq!(full.last_event_id, 5);
-        assert_eq!(full.updated_at, 5000);
+        assert_eq!(
+            full.updated_at, 100,
+            "a zero-advance heartbeat must NOT bump updated_at (H65)"
+        );
+        // A real advance DOES move both.
+        db.listener_cursor_advance("replication", 9, 6000).unwrap();
+        let full = db
+            .listener_cursor_load_full("replication")
+            .unwrap()
+            .unwrap();
+        assert_eq!(full.last_event_id, 9);
+        assert_eq!(full.updated_at, 6000, "a real advance bumps updated_at");
     }
 
     #[test]
