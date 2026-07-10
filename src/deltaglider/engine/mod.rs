@@ -1632,7 +1632,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         delete_delta: bool,
     ) {
         let res = if delete_delta {
-            self.storage.delete_delta(bucket, deltaspace_id, filename).await
+            self.storage
+                .delete_delta(bucket, deltaspace_id, filename)
+                .await
         } else {
             self.storage
                 .delete_passthrough(bucket, deltaspace_id, filename)

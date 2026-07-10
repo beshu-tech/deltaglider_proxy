@@ -1980,7 +1980,7 @@ mod tests {
         // though throttled can never reach 3.
         assert!(page_is_throttle_aborted(0, 2, 2)); // whole 2-object page throttled
         assert!(page_is_throttle_aborted(0, 1, 1)); // whole 1-object page throttled
-        // A large page needs ≥3 (a stray 503 or two must NOT abort).
+                                                    // A large page needs ≥3 (a stray 503 or two must NOT abort).
         assert!(!page_is_throttle_aborted(0, 2, 1000));
         assert!(page_is_throttle_aborted(0, 3, 1000));
         // Any success this page → never abort (backend is coping).

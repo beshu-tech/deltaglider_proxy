@@ -1037,7 +1037,10 @@ impl MultipartStore {
     /// tracked relayed upload. `min_age` guards the promotion race for the
     /// PERIODIC sweep (H19) — pass a grace period there; startup passes ZERO
     /// (no concurrent uploads exist yet).
-    pub fn sweep_orphan_relay_artifacts(&self, min_age: std::time::Duration) -> MultipartSweepReport {
+    pub fn sweep_orphan_relay_artifacts(
+        &self,
+        min_age: std::time::Duration,
+    ) -> MultipartSweepReport {
         let active_relay_dirs: HashSet<PathBuf> = self
             .uploads
             .read()
@@ -1996,7 +1999,10 @@ mod tests {
             std::time::Duration::from_secs(3600),
         );
         assert_eq!(dirs_removed, 0, "a recent dir must be spared by min_age");
-        assert!(fresh_orphan.exists(), "the in-flight relay dir must survive");
+        assert!(
+            fresh_orphan.exists(),
+            "the in-flight relay dir must survive"
+        );
     }
 
     #[test]

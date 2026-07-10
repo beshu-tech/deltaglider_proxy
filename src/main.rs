@@ -554,8 +554,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             // Periodic: only delete orphans older than the completing timeout, so
             // a concurrent UploadPart's freshly-promoted relay dir (not in the
             // active-set snapshot) is never swept out from under it (H19).
-            let orphan_report =
-                mp.sweep_orphan_relay_artifacts(multipart_completing_timeout);
+            let orphan_report = mp.sweep_orphan_relay_artifacts(multipart_completing_timeout);
             metrics
                 .multipart_sweep_runs_total
                 .with_label_values(&["periodic"])

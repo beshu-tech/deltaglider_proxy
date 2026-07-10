@@ -2223,7 +2223,9 @@ impl Config {
         ) {
             match v {
                 serde_yaml::Value::String(s) => *counts.entry(s.as_str()).or_insert(0) += 1,
-                serde_yaml::Value::Sequence(seq) => seq.iter().for_each(|i| count_values(i, counts)),
+                serde_yaml::Value::Sequence(seq) => {
+                    seq.iter().for_each(|i| count_values(i, counts))
+                }
                 serde_yaml::Value::Mapping(map) => {
                     map.iter().for_each(|(_, val)| count_values(val, counts))
                 }

@@ -375,7 +375,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     sh.update(&buf[..n]);
                     mh.update(&buf[..n]);
                 }
-                Ok((hex::encode(sh.finalize()), hex::encode(mh.finalize()), observed))
+                Ok((
+                    hex::encode(sh.finalize()),
+                    hex::encode(mh.finalize()),
+                    observed,
+                ))
             })
             .await
             .map_err(|e| EngineError::Storage(StorageError::Other(format!("hash task: {e}"))))?

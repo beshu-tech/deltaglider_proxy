@@ -166,8 +166,7 @@ pub struct AdminState {
     /// REGARDLESS of the lease backend — the node-local SQLite check alone is
     /// blind to a scheduler holding the S3 lease (H14/H29/H48). None when no
     /// coordination lease is wired (e.g. no config DB / legacy mode).
-    pub coordination_lease:
-        Option<Arc<dyn crate::coordination::CoordinationLease>>,
+    pub coordination_lease: Option<Arc<dyn crate::coordination::CoordinationLease>>,
 }
 
 /// Per-rule cancel flags for in-flight parity audits (see [`AdminState`]).

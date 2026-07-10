@@ -101,7 +101,11 @@ pub async fn run_now(
     if let Some(lease) = state.coordination_lease.as_ref() {
         let now = replication::current_unix_seconds();
         if lease
-            .is_held(crate::coordination::LeaseSubsystem::Replication, &rule.name, now)
+            .is_held(
+                crate::coordination::LeaseSubsystem::Replication,
+                &rule.name,
+                now,
+            )
             .await
             .unwrap_or(false)
         {
@@ -342,7 +346,11 @@ pub async fn verify(
     // lease too so verify doesn't run a parity audit against a mid-sync dest.
     if let Some(lease) = state.coordination_lease.as_ref() {
         if lease
-            .is_held(crate::coordination::LeaseSubsystem::Replication, &rule.name, now)
+            .is_held(
+                crate::coordination::LeaseSubsystem::Replication,
+                &rule.name,
+                now,
+            )
             .await
             .unwrap_or(false)
         {
