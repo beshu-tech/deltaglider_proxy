@@ -405,6 +405,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             buckets,
             input.prefix.as_deref(),
             input.max_buckets,
+            input.continuation_token.as_deref(),
         )))
     }
 
@@ -2031,10 +2032,18 @@ fn list_buckets_output_from_rows(
     mut rows: Vec<(String, chrono::DateTime<chrono::Utc>)>,
     prefix: Option<&str>,
     max_buckets: Option<i32>,
+    continuation_token: Option<&str>,
 ) -> s3s::dto::ListBucketsOutput {
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     if let Some(prefix) = prefix {
         rows.retain(|(name, _)| name.starts_with(prefix));
+    }
+    // Resume past the previous page: the token is the last bucket name we
+    // returned, so drop everything <= it. Without this, a paginating client
+    // gets page 1 forever and buckets beyond the first page are unreachable
+    // (X-ray H25).
+    if let Some(token) = continuation_token {
+        rows.retain(|(name, _)| name.as_str() > token);
     }
     let cap = max_buckets
         .and_then(|n| usize::try_from(n.max(0)).ok())
@@ -2198,12 +2207,43 @@ mod tests {
             ],
             Some("a"),
             Some(1),
+            None,
         );
         let buckets = out.buckets.expect("buckets");
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].name.as_deref(), Some("alpha"));
         assert_eq!(out.continuation_token.as_deref(), Some("alpha"));
         assert_eq!(out.prefix.as_deref(), Some("a"));
+    }
+
+    /// X-ray H25: the continuation token from a prior page must be honored, or
+    /// pagination re-serves page 1 forever and later buckets are unreachable.
+    #[test]
+    fn list_buckets_output_resumes_past_continuation_token() {
+        let ts = chrono::Utc::now();
+        let rows = || {
+            vec![
+                ("a".to_string(), ts),
+                ("b".to_string(), ts),
+                ("c".to_string(), ts),
+            ]
+        };
+        // Page 1: cap 1, no token → "a", truncated, token="a".
+        let p1 = list_buckets_output_from_rows(rows(), None, Some(1), None);
+        assert_eq!(p1.buckets.as_ref().unwrap()[0].name.as_deref(), Some("a"));
+        assert_eq!(p1.continuation_token.as_deref(), Some("a"));
+        // Page 2: same rows, token="a" → must SKIP "a" and return "b".
+        let p2 = list_buckets_output_from_rows(rows(), None, Some(1), Some("a"));
+        assert_eq!(
+            p2.buckets.as_ref().unwrap()[0].name.as_deref(),
+            Some("b"),
+            "page 2 must resume past the token, not re-serve page 1"
+        );
+        assert_eq!(p2.continuation_token.as_deref(), Some("b"));
+        // Page 3: token="b" → "c", not truncated, no token.
+        let p3 = list_buckets_output_from_rows(rows(), None, Some(1), Some("b"));
+        assert_eq!(p3.buckets.as_ref().unwrap()[0].name.as_deref(), Some("c"));
+        assert_eq!(p3.continuation_token, None);
     }
 
     #[test]
