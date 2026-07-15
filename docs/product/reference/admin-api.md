@@ -238,8 +238,11 @@ Unauthenticated — needed for load-balancer probes and Prometheus:
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/_/health` | `{status, peak_rss_bytes, cache_*}` — no version (anti-fingerprinting) |
+| `GET` | `/_/health` | Liveness — process answers; no backend I/O, no version (anti-fingerprinting) |
+| `GET` | `/_/ready` | Readiness — actually probes the storage backend + config DB; `200 {status:"ready"}` or `503`. Point LB **readiness** checks here; use `/_/health` for **liveness**. |
 | `GET` | `/_/metrics` | Prometheus text format |
+
+`/_/ready` probes the backend with a bounded, retried `ListBuckets` so a brief provider latency spike doesn't flip readiness to a paging `503`: it only reports not-ready if **every** attempt fails. Tune with `DGP_READY_TIMEOUT_SECS` (per-attempt, default 3) and `DGP_READY_RETRIES` (extra attempts, default 2) — raise the timeout for a storage provider with a long tail latency, raise retries to ride out short blips.
 
 Session-protected (reveals per-bucket sizes):
 

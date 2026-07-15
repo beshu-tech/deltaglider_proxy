@@ -1001,6 +1001,8 @@ Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_
 | `DGP_AUDIT_RING_SIZE` | `500` | In-memory audit ring capacity (admin Audit log viewer) |
 | `DGP_BLOCKING_THREADS` | 512 | Max tokio blocking threads |
 | `DGP_REQUEST_TIMEOUT_SECS` | 300 | Per-request timeout (returns 504) |
+| `DGP_READY_TIMEOUT_SECS` | 3 | Per-attempt backend timeout for the `/_/ready` probe |
+| `DGP_READY_RETRIES` | 2 | Extra `/_/ready` backend attempts before reporting not-ready (short backoff) |
 | `DGP_MAX_CONCURRENT_REQUESTS` | 1024 | Tower concurrency limit |
 | `DGP_MAX_MULTIPART_UPLOADS` | 1000 | Concurrent multipart upload cap |
 | `DGP_DEBUG_HEADERS` | false | Expose fingerprinting headers |
