@@ -87,6 +87,17 @@ pub trait StorageBackend: Send + Sync {
     /// Create a new bucket
     async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError>;
 
+    /// Ensure a bucket DECLARED in config exists, if this backend can create it
+    /// implicitly and safely. Filesystem backends `mkdir` the bucket dir (a
+    /// declared bucket routed to local disk should just work on first write —
+    /// #63); every other backend no-ops (never auto-create a real remote S3
+    /// bucket at boot, and never create a bucket implicitly on the WRITE path —
+    /// that's a deliberate refusal, see `filesystem::require_bucket_exists`).
+    /// Called once at startup for each `storage.buckets` entry; idempotent.
+    async fn ensure_declared_bucket(&self, _bucket: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     /// Delete a bucket (must be empty)
     async fn delete_bucket(&self, bucket: &str) -> Result<(), StorageError>;
 
@@ -636,6 +647,9 @@ macro_rules! impl_storage_backend_for_box {
         impl StorageBackend for Box<dyn StorageBackend> {
             async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError> {
                 (**self).create_bucket(bucket).await
+            }
+            async fn ensure_declared_bucket(&self, bucket: &str) -> Result<(), StorageError> {
+                (**self).ensure_declared_bucket(bucket).await
             }
             async fn delete_bucket(&self, bucket: &str) -> Result<(), StorageError> {
                 (**self).delete_bucket(bucket).await

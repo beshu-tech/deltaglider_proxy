@@ -699,6 +699,12 @@ impl StorageBackend for FilesystemBackend {
         Ok(())
     }
 
+    /// A declared filesystem bucket is just a directory — create it so its
+    /// first write doesn't 404 (#63). Idempotent (`create_dir_all`).
+    async fn ensure_declared_bucket(&self, bucket: &str) -> Result<(), StorageError> {
+        self.create_bucket(bucket).await
+    }
+
     #[instrument(skip(self))]
     async fn delete_bucket(&self, bucket: &str) -> Result<(), StorageError> {
         let bucket_dir = self.bucket_dir(bucket);
@@ -1598,6 +1604,45 @@ mod tests {
     }
 
     /// Same guard covers put_reference.
+    /// #63: a bucket DECLARED in config is pre-created at startup via
+    /// ensure_declared_bucket, so its first write no longer 404s. This is
+    /// declared intent only — the write path itself still refuses to create a
+    /// bucket implicitly (test_require_bucket_exists_rejects_put_reference).
+    #[tokio::test]
+    async fn test_ensure_declared_bucket_creates_dir_then_write_succeeds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+
+        // Before: writing to an undeclared bucket 404s.
+        assert!(matches!(
+            backend
+                .put_reference("declared", "ns", b"x", &dummy_metadata("reference.bin"))
+                .await,
+            Err(StorageError::BucketNotFound(_))
+        ));
+
+        // Declare it (what startup does for each storage.buckets entry).
+        backend
+            .ensure_declared_bucket("declared")
+            .await
+            .expect("ensure_declared_bucket");
+        assert!(tmp.path().join("declared").is_dir());
+
+        // Now the first write succeeds — no explicit CreateBucket needed.
+        backend
+            .put_reference("declared", "ns", b"x", &dummy_metadata("reference.bin"))
+            .await
+            .expect("write into declared bucket");
+
+        // Idempotent: a second call is fine.
+        backend
+            .ensure_declared_bucket("declared")
+            .await
+            .expect("idempotent");
+    }
+
     #[tokio::test]
     async fn test_require_bucket_exists_rejects_put_reference() {
         let tmp = tempfile::tempdir().expect("tempdir");

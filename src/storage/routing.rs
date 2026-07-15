@@ -499,6 +499,12 @@ impl StorageBackend for RoutingBackend {
         res
     }
 
+    /// Route a declared bucket to its target backend so the backend decides
+    /// whether to create it (filesystem → mkdir, others → no-op). #63.
+    async fn ensure_declared_bucket(&self, bucket: &str) -> Result<(), StorageError> {
+        route_existing!(self, bucket, ensure_declared_bucket)
+    }
+
     async fn delete_bucket(&self, bucket: &str) -> Result<(), StorageError> {
         let res = route_existing!(self, bucket, delete_bucket);
         if res.is_ok() {

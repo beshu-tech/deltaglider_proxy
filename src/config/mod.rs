@@ -369,6 +369,18 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Server",
     },
     EnvVarEntry {
+        name: "DGP_READY_TIMEOUT_SECS",
+        description: "Per-attempt backend timeout for the /_/ready probe (default: 3)",
+        example: "3",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_READY_RETRIES",
+        description: "Extra /_/ready backend attempts after the first before reporting not-ready, with a short backoff (default: 2)",
+        example: "2",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_CODEC_TIMEOUT_SECS",
         description: "xdelta3 subprocess timeout in seconds for the buffered path (default: 60)",
         example: "60",
@@ -880,13 +892,9 @@ impl BackendEncryptionConfig {
                 clear_unless_ref(key);
                 clear_unless_ref(legacy_key);
             }
-            Self::SseKms {
-                legacy_key,
-                kms_key_id: _,
-                ..
-            } => {
+            Self::SseKms { legacy_key, .. } => {
                 // kms_key_id is an ARN — NOT secret. Operators need to
-                // see it to know WHICH KMS key.
+                // see it to know WHICH KMS key (so it's left in the `..`).
                 clear_unless_ref(legacy_key);
             }
             Self::SseS3 { legacy_key, .. } => {
@@ -2917,6 +2925,8 @@ mod tests {
             "DGP_MAX_CONCURRENT_REQUESTS",           // startup::build_s3_router()
             "DGP_CORS_PERMISSIVE",                   // demo::ui_router()
             "DGP_REQUEST_TIMEOUT_SECS",              // startup::build_s3_router()
+            "DGP_READY_TIMEOUT_SECS",                // api::handlers::status::readiness_check()
+            "DGP_READY_RETRIES",                     // api::handlers::status::readiness_check()
             "DGP_CODEC_TIMEOUT_SECS",                // deltaglider::codec::codec_timeout()
             "DGP_CODEC_STALL_SECS",                  // deltaglider::codec::codec_stall_timeout()
             "DGP_CODEC_ABSOLUTE_SECS",               // deltaglider::codec::codec_absolute_ceiling()

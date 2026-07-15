@@ -485,6 +485,15 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let engine = DynEngine::new(&config, Some(metrics.clone()))
         .await?
         .with_bucket_usage(bucket_usage.clone());
+    // #63: create dirs for buckets DECLARED in storage.buckets that route to a
+    // filesystem backend, so their first write doesn't 404. Only declared intent
+    // (no write-path auto-create, no remote S3 side effects — other backends
+    // no-op via the trait default). Idempotent; a failure is logged, not fatal.
+    for bucket in config.buckets.keys() {
+        if let Err(e) = engine.storage().ensure_declared_bucket(bucket).await {
+            tracing::warn!("could not pre-create declared bucket '{}': {}", bucket, e);
+        }
+    }
     if engine.is_cli_available() {
         // Log the exact version on EVERY boot — it determines the delta format +
         // the armor default (see codec.rs `-a`), so it's the first thing to check

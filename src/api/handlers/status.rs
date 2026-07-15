@@ -204,11 +204,30 @@ pub async fn readiness_check(
     let engine = state.engine.load();
     // Cheapest real backend op: list buckets, capped so a dead/slow backend
     // fails the probe fast rather than hanging the LB health check.
-    let backend = match tokio::time::timeout(Duration::from_secs(3), engine.list_buckets()).await {
-        Ok(Ok(_)) => "ready",
-        Ok(Err(_)) => "unreachable",
-        Err(_) => "timeout",
-    };
+    //
+    // Both the per-attempt timeout and the retry count are tunable (#62): a
+    // brief provider latency spike (e.g. Hetzner Object Storage tail latency)
+    // should not immediately flip readiness to 503 and page. We retry the
+    // list a few times with a short backoff and only report not-ready if EVERY
+    // attempt fails — so one slow/failed call between good ones passes.
+    let timeout_secs: u64 =
+        crate::config::env_parse_with_default("DGP_READY_TIMEOUT_SECS", 3).max(1);
+    let retries: u32 = crate::config::env_parse_with_default("DGP_READY_RETRIES", 2);
+    let per_attempt = Duration::from_secs(timeout_secs);
+    let mut backend = "timeout";
+    for attempt in 0..=retries {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        match tokio::time::timeout(per_attempt, engine.list_buckets()).await {
+            Ok(Ok(_)) => {
+                backend = "ready";
+                break;
+            }
+            Ok(Err(_)) => backend = "unreachable",
+            Err(_) => backend = "timeout",
+        }
+    }
     // config DB: if configured, confirm we can take the lock (a poisoned/wedged
     // mutex would mean the control plane is stuck). `None` = legacy/open mode.
     let config_db = match &state.config_db {

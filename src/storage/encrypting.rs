@@ -1656,6 +1656,9 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     async fn create_bucket(&self, b: &str) -> Result<(), StorageError> {
         self.inner.create_bucket(b).await
     }
+    async fn ensure_declared_bucket(&self, b: &str) -> Result<(), StorageError> {
+        self.inner.ensure_declared_bucket(b).await
+    }
     async fn delete_bucket(&self, b: &str) -> Result<(), StorageError> {
         self.inner.delete_bucket(b).await
     }
