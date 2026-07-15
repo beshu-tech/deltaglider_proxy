@@ -244,7 +244,7 @@ async fn test_disable_key_then_read_encrypted_object_errors_not_corrupts() {
                          — disable path must hard-fail reads of historical \
                          encrypted objects, not serve ciphertext",
                         body.len(),
-                        &body.iter().take(16).copied().collect::<Vec<_>>()
+                        body.iter().take(16).copied().collect::<Vec<_>>()
                     );
                 }
             }
@@ -270,7 +270,7 @@ async fn test_disable_key_then_read_encrypted_object_errors_not_corrupts() {
                         "chunked-encrypted object without key returned {} bytes \
                          (first 8: {:02x?}) — must hard-fail, not stream ciphertext",
                         body.len(),
-                        &body.iter().take(8).copied().collect::<Vec<_>>()
+                        body.iter().take(8).copied().collect::<Vec<_>>()
                     );
                 }
             }

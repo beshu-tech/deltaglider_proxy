@@ -630,7 +630,7 @@ async fn test_v1_list_objects_paginates_via_marker() {
     for k in ["aaa.bin", "bbb.bin", "ccc.bin"] {
         s3.put_object()
             .bucket(server.bucket())
-            .key(format!("{}{}", &prefix, k))
+            .key(format!("{}{}", prefix, k))
             .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
             .send()
             .await
@@ -641,7 +641,7 @@ async fn test_v1_list_objects_paginates_via_marker() {
     let resp = list_objects_v1_raw(
         &server.endpoint(),
         server.bucket(),
-        Some(&format!("max-keys=1&prefix={}", &prefix)),
+        Some(&format!("max-keys=1&prefix={}", prefix)),
     )
     .await;
     assert_eq!(resp.status().as_u16(), 200);
@@ -675,13 +675,13 @@ async fn test_v1_list_objects_paginates_via_marker() {
         server.bucket(),
         Some(&format!(
             "max-keys=1&prefix={}&marker={}",
-            &prefix, &next_marker
+            prefix, next_marker
         )),
     )
     .await;
     assert_eq!(resp2.status().as_u16(), 200);
     let body2 = resp2.text().await.unwrap();
-    let first_key = format!("<Key>{}aaa.bin</Key>", &prefix);
+    let first_key = format!("<Key>{}aaa.bin</Key>", prefix);
     assert!(
         !body2.contains(&first_key),
         "page-2 must skip the key from page-1; marker ignored?"
@@ -691,7 +691,7 @@ async fn test_v1_list_objects_paginates_via_marker() {
     for k in ["aaa.bin", "bbb.bin", "ccc.bin"] {
         s3.delete_object()
             .bucket(server.bucket())
-            .key(format!("{}{}", &prefix, k))
+            .key(format!("{}{}", prefix, k))
             .send()
             .await
             .ok();
@@ -734,7 +734,7 @@ async fn test_v1_list_objects_with_delimiter_produces_common_prefixes() {
     for k in ["dir-a/x.bin", "dir-b/y.bin", "top.bin"] {
         s3.put_object()
             .bucket(server.bucket())
-            .key(format!("{}{}", &prefix, k))
+            .key(format!("{}{}", prefix, k))
             .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
             .send()
             .await
@@ -744,7 +744,7 @@ async fn test_v1_list_objects_with_delimiter_produces_common_prefixes() {
     let resp = list_objects_v1_raw(
         &server.endpoint(),
         server.bucket(),
-        Some(&format!("delimiter=%2F&prefix={}", &prefix)),
+        Some(&format!("delimiter=%2F&prefix={}", prefix)),
     )
     .await;
     assert_eq!(resp.status().as_u16(), 200);
@@ -754,14 +754,14 @@ async fn test_v1_list_objects_with_delimiter_produces_common_prefixes() {
         "delimiter=/ must produce CommonPrefixes, got: {}",
         body
     );
-    let dir_a_prefix = format!("{}dir-a/", &prefix);
+    let dir_a_prefix = format!("{}dir-a/", prefix);
     assert!(
         body.contains(&dir_a_prefix),
         "CommonPrefixes must include {}, got: {}",
         dir_a_prefix,
         body
     );
-    let top_key = format!("<Key>{}top.bin</Key>", &prefix);
+    let top_key = format!("<Key>{}top.bin</Key>", prefix);
     assert!(
         body.contains(&top_key),
         "top-level objects must appear as Contents (not CommonPrefixes), got: {}",
@@ -772,7 +772,7 @@ async fn test_v1_list_objects_with_delimiter_produces_common_prefixes() {
     for k in ["dir-a/x.bin", "dir-b/y.bin", "top.bin"] {
         s3.delete_object()
             .bucket(server.bucket())
-            .key(format!("{}{}", &prefix, k))
+            .key(format!("{}{}", prefix, k))
             .send()
             .await
             .ok();
