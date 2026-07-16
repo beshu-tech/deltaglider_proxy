@@ -1391,14 +1391,10 @@ impl StorageBackend for FilesystemBackend {
                 None => continue,
             };
 
-            // Skip hidden/internal entries.
-            if name.starts_with('.') {
-                continue;
-            }
-
             if ft.is_dir() {
-                // Skip the `.dg` internal directory (already caught by dot check
-                // above, but be explicit for clarity).
+                // Hide only the `.dg` internal directory. Other dot-dirs
+                // (`.well-known/`…) are legitimate user prefixes — parity with
+                // the S3 backend and with this backend's own flat listing.
                 if name == ".dg" {
                     continue;
                 }
@@ -1421,8 +1417,9 @@ impl StorageBackend for FilesystemBackend {
 
                 common_prefixes.insert(cp);
             } else {
-                // File — skip reference.bin.
-                if name == "reference.bin" {
+                // Dot-FILES stay hidden: they are this backend's temp/internal
+                // namespace (atomic-write temps). reference.bin is DG-internal.
+                if name.starts_with('.') || name == "reference.bin" {
                     continue;
                 }
 
@@ -1890,6 +1887,65 @@ mod tests {
 
         assert!(listed.objects.is_empty());
         assert!(listed.common_prefixes.is_empty());
+    }
+
+    /// Dot-DIRS with real content are legitimate user prefixes and must show up
+    /// in delimiter listings (S3-backend + flat-listing parity). Only `.dg` is
+    /// internal; dot-FILES remain hidden (atomic-write temp namespace).
+    #[tokio::test]
+    async fn test_delegated_list_shows_dot_dirs_hides_dg_and_dot_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+
+        backend
+            .put_passthrough(
+                "bucket",
+                ".well-known",
+                "cert.txt",
+                b"pem",
+                &dummy_metadata("cert.txt"),
+            )
+            .await
+            .expect("put dot-dir object");
+        backend
+            .put_passthrough("bucket", "", "top.txt", b"x", &dummy_metadata("top.txt"))
+            .await
+            .expect("put root object");
+        // Internal residue at the bucket root: a `.dg` dir and a dot-file.
+        let ds = tmp.path().join("bucket").join("deltaspaces");
+        fs::create_dir_all(ds.join(".dg")).await.expect("mk .dg");
+        fs::write(ds.join(".dg").join("reference.bin"), b"ref")
+            .await
+            .expect("write ref");
+        fs::write(ds.join(".tmp-upload"), b"partial")
+            .await
+            .expect("write temp");
+
+        let listed = backend
+            .list_objects_delegated("bucket", "", Some("/"), 100, None)
+            .await
+            .expect("list")
+            .expect("delegated");
+
+        assert_eq!(
+            listed.common_prefixes,
+            vec![".well-known/".to_string()],
+            "dot-dir with data must list; .dg must stay hidden"
+        );
+        let keys: Vec<&str> = listed.objects.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["top.txt"], "dot-files must stay hidden");
+
+        // And the dot-dir's own level lists its content.
+        let inner = backend
+            .list_objects_delegated("bucket", ".well-known/", Some("/"), 100, None)
+            .await
+            .expect("list inner")
+            .expect("delegated inner");
+        let inner_keys: Vec<&str> = inner.objects.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(inner_keys, vec![".well-known/cert.txt"]);
     }
 
     #[tokio::test]
