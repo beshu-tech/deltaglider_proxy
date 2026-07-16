@@ -10,3 +10,7 @@ iam.json
 manifest.json
 *.db
 *.db.bak
+
+# Outputs of create-maintenance-user.sh (LIVE secrets — never commit).
+maintenance-user.json
+prod-export.yaml
