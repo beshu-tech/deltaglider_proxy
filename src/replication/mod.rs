@@ -23,6 +23,7 @@ pub mod planner;
 pub mod remediation;
 pub mod scheduler;
 pub mod state_store;
+pub mod walk;
 pub mod worker;
 
 pub use crate::background::RunLease;
