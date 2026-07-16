@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.14.1 — 2026-07-16
+
 ## v1.14.0 — 2026-07-10
 
 The completion of the correctness/security review begun in v1.13.0 — the
