@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## v1.14.1 — 2026-07-16
+
+Two operability fixes from production issue reports.
+
+### Fixed
+
+- **`/_/ready` no longer flips to a paging 503 on a brief backend blip** (#62).
+  The readiness probe's backend check is now retried with a tunable per-attempt
+  timeout (`DGP_READY_TIMEOUT_SECS`, default 3) and retry count
+  (`DGP_READY_RETRIES`, default 2) — it reports not-ready only if every attempt
+  fails, so a short storage-provider latency spike (e.g. object-storage tail
+  latency) doesn't mark an otherwise-healthy edge out of rotation. Point load
+  balancer **readiness** checks at `/_/ready` and **liveness** at `/_/health`.
+- **A bucket declared in `storage.buckets` on a filesystem backend is created at
+  startup** (#63), so its first write no longer returns `NoSuchBucket` before an
+  explicit `CreateBucket`. Declared intent only: implicit bucket creation on the
+  write path stays refused, and remote S3 buckets are never auto-created.
+
 ## v1.14.0 — 2026-07-10
 
 The completion of the correctness/security review begun in v1.13.0 — the
