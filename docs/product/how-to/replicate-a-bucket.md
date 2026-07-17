@@ -41,7 +41,7 @@ From the admin UI: **Settings → Jobs** — replication rules live in the stora
 
 ![Object replication settings](/_/screenshots/object-replication.jpg)
 
-Replication has two triggers: **event-driven** copies each PUT/DELETE/COPY in near-real time (the primary path), and the rule's `interval` schedules a slow full reconcile as the self-healing backstop. You don't choose between them — both run; `interval` only sets how often the backstop sweeps ([details](../reference/replication.md#triggers)).
+Replication has two triggers: **event-driven** copies each PUT/DELETE/COPY in near-real time (the primary path), and the rule's `interval` schedules a periodic full reconcile as the self-healing backstop. You don't choose between them — both run; `interval` only sets how often the backstop sweeps ([details](../reference/replication.md#triggers)).
 
 Every copy goes through the engine, so each side applies its own encryption and compression — you can replicate from an encrypted backend to a plaintext one and vice versa.
 

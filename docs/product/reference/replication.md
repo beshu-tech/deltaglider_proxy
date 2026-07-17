@@ -1,13 +1,22 @@
 # Bucket replication
 
-Engine-routed source → destination object copy, transparent to per-backend encryption and delta compression. Replication is event-driven: object mutations are copied in near-real time, with a slow full reconcile as the self-healing safety net. Every copy goes through `engine.retrieve` → `engine.store`, so each side applies its own encryption and compression configuration independently.
+Engine-routed source → destination object copy, transparent to per-backend encryption and delta compression. Replication is event-driven: object mutations are copied in near-real time, with a periodic full reconcile as the self-healing safety net. Every copy goes through `engine.retrieve` → `engine.store`, so each side applies its own encryption and compression configuration independently.
 
 ## Triggers
 
 Replication has two paths, primary and backstop:
 
 - **Event-driven (primary).** Object mutations (PUT / DELETE / COPY / CompleteMultipartUpload) are appended to the durable `event_outbox` by the S3 write path. A per-process event consumer drains the outbox in near-real time over its own per-listener cursor (`WHERE id > cursor`, independent of the webhook-delivery listener), compacts a burst of events for one `(bucket, key)` into a single liveness verdict, and fans each surviving key out to every replication rule whose `source` matches. Copy-vs-skip / delete-vs-noop idempotency is the planner's job (`should_replicate` + a destination HEAD) — the same logic reconcile uses, so there is no separate per-key sync table. See [event-outbox.md](event-outbox.md) for the cursor/compaction model.
-- **Full reconcile (safety net).** Each rule's `interval` (default 24h) schedules a slow full source list-and-diff that catches anything a dropped event missed. Events are the primary trigger; the reconcile sweep is the backstop, not the main copy path.
+- **Full reconcile (safety net).** Each rule's `interval` (default 24h) schedules a full source-vs-destination reconcile that catches anything a dropped event missed. Events are the primary trigger; the reconcile is the backstop, not the main copy path. It runs as a directory-scoped tree walk (see below), so it starts copying within seconds of a run beginning rather than waiting on a full up-front scan.
+
+## How the reconcile walk works
+
+The full reconcile is a **directory-scoped tree walk**, not an up-front full listing. It descends the source and destination trees one directory pair at a time (delimiter-scoped listings), and syncs each folder the moment it is discovered:
+
+- **Copying starts immediately** — the first folder is reconciled while the rest of the tree is still being discovered, so a run begins moving bytes within seconds regardless of tree size. `dir_concurrency` (default 4) controls how many directories are listed in parallel; object copies remain bounded by `transfers`.
+- **Minimal backend requests.** Listings run in lite mode; a subtree missing on the destination is proven absent from the folder comparison itself, so its objects copy with no existence probes. When source and destination are both filesystem backends (whose listings carry authoritative metadata), an entire reconcile — initial sync or converged re-check — issues **zero** per-object HEAD requests. On S3 backends, only keys present on *both* sides are HEAD-resolved, in batches.
+- **Fine-grained resume.** A killed, paused, or interrupted run resumes from its exact position in the tree — even mid-directory — via a scope-stamped cursor persisted as it goes.
+- **Observability.** Prometheus counters `deltaglider_replication_list_calls_total`, `..._head_calls_total`, and `..._dirs_completed_total` expose the walk's I/O; the Jobs screen shows directories completed/pending for a running reconcile.
 
 ## Scope
 
@@ -76,7 +85,7 @@ The guardrail is provenance: delete replication only targets objects that carry 
 
 - **Rules** are YAML-authored. Changes apply through the section PUT pipeline; cycle detection runs on every load.
 - **Runtime state** lives in the encrypted config DB (`ConfigDb` v6):
-    - `replication_state`: one row per rule. Scheduling state + pause flag + lifetime counters + continuation token + leader lease columns (the node-local lease; with a coordination bucket the authoritative lease is the S3 lease object, and these columns back the run-now/worker bookkeeping on the leader). `INSERT OR IGNORE` on config load preserves operator-set pause + lifetime counters across reloads.
+    - `replication_state`: one row per rule. Scheduling state + pause flag + lifetime counters + resume cursor + leader lease columns (the node-local lease; with a coordination bucket the authoritative lease is the S3 lease object, and these columns back the run-now/worker bookkeeping on the leader). The resume cursor is a scope-stamped position in the reconcile walk's tree traversal — an interrupted run resumes exactly where it stopped; a cursor from an incompatible earlier format is discarded and the next run starts a fresh (idempotent) pass. `INSERT OR IGNORE` on config load preserves operator-set pause + lifetime counters across reloads.
     - `replication_run_history`: append-only per-run records. CASCADE DELETE on rule removal.
     - `replication_failures`: per-object error ring, bounded by `max_failures_retained`.
 - **Boot reconciliation**: any `status='running'` rows left from a previous process are flipped to `failed` on startup with a diagnostic failure entry. Prevents zombie run rows.
