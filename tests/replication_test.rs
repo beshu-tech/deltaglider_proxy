@@ -285,11 +285,12 @@ replication:
       conflict: content-diff
 ";
 
-/// Prefix-tree dest oracle: a SPARSE destination (one subtree already mirrored,
-/// another entirely absent) converges in one run. The absent subtree is
-/// bulk-copied without per-object dest HEADs (proven absent from a common-prefix
-/// probe); the present subtree is descended and compared. Exercises
-/// build_dest_oracle's descend/absent classification end-to-end.
+/// The walk's flagship shape: a SPARSE destination (one subtree already
+/// mirrored, another entirely absent) converges in one run. The absent
+/// subtree bulk-copies with ZERO dest HEADs (absence proven by the per-dir
+/// merge); the present subtree is compared HEAD-free too (FS↔FS PureMirror:
+/// lite listings carry logical facts). Count-gated via Prometheus — never
+/// wall-clock.
 #[tokio::test]
 async fn test_replication_sparse_dest_prefix_tree() {
     let server = TestServer::builder()
@@ -373,6 +374,23 @@ async fn test_replication_sparse_dest_prefix_tree() {
             .await
             .unwrap_or_else(|_| panic!("dest missing {key}"));
     }
+
+    // Deterministic I/O accounting (fresh server ⇒ counters are this run's):
+    // dirs: root, present/, absent/, absent/deep/ = 4.
+    // Lists: Compare dirs (root, present/) cost 2 pages, SrcOnly dirs
+    // (absent/, absent/deep/) cost 1 — batch_size 100 ⇒ one page per level.
+    // HEADs: ZERO — PureMirror decides every pair from listing facts, and the
+    // absent subtree needs no existence probes at all.
+    let m = common::metrics_snapshot(&server.endpoint()).await;
+    assert_eq!(m.head_calls_total, 0, "PureMirror run must issue no HEADs");
+    assert_eq!(
+        m.dirs_completed_total, 4,
+        "root + present + absent + absent/deep"
+    );
+    assert_eq!(
+        m.list_calls_total, 6,
+        "2×Compare(2 dirs) + 1×SrcOnly(2 dirs)"
+    );
 }
 
 /// Scheduler regression: a rule added via the storage section should run
@@ -2520,4 +2538,357 @@ async fn test_replication_object_timeout_fires_and_records_error() {
         has_timeout,
         "a 'timed out' failure must be recorded: {failures}"
     );
+}
+
+const DISCOVERY_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: discovery-rule
+      enabled: true
+      source:
+        bucket: disc-src
+        prefix: \"\"
+      destination:
+        bucket: disc-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 1
+";
+
+/// THE prod-fix proof: copies start BEFORE discovery completes. With a page
+/// budget far too small to even finish listing the tree, the first run still
+/// copies objects — under the old architecture the dest-oracle pre-pass had
+/// to walk the ENTIRE tree before the first byte moved, so a budget this
+/// small could never copy anything.
+#[tokio::test]
+async fn test_replication_first_copy_before_full_discovery() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .env("DGP_TEST_MAX_JOB_PAGES", "5")
+        .extra_yaml_storage_section(DISCOVERY_RULE_YAML)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["disc-src", "disc-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    // 10 directories × 1 object: full discovery alone needs >10 pages at
+    // batch_size 1; the budget allows 5.
+    for i in 0..10 {
+        client
+            .put_object()
+            .bucket("disc-src")
+            .key(format!("d{i}/obj.txt"))
+            .body(ByteStream::from(format!("payload-{i}").into_bytes()))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    let run = fire_run_now(&admin, &server.endpoint(), "discovery-rule").await;
+    assert_eq!(
+        run["status_raw"].as_str(),
+        Some("stopped"),
+        "budget-truncated, not failed: {run}"
+    );
+    assert!(
+        run["objects_processed"].as_i64().unwrap_or(0) >= 1,
+        "copies must start before discovery finishes: {run}"
+    );
+    let dst = client
+        .list_objects_v2()
+        .bucket("disc-dst")
+        .send()
+        .await
+        .unwrap();
+    assert!(!dst.contents().is_empty(), "first bytes landed on dest");
+}
+
+const PERDIR_DEL_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  dir_concurrency: 1
+  rules:
+    - name: perdir-rule
+      enabled: true
+      source:
+        bucket: pd-src
+        prefix: \"\"
+      destination:
+        bucket: pd-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 1
+      replicate_deletes: true
+";
+
+/// Per-directory delete gating: an orphan in dir `a/` (which completes
+/// cleanly, first in walk order with dir_concurrency=1) is deleted even
+/// though the run truncates on its page budget inside dir `b/`. The old
+/// all-or-nothing gate ("deletes only after a complete clean forward pass")
+/// could NEVER delete anything in a truncated run.
+#[tokio::test]
+async fn test_replication_per_dir_delete_with_truncation_elsewhere() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .env("DGP_TEST_MAX_JOB_PAGES", "12")
+        .extra_yaml_storage_section(PERDIR_DEL_RULE_YAML)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["pd-src", "pd-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+
+    // Run 1 (cheap: 3 pages) stamps the provenance marker on a/orphan.txt.
+    client
+        .put_object()
+        .bucket("pd-src")
+        .key("a/orphan.txt")
+        .body(ByteStream::from(b"orphan".to_vec()))
+        .send()
+        .await
+        .expect("seed orphan");
+    let admin = admin_http_client(&server.endpoint()).await;
+    let run = fire_run_now(&admin, &server.endpoint(), "perdir-rule").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
+
+    // Orphan the dest copy and add enough b/ work to blow the budget there.
+    client
+        .delete_object()
+        .bucket("pd-src")
+        .key("a/orphan.txt")
+        .send()
+        .await
+        .expect("unseed orphan");
+    for i in 0..10 {
+        client
+            .put_object()
+            .bucket("pd-src")
+            .key(format!("b/obj-{i}.txt"))
+            .body(ByteStream::from(format!("payload-{i}").into_bytes()))
+            .send()
+            .await
+            .expect("seed b");
+    }
+
+    // Run 2: dir a/ (dest-only) completes cleanly → its provenance-owned
+    // orphan is deleted; the budget then runs out inside b/.
+    let run = fire_run_now(&admin, &server.endpoint(), "perdir-rule").await;
+    assert_eq!(
+        run["status_raw"].as_str(),
+        Some("stopped"),
+        "run truncates in b/: {run}"
+    );
+    assert_eq!(
+        run["objects_deleted"].as_i64(),
+        Some(1),
+        "a/ orphan deleted despite truncation elsewhere: {run}"
+    );
+    let orphan = client
+        .get_object()
+        .bucket("pd-dst")
+        .key("a/orphan.txt")
+        .send()
+        .await;
+    assert!(orphan.is_err(), "orphan must be gone from dest");
+    let copied = client
+        .list_objects_v2()
+        .bucket("pd-dst")
+        .prefix("b/")
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .len();
+    assert!(
+        copied > 0 && copied < 10,
+        "b/ was mid-copy when the budget hit (got {copied})"
+    );
+}
+
+const MIRROR_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: mirror-rule
+      enabled: true
+      source:
+        bucket: mir-src
+        prefix: \"\"
+      destination:
+        bucket: mir-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 100
+";
+
+/// PureMirror I/O contract, count-gated: an initial sync AND a converged
+/// re-run over an FS↔FS pair issue ZERO per-object HEADs (lite listings are
+/// fact-authoritative), and listings cost exactly 2 pages per Compare dir /
+/// 1 per SrcOnly dir.
+#[tokio::test]
+async fn test_replication_pure_mirror_zero_heads() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(MIRROR_RULE_YAML)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["mir-src", "mir-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    for (key, body) in [
+        ("top.txt", &b"top"[..]),
+        ("sub/a.txt", &b"alpha"[..]),
+        ("sub/b.txt", &b"bravo"[..]),
+    ] {
+        client
+            .put_object()
+            .bucket("mir-src")
+            .key(key)
+            .body(ByteStream::from(body.to_vec()))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+
+    // Run 1: initial sync — dest empty ⇒ root Compare (2 pages), sub/ is
+    // SrcOnly (1 page). 3 copies.
+    let run = fire_run_now(&admin, &ep, "mirror-rule").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
+    assert_eq!(run["objects_processed"].as_i64(), Some(3), "{run}");
+    let m = common::metrics_snapshot(&ep).await;
+    assert_eq!(m.head_calls_total, 0, "initial sync: zero HEADs");
+    assert_eq!(m.list_calls_total, 3, "root Compare(2) + sub SrcOnly(1)");
+    assert_eq!(m.dirs_completed_total, 2);
+
+    // Run 2: converged mirror — both dirs Compare (2 pages each), every pair
+    // decided HEAD-free from lite facts (NewerWins tie ⇒ skip).
+    let run = fire_run_now(&admin, &ep, "mirror-rule").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
+    assert_eq!(
+        run["objects_processed"].as_i64(),
+        Some(0),
+        "all skips: {run}"
+    );
+    let m = common::metrics_snapshot(&ep).await;
+    assert_eq!(m.head_calls_total, 0, "converged re-run: still zero HEADs");
+    assert_eq!(m.list_calls_total, 3 + 4, "run 2 adds 2×Compare for 2 dirs");
+    assert_eq!(m.dirs_completed_total, 4);
+}
+
+const KILLWALK_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  dir_concurrency: 1
+  rules:
+    - name: killwalk-rule
+      enabled: true
+      source:
+        bucket: kw-src
+        prefix: \"\"
+      destination:
+        bucket: kw-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 10
+";
+
+/// Kill mid-walk on a MULTI-DIRECTORY tree: the run settles cancelled with
+/// the cursor mid-tree, and the resumed run copies only the remainder — the
+/// walk's per-path watermark survives a kill across directory boundaries.
+#[tokio::test]
+async fn test_replication_kill_mid_walk_resumes_across_dirs() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(KILLWALK_RULE_YAML)
+        .env("DGP_TEST_COPY_STALL_MS", "50")
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["kw-src", "kw-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    for d in ["a", "b", "c"] {
+        for i in 0..20 {
+            client
+                .put_object()
+                .bucket("kw-src")
+                .key(format!("{d}/obj-{i:02}.txt"))
+                .body(ByteStream::from(format!("payload-{d}-{i}").into_bytes()))
+                .send()
+                .await
+                .expect("seed");
+        }
+    }
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+
+    // Start the run (60 × 50ms stalls ≈ several seconds of runway), then kill.
+    let before = latest_run_id(&admin, &ep, "killwalk-rule").await;
+    let resp = admin
+        .post(format!(
+            "{ep}/_/api/admin/jobs/replication:killwalk-rule/run-now"
+        ))
+        .send()
+        .await
+        .expect("run-now");
+    assert_eq!(resp.status().as_u16(), 202);
+    // Let the walk make real progress first — a kill that lands before the
+    // first copy proves nothing about mid-tree resume.
+    for _ in 0..200 {
+        let n = client
+            .list_objects_v2()
+            .bucket("kw-dst")
+            .send()
+            .await
+            .map(|r| r.contents().len())
+            .unwrap_or(0);
+        if n >= 5 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    fire_kill(&admin, &ep, "killwalk-rule").await;
+    let run = wait_for_run_after(&admin, &ep, "killwalk-rule", before).await;
+    assert_eq!(run["status"].as_str(), Some("cancelled"), "{run}");
+    let killed_at = client
+        .list_objects_v2()
+        .bucket("kw-dst")
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .len();
+    assert!(
+        killed_at < 60,
+        "kill must land before the walk finishes (copied {killed_at})"
+    );
+
+    // Resume: the remainder only — never re-copying settled ground.
+    let run = fire_run_now(&admin, &ep, "killwalk-rule").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
+    let resumed = run["objects_processed"].as_i64().unwrap_or(-1);
+    assert!(
+        resumed < 60,
+        "resume copies only the remainder, got {resumed}"
+    );
+    let total = client
+        .list_objects_v2()
+        .bucket("kw-dst")
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .len();
+    assert_eq!(total, 60, "full convergence after kill + resume");
 }
