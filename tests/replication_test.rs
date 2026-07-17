@@ -2365,7 +2365,7 @@ replication:
 async fn test_replication_budget_truncation_keeps_cursor_and_resumes() {
     let server = TestServer::builder()
         .auth("bootstrap_key", "bootstrap_secret")
-        .env("DGP_TEST_MAX_JOB_PAGES", "2")
+        .env("DGP_TEST_MAX_JOB_PAGES", "3")
         .extra_yaml_storage_section(TRUNC_RULE_YAML)
         .build()
         .await;
@@ -2386,8 +2386,9 @@ async fn test_replication_budget_truncation_keeps_cursor_and_resumes() {
     let admin = admin_http_client(&server.endpoint()).await;
     let ep = server.endpoint();
 
-    // Run 1: 2-page budget over 5 one-object pages → truncated. Must be
-    // "stopped" with exactly 2 copied — and the cursor kept.
+    // Run 1: 3-page budget = 1 dest page (empty level) + 2 src pages under
+    // the walk's uniform both-sides accounting → truncated after 2 copies.
+    // Must be "stopped" — and the cursor kept.
     let run = fire_run_now(&admin, &ep, "trunc-rule").await;
     // The jobs view folds stopped→cancelled for display; the RAW status is the
     // settle contract under test.
@@ -2398,7 +2399,8 @@ async fn test_replication_budget_truncation_keeps_cursor_and_resumes() {
     );
     assert_eq!(run["objects_processed"].as_i64(), Some(2), "{run}");
 
-    // Run 2 RESUMES from the cursor: 2 more, no re-copying (processed==2).
+    // Run 2 RESUMES from the cursor (1 dest page skips settled ground via the
+    // resume token): 2 more, no re-copying (processed==2).
     let run = fire_run_now(&admin, &ep, "trunc-rule").await;
     assert_eq!(run["objects_processed"].as_i64(), Some(2), "resumed: {run}");
     let dst = client

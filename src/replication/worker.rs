@@ -27,20 +27,20 @@
 //! `reconcile_on_boot` flips the running row to `failed` but the token
 //! stays — next legitimate run resumes from the saved cursor.
 
-use super::planner::{normalize_prefix, plan_batch};
+use super::planner::{compile_rule_globs, normalize_prefix};
 use super::state_store::{current_unix_seconds, FailureInsert, RunTotals};
+use super::walk;
 use crate::background::RunLease;
 use crate::config_db::ConfigDb;
-use crate::config_sections::{ConflictPolicy, ReplicationRule};
+use crate::config_sections::ReplicationRule;
 use crate::deltaglider::DynEngine;
 use crate::event_outbox::{EventKind, EventSource, NewEvent};
-use crate::job_loop::Pager;
+use crate::job_loop::MAX_JOB_PAGES;
 use crate::metrics::{bump_peak, Metrics};
 use crate::transfer::{
     copy_object_with_retries, CopyStrategy, ObjectTransferRequest, TransferProvenance,
     REPLICATION_RULE_METADATA_KEY,
 };
-use crate::types::FileMetadata;
 use futures::stream::StreamExt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -104,6 +104,218 @@ impl Drop for InFlightGuard {
             }
             if v.is_empty() {
                 map.remove(&self.rule);
+            }
+        }
+    }
+}
+
+/// Live walk progress for the Jobs UI (dirs completed / dirs pending),
+/// updated at each driver checkpoint. In-memory and node-local by design —
+/// live progress, not durable state.
+static WALK_PROGRESS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, (u64, u64)>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Snapshot of a rule's walk progress for the admin jobs API.
+pub fn walk_snapshot(rule: &str) -> Option<(u64, u64)> {
+    WALK_PROGRESS.lock().get(rule).copied()
+}
+
+/// RAII: clears the walk-progress entry when the run ends, however it ends.
+struct WalkProgressGuard(String);
+
+impl Drop for WalkProgressGuard {
+    fn drop(&mut self) {
+        WALK_PROGRESS.lock().remove(&self.0);
+    }
+}
+
+/// One completed driver operation, fed back into the WalkMachine (plus the
+/// driver-side bookkeeping the machine doesn't need: totals, abort flags).
+enum DriverDone {
+    List {
+        req_id: u64,
+        result: Result<walk::RelListing, String>,
+    },
+    Heads {
+        req_id: u64,
+        side: walk::Side,
+        results: Vec<(String, walk::HeadResult)>,
+    },
+    Copy {
+        item_id: u64,
+        res: Result<Box<PerObjectResult>, crate::config_db::ConfigDbError>,
+    },
+    Delete {
+        item_id: u64,
+        deleted: bool,
+        error: bool,
+    },
+}
+
+/// (bucket, normalized rule prefix) for one side of the walk.
+fn side_target(
+    rule: &ReplicationRule,
+    source_prefix: &str,
+    dest_prefix: &str,
+    side: walk::Side,
+) -> (String, String) {
+    match side {
+        walk::Side::Src => (rule.source.bucket.clone(), source_prefix.to_string()),
+        walk::Side::Dest => (rule.destination.bucket.clone(), dest_prefix.to_string()),
+    }
+}
+
+/// Convert an engine listing page into the machine's relative form: strip the
+/// side prefix VERBATIM (never normalize — `a//x` stays distinct from `a/x`)
+/// and interleave objects + collapsed prefixes in engine (lexicographic)
+/// order. Engine continuation tokens are user-visible keys under the listing
+/// prefix on every backend, so they strip the same way; a key outside the
+/// prefix is an engine bug and fails the listing loudly (safe direction).
+fn to_rel_listing(
+    page: crate::deltaglider::ListObjectsPage,
+    side_prefix: &str,
+) -> Result<walk::RelListing, String> {
+    let strip = |k: &str| -> Result<String, String> {
+        k.strip_prefix(side_prefix)
+            .map(str::to_string)
+            .ok_or_else(|| format!("listing entry {k:?} outside prefix {side_prefix:?}"))
+    };
+    let mut entries: Vec<walk::RelEntry> =
+        Vec::with_capacity(page.objects.len() + page.common_prefixes.len());
+    let mut objs = page.objects.into_iter().peekable();
+    let mut dirs = page.common_prefixes.into_iter().peekable();
+    loop {
+        let take_obj = match (objs.peek(), dirs.peek()) {
+            (Some((ok, _)), Some(dp)) => ok.as_str() <= dp.as_str(),
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        if take_obj {
+            let (k, meta) = objs.next().expect("peeked");
+            entries.push(walk::RelEntry {
+                path: strip(&k)?,
+                kind: walk::EntryKind::Obj(Box::new(meta)),
+            });
+        } else {
+            let d = dirs.next().expect("peeked");
+            entries.push(walk::RelEntry {
+                path: strip(&d)?,
+                kind: walk::EntryKind::Dir,
+            });
+        }
+    }
+    let next_token = match page.next_continuation_token {
+        Some(t) => Some(strip(&t)?),
+        None => None,
+    };
+    Ok(walk::RelListing {
+        entries,
+        truncated: page.is_truncated,
+        next_token,
+    })
+}
+
+/// The delete pipeline, verbatim old `run_delete_pass` per-key semantics:
+/// provenance HEAD-confirm when the listing lacked our marker (HEAD error →
+/// preserve), source-absence HEAD (delete ONLY on NoSuchKey; any other error
+/// → preserve + failure ring), then the destination delete.
+#[allow(clippy::too_many_arguments)]
+async fn execute_delete(
+    db: &Arc<Mutex<ConfigDb>>,
+    engine: &Arc<DynEngine>,
+    rule_name: &str,
+    src_bucket: &str,
+    dst_bucket: &str,
+    abs_src: &str,
+    abs_dest: &str,
+    item_id: u64,
+    needs_provenance_head: bool,
+    run_id: i64,
+    max_failures_retained: u32,
+) -> DriverDone {
+    if needs_provenance_head {
+        if let Some(m) = engine.metrics() {
+            m.replication_head_calls_total.inc();
+        }
+        let owned = match engine.head(dst_bucket, abs_dest).await {
+            Ok(meta) => super::event_consumer::owned_by_rule(&meta, rule_name),
+            // HEAD failed — preserve. Better a leftover copy than a
+            // false-delete of a foreign object.
+            Err(_) => false,
+        };
+        if !owned {
+            return DriverDone::Delete {
+                item_id,
+                deleted: false,
+                error: false,
+            };
+        }
+    }
+    if let Some(m) = engine.metrics() {
+        m.replication_head_calls_total.inc();
+    }
+    match engine.head(src_bucket, abs_src).await {
+        Ok(_) => DriverDone::Delete {
+            item_id,
+            deleted: false,
+            error: false, // source reappeared — nothing to replicate
+        },
+        Err(e) => {
+            let s3e: crate::api::S3Error = e.into();
+            if matches!(s3e, crate::api::S3Error::NoSuchKey(_)) {
+                // Same test-only stall as the copy path: lets a kill land
+                // deterministically mid-delete (inert in prod).
+                maybe_pass_stall().await;
+                match engine.delete(dst_bucket, abs_dest).await {
+                    Ok(_) => DriverDone::Delete {
+                        item_id,
+                        deleted: true,
+                        error: false,
+                    },
+                    Err(de) => {
+                        if let Err(le) = log_failure(
+                            db,
+                            rule_name,
+                            run_id,
+                            abs_src,
+                            abs_dest,
+                            &format!("destination delete failed: {de}"),
+                            max_failures_retained,
+                        )
+                        .await
+                        {
+                            warn!(
+                                "replication rule '{rule_name}': failure-ring write failed: {le}"
+                            );
+                        }
+                        DriverDone::Delete {
+                            item_id,
+                            deleted: false,
+                            error: true,
+                        }
+                    }
+                }
+            } else {
+                if let Err(le) = log_failure(
+                    db,
+                    rule_name,
+                    run_id,
+                    abs_src,
+                    abs_dest,
+                    &format!("delete-pass head source failed: {s3e}"),
+                    max_failures_retained,
+                )
+                .await
+                {
+                    warn!("replication rule '{rule_name}': failure-ring write failed: {le}");
+                }
+                DriverDone::Delete {
+                    item_id,
+                    deleted: false,
+                    error: true,
+                }
             }
         }
     }
@@ -278,468 +490,543 @@ pub async fn run_rule(
     };
     let events_sink: EventSink = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
 
-    // Build a dest-presence ORACLE once per run by DESCENDING the dest+source
-    // prefix trees with a `/` delimiter, instead of HEADing every source key (or
-    // even flat-listing the whole dest). A HEAD per object against a remote dest
-    // is what made a copy to an empty/sparse destination spend minutes "thinking"
-    // before copying anything. With the oracle, an absent dest subtree is proven
-    // from a single common-prefix probe — its objects all copy with no HEAD — and
-    // planning HEADs a dest key ONLY when it actually exists. Bounded: an enormous
-    // or errored/cancelled descent falls back to per-key HEAD (old behavior).
-    let dest_oracle = build_dest_oracle(engine, &ctrl, rule, &dest_prefix, &source_prefix).await;
-
-    let mut pager = Pager::resuming(continuation).with_test_max_pages_env();
-    // Fold a DB error into a fatal STOP instead of `?`-returning out of
-    // run_rule: the post-loop event flush + settle must ALWAYS run (an early
-    // return leaves the run row 'running' forever and drops buffered events).
-    macro_rules! fatal_break {
-        ($lbl:lifetime, $msg:expr) => {{
-            warn!("replication rule '{}': {}", rule.name, $msg);
+    // ── Fused directory-scoped tree walk ──
+    //
+    // The pure WalkMachine (`replication::walk`) owns every decision: per-dir
+    // src/dest merge, policy/regime-driven HEAD resolution (PureMirror ⇒ zero
+    // HEADs), per-dir provenance-gated deletes, the resume watermark, the page
+    // budget, and the flat-sweep degrade. This driver only executes commands
+    // against the engine and feeds results back — copies start with the first
+    // directory, no discovery pre-pass.
+    let scope = walk::cursor_scope(
+        &rule.source.bucket,
+        &source_prefix,
+        &rule.destination.bucket,
+        &dest_prefix,
+    );
+    let resume = walk::load_cursor(continuation.as_deref(), &scope);
+    let was_resumed = resume.is_some();
+    if continuation.is_some() && !was_resumed {
+        info!(
+            "replication rule '{}': stale/legacy cursor discarded — starting a fresh walk",
+            rule.name
+        );
+    }
+    let regime = walk::FactRegime {
+        src_lite_authoritative: engine.lite_list_carries_logical_facts(&rule.source.bucket),
+        dest_lite_authoritative: engine.lite_list_carries_logical_facts(&rule.destination.bucket),
+    };
+    let max_pages = match crate::config::env_parse::<u32>("DGP_TEST_MAX_JOB_PAGES") {
+        Some(n) if n > 0 => n,
+        _ => MAX_JOB_PAGES,
+    };
+    let dir_workers = concurrency.dir_concurrency.clamp(1, 16) as usize;
+    let mut machine = match compile_rule_globs(rule) {
+        Ok((include_globs, exclude_globs)) => Some(walk::WalkMachine::new(
+            walk::WalkConfig {
+                scope,
+                rule_name: rule.name.clone(),
+                src_prefix: source_prefix.clone(),
+                dest_prefix: dest_prefix.clone(),
+                conflict: rule.conflict,
+                strict_content_diff: rule.strict_content_diff,
+                replicate_deletes: rule.replicate_deletes,
+                include_globs,
+                exclude_globs,
+                regime,
+                page_size: cap,
+                max_pages,
+                dir_workers,
+                head_batch: 100,
+                max_child_dirs_per_dir: 10_000,
+                max_pending_dirs: 500_000,
+                action_buffer: (transfers * 8).max(64),
+            },
+            resume,
+        )),
+        Err(e) => {
+            warn!("replication rule '{}' glob compile failed: {e}", rule.name);
             totals.errors += 1;
             hit_fatal_error = true;
-            break $lbl;
-        }};
-    }
-    // ── Forward-copy pass: paginate source until exhausted ──
-    'pages: while let Some(page_idx) = pager.begin_page() {
-        // Uniform page-boundary control check (kill / pause / lease renew).
-        // ponytail: PAUSE is a live DB flag; DISABLE is a config edit the worker
-        // can't see through its `&ReplicationRule` snapshot — Pause is the button.
-        match ctrl.check(true).await {
-            Err(e) => fatal_break!('pages, format!("control check failed: {e}")),
-            Ok(v) => match v {
-                ControlVerdict::Continue => {}
-                ControlVerdict::Killed => {
-                    info!(
-                        "replication rule '{}' killed mid-run — stopping at page {} boundary",
-                        rule.name, page_idx
-                    );
-                    killed = true;
-                    break 'pages;
+            None
+        }
+    };
+
+    // Poison-skips recorded by copy_one_object (folded from PerObjectResult);
+    // planner skips come from the machine's stats. Both feed objects_skipped.
+    let mut poison_skipped: i64 = 0;
+    let _progress_guard = WalkProgressGuard(rule.name.clone());
+
+    if let Some(machine) = machine.as_mut() {
+        let mut inflight: futures::stream::FuturesUnordered<
+            std::pin::Pin<Box<dyn std::future::Future<Output = DriverDone> + Send>>,
+        > = futures::stream::FuturesUnordered::new();
+        let (mut lists_inflight, mut heads_inflight) = (0usize, 0usize);
+        let (mut copies_inflight, mut deletes_inflight) = (0usize, 0usize);
+        // Rolling abort-classification window, reset at each control boundary
+        // (the old page boundary): dest-fatal and throttle-abort gates keep
+        // their zero-successes semantics over the window.
+        let (mut win_attempted, mut win_copied, mut win_throttled) = (0i64, 0i64, 0i64);
+        let mut clear_failure_keys: Vec<String> = Vec::new();
+        let mut last_persisted_pos = machine.cursor().map(|c| c.pos);
+        let mut last_dirs_reported: u64 = 0;
+        let mut first_list_done = false;
+        let mut events_since_flush = 0usize;
+        let mut need_check = true;
+        let mut kill_watch = Box::pin(poll_run_killed(&db, run_id));
+
+        'walk: loop {
+            // Control boundary (kill / pause / lease renew / maintenance),
+            // page-boundary cadence: every completed listing re-arms it.
+            if need_check {
+                need_check = false;
+                win_attempted = 0;
+                win_copied = 0;
+                win_throttled = 0;
+                match ctrl.check(true).await {
+                    Err(e) => {
+                        warn!(
+                            "replication rule '{}': control check failed: {e}",
+                            rule.name
+                        );
+                        totals.errors += 1;
+                        hit_fatal_error = true;
+                        machine.drain(walk::DrainReason::Fatal);
+                        break 'walk;
+                    }
+                    Ok(ControlVerdict::Continue) => {}
+                    Ok(ControlVerdict::Killed) => {
+                        info!("replication rule '{}' killed mid-walk", rule.name);
+                        killed = true;
+                        machine.drain(walk::DrainReason::Killed);
+                        break 'walk;
+                    }
+                    Ok(ControlVerdict::Paused) => {
+                        info!(
+                            "replication rule '{}' paused mid-walk (cursor preserved for resume)",
+                            rule.name
+                        );
+                        stopped_paused = true;
+                        machine.drain(walk::DrainReason::Paused);
+                        break 'walk;
+                    }
+                    Ok(ControlVerdict::LeaseLost) => {
+                        totals.errors += 1;
+                        hit_fatal_error = true;
+                        machine.drain(walk::DrainReason::LeaseLost);
+                        break 'walk;
+                    }
                 }
-                ControlVerdict::Paused => {
-                    info!(
-                        "replication rule '{}' paused mid-run — stopping after page {} (cursor preserved for resume)",
-                        rule.name, page_idx
-                    );
-                    stopped_paused = true;
-                    break 'pages;
+            }
+
+            let caps = walk::DriverCaps {
+                list: (dir_workers * 2).saturating_sub(lists_inflight),
+                head: 2usize.saturating_sub(heads_inflight),
+                copy: transfers.saturating_sub(copies_inflight),
+                delete: 2usize.saturating_sub(deletes_inflight),
+            };
+            let cmds = machine.poll(caps);
+            let dispatched = !cmds.is_empty();
+            for cmd in cmds {
+                match cmd {
+                    walk::Cmd::List {
+                        req_id,
+                        side,
+                        rel_prefix,
+                        token,
+                        delimited,
+                    } => {
+                        lists_inflight += 1;
+                        let engine = engine.clone();
+                        let (bucket, side_prefix) =
+                            side_target(rule, &source_prefix, &dest_prefix, side);
+                        let page_size = cap;
+                        inflight.push(Box::pin(async move {
+                            let abs_prefix = format!("{side_prefix}{rel_prefix}");
+                            let abs_token = token.map(|t| format!("{side_prefix}{t}"));
+                            if let Some(m) = engine.metrics() {
+                                m.replication_list_calls_total.inc();
+                            }
+                            let result = engine
+                                .list_objects(
+                                    &bucket,
+                                    &abs_prefix,
+                                    delimited.then_some("/"),
+                                    page_size,
+                                    abs_token.as_deref(),
+                                    false,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())
+                                .and_then(|p| to_rel_listing(p, &side_prefix));
+                            DriverDone::List { req_id, result }
+                        }));
+                    }
+                    walk::Cmd::Head {
+                        req_id,
+                        side,
+                        rel_keys,
+                    } => {
+                        heads_inflight += 1;
+                        let engine = engine.clone();
+                        let (bucket, side_prefix) =
+                            side_target(rule, &source_prefix, &dest_prefix, side);
+                        inflight.push(Box::pin(async move {
+                            let mut results = Vec::with_capacity(rel_keys.len());
+                            for rel in rel_keys {
+                                let abs = format!("{side_prefix}{rel}");
+                                if let Some(m) = engine.metrics() {
+                                    m.replication_head_calls_total.inc();
+                                }
+                                let r = match engine.head(&bucket, &abs).await {
+                                    Ok(meta) => walk::HeadResult::Resolved(Box::new(meta)),
+                                    Err(e) => {
+                                        let s3e: crate::api::S3Error = e.into();
+                                        if matches!(s3e, crate::api::S3Error::NoSuchKey(_)) {
+                                            walk::HeadResult::Gone
+                                        } else {
+                                            walk::HeadResult::Unresolved
+                                        }
+                                    }
+                                };
+                                results.push((rel, r));
+                            }
+                            DriverDone::Heads {
+                                req_id,
+                                side,
+                                results,
+                            }
+                        }));
+                    }
+                    walk::Cmd::Copy {
+                        item_id,
+                        rel_key,
+                        src_size,
+                    } => {
+                        copies_inflight += 1;
+                        let db = db.clone();
+                        let engine = engine.clone();
+                        let rule_name = rule.name.clone();
+                        let src_bucket = rule.source.bucket.clone();
+                        let dst_bucket = rule.destination.bucket.clone();
+                        let events = events_sink.clone();
+                        let abs_src = format!("{source_prefix}{rel_key}");
+                        let abs_dest = format!("{dest_prefix}{rel_key}");
+                        inflight.push(Box::pin(async move {
+                            // Guard increments objects_inflight (+peak) on entry and
+                            // decrements on drop → proves the `transfers` concurrency.
+                            let _obj_guard = engine.metrics().cloned().map(ObjectGuard::new);
+                            // Live "currently copying" registration for the Jobs UI
+                            // (RAII: a kill dropping this future unregisters it).
+                            let _inflight_reg = InFlightGuard::new(&rule_name, &abs_src, src_size);
+                            let res = copy_one_object(
+                                &db,
+                                &engine,
+                                &rule_name,
+                                &src_bucket,
+                                &dst_bucket,
+                                &abs_src,
+                                &abs_dest,
+                                run_id,
+                                object_timeout,
+                                object_skip_after_failures,
+                                upload_concurrency,
+                                max_failures_retained,
+                                &events,
+                            )
+                            .await;
+                            DriverDone::Copy {
+                                item_id,
+                                res: res.map(Box::new),
+                            }
+                        }));
+                    }
+                    walk::Cmd::Delete {
+                        item_id,
+                        rel_key,
+                        needs_provenance_head,
+                    } => {
+                        deletes_inflight += 1;
+                        let db = db.clone();
+                        let engine = engine.clone();
+                        let rule_name = rule.name.clone();
+                        let src_bucket = rule.source.bucket.clone();
+                        let dst_bucket = rule.destination.bucket.clone();
+                        let abs_src = format!("{source_prefix}{rel_key}");
+                        let abs_dest = format!("{dest_prefix}{rel_key}");
+                        inflight.push(Box::pin(async move {
+                            execute_delete(
+                                &db,
+                                &engine,
+                                &rule_name,
+                                &src_bucket,
+                                &dst_bucket,
+                                &abs_src,
+                                &abs_dest,
+                                item_id,
+                                needs_provenance_head,
+                                run_id,
+                                max_failures_retained,
+                            )
+                            .await
+                        }));
+                    }
                 }
-                ControlVerdict::LeaseLost => {
+            }
+
+            if inflight.is_empty() {
+                if !dispatched {
+                    break 'walk; // done, truncated, drained, or failed
+                }
+                continue;
+            }
+
+            // Await one completion, racing the operator kill so a wedged
+            // object aborts NOW (dropping `inflight` cancels every transfer).
+            let done = tokio::select! {
+                biased;
+                killed_now = &mut kill_watch => {
+                    if killed_now {
+                        killed = true;
+                    }
+                    machine.drain(walk::DrainReason::Killed);
+                    break 'walk;
+                }
+                done = inflight.next() => match done {
+                    Some(d) => d,
+                    None => break 'walk,
+                },
+            };
+
+            match done {
+                DriverDone::List { req_id, result } => {
+                    lists_inflight -= 1;
+                    need_check = true;
+                    match result {
+                        Ok(page) => {
+                            first_list_done = true;
+                            machine.on_event(walk::Event::ListPage { req_id, page });
+                        }
+                        Err(msg) => {
+                            warn!("replication rule '{}' list failed: {}", rule.name, msg);
+                            // Poison-token guard: a RESUMED walk whose FIRST
+                            // listing fails most likely holds a stale cursor —
+                            // clear it so the next tick starts fresh.
+                            if was_resumed && !first_list_done {
+                                let db = db.lock().await;
+                                let _ = db.replication_set_continuation_token(&rule.name, None);
+                            }
+                            if let Err(le) = log_failure(
+                                &db,
+                                &rule.name,
+                                run_id,
+                                "",
+                                "",
+                                &format!("list failed: {msg}"),
+                                max_failures_retained,
+                            )
+                            .await
+                            {
+                                warn!(
+                                    "replication rule '{}': failure-ring write failed: {le}",
+                                    rule.name
+                                );
+                            }
+                            totals.errors += 1;
+                            hit_fatal_error = true;
+                            machine.on_event(walk::Event::ListFailed { req_id });
+                        }
+                    }
+                }
+                DriverDone::Heads {
+                    req_id,
+                    side,
+                    results,
+                } => {
+                    heads_inflight -= 1;
+                    machine.on_event(walk::Event::HeadDone { req_id, results });
+                    let _ = side;
+                }
+                DriverDone::Copy { item_id, res } => {
+                    copies_inflight -= 1;
+                    match res {
+                        Err(e) => {
+                            warn!(
+                                "replication rule '{}': per-object DB write failed: {e}",
+                                rule.name
+                            );
+                            totals.errors += 1;
+                            hit_fatal_error = true;
+                            machine.drain(walk::DrainReason::Fatal);
+                            machine.on_event(walk::Event::CopySettled { item_id, ok: false });
+                        }
+                        Ok(r) => {
+                            if let Some(k) = r.clear_failure_key.clone() {
+                                clear_failure_keys.push(k);
+                            }
+                            totals.objects_copied += r.objects_copied;
+                            poison_skipped += r.objects_skipped;
+                            totals.bytes_copied += r.bytes_copied;
+                            totals.errors += r.errors;
+                            totals.delta_passthrough += r.delta_passthrough;
+                            totals.bytes_egress_saved += r.bytes_egress_saved;
+                            win_attempted += 1;
+                            win_copied += r.objects_copied;
+                            if r.throttled {
+                                win_throttled += 1;
+                            }
+                            if r.had_error {
+                                had_any_error = true;
+                            }
+                            machine.on_event(walk::Event::CopySettled {
+                                item_id,
+                                ok: !r.had_error,
+                            });
+                            // Destination unusable (bucket missing / over quota):
+                            // abort instead of retrying every remaining object.
+                            // Gated on zero successes this window — a stray token
+                            // in one error must not abort a healthy run.
+                            if r.dest_fatal && win_copied == 0 {
+                                warn!(
+                                    "replication rule '{}' aborting run: destination unusable (bucket missing or over quota)",
+                                    rule.name
+                                );
+                                hit_fatal_error = true;
+                                dest_unusable = true;
+                                machine.drain(walk::DrainReason::Fatal);
+                            }
+                            // Backend shedding load (503 SlowDown / 429): abort with
+                            // backoff instead of grinding the key list.
+                            if page_is_throttle_aborted(win_copied, win_throttled, win_attempted) {
+                                warn!(
+                                    "replication rule '{}' aborting run: backend throttled ({} SlowDown rejections this window)",
+                                    rule.name, win_throttled
+                                );
+                                let _ = log_failure(
+                                    &db,
+                                    &rule.name,
+                                    run_id,
+                                    "",
+                                    "",
+                                    &format!(
+                                        "run aborted: backend throttled ({win_throttled} SlowDown rejections); \
+                                         resuming from cursor after backoff"
+                                    ),
+                                    max_failures_retained,
+                                )
+                                .await;
+                                hit_fatal_error = true;
+                                backend_throttled = true;
+                                machine.drain(walk::DrainReason::Fatal);
+                            }
+                        }
+                    }
+                }
+                DriverDone::Delete {
+                    item_id,
+                    deleted,
+                    error,
+                } => {
+                    deletes_inflight -= 1;
+                    if deleted {
+                        totals.objects_deleted += 1;
+                    }
+                    if error {
+                        totals.errors += 1;
+                        had_any_error = true;
+                    }
+                    machine.on_event(walk::Event::DeleteSettled {
+                        item_id,
+                        ok: !error,
+                    });
+                }
+            }
+
+            // Fused checkpoint when the durable position moved (or every 32
+            // events for progress/event visibility during long stretches):
+            // failure-ledger clears + cursor + run progress + event flush
+            // under ONE db.lock — the old per-page contract.
+            events_since_flush += 1;
+            if events_since_flush >= 64 {
+                need_check = true;
+            }
+            let cur_pos = machine.cursor().map(|c| c.pos);
+            if cur_pos != last_persisted_pos || events_since_flush >= 32 {
+                let stats = machine.stats().clone();
+                totals.objects_scanned = stats.objects_scanned as i64;
+                totals.objects_skipped = stats.objects_skipped as i64 + poison_skipped;
+                if let Some(m) = engine.metrics() {
+                    let delta = stats.dirs_completed.saturating_sub(last_dirs_reported);
+                    if delta > 0 {
+                        m.replication_dirs_completed_total.inc_by(delta);
+                        last_dirs_reported = stats.dirs_completed;
+                    }
+                }
+                let (dirs_done, dirs_pending) = machine.progress();
+                WALK_PROGRESS
+                    .lock()
+                    .insert(rule.name.clone(), (dirs_done, dirs_pending));
+                let cursor_json = machine.cursor().map(|c| c.to_json());
+                let db = db.lock().await;
+                for k in clear_failure_keys.drain(..) {
+                    let _ = db.replication_clear_object_failure(&rule.name, &k);
+                }
+                let persist = db
+                    .replication_set_continuation_token(&rule.name, cursor_json.as_deref())
+                    .and_then(|_| db.replication_update_run_progress(run_id, totals));
+                let mut drained: Vec<NewEvent> = std::mem::take(&mut *events_sink.lock());
+                flush_page_events_locked(&db, &rule.name, &mut drained);
+                drop(db);
+                if let Err(e) = persist {
+                    warn!(
+                        "replication rule '{}': cursor/progress persist failed: {e}",
+                        rule.name
+                    );
                     totals.errors += 1;
                     hit_fatal_error = true;
-                    break 'pages;
+                    machine.drain(walk::DrainReason::Fatal);
                 }
-            },
-        }
-
-        let page = match engine
-            .list_objects(
-                &rule.source.bucket,
-                &source_prefix,
-                None,
-                cap,
-                pager.token(),
-                true,
-            )
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(
-                    "replication rule '{}' list page {} failed: {}",
-                    rule.name, page_idx, e
-                );
-                // Poison-token guard: a RESUMED run whose FIRST page fails
-                // to list most likely holds a backend-invalidated token —
-                // clear it so the next tick starts fresh instead of
-                // wedging every subsequent run on the same bad cursor.
-                if pager.poisoned_resume_token() {
-                    let db = db.lock().await;
-                    let _ = db.replication_set_continuation_token(&rule.name, None);
-                }
-                if let Err(le) = log_failure(
-                    &db,
-                    &rule.name,
-                    run_id,
-                    "",
-                    "",
-                    &format!("list source failed: {}", e),
-                    max_failures_retained,
-                )
-                .await
-                {
-                    warn!(
-                        "replication rule '{}': failure-ring write failed: {le}",
-                        rule.name
-                    );
-                }
-                totals.errors += 1;
-                hit_fatal_error = true;
-                break 'pages;
-            }
-        };
-
-        totals.objects_scanned += page.objects.len() as i64;
-
-        // Plan this page. The planner heads each destination key and
-        // applies the conflict policy + glob filters.
-        let plan = {
-            let head_engine = engine.clone();
-            let dest_bucket = rule.destination.bucket.clone();
-            let dest_oracle = &dest_oracle;
-            let conflict = rule.conflict;
-            plan_batch(&page.objects, rule, move |dest_key| {
-                let engine = head_engine.clone();
-                let dest_bucket = dest_bucket.clone();
-                let dk = dest_key.to_string();
-                // Decide what dest metadata (if any) the planner needs WITHOUT a
-                // HEAD where provable:
-                //  - absent on dest   → None (copy under every policy).
-                //  - SkipIfDestExists → existence ONLY; the policy discards the
-                //    metadata, so a synth meta (any) skips the HEAD. Safe on every
-                //    backend incl. encrypted (we never read the dest's content).
-                //  - else (ContentDiff / NewerWins / delta-eligible) → real HEAD.
-                //    NOTE: ContentDiff head-free from the lite list is UNSAFE on an
-                //    encrypting dest backend — the lite list returns ciphertext
-                //    size/etag while a HEAD returns decrypted logical facts, so a
-                //    lite compare would over-copy every tick. Deferred until the
-                //    engine can cheaply report whether a dest bucket encrypts.
-                let maybe_present = dest_oracle.may_contain(&dk);
-                let synth = if !maybe_present {
-                    Some(None) // resolved: absent
-                } else if let Some(leaf) = dest_oracle.leaf(&dk) {
-                    if matches!(conflict, ConflictPolicy::SkipIfDestExists) {
-                        Some(Some(leaf.synth_meta(&dk)))
-                    } else {
-                        None // need a real HEAD (decrypted/logical facts)
-                    }
-                } else {
-                    None // Unbounded / no leaf — HEAD
-                };
-                async move {
-                    match synth {
-                        Some(resolved) => resolved,
-                        None => engine.head(&dest_bucket, &dk).await.ok(),
-                    }
-                }
-            })
-            .await
-        };
-
-        let plan = match plan {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(
-                    "replication rule '{}' page {} planner error: {}",
-                    rule.name, page_idx, e
-                );
-                if let Err(le) = log_failure(
-                    &db,
-                    &rule.name,
-                    run_id,
-                    "",
-                    "",
-                    &format!("planner error: {}", e),
-                    max_failures_retained,
-                )
-                .await
-                {
-                    warn!(
-                        "replication rule '{}': failure-ring write failed: {le}",
-                        rule.name
-                    );
-                }
-                totals.errors += 1;
-                hit_fatal_error = true;
-                break 'pages;
-            }
-        };
-
-        totals.objects_skipped += plan.skipped.len() as i64;
-
-        // Register this page's dest writes with the maintenance gate BEFORE the
-        // busy check, so the acquire-then-recheck closes the TOCTOU with a
-        // maintenance job arming concurrently (H22): either our +1 is visible to
-        // its drain_inflight_writes (it waits for this page), or ctrl.check below
-        // sees is_busy and we defer with the guard dropped and no copies done.
-        // The per-page barrier bounds how long a drain can wait on us.
-        let _page_write = ctrl
-            .maintenance_gate
-            .as_ref()
-            .map(|g| g.begin_write(&ctrl.dest_bucket));
-
-        // Renew the lease ONCE before the page's concurrent copy batch.
-        // The independent heartbeat task keeps it alive during the batch;
-        // the post-batch check re-reads it. Events flush post-loop.
-        match ctrl.check(true).await {
-            Err(e) => fatal_break!('pages, format!("control check failed: {e}")),
-            Ok(ControlVerdict::Continue) => {}
-            Ok(ControlVerdict::Killed) => {
-                killed = true;
-                break 'pages;
-            }
-            Ok(ControlVerdict::Paused) => {
-                stopped_paused = true;
-                break 'pages;
-            }
-            Ok(ControlVerdict::LeaseLost) => {
-                totals.errors += 1;
-                hit_fatal_error = true;
-                break 'pages;
+                last_persisted_pos = cur_pos;
+                events_since_flush = 0;
             }
         }
 
-        // Copy up to `transfers` objects concurrently. Each unit does its
-        // own DB writes (failure/clear — they serialize through the shared
-        // Arc<Mutex<ConfigDb>>) and returns its totals delta + optional
-        // event. The page boundary is the barrier: the cursor does not
-        // advance until every in-flight object of this page finishes.
-        let page_attempted = plan.to_copy.len() as i64;
-        let copy_page = futures::stream::iter(plan.to_copy.clone())
-            .map(|(src_key, dest_key, src_size)| {
-                let db = db.clone();
-                let engine = engine.clone();
-                let rule_name = rule.name.clone();
-                let src_bucket = rule.source.bucket.clone();
-                let dst_bucket = rule.destination.bucket.clone();
-                let events = events_sink.clone();
-                async move {
-                    // Guard increments objects_inflight (+peak) on entry and
-                    // decrements on drop → proves the `transfers` concurrency.
-                    let _obj_guard = engine.metrics().cloned().map(ObjectGuard::new);
-                    // Live "currently copying" registration for the Jobs UI
-                    // (RAII: a kill dropping this future unregisters it).
-                    let _inflight = InFlightGuard::new(&rule_name, &src_key, src_size);
-                    copy_one_object(
-                        &db,
-                        &engine,
-                        &rule_name,
-                        &src_bucket,
-                        &dst_bucket,
-                        &src_key,
-                        &dest_key,
-                        run_id,
-                        object_timeout,
-                        object_skip_after_failures,
-                        upload_concurrency,
-                        max_failures_retained,
-                        &events,
-                    )
-                    .await
-                }
-            })
-            .buffer_unordered(transfers)
-            .collect::<Vec<_>>();
-
-        // Race the page against a kill poll. If the operator kills the run, the
-        // collect future is DROPPED — every in-flight copy_one_object drops with
-        // it, aborting the underlying HTTP transfers immediately (a wedged
-        // object on a dead dest dies now, not after object_timeout).
-        let object_results: Vec<Result<PerObjectResult, crate::config_db::ConfigDbError>> = tokio::select! {
-            biased;
-            killed_now = poll_run_killed(&db, run_id) => {
-                if killed_now { killed = true; }
-                Vec::new()
-            }
-            results = copy_page => results,
-        };
-        if killed {
-            break 'pages;
-        }
-
-        // Fold the concurrent results into totals + flags + events. DB
-        // failure/clear writes already happened inside each unit; any
-        // ConfigDb error is surfaced here (the first one wins).
-        let mut dest_fatal = false;
-        let mut page_copied: i64 = 0;
-        let mut page_throttled: i64 = 0;
-        let mut clear_failure_keys: Vec<String> = Vec::new();
-        for res in object_results {
-            let res = match res {
-                Ok(r) => r,
-                Err(e) => fatal_break!('pages, format!("per-object DB write failed: {e}")),
-            };
-            if let Some(k) = res.clear_failure_key {
-                clear_failure_keys.push(k);
-            }
-            totals.objects_copied += res.objects_copied;
-            totals.objects_skipped += res.objects_skipped;
-            totals.bytes_copied += res.bytes_copied;
-            totals.errors += res.errors;
-            totals.delta_passthrough += res.delta_passthrough;
-            totals.bytes_egress_saved += res.bytes_egress_saved;
-            page_copied += res.objects_copied;
-            if res.had_error {
-                had_any_error = true;
-            }
-            if res.dest_fatal {
-                dest_fatal = true;
-            }
-            if res.throttled {
-                page_throttled += 1;
+        // Final stats sync (the loop may have broken between checkpoints).
+        let stats = machine.stats().clone();
+        totals.objects_scanned = stats.objects_scanned as i64;
+        totals.objects_skipped = stats.objects_skipped as i64 + poison_skipped;
+        if let Some(m) = engine.metrics() {
+            let delta = stats.dirs_completed.saturating_sub(last_dirs_reported);
+            if delta > 0 {
+                m.replication_dirs_completed_total.inc_by(delta);
             }
         }
-        // Destination unusable (bucket missing / over quota) — abort the run
-        // instead of retrying every remaining object against a dead dest.
-        // GATE on zero successes this page: a single object's stray token
-        // ("quota" in an IAM denial, a key echoing "storage limit") must NOT
-        // abort a page that is otherwise copying fine. A truly dead dest fails
-        // EVERY object, so page_copied==0 holds for the real case.
-        if dest_fatal && page_copied == 0 {
-            warn!(
-                "replication rule '{}' aborting run: destination unusable (bucket missing or over quota)",
-                rule.name
-            );
-            hit_fatal_error = true;
-            dest_unusable = true;
-            break 'pages;
-        }
-        // Backend shedding load (503 SlowDown / 429): abort instead of
-        // grinding the remaining key list through per-object retries. Gated
-        // on zero successes this page AND (≥3 throttled OR the WHOLE page
-        // throttled). The whole-page clause matters for small batch_size (≤2):
-        // page_throttled>=3 alone is unsatisfiable there, so a fully-throttling
-        // backend would grind object-by-object with no backoff (the exact prod
-        // incident the gate exists for). The cursor resumes after backoff;
-        // copies are idempotent. Guard page_attempted>0 so an empty page (all
-        // filtered) never trips it.
-        if page_is_throttle_aborted(page_copied, page_throttled, page_attempted) {
-            warn!(
-                "replication rule '{}' aborting run: backend throttled ({} objects rejected with SlowDown this page)",
-                rule.name, page_throttled
-            );
-            let _ = log_failure(
-                &db,
-                &rule.name,
-                run_id,
-                "",
-                "",
-                &format!(
-                    "run aborted: backend throttled ({page_throttled} SlowDown rejections in one page); \
-                     resuming from cursor after backoff"
-                ),
-                max_failures_retained,
-            )
-            .await;
-            hit_fatal_error = true;
-            backend_throttled = true;
-            break 'pages;
-        }
-        {
+        // Any pending failure-ledger clears from the tail of the run.
+        if !clear_failure_keys.is_empty() {
             let db = db.lock().await;
-            if let Err(e) = db.replication_update_run_progress(run_id, totals) {
-                drop(db);
-                fatal_break!('pages, format!("progress persist failed: {e}"));
+            for k in clear_failure_keys.drain(..) {
+                let _ = db.replication_clear_object_failure(&rule.name, &k);
             }
-        }
-
-        // Post-batch control re-check: stop before persisting the cursor if a
-        // kill/pause/lease-loss landed while the batch ran (no renew: the
-        // heartbeat owns liveness during the batch).
-        match ctrl.check(false).await {
-            Err(e) => fatal_break!('pages, format!("control check failed: {e}")),
-            Ok(ControlVerdict::Continue) => {}
-            Ok(ControlVerdict::Killed) => {
-                killed = true;
-                break 'pages;
-            }
-            Ok(ControlVerdict::Paused) => {
-                stopped_paused = true;
-                break 'pages;
-            }
-            Ok(ControlVerdict::LeaseLost) => {
-                // First detection (check(false) never logs): record it so the
-                // failure ring explains the failed run.
-                let _ = log_failure(
-                    &db,
-                    &rule.name,
-                    run_id,
-                    "",
-                    "",
-                    "lost replication lease; stopping run before more work",
-                    max_failures_retained,
-                )
-                .await;
-                totals.errors += 1;
-                hit_fatal_error = true;
-                break 'pages;
-            }
-        }
-
-        // Persist the cursor so the next tick can resume here if we
-        // crash before the run finishes naturally, and flush this page's
-        // buffered copy events in a single batched insert under the same
-        // lock acquisition. Event-append is non-critical: a failure is
-        // logged and the run continues (the copies themselves are
-        // durable).
-        let more = pager.advance(page.is_truncated, page.next_continuation_token);
-        {
-            // Single lock acquisition fuses the cursor persist, the run
-            // progress, and the page's event flush — do not split (see
-            // the throughput note above).
-            let db = db.lock().await;
-            // Clear the failure ledger for every durably-copied object in this
-            // page (deferred from copy_one_object so a mid-object kill can't lose
-            // it — H15). Best-effort: a clear failure must not abort the run.
-            for k in &clear_failure_keys {
-                let _ = db.replication_clear_object_failure(&rule.name, k);
-            }
-            let persist = db
-                .replication_set_continuation_token(&rule.name, pager.token())
-                .and_then(|_| db.replication_update_run_progress(run_id, totals));
-            let mut drained: Vec<NewEvent> = std::mem::take(&mut *events_sink.lock());
-            flush_page_events_locked(&db, &rule.name, &mut drained);
-            if let Err(e) = persist {
-                drop(db);
-                fatal_break!('pages, format!("cursor/progress persist failed: {e}"));
-            }
-        }
-
-        if !more {
-            break 'pages;
         }
     }
 
     // Unconditional flush: covers EVERY break path (kill, pause, lease,
     // dest-fatal) — events pushed by durably-completed copies must survive.
     flush_event_sink(&db, &rule.name, &events_sink).await;
-    // Forward pass ran out of page budget with pages pending: the cursor
-    // stays persisted so the next tick resumes the tail (never a clean pass).
-    let truncated = pager.truncated_by_page_budget();
+    // Walk ran out of page budget (or stopped short of completion for any
+    // non-terminal reason): the cursor stays persisted so the next tick
+    // resumes the tail (never reported as a clean pass).
+    let truncated = machine.as_ref().is_some_and(|m| {
+        m.truncated_by_budget() || (!killed && !stopped_paused && !hit_fatal_error && !m.is_done())
+    });
+    let final_cursor_json = machine
+        .as_ref()
+        .and_then(|m| m.cursor())
+        .map(|c| c.to_json());
 
-    // ── Delete-replication pass (opt-in per rule) ──
-    //
-    // After the forward copy completes, paginate the destination prefix
-    // and delete every key whose corresponding source key is missing.
-    // Only fires on a COMPLETE clean forward pass — a partial/truncated
-    // listing could make a present source key look missing, and a false
-    // destination wipe would be catastrophic.
-    if rule.replicate_deletes && !hit_fatal_error && !stopped_paused && !killed && !truncated {
-        match run_delete_pass(
-            &ctrl,
-            engine,
-            rule,
-            run_id,
-            &mut totals,
-            &mut had_any_error,
-            max_failures_retained,
-        )
-        .await
-        {
-            Ok(ControlVerdict::Continue) => {}
-            Ok(ControlVerdict::Killed) => killed = true,
-            Ok(ControlVerdict::Paused) => stopped_paused = true,
-            Ok(ControlVerdict::LeaseLost) => {
-                totals.errors += 1;
-                hit_fatal_error = true;
-            }
-            Err(e) => {
-                warn!("replication rule '{}' delete pass error: {}", rule.name, e);
-                had_any_error = true;
-            }
-        }
-    }
+    // Deletes are fused into the walk: each directory's provenance-gated
+    // candidates flush when THAT directory completes cleanly (per-dir gate,
+    // strictly narrower blast radius than the old whole-run clean-pass gate).
 
     // Final status, three-way:
     // - "failed": a FATAL error (couldn't list source), OR the sweep errored
@@ -795,6 +1082,10 @@ pub async fn run_rule(
 
         if decision.clear_cursor {
             db.replication_set_continuation_token(&rule.name, None)?;
+        } else if let Some(json) = final_cursor_json.as_deref() {
+            // Persist the FINAL watermark (checkpoints may lag it) so the
+            // resumed run redoes as little as possible.
+            db.replication_set_continuation_token(&rule.name, Some(json))?;
         }
         if !db.replication_finish_run(
             run_id,
@@ -1414,554 +1705,6 @@ async fn log_failure(
     )
 }
 
-/// Delete-replication pass: paginate the destination prefix; for each
-/// key that's NOT on source, delete it from destination.
-///
-/// The key check is HEAD-on-source (cheaper than re-listing). If the
-/// HEAD succeeds the source has it → keep destination's copy. If the
-/// HEAD returns NotFound → delete destination.
-///
-/// Other errors (network, AccessDenied) are recorded as failures and
-/// the destination key is preserved. Better to leave an extra copy than
-/// to false-delete on a transient.
-async fn run_delete_pass(
-    ctrl: &RunControl,
-    engine: &Arc<DynEngine>,
-    rule: &ReplicationRule,
-    run_id: i64,
-    totals: &mut RunTotals,
-    had_any_error: &mut bool,
-    max_failures_retained: u32,
-) -> Result<ControlVerdict, crate::config_db::ConfigDbError> {
-    let db = ctrl.db.clone();
-    let cap = rule.batch_size.clamp(1, 10_000);
-    let destination_prefix = normalize_prefix(&rule.destination.prefix);
-
-    let mut pager = Pager::fresh().with_test_max_pages_env();
-    'pages: while let Some(page_idx) = pager.begin_page() {
-        // This is the run's only DESTRUCTIVE phase — the same page-boundary
-        // control check as the forward pass: a killed run must stop deleting.
-        match ctrl.check(true).await? {
-            ControlVerdict::Continue => {}
-            verdict => {
-                info!(
-                    "replication rule '{}' delete pass stopping at page {} ({:?})",
-                    rule.name, page_idx, verdict
-                );
-                return Ok(verdict);
-            }
-        }
-        // metadata=true so user_metadata (carrying our provenance
-        // marker, H2 fix) is populated in the listing — saves a
-        // per-object HEAD round-trip.
-        let page = match engine
-            .list_objects(
-                &rule.destination.bucket,
-                &destination_prefix,
-                None,
-                cap,
-                pager.token(),
-                true,
-            )
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                warn!(
-                    "replication rule '{}' delete-pass list page {} failed: {}",
-                    rule.name, page_idx, e
-                );
-                log_failure(
-                    &db,
-                    &rule.name,
-                    run_id,
-                    "",
-                    "",
-                    &format!("delete-pass list dest failed: {}", e),
-                    max_failures_retained,
-                )
-                .await?;
-                totals.errors += 1;
-                *had_any_error = true;
-                return Ok(ControlVerdict::Continue);
-            }
-        };
-
-        for (dest_key, listed_meta) in &page.objects {
-            // H2 fix: only consider deleting objects this rule wrote.
-            // Each replicated copy carries `dg-replication-rule = <rule.name>`
-            // in user_metadata (stamped by `copy_one`). If the listed
-            // metadata is missing (LIST without metadata=true) or the
-            // marker doesn't match, skip — never delete unrelated
-            // objects, even if their key-after-prefix-rewrite happens
-            // to be missing on source.
-            //
-            // The list call below already passes `metadata=true` so
-            // user_metadata is populated. Defence in depth: if it's
-            // empty, we HEAD to confirm before any delete.
-            let has_marker_in_listing = listed_meta
-                .user_metadata
-                .get(REPLICATION_RULE_METADATA_KEY)
-                .map(|v| v == &rule.name)
-                .unwrap_or(false);
-
-            let owned_by_this_rule = if has_marker_in_listing {
-                true
-            } else {
-                // Listing didn't carry user-metadata (some backends
-                // omit it). HEAD the object to be sure.
-                match engine.head(&rule.destination.bucket, dest_key).await {
-                    Ok(meta) => meta
-                        .user_metadata
-                        .get(REPLICATION_RULE_METADATA_KEY)
-                        .map(|v| v == &rule.name)
-                        .unwrap_or(false),
-                    // HEAD failed — preserve. Better to leak a
-                    // candidate than false-delete a foreign object.
-                    Err(_) => false,
-                }
-            };
-
-            if !owned_by_this_rule {
-                debug!(
-                    "replication rule '{}' delete-pass skip (no provenance marker): {:?}",
-                    rule.name, dest_key
-                );
-                continue;
-            }
-
-            // Translate dest key back to its source counterpart.
-            let src_key = match dest_to_source_key(rule, dest_key) {
-                Some(k) => k,
-                None => {
-                    // Key sits outside the rule's destination-prefix
-                    // (paranoid case: marker matched but prefix doesn't).
-                    continue;
-                }
-            };
-
-            // HEAD source. NotFound → delete destination (we wrote it,
-            // it's still under our prefix, source no longer has the
-            // key — this is a legitimate deletion to replicate).
-            // Other errors → leave alone, log as failure.
-            match engine.head(&rule.source.bucket, &src_key).await {
-                Ok(_) => {
-                    // Source still has it. Skip.
-                }
-                Err(e) => {
-                    let s3_err: crate::api::S3Error = e.into();
-                    if matches!(s3_err, crate::api::S3Error::NoSuchKey(_)) {
-                        // Source missing → replicate the deletion.
-                        // Same test-only stall as the copy path: lets a kill land
-                        // deterministically mid-delete-pass (inert in prod).
-                        maybe_pass_stall().await;
-                        match engine.delete(&rule.destination.bucket, dest_key).await {
-                            Ok(_) => {
-                                totals.objects_deleted += 1;
-                            }
-                            Err(de) => {
-                                totals.errors += 1;
-                                *had_any_error = true;
-                                log_failure(
-                                    &db,
-                                    &rule.name,
-                                    run_id,
-                                    &src_key,
-                                    dest_key,
-                                    &format!("destination delete failed: {}", de),
-                                    max_failures_retained,
-                                )
-                                .await?;
-                            }
-                        }
-                    } else {
-                        // Anything else: log & preserve. False-delete
-                        // would be much worse than a leftover copy.
-                        totals.errors += 1;
-                        *had_any_error = true;
-                        log_failure(
-                            &db,
-                            &rule.name,
-                            run_id,
-                            &src_key,
-                            dest_key,
-                            &format!("delete-pass head source failed: {}", s3_err),
-                            max_failures_retained,
-                        )
-                        .await?;
-                    }
-                }
-            }
-        }
-
-        if !pager.advance(page.is_truncated, page.next_continuation_token) {
-            break 'pages;
-        }
-    }
-
-    // Budget truncation: the dest tail was never scanned. Surface it (safe
-    // direction — under-delete) instead of pretending the sweep completed.
-    if pager.truncated_by_page_budget() {
-        log_failure(
-            &db,
-            &rule.name,
-            run_id,
-            "",
-            "",
-            "delete pass truncated by page budget; destination tail not swept this run",
-            max_failures_retained,
-        )
-        .await?;
-        totals.errors += 1;
-        *had_any_error = true;
-    }
-
-    Ok(ControlVerdict::Continue)
-}
-
-/// Translate a destination key back to its source-side counterpart by
-/// reversing the prefix-rewrite the planner applies.
-///
-/// Returns `None` when the destination key doesn't start with the
-/// rule's destination prefix (which means it's outside this rule's
-/// jurisdiction; the delete pass leaves it alone).
-fn dest_to_source_key(rule: &ReplicationRule, dest_key: &str) -> Option<String> {
-    let dst_prefix = normalize_prefix(&rule.destination.prefix);
-    let src_prefix = normalize_prefix(&rule.source.prefix);
-    let dst_prefix = dst_prefix.as_str();
-    let src_prefix = src_prefix.as_str();
-    if dst_prefix.is_empty() && src_prefix.is_empty() {
-        return Some(dest_key.to_string());
-    }
-    if dst_prefix == src_prefix {
-        return Some(dest_key.to_string());
-    }
-    if dst_prefix.is_empty() {
-        return Some(format!(
-            "{}{}",
-            src_prefix,
-            dest_key.trim_start_matches('/')
-        ));
-    }
-    let tail = dest_key.strip_prefix(dst_prefix)?;
-    Some(format!("{}{}", src_prefix, tail.trim_start_matches('/')))
-}
-
-/// Minimal lite facts about a present destination object, captured from the
-/// delimiter listing so policy compares (NewerWins timestamp, ContentDiff
-/// size/etag) can run HEAD-free for passthrough keys (see the planner closure).
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct DestLeaf {
-    file_size: u64,
-    /// Stored ETag from the lite list (md5 for passthrough, delta-blob etag for
-    /// delta objects). Empty string ⇒ none.
-    etag: String,
-    created_at: i64,
-}
-
-impl DestLeaf {
-    /// Synthesize a passthrough-shaped `FileMetadata` from the lite facts, so
-    /// `should_replicate` can run a HEAD-free compare (Case 2/4). `file_sha256`
-    /// is empty (the lite list never carries it) — ContentDiff then compares on
-    /// size + etag, exactly as it does for any foreign object missing a SHA.
-    fn synth_meta(&self, dest_key: &str) -> FileMetadata {
-        use chrono::TimeZone;
-        let name = dest_key.rsplit('/').next().unwrap_or(dest_key).to_string();
-        let created = chrono::Utc
-            .timestamp_millis_opt(self.created_at)
-            .single()
-            .unwrap_or_else(chrono::Utc::now);
-        FileMetadata::fallback(
-            name,
-            self.file_size,
-            self.etag.clone(),
-            created,
-            None,
-            crate::types::StorageInfo::Passthrough,
-        )
-    }
-}
-
-/// Prefix-tree destination oracle, built once per run by DESCENDING the dest (and
-/// source) trees with a `/` delimiter instead of flat-listing every key. Answers
-/// the same `may_contain(dest_key)` question the old flat `DestIndex` did, but a
-/// whole dest subtree that doesn't exist is proven absent from a single
-/// common-prefix probe — so an empty/sparse dest costs near-zero dest work and a
-/// missing subtree's objects all copy with no per-object HEAD.
-enum DestOracle {
-    Known {
-        /// Dest keys that EXIST, with their lite facts (under existing subtrees).
-        present: std::collections::HashMap<String, DestLeaf>,
-        /// Normalized `pfx/` subtrees proven to have ZERO keys on the dest.
-        absent_subtrees: Vec<String>,
-    },
-    /// Dest too large / listing errored / build cancelled — HEAD every key
-    /// (identical to the pre-oracle behavior). NEVER a partial `Known`.
-    Unbounded,
-}
-
-/// PURE: is `key` under the proven-absent subtree `prefix`? A `/`-terminated
-/// prefix matches only true path descendants (`foo/` matches `foo/x`, NOT
-/// `foobar/x`). An empty prefix (whole-bucket absent) matches everything. A
-/// non-`/`-terminated prefix (shouldn't happen — common-prefixes always end in
-/// `/`) is rejected defensively so it can never false-match a sibling.
-fn key_under_absent_prefix(key: &str, prefix: &str) -> bool {
-    if prefix.is_empty() {
-        return true;
-    }
-    prefix.ends_with('/') && key.starts_with(prefix)
-}
-
-impl DestOracle {
-    /// True if the key MIGHT exist on the destination (so a HEAD is warranted).
-    /// `Unbounded` always returns true (preserves the HEAD-every-key fallback).
-    /// A key under a proven-absent subtree short-circuits to false (copy, no HEAD).
-    fn may_contain(&self, dest_key: &str) -> bool {
-        match self {
-            DestOracle::Unbounded => true,
-            DestOracle::Known {
-                present,
-                absent_subtrees,
-            } => {
-                // `key_under_absent_prefix` requires the prefix to be `/`-terminated
-                // so a sibling `foobar/x` can NEVER match the absent subtree `foo/`
-                // (a raw `starts_with` would). Marking a live sibling absent →
-                // copy-with-no-HEAD → overwrite, so this boundary is load-bearing.
-                if absent_subtrees
-                    .iter()
-                    .any(|p| key_under_absent_prefix(dest_key, p))
-                {
-                    return false;
-                }
-                present.contains_key(dest_key)
-            }
-        }
-    }
-
-    /// Lite facts for a present dest key, if known (HEAD-free policy compare).
-    fn leaf(&self, dest_key: &str) -> Option<&DestLeaf> {
-        match self {
-            DestOracle::Unbounded => None,
-            DestOracle::Known { present, .. } => present.get(dest_key),
-        }
-    }
-}
-
-/// Cap on how many dest keys we'll hold in `present`. Above this the oracle
-/// degrades to `Unbounded` (per-key HEAD) to bound memory. 1M keys ≈ tens of MB.
-const DEST_INDEX_MAX_KEYS: usize = 1_000_000;
-/// Cap on list calls during the descent (frontier pops). Bounds a pathological
-/// deeply-nested tree; breach ⇒ `Unbounded`.
-const MAX_ORACLE_LEVELS: usize = 50_000;
-/// Cap on queued + recorded subtrees; breach ⇒ `Unbounded`.
-const MAX_ORACLE_FRONTIER: usize = 100_000;
-const MAX_ABSENT_SUBTREES: usize = 100_000;
-/// Per-level page size for the delimiter listing (matches the old flat builder).
-const LEVEL_PAGE_KEYS: u32 = 1000;
-
-/// One level's pure classification: given the source and dest listings AT a
-/// common prefix (objects + child common-prefixes), decide what to record. This
-/// is the testable heart of the descent — no I/O.
-struct LevelOutcome {
-    /// Dest leaf objects present at this level → (dest_key, facts).
-    present: Vec<(String, DestLeaf)>,
-    /// Dest child subtrees to descend into (they exist on dest) → dest prefix.
-    descend: Vec<String>,
-    /// Source child subtrees absent on dest → dest prefix (copy-all, no HEADs).
-    absent: Vec<String>,
-}
-
-/// PURE: classify one descended level. `src_cps`/`dest_cps` are child
-/// common-prefixes (already dest-namespace for dest, source-namespace for src);
-/// `rewrite` maps a source child prefix into the dest namespace.
-fn step_level(
-    dest_objects: &[(String, FileMetadata)],
-    dest_cps: &[String],
-    src_cps: &[String],
-    rewrite: impl Fn(&str) -> Option<String>,
-) -> LevelOutcome {
-    let present: Vec<(String, DestLeaf)> = dest_objects
-        .iter()
-        .map(|(k, m)| {
-            (
-                k.clone(),
-                DestLeaf {
-                    file_size: m.file_size,
-                    etag: m.md5.clone(),
-                    created_at: m.created_at.timestamp_millis(),
-                },
-            )
-        })
-        .collect();
-    let dest_set: std::collections::HashSet<&str> = dest_cps.iter().map(|s| s.as_str()).collect();
-    // Dest child subtrees that exist → descend (compare finer).
-    let descend: Vec<String> = dest_cps.to_vec();
-    // Source child subtrees with no matching dest common-prefix → absent.
-    let mut absent = Vec::new();
-    for scp in src_cps {
-        if let Some(dcp) = rewrite(scp) {
-            if !dest_set.contains(dcp.as_str()) {
-                absent.push(dcp);
-            }
-        }
-    }
-    LevelOutcome {
-        present,
-        descend,
-        absent,
-    }
-}
-
-/// Translate a SOURCE prefix into the destination namespace (the forward of
-/// [`dest_to_source_key`]) — used to compare source children against dest
-/// common-prefixes during the tree descent.
-fn source_prefix_to_dest(rule: &ReplicationRule, src_prefix: &str) -> Option<String> {
-    let dst = normalize_prefix(&rule.destination.prefix);
-    let src = normalize_prefix(&rule.source.prefix);
-    let (dst, src) = (dst.as_str(), src.as_str());
-    if (dst.is_empty() && src.is_empty()) || dst == src {
-        return Some(src_prefix.to_string());
-    }
-    if src.is_empty() {
-        return Some(format!("{}{}", dst, src_prefix.trim_start_matches('/')));
-    }
-    let tail = src_prefix.strip_prefix(src)?;
-    Some(format!("{}{}", dst, tail.trim_start_matches('/')))
-}
-
-/// Build the prefix-tree destination oracle by descending BOTH trees with a `/`
-/// delimiter. Returns `Unbounded` (HEAD-every-key) on any list error, cap breach,
-/// or kill/pause — never a partial `Known`. `dest_prefix`/`source_prefix` are the
-/// normalized rule prefixes.
-async fn build_dest_oracle(
-    engine: &DynEngine,
-    ctrl: &RunControl,
-    rule: &ReplicationRule,
-    dest_prefix: &str,
-    source_prefix: &str,
-) -> DestOracle {
-    let mut present: std::collections::HashMap<String, DestLeaf> = std::collections::HashMap::new();
-    let mut absent_subtrees: Vec<String> = Vec::new();
-    // Frontier holds (dest_prefix, source_prefix) pairs to descend in lockstep.
-    let mut frontier: std::collections::VecDeque<(String, String)> =
-        std::collections::VecDeque::new();
-    frontier.push_back((dest_prefix.to_string(), source_prefix.to_string()));
-    let mut levels = 0usize;
-
-    while let Some((dpfx, spfx)) = frontier.pop_front() {
-        levels += 1;
-        if levels > MAX_ORACLE_LEVELS
-            || frontier.len() > MAX_ORACLE_FRONTIER
-            || absent_subtrees.len() > MAX_ABSENT_SUBTREES
-        {
-            return DestOracle::Unbounded;
-        }
-        // Honor kill/pause/lease-loss during the (potentially long) descent —
-        // the same uniform check as the copy loop (one-off ignores pause).
-        // Bail to Unbounded: a partial Known over-marks absent → over-copy.
-        match ctrl.check(false).await {
-            Ok(ControlVerdict::Continue) => {}
-            _ => return DestOracle::Unbounded,
-        }
-
-        // List the dest level (delimiter='/', metadata=true so leaves carry lite
-        // facts for the HEAD-free policy compare), draining the level's own
-        // pagination. Accumulate child common-prefixes across pages.
-        let mut dest_cps: Vec<String> = Vec::new();
-        let mut dest_objects: Vec<(String, FileMetadata)> = Vec::new();
-        let mut pager = Pager::fresh();
-        while pager.begin_page().is_some() {
-            let page = match engine
-                .list_objects(
-                    &rule.destination.bucket,
-                    &dpfx,
-                    Some("/"),
-                    LEVEL_PAGE_KEYS,
-                    pager.token(),
-                    true,
-                )
-                .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("replication dest oracle list {}/{dpfx} failed ({e}); HEAD-every-key fallback", rule.destination.bucket);
-                    return DestOracle::Unbounded;
-                }
-            };
-            dest_cps.extend(page.common_prefixes.iter().cloned());
-            dest_objects.extend(page.objects.iter().cloned());
-            if pager.truncated_by_page_budget() {
-                return DestOracle::Unbounded;
-            }
-            if !pager.advance(page.is_truncated, page.next_continuation_token.clone()) {
-                break;
-            }
-        }
-        // Post-loop guard: begin_page() returns None at the budget boundary and
-        // exits the loop WITHOUT re-checking, so a level truncated exactly at the
-        // last allowed page would otherwise be treated as complete → over-copy.
-        if pager.truncated_by_page_budget() {
-            return DestOracle::Unbounded;
-        }
-
-        // List the source level for child common-prefixes (lite — we only need
-        // the prefix names to decide descend-vs-absent).
-        let mut src_cps: Vec<String> = Vec::new();
-        let mut spager = Pager::fresh();
-        while spager.begin_page().is_some() {
-            let page = match engine
-                .list_objects(
-                    &rule.source.bucket,
-                    &spfx,
-                    Some("/"),
-                    LEVEL_PAGE_KEYS,
-                    spager.token(),
-                    false,
-                )
-                .await
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!("replication source oracle list {}/{spfx} failed ({e}); HEAD-every-key fallback", rule.source.bucket);
-                    return DestOracle::Unbounded;
-                }
-            };
-            src_cps.extend(page.common_prefixes.iter().cloned());
-            if spager.truncated_by_page_budget() {
-                return DestOracle::Unbounded;
-            }
-            if !spager.advance(page.is_truncated, page.next_continuation_token.clone()) {
-                break;
-            }
-        }
-        if spager.truncated_by_page_budget() {
-            return DestOracle::Unbounded;
-        }
-
-        let outcome = step_level(&dest_objects, &dest_cps, &src_cps, |scp| {
-            source_prefix_to_dest(rule, scp)
-        });
-        for (k, leaf) in outcome.present {
-            present.insert(k, leaf);
-            if present.len() > DEST_INDEX_MAX_KEYS {
-                return DestOracle::Unbounded;
-            }
-        }
-        absent_subtrees.extend(outcome.absent);
-        // Descend shared subtrees: pair each dest child with its source prefix.
-        for dcp in outcome.descend {
-            if let Some(scp) = dest_to_source_key(rule, &dcp) {
-                frontier.push_back((dcp, scp));
-            }
-        }
-    }
-
-    DestOracle::Known {
-        present,
-        absent_subtrees,
-    }
-}
-
 /// Compute when this rule should next be due. Falls back to a 1-hour
 /// recovery window if the rule's `interval` is unparseable (should
 /// never happen in practice — validated at Config::check time).
@@ -1990,25 +1733,6 @@ mod tests {
         assert!(!page_is_throttle_aborted(5, 100, 1000));
         // No throttles → never abort.
         assert!(!page_is_throttle_aborted(0, 0, 1000));
-    }
-
-    #[test]
-    fn absent_prefix_matches_only_path_descendants() {
-        // A live sibling must NEVER match a proven-absent subtree.
-        assert!(key_under_absent_prefix("foo/x", "foo/"));
-        assert!(key_under_absent_prefix("foo/bar/x", "foo/"));
-        assert!(
-            !key_under_absent_prefix("foobar/x", "foo/"),
-            "sibling must not match"
-        );
-        assert!(!key_under_absent_prefix("food", "foo/"));
-        // The prefix key itself (no trailing slash) is not "under" the subtree.
-        assert!(!key_under_absent_prefix("foo", "foo/"));
-        // Whole-bucket absent (empty prefix) matches everything.
-        assert!(key_under_absent_prefix("anything/at/all", ""));
-        // Defensive: a non-slash prefix (shouldn't occur) never matches.
-        assert!(!key_under_absent_prefix("foobar/x", "foo"));
-        assert!(!key_under_absent_prefix("foo/x", "foo"));
     }
 
     #[test]
@@ -2198,103 +1922,6 @@ mod tests {
         }
     }
 
-    fn leaf(size: u64) -> DestLeaf {
-        DestLeaf {
-            file_size: size,
-            etag: "etag".into(),
-            created_at: 0,
-        }
-    }
-
-    #[test]
-    fn oracle_may_contain_truth_table() {
-        // Unbounded → everything may be present (HEAD-every-key fallback).
-        let u = DestOracle::Unbounded;
-        assert!(u.may_contain("anything"));
-        assert!(u.leaf("anything").is_none());
-
-        let mut present = std::collections::HashMap::new();
-        present.insert("builds/a.txt".to_string(), leaf(10));
-        let k = DestOracle::Known {
-            present,
-            absent_subtrees: vec!["mirror/".to_string()],
-        };
-        // Present key → may contain + leaf available.
-        assert!(k.may_contain("builds/a.txt"));
-        assert_eq!(k.leaf("builds/a.txt").map(|l| l.file_size), Some(10));
-        // Key under a proven-absent subtree → definitely missing (copy, no HEAD).
-        assert!(!k.may_contain("mirror/anything/deep.bin"));
-        // Key neither present nor under an absent subtree → missing (no leaf).
-        assert!(!k.may_contain("builds/b.txt"));
-        assert!(k.leaf("builds/b.txt").is_none());
-    }
-
-    #[test]
-    fn step_level_classifies_descend_absent_present() {
-        // Dest has child "shared/" and a leaf "f.txt"; source has children
-        // "shared/" and "fresh/". → descend shared/, mark fresh/ absent, present f.txt.
-        let dest_objs = vec![(
-            "f.txt".to_string(),
-            FileMetadata::fallback(
-                "f.txt".into(),
-                5,
-                "e".into(),
-                chrono::Utc::now(),
-                None,
-                crate::types::StorageInfo::Passthrough,
-            ),
-        )];
-        let dest_cps = vec!["shared/".to_string()];
-        let src_cps = vec!["shared/".to_string(), "fresh/".to_string()];
-        let out = step_level(&dest_objs, &dest_cps, &src_cps, |p| Some(p.to_string()));
-        assert_eq!(out.descend, vec!["shared/".to_string()]);
-        assert_eq!(out.absent, vec!["fresh/".to_string()]);
-        assert_eq!(out.present.len(), 1);
-        assert_eq!(out.present[0].0, "f.txt");
-        assert_eq!(out.present[0].1.file_size, 5);
-    }
-
-    #[test]
-    fn step_level_empty_dest_marks_all_source_absent() {
-        let src_cps = vec!["a/".to_string(), "b/".to_string()];
-        let out = step_level(&[], &[], &src_cps, |p| Some(p.to_string()));
-        assert!(out.descend.is_empty());
-        assert!(out.present.is_empty());
-        assert_eq!(out.absent, vec!["a/".to_string(), "b/".to_string()]);
-    }
-
-    #[test]
-    fn source_prefix_to_dest_rewrites() {
-        let mut rule = mk_rule();
-        // identity when both empty
-        assert_eq!(
-            source_prefix_to_dest(&rule, "builds/"),
-            Some("builds/".to_string())
-        );
-        rule.source.prefix = "builds/".into();
-        rule.destination.prefix = "mirror/".into();
-        assert_eq!(
-            source_prefix_to_dest(&rule, "builds/releases/"),
-            Some("mirror/releases/".to_string())
-        );
-        // a source child outside the source prefix → None (not this rule's).
-        assert_eq!(source_prefix_to_dest(&rule, "other/"), None);
-    }
-
-    #[test]
-    fn dest_leaf_synth_meta_round_trips_size_etag() {
-        let l = DestLeaf {
-            file_size: 42,
-            etag: "abc".into(),
-            created_at: 1_700_000_000_000,
-        };
-        let m = l.synth_meta("builds/x.bin");
-        assert_eq!(m.file_size, 42);
-        assert_eq!(m.md5, "abc");
-        assert!(m.file_sha256.is_empty()); // lite never carries sha
-        assert_eq!(m.created_at.timestamp_millis(), 1_700_000_000_000);
-    }
-
     fn mk_rule() -> ReplicationRule {
         ReplicationRule {
             name: "r".to_string(),
@@ -2351,43 +1978,5 @@ mod tests {
         assert_eq!(runs[0].objects_scanned, 10);
         assert_eq!(runs[0].objects_copied, 4);
         assert_eq!(runs[0].errors, 2);
-    }
-
-    #[test]
-    fn dest_to_source_key_identity_when_prefixes_empty() {
-        let rule = mk_rule();
-        assert_eq!(
-            dest_to_source_key(&rule, "file.txt"),
-            Some("file.txt".to_string())
-        );
-    }
-
-    #[test]
-    fn dest_to_source_key_strips_destination_prefix() {
-        let mut rule = mk_rule();
-        rule.source.prefix = "releases/".into();
-        rule.destination.prefix = "archive/2026/".into();
-        assert_eq!(
-            dest_to_source_key(&rule, "archive/2026/v1.zip"),
-            Some("releases/v1.zip".to_string())
-        );
-    }
-
-    #[test]
-    fn dest_to_source_key_returns_none_for_outside_keys() {
-        let mut rule = mk_rule();
-        rule.destination.prefix = "archive/".into();
-        assert_eq!(dest_to_source_key(&rule, "other-stuff/x.bin"), None);
-    }
-
-    #[test]
-    fn dest_to_source_key_handles_empty_dest_prefix_with_src_prefix() {
-        let mut rule = mk_rule();
-        rule.source.prefix = "releases/".into();
-        rule.destination.prefix = "".into();
-        assert_eq!(
-            dest_to_source_key(&rule, "v1.zip"),
-            Some("releases/v1.zip".to_string())
-        );
     }
 }

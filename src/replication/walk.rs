@@ -739,6 +739,14 @@ impl WalkMachine {
         &self.stats
     }
 
+    /// Live progress for the Jobs UI: (dirs completed, dirs pending+active).
+    pub fn progress(&self) -> (u64, u64) {
+        (
+            self.stats.dirs_completed,
+            (self.pending.len() + self.active.len()) as u64,
+        )
+    }
+
     /// Persistable resume position: the tracker watermark, or the loaded
     /// resume position while nothing new has settled. None ⇒ fresh start.
     pub fn cursor(&self) -> Option<CursorV1> {

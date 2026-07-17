@@ -395,6 +395,13 @@ pub async fn list_jobs(
                         .into_iter()
                         .take(3)
                         .collect::<Vec<_>>(),
+                    // Live walk progress ("1,234 dirs done · 87 pending") for
+                    // a running reconcile; absent when no walk is running.
+                    "walk": crate::replication::worker::walk_snapshot(&rule.name)
+                        .map(|(done, pending)| serde_json::json!({
+                            "dirs_completed": done,
+                            "dirs_pending": pending,
+                        })),
                 }),
             });
         }
