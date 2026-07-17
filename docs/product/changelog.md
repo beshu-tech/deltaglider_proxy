@@ -8,7 +8,64 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-07-16_
+_Last updated: 2026-07-17_
+
+## v1.15.0 — 2026-07-17
+
+### Changed — replication reconciliation rebuilt as a streaming tree walk
+
+The scheduled reconcile pass no longer spends hours "initializing" on large
+buckets before copying anything. The old three-phase design (a full dual-tree
+discovery pre-pass, then a flat copy sweep, then a third full destination
+listing for deletes) is replaced by ONE directory-by-directory walk that
+syncs each folder as it discovers it.
+
+- **First copies start within seconds** of a run starting, regardless of tree
+  size — discovery and copying are interleaved, with configurable parallel
+  directory listings (`replication.dir_concurrency`, default 4).
+- **Far fewer requests against the backend.** Listings run in lite mode
+  everywhere (the per-page HEAD-enrichment sweeps are gone); a subtree missing
+  on the destination is proven absent from the folder comparison itself, so
+  its objects copy with zero existence probes. On a filesystem↔filesystem
+  pair, an entire run — initial sync or converged re-check — issues **zero**
+  per-object HEADs; on S3 backends only keys present on BOTH sides are
+  HEAD-resolved, batched.
+- **Delete replication is now per-directory.** A folder that reconciled
+  cleanly can replicate its deletions even when the run stops early elsewhere
+  (the old design only deleted after a perfect full pass), while keeping every
+  safety layer: provenance marker, HEAD re-confirmation of source absence,
+  and never touching foreign objects.
+- **Resume is finer-grained.** The persisted cursor is now a position in the
+  tree (scope-stamped to the rule's buckets/prefixes); a killed, paused, or
+  budget-truncated run resumes exactly where it stopped, even mid-directory.
+  On upgrade, the previous cursor format is discarded once and the next run
+  starts a fresh (idempotent) pass.
+- **Live progress**: the Jobs screen shows directories completed/pending for
+  a running reconcile, and three new Prometheus counters
+  (`deltaglider_replication_list_calls_total`, `..._head_calls_total`,
+  `..._dirs_completed_total`) make the walk's I/O auditable.
+- The walk core is a pure state machine with a model-based property-test
+  suite (action-set equivalence against a naive global diff, crash-cut resume
+  equivalence, page-size invariance, never-false-delete, cursor monotonicity,
+  budget convergence, degrade-mode equivalence).
+
+### Fixed
+
+- **Kill/pause/lease-loss now interrupt a replication run promptly at any
+  phase.** Two driver bugs found while stress-looping the integration suite:
+  control checks could go dead for the remainder of a run after listings
+  finished, and a config-DB lock could be handed to a suspended poll future,
+  freezing every DB user in the proxy (jobs API, heartbeat, kill) until
+  restart.
+- **Filesystem delimiter listings no longer hide dot-directories** (e.g.
+  `.well-known/`): they were invisible as folders while their objects were
+  reachable directly — now consistent with flat listings and the S3 backend.
+  Dot-files (internal temp namespace) stay hidden; `.dg` stays internal.
+- **Keys with an empty path segment (`a//x`) now replicate to their true
+  destination key.** The per-object rewrite used by the old pass collapsed
+  the doubled slash (`a//x` and `a/x` fought over one destination key); the
+  walk maps prefixes verbatim. Pre-existing collapsed copies become
+  rule-owned orphans that a delete-enabled rule converges away.
 
 ## v1.14.1 — 2026-07-16
 
