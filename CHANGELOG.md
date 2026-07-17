@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.15.0 — 2026-07-17
+
 ### Changed — replication reconciliation rebuilt as a streaming tree walk
 
 The scheduled reconcile pass no longer spends hours "initializing" on large
