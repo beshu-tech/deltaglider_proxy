@@ -912,6 +912,13 @@ impl WalkMachine {
             self.tracker.settle(&rel);
             task.outstanding -= 1;
         }
+        // Buffered delete candidates likewise: the flat sweep re-discovers
+        // them (they sit above the restart watermark). Keeping them would
+        // double-emit each Delete on completion.
+        for (rel, _) in std::mem::take(&mut task.delete_candidates) {
+            self.tracker.settle(&rel);
+            task.outstanding -= 1;
+        }
         task.head_batch = [Vec::new(), Vec::new()];
 
         // Purge undispatched descendants; the sweep re-covers their subtrees.
@@ -1483,7 +1490,20 @@ impl WalkMachine {
         if task.outstanding > 0 {
             return;
         }
-        self.active.remove(key);
+        // Close any marker the backpressure short-circuit kept advance_dir
+        // from closing — a leaked marker would freeze the watermark (and the
+        // persisted cursor) for the rest of the run.
+        let mut task = self.active.remove(key).expect("checked above");
+        for s in [task.src.as_mut(), task.dest.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            if !s.marker_closed {
+                s.marker_closed = true;
+                let m = s.marker.clone();
+                self.tracker.close_marker(&m);
+            }
+        }
         self.stats.dirs_completed += 1;
     }
 }

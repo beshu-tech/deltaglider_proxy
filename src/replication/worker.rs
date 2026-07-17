@@ -526,6 +526,9 @@ pub async fn run_rule(
     // Poison-skips recorded by copy_one_object (folded from PerObjectResult);
     // planner skips come from the machine's stats. Both feed objects_skipped.
     let mut poison_skipped: i64 = 0;
+    // Set when the poison-cursor guard cleared a stale resume cursor — the
+    // settle epilogue must not write it back (see final_cursor_json).
+    let mut poison_cleared_any = false;
     let _progress_guard = WalkProgressGuard(rule.name.clone());
 
     if let Some(machine) = machine.as_mut() {
@@ -718,7 +721,18 @@ pub async fn run_rule(
                         let events = events_sink.clone();
                         let abs_src = format!("{source_prefix}{rel_key}");
                         let abs_dest = format!("{dest_prefix}{rel_key}");
+                        // Register this dest write with the maintenance gate
+                        // BEFORE it starts (H22): a migrate/re-encrypt arming
+                        // the gate mid-run either sees this +1 and drains it,
+                        // or the next control check defers the run. The RAII
+                        // guard rides in the copy future — a kill dropping the
+                        // future releases it.
+                        let write_guard = ctrl
+                            .maintenance_gate
+                            .as_ref()
+                            .map(|g| g.begin_write(&ctrl.dest_bucket));
                         inflight.push(Box::pin(async move {
+                            let _write_guard = write_guard;
                             // Guard increments objects_inflight (+peak) on entry and
                             // decrements on drop → proves the `transfers` concurrency.
                             let _obj_guard = engine.metrics().cloned().map(ObjectGuard::new);
@@ -818,6 +832,7 @@ pub async fn run_rule(
                             // listing fails most likely holds a stale cursor —
                             // clear it so the next tick starts fresh.
                             if was_resumed && !first_list_done {
+                                poison_cleared_any = true;
                                 let db = db.lock().await;
                                 let _ = db.replication_set_continuation_token(&rule.name, None);
                             }
@@ -1074,10 +1089,16 @@ pub async fn run_rule(
     let truncated = machine.as_ref().is_some_and(|m| {
         m.truncated_by_budget() || (!killed && !stopped_paused && !hit_fatal_error && !m.is_done())
     });
-    let final_cursor_json = machine
-        .as_ref()
-        .and_then(|m| m.cursor())
-        .map(|c| c.to_json());
+    let final_cursor_json = if poison_cleared_any {
+        // The poison guard already cleared the stale cursor inline — never
+        // write it back (machine.cursor() falls back to the resume position).
+        None
+    } else {
+        machine
+            .as_ref()
+            .and_then(|m| m.cursor())
+            .map(|c| c.to_json())
+    };
 
     // Deletes are fused into the walk: each directory's provenance-gated
     // candidates flush when THAT directory completes cleanly (per-dir gate,

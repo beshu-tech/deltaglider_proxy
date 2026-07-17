@@ -2811,7 +2811,9 @@ async fn test_replication_kill_mid_walk_resumes_across_dirs() {
     let server = TestServer::builder()
         .auth("bootstrap_key", "bootstrap_secret")
         .extra_yaml_storage_section(KILLWALK_RULE_YAML)
-        .env("DGP_TEST_COPY_STALL_MS", "50")
+        // 150ms/object × 60 objects ÷ 4 transfers ≈ 2.3s of runway — the
+        // ≤1s kill-tick latency lands with a comfortable margin.
+        .env("DGP_TEST_COPY_STALL_MS", "150")
         .build()
         .await;
     let client = server.s3_client().await;
@@ -2853,7 +2855,7 @@ async fn test_replication_kill_mid_walk_resumes_across_dirs() {
             .await
             .map(|r| r.contents().len())
             .unwrap_or(0);
-        if n >= 5 {
+        if n >= 3 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
