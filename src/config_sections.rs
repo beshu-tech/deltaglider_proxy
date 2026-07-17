@@ -375,6 +375,11 @@ pub struct ReplicationConfig {
     #[serde(default = "default_upload_concurrency")]
     pub upload_concurrency: u32,
 
+    /// Concurrent directory listings during the reconcile walk. Copies stay
+    /// bounded by `transfers` regardless. Default `4`.
+    #[serde(default = "default_dir_concurrency")]
+    pub dir_concurrency: u32,
+
     /// Replication rules. Each rule describes a source → destination
     /// copy with its own interval and filters. Empty by default.
     #[serde(default)]
@@ -393,6 +398,7 @@ impl Default for ReplicationConfig {
             object_skip_after_failures: default_object_skip_after_failures(),
             transfers: default_transfers(),
             upload_concurrency: default_upload_concurrency(),
+            dir_concurrency: default_dir_concurrency(),
             rules: Vec::new(),
         }
     }
@@ -404,6 +410,10 @@ fn default_transfers() -> u32 {
 
 fn default_upload_concurrency() -> u32 {
     crate::transfer_plan::UPLOAD_CONCURRENCY as u32
+}
+
+fn default_dir_concurrency() -> u32 {
+    4
 }
 
 fn default_replication_enabled() -> bool {
@@ -1692,6 +1702,12 @@ pub fn validate_replication(cfg: &ReplicationConfig) -> Vec<String> {
             cfg.upload_concurrency
         ));
     }
+    if cfg.dir_concurrency == 0 || cfg.dir_concurrency > 16 {
+        warnings.push(format!(
+            "replication.dir_concurrency={} out of range [1,16]; clamped at runtime",
+            cfg.dir_concurrency
+        ));
+    }
 
     // Per-rule checks.
     let mut seen_names = std::collections::HashSet::new();
@@ -2690,6 +2706,7 @@ mod tests {
             object_skip_after_failures: 5,
             transfers: 4,
             upload_concurrency: 4,
+            dir_concurrency: 4,
             rules: vec![rule("r", ("a", ""), ("b", ""), "1h")],
         };
         let yaml = serde_yaml::to_string(&cfg).unwrap();

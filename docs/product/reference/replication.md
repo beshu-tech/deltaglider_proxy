@@ -29,6 +29,7 @@ storage:
     lease_ttl: "300s"                # failover window for a dead runner (min 15s; default 5m)
     heartbeat_interval: "60s"        # lease renewal cadence (min 5s; must be < lease_ttl)
     max_failures_retained: 100       # per-rule failure ring size
+    dir_concurrency: 4               # concurrent directory listings in the reconcile walk (1-16); copies stay bounded by transfers
 
     rules:
       - name: mirror-releases-to-dr
@@ -89,6 +90,7 @@ Warnings (surfaced at startup; do not block config load):
 - Interval unparseable or below 30s.
 - `tick_interval` below 5s (scheduler anti-thrash).
 - `batch_size` outside `[1, 10_000]`.
+- `dir_concurrency` outside `[1, 16]`.
 - Self-loop (source == destination).
 - Multi-hop cycles (A→B + B→A with overlapping prefixes) — flagged with the full cycle path.
 - Invalid include/exclude glob patterns.

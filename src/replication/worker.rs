@@ -174,11 +174,13 @@ pub struct RunOutcome {
 }
 
 /// Per-run concurrency knobs (Phase B+). `transfers` = concurrent objects
-/// per page; `upload_concurrency` = in-flight parts per streaming object.
+/// per page; `upload_concurrency` = in-flight parts per streaming object;
+/// `dir_concurrency` = concurrent directory listings in the reconcile walk.
 #[derive(Debug, Clone, Copy)]
 pub struct RunConcurrency {
     pub transfers: u32,
     pub upload_concurrency: u32,
+    pub dir_concurrency: u32,
 }
 
 impl Default for RunConcurrency {
@@ -186,6 +188,7 @@ impl Default for RunConcurrency {
         Self {
             transfers: crate::transfer_plan::TRANSFERS as u32,
             upload_concurrency: crate::transfer_plan::UPLOAD_CONCURRENCY as u32,
+            dir_concurrency: 4,
         }
     }
 }

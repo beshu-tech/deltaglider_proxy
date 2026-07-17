@@ -1192,6 +1192,9 @@ pub struct MetricsSnapshot {
     pub bytes_streamed_total: u64,
     pub delta_bytes_saved_total: u64,
     pub delta_passthrough_bytes_saved_total: u64,
+    pub list_calls_total: u64,
+    pub head_calls_total: u64,
+    pub dirs_completed_total: u64,
     pub process_peak_rss_bytes: u64,
 }
 
@@ -1227,6 +1230,9 @@ pub async fn metrics_snapshot(endpoint: &str) -> MetricsSnapshot {
         }
         let parsed = value.trim().parse::<f64>().unwrap_or(0.0) as u64;
         match name {
+            "deltaglider_replication_list_calls_total" => snap.list_calls_total = parsed,
+            "deltaglider_replication_head_calls_total" => snap.head_calls_total = parsed,
+            "deltaglider_replication_dirs_completed_total" => snap.dirs_completed_total = parsed,
             "deltaglider_replication_part_bytes_resident" => snap.part_bytes_resident = parsed,
             "deltaglider_replication_part_bytes_resident_peak" => {
                 snap.part_bytes_resident_peak = parsed

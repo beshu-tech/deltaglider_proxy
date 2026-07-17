@@ -175,6 +175,7 @@ async fn run_due_rules(
             crate::replication::RunConcurrency {
                 transfers: replication.transfers,
                 upload_concurrency: replication.upload_concurrency,
+                dir_concurrency: replication.dir_concurrency,
             },
             Some(state.maintenance_gate.clone()),
             Some(lease.clone()),

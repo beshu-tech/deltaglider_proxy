@@ -192,6 +192,7 @@ pub async fn run_now(
     let concurrency = replication::RunConcurrency {
         transfers: repl.transfers,
         upload_concurrency: repl.upload_concurrency,
+        dir_concurrency: repl.dir_concurrency,
     };
     let rule_owned = rule.clone();
     tokio::spawn(async move {

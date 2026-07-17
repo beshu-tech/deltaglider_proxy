@@ -82,6 +82,15 @@ pub struct Metrics {
     pub replication_part_retries_total: IntCounter,
     pub replication_bytes_streamed_total: IntCounter,
     pub replication_delta_passthrough_bytes_saved_total: IntCounter,
+
+    // -- Replication reconcile walk --
+    // Deterministic I/O counters for the tree walk: tests gate on counts
+    // (zero HEADs on PureMirror, list-calls ≈ 2×dirs), never wall-clock.
+    // Bumped ONLY at the reconcile driver's call sites — parity, the event
+    // consumer, and API listings must not pollute them.
+    pub replication_list_calls_total: IntCounter,
+    pub replication_head_calls_total: IntCounter,
+    pub replication_dirs_completed_total: IntCounter,
 }
 
 /// Set `peak` to `live`'s current value when it has risen above the prior
@@ -498,6 +507,30 @@ impl Metrics {
             )
             .unwrap()
         );
+        let replication_list_calls_total = register!(
+            registry,
+            IntCounter::new(
+                "deltaglider_replication_list_calls_total",
+                "Listing pages issued by the replication reconcile walk (both sides)",
+            )
+            .unwrap()
+        );
+        let replication_head_calls_total = register!(
+            registry,
+            IntCounter::new(
+                "deltaglider_replication_head_calls_total",
+                "Per-object HEAD calls issued by the replication reconcile walk",
+            )
+            .unwrap()
+        );
+        let replication_dirs_completed_total = register!(
+            registry,
+            IntCounter::new(
+                "deltaglider_replication_dirs_completed_total",
+                "Directories fully reconciled by the replication walk",
+            )
+            .unwrap()
+        );
 
         Metrics {
             registry,
@@ -542,6 +575,9 @@ impl Metrics {
             replication_part_retries_total,
             replication_bytes_streamed_total,
             replication_delta_passthrough_bytes_saved_total,
+            replication_list_calls_total,
+            replication_head_calls_total,
+            replication_dirs_completed_total,
         }
     }
 }
