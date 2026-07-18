@@ -2,23 +2,6 @@
 
 ## Unreleased
 
-## v1.15.2 — 2026-07-18
-
-### Added — each run shows which algorithm it applied
-
-The run drawer now names how each copied object was moved, in plain language:
-
-- **⚡ shipped as-is** — the delta bytes were copied verbatim, no decompress or
-  recompress (the cheapest path; hover for the technical term).
-- **↻ rebuilt** — decompressed from the delta and re-stored (recompressed or
-  re-encrypted) at the destination.
-- **→ straight copy** — a whole already-compressed object (image, video,
-  archive) copied byte-for-byte.
-
-Alongside the mix, **"saved &lt;N&gt;"** reports the egress that never crossed the
-wire because deltas shipped as-is. This turns the run history into an honest
-account of what the engine did, not just how many objects moved.
-
 ### Fixed — false "checksum mismatch" on replicated delta objects (+ a silent corruption)
 
 When a destination backend dropped a delta object's DeltaGlider metadata headers
@@ -39,6 +22,23 @@ objects written by other tools. Previously only objects this exact rule had
 written were removed, so a destination could never fully converge. The
 destination bucket must be **dedicated to the rule**; a bucket shared with
 another writer is no longer a supported setup.
+
+## v1.15.2 — 2026-07-18
+
+### Added — each run shows which algorithm it applied
+
+The run drawer now names how each copied object was moved, in plain language:
+
+- **⚡ shipped as-is** — the delta bytes were copied verbatim, no decompress or
+  recompress (the cheapest path; hover for the technical term).
+- **↻ rebuilt** — decompressed from the delta and re-stored (recompressed or
+  re-encrypted) at the destination.
+- **→ straight copy** — a whole already-compressed object (image, video,
+  archive) copied byte-for-byte.
+
+Alongside the mix, **"saved &lt;N&gt;"** reports the egress that never crossed the
+wire because deltas shipped as-is. This turns the run history into an honest
+account of what the engine did, not just how many objects moved.
 
 ## v1.15.1 — 2026-07-18
 
