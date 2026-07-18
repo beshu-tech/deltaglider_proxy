@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.15.1 — 2026-07-18
+
 ### Fixed — replication no longer re-copies destinations with stripped metadata
 
 A destination bucket whose objects were copied in with a tool that didn't
