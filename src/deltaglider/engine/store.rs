@@ -428,18 +428,26 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .invalidate(&Self::cache_key(bucket, &deltaspace_id));
             // Fall through — the encode block below now sees has_existing_reference
             // effectively true (the reference is on disk).
-        } else {
-            // Existing reference: heal it in place (same bytes) if its DG
-            // metadata was stripped, so the delta we encode next carries a
-            // valid ref_sha256 and replication stops re-copying this
-            // deltaspace. No-op (zero I/O) when the reference is healthy.
+        }
+
+        // Existing-reference metadata, carried forward for the spool reservation
+        // below (avoids a redundant re-read). `None` on the fresh-baseline path.
+        let existing_ref_meta = if has_existing_reference {
+            // Heal it in place (same bytes) if its DG metadata was stripped, so
+            // the delta we encode next carries a valid ref_sha256 and
+            // replication stops re-copying this deltaspace. No-op (zero extra
+            // I/O) when the reference is healthy; returns the current metadata.
             let read = self
                 .storage
                 .get_reference_metadata(bucket, &deltaspace_id)
                 .await?;
-            self.heal_reference_if_corrupt(bucket, &deltaspace_id, read)
-                .await?;
-        }
+            Some(
+                self.heal_reference_if_corrupt(bucket, &deltaspace_id, read)
+                    .await?,
+            )
+        } else {
+            None
+        };
 
         // (3) Encode from the body spool against the reference, capped. Reaches
         // here both for an existing reference AND a freshly-created baseline
@@ -451,12 +459,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // — reserve it at the reference's actual size so the byte-budget isn't
         // under-accounted under concurrency (→ ENOSPC). Falls back to `size` for
         // a freshly-created baseline (no reference metadata yet).
-        let ref_size = self
-            .storage
-            .get_reference_metadata(bucket, &deltaspace_id)
-            .await
-            .map(|m| m.file_size)
-            .unwrap_or(size);
+        let ref_size = existing_ref_meta.map(|m| m.file_size).unwrap_or(size);
         let (ref_spool, delta_spool) = self.spool_acquire_pair(ref_size, size).await?;
         self.storage
             .get_reference_to_file(bucket, &deltaspace_id, ref_spool.path())
