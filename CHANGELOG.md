@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Fixed — replication no longer re-copies destinations with stripped metadata
+
+A destination bucket whose objects were copied in with a tool that didn't
+preserve S3 metadata (the DeltaGlider `x-amz-meta-dg-*` headers) would be
+**re-replicated in full on every run** — the proxy couldn't read the
+destination's logical size/hash, so a content-diff rule always saw a
+"difference" and re-shipped, potentially gigabytes per run, forever.
+
+- **The destination now self-heals on write.** When a replication copy lands in
+  a prefix whose reference lost its metadata, the proxy re-stamps that metadata
+  in place (the stored bytes are never touched, so nothing already there
+  breaks). After one more pass the destination reads cleanly and the rule
+  **converges** — byte-identical objects are skipped instead of re-copied. This
+  also restores the destination as a usable backup (delta reconstruction needs
+  that metadata).
+- This affected pre-existing corrupt destinations regardless of version; it was
+  never introduced by a release.
+
+### Added — live reconcile progress in the Jobs screen
+
+A running replication reconcile now shows what it's doing: the run drawer
+displays **"scanning `<current folder>` · N folders done · M pending"** with a
+live activity bar. A long comparison pass that is skipping already-replicated
+objects (and therefore shows "0 copied") now reads as *working, and here* rather
+than looking stuck.
+
 ## v1.15.0 — 2026-07-17
 
 ### Changed — replication reconciliation rebuilt as a streaming tree walk
