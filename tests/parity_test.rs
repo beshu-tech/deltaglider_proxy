@@ -267,13 +267,15 @@ async fn test_parity_audit_lifecycle() {
     );
 }
 
-/// Wave-3 regression (finding #4/#23): on an S3 backend the lite LIST carries
-/// NO user_metadata, so parity must HEAD-resolve ownership. This plants BOTH a
-/// rule-OWNED orphan (source deleted after copy → owned_by_rule=true) and a
-/// FOREIGN object (never replicated) on the dest and asserts parity tells them
-/// apart — the exact distinction the filesystem test can't exercise.
+/// On an S3 backend the lite LIST carries no user_metadata, so parity resolves
+/// dest facts via HEAD. This plants a rule-copied orphan (source deleted after
+/// copy) AND a directly-placed object on the dest, and asserts BOTH are detected
+/// as orphans on the Transforming path. Under the faithful-mirror contract both
+/// carry the same remediation (`rule_owned_orphan_source_deleted`) regardless of
+/// provenance — ownership no longer downgrades one to a "foreign, hands-off"
+/// finding.
 #[tokio::test]
-async fn test_parity_orphan_ownership_via_head_on_s3() {
+async fn test_parity_orphan_source_absence_on_s3() {
     skip_unless_minio!();
     let uniq = format!("{}", std::process::id());
     let src = format!("parity-s3-src-{uniq}");
@@ -367,9 +369,9 @@ replication:
         Some(2),
         "both extras are orphans: {out}"
     );
-    // Ownership surfaces as the annotated remediation reason: HEAD-resolved
-    // ownership on S3 must diagnose the deleted-source copy as rule-owned and
-    // the directly-placed object as foreign — NOT both foreign (the #4 bug).
+    // Faithful mirror: BOTH orphans carry the same remediation regardless of
+    // provenance — the deleted-source copy AND the directly-placed object are
+    // both `rule_owned_orphan_source_deleted`; none are downgraded to foreign.
     let samples = out["orphan_samples"]
         .as_array()
         .cloned()
@@ -389,13 +391,10 @@ replication:
         .filter(|s| reason(s) == "foreign_orphan")
         .count();
     assert_eq!(
-        owned, 1,
-        "the deleted-source copy must be a RULE-OWNED orphan (HEAD-resolved): {out}"
+        owned, 2,
+        "both dest-extras are source-absent orphans (no foreign downgrade): {out}"
     );
-    assert_eq!(
-        foreign, 1,
-        "the directly-placed object must be a FOREIGN orphan: {out}"
-    );
+    assert_eq!(foreign, 0, "no orphan is classified as foreign now: {out}");
 
     // SECOND verify (regression for the verify-swarm's finding #1): the first
     // verify cached logical facts for the dest orphans. A cache HIT must NOT
@@ -416,11 +415,11 @@ replication:
         .filter(|s| reason(s) == "foreign_orphan")
         .count();
     assert_eq!(
-        owned2, 1,
-        "SECOND verify must STILL see the rule-owned orphan (no cache regression): {out2}"
+        owned2, 2,
+        "SECOND verify must STILL see both source-absent orphans (no cache regression): {out2}"
     );
     assert_eq!(
-        foreign2, 1,
-        "SECOND verify must STILL see the foreign orphan: {out2}"
+        foreign2, 0,
+        "SECOND verify: still no foreign downgrade: {out2}"
     );
 }
