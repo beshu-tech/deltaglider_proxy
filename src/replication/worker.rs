@@ -923,6 +923,7 @@ pub async fn run_rule(
                         totals.errors += r.errors;
                         totals.delta_passthrough += r.delta_passthrough;
                         totals.bytes_egress_saved += r.bytes_egress_saved;
+                        totals.reconstructed += r.reconstructed;
                         win_attempted += 1;
                         win_copied += r.objects_copied;
                         if r.throttled {
@@ -1245,6 +1246,8 @@ struct PerObjectResult {
     // Fast-path attribution for the successful copy (zero otherwise).
     delta_passthrough: i64,
     bytes_egress_saved: i64,
+    // Object was decompressed + re-stored (recompress/re-encrypt).
+    reconstructed: i64,
     // On a DURABLE success, the source key whose failure ledger must be cleared.
     // Deferred to the page's post-copy DB critical section (NOT cleared inside
     // copy_one_object) so a kill dropping the collect future while an object is
@@ -1319,6 +1322,8 @@ async fn copy_one_object(
             out.bytes_egress_saved = outcome.bytes_egress_saved as i64;
             if outcome.strategy == CopyStrategy::DeltaPassthrough {
                 out.delta_passthrough = 1;
+            } else if outcome.strategy == CopyStrategy::Reconstructed {
+                out.reconstructed = 1;
             }
             // Push the event BEFORE any further await: the copy is durable, so
             // a kill dropping this future from here on must not lose it.

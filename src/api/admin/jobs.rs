@@ -244,6 +244,9 @@ pub struct JobRunEntry {
     /// delta_passthrough. Egress saved = Σ(logical − delta).
     pub delta_passthrough: i64,
     pub bytes_egress_saved: i64,
+    /// Objects decompressed + re-stored (recompress/re-encrypt). Straight
+    /// passthrough = copied − delta_passthrough − reconstructed.
+    pub reconstructed: i64,
 }
 
 /// Unified failure entry — field union; `object_key` is always set
@@ -603,6 +606,7 @@ pub async fn job_runs(
                 errors: r.errors,
                 delta_passthrough: r.delta_passthrough,
                 bytes_egress_saved: r.bytes_egress_saved,
+                reconstructed: r.reconstructed,
             })
             .collect(),
         JobSubsystem::Lifecycle => db
@@ -624,6 +628,7 @@ pub async fn job_runs(
                 errors: r.errors,
                 delta_passthrough: 0,
                 bytes_egress_saved: 0,
+                reconstructed: 0,
             })
             .collect(),
         JobSubsystem::Maintenance => {
@@ -647,6 +652,7 @@ pub async fn job_runs(
                 errors: job.objects_failed,
                 delta_passthrough: 0,
                 bytes_egress_saved: 0,
+                reconstructed: 0,
             }]
         }
     };

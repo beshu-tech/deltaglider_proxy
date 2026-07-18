@@ -13,11 +13,13 @@ import {
   isActiveJobStatus,
   jobInFlight,
   jobWalkProgress,
+  jobStrategyMix,
   jobStatusLabel,
   jobStatusTone,
   kindLabel,
   parseJobId,
 } from '../../jobsView';
+import StrategyBand from './StrategyBand';
 import { formatBytes } from '../../utils';
 import { qk } from '../../queries/keys';
 import { useJobFailures, useJobRuns } from '../../queries/jobs';
@@ -256,14 +258,17 @@ export default function JobDrawer({
           track: 'minmax(0,1fr)',
           hideLabelOnNarrow: true,
           render: (r) => (
-            <OutcomeMeter
-              scanned={r.objects_scanned}
-              copied={r.objects_processed}
-              errors={r.errors}
-              skipped={r.objects_skipped}
-              status={r.status}
-              percent={'__percent' in r ? (r as { __percent: number | null }).__percent : null}
-            />
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <OutcomeMeter
+                scanned={r.objects_scanned}
+                copied={r.objects_processed}
+                errors={r.errors}
+                skipped={r.objects_skipped}
+                status={r.status}
+                percent={'__percent' in r ? (r as { __percent: number | null }).__percent : null}
+              />
+              <StrategyBand mix={jobStrategyMix(r)} />
+            </div>
           ),
         },
       ]}

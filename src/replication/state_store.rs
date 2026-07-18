@@ -51,6 +51,8 @@ pub struct RunRecord {
     // Fast-path run stats (v17).
     pub delta_passthrough: i64,
     pub bytes_egress_saved: i64,
+    // v24: objects decompressed + re-stored (recompress/re-encrypt).
+    pub reconstructed: i64,
 }
 
 /// A per-object failure row.
@@ -92,10 +94,12 @@ pub struct RunTotals {
     pub bytes_copied: i64,
     pub errors: i64,
     // Fast-path run stats (v17). `delta_passthrough` = objects that shipped
-    // their `.delta` verbatim; `bytes_egress_saved` = Σ(logical − delta). Other
-    // strategy counts are derivable (objects_copied − delta_passthrough).
+    // their `.delta` verbatim; `bytes_egress_saved` = Σ(logical − delta).
+    // `reconstructed` = objects decompressed + re-stored (recompress/re-encrypt).
+    // Straight passthrough = objects_copied − delta_passthrough − reconstructed.
     pub delta_passthrough: i64,
     pub bytes_egress_saved: i64,
+    pub reconstructed: i64,
 }
 
 pub fn current_unix_seconds() -> i64 {
@@ -451,7 +455,8 @@ impl ConfigDb {
                     errors             = ?,
                     status             = ?,
                     delta_passthrough  = ?,
-                    bytes_egress_saved = ?
+                    bytes_egress_saved = ?,
+                    reconstructed      = ?
               WHERE id = ? AND status IN ('running', 'cancelling')",
             params![
                 finished_at,
@@ -464,6 +469,7 @@ impl ConfigDb {
                 status,
                 totals.delta_passthrough,
                 totals.bytes_egress_saved,
+                totals.reconstructed,
                 run_id
             ],
         )?;
@@ -508,7 +514,8 @@ impl ConfigDb {
                     bytes_copied       = ?,
                     errors             = ?,
                     delta_passthrough  = ?,
-                    bytes_egress_saved = ?
+                    bytes_egress_saved = ?,
+                    reconstructed      = ?
               WHERE id = ?
                 AND status = 'running'",
             params![
@@ -520,6 +527,7 @@ impl ConfigDb {
                 totals.errors,
                 totals.delta_passthrough,
                 totals.bytes_egress_saved,
+                totals.reconstructed,
                 run_id,
             ],
         )?;
@@ -780,7 +788,7 @@ impl ConfigDb {
             "SELECT id, rule_name, triggered_by, started_at, finished_at,
                     objects_scanned, objects_copied, objects_skipped, objects_deleted,
                     bytes_copied, errors, status,
-                    delta_passthrough, bytes_egress_saved
+                    delta_passthrough, bytes_egress_saved, reconstructed
              FROM replication_run_history
              WHERE rule_name = ?
              ORDER BY started_at DESC
@@ -803,6 +811,7 @@ impl ConfigDb {
                     status: r.get(11)?,
                     delta_passthrough: r.get(12)?,
                     bytes_egress_saved: r.get(13)?,
+                    reconstructed: r.get(14)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1386,6 +1395,8 @@ mod tests {
             objects_deleted: 0,
             bytes_copied: 1024,
             errors: 0,
+            delta_passthrough: 4,
+            reconstructed: 2,
             ..Default::default()
         };
         db.replication_finish_run(id, "r", "succeeded", 300, totals, 900)
@@ -1404,6 +1415,9 @@ mod tests {
         assert_eq!(runs[0].status, "succeeded");
         assert_eq!(runs[0].objects_copied, 7);
         assert_eq!(runs[0].bytes_copied, 1024);
+        // v24 strategy mix round-trips (verbatim + rebuilt; straight = 7−4−2 = 1).
+        assert_eq!(runs[0].delta_passthrough, 4);
+        assert_eq!(runs[0].reconstructed, 2);
     }
 
     #[test]

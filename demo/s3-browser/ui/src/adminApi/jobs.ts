@@ -24,7 +24,13 @@ interface JobRunEntry {
   objects_deleted?: number | null;
   bytes: number;
   errors: number;
+  // Strategy mix (replication only; 0 elsewhere). Straight passthrough =
+  // objects_processed − delta_passthrough − reconstructed.
+  delta_passthrough?: number;
+  bytes_egress_saved?: number;
+  reconstructed?: number;
 }
+export type { JobRunEntry };
 
 interface JobFailureEntry {
   id: number;

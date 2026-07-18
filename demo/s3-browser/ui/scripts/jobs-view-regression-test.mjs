@@ -26,6 +26,7 @@ const {
   computeRate,
   deriveVerifyProgress,
   jobWalkProgress,
+  jobStrategyMix,
 } = await import(moduleUrl);
 
 const row = (over = {}) => ({
@@ -320,5 +321,48 @@ assert.deepEqual(
   { scanning: null, dirs_completed: 0, dirs_pending: 0 },
   'wrong-typed fields → coerced to safe defaults',
 );
+
+// --- jobStrategyMix -------------------------------------------------------
+assert.equal(jobStrategyMix(null), null, 'null run → null');
+assert.equal(jobStrategyMix({ objects_processed: 0 }), null, 'nothing copied → null');
+{
+  // 10 copied: 6 verbatim + 1 rebuilt → 3 straight (derived).
+  const mix = jobStrategyMix({
+    objects_processed: 10,
+    delta_passthrough: 6,
+    reconstructed: 1,
+    bytes_egress_saved: 2048,
+  });
+  assert.deepEqual(
+    mix.segments.map((s) => [s.key, s.count]),
+    [
+      ['verbatim', 6],
+      ['reconstructed', 1],
+      ['straight', 3],
+    ],
+    'full mix → three segments in order with straight derived',
+  );
+  assert.equal(mix.bytesEgressSaved, 2048);
+}
+{
+  // All straight copy (no delta counters): only the straight segment.
+  const mix = jobStrategyMix({ objects_processed: 4 });
+  assert.deepEqual(
+    mix.segments.map((s) => [s.key, s.count]),
+    [['straight', 4]],
+    'no delta counters → all straight, other segments omitted',
+  );
+  assert.equal(mix.bytesEgressSaved, 0);
+}
+{
+  // Over-count guard: counters exceed copied → straight floors at 0.
+  const mix = jobStrategyMix({ objects_processed: 5, delta_passthrough: 9 });
+  assert.equal(
+    mix.segments.find((s) => s.key === 'straight'),
+    undefined,
+    'over-count → straight is 0 and omitted',
+  );
+  assert.equal(mix.segments[0].count, 9, 'verbatim kept as reported');
+}
 
 console.log('jobs view regression checks passed');

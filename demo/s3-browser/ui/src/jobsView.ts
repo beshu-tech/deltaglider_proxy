@@ -94,6 +94,73 @@ export function jobWalkProgress(
   return { scanning, dirs_completed, dirs_pending };
 }
 
+export type StrategySegment = {
+  key: 'verbatim' | 'reconstructed' | 'straight';
+  count: number;
+  /** Layman label shown inline. */
+  label: string;
+  /** Technical explanation, surfaced on hover. */
+  hint: string;
+  /** Leading glyph. */
+  glyph: string;
+};
+
+export type StrategyMix = {
+  segments: StrategySegment[];
+  bytesEgressSaved: number;
+};
+
+/**
+ * How each copied object was moved — the "what algorithm did the engine
+ * apply" story. `delta_passthrough` (verbatim) and `reconstructed` come
+ * straight from the run; `straight` is the remainder (copied − the two).
+ * Returns null when nothing was copied (no story to tell) or the run predates
+ * the counters. Only non-zero segments are included, so the caller renders
+ * exactly what happened.
+ */
+export function jobStrategyMix(
+  run: {
+    objects_processed?: number;
+    delta_passthrough?: number;
+    reconstructed?: number;
+    bytes_egress_saved?: number;
+  } | null,
+): StrategyMix | null {
+  if (!run) return null;
+  const copied = run.objects_processed ?? 0;
+  if (copied <= 0) return null;
+  const verbatim = Math.max(0, run.delta_passthrough ?? 0);
+  const reconstructed = Math.max(0, run.reconstructed ?? 0);
+  const straight = Math.max(0, copied - verbatim - reconstructed);
+  const all: StrategySegment[] = [
+    {
+      key: 'verbatim',
+      count: verbatim,
+      label: 'shipped as-is',
+      hint: 'Delta bytes copied verbatim — no decompress, no recompress. The cheapest path.',
+      glyph: '⚡',
+    },
+    {
+      key: 'reconstructed',
+      count: reconstructed,
+      label: 'rebuilt',
+      hint: 'Decompressed from the delta, then re-stored (recompressed or re-encrypted) at the destination.',
+      glyph: '↻',
+    },
+    {
+      key: 'straight',
+      count: straight,
+      label: 'straight copy',
+      hint: 'Whole object copied byte-for-byte (already-compressed files: images, video, archives).',
+      glyph: '→',
+    },
+  ];
+  return {
+    segments: all.filter((s) => s.count > 0),
+    bytesEgressSaved: Math.max(0, run.bytes_egress_saved ?? 0),
+  };
+}
+
 /** AntD tag color for a job row. Pause/disable win over the last status. */
 export function jobStatusTone(row: Pick<JobRow, 'status' | 'paused' | 'enabled'>): string {
   if (row.enabled === false) return 'default';

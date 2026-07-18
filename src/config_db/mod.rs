@@ -25,7 +25,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 23;
+const SCHEMA_VERSION: i32 = 24;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -789,6 +789,23 @@ impl ConfigDb {
             )?;
             info!(
                 "Migrated config DB schema from v{} to v23 (replication_parity_objects.created_at)",
+                version
+            );
+        }
+
+        if version < 24 {
+            // v24: reconstructed run stat. Splits the "copied but not
+            // delta-verbatim" bucket into rebuilt (decompress+re-store) vs
+            // straight passthrough, so the run drawer can name the algorithm
+            // applied. Straight = objects_copied − delta_passthrough − reconstructed.
+            add_column_if_missing(
+                conn,
+                "replication_run_history",
+                "reconstructed",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            info!(
+                "Migrated config DB schema from v{} to v24 (reconstructed run stat)",
                 version
             );
         }
