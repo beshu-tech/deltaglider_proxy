@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.15.3 — 2026-07-18
+
 ### Fixed — false "checksum mismatch" on replicated delta objects (+ a silent corruption)
 
 When a destination backend dropped a delta object's DeltaGlider metadata headers
