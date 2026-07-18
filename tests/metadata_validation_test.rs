@@ -439,3 +439,132 @@ fn generate_zip_like(seed: u8, size: usize) -> Vec<u8> {
     data.truncate(size);
     data
 }
+
+// ============================================================================
+// 5. Heal-on-write: a store into a prefix whose reference lost its DG metadata
+//    re-stamps the reference (same bytes, valid headers) so future reads
+//    resolve it — stopping the replication re-copy loop on legacy corrupt data.
+// ============================================================================
+
+/// Strip the DG xattr from an on-disk deltaspace file (simulate the "copied
+/// without --metadata" damage that leaves bytes intact but headers gone).
+fn strip_xattr(data_dir: &Path, bucket: &str, prefix: &str, filename: &str) {
+    let path = data_dir
+        .join(bucket)
+        .join("deltaspaces")
+        .join(prefix)
+        .join(filename);
+    // Remove if present; ignore "no such attr".
+    let _ = xattr::remove(&path, "user.dg.metadata");
+}
+
+fn read_xattr(data_dir: &Path, bucket: &str, prefix: &str, filename: &str) -> Option<Vec<u8>> {
+    let path = data_dir
+        .join(bucket)
+        .join("deltaspaces")
+        .join(prefix)
+        .join(filename);
+    xattr::get(&path, "user.dg.metadata").ok().flatten()
+}
+
+fn ref_bytes(data_dir: &Path, bucket: &str, prefix: &str) -> Vec<u8> {
+    let path = data_dir
+        .join(bucket)
+        .join("deltaspaces")
+        .join(prefix)
+        .join("reference.bin");
+    std::fs::read(path).expect("read reference.bin")
+}
+
+#[tokio::test]
+async fn test_store_heals_stripped_reference_metadata_preserving_bytes() {
+    let server = TestServer::filesystem().await;
+    let client = server.s3_client().await;
+    let data_dir = server.data_dir().expect("filesystem backend").to_path_buf();
+    let bucket = server.bucket().to_string();
+    let prefix = "heal"; // deltaspace prefix
+
+    let v1 = generate_zip_like(1, 20000);
+    let v2 = generate_zip_like(2, 20000);
+    let v3 = generate_zip_like(3, 20000);
+
+    // PUT v1 (creates reference.bin) + v2 (creates a delta against it).
+    for (key, body) in [("heal/a-v1.zip", &v1), ("heal/a-v2.zip", &v2)] {
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(body.clone()))
+            .send()
+            .await
+            .expect("PUT");
+    }
+
+    // Corrupt: strip the reference's DG metadata (bytes stay intact).
+    let ref_before = ref_bytes(&data_dir, &bucket, prefix);
+    strip_xattr(&data_dir, &bucket, prefix, "reference.bin");
+    assert!(
+        read_xattr(&data_dir, &bucket, prefix, "reference.bin").is_none(),
+        "precondition: reference metadata stripped"
+    );
+
+    // A store into the same deltaspace must HEAL the reference in place.
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("heal/a-v3.zip")
+        .body(aws_sdk_s3::primitives::ByteStream::from(v3.clone()))
+        .send()
+        .await
+        .expect("PUT v3 (triggers heal)");
+
+    // Reference metadata is back, and it's a valid reference.
+    let healed = read_xattr(&data_dir, &bucket, prefix, "reference.bin")
+        .expect("reference metadata re-stamped after store");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&healed).expect("healed metadata is valid JSON");
+    assert_eq!(
+        meta.get("original_name").and_then(|v| v.as_str()),
+        Some("__reference__"),
+        "healed reference keeps the internal name (migrator invariant)"
+    );
+    assert!(
+        meta.get("file_sha256")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        "healed reference carries a non-empty sha256: {meta}"
+    );
+
+    // Bytes UNCHANGED — existing deltas were encoded against these bytes.
+    let ref_after = ref_bytes(&data_dir, &bucket, prefix);
+    assert_eq!(
+        ref_before, ref_after,
+        "reference bytes must be identical after a metadata-only heal"
+    );
+
+    // All three members still reconstruct byte-exactly (the pre-existing delta
+    // v2 proves the heal didn't break reconstruction).
+    for (key, expected) in [
+        ("heal/a-v1.zip", &v1),
+        ("heal/a-v2.zip", &v2),
+        ("heal/a-v3.zip", &v3),
+    ] {
+        let got = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("GET")
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(
+            got.as_ref(),
+            expected.as_slice(),
+            "{key} roundtrip mismatch"
+        );
+    }
+}

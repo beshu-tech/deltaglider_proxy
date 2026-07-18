@@ -1912,6 +1912,111 @@ async fn test_replication_content_diff_converges_then_copies_real_change() {
     );
 }
 
+const HEAL_RULE_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"30s\"
+  rules:
+    - name: heal-rule
+      enabled: true
+      source:
+        bucket: heal-src
+        prefix: \"\"
+      destination:
+        bucket: heal-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 100
+      conflict: content-diff
+";
+
+/// End-to-end convergence over a destination whose delta metadata was stripped
+/// (the prod `backup-hz` corruption). Before the fix this re-copied the whole
+/// deltaspace EVERY run forever, because a stripped delta reads back with the
+/// wrong (delta-stored) size → content-diff always saw a difference. Now the
+/// copy heals the reference on write, so the re-stamped dest delta resolves
+/// cleanly and the NEXT run skips → the run converges.
+#[tokio::test]
+async fn test_replication_heals_corrupt_dest_and_converges() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(HEAL_RULE_YAML)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    let data_dir = server.data_dir().expect("filesystem backend").to_path_buf();
+    for b in ["heal-src", "heal-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    // Two similar delta-eligible objects in one prefix → reference + delta.
+    let v1: Vec<u8> = (0..20000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let mut v2 = v1.clone();
+    for b in v2.iter_mut().take(200) {
+        *b ^= 0x5a;
+    }
+    for (key, body) in [("app/v1.zip", &v1), ("app/v2.zip", &v2)] {
+        client
+            .put_object()
+            .bucket("heal-src")
+            .key(key)
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await
+            .expect("seed src");
+    }
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let run = || async { fire_run_now(&admin, &ep, "heal-rule").await };
+
+    // Run 1: dest empty → both copied (builds dest reference + delta).
+    let r1 = run().await;
+    assert_eq!(
+        r1["objects_processed"].as_i64(),
+        Some(2),
+        "run1 copies 2: {r1}"
+    );
+
+    // Corrupt the DEST like the prod damage: strip the reference AND the delta
+    // xattrs (bytes intact). The prefix on disk is "app".
+    let ds = |f: &str| {
+        data_dir
+            .join("heal-dst")
+            .join("deltaspaces")
+            .join("app")
+            .join(f)
+    };
+    for f in ["reference.bin", "v1.zip.delta", "v2.zip.delta"] {
+        let p = ds(f);
+        if p.exists() {
+            let _ = xattr::remove(&p, "user.dg.metadata");
+        }
+    }
+
+    // Run 2: the corrupt dest reads back with wrong sizes → content-diff
+    // re-copies. This is the heal-triggering pass (store re-stamps the
+    // reference; the fresh deltas carry clean metadata).
+    let r2 = run().await;
+    assert!(
+        r2["objects_processed"].as_i64().unwrap_or(0) >= 1,
+        "run2 re-copies the corrupt objects (and heals): {r2}"
+    );
+
+    // Run 3: now the dest metadata resolves cleanly → content-diff SKIPS.
+    // Before the fix this would re-copy forever; convergence is the fix.
+    let r3 = run().await;
+    assert_eq!(
+        r3["objects_processed"].as_i64(),
+        Some(0),
+        "run3 converges: 0 re-copied after the heal: {r3}"
+    );
+    assert_eq!(
+        r3["objects_skipped"].as_i64(),
+        Some(2),
+        "both objects skip once healed: {r3}"
+    );
+}
+
 // ───────────────────────── kill / delete / truncation ─────────────────────────
 // The kill feature shipped three fix waves with ZERO tests calling the kill
 // action; these are the regression pins for the whole control surface.

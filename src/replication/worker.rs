@@ -109,16 +109,24 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// Live walk progress for the Jobs UI (dirs completed / dirs pending),
-/// updated at each driver checkpoint. In-memory and node-local by design —
-/// live progress, not durable state.
+/// Live walk progress for the Jobs UI, updated at each driver checkpoint.
+/// In-memory and node-local by design — live progress, not durable state.
+#[derive(Clone, Default)]
+pub struct WalkProgress {
+    pub dirs_completed: u64,
+    pub dirs_pending: u64,
+    /// The directory currently being scanned (ABSOLUTE — rule prefix
+    /// re-applied for display), or None between checkpoints / at the end.
+    pub scanning: Option<String>,
+}
+
 static WALK_PROGRESS: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<String, (u64, u64)>>,
+    parking_lot::Mutex<std::collections::HashMap<String, WalkProgress>>,
 > = std::sync::LazyLock::new(Default::default);
 
 /// Snapshot of a rule's walk progress for the admin jobs API.
-pub fn walk_snapshot(rule: &str) -> Option<(u64, u64)> {
-    WALK_PROGRESS.lock().get(rule).copied()
+pub fn walk_snapshot(rule: &str) -> Option<WalkProgress> {
+    WALK_PROGRESS.lock().get(rule).cloned()
 }
 
 /// RAII: clears the walk-progress entry when the run ends, however it ends.
@@ -1033,9 +1041,18 @@ pub async fn run_rule(
                     }
                 }
                 let (dirs_done, dirs_pending) = machine.progress();
-                WALK_PROGRESS
-                    .lock()
-                    .insert(rule.name.clone(), (dirs_done, dirs_pending));
+                // Re-apply the source prefix so the UI shows the absolute path.
+                let scanning = machine
+                    .scanning()
+                    .map(|rel| format!("{source_prefix}{rel}"));
+                WALK_PROGRESS.lock().insert(
+                    rule.name.clone(),
+                    WalkProgress {
+                        dirs_completed: dirs_done,
+                        dirs_pending,
+                        scanning,
+                    },
+                );
                 let cursor_json = machine.cursor().map(|c| c.to_json());
                 let db = db.lock().await;
                 for k in clear_failure_keys.drain(..) {

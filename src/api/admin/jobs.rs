@@ -395,12 +395,16 @@ pub async fn list_jobs(
                         .into_iter()
                         .take(3)
                         .collect::<Vec<_>>(),
-                    // Live walk progress ("1,234 dirs done · 87 pending") for
-                    // a running reconcile; absent when no walk is running.
+                    // Live walk progress ("scanning ror/builds/… · 1,234 dirs
+                    // done · 87 pending") for a running reconcile; absent when
+                    // no walk is running. dirs_pending is NOT a percent basis
+                    // (it grows-then-drains during tree discovery) — the UI
+                    // shows it as an activity indicator, not a progress %.
                     "walk": crate::replication::worker::walk_snapshot(&rule.name)
-                        .map(|(done, pending)| serde_json::json!({
-                            "dirs_completed": done,
-                            "dirs_pending": pending,
+                        .map(|w| serde_json::json!({
+                            "dirs_completed": w.dirs_completed,
+                            "dirs_pending": w.dirs_pending,
+                            "scanning": w.scanning,
                         })),
                 }),
             });

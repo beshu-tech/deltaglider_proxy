@@ -203,8 +203,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // the deltaspace permanently. Rollback on failure to restore
         // the "no reference yet" invariant.
         let ref_meta = if has_existing_reference {
-            self.storage
+            let read = self
+                .storage
                 .get_reference_metadata(ctx.bucket, ctx.deltaspace_id)
+                .await?;
+            // Heal a stripped-metadata reference in place (same bytes) so the
+            // delta we write next carries a valid ref_sha256 and replication
+            // stops re-copying this deltaspace. No-op (zero I/O) when healthy.
+            self.heal_reference_if_corrupt(ctx.bucket, ctx.deltaspace_id, read)
                 .await?
         } else {
             debug!("No reference in deltaspace, creating baseline");
@@ -357,34 +363,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // `size` (source overwritten mid-stream, or a stale/corrupt xattr
         // file_size on a filesystem source) — else we'd stamp file_size=declared
         // over a sha256 of DIFFERENT bytes. Matches the multipart-relay guard.
-        let (sha256, md5, observed) = {
-            let path = body.path().to_path_buf();
-            tokio::task::spawn_blocking(move || -> std::io::Result<(String, String, u64)> {
-                use std::io::Read;
-                let mut f = std::fs::File::open(&path)?;
-                let mut sh = Sha256::new();
-                let mut mh = Md5::new();
-                let mut observed: u64 = 0;
-                let mut buf = vec![0u8; 256 * 1024];
-                loop {
-                    let n = f.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    observed = observed.saturating_add(n as u64);
-                    sh.update(&buf[..n]);
-                    mh.update(&buf[..n]);
-                }
-                Ok((
-                    hex::encode(sh.finalize()),
-                    hex::encode(mh.finalize()),
-                    observed,
-                ))
-            })
-            .await
-            .map_err(|e| EngineError::Storage(StorageError::Other(format!("hash task: {e}"))))?
-            .map_err(|e| EngineError::Storage(StorageError::from(e)))?
-        };
+        let (sha256, md5, observed) = Self::hash_spool_file(body.path()).await?;
         if observed != size {
             return Err(EngineError::Storage(StorageError::Other(format!(
                 "Spooled object size mismatch: declared {size}, observed {observed}"
@@ -449,6 +428,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .invalidate(&Self::cache_key(bucket, &deltaspace_id));
             // Fall through — the encode block below now sees has_existing_reference
             // effectively true (the reference is on disk).
+        } else {
+            // Existing reference: heal it in place (same bytes) if its DG
+            // metadata was stripped, so the delta we encode next carries a
+            // valid ref_sha256 and replication stops re-copying this
+            // deltaspace. No-op (zero I/O) when the reference is healthy.
+            let read = self
+                .storage
+                .get_reference_metadata(bucket, &deltaspace_id)
+                .await?;
+            self.heal_reference_if_corrupt(bucket, &deltaspace_id, read)
+                .await?;
         }
 
         // (3) Encode from the body spool against the reference, capped. Reaches
@@ -801,6 +791,104 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.cache.put(&cache_key, Bytes::copy_from_slice(ctx.data));
 
         Ok(metadata)
+    }
+
+    /// True iff a read reference's DG metadata is missing/corrupt (its S3
+    /// `x-amz-meta-dg-*` headers / xattr were stripped — the classic "copied
+    /// without --metadata" damage). Both conditions matter: a fully-stripped
+    /// reference reads back as a `Passthrough` fallback (fails `is_reference`),
+    /// and a partially-stripped one that kept `dg-note=reference` but lost its
+    /// SHA reads as a Reference with an empty `file_sha256`. A HEALTHY reference
+    /// always carries a non-empty `file_sha256`. NB: a transient backend error
+    /// surfaces as `Err` from `get_reference_metadata`, never as this shape —
+    /// so this can never mistake a 503/timeout for corruption.
+    fn reference_metadata_is_corrupt(m: &FileMetadata) -> bool {
+        !m.is_reference() || m.file_sha256.is_empty()
+    }
+
+    /// Heal a reference whose DG metadata was stripped, RE-STAMPING it (same
+    /// bytes, correct headers) so future reads resolve it and content-diff
+    /// replication stops re-copying the whole deltaspace every run. Returns the
+    /// (possibly re-stamped) reference metadata to encode against.
+    ///
+    /// Bytes are UNCHANGED — every existing sibling delta was encoded against
+    /// these bytes and must still reconstruct (the decode uses the reference
+    /// bytes, not its `ref_sha256`). Caller MUST hold the per-deltaspace prefix
+    /// lock. `original_name` is pinned to `INTERNAL_REFERENCE_NAME` — the
+    /// legacy-reference migrator keys off that to skip already-internal
+    /// references; any other value would trigger a spurious migration.
+    async fn heal_reference_if_corrupt(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+        ref_meta: FileMetadata,
+    ) -> Result<FileMetadata, EngineError> {
+        if !Self::reference_metadata_is_corrupt(&ref_meta) {
+            return Ok(ref_meta); // healthy — zero extra I/O
+        }
+        warn!(
+            "Reference {}/{} has stripped DG metadata — re-stamping (bytes unchanged) \
+             so replication stops re-copying this deltaspace",
+            bucket, deltaspace_id
+        );
+        // Materialise the intact reference bytes to a spool, re-hash, re-put
+        // with correct metadata. Reserve the spool at the reference's on-disk
+        // size (fall back to the fallback-reported size, which is the object's
+        // content length — accurate for the reference object).
+        let spool = self.spool_acquire(ref_meta.file_size.max(1)).await?;
+        self.storage
+            .get_reference_to_file(bucket, deltaspace_id, spool.path())
+            .await?;
+        let (sha256, md5, size) = Self::hash_spool_file(spool.path()).await?;
+        let healed = FileMetadata::new_reference(
+            Self::INTERNAL_REFERENCE_NAME.to_string(),
+            // source_name is cosmetic (display/label only; not used by decode,
+            // verify, or replication compare). A stable placeholder that equals
+            // the read-side default keeps re-reads idempotent.
+            Self::INTERNAL_REFERENCE_NAME.to_string(),
+            sha256,
+            md5,
+            size,
+            ref_meta.content_type.clone(),
+        );
+        self.storage
+            .put_reference_from_file(bucket, deltaspace_id, spool.path(), &healed)
+            .await?;
+        self.cache
+            .invalidate(&Self::cache_key(bucket, deltaspace_id));
+        Ok(healed)
+    }
+
+    /// Stream-hash a spool file → (sha256_hex, md5_hex, byte_len). Bounded
+    /// memory (256KiB chunks). Shared by the store hash path and the reference
+    /// heal.
+    async fn hash_spool_file(path: &Path) -> Result<(String, String, u64), EngineError> {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || -> std::io::Result<(String, String, u64)> {
+            use std::io::Read;
+            let mut f = std::fs::File::open(&path)?;
+            let mut sh = Sha256::new();
+            let mut mh = Md5::new();
+            let mut observed: u64 = 0;
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                observed = observed.saturating_add(n as u64);
+                sh.update(&buf[..n]);
+                mh.update(&buf[..n]);
+            }
+            Ok((
+                hex::encode(sh.finalize()),
+                hex::encode(mh.finalize()),
+                observed,
+            ))
+        })
+        .await
+        .map_err(|e| EngineError::Storage(StorageError::Other(format!("hash task: {e}"))))?
+        .map_err(|e| EngineError::Storage(StorageError::from(e)))
     }
 
     /// Check if a key's filename is eligible for delta compression.

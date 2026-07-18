@@ -747,6 +747,15 @@ impl WalkMachine {
         )
     }
 
+    /// The directory currently being scanned, for the live Jobs UI. `active`
+    /// is a BTreeMap so the smallest key is the lexicographically-earliest
+    /// in-flight directory — the honest "where the walk is" for a left-to-right
+    /// tree walk. Relative to the rule prefix (caller prefixes it back for
+    /// display). None when nothing is active (between checkpoints / at the end).
+    pub fn scanning(&self) -> Option<String> {
+        self.active.keys().next().cloned()
+    }
+
     /// Persistable resume position: the tracker watermark, or the loaded
     /// resume position while nothing new has settled. None ⇒ fresh start.
     pub fn cursor(&self) -> Option<CursorV1> {
