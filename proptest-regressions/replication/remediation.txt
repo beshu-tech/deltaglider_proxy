@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c7b76af40925c9bc9dda0f16a6709f3403429c341b16d244a62782c4dc703f74 # shrinks to kind = OrphanOnDest, policy = NewerWins, rd = false, src = None, dst = None, owned = Some(false), has_ledger = false

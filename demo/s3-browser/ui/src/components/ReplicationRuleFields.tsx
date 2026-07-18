@@ -118,7 +118,7 @@ export default function ReplicationRuleFields({
           <FormField
             label="Delete replication"
             yamlPath="storage.replication.rules[].replicate_deletes"
-            helpText="Propagate source deletions to the destination. Only objects this rule previously wrote are removed."
+            helpText="Make the destination a faithful mirror: any object not present at source is deleted."
           >
             <Switch
               checked={rule.replicate_deletes}
@@ -128,7 +128,7 @@ export default function ReplicationRuleFields({
               type="warning"
               showIcon
               message="Deletes are destructive"
-              description="When enabled, destination objects previously written by this rule are deleted if the corresponding source key disappears. Manually-created destination objects are preserved."
+              description="When enabled, the destination is a faithful mirror of the source: ANY destination object absent at source is deleted — including objects written by other tools. The destination bucket must be dedicated to this rule."
               style={{ marginTop: 8 }}
             />
           </FormField>

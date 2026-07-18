@@ -336,3 +336,94 @@ async fn delta_passthrough_encrypted_same_key_ships_verbatim_and_reads_back() {
         r2
     );
 }
+
+/// Regression (convergence): a destination delta object whose DG metadata was
+/// STRIPPED (the prod Hetzner signature — HEAD falls back to the raw delta size,
+/// GET would serve the delta blob as-is) is made healthy again by the next
+/// replication pass: the run succeeds (no false "truncation" verify error) and
+/// the dest GET reconstructs byte-identical.
+///
+/// The pure verify-accept decision (accept a stripped dest whose size == the
+/// shipped delta) is covered exhaustively by `verify_size_verdict_truth_table`
+/// in src/transfer.rs — that S3-only strip-at-write-time path can't be
+/// reproduced on the filesystem test backend, which always persists xattrs.
+#[tokio::test]
+async fn stripped_dest_delta_metadata_heals_and_does_not_false_fail_verify() {
+    if !xdelta3_available() {
+        eprintln!("skip: xdelta3 not on PATH — fast path can't fire");
+        return;
+    }
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(RULE_YAML)
+        .build()
+        .await;
+
+    let s3 = server.s3_client().await;
+    for b in ["dp-src", "dp-dst"] {
+        s3.create_bucket().bucket(b).send().await.ok();
+    }
+    let v2 = seed_delta(&server, "dp-src", "rel/").await;
+
+    // Run 1: replicate v1+v2 via the fast path.
+    let r1 = run_now(&server).await;
+    assert_eq!(r1["objects_processed"].as_i64(), Some(2), "run1: {}", r1);
+    let run1 = latest_run(&server).await;
+    assert!(
+        run1["delta_passthrough"].as_i64().unwrap_or(0) >= 1,
+        "fast path must fire: {}",
+        run1
+    );
+
+    // Simulate the backend stripping the dest delta object's DG metadata.
+    let data_dir = server
+        .data_dir()
+        .expect("filesystem data dir")
+        .to_path_buf();
+    let delta_path = data_dir
+        .join("dp-dst")
+        .join("deltaspaces")
+        .join("rel/")
+        .join("v2.tar.delta");
+    assert!(delta_path.exists(), "dest delta must exist: {delta_path:?}");
+    let _ = xattr::remove(&delta_path, "user.dg.metadata");
+    assert!(
+        xattr::get(&delta_path, "user.dg.metadata")
+            .ok()
+            .flatten()
+            .is_none(),
+        "dest delta metadata should be stripped now"
+    );
+
+    // Change source v2 so content-diff re-copies it (drives the fast path over
+    // the stripped dest), then run: this must SUCCEED (no false truncation) and
+    // heal the metadata.
+    let v3 = mutate_binary(&v2, 0.02);
+    put_tar(&server, "dp-src", "rel/v2.tar", v3.clone()).await;
+    let r2 = run_now(&server).await;
+    assert_eq!(
+        r2["status"].as_str(),
+        Some("succeeded"),
+        "run over stripped dest must not false-fail verify: {}",
+        r2
+    );
+    assert_eq!(r2["errors"].as_i64(), Some(0), "no verify errors: {}", r2);
+
+    // THE corruption net: the dest GET reconstructs byte-identical — proving the
+    // stripped object was healed (a stripped delta would be served as raw delta
+    // bytes ≠ v3).
+    let dest_v2 = get_bytes(&server, "dp-dst", "rel/v2.tar").await;
+    assert_eq!(
+        dest_v2, v3,
+        "healed dest delta must reconstruct byte-identical (no corruption)"
+    );
+
+    // And the metadata is back (heal re-stamped it).
+    assert!(
+        xattr::get(&delta_path, "user.dg.metadata")
+            .ok()
+            .flatten()
+            .is_some(),
+        "heal must re-stamp the dest delta metadata"
+    );
+}

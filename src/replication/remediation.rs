@@ -252,47 +252,29 @@ fn analyze_mismatch_newer_wins(facts: &FindingFacts) -> Remediation {
 /// Orphan: a forward copy NEVER deletes. Whether re-run helps depends on
 /// ownership (foreign vs ours) and `replicate_deletes`.
 fn analyze_orphan(facts: &FindingFacts) -> Remediation {
-    match facts.dest_owned_by_rule {
-        Some(true) if facts.replicate_deletes => Remediation {
+    // Faithful mirror: an orphan (present on dest, absent at source) is removed
+    // by a re-run when mirror-delete is on — regardless of who wrote it. When
+    // it's off, enabling it is the fix. Ownership no longer matters.
+    if facts.replicate_deletes {
+        Remediation {
             reason: ReasonCode::RuleOwnedOrphanSourceDeleted,
             rerun_helps: RerunVerdict::Yes,
             fix: FixAction::DeleteFromDest { foreign: false },
-            reason_detail: "we copied this key; the source was since deleted".to_string(),
-            fix_detail: "re-run the rule — mirror-delete removes the orphaned copy".to_string(),
-        },
-        Some(true) => Remediation {
+            reason_detail: "present on the destination but absent at source".to_string(),
+            fix_detail: "re-run the rule — mirror-delete removes it".to_string(),
+        }
+    } else {
+        Remediation {
             reason: ReasonCode::RuleOwnedOrphanSourceDeleted,
             rerun_helps: RerunVerdict::No {
                 why: NoReason::OrphanNeedsDelete,
             },
             fix: FixAction::EnableReplicateDeletes,
-            reason_detail:
-                "we copied this key and the source is gone, but mirror-delete is disabled"
-                    .to_string(),
-            fix_detail: "enable replicate_deletes on the rule, then re-run to remove it"
+            reason_detail: "present on the destination but absent at source; mirror-delete is off"
                 .to_string(),
-        },
-        Some(false) => Remediation {
-            reason: ReasonCode::ForeignOrphan,
-            rerun_helps: RerunVerdict::No {
-                why: NoReason::ForeignNotOurs,
-            },
-            fix: FixAction::DeleteFromDest { foreign: true },
-            reason_detail: "destination object was not written by this rule".to_string(),
-            fix_detail:
-                "we never touch foreign objects — delete it manually if it shouldn't be there"
-                    .to_string(),
-        },
-        None => Remediation {
-            reason: ReasonCode::ForeignOrphan,
-            rerun_helps: RerunVerdict::No {
-                why: NoReason::ForeignNotOurs,
-            },
-            fix: FixAction::ManualReview,
-            reason_detail: "destination ownership could not be determined".to_string(),
-            fix_detail: "inspect the object and delete it manually if it shouldn't be there"
+            fix_detail: "enable delete replication on the rule, then re-run to remove it"
                 .to_string(),
-        },
+        }
     }
 }
 
@@ -497,33 +479,31 @@ mod tests {
     }
 
     #[test]
-    fn orphan_foreign_is_not_ours_delete_manually() {
+    fn orphan_foreign_with_deletes_reruns_too() {
+        // Faithful mirror: a foreign orphan is deleted by a re-run just like an
+        // owned one — ownership no longer gates the delete.
         let mut f = facts(FindingKind::OrphanOnDest, ConflictPolicy::NewerWins);
         f.dest_owned_by_rule = Some(false);
+        f.replicate_deletes = true;
         let r = analyze_finding(&f);
-        assert_eq!(r.reason, ReasonCode::ForeignOrphan);
-        assert_eq!(
-            r.rerun_helps,
-            RerunVerdict::No {
-                why: NoReason::ForeignNotOurs
-            }
-        );
-        assert_eq!(r.fix, FixAction::DeleteFromDest { foreign: true });
+        assert_eq!(r.rerun_helps, RerunVerdict::Yes);
+        assert_eq!(r.fix, FixAction::DeleteFromDest { foreign: false });
     }
 
     #[test]
-    fn orphan_unknown_ownership_is_manual_review() {
+    fn orphan_unknown_ownership_with_deletes_off_needs_enable() {
+        // Ownership unknown, mirror-delete off → enable it, then re-run.
         let mut f = facts(FindingKind::OrphanOnDest, ConflictPolicy::NewerWins);
         f.dest_owned_by_rule = None;
+        f.replicate_deletes = false;
         let r = analyze_finding(&f);
-        assert_eq!(r.reason, ReasonCode::ForeignOrphan);
         assert_eq!(
             r.rerun_helps,
             RerunVerdict::No {
-                why: NoReason::ForeignNotOurs
+                why: NoReason::OrphanNeedsDelete
             }
         );
-        assert_eq!(r.fix, FixAction::ManualReview);
+        assert_eq!(r.fix, FixAction::EnableReplicateDeletes);
     }
 
     // ─────────────── proptest invariants ───────────────
@@ -586,12 +566,19 @@ mod tests {
                 prop_assert!(is_no);
             }
 
-            // (d) foreign orphan ⟹ No{ForeignNotOurs}.
-            if kind == FindingKind::OrphanOnDest && owned == Some(false) {
-                prop_assert_eq!(
-                    r.rerun_helps,
-                    RerunVerdict::No { why: NoReason::ForeignNotOurs }
-                );
+            // (d) faithful mirror: an orphan's verdict depends ONLY on
+            // replicate_deletes, never on ownership. deletes on ⟹ Yes (re-run
+            // removes it); deletes off ⟹ No{OrphanNeedsDelete} (enable it).
+            if kind == FindingKind::OrphanOnDest {
+                if rd {
+                    prop_assert_eq!(r.rerun_helps, RerunVerdict::Yes);
+                    prop_assert_eq!(r.fix, FixAction::DeleteFromDest { foreign: false });
+                } else {
+                    prop_assert_eq!(
+                        r.rerun_helps,
+                        RerunVerdict::No { why: NoReason::OrphanNeedsDelete }
+                    );
+                }
             }
 
             // (e) (missing|mismatch) + ledger + copy-permitting policy ⟹ CopyFailing.

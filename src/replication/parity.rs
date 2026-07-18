@@ -1967,8 +1967,11 @@ mod tests {
     }
 
     #[test]
-    fn annotate_orphan_uses_dest_ownership() {
-        use super::super::remediation::ReasonCode;
+    fn annotate_orphan_is_rule_removable_regardless_of_ownership() {
+        use super::super::remediation::{ReasonCode, RerunVerdict};
+        // Faithful mirror: even a FOREIGN orphan (written by another tool) is
+        // removed by a re-run when mirror-delete is on — ownership no longer
+        // downgrades it to a "not ours, manual" finding.
         let source: BTreeMap<String, ObjState> = BTreeMap::new();
         let mut d = st(Some("h"), 5, None, None);
         d.owned_by_rule = Some(false); // foreign
@@ -1979,13 +1982,15 @@ mod tests {
             &source,
             &dest,
             ConflictPolicy::NewerWins,
-            true,
+            true, // replicate_deletes on
             &HashMap::new(),
             &HashMap::new(),
         );
         let rem = diff.orphan_samples[0].remediation.as_ref().unwrap();
-        assert_eq!(rem.reason, ReasonCode::ForeignOrphan);
-        assert_eq!(fold_actionable(&diff).foreign_orphans, 1);
+        assert_eq!(rem.reason, ReasonCode::RuleOwnedOrphanSourceDeleted);
+        assert_eq!(rem.rerun_helps, RerunVerdict::Yes);
+        // No longer classified as a foreign orphan.
+        assert_eq!(fold_actionable(&diff).foreign_orphans, 0);
     }
 
     #[test]

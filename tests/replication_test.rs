@@ -944,9 +944,9 @@ async fn test_replication_replicate_deletes_removes_orphans() {
 
     let admin = admin_http_client(&server.endpoint()).await;
 
-    // First run: forward-copy 4 keys onto dst (with provenance markers).
-    // Delete pass: nothing to delete (each replicated key still on src).
-    // `manual.txt` is preserved because it has no provenance marker.
+    // First run: forward-copy 4 keys onto dst. Delete pass: `manual.txt` is
+    // absent at source, so the FAITHFUL MIRROR deletes it immediately —
+    // regardless of provenance (the destination is dedicated to this rule).
     fire_run_now(&admin, &server.endpoint(), "delete-rule").await;
 
     for key in ["a.txt", "b.txt", "c.txt", "d.txt"] {
@@ -958,17 +958,19 @@ async fn test_replication_replicate_deletes_removes_orphans() {
             .await
             .expect("replicated key on dst");
     }
-    client
+    // manual.txt (hand-placed, no marker, absent at source) is DELETED now.
+    let head_manual = client
         .head_object()
         .bucket("del-dst")
         .key("manual.txt")
         .send()
-        .await
-        .expect("H2: manual.txt (no provenance marker) must survive first run");
+        .await;
+    assert!(
+        head_manual.is_err(),
+        "faithful mirror: manual.txt (absent at source) must be deleted regardless of provenance"
+    );
 
-    // Now delete d.txt from source. Next replication run should delete
-    // d.txt from destination (it carries the provenance marker), but
-    // leave manual.txt alone.
+    // Now delete d.txt from source. Next run deletes it from the destination.
     client
         .delete_object()
         .bucket("del-src")
@@ -991,16 +993,7 @@ async fn test_replication_replicate_deletes_removes_orphans() {
         "replicated d.txt must be deleted from destination after source delete"
     );
 
-    // manual.txt MUST still be there — no provenance marker, not ours.
-    client
-        .head_object()
-        .bucket("del-dst")
-        .key("manual.txt")
-        .send()
-        .await
-        .expect("H2 REGRESSION: manual.txt without provenance marker was deleted");
-
-    // Other replicated keys should still be there.
+    // The source-present keys should still be there.
     for key in ["a.txt", "b.txt", "c.txt"] {
         client
             .head_object()
@@ -1309,202 +1302,16 @@ replication:
 }
 
 // ════════════════════════════════════════════════════════════════════
-// H2 (fourth-wave) — replication delete-pass provenance edge cases
+// Faithful-mirror contract (replaces the old H2 provenance edge cases)
 // ════════════════════════════════════════════════════════════════════
 //
-// The fourth-wave H2 fix gates `run_delete_pass` on a per-rule
-// provenance marker (`x-amz-meta-dg-replication-rule = <rule.name>`)
-// stamped at copy time. The basic "operator placed an unrelated
-// object" path is already covered by `test_replication_replicate_
-// deletes_removes_orphans` (manual.txt without any marker survives).
-//
-// What was NOT covered before this batch:
-//
-//   **Sibling-rule marker mismatch**: an object on dest bearing
-//   a different rule's marker (`dg-replication-rule = sibling-b`)
-//   must NOT be deleted by THIS rule's delete pass — even when
-//   its source-side counterpart is missing.
-//
-// Pre-fix the run_delete_pass had no provenance check at all, so any
-// dest key whose source counterpart was missing was deleted.
-// Post-fix the marker must equal the running rule's `name` exactly.
-//
-// Note on test mechanics: clients cannot spoof `dg-*` metadata via
-// the S3 PUT path — `extract_user_metadata` in `src/api/handlers/
-// mod.rs` filters them out as a hardening measure. To plant a foreign
-// marker we therefore configure TWO rules (`sibling-a`, `sibling-b`)
-// pointing at overlapping destination prefixes; each rule's `copy_one`
-// stamps its own name. Then we run rule A, run rule B, and verify that
-// rule A's delete pass does not touch the keys rule B planted.
-
-const TWO_SIBLING_RULES_YAML: &str = "
-replication:
-  enabled: true
-  tick_interval: \"30s\"
-  rules:
-    - name: sibling-a
-      enabled: true
-      source:
-        bucket: a-src
-        prefix: \"\"
-      destination:
-        bucket: shared-dst
-        prefix: \"\"
-      interval: \"1h\"
-      batch_size: 100
-      replicate_deletes: true
-    - name: sibling-b
-      enabled: true
-      source:
-        bucket: b-src
-        prefix: \"\"
-      destination:
-        bucket: shared-dst
-        prefix: \"\"
-      interval: \"1h\"
-      batch_size: 100
-      replicate_deletes: true
-";
-
-/// H2 (fourth-wave) regression: when two rules write to the same
-/// destination bucket, each rule's delete pass must only consider
-/// keys that carry ITS OWN provenance marker.
-///
-/// Pre-fix the run_delete_pass had no provenance check at all, so
-/// rule A's delete pass would gleefully delete keys rule B had just
-/// replicated (because A's source bucket has no key matching B's
-/// destination key, and the marker check was missing).
-///
-/// Setup: two rules, two source buckets, one shared destination. Both
-/// rules run, both stamp their own markers. Then we delete a key from
-/// rule A's source and run rule A. Rule A's delete pass MUST delete
-/// the matching dest key (its own provenance), but MUST leave rule
-/// B's keys alone — even though, from rule A's source's perspective,
-/// they have no source counterpart.
-#[tokio::test]
-async fn test_replication_delete_pass_skips_sibling_rule_keys() {
-    let server = TestServer::builder()
-        .auth("bootstrap_key", "bootstrap_secret")
-        .extra_yaml_storage_section(TWO_SIBLING_RULES_YAML)
-        .build()
-        .await;
-    let s3 = server.s3_client().await;
-    for b in ["a-src", "b-src", "shared-dst"] {
-        s3.create_bucket().bucket(b).send().await.ok();
-    }
-
-    // Rule A's source content.
-    for key in ["a-only-1.bin", "a-only-2.bin"] {
-        s3.put_object()
-            .bucket("a-src")
-            .key(key)
-            .body(ByteStream::from(b"from-a".to_vec()))
-            .send()
-            .await
-            .unwrap();
-    }
-    // Rule B's source content (different keys to avoid prefix collision).
-    for key in ["b-only-1.bin", "b-only-2.bin"] {
-        s3.put_object()
-            .bucket("b-src")
-            .key(key)
-            .body(ByteStream::from(b"from-b".to_vec()))
-            .send()
-            .await
-            .unwrap();
-    }
-
-    let admin = admin_http_client(&server.endpoint()).await;
-
-    // Trigger both rules so each stamps its own marker on dest.
-    for rule_name in ["sibling-a", "sibling-b"] {
-        let resp = admin
-            .post(format!(
-                "{}/_/api/admin/jobs/replication:{}/run-now",
-                server.endpoint(),
-                rule_name
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status().as_u16(), 202, "run {} failed", rule_name);
-        wait_for_latest_run(&admin, &server.endpoint(), rule_name).await;
-    }
-
-    // Sanity: all four keys present on dst.
-    for key in [
-        "a-only-1.bin",
-        "a-only-2.bin",
-        "b-only-1.bin",
-        "b-only-2.bin",
-    ] {
-        s3.head_object()
-            .bucket("shared-dst")
-            .key(key)
-            .send()
-            .await
-            .unwrap_or_else(|_| panic!("expected {} on shared-dst after both rules ran", key));
-    }
-
-    // Now delete a-only-1 from rule A's source. Rule A's NEXT run
-    // will see the orphan on dst, match its own provenance marker,
-    // and delete it.
-    //
-    // CRUCIAL: rule A's delete pass also sees b-only-1 / b-only-2
-    // on dst. From A's perspective, neither key exists in `a-src`.
-    // Pre-fix it would delete them. Post-fix it sees the marker is
-    // `sibling-b`, not `sibling-a`, and skips.
-    s3.delete_object()
-        .bucket("a-src")
-        .key("a-only-1.bin")
-        .send()
-        .await
-        .unwrap();
-
-    let body = fire_run_now(&admin, &server.endpoint(), "sibling-a").await;
-    assert_eq!(
-        body["status"].as_str(),
-        Some("succeeded"),
-        "rule A run should succeed: {}",
-        body
-    );
-
-    // a-only-1 should be GONE from dst (rule A's own deletion).
-    let head_a1 = s3
-        .head_object()
-        .bucket("shared-dst")
-        .key("a-only-1.bin")
-        .send()
-        .await;
-    assert!(
-        head_a1.is_err(),
-        "rule A should delete its own orphan a-only-1 from dst"
-    );
-
-    // b-only-1 and b-only-2 must STILL be there — they were written
-    // by rule B, not rule A. Pre-fix these would have been deleted.
-    for key in ["b-only-1.bin", "b-only-2.bin"] {
-        s3.head_object()
-            .bucket("shared-dst")
-            .key(key)
-            .send()
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "H2 REGRESSION: rule A's delete pass deleted {} (owned by rule B): {:?}",
-                    key, e
-                )
-            });
-    }
-
-    // a-only-2 remains because its source counterpart is still in a-src.
-    s3.head_object()
-        .bucket("shared-dst")
-        .key("a-only-2.bin")
-        .send()
-        .await
-        .expect("a-only-2 still on dst (source counterpart present)");
-}
+// `replicate_deletes` now makes the destination a faithful copy of the
+// source: ANY dest key absent at source is deleted, regardless of who
+// wrote it. The old per-rule provenance gate (which preserved objects a
+// different rule or an operator had placed) is GONE — a shared or
+// co-located destination bucket is no longer supported. The surviving
+// coverage lives in `test_replication_replicate_deletes_removes_orphans`
+// (an unmarked, source-absent object is now deleted, not preserved).
 
 // ════════════════════════════════════════════════════════════════════
 // M1 (third-wave) — partial-failure status flip

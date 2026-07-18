@@ -15,7 +15,6 @@
 //! single-string resume cursor — even mid-directory.
 
 use crate::config_sections::ConflictPolicy;
-use crate::replication::event_consumer::owned_by_rule;
 use crate::replication::planner::{should_replicate, Decision};
 use crate::types::FileMetadata;
 use globset::GlobSet;
@@ -1244,10 +1243,13 @@ impl WalkMachine {
                 if e.path.ends_with('/') || is_dg_internal(&abs_dest) {
                     return; // markers and DG internals are never candidates
                 }
-                // Provenance: trust the listing when it carries our marker;
-                // otherwise the driver must HEAD-confirm before deleting.
-                let owned_in_listing = owned_by_rule(&dest_lite, &self.cfg.rule_name);
-                let needs_head = !owned_in_listing;
+                // Faithful mirror: a dest key absent at source is deleted,
+                // regardless of who wrote it. No provenance gate — the
+                // destination is dedicated to this rule. The source-absence
+                // HEAD in the driver is still the safety (delete ONLY on a
+                // confirmed NoSuchKey; any other error preserves).
+                let needs_head = false;
+                let _ = &dest_lite;
                 self.tracker.open_item(&e.path);
                 let Some(task) = self.active.get_mut(key) else {
                     return;
@@ -2057,11 +2059,10 @@ mod machine_tests {
 
         let mut deletes = BTreeSet::new();
         if replicate_deletes {
-            for (k, o) in &world.dest {
-                if !is_marker_or_internal(k)
-                    && !world.src.contains_key(k)
-                    && owned_by_rule(&o.true_meta, RULE)
-                {
+            // Faithful mirror: EVERY dest-only key is a delete, regardless of
+            // provenance (markers/internals excepted).
+            for k in world.dest.keys() {
+                if !is_marker_or_internal(k) && !world.src.contains_key(k) {
                     deletes.insert(k.clone());
                 }
             }
@@ -2148,28 +2149,13 @@ mod machine_tests {
                 Cmd::Delete {
                     item_id,
                     rel_key,
-                    needs_provenance_head,
+                    needs_provenance_head: _,
                 } => {
-                    // Driver pipeline: provenance (+P4 safety assertions),
-                    // src-absence confirm, then delete.
-                    let owned = match self.world.dest.get(&rel_key) {
-                        Some(o) => {
-                            if needs_provenance_head {
-                                owned_by_rule(&o.true_meta, RULE)
-                            } else {
-                                // Machine trusted the listing — that trust must
-                                // be justified by the truth (P4).
-                                assert!(
-                                    owned_by_rule(&o.true_meta, RULE),
-                                    "machine trusted listing provenance for {rel_key:?} \
-                                     but the object is not rule-owned"
-                                );
-                                true
-                            }
-                        }
-                        None => false, // already gone — nothing to delete
-                    };
-                    if owned && !self.world.src.contains_key(&rel_key) {
+                    // Faithful mirror: the driver's only gate is the src-absence
+                    // confirm — a dest key absent at source is deleted regardless
+                    // of provenance (the destination is dedicated to this rule).
+                    let present_on_dest = self.world.dest.contains_key(&rel_key);
+                    if present_on_dest && !self.world.src.contains_key(&rel_key) {
                         self.world.dest.remove(&rel_key);
                         self.trace.deletes.insert(rel_key);
                     }
@@ -2420,23 +2406,25 @@ mod machine_tests {
     }
 
     #[test]
-    fn deletes_only_owned_and_absent_from_source() {
+    fn deletes_every_dest_only_key_regardless_of_provenance() {
+        // Faithful mirror: any dest key absent at source is deleted, whether or
+        // not this rule wrote it. Only source-present keys are preserved.
         let mut w = simple_world(AUTH);
         w.src.insert(
             "keep".into(),
             world_obj(mk_meta(1, "s", "e", 100, false), true),
         );
-        // Orphan owned by this rule → deleted.
+        // Orphan this rule wrote → deleted.
         w.dest.insert(
             "orphan".into(),
             world_obj(mk_meta(1, "s", "e", 100, true), true),
         );
-        // Foreign orphan → preserved.
+        // Foreign orphan (some other writer) → ALSO deleted now.
         w.dest.insert(
             "foreign".into(),
             world_obj(mk_meta(1, "s", "e", 100, false), true),
         );
-        // Present on source → preserved (and copied? identical ⇒ policy).
+        // Present on source → preserved.
         w.dest.insert(
             "keep".into(),
             world_obj(mk_meta(1, "s", "e", 100, true), true),
@@ -2444,7 +2432,7 @@ mod machine_tests {
         let (trace, _) = run_full(&w, ConflictPolicy::SkipIfDestExists, true);
         assert_eq!(
             trace.deletes,
-            ["orphan"]
+            ["foreign", "orphan"]
                 .into_iter()
                 .map(String::from)
                 .collect::<BTreeSet<_>>()

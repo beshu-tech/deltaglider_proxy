@@ -621,29 +621,91 @@ async fn verify_destination(
     expected_bytes: usize,
     expected_multipart_etag: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    verify_destination_sized(
+        engine,
+        request,
+        expected_bytes,
+        None,
+        expected_multipart_etag,
+    )
+    .await
+}
+
+/// Like [`verify_destination`], but tolerant of a delta object whose DG
+/// metadata was stripped by the backend. On the delta-passthrough fast path the
+/// dest HEAD resolves to the LOGICAL size only while the object's `x-amz-meta-dg-*`
+/// headers are intact; if the backend dropped them, HEAD falls back to the raw
+/// stored (delta-blob) size and a logical-size compare would FALSELY report a
+/// truncation. When `stored_delta_size` is supplied and the HEAD came back at
+/// exactly that size, the object is present and correctly sized — accept it (the
+/// caller heals the stripped metadata separately).
+async fn verify_destination_sized(
+    engine: &Arc<DynEngine>,
+    request: ObjectTransferRequest<'_>,
+    expected_bytes: usize,
+    stored_delta_size: Option<u64>,
+    expected_multipart_etag: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let dest = engine
         .head(request.destination_bucket, request.destination_key)
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("destination verify head failed: {}", e).into()
         })?;
-    if dest.file_size != expected_bytes as u64 {
-        return Err(format!(
+    match verify_size_verdict(
+        dest.file_size,
+        expected_bytes as u64,
+        stored_delta_size,
+        dest.multipart_etag.as_deref(),
+        expected_multipart_etag,
+    ) {
+        Ok(()) => Ok(()),
+        Err(VerifyReject::Size { found }) => Err(format!(
             "destination verify failed: expected {} bytes, found {}",
-            expected_bytes, dest.file_size
+            expected_bytes, found
         )
-        .into());
+        .into()),
+        Err(VerifyReject::Etag { found }) => Err(format!(
+            "destination verify failed: expected multipart etag {:?}, found {:?}",
+            expected_multipart_etag, found
+        )
+        .into()),
     }
-    if let Some(expected) = expected_multipart_etag {
-        if dest.multipart_etag.as_deref() != Some(expected) {
-            return Err(format!(
-                "destination verify failed: expected multipart etag {:?}, found {:?}",
-                expected, dest.multipart_etag
-            )
-            .into());
+}
+
+#[derive(Debug, PartialEq)]
+enum VerifyReject {
+    Size { found: u64 },
+    Etag { found: Option<String> },
+}
+
+/// Pure verify decision. A dest is accepted when its HEAD size equals the
+/// LOGICAL size (metadata intact — then the etag must also match), OR when it
+/// equals the raw delta blob we just shipped (the backend stripped the dg
+/// metadata so HEAD fell back to the stored size — accept, caller heals; the
+/// etag is meaningless on a stripped/passthrough-resolved object, so it's not
+/// checked in that case).
+fn verify_size_verdict(
+    dest_size: u64,
+    logical_size: u64,
+    stored_delta_size: Option<u64>,
+    dest_etag: Option<&str>,
+    expected_etag: Option<&str>,
+) -> Result<(), VerifyReject> {
+    if dest_size == logical_size {
+        if let Some(expected) = expected_etag {
+            if dest_etag != Some(expected) {
+                return Err(VerifyReject::Etag {
+                    found: dest_etag.map(String::from),
+                });
+            }
         }
+        return Ok(());
     }
-    Ok(())
+    if stored_delta_size == Some(dest_size) {
+        return Ok(());
+    }
+    Err(VerifyReject::Size { found: dest_size })
 }
 
 /// Test seam: when `DGP_TEST_FAIL_PART_ONCE=<part#>` is set, return a
@@ -989,14 +1051,19 @@ async fn delta_passthrough_copy(
         seeded_ref_bytes,
     );
 
-    // HEAD reports the LOGICAL size, not the delta size.
-    verify_destination(
+    // HEAD reports the LOGICAL size when the dest delta's DG metadata is intact.
+    // If the backend stripped that metadata, HEAD falls back to the raw delta
+    // size — accept that (== the blob we just shipped) instead of false-failing,
+    // then heal the metadata so the object stays restorable + verifies cleanly.
+    verify_destination_sized(
         engine,
         request,
         source_head.file_size as usize,
+        Some(src_delta_size),
         source_head.multipart_etag.as_deref(),
     )
     .await?;
+    heal_stripped_dest_delta(engine, request, &counter_meta, src_delta_size).await;
 
     let bytes_egress_saved = source_head.file_size.saturating_sub(src_delta_size);
     // Metric counts replication only — lifecycle transitions share this path
@@ -1015,6 +1082,79 @@ async fn delta_passthrough_copy(
         source_file_size: source_head.file_size,
         bytes_egress_saved,
     }))
+}
+
+/// Heal a destination delta object whose DG metadata the backend stripped.
+///
+/// After a verbatim delta ship, if the dest HEAD resolves to the raw delta size
+/// (not the logical size), the backend dropped the object's `x-amz-meta-dg-*`
+/// headers — so a client GET would mis-detect it as a passthrough and serve the
+/// raw delta bytes (corruption), and every re-verify would false-fail. Re-PUT
+/// the same delta bytes with the correct metadata (`meta`, which carries the
+/// logical StorageInfo::Delta fields). Best-effort: a failure here doesn't fail
+/// the copy — the object is present and byte-correct; the next run retries.
+async fn heal_stripped_dest_delta(
+    engine: &Arc<DynEngine>,
+    request: ObjectTransferRequest<'_>,
+    meta: &crate::types::FileMetadata,
+    expected_delta_size: u64,
+) {
+    use crate::types::ObjectKey;
+    let dest = match engine
+        .head(request.destination_bucket, request.destination_key)
+        .await
+    {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    // Intact metadata → HEAD returns logical size → nothing to heal.
+    if dest.file_size == meta.file_size {
+        return;
+    }
+    // Only heal the specific stripped-delta signature (raw delta size back).
+    if dest.file_size != expected_delta_size {
+        return;
+    }
+    let dest_key = ObjectKey::parse(request.destination_bucket, request.destination_key);
+    // Re-fetch the delta blob from the DEST (present, just metadata-stripped) and
+    // re-PUT with the correct metadata to re-stamp the dg-* headers.
+    let delta_bytes = match engine
+        .get_delta_raw(
+            request.destination_bucket,
+            &dest_key.prefix,
+            &dest_key.filename,
+        )
+        .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                "heal: could not read stripped dest delta {}/{}: {e}",
+                request.destination_bucket, request.destination_key
+            );
+            return;
+        }
+    };
+    if let Err(e) = engine
+        .put_delta_raw(
+            request.destination_bucket,
+            &dest_key.prefix,
+            &dest_key.filename,
+            &delta_bytes,
+            meta,
+        )
+        .await
+    {
+        warn!(
+            "heal: could not re-stamp stripped dest delta {}/{}: {e}",
+            request.destination_bucket, request.destination_key
+        );
+    } else {
+        info!(
+            "heal: re-stamped stripped DG metadata on {}/{}",
+            request.destination_bucket, request.destination_key
+        );
+    }
 }
 
 /// Bounded-memory copy for large objects (Phase 4.1): stream the source
@@ -1097,6 +1237,40 @@ async fn spooled_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_size_verdict_truth_table() {
+        // logical match + etag match → OK
+        assert_eq!(
+            verify_size_verdict(1000, 1000, Some(400), Some("e"), Some("e")),
+            Ok(())
+        );
+        // logical match + etag MISMATCH → reject on etag
+        assert_eq!(
+            verify_size_verdict(1000, 1000, Some(400), Some("bad"), Some("e")),
+            Err(VerifyReject::Etag {
+                found: Some("bad".into())
+            })
+        );
+        // logical match + no expected etag → OK (etag unchecked)
+        assert_eq!(verify_size_verdict(1000, 1000, None, None, None), Ok(()));
+        // stripped delta: HEAD returns the raw delta size we shipped → ACCEPT,
+        // even though it ≠ logical, and WITHOUT checking the (meaningless) etag.
+        assert_eq!(
+            verify_size_verdict(400, 1000, Some(400), None, Some("e")),
+            Ok(())
+        );
+        // genuinely wrong size (not logical, not the shipped delta) → reject.
+        assert_eq!(
+            verify_size_verdict(777, 1000, Some(400), None, None),
+            Err(VerifyReject::Size { found: 777 })
+        );
+        // no stored_delta_size hint (buffered path) + size mismatch → reject.
+        assert_eq!(
+            verify_size_verdict(400, 1000, None, None, None),
+            Err(VerifyReject::Size { found: 400 })
+        );
+    }
 
     #[test]
     fn transient_copy_error_classification_is_narrow() {

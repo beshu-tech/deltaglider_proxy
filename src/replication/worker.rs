@@ -226,45 +226,23 @@ fn to_rel_listing(
     })
 }
 
-/// The delete pipeline, verbatim old `run_delete_pass` per-key semantics:
-/// provenance HEAD-confirm when the listing lacked our marker (HEAD error →
-/// preserve), source-absence HEAD (delete ONLY on NoSuchKey; any other error
-/// → preserve + failure ring), then the destination delete.
+/// The delete pipeline (faithful mirror): source-absence HEAD (delete ONLY on
+/// NoSuchKey; any other error → preserve + failure ring), then the destination
+/// delete. No provenance check — the destination is dedicated to this rule, so
+/// any key absent at source is removed regardless of who wrote it.
 /// DB-FREE by contract (see `copy_one_object`) — failure text rides back in
 /// `DriverDone::Delete.error` for the driver to persist.
-#[allow(clippy::too_many_arguments)]
 async fn execute_delete(
     engine: &Arc<DynEngine>,
-    rule_name: &str,
     src_bucket: &str,
     dst_bucket: &str,
     abs_src: &str,
     abs_dest: &str,
     item_id: u64,
-    needs_provenance_head: bool,
 ) -> DriverDone {
-    if needs_provenance_head {
-        if let Some(m) = engine.metrics() {
-            m.replication_head_calls_total.inc();
-        }
-        let owned = match engine.head(dst_bucket, abs_dest).await {
-            Ok(meta) => super::event_consumer::owned_by_rule(&meta, rule_name),
-            // HEAD failed — preserve. Better a leftover copy than a
-            // false-delete of a foreign object.
-            Err(_) => false,
-        };
-        if !owned {
-            return DriverDone::Delete {
-                item_id,
-                deleted: false,
-                error: None,
-            };
-        }
-    }
     if let Some(m) = engine.metrics() {
         m.replication_head_calls_total.inc();
     }
-    let _ = rule_name;
     match engine.head(src_bucket, abs_src).await {
         Ok(_) => DriverDone::Delete {
             item_id,
@@ -769,11 +747,10 @@ pub async fn run_rule(
                     walk::Cmd::Delete {
                         item_id,
                         rel_key,
-                        needs_provenance_head,
+                        needs_provenance_head: _,
                     } => {
                         deletes_inflight += 1;
                         let engine = engine.clone();
-                        let rule_name = rule.name.clone();
                         let src_bucket = rule.source.bucket.clone();
                         let dst_bucket = rule.destination.bucket.clone();
                         let abs_src = format!("{source_prefix}{rel_key}");
@@ -781,13 +758,11 @@ pub async fn run_rule(
                         inflight.push(Box::pin(async move {
                             execute_delete(
                                 &engine,
-                                &rule_name,
                                 &src_bucket,
                                 &dst_bucket,
                                 &abs_src,
                                 &abs_dest,
                                 item_id,
-                                needs_provenance_head,
                             )
                             .await
                         }));
