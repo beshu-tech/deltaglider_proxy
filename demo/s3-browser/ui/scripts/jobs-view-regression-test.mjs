@@ -25,6 +25,7 @@ const {
   fixActionMeta,
   computeRate,
   deriveVerifyProgress,
+  jobWalkProgress,
 } = await import(moduleUrl);
 
 const row = (over = {}) => ({
@@ -286,5 +287,38 @@ assert.deepEqual(deriveVerifyProgress(500, undefined), { determinate: false, per
 assert.deepEqual(deriveVerifyProgress(500, 1000), { determinate: true, percent: 50 });
 assert.deepEqual(deriveVerifyProgress(2000, 1000), { determinate: true, percent: 100 }, 'clamped at 100');
 assert.deepEqual(deriveVerifyProgress(0, 1000), { determinate: true, percent: 0 });
+
+// ── jobWalkProgress: live only, defensive on shape ──────────────────────────
+assert.equal(jobWalkProgress(null), null, 'null row → null');
+assert.equal(
+  jobWalkProgress(row({ status: 'succeeded', detail: { walk: { dirs_completed: 5 } } })),
+  null,
+  'inactive status → null (no live progress)',
+);
+assert.equal(
+  jobWalkProgress(row({ status: 'running', detail: {} })),
+  null,
+  'active but no walk detail → null',
+);
+assert.deepEqual(
+  jobWalkProgress(
+    row({
+      status: 'running',
+      detail: { walk: { scanning: 'ror/builds/1.70/', dirs_completed: 157, dirs_pending: 128 } },
+    }),
+  ),
+  { scanning: 'ror/builds/1.70/', dirs_completed: 157, dirs_pending: 128 },
+  'active + full walk detail → parsed',
+);
+assert.deepEqual(
+  jobWalkProgress(row({ status: 'running', detail: { walk: { dirs_completed: 3 } } })),
+  { scanning: null, dirs_completed: 3, dirs_pending: 0 },
+  'partial walk detail → defaults (no scanning, pending 0)',
+);
+assert.deepEqual(
+  jobWalkProgress(row({ status: 'running', detail: { walk: { scanning: 42 } } })),
+  { scanning: null, dirs_completed: 0, dirs_pending: 0 },
+  'wrong-typed fields → coerced to safe defaults',
+);
 
 console.log('jobs view regression checks passed');

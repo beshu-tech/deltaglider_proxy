@@ -70,6 +70,30 @@ export function jobInFlight(row: Pick<JobRow, 'status' | 'detail'> | null): InFl
   );
 }
 
+export type WalkProgress = {
+  scanning: string | null;
+  dirs_completed: number;
+  dirs_pending: number;
+};
+
+/**
+ * Live reconcile-walk progress from a replication row's detail (active run
+ * only). `scanning` is the directory the walk is currently in; the dir counts
+ * are an activity indicator, NOT a percent basis (pending grows-then-drains as
+ * the tree is discovered). Absent on old servers / non-replication kinds.
+ */
+export function jobWalkProgress(
+  row: Pick<JobRow, 'status' | 'detail'> | null,
+): WalkProgress | null {
+  if (!row || !isActiveJobStatus(row.status)) return null;
+  const raw = row.detail?.walk as Record<string, unknown> | undefined;
+  if (!raw || typeof raw !== 'object') return null;
+  const dirs_completed = typeof raw.dirs_completed === 'number' ? raw.dirs_completed : 0;
+  const dirs_pending = typeof raw.dirs_pending === 'number' ? raw.dirs_pending : 0;
+  const scanning = typeof raw.scanning === 'string' ? raw.scanning : null;
+  return { scanning, dirs_completed, dirs_pending };
+}
+
 /** AntD tag color for a job row. Pause/disable win over the last status. */
 export function jobStatusTone(row: Pick<JobRow, 'status' | 'paused' | 'enabled'>): string {
   if (row.enabled === false) return 'default';

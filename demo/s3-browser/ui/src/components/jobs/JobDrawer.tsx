@@ -6,11 +6,13 @@ import { useEffect, useRef, useMemo } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Alert, Drawer, Empty, Tabs, Tag, Typography } from 'antd';
 import { useColors } from '../../ThemeContext';
+import './OutcomeMeter.css';
 import type { LifecycleConfig, ReplicationConfig } from '../../adminApi';
 import type { JobRow } from '../../jobsView';
 import {
   isActiveJobStatus,
   jobInFlight,
+  jobWalkProgress,
   jobStatusLabel,
   jobStatusTone,
   kindLabel,
@@ -70,6 +72,10 @@ export default function JobDrawer({
   // Live "currently copying" objects (name + size) — justifies a slow-moving
   // counter when the run is chewing through multi-GB files.
   const inFlight = jobInFlight(serverRow);
+  // Live reconcile-walk position + dir counts (replication rows on an active
+  // run). Shown as an activity indicator so a long HEAD-heavy scan reads as
+  // "working, here" rather than "stuck at 0 copied".
+  const walk = jobWalkProgress(serverRow);
   // Runs/failures only exist for jobs the SERVER knows (not drafts).
   // These are NOT polled — the jobs LIST already polls (2s while active) and
   // carries the live progress in `serverRow`. We overlay that onto the running
@@ -346,6 +352,49 @@ export default function JobDrawer({
         )
       }
     >
+      {walk && (
+        <div
+          style={{
+            marginBottom: 12,
+            padding: '8px 12px',
+            borderRadius: 8,
+            background: c.BG_ELEVATED,
+            fontSize: 12.5,
+          }}
+        >
+          <div style={{ display: 'flex', gap: 8, alignItems: 'baseline' }}>
+            <Typography.Text type="secondary" style={{ whiteSpace: 'nowrap' }}>
+              scanning
+            </Typography.Text>
+            <Typography.Text
+              style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}
+              ellipsis
+            >
+              {walk.scanning ?? '…'}
+            </Typography.Text>
+          </div>
+          <div style={{ marginTop: 2 }}>
+            <Typography.Text type="secondary">
+              {walk.dirs_completed.toLocaleString()} dirs done ·{' '}
+              {walk.dirs_pending.toLocaleString()} pending
+            </Typography.Text>
+          </div>
+          {/* Slim indeterminate activity bar — no honest % (pending grows then
+              drains as the tree is discovered), so this signals motion only. */}
+          <div
+            style={{
+              position: 'relative',
+              height: 3,
+              marginTop: 6,
+              borderRadius: 2,
+              overflow: 'hidden',
+              background: c.BORDER,
+            }}
+          >
+            <div className="dg-meter-indeterminate" />
+          </div>
+        </div>
+      )}
       {inFlight.length > 0 && (
         <div
           style={{
