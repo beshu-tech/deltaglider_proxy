@@ -10,6 +10,29 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-07-18_
 
+## v1.15.3 — 2026-07-18
+
+### Fixed — false "checksum mismatch" on replicated delta objects (+ a silent corruption)
+
+When a destination backend dropped a delta object's DeltaGlider metadata headers
+(the same stripping that affected references), two things went wrong: the
+post-copy check compared the source's real size against the destination's
+*compressed delta* size and reported a bogus "truncation" that a re-run could
+never clear; and — more seriously — a download of such an object served the raw
+delta bytes instead of reconstructing the original (a corrupt file under a
+success response). Both are fixed: the check now recognises the stripped-delta
+case, and the copy **re-stamps the missing metadata** so the object stays
+downloadable and correct.
+
+### Changed — delete replication is now a faithful mirror
+
+With delete replication enabled, the destination is now a faithful copy of the
+source: **any** destination object not present at source is removed — including
+objects written by other tools. Previously only objects this exact rule had
+written were removed, so a destination could never fully converge. The
+destination bucket must be **dedicated to the rule**; a bucket shared with
+another writer is no longer a supported setup.
+
 ## v1.15.2 — 2026-07-18
 
 ### Added — each run shows which algorithm it applied
