@@ -111,8 +111,10 @@ fn validate_and_normalize_prefix(prefix: &str) -> PrefixOutcome {
     if !prefix.is_empty() && prefix.chars().all(|c| c == '/') {
         return PrefixOutcome::BareSlash;
     }
-    // Strip leading slash.
-    let p = prefix.strip_prefix('/').unwrap_or(prefix).to_string();
+    // Strip ALL leading slashes — stripping only one leaves `"//a/"` as `"/a/"`,
+    // which is accepted but then re-normalizes to `"a/"` (non-idempotent). An
+    // internal `//` still trips the dangerous-pattern gate below.
+    let p = prefix.trim_start_matches('/').to_string();
     // Directory-shape + dangerous-pattern gate (shared validator). It
     // accepts the empty string (whole-bucket-public), rejects `..`/NUL/`//`,
     // and requires a trailing `/` on non-empty prefixes.
