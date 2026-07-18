@@ -10,6 +10,23 @@ follow [semantic versioning](https://semver.org/); the Docker image
 
 _Last updated: 2026-07-18_
 
+## v1.15.2 — 2026-07-18
+
+### Added — each run shows which algorithm it applied
+
+The run drawer now names how each copied object was moved, in plain language:
+
+- **⚡ shipped as-is** — the delta bytes were copied verbatim, no decompress or
+  recompress (the cheapest path; hover for the technical term).
+- **↻ rebuilt** — decompressed from the delta and re-stored (recompressed or
+  re-encrypted) at the destination.
+- **→ straight copy** — a whole already-compressed object (image, video,
+  archive) copied byte-for-byte.
+
+Alongside the mix, **"saved &lt;N&gt;"** reports the egress that never crossed the
+wire because deltas shipped as-is. This turns the run history into an honest
+account of what the engine did, not just how many objects moved.
+
 ## v1.15.1 — 2026-07-18
 
 ### Fixed — replication no longer re-copies destinations with stripped metadata

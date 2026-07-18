@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.15.2 — 2026-07-18
+
 ### Added — each run shows which algorithm it applied
 
 The run drawer now names how each copied object was moved, in plain language:
