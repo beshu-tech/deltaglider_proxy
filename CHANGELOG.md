@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.15.4 — 2026-07-19
+
 ### Fixed — much faster replication Verify
 
 The parity **Verify** audit on large S3↔S3 rules crawled (a ~99K-object backup

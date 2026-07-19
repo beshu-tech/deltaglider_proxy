@@ -8,7 +8,49 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-07-18_
+_Last updated: 2026-07-19_
+
+## v1.15.4 — 2026-07-19
+
+### Fixed — much faster replication Verify
+
+The parity **Verify** audit on large S3↔S3 rules crawled (a ~99K-object backup
+took ~30 minutes) because it checked objects in small batches, waiting for each
+batch to finish before starting the next, and re-checked the tiny `.sha1`/
+`.sha256`/`.sha512` checksum files even though it already knew their size. Verify
+now streams the checks continuously and skips the checksum sidecars, so it
+finishes several times faster. Concurrency is tunable via
+`DGP_PARITY_HEAD_CONCURRENCY` (default 15) for cautious dialing on a slow backend;
+the backend-throttle backstop is preserved.
+
+### Fixed — Verify no longer shows a stale result mid-scan
+
+While a new Verify was running, the screen could show the **previous** scan's
+findings (with an old timestamp) as if they were current — which looked like the
+running scan had already found problems. A running/cancelling Verify now shows
+live progress instead of a phantom verdict.
+
+### Fixed — Verify could report a stale size after an overwrite
+
+On a filesystem destination, Verify's per-object cache keyed on the file's
+logical checksum, which doesn't change when the same file is re-compressed
+against a rotated baseline — so an overwritten object could be reported with its
+**old** size. The cache now keys on the stored blob's own version, so an
+overwrite is always detected.
+
+### Changed — "Re-run won't help" is now "Re-run may help" for transient errors
+
+A copy that failed on a **transient** error (a slow/stalled read, a timeout, a
+throttle, a dropped connection) was shown as "Re-run won't help", discouraging a
+retry that would in fact succeed. Those now read **"Re-run may help"**; only a
+structural failure (permissions, missing bucket) stays a hard no.
+
+### Changed — delete replication is a faithful mirror on every path
+
+Delete replication now removes any destination object absent at source
+regardless of provenance on **both** the scheduled reconcile and the
+event-driven path (previously the event-driven path still preserved objects it
+hadn't written itself, so the two paths could delete differently).
 
 ## v1.15.3 — 2026-07-18
 
