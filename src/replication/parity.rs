@@ -196,6 +196,14 @@ pub struct ObjState {
     /// `Some(true/false)` once the dest scan resolves rule ownership; `None`
     /// on source entries and until annotated (rule-agnostic at construction).
     pub owned_by_rule: Option<bool>,
+    /// STORED-blob content-version token for the parity cache (NOT the logical
+    /// etag). For a DELTA object this is `"{delta_size}:{ref_sha256}"` — it
+    /// changes whenever the delta is re-encoded (e.g. against a rotated
+    /// reference), which the logical `etag`/md5 does NOT (same logical file →
+    /// same md5). For passthrough it IS the logical etag/md5 (stored verbatim).
+    /// This is what busts a stale parity-cache hit after an overwrite; using the
+    /// logical etag here let a re-delta collide and serve a stale size.
+    pub stored_version: Option<String>,
 }
 
 impl ObjState {
@@ -216,6 +224,25 @@ impl ObjState {
             .as_deref()
             .and_then(|e| e.rsplit_once('-'))
             .and_then(|(_, n)| n.parse::<u32>().ok());
+        // Stored-blob content-version for the parity cache.
+        //  - DELTA with a resolved ref_sha256 (filesystem HEAD): the
+        //    (delta_size, ref_sha256) pair — changes on any re-encode, unlike
+        //    the logical md5 (stable across re-deltas → the stale-cache bug).
+        //  - DELTA stub from an S3 lite list (ref_sha256 empty): fold delta_size
+        //    together with the S3 object ETag (which the lite list already put in
+        //    `md5`) so we never DROP the strongest S3 content-version.
+        //  - Passthrough: the logical etag (stored verbatim).
+        let stored_version = match &m.storage_info {
+            crate::types::StorageInfo::Delta {
+                delta_size,
+                ref_sha256,
+                ..
+            } if !ref_sha256.is_empty() => Some(format!("d:{delta_size}:{ref_sha256}")),
+            crate::types::StorageInfo::Delta { delta_size, .. } => {
+                Some(format!("d:{delta_size}:{}", etag.as_deref().unwrap_or("")))
+            }
+            _ => etag.clone(),
+        };
         ObjState {
             sha256,
             size: m.file_size,
@@ -223,6 +250,7 @@ impl ObjState {
             multipart_parts,
             created_at: Some(m.created_at.timestamp_millis()),
             owned_by_rule: None,
+            stored_version,
         }
     }
 }
@@ -685,10 +713,12 @@ fn cache_entry_from_meta(m: &FileMetadata, stored_etag: Option<String>) -> Parit
     }
 }
 
-/// The STORED-blob etag the lite list recorded for `map_key` (the content-version
-/// token). Read from the ObjState BEFORE any logical overlay.
+/// The STORED-blob content-version the lite list recorded for `map_key`. Read
+/// from the ObjState BEFORE any logical overlay. This is `stored_version` (the
+/// delta-aware token), NOT the logical `etag` — using the logical etag let a
+/// re-delta against a rotated reference collide and serve a stale cached size.
 fn lite_stored_etag(map: &BTreeMap<String, ObjState>, map_key: &str) -> Option<String> {
-    map.get(map_key).and_then(|st| st.etag.clone())
+    map.get(map_key).and_then(|st| st.stored_version.clone())
 }
 
 /// A cache hit is only valid when the stored blob hasn't changed since it was
@@ -1445,6 +1475,9 @@ mod tests {
             multipart_parts: parts,
             created_at: None,
             owned_by_rule: None,
+            // Passthrough default: stored version == logical etag. Delta-specific
+            // cache tests set this explicitly via `..st(...)`.
+            stored_version: etag.map(|s| s.to_string()),
         }
     }
 
@@ -1556,6 +1589,73 @@ mod tests {
             &entry(Some("blob-v1")),
             &Some("blob-v2".into())
         ));
+    }
+
+    #[test]
+    fn delta_reencode_changes_stored_version_even_with_same_logical_content() {
+        // THE plumbing test (the bug that served a stale size): the SAME logical
+        // file (identical sha/md5/file_size) re-delta'd against a ROTATED
+        // reference produces a different .delta blob. The cache token MUST change
+        // so the overwrite busts the cache — using the logical md5 (stable here)
+        // let it collide and serve the stale size.
+        let before = FileMetadata::new_delta(
+            "app.zip".into(),
+            "LOGICAL_SHA".into(),
+            "LOGICAL_MD5".into(), // logical md5 — IDENTICAL before/after
+            52_524_126,           // logical size — identical
+            "reference.bin".into(),
+            "REF_SHA_OLD".into(),
+            30_019_443, // delta size against the OLD reference
+            None,
+        );
+        let after = FileMetadata::new_delta(
+            "app.zip".into(),
+            "LOGICAL_SHA".into(),
+            "LOGICAL_MD5".into(),
+            52_524_126,
+            "reference.bin".into(),
+            "REF_SHA_NEW".into(), // rotated reference
+            30_244_201,           // different delta bytes
+            None,
+        );
+        let sv_before = ObjState::from_metadata(&before).stored_version;
+        let sv_after = ObjState::from_metadata(&after).stored_version;
+        assert!(sv_before.is_some());
+        assert_ne!(
+            sv_before, sv_after,
+            "a re-delta against a rotated reference MUST change the stored-version token"
+        );
+        // And a genuine no-op re-resolve (identical delta) keeps the token stable
+        // so the warm-cache hit still works.
+        let same = ObjState::from_metadata(&before).stored_version;
+        assert_eq!(sv_before, same);
+    }
+
+    #[test]
+    fn s3_delta_stub_stored_version_folds_size_and_etag() {
+        // S3 lite list → delta_stub (ref_sha256 empty). The token must still
+        // change on overwrite: fold delta_size with the S3 ETag (carried in md5).
+        // Never drop the S3 etag, else two same-size delta blobs would collide.
+        use crate::types::StorageInfo;
+        let mut m = FileMetadata::new_passthrough(
+            "app.zip".into(),
+            "LOGICAL_SHA".into(),
+            "ETAG_V1".into(), // S3 object etag (lite list puts it in md5)
+            30_019_443,
+            None,
+        );
+        m.storage_info = StorageInfo::delta_stub(30_019_443);
+        let v1 = ObjState::from_metadata(&m).stored_version.unwrap();
+
+        // Overwrite: new S3 etag (new PUT) — token must change even if size same.
+        let mut m2 = m.clone();
+        m2.md5 = "ETAG_V2".into();
+        let v2 = ObjState::from_metadata(&m2).stored_version.unwrap();
+        assert_ne!(
+            v1, v2,
+            "S3 delta overwrite (new etag) must change the token"
+        );
+        assert!(v1.contains("30019443") && v1.contains("ETAG_V1"));
     }
 
     #[test]
@@ -1838,10 +1938,11 @@ mod tests {
             .prop_map(|(sha, size, etag, parts)| ObjState {
                 sha256: sha,
                 size,
-                etag,
+                etag: etag.clone(),
                 multipart_parts: parts,
                 created_at: None,
                 owned_by_rule: None,
+                stored_version: etag,
             })
     }
 

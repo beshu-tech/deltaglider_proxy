@@ -274,15 +274,27 @@ fn parity_status_from_row(
             error: None,
         };
     };
-    let outcome = row
-        .outcome_json
-        .as_deref()
-        .and_then(|j| serde_json::from_str(j).ok());
+    // While a scan is IN FLIGHT, the persisted `outcome_json` (and its
+    // scanned_at) belong to the PREVIOUS completed audit. Surfacing it makes a
+    // running/cancelling verify look like it already found those (stale)
+    // differences — the exact confusion that got a slow run killed. Suppress the
+    // stale outcome until the current scan settles; the UI then shows live
+    // progress (its `running && !outcome` guard) instead of a phantom verdict.
+    let in_flight = matches!(row.status.as_str(), "running" | "cancelling");
+    let outcome = if in_flight {
+        None
+    } else {
+        row.outcome_json
+            .as_deref()
+            .and_then(|j| serde_json::from_str(j).ok())
+    };
     ParityStatusResponse {
         status: row.status,
         progress_scanned: row.progress_scanned,
         progress_total: row.progress_total,
-        scanned_at: row.scanned_at,
+        // scanned_at also describes the PREVIOUS result — hide it while in flight
+        // so the UI never pairs a live scan with a stale timestamp.
+        scanned_at: if in_flight { None } else { row.scanned_at },
         outcome,
         error: row.last_error,
     }
@@ -645,4 +657,41 @@ pub async fn resume(
         "",
     );
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replication::ParityResultRow;
+
+    fn row(status: &str, has_outcome: bool) -> ParityResultRow {
+        ParityResultRow {
+            status: status.to_string(),
+            scanned_at: Some(1000),
+            progress_scanned: 5,
+            progress_total: 10,
+            outcome_json: has_outcome
+                .then(|| r#"{"rule_name":"r","source_bucket":"s","dest_bucket":"d","source_objects":0,"dest_objects":0,"matched":1,"missing_on_dest":0,"orphan_on_dest":0,"checksum_mismatch":0,"unverifiable":0,"truncated":false,"in_sync":true,"scanned_at":1000,"conflict_policy":"content-diff","replicate_deletes":false,"actionable":{"rerun_fixes":0,"rerun_conditional":0,"needs_manual":0,"copy_failing":0,"foreign_orphans":0},"missing_samples":[],"orphan_samples":[],"mismatch_samples":[]}"#.to_string()),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn stale_outcome_is_suppressed_while_scan_in_flight() {
+        // A settled scan surfaces its outcome + timestamp.
+        let done = parity_status_from_row(Some(row("done", true)));
+        assert!(done.outcome.is_some(), "done → outcome shown");
+        assert_eq!(done.scanned_at, Some(1000));
+
+        // A running/cancelling scan must NOT surface the PREVIOUS outcome or its
+        // timestamp — else the UI renders a phantom (stale) verdict mid-scan.
+        for st in ["running", "cancelling"] {
+            let r = parity_status_from_row(Some(row(st, true)));
+            assert!(r.outcome.is_none(), "{st}: stale outcome must be hidden");
+            assert_eq!(r.scanned_at, None, "{st}: stale timestamp must be hidden");
+            // Progress still flows so the UI shows a live bar.
+            assert_eq!(r.progress_scanned, 5);
+            assert_eq!(r.progress_total, 10);
+        }
+    }
 }
