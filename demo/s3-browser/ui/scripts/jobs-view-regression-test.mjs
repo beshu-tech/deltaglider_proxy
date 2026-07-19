@@ -195,6 +195,11 @@ assert.deepEqual(rerunVerdictMeta({ verdict: 'conditional', why: 'newer_wins_dep
   color: 'blue',
   tone: 'maybe',
 });
+// conditional/transient → "Re-run may help" (a stalled/slow read may clear on retry).
+assert.deepEqual(
+  rerunVerdictMeta({ verdict: 'conditional', why: 'transient_copy_error_may_clear' }),
+  { label: 'Re-run may help', cause: 'transient error — retry', color: 'blue', tone: 'maybe' },
+);
 // THE LIE — skip-if-dest-exists mismatch: a HARD no (red). The verdict label is
 // now a fixed short chip; the specific cause moved to `cause` (de-dup fix so the
 // WHY column doesn't say the same thing twice).

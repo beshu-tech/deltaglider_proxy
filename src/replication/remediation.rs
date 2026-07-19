@@ -64,6 +64,11 @@ pub enum NoReason {
 #[serde(rename_all = "snake_case")]
 pub enum ConditionalReason {
     NewerWinsDependsOnTimestamps,
+    /// The last copy failure was a TRANSIENT error (a stalled/slow read, a
+    /// timeout, a throttle, a dropped connection). Re-running may well succeed
+    /// once the transient condition clears — unlike a structural failure
+    /// (permissions, missing bucket) where re-run is futile until fixed.
+    TransientCopyErrorMayClear,
 }
 
 /// Tri-state verdict — never a bool — on whether re-running the rule fixes
@@ -110,20 +115,45 @@ fn policy_permits_copy_over_existing(policy: ConflictPolicy) -> bool {
 
 /// A copy that keeps failing — ledger overrides policy: the bytes never land,
 /// so no policy reasoning matters until the underlying error is fixed.
+///
+/// The re-run verdict depends on the ERROR TYPE. A TRANSIENT error (a stalled
+/// or slow read, a timeout, a throttle, a dropped connection) is Conditional —
+/// re-running may well succeed once the condition clears (e.g. after raising the
+/// read/stall timeouts). A STRUCTURAL error (permissions, missing bucket, quota)
+/// is a hard No until the operator fixes the cause. The old code said No for
+/// both, which mis-advised operators on transient stalls.
 fn copy_failing(ledger: &ObjectFailure) -> Remediation {
-    Remediation {
-        reason: ReasonCode::CopyFailing,
-        rerun_helps: RerunVerdict::No {
-            why: NoReason::CopyKeepsFailing,
-        },
-        fix: FixAction::ResolveCopyFailure,
-        reason_detail: format!(
-            "copy has failed {} time(s); last error: {}",
-            ledger.consecutive_failures, ledger.last_error
-        ),
-        fix_detail:
-            "fix the underlying copy error (permissions, backend reachability), then re-run"
-                .to_string(),
+    let transient = crate::transfer::is_transient_copy_error(&ledger.last_error);
+    let reason_detail = format!(
+        "copy has failed {} time(s); last error: {}",
+        ledger.consecutive_failures, ledger.last_error
+    );
+    if transient {
+        Remediation {
+            reason: ReasonCode::CopyFailing,
+            rerun_helps: RerunVerdict::Conditional {
+                why: ConditionalReason::TransientCopyErrorMayClear,
+            },
+            fix: FixAction::ResolveCopyFailure,
+            reason_detail,
+            fix_detail:
+                "transient error (slow/stalled read, timeout, throttle) — re-run to retry; if it \
+                 persists, raise the S3 read/stall timeouts (DGP_S3_READ_TIMEOUT_SECS / \
+                 DGP_S3_STALL_GRACE_SECS)"
+                    .to_string(),
+        }
+    } else {
+        Remediation {
+            reason: ReasonCode::CopyFailing,
+            rerun_helps: RerunVerdict::No {
+                why: NoReason::CopyKeepsFailing,
+            },
+            fix: FixAction::ResolveCopyFailure,
+            reason_detail,
+            fix_detail:
+                "fix the underlying copy error (permissions, backend reachability), then re-run"
+                    .to_string(),
+        }
     }
 }
 
@@ -284,9 +314,18 @@ mod tests {
     use proptest::prelude::*;
 
     fn led(failures: u32) -> ObjectFailure {
+        // "boom" is a STRUCTURAL (non-transient) error → hard No.
         ObjectFailure {
             consecutive_failures: failures,
             last_error: "boom".to_string(),
+            last_failed_at: 100,
+        }
+    }
+
+    fn led_err(failures: u32, err: &str) -> ObjectFailure {
+        ObjectFailure {
+            consecutive_failures: failures,
+            last_error: err.to_string(),
             last_failed_at: 100,
         }
     }
@@ -447,6 +486,35 @@ mod tests {
         let r = analyze_finding(&f);
         assert_eq!(r.reason, ReasonCode::CopyFailing);
         assert_eq!(r.fix, FixAction::ResolveCopyFailure);
+    }
+
+    #[test]
+    fn copy_failing_transient_error_is_conditional_not_hard_no() {
+        // A TRANSIENT last-error (a stalled/slow read → "streaming error") means
+        // re-run MAY succeed once the condition clears — Conditional, not a hard
+        // No. This is the prod case: slow Hetzner reads false-aborting.
+        let l = led_err(3, "source retrieve failed: S3 error: streaming error");
+        let mut f = facts(FindingKind::ChecksumMismatch, ConflictPolicy::ContentDiff);
+        f.ledger = Some(&l);
+        let r = analyze_finding(&f);
+        assert_eq!(r.reason, ReasonCode::CopyFailing);
+        assert_eq!(
+            r.rerun_helps,
+            RerunVerdict::Conditional {
+                why: ConditionalReason::TransientCopyErrorMayClear
+            }
+        );
+
+        // A STRUCTURAL error stays a hard No.
+        let l2 = led_err(3, "AccessDenied: permission denied");
+        f.ledger = Some(&l2);
+        let r2 = analyze_finding(&f);
+        assert_eq!(
+            r2.rerun_helps,
+            RerunVerdict::No {
+                why: NoReason::CopyKeepsFailing
+            }
+        );
     }
 
     // ─────────────── Orphan (4 rows) ───────────────

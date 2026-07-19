@@ -331,7 +331,9 @@ export function rerunVerdictMeta(rerun: RerunVerdict): {
     case 'yes':
       return { label: 'Re-run fixes this', color: 'green', tone: 'good' };
     case 'conditional':
-      return { label: 'Depends on timestamps', color: 'blue', tone: 'maybe' };
+      return rerun.why === 'transient_copy_error_may_clear'
+        ? { label: 'Re-run may help', cause: 'transient error — retry', color: 'blue', tone: 'maybe' }
+        : { label: 'Depends on timestamps', color: 'blue', tone: 'maybe' };
     case 'no': {
       // Gold = soft (an out-of-band delete is the real fix, nothing lied);
       // red = the hard policy lie (re-run runs but provably won't help).

@@ -74,7 +74,10 @@ export type RerunVerdict =
         | 'foreign_not_ours'
         | 'copy_keeps_failing';
     }
-  | { verdict: 'conditional'; why: 'newer_wins_depends_on_timestamps' };
+  | {
+      verdict: 'conditional';
+      why: 'newer_wins_depends_on_timestamps' | 'transient_copy_error_may_clear';
+    };
 
 /** The guided fix. Discriminated on `action`; only `run_now` is executable. */
 export type FixAction =
