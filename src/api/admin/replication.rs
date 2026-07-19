@@ -671,7 +671,7 @@ mod tests {
             progress_scanned: 5,
             progress_total: 10,
             outcome_json: has_outcome
-                .then(|| r#"{"rule_name":"r","source_bucket":"s","dest_bucket":"d","source_objects":0,"dest_objects":0,"matched":1,"missing_on_dest":0,"orphan_on_dest":0,"checksum_mismatch":0,"unverifiable":0,"truncated":false,"in_sync":true,"scanned_at":1000,"conflict_policy":"content-diff","replicate_deletes":false,"actionable":{"rerun_fixes":0,"rerun_conditional":0,"needs_manual":0,"copy_failing":0,"foreign_orphans":0},"missing_samples":[],"orphan_samples":[],"mismatch_samples":[]}"#.to_string()),
+                .then(|| r#"{"rule_name":"r","source_bucket":"s","dest_bucket":"d","source_objects":0,"dest_objects":0,"matched":1,"missing_on_dest":0,"orphan_on_dest":0,"checksum_mismatch":0,"unverifiable":0,"truncated":false,"in_sync":true,"scanned_at":1000,"conflict_policy":"content-diff","replicate_deletes":false,"actionable":{"rerun_fixes":0,"rerun_conditional":0,"needs_manual":0,"copy_failing":0},"missing_samples":[],"orphan_samples":[],"mismatch_samples":[]}"#.to_string()),
             last_error: None,
         }
     }

@@ -218,10 +218,9 @@ assert.match(
   rerunVerdictMeta({ verdict: 'no', why: 'tied_timestamps_no_winner' }).cause,
   /timestamps tied/,
 );
-// orphan-needs-delete / foreign — soft (gold) no: the real fix is an out-of-band delete.
+// orphan-needs-delete — soft (gold) no: the real fix is enabling mirror-delete.
 assert.equal(rerunVerdictMeta({ verdict: 'no', why: 'orphan_needs_delete' }).color, 'gold');
-assert.equal(rerunVerdictMeta({ verdict: 'no', why: 'foreign_not_ours' }).color, 'gold');
-for (const why of ['policy_skips_existing_dest', 'dest_newer_than_source', 'tied_timestamps_no_winner', 'orphan_needs_delete', 'foreign_not_ours', 'copy_keeps_failing']) {
+for (const why of ['policy_skips_existing_dest', 'dest_newer_than_source', 'tied_timestamps_no_winner', 'orphan_needs_delete', 'copy_keeps_failing']) {
   assert.equal(rerunVerdictMeta({ verdict: 'no', why }).tone, 'bad', `no:${why} is a bad tone`);
 }
 

@@ -586,9 +586,6 @@ pub fn fold_actionable(diff: &ParityDiff) -> ActionableSummary {
         if rem.reason == ReasonCode::CopyFailing {
             s.copy_failing += 1;
         }
-        if rem.reason == ReasonCode::ForeignOrphan {
-            s.foreign_orphans += 1;
-        }
     }
     s
 }
@@ -606,8 +603,6 @@ pub struct ActionableSummary {
     pub needs_manual: u64,
     /// The copy keeps failing (`ReasonCode::CopyFailing`).
     pub copy_failing: u64,
-    /// Foreign orphans on the destination (`ReasonCode::ForeignOrphan`).
-    pub foreign_orphans: u64,
 }
 
 /// The serialized audit verdict consumed by the frontend.
@@ -2163,8 +2158,9 @@ mod tests {
         let rem = diff.orphan_samples[0].remediation.as_ref().unwrap();
         assert_eq!(rem.reason, ReasonCode::RuleOwnedOrphanSourceDeleted);
         assert_eq!(rem.rerun_helps, RerunVerdict::Yes);
-        // No longer classified as a foreign orphan.
-        assert_eq!(fold_actionable(&diff).foreign_orphans, 0);
+        // A source-absent orphan under mirror-delete is a re-run fix, not a
+        // "foreign, hands-off" finding (the ForeignOrphan category is retired).
+        assert_eq!(fold_actionable(&diff).rerun_fixes, 1);
     }
 
     #[test]

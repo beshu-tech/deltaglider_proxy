@@ -301,7 +301,7 @@ pub fn spawn_event_consumer(
             // overlap on the same cursor window. That is intentionally tolerated
             // because every action is idempotent: a re-Copy is gated by a dest
             // HEAD + `should_replicate` (a no-op when current), and a re-Delete
-            // is provenance-guarded + HEADs an already-absent dest. The cursor
+            // re-confirms source-absence + HEADs an already-absent dest. The cursor
             // advance is monotonic (`MAX`), so overlap costs duplicate WORK, not
             // correctness. Per-rule leases below add a second mutual-exclusion
             // layer for the common case.
@@ -601,17 +601,23 @@ async fn apply_action(
             if !rule.replicate_deletes {
                 return Ok(());
             }
-            // Only delete a dest object WE wrote (provenance marker), mirroring
-            // the reconcile delete-pass safety property.
-            match engine.head(&rule.destination.bucket, &dest_key).await {
-                Ok(meta) => {
-                    if owned_by_rule(&meta, &rule.name) {
-                        engine.delete(&rule.destination.bucket, &dest_key).await?;
+            // Faithful mirror (matches the reconcile worker's execute_delete): a
+            // source-absent dest key is removed regardless of provenance — the
+            // destination is dedicated to the rule. The delete EVENT is the
+            // source-absence signal, but re-confirm it (a re-create may have
+            // landed after the event) so we never delete a dest whose source
+            // came back. Delete ONLY on a confirmed source NoSuchKey.
+            match engine.head(bucket, key).await {
+                // Source reappeared → do NOT delete; the copy path will re-sync.
+                Ok(_) => Ok(()),
+                Err(crate::deltaglider::EngineError::NotFound(_)) => {
+                    match engine.delete(&rule.destination.bucket, &dest_key).await {
+                        Ok(_) => Ok(()),
+                        // Dest already gone → nothing to delete.
+                        Err(crate::deltaglider::EngineError::NotFound(_)) => Ok(()),
+                        Err(e) => Err(Box::new(e)),
                     }
-                    Ok(())
                 }
-                // Dest absent → nothing to delete.
-                Err(crate::deltaglider::EngineError::NotFound(_)) => Ok(()),
                 Err(e) => Err(Box::new(e)),
             }
         }

@@ -58,8 +58,7 @@ export type ReasonCode =
   | 'dest_modified_after_copy'
   | 'diverged_same_timestamp'
   | 'diverged_unknown_age'
-  | 'rule_owned_orphan_source_deleted'
-  | 'foreign_orphan';
+  | 'rule_owned_orphan_source_deleted';
 
 /** Tri-state "will a re-run fix this?" verdict (never a bool). Discriminated on `verdict`. */
 export type RerunVerdict =
@@ -71,7 +70,6 @@ export type RerunVerdict =
         | 'dest_newer_than_source'
         | 'tied_timestamps_no_winner'
         | 'orphan_needs_delete'
-        | 'foreign_not_ours'
         | 'copy_keeps_failing';
     }
   | {
@@ -115,7 +113,6 @@ export interface ActionableSummary {
   rerun_conditional: number;
   needs_manual: number;
   copy_failing: number;
-  foreign_orphans: number;
 }
 
 export interface ParityOutcome {

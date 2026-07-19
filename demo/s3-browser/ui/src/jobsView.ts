@@ -337,7 +337,7 @@ export function rerunVerdictMeta(rerun: RerunVerdict): {
     case 'no': {
       // Gold = soft (an out-of-band delete is the real fix, nothing lied);
       // red = the hard policy lie (re-run runs but provably won't help).
-      const soft = rerun.why === 'orphan_needs_delete' || rerun.why === 'foreign_not_ours';
+      const soft = rerun.why === 'orphan_needs_delete';
       const cause =
         rerun.why === 'policy_skips_existing_dest'
           ? 'policy skips existing destination'
@@ -347,9 +347,7 @@ export function rerunVerdictMeta(rerun: RerunVerdict): {
               ? 'timestamps tied, no winner'
               : rerun.why === 'orphan_needs_delete'
                 ? 'needs a delete'
-                : rerun.why === 'foreign_not_ours'
-                  ? 'not written by this rule'
-                  : 'copy keeps failing';
+                : 'copy keeps failing';
       return { label: "Re-run won't help", cause, color: soft ? 'gold' : 'red', tone: 'bad' };
     }
     default:

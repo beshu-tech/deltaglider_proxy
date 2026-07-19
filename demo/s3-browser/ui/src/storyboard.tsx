@@ -26,7 +26,6 @@ const DEMOED_REASONS: ReasonCode[] = [
   'dest_modified_after_copy',
   'diverged_unknown_age',
   'rule_owned_orphan_source_deleted',
-  'foreign_orphan',
 ];
 
 const now = Math.floor(Date.now() / 1000);
@@ -46,7 +45,6 @@ const noActionable: ActionableSummary = {
   rerun_conditional: 0,
   needs_manual: 0,
   copy_failing: 0,
-  foreign_orphans: 0,
 };
 
 // ── Remediation fixtures (one per interesting verdict) ──────────────────────
@@ -64,12 +62,12 @@ const remCopyFailing: Remediation = {
   reason_detail: 'copy has failed 4 time(s); last error: AccessDenied writing to b2',
   fix_detail: 'fix the underlying copy error (permissions, backend reachability), then re-run',
 };
-const remForeignOrphan: Remediation = {
-  reason: 'foreign_orphan',
-  rerun_helps: { verdict: 'no', why: 'foreign_not_ours' },
-  fix: { action: 'delete_from_dest', foreign: true },
-  reason_detail: 'destination object was not written by this rule',
-  fix_detail: "we never touch foreign objects — delete it manually if it shouldn't be there",
+const remOrphanReRunDeletes: Remediation = {
+  reason: 'rule_owned_orphan_source_deleted',
+  rerun_helps: { verdict: 'yes' },
+  fix: { action: 'delete_from_dest', foreign: false },
+  reason_detail: 'present on the destination but absent at source',
+  fix_detail: 're-run the rule — mirror-delete removes it',
 };
 const remOrphanNeedsDelete: Remediation = {
   reason: 'rule_owned_orphan_source_deleted',
@@ -150,14 +148,14 @@ const amber: ParityOutcome = {
   in_sync: false,
   scanned_at: ago(1),
   // 2 fixable (never-copied) · 1 failing · 2 orphans needing manual action.
-  actionable: { rerun_fixes: 2, rerun_conditional: 0, needs_manual: 2, copy_failing: 1, foreign_orphans: 1 },
+  actionable: { rerun_fixes: 2, rerun_conditional: 0, needs_manual: 2, copy_failing: 1 },
   missing_samples: [
     f('ror/builds/1.28.1/readonlyrest-1.28.1_es6.2.2.zip', 'missing_on_dest', 'absent on destination', remNeverCopied),
     f('ror/builds/1.28.0/readonlyrest-1.28.0_es7.9.2.zip', 'missing_on_dest', 'absent on destination', remNeverCopied),
     f('ror/builds/1.28.0/readonlyrest-1.28.0_es7.5.0.zip.sha1', 'missing_on_dest', 'absent on destination', remCopyFailing),
   ],
   orphan_samples: [
-    f('ror/builds/legacy/old-artifact-2019.zip', 'orphan_on_dest', 'on destination, not in source', remForeignOrphan),
+    f('ror/builds/legacy/old-artifact-2019.zip', 'orphan_on_dest', 'on destination, not in source', remOrphanReRunDeletes),
     f('ror/scratch/tmp-upload.bin', 'orphan_on_dest', 'on destination, not in source', remOrphanNeedsDelete),
   ],
 };
@@ -170,7 +168,7 @@ const red: ParityOutcome = {
   unverifiable: 4,
   in_sync: false,
   scanned_at: ago(0),
-  actionable: { rerun_fixes: 1, rerun_conditional: 1, needs_manual: 0, copy_failing: 1, foreign_orphans: 0 },
+  actionable: { rerun_fixes: 1, rerun_conditional: 1, needs_manual: 0, copy_failing: 1 },
   mismatch_samples: [
     f('ror/builds/1.28.0/readonlyrest-1.28.0_es8.0.0.zip', 'checksum_mismatch', 'sha256 differ', remSrcNewer, 'sha256'),
     f('ror/builds/1.28.0/manifest.json', 'checksum_mismatch', 'size 4096 vs 4101', remConditional),
@@ -187,7 +185,7 @@ const skipLie: ParityOutcome = {
   in_sync: false,
   scanned_at: ago(2),
   conflict_policy: 'skip-if-dest-exists',
-  actionable: { rerun_fixes: 0, rerun_conditional: 0, needs_manual: 3, copy_failing: 0, foreign_orphans: 0 },
+  actionable: { rerun_fixes: 0, rerun_conditional: 0, needs_manual: 3, copy_failing: 0 },
   mismatch_samples: [
     f('ror/builds/1.28.0/readonlyrest-1.28.0_es8.0.0.zip', 'checksum_mismatch', 'sha256 differ', remSkipLie, 'sha256'),
     f('ror/builds/1.28.0/manifest.json', 'checksum_mismatch', 'size 4096 vs 4101', remChangePolicy),

@@ -42,7 +42,6 @@ pub enum ReasonCode {
     DivergedSameTimestamp,
     DivergedUnknownAge,
     RuleOwnedOrphanSourceDeleted,
-    ForeignOrphan,
 }
 
 /// Why a re-run would NOT help.
@@ -55,7 +54,6 @@ pub enum NoReason {
     /// differ in content, so a re-run neither side wins → skipped.
     TiedTimestampsNoWinner,
     OrphanNeedsDelete,
-    ForeignNotOurs,
     CopyKeepsFailing,
 }
 
