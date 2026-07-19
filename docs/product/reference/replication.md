@@ -24,7 +24,7 @@ The full reconcile is a **directory-scoped tree walk**, not an up-front full lis
 - Disabled rules and paused rules are skipped by the event consumer, the reconcile scheduler, and run-now alike.
 - A per-rule leader lease prevents two executions of the same rule at the same time. Single-instance (no `config_sync_bucket`) it is a node-local DB lease; with a coordination bucket configured it is an S3 conditional-write lease object (`_dgp/leases/replication/<rule>.json`) visible to every instance — a dead leader's lease lapses and a peer takes over automatically. If a rule is already leased, run-now returns `409 Conflict` and the scheduler skips that tick. Long runs heartbeat the lease before starting new pages/objects; if the lease is lost, the worker stops before doing more work and records a failure.
 - At-least-once semantics. Conflict policies: `newer-wins` (default), `content-diff`, `skip-if-dest-exists`.
-- Optional delete replication for destination objects previously written by the same rule.
+- Optional delete replication (faithful mirror): any destination object absent at source is removed. Requires a destination bucket dedicated to the rule.
 - Optional include / exclude glob filters per rule.
 - Static validation at config load: rule-name regex, humantime interval parsing, self-loop rejection, multi-hop cycle detection.
 
@@ -69,9 +69,9 @@ Rule-name grammar: `[A-Za-z0-9_.-]{1,64}`. The name is also the primary key in t
 
 ## Delete replication
 
-When `replicate_deletes: true`, a run also checks the rule's previously-written destination objects. If the corresponding source object no longer exists, the worker deletes the destination copy.
+When `replicate_deletes: true`, the destination is a **faithful mirror** of the source: any destination object that is not present at source is deleted — regardless of who wrote it. This applies on both the scheduled reconcile and the event-driven path.
 
-The guardrail is provenance: delete replication only targets objects that carry this rule's replication marker. Manually-created destination objects and objects written by a different rule are preserved.
+The only guardrail is source-absence: a destination object is deleted only after a source HEAD confirms the key is genuinely gone (a `NoSuchKey`); any other error preserves it. Because delete replication removes *anything* absent at source — including objects written by other tools or a different rule — the destination bucket must be **dedicated to this rule**. A bucket shared with another writer is not a supported setup for delete replication.
 
 ## What doesn't replicate
 

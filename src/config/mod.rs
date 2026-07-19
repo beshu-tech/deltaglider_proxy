@@ -148,6 +148,14 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Storage",
     },
     EnvVarEntry {
+        name: "DGP_PARITY_HEAD_CONCURRENCY",
+        description: "Concurrent HEADs during a replication Verify (parity) audit \
+                      on an S3 backend; higher is faster, lower is gentler on a \
+                      throttling backend (clamped 1-64)",
+        example: "15",
+        category: "Replication",
+    },
+    EnvVarEntry {
         name: "DGP_BACKEND_LIST_COOLDOWN_SECS",
         description: "How long a backend that fails a bucket listing is skipped \
                       (served from last-known-good) before the next re-probe",
@@ -2947,6 +2955,7 @@ mod tests {
             "DGP_S3_CONNECT_TIMEOUT_SECS",    // storage::s3::build_client()
             "DGP_S3_OPERATION_ATTEMPT_TIMEOUT_SECS", // storage::s3::build_client()
             "DGP_S3_STALL_GRACE_SECS",        // storage::s3::build_client()
+            "DGP_PARITY_HEAD_CONCURRENCY",    // replication::parity::head_burst()
             "DGP_BACKEND_LIST_COOLDOWN_SECS", // storage::routing::RoutingBackend::new()
             "DGP_BACKEND_LIST_TIMEOUT_SECS",  // storage::routing::RoutingBackend::new()
             "DGP_BACKEND_LIST_FRESH_SECS",    // storage::routing::RoutingBackend::new()

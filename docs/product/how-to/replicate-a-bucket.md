@@ -61,7 +61,7 @@ Directory markers and storage-layer delta artifacts never replicate; the engine 
 
 ## 5. Decide on delete replication
 
-By default, deletes do not propagate — `releases-dr` keeps objects that vanish from `releases`. If you want a true mirror, set `replicate_deletes: true`. The guardrail is provenance: delete replication only removes destination objects this rule itself wrote; manually created objects and objects from other rules are preserved.
+By default, deletes do not propagate — `releases-dr` keeps objects that vanish from `releases`. If you want a true mirror, set `replicate_deletes: true`: the destination becomes a faithful mirror where **any** object absent at source is removed (a destination object is deleted only after a source HEAD confirms the key is gone). Because it removes anything not present at source — including objects written by other tools or another rule — the destination bucket (`releases-dr`) must be **dedicated to this rule**.
 
 ## 6. Run it now
 
