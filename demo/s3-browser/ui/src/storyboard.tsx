@@ -193,12 +193,24 @@ const skipLie: ParityOutcome = {
   ],
 };
 
+// Everything matches, but some objects could only be SIZE-matched (no comparable
+// checksum on both sides). NOT a difference — benign blue/info, not amber warning.
+const sizeOnly: ParityOutcome = {
+  ...base,
+  matched: 1284,
+  unverifiable: 685,
+  in_sync: false, // unverifiable > 0 → not fully checksum-proven
+  scanned_at: ago(41),
+  regime: 'transforming',
+};
+
 const FIXTURES: { label: string; outcome: ParityOutcome }[] = [
   { label: 'In sync (the deliverable)', outcome: inSync },
   { label: 'In sync — scan truncated', outcome: truncated },
   { label: 'Differences — missing & extra (amber)', outcome: amber },
   { label: 'Differences — checksum mismatch (red)', outcome: red },
   { label: 'skip-if-dest-exists (the lie)', outcome: skipLie },
+  { label: 'Size-only matches (benign, blue)', outcome: sizeOnly },
 ];
 
 function Storyboard() {

@@ -15,6 +15,7 @@ import RecordList from './RecordList';
 import {
   CaretRightOutlined,
   CheckOutlined,
+  InfoCircleOutlined,
   ReloadOutlined,
   SafetyCertificateOutlined,
   WarningOutlined,
@@ -87,12 +88,15 @@ function useObjRate(scanned: number | undefined): string {
   return `~${rate < 10 ? rate.toFixed(1) : Math.round(rate).toLocaleString()}/s`;
 }
 
-/** Severity drives the halo + headline color: clean → green, mismatch → red, else amber. */
-type Tone = 'green' | 'amber' | 'red';
+/** Severity drives the halo + headline color: clean → green, mismatch → red,
+ *  size-only-only (benign, just not checksum-proven) → blue, else amber. */
+type Tone = 'green' | 'amber' | 'red' | 'blue';
 
 function toneFor(o: ParityOutcome): Tone {
   if (o.in_sync) return 'green';
   if (o.checksum_mismatch > 0) return 'red';
+  // Nothing missing/extra/corrupt, only size-only matches → benign, not a warning.
+  if (o.missing_on_dest === 0 && o.orphan_on_dest === 0 && o.unverifiable > 0) return 'blue';
   return 'amber';
 }
 
@@ -423,19 +427,30 @@ export function ParityResult({
   const pure = outcome.regime === 'pure_mirror';
 
   const haloColor =
-    tone === 'green' ? c.ACCENT_GREEN : tone === 'red' ? c.ACCENT_RED : c.ACCENT_AMBER;
+    tone === 'green'
+      ? c.ACCENT_GREEN
+      : tone === 'red'
+        ? c.ACCENT_RED
+        : tone === 'blue'
+          ? c.ACCENT_BLUE
+          : c.ACCENT_AMBER;
   const glow =
     tone === 'green'
       ? c.GLOW_GREEN
       : tone === 'red'
         ? 'rgba(251,113,133,0.30)'
-        : 'rgba(251,191,36,0.30)';
+        : tone === 'blue'
+          ? 'rgba(45,212,191,0.28)'
+          : 'rgba(251,191,36,0.30)';
 
-  const totalDiffs =
-    outcome.missing_on_dest +
-    outcome.orphan_on_dest +
-    outcome.checksum_mismatch +
-    outcome.unverifiable;
+  // REAL differences = missing / extra / corrupt. Size-only matches
+  // (`unverifiable`) are MATCHES we just couldn't checksum — they are NOT
+  // differences and must not inflate the headline count (the "685 differences"
+  // confusion). They surface separately as an info note + chip.
+  const realDiffs =
+    outcome.missing_on_dest + outcome.orphan_on_dest + outcome.checksum_mismatch;
+  // Only-size-only case: nothing real is wrong, but not fully checksum-proven.
+  const sizeOnlyOnly = realDiffs === 0 && outcome.unverifiable > 0;
 
   const scannedDate = new Date(outcome.scanned_at * 1000);
   const scannedAbsolute = scannedDate.toLocaleString();
@@ -497,6 +512,8 @@ export function ParityResult({
           >
             {inSync ? (
               <CheckOutlined style={{ fontSize: 40, color: haloColor }} />
+            ) : tone === 'blue' ? (
+              <InfoCircleOutlined style={{ fontSize: 38, color: haloColor }} />
             ) : (
               <WarningOutlined style={{ fontSize: 38, color: haloColor }} />
             )}
@@ -509,7 +526,11 @@ export function ParityResult({
             ? outcome.truncated
               ? 'Verified in sync (scanned portion)'
               : 'Verified in sync'
-            : `${totalDiffs.toLocaleString()} difference${totalDiffs === 1 ? '' : 's'} found`}
+            : sizeOnlyOnly
+              ? outcome.truncated
+                ? 'No differences (scanned portion)'
+                : 'No differences found'
+              : `${realDiffs.toLocaleString()} difference${realDiffs === 1 ? '' : 's'} found`}
         </div>
 
         {/* Body line */}
@@ -520,6 +541,13 @@ export function ParityResult({
               {outcome.matched.toLocaleString()}
             </span>{' '}
             objects match by checksum. No missing files, no extras.
+          </div>
+        ) : sizeOnlyOnly ? (
+          <div style={{ fontSize: 14, color: c.TEXT_SECONDARY, lineHeight: 1.55, maxWidth: 460, margin: '0 auto' }}>
+            Nothing is missing, extra, or corrupt. All{' '}
+            <span style={{ fontWeight: 700 }}>{outcome.matched.toLocaleString()}</span> objects match
+            — but <span style={{ fontWeight: 700 }}>{outcome.unverifiable.toLocaleString()}</span> of
+            them could only be size-matched, not checksum-verified (see below).
           </div>
         ) : (
           <div style={{ fontSize: 14, color: c.TEXT_SECONDARY, lineHeight: 1.55, maxWidth: 460, margin: '0 auto' }}>
@@ -607,7 +635,8 @@ export function ParityResult({
         )}
 
         {/* Unverifiable-only case: nothing is missing/extra/corrupt, but some
-            objects could only be size-matched (foreign, no logical SHA-256). */}
+            objects could only be size-matched (no comparable checksum on both
+            sides — see the description for the two common causes). */}
         {!inSync &&
           outcome.unverifiable > 0 &&
           outcome.missing_on_dest === 0 &&
@@ -617,8 +646,8 @@ export function ParityResult({
               type="info"
               showIcon
               style={{ borderRadius: 8, marginTop: 14 }}
-              message="Some objects matched on size only"
-              description="These objects weren't written through the proxy, so only size could be checked — write them through the proxy for full checksum parity."
+              message={`${outcome.unverifiable.toLocaleString()} objects match on size, not checksum`}
+              description="Their sizes match on both sides, but there was no comparable checksum to prove the bytes are identical — usually because they were written to the backend directly (not through the proxy), or the two sides store them differently. This is not a mismatch; re-write them through the proxy if you want full checksum parity."
             />
           )}
 

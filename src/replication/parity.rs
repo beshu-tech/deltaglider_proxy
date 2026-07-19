@@ -169,9 +169,16 @@ pub fn classify_regime(src_lite_authoritative: bool, dst_lite_authoritative: boo
 
 /// Per-category sample cap surfaced to the UI (exact counts stay unbounded).
 pub const SAMPLE_CAP: usize = 100;
-/// Hard ceiling on total objects scanned across both sides before we stop
+/// Default ceiling on total objects scanned across both sides before we stop
 /// and report `truncated=true` (2× usage_scanner's 100k — two prefixes).
+/// Override with `DGP_PARITY_MAX_OBJECTS` for buckets larger than ~100k objects.
 pub const MAX_PARITY_OBJECTS: usize = 200_000;
+
+/// The effective parity scan cap: `DGP_PARITY_MAX_OBJECTS` env override, else
+/// [`MAX_PARITY_OBJECTS`]. Clamped to a sane floor so it can't be set to 0.
+pub fn max_parity_objects() -> usize {
+    crate::config::env_parse_with_default("DGP_PARITY_MAX_OBJECTS", MAX_PARITY_OBJECTS).max(1000)
+}
 /// Objects per `list_objects` page.
 const PAGE_SIZE: u32 = 1000;
 /// Per-page list retries on a transient throttle (503) before giving up.
@@ -360,12 +367,13 @@ pub fn compare_pair(
     }
 
     // Tier 3: size only. Equal here (size diff handled above) → Match but
-    // unverifiable (we couldn't prove byte-equality).
+    // unverifiable (no comparable checksum on both sides, so we could only prove
+    // the sizes match — not the bytes).
     (
         FindingKind::Match,
         Some(Verifier::SizeOnly),
         true,
-        "matched on size only — write through the proxy for checksum parity".to_string(),
+        "size matches; no comparable checksum on both sides to prove byte-equality".to_string(),
     )
 }
 

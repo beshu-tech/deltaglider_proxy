@@ -156,6 +156,14 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Replication",
     },
     EnvVarEntry {
+        name: "DGP_PARITY_MAX_OBJECTS",
+        description: "Max objects a replication Verify (parity) audit scans across \
+                      both sides before it caps and reports a partial result; raise \
+                      it for buckets larger than ~100k objects (min 1000)",
+        example: "500000",
+        category: "Replication",
+    },
+    EnvVarEntry {
         name: "DGP_BACKEND_LIST_COOLDOWN_SECS",
         description: "How long a backend that fails a bucket listing is skipped \
                       (served from last-known-good) before the next re-probe",
@@ -2956,6 +2964,7 @@ mod tests {
             "DGP_S3_OPERATION_ATTEMPT_TIMEOUT_SECS", // storage::s3::build_client()
             "DGP_S3_STALL_GRACE_SECS",        // storage::s3::build_client()
             "DGP_PARITY_HEAD_CONCURRENCY",    // replication::parity::head_burst()
+            "DGP_PARITY_MAX_OBJECTS",         // replication::parity::max_parity_objects()
             "DGP_BACKEND_LIST_COOLDOWN_SECS", // storage::routing::RoutingBackend::new()
             "DGP_BACKEND_LIST_TIMEOUT_SECS",  // storage::routing::RoutingBackend::new()
             "DGP_BACKEND_LIST_FRESH_SECS",    // storage::routing::RoutingBackend::new()

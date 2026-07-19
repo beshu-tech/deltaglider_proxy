@@ -316,7 +316,7 @@ pub async fn verify(
         let outcome = replication::parity_audit(
             &engine,
             &rule,
-            replication::parity::MAX_PARITY_OBJECTS,
+            replication::parity::max_parity_objects(),
             None,
             None,
         )
@@ -438,7 +438,7 @@ pub async fn verify(
         let audit = std::panic::AssertUnwindSafe(replication::parity_audit(
             &engine,
             &rule_clone,
-            replication::parity::MAX_PARITY_OBJECTS,
+            replication::parity::max_parity_objects(),
             Some(&db_for_task),
             Some(replication::parity::ParityProgress {
                 db: &db_for_task,
