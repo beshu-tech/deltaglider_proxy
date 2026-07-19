@@ -281,13 +281,10 @@ pub enum Cmd {
         rel_key: String,
         src_size: u64,
     },
-    /// Delete pipeline: [dest provenance HEAD iff flagged] → src-absence
-    /// HEAD confirm (delete only on NoSuchKey) → engine.delete.
-    Delete {
-        item_id: u64,
-        rel_key: String,
-        needs_provenance_head: bool,
-    },
+    /// Delete pipeline (faithful mirror): src-absence HEAD confirm (delete only
+    /// on NoSuchKey) → engine.delete. No provenance check — any source-absent
+    /// dest key is removed regardless of who wrote it.
+    Delete { item_id: u64, rel_key: String },
 }
 
 /// One listing entry, relative path. `Dir` paths end in `/` and are VERBATIM
@@ -484,7 +481,7 @@ struct DirTask {
     outstanding: usize,
     copy_errors: usize,
     /// Buffered until the dir completes cleanly (AfterDirClean gate).
-    delete_candidates: Vec<(String, bool)>,
+    delete_candidates: Vec<String>,
     pending_pairs: BTreeMap<String, PendingPair>,
     head_batch: [Vec<String>; 2], // [Src, Dest] keys awaiting batch emission
     deletes_flushed: bool,
@@ -523,7 +520,7 @@ pub struct WalkMachine {
     pending: BTreeMap<String, PendingDir>,
     active: BTreeMap<String, DirTask>,
     ready_copies: VecDeque<(u64, String, u64)>,
-    ready_deletes: VecDeque<(u64, String, bool)>,
+    ready_deletes: VecDeque<(u64, String)>,
     ready_heads: VecDeque<(u64, Side, Vec<String>)>,
     routes: HashMap<u64, CmdRoute>,
     next_id: u64,
@@ -643,15 +640,10 @@ impl WalkMachine {
         }
         let mut delete_slots = caps.delete;
         while delete_slots > 0 {
-            let Some((item_id, rel_key, needs_provenance_head)) = self.ready_deletes.pop_front()
-            else {
+            let Some((item_id, rel_key)) = self.ready_deletes.pop_front() else {
                 break;
             };
-            out.push(Cmd::Delete {
-                item_id,
-                rel_key,
-                needs_provenance_head,
-            });
+            out.push(Cmd::Delete { item_id, rel_key });
             delete_slots -= 1;
         }
 
@@ -923,7 +915,7 @@ impl WalkMachine {
         // Buffered delete candidates likewise: the flat sweep re-discovers
         // them (they sit above the restart watermark). Keeping them would
         // double-emit each Delete on completion.
-        for (rel, _) in std::mem::take(&mut task.delete_candidates) {
+        for rel in std::mem::take(&mut task.delete_candidates) {
             self.tracker.settle(&rel);
             task.outstanding -= 1;
         }
@@ -1248,14 +1240,13 @@ impl WalkMachine {
                 // destination is dedicated to this rule. The source-absence
                 // HEAD in the driver is still the safety (delete ONLY on a
                 // confirmed NoSuchKey; any other error preserves).
-                let needs_head = false;
                 let _ = &dest_lite;
                 self.tracker.open_item(&e.path);
                 let Some(task) = self.active.get_mut(key) else {
                     return;
                 };
                 task.outstanding += 1;
-                task.delete_candidates.push((e.path, needs_head));
+                task.delete_candidates.push(e.path);
             }
         }
     }
@@ -1472,7 +1463,7 @@ impl WalkMachine {
                 task.deletes_flushed = true;
                 std::mem::take(&mut task.delete_candidates)
             };
-            for (rel, needs_head) in candidates {
+            for rel in candidates {
                 if clean && self.drained.is_none() {
                     let item_id = self.next_id;
                     self.next_id += 1;
@@ -1483,7 +1474,7 @@ impl WalkMachine {
                             rel: rel.clone(),
                         },
                     );
-                    self.ready_deletes.push_back((item_id, rel, needs_head));
+                    self.ready_deletes.push_back((item_id, rel));
                 } else {
                     // Dirty dir / aborting run: preserve. Settle so the run's
                     // cursor can pass — the NEXT full pass re-discovers them.
@@ -2146,11 +2137,7 @@ mod machine_tests {
                     self.trace.copies.insert(rel_key);
                     self.queue.push(Event::CopySettled { item_id, ok: true });
                 }
-                Cmd::Delete {
-                    item_id,
-                    rel_key,
-                    needs_provenance_head: _,
-                } => {
+                Cmd::Delete { item_id, rel_key } => {
                     // Faithful mirror: the driver's only gate is the src-absence
                     // confirm — a dest key absent at source is deleted regardless
                     // of provenance (the destination is dedicated to this rule).

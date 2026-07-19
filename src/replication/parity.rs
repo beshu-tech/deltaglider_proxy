@@ -717,7 +717,7 @@ fn cache_entry_from_meta(m: &FileMetadata, stored_etag: Option<String>) -> Parit
 /// from the ObjState BEFORE any logical overlay. This is `stored_version` (the
 /// delta-aware token), NOT the logical `etag` — using the logical etag let a
 /// re-delta against a rotated reference collide and serve a stale cached size.
-fn lite_stored_etag(map: &BTreeMap<String, ObjState>, map_key: &str) -> Option<String> {
+fn lite_stored_version(map: &BTreeMap<String, ObjState>, map_key: &str) -> Option<String> {
     map.get(map_key).and_then(|st| st.stored_version.clone())
 }
 
@@ -725,8 +725,8 @@ fn lite_stored_etag(map: &BTreeMap<String, ObjState>, map_key: &str) -> Option<S
 /// cached: the cached `stored_etag` must equal the current lite `stored_etag`.
 /// A `None`/`None` pair (no etag either side) is treated as a MISS — we can't
 /// prove the object is unchanged, so we re-read rather than risk a stale verdict.
-fn cache_hit_fresh(cached: &ParityCacheEntry, lite_stored_etag: &Option<String>) -> bool {
-    matches!((&cached.stored_etag, lite_stored_etag), (Some(a), Some(b)) if a == b)
+fn cache_hit_fresh(cached: &ParityCacheEntry, lite_stored_version: &Option<String>) -> bool {
+    matches!((&cached.stored_etag, lite_stored_version), (Some(a), Some(b)) if a == b)
 }
 
 /// Resolve logical metadata for SOURCE keys queued for resolution: parity cache
@@ -764,7 +764,7 @@ async fn resolve_logical(
         let Ok(dk) = rewrite_key(src_prefix, dst_prefix, raw) else {
             continue;
         };
-        let lite = lite_stored_etag(source, &dk);
+        let lite = lite_stored_version(source, &dk);
         match cached.get(&dk) {
             Some(e) if cache_hit_fresh(e, &lite) => apply_logical(source, &dk, e),
             _ => miss_raw.push(raw),
@@ -784,7 +784,7 @@ async fn resolve_logical(
         };
         match outcome {
             HeadOutcome::Resolved(meta) => {
-                let stored = lite_stored_etag(source, &dk);
+                let stored = lite_stored_version(source, &dk);
                 let e = cache_entry_from_meta(&meta, stored);
                 apply_logical(source, &dk, &e);
                 to_cache.push((dk, e));
@@ -842,7 +842,7 @@ async fn resolve_logical_dest(
     };
     let mut miss: Vec<&String> = Vec::new();
     for k in raw_keys {
-        let lite = lite_stored_etag(dest, k);
+        let lite = lite_stored_version(dest, k);
         match cached.get(k) {
             Some(e) if cache_hit_fresh(e, &lite) => apply_logical(dest, k, e),
             _ => miss.push(k),
@@ -864,7 +864,7 @@ async fn resolve_logical_dest(
                         st.owned_by_rule = Some(event_consumer::owned_by_rule(&meta, &rule.name));
                     }
                 }
-                let stored = lite_stored_etag(dest, &k);
+                let stored = lite_stored_version(dest, &k);
                 let e = cache_entry_from_meta(&meta, stored);
                 apply_logical(dest, &k, &e);
                 to_cache.push((k, e));
@@ -900,6 +900,18 @@ enum HeadOutcome {
 /// outcomes so a transient failure is distinguishable from a raced delete.
 /// Flushes running progress (`base` + completed) so the count keeps moving
 /// through a long burst instead of freezing at the end-of-listing value.
+/// Throttle-abort decision: trip only once the sliding window is FULL and its
+/// transient count meets the threshold. Window-not-full never trips (so a short
+/// startup burst or a small key set can't abort). Pure for unit testing.
+fn throttle_window_tripped(
+    window_len: usize,
+    transient_count: usize,
+    window_cap: usize,
+    min_transient: usize,
+) -> bool {
+    window_len >= window_cap && transient_count >= min_transient
+}
+
 async fn head_burst(
     engine: &DynEngine,
     bucket: &str,
@@ -919,11 +931,15 @@ async fn head_burst(
     // Default 15 (modestly above 10); env-tunable for cautious prod dialing.
     let concurrency: usize =
         crate::config::env_parse_with_default("DGP_PARITY_HEAD_CONCURRENCY", 15usize).clamp(1, 64);
-    // Abort when this many HEADs fail transiently IN A ROW: a throttled/dead
-    // backend sheds load steadily, so a long consecutive-transient run is the
-    // flat-pipeline analogue of the old "whole batch failed" signal. Resolved/
-    // Gone resets the counter — a few scattered transients never trip it.
-    const CONSECUTIVE_TRANSIENT_ABORT: usize = 10;
+    // Abort on a SUSTAINED transient failure RATIO over a sliding window, not a
+    // consecutive run: under `buffer_unordered` outcomes arrive out of order, so
+    // an occasional lucky Resolved would reset a consecutive counter and let a
+    // throttled backend grind on. A windowed ratio (≥ABORT_RATIO transient in the
+    // last WINDOW outcomes, once the window is full) catches sustained partial
+    // throttling the consecutive signal misses. The SDK adaptive limiter still
+    // paces every request after one 503; this is the belt over that suspenders.
+    const ABORT_WINDOW: usize = 40;
+    const ABORT_TRANSIENT_MIN: usize = 32; // ≥80% of the window transient → abort
     const FLUSH_EVERY_N_HEADS: usize = 500;
     let owned: Vec<String> = keys.iter().map(|k| (*k).clone()).collect();
     let mut out: Vec<(String, HeadOutcome)> = Vec::with_capacity(owned.len());
@@ -944,16 +960,27 @@ async fn head_burst(
     }))
     .buffer_unordered(concurrency);
 
-    let mut consecutive_transient = 0usize;
+    let mut window: std::collections::VecDeque<bool> = std::collections::VecDeque::new();
+    let mut window_transient = 0usize;
     let mut aborted = false;
     while let Some((key, outcome)) = stream.next().await {
-        if matches!(outcome, HeadOutcome::Unresolved) {
-            consecutive_transient += 1;
-        } else {
-            consecutive_transient = 0;
+        let is_transient = matches!(outcome, HeadOutcome::Unresolved);
+        window.push_back(is_transient);
+        if is_transient {
+            window_transient += 1;
+        }
+        if window.len() > ABORT_WINDOW && window.pop_front() == Some(true) {
+            window_transient -= 1;
         }
         out.push((key, outcome));
-        if consecutive_transient >= CONSECUTIVE_TRANSIENT_ABORT {
+        // Only judge once the window is full, so a short burst at the very start
+        // can't trip it (and a small key set never trips at all).
+        if throttle_window_tripped(
+            window.len(),
+            window_transient,
+            ABORT_WINDOW,
+            ABORT_TRANSIENT_MIN,
+        ) {
             aborted = true;
             break;
         }
@@ -971,7 +998,7 @@ async fn head_burst(
         let done: std::collections::HashSet<String> = out.iter().map(|(k, _)| k.clone()).collect();
         let leftover = owned.len() - out.len();
         tracing::warn!(
-            "parity resolve on {bucket}: {CONSECUTIVE_TRANSIENT_ABORT} consecutive HEADs failed \
+            "parity resolve on {bucket}: ≥{ABORT_TRANSIENT_MIN}/{ABORT_WINDOW} recent HEADs failed \
              transiently — marking the remaining {leftover} keys unresolved (partial audit) \
              instead of grinding a throttled backend"
         );
@@ -1574,6 +1601,19 @@ mod tests {
         assert!(!should_flush_now(0, 0, min - 1, min));
         // But time arm still fires even with every=0.
         assert!(should_flush_now(0, 0, min, min));
+    }
+
+    #[test]
+    fn throttle_window_trips_only_when_full_and_over_threshold() {
+        // Not full → never trips, even at 100% transient (short startup burst /
+        // small key set can't abort).
+        assert!(!throttle_window_tripped(39, 39, 40, 32));
+        assert!(!throttle_window_tripped(10, 10, 40, 32));
+        // Full but below threshold (e.g. 31/40 transient) → keep going.
+        assert!(!throttle_window_tripped(40, 31, 40, 32));
+        // Full AND at/over threshold → abort (sustained throttling).
+        assert!(throttle_window_tripped(40, 32, 40, 32));
+        assert!(throttle_window_tripped(40, 40, 40, 32));
     }
 
     #[test]

@@ -744,11 +744,7 @@ pub async fn run_rule(
                             }
                         }));
                     }
-                    walk::Cmd::Delete {
-                        item_id,
-                        rel_key,
-                        needs_provenance_head: _,
-                    } => {
+                    walk::Cmd::Delete { item_id, rel_key } => {
                         deletes_inflight += 1;
                         let engine = engine.clone();
                         let src_bucket = rule.source.bucket.clone();

@@ -1100,61 +1100,57 @@ async fn heal_stripped_dest_delta(
     expected_delta_size: u64,
 ) {
     use crate::types::ObjectKey;
-    let dest = match engine
+    // Cheap pre-check OUTSIDE the lock: skip the common healthy case (HEAD returns
+    // the logical size) without taking the lock at all.
+    match engine
         .head(request.destination_bucket, request.destination_key)
         .await
     {
-        Ok(m) => m,
+        Ok(m) if m.file_size == meta.file_size => return, // intact
+        Ok(m) if m.file_size != expected_delta_size => return, // not the stripped signature
+        Ok(_) => {}
         Err(_) => return,
-    };
-    // Intact metadata → HEAD returns logical size → nothing to heal.
-    if dest.file_size == meta.file_size {
-        return;
-    }
-    // Only heal the specific stripped-delta signature (raw delta size back).
-    if dest.file_size != expected_delta_size {
-        return;
     }
     let dest_key = ObjectKey::parse(request.destination_bucket, request.destination_key);
-    // Re-fetch the delta blob from the DEST (present, just metadata-stripped) and
-    // re-PUT with the correct metadata to re-stamp the dg-* headers.
-    let delta_bytes = match engine
-        .get_delta_raw(
-            request.destination_bucket,
-            &dest_key.prefix,
-            &dest_key.filename,
-        )
-        .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(
-                "heal: could not read stripped dest delta {}/{}: {e}",
-                request.destination_bucket, request.destination_key
-            );
-            return;
-        }
-    };
-    if let Err(e) = engine
-        .put_delta_raw(
-            request.destination_bucket,
-            &dest_key.prefix,
-            &dest_key.filename,
-            &delta_bytes,
-            meta,
-        )
-        .await
-    {
-        warn!(
-            "heal: could not re-stamp stripped dest delta {}/{}: {e}",
-            request.destination_bucket, request.destination_key
-        );
-    } else {
-        info!(
-            "heal: re-stamped stripped DG metadata on {}/{}",
-            request.destination_bucket, request.destination_key
-        );
-    }
+    let bucket = request.destination_bucket;
+    let key = request.destination_key;
+    // Re-fetch + re-PUT UNDER the deltaspace prefix lock so a concurrent same-key
+    // writer can't slip a newer blob between our read and re-stamp (which would
+    // re-stamp the newer bytes with the older source's metadata → unreconstructable).
+    // Re-assert the stripped signature INSIDE the lock: if the object changed since
+    // the pre-check, another writer already re-stamped it — nothing to heal.
+    engine
+        .with_dest_prefix_lock(&dest_key.prefix, || async {
+            match engine.head(bucket, key).await {
+                Ok(m) if m.file_size != expected_delta_size => return, // healed/changed under us
+                Ok(_) => {}
+                Err(_) => return,
+            }
+            let delta_bytes = match engine
+                .get_delta_raw(bucket, &dest_key.prefix, &dest_key.filename)
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("heal: could not read stripped dest delta {bucket}/{key}: {e}");
+                    return;
+                }
+            };
+            match engine
+                .put_delta_raw(
+                    bucket,
+                    &dest_key.prefix,
+                    &dest_key.filename,
+                    &delta_bytes,
+                    meta,
+                )
+                .await
+            {
+                Ok(_) => info!("heal: re-stamped stripped DG metadata on {bucket}/{key}"),
+                Err(e) => warn!("heal: could not re-stamp stripped dest delta {bucket}/{key}: {e}"),
+            }
+        })
+        .await;
 }
 
 /// Bounded-memory copy for large objects (Phase 4.1): stream the source
