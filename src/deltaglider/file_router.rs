@@ -99,4 +99,18 @@ mod tests {
         assert!(!router.is_delta_eligible("README"));
         assert!(!router.is_delta_eligible("Makefile"));
     }
+
+    #[test]
+    fn checksum_sidecars_are_never_delta_eligible() {
+        // Parity's is_verbatim_sidecar skips HEADing these on the assumption they
+        // are stored verbatim. If a future eligibility change made a sidecar
+        // delta-eligible, that skip would read the wrong (delta) size — fail here.
+        let router = FileRouter::new();
+        for k in ["x.sha1", "x.sha256", "x.sha512", "app-1.2.3.zip.sha1"] {
+            assert!(
+                !router.is_delta_eligible(k),
+                "sidecar must be verbatim: {k}"
+            );
+        }
+    }
 }

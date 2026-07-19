@@ -632,6 +632,19 @@ fn needs_logical_resolution(engine: &DynEngine, key: &str, meta: &FileMetadata) 
     meta.is_delta() || engine.is_delta_eligible_key(key)
 }
 
+/// True for a small VERBATIM sidecar (`.sha1`/`.sha256`/`.sha512`) that is
+/// stored byte-for-byte on every backend — its lite size/etag are authoritative
+/// even on S3, so it NEVER needs a logical HEAD. These make up a large fraction
+/// of the object count (each artifact ships a checksum sidecar), so skipping
+/// their HEADs roughly halves a HEAD-bound S3 parity sweep. Correctness: a
+/// sidecar can still be a mismatch (size/etag differ) or an orphan — but those
+/// are decided from the lite entry, which is exact for a verbatim object.
+fn is_verbatim_sidecar(engine: &DynEngine, key: &str, meta: &FileMetadata) -> bool {
+    !meta.is_delta()
+        && !engine.is_delta_eligible_key(key)
+        && (key.ends_with(".sha1") || key.ends_with(".sha256") || key.ends_with(".sha512"))
+}
+
 /// Overlay logical (sha256, size, etag) onto the `ObjState` in `map` for `key`.
 fn apply_logical(map: &mut BTreeMap<String, ObjState>, map_key: &str, e: &ParityCacheEntry) {
     if let Some(st) = map.get_mut(map_key) {
@@ -865,65 +878,76 @@ async fn head_burst(
     base: u64,
 ) -> Vec<(String, HeadOutcome)> {
     use futures::stream::StreamExt;
-    // 10, down from 50: fifty concurrent HEADs is the burst shape that trips
-    // Ceph qos (Hetzner 503 SlowDown RCA, 2026-07-09). Ten keeps a resolve
-    // sweep fast on a healthy backend and doubles as the abort batch size.
-    const HEAD_CONCURRENCY: usize = 10;
+    // FLAT pipeline (was batched-with-barrier): keep N HEADs continuously
+    // in flight instead of firing N then waiting for ALL N — the barrier idled
+    // the fast HEADs behind the slowest one in every batch, the dominant cost of
+    // a slow S3 sweep. Peak concurrency is unchanged (still bounded by N), so the
+    // throttle posture that motivated the 50→10 drop (Hetzner Ceph 503 SlowDown,
+    // 2026-07-09) is preserved. Two independent backstops remain: the SDK's
+    // adaptive rate limiter paces ALL requests after one 503, and the
+    // consecutive-transient circuit breaker below aborts a throttled sweep.
+    // Default 15 (modestly above 10); env-tunable for cautious prod dialing.
+    let concurrency: usize =
+        crate::config::env_parse_with_default("DGP_PARITY_HEAD_CONCURRENCY", 15usize).clamp(1, 64);
+    // Abort when this many HEADs fail transiently IN A ROW: a throttled/dead
+    // backend sheds load steadily, so a long consecutive-transient run is the
+    // flat-pipeline analogue of the old "whole batch failed" signal. Resolved/
+    // Gone resets the counter — a few scattered transients never trip it.
+    const CONSECUTIVE_TRANSIENT_ABORT: usize = 10;
     const FLUSH_EVERY_N_HEADS: usize = 500;
     let owned: Vec<String> = keys.iter().map(|k| (*k).clone()).collect();
-    let mut out: Vec<(String, HeadOutcome)> = Vec::new();
-    let mut remaining = owned.as_slice();
-    while !remaining.is_empty() {
-        let (batch, rest) = remaining.split_at(remaining.len().min(HEAD_CONCURRENCY));
-        remaining = rest;
-        let results: Vec<(String, HeadOutcome)> =
-            futures::stream::iter(batch.iter().cloned().map(|key| async move {
-                let outcome = match engine.head(bucket, &key).await {
-                    Ok(m) => HeadOutcome::Resolved(Box::new(m)),
-                    Err(e) => {
-                        let s = e.to_string();
-                        let s = s.to_ascii_lowercase();
-                        if s.contains("not found") || s.contains("nosuchkey") {
-                            HeadOutcome::Gone
-                        } else {
-                            HeadOutcome::Unresolved
-                        }
-                    }
-                };
-                (key, outcome)
-            }))
-            .buffer_unordered(HEAD_CONCURRENCY)
-            .collect()
-            .await;
-        // A batch where EVERY head failed transiently means the backend is
-        // shedding load (503 SlowDown) or unreachable — stop asking and mark
-        // the rest Unresolved. The audit already reports honest partial
-        // coverage for Unresolved keys; grinding on buys nothing.
-        let batch_unresolved = results
-            .iter()
-            .filter(|(_, o)| matches!(o, HeadOutcome::Unresolved))
-            .count();
-        let full_batch_failed = batch_unresolved == results.len() && results.len() >= 3;
-        out.extend(results);
-        if full_batch_failed {
-            tracing::warn!(
-                "parity resolve on {bucket}: a whole HEAD batch failed transiently — \
-                 marking the remaining {} keys unresolved (partial audit) instead of \
-                 grinding a throttled backend",
-                remaining.len()
-            );
-            out.extend(
-                remaining
-                    .iter()
-                    .map(|k| (k.clone(), HeadOutcome::Unresolved)),
-            );
+    let mut out: Vec<(String, HeadOutcome)> = Vec::with_capacity(owned.len());
+
+    let mut stream = futures::stream::iter(owned.iter().cloned().map(|key| async move {
+        let outcome = match engine.head(bucket, &key).await {
+            Ok(m) => HeadOutcome::Resolved(Box::new(m)),
+            Err(e) => {
+                let s = e.to_string().to_ascii_lowercase();
+                if s.contains("not found") || s.contains("nosuchkey") {
+                    HeadOutcome::Gone
+                } else {
+                    HeadOutcome::Unresolved
+                }
+            }
+        };
+        (key, outcome)
+    }))
+    .buffer_unordered(concurrency);
+
+    let mut consecutive_transient = 0usize;
+    let mut aborted = false;
+    while let Some((key, outcome)) = stream.next().await {
+        if matches!(outcome, HeadOutcome::Unresolved) {
+            consecutive_transient += 1;
+        } else {
+            consecutive_transient = 0;
+        }
+        out.push((key, outcome));
+        if consecutive_transient >= CONSECUTIVE_TRANSIENT_ABORT {
+            aborted = true;
             break;
         }
         if let Some(p) = progress {
-            if (out.len() / FLUSH_EVERY_N_HEADS)
-                > (out.len().saturating_sub(batch.len())) / FLUSH_EVERY_N_HEADS
-            {
+            if out.len().is_multiple_of(FLUSH_EVERY_N_HEADS) {
                 p.flush_scanned(base + out.len() as u64).await;
+            }
+        }
+    }
+    // Dropping `stream` cancels the in-flight HEADs. Mark every not-yet-resolved
+    // key Unresolved so the audit reports honest partial coverage (a throttled
+    // backend is never counted as a mismatch) rather than grinding on.
+    if aborted {
+        drop(stream);
+        let done: std::collections::HashSet<String> = out.iter().map(|(k, _)| k.clone()).collect();
+        let leftover = owned.len() - out.len();
+        tracing::warn!(
+            "parity resolve on {bucket}: {CONSECUTIVE_TRANSIENT_ABORT} consecutive HEADs failed \
+             transiently — marking the remaining {leftover} keys unresolved (partial audit) \
+             instead of grinding a throttled backend"
+        );
+        for k in &owned {
+            if !done.contains(k) {
+                out.push((k.clone(), HeadOutcome::Unresolved));
             }
         }
     }
@@ -1173,7 +1197,11 @@ pub async fn parity_audit(
             dest_to_source.insert(dest_key.clone(), key.to_string());
             // PureMirror skips resolution: the lite entry already carries the
             // logical sha/size/etag (filesystem xattr), so the compare is direct.
+            // A verbatim sidecar (.sha1/.sha256/.sha512) is exact from the lite
+            // list on ANY backend — skip its HEAD even when the list isn't
+            // otherwise authoritative (the S3 sweep's biggest avoidable cost).
             if !pure_mirror
+                && !is_verbatim_sidecar(engine, key, meta)
                 && (!src_lite_authoritative || needs_logical_resolution(engine, key, meta))
             {
                 src_needs_logical.push(key.to_string());
@@ -1209,7 +1237,12 @@ pub async fn parity_audit(
             } else {
                 Some(false)
             };
+            // Skip the HEAD for a verbatim sidecar: its size/etag are exact from
+            // the lite list, and ownership no longer gates deletes (faithful
+            // mirror deletes any source-absent key regardless of provenance), so
+            // the ownership overlay a HEAD would provide changes no verdict.
             if !pure_mirror
+                && !is_verbatim_sidecar(engine, key, meta)
                 && (!dest_lite_authoritative || needs_logical_resolution(engine, key, meta))
             {
                 dst_needs_logical.push(key.to_string());
