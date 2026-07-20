@@ -8,7 +8,66 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-07-19_
+_Last updated: 2026-07-20_
+
+## v1.15.5 — 2026-07-20
+
+### Changed — Verify is now honest about what it proves (a metadata audit)
+
+The replication **Verify** feature is now called an **Audit** and states plainly
+what it does: a fast *metadata* audit that checks every source object exists on
+the destination with matching **recorded** checksums and sizes — with **no
+downloads**. It compares recorded metadata; it does not re-read the destination's
+stored bytes, so it proves the two sides *agree*, not that the destination
+reconstructs byte-for-byte. The old copy over-claimed a byte-level guarantee it
+never delivered (the recorded checksum is copied source→dest verbatim on the
+delta fast path, so a match there is a metadata match, not a proof of the landed
+bytes). A clean audit now shows a **"Want byte-level certainty?"** panel that
+names deep byte verification as a separate, upcoming capability — so the ceiling
+of the audit is explicit, not implied.
+
+We investigated a cheap "compare the backend ETag" shortcut to catch stored-byte
+corruption without downloads and **rejected it**: it can't be gated safely across
+encrypted, cross-backend, or multipart destinations without painting healthy
+mirrors as corrupt. Real byte-level proof requires reconstructing and re-hashing,
+which will ship as an explicit opt-in.
+
+### Changed — one authoritative Verify verdict
+
+The audit now returns a single server-decided verdict — **Verified in sync**,
+**Not fully verified**, or **Differences found** — with a plain-language sentence,
+instead of the screen inferring severity from raw counts. This removes cases where
+the headline and the status icon could disagree (e.g. "685 differences" for a
+backup where nothing was actually different).
+
+### Fixed — Verify progress no longer looks frozen
+
+On a large bucket the progress bar sat at an indeterminate "spinner" for the whole
+listing phase (the slowest part), so a multi-minute audit looked stuck and got
+killed. The bar now seeds an estimated total from the previous run's object count
+(so it's determinate from the first update) and labels the phase ("Listing
+objects…" → "Comparing…"); the exact total still corrects it once listing
+finishes. The "scan capped" notice now says plainly that the rest is *unverified*
+and names the `DGP_PARITY_MAX_OBJECTS` knob to raise the cap.
+
+### Fixed — Verify no longer calls size-only matches "differences"
+
+The **Verify** result counted objects that match on size but can't be
+checksum-compared (no comparable checksum on both sides) toward its "N
+differences found" headline, with an amber warning — so a backup where nothing
+was actually wrong could read as "685 differences found". Those are matches, not
+differences: the headline now counts only genuinely missing/extra/corrupt
+objects, a size-only-only result reads **"No differences found"** with a neutral
+info icon, and the explanation no longer asserts a single cause — it names both
+(objects written to the backend directly instead of through the proxy, or the
+two sides storing them differently) and states plainly that it is not a mismatch.
+
+### Added — tunable Verify scan cap
+
+`DGP_PARITY_MAX_OBJECTS` (default 200000) sets how many objects a Verify audit
+scans across both sides before it caps and reports a partial ("scan capped")
+result. Raise it for buckets larger than ~100k objects so the whole bucket is
+covered in one audit.
 
 ## v1.15.4 — 2026-07-19
 
