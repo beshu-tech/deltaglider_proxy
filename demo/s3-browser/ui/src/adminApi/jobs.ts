@@ -150,8 +150,9 @@ export interface ParityOutcome {
   verdict_summary?: string;
 }
 
-/** The single server-derived conclusion of a parity audit. */
-export type Verdict = 'safe' | 'incomplete' | 'at_risk';
+/** The single server-derived conclusion of a parity audit. Internal to the
+ *  outcome shape (consumed via `ParityOutcome.verdict`); not re-exported. */
+type Verdict = 'safe' | 'incomplete' | 'at_risk';
 
 export async function getJobs(): Promise<JobsOverview> {
   return fetchJson('/api/admin/jobs', 'Jobs');
