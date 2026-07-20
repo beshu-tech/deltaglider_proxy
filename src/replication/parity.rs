@@ -170,9 +170,12 @@ pub fn classify_regime(src_lite_authoritative: bool, dst_lite_authoritative: boo
 /// Per-category sample cap surfaced to the UI (exact counts stay unbounded).
 pub const SAMPLE_CAP: usize = 100;
 /// Default ceiling on total objects scanned across both sides before we stop
-/// and report `truncated=true` (2× usage_scanner's 100k — two prefixes).
-/// Override with `DGP_PARITY_MAX_OBJECTS` for buckets larger than ~100k objects.
-pub const MAX_PARITY_OBJECTS: usize = 200_000;
+/// and report `truncated=true`. This is a runaway-scan safety ceiling, not a
+/// tuning knob — the audit already has a throttle backstop + tunable
+/// concurrency, so the cost of a high default is only more list/HEAD pages on a
+/// genuinely huge bucket. Set at 1M (≈500k objects/side) so a normal large
+/// mirror is scanned whole; override with `DGP_PARITY_MAX_OBJECTS` if needed.
+pub const MAX_PARITY_OBJECTS: usize = 1_000_000;
 
 /// The effective parity scan cap: `DGP_PARITY_MAX_OBJECTS` env override, else
 /// [`MAX_PARITY_OBJECTS`]. Clamped to a sane floor so it can't be set to 0.

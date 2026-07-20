@@ -158,9 +158,10 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     EnvVarEntry {
         name: "DGP_PARITY_MAX_OBJECTS",
         description: "Max objects a replication Verify (parity) audit scans across \
-                      both sides before it caps and reports a partial result; raise \
-                      it for buckets larger than ~100k objects (min 1000)",
-        example: "500000",
+                      both sides before it caps and reports a partial result; a \
+                      runaway-scan safety ceiling (default 1000000, ≈500k/side), \
+                      raise for even larger mirrors (min 1000)",
+        example: "1000000",
         category: "Replication",
     },
     EnvVarEntry {

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed — Verify scan-cap default raised to 1,000,000
+
+The default `DGP_PARITY_MAX_OBJECTS` (max objects a Verify audit scans across
+both sides before it caps and reports a partial result) is now **1,000,000**
+(was 200,000). This is a runaway-scan safety ceiling — the audit already has a
+throttle backstop and tunable concurrency — so the old default was capping
+ordinary large mirrors (~100k objects/side) and reporting them as "not fully
+verified" when they were fine. The new default covers ≈500k objects/side; still
+overridable via the env var for even larger buckets.
+
 ## v1.15.5 — 2026-07-20
 
 ### Changed — Verify is now honest about what it proves (a metadata audit)
