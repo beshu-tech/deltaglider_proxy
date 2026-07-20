@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.15.5 — 2026-07-20
+
 ### Changed — Verify is now honest about what it proves (a metadata audit)
 
 The replication **Verify** feature is now called an **Audit** and states plainly
