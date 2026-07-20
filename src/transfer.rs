@@ -629,6 +629,17 @@ async fn verify_destination(
         expected_multipart_etag,
     )
     .await
+    .map(|_| ())
+}
+
+/// Which way `verify_destination_sized` accepted the destination.
+#[derive(Debug, PartialEq, Eq)]
+enum VerifyAccepted {
+    /// HEAD returned the LOGICAL size — DG metadata intact, nothing to heal.
+    Intact,
+    /// HEAD returned the raw delta-blob size — the backend stripped the metadata;
+    /// the object is present + correctly sized, but the caller must re-stamp it.
+    StrippedDelta,
 }
 
 /// Like [`verify_destination`], but tolerant of a delta object whose DG
@@ -645,7 +656,7 @@ async fn verify_destination_sized(
     expected_bytes: usize,
     stored_delta_size: Option<u64>,
     expected_multipart_etag: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<VerifyAccepted, Box<dyn std::error::Error + Send + Sync>> {
     let dest = engine
         .head(request.destination_bucket, request.destination_key)
         .await
@@ -659,7 +670,10 @@ async fn verify_destination_sized(
         dest.multipart_etag.as_deref(),
         expected_multipart_etag,
     ) {
-        Ok(()) => Ok(()),
+        // Distinguish the two accept paths so the caller's heal can skip its own
+        // redundant HEAD: logical size → intact; stored-delta size → stripped.
+        Ok(()) if dest.file_size == expected_bytes as u64 => Ok(VerifyAccepted::Intact),
+        Ok(()) => Ok(VerifyAccepted::StrippedDelta),
         Err(VerifyReject::Size { found }) => Err(format!(
             "destination verify failed: expected {} bytes, found {}",
             expected_bytes, found
@@ -1055,7 +1069,9 @@ async fn delta_passthrough_copy(
     // If the backend stripped that metadata, HEAD falls back to the raw delta
     // size — accept that (== the blob we just shipped) instead of false-failing,
     // then heal the metadata so the object stays restorable + verifies cleanly.
-    verify_destination_sized(
+    // Verify already HEADed the dest; its verdict tells us whether a heal is
+    // needed, so heal only fires (and re-HEADs under the lock) on the stripped path.
+    let accepted = verify_destination_sized(
         engine,
         request,
         source_head.file_size as usize,
@@ -1063,7 +1079,9 @@ async fn delta_passthrough_copy(
         source_head.multipart_etag.as_deref(),
     )
     .await?;
-    heal_stripped_dest_delta(engine, request, &counter_meta, src_delta_size).await;
+    if accepted == VerifyAccepted::StrippedDelta {
+        heal_stripped_dest_delta(engine, request, &counter_meta, src_delta_size).await;
+    }
 
     let bytes_egress_saved = source_head.file_size.saturating_sub(src_delta_size);
     // Metric counts replication only — lifecycle transitions share this path
@@ -1086,13 +1104,14 @@ async fn delta_passthrough_copy(
 
 /// Heal a destination delta object whose DG metadata the backend stripped.
 ///
-/// After a verbatim delta ship, if the dest HEAD resolves to the raw delta size
-/// (not the logical size), the backend dropped the object's `x-amz-meta-dg-*`
-/// headers — so a client GET would mis-detect it as a passthrough and serve the
-/// raw delta bytes (corruption), and every re-verify would false-fail. Re-PUT
-/// the same delta bytes with the correct metadata (`meta`, which carries the
-/// logical StorageInfo::Delta fields). Best-effort: a failure here doesn't fail
-/// the copy — the object is present and byte-correct; the next run retries.
+/// Called ONLY when `verify_destination_sized` already accepted the dest via the
+/// stripped-delta path (HEAD returned the raw delta size, not the logical size),
+/// so no redundant pre-check HEAD here — verify's verdict is the gate. A stripped
+/// object would make a client GET mis-detect it as passthrough and serve the raw
+/// delta bytes (corruption), and every re-verify false-fail. Re-PUT the same delta
+/// bytes with the correct metadata (`meta`, the logical StorageInfo::Delta fields)
+/// UNDER the deltaspace lock. Best-effort: a failure here doesn't fail the copy —
+/// the object is present and byte-correct; the next run retries.
 async fn heal_stripped_dest_delta(
     engine: &Arc<DynEngine>,
     request: ObjectTransferRequest<'_>,
@@ -1100,17 +1119,6 @@ async fn heal_stripped_dest_delta(
     expected_delta_size: u64,
 ) {
     use crate::types::ObjectKey;
-    // Cheap pre-check OUTSIDE the lock: skip the common healthy case (HEAD returns
-    // the logical size) without taking the lock at all.
-    match engine
-        .head(request.destination_bucket, request.destination_key)
-        .await
-    {
-        Ok(m) if m.file_size == meta.file_size => return, // intact
-        Ok(m) if m.file_size != expected_delta_size => return, // not the stripped signature
-        Ok(_) => {}
-        Err(_) => return,
-    }
     let dest_key = ObjectKey::parse(request.destination_bucket, request.destination_key);
     let bucket = request.destination_bucket;
     let key = request.destination_key;

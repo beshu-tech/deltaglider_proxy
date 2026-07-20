@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Fixed — Verify no longer calls size-only matches "differences"
+
+The **Verify** result counted objects that match on size but can't be
+checksum-compared (no comparable checksum on both sides) toward its "N
+differences found" headline, with an amber warning — so a backup where nothing
+was actually wrong could read as "685 differences found". Those are matches, not
+differences: the headline now counts only genuinely missing/extra/corrupt
+objects, a size-only-only result reads **"No differences found"** with a neutral
+info icon, and the explanation no longer asserts a single cause — it names both
+(objects written to the backend directly instead of through the proxy, or the
+two sides storing them differently) and states plainly that it is not a mismatch.
+
+### Added — tunable Verify scan cap
+
+`DGP_PARITY_MAX_OBJECTS` (default 200000) sets how many objects a Verify audit
+scans across both sides before it caps and reports a partial ("scan capped")
+result. Raise it for buckets larger than ~100k objects so the whole bucket is
+covered in one audit.
+
 ## v1.15.4 — 2026-07-19
 
 ### Fixed — much faster replication Verify
