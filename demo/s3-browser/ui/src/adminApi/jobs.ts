@@ -142,7 +142,16 @@ export interface ParityOutcome {
   missing_samples: ParityFinding[];
   orphan_samples: ParityFinding[];
   mismatch_samples: ParityFinding[];
+  /** THE authoritative conclusion, derived server-side. The UI renders this
+   *  verdict + its summary instead of re-deriving tone from the raw counts, so
+   *  the halo and the headline can never disagree. Optional for pre-field rows. */
+  verdict?: Verdict;
+  /** Plain-language sentence matching `verdict` — shown verbatim as the body. */
+  verdict_summary?: string;
 }
+
+/** The single server-derived conclusion of a parity audit. */
+export type Verdict = 'safe' | 'incomplete' | 'at_risk';
 
 export async function getJobs(): Promise<JobsOverview> {
   return fetchJson('/api/admin/jobs', 'Jobs');

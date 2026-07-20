@@ -645,6 +645,87 @@ pub struct ParityOutcome {
     pub missing_samples: Vec<ParityFinding>,
     pub orphan_samples: Vec<ParityFinding>,
     pub mismatch_samples: Vec<ParityFinding>,
+    /// The ONE authoritative verdict, derived server-side (see `derive_verdict`)
+    /// so the frontend renders a single conclusion instead of re-deriving tone
+    /// from the raw counts. Defaults to `Safe` for outcomes serialized before
+    /// this field existed (harmless — a stale row is re-verified on view).
+    #[serde(default = "default_verdict")]
+    pub verdict: Verdict,
+    /// One-sentence, human plain-language summary matching `verdict` — the
+    /// headline the UI shows verbatim. Empty for pre-field outcomes.
+    #[serde(default)]
+    pub verdict_summary: String,
+}
+
+/// The single authoritative conclusion of a parity audit. Replaces the
+/// frontend's `toneFor` count-arithmetic (VerifyTab.tsx) so "685 differences"
+/// and "no differences while not in_sync" can never disagree with the halo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Every source object is present on the destination and proven equal.
+    #[default]
+    Safe,
+    /// Nothing is missing/extra/different, but the scan couldn't PROVE full
+    /// equality — capped scan, unresolved HEADs, or size-only matches. Benign
+    /// but not a clean bill of health.
+    Incomplete,
+    /// Real divergence: something is missing, extra, or its bytes differ.
+    AtRisk,
+}
+
+fn default_verdict() -> Verdict {
+    Verdict::Safe
+}
+
+/// PURE: the single conclusion + its plain-language sentence, from the counts.
+/// Precedence: any real divergence (missing/extra/mismatch) → AtRisk; else a
+/// truncated or size-only-only or otherwise-not-in_sync scan → Incomplete;
+/// else Safe. `matched`/`source_objects` fill the sentence's denominator.
+pub fn derive_verdict(
+    in_sync: bool,
+    truncated: bool,
+    missing_on_dest: u64,
+    orphan_on_dest: u64,
+    checksum_mismatch: u64,
+    unverifiable: u64,
+    matched: u64,
+) -> (Verdict, String) {
+    let real_diffs = missing_on_dest + orphan_on_dest + checksum_mismatch;
+    if real_diffs > 0 {
+        let mut parts = Vec::new();
+        if missing_on_dest > 0 {
+            parts.push(format!("{missing_on_dest} missing on destination"));
+        }
+        if orphan_on_dest > 0 {
+            parts.push(format!("{orphan_on_dest} extra on destination"));
+        }
+        if checksum_mismatch > 0 {
+            parts.push(format!("{checksum_mismatch} with differing bytes"));
+        }
+        return (
+            Verdict::AtRisk,
+            format!("The copy has drifted: {}.", parts.join(", ")),
+        );
+    }
+    if in_sync {
+        return (
+            Verdict::Safe,
+            format!("All {matched} objects are present and verified identical."),
+        );
+    }
+    // Not in_sync with no real diffs → couldn't fully prove equality.
+    let why = if truncated {
+        "the scan was capped or some objects couldn't be read, so completeness isn't proven"
+    } else if unverifiable > 0 {
+        "some objects could only be matched by size, not by checksum"
+    } else {
+        "equality couldn't be fully proven"
+    };
+    (
+        Verdict::Incomplete,
+        format!("Nothing is missing or different, but {why}."),
+    )
 }
 
 /// True when an object listed under a prefix is an internal/marker key we
@@ -1457,6 +1538,16 @@ pub async fn parity_audit(
     );
     let actionable = fold_actionable(&diff);
 
+    let (verdict, verdict_summary) = derive_verdict(
+        in_sync,
+        truncated,
+        diff.missing_on_dest,
+        diff.orphan_on_dest,
+        diff.checksum_mismatch,
+        diff.unverifiable,
+        diff.matched,
+    );
+
     Ok(ParityOutcome {
         rule_name: rule.name.clone(),
         source_bucket: rule.source.bucket.clone(),
@@ -1478,6 +1569,8 @@ pub async fn parity_audit(
         missing_samples: diff.missing_samples,
         orphan_samples: diff.orphan_samples,
         mismatch_samples: diff.mismatch_samples,
+        verdict,
+        verdict_summary,
     })
 }
 
@@ -1495,6 +1588,51 @@ mod tests {
         assert_eq!(classify_regime(false, true), Transforming);
         assert_eq!(classify_regime(true, false), Transforming);
         assert_eq!(classify_regime(false, false), Transforming);
+    }
+
+    #[test]
+    fn derive_verdict_truth_table() {
+        // Clean in-sync → Safe.
+        let (v, s) = derive_verdict(true, false, 0, 0, 0, 0, 42);
+        assert_eq!(v, Verdict::Safe);
+        assert!(s.contains("42") && s.contains("identical"), "{s}");
+
+        // Any real divergence → AtRisk, regardless of in_sync flag shape.
+        assert_eq!(
+            derive_verdict(false, false, 3, 0, 0, 0, 10).0,
+            Verdict::AtRisk
+        );
+        assert_eq!(
+            derive_verdict(false, false, 0, 2, 0, 0, 10).0,
+            Verdict::AtRisk
+        );
+        assert_eq!(
+            derive_verdict(false, false, 0, 0, 1, 0, 10).0,
+            Verdict::AtRisk
+        );
+        // Mismatch wins even if something is also missing (both named in summary).
+        let (v, s) = derive_verdict(false, false, 1, 0, 1, 0, 8);
+        assert_eq!(v, Verdict::AtRisk);
+        assert!(s.contains("missing") && s.contains("differing"), "{s}");
+
+        // Not in_sync, no real diffs → Incomplete (never Safe, never AtRisk).
+        // Truncated variant.
+        let (v, s) = derive_verdict(false, true, 0, 0, 0, 0, 100);
+        assert_eq!(v, Verdict::Incomplete);
+        assert!(
+            s.contains("capped") || s.contains("couldn't be read"),
+            "{s}"
+        );
+        // Size-only variant.
+        let (v, s) = derive_verdict(false, false, 0, 0, 0, 5, 100);
+        assert_eq!(v, Verdict::Incomplete);
+        assert!(s.contains("size"), "{s}");
+
+        // AtRisk takes precedence over truncation.
+        assert_eq!(
+            derive_verdict(false, true, 1, 0, 0, 0, 9).0,
+            Verdict::AtRisk
+        );
     }
 
     fn st(sha: Option<&str>, size: u64, etag: Option<&str>, parts: Option<u32>) -> ObjState {

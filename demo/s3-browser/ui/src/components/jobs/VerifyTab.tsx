@@ -88,16 +88,55 @@ function useObjRate(scanned: number | undefined): string {
   return `~${rate < 10 ? rate.toFixed(1) : Math.round(rate).toLocaleString()}/s`;
 }
 
-/** Severity drives the halo + headline color: clean → green, mismatch → red,
- *  size-only-only (benign, just not checksum-proven) → blue, else amber. */
+/** Severity drives the halo + headline color. Driven by the server's
+ *  authoritative `verdict` when present (safe→green, incomplete→blue,
+ *  at_risk→red if any byte-mismatch else amber); falls back to the old
+ *  count-arithmetic for pre-field outcomes so a stale row still renders. */
 type Tone = 'green' | 'amber' | 'red' | 'blue';
 
 function toneFor(o: ParityOutcome): Tone {
+  if (o.verdict) {
+    switch (o.verdict) {
+      case 'safe':
+        return 'green';
+      case 'incomplete':
+        return 'blue';
+      case 'at_risk':
+        return o.checksum_mismatch > 0 ? 'red' : 'amber';
+    }
+  }
+  // Legacy fallback (outcome serialized before `verdict` existed).
   if (o.in_sync) return 'green';
   if (o.checksum_mismatch > 0) return 'red';
-  // Nothing missing/extra/corrupt, only size-only matches → benign, not a warning.
   if (o.missing_on_dest === 0 && o.orphan_on_dest === 0 && o.unverifiable > 0) return 'blue';
   return 'amber';
+}
+
+/** Short headline word from the authoritative verdict (+ truncation nuance).
+ *  Legacy fallback mirrors toneFor/legacyBody: ANY real diff (missing/extra/
+ *  mismatch) → at_risk, so the headline can't read "not fully verified" while
+ *  the halo + body say files are missing. */
+function headlineFor(o: ParityOutcome): string {
+  const realDiffs = o.missing_on_dest + o.orphan_on_dest + o.checksum_mismatch;
+  const v = o.verdict ?? (o.in_sync ? 'safe' : realDiffs > 0 ? 'at_risk' : 'incomplete');
+  const scoped = o.truncated ? ' (scanned portion)' : '';
+  switch (v) {
+    case 'safe':
+      return `Verified in sync${scoped}`;
+    case 'incomplete':
+      return `Not fully verified${scoped}`;
+    case 'at_risk':
+      return `Differences found${scoped}`;
+  }
+}
+
+/** Derived body sentence for pre-field (legacy) outcomes with no summary. */
+function legacyBody(o: ParityOutcome): string {
+  if (o.in_sync) return `All ${o.matched.toLocaleString()} objects match. No missing files, no extras.`;
+  const realDiffs = o.missing_on_dest + o.orphan_on_dest + o.checksum_mismatch;
+  if (realDiffs === 0)
+    return `Nothing is missing or different, but some objects couldn't be fully verified.`;
+  return `${o.matched.toLocaleString()} of ${o.source_objects.toLocaleString()} source objects match. Some are missing or different on the destination.`;
 }
 
 export default function VerifyTab({ ruleName }: Props) {
@@ -126,10 +165,20 @@ export default function VerifyTab({ ruleName }: Props) {
 
   // ── running with NO prior result → live progress + cancel ──────────────────
   if (running && !outcome) {
+    // Phase label: an unknown/zero denominator means we're still LISTING (the
+    // dominant early cost on a big bucket); a known total means COMPARING. This
+    // explains the early indeterminate span instead of reading as "frozen".
+    const listing = !s?.progress_total || s.progress_total <= 0;
     return (
       <LoadingBlock
         c={c}
-        label={cancelling ? 'Cancelling…' : 'Comparing source and destination…'}
+        label={
+          cancelling
+            ? 'Cancelling…'
+            : listing
+              ? 'Listing objects…'
+              : 'Comparing source and destination…'
+        }
         scanned={s?.progress_scanned}
         total={s?.progress_total}
         onCancel={cancelling ? undefined : onCancel}
@@ -185,14 +234,15 @@ export default function VerifyTab({ ruleName }: Props) {
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
           <SafetyCertificateOutlined style={{ fontSize: 18, color: c.ACCENT_BLUE }} />
           <Text strong style={{ fontSize: 15 }}>
-            Verify replication parity
+            Audit replication parity
           </Text>
         </div>
         <Text style={{ display: 'block', color: c.TEXT_SECONDARY, lineHeight: 1.5, marginBottom: 4 }}>
-          Verify that every object in the source exists on the destination with a matching checksum.
+          A fast <strong>metadata audit</strong>: it checks that every source object exists on the
+          destination and that their recorded checksums and sizes agree.
         </Text>
         <Text type="secondary" style={{ display: 'block', fontSize: 12.5, marginBottom: 18 }}>
-          Checks that every object matches — no downloads. Runs in the background;
+          No downloads — it does not re-read the destination's bytes. Runs in the background;
           the result is saved, so you can leave this page and come back.
         </Text>
         <Button
@@ -201,7 +251,7 @@ export default function VerifyTab({ ruleName }: Props) {
           onClick={run}
           loading={start.isPending}
         >
-          Run verification
+          Run audit
         </Button>
       </div>
     );
@@ -348,7 +398,7 @@ function LoadingBlock({
         </div>
 
         <Text type="secondary" style={{ display: 'block', fontSize: 11.5, color: c.TEXT_MUTED, marginTop: 16 }}>
-          Checks that every object matches — no downloads. Runs in the background, so you can
+          Comparing recorded metadata — no downloads. Runs in the background, so you can
           leave this page and come back.
         </Text>
 
@@ -443,15 +493,6 @@ export function ParityResult({
           ? 'rgba(45,212,191,0.28)'
           : 'rgba(251,191,36,0.30)';
 
-  // REAL differences = missing / extra / corrupt. Size-only matches
-  // (`unverifiable`) are MATCHES we just couldn't checksum — they are NOT
-  // differences and must not inflate the headline count (the "685 differences"
-  // confusion). They surface separately as an info note + chip.
-  const realDiffs =
-    outcome.missing_on_dest + outcome.orphan_on_dest + outcome.checksum_mismatch;
-  // Only-size-only case: nothing real is wrong, but not fully checksum-proven.
-  const sizeOnlyOnly = realDiffs === 0 && outcome.unverifiable > 0;
-
   const scannedDate = new Date(outcome.scanned_at * 1000);
   const scannedAbsolute = scannedDate.toLocaleString();
 
@@ -520,41 +561,17 @@ export function ParityResult({
           </div>
         </div>
 
-        {/* Headline */}
+        {/* Headline — one word from the authoritative verdict. */}
         <div style={{ fontSize: 21, fontWeight: 700, color: c.TEXT_PRIMARY, marginBottom: 8 }}>
-          {inSync
-            ? outcome.truncated
-              ? 'Verified in sync (scanned portion)'
-              : 'Verified in sync'
-            : sizeOnlyOnly
-              ? outcome.truncated
-                ? 'No differences (scanned portion)'
-                : 'No differences found'
-              : `${realDiffs.toLocaleString()} difference${realDiffs === 1 ? '' : 's'} found`}
+          {headlineFor(outcome)}
         </div>
 
-        {/* Body line */}
-        {inSync ? (
-          <div style={{ fontSize: 14, color: c.TEXT_SECONDARY, lineHeight: 1.55, maxWidth: 440, margin: '0 auto' }}>
-            All{' '}
-            <span style={{ color: haloColor, fontWeight: 700 }}>
-              {outcome.matched.toLocaleString()}
-            </span>{' '}
-            objects match by checksum. No missing files, no extras.
-          </div>
-        ) : sizeOnlyOnly ? (
-          <div style={{ fontSize: 14, color: c.TEXT_SECONDARY, lineHeight: 1.55, maxWidth: 460, margin: '0 auto' }}>
-            Nothing is missing, extra, or corrupt. All{' '}
-            <span style={{ fontWeight: 700 }}>{outcome.matched.toLocaleString()}</span> objects match
-            — but <span style={{ fontWeight: 700 }}>{outcome.unverifiable.toLocaleString()}</span> of
-            them could only be size-matched, not checksum-verified (see below).
-          </div>
-        ) : (
-          <div style={{ fontSize: 14, color: c.TEXT_SECONDARY, lineHeight: 1.55, maxWidth: 460, margin: '0 auto' }}>
-            {outcome.matched.toLocaleString()} of {outcome.source_objects.toLocaleString()} source
-            objects match. Some files are missing or different on the destination.
-          </div>
-        )}
+        {/* Body line — the server's plain-language summary, verbatim, so the
+            halo and the sentence can never disagree. Falls back to a derived
+            sentence for pre-field (legacy) outcomes. */}
+        <div style={{ fontSize: 14, color: c.TEXT_SECONDARY, lineHeight: 1.55, maxWidth: 460, margin: '0 auto' }}>
+          {outcome.verdict_summary || legacyBody(outcome)}
+        </div>
 
         {/* Rule-context line — WHY the verdicts read as they do. */}
         <RuleContextLine outcome={outcome} c={c} />
@@ -588,15 +605,17 @@ export function ParityResult({
         {/* Honest, sample-scoped actionable summary (only when not in sync). */}
         {!inSync && <ActionableLine outcome={outcome} c={c} />}
 
-        {/* Provenance footnote */}
+        {/* Provenance footnote — states the actual mechanism honestly. Both
+            regimes are metadata-only (no downloads); they differ in HOW the
+            metadata was sourced, which is the honest distinction to surface. */}
         <div
           style={{ fontSize: 12, color: c.TEXT_MUTED, marginTop: 18 }}
           title={`Scanned at ${scannedAbsolute}`}
         >
           Checked {timeAgo(scannedDate)} ·{' '}
           {pure
-            ? 'metadata only — no downloads'
-            : 'metadata only — no downloads'}
+            ? 'compared sizes + checksums from the object listing — no downloads'
+            : 'compared recorded checksums + sizes — no downloads'}
         </div>
 
         {/* Re-verify control lives here only when idle; while running, the
@@ -604,11 +623,18 @@ export function ParityResult({
         {!reverifying && (
           <div style={{ marginTop: 18, display: 'flex', gap: 8, justifyContent: 'center', alignItems: 'center' }}>
             <Button icon={<ReloadOutlined />} onClick={onReverify}>
-              {inSync ? 'Re-verify' : 'Verify again'}
+              {inSync ? 'Re-audit' : 'Audit again'}
             </Button>
           </div>
         )}
       </div>
+
+      {/* Earned next step: byte-level deep verify. Prominent after a clean
+          audit; a metadata audit can't PROVE the stored bytes reconstruct, so
+          this is the honest path to certainty. Disabled until the L2 capability
+          ships — shown as "coming soon" so the ceiling of today's audit is
+          explicit rather than implied. */}
+      {!reverifying && tone === 'green' && <DeepVerifyAffordance c={c} />}
 
       {/* Everything below the verdict is also part of the STALE prior result —
           dim it together while a re-verify runs. */}
@@ -621,16 +647,24 @@ export function ParityResult({
           transition: 'opacity 0.2s ease, filter 0.2s ease',
         }}
       >
-        {/* Truncation note */}
+        {/* Truncation note — names the exact cap knob + says plainly that the
+            rest is UNVERIFIED, not proven complete (ROOT D: every limit gets an
+            executable path). */}
         {outcome.truncated && (
           <Alert
-            type="info"
+            type="warning"
             showIcon
             style={{ borderRadius: 8, marginTop: 14 }}
-            message="Scan capped"
-            description={`The audit stopped after the first ${(
-              outcome.source_objects + outcome.dest_objects
-            ).toLocaleString()} objects. Counts and findings cover only the scanned portion.`}
+            message="Only part of the mirror was checked"
+            description={
+              <>
+                The audit stopped after the first{' '}
+                {(outcome.source_objects + outcome.dest_objects).toLocaleString()} objects — the rest
+                are <strong>unverified</strong>, not proven complete. Counts and findings below cover
+                only the scanned portion. Raise the cap with the{' '}
+                <code>DGP_PARITY_MAX_OBJECTS</code> environment variable to scan more.
+              </>
+            }
           />
         )}
 
@@ -661,6 +695,46 @@ export function ParityResult({
           />
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * The earned next step after a clean metadata audit: byte-level deep verify
+ * (reconstruct a sample of objects from their stored delta + reference and
+ * re-hash them). Shown ONLY after a green verdict — a metadata audit proves the
+ * two sides AGREE on recorded checksums, but not that the destination's stored
+ * bytes actually reconstruct. Disabled ("coming soon") until the L2 capability
+ * ships, so the ceiling of today's audit is explicit, not implied.
+ */
+function DeepVerifyAffordance({ c }: { c: ReturnType<typeof useColors> }) {
+  return (
+    <div
+      style={{
+        marginTop: 14,
+        padding: '14px 16px',
+        borderRadius: 12,
+        background: c.BG_ELEVATED,
+        border: `1px dashed ${c.BORDER}`,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 14,
+      }}
+    >
+      <SafetyCertificateOutlined style={{ fontSize: 20, color: c.TEXT_MUTED, flexShrink: 0 }} />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <Text strong style={{ display: 'block', fontSize: 13.5, color: c.TEXT_PRIMARY }}>
+          Want byte-level certainty?
+        </Text>
+        <Text type="secondary" style={{ fontSize: 12.5, color: c.TEXT_MUTED, lineHeight: 1.5 }}>
+          This audit compares recorded metadata — it doesn't re-read the destination's bytes.
+          Deep verify (coming soon) will reconstruct a sample of objects and re-hash them to prove
+          they actually restore.
+        </Text>
+      </div>
+      <Button size="small" disabled style={{ flexShrink: 0 }}>
+        Coming soon
+      </Button>
     </div>
   );
 }

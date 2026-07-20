@@ -991,14 +991,24 @@ impl ConfigDb {
     }
 
     /// Mark a rule's parity audit as RUNNING (clears the prior outcome's error,
-    /// keeps the last outcome_json visible while the new scan runs).
-    pub fn parity_result_set_running(&self, rule: &str, now: i64) -> Result<(), ConfigDbError> {
+    /// keeps the last outcome_json visible while the new scan runs). `est_total`
+    /// seeds `progress_total` with an ESTIMATE (the prior run's object count) so
+    /// the bar goes determinate from the first poll instead of showing a rising
+    /// count against a zero denominator (the "looked frozen" kill). The real
+    /// `parity_result_set_total` corrects it exactly once listing finishes. Pass
+    /// 0 on a first-ever run (no prior estimate → indeterminate, as before).
+    pub fn parity_result_set_running(
+        &self,
+        rule: &str,
+        est_total: i64,
+        now: i64,
+    ) -> Result<(), ConfigDbError> {
         self.conn.execute(
             "INSERT INTO replication_parity (rule_name, status, progress_scanned, progress_total, updated_at)
-             VALUES (?, 'running', 0, 0, ?)
+             VALUES (?, 'running', 0, ?, ?)
              ON CONFLICT(rule_name) DO UPDATE SET
-                status = 'running', progress_scanned = 0, progress_total = 0, last_error = NULL, updated_at = ?",
-            params![rule, now, now],
+                status = 'running', progress_scanned = 0, progress_total = ?, last_error = NULL, updated_at = ?",
+            params![rule, est_total, now, est_total, now],
         )?;
         Ok(())
     }
@@ -1679,18 +1689,22 @@ mod tests {
             db.parity_result_load("r").unwrap().is_none(),
             "idle = no row"
         );
-        db.parity_result_set_running("r", 100).unwrap();
+        // Seed with an ESTIMATE (prior run's object count) → determinate bar
+        // from the first poll; scanned still resets to 0.
+        db.parity_result_set_running("r", 8500, 100).unwrap();
         let row = db.parity_result_load("r").unwrap().unwrap();
         assert_eq!(row.status, "running");
         assert_eq!(row.progress_scanned, 0);
+        assert_eq!(row.progress_total, 8500, "estimate seeds the denominator");
 
         db.parity_result_progress("r", 4200, 110).unwrap();
         db.parity_result_set_total("r", 9000, 110).unwrap();
         let row = db.parity_result_load("r").unwrap().unwrap();
         assert_eq!(row.progress_scanned, 4200);
-        assert_eq!(row.progress_total, 9000);
-        // A new run resets BOTH counters (else a stale denominator shows).
-        db.parity_result_set_running("r", 115).unwrap();
+        assert_eq!(row.progress_total, 9000, "real total corrects the estimate");
+        // A new run resets scanned to 0 and re-seeds the denominator with the
+        // new estimate (0 here = first-ever-style → indeterminate).
+        db.parity_result_set_running("r", 0, 115).unwrap();
         let row = db.parity_result_load("r").unwrap().unwrap();
         assert_eq!((row.progress_scanned, row.progress_total), (0, 0));
 
@@ -1713,7 +1727,7 @@ mod tests {
         let db = db();
         // Cancelling an idle audit is a no-op.
         assert!(!db.parity_request_cancel("r", 100).unwrap());
-        db.parity_result_set_running("r", 100).unwrap();
+        db.parity_result_set_running("r", 0, 100).unwrap();
         // Now a running audit can be signalled.
         assert!(db.parity_request_cancel("r", 110).unwrap());
         assert_eq!(
@@ -1739,7 +1753,7 @@ mod tests {
         assert!(!db
             .parity_try_acquire_lease("r", "owner-b", 110, 60)
             .unwrap());
-        db.parity_result_set_running("r", 110).unwrap();
+        db.parity_result_set_running("r", 0, 110).unwrap();
 
         // Boot reconcile: stale-lease clear + mark a 'running' row failed.
         let n = db.parity_reconcile_on_boot().unwrap();
@@ -1762,7 +1776,7 @@ mod tests {
         // Live lease (expires at 100+60=160), running row.
         db.parity_try_acquire_lease("r", "owner-a", 100, 60)
             .unwrap();
-        db.parity_result_set_running("r", 100).unwrap();
+        db.parity_result_set_running("r", 0, 100).unwrap();
 
         // Before expiry: NOT reaped, still running.
         assert!(!db.parity_reap_if_dead("r", 150).unwrap());

@@ -103,6 +103,8 @@ Pause and resume from the job row (or `POST …/pause` / `…/resume`); paused r
 
 ## Verify
 
+The **Audit** button on the rule's Verify tab runs a fast **metadata audit**: it lists both sides and checks that every source object exists on the destination with matching recorded checksums and sizes. It issues no downloads, so it does **not** re-read the destination's stored bytes — it proves the two sides *agree on recorded metadata*, not that the destination reconstructs byte-for-byte. It returns one verdict — **Verified in sync**, **Not fully verified** (capped scan or size-only matches), or **Differences found** — with a guided fix for each finding. For byte-level proof, use the CLI checks below.
+
 1. The destination has the objects:
 
    ```bash

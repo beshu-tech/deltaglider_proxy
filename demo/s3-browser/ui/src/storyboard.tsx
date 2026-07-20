@@ -126,6 +126,8 @@ const base: ParityOutcome = {
   missing_samples: [],
   orphan_samples: [],
   mismatch_samples: [],
+  verdict: 'safe',
+  verdict_summary: 'All 1284 objects are present and verified identical.',
 };
 
 const inSync: ParityOutcome = { ...base };
@@ -138,6 +140,9 @@ const truncated: ParityOutcome = {
   truncated: true,
   in_sync: false, // truncated → not provably in sync
   scanned_at: ago(11),
+  verdict: 'incomplete',
+  verdict_summary:
+    "Nothing is missing or different, but the scan was capped or some objects couldn't be read, so completeness isn't proven.",
 };
 
 const amber: ParityOutcome = {
@@ -147,6 +152,8 @@ const amber: ParityOutcome = {
   orphan_on_dest: 2,
   in_sync: false,
   scanned_at: ago(1),
+  verdict: 'at_risk',
+  verdict_summary: 'The copy has drifted: 3 missing on destination, 2 extra on destination.',
   // 2 fixable (never-copied) · 1 failing · 2 orphans needing manual action.
   actionable: { rerun_fixes: 2, rerun_conditional: 0, needs_manual: 2, copy_failing: 1 },
   missing_samples: [
@@ -168,6 +175,8 @@ const red: ParityOutcome = {
   unverifiable: 4,
   in_sync: false,
   scanned_at: ago(0),
+  verdict: 'at_risk',
+  verdict_summary: 'The copy has drifted: 3 with differing bytes.',
   actionable: { rerun_fixes: 1, rerun_conditional: 1, needs_manual: 0, copy_failing: 1 },
   mismatch_samples: [
     f('ror/builds/1.28.0/readonlyrest-1.28.0_es8.0.0.zip', 'checksum_mismatch', 'sha256 differ', remSrcNewer, 'sha256'),
@@ -185,6 +194,8 @@ const skipLie: ParityOutcome = {
   in_sync: false,
   scanned_at: ago(2),
   conflict_policy: 'skip-if-dest-exists',
+  verdict: 'at_risk',
+  verdict_summary: 'The copy has drifted: 3 with differing bytes.',
   actionable: { rerun_fixes: 0, rerun_conditional: 0, needs_manual: 3, copy_failing: 0 },
   mismatch_samples: [
     f('ror/builds/1.28.0/readonlyrest-1.28.0_es8.0.0.zip', 'checksum_mismatch', 'sha256 differ', remSkipLie, 'sha256'),
@@ -202,6 +213,9 @@ const sizeOnly: ParityOutcome = {
   in_sync: false, // unverifiable > 0 → not fully checksum-proven
   scanned_at: ago(41),
   regime: 'transforming',
+  verdict: 'incomplete',
+  verdict_summary:
+    'Nothing is missing or different, but some objects could only be matched by size, not by checksum.',
 };
 
 const FIXTURES: { label: string; outcome: ParityOutcome }[] = [

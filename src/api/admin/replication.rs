@@ -397,7 +397,19 @@ pub async fn verify(
 
     {
         let db = db_arc.lock().await;
-        let _ = db.parity_result_set_running(&rule.name, now);
+        // Seed the progress bar with the PRIOR run's object count so it goes
+        // determinate immediately (kills the "looked frozen" indeterminate span
+        // during listing); the driver's real set_total corrects it. First-ever
+        // run has no prior → 0 → indeterminate, as before.
+        let est_total = db
+            .parity_result_load(&rule.name)
+            .ok()
+            .flatten()
+            .and_then(|r| r.outcome_json)
+            .and_then(|j| serde_json::from_str::<replication::ParityOutcome>(&j).ok())
+            .map(|o| (o.source_objects + o.dest_objects) as i64)
+            .unwrap_or(0);
+        let _ = db.parity_result_set_running(&rule.name, est_total, now);
     }
     // NOTE: no sync push — coordination tables (leases, parity, run history)
     // are NODE-LOCAL (dropped from the IAM sync set in B3), so a push cannot
@@ -690,6 +702,8 @@ mod tests {
             missing_samples: vec![],
             orphan_samples: vec![],
             mismatch_samples: vec![],
+            verdict: crate::replication::parity::Verdict::Safe,
+            verdict_summary: "All 1 objects are present and verified identical.".into(),
         };
         serde_json::to_string(&o).expect("serialize test outcome")
     }
