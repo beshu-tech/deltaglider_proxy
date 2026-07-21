@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.16.0 — 2026-07-21
+
 ### Added — backend connection health is now enforced, end to end
 
 A storage backend that can't be reached or whose credentials are rejected can
