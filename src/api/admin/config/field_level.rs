@@ -216,6 +216,11 @@ pub struct BackendInfoResponse {
     /// `GET /backends` only — drives the BackendsPanel capability banner.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capability: Option<crate::coordination::CapabilityVerdict>,
+    /// Connectivity/auth health from the boot probe + re-probe loop.
+    /// `None` = never probed (DGP_BOOT_BACKEND_PROBE=off). Populated by
+    /// `GET /backends` only — drives the BackendsPanel health column.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<crate::coordination::health::HealthEntry>,
 }
 
 impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
@@ -233,6 +238,7 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 encryption,
                 is_synthesized: false,
                 capability: None,
+                health: None,
             },
             crate::config::BackendConfig::S3 {
                 endpoint,
@@ -251,6 +257,7 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 encryption,
                 is_synthesized: false,
                 capability: None,
+                health: None,
             },
         }
     }

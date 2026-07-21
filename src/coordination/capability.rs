@@ -52,7 +52,8 @@ pub struct BackendCapabilityCache {
 
 /// In-memory identity of a backend definition (includes credentials — never
 /// persisted or exposed; a credential rotation deliberately re-probes).
-fn fingerprint(config: &crate::config::BackendConfig) -> String {
+/// Shared with the sibling health cache (`super::health`).
+pub(crate) fn fingerprint(config: &crate::config::BackendConfig) -> String {
     serde_json::to_string(config).unwrap_or_default()
 }
 

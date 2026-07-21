@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react';
-import { Layout, Spin, Empty, Grid, Button, Progress, Space } from 'antd';
+import { Alert, Layout, Spin, Empty, Grid, Button, Progress, Space } from 'antd';
 import useS3Browser from './useS3Browser';
 import TopBar from './components/TopBar';
 import BulkActionBar from './components/BulkActionBar';
@@ -559,9 +559,54 @@ export default function App() {
         )}
 
         <div style={{ flex: 1, overflow: 'auto' }}>
+          {/* An unrefreshed FAULT always outranks the friendly empty state:
+              a failed listing must never render as "No objects yet — add
+              demo data" (the beshu-b2 incident: a bucket whose backend was
+              unreachable looked innocently empty). With stale rows on hand
+              we show them under a warning banner instead. */}
+          {s3.error && !isEmpty && (
+            <Alert
+              type="warning"
+              showIcon
+              banner
+              message="Showing a stale listing — the last refresh failed"
+              description={s3.error}
+              style={{ borderRadius: 0 }}
+            />
+          )}
           {s3.loading && isEmpty ? (
             <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', padding: '64px 0' }}>
               <Spin description="Loading objects..." />
+            </div>
+          ) : s3.error && isEmpty ? (
+            <div style={{ maxWidth: 560, margin: '48px auto', padding: '0 16px' }}>
+              <Alert
+                type="error"
+                showIcon
+                message={
+                  /NoSuchBucket/i.test(s3.error)
+                    ? `Bucket '${activeBucket}' was not found on its storage backend`
+                    : /ServiceUnavailable|unavailable|503/i.test(s3.error)
+                      ? `Bucket '${activeBucket}' is currently unavailable`
+                      : 'Failed to load objects'
+                }
+                description={
+                  <Space direction="vertical" size={8}>
+                    <span>{s3.error}</span>
+                    {/NoSuchBucket/i.test(s3.error) && (
+                      <span>
+                        The bucket exists in this proxy's configuration but not on the
+                        backend it routes to — check the bucket's backend under
+                        Settings → Storage → Buckets, or create it on that backend.
+                      </span>
+                    )}
+                    <Button size="small" onClick={s3.mutate}>
+                      Retry
+                    </Button>
+                  </Space>
+                }
+                style={{ borderRadius: 8 }}
+              />
             </div>
           ) : isEmpty ? (
             <Empty

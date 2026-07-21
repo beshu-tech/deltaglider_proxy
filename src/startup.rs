@@ -357,6 +357,7 @@ pub fn build_s3_router(
     config_db_mismatch: bool,
     public_prefix_snapshot: &deltaglider_proxy::bucket_policy::SharedPublicPrefixSnapshot,
     admission_chain: &deltaglider_proxy::admission::SharedAdmissionChain,
+    shared_config: &deltaglider_proxy::config::SharedConfig,
 ) -> Router {
     use axum::error_handling::HandleError;
     use deltaglider_proxy::iam::IamState;
@@ -731,6 +732,17 @@ pub fn build_s3_router(
             deltaglider_proxy::metrics::http_metrics_middleware,
         ))
         .layer(middleware::from_fn(authorization_middleware))
+        // Backend-health gate: buckets on an UNHEALTHY backend answer an
+        // honest 503 naming the backend + cause, all verbs — instead of
+        // per-request timeout storms or misleading 404s. Permanent layer
+        // for the same reason as the maintenance gate (dynamic state must
+        // survive config rebuilds). Fail-open: only a definitive unhealthy
+        // verdict gates. Deliberately INSIDE SigV4 (runs after signature
+        // verification): the 503 body names internal backend topology and
+        // credential state — anonymous callers must never see it.
+        .layer(middleware::from_fn(
+            deltaglider_proxy::coordination::health::backend_health_gate_middleware,
+        ))
         .layer(middleware::from_fn(sigv4_auth_middleware))
         // Maintenance write-gate: runs after admission, before SigV4. A
         // PERMANENT layer whose contents (the busy-bucket set) swap
@@ -746,7 +758,13 @@ pub fn build_s3_router(
         .layer(axum::Extension(iam_state.clone()))
         .layer(axum::Extension(public_prefix_snapshot.clone()))
         .layer(axum::Extension(admission_chain.clone()))
-        .layer(axum::Extension(state.maintenance_gate.clone()));
+        .layer(axum::Extension(state.maintenance_gate.clone()))
+        .layer(axum::Extension(
+            deltaglider_proxy::coordination::health::BackendHealthGate {
+                health: state.backend_health.clone(),
+                config: shared_config.clone(),
+            },
+        ));
 
     if config_db_mismatch {
         error!(
@@ -1397,6 +1415,75 @@ pub async fn validate_backend_write_capability(
                  {:?} are unvalidated; the proxy continues but multi-instance write safety \
                  is UNPROVEN on this backend. See {CAPABILITY_DOC_URL}",
                 group.buckets
+            ),
+        }
+    }
+}
+
+/// Boot-time backend HEALTH gate: probe every configured backend's
+/// connectivity + credentials before serving.
+///
+/// Policy (`DGP_BOOT_BACKEND_PROBE`, default `enforce`):
+///   - every backend healthy → one info! line each.
+///   - SOME unhealthy → ERROR per backend naming the cause; the proxy starts
+///     DEGRADED (their buckets answer 503 via the health gate until the
+///     re-probe loop sees recovery).
+///   - ALL unhealthy + `enforce` → FATAL exit(1): a proxy with zero working
+///     storage backends serves nothing but garbage.
+///   - `warn` → same probes/logs, never exits. `off` → no probes.
+pub async fn boot_backend_health_gate(
+    config: &Config,
+    health: &deltaglider_proxy::coordination::BackendHealthCache,
+) {
+    use deltaglider_proxy::coordination::health::{
+        boot_probe_mode, probe_backend_health, probe_targets, BootProbeMode,
+    };
+
+    let mode = boot_probe_mode();
+    if mode == BootProbeMode::Off {
+        info!("Backend health gate: DISABLED (DGP_BOOT_BACKEND_PROBE=off)");
+        return;
+    }
+    let targets = probe_targets(config);
+    let total = targets.len();
+    let mut gating = 0usize; // AuthRejected / Unreachable — definitive faults
+    for (name, backend, fallback) in targets {
+        let verdict = probe_backend_health(&backend, fallback.as_deref()).await;
+        health.set(&name, &backend, verdict.clone());
+        if verdict.is_healthy() {
+            info!("backend health: '{name}' — connection healthy");
+        } else if verdict.is_gating() {
+            gating += 1;
+            error!(
+                "backend health: '{name}' UNHEALTHY — {}. Buckets routed to it will \
+                 answer 503 until it recovers (re-probed every 30s)",
+                verdict.cause()
+            );
+        } else {
+            error!(
+                "backend health: '{name}' DEGRADED — {}. Requests are NOT blocked \
+                 (the backend is reachable); re-probed every 30s",
+                verdict.cause()
+            );
+        }
+    }
+    // FATAL only when every backend is DEFINITIVELY dead (creds rejected /
+    // unreachable). A merely-Erroring backend (throttle storm, transient 5xx)
+    // must not turn a restart into a crash loop that hammers the provider.
+    if gating == total && total > 0 {
+        match mode {
+            BootProbeMode::Enforce => {
+                error!(
+                    "FATAL: ALL {total} configured storage backend(s) failed the boot health \
+                     probe — the proxy has no working storage and refuses to start. Fix the \
+                     backend endpoints/credentials, or set DGP_BOOT_BACKEND_PROBE=warn to \
+                     start degraded anyway"
+                );
+                std::process::exit(1);
+            }
+            _ => error!(
+                "ALL {total} configured storage backend(s) failed the boot health probe — \
+                 starting anyway (DGP_BOOT_BACKEND_PROBE=warn); every bucket will answer 503"
             ),
         }
     }

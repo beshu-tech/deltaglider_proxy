@@ -179,7 +179,12 @@ impl TestServer {
             // DGP_BOOTSTRAP_PASSWORD_HASH would otherwise break every
             // test that logs in with [`TEST_BOOTSTRAP_PASSWORD`].
             .env_remove("DGP_BOOTSTRAP_PASSWORD_HASH")
-            .env_remove("DGP_ADMIN_PASSWORD_HASH");
+            .env_remove("DGP_ADMIN_PASSWORD_HASH")
+            // Boot backend-health probe: OFF by default in the harness — many
+            // tests deliberately spawn against dead/absent endpoints and must
+            // not exit(1) or pay probe timeouts. Gate tests opt back in via
+            // .env("DGP_BOOT_BACKEND_PROBE", "enforce").
+            .env("DGP_BOOT_BACKEND_PROBE", "off");
         if let Some(ref key) = encryption_key {
             cmd.env("DGP_ENCRYPTION_KEY", key);
         }
@@ -354,7 +359,12 @@ impl TestServer {
             // Explicitly NOT setting DGP_ENCRYPTION_KEY.
             .env_remove("DGP_ENCRYPTION_KEY")
             .env_remove("DGP_BOOTSTRAP_PASSWORD_HASH")
-            .env_remove("DGP_ADMIN_PASSWORD_HASH");
+            .env_remove("DGP_ADMIN_PASSWORD_HASH")
+            // Boot backend-health probe: OFF by default in the harness — many
+            // tests deliberately spawn against dead/absent endpoints and must
+            // not exit(1) or pay probe timeouts. Gate tests opt back in via
+            // .env("DGP_BOOT_BACKEND_PROBE", "enforce").
+            .env("DGP_BOOT_BACKEND_PROBE", "off");
         for (key, value) in &self.extra_env {
             cmd.env(key, value);
         }
@@ -1415,7 +1425,12 @@ impl TestServer {
             .env("DGP_DEBUG_HEADERS", "true")
             .env("DGP_TRUST_PROXY_HEADERS", "true")
             .env_remove("DGP_BOOTSTRAP_PASSWORD_HASH")
-            .env_remove("DGP_ADMIN_PASSWORD_HASH");
+            .env_remove("DGP_ADMIN_PASSWORD_HASH")
+            // Boot backend-health probe: OFF by default in the harness — many
+            // tests deliberately spawn against dead/absent endpoints and must
+            // not exit(1) or pay probe timeouts. Gate tests opt back in via
+            // .env("DGP_BOOT_BACKEND_PROBE", "enforce").
+            .env("DGP_BOOT_BACKEND_PROBE", "off");
         for (key, value) in &self.extra_env {
             cmd.env(key, value);
         }

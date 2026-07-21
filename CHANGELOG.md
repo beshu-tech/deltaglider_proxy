@@ -2,6 +2,68 @@
 
 ## Unreleased
 
+### Added — backend connection health is now enforced, end to end
+
+A storage backend that can't be reached or whose credentials are rejected can
+no longer hide (previously it booted silently and every request failed
+one-by-one — a bucket on it even rendered as innocently "empty" in the
+browser):
+
+- **Boot probe.** Every configured backend (default + named) is probed at
+  startup — an authenticated call, with a scoped-key fallback so
+  bucket-restricted keys (e.g. Backblaze B2 application keys) don't
+  false-alarm. Unhealthy backends are logged as ERRORs naming the cause
+  (credentials rejected / endpoint unreachable / erroring). If **all**
+  backends fail **definitively** (credentials rejected or unreachable — a
+  merely-erroring/throttling backend never triggers this, so a provider
+  hiccup can't cause a crash loop), the proxy **refuses to start**. Tunable
+  via `DGP_BOOT_BACKEND_PROBE` = `enforce` (default) | `warn` | `off`.
+- **Honest 503s.** Requests to a bucket routed to a backend with a
+  *definitive* fault (credentials rejected / unreachable) answer a fast
+  `503 ServiceUnavailable` naming the backend and cause — all verbs —
+  instead of per-request timeout storms or misleading 404s. A reachable but
+  erroring backend is flagged, never blocked. Unhealthy backends are
+  re-probed every 30s, so recovery self-heals. The 503 (which names internal
+  topology) is only sent to authenticated callers.
+- **Apply gate.** Adding a backend or changing a backend's definition
+  (endpoint, credentials) via the GUI or `config apply` now runs a live
+  connection probe first — a typo'd secret or dead endpoint is **rejected
+  with the exact cause** instead of going live silently. Unchanged backends
+  are never re-probed.
+- **GUI health.** Storage → Backends shows a live health badge per backend
+  (Connected / Credentials rejected / Unreachable), a loud error card when
+  one is down, and a **Test connection** button that runs the probe
+  server-side — exercising the server's actual credentials (the old test
+  ran from the browser and couldn't check credentials at all).
+- **No more innocent empty states.** A failed listing in the file browser now
+  renders as an error naming the cause ("bucket not found on its backend" /
+  "bucket unavailable: backend X unreachable") instead of "No objects yet —
+  add demo data". The bucket-usage chip stops showing stale counts for a
+  bucket whose backend is unreachable.
+
+### Fixed — misrouted buckets can no longer exist silently
+
+A bucket routed to an **undefined backend name** was a warning ("route will be
+ignored") and silently fell through to the default backend — where it 404'd.
+It is now a **fatal config error**: the proxy refuses to boot with it, and
+every apply / section save rejects it, naming the bucket, the missing backend,
+and the available backends. Duplicate backend names are fatal for the same
+reason. Additionally, a bare 404 on bucket probes (HEAD responses carry no
+error body) was misread as a *transient* error, leaving an unrouted bucket
+"transiently" unroutable forever and blocking backend discovery — now
+correctly classified as "bucket absent".
+
+### Fixed — GUI bucket edits no longer fail with a cryptic serde error
+
+Editing a bucket's placement (or any storage setting) could fail with
+`invalid storage section body: invalid type: null, expected a sequence` — a
+raw serde error, unfixable from the GUI. Root cause: the server's JSON
+merge-patch inserted `null` values verbatim for keys that didn't exist yet
+(RFC 7396 defines null as *removal*, which is a no-op on an absent key).
+Fixed per the RFC, and config errors now name the exact offending field
+(`storage.buckets.<name>.public_prefixes: invalid type ...`) instead of a
+path-less message.
+
 ### Changed — Verify scan-cap default raised to 1,000,000
 
 The default `DGP_PARITY_MAX_OBJECTS` (max objects a Verify audit scans across

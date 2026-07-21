@@ -132,6 +132,20 @@ export function normalizeS3Error(err: unknown, context: string): Error {
     return new Error(`${context} failed${status ? ` (${status})` : ''}: ${hint}${reqPart}`);
   }
 
+  // The proxy's own 503s (backend-health gate, maintenance gate) carry a
+  // crafted, actionable <Message> naming the backend and cause — surface it
+  // VERBATIM instead of the generic gateway hint, which would misdirect the
+  // operator toward reverse-proxy limits.
+  const serverMessage = (err as { message?: string })?.message;
+  if (
+    status === 503 &&
+    typeof serverMessage === 'string' &&
+    /backend|read-only|unavailable/i.test(serverMessage)
+  ) {
+    const reqPart = requestIdSuffix(requestId);
+    return new Error(`${context} failed (503): ${serverMessage}${reqPart}`);
+  }
+
   // Gateway/plaintext failures during large PUTs may arrive as non-S3 bodies.
   // Make these explicit even when SDK metadata is incomplete.
   if (status === 502 || status === 503 || status === 504 || hasGatewayBody) {

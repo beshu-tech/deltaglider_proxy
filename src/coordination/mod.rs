@@ -22,10 +22,12 @@
 //! the exact expiry instant is never simultaneously renewable and stealable.
 
 pub mod capability;
+pub mod health;
 pub mod lease;
 pub mod s3_lease;
 
 pub use capability::{BackendCapabilityCache, CapabilityVerdict, VerifiedVia};
+pub use health::{BackendHealthCache, HealthVerdict};
 pub use lease::{CoordinationLease, LeaseSubsystem, LocalLease};
 pub use s3_lease::S3Lease;
 

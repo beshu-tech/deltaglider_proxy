@@ -1,6 +1,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { ReloadOutlined } from '@ant-design/icons';
 import { getBucketUsage, refreshBucketUsage } from '../adminApi';
+import { useBucketOrigins } from '../queries/backends';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
 import { formatBytes } from '../utils';
@@ -38,8 +39,39 @@ export default function BucketUsageChip({
     },
   });
 
+  // When the bucket's backend is unreachable, the running counter is
+  // UNVERIFIABLE — showing the stale number as fact misled the beshu-b2
+  // incident (21,317 objects displayed for a bucket the proxy couldn't even
+  // reach). Render a warning chip instead. Shares the cached origins query.
+  const origins = useBucketOrigins({ enabled: canAdmin && !!bucket });
+  const unavailable = origins.data?.buckets.find((b) => b.name === bucket)?.unavailable;
+
   // No session, no data, or a "disabled" payload (open-mode dev) → render nothing.
   if (!canAdmin || !data || data.object_count == null) return null;
+
+  if (unavailable) {
+    return (
+      <span
+        title={`Backend unreachable — the stored size/count can't be verified. ${unavailable}`}
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: 6,
+          padding: '2px 8px',
+          borderRadius: 6,
+          border: `1px solid ${c.ACCENT_AMBER}66`,
+          background: c.BG_ELEVATED,
+          fontSize: 12,
+          color: c.ACCENT_AMBER,
+          whiteSpace: 'nowrap',
+          cursor: 'default',
+        }}
+      >
+        <span style={{ width: 7, height: 7, borderRadius: '50%', background: c.ACCENT_AMBER }} />
+        backend unreachable
+      </span>
+    );
+  }
 
   const scannedTitle =
     data.last_scan_at != null

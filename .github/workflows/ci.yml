@@ -409,6 +409,7 @@ jobs:
             --test cli_s3_sync_test \
             --test cli_s3_verify_test \
             --test backend_capability_gate_test \
+            --test backend_health_test \
             --test config_sync_ha_test \
             --test config_sync_test \
             --test coordination_lease_test \

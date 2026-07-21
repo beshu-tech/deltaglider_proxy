@@ -5,8 +5,8 @@ import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { Button, Input, Modal, Radio, Switch, Typography, Space, Alert, Spin } from 'antd';
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
-import type { BackendInfo, CreateBackendRequest } from '../adminApi';
-import { createBackend, deleteBackend, testS3Connection, updateAdminConfig, putSection } from '../adminApi';
+import type { BackendHealthEntry, BackendInfo, CreateBackendRequest } from '../adminApi';
+import { createBackend, deleteBackend, probeBackend, testS3Connection, updateAdminConfig, putSection } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
 import { useBackends, useBucketOrigins } from '../queries/backends';
 import CreateBucketModal from './CreateBucketModal';
@@ -21,6 +21,50 @@ import MaskedSecretInput from './MaskedSecretInput';
 import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
+
+/** Plain-language one-liner for a health verdict (badge + Test result). */
+function healthLabel(h: BackendHealthEntry): string {
+  switch (h.status) {
+    case 'healthy':
+      return 'Connected';
+    case 'auth-rejected':
+      return `Credentials rejected (${h.detail}) — check access key / secret`;
+    case 'unreachable':
+      return `Endpoint unreachable (${h.detail})`;
+    case 'erroring':
+      return `Backend erroring (${h.detail})`;
+  }
+}
+
+/** Colored status dot + short label for the backend row header. */
+function HealthBadge({ h, colors }: { h: BackendHealthEntry; colors: ReturnType<typeof useColors> }) {
+  const ok = h.status === 'healthy';
+  const color = ok ? colors.ACCENT_GREEN : h.status === 'auth-rejected' ? colors.ACCENT_RED : colors.ACCENT_AMBER;
+  const short = ok
+    ? 'Connected'
+    : h.status === 'auth-rejected'
+      ? 'CREDENTIALS REJECTED'
+      : h.status === 'unreachable'
+        ? 'UNREACHABLE'
+        : 'ERRORING';
+  return (
+    <span
+      title={`${healthLabel(h)} · probed ${new Date(h.probed_at * 1000).toLocaleString()}`}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        gap: 5,
+        marginLeft: 8,
+        fontSize: 10,
+        fontWeight: 600,
+        color,
+      }}
+    >
+      <span style={{ width: 7, height: 7, borderRadius: '50%', background: color, flexShrink: 0 }} />
+      {short}
+    </span>
+  );
+}
 
 interface Props {
   onSessionExpired?: () => void;
@@ -206,25 +250,23 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
     });
   };
 
+  // Server-side probe: exercises the SERVER's credentials + endpoint +
+  // network (the client-side test never could test creds — the exact class
+  // of silent breakage that hid the unpopulated-B2-secrets incident).
+  // Updates the server health cache, so the health badge refreshes too.
   const handleTestConnection = async (b: BackendInfo) => {
-    if (b.backend_type !== 's3') return;
     setTestingBackend(b.name);
     setTestResult(null);
     try {
-      const result = await testS3Connection({
-        endpoint: b.endpoint || undefined,
-        region: b.region || undefined,
-        force_path_style: b.force_path_style ?? true,
-      });
+      const entry = await probeBackend(b.name);
       setTestResult({
         name: b.name,
-        ok: result.success,
-        message: result.success
-          ? `Connected — ${result.buckets?.length ?? 0} bucket(s)`
-          : result.error || 'Connection failed',
+        ok: entry.status === 'healthy',
+        message: healthLabel(entry),
       });
-    } catch {
-      setTestResult({ name: b.name, ok: false, message: 'Network error' });
+      qc.invalidateQueries({ queryKey: qk.backends.list() });
+    } catch (e) {
+      setTestResult({ name: b.name, ok: false, message: normalizeUiError(e, 'Probe failed') });
     } finally {
       setTestingBackend(null);
     }
@@ -376,6 +418,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                       LEGACY SINGLETON
                     </span>
                   )}
+                  {b.health && <HealthBadge h={b.health} colors={colors} />}
                   <div style={{ fontSize: 12, color: colors.TEXT_MUTED, fontFamily: 'var(--font-mono)', overflowWrap: 'anywhere' }}>
                     {b.backend_type === 'filesystem'
                       ? `filesystem: ${b.path}`
@@ -398,17 +441,38 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 >
                   Create bucket here
                 </Button>
-                {b.backend_type === 's3' && (
-                  <Button size="small" icon={<ApiOutlined />} loading={testingBackend === b.name} onClick={() => handleTestConnection(b)} title="Test the S3 connection">
-                    Test
-                  </Button>
-                )}
+                <Button
+                  size="small"
+                  icon={<ApiOutlined />}
+                  loading={testingBackend === b.name}
+                  onClick={() => handleTestConnection(b)}
+                  title="Live server-side probe of this backend's connectivity + credentials"
+                >
+                  Test connection
+                </Button>
                 {!b.is_synthesized && (
                   <Button size="small" icon={<DeleteOutlined />} danger onClick={() => handleDelete(b.name)} title="Remove backend" />
                 )}
               </div>
               {testResult?.name === b.name && (
                 <Alert type={testResult.ok ? 'success' : 'error'} message={testResult.message} showIcon style={{ marginTop: 8, borderRadius: 6 }} />
+              )}
+              {/* Loud connection-health fault. Only DEFINITIVE faults
+                 (credentials rejected / unreachable) gate requests with 503;
+                 'erroring' (reachable but 5xx/throttling) still serves and
+                 is a warning, not an outage claim. */}
+              {b.health && b.health.status !== 'healthy' && (
+                <Alert
+                  type={b.health.status === 'erroring' ? 'warning' : 'error'}
+                  showIcon
+                  message={b.health.status === 'erroring' ? 'Backend degraded' : 'Backend unavailable'}
+                  description={
+                    b.health.status === 'erroring'
+                      ? `${healthLabel(b.health)}. Requests are NOT blocked — the backend is reachable but failing some calls. Re-probed every 30s.`
+                      : `${healthLabel(b.health)}. Buckets routed to this backend answer 503 until it recovers — re-probed every 30s, or use 'Test connection' after fixing it.`
+                  }
+                  style={{ marginTop: 8, borderRadius: 6 }}
+                />
               )}
               {/* Conditional-write verdict from the startup capability gate
                  (guard B). Absent = not assessed (single-instance, or no

@@ -76,6 +76,10 @@ pub struct AppState {
     /// gate (empty when single-instance — the gate doesn't run). Consulted
     /// by the hot-apply pre-commit gate + the admin backends API.
     pub backend_capabilities: Arc<crate::coordination::BackendCapabilityCache>,
+    /// Per-backend connectivity/auth health from the boot probe + re-probe
+    /// loop. Gates S3 requests to buckets on unhealthy backends (503) and
+    /// feeds the admin backends API. See `src/coordination/health.rs`.
+    pub backend_health: Arc<crate::coordination::BackendHealthCache>,
 }
 
 // ---------------------------------------------------------------------------

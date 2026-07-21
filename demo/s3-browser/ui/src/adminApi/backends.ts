@@ -68,3 +68,13 @@ export async function deleteBackend(name: string): Promise<{ success: boolean; e
   const res = await adminFetch(`/api/admin/backends/${encodeURIComponent(name)}`, 'DELETE');
   return safeJson(res);
 }
+
+/** "Test connection": live connectivity/credentials probe of one backend;
+ *  updates the server-side health cache and returns the fresh verdict. */
+export async function probeBackend(
+  name: string,
+): Promise<import('./core').BackendHealthEntry> {
+  const res = await adminFetch(`/api/admin/backends/${encodeURIComponent(name)}/probe`, 'POST');
+  if (!res.ok) await throwApiError(res, `Test connection to ${name}`);
+  return safeJson(res);
+}

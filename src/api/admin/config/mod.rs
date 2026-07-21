@@ -248,6 +248,16 @@ pub(crate) async fn apply_config_transition(
     let mut warnings = Vec::new();
     let mut requires_restart = false;
 
+    // -1. FATAL config-graph errors (bucket → undefined backend, duplicate
+    //     backend names): reject before ANY side effect. These states are
+    //     un-runnable — a misrouted bucket silently falls to the default
+    //     backend and 404s (the beshu-b2 incident). Boot enforces the same
+    //     invariant; an apply must not smuggle one past it.
+    let fatal = new_cfg.check_fatal();
+    if !fatal.is_empty() {
+        return Err(format!("config refused: {}", fatal.join("; ")));
+    }
+
     // 0. Backend write-capability pre-commit gate (guard B, hot-apply half):
     //    refuse a transition that would route a client-writable bucket onto a
     //    known/probed non-CAS backend under multi-instance — the startup gate
@@ -258,6 +268,15 @@ pub(crate) async fn apply_config_transition(
         &state.s3_state.backend_capabilities,
     )
     .await?;
+
+    // 0a. Backend HEALTH pre-commit gate: any backend whose DEFINITION this
+    //     transition changes must pass a live connection/credentials probe —
+    //     "Test connection" built into apply, so a typo'd secret or dead
+    //     endpoint is rejected with a named cause instead of going live
+    //     silently. Unchanged backends are never re-probed; an already-
+    //     unhealthy unchanged backend doesn't block unrelated applies.
+    crate::coordination::health::hot_apply_health_gate(new_cfg, &state.s3_state.backend_health)
+        .await?;
 
     // 0b. Declarative-IAM PRE-COMMIT validation gate (H8/H19). The full
     //     reconcile at step 4c runs AFTER the engine rebuild + IAM swap +

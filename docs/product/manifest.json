@@ -97,6 +97,11 @@
       "order": 65
     },
     {
+      "path": "how-to/diagnose-backend-connectivity",
+      "group": "Guides: deploy & operate",
+      "order": 66
+    },
+    {
       "path": "how-to/monitor-with-prometheus",
       "group": "Guides: deploy & operate",
       "order": 70

@@ -20,6 +20,9 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# Field-path context on config deserialization errors ("storage.buckets.x.public_prefixes:
+# expected a sequence") — operators must never see a path-less serde error.
+serde_path_to_error = "0.1"
 schemars = "0.8"
 # IP + CIDR parsing for admission block source_ip_list authoring.
 ipnet = { version = "2.11", features = ["serde"] }

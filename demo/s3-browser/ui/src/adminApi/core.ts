@@ -213,6 +213,11 @@ export interface BackendInfo {
    * (single-instance, or no client-writable routed buckets on it).
    */
   capability?: BackendCapabilityVerdict;
+  /**
+   * Connectivity/auth health from the boot probe + 30s re-probe loop.
+   * Absent when probing is disabled (DGP_BOOT_BACKEND_PROBE=off).
+   */
+  health?: BackendHealthEntry;
 }
 
 /** Mirror of the server's coordination::CapabilityVerdict (kebab-case tag). */
@@ -220,6 +225,17 @@ type BackendCapabilityVerdict =
   | { verdict: 'cas-verified'; via: 'probe' }
   | { verdict: 'non-cas' }
   | { verdict: 'unknown'; reason: string };
+
+/** Mirror of the server's coordination::health::HealthEntry (kebab-case tag). */
+export type BackendHealthEntry = {
+  /** Unix seconds of the probe that established this verdict. */
+  probed_at: number;
+} & (
+  | { status: 'healthy' }
+  | { status: 'auth-rejected'; detail: string }
+  | { status: 'unreachable'; detail: string }
+  | { status: 'erroring'; detail: string }
+);
 
 export async function getAdminConfig(): Promise<AdminConfig | null> {
   const res = await adminFetch('/api/admin/config');

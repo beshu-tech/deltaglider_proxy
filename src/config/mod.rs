@@ -165,6 +165,15 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Replication",
     },
     EnvVarEntry {
+        name: "DGP_BOOT_BACKEND_PROBE",
+        description: "Boot-time backend health gate: 'enforce' (default) probes every \
+                      configured backend's connectivity+credentials and refuses to start \
+                      when ALL fail; 'warn' probes and logs but never exits; 'off' skips \
+                      probing. Unhealthy backends' buckets answer 503 until recovery",
+        example: "enforce",
+        category: "Storage",
+    },
+    EnvVarEntry {
         name: "DGP_BACKEND_LIST_COOLDOWN_SECS",
         description: "How long a backend that fails a bucket listing is skipped \
                       (served from last-known-good) before the next re-probe",
@@ -2019,6 +2028,46 @@ impl Config {
         }
     }
 
+    /// FATAL config errors — graph states the proxy must never run with,
+    /// as opposed to [`Self::check`]'s advisory warnings:
+    ///
+    ///   * a bucket routed to an UNDEFINED backend name — requests would
+    ///     silently fall through to the default backend and 404/misroute
+    ///     (the beshu-b2 incident);
+    ///   * duplicate backend names — ambiguous routing, "first entry wins"
+    ///     is a silent coin-flip after a config edit.
+    ///
+    /// Enforced at boot (refuse to start) and at every apply / section-PUT
+    /// (reject the transition). Pure read — never mutates.
+    pub fn check_fatal(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for backend in &self.backends {
+            if !seen.insert(backend.name.as_str()) {
+                errors.push(format!(
+                    "duplicate backend name '{}' — backend names must be unique",
+                    backend.name
+                ));
+            }
+        }
+        for (bucket, policy) in &self.buckets {
+            if let Some(ref backend) = policy.backend {
+                // "default" is the SYNTHESIZED name of the singleton
+                // `storage.backend` (what the GUI displays and the admin API
+                // accepts) — always resolvable, never in `backends[]`.
+                if backend != "default" && !self.backends.iter().any(|b| &b.name == backend) {
+                    errors.push(format!(
+                        "bucket '{bucket}' routes to undefined backend '{backend}' — \
+                         define the backend under storage.backends or remove the route \
+                         (available: {:?})",
+                        self.backends.iter().map(|b| &b.name).collect::<Vec<_>>()
+                    ));
+                }
+            }
+        }
+        errors
+    }
+
     /// Returns true if SigV4 authentication is enabled (both credentials are set).
     pub fn auth_enabled(&self) -> bool {
         self.access_key_id.is_some() && self.secret_access_key.is_some()
@@ -2966,6 +3015,7 @@ mod tests {
             "DGP_S3_STALL_GRACE_SECS",        // storage::s3::build_client()
             "DGP_PARITY_HEAD_CONCURRENCY",    // replication::parity::head_burst()
             "DGP_PARITY_MAX_OBJECTS",         // replication::parity::max_parity_objects()
+            "DGP_BOOT_BACKEND_PROBE",         // coordination::health::boot_probe_mode()
             "DGP_BACKEND_LIST_COOLDOWN_SECS", // storage::routing::RoutingBackend::new()
             "DGP_BACKEND_LIST_TIMEOUT_SECS",  // storage::routing::RoutingBackend::new()
             "DGP_BACKEND_LIST_FRESH_SECS",    // storage::routing::RoutingBackend::new()
@@ -3451,6 +3501,67 @@ encryption_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
             cfg.backend_encryption,
             BackendEncryptionConfig::None { .. }
         ));
+    }
+
+    #[test]
+    fn check_fatal_rejects_undefined_backend_route_and_dup_names() {
+        // Bucket routed to an undefined backend → FATAL (the beshu-b2
+        // incident: the route silently fell to the default backend and 404'd).
+        let cfg = Config::from_yaml_str(
+            r#"
+storage:
+  buckets:
+    beshu-b2: { backend: b2 }
+"#,
+        )
+        .expect("parses");
+        let errors = cfg.check_fatal();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("beshu-b2") && errors[0].contains("undefined backend 'b2'"));
+
+        // Duplicate backend names → FATAL.
+        let cfg = Config::from_yaml_str(
+            r#"
+storage:
+  backends:
+    - name: b2
+      type: s3
+      endpoint: "http://x"
+      region: r
+      access_key_id: k
+      secret_access_key: s
+    - name: b2
+      type: filesystem
+      path: /tmp/x
+"#,
+        )
+        .expect("parses");
+        let errors = cfg.check_fatal();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("duplicate backend name 'b2'")),
+            "{errors:?}"
+        );
+
+        // A correctly-routed config has no fatal errors.
+        let cfg = Config::from_yaml_str(
+            r#"
+storage:
+  backends:
+    - name: b2
+      type: s3
+      endpoint: "http://x"
+      region: r
+      access_key_id: k
+      secret_access_key: s
+  buckets:
+    mirror: { backend: b2 }
+    plain: {}
+"#,
+        )
+        .expect("parses");
+        assert!(cfg.check_fatal().is_empty());
     }
 
     #[test]

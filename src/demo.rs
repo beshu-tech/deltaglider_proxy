@@ -208,6 +208,10 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         )
         .route("/_/api/admin/backends/:name", delete(admin::delete_backend))
         .route(
+            "/_/api/admin/backends/:name/probe",
+            post(admin::probe_backend),
+        )
+        .route(
             "/_/api/admin/buckets",
             get(admin::list_bucket_origins).post(admin::create_bucket_on_backend),
         )

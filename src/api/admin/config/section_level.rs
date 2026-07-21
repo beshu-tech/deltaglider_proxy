@@ -788,41 +788,54 @@ where
     let mut merged = serde_json::to_value(current)
         .map_err(|e| format!("internal: failed to project {} section: {}", label, e))?;
     apply_merge_patch(&mut merged, patch);
-    serde_json::from_value(merged).map_err(|e| format!("invalid {} section body: {}", label, e))
+    // Deserialize with field-path tracking so a type error names the exact
+    // offending field ("buckets.beshu-b2.public_prefixes: invalid type …")
+    // instead of a path-less serde message the operator can't act on.
+    serde_path_to_error::deserialize(merged).map_err(|e| {
+        let path = e.path().to_string();
+        let inner = e.into_inner();
+        if path == "." {
+            format!("invalid {label} section body: {inner}")
+        } else {
+            format!("invalid {label} section body at `{path}`: {inner}")
+        }
+    })
 }
 
 /// Apply a JSON Merge Patch (RFC 7396) in-place to `target`.
 ///
 /// The algorithm is short enough to inline rather than pull in an
-/// external crate:
+/// external crate. Per the spec (`MergePatch(Target, Patch)`):
 ///
-///   * If `patch` is an object and `target` is an object, recurse
-///     into each patch key:
-///       - patch[k] == null -> remove k from target
-///       - patch[k] == anything else -> recursively merge into target[k]
-///       - if target[k] is absent, target[k] = patch[k].clone()
-///   * Otherwise `patch` replaces `target` wholesale.
+///   * If `patch` is an object: a non-object target is first replaced
+///     with `{}` (the spec treats it as undefined), then each patch key
+///     recurses — `null` removes the key, anything else merges.
+///   * Otherwise `patch` replaces `target` wholesale (arrays atomic).
 ///
-/// This is the standard spec; arrays are replaced atomically.
+/// The recursion on ABSENT keys is load-bearing: a `null` nested inside
+/// a newly-inserted subtree means "remove" and must be DROPPED, never
+/// inserted verbatim (a surviving null then fails typed deserialization
+/// — the `public_prefixes: null` → "expected a sequence" incident).
 fn apply_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
-    match (target, patch) {
-        (serde_json::Value::Object(target_map), serde_json::Value::Object(patch_map)) => {
-            for (k, v) in patch_map {
-                if v.is_null() {
-                    target_map.remove(k);
-                } else {
-                    match target_map.get_mut(k) {
-                        Some(existing) => apply_merge_patch(existing, v),
-                        None => {
-                            target_map.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
+    if let serde_json::Value::Object(patch_map) = patch {
+        if !target.is_object() {
+            *target = serde_json::Value::Object(serde_json::Map::new());
+        }
+        let target_map = target
+            .as_object_mut()
+            .expect("target coerced to object above");
+        for (k, v) in patch_map {
+            if v.is_null() {
+                target_map.remove(k);
+            } else {
+                let slot = target_map
+                    .entry(k.clone())
+                    .or_insert(serde_json::Value::Null);
+                apply_merge_patch(slot, v);
             }
         }
-        (target_slot, _) => {
-            *target_slot = patch.clone();
-        }
+    } else {
+        *target = patch.clone();
     }
 }
 
@@ -1225,6 +1238,92 @@ fn shallow_diff(
 mod tests {
     use super::*;
     use crate::config::BackendEncryptionConfig as E;
+
+    // ── apply_merge_patch: RFC 7396 conformance ──────────────────────────────
+
+    #[test]
+    fn merge_patch_null_removes_present_and_noops_absent() {
+        use serde_json::json;
+        let mut t = json!({"a": 1, "b": 2});
+        apply_merge_patch(&mut t, &json!({"a": null, "c": null}));
+        // null removes an existing key; null on an ABSENT key is a no-op —
+        // it must NOT insert a literal null (the incident's root cause).
+        assert_eq!(t, json!({"b": 2}));
+    }
+
+    #[test]
+    fn merge_patch_nested_null_in_inserted_subtree_is_dropped() {
+        use serde_json::json;
+        // THE incident shape: patching a bucket that has no server-side
+        // policy yet, with the GUI's `public_prefixes: null` in the patch.
+        let mut t = json!({ "buckets": {} });
+        apply_merge_patch(
+            &mut t,
+            &json!({ "buckets": { "beshu-b2": { "backend": "b2", "public_prefixes": null } } }),
+        );
+        assert_eq!(t, json!({ "buckets": { "beshu-b2": { "backend": "b2" } } }));
+    }
+
+    #[test]
+    fn merge_patch_object_onto_non_object_coerces_and_strips_nulls() {
+        use serde_json::json;
+        let mut t = json!("scalar");
+        apply_merge_patch(&mut t, &json!({"keep": 1, "drop": null}));
+        assert_eq!(t, json!({"keep": 1}));
+    }
+
+    #[test]
+    fn merge_patch_arrays_replace_atomically_and_scalars_replace() {
+        use serde_json::json;
+        let mut t = json!({"list": [1, 2, 3], "s": "old"});
+        apply_merge_patch(&mut t, &json!({"list": [9], "s": "new"}));
+        assert_eq!(t, json!({"list": [9], "s": "new"}));
+    }
+
+    #[test]
+    fn merge_into_typed_names_the_offending_field_path() {
+        use serde_json::json;
+        // A genuinely wrong type must produce an error naming the exact
+        // field, not a path-less serde diagnostic (the operator-facing
+        // "invalid type: null, expected a sequence" incident class).
+        let current = crate::config_sections::StorageSection::default();
+        let patch = json!({ "buckets": { "beshu-b2": { "quota_bytes": "not-a-number" } } });
+        let err =
+            merge_into_typed::<crate::config_sections::StorageSection>(&current, &patch, "storage")
+                .expect_err("string where number expected must fail");
+        assert!(
+            err.contains("buckets.beshu-b2.quota_bytes"),
+            "error must name the field path, got: {err}"
+        );
+    }
+
+    #[test]
+    fn merge_into_typed_accepts_gui_null_public_prefixes_on_fresh_bucket() {
+        use serde_json::json;
+        // End-to-end regression for the operator-blocking 400:
+        // `invalid storage section body: invalid type: null, expected a
+        // sequence`. A fresh (absent) bucket policy patched with the GUI's
+        // `public_prefixes: null` must deserialize cleanly.
+        let current = crate::config_sections::StorageSection::default();
+        let patch = json!({
+            "buckets": { "beshu-b2": { "backend": "b2", "public_prefixes": null } }
+        });
+        let merged: Result<crate::config_sections::StorageSection, String> =
+            merge_into_typed(&current, &patch, "storage");
+        let merged = merged.expect("null-for-list from the GUI must not 400");
+        assert_eq!(
+            merged
+                .buckets
+                .get("beshu-b2")
+                .and_then(|b| b.backend.as_deref()),
+            Some("b2")
+        );
+        assert!(merged
+            .buckets
+            .get("beshu-b2")
+            .map(|b| b.public_prefixes.is_empty())
+            .unwrap_or(false));
+    }
 
     const HEX32: &str = "0101010101010101010101010101010101010101010101010101010101010101";
     const HEX32_B: &str = "0202020202020202020202020202020202020202020202020202020202020202";

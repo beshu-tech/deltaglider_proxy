@@ -162,7 +162,8 @@ impl Drop for WriteGuard {
 
 /// First path segment of an S3 request = the bucket (lowercased).
 /// Root-level requests (ListBuckets, health) have no bucket.
-fn bucket_from_path(path: &str) -> Option<String> {
+/// Shared with the backend-health gate (`coordination::health`).
+pub(crate) fn bucket_from_path(path: &str) -> Option<String> {
     let trimmed = path.trim_start_matches('/');
     if trimmed.is_empty() {
         return None;

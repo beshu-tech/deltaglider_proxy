@@ -423,6 +423,16 @@ impl S3Backend {
         {
             return StorageError::NotFound(format!("{} key not found", op));
         }
+        // Bucket-level 404 → the bucket is absent. HEAD responses carry NO
+        // body, so the NoSuchBucket marker check above can never match for
+        // HeadBucket — and S3 semantics define a HeadBucket 404 as "bucket
+        // does not exist". Without this, a bare 404 fell into `S3(...)`,
+        // which routing treats as TRANSIENT: an unrouted bucket became
+        // "transiently" unroutable forever and backend discovery never ran
+        // (the beshu-b2 incident).
+        if op.is_bucket_level() && matches!(status, Some(404)) {
+            return StorageError::BucketNotFound(bucket.to_string());
+        }
         // Some S3-compatible providers (MinIO, Ceph) return 403 for non-existent
         // buckets to prevent bucket enumeration. Only treat 403 as BucketNotFound
         // if the operation is bucket-level. Object-level 403 errors are genuine
@@ -2630,6 +2640,26 @@ mod tests {
             "bucket-level 404 must not be a key NotFound, got {:?}",
             classified
         );
+    }
+
+    /// A bare 404 on HeadBucket → BucketNotFound. HEAD responses carry no
+    /// body, so the NoSuchBucket-marker heuristic can never match — before
+    /// this mapping, the error fell into `S3(...)`, which routing treats as
+    /// TRANSIENT, leaving an unrouted bucket "transiently" unroutable
+    /// forever and never scanning other backends (the beshu-b2 incident).
+    #[test]
+    fn classify_s3_error_head_bucket_bare_404_is_bucket_not_found() {
+        let inner = aws_sdk_s3::operation::head_bucket::HeadBucketError::generic(
+            aws_smithy_types::error::ErrorMetadata::builder()
+                .code("NotFound")
+                .build(),
+        );
+        let err: SdkError<_> = SdkError::service_error(inner, http_response(404, None));
+        let classified = S3Backend::classify_s3_error("ghost", &err, S3Op::HeadBucket);
+        match classified {
+            StorageError::BucketNotFound(bucket) => assert_eq!(bucket, "ghost"),
+            other => panic!("bare HeadBucket 404 must be BucketNotFound, got {other:?}"),
+        }
     }
 
     /// An object-level 403 must stay `S3(...)` — never get rewritten to

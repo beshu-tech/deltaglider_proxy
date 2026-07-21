@@ -140,14 +140,55 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
     // Stamp the startup capability-gate verdicts (guard B) so the panel can
     // render a per-backend conditional-write banner. Absent = not assessed.
     let verdicts = state.s3_state.backend_capabilities.snapshot();
+    // Stamp connectivity/auth health (boot probe + re-probe loop) — drives
+    // the panel's health column. Absent = never probed (probe off).
+    let health = state.s3_state.backend_health.snapshot();
     for b in &mut backends {
         b.capability = verdicts.get(&b.name).cloned();
+        b.health = health.get(&b.name).cloned();
     }
 
     Json(BackendListResponse {
         backends,
         default_backend: cfg.default_backend.clone(),
     })
+}
+
+/// POST /api/admin/backends/:name/probe — "Test connection": run a live
+/// connectivity/credentials probe against one backend RIGHT NOW, update the
+/// health cache, and return the verdict. `:name` accepts a named backend or
+/// the synthesized `"default"`.
+pub async fn probe_backend(
+    State(state): State<Arc<AdminState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<Json<crate::coordination::health::HealthEntry>, (StatusCode, String)> {
+    let target = {
+        let cfg = state.config.read().await;
+        crate::coordination::health::probe_targets(&cfg)
+            .into_iter()
+            .find(|(n, _, _)| *n == name)
+    };
+    let Some((name, backend, fallback)) = target else {
+        return Err((StatusCode::NOT_FOUND, format!("no backend named '{name}'")));
+    };
+    let verdict =
+        crate::coordination::health::probe_backend_health(&backend, fallback.as_deref()).await;
+    state.s3_state.backend_health.set(&name, &backend, verdict);
+    let entry = state
+        .s3_state
+        .backend_health
+        .snapshot()
+        .remove(&name)
+        .expect("entry just set");
+    crate::audit::audit_log(
+        "backend_probe",
+        "admin",
+        &name,
+        &axum::http::HeaderMap::new(),
+        "",
+        "",
+    );
+    Ok(Json(entry))
 }
 
 /// GET /api/admin/buckets — list buckets with resolved backend origin.
@@ -373,6 +414,38 @@ pub async fn create_backend(
             );
         }
     };
+
+    // Health pre-commit gate (parity with apply/section-PUT — without it the
+    // GUI's "Add backend" was the one door where an unpopulated secret or
+    // dead endpoint still went live silently, the exact incident class this
+    // gate exists for). Runs BEFORE the config write lock so a slow probe
+    // never stalls S3 traffic. Success seeds the health cache so the badge
+    // is green immediately. `DGP_BOOT_BACKEND_PROBE=off` skips, same as
+    // everywhere else.
+    if crate::coordination::health::boot_probe_mode()
+        != crate::coordination::health::BootProbeMode::Off
+    {
+        let verdict =
+            crate::coordination::health::probe_backend_health(&backend_config, None).await;
+        if !verdict.is_healthy() {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(BackendMutationResponse {
+                    success: false,
+                    error: Some(format!(
+                        "backend '{name}' failed its connection probe — {}. Fix the \
+                         endpoint/credentials and retry (nothing was changed)",
+                        verdict.cause()
+                    )),
+                    requires_restart: false,
+                }),
+            );
+        }
+        state
+            .s3_state
+            .backend_health
+            .set(&name, &backend_config, verdict);
+    }
 
     let mut cfg = state.config.write().await;
 

@@ -429,6 +429,18 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         config.listen_addr = addr.parse()?;
     }
 
+    // FATAL config-graph errors: a bucket routed to an undefined backend or
+    // duplicate backend names must be impossible to RUN with (the misroute
+    // silently falls to the default backend and 404s — the beshu-b2
+    // incident). Same invariant is enforced on every apply/section-PUT.
+    let fatal = config.check_fatal();
+    if !fatal.is_empty() {
+        for e in &fatal {
+            eprintln!("FATAL config error: {e}");
+        }
+        std::process::exit(1);
+    }
+
     // Apply `advanced.log_level` from the config file to the already-
     // initialised tracing filter — caught during browser testing of
     // v0.8.0 where `advanced.log_level: info` was silently ignored
@@ -659,6 +671,13 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // line, zero probes. See docs/product/how-to/backend-capability-validation.md.
     startup::validate_backend_write_capability(&config, &backend_capabilities).await;
 
+    // Backend HEALTH gate: probe every configured backend's connectivity +
+    // credentials before serving. ALL dead → exit(1) (enforce, the default);
+    // some dead → degraded start, their buckets answer 503. A backend with
+    // silently-broken credentials must never boot invisible again.
+    let backend_health = Arc::new(deltaglider_proxy::coordination::BackendHealthCache::default());
+    startup::boot_backend_health_gate(&config, &backend_health).await;
+
     let state = Arc::new(AppState {
         engine: ArcSwap::from_pointee(engine),
         multipart,
@@ -669,6 +688,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         maintenance_gate: maintenance_gate.clone(),
         maintenance_notify: maintenance_notify.clone(),
         backend_capabilities: backend_capabilities.clone(),
+        backend_health: backend_health.clone(),
     });
 
     // Re-arm the maintenance write-gate for jobs that survived a restart
@@ -817,7 +837,52 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         config_db_mismatch,
         &public_prefix_snapshot,
         &admission_chain,
+        &shared_config,
     );
+
+    // Backend-health re-probe loop: only UNHEALTHY backends are re-probed
+    // (healthy ones re-probe on definition change or manual Test connection),
+    // so a recovered backend self-heals within ~30s and its gated buckets
+    // reopen without a restart.
+    spawn_periodic(Duration::from_secs(30), {
+        let health = backend_health.clone();
+        let shared_config = shared_config.clone();
+        move || {
+            let health = health.clone();
+            let shared_config = shared_config.clone();
+            tokio::spawn(async move {
+                let unhealthy = health.unhealthy_names();
+                if unhealthy.is_empty() {
+                    return;
+                }
+                let targets = {
+                    let cfg = shared_config.read().await;
+                    deltaglider_proxy::coordination::health::probe_targets(&cfg)
+                };
+                // Hygiene FIRST: drop entries for backends no longer in the
+                // config (deleted backends, rejected-apply ghosts). A stale
+                // unhealthy entry would otherwise pin the gate's slow path
+                // forever and can never self-heal (it has no probe target).
+                let current: std::collections::BTreeSet<String> =
+                    targets.iter().map(|(n, _, _)| n.clone()).collect();
+                health.retain_backends(&current);
+                for (name, backend, fallback) in targets {
+                    if !unhealthy.contains(&name) {
+                        continue;
+                    }
+                    let verdict = deltaglider_proxy::coordination::health::probe_backend_health(
+                        &backend,
+                        fallback.as_deref(),
+                    )
+                    .await;
+                    if verdict.is_healthy() {
+                        tracing::info!("backend health: '{name}' RECOVERED — gated buckets reopen");
+                    }
+                    health.set(&name, &backend, verdict);
+                }
+            });
+        }
+    });
 
     // --- External auth (OAuth/OIDC) ---
     let external_auth = {
