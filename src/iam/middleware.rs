@@ -167,19 +167,17 @@ pub async fn authorization_middleware(
     // 2. If an explicit Deny matches (including condition-based Deny like
     //    `s3:prefix ".*"`), the request is blocked immediately — Deny always wins.
     //
-    // 3. If no Allow covers the prefix outright but the user has *any*
-    //    permission referencing this bucket (e.g. `bucket/alice/*`), the
-    //    request is ADMITTED but marked `ListScope::Filtered`. The handler
-    //    MUST then filter returned keys by per-key permission. This closes
-    //    the C1 IAM LIST bypass (previously unfiltered list leaked every key).
+    // 3. If no Allow covers the prefix outright but the user can discover the
+    //    requested scope (or is listing the bucket root), the request is
+    //    ADMITTED but marked `ListScope::Filtered`. Unrelated non-empty
+    //    prefixes are denied. The handler MUST filter returned keys by
+    //    per-key permission, closing the C1 IAM LIST bypass.
     //
     // 4. Anonymous users get no fallback: only public-prefix policies apply,
     //    so if iam-rs didn't match Allow at step 1, they're denied.
     //
-    // The "any permission on bucket" fallback is preserved because it matches
-    // AWS: a user with s3:GetObject on bucket/* can still ListBucket even
-    // without an explicit s3:ListBucket statement. What's NEW in this fix is
-    // that the handler must FILTER, not return everything wholesale.
+    // The root fallback preserves scoped-prefix discovery without granting a
+    // successful LIST for an unrelated, non-empty prefix.
     let (allowed, list_scope) = if action == S3Action::List && key.is_empty() {
         // Extract the requested prefix (may be empty).
         let requested_prefix = extract_prefix_from_query(request.uri().query());
@@ -212,9 +210,12 @@ pub async fn authorization_middleware(
             // Anonymous users must NOT use the can_see_bucket fallback —
             // it would allow unscoped LIST, leaking keys outside public prefixes.
             (false, None)
-        } else if user.can_see_bucket(bucket) {
-            // No explicit Allow on the prefix, but the user has SOME
-            // permission on this bucket. Admit with filtering enforced.
+        } else if user.can_see_bucket(bucket)
+            && (requested_prefix.is_empty()
+                || super::permissions::user_can_see_common_prefix(&user, bucket, &requested_prefix))
+        {
+            // Preserve root discovery and overlapping scoped prefixes, but do
+            // not turn a disjoint prefix into a successful empty listing.
             (
                 true,
                 Some(ListScope::Filtered {

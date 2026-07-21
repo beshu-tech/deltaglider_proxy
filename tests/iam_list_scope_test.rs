@@ -503,15 +503,14 @@ async fn test_condition_scoped_beshu_reports_common_prefix_navigation() {
     );
     assert_eq!(report_keys.len(), 2, "expected both report keys");
 
-    let private = reports_user
-        .list_objects_v2()
-        .bucket("beshu")
-        .prefix("ror/private/")
-        .send()
-        .await
-        .expect("disallowed prefix is admitted only for filtered listing");
     assert!(
-        private.contents().is_empty() && private.common_prefixes().is_empty(),
-        "private prefix should be filtered empty"
+        reports_user
+            .list_objects_v2()
+            .bucket("beshu")
+            .prefix("ror/private/")
+            .send()
+            .await
+            .is_err(),
+        "disallowed prefix must return AccessDenied"
     );
 }
