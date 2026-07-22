@@ -630,6 +630,16 @@ pub struct ParityOutcome {
     pub checksum_mismatch: u64,
     pub unverifiable: u64,
     pub truncated: bool,
+    /// WHY the scan is partial, when it is — the two causes need OPPOSITE
+    /// remedies. `cap_hit`: the listing reached `DGP_PARITY_MAX_OBJECTS`
+    /// (raise the cap). `unresolved`: objects dropped from the compare
+    /// because their HEAD kept failing transiently (re-run the audit /
+    /// throttling — raising the cap does nothing). Serde defaults keep
+    /// pre-field persisted rows loading.
+    #[serde(default)]
+    pub cap_hit: bool,
+    #[serde(default)]
+    pub unresolved: u64,
     /// The signal: strict — `unverifiable` counts against it.
     pub in_sync: bool,
     pub scanned_at: i64,
@@ -684,10 +694,14 @@ fn default_verdict() -> Verdict {
 /// PURE: the single conclusion + its plain-language sentence, from the counts.
 /// Precedence: any real divergence (missing/extra/mismatch) → AtRisk; else a
 /// truncated or size-only-only or otherwise-not-in_sync scan → Incomplete;
-/// else Safe. `matched`/`source_objects` fill the sentence's denominator.
+/// else Safe. `cap_hit` / `unresolved` name the partial-scan CAUSE precisely
+/// (the remedies are opposite: raise the cap vs re-run the audit).
+#[allow(clippy::too_many_arguments)]
 pub fn derive_verdict(
     in_sync: bool,
     truncated: bool,
+    cap_hit: bool,
+    unresolved: u64,
     missing_on_dest: u64,
     orphan_on_dest: u64,
     checksum_mismatch: u64,
@@ -717,13 +731,22 @@ pub fn derive_verdict(
             format!("All {matched} objects are present and verified identical."),
         );
     }
-    // Not in_sync with no real diffs → couldn't fully prove equality.
-    let why = if truncated {
-        "the scan was capped or some objects couldn't be read, so completeness isn't proven"
+    // Not in_sync with no real diffs → couldn't fully prove equality. The
+    // partial-scan CAUSE matters — "raise the cap" is the wrong remedy for
+    // transient read failures and vice versa — so name it precisely.
+    let why = if cap_hit {
+        "the scan hit the object cap, so completeness isn't proven".to_string()
+    } else if unresolved > 0 {
+        format!(
+            "{unresolved} object(s) couldn't be read (transient backend errors) — \
+             re-running the audit usually clears this"
+        )
+    } else if truncated {
+        "the scan was partial, so completeness isn't proven".to_string()
     } else if unverifiable > 0 {
-        "some objects could only be matched by size, not by checksum"
+        "some objects could only be matched by size, not by checksum".to_string()
     } else {
-        "equality couldn't be fully proven"
+        "equality couldn't be fully proven".to_string()
     };
     (
         Verdict::Incomplete,
@@ -1482,8 +1505,12 @@ pub async fn parity_audit(
     // A transient HEAD that left a key unresolved means the audit couldn't see
     // every object — treat it as truncated (partial) so it never reports a
     // false in_sync off keys that were silently dropped from the compare.
-    let unresolved = src_unresolved + dst_unresolved;
-    let truncated = src_truncated || dst_truncated || unresolved > 0;
+    // `cap_hit` vs `unresolved` are carried SEPARATELY into the outcome: the
+    // UI must never tell the operator to raise the object cap when the real
+    // cause was transient read failures (and vice versa).
+    let unresolved = (src_unresolved + dst_unresolved) as u64;
+    let cap_hit = src_truncated || dst_truncated;
+    let truncated = cap_hit || unresolved > 0;
 
     if truncated {
         warn!(
@@ -1544,6 +1571,8 @@ pub async fn parity_audit(
     let (verdict, verdict_summary) = derive_verdict(
         in_sync,
         truncated,
+        cap_hit,
+        unresolved,
         diff.missing_on_dest,
         diff.orphan_on_dest,
         diff.checksum_mismatch,
@@ -1563,6 +1592,8 @@ pub async fn parity_audit(
         checksum_mismatch: diff.checksum_mismatch,
         unverifiable: diff.unverifiable,
         truncated,
+        cap_hit,
+        unresolved,
         in_sync,
         scanned_at: super::current_unix_seconds(),
         regime,
@@ -1596,44 +1627,50 @@ mod tests {
     #[test]
     fn derive_verdict_truth_table() {
         // Clean in-sync → Safe.
-        let (v, s) = derive_verdict(true, false, 0, 0, 0, 0, 42);
+        let (v, s) = derive_verdict(true, false, false, 0, 0, 0, 0, 0, 42);
         assert_eq!(v, Verdict::Safe);
         assert!(s.contains("42") && s.contains("identical"), "{s}");
 
         // Any real divergence → AtRisk, regardless of in_sync flag shape.
         assert_eq!(
-            derive_verdict(false, false, 3, 0, 0, 0, 10).0,
+            derive_verdict(false, false, false, 0, 3, 0, 0, 0, 10).0,
             Verdict::AtRisk
         );
         assert_eq!(
-            derive_verdict(false, false, 0, 2, 0, 0, 10).0,
+            derive_verdict(false, false, false, 0, 0, 2, 0, 0, 10).0,
             Verdict::AtRisk
         );
         assert_eq!(
-            derive_verdict(false, false, 0, 0, 1, 0, 10).0,
+            derive_verdict(false, false, false, 0, 0, 0, 1, 0, 10).0,
             Verdict::AtRisk
         );
         // Mismatch wins even if something is also missing (both named in summary).
-        let (v, s) = derive_verdict(false, false, 1, 0, 1, 0, 8);
+        let (v, s) = derive_verdict(false, false, false, 0, 1, 0, 1, 0, 8);
         assert_eq!(v, Verdict::AtRisk);
         assert!(s.contains("missing") && s.contains("differing"), "{s}");
 
         // Not in_sync, no real diffs → Incomplete (never Safe, never AtRisk).
-        // Truncated variant.
-        let (v, s) = derive_verdict(false, true, 0, 0, 0, 0, 100);
+        // CAP-hit variant: names the cap, never the read failures.
+        let (v, s) = derive_verdict(false, true, true, 0, 0, 0, 0, 0, 100);
         assert_eq!(v, Verdict::Incomplete);
-        assert!(
-            s.contains("capped") || s.contains("couldn't be read"),
-            "{s}"
-        );
+        assert!(s.contains("cap"), "{s}");
+        assert!(!s.contains("couldn't be read"), "{s}");
+        // UNRESOLVED-reads variant: names the transient reads + the re-run
+        // remedy, never the cap (raising it would do nothing — the incident
+        // where 36 throttled HEADs rendered as 'raise DGP_PARITY_MAX_OBJECTS').
+        let (v, s) = derive_verdict(false, true, false, 36, 0, 0, 0, 0, 100);
+        assert_eq!(v, Verdict::Incomplete);
+        assert!(s.contains("36") && s.contains("couldn't be read"), "{s}");
+        assert!(s.contains("re-run") || s.contains("re-running"), "{s}");
+        assert!(!s.contains("cap"), "{s}");
         // Size-only variant.
-        let (v, s) = derive_verdict(false, false, 0, 0, 0, 5, 100);
+        let (v, s) = derive_verdict(false, false, false, 0, 0, 0, 0, 5, 100);
         assert_eq!(v, Verdict::Incomplete);
         assert!(s.contains("size"), "{s}");
 
         // AtRisk takes precedence over truncation.
         assert_eq!(
-            derive_verdict(false, true, 1, 0, 0, 0, 9).0,
+            derive_verdict(false, true, true, 0, 1, 0, 0, 0, 9).0,
             Verdict::AtRisk
         );
     }

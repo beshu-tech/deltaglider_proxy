@@ -127,6 +127,13 @@ export interface ParityOutcome {
   checksum_mismatch: number;
   unverifiable: number;
   truncated: boolean;
+  /** WHY the scan is partial: the listing cap was actually reached (raise
+   *  `DGP_PARITY_MAX_OBJECTS`) — vs `unresolved` reads (re-run the audit).
+   *  Optional: absent on rows persisted before these fields existed. */
+  cap_hit?: boolean;
+  /** Objects dropped from the compare because their read kept failing
+   *  transiently (throttling). Re-running usually clears it. */
+  unresolved?: number;
   /** THE signal: true iff !truncated && missing/orphan/mismatch/unverifiable all 0. */
   in_sync: boolean;
   scanned_at: number; // unix SECONDS

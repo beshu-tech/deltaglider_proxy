@@ -693,6 +693,8 @@ mod tests {
             checksum_mismatch: 0,
             unverifiable: 0,
             truncated: false,
+            cap_hit: false,
+            unresolved: 0,
             in_sync: true,
             scanned_at: 1000,
             regime: Regime::Transforming,

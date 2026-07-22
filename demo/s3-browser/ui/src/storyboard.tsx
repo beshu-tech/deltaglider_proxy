@@ -138,11 +138,29 @@ const truncated: ParityOutcome = {
   dest_objects: 100000,
   matched: 100000,
   truncated: true,
+  cap_hit: true,
   in_sync: false, // truncated → not provably in sync
   scanned_at: ago(11),
   verdict: 'incomplete',
   verdict_summary:
-    "Nothing is missing or different, but the scan was capped or some objects couldn't be read, so completeness isn't proven.",
+    "Nothing is missing or different, but the scan hit the object cap, so completeness isn't proven.",
+};
+
+// Whole mirror listed, but some reads kept failing transiently (throttling):
+// the remedy is RE-RUN, never "raise the cap" — the alert must say so.
+const unresolvedReads: ParityOutcome = {
+  ...base,
+  source_objects: 99654,
+  dest_objects: 99654,
+  matched: 99618,
+  truncated: true,
+  cap_hit: false,
+  unresolved: 36,
+  in_sync: false,
+  scanned_at: ago(7),
+  verdict: 'incomplete',
+  verdict_summary:
+    "Nothing is missing or different, but 36 object(s) couldn't be read (transient backend errors) — re-running the audit usually clears this.",
 };
 
 const amber: ParityOutcome = {
@@ -221,6 +239,7 @@ const sizeOnly: ParityOutcome = {
 const FIXTURES: { label: string; outcome: ParityOutcome }[] = [
   { label: 'In sync (the deliverable)', outcome: inSync },
   { label: 'In sync — scan truncated', outcome: truncated },
+  { label: 'Unresolved reads (re-run remedy)', outcome: unresolvedReads },
   { label: 'Differences — missing & extra (amber)', outcome: amber },
   { label: 'Differences — checksum mismatch (red)', outcome: red },
   { label: 'skip-if-dest-exists (the lie)', outcome: skipLie },

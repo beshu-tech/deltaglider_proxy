@@ -647,23 +647,49 @@ export function ParityResult({
           transition: 'opacity 0.2s ease, filter 0.2s ease',
         }}
       >
-        {/* Truncation note — names the exact cap knob + says plainly that the
-            rest is UNVERIFIED, not proven complete (ROOT D: every limit gets an
-            executable path). */}
+        {/* Partial-scan note — the CAUSE decides the remedy shown. cap_hit →
+            raise the cap; unresolved reads → re-run (raising the cap would do
+            nothing — the incident where 36 throttled HEADs rendered as "raise
+            DGP_PARITY_MAX_OBJECTS"). Legacy rows (neither field) get the
+            hedged both-causes wording. */}
         {outcome.truncated && (
           <Alert
             type="warning"
             showIcon
             style={{ borderRadius: 8, marginTop: 14 }}
-            message="Only part of the mirror was checked"
+            message={
+              outcome.cap_hit
+                ? 'Only part of the mirror was checked'
+                : (outcome.unresolved ?? 0) > 0
+                  ? `${(outcome.unresolved ?? 0).toLocaleString()} object${(outcome.unresolved ?? 0) === 1 ? '' : 's'} couldn't be read`
+                  : 'Only part of the mirror was checked'
+            }
             description={
-              <>
-                The audit stopped after the first{' '}
-                {(outcome.source_objects + outcome.dest_objects).toLocaleString()} objects — the rest
-                are <strong>unverified</strong>, not proven complete. Counts and findings below cover
-                only the scanned portion. Raise the cap with the{' '}
-                <code>DGP_PARITY_MAX_OBJECTS</code> environment variable to scan more.
-              </>
+              outcome.cap_hit ? (
+                <>
+                  The audit stopped after the first{' '}
+                  {(outcome.source_objects + outcome.dest_objects).toLocaleString()} objects — the
+                  rest are <strong>unverified</strong>, not proven complete. Counts and findings
+                  below cover only the scanned portion. Raise the cap with the{' '}
+                  <code>DGP_PARITY_MAX_OBJECTS</code> environment variable to scan more.
+                </>
+              ) : (outcome.unresolved ?? 0) > 0 ? (
+                <>
+                  The whole mirror was listed, but{' '}
+                  {(outcome.unresolved ?? 0).toLocaleString()} object
+                  {(outcome.unresolved ?? 0) === 1 ? '' : 's'} had to be dropped from the compare
+                  because the backend kept failing their reads (usually throttling) — they are{' '}
+                  <strong>unverified</strong>. <strong>Re-run the audit</strong> — this typically
+                  clears on its own. If it persists, lower{' '}
+                  <code>DGP_PARITY_HEAD_CONCURRENCY</code> to be gentler on the backend.
+                </>
+              ) : (
+                <>
+                  The audit covered only part of the mirror — the rest is{' '}
+                  <strong>unverified</strong>. Re-run the audit; if it keeps happening, check the
+                  scan cap (<code>DGP_PARITY_MAX_OBJECTS</code>) and backend health.
+                </>
+              )
             }
           />
         )}
