@@ -8,7 +8,20 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-07-21_
+_Last updated: 2026-07-22_
+
+## v1.16.1 — 2026-07-22
+
+### Fixed — Verify no longer blames the scan cap for transient read failures
+
+A partial Verify audit carried only one flag, so the UI always rendered the
+"scan capped — raise `DGP_PARITY_MAX_OBJECTS`" advice even when the real cause
+was a handful of objects whose reads kept failing transiently (backend
+throttling) — raising the cap does nothing for that. The outcome now carries
+the cause separately: a genuinely capped scan keeps the cap advice, while
+unresolved reads render as "N objects couldn't be read — re-run the audit
+(usually clears); if it persists, lower `DGP_PARITY_HEAD_CONCURRENCY`". The
+server verdict sentence makes the same distinction.
 
 ## v1.16.0 — 2026-07-21
 

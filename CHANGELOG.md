@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.16.1 — 2026-07-22
+
 ### Fixed — Verify no longer blames the scan cap for transient read failures
 
 A partial Verify audit carried only one flag, so the UI always rendered the
