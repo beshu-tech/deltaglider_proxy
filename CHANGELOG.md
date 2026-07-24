@@ -7,13 +7,16 @@
 New `operator/` crate: a Kubernetes operator (CRD `DeltaGliderProxy`,
 group `deltaglider.beshu.tech/v1alpha1`) that manages the proxy StatefulSet
 (one PVC per pod), the config, the Services — and an HAProxy router that
-**consistent-hashes S3 traffic by URL path**. That routing is what makes a
-multi-pod deployment work with S3 multipart uploads: multipart state is
-per-pod, so behind a round-robin Service the SDK's parallel `UploadPart`
-calls hit the wrong pods and fail with `NoSuchUpload`. Path-pinning routes
-every request for one object key (all multipart parts included) to the same
-pod, and also keeps same-prefix writes on one pod as the delta engine's
-reference lock requires. Consistent hashing is the only multipart strategy
+**consistent-hashes S3 traffic by the directory of the URL path** (the
+deltaspace). That routing is what makes a multi-pod deployment work with S3
+multipart uploads: multipart state is per-pod, so behind a round-robin
+Service the SDK's parallel `UploadPart` requests hit the wrong pods and
+fail with `NoSuchUpload`. Directory-pinning routes every request that
+touches one delta prefix — all keys in it, every multipart part — to the
+same pod, which both keeps multipart uploads working and satisfies the
+delta engine's single-writer-per-deltaspace reference lock (per-key
+hashing would not: two keys in one prefix share one reference file).
+Routing behaviour verified against haproxy:3.0. Consistent hashing is the only multipart strategy
 implemented — the trade-offs (ring remap on scale, per-pod upload loss on
 restart) are documented in the operator README and in
 `docs/product/how-to/scale-out-with-the-kubernetes-operator.md`. The Helm

@@ -63,13 +63,17 @@ session affinity cannot apply, and `sessionAffinity: ClientIP` stops working whe
 clients share one IP address behind a NAT gateway.
 
 **What the operator does about it.** The managed HAProxy router chooses the target pod
-for every S3 request by hashing the URL path (`balance uri path-only` together with
-`hash-type consistent`). All requests that concern one object key share the same path —
-the `CreateMultipartUpload` request, every `UploadPart` request, and the final
-`CompleteMultipartUpload` request — so they all reach the same proxy pod. The hash ring
-is built from the StatefulSet's stable DNS names, which means every router pod computes
-exactly the same mapping. The same pinning also sends all writes for one delta prefix
-to one pod, which the delta engine's in-process reference lock requires.
+for every S3 request by hashing the **directory of the URL path** — the request path
+with its last segment removed (`balance hash path,regsub([^/]*$,x)` together with
+`hash-type consistent`; the query string is never part of the hash). Everything inside
+one directory therefore reaches the same pod: every object key in that prefix, and for
+each of those keys the `CreateMultipartUpload` request, every `UploadPart` request,
+and the final `CompleteMultipartUpload` request. The directory, not the full path, is
+the right unit because a delta prefix is shared state: all keys in one prefix update
+the same reference file, and the lock that serialises those updates lives inside a
+single process. Hashing per directory sends all of that work to one pod, which keeps
+the lock effective. The hash ring is built from the StatefulSet's stable DNS names,
+which means every router pod computes exactly the same mapping.
 
 **Consistent hashing is the only multipart strategy this deployment implements.** The
 pods do not share any multipart state with each other. That has honest consequences,

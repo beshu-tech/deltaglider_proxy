@@ -52,18 +52,41 @@ affinity cannot fix this, because S3 clients do not carry cookies, and affinity 
 client IP address stops working when many clients share one address behind a NAT
 gateway.
 
-The supported answer is **consistent hashing by URL path** at the load balancer. All
-requests for one object key share the same path, so hashing on the path sends them all
-to the same instance — including every part of a multipart upload. The same routing
-also keeps all writes into one delta prefix on a single instance, which the delta
-engine's in-process reference lock requires. On Kubernetes, the official operator
-deploys this router for you — see
+The supported answer is **consistent hashing by the directory of the URL path** at the
+load balancer. Hash the request path with its last segment removed — in S3 terms, the
+bucket plus the key's prefix. Everything in one directory then reaches the same
+instance: every object key in that prefix, and every part of any multipart upload of
+those keys. Hashing the directory rather than the full path matters for a second
+reason: a delta prefix is shared state. All keys in one prefix update the same
+reference file, and the lock that serialises those updates lives inside a single
+process — so all writes into one prefix must land on one instance, not just all
+requests for one key.
+
+On Kubernetes, the official operator deploys this router for you — see
 [How to scale out with the Kubernetes operator](scale-out-with-the-kubernetes-operator.md).
-On any other platform, configure the equivalent on your load balancer: for HAProxy use
-`balance uri` together with `hash-type consistent`; for nginx use
-`hash $uri consistent`. Be aware of the limit of this approach: when you add or remove
-an instance, part of the hash ring moves, so a multipart upload that is in flight on a
-moved key fails and the client has to restart it from the beginning.
+On any other platform, configure the equivalent on your load balancer. For HAProxy:
+
+```
+balance hash path,regsub([^/]*$,x)
+hash-type consistent
+```
+
+For nginx, derive the directory with a `map` and hash on it:
+
+```
+map $uri $uri_dir {
+    ~^(?<dir>.*/) $dir;
+    default       $uri;
+}
+upstream dgp {
+    hash $uri_dir consistent;
+    ...
+}
+```
+
+Be aware of the limit of this approach: when you add or remove an instance, part of
+the hash ring moves, so a multipart upload that is in flight on a moved prefix fails
+and the client has to restart it from the beginning.
 
 ## 6. Mind upgrades across the fleet
 

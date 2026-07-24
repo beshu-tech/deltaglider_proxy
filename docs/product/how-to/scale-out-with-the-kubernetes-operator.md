@@ -29,13 +29,16 @@ and on its local disk:
   different pods writing into the same prefix at the same moment.
 
 The operator solves both problems in the same way, and this is the only multipart
-strategy DeltaGlider implements: **consistent hashing by URL path**. An HAProxy router
-runs in front of the proxy pods and chooses the target pod by hashing the path of every
-S3 request. All requests that concern one object key share the same path, so they all
-reach the same pod — including every part of a multipart upload. For the same reason,
-all writes into one prefix arrive at one pod, which keeps the reference lock effective.
-This approach has real trade-offs; they are listed at the end of this guide, and you
-should read them before going live.
+strategy DeltaGlider implements: **consistent hashing by the directory of the URL
+path**. An HAProxy router runs in front of the proxy pods and chooses the target pod by
+hashing the request path with its last segment removed — in S3 terms, the bucket and
+the key's prefix. Everything that lives in one directory therefore reaches the same
+pod: every object key in that prefix, every part of any multipart upload of those
+keys, and the prefix's delta reference file. That is deliberately one level coarser
+than hashing the full path, because a delta prefix is shared between all of the keys
+inside it — pinning only per key would still let two pods update the same reference
+file at the same time. This approach has real trade-offs; they are listed at the end
+of this guide, and you should read them before going live.
 
 ## 1. Install the operator
 
@@ -133,7 +136,7 @@ Accept the following consequences before you scale:
 |---|---|
 | Scaling the proxy pods changes part of the hash ring | A multipart upload that is in flight during a scale-up or scale-down can fail with `NoSuchUpload` if its key now maps to a different pod. The client has to restart that upload from the beginning. Scale during quiet periods. |
 | A proxy pod restart discards the multipart uploads it was holding | This is the same behaviour as a single-instance restart: the client has to retry the upload. |
-| All traffic for one prefix goes to one pod | Load is spread across pods by object key, not by request. A single very busy bucket or prefix will not fan out across the fleet. |
+| All traffic for one prefix goes to one pod | Load is spread across pods by directory, not by request. A single very busy prefix will not fan out across the fleet. |
 | The admin UI sticks to a pod by source IP | Admin sessions are held in memory, so a pod restart logs its admin users out. |
 
 The rest of the multi-instance contract — one IAM writer at a time, synchronisation

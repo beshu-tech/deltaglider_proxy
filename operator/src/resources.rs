@@ -52,9 +52,10 @@ fn fnv1a_hex(s: &str) -> String {
 }
 
 /// The HAProxy config implementing the multi-pod contract:
-/// S3 traffic is consistent-hashed by URL path (bucket/key), so every request for a
-/// given object — including all parts of a multipart upload — lands on the same proxy
-/// pod. Admin UI traffic (/_/) is source-IP sticky because sessions are in-memory.
+/// S3 traffic is consistent-hashed by the DIRECTORY of the URL path (= the deltaspace),
+/// so every request touching one delta prefix — all keys in it, all multipart parts —
+/// lands on the same proxy pod, keeping the in-process reference lock sufficient.
+/// Admin UI traffic (/_/) is source-IP sticky because sessions are in-memory.
 pub fn haproxy_cfg(cr_name: &str, namespace: &str, replicas: i32) -> String {
     let mut servers_s3 = String::new();
     let mut servers_admin = String::new();
@@ -94,10 +95,10 @@ frontend dgp
   use_backend admin if is_admin
   default_backend s3
 
-# Consistent hash by URI path only (query string and any HTTP/2 authority excluded):
-# all requests for one object key — every multipart part included — pin to one pod.
+# Hash the DIRECTORY of the path (last segment → constant, query ignored): one
+# deltaspace = one pod, so the in-process reference lock and MPU state stay safe.
 backend s3
-  balance uri path-only
+  balance hash path,regsub([^/]*$,x)
   hash-type consistent
   option httpchk GET /_/ready
   http-check expect status 200
@@ -418,8 +419,11 @@ mod tests {
     fn haproxy_cfg_pins_by_path_and_lists_stable_pod_dns() {
         let cfg = haproxy_cfg("dgp", "dgp-ns", 3);
         assert!(
-            cfg.contains("balance uri path-only"),
-            "S3 backend must hash by path only (query string + h2 authority excluded)"
+            cfg.contains("balance hash path,regsub([^/]*$,x)"),
+            "S3 backend must hash by path DIRECTORY: the deltaspace reference lock is \
+             in-process, so all writes into one prefix must colocate on one pod \
+             (verified live on haproxy:3.0 — same dir/folder-marker → same server, \
+             query string ignored)"
         );
         assert!(cfg.contains("hash-type consistent"));
         assert!(

@@ -45,6 +45,8 @@ docker build -t deltaglider-proxy .
 
 `docs/product/` follows Diátaxis strictly — every page is exactly ONE of: `tutorials/` (lessons, executed end-to-end before merge), `how-to/` (goal-named recipes), `reference/` (austere facts), `explanation/` (concepts). Manifest groups mirror the quadrants (Start here · 3× Guides · Reference · Concepts · Releases). Content loads by Vite glob over `docs/product/**/*.md` on BOTH surfaces (`docs-imports.ts`, `marketing/src/lib/docContent.ts`) — there is NO hand-maintained import list. Adding a doc = drop the .md + add its manifest entry; manifest.json must stay in parity with disk (CI: check-docs-registry.sh); `# validate` YAML blocks are linted. Running examples use ONE fixed cast (backends hetzner-fsn1/local-disk/aws-dr; buckets releases/db-archive/downloads; users ci-uploader/backup-bot/dana; group Engineering) — never invent new example names. Marketing 301s for old slugs live in marketing/astro.config.mjs REDIRECTS (sitemap filter derives from it). New docs: pick the quadrant first; mixed-type pages are a regression.
 
+**Prose style (docs/product + user-facing READMEs — user-mandated):** write plain, fully-formed English. Say "requests", never "calls", for HTTP/S3 traffic. Complete sentences with articles and prepositions — no telegraphic/compressed phrasing, no noun piles. Explain the mechanism behind every claim before its consequence (e.g. "no other pod knows that this upload exists" before "so the request fails with `NoSuchUpload`"). One idea per sentence. Terseness stays right for code comments and chat replies, but not for documentation.
+
 CI merge gate: `verify-integration-test-registry` → `fmt` → `clippy -D warnings` → parallel test jobs (lib, curated integration + extended admin/IAM/replication, delta) → `e2e-smoke` → RustSec audit → Cargo deny → frontend (lint, tsc, knip, Node scripts) → docs/schema → claude-review. See `ci.yml` for the exact `--test` lists.
 
 ## Architecture
@@ -230,18 +232,20 @@ single-instance planes below are addressed.
   is invalid on B (intermittent 401s). Sticky sessions required for the admin GUI.
 - **Multipart uploads** (`multipart.rs`, in-memory) — UploadPart/Complete must hit
   the SAME node as CreateMultipartUpload (else `NoSuchUpload`; the error message
-  now says so). Supported answer: consistent-hash by URL path at the LB — on k8s the
-  official operator (`operator/`, CRD DeltaGliderProxy) deploys an HAProxy router
-  doing exactly that (`balance uri path-only`); it's the ONLY multipart strategy
-  implemented (no cross-pod MPU state). Trade-offs in operator/README.md +
-  docs/product/how-to/scale-out-with-the-kubernetes-operator.md.
+  now says so). Supported answer: consistent-hash by the DIRECTORY of the URL path at
+  the LB (= per-deltaspace, NOT per-key — the reference-lock bullet below is why) — on
+  k8s the official operator (`operator/`, CRD DeltaGliderProxy) deploys an HAProxy
+  router doing exactly that (`balance hash path,regsub([^/]*$,x)`, behaviour verified
+  live); ONLY multipart strategy implemented (no cross-pod MPU state). Trade-offs in
+  operator/README.md + docs/product/how-to/scale-out-with-the-kubernetes-operator.md.
 - **Metadata cache** (`metadata_cache.rs`, 10-min TTL, local invalidate) — a
   DELETE/PUT on A leaves B serving stale existence/size for up to 10 min.
 - **Rate limiter** (`rate_limiter.rs`, per-instance) — effective limit is N× the
   configured cap across N nodes.
 - **Maintenance write-gate busy-set**, **delta-reference RMW lock**
   (`engine/mod.rs` `prefix_locks`, in-process) — concurrent same-prefix PUTs on
-  two nodes can corrupt `reference.bin`. Single-writer per deltaspace assumed.
+  two nodes can corrupt `reference.bin`. Single-writer per deltaspace assumed —
+  the operator's directory-hash router (bullet above) satisfies it by routing.
 
 **Hard prerequisites for any multi-instance deployment:**
 - **All instances MUST share the same `DGP_BOOTSTRAP_PASSWORD_HASH`** — it
