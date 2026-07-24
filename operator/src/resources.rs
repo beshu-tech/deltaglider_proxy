@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Pure builders: CR → desired child objects as JSON values (apiVersion/kind included,
 //! as server-side apply requires). Tests deserialize them into typed k8s structs.
 

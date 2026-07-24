@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! The reconcile loop: server-side apply the desired children, then report status.
 
 use crate::crd::DeltaGliderProxy;
