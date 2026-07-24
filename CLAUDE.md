@@ -230,7 +230,11 @@ single-instance planes below are addressed.
   is invalid on B (intermittent 401s). Sticky sessions required for the admin GUI.
 - **Multipart uploads** (`multipart.rs`, in-memory) — UploadPart/Complete must hit
   the SAME node as CreateMultipartUpload (else `NoSuchUpload`; the error message
-  now says so). Sticky-route multipart.
+  now says so). Supported answer: consistent-hash by URL path at the LB — on k8s the
+  official operator (`operator/`, CRD DeltaGliderProxy) deploys an HAProxy router
+  doing exactly that (`balance uri path-only`); it's the ONLY multipart strategy
+  implemented (no cross-pod MPU state). Trade-offs in operator/README.md +
+  docs/product/how-to/scale-out-with-the-kubernetes-operator.md.
 - **Metadata cache** (`metadata_cache.rs`, 10-min TTL, local invalidate) — a
   DELETE/PUT on A leaves B serving stale existence/size for up to 10 min.
 - **Rate limiter** (`rate_limiter.rs`, per-instance) — effective limit is N× the
