@@ -146,9 +146,10 @@ The chart ships the hardening the Dockerfile expects — leave these alone:
 ## Replicas
 
 `replicaCount` defaults to `1` — keep it there. The chart has no multipart-aware
-routing: above one replica, S3 multipart uploads fail with `NoSuchUpload` under a
-round-robin Service. For multi-pod, use the official operator instead — it deploys the
-consistent-hashing router this requires: [How to scale out with the Kubernetes
+routing: with more than one replica behind a round-robin Service, S3 multipart uploads
+fail with `NoSuchUpload`, because the state of an upload lives only on the pod that
+started it. For a multi-pod deployment, use the official operator instead — it deploys
+the consistent-hashing router that this requires: [How to scale out with the Kubernetes
 operator](scale-out-with-the-kubernetes-operator.md).
 
 With config sync set up, replication rules elect one leader per rule through an S3-CAS lease in the sync bucket (default `lease_ttl: "300s"`, `heartbeat_interval: "60s"`); a dead leader's lease lapses and a peer takes over automatically. Lifecycle and maintenance jobs still use node-local database leases, so they may run on more than one pod (idempotent — wasteful, not corrupting). Do not scale above one replica if each pod has its own independent `/data/deltaglider_config.db` — in that shape, each pod is an independent control plane. To run more than one instance, set up config sync first: [How to run multiple instances (HA)](run-multiple-instances.md).

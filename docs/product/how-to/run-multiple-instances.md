@@ -43,22 +43,27 @@ See [How to deploy on Kubernetes with Helm](deploy-on-kubernetes.md) for the cha
 
 ## 5. Route multipart uploads to one instance
 
-Multipart upload state (the upload id and its received parts) lives only in the memory
-and local disk of the instance that answered `CreateMultipartUpload`. Behind a
-round-robin load balancer, `UploadPart` calls landing on other instances fail with
-`NoSuchUpload`. Cookie-based session affinity cannot fix this — S3 clients don't carry
-cookies — and client-IP affinity collapses when many clients sit behind one NAT.
+The state of a multipart upload — the upload id and the parts received so far — lives
+only in the memory and on the local disk of the instance that answered the
+`CreateMultipartUpload` request. No other instance knows about that upload. Behind a
+round-robin load balancer, every `UploadPart` request that lands on a different
+instance is therefore rejected with a `NoSuchUpload` error. Cookie-based session
+affinity cannot fix this, because S3 clients do not carry cookies, and affinity by
+client IP address stops working when many clients share one address behind a NAT
+gateway.
 
-The supported answer is **consistent hashing by URL path** at the load balancer: all
-requests for one object key (every multipart part included) then pin to the same
-instance. This also keeps all writes to one delta prefix on one instance, which the
-delta engine's in-process reference lock requires. On Kubernetes, the official operator
+The supported answer is **consistent hashing by URL path** at the load balancer. All
+requests for one object key share the same path, so hashing on the path sends them all
+to the same instance — including every part of a multipart upload. The same routing
+also keeps all writes into one delta prefix on a single instance, which the delta
+engine's in-process reference lock requires. On Kubernetes, the official operator
 deploys this router for you — see
 [How to scale out with the Kubernetes operator](scale-out-with-the-kubernetes-operator.md).
-Elsewhere, configure it on your LB (HAProxy: `balance uri` + `hash-type consistent`;
-nginx: `hash $uri consistent`). Know the limits: resizing the fleet remaps part of the
-hash ring, so in-flight multipart uploads on remapped keys fail and clients must restart
-them.
+On any other platform, configure the equivalent on your load balancer: for HAProxy use
+`balance uri` together with `hash-type consistent`; for nginx use
+`hash $uri consistent`. Be aware of the limit of this approach: when you add or remove
+an instance, part of the hash ring moves, so a multipart upload that is in flight on a
+moved key fails and the client has to restart it from the beginning.
 
 ## 6. Mind upgrades across the fleet
 

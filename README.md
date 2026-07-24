@@ -261,7 +261,7 @@ The chart mounts config at `/data/deltaglider_proxy.yaml` so the encrypted IAM D
 
 ### Kubernetes operator (multi-pod)
 
-For multi-pod deployments, use the official operator in [`operator/`](operator/): it manages the proxy pods **plus the consistent-hashing router** that multi-pod S3 traffic requires — without it, multipart uploads fail with `NoSuchUpload` behind a round-robin Service (multipart state is per-pod). The operator README states the trade-offs explicitly. Guide: [How to scale out with the Kubernetes operator](docs/product/how-to/scale-out-with-the-kubernetes-operator.md).
+For deployments with more than one pod, use the official operator in [`operator/`](operator/). It manages the proxy pods **plus the consistent-hashing router** that multi-pod S3 traffic requires. Without that router, multipart uploads fail with `NoSuchUpload` behind a round-robin Service, because the state of an upload lives only on the pod that started it. The operator README states the trade-offs explicitly. Guide: [How to scale out with the Kubernetes operator](docs/product/how-to/scale-out-with-the-kubernetes-operator.md).
 
 ## Documentation
 
