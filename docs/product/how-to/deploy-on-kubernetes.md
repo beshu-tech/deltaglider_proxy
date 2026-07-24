@@ -145,7 +145,11 @@ The chart ships the hardening the Dockerfile expects — leave these alone:
 
 ## Replicas
 
-`replicaCount` defaults to `1` — keep it there unless the pods share IAM state.
+`replicaCount` defaults to `1` — keep it there. The chart has no multipart-aware
+routing: above one replica, S3 multipart uploads fail with `NoSuchUpload` under a
+round-robin Service. For multi-pod, use the official operator instead — it deploys the
+consistent-hashing router this requires: [How to scale out with the Kubernetes
+operator](scale-out-with-the-kubernetes-operator.md).
 
 With config sync set up, replication rules elect one leader per rule through an S3-CAS lease in the sync bucket (default `lease_ttl: "300s"`, `heartbeat_interval: "60s"`); a dead leader's lease lapses and a peer takes over automatically. Lifecycle and maintenance jobs still use node-local database leases, so they may run on more than one pod (idempotent — wasteful, not corrupting). Do not scale above one replica if each pod has its own independent `/data/deltaglider_config.db` — in that shape, each pod is an independent control plane. To run more than one instance, set up config sync first: [How to run multiple instances (HA)](run-multiple-instances.md).
 
@@ -176,11 +180,12 @@ curl -fsS https://s3.acme.example/_/health
 aws --endpoint-url https://s3.acme.example s3 ls
 ```
 
-The liveness/readiness probes hit `GET /_/health`; a pod stuck out of `Running` usually means the PVC didn't bind or the config failed validation — `kubectl logs` shows the startup error.
+The liveness probe hits `GET /_/health` (fast, no I/O); the readiness probe hits `GET /_/ready`, which really probes the storage backend and config DB — a pod that can't reach its backend stays out of rotation. A pod stuck out of `Running` usually means the PVC didn't bind or the config failed validation — `kubectl logs` shows the startup error.
 
 ## Related
 
 - [Kubernetes hello world](../tutorials/kubernetes-hello-world.md) — the local `kind` walkthrough
+- [How to scale out with the Kubernetes operator](scale-out-with-the-kubernetes-operator.md) — multi-pod deployments
 - [How to take a proxy to production](go-to-production.md) — the full production checklist
 - [How to serve TLS](serve-tls.md) — ingress timeouts and forwarded headers
 - [Configuration reference](../reference/configuration.md) — every field in `config.inline`

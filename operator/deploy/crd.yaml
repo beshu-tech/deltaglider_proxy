@@ -1,0 +1,139 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: deltagliderproxies.deltaglider.beshu.tech
+spec:
+  group: deltaglider.beshu.tech
+  names:
+    categories: []
+    kind: DeltaGliderProxy
+    plural: deltagliderproxies
+    shortNames:
+    - dgp
+    singular: deltagliderproxy
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.replicas
+      name: Replicas
+      type: integer
+    - jsonPath: .status.phase
+      name: Ready
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for DeltaGliderProxySpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              configYaml:
+                description: Inline DeltaGlider YAML config. Rendered to a ConfigMap and mounted at /data/deltaglider_proxy.yaml so the encrypted IAM DB lands on the writable volume next to it. Secrets belong in `envFromSecret`, not here.
+                nullable: true
+                type: string
+              envFromSecret:
+                description: Name of an existing Secret whose keys are injected as environment variables (DGP_ACCESS_KEY_ID, DGP_SECRET_ACCESS_KEY, DGP_BOOTSTRAP_PASSWORD_HASH, DGP_BE_AWS_* backend credentials, ...).
+                nullable: true
+                type: string
+              image:
+                description: Proxy container image. Defaults to the operator's pinned release.
+                nullable: true
+                type: string
+              replicas:
+                description: 'Number of proxy pods. Above 1, read the HA notes in the operator README first: you need an S3 storage backend, a shared bootstrap password hash, and a config sync bucket. Multipart uploads work because the managed router consistently hashes requests by URL path, pinning each object''s requests to one pod.'
+                format: int32
+                nullable: true
+                type: integer
+              resources:
+                description: Proxy container resources.
+                nullable: true
+                properties:
+                  limits:
+                    nullable: true
+                    properties:
+                      cpu:
+                        nullable: true
+                        type: string
+                      memory:
+                        nullable: true
+                        type: string
+                    type: object
+                  requests:
+                    nullable: true
+                    properties:
+                      cpu:
+                        nullable: true
+                        type: string
+                      memory:
+                        nullable: true
+                        type: string
+                    type: object
+                type: object
+              router:
+                description: The consistent-hashing HAProxy router in front of the proxy pods.
+                nullable: true
+                properties:
+                  image:
+                    description: Router image (default haproxy:3.0-alpine).
+                    nullable: true
+                    type: string
+                  replicas:
+                    description: Router pod count (default 2). Routers are stateless; the hash ring is deterministic, so every router maps a given path to the same proxy pod.
+                    format: int32
+                    nullable: true
+                    type: integer
+                type: object
+              service:
+                description: How the router is exposed.
+                nullable: true
+                properties:
+                  type:
+                    description: 'Service type for the entrypoint: ClusterIP (default), NodePort, LoadBalancer.'
+                    nullable: true
+                    type: string
+                type: object
+              storage:
+                description: Per-pod persistent volume for /data (config DB, filesystem-backend objects).
+                nullable: true
+                properties:
+                  size:
+                    description: PVC size per pod (default "10Gi").
+                    nullable: true
+                    type: string
+                  storageClass:
+                    description: 'StorageClass name (default: cluster default).'
+                    nullable: true
+                    type: string
+                type: object
+            type: object
+          status:
+            nullable: true
+            properties:
+              message:
+                nullable: true
+                type: string
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                description: Ready | Progressing
+                nullable: true
+                type: string
+              readyReplicas:
+                format: int32
+                nullable: true
+                type: integer
+              routerReadyReplicas:
+                format: int32
+                nullable: true
+                type: integer
+            type: object
+        required:
+        - spec
+        title: DeltaGliderProxy
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

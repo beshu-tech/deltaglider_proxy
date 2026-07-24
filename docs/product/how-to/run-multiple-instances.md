@@ -41,7 +41,26 @@ Use this during rollouts and incident response — e.g. you just disabled a leak
 
 See [How to deploy on Kubernetes with Helm](deploy-on-kubernetes.md) for the chart specifics.
 
-## 5. Mind upgrades across the fleet
+## 5. Route multipart uploads to one instance
+
+Multipart upload state (the upload id and its received parts) lives only in the memory
+and local disk of the instance that answered `CreateMultipartUpload`. Behind a
+round-robin load balancer, `UploadPart` calls landing on other instances fail with
+`NoSuchUpload`. Cookie-based session affinity cannot fix this — S3 clients don't carry
+cookies — and client-IP affinity collapses when many clients sit behind one NAT.
+
+The supported answer is **consistent hashing by URL path** at the load balancer: all
+requests for one object key (every multipart part included) then pin to the same
+instance. This also keeps all writes to one delta prefix on one instance, which the
+delta engine's in-process reference lock requires. On Kubernetes, the official operator
+deploys this router for you — see
+[How to scale out with the Kubernetes operator](scale-out-with-the-kubernetes-operator.md).
+Elsewhere, configure it on your LB (HAProxy: `balance uri` + `hash-type consistent`;
+nginx: `hash $uri consistent`). Know the limits: resizing the fleet remaps part of the
+hash ring, so in-flight multipart uploads on remapped keys fail and clients must restart
+them.
+
+## 6. Mind upgrades across the fleet
 
 During a rolling upgrade, a newer binary may migrate the DB schema forward; older instances still running will download a DB they can't fully read. Upgrade all instances before making IAM mutations, or accept that mid-rollout mutations are lost on older readers. Details: [How to upgrade the proxy](upgrade.md).
 

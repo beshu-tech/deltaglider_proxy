@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### Added — official Kubernetes operator with multipart-safe multi-pod routing
+
+New `operator/` crate: a Kubernetes operator (CRD `DeltaGliderProxy`,
+group `deltaglider.beshu.tech/v1alpha1`) that manages the proxy StatefulSet
+(one PVC per pod), the config, the Services — and an HAProxy router that
+**consistent-hashes S3 traffic by URL path**. That routing is what makes a
+multi-pod deployment work with S3 multipart uploads: multipart state is
+per-pod, so behind a round-robin Service the SDK's parallel `UploadPart`
+calls hit the wrong pods and fail with `NoSuchUpload`. Path-pinning routes
+every request for one object key (all multipart parts included) to the same
+pod, and also keeps same-prefix writes on one pod as the delta engine's
+reference lock requires. Consistent hashing is the only multipart strategy
+implemented — the trade-offs (ring remap on scale, per-pod upload loss on
+restart) are documented in the operator README and in
+`docs/product/how-to/scale-out-with-the-kubernetes-operator.md`. The Helm
+chart remains the single-pod path and now says so explicitly.
+
+The router stamps `X-Forwarded-For` (and the pods get
+`DGP_TRUST_PROXY_HEADERS=true`) so rate limits, `aws:SourceIp` conditions,
+and admin-session IP binding see real client IPs; ring membership tracks
+`/_/ready` (real backend readiness), not just liveness. The Helm chart's
+readiness probe now also points at `/_/ready` instead of `/_/health`,
+matching the backend-health invariant shipped in v1.16.0.
+
 ## v1.16.1 — 2026-07-22
 
 ### Fixed — Verify no longer blames the scan cap for transient read failures

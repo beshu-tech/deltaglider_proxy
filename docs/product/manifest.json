@@ -1,5 +1,5 @@
 {
-  "_comment": "Single source of truth for product-docs grouping + ordering. Consumed by BOTH the in-product docs viewer (demo/s3-browser/ui/src/docs-imports.ts) and the marketing website docs renderer (marketing/src/pages/docs). Add a doc: drop the .md under docs/product/, then add a `docs` entry here (path is relative to docs/product/, without the .md extension). `group` must be one of `groups[].id`. `order` sorts within a group (lower = earlier). CI (scripts/check-docs-registry.sh) keeps this in lockstep with the .md files on disk. The groups mirror the Diátaxis quadrants: Start here = tutorials, the three Guides groups = how-to, Reference = facts, Concepts = explanation.",
+  "_comment": "Single source of truth for product-docs grouping + ordering. Consumed by BOTH the in-product docs viewer (demo/s3-browser/ui/src/docs-imports.ts) and the marketing website docs renderer (marketing/src/pages/docs). Add a doc: drop the .md under docs/product/, then add a `docs` entry here (path is relative to docs/product/, without the .md extension). `group` must be one of `groups[].id`. `order` sorts within a group (lower = earlier). CI (scripts/check-docs-registry.sh) keeps this in lockstep with the .md files on disk. The groups mirror the Di\u00e1taxis quadrants: Start here = tutorials, the three Guides groups = how-to, Reference = facts, Concepts = explanation.",
   "groups": [
     {
       "id": "Start here",
@@ -23,7 +23,7 @@
     },
     {
       "id": "Concepts",
-      "tagline": "How it works and why — readable away from the keyboard."
+      "tagline": "How it works and why \u2014 readable away from the keyboard."
     },
     {
       "id": "Releases",
@@ -70,6 +70,11 @@
       "path": "how-to/deploy-on-kubernetes",
       "group": "Guides: deploy & operate",
       "order": 20
+    },
+    {
+      "path": "how-to/scale-out-with-the-kubernetes-operator",
+      "group": "Guides: deploy & operate",
+      "order": 25
     },
     {
       "path": "how-to/serve-tls",

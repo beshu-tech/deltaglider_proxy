@@ -1,0 +1,27 @@
+# Operator crate CI — separate from the proxy merge gate, path-filtered.
+name: operator-ci
+
+on:
+  push:
+    branches: [main]
+    paths: ["operator/**", ".github/workflows/operator-ci.yml"]
+  pull_request:
+    paths: ["operator/**", ".github/workflows/operator-ci.yml"]
+
+jobs:
+  operator:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: operator
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: operator
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked

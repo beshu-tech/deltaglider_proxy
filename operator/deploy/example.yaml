@@ -1,0 +1,36 @@
+# A 3-pod HA DeltaGliderProxy against an S3 backend.
+# Prerequisite Secret (create it first, outside version control):
+#
+#   kubectl -n dgp create secret generic dgp-env \
+#     --from-literal=DGP_ACCESS_KEY_ID=admin \
+#     --from-literal=DGP_SECRET_ACCESS_KEY=replace-me \
+#     --from-literal=DGP_BOOTSTRAP_PASSWORD_HASH="JDJiJDEyJ..." \
+#     --from-literal=DGP_BE_AWS_ACCESS_KEY_ID="..." \
+#     --from-literal=DGP_BE_AWS_SECRET_ACCESS_KEY="..."
+#
+# All pods MUST share the same DGP_BOOTSTRAP_PASSWORD_HASH, and replicas > 1
+# requires an S3 storage backend plus a config sync bucket (see README).
+apiVersion: deltaglider.beshu.tech/v1alpha1
+kind: DeltaGliderProxy
+metadata:
+  name: dgp
+  namespace: dgp
+spec:
+  replicas: 3
+  configYaml: |
+    storage:
+      s3: https://s3.eu-central-1.amazonaws.com
+      region: eu-central-1
+    access:
+      iam_mode: gui
+    advanced:
+      listen_addr: "0.0.0.0:9000"
+      config_sync_bucket: dgp-iam-sync
+      log_level: "deltaglider_proxy=info,tower_http=warn"
+  envFromSecret: dgp-env
+  storage:
+    size: 20Gi
+  router:
+    replicas: 2
+  service:
+    type: ClusterIP
