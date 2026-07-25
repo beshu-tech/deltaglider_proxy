@@ -27,6 +27,15 @@ spec:
         properties:
           spec:
             properties:
+              bootstrapPassword:
+                description: Bootstrap password management. With autoGenerate, the operator creates a Secret `<name>-bootstrap` holding a random password and its hash, and injects it into every pod — no manual --set-bootstrap-password step.
+                nullable: true
+                properties:
+                  autoGenerate:
+                    description: 'Generate the bootstrap password + hash once and keep them in a Secret. Never rotated by the operator; read it with: kubectl get secret <name>-bootstrap -o jsonpath=''{.data.password}'' | base64 -d'
+                    nullable: true
+                    type: boolean
+                type: object
               configYaml:
                 description: Inline DeltaGlider YAML config. Rendered to a ConfigMap and mounted at /data/deltaglider_proxy.yaml so the encrypted IAM DB lands on the writable volume next to it. Secrets belong in `envFromSecret`, not here.
                 nullable: true

@@ -49,6 +49,19 @@ pub struct DeltaGliderProxySpec {
     pub service: Option<ServiceSpec>,
     /// Proxy container resources.
     pub resources: Option<ResourcesSpec>,
+    /// Bootstrap password management. With autoGenerate, the operator creates a
+    /// Secret `<name>-bootstrap` holding a random password and its hash, and injects
+    /// it into every pod — no manual --set-bootstrap-password step.
+    pub bootstrap_password: Option<BootstrapPasswordSpec>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BootstrapPasswordSpec {
+    /// Generate the bootstrap password + hash once and keep them in a Secret.
+    /// Never rotated by the operator; read it with:
+    /// kubectl get secret <name>-bootstrap -o jsonpath='{.data.password}' | base64 -d
+    pub auto_generate: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, Default)]
@@ -140,5 +153,12 @@ impl DeltaGliderProxy {
             .as_ref()
             .and_then(|s| s.size.clone())
             .unwrap_or_else(|| "10Gi".into())
+    }
+    pub fn bootstrap_auto_generate(&self) -> bool {
+        self.spec
+            .bootstrap_password
+            .as_ref()
+            .and_then(|b| b.auto_generate)
+            .unwrap_or(false)
     }
 }

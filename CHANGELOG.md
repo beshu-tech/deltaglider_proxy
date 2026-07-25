@@ -16,7 +16,20 @@ touches one delta prefix — all keys in it, every multipart part — to the
 same pod, which both keeps multipart uploads working and satisfies the
 delta engine's single-writer-per-deltaspace reference lock (per-key
 hashing would not: two keys in one prefix share one reference file).
-Routing behaviour verified against haproxy:3.0. Consistent hashing is the only multipart strategy
+Routing behaviour verified against haproxy:3.0.
+
+Operator 0.2.0 lowers the friction of getting to a correct multi-pod
+deployment. The multi-replica requirements are now **enforced**: when
+`replicas > 1` but the spec has no config sync bucket, uses a filesystem
+backend, or has no shared bootstrap password hash, the operator deploys a
+single pod, sets the resource's phase to `Degraded`, and lists the exact
+problems in `status.message` — a broken spec can no longer scale into data
+corruption. And `spec.bootstrapPassword.autoGenerate: true` removes the
+manual hash step entirely: the operator generates a random password once,
+stores it with its bcrypt hash in a Secret named `<name>-bootstrap`, and
+injects the hash into every pod. The operator image is published to
+Docker Hub by CI on every operator version bump (skipped entirely when
+the version is already published). Consistent hashing is the only multipart strategy
 implemented — the trade-offs (ring remap on scale, per-pod upload loss on
 restart) are documented in the operator README and in
 `docs/product/how-to/scale-out-with-the-kubernetes-operator.md`. The Helm

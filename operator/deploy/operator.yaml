@@ -28,6 +28,11 @@ rules:
   - apiGroups: [""]
     resources: ["services", "configmaps"]
     verbs: ["get", "list", "watch", "create", "patch"]
+  # Preflight reads the env Secret's KEY NAMES; autoGenerate creates <name>-bootstrap
+  # once. get + create only — the operator can never list or overwrite secrets.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create"]
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "watch", "create", "patch"]
@@ -72,7 +77,7 @@ spec:
         runAsUser: 999
       containers:
         - name: operator
-          image: beshultd/deltaglider-operator:0.1.0
+          image: beshultd/deltaglider-operator:0.2.0
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false

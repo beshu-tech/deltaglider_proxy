@@ -110,7 +110,7 @@ Two more operational notes:
   volume. After you scale `replicas` down, reclaim the removed pods' volumes manually
   if you want the storage back.
 
-## Requirements for `replicas > 1`
+## Requirements for `replicas > 1` (enforced)
 
 Multipart routing is necessary but not sufficient. The
 [multi-instance contract](../docs/product/how-to/run-multiple-instances.md) also
@@ -120,11 +120,22 @@ requires:
    more than one pod each pod would see different data.
 2. **The same `DGP_BOOTSTRAP_PASSWORD_HASH` on every pod.** This hash encrypts the
    shared IAM database. The operator injects one Secret into all pods, which guarantees
-   that they agree.
+   that they agree. If you would rather not create the hash yourself, set
+   `spec.bootstrapPassword.autoGenerate: true` and the operator generates a random
+   password and its hash once, stores both in a Secret named `<name>-bootstrap`, and
+   injects the hash into every pod. Read the password with:
+   `kubectl get secret <name>-bootstrap -o jsonpath='{.data.password}' | base64 -d`.
 3. **A config sync bucket** (`advanced.config_sync_bucket`). It carries IAM users and
    groups between the pods and hosts the leader leases for replication rules.
 4. **One admin writer at a time.** Make IAM changes through one pod only, or switch to
    `iam_mode: declarative`. The IAM synchronisation is not multi-master.
+
+The operator checks points 1–3 before it scales. If you set `replicas: 3` but the spec
+violates the contract — no sync bucket, a filesystem backend, a missing Secret, or no
+bootstrap hash — the operator deploys **one** pod instead, sets the resource's phase to
+`Degraded`, and writes the exact list of problems into `status.message`. Fix the spec
+and the operator scales up on the next reconcile. A broken spec can never scale into
+data corruption.
 
 ## Spec reference
 
@@ -148,6 +159,8 @@ spec:
   resources:                   # resources of the proxy container
     requests: { cpu: "500m", memory: 1Gi }
     limits: { memory: 4Gi }
+  bootstrapPassword:
+    autoGenerate: true         # operator creates <name>-bootstrap once (default false)
 ```
 
 `kubectl get dgp` shows the replica count and the phase (`Ready` or `Progressing`),

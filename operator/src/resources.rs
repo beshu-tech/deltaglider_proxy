@@ -127,15 +127,29 @@ pub fn config_configmap(cr: &DeltaGliderProxy) -> Option<Value> {
     }))
 }
 
-/// ConfigMap holding the rendered haproxy.cfg.
-pub fn router_configmap(cr: &DeltaGliderProxy) -> Value {
+/// ConfigMap holding the rendered haproxy.cfg. `replicas` is the EFFECTIVE count
+/// (preflight may clamp it below spec.replicas).
+pub fn router_configmap(cr: &DeltaGliderProxy, replicas: i32) -> Value {
     let name = format!("{}-router", cr_name(cr));
     let ns = cr.meta().namespace.clone().unwrap_or_default();
     json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": meta(cr, &name, "router"),
-        "data": { "haproxy.cfg": haproxy_cfg(&cr_name(cr), &ns, cr.replicas()) },
+        "data": { "haproxy.cfg": haproxy_cfg(&cr_name(cr), &ns, replicas) },
+    })
+}
+
+/// The auto-generated bootstrap Secret (`password` for the human, `hash` for the
+/// pods). Create-once: the reconciler never overwrites an existing one.
+pub fn bootstrap_secret(cr: &DeltaGliderProxy, password: &str, hash_b64: &str) -> Value {
+    let name = format!("{}-bootstrap", cr_name(cr));
+    json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": meta(cr, &name, "proxy"),
+        "type": "Opaque",
+        "stringData": { "password": password, "hash": hash_b64 },
     })
 }
 
@@ -176,8 +190,8 @@ pub fn entry_service(cr: &DeltaGliderProxy) -> Value {
 
 /// The proxy StatefulSet: one PVC per pod, config mounted read-only at
 /// /data/deltaglider_proxy.yaml over the writable volume (subPath), same hardening
-/// as the Helm chart / Dockerfile.
-pub fn proxy_statefulset(cr: &DeltaGliderProxy) -> Value {
+/// as the Helm chart / Dockerfile. `replicas` is the EFFECTIVE count.
+pub fn proxy_statefulset(cr: &DeltaGliderProxy, replicas: i32) -> Value {
     let name = cr_name(cr);
     let has_config = cr.spec.config_yaml.is_some();
 
@@ -187,6 +201,14 @@ pub fn proxy_statefulset(cr: &DeltaGliderProxy) -> Value {
     let mut env = vec![json!({ "name": "DGP_TRUST_PROXY_HEADERS", "value": "true" })];
     if has_config {
         env.push(json!({ "name": "DGP_CONFIG", "value": CONFIG_MOUNT }));
+    }
+    if cr.bootstrap_auto_generate() {
+        env.push(json!({
+            "name": "DGP_BOOTSTRAP_PASSWORD_HASH",
+            "valueFrom": { "secretKeyRef": {
+                "name": format!("{name}-bootstrap"), "key": "hash",
+            }},
+        }));
     }
 
     let mut env_from = vec![];
@@ -254,7 +276,7 @@ pub fn proxy_statefulset(cr: &DeltaGliderProxy) -> Value {
         "kind": "StatefulSet",
         "metadata": meta(cr, &name, "proxy"),
         "spec": {
-            "replicas": cr.replicas(),
+            "replicas": replicas,
             "serviceName": format!("{name}-pods"),
             "podManagementPolicy": "Parallel",
             "selector": { "matchLabels": {
@@ -306,12 +328,12 @@ pub fn proxy_statefulset(cr: &DeltaGliderProxy) -> Value {
 
 /// The router Deployment. The pod template carries a hash of the rendered
 /// haproxy.cfg so ANY config change rolls the routers (subPath mounts never update).
-pub fn router_deployment(cr: &DeltaGliderProxy) -> Value {
+pub fn router_deployment(cr: &DeltaGliderProxy, replicas: i32) -> Value {
     let name = cr_name(cr);
     let router_name = format!("{name}-router");
     let ns = cr.meta().namespace.clone().unwrap_or_default();
     let mut pod_labels = labels(&name, "router");
-    pod_labels["dgp.beshu.tech/ring"] = json!(fnv1a_hex(&haproxy_cfg(&name, &ns, cr.replicas())));
+    pod_labels["dgp.beshu.tech/ring"] = json!(fnv1a_hex(&haproxy_cfg(&name, &ns, replicas)));
     json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -408,11 +430,17 @@ mod tests {
                 }),
                 service: None,
                 resources: None,
+                bootstrap_password: None,
             },
         );
         cr.meta_mut().namespace = Some("dgp-ns".into());
         cr.meta_mut().uid = Some("uid-1".into());
         cr
+    }
+
+    /// Builders under test get spec.replicas as the effective count.
+    fn eff(cr: &DeltaGliderProxy) -> i32 {
+        cr.replicas()
     }
 
     #[test]
@@ -455,11 +483,11 @@ mod tests {
     #[test]
     fn children_typecheck_and_carry_owner_refs() {
         let cr = cr(3);
-        let sts: StatefulSet = serde_json::from_value(proxy_statefulset(&cr)).unwrap();
-        let dep: Deployment = serde_json::from_value(router_deployment(&cr)).unwrap();
+        let sts: StatefulSet = serde_json::from_value(proxy_statefulset(&cr, eff(&cr))).unwrap();
+        let dep: Deployment = serde_json::from_value(router_deployment(&cr, eff(&cr))).unwrap();
         let hs: Service = serde_json::from_value(headless_service(&cr)).unwrap();
         let es: Service = serde_json::from_value(entry_service(&cr)).unwrap();
-        let rcm: ConfigMap = serde_json::from_value(router_configmap(&cr)).unwrap();
+        let rcm: ConfigMap = serde_json::from_value(router_configmap(&cr, eff(&cr))).unwrap();
         let ccm: ConfigMap = serde_json::from_value(config_configmap(&cr).unwrap()).unwrap();
         for m in [
             sts.metadata.clone(),
@@ -483,7 +511,7 @@ mod tests {
     #[test]
     fn config_mounted_over_writable_data_via_subpath() {
         let cr = cr(1);
-        let sts: StatefulSet = serde_json::from_value(proxy_statefulset(&cr)).unwrap();
+        let sts: StatefulSet = serde_json::from_value(proxy_statefulset(&cr, eff(&cr))).unwrap();
         let pod = sts.spec.unwrap().template.spec.unwrap();
         let c = &pod.containers[0];
         let cfg_mount = c
@@ -510,7 +538,7 @@ mod tests {
         let mut b = cr(1);
         b.spec.config_yaml = Some("storage:\n  filesystem: /data/other\n".into());
         let hash = |cr: &DeltaGliderProxy| {
-            proxy_statefulset(cr)["spec"]["template"]["metadata"]["annotations"]
+            proxy_statefulset(cr, 1)["spec"]["template"]["metadata"]["annotations"]
                 ["dgp.beshu.tech/config-hash"]
                 .clone()
         };
@@ -541,7 +569,7 @@ mod tests {
         let mut cr = cr(1);
         cr.spec.config_yaml = None;
         assert!(config_configmap(&cr).is_none());
-        let sts: StatefulSet = serde_json::from_value(proxy_statefulset(&cr)).unwrap();
+        let sts: StatefulSet = serde_json::from_value(proxy_statefulset(&cr, eff(&cr))).unwrap();
         let pod = sts.spec.unwrap().template.spec.unwrap();
         assert!(pod.containers[0]
             .volume_mounts
@@ -553,8 +581,8 @@ mod tests {
 
     #[test]
     fn ring_annotation_rolls_routers_on_scale() {
-        let a = router_deployment(&cr(2));
-        let b = router_deployment(&cr(3));
+        let a = router_deployment(&cr(2), 2);
+        let b = router_deployment(&cr(3), 3);
         let ring =
             |v: &Value| v["spec"]["template"]["metadata"]["labels"]["dgp.beshu.tech/ring"].clone();
         assert_ne!(ring(&a), ring(&b));

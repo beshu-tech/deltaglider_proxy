@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 mod crd;
+mod preflight;
 mod reconcile;
 mod resources;
 

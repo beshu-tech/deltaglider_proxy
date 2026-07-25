@@ -68,6 +68,13 @@ Generate the hash with the proxy binary:
 printf '%s\n' 'your-admin-password' | deltaglider_proxy --set-bootstrap-password
 ```
 
+If you would rather skip this step, leave `DGP_BOOTSTRAP_PASSWORD_HASH` out of the
+Secret and set `bootstrapPassword: { autoGenerate: true }` in the resource below. The
+operator then generates a random password once, stores it together with its hash in a
+Secret named `<name>-bootstrap`, and injects the hash into every pod. Read the
+password later with
+`kubectl -n dgp get secret dgp-bootstrap -o jsonpath='{.data.password}' | base64 -d`.
+
 ## 3. Declare the proxy
 
 A multi-pod deployment needs an S3 storage backend, because the filesystem backend is
@@ -103,6 +110,12 @@ spec:
 kubectl apply -f dgp.yaml
 kubectl -n dgp get dgp dgp -w     # wait for phase: Ready
 ```
+
+The operator checks the multi-replica requirements before it scales: if the spec has
+no config sync bucket, uses a filesystem backend, or has no shared bootstrap password
+hash, the operator deploys one pod instead of three, sets the phase to `Degraded`, and
+lists the exact problems in `status.message` (`kubectl -n dgp describe dgp dgp` shows
+them). Fix the spec and it scales up on its own.
 
 The operator creates the proxy pods (a StatefulSet with one persistent volume per
 pod), the HAProxy router pods, and a Service named `dgp` in front of the routers.
