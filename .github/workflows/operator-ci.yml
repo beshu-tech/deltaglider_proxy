@@ -25,3 +25,49 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+
+  # Publish beshultd/deltaglider-operator — but ONLY when the version in
+  # operator/Cargo.toml has no tag on Docker Hub yet. Rust builds are expensive;
+  # docs-only pushes and re-runs of an already-published version skip everything.
+  publish:
+    needs: operator
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read operator version
+        id: ver
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' operator/Cargo.toml | head -1)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "operator version: $v"
+      - name: Check whether this version is already on Docker Hub
+        id: exists
+        run: |
+          if docker manifest inspect "beshultd/deltaglider-operator:${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "tag already published — skipping build"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.exists.outputs.exists == 'false'
+        uses: docker/setup-qemu-action@v3
+      - if: steps.exists.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+      - if: steps.exists.outputs.exists == 'false'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - if: steps.exists.outputs.exists == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: operator
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            beshultd/deltaglider-operator:${{ steps.ver.outputs.version }}
+            beshultd/deltaglider-operator:latest
+          cache-from: type=gha,scope=operator
+          cache-to: type=gha,scope=operator,mode=max

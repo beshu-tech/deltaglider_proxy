@@ -36,4 +36,19 @@ mod tests {
             "deploy/crd.yaml is stale — regenerate with `cargo run -- crd > deploy/crd.yaml`"
         );
     }
+
+    #[test]
+    fn operator_yaml_image_tag_matches_crate_version() {
+        // CI publishes beshultd/deltaglider-operator:<Cargo.toml version> — the deploy
+        // manifest must reference exactly that tag or installs pull a stale image.
+        let expected = format!(
+            "beshultd/deltaglider-operator:{}",
+            env!("CARGO_PKG_VERSION")
+        );
+        let on_disk = include_str!("../deploy/operator.yaml");
+        assert!(
+            on_disk.contains(&expected),
+            "deploy/operator.yaml must reference {expected} (bump it with the crate version)"
+        );
+    }
 }
