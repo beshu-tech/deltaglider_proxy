@@ -113,9 +113,10 @@ kubectl -n dgp get dgp dgp -w     # wait for phase: Ready
 
 The operator checks the multi-replica requirements before it scales: if the spec has
 no config sync bucket, uses a filesystem backend, or has no shared bootstrap password
-hash, the operator deploys one pod instead of three, sets the phase to `Degraded`, and
-lists the exact problems in `status.message` (`kubectl -n dgp describe dgp dgp` shows
-them). Fix the spec and it scales up on its own.
+hash, the operator refuses to scale up — a fresh deployment comes up with one pod, an
+already-running fleet keeps its current size — and it sets the phase to `Degraded`
+with the exact problems listed in `status.message` (`kubectl -n dgp describe dgp dgp`
+shows them). Fix the spec and it scales up on its own.
 
 The operator creates the proxy pods (a StatefulSet with one persistent volume per
 pod), the HAProxy router pods, and a Service named `dgp` in front of the routers.

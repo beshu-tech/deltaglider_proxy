@@ -56,16 +56,12 @@ fn fnv1a_hex(s: &str) -> String {
 /// so every request touching one delta prefix — all keys in it, all multipart parts —
 /// lands on the same proxy pod, keeping the in-process reference lock sufficient.
 /// Admin UI traffic (/_/) is source-IP sticky because sessions are in-memory.
-pub fn haproxy_cfg(cr_name: &str, namespace: &str, replicas: i32) -> String {
-    let mut servers_s3 = String::new();
-    let mut servers_admin = String::new();
-    for i in 0..replicas {
+pub fn haproxy_cfg(cr_name: &str, namespace: &str, proxy_replicas: i32) -> String {
+    let mut servers = String::new();
+    for i in 0..proxy_replicas {
         // StatefulSet stable DNS names keep the hash ring identical on every router.
         let host = format!("{cr_name}-{i}.{cr_name}-pods.{namespace}.svc.cluster.local");
-        servers_s3.push_str(&format!(
-            "  server dgp{i} {host}:{PROXY_PORT} check resolvers kube init-addr none\n"
-        ));
-        servers_admin.push_str(&format!(
+        servers.push_str(&format!(
             "  server dgp{i} {host}:{PROXY_PORT} check resolvers kube init-addr none\n"
         ));
     }
@@ -103,7 +99,7 @@ backend s3
   option httpchk GET /_/ready
   http-check expect status 200
   default-server inter 10s rise 2 fall 3
-{servers_s3}
+{servers}
 # Admin UI sessions are in-memory and IP-bound: source-IP stickiness.
 backend admin
   balance source
@@ -111,7 +107,7 @@ backend admin
   option httpchk GET /_/ready
   http-check expect status 200
   default-server inter 10s rise 2 fall 3
-{servers_admin}"#
+{servers}"#
     )
 }
 
@@ -127,27 +123,32 @@ pub fn config_configmap(cr: &DeltaGliderProxy) -> Option<Value> {
     }))
 }
 
-/// ConfigMap holding the rendered haproxy.cfg. `replicas` is the EFFECTIVE count
-/// (preflight may clamp it below spec.replicas).
-pub fn router_configmap(cr: &DeltaGliderProxy, replicas: i32) -> Value {
+/// ConfigMap holding the rendered haproxy.cfg. `proxy_replicas` is the EFFECTIVE
+/// ring size (preflight may hold it below spec.replicas).
+pub fn router_configmap(cr: &DeltaGliderProxy, proxy_replicas: i32) -> Value {
     let name = format!("{}-router", cr_name(cr));
     let ns = cr.meta().namespace.clone().unwrap_or_default();
     json!({
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": meta(cr, &name, "router"),
-        "data": { "haproxy.cfg": haproxy_cfg(&cr_name(cr), &ns, replicas) },
+        "data": { "haproxy.cfg": haproxy_cfg(&cr_name(cr), &ns, proxy_replicas) },
     })
 }
 
-/// The auto-generated bootstrap Secret (`password` for the human, `hash` for the
-/// pods). Create-once: the reconciler never overwrites an existing one.
+/// The auto-generated bootstrap Secret (`password` for the human, `hash` for the pods).
+/// Create-once and NO ownerReference: the hash decrypts IAM data on PVCs that survive
+/// CR deletion, so the Secret must survive too (manual teardown, like the PVCs).
 pub fn bootstrap_secret(cr: &DeltaGliderProxy, password: &str, hash_b64: &str) -> Value {
     let name = format!("{}-bootstrap", cr_name(cr));
     json!({
         "apiVersion": "v1",
         "kind": "Secret",
-        "metadata": meta(cr, &name, "proxy"),
+        "metadata": {
+            "name": name,
+            "namespace": cr.meta().namespace,
+            "labels": labels(cr.meta().name.as_deref().unwrap_or_default(), "proxy"),
+        },
         "type": "Opaque",
         "stringData": { "password": password, "hash": hash_b64 },
     })
@@ -328,12 +329,12 @@ pub fn proxy_statefulset(cr: &DeltaGliderProxy, replicas: i32) -> Value {
 
 /// The router Deployment. The pod template carries a hash of the rendered
 /// haproxy.cfg so ANY config change rolls the routers (subPath mounts never update).
-pub fn router_deployment(cr: &DeltaGliderProxy, replicas: i32) -> Value {
+pub fn router_deployment(cr: &DeltaGliderProxy, proxy_replicas: i32) -> Value {
     let name = cr_name(cr);
     let router_name = format!("{name}-router");
     let ns = cr.meta().namespace.clone().unwrap_or_default();
     let mut pod_labels = labels(&name, "router");
-    pod_labels["dgp.beshu.tech/ring"] = json!(fnv1a_hex(&haproxy_cfg(&name, &ns, replicas)));
+    pod_labels["dgp.beshu.tech/ring"] = json!(fnv1a_hex(&haproxy_cfg(&name, &ns, proxy_replicas)));
     json!({
         "apiVersion": "apps/v1",
         "kind": "Deployment",
@@ -438,11 +439,6 @@ mod tests {
         cr
     }
 
-    /// Builders under test get spec.replicas as the effective count.
-    fn eff(cr: &DeltaGliderProxy) -> i32 {
-        cr.replicas()
-    }
-
     #[test]
     fn haproxy_cfg_pins_by_path_and_lists_stable_pod_dns() {
         let cfg = haproxy_cfg("dgp", "dgp-ns", 3);
@@ -483,11 +479,13 @@ mod tests {
     #[test]
     fn children_typecheck_and_carry_owner_refs() {
         let cr = cr(3);
-        let sts: StatefulSet = serde_json::from_value(proxy_statefulset(&cr, eff(&cr))).unwrap();
-        let dep: Deployment = serde_json::from_value(router_deployment(&cr, eff(&cr))).unwrap();
+        let sts: StatefulSet =
+            serde_json::from_value(proxy_statefulset(&cr, cr.replicas())).unwrap();
+        let dep: Deployment =
+            serde_json::from_value(router_deployment(&cr, cr.replicas())).unwrap();
         let hs: Service = serde_json::from_value(headless_service(&cr)).unwrap();
         let es: Service = serde_json::from_value(entry_service(&cr)).unwrap();
-        let rcm: ConfigMap = serde_json::from_value(router_configmap(&cr, eff(&cr))).unwrap();
+        let rcm: ConfigMap = serde_json::from_value(router_configmap(&cr, cr.replicas())).unwrap();
         let ccm: ConfigMap = serde_json::from_value(config_configmap(&cr).unwrap()).unwrap();
         for m in [
             sts.metadata.clone(),
@@ -511,7 +509,8 @@ mod tests {
     #[test]
     fn config_mounted_over_writable_data_via_subpath() {
         let cr = cr(1);
-        let sts: StatefulSet = serde_json::from_value(proxy_statefulset(&cr, eff(&cr))).unwrap();
+        let sts: StatefulSet =
+            serde_json::from_value(proxy_statefulset(&cr, cr.replicas())).unwrap();
         let pod = sts.spec.unwrap().template.spec.unwrap();
         let c = &pod.containers[0];
         let cfg_mount = c
@@ -554,6 +553,36 @@ mod tests {
     }
 
     #[test]
+    fn clamped_replicas_build_one_pod_objects() {
+        // The preflight-hold path: spec says 3, effective is 1.
+        let cr = cr(3);
+        let sts: StatefulSet = serde_json::from_value(proxy_statefulset(&cr, 1)).unwrap();
+        assert_eq!(sts.spec.unwrap().replicas, Some(1));
+        let ring = haproxy_cfg("dgp", "dgp-ns", 1);
+        assert_eq!(
+            ring.matches("server dgp0 ").count(),
+            2,
+            "one pod in both backends"
+        );
+        assert!(
+            !ring.contains("server dgp1 "),
+            "held ring must not list pod 1"
+        );
+    }
+
+    #[test]
+    fn bootstrap_secret_survives_cr_deletion() {
+        use k8s_openapi::api::core::v1::Secret;
+        let s: Secret = serde_json::from_value(bootstrap_secret(&cr(1), "pw", "aGFzaA==")).unwrap();
+        assert!(
+            s.metadata.owner_references.is_none(),
+            "an ownerReference would GC the hash while the PVCs survive → IAM DB lockout"
+        );
+        let data = s.string_data.unwrap();
+        assert!(data.contains_key("password") && data.contains_key("hash"));
+    }
+
+    #[test]
     fn router_pdb_keeps_one_router_through_drains() {
         use k8s_openapi::api::policy::v1::PodDisruptionBudget;
         let pdb: PodDisruptionBudget = serde_json::from_value(router_pdb(&cr(2))).unwrap();
@@ -569,7 +598,8 @@ mod tests {
         let mut cr = cr(1);
         cr.spec.config_yaml = None;
         assert!(config_configmap(&cr).is_none());
-        let sts: StatefulSet = serde_json::from_value(proxy_statefulset(&cr, eff(&cr))).unwrap();
+        let sts: StatefulSet =
+            serde_json::from_value(proxy_statefulset(&cr, cr.replicas())).unwrap();
         let pod = sts.spec.unwrap().template.spec.unwrap();
         assert!(pod.containers[0]
             .volume_mounts

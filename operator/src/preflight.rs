@@ -15,6 +15,47 @@ pub enum EnvSecret {
     Missing(String),
     /// Named and found; these are its key names (values never leave the cluster).
     Keys(Vec<String>),
+    /// The read failed transiently — the truth is unknown this cycle.
+    Unknown,
+}
+
+/// The replica count to actually deploy. `may_scale_up` is true only when preflight
+/// ran and found no problems. Otherwise we HOLD the current fleet size (killing
+/// healthy pods remaps the hash ring) and only block growth past it.
+pub fn effective_replicas(spec_replicas: i32, may_scale_up: bool, current: Option<i32>) -> i32 {
+    if may_scale_up {
+        spec_replicas
+    } else {
+        spec_replicas.min(current.unwrap_or(0).max(1))
+    }
+}
+
+/// Status phase + message, pure so the truth table is unit-testable.
+pub fn phase_and_message(
+    problems: &[String],
+    ready: i32,
+    want: i32,
+    router_ready: i32,
+) -> (&'static str, String) {
+    if !problems.is_empty() {
+        (
+            "Degraded",
+            format!(
+                "scale-up blocked — spec violates the multi-replica contract: {}",
+                problems.join(" | ")
+            ),
+        )
+    } else if ready >= want && router_ready >= 1 {
+        (
+            "Ready",
+            format!("{ready}/{want} proxy pods, {router_ready} router pods ready"),
+        )
+    } else {
+        (
+            "Progressing",
+            format!("{ready}/{want} proxy pods, {router_ready} router pods ready"),
+        )
+    }
 }
 
 /// Returns the list of problems that make `replicas > 1` unsafe. Empty = go.
@@ -42,6 +83,8 @@ pub fn multi_replica_problems(cr: &DeltaGliderProxy, env_secret: &EnvSecret) -> 
         },
     };
 
+    // Unknown never reaches these checks — the caller skips preflight on a transient
+    // read failure, so a control-plane blip can neither invent problems nor assert health.
     let secret_has = |key: &str| match env_secret {
         EnvSecret::Keys(keys) => keys.iter().any(|k| k == key),
         _ => false,
@@ -207,6 +250,34 @@ mod tests {
         let c = cr(2, Some(GOOD_HA_YAML), false);
         let problems = multi_replica_problems(&c, &EnvSecret::Missing("dgp-env".into()));
         assert!(problems.iter().any(|p| p.contains("does not exist")));
+    }
+
+    #[test]
+    fn effective_replicas_holds_fleet_never_scales_down_on_problems() {
+        // Clean preflight: spec wins.
+        assert_eq!(effective_replicas(3, true, Some(2)), 3);
+        // Problems on a running 3-fleet: HOLD 3, never kill healthy pods.
+        assert_eq!(effective_replicas(3, false, Some(3)), 3);
+        // Problems while asking to grow 2→5: hold at 2.
+        assert_eq!(effective_replicas(5, false, Some(2)), 2);
+        // Problems on a fresh deploy (no StatefulSet yet): come up at 1.
+        assert_eq!(effective_replicas(3, false, None), 1);
+        assert_eq!(effective_replicas(3, false, Some(0)), 1);
+        // Spec below current: shrink is honored even with problems (user asked).
+        assert_eq!(effective_replicas(1, false, Some(3)), 1);
+    }
+
+    #[test]
+    fn phase_message_truth_table() {
+        let (p, m) = phase_and_message(&["x".into()], 3, 3, 2);
+        assert_eq!(p, "Degraded");
+        assert!(m.contains("scale-up blocked"));
+        let (p, _) = phase_and_message(&[], 3, 3, 1);
+        assert_eq!(p, "Ready");
+        let (p, _) = phase_and_message(&[], 1, 3, 2);
+        assert_eq!(p, "Progressing");
+        let (p, _) = phase_and_message(&[], 3, 3, 0);
+        assert_eq!(p, "Progressing", "no router ready means not Ready");
     }
 
     #[test]

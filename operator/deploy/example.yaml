@@ -4,12 +4,16 @@
 #   kubectl -n dgp create secret generic dgp-env \
 #     --from-literal=DGP_ACCESS_KEY_ID=admin \
 #     --from-literal=DGP_SECRET_ACCESS_KEY=replace-me \
-#     --from-literal=DGP_BOOTSTRAP_PASSWORD_HASH="JDJiJDEyJ..." \
 #     --from-literal=DGP_BE_AWS_ACCESS_KEY_ID="..." \
 #     --from-literal=DGP_BE_AWS_SECRET_ACCESS_KEY="..."
 #
-# All pods MUST share the same DGP_BOOTSTRAP_PASSWORD_HASH, and replicas > 1
-# requires an S3 storage backend plus a config sync bucket (see README).
+# The bootstrap password is auto-generated below (bootstrapPassword.autoGenerate) —
+# read it later with:
+#   kubectl -n dgp get secret dgp-bootstrap -o jsonpath='{.data.password}' | base64 -d
+# Prefer to control it yourself? Drop autoGenerate and add
+# DGP_BOOTSTRAP_PASSWORD_HASH to the Secret instead. Either way every pod shares it,
+# and replicas > 1 requires an S3 storage backend plus a config sync bucket — the
+# operator enforces both (phase Degraded + status.message name what is missing).
 apiVersion: deltaglider.beshu.tech/v1alpha1
 kind: DeltaGliderProxy
 metadata:
@@ -28,6 +32,8 @@ spec:
       config_sync_bucket: dgp-iam-sync
       log_level: "deltaglider_proxy=info,tower_http=warn"
   envFromSecret: dgp-env
+  bootstrapPassword:
+    autoGenerate: true
   storage:
     size: 20Gi
   router:

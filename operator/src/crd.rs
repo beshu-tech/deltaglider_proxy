@@ -22,7 +22,7 @@ pub const PROXY_PORT: i32 = 9000;
     status = "DeltaGliderProxyStatus",
     shortname = "dgp",
     printcolumn = r#"{"name":"Replicas","type":"integer","jsonPath":".spec.replicas"}"#,
-    printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.phase"}"#
+    printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct DeltaGliderProxySpec {
@@ -110,14 +110,16 @@ pub struct DeltaGliderProxyStatus {
     pub observed_generation: Option<i64>,
     pub ready_replicas: Option<i32>,
     pub router_ready_replicas: Option<i32>,
-    /// Ready | Progressing
+    /// Ready | Progressing | Degraded
     pub phase: Option<String>,
     pub message: Option<String>,
 }
 
 impl DeltaGliderProxy {
+    /// Floor 1: scale-to-zero isn't supported (an empty hash ring answers 503 to
+    /// everything while the CR would still report Ready).
     pub fn replicas(&self) -> i32 {
-        self.spec.replicas.unwrap_or(1).max(0)
+        self.spec.replicas.unwrap_or(1).max(1)
     }
     pub fn image(&self) -> String {
         self.spec

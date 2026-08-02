@@ -18,7 +18,7 @@ spec:
       name: Replicas
       type: integer
     - jsonPath: .status.phase
-      name: Ready
+      name: Phase
       type: string
     name: v1alpha1
     schema:
@@ -126,7 +126,7 @@ spec:
                 nullable: true
                 type: integer
               phase:
-                description: Ready | Progressing
+                description: Ready | Progressing | Degraded
                 nullable: true
                 type: string
               readyReplicas:

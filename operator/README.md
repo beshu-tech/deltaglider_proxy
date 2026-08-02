@@ -109,6 +109,12 @@ Two more operational notes:
 - **Scaling down keeps the volumes.** The operator never deletes a pod's persistent
   volume. After you scale `replicas` down, reclaim the removed pods' volumes manually
   if you want the storage back.
+- **The bootstrap Secret survives deletion of the resource.** `<name>-bootstrap`
+  deliberately carries no owner reference: the hash inside it decrypts the IAM
+  database on the persistent volumes, and those volumes survive a `kubectl delete
+  dgp`. If the Secret were garbage-collected with the resource, recreating it would
+  generate a new password and permanently lock the surviving data out. For a truly
+  clean teardown, delete the Secret and the volumes together, by hand.
 
 ## Requirements for `replicas > 1` (enforced)
 
@@ -132,10 +138,12 @@ requires:
 
 The operator checks points 1–3 before it scales. If you set `replicas: 3` but the spec
 violates the contract — no sync bucket, a filesystem backend, a missing Secret, or no
-bootstrap hash — the operator deploys **one** pod instead, sets the resource's phase to
-`Degraded`, and writes the exact list of problems into `status.message`. Fix the spec
-and the operator scales up on the next reconcile. A broken spec can never scale into
-data corruption.
+bootstrap hash — the operator refuses to scale up: a fresh deployment comes up with
+**one** pod, and a fleet that is already running keeps its current size (the operator
+never kills healthy pods over a preflight problem). Either way the resource's phase
+becomes `Degraded` and `status.message` lists the exact problems. Fix the spec and the
+operator scales up on the next reconcile. A broken spec can never scale into data
+corruption.
 
 ## Spec reference
 

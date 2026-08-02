@@ -3,7 +3,7 @@
 //! The reconcile loop: server-side apply the desired children, then report status.
 
 use crate::crd::DeltaGliderProxy;
-use crate::preflight::{multi_replica_problems, EnvSecret};
+use crate::preflight::{effective_replicas, multi_replica_problems, phase_and_message, EnvSecret};
 use crate::resources;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
@@ -72,8 +72,11 @@ async fn observe_env_secret(client: &Client, ns: &str, cr: &DeltaGliderProxy) ->
             EnvSecret::Keys(keys)
         }
         Ok(None) => EnvSecret::Missing(name.clone()),
-        // Transient read failure: don't invent a blocking problem out of a blip.
-        Err(_) => EnvSecret::Keys(vec!["DGP_BOOTSTRAP_PASSWORD_HASH".into()]),
+        // Transient read failure: the truth is unknown — never guess in either direction.
+        Err(e) => {
+            tracing::warn!(secret = %name, error = %e, "env Secret unreadable this cycle");
+            EnvSecret::Unknown
+        }
     }
 }
 
@@ -117,15 +120,24 @@ pub async fn reconcile(cr: Arc<DeltaGliderProxy>, ctx: Arc<Ctx>) -> Result<Actio
 
     ensure_bootstrap_secret(client, &ns, &cr).await?;
 
-    // Multi-replica preflight: a spec that violates the HA contract deploys at ONE
-    // replica and reports Degraded, instead of scaling into corruption.
+    // Multi-replica preflight: contract violations block scale-UP (fresh deploys come
+    // up at 1) but never scale DOWN a running fleet — that would kill healthy pods.
+    let name = resources::cr_name(&cr);
+    let sts_api: Api<StatefulSet> = Api::namespaced(client.clone(), &ns);
+    let current = sts_api
+        .get_opt(&name)
+        .await?
+        .and_then(|s| s.spec)
+        .and_then(|s| s.replicas);
     let env_secret = observe_env_secret(client, &ns, &cr).await;
-    let problems = multi_replica_problems(&cr, &env_secret);
-    let replicas = if problems.is_empty() {
-        cr.replicas()
+    let unknown = env_secret == EnvSecret::Unknown;
+    let problems = if unknown {
+        vec![]
     } else {
-        1
+        multi_replica_problems(&cr, &env_secret)
     };
+    let may_scale_up = !unknown && problems.is_empty();
+    let replicas = effective_replicas(cr.replicas(), may_scale_up, current);
 
     if let Some(cm) = resources::config_configmap(&cr) {
         apply::<ConfigMap>(client, &ns, &cm).await?;
@@ -138,10 +150,8 @@ pub async fn reconcile(cr: Arc<DeltaGliderProxy>, ctx: Arc<Ctx>) -> Result<Actio
     apply::<PodDisruptionBudget>(client, &ns, &resources::router_pdb(&cr)).await?;
 
     // Status from the children's own status stanzas.
-    let name = resources::cr_name(&cr);
-    let sts: Api<StatefulSet> = Api::namespaced(client.clone(), &ns);
     let dep: Api<Deployment> = Api::namespaced(client.clone(), &ns);
-    let ready = sts
+    let ready = sts_api
         .get_status(&name)
         .await
         .ok()
@@ -155,26 +165,7 @@ pub async fn reconcile(cr: Arc<DeltaGliderProxy>, ctx: Arc<Ctx>) -> Result<Actio
         .and_then(|d| d.status)
         .and_then(|s| s.ready_replicas)
         .unwrap_or(0);
-    let want = replicas;
-    let (phase, message) = if !problems.is_empty() {
-        (
-            "Degraded",
-            format!(
-                "replicas clamped to 1 — spec violates the multi-replica contract: {}",
-                problems.join(" | ")
-            ),
-        )
-    } else if ready >= want && router_ready >= 1 {
-        (
-            "Ready",
-            format!("{ready}/{want} proxy pods, {router_ready} router pods ready"),
-        )
-    } else {
-        (
-            "Progressing",
-            format!("{ready}/{want} proxy pods, {router_ready} router pods ready"),
-        )
-    };
+    let (phase, message) = phase_and_message(&problems, ready, replicas, router_ready);
     let status = json!({
         "apiVersion": "deltaglider.beshu.tech/v1alpha1",
         "kind": "DeltaGliderProxy",
@@ -191,7 +182,9 @@ pub async fn reconcile(cr: Arc<DeltaGliderProxy>, ctx: Arc<Ctx>) -> Result<Actio
         .await?;
 
     tracing::info!(cr = %name, %ns, ready, router_ready, phase, "reconciled");
-    Ok(Action::requeue(Duration::from_secs(300)))
+    // An unreadable env Secret held the fleet in place — re-check soon, not in 5 min.
+    let requeue = if unknown { 30 } else { 300 };
+    Ok(Action::requeue(Duration::from_secs(requeue)))
 }
 
 fn error_policy(cr: Arc<DeltaGliderProxy>, err: &Error, _ctx: Arc<Ctx>) -> Action {
@@ -230,4 +223,53 @@ pub async fn run(client: Client) -> anyhow::Result<()> {
         })
         .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod bootstrap_hash_tests {
+    //! Regression guard for the operator↔proxy bootstrap-hash contract.
+    //! The operator emits `base64(bcrypt::hash(pw, 12))` into the Secret key
+    //! `hash`; the proxy's `Config::decode_hash` base64-decodes any non-`$`
+    //! value and expects a `$2b$…` bcrypt string. If either side's encoding
+    //! drifts, autoGenerate ships a bricked login — this test fails first.
+    use base64::Engine;
+
+    /// Reproduce the operator's exact recipe (see `ensure_bootstrap_secret`).
+    fn operator_hash_b64(password: &str) -> String {
+        let hash = bcrypt::hash(password, 12).expect("bcrypt with fixed cost cannot fail");
+        base64::engine::general_purpose::STANDARD.encode(hash)
+    }
+
+    #[test]
+    fn hash_b64_decodes_to_verifiable_bcrypt() {
+        let password = "correct horse battery staple";
+        let b64 = operator_hash_b64(password);
+
+        // The proxy: non-`$` value → base64 decode → must be UTF-8 bcrypt.
+        let decoded_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .expect("operator output must be valid base64");
+        let decoded = String::from_utf8(decoded_bytes).expect("bcrypt hash is UTF-8");
+
+        // Proxy's decode_hash gate: must start with `$2` (accepts $2a/$2b/$2y).
+        assert!(
+            decoded.starts_with("$2"),
+            "decoded hash must be a bcrypt string, got {decoded:?}"
+        );
+        // The rust bcrypt crate emits the $2b$ variant at cost 12.
+        assert!(
+            decoded.starts_with("$2b$12$"),
+            "expected $2b$ cost-12, got {decoded:?}"
+        );
+
+        // The whole point: the plaintext verifies against the decoded hash.
+        assert!(
+            bcrypt::verify(password, &decoded).expect("verify runs"),
+            "plaintext must verify against the operator-generated hash"
+        );
+
+        // Emit a specimen for the manual end-to-end boot test.
+        eprintln!("SPECIMEN_PASSWORD={password}");
+        eprintln!("SPECIMEN_HASH_B64={b64}");
+    }
 }
