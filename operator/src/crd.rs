@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Default proxy image when `spec.image` is not set.
-pub const DEFAULT_IMAGE: &str = "beshultd/deltaglider_proxy:1.16.0";
+pub const DEFAULT_IMAGE: &str = "beshultd/deltaglider_proxy:1.17.0";
 /// Default router image when `spec.router.image` is not set.
 pub const DEFAULT_ROUTER_IMAGE: &str = "haproxy:3.0-alpine";
 /// The single port everything listens on (S3 API + admin UI).

@@ -150,7 +150,7 @@ corruption.
 ```yaml
 spec:
   replicas: 3                  # number of proxy pods (default 1)
-  image: beshultd/deltaglider_proxy:1.16.0   # default: the operator's pinned release
+  image: beshultd/deltaglider_proxy:1.17.0   # default: the operator's pinned release
   configYaml: |                # inline DeltaGlider YAML (no secret VALUES here)
     storage:
       s3: https://s3.eu-central-1.amazonaws.com

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed — operator 0.2.4 and Helm chart defaults track v1.17.0
+
+The operator's pinned default proxy image and the Helm chart's
+`appVersion` now point at v1.17.0, so a spec without an explicit `image`
+deploys the release with the multipart-completion resilience fixes. The
+Kubernetes guide's note about in-cluster DNS backends now names the
+versions precisely: v1.17.0 and later accept `*.svc.cluster.local`
+endpoints when `DGP_BACKEND_ALLOW_LOCAL` is set; older releases need the
+Service's ClusterIP.
+
 ## v1.17.0 — 2026-08-04
 
 ### Fixed — CompleteMultipartUpload survives client disconnects and tolerates retries

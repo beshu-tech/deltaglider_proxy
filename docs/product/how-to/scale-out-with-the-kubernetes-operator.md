@@ -117,12 +117,12 @@ The `${env:...}` references are expanded by the proxy inside the pod, against th
 environment variables that the Secret provides — so the credentials reach the storage
 backend without ever being written into the ConfigMap.
 
-If your backend is an in-cluster MinIO reached over plain `http://`, two extra things
-are needed: add `DGP_BACKEND_ALLOW_LOCAL: "true"` to the Secret (the SSRF guard
-refuses plain-http and private addresses by default), and be aware that proxy releases
-up to v1.16.1 also refuse `*.svc.cluster.local` hostnames outright — on those
-versions, point the endpoint at the Service's ClusterIP instead of its DNS name. The
-next proxy release accepts in-cluster DNS names when the dev flag is set.
+If your backend is an in-cluster MinIO reached over plain `http://`, add
+`DGP_BACKEND_ALLOW_LOCAL: "true"` to the Secret — the SSRF guard refuses plain-http
+and private addresses by default. On proxy releases v1.17.0 and later, that flag also
+admits in-cluster DNS names such as `minio.dgp.svc.cluster.local`; releases up to
+v1.16.1 refuse those hostnames outright, so on older versions point the endpoint at
+the Service's ClusterIP instead of its DNS name.
 
 The operator checks the multi-replica requirements before it scales: if the spec has
 no config sync bucket, uses a filesystem backend, or has no shared bootstrap password
