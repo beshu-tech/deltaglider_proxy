@@ -75,12 +75,13 @@ pub fn validate_outbound_url(url: &str, kind: UrlKind) -> Result<(), UrlValidati
 fn check_host(host: &str, kind: UrlKind) -> Result<(), UrlValidationError> {
     let normalised = host.trim_matches(['[', ']']).to_ascii_lowercase();
 
-    if FORBIDDEN_HOSTNAMES.iter().any(|h| normalised == *h)
-        || FORBIDDEN_SUFFIXES.iter().any(|s| normalised.ends_with(s))
-    {
-        // BackendDev permits `localhost` (and only that — not `metadata.*`).
-        let dev_ok =
-            matches!(kind, UrlKind::BackendDev) && DEV_ALLOWED.iter().any(|h| normalised == *h);
+    let name_hit = FORBIDDEN_HOSTNAMES.iter().any(|h| normalised == *h);
+    let suffix_hit = FORBIDDEN_SUFFIXES.iter().any(|s| normalised.ends_with(s));
+    if name_hit || suffix_hit {
+        // BackendDev permits `localhost` and forbidden SUFFIXES (k8s in-cluster DNS
+        // ends `.svc.cluster.local`); named metadata hosts stay blocked even in dev.
+        let dev_ok = matches!(kind, UrlKind::BackendDev)
+            && (!name_hit || DEV_ALLOWED.iter().any(|h| normalised == *h));
         if !dev_ok {
             return Err(UrlValidationError::ForbiddenHost(host.to_string()));
         }
@@ -378,6 +379,34 @@ impl reqwest::dns::Resolve for SsrfGuardedResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_dev_allows_kubernetes_cluster_dns_but_never_metadata() {
+        // In-cluster service DNS ends `.svc.cluster.local` — a standard k8s backend
+        // shape (caught live: MinIO-in-cluster was unreachable even with allow_local).
+        let k8s = "http://minio.dgp.svc.cluster.local:9000";
+        assert!(validate_outbound_url(k8s, UrlKind::BackendDev).is_ok());
+        // Production mode still refuses it.
+        assert!(validate_outbound_url(k8s, UrlKind::Backend).is_err());
+        // Named metadata hosts stay blocked even in dev, suffix or not.
+        for u in [
+            "http://metadata.google.internal/",
+            "http://metadata.aws/",
+            "http://metadata/",
+        ] {
+            assert!(
+                validate_outbound_url(u, UrlKind::BackendDev).is_err(),
+                "dev must still reject {u}"
+            );
+        }
+        // Other forbidden suffixes open up in dev only.
+        assert!(
+            validate_outbound_url("http://ceph.storage.internal:7480", UrlKind::BackendDev).is_ok()
+        );
+        assert!(
+            validate_outbound_url("http://ceph.storage.internal:7480", UrlKind::Backend).is_err()
+        );
+    }
 
     #[test]
     fn validate_url_blocks_imds() {

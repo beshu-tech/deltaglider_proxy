@@ -152,16 +152,18 @@ pub async fn reconcile(cr: Arc<DeltaGliderProxy>, ctx: Arc<Ctx>) -> Result<Actio
     // Status from the children's own status stanzas.
     let dep: Api<Deployment> = Api::namespaced(client.clone(), &ns);
     let ready = sts_api
-        .get_status(&name)
+        .get_opt(&name)
         .await
         .ok()
+        .flatten()
         .and_then(|s| s.status)
         .and_then(|s| s.ready_replicas)
         .unwrap_or(0);
     let router_ready = dep
-        .get_status(&format!("{name}-router"))
+        .get_opt(&format!("{name}-router"))
         .await
         .ok()
+        .flatten()
         .and_then(|d| d.status)
         .and_then(|s| s.ready_replicas)
         .unwrap_or(0);

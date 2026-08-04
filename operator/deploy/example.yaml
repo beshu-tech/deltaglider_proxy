@@ -25,6 +25,8 @@ spec:
     storage:
       s3: https://s3.eu-central-1.amazonaws.com
       region: eu-central-1
+      access_key_id: ${env:DGP_BE_AWS_ACCESS_KEY_ID}
+      secret_access_key: ${env:DGP_BE_AWS_SECRET_ACCESS_KEY}
     access:
       iam_mode: gui
     advanced:

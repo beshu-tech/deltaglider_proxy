@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Fixed — dev-mode backend guard now accepts in-cluster Kubernetes DNS names
+
+The SSRF guard rejected every hostname ending in `.local` or `.internal`,
+even with `allow_local: true` / `DGP_BACKEND_ALLOW_LOCAL=true` — and
+Kubernetes in-cluster service names all end in `.svc.cluster.local`, so an
+in-cluster MinIO or Ceph backend was unreachable by name (the error even
+suggested the flag that then changed nothing). Dev mode now permits the
+forbidden name suffixes while still refusing the named cloud-metadata
+hosts; production mode is unchanged and still rejects them all. Found by
+running the operator against a real cluster.
+
+### Fixed — Kubernetes operator: 0.2.2
+
+Three defects found by actually deploying the operator (none of them
+reachable by unit tests): the published images were built on a newer
+Debian than their runtime and died at exec with a glibc version error
+(builder now pinned to bookworm to match the distroless runtime); the
+status readers used the `/status` subresource, which needs an RBAC grant
+the ClusterRole never had, so every deployment reported `0/N Progressing`
+forever (now reads the whole object, which the existing grant covers);
+and every documented `configYaml` sample kept the backend credentials
+only in the env Secret, which a YAML-defined backend never reads — the
+samples now use `${env:...}` references, which the proxy expands inside
+the pod so credentials reach the backend without ever sitting in the
+ConfigMap.
+
 ### Added — official Kubernetes operator with multipart-safe multi-pod routing
 
 New `operator/` crate: a Kubernetes operator (CRD `DeltaGliderProxy`,

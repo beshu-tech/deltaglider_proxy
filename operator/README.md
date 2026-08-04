@@ -151,10 +151,14 @@ corruption.
 spec:
   replicas: 3                  # number of proxy pods (default 1)
   image: beshultd/deltaglider_proxy:1.16.0   # default: the operator's pinned release
-  configYaml: |                # inline DeltaGlider YAML (do not put secrets here)
+  configYaml: |                # inline DeltaGlider YAML (no secret VALUES here)
     storage:
       s3: https://s3.eu-central-1.amazonaws.com
       region: eu-central-1
+      # ${env:...} references resolve inside the pod against the env Secret's
+      # values, so the ConfigMap never carries a credential.
+      access_key_id: ${env:DGP_BE_AWS_ACCESS_KEY_ID}
+      secret_access_key: ${env:DGP_BE_AWS_SECRET_ACCESS_KEY}
   envFromSecret: dgp-env       # a Secret whose keys become DGP_* environment variables
   storage:
     size: 20Gi                 # persistent volume per pod for /data (default 10Gi)
