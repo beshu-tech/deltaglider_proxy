@@ -50,6 +50,17 @@ pub fn phase_and_message(
             "Ready",
             format!("{ready}/{want} proxy pods, {router_ready} router pods ready"),
         )
+    } else if ready == 0 && want > 0 && router_ready >= 1 {
+        // Routers up but not one proxy pod ready: readiness really probes the
+        // storage backend, so this usually means the backend is unreachable.
+        (
+            "Progressing",
+            format!(
+                "0/{want} proxy pods ready while routers are up — the readiness probe \
+                 checks the storage backend, so check backend connectivity \
+                 (kubectl logs <pod>)"
+            ),
+        )
     } else {
         (
             "Progressing",
@@ -278,6 +289,12 @@ mod tests {
         assert_eq!(p, "Progressing");
         let (p, _) = phase_and_message(&[], 3, 3, 0);
         assert_eq!(p, "Progressing", "no router ready means not Ready");
+        let (p, m) = phase_and_message(&[], 0, 3, 2);
+        assert_eq!(p, "Progressing");
+        assert!(
+            m.contains("backend"),
+            "zero-ready fleet with live routers must hint at the backend"
+        );
     }
 
     #[test]

@@ -88,7 +88,24 @@ Be aware of the limit of this approach: when you add or remove an instance, part
 the hash ring moves, so a multipart upload that is in flight on a moved prefix fails
 and the client has to restart it from the beginning.
 
-## 6. Mind upgrades across the fleet
+## 6. Know what stays per-instance
+
+Two more pieces of state live inside each instance and are not shared. Neither breaks
+correctness, but both change behaviour compared to a single instance:
+
+- **The metadata cache.** Each instance caches object metadata (existence, size, ETag)
+  for up to ten minutes and only invalidates its own cache on writes. Good news if
+  you route with the directory hash described above: all requests for one prefix
+  reach the same instance, so that instance's cache is coherent for its own prefixes
+  and the staleness window almost never shows. It can surface right after the hash
+  ring moves (a scale event), when a prefix's new owner may serve up to ten minutes
+  of stale metadata for objects the old owner changed.
+- **Rate limits.** The login rate limiter counts per instance, so with N instances the
+  effective limit is up to N times the configured value. Size the configured limit
+  accordingly, and remember that the admin GUI's source-IP stickiness concentrates
+  everyone behind one NAT gateway onto a single instance's budget.
+
+## 7. Mind upgrades across the fleet
 
 During a rolling upgrade, a newer binary may migrate the DB schema forward; older instances still running will download a DB they can't fully read. Upgrade all instances before making IAM mutations, or accept that mid-rollout mutations are lost on older readers. Details: [How to upgrade the proxy](upgrade.md).
 

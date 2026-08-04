@@ -438,6 +438,7 @@ jobs:
             --test aws_chunked_upload_test \
             --test iam_list_scope_test \
             --test multipart_etag_test \
+            --test multipart_complete_resilience_test \
             --test public_prefix_list_test \
             --test public_prefix_test \
             --test recursive_delete_test \

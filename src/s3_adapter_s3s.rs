@@ -1152,141 +1152,106 @@ impl s3s::S3 for DeltaGliderS3Service {
         .map_err(engine_error_to_s3s)?;
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
         let requested_parts = completed_parts_to_request(input.multipart_upload.as_ref())?;
-        let engine = self.state.engine.load();
-        let delta_limit = crate::config::env_parse_with_default(
-            "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
-            64 * 1024 * 1024,
-        );
-        let total_parts_size: u64 = requested_parts
-            .iter()
-            .filter_map(|(num, _)| self.state.multipart.get_part_size(&input.upload_id, *num))
-            .sum();
-        // Quota check before storing (parity with axum
-        // `multipart::handle_complete_multipart` line 127). Done here,
-        // not on UploadPart, because parts can be aborted before
-        // storage; only Complete commits bytes.
-        crate::api::handlers::object_helpers::check_quota(
-            &self.state,
-            &input.bucket,
-            total_parts_size,
-        )
-        .map_err(engine_error_to_s3s)?;
-        let force_chunked_passthrough =
-            !engine.is_delta_eligible(&input.key) || total_parts_size > delta_limit;
-        let (multipart_etag, store_meta) = if force_chunked_passthrough {
-            let completed = self
-                .state
-                .multipart
-                .complete_passthrough(
-                    &input.upload_id,
-                    &input.bucket,
-                    &input.key,
-                    &requested_parts,
-                )
-                .map_err(engine_error_to_s3s)?;
-            let etag = completed.etag.clone();
-            let store_result = match completed.payload {
-                crate::multipart::PassthroughPayload::Chunks(parts) => {
-                    engine
-                        .store_passthrough_chunked_with_multipart_etag(
-                            &input.bucket,
-                            &input.key,
-                            &parts,
-                            completed.total_size,
-                            completed.content_type,
-                            completed.user_metadata,
-                            etag.clone(),
-                        )
-                        .await
-                }
-                crate::multipart::PassthroughPayload::RelayedParts(paths) => {
-                    // Protect the relay part files from the idle-TTL sweeper for
-                    // the duration of the store: a slow store to a remote backend
-                    // can exceed completing_timeout, and sweeping mid-store would
-                    // delete the parts being read, losing them forever (H18).
-                    let _store_guard = self.state.multipart.store_guard(&input.upload_id);
-                    engine
-                        .store_passthrough_relayed_parts_with_multipart_etag(
-                            &input.bucket,
-                            &input.key,
-                            &paths,
-                            completed.total_size,
-                            completed.content_type,
-                            completed.user_metadata,
-                            etag.clone(),
-                        )
-                        .await
-                }
-            };
-            match store_result {
-                Ok(result) => (etag, Some(result.metadata)),
-                Err(e) => {
-                    self.state.multipart.rollback_upload(&input.upload_id);
-                    return Err(engine_error_to_s3s(e));
-                }
+
+        // Completion registry: exactly one request runs the store pipeline, on a
+        // DETACHED task (a client disconnect must not cancel a half-done store);
+        // identical retries join the in-flight outcome or hit the tombstone.
+        let begin = self
+            .state
+            .multipart
+            .begin_complete(
+                &input.upload_id,
+                &input.bucket,
+                &input.key,
+                &requested_parts,
+            )
+            .map_err(engine_error_to_s3s)?;
+        let complete_response = |etag: &str,
+                                 meta: Option<&crate::types::FileMetadata>|
+         -> s3s::S3Result<
+            s3s::S3Response<s3s::dto::CompleteMultipartUploadOutput>,
+        > {
+            let location = format!("/{}/{}", input.bucket, input.key);
+            let mut resp = s3s::S3Response::new(s3s::dto::CompleteMultipartUploadOutput {
+                bucket: Some(input.bucket.clone()),
+                key: Some(input.key.clone()),
+                e_tag: Some(parse_s3s_etag(etag)?),
+                location: Some(location),
+                ..Default::default()
+            });
+            // Parity with the legacy axum handler: `x-amz-storage-type` (+
+            // stored-size) so operators can observe how the multipart landed.
+            if let Some(meta) = meta {
+                add_storage_debug_headers(&mut resp.headers, meta);
             }
-        } else {
-            let completed = self
-                .state
-                .multipart
-                .complete(
-                    &input.upload_id,
-                    &input.bucket,
-                    &input.key,
-                    &requested_parts,
-                )
-                .map_err(engine_error_to_s3s)?;
-            let etag = completed.etag.clone();
-            match engine
-                .store_with_multipart_etag(
-                    &input.bucket,
-                    &input.key,
-                    &completed.data,
-                    completed.content_type,
-                    completed.user_metadata,
-                    etag.clone(),
-                )
-                .await
-            {
-                Ok(result) => (etag, Some(result.metadata)),
-                Err(e) => {
-                    self.state.multipart.rollback_upload(&input.upload_id);
-                    return Err(engine_error_to_s3s(e));
-                }
-            }
+            Ok(resp)
         };
-        self.state.multipart.finish_upload(&input.upload_id);
-        // A completed multipart upload created the final object — emit
-        // ObjectCreated before `input.bucket`/`input.key` are moved into the
-        // response.
-        self.emit_object_event(
-            crate::event_outbox::EventKind::ObjectCreated,
-            &input.bucket,
-            &input.key,
-            serde_json::json!({
-                "etag": multipart_etag,
-                "storage_type": store_meta.as_ref().map(|m| m.storage_info.label()),
-            }),
-        )
-        .await;
-        let location = format!("/{}/{}", input.bucket, input.key);
-        let mut resp = s3s::S3Response::new(s3s::dto::CompleteMultipartUploadOutput {
-            bucket: Some(input.bucket),
-            key: Some(input.key),
-            e_tag: Some(parse_s3s_etag(&multipart_etag)?),
-            location: Some(location),
-            ..Default::default()
-        });
-        // Parity with the legacy axum multipart handler: emit
-        // `x-amz-storage-type` (and `x-deltaglider-stored-size`) on
-        // CompleteMultipartUpload responses so tests / operators can
-        // observe whether the multipart landed as `delta`, `passthrough`,
-        // or another storage shape. The s3s rewrite dropped this header,
-        // breaking tests/s3_integration_test.rs::test_multipart_*.
-        if let Some(meta) = store_meta.as_ref() {
-            add_storage_debug_headers(&mut resp.headers, meta);
+        match begin {
+            crate::multipart::BeginComplete::AlreadyDone { etag } => complete_response(&etag, None),
+            crate::multipart::BeginComplete::Join(rx) => match await_completion_outcome(rx).await {
+                Ok(etag) => complete_response(&etag, None),
+                Err(msg) => Err(engine_error_to_s3s(
+                    crate::api::errors::S3Error::InternalError(msg),
+                )),
+            },
+            crate::multipart::BeginComplete::Owner(publisher) => {
+                // Admission (quota) + routing decisions run ONLY for the owner: a
+                // tombstone/join retry must never be re-admitted — its bytes are
+                // already committed, and the freeze/quota gates would wrongly
+                // reject a completion that has in fact succeeded (review MAJOR 1).
+                let total_parts_size: u64 = requested_parts
+                    .iter()
+                    .filter_map(|(num, _)| {
+                        self.state.multipart.get_part_size(&input.upload_id, *num)
+                    })
+                    .sum();
+                crate::api::handlers::object_helpers::check_quota(
+                    &self.state,
+                    &input.bucket,
+                    total_parts_size,
+                )
+                .map_err(engine_error_to_s3s)?;
+                let delta_limit = crate::config::env_parse_with_default(
+                    "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
+                    64 * 1024 * 1024,
+                );
+                let force_chunked_passthrough =
+                    !self.state.engine.load().is_delta_eligible(&input.key)
+                        || total_parts_size > delta_limit;
+                let state = self.state.clone();
+                let (bucket, key, upload_id) = (
+                    input.bucket.clone(),
+                    input.key.clone(),
+                    input.upload_id.clone(),
+                );
+                let parts = requested_parts.clone();
+                let handle = tokio::spawn(async move {
+                    let result = run_multipart_completion(
+                        state,
+                        bucket,
+                        key,
+                        upload_id,
+                        parts,
+                        force_chunked_passthrough,
+                    )
+                    .await;
+                    match &result {
+                        Ok((etag, _)) => publisher.publish(Ok(etag.clone())),
+                        Err(e) => publisher.publish(Err(e.to_string())),
+                    }
+                    result
+                });
+                match handle.await {
+                    Ok(Ok((etag, meta))) => complete_response(&etag, meta.as_ref()),
+                    Ok(Err(e)) => Err(engine_error_to_s3s(e)),
+                    Err(join_err) => Err(engine_error_to_s3s(
+                        crate::api::errors::S3Error::InternalError(format!(
+                            "completion task failed: {join_err}"
+                        )),
+                    )),
+                }
+            }
         }
-        Ok(resp)
     }
 
     async fn list_multipart_uploads(
@@ -1837,6 +1802,126 @@ async fn evaluate_put_etag_conditionals_s3s(
         }
     }
     Ok(())
+}
+
+/// Await a joined completion's outcome (initial watch value is None).
+async fn await_completion_outcome(
+    mut rx: tokio::sync::watch::Receiver<Option<crate::multipart::CompletionResult>>,
+) -> crate::multipart::CompletionResult {
+    loop {
+        if let Some(result) = rx.borrow().clone() {
+            return result;
+        }
+        if rx.changed().await.is_err() {
+            return Err("completion task dropped before publishing".to_string());
+        }
+    }
+}
+
+/// The CompleteMultipartUpload store pipeline. Runs on a DETACHED tokio task so a
+/// client disconnect cannot cancel a half-done store (which used to roll back the
+/// whole upload and poison the SDK's retry). Owns finish/rollback + event emission.
+async fn run_multipart_completion(
+    state: Arc<AppState>,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    requested_parts: Vec<(u32, String)>,
+    force_chunked_passthrough: bool,
+) -> Result<(String, Option<FileMetadata>), crate::api::S3Error> {
+    // Deterministic chaos hook for tests: hold the store window open.
+    let stall_ms: u64 = crate::config::env_parse_with_default("DGP_TEST_COMPLETE_STALL_MS", 0);
+    if stall_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(stall_ms)).await;
+    }
+    let engine = state.engine.load();
+    let (etag, store_meta) = if force_chunked_passthrough {
+        let completed =
+            state
+                .multipart
+                .complete_passthrough(&upload_id, &bucket, &key, &requested_parts)?;
+        let etag = completed.etag.clone();
+        let store_result = match completed.payload {
+            crate::multipart::PassthroughPayload::Chunks(parts) => {
+                engine
+                    .store_passthrough_chunked_with_multipart_etag(
+                        &bucket,
+                        &key,
+                        &parts,
+                        completed.total_size,
+                        completed.content_type,
+                        completed.user_metadata,
+                        etag.clone(),
+                    )
+                    .await
+            }
+            crate::multipart::PassthroughPayload::RelayedParts(paths) => {
+                // Protect the relay part files from the idle-TTL sweeper while the
+                // store reads them (H18) — a slow remote store can exceed
+                // completing_timeout.
+                let _store_guard = state.multipart.store_guard(&upload_id);
+                engine
+                    .store_passthrough_relayed_parts_with_multipart_etag(
+                        &bucket,
+                        &key,
+                        &paths,
+                        completed.total_size,
+                        completed.content_type,
+                        completed.user_metadata,
+                        etag.clone(),
+                    )
+                    .await
+            }
+        };
+        match store_result {
+            Ok(result) => (etag, Some(result.metadata)),
+            Err(e) => {
+                state.multipart.rollback_upload(&upload_id);
+                return Err(e.into());
+            }
+        }
+    } else {
+        let completed = state
+            .multipart
+            .complete(&upload_id, &bucket, &key, &requested_parts)?;
+        let etag = completed.etag.clone();
+        match engine
+            .store_with_multipart_etag(
+                &bucket,
+                &key,
+                &completed.data,
+                completed.content_type,
+                completed.user_metadata,
+                etag.clone(),
+            )
+            .await
+        {
+            Ok(result) => (etag, Some(result.metadata)),
+            Err(e) => {
+                state.multipart.rollback_upload(&upload_id);
+                return Err(e.into());
+            }
+        }
+    };
+    state.multipart.finish_upload(&upload_id);
+    if crate::replication::event_consumer::is_user_object_key(&key) {
+        crate::api::handlers::object_helpers::enqueue_object_event(
+            &state,
+            crate::event_outbox::NewEvent::new(
+                crate::event_outbox::EventKind::ObjectCreated,
+                &bucket,
+                &key,
+                crate::event_outbox::EventSource::S3Api,
+                crate::replication::current_unix_seconds(),
+                serde_json::json!({
+                    "etag": etag,
+                    "storage_type": store_meta.as_ref().map(|m| m.storage_info.label()),
+                }),
+            ),
+        )
+        .await;
+    }
+    Ok((etag, store_meta))
 }
 
 fn engine_error_to_s3s(err: impl Into<crate::api::S3Error>) -> s3s::S3Error {

@@ -157,14 +157,26 @@ proxy pods without going through the router.
 ## Know the trade-offs
 
 Consistent hashing pins traffic to pods; it does not share any state between them.
-Accept the following consequences before you scale:
+Accept the following consequences before you scale.
+
+**Four different events move the hash ring**, and every one of them has the same
+consequence — a multipart upload that is in flight on a moved prefix fails with
+`NoSuchUpload`, and the client has to restart that upload from the beginning:
+
+| Ring-moving event | How it happens |
+|---|---|
+| Scaling up | You raise `replicas`; part of the key space moves to the new pods. |
+| Scaling down | You lower `replicas`; the removed pods' key space redistributes. |
+| A proxy pod restart | The pod's ring slot is unchanged (stable name), but the multipart state it held in memory is gone. |
+| Readiness ejection | A pod that fails its readiness probe for roughly thirty seconds — one backend hiccup is enough — is removed from the ring by the routers with no operator action involved, and comes back when it recovers. Same blast radius as a scale event. |
+
+The remaining structural consequences:
 
 | Behaviour | Consequence |
 |---|---|
-| Scaling the proxy pods changes part of the hash ring | A multipart upload that is in flight during a scale-up or scale-down can fail with `NoSuchUpload` if its key now maps to a different pod. The client has to restart that upload from the beginning. Scale during quiet periods. |
-| A proxy pod restart discards the multipart uploads it was holding | This is the same behaviour as a single-instance restart: the client has to retry the upload. |
+| Readiness is all-or-nothing per pod | Every pod's readiness probe checks the storage backend, so a backend outage removes **all** pods from the ring at once (correct for one backend — nothing could be served anyway). With several backends, one dead backend still fails every pod's probe and takes buckets on healthy backends down with it. |
 | All traffic for one prefix goes to one pod | Load is spread across pods by directory, not by request. A single very busy prefix will not fan out across the fleet. |
-| The admin UI sticks to a pod by source IP | Admin sessions are held in memory, so a pod restart logs its admin users out. |
+| The admin UI is effectively single-pod | Sessions are in memory and source-IP sticky: a pod restart logs its admin users out, everyone behind one NAT gateway lands on the same pod, and they share that pod's login rate-limit budget. Treat the admin GUI as a one-pod surface for now. |
 
 The rest of the multi-instance contract — one IAM writer at a time, synchronisation
 lag, upgrade ordering — is unchanged and described in

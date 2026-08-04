@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+### Fixed — CompleteMultipartUpload survives client disconnects and tolerates retries
+
+Found by killing a load-balancer mid-request on a live cluster: when the
+client's connection dropped while `CompleteMultipartUpload` was being
+processed, the cancelled request future abandoned the half-done store,
+the upload state rolled back, and the SDK's automatic retry was refused
+with `InvalidRequest: Upload is already being completed` — the upload was
+destroyed and the retry poisoned. This could be triggered by any dying
+proxy hop or flaky network, on single-instance deployments too. The store
+pipeline now runs on a detached task that a disconnect cannot cancel, and
+a completion registry makes retries safe: an identical retried Complete
+joins the in-flight completion (or returns the finished result from a
+success tombstone), a retry with a different part list is refused, and a
+failed completion clears the way for a fresh attempt. Covered by
+deterministic disconnect/race tests (`DGP_TEST_COMPLETE_STALL_MS` hook).
+
+### Changed — HA documentation states the full failure model
+
+The scale-out guide now lists all four events that move the hash ring
+(scale up, scale down, pod restart, readiness ejection) with their blast
+radius, the all-or-nothing nature of per-pod readiness, and the admin
+GUI's effective single-pod behaviour. The multi-instance guide gains the
+per-instance state that was previously only in internal notes: metadata
+cache staleness (and why directory-hash routing mostly neutralises it)
+and rate-limit multiplication. Operator 0.2.3's status message now points
+at backend connectivity when routers are up but no proxy pod is ready.
+
 ### Fixed — dev-mode backend guard now accepts in-cluster Kubernetes DNS names
 
 The SSRF guard rejected every hostname ending in `.local` or `.internal`,

@@ -243,8 +243,87 @@ fn default_multipart_idle_ttl_hours() -> i64 {
 }
 
 /// Thread-safe in-memory store for multipart upload state
+/// Outcome of a completion, shareable with retried Complete requests.
+pub type CompletionResult = Result<String, String>;
+
+const COMPLETION_TOMBSTONE_TTL_SECS: u64 = 900;
+
+enum CompletionSlot {
+    InFlight {
+        fingerprint: u64,
+        rx: tokio::sync::watch::Receiver<Option<CompletionResult>>,
+        started_at: std::time::Instant,
+    },
+    Done {
+        fingerprint: u64,
+        etag: String,
+        bucket: String,
+        key: String,
+        at: std::time::Instant,
+    },
+}
+
+/// What a CompleteMultipartUpload request should do (see `begin_complete`).
+pub enum BeginComplete {
+    Owner(CompletionPublisher),
+    Join(tokio::sync::watch::Receiver<Option<CompletionResult>>),
+    AlreadyDone { etag: String },
+}
+
+/// Held by the owning completion task; publishes the outcome to joiners and
+/// the tombstone. Dropping without publishing (panic/abort) publishes an error
+/// and clears the slot so later attempts aren't wedged.
+pub struct CompletionPublisher {
+    store: std::sync::Arc<MultipartStore>,
+    upload_id: String,
+    fingerprint: u64,
+    bucket: String,
+    key: String,
+    tx: tokio::sync::watch::Sender<Option<CompletionResult>>,
+    published: bool,
+}
+
+impl CompletionPublisher {
+    pub fn publish(mut self, result: CompletionResult) {
+        self.published = true;
+        self.store.publish_completion(
+            &self.upload_id,
+            self.fingerprint,
+            &self.bucket,
+            &self.key,
+            &result,
+        );
+        let _ = self.tx.send(Some(result));
+    }
+}
+
+impl Drop for CompletionPublisher {
+    fn drop(&mut self) {
+        if !self.published {
+            self.store.clear_completion_slot(&self.upload_id);
+            let _ = self.tx.send(Some(Err(
+                "completion task aborted before finishing".to_string()
+            )));
+        }
+    }
+}
+
+/// Order-sensitive digest of the requested part list: retries with the same
+/// parts join/match; a different list is a different completion.
+pub fn completion_fingerprint(parts: &[(u32, String)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (n, e) in parts {
+        n.hash(&mut h);
+        e.hash(&mut h);
+    }
+    h.finish()
+}
+
 pub struct MultipartStore {
     uploads: RwLock<HashMap<String, MultipartUpload>>,
+    /// CompleteMultipartUpload registry: in-flight completions + success tombstones.
+    completions: parking_lot::Mutex<HashMap<String, CompletionSlot>>,
     max_object_size: u64,
     max_uploads: usize,
     /// Global in-flight bytes across all uploads. Kept consistent with
@@ -264,6 +343,7 @@ impl MultipartStore {
         let idle_ttl_hours = default_multipart_idle_ttl_hours();
         Self {
             uploads: RwLock::new(HashMap::new()),
+            completions: parking_lot::Mutex::new(HashMap::new()),
             max_object_size,
             max_uploads,
             in_flight_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -281,6 +361,7 @@ impl MultipartStore {
     ) -> Self {
         Self {
             uploads: RwLock::new(HashMap::new()),
+            completions: parking_lot::Mutex::new(HashMap::new()),
             max_object_size,
             max_uploads: 1000,
             in_flight_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -615,6 +696,113 @@ impl MultipartStore {
         }
 
         Ok(result)
+    }
+
+    /// Route a CompleteMultipartUpload request through the completion registry.
+    /// Exactly one request becomes the Owner and runs the store pipeline (on a
+    /// DETACHED task, so a client disconnect cannot cancel it); identical retries
+    /// Join the in-flight outcome or hit the success tombstone. This is what makes
+    /// Complete disconnect-proof and retry-idempotent (found live: a router dying
+    /// mid-Complete used to destroy the upload and poison the retry).
+    pub fn begin_complete(
+        self: &std::sync::Arc<Self>,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+        requested_parts: &[(u32, String)],
+    ) -> Result<BeginComplete, S3Error> {
+        let fingerprint = completion_fingerprint(requested_parts);
+        let mut slots = self.completions.lock();
+        match slots.get(upload_id) {
+            Some(CompletionSlot::Done {
+                fingerprint: f,
+                etag,
+                bucket: b,
+                key: k,
+                ..
+            }) if *f == fingerprint && b == bucket && k == key => {
+                Ok(BeginComplete::AlreadyDone { etag: etag.clone() })
+            }
+            Some(CompletionSlot::Done { .. }) => Err(S3Error::InvalidPart(
+                "CompleteMultipartUpload retried with a different part list than the \
+                 completed upload"
+                    .to_string(),
+            )),
+            Some(CompletionSlot::InFlight {
+                fingerprint: f, rx, ..
+            }) if *f == fingerprint => Ok(BeginComplete::Join(rx.clone())),
+            Some(CompletionSlot::InFlight { .. }) => Err(S3Error::InvalidRequest(
+                "another CompleteMultipartUpload with a different part list is in flight"
+                    .to_string(),
+            )),
+            None => {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                slots.insert(
+                    upload_id.to_string(),
+                    CompletionSlot::InFlight {
+                        fingerprint,
+                        rx,
+                        started_at: std::time::Instant::now(),
+                    },
+                );
+                Ok(BeginComplete::Owner(CompletionPublisher {
+                    store: std::sync::Arc::clone(self),
+                    upload_id: upload_id.to_string(),
+                    fingerprint,
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    tx,
+                    published: false,
+                }))
+            }
+        }
+    }
+
+    fn publish_completion(
+        &self,
+        upload_id: &str,
+        fingerprint: u64,
+        bucket: &str,
+        key: &str,
+        result: &CompletionResult,
+    ) {
+        let mut slots = self.completions.lock();
+        match result {
+            Ok(etag) => {
+                slots.insert(
+                    upload_id.to_string(),
+                    CompletionSlot::Done {
+                        fingerprint,
+                        etag: etag.clone(),
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        at: std::time::Instant::now(),
+                    },
+                );
+            }
+            // Failure clears the slot: the upload rolled back to Open, so the
+            // next Complete attempt becomes a fresh Owner.
+            Err(_) => {
+                slots.remove(upload_id);
+            }
+        }
+    }
+
+    /// Drop success tombstones past their TTL, and self-heal InFlight slots whose
+    /// task can no longer publish (aborted/never-polled): a wedged slot would make
+    /// every future Complete for that id hang on a silent receiver (review MAJOR 2).
+    fn prune_completion_tombstones(&self, completing_timeout: std::time::Duration) {
+        let ttl = std::time::Duration::from_secs(COMPLETION_TOMBSTONE_TTL_SECS);
+        let in_flight_bound = completing_timeout.saturating_mul(2).max(ttl);
+        self.completions.lock().retain(|_, slot| match slot {
+            CompletionSlot::Done { at, .. } => at.elapsed() < ttl,
+            CompletionSlot::InFlight { started_at, .. } => started_at.elapsed() < in_flight_bound,
+        });
+    }
+
+    /// Clear an upload's completion slot (publisher Drop path).
+    fn clear_completion_slot(&self, upload_id: &str) {
+        self.completions.lock().remove(upload_id);
     }
 
     /// Roll the upload back to `Open` after a failed engine.store*.
@@ -986,6 +1174,7 @@ impl MultipartStore {
         max_age: std::time::Duration,
         completing_timeout: std::time::Duration,
     ) -> MultipartSweepReport {
+        self.prune_completion_tombstones(completing_timeout);
         let now = Utc::now();
         let max_age_cutoff = now - Duration::from_std(max_age).unwrap_or(Duration::hours(1));
         let idle_cutoff = now - self.idle_ttl;
@@ -1232,6 +1421,90 @@ fn cleanup_orphan_relay_entries_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parts_fixture() -> Vec<(u32, String)> {
+        vec![(1, "\"etag1\"".to_string()), (2, "\"etag2\"".to_string())]
+    }
+
+    #[tokio::test]
+    async fn completion_registry_owner_join_tombstone_lifecycle() {
+        let store = std::sync::Arc::new(MultipartStore::new(1024));
+        let parts = parts_fixture();
+
+        // First request owns the completion.
+        let owner = match store.begin_complete("up1", "b", "k", &parts).unwrap() {
+            BeginComplete::Owner(p) => p,
+            _ => panic!("first begin_complete must be Owner"),
+        };
+        // An identical retry while in flight joins.
+        let rx = match store.begin_complete("up1", "b", "k", &parts).unwrap() {
+            BeginComplete::Join(rx) => rx,
+            _ => panic!("identical retry must Join"),
+        };
+        // A different part list while in flight is refused.
+        let other = vec![(1, "\"other\"".to_string())];
+        assert!(store.begin_complete("up1", "b", "k", &other).is_err());
+
+        // Owner publishes success: joiner sees the etag, later retries hit the tombstone.
+        owner.publish(Ok("\"final-etag\"".to_string()));
+        assert_eq!(rx.borrow().clone().unwrap().unwrap(), "\"final-etag\"");
+        match store.begin_complete("up1", "b", "k", &parts).unwrap() {
+            BeginComplete::AlreadyDone { etag } => assert_eq!(etag, "\"final-etag\""),
+            _ => panic!("retry after success must hit the tombstone"),
+        }
+        // Tombstone with a different part list is refused; different bucket/key too.
+        assert!(store.begin_complete("up1", "b", "k", &other).is_err());
+        assert!(store.begin_complete("up1", "OTHER", "k", &parts).is_err());
+    }
+
+    #[tokio::test]
+    async fn completion_registry_failure_clears_slot_for_fresh_retry() {
+        let store = std::sync::Arc::new(MultipartStore::new(1024));
+        let parts = parts_fixture();
+        let owner = match store.begin_complete("up2", "b", "k", &parts).unwrap() {
+            BeginComplete::Owner(p) => p,
+            _ => panic!("must be Owner"),
+        };
+        owner.publish(Err("backend exploded".to_string()));
+        // Failure clears the slot: the next attempt is a fresh Owner, not a join.
+        assert!(matches!(
+            store.begin_complete("up2", "b", "k", &parts).unwrap(),
+            BeginComplete::Owner(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn completion_publisher_drop_without_publish_unwedges_registry() {
+        let store = std::sync::Arc::new(MultipartStore::new(1024));
+        let parts = parts_fixture();
+        let owner = match store.begin_complete("up3", "b", "k", &parts).unwrap() {
+            BeginComplete::Owner(p) => p,
+            _ => panic!("must be Owner"),
+        };
+        let rx = match store.begin_complete("up3", "b", "k", &parts).unwrap() {
+            BeginComplete::Join(rx) => rx,
+            _ => panic!("must Join"),
+        };
+        drop(owner); // task panicked / was aborted without publishing
+        assert!(
+            rx.borrow().clone().unwrap().is_err(),
+            "joiner must be released"
+        );
+        assert!(matches!(
+            store.begin_complete("up3", "b", "k", &parts).unwrap(),
+            BeginComplete::Owner(_)
+        ));
+    }
+
+    #[test]
+    fn completion_fingerprint_is_order_sensitive_and_content_sensitive() {
+        let a = completion_fingerprint(&parts_fixture());
+        assert_eq!(a, completion_fingerprint(&parts_fixture()));
+        let reordered = vec![(2, "\"etag2\"".to_string()), (1, "\"etag1\"".to_string())];
+        assert_ne!(a, completion_fingerprint(&reordered));
+        let different = vec![(1, "\"etag1\"".to_string())];
+        assert_ne!(a, completion_fingerprint(&different));
+    }
 
     #[test]
     fn test_create_and_upload_part() {
