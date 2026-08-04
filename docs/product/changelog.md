@@ -8,7 +8,106 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-07-22_
+_Last updated: 2026-08-04_
+
+## v1.17.0 — 2026-08-04
+
+### Fixed — CompleteMultipartUpload survives client disconnects and tolerates retries
+
+Found by killing a load-balancer mid-request on a live cluster: when the
+client's connection dropped while `CompleteMultipartUpload` was being
+processed, the cancelled request future abandoned the half-done store,
+the upload state rolled back, and the SDK's automatic retry was refused
+with `InvalidRequest: Upload is already being completed` — the upload was
+destroyed and the retry poisoned. This could be triggered by any dying
+proxy hop or flaky network, on single-instance deployments too. The store
+pipeline now runs on a detached task that a disconnect cannot cancel, and
+a completion registry makes retries safe: an identical retried Complete
+joins the in-flight completion (or returns the finished result from a
+success tombstone), a retry with a different part list is refused, and a
+failed completion clears the way for a fresh attempt. Covered by
+deterministic disconnect/race tests (`DGP_TEST_COMPLETE_STALL_MS` hook).
+
+### Changed — HA documentation states the full failure model
+
+The scale-out guide now lists all four events that move the hash ring
+(scale up, scale down, pod restart, readiness ejection) with their blast
+radius, the all-or-nothing nature of per-pod readiness, and the admin
+GUI's effective single-pod behaviour. The multi-instance guide gains the
+per-instance state that was previously only in internal notes: metadata
+cache staleness (and why directory-hash routing mostly neutralises it)
+and rate-limit multiplication. Operator 0.2.3's status message now points
+at backend connectivity when routers are up but no proxy pod is ready.
+
+### Fixed — dev-mode backend guard now accepts in-cluster Kubernetes DNS names
+
+The SSRF guard rejected every hostname ending in `.local` or `.internal`,
+even with `allow_local: true` / `DGP_BACKEND_ALLOW_LOCAL=true` — and
+Kubernetes in-cluster service names all end in `.svc.cluster.local`, so an
+in-cluster MinIO or Ceph backend was unreachable by name (the error even
+suggested the flag that then changed nothing). Dev mode now permits the
+forbidden name suffixes while still refusing the named cloud-metadata
+hosts; production mode is unchanged and still rejects them all. Found by
+running the operator against a real cluster.
+
+### Fixed — Kubernetes operator: 0.2.2
+
+Three defects found by actually deploying the operator (none of them
+reachable by unit tests): the published images were built on a newer
+Debian than their runtime and died at exec with a glibc version error
+(builder now pinned to bookworm to match the distroless runtime); the
+status readers used the `/status` subresource, which needs an RBAC grant
+the ClusterRole never had, so every deployment reported `0/N Progressing`
+forever (now reads the whole object, which the existing grant covers);
+and every documented `configYaml` sample kept the backend credentials
+only in the env Secret, which a YAML-defined backend never reads — the
+samples now use `${env:...}` references, which the proxy expands inside
+the pod so credentials reach the backend without ever sitting in the
+ConfigMap.
+
+### Added — official Kubernetes operator with multipart-safe multi-pod routing
+
+New `operator/` crate: a Kubernetes operator (CRD `DeltaGliderProxy`,
+group `deltaglider.beshu.tech/v1alpha1`) that manages the proxy StatefulSet
+(one PVC per pod), the config, the Services — and an HAProxy router that
+**consistent-hashes S3 traffic by the directory of the URL path** (the
+deltaspace). That routing is what makes a multi-pod deployment work with S3
+multipart uploads: multipart state is per-pod, so behind a round-robin
+Service the SDK's parallel `UploadPart` requests hit the wrong pods and
+fail with `NoSuchUpload`. Directory-pinning routes every request that
+touches one delta prefix — all keys in it, every multipart part — to the
+same pod, which both keeps multipart uploads working and satisfies the
+delta engine's single-writer-per-deltaspace reference lock (per-key
+hashing would not: two keys in one prefix share one reference file).
+Routing behaviour verified against haproxy:3.0.
+
+Operator 0.2.0 lowers the friction of getting to a correct multi-pod
+deployment. The multi-replica requirements are now **enforced**: when
+`replicas > 1` but the spec has no config sync bucket, uses a filesystem
+backend, or has no shared bootstrap password hash, the operator refuses to
+scale up — a fresh deployment comes up with one pod, an already-running
+fleet keeps its current size (healthy pods are never killed over a
+preflight problem, and a transient Secret-read failure changes nothing) —
+and the resource reports phase `Degraded` with the exact problems in
+`status.message`. A broken spec can no longer scale into data corruption.
+`spec.bootstrapPassword.autoGenerate: true` removes the manual hash step
+entirely: the operator generates a random password once, stores it with
+its bcrypt hash in a Secret named `<name>-bootstrap` (which deliberately
+survives deletion of the resource, like the data volumes it decrypts),
+and injects the hash into every pod. The operator image is published to
+Docker Hub by CI on every operator version bump (skipped entirely when
+the version is already published). Consistent hashing is the only multipart strategy
+implemented — the trade-offs (ring remap on scale, per-pod upload loss on
+restart) are documented in the operator README and in
+`docs/product/how-to/scale-out-with-the-kubernetes-operator.md`. The Helm
+chart remains the single-pod path and now says so explicitly.
+
+The router stamps `X-Forwarded-For` (and the pods get
+`DGP_TRUST_PROXY_HEADERS=true`) so rate limits, `aws:SourceIp` conditions,
+and admin-session IP binding see real client IPs; ring membership tracks
+`/_/ready` (real backend readiness), not just liveness. The Helm chart's
+readiness probe now also points at `/_/ready` instead of `/_/health`,
+matching the backend-health invariant shipped in v1.16.0.
 
 ## v1.16.1 — 2026-07-22
 
