@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.17.0 — 2026-08-04
+
 ### Fixed — CompleteMultipartUpload survives client disconnects and tolerates retries
 
 Found by killing a load-balancer mid-request on a live cluster: when the
