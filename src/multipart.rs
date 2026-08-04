@@ -1239,8 +1239,32 @@ impl MultipartStore {
                 RelayStrategy::InMemory { .. } => None,
             })
             .collect();
-        let (dirs_removed, files_removed) =
+        let (mut dirs_removed, mut files_removed) =
             cleanup_orphan_relay_entries_at(&relay_root_dir(), &active_relay_dirs, min_age);
+
+        // Foreign per-process roots (crashed/finished proxies): reap only STALE
+        // leftovers — a young dir may belong to a live sibling process's upload.
+        let foreign_min_age = std::time::Duration::from_secs(
+            crate::config::env_parse_with_default("DGP_RELAY_FOREIGN_MIN_AGE_SECS", 3600),
+        );
+        let mine = relay_root_dir();
+        if let Ok(entries) = fs::read_dir(relay_parent_dir()) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path == mine || !path.is_dir() {
+                    continue;
+                }
+                let (fd, ff) = cleanup_orphan_relay_entries_at(
+                    &path,
+                    &HashSet::new(),
+                    min_age.max(foreign_min_age),
+                );
+                dirs_removed += fd;
+                files_removed += ff;
+                // Removes the pid dir only when empty; a live sibling keeps it.
+                let _ = fs::remove_dir(&path);
+            }
+        }
         MultipartSweepReport {
             orphan_relay_dirs_removed: dirs_removed,
             orphan_relay_files_removed: files_removed,
@@ -1270,8 +1294,16 @@ impl MultipartStore {
     }
 }
 
-fn relay_root_dir() -> PathBuf {
+/// Parent of all per-process relay roots on this host.
+fn relay_parent_dir() -> PathBuf {
     std::env::temp_dir().join(RELAY_ROOT_DIR)
+}
+
+/// Per-PROCESS relay root. Sharing one root across processes let a booting
+/// instance's age-zero startup sweep delete the LIVE relay parts of every other
+/// proxy on the host (chaos-found: "Failed to persist relay part: No such file").
+fn relay_root_dir() -> PathBuf {
+    relay_parent_dir().join(std::process::id().to_string())
 }
 
 fn relay_dir_for_upload(upload_id: &str) -> PathBuf {

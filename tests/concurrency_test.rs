@@ -213,15 +213,15 @@ async fn test_parallel_puts_different_prefixes() {
 // produces split-brain if the metadata cache isn't invalidated
 // correctly.
 
-/// Double-Complete on the SAME multipart upload ID: only one must
-/// succeed. The proxy guards this at the MultipartStore layer with a
-/// `completed` boolean flipped under the uploads RwLock — but that
-/// invariant needs to survive the full HTTP round-trip (handler →
-/// extractor → store → XML response), which is what we're asserting
-/// here. A regression where the flag were dropped would surface as
-/// two 200 OKs (the second clobbers the first's assembled state).
+/// Double-Complete on the SAME multipart upload ID with the SAME part list:
+/// both requests must converge on ONE completion. The completion registry
+/// makes the second request join the first's in-flight outcome (or hit its
+/// success tombstone), so both return 200 with the SAME ETag while the store
+/// pipeline runs exactly once — the silent-corruption scenario (two
+/// independent stores clobbering each other) is structurally impossible.
+/// This matches S3, where a retried identical Complete is not an error.
 #[tokio::test]
-async fn test_concurrent_complete_same_upload_id_one_wins() {
+async fn test_concurrent_complete_same_upload_id_converges() {
     let server = TestServer::filesystem().await;
     let http = reqwest::Client::new();
     let endpoint = server.endpoint();
@@ -262,12 +262,10 @@ async fn test_concurrent_complete_same_upload_id_one_wins() {
         .expect("upload_part must return ETag")
         .to_string();
 
-    // Step 3: fire two Complete requests at the same upload ID
-    // concurrently. Only ONE must land a 200 OK; the other must
-    // be rejected. What "rejected" looks like is documented by
-    // `MultipartStore::complete`: the NoSuchUpload variant when the
-    // upload is already marked completed. Over HTTP that surfaces
-    // as 4xx, not 200.
+    // Step 3: fire two identical Complete requests at the same upload ID
+    // concurrently. The completion registry lets the loser JOIN the
+    // winner's outcome: both must return 200 with the same ETag, and the
+    // store pipeline must have run exactly once.
     let complete_xml = format!(
         r#"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"#
     );
@@ -299,19 +297,25 @@ async fn test_concurrent_complete_same_upload_id_one_wins() {
 
     let (ra, rb) = (a.await.unwrap().unwrap(), b.await.unwrap().unwrap());
     let statuses = [ra.status().as_u16(), rb.status().as_u16()];
-    let successes = statuses.iter().filter(|s| **s < 400).count();
-    let failures = statuses.iter().filter(|s| **s >= 400).count();
-
-    // EXACTLY one success, EXACTLY one failure. Two successes would be
-    // the silent-corruption regression; two failures would be a worse
-    // regression where Complete is broken.
-    assert_eq!(
-        successes, 1,
-        "expected exactly 1 Complete to succeed, got statuses {statuses:?}"
+    assert!(
+        statuses.iter().all(|s| *s < 400),
+        "both identical Completes must succeed (joiner shares the owner's outcome), \
+         got statuses {statuses:?}"
     );
+    // Both responses must carry the SAME multipart ETag: one completion, two answers.
+    let body_a = ra.text().await.unwrap();
+    let body_b = rb.text().await.unwrap();
+    let etag_of = |xml: &str| {
+        xml.split("<ETag>")
+            .nth(1)
+            .and_then(|s| s.split("</ETag>").next())
+            .map(str::to_string)
+            .expect("Complete response carries an ETag")
+    };
     assert_eq!(
-        failures, 1,
-        "expected exactly 1 Complete to fail, got statuses {statuses:?}"
+        etag_of(&body_a),
+        etag_of(&body_b),
+        "both Completes must report the same completion outcome"
     );
 
     // And the object exists and is readable — whichever Complete won

@@ -1444,14 +1444,22 @@ async fn test_multipart_large_zip_forces_passthrough_on_s3_backend() {
 
 #[tokio::test]
 async fn test_startup_sweeps_orphan_relay_artifacts() {
-    let relay_root = std::env::temp_dir().join("deltaglider-mpu-relay");
+    // Relay roots are per-process (a shared root let one booting proxy delete a
+    // live sibling's relay parts). Crash leftovers live under a DEAD pid's root
+    // and are reaped once STALE; the test shrinks the staleness bound to zero.
+    let relay_root = std::env::temp_dir()
+        .join("deltaglider-mpu-relay")
+        .join("999999999"); // a pid no live process owns
     let orphan_dir = relay_root.join(format!("orphan-dir-{}", unique_prefix()));
     let orphan_file = relay_root.join(format!("orphan-file-{}.tmp", unique_prefix()));
     fs::create_dir_all(&orphan_dir).expect("create orphan relay dir");
     fs::write(orphan_dir.join("part-00001.bin"), b"orphan").expect("write orphan relay part");
     fs::write(&orphan_file, b"orphan").expect("write orphan relay file");
 
-    let _server = TestServer::filesystem().await;
+    let _server = TestServer::builder()
+        .env("DGP_RELAY_FOREIGN_MIN_AGE_SECS", "0")
+        .build()
+        .await;
 
     for _ in 0..40 {
         if !orphan_dir.exists() && !orphan_file.exists() {

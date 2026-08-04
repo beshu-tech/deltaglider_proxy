@@ -154,6 +154,7 @@ fn warn_active_test_seams() {
         "DGP_TEST_COPY_STALL_MS",
         "DGP_TEST_MAX_JOB_PAGES",
         "DGP_TEST_FORCE_NONCAS_BACKEND",
+        "DGP_RELAY_FOREIGN_MIN_AGE_SECS",
     ];
     let active: Vec<&str> = SEAMS
         .iter()

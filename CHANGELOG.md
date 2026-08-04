@@ -18,6 +18,20 @@ success tombstone), a retry with a different part list is refused, and a
 failed completion clears the way for a fresh attempt. Covered by
 deterministic disconnect/race tests (`DGP_TEST_COMPLETE_STALL_MS` hook).
 
+### Fixed — one proxy's boot can no longer destroy another proxy's in-flight multipart parts
+
+Large multipart parts are relayed to a directory under the system
+temporary folder, and that directory was shared by every proxy process on
+the host. The startup sweep that cleans crash leftovers deleted
+everything it did not recognise — including the LIVE relay parts of
+another proxy running on the same machine, whose upload then failed with
+"Failed to persist relay part". Relay roots are now per-process; leftover
+roots of dead processes are still reaped, but only after they have been
+stale for an hour (tunable via `DGP_RELAY_FOREIGN_MIN_AGE_SECS`). Two
+identical racing Completes also now both return the same success instead
+of one being rejected (a consequence of the completion registry above),
+and the concurrency test asserts the new converging contract.
+
 ### Changed — HA documentation states the full failure model
 
 The scale-out guide now lists all four events that move the hash ring
