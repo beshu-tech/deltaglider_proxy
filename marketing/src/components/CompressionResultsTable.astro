@@ -24,6 +24,11 @@ interface Props {
 
 const { detailed = true, includeTotalRow = true } = Astro.props;
 
+// Verdict grade chip: recognised grades render as a small tag, the rest
+// of the verdict stays plain text.
+const gradeOf = (v: string) => v.match(/^(Excellent|Fair|Complete)/)?.[1];
+const noteOf = (v: string) => v.replace(/^(Excellent|Fair|Complete)\s*/, '').replace(/^\((.*)\)$/, '$1');
+
 interface Row {
   version: string;
   variant?: string;
@@ -61,6 +66,7 @@ const rows: Row[] = [
 ];
 ---
 
+<div class="table-scroll">
 <table class="compact-table">
   <thead>
     <tr>
@@ -85,15 +91,25 @@ const rows: Row[] = [
               <span class="compression-badge">-{r.compression}</span>
             </div>
           </td>
-          <td>{r.verdict}</td>
+          <td class="verdict-cell">
+            {gradeOf(r.verdict) ? (
+              <>
+                <span class={`grade grade--${gradeOf(r.verdict)!.toLowerCase()}`}>{gradeOf(r.verdict)}</span>
+                {noteOf(r.verdict) && <span class="verdict-note">{noteOf(r.verdict)}</span>}
+              </>
+            ) : (
+              <span class="verdict-note">{r.verdict}</span>
+            )}
+          </td>
         </tr>
       ))
     }
     {
       includeTotalRow && (
-        <tr>
+        <tr class="total-row">
           <td>
             <strong>Full migration</strong>
+            {detailed && <div class="variant-label">174 versions</div>}
           </td>
           <td>
             <div class="size-flow">
@@ -102,39 +118,106 @@ const rows: Row[] = [
               <span class="dst-size">134 GB</span>
             </div>
           </td>
-          <td>Complete</td>
+          <td class="verdict-cell">
+            <span class="grade grade--complete">Complete</span>
+          </td>
         </tr>
       )
     }
   </tbody>
 </table>
+</div>
 
 <style>
+  /* Wide tables scroll inside their own container; the page never
+     scrolls horizontally. */
+  .table-scroll {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    margin: 1.75rem 0;
+  }
+
   .compact-table {
     width: 100%;
+    min-width: 34rem;
     border-collapse: collapse;
     font-size: 0.95rem;
+    margin: 0;
   }
   
   .compact-table th {
     text-align: left;
-    padding-bottom: 0.75rem;
+    padding: 0.85rem 1.25rem;
     border-bottom: 1px solid var(--rule);
     color: var(--ink-soft);
     text-transform: uppercase;
-    font-size: 0.8rem;
+    font-size: 0.78rem;
     letter-spacing: 0.05em;
+    font-weight: 600;
+    background: rgba(255, 255, 255, 0.02);
   }
 
   .compact-table td {
-    padding: 1rem 0;
+    padding: 1.05rem 1.25rem;
     border-bottom: 1px solid var(--rule);
     vertical-align: middle;
   }
 
+  .compact-table th:first-child,
+  .compact-table td:first-child {
+    width: 22%;
+  }
+
+  .compact-table th:last-child,
+  .compact-table td:last-child {
+    width: 34%;
+  }
+
   .compact-table tr:last-child td {
     border-bottom: none;
-    padding-bottom: 0;
+  }
+
+  .verdict-cell {
+    line-height: 1.45;
+  }
+
+  .grade {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    padding: 0.18rem 0.55rem;
+    border-radius: 999px;
+    border: 1px solid var(--rule-strong);
+    color: var(--ink-soft);
+  }
+
+  .grade--excellent,
+  .grade--complete {
+    color: var(--brand);
+    border-color: rgba(34, 211, 238, 0.35);
+    background: rgba(34, 211, 238, 0.08);
+  }
+
+  .verdict-note {
+    display: block;
+    margin-top: 0.3rem;
+    font-size: 0.85rem;
+    color: var(--ink-soft);
+  }
+
+  .total-row strong {
+    white-space: nowrap;
+  }
+
+  .total-row td {
+    background: rgba(34, 211, 238, 0.045);
+    border-top: 2px solid rgba(34, 211, 238, 0.35);
+  }
+
+  .total-row .dst-size {
+    color: var(--brand);
   }
 
   .variant-label {
@@ -147,6 +230,8 @@ const rows: Row[] = [
   .size-flow {
     display: inline-flex;
     align-items: center;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
     gap: 0.5rem;
     background: rgba(255,255,255,0.02);
     padding: 0.4rem 0.75rem;

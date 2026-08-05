@@ -53,45 +53,68 @@ const dateModified = '2026-08-05';
       <p class="byline">By Simone Scarduzio, founder, Beshu Tech</p>
 
       <p class="hero-lede">
-        I migrated Beshu Tech's own ReadonlyREST build catalog — 145
-        versions, 8 years of release history, ~103,088 objects, 1.71 TB
-        on AWS S3 (eu-west-1) — to Hetzner Object Storage (hel1) via
-        DeltaGlider. This page is the engineering retrospective: what
-        worked, what broke, what I fixed.
+        For eight years, every ReadonlyREST release uploaded another set
+        of Kibana plugin bundles to AWS S3. By the time I looked, the
+        catalog had grown to 145 versions — about 103,000 objects,
+        1.71&nbsp;TB — and we were paying to keep every byte of it,
+        month after month. This is the story of moving all of it to
+        Hetzner Object Storage through DeltaGlider: why, how, what it
+        cost, and the pitfalls worth knowing if you try the same.
       </p>
 
-      <p>
-        The migration is complete. The whole catalog — plus every release
-        shipped since, 174 versions today — is stored in 134 GB on
-        Hetzner: roughly 1,270% smaller than the 1.71 TB it occupied on
-        AWS S3, with over 92% of the bytes gone. It serves production
-        downloads through DeltaGlider today.
-      </p>
+      <aside class="result" aria-label="Final migration result">
+        <div class="result-stat" role="img" aria-label="1.71 terabytes reduced to 134 gigabytes">
+          <span class="result-src">1.71&nbsp;TB</span>
+          <span class="result-arrow">→</span>
+          <span class="result-dst">134&nbsp;GB</span>
+        </div>
+        <p class="result-note">
+          The migration is complete. The whole catalog — plus every
+          release shipped since, 174 versions today — is stored roughly
+          1,270% smaller, and serves production downloads through
+          DeltaGlider today.
+        </p>
+      </aside>
     </div>
   </section>
 
   <div class="shell">
     <section class="why">
-      <h2>Why migrate at all</h2>
+      <h2>Why we finally moved it</h2>
 
       <p>
-        We uploaded near-identical Kibana plugin files 145 times over
-        8 years of releases (1.12.x → 1.69.0), and paid to store every
-        full copy. Most of the bytes are identical between versions.
+        A build catalog is a strange kind of data. Nobody touches it for
+        months, and then a customer on an old Elasticsearch version
+        needs one exact plugin build — and it has to be there,
+        byte-perfect. So it sits in a bucket, grows with every release,
+        and the bill grows with it.
       </p>
 
       <p>
-        I picked Hetzner Object Storage as the destination because it's
-        the cheapest S3-compatible option that fits the migration
-        shape: cold-tier-friendly pricing, EU jurisdiction, and no
-        enterprise sales motion — which is fine for this use case.
-        Beshu Tech has no partnership with Hetzner; this is a vendor
-        choice, not a sponsored decision.
+        The wasteful part is what those releases contain. Each version
+        ships nearly the same set of plugin bundles as the one before
+        it, with a thin layer of changed code inside. Across the 145
+        releases from 1.12.x to 1.69.0 we uploaded near-identical files
+        again and again — and paid full price to store every copy,
+        because S3 neither knows nor cares that the bytes repeat.
+      </p>
+
+      <p>
+        I picked Hetzner Object Storage as the destination because it is
+        the cheapest S3-compatible option that fit: cold-tier-friendly
+        pricing, EU jurisdiction, and no enterprise sales process. Beshu
+        Tech has no partnership with Hetzner; it's a vendor choice, not
+        a sponsored one.
       </p>
     </section>
 
     <section class="shape">
-      <h2>Migration shape</h2>
+      <h2>The setup</h2>
+
+      <p>
+        The whole rig was one small EC2 instance in the same region as
+        the source bucket, so reading from S3 was free:
+      </p>
 
       <ul>
         <li>
@@ -114,99 +137,109 @@ const dateModified = '2026-08-05';
           <code>deltaglider cp -r</code> to Hetzner
         </li>
         <li>
-          <strong>Cold storage:</strong> older 99 versions were on
-          Glacier Deep Archive; restored via Bulk tier (~$2 total).
-          ~$9 in EC2 compute in total.
+          <strong>Cold storage:</strong> the older 99 versions were
+          asleep on Glacier Deep Archive
         </li>
       </ul>
+
+      <p>
+        The run itself was pleasantly boring. The Glacier versions had
+        to be woken up first — a Bulk-tier restore, about $2 for all
+        ninety-nine. From there, each version followed the same loop:
+        sync it down, merge the enterprise, free, and pro variants into
+        one layout, and push it to Hetzner through
+        <code>deltaglider cp</code>. The entire migration cost roughly
+        $9 of EC2 compute.
+      </p>
     </section>
 
     <section class="results">
-      <h2>Per-version results (verified, SHA-256 round-tripped)</h2>
-
-      <CompressionResultsTable detailed={true} includeTotalRow={false} />
+      <h2>The results</h2>
 
       <p>
-        1.38.0 compressed worse than the others because its
-        <code>legacy/</code> folder mixes ES 6, 7, and 8 Kibana plugins,
-        which are not similar to each other: the root folder stored
-        1,520% smaller, the legacy folder only 270% smaller. The admin
-        UI's Delta Efficiency Panel flags exactly this ("Fair, near
-        Poor"), so you can spot it in your own buckets.
+        Every number below is verified: each migrated version was hashed
+        at the source, round-tripped back through DeltaGlider, and
+        hashed again. Three versions tell the story, and the last row is
+        the whole catalog:
+      </p>
+
+      <CompressionResultsTable detailed={true} includeTotalRow={true} />
+
+      <p>
+        The outlier is the interesting one. 1.38.0 compressed worse than
+        the rest because its <code>legacy/</code> folder mixes Kibana
+        plugins for Elasticsearch 6, 7, and 8 — three families of files
+        that are not similar to <em>each other</em>, so the delta
+        encoder finds less repetition to exploit. The root folder stored
+        1,520% smaller; the legacy folder only 270%. The admin UI's
+        Delta Efficiency Panel flags exactly this pattern ("Fair, near
+        Poor"), so you can spot it in your own buckets before it costs
+        you anything.
       </p>
     </section>
 
     <section class="bugs">
-      <h2>What broke and how I fixed it</h2>
+      <h2>Pitfalls worth knowing</h2>
 
       <p>
-        Four things broke:
+        Four things tripped me up along the way. None of them was
+        serious, and every one has a fix you can copy:
       </p>
 
-      <h3>Bug 1: deltaglider CLI hardcoded <code>/tmp</code></h3>
+      <h3>The CLI wrote its temp files to <code>/tmp</code></h3>
 
       <p>
         The Python deltaglider 6.1.1 CLI hardcoded <code>/tmp</code>
-        for working files. <code>/tmp</code> on my EC2 was
-        <code>tmpfs</code>, 1.9 GB. Mid-large-version migration: out
-        of space.
+        for its working files, and <code>/tmp</code> on my EC2 was a
+        1.9 GB <code>tmpfs</code> — a mid-size version ran it out of
+        space. I patched it to honor <code>TMPDIR</code> and sent the
+        fix upstream.
+      </p>
+
+      <h3>A 30 GB disk wasn't enough</h3>
+
+      <p>
+        Staging 13 GB of source next to xdelta3's temporary files burst
+        the 30 GB volume at the first multi-gigabyte version. Growing it
+        to 100 GB cost about $8 per month for the migration window —
+        cheap insurance.
+      </p>
+
+      <h3><code>pipefail</code> and <code>head</code> don't mix</h3>
+
+      <p>
+        My script had <code>set -o pipefail</code> and piped
+        deltaglider's output through <code>grep -E ... | head -200</code>.
+        After the 200th matching line, <code>head</code> closed the
+        pipe, <code>pipefail</code> turned that into an exit, and the
+        migration stopped silently mid-upload. Dropping the
+        <code>| head</code> made the logs noisier and the script honest.
+      </p>
+
+      <h3>Reverse proxies default to 60-second timeouts</h3>
+
+      <p>
+        The production deployment sits behind Traefik, whose default
+        <code>respondingTimeouts.readTimeout</code> is 60 seconds.
+        Multi-gigabyte uploads over the internet died at exactly the
+        60-second mark with a 502.
       </p>
 
       <p>
-        Fix: patched <code>client.py</code> + <code>main.py</code>
-        in-place to honor <code>os.environ.get("TMPDIR")</code>.
-        Upstreaming the fix.
-      </p>
-
-      <h3>Bug 2: 30 GB EBS too small</h3>
-
-      <p>
-        Staging 13 GB of source + xdelta3 temp files + downloaded
-        archive + staging area = busted the 30 GB EBS at the first
-        multi-GB version.
-      </p>
-
-      <p>
-        Fix: grew EBS to 100 GB. Cost difference: ~$8/month for the
-        migration window. Cheap.
-      </p>
-
-      <h3>Bug 3: <code>pipefail + head</code> silent kill</h3>
-
-      <p>
-        My migration script had <code>set -o pipefail</code> and piped
-        deltaglider output through
-        <code>grep -E ... | head -200</code>. After 200 matched lines,
-        <code>head</code> closed the pipe. <code>pipefail</code> made
-        the script exit. Migration silently aborted mid-upload.
-      </p>
-
-      <p>
-        Fix: dropped the <code>| head</code>. Logs are slightly
-        noisier but the script doesn't lie about whether it succeeded.
-      </p>
-
-      <h3>Bug 4: Traefik 60s read timeout</h3>
-
-      <p>
-        Production Coolify deployment had Traefik with the default
-        <code>respondingTimeouts.readTimeout = 60s</code>. Cross-
-        internet uploads of multi-GB files hit exactly 60s and got
-        killed with a 502.
-      </p>
-
-      <p>
-        Fix: set Traefik <code>readTimeout</code> to 30m. Documented
-        the gotcha in <a href="/docs/how-to/troubleshooting">/docs/how-to/troubleshooting</a>
-        because every reverse-proxy default is wrong for large S3
-        uploads.
+        I raised it to 30 minutes and wrote the gotcha into
+        <a href="/docs/how-to/troubleshooting">the troubleshooting
+        guide</a>, because every reverse proxy's default is wrong for
+        large S3 uploads.
       </p>
     </section>
 
     <section class="verification">
-      <h2>How I'm verifying the migration is correct</h2>
+      <h2>Checking the bytes came back right</h2>
 
-      <p>For every migrated version:</p>
+      <p>
+        Compression is worthless if the data comes back wrong, so every
+        migrated version went through the same three checks:
+      </p>
 
       <ol>
         <li>
@@ -257,11 +290,73 @@ const dateModified = '2026-08-05';
 </BaseLayout>
 
 <style>
+  /* One centered reading column: the article measure IS the shell on
+     this page, so text, table, and headings share the same edges. */
+  .shell {
+    max-width: var(--measure);
+  }
+
+  .hero h1 {
+    font-size: clamp(2.3rem, 4.8vw, 3.3rem);
+    letter-spacing: -0.02em;
+    text-wrap: balance;
+  }
+
   .byline {
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
     color: var(--ink-soft);
-    font-style: italic;
-    margin-top: -0.5rem;
-    margin-bottom: 1.5rem;
+    margin-top: -0.25rem;
+    margin-bottom: 1.75rem;
+  }
+
+  /* Final-result callout — the page's headline fact. */
+  .result {
+    margin-top: 2.25rem;
+    padding: 1.6rem 1.8rem;
+    background: var(--bg-card);
+    border: 1px solid rgba(34, 211, 238, 0.28);
+    border-radius: 14px;
+    box-shadow: var(--shadow-md), 0 0 28px rgba(34, 211, 238, 0.08);
+  }
+
+  .result-stat {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 0.9rem;
+    font-family: var(--font-mono);
+    font-weight: 700;
+    line-height: 1;
+    margin-bottom: 0.9rem;
+  }
+
+  .result-src {
+    font-size: clamp(1.5rem, 3vw, 2rem);
+    color: var(--ink-soft);
+    text-decoration: line-through;
+    text-decoration-thickness: 2px;
+  }
+
+  .result-arrow {
+    font-size: clamp(1.3rem, 2.5vw, 1.7rem);
+    color: var(--ink-faint);
+  }
+
+  .result-dst {
+    font-size: clamp(2rem, 4.5vw, 2.8rem);
+    color: var(--brand);
+    text-shadow: 0 0 24px rgba(34, 211, 238, 0.35);
+  }
+
+  .result-note {
+    margin: 0;
+    max-width: none;
+    color: var(--ink-strong);
+    font-size: 0.98rem;
+    line-height: 1.6;
   }
 
   .why,
@@ -269,15 +364,26 @@ const dateModified = '2026-08-05';
   .results,
   .bugs,
   .verification,
-  .final,
   .reproducibility,
   .cta {
-    margin: 3rem 0;
+    margin: 3.5rem 0;
   }
 
   .bugs h3 {
-    margin-top: 2rem;
-    font-size: 1.1rem;
-    color: var(--ink-soft);
+    margin-top: 2.5rem;
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: var(--ink-strong);
+  }
+
+  /* On wide screens, let the data table breathe beyond the text measure —
+     symmetric bleed keeps the column centered. */
+  @media (min-width: 1080px) {
+    .results :global(.table-scroll) {
+      --bleed: 7rem;
+      width: calc(100% + 2 * var(--bleed));
+      margin-left: calc(-1 * var(--bleed));
+      margin-right: calc(-1 * var(--bleed));
+    }
   }
 </style>
