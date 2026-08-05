@@ -449,6 +449,12 @@
 
 /* === Provider comparison panel === */
 
+.calc-compare {
+  padding: 0 1.5rem 1.5rem;
+  border-top: 1px solid var(--rule);
+  background: var(--bg-soft);
+}
+
 .provider-compare {
   margin-top: 1.25rem;
   padding: 1.1rem 1.25rem 1rem;
@@ -511,6 +517,13 @@
   padding: 0.35rem 0.5rem;
   border-radius: 6px;
   transition: background 0.15s ease;
+}
+
+/* Full-width placement: labels get room for one line, bars line up. */
+@media (min-width: 900px) {
+  .provider-row {
+    grid-template-columns: 16rem 1fr;
+  }
 }
 
 .provider-row.is-selected {

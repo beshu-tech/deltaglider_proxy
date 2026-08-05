@@ -228,13 +228,17 @@ export default function PricingCalculator() {
             showFormula={showFormula}
             onToggleFormula={() => setShowFormula((v) => !v)}
           />
-          <ProviderComparison
-            sourceGb={sourceGb}
-            storedGb={sourceGb / inputs.compressionRatio}
-            selectedId={providerId}
-            onSelect={setProviderId}
-          />
         </section>
+      </div>
+
+      {/* Full-width: needs the horizontal room for one bar row per provider */}
+      <div className="calc-compare">
+        <ProviderComparison
+          sourceGb={sourceGb}
+          storedGb={sourceGb / inputs.compressionRatio}
+          selectedId={providerId}
+          onSelect={setProviderId}
+        />
       </div>
     </div>
   );

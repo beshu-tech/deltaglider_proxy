@@ -408,6 +408,12 @@ function renderDescription(id: string, description: string): string {
     margin: 0 auto;
   }
 
+  /* The global p rule caps width at the measure and anchors left; this
+     hero is centered, so the paragraph must center too. */
+  .calculator-hero-inner p {
+    margin-inline: auto;
+  }
+
   .calculator-hero h2 {
     font-size: 3rem;
     margin-bottom: 1rem;

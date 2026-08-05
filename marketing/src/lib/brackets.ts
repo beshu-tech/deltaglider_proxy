@@ -40,7 +40,7 @@ export const BRACKETS: readonly Bracket[] = [
     id: 'free',
     name: 'Free',
     priceUsd: 0,
-    priceLabel: 'Free, BUSL-1.1',
+    priceLabel: '$0',
     description:
       'The full product, self-hosted, with community support on GitHub. Production use is free up to 15 TB of compressed stored data per organization. Nothing is gated and there are no license keys. Every release becomes Apache-2.0 two years after it ships.',
   },
