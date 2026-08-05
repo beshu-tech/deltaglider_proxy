@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Persistent state for replication — wraps the v6 SQLCipher tables:
 //!

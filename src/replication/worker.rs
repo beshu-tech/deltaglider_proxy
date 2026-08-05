@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Replication worker: executes one full run of a single rule against
 //! a live engine + config DB.

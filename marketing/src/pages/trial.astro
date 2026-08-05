@@ -1,8 +1,8 @@
 ---
-// /trial — 30-day production support trial. The software is GPL-3.0 and
-// free regardless; the trial is for the support relationship (direct
-// engineering email + 12h SLA + arch review call). Frame C: trial the
-// relationship, not the software. v2 layout: hero illustration
+// /trial — 30-day Commercial-plan trial. The software is BUSL-1.1 and
+// free under the 15 TB grant regardless; the trial is for the support
+// relationship (direct engineering email + 12h SLA + arch review call).
+// Frame C: trial the relationship, not the software. v2 layout: hero illustration
 // (Gemini-generated, brand palette, /illustrations/trial-pairing.jpg),
 // glyph cards for what's included, a visual 30-day timeline, honesty
 // columns. We do NOT promise Slack channels or operating migrations.
@@ -16,9 +16,9 @@ import {
   trialOfferSchema,
 } from '../lib/seo';
 
-const title = '30-day production support trial — DeltaGlider';
+const title = '30-day Commercial trial — DeltaGlider';
 const description =
-  "Try the relationship. Direct engineering email, a 12-hour response SLA, one architecture review call. The software stays free regardless — it's GPL-3.0.";
+  "Try the relationship. Direct engineering email, a 12-hour response SLA, one architecture review call. The software stays free under the 15 TB grant regardless.";
 
 const included = [
   {
@@ -41,7 +41,7 @@ const included = [
 const timeline = [
   {
     day: 'Day 0',
-    text: 'You email contact@beshu.tech with subject “DeltaGlider — Production support trial.” We respond within 1 business day with a scheduling link for the review call.',
+    text: 'You email contact@beshu.tech with subject “DeltaGlider — Commercial trial.” We respond within 1 business day with a scheduling link for the review call.',
   },
   {
     day: 'Days 1–7',
@@ -57,7 +57,7 @@ const timeline = [
   },
   {
     day: 'Day 30',
-    text: 'Conversion conversation. Sign a paid support contract (Starter $2.5k, Growth $7.5k, Scale $15k) — or thank us, exit, and keep running the OSS build for free. Nothing changes on your side.',
+    text: 'Conversion conversation. Sign the Commercial plan ($5k/year, everything included) — or thank us, exit, and keep running the free build. Under the 15 TB grant, nothing changes on your side at all.',
   },
 ] as const;
 ---
@@ -77,18 +77,19 @@ const timeline = [
   <section class="hero">
     <div class="shell trial-hero-grid">
       <div class="trial-hero-copy">
-        <h1>30-day production support trial.</h1>
+        <h1>30-day Commercial trial.</h1>
 
         <p class="hero-lede">
           Try the relationship. The software is free regardless.
         </p>
 
         <p>
-          DeltaGlider is GPL-3.0 — you can run the OSS build forever
-          without paying us. The trial isn't for the software. It's for the
-          support relationship: a direct email line to Beshu Tech's 10
-          senior engineers, a 12-hour response SLA, and one architecture
-          review call.
+          DeltaGlider is free for production use up to 15 TB of compressed
+          data, and nothing in the software is ever gated. The trial isn't
+          for the software. It's for the Commercial plan's support
+          relationship: a direct email line to Beshu Tech's senior
+          engineers, a 12-hour response SLA, and one architecture review
+          call.
         </p>
 
         <p class="trial-no-strings">
@@ -97,12 +98,12 @@ const timeline = [
 
         <div class="hero-ctas">
           <a
-            href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20Production%20support%20trial"
+            href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20Commercial%20trial"
             class="btn btn-primary"
           >
             Start the trial
           </a>
-          <a href="/docs/tutorials/first-delta-savings" class="btn">Try the OSS build first</a>
+          <a href="/docs/tutorials/first-delta-savings" class="btn">Run it free first</a>
         </div>
       </div>
 
@@ -185,7 +186,8 @@ const timeline = [
             </li>
             <li>
               You need 24/7 on-call coverage — the trial is business-hours
-              only. 24/7 is part of paid Enterprise contracts.
+              only, and so is the standard Commercial plan. 24/7 is a
+              custom conversation with sales.
             </li>
             <li>
               You need a contract signed before any interaction — skip the
@@ -201,12 +203,13 @@ const timeline = [
       <h2>Why this isn't a software trial</h2>
 
       <p>
-        The software is GPL-3.0. There's nothing to gate, no time-locked
-        feature flag, no expiring license key. Gating the software would
-        be (a) impossible because it's open source, (b) hostile because
-        it would force you to fork the project, (c) pointless because
-        the whole pitch is "this is critical infra you can self-host
-        forever."
+        There is nothing to gate: no time-locked feature flag, no
+        expiring license key, no phone-home. That is a deliberate choice.
+        The license is legal text you can read, not a technical lock —
+        gating critical storage infrastructure would be hostile to the
+        people trusting it with their data. And every release becomes
+        Apache-2.0 open source two years after it ships, so the long-term
+        self-host story holds.
       </p>
 
       <p>
@@ -221,12 +224,12 @@ const timeline = [
 
       <div class="hero-ctas">
         <a
-          href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20Production%20support%20trial"
+          href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20Commercial%20trial"
           class="btn btn-primary"
         >
           Email contact@beshu.tech
         </a>
-        <a href="/docs/tutorials/first-delta-savings" class="btn">Try the OSS build first</a>
+        <a href="/docs/tutorials/first-delta-savings" class="btn">Run it free first</a>
       </div>
     </section>
   </div>

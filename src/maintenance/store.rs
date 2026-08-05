@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Persistent state for one-off maintenance jobs — wraps the v13
 //! SQLCipher tables:

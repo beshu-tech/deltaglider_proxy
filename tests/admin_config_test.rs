@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Integration tests for admin config hot-reload and backend CRUD.
 //! All tests spawn a real proxy process and make real HTTP requests.

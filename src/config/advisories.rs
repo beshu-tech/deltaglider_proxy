@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Cross-field config ADVISORIES — "this combination is suspicious" checks that
 //! surface to the admin at SAVE time (and `config lint`).

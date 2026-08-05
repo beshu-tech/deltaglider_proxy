@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Phase B: streaming multipart replication copy of a large passthrough
 //! object. Exercises the `transfer.rs` streaming branch end-to-end through

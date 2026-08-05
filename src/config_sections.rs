@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Sectioned configuration shape for Phase 3 of the progressive-disclosure
 //! refactor.

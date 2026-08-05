@@ -66,7 +66,8 @@ the Contribution, including without limitation:
   publicly display, publicly perform, sublicense, and distribute the
   Contribution and such derivative works;
 - the right to license the Contribution under any terms Beshu chooses,
-  including but not limited to open-source licenses (such as GPL-3.0)
+  including but not limited to source-available licenses (such as
+  BUSL-1.1), open-source licenses (such as Apache-2.0 or GPL-3.0),
   and proprietary commercial licenses;
 - all rights of attribution and integrity, to the maximum extent
   permitted by applicable law.

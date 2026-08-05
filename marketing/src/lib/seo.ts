@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 // seo.ts — single source of truth for SEO + schema.org JSON-LD.
 //
 // Every page's JSON-LD is composed from these typed builders. Update
@@ -14,7 +14,7 @@ export const SITE = {
   productName: 'DeltaGlider — S3-compatible storage compression',
   /** Default description for pages that don't override it. */
   description:
-    'Storage compression for S3, behind the same S3 API your apps already use. Open source (GPL-3.0). Built by Beshu Tech.',
+    'Storage compression for S3, behind the same S3 API your apps already use. Source-available (BUSL-1.1), free up to 15 TB. Built by Beshu Tech.',
   /** Path to the default Open Graph preview image (1200x630). */
   ogImage: '/og-default.svg',
   /** Repo URL (also used for sameAs in SoftwareApplication). */
@@ -119,7 +119,7 @@ export function softwareApplicationSchema() {
     applicationCategory: 'DeveloperApplication',
     applicationSubCategory: 'StorageProxy',
     operatingSystem: 'Linux, macOS, Windows (via Docker)',
-    // GPL-3.0 + commercial — the OSS price is $0.
+    // BUSL-1.1 + commercial — the free-grant price is $0.
     offers: {
       '@type': 'Offer',
       price: '0',
@@ -131,7 +131,7 @@ export function softwareApplicationSchema() {
       '@id': `${BESHU.url}#organization`,
     },
     softwareRequirements: 'Linux x86_64 / aarch64; Docker recommended',
-    license: 'https://www.gnu.org/licenses/gpl-3.0.en.html',
+    license: `${SITE.repoUrl}/blob/main/LICENSE`,
     codeRepository: SITE.repoUrl,
     programmingLanguage: 'Rust',
   };
@@ -201,7 +201,7 @@ export function pricingProductSchema(tiers: PricingTier[]) {
     '@type': 'Product',
     '@id': `${SITE.url}/pricing#product`,
     name: SITE.name,
-    description: 'DeltaGlider production support, scaling with your stored footprint.',
+    description: 'DeltaGlider Commercial — one flat annual plan for deployments above the free 15 TB grant.',
     brand: {
       '@type': 'Brand',
       name: SITE.name,
@@ -233,9 +233,9 @@ export function trialOfferSchema({ durationDays }: TrialOfferInput) {
     '@context': 'https://schema.org',
     '@type': 'Offer',
     '@id': `${SITE.url}/trial#offer`,
-    name: `${durationDays}-day DeltaGlider production support trial`,
+    name: `${durationDays}-day DeltaGlider Commercial trial`,
     description:
-      'Direct engineering email, a 12-hour response SLA, one architecture review call. The software is GPL-3.0 and remains free regardless.',
+      'Direct engineering email, a 12-hour response SLA, one architecture review call. The software is source-available (BUSL-1.1) and stays free under the 15 TB grant regardless.',
     price: '0',
     priceCurrency: 'USD',
     availability: 'https://schema.org/InStock',

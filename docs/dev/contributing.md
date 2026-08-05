@@ -233,13 +233,17 @@ Open an issue on GitHub. If it's a bug, include:
 
 ## License and Contributor Agreement
 
-### Code is GPL-3.0
+### Code is BUSL-1.1
 
-DeltaGlider Proxy is licensed under [GPL-3.0-only](../../LICENSE).
-Every Rust source file must start with the SPDX header:
+DeltaGlider Proxy is licensed under the
+[Business Source License 1.1](../../LICENSE): production use is free up
+to 15 TB of compressed stored data, and every release converts to
+Apache-2.0 two years after it ships. Releases up to and including
+v1.17.0 remain GPL-3.0. Every Rust source file must start with the
+SPDX header:
 
 ```rust
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 ```
 
 CI fails if a `.rs` file is missing this header. Run
@@ -250,8 +254,9 @@ CI fails if a `.rs` file is missing this header. Run
 To contribute, you must sign the
 [Contributor License Agreement](../../CLA.md). By signing, you
 **assign copyright** in your contribution to **Beshu Limited**. This
-lets us dual-license the project (GPL-3.0 + commercial) — the same
-model used by ReadonlyREST and many other open-core products.
+lets us license the project (BUSL-1.1 + commercial) — the same
+model used by ReadonlyREST and many other commercial products built
+in the open.
 
 **How to sign**: when you open your first pull request, a CLA
 Assistant bot will comment with a link and signing instructions. You

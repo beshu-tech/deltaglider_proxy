@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! `kind = "migrate"` maintenance jobs: move a bucket between backends as
 //! a durable, resumable, WRITE-GATED background job.

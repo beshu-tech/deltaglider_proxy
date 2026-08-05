@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Changed — License: GPL-3.0 → Business Source License 1.1
+
+DeltaGlider Proxy is now licensed under the Business Source License 1.1
+(BUSL-1.1). What this means in practice:
+
+- **Production use stays free for most deployments.** The license grants
+  free production use as long as the total compressed data stored through
+  the proxy stays under 15 TB per organization, and the proxy itself is
+  not resold as a hosted or managed service. Development, testing, and
+  evaluation are free at any size.
+- **Every release becomes open source on a schedule.** Two years after
+  each version is first released, that version automatically converts to
+  the Apache License 2.0.
+- **Nothing is gated.** There are no license keys, no feature flags, and
+  no phone-home. The full product ships to everyone; the license is a
+  legal term, not a technical lock. The admin dashboard already shows
+  your compressed footprint, so you can see for yourself which side of
+  the 15 TB line you are on.
+- **Old releases are unaffected.** Every release up to and including
+  v1.17.0 was published under GPL-3.0 and remains under GPL-3.0 forever.
+
+Deployments above the 15 TB grant, embedding in proprietary products,
+and hosted-service resale require a commercial license — see
+[deltaglider.com/pricing](https://deltaglider.com/pricing/). The pricing
+model changed with the license: the TB-bracketed support tiers are gone,
+replaced by a single flat Commercial plan that bundles the license,
+signed builds, support, and everything else.
+
 ### Changed — operator 0.2.4 and Helm chart defaults track v1.17.0
 
 The operator's pinned default proxy image and the Helm chart's

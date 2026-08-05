@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Axum middleware that evaluates the admission chain and annotates the
 //! request with the decision for downstream layers.

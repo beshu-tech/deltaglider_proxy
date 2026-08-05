@@ -71,7 +71,7 @@ LABEL org.opencontainers.image.title="DeltaGlider Proxy" \
       org.opencontainers.image.description="S3-compatible proxy with transparent delta compression" \
       org.opencontainers.image.vendor="DeltaGlider" \
       org.opencontainers.image.source="https://github.com/beshu-tech/deltaglider_proxy" \
-      org.opencontainers.image.licenses="GPL-3.0-only"
+      org.opencontainers.image.licenses="BUSL-1.1"
 
 # Install ca-certificates (HTTPS) and curl (healthcheck).
 # xdelta3 is copied from build stage to reduce apt dependency surface.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Pure causal model for a parity finding: WHY it diverged, whether a
 //! re-run actually fixes it (POLICY-AWARELY), and the guided next step.

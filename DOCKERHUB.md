@@ -156,4 +156,4 @@ The Docker image includes a built-in healthcheck on port 9000 (15s interval).
 ## Source & License
 
 - **Source**: [github.com/beshu-tech/deltaglider_proxy](https://github.com/beshu-tech/deltaglider_proxy)
-- **License**: GPL-3.0
+- **License**: BUSL-1.1 — free for production use up to 15 TB of compressed stored data; every release converts to Apache-2.0 two years after it ships. Releases up to v1.17.0 remain GPL-3.0. See [deltaglider.com/pricing](https://deltaglider.com/pricing/).

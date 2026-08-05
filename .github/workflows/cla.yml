@@ -53,8 +53,8 @@ jobs:
             [Contributor License Agreement](https://github.com/beshu-tech/deltaglider_proxy/blob/main/CLA.md).
 
             By signing the CLA, you assign copyright in your contribution
-            to **Beshu Limited** so the project maintainers can dual-
-            license the code (open source + commercial).
+            to **Beshu Limited** so the project maintainers can license
+            the code (source-available + commercial).
 
             **To sign**, post the following as a single comment on this PR:
           custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'

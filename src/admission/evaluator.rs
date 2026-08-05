@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Admission evaluator — take a normalised request description, walk the
 //! chain, return a decision.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Unified jobs API — ONE read+action surface over the three job
 //! subsystems (replication rules, lifecycle rules, maintenance one-offs).

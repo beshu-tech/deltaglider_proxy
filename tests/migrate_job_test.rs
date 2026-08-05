@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Integration tests for `kind = "migrate"` maintenance jobs — the durable,
 //! resumable, write-gated replacement for the old synchronous bucket

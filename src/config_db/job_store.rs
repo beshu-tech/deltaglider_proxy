@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Shared job-machinery primitives for the three job subsystems
 //! (replication, lifecycle, maintenance).

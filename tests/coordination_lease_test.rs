@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! S3-object leader-lease integration tests against a REAL CAS-enforcing backend
 //! (MinIO). The pure acquire/renew/steal DECISION kernels are unit-tested in

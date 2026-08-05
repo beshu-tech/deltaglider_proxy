@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Pure `s3://bucket/key` URL parser shared by `cp`, `ls`, `rm`,
 //! `stats`, and `verify` CLI subcommands.

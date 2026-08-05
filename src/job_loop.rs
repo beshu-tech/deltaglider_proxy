@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Canonical pagination state machine for the job subsystems
 //! (replication, lifecycle, maintenance).

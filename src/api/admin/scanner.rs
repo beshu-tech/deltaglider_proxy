@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Usage scanner handlers: scan_usage, get_usage, migrate_legacy, plus the
 //! O(1) bucket-usage COUNTER (`get_bucket_usage`) and its full-scan

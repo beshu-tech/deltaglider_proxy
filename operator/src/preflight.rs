@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Pure multi-replica preflight: turns the README's "requirements for replicas > 1"
 //! into enforced invariants. Pure function over the spec + observed Secret keys, so

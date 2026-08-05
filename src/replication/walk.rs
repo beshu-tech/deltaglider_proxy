@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Fused directory-scoped reconcile walk — PURE core (no I/O, no tokio).
 //!

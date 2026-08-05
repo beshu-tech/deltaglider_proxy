@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Audit log viewer handler (Wave 11 of the admin UI revamp).
 //!

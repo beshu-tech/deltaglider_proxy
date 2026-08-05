@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Per-rule replication actions (run-now / pause / resume), consumed by
 //! the unified jobs API (`api/admin/jobs.rs`) under

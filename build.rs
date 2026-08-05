@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 fn main() {
     // Embed UTC build timestamp so the binary always knows when it was compiled.

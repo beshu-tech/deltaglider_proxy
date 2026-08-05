@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Finding #1 (2026-07-02 two-week review): a streaming multipart copy must
 //! FAIL when the source object changes generation mid-copy, rather than

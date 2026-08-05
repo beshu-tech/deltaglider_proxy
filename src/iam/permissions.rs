@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Permission evaluation: pure functions with no I/O, no framework dependencies.
 //!

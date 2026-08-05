@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! [`S3Lease`] — a cross-instance leader lease stored as a CAS'd object in the
 //! coordination bucket. This is what turns the node-local [`super::LocalLease`]

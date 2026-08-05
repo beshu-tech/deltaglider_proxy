@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Admin-API config surface, split into submodules along four genuine
 //! seams. Each submodule owns its handlers AND the request/response

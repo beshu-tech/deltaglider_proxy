@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! E1 security/hygiene fix regression tests: recursive DELETE uses a
 //! paginated loop instead of materialising the full listing with

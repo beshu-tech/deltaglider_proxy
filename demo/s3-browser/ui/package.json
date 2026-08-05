@@ -2,6 +2,7 @@
   "name": "deltaglider-s3-browser",
   "private": true,
   "version": "0.1.0",
+  "license": "BUSL-1.1",
   "type": "module",
   "engines": {
     "node": ">=22"

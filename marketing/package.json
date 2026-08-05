@@ -1,6 +1,7 @@
 {
   "name": "deltaglider-marketing",
   "version": "0.0.0",
+  "license": "BUSL-1.1",
   "private": true,
   "type": "module",
   "scripts": {

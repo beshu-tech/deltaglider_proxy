@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! `deltaglider_proxy get-bucket-acl s3://bucket`
 //! `deltaglider_proxy put-bucket-acl s3://bucket [--acl …|--grant-… …]`

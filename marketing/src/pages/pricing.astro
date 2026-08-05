@@ -1,11 +1,13 @@
 ---
-// /pricing — v5 plan §4.5.
-// Calculator React island + static tier table, both fed by the single
-// source of truth in src/lib/brackets.ts.
+// /pricing — calculator React island + static tier cards, both fed by
+// the single source of truth in src/lib/brackets.ts.
 //
-// JSON-LD Offers are generated from SCHEMA_OFFER_BRACKETS (the priced
-// production-support tiers only) — Enterprise + Commercial-license
-// are excluded because they have no fixed price.
+// The model (since the BUSL-1.1 relicense): free under the 15 TB
+// compressed-footprint grant, one flat Commercial plan above it, and
+// an OEM row for embedding / hosted-service resale.
+//
+// JSON-LD Offers are generated from SCHEMA_OFFER_BRACKETS (the
+// fixed-price paid tiers only) — OEM is excluded (no fixed price).
 
 import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
@@ -15,25 +17,25 @@ import {
   breadcrumbListSchema,
   pricingProductSchema,
 } from '../lib/seo';
-import { BRACKETS, SCHEMA_OFFER_BRACKETS } from '../lib/brackets';
+import { BRACKETS, SCHEMA_OFFER_BRACKETS, FREE_GRANT_TB } from '../lib/brackets';
 import '../styles/calculator.css';
 
 const title = 'Pricing — DeltaGlider';
 const description =
-  'Open source GPL-3.0 forever. Production support from $2.5k/year, scaling with your stored footprint. Calculator shows your annual savings live.';
+  `Free up to ${FREE_GRANT_TB} TB of compressed data. One flat Commercial plan at $5k/year — license, support, and signed builds included. Calculator shows your annual savings live.`;
 
 // Schema generator wants {sku, name, price, description}. Adapt from
 // the rich Bracket shape — single source of truth lives in brackets.ts.
 const schemaTiers = SCHEMA_OFFER_BRACKETS.map((b) => ({
-  sku: `production-support-${b.id}`,
+  sku: `deltaglider-${b.id}`,
   name: b.name,
   price: String(b.priceUsd),
   description: b.description,
 }));
 
-const freeTiers = BRACKETS.filter((b) => b.id === 'oss' || b.id === 'trial');
-const commercialTiers = BRACKETS.filter((b) => b.name.startsWith('Production support — '));
-const customTiers = BRACKETS.filter((b) => b.id === 'commercial');
+const freeTiers = BRACKETS.filter((b) => b.id === 'free' || b.id === 'trial');
+const commercialTiers = BRACKETS.filter((b) => b.id === 'commercial');
+const customTiers = BRACKETS.filter((b) => b.id === 'oem');
 
 /**
  * Special-case the trial-row description so the in-table link
@@ -47,10 +49,10 @@ function renderDescription(id: string, description: string): string {
       'See <a href="/trial">/trial</a>',
     );
   }
-  
-  // Highlight important metrics and absorb the trailing period
-  html = html.replace(/([0-9]+(?:-[0-9]+)? TB\+? stored footprint)\./, '<span class="pr-highlight">$1</span>');
-  
+
+  // Highlight the grant threshold and absorb the surrounding phrase
+  html = html.replace(/([0-9]+ TB of compressed stored data)/, '<span class="pr-highlight">$1</span>');
+
   return html;
 }
 ---
@@ -87,7 +89,7 @@ function renderDescription(id: string, description: string): string {
     <section class="tiers">
       <h2>What you'd pay</h2>
 
-      <h3>Open source & evaluation</h3>
+      <h3>Free & evaluation</h3>
       <div class="pricing-stack">
         {
           freeTiers.map((b) => {
@@ -106,27 +108,26 @@ function renderDescription(id: string, description: string): string {
         }
       </div>
 
-      <h3 class="tiers-commercial-header">Production support</h3>
-      <div class="pricing-pillars">
+      <h3 class="tiers-commercial-header">Commercial</h3>
+      <div class="pricing-stack">
         {
           commercialTiers.map((b) => {
-            const shortName = b.name.replace('Production support — ', '');
             return (
-              <div class="pricing-pillar">
-                <div class="pr-pillar-tier">
-                  <h4 class="tier-title">{shortName}</h4>
+              <div class="pricing-row pricing-row-commercial">
+                <div class="pr-tier">
+                  <h4 class="tier-title">{b.name}</h4>
                 </div>
-                <div class="pr-pillar-price">
+                <div class="pr-price">
                   <span class="price-val">{b.priceLabel}</span>
                 </div>
-                <div class="pr-pillar-desc" set:html={renderDescription(b.id, b.description)} />
+                <div class="pr-desc" set:html={renderDescription(b.id, b.description)} />
               </div>
             );
           })
         }
       </div>
 
-      <h3>Custom licensing</h3>
+      <h3>OEM & embedding</h3>
       <div class="pricing-stack">
         {
           customTiers.map((b) => {
@@ -147,56 +148,67 @@ function renderDescription(id: string, description: string): string {
     </section>
 
     <section class="meter">
-      <h2>What we mean by "stored footprint"</h2>
+      <h2>What we mean by "compressed stored footprint"</h2>
 
       <p>
-        Stored footprint = compressed bytes physically stored on your
-        backend across all DeltaGlider-managed buckets, measured at
-        month-end. This is the number DeltaGlider already reports at
-        <code>/_/stats</code>. Not source/logical bytes. Not
-        ingress/egress. Storage-layer replicas (whatever your backend
-        does under the hood) don't count.
+        Compressed stored footprint = the bytes physically stored on your
+        backend across all DeltaGlider-managed buckets, after
+        DeltaGlider's compression. This is the number the license grant
+        is measured on, and it is the number DeltaGlider already shows
+        you — in the admin dashboard and at <code>/_/stats</code>. It is
+        not your source (logical) bytes, and it is not ingress or egress.
+        Storage-layer replicas (whatever your backend does under the
+        hood) don't count.
       </p>
 
       <p>
-        We don't collect telemetry. You self-report at renewal; we
-        cross-check via the <code>/_/stats</code> endpoint if you give
-        us read access during the conversation.
+        We don't collect telemetry and the software never phones home.
+        Your own dashboard tells you which side of the {FREE_GRANT_TB} TB
+        line you are on; you self-report, and we cross-check via the
+        <code>/_/stats</code> endpoint only if you give us read access
+        during the conversation.
       </p>
     </section>
 
     <section class="commercial">
-      <h2>When does someone need a commercial license?</h2>
+      <h2>When do you need the Commercial plan?</h2>
 
       <p>
-        DeltaGlider is GPL-3.0. Most users — including internal
-        infrastructure at any company size — use the OSS build freely
-        with no obligation. You need a commercial license only if:
+        DeltaGlider is source-available under the
+        <a href="https://github.com/beshu-tech/deltaglider_proxy/blob/main/LICENSE">Business Source License 1.1</a>.
+        The license itself grants free production use to most deployments,
+        and every release becomes Apache-2.0 open source two years after
+        it ships. You need a paid license only if one of these applies:
       </p>
 
       <ul>
         <li>
-          You're embedding DeltaGlider in a proprietary product you
-          distribute to customers, AND you can't (or don't want to)
-          satisfy GPL-3.0's source-availability obligations
+          Your total compressed stored footprint exceeds
+          {FREE_GRANT_TB} TB per organization — that's the Commercial
+          plan, at the flat published price above
         </li>
         <li>
-          Your legal team requires the GPL obligation removed for any
-          other reason
+          You offer DeltaGlider itself to your customers as a hosted or
+          managed service — that's an OEM conversation
+        </li>
+        <li>
+          You embed DeltaGlider in a proprietary product you distribute —
+          also an OEM conversation
         </li>
       </ul>
 
       <p>
-        If you're a SaaS or platform running DeltaGlider on your own
-        infrastructure for your own apps, the OSS build is fine
-        forever. Production support is the relationship you buy, not a
-        license.
+        Everything else is free: internal infrastructure under the grant,
+        development, testing, evaluation at any size. If your compressed
+        footprint is above {FREE_GRANT_TB} TB, DeltaGlider is saving you
+        far more than the plan costs — that is exactly what the
+        calculator above shows.
       </p>
 
       <p>
         →
-        <a href="mailto:sales@beshu.tech?subject=DeltaGlider%20-%20Commercial%20license%20inquiry">
-          Talk to sales
+        <a href="mailto:sales@beshu.tech?subject=DeltaGlider%20-%20OEM%20license%20inquiry">
+          Talk to sales about OEM
         </a>
       </p>
     </section>
@@ -208,31 +220,48 @@ function renderDescription(id: string, description: string): string {
 
       <div class="faq-grid">
         <div class="faq-item">
-          <h3>Why is Starter $2.5k? That feels high for "support."</h3>
+          <h3>Is DeltaGlider still open source?</h3>
           <p>
-            It's not just support — it's an SLA on critical infrastructure
-            plus a direct email line to the senior engineers who wrote the
-            proxy. At your scale (typically 1–10 TB stored footprint = 100
-            TB+ of source artifacts), the savings calculator above shows
-            annual savings in the $30–60k range for typical SaaS deployments.
-            $2.5k is small next to that.
+            It is source-available: the full source is public, you can
+            read and build every line, and nothing is gated behind a
+            license key. It is not open source by the OSI definition —
+            but every release automatically becomes Apache-2.0, a fully
+            open license, two years after it ships. Releases up to
+            v1.17.0 were GPL-3.0 and stay GPL-3.0 forever.
           </p>
         </div>
 
         <div class="faq-item">
-          <h3>What happens if I exceed my bracket?</h3>
+          <h3>Why one flat price instead of brackets?</h3>
           <p>
-            Measured at renewal, not mid-year. If you're at 12 TB stored
-            footprint at renewal, you renew at Growth. No surprise
-            invoices.
+            Because support effort doesn't scale with your bytes, and
+            charging more the better the compression works taxed the
+            product for doing its job. Above the free grant, every
+            deployment gets the same plan: license, support, signed
+            builds, everything. If your savings are $200k/yr, good — the
+            price stays $5k.
           </p>
         </div>
 
         <div class="faq-item">
-          <h3>What about shrinking?</h3>
+          <h3>Why is the plan $5k? That feels high for "support."</h3>
           <p>
-            Same — you renew at a lower bracket and pay less. Brackets are
-            a relationship tier, not a usage meter.
+            It isn't support alone — it's the license above the
+            {FREE_GRANT_TB} TB grant, an SLA on critical infrastructure,
+            and a direct email line to the engineers who wrote the proxy.
+            Above the grant your compressed footprint implies hundreds of
+            terabytes of source data, and the calculator above typically
+            shows savings 10 to 40 times the plan price.
+          </p>
+        </div>
+
+        <div class="faq-item">
+          <h3>What happens if I cross the {FREE_GRANT_TB} TB line mid-year?</h3>
+          <p>
+            Nothing breaks and nothing gets gated. The software keeps
+            working; the admin dashboard shows your footprint. You buy
+            the Commercial plan when you cross the line — measured
+            honestly, no surprise invoices, no phone-home.
           </p>
         </div>
 
@@ -245,20 +274,11 @@ function renderDescription(id: string, description: string): string {
         </div>
 
         <div class="faq-item">
-          <h3>Why don't you publish the Enterprise price?</h3>
+          <h3>I'm under the grant — do I still get the trial?</h3>
           <p>
-            Because Enterprise deals genuinely vary — multi-region SLA
-            shape, named-eng-contact attribution, custom audit/compliance
-            attachments. The $15k Scale price is the anchor below;
-            Enterprise is a conversation, not a row in a table.
-          </p>
-        </div>
-
-        <div class="faq-item">
-          <h3>I'm at 0 TB today — do I still get the trial?</h3>
-          <p>
-            Yes. The trial is bracket-agnostic. Try the relationship
-            before committing to a bracket. <a href="/trial">/trial</a>
+            Yes. The 30-day trial gives you the Commercial plan's
+            support relationship regardless of your size, so you can try
+            it before you need it. <a href="/trial">/trial</a>
           </p>
         </div>
 
@@ -273,6 +293,17 @@ function renderDescription(id: string, description: string): string {
             set it up.
           </p>
         </div>
+
+        <div class="faq-item">
+          <h3>What stops me from just using the free grant forever?</h3>
+          <p>
+            Nothing, if you stay under it — that's the point. The grant
+            exists so that small teams, homelabs, and startups never pay.
+            Above it, the license text itself requires a commercial
+            license; whether you honor that is a question for your
+            compliance process, not for our software.
+          </p>
+        </div>
       </div>
     </section>
 
@@ -281,7 +312,7 @@ function renderDescription(id: string, description: string): string {
 
       <div class="hero-ctas">
         <a href="/trial" class="btn btn-primary">Start a 30-day trial</a>
-        <a href="/docs/tutorials/first-delta-savings" class="btn">Try the OSS build</a>
+        <a href="/docs/tutorials/first-delta-savings" class="btn">Run it free</a>
         <a
           href="mailto:sales@beshu.tech?subject=DeltaGlider%20-%20Sales%20inquiry"
           class="btn"
@@ -479,72 +510,8 @@ function renderDescription(id: string, description: string): string {
     font-weight: 600;
   }
 
-  /* === Pricing Pillars Design === */
-  .pricing-pillars {
-    display: grid;
-    grid-template-columns: 1fr;
-    gap: 1.5rem;
-    margin-top: 1.5rem;
-  }
-
-  @media (min-width: 768px) {
-    .pricing-pillars {
-      grid-template-columns: repeat(2, 1fr);
-    }
-  }
-
-  @media (min-width: 1024px) {
-    .pricing-pillars {
-      grid-template-columns: repeat(4, 1fr);
-    }
-  }
-
-  .pricing-pillar {
-    background: var(--bg-card);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border: 1px solid var(--rule);
-    border-radius: 12px;
-    padding: 2rem 1.5rem;
-    box-shadow: var(--shadow-sm);
-    display: flex;
-    flex-direction: column;
-    transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.2s ease, border-color 0.2s ease;
+  /* The single Commercial row gets the brand accent the pillar grid used to carry. */
+  .pricing-row-commercial {
     border-top: 4px solid var(--brand);
-  }
-
-  .pricing-pillar:hover {
-    transform: translateY(-4px) scale(1.02);
-    box-shadow: var(--shadow-md), 0 0 20px var(--brand-soft);
-    border-color: var(--rule-strong);
-  }
-
-  .pr-pillar-tier {
-    margin-bottom: 0.5rem;
-  }
-
-  .pr-pillar-price {
-    margin-bottom: 1.5rem;
-  }
-
-  .pr-pillar-price .price-val {
-    font-size: 1.75rem;
-    font-weight: 700;
-    color: var(--brand);
-    font-family: var(--font-mono);
-  }
-
-  .pr-pillar-desc {
-    font-size: 0.95rem;
-    color: var(--ink-soft);
-    line-height: 1.55;
-    margin: 0;
-  }
-
-  .pr-pillar-desc :global(.pr-highlight) {
-    color: var(--ink-strong);
-    font-weight: 600;
-    display: block; 
-    margin-bottom: 0.5rem;
   }
 </style>

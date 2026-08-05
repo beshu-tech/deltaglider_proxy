@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Include/exclude glob filter for recursive CLI commands (`cp -r`,
 //! `rm -r`, and the deferred `sync` / `migrate`).

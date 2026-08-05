@@ -6,6 +6,7 @@
 
 import {
   bracketForFootprintTb,
+  FREE_GRANT_TB,
   type Bracket,
 } from './brackets';
 
@@ -47,8 +48,8 @@ export interface BreakdownLine {
  * telling the UI to swap to a "self-disqualify" card. */
 export type CalculatorResult =
   | { kind: 'belowThreshold' }
-  | { kind: 'negativeNet'; savings: number; supportCost: number }
-  | { kind: 'enterprise'; savings: number; lines: BreakdownLine[] }
+  | { kind: 'negativeNet'; savings: number; licenseCost: number }
+  | { kind: 'free'; savings: number; lines: BreakdownLine[]; warnings: Warning[] }
   | { kind: 'ok'; bracket: Bracket; savings: number; netSavings: number; lines: BreakdownLine[]; warnings: Warning[] };
 
 /** Soft warnings rendered as warning chips next to the result card.
@@ -69,9 +70,6 @@ const REPLICATION_EGRESS_USD_PER_GB = 0.02;
  * calculator swaps to a "come back later" message. */
 export const SOURCE_TB_LOWER_THRESHOLD = 1;
 
-/** Above this stored footprint the visitor goes to Enterprise — talk to sales. */
-export const SCALE_TB_UPPER = 250;
-
 /** Compress everything into the result.
  *
  * Algorithm:
@@ -81,10 +79,11 @@ export const SCALE_TB_UPPER = 250;
  *   today egress    = sourceTb * growthRate * 1024 * (regions - 1 replicas) * $0.02
  *   dgp egress      = storedFootprint * growthRate * 1024 * (regions - 1 replicas) * $0.02
  *   savings         = (todayStorage + todayEgress) - (dgpStorage + dgpEgress)
- *   supportCost     = bracket.priceUsd
- *   netSavings      = savings - supportCost
+ *   licenseCost     = 0 under the 15 TB grant, else the flat Commercial price
+ *   netSavings      = savings - licenseCost
  *
- * Then bracket-selection happens against `storedFootprint`.
+ * Tier selection happens against `storedFootprint` (compressed bytes),
+ * because that is what the BUSL-1.1 grant is measured on.
  */
 export function calculate(inputs: CalculatorInputs): CalculatorResult {
   const { sourceTb, regions, costPerGbMonthUsd, compressionRatio, annualGrowthRate } = inputs;
@@ -127,7 +126,8 @@ export function calculate(inputs: CalculatorInputs): CalculatorResult {
     { label: 'Subtotal — storage + transfer', today: todaySubtotal, dgp: dgpSubtotal },
   ];
 
-  // Bracket selection based on stored footprint.
+  // Tier selection based on the compressed stored footprint — the
+  // number the BUSL-1.1 grant is measured on.
   const bracket = bracketForFootprintTb(storedFootprintTb);
 
   // Warnings: surfaced as chips alongside the result; don't override.
@@ -135,29 +135,29 @@ export function calculate(inputs: CalculatorInputs): CalculatorResult {
   if (compressionRatio < 3) warnings.push('lowCompressionRatio');
   if (costPerGbMonthUsd < 0.005) warnings.push('cheapBackendAlready');
 
-  // Enterprise: no fixed support price; show savings, defer to sales.
-  if (bracket.id === 'enterprise' || bracket.priceUsd === null) {
-    return { kind: 'enterprise', savings, lines };
+  // Under the free grant: DeltaGlider costs nothing.
+  if (bracket.id === 'free' || bracket.priceUsd === null || bracket.priceUsd === 0) {
+    return { kind: 'free', savings, lines, warnings };
   }
 
-  const supportCost = bracket.priceUsd;
-  const netSavings = savings - supportCost;
+  const licenseCost = bracket.priceUsd;
+  const netSavings = savings - licenseCost;
 
-  // Bad-case: support costs more than savings.
+  // Bad-case: the license costs more than the savings.
   if (netSavings < 0) {
-    return { kind: 'negativeNet', savings, supportCost };
+    return { kind: 'negativeNet', savings, licenseCost };
   }
 
-  // Add the support-cost line + total-annual-cost line to the breakdown.
+  // Add the license-cost line + total-annual-cost line to the breakdown.
   lines.push({
-    label: 'DeltaGlider production support',
+    label: 'DeltaGlider Commercial plan',
     today: 0,
-    dgp: supportCost,
+    dgp: licenseCost,
   });
   lines.push({
     label: 'Total annual cost',
     today: todaySubtotal,
-    dgp: dgpSubtotal + supportCost,
+    dgp: dgpSubtotal + licenseCost,
   });
 
   return { kind: 'ok', bracket, savings, netSavings, lines, warnings };
@@ -211,29 +211,29 @@ export function buildMarkdown(inputs: CalculatorInputs, result: CalculatorResult
   if (result.kind === 'belowThreshold') {
     lines.push('## Verdict');
     lines.push('');
-    lines.push('Below 1 TB — DeltaGlider isn\'t worth it at this scale. Use the OSS build for free.');
+    lines.push('Below 1 TB — DeltaGlider isn\'t worth it at this scale. Run the free build anyway if you like; it costs nothing.');
     return lines.join('\n');
   }
   if (result.kind === 'negativeNet') {
     lines.push('## Verdict');
     lines.push('');
-    lines.push(`Storage savings (${formatUsd(result.savings)}) would be less than the support contract (${formatUsd(result.supportCost)}). Use the OSS build (free) or talk to us about a different fit.`);
+    lines.push(`Storage savings (${formatUsd(result.savings)}) would be less than the Commercial plan (${formatUsd(result.licenseCost)}). Talk to us about a different fit, or reduce scope until you fit the free 15 TB grant.`);
     return lines.join('\n');
   }
-  if (result.kind === 'enterprise') {
+  if (result.kind === 'free') {
     lines.push('## Verdict');
     lines.push('');
     lines.push(`Approximate annual storage savings: **${formatUsd(result.savings)}**.`);
     lines.push('');
-    lines.push('At this scale, you need an Enterprise contract — multi-region SLA, a named engineering contact, custom terms. Email sales@beshu.tech.');
+    lines.push(`Your compressed footprint stays under the ${FREE_GRANT_TB} TB free grant — DeltaGlider costs you nothing. The savings above are the whole story.`);
     return lines.join('\n');
   }
   // OK case
   lines.push('## Verdict');
   lines.push('');
   lines.push(`Approximate annual storage savings: **${formatUsd(result.savings)}**.`);
-  lines.push(`Production support bracket: ${result.bracket.name} at ${result.bracket.priceLabel}.`);
-  lines.push(`Net annual savings after support: **${formatUsd(result.netSavings)}**.`);
+  lines.push(`License: ${result.bracket.name} plan at ${result.bracket.priceLabel} (compressed footprint above the ${FREE_GRANT_TB} TB free grant).`);
+  lines.push(`Net annual savings after the license: **${formatUsd(result.netSavings)}**.`);
   lines.push('');
   lines.push('## Breakdown');
   lines.push('');
@@ -247,6 +247,6 @@ export function buildMarkdown(inputs: CalculatorInputs, result: CalculatorResult
   lines.push('');
   lines.push('---');
   lines.push('');
-  lines.push('Conservative assumptions. Real numbers depend on your data — run the OSS build (`docker run --rm -it -p 9000:9000 -v dgp-data:/data -e DGP_AUTHENTICATION=none beshultd/deltaglider_proxy`) against a sample of your data and read the Delta Efficiency Panel for a verified compression ratio.');
+  lines.push('Conservative assumptions. Real numbers depend on your data — run the free build (`docker run --rm -it -p 9000:9000 -v dgp-data:/data -e DGP_AUTHENTICATION=none beshultd/deltaglider_proxy`) against a sample of your data and read the Delta Efficiency Panel for a verified compression ratio.');
   return lines.join('\n');
 }

@@ -192,7 +192,7 @@ export default function PricingCalculator() {
                 />
                 <p className="field-help">
                   Conservative default. Verified ReadonlyREST migration ratios so far:
-                  74%, 76%, 99%. Run the OSS build's Delta Efficiency Panel on
+                  74%, 76%, 99%. Run the free build's Delta Efficiency Panel on
                   your bucket for a real number.
                 </p>
               </div>
@@ -328,12 +328,12 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
       <div className="card card-disqualify">
         <h3 id="calc-result-heading">DeltaGlider isn't worth it for you yet</h3>
         <p>
-          At under 1 TB of source artifacts, the savings won't cover the
-          support contract. Come back at 5 TB+, or use the OSS build for
-          free.
+          At under 1 TB of source artifacts, the savings are too small to
+          matter. Come back at 5 TB+, or run the free build anyway — it
+          costs nothing at this size.
         </p>
         <p>
-          → <a href="https://github.com/beshu-tech/deltaglider_proxy">Try the OSS build</a>
+          → <a href="https://github.com/beshu-tech/deltaglider_proxy">Run it free</a>
         </p>
       </div>
     );
@@ -342,16 +342,16 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
   if (result.kind === 'negativeNet') {
     return (
       <div className="card card-disqualify">
-        <h3 id="calc-result-heading">Savings would not cover the support contract</h3>
+        <h3 id="calc-result-heading">Savings would not cover the license</h3>
         <p>
           At this scale (savings ≈ <strong>{formatUsd(result.savings)}/yr</strong>),
-          the Starter support contract (<strong>{formatUsd(result.supportCost)}/yr</strong>)
-          would cost more than the storage you'd save. Use the OSS build (free),
-          or talk to us about a different fit.
+          the Commercial plan (<strong>{formatUsd(result.licenseCost)}/yr</strong>)
+          would cost more than the storage you'd save. Talk to us about a
+          different fit.
         </p>
         <div className="card-ctas">
           <a className="btn btn-primary" href="https://github.com/beshu-tech/deltaglider_proxy">
-            Try the OSS build
+            Run it free
           </a>
           <a className="link-action" href="mailto:sales@beshu.tech?subject=DeltaGlider%20-%20Different%20fit">
             Email us
@@ -361,23 +361,20 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
     );
   }
 
-  if (result.kind === 'enterprise') {
+  if (result.kind === 'free') {
     return (
-      <div className="card card-enterprise">
-        <h3 id="calc-result-heading">Enterprise — talk to sales</h3>
-        <p>
-          Approximate annual savings: <strong>{formatUsd(result.savings)}</strong>.
-        </p>
-        <p>
-          At 250 TB+ stored footprint, you need a multi-region SLA, named
-          engineering contact, and custom terms — not a one-size-fits-all bracket.
+      <div className="card card-ok">
+        <h3 id="calc-result-heading" className="calc-hero-heading">
+          You'd save approximately <strong className="calc-hero-number">{formatUsd(result.savings, { compact: true })}/year</strong>
+        </h3>
+        <p className="calc-hero-subtext">
+          Your compressed footprint stays under the <strong>15 TB free
+          grant</strong>, so DeltaGlider costs you <strong className="calc-hero-net">nothing</strong> —
+          the savings above are the whole story.
         </p>
         <div className="card-ctas">
-          <a
-            className="btn btn-primary"
-            href="mailto:sales@beshu.tech?subject=DeltaGlider%20-%20Enterprise%20sales%20inquiry"
-          >
-            Schedule a sales call
+          <a className="btn btn-brand" href="https://github.com/beshu-tech/deltaglider_proxy">
+            Run it free
           </a>
           <button type="button" className="link-action" onClick={onCopy}>
             {copyState === 'copied' ? 'Copied!' : copyState === 'failed' ? 'Copy failed' : 'Copy this estimate'}
@@ -395,8 +392,9 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
         You'd save approximately <strong className="calc-hero-number">{formatUsd(result.savings, { compact: true })}/year</strong>
       </h3>
       <p className="calc-hero-subtext">
-        After subscribing to <strong>{result.bracket.name}</strong> at{' '}
-        <strong>{result.bracket.priceLabel}</strong>,
+        After the <strong>{result.bracket.name}</strong> plan at{' '}
+        <strong>{result.bracket.priceLabel}</strong> (your compressed footprint
+        is above the 15 TB free grant),
         net annual savings: <strong className="calc-hero-net">{formatUsd(result.netSavings)}</strong>.
       </p>
 
@@ -405,7 +403,7 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
           {result.warnings.map((w) => (
             <li key={w} className="warning-chip">
               {w === 'lowCompressionRatio' &&
-                'Your data compresses below 67% bytes saved — DeltaGlider may not be the right fit. Run the OSS build + Delta Efficiency Panel on your own data to verify.'}
+                'Your data compresses below 67% bytes saved — DeltaGlider may not be the right fit. Run the free build + Delta Efficiency Panel on your own data to verify.'}
               {w === 'cheapBackendAlready' &&
                 "You're already on cheap object storage — savings will be smaller, but data sovereignty and lock-in benefits still apply."}
             </li>
@@ -418,7 +416,7 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
           Start a 30-day trial
         </a>
         <a className="link-action" href="https://github.com/beshu-tech/deltaglider_proxy">
-          Run the OSS build
+          Run the free build
         </a>
         <button type="button" className="link-action" onClick={onCopy}>
           {copyState === 'copied' ? 'Copied!' : copyState === 'failed' ? 'Copy failed' : 'Copy this estimate'}
@@ -483,12 +481,13 @@ today_egress       = source_tb × growth × 1024 × (regions - 1) × $0.02
 dgp_egress         = stored_footprint × growth × 1024 × (regions - 1) × $0.02
 savings            = (today_storage + today_egress)
                    − (dgp_storage  + dgp_egress)
-support_cost       = bracket_lookup(stored_footprint)
-net_savings        = savings − support_cost`}
+license_cost       = 0 if stored_footprint ≤ 15 TB, else $5k (Commercial)
+net_savings        = savings − license_cost`}
       </pre>
       <p>
-        Bracket lookup: 0–10 TB → Starter $2.5k · 10–50 TB → Growth $7.5k ·
-        50–250 TB → Scale $15k · 250 TB+ → Enterprise, talk to sales.
+        License lookup: the BUSL-1.1 grant makes production use free up to
+        15 TB of compressed stored data; above that, the flat Commercial
+        plan at $5k/year applies.
       </p>
     </div>
   );

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! `deltaglider_proxy s3 ls` — list buckets or objects with AWS-CLI-shaped
 //! output. The command shape mirrors `aws s3 ls`:

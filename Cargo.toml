@@ -2,7 +2,7 @@
 name = "deltaglider_proxy"
 version = "1.17.0"
 description = "S3-compatible proxy with transparent delta compression"
-license = "GPL-3.0-only"
+license = "BUSL-1.1"
 readme = "README.md"
 edition = "2021"
 

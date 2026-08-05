@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! The maintenance runner: a single background task that claims queued
 //! jobs (oldest first, one at a time — bounded resource usage) and

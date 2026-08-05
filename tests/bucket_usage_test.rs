@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Integration coverage for the per-bucket running usage counter (the O(1)
 //! Ceph-style size). Exercises the real PUT/DELETE pipeline + the admin

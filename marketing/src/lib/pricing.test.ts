@@ -11,6 +11,7 @@ import {
   SOURCE_TB_LOWER_THRESHOLD,
   type CalculatorInputs,
 } from './pricing';
+import { FREE_GRANT_TB, COMMERCIAL_PRICE_USD } from './brackets';
 
 /** Default inputs matching the calculator's default slider positions. */
 const defaultInputs = (overrides: Partial<CalculatorInputs> = {}): CalculatorInputs => ({
@@ -23,39 +24,33 @@ const defaultInputs = (overrides: Partial<CalculatorInputs> = {}): CalculatorInp
 });
 
 describe('calculate', () => {
-  it('starter bracket at 50 TB source × 10× = 5 TB stored → Starter ($2.5k)', () => {
-    // 50 TB × 2 regions produces enough savings to clear the $2.5k Starter
-    // floor. (At 5 TB source, savings ~$2.8k vs $2.5k → ok now, the floor is
-    // lower than before.)
+  it('free under the grant: 50 TB source × 10× = 5 TB stored → free', () => {
     const result = calculate(defaultInputs({ sourceTb: 50 }));
-    expect(result.kind).toBe('ok');
-    if (result.kind === 'ok') {
-      expect(result.bracket.id).toBe('starter');
-      expect(result.bracket.priceUsd).toBe(2_500);
-    }
+    expect(result.kind).toBe('free');
   });
 
-  it('growth bracket at 300 TB source × 10× = 30 TB stored → Growth ($7.5k)', () => {
+  it('free at the grant boundary: 150 TB source × 10× = 15 TB stored → still free', () => {
+    // The grant is inclusive: footprint ≤ 15 TB stays free.
+    const result = calculate(defaultInputs({ sourceTb: 150 }));
+    expect(result.kind).toBe('free');
+  });
+
+  it('commercial above the grant: 300 TB source × 10× = 30 TB stored → Commercial ($5k)', () => {
     const result = calculate(defaultInputs({ sourceTb: 300 }));
     expect(result.kind).toBe('ok');
     if (result.kind === 'ok') {
-      expect(result.bracket.id).toBe('growth');
-      expect(result.bracket.priceUsd).toBe(7_500);
+      expect(result.bracket.id).toBe('commercial');
+      expect(result.bracket.priceUsd).toBe(COMMERCIAL_PRICE_USD);
     }
   });
 
-  it('scale bracket at 1500 TB source × 10× = 150 TB stored → Scale ($15k)', () => {
-    const result = calculate(defaultInputs({ sourceTb: 1500 }));
+  it('commercial stays flat at any scale: 3000 TB source × 10× = 300 TB stored → same $5k', () => {
+    const result = calculate(defaultInputs({ sourceTb: 3000 }));
     expect(result.kind).toBe('ok');
     if (result.kind === 'ok') {
-      expect(result.bracket.id).toBe('scale');
-      expect(result.bracket.priceUsd).toBe(15_000);
+      expect(result.bracket.id).toBe('commercial');
+      expect(result.bracket.priceUsd).toBe(COMMERCIAL_PRICE_USD);
     }
-  });
-
-  it('enterprise sentinel at 3000 TB source × 10× = 300 TB stored', () => {
-    const result = calculate(defaultInputs({ sourceTb: 3000 }));
-    expect(result.kind).toBe('enterprise');
   });
 
   it('belowThreshold sentinel at 0.5 TB source', () => {
@@ -72,11 +67,15 @@ describe('calculate', () => {
     expect(SOURCE_TB_LOWER_THRESHOLD).toBe(1);
   });
 
-  it('negativeNet when support cost exceeds savings (e.g. low compression + small footprint)', () => {
-    // 2 TB × 2× compression × 1 region × $0.001/GB → ~$2.45k savings/yr
-    // vs Starter $2.5k → still negative (just barely).
+  it('FREE_GRANT_TB matches the license grant (15 TB)', () => {
+    expect(FREE_GRANT_TB).toBe(15);
+  });
+
+  it('negativeNet when the license costs more than the savings (over grant, cheap storage, low ratio)', () => {
+    // 40 TB × 2× compression = 20 TB stored (over the grant), 1 region,
+    // $0.001/GB-month → savings ≈ $246/yr vs the $5k Commercial plan.
     const result = calculate({
-      sourceTb: 2,
+      sourceTb: 40,
       regions: 1,
       costPerGbMonthUsd: 0.001,
       compressionRatio: 2,
@@ -84,14 +83,13 @@ describe('calculate', () => {
     });
     expect(result.kind).toBe('negativeNet');
     if (result.kind === 'negativeNet') {
-      expect(result.supportCost).toBe(2_500);
-      expect(result.savings).toBeLessThan(2_500);
+      expect(result.licenseCost).toBe(COMMERCIAL_PRICE_USD);
+      expect(result.savings).toBeLessThan(COMMERCIAL_PRICE_USD);
     }
   });
 
-  it('breakdown arithmetic matches (golden test for 300 TB source — the v5 §5.4 example case)', () => {
+  it('breakdown arithmetic matches (golden test for 300 TB source)', () => {
     // 300 TB source × 10× compression = 30 TB stored.
-    // The result-card mockup in v5 §5.4 documents this exact case.
     // Storage: 30 TB × 1024 GB × 12 mo × $0.023/GB/mo = $8,478.72/yr per region post-DGP
     //          300 TB                                  = $84,787.20/yr per region today
     // ×2 regions:                                       = $16,957.44 (post) / $169,574.40 (today)
@@ -122,9 +120,9 @@ describe('calculate', () => {
       const expectedTodaySubtotal = 300 * 1024 * 12 * 0.023 * 2 + 300 * 0.30 * 1024 * 0.02;
       expect(result.lines[4].today).toBeCloseTo(expectedTodaySubtotal, 1);
 
-      // Bracket pick + savings
-      expect(result.bracket.id).toBe('growth');
-      expect(result.netSavings).toBeCloseTo(result.savings - 7_500, 1);
+      // Flat license + net savings
+      expect(result.bracket.id).toBe('commercial');
+      expect(result.netSavings).toBeCloseTo(result.savings - COMMERCIAL_PRICE_USD, 1);
     }
   });
 
@@ -140,7 +138,7 @@ describe('calculate', () => {
     ];
     for (const tc of testCases) {
       const result = calculate(defaultInputs(tc));
-      if (result.kind !== 'ok' && result.kind !== 'enterprise') continue;
+      if (result.kind !== 'ok' && result.kind !== 'free') continue;
       const subtotalLine = result.lines.find((l) => l.label.startsWith('Subtotal'));
       expect(subtotalLine, `case ${JSON.stringify(tc)}`).toBeDefined();
       const computedSavings = subtotalLine!.today - subtotalLine!.dgp;
@@ -149,28 +147,27 @@ describe('calculate', () => {
   });
 
   it('warnings: low compression ratio (< 3×) emits lowCompressionRatio chip', () => {
+    // 50 TB × 2× = 25 TB stored → over the grant → 'ok' with the warning.
     const result = calculate(defaultInputs({ sourceTb: 50, compressionRatio: 2 }));
+    expect(result.kind).toBe('ok');
     if (result.kind === 'ok') {
       expect(result.warnings).toContain('lowCompressionRatio');
     }
   });
 
-  it('warnings: cheap backend (< $0.005/GB-month) emits cheapBackendAlready chip', () => {
-    // Need to ensure the math still produces a positive bracket result with cheap storage.
-    // Backblaze-cheap pricing with a lot of data still produces savings.
+  it('warnings: cheap backend (< $0.005/GB-month) emits cheapBackendAlready chip (free kind too)', () => {
+    // 100 TB × 10× = 10 TB stored → under the grant → 'free' carries warnings.
     const result = calculate(defaultInputs({ sourceTb: 100, costPerGbMonthUsd: 0.003 }));
-    if (result.kind === 'ok') {
+    expect(result.kind).toBe('free');
+    if (result.kind === 'free') {
       expect(result.warnings).toContain('cheapBackendAlready');
     }
   });
 
   it('regions = 1 should not multiply egress (no replicas)', () => {
-    // 50 TB / 10× = 5 TB stored → Starter ($2.5k). Single-region savings
-    // at 50 TB × $0.023 × 1024 × 12 = $14.1k today vs $1.4k post = $12.7k
-    // savings, which clears the $2.5k floor.
     const result = calculate(defaultInputs({ sourceTb: 50, regions: 1 }));
-    expect(result.kind).toBe('ok');
-    if (result.kind === 'ok') {
+    expect(result.kind).toBe('free');
+    if (result.kind === 'free') {
       const egressLine = result.lines.find((l) => l.label.includes('egress'));
       expect(egressLine?.today).toBe(0);
       expect(egressLine?.dgp).toBe(0);
@@ -216,31 +213,30 @@ describe('formatTb', () => {
 });
 
 describe('buildMarkdown', () => {
-  it('produces a stable markdown snippet for the 300 TB / 2 region "Growth" case', () => {
-    // 300 TB / 10× = 30 TB stored → Growth bracket per the v5 §5.4 mockup.
+  it('produces a stable markdown snippet for the 300 TB / 2 region Commercial case', () => {
     const inputs = defaultInputs({ sourceTb: 300 });
     const result = calculate(inputs);
     const md = buildMarkdown(inputs, result);
     expect(md).toContain('# DeltaGlider savings estimate');
-    expect(md).toContain('300 TB');    // source footprint in inputs
-    expect(md).toContain('Growth');    // bracket name
-    expect(md).toContain('$7.5k/year'); // bracket priceLabel
-    expect(md).toContain('| Line |');  // breakdown table header
+    expect(md).toContain('300 TB');      // source footprint in inputs
+    expect(md).toContain('Commercial');  // tier name
+    expect(md).toContain('$5k/year');    // tier priceLabel
+    expect(md).toContain('| Line |');    // breakdown table header
   });
 
-  it('belowThreshold markdown is short and points at OSS', () => {
+  it('belowThreshold markdown is short and points at the free build', () => {
     const inputs = defaultInputs({ sourceTb: 0.5 });
     const result = calculate(inputs);
     const md = buildMarkdown(inputs, result);
     expect(md).toContain('Below 1 TB');
-    expect(md).toContain('OSS build');
+    expect(md).toContain('free build');
   });
 
-  it('enterprise markdown defers to sales contact', () => {
-    const inputs = defaultInputs({ sourceTb: 3000 });
+  it('free-grant markdown says DeltaGlider costs nothing', () => {
+    const inputs = defaultInputs({ sourceTb: 50 });
     const result = calculate(inputs);
     const md = buildMarkdown(inputs, result);
-    expect(md).toContain('Enterprise');
-    expect(md).toContain('sales@beshu.tech');
+    expect(md).toContain('15 TB free grant');
+    expect(md).toContain('costs you nothing');
   });
 });

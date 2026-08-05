@@ -315,6 +315,11 @@
       "path": "changelog",
       "group": "Releases",
       "order": 0
+    },
+    {
+      "path": "explanation/the-deltaglider-license",
+      "group": "Concepts",
+      "order": 60
     }
   ]
 }

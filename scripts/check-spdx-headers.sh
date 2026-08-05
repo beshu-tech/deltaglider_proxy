@@ -2,17 +2,18 @@
 # Fail CI if any .rs file is missing the SPDX-License-Identifier header.
 #
 # Every Rust source file in this repo MUST start with:
-#     // SPDX-License-Identifier: GPL-3.0-only
+#     // SPDX-License-Identifier: BUSL-1.1
 #
-# This enforces the GPL-3.0 relicense (v0.10.0) at the file level so that
-# new files added in PRs can't accidentally ship without the header.
+# This enforces the current license (BUSL-1.1 since v1.18.0; GPL-3.0 from
+# v0.10.0 to v1.17.0) at the file level so that new files added in PRs
+# can't accidentally ship without the header.
 #
 # Run locally:   ./scripts/check-spdx-headers.sh
 # Run in CI:     same script, invoked by .github/workflows/ci.yml
 
 set -euo pipefail
 
-EXPECTED='// SPDX-License-Identifier: GPL-3.0-only'
+EXPECTED='// SPDX-License-Identifier: BUSL-1.1'
 
 # Find every tracked + untracked .rs file (excluding target/, .git/, node_modules/).
 #
@@ -26,10 +27,11 @@ while IFS= read -r f; do
         missing+=("$f")
     fi
 done < <(find . -name '*.rs' \
-    -not -path './target/*' \
+    -not -path '*/target/*' \
     -not -path './.git/*' \
-    -not -path './node_modules/*' \
-    -not -path './marketing/node_modules/*')
+    -not -path './.claude/*' \
+    -not -path './.venv*' \
+    -not -path '*/node_modules/*')
 
 if [ "${#missing[@]}" -gt 0 ]; then
     echo "::error::SPDX-License-Identifier header missing in ${#missing[@]} file(s):"

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! AWS credential resolution for the `cp`/`ls`/`rm`/`stats`/`verify`
 //! subcommands. Hand-rolled to keep the binary free of `aws-config`

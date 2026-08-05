@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Metadata validation tests: verify correct handling of missing, partial, and wrong metadata.
 //!

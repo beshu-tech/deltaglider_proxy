@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Integration tests for config DB backup/restore — the manual equivalent of
 //! config sync. Tests the full IAM state export/import flow across two server instances.

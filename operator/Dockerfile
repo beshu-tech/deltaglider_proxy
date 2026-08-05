@@ -7,6 +7,11 @@ COPY . .
 RUN cargo build --release --locked
 
 FROM gcr.io/distroless/cc-debian12:nonroot
+LABEL org.opencontainers.image.title="DeltaGlider Operator" \
+      org.opencontainers.image.description="Kubernetes operator for DeltaGlider Proxy" \
+      org.opencontainers.image.vendor="DeltaGlider" \
+      org.opencontainers.image.source="https://github.com/beshu-tech/deltaglider_proxy" \
+      org.opencontainers.image.licenses="BUSL-1.1"
 COPY --from=builder /build/target/release/deltaglider-operator /deltaglider-operator
 USER nonroot
 ENTRYPOINT ["/deltaglider-operator"]

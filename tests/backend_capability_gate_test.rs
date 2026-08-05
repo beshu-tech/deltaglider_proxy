@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Guard B integration tests: the startup backend write-capability gate and
 //! the hot-apply pre-commit gate. A real non-CAS backend can't exist in the

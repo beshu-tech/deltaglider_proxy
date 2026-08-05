@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Phase 3c.3 — Atomic reconcile of the IAM DB against an [`IamDiff`].
 //!

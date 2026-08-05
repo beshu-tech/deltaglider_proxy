@@ -289,7 +289,25 @@ Plus the [FAQ index](docs/product/faq.md).
 
 ## License
 
-[GPL-3.0](LICENSE). Contributors must sign the [Contributor License
-Agreement](CLA.md), which assigns copyright to Beshu Limited so the
-project can be dual-licensed (open source + commercial). A bot will
-prompt you to sign on your first pull request.
+[Business Source License 1.1](LICENSE) (BUSL-1.1). In plain terms:
+
+- **Free for most users.** Production use is free as long as the total
+  compressed data stored through the proxy stays under **15 TB** per
+  organization, and you don't resell the proxy itself as a hosted
+  service. Development, testing, and evaluation are always free, at any
+  size. There are no license keys and nothing is gated — the license is
+  a legal term you can read, not a technical lock.
+- **Every release becomes open source.** Two years after each version
+  is released, that version automatically converts to the
+  [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+- **Larger deployments need a commercial license.** If your compressed
+  footprint exceeds 15 TB, or you want to embed DeltaGlider in a
+  proprietary product or offer it as a service, see
+  [deltaglider.com/pricing](https://deltaglider.com/pricing/).
+- **Older releases stay GPL.** Every release up to and including
+  v1.17.0 was published under GPL-3.0 and remains under GPL-3.0
+  forever.
+
+Contributors must sign the [Contributor License Agreement](CLA.md),
+which assigns copyright to Beshu Limited so the project can be licensed
+this way. A bot will prompt you to sign on your first pull request.

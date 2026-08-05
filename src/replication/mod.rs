@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Lazy bucket replication: run-now source→destination copies
 //! routed through the engine so encryption / delta compression stay

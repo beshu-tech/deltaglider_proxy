@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Integration coverage for the replication parity audit
 //! (`POST /_/api/admin/jobs/replication:<rule>/verify`).

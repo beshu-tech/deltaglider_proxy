@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Guard A integration tests: a `replication_target_only` bucket refuses
 //! every CLIENT write shape with 403 AccessDenied, while replication (which

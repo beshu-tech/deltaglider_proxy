@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! C2 security fix regression tests: writes to a non-existent bucket must
 //! always return NoSuchBucket, never implicitly create the bucket root.

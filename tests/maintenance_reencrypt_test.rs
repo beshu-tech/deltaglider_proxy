@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Integration tests for the one-off bucket re-encryption maintenance job
 //! (`src/maintenance/`): durable job rows, the per-bucket WRITE gate

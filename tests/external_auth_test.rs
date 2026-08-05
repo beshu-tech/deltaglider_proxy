@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: BUSL-1.1
 
 //! Integration tests for external authentication: provider CRUD, group mapping,
 //! whoami, preview, backup/restore, and sync memberships.
