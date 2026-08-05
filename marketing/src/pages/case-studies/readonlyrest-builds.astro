@@ -15,13 +15,13 @@ import {
 
 const path = '/case-studies/readonlyrest-builds';
 const title =
-  "Migrating ReadonlyREST's 1.71 TB build catalog off AWS S3 — in progress";
+  "Migrating ReadonlyREST's 1.71 TB build catalog off AWS S3";
 const description =
-  'Engineering retrospective: 145 versions, 8 years of release history, ~103,088 objects. ~$9 in EC2 compute so far. Per-version compression results and the bug log.';
+  'Engineering retrospective: 145 versions, 8 years of release history, ~103,088 objects moved to Hetzner and stored roughly 1,270% smaller. Per-version compression results and the bug log.';
 
-// Article publication metadata. Updated when the migration completes.
+// Article publication metadata.
 const datePublished = '2026-05-14';
-const dateModified = '2026-05-14';
+const dateModified = '2026-08-05';
 ---
 
 <BaseLayout title={title} description={description} ogType="article">
@@ -48,12 +48,12 @@ const dateModified = '2026-05-14';
   </Fragment>
   <section class="hero">
     <div class="shell">
-      <h1>Migrating ReadonlyREST's build catalog off AWS S3 — in progress</h1>
+      <h1>Migrating ReadonlyREST's build catalog off AWS S3</h1>
 
       <p class="byline">By Simone Scarduzio, founder, Beshu Tech</p>
 
       <p class="hero-lede">
-        I'm migrating Beshu Tech's own ReadonlyREST build catalog — 145
+        I migrated Beshu Tech's own ReadonlyREST build catalog — 145
         versions, 8 years of release history, ~103,088 objects, 1.71 TB
         on AWS S3 (eu-west-1) — to Hetzner Object Storage (hel1) via
         DeltaGlider. This page is the engineering retrospective: what
@@ -61,8 +61,11 @@ const dateModified = '2026-05-14';
       </p>
 
       <p>
-        Final compression ratio will be published when the full migration
-        completes (next week or two as of writing).
+        The migration is complete. The whole catalog — plus every release
+        shipped since, 174 versions today — is stored in 134 GB on
+        Hetzner: roughly 1,270% smaller than the 1.71 TB it occupied on
+        AWS S3, with over 92% of the bytes gone. It serves production
+        downloads through DeltaGlider today.
       </p>
     </div>
   </section>
@@ -113,13 +116,13 @@ const dateModified = '2026-05-14';
         <li>
           <strong>Cold storage:</strong> older 99 versions were on
           Glacier Deep Archive; restored via Bulk tier (~$2 total).
-          ~$9 in EC2 compute so far.
+          ~$9 in EC2 compute in total.
         </li>
       </ul>
     </section>
 
     <section class="results">
-      <h2>Per-version results so far (verified, SHA-256 round-tripped)</h2>
+      <h2>Per-version results (verified, SHA-256 round-tripped)</h2>
 
       <CompressionResultsTable detailed={true} includeTotalRow={false} />
 
@@ -220,7 +223,7 @@ const dateModified = '2026-05-14';
       </ol>
 
       <p>
-        No exceptions logged so far. Bit-perfect round-trip on every
+        No exceptions logged. Bit-perfect round-trip on every
         sampled object, across all three folders (root, legacy, universal).
       </p>
     </section>
@@ -229,14 +232,14 @@ const dateModified = '2026-05-14';
       <h2>Reproducibility</h2>
 
       <p>
-        When the migration completes, this page will include:
+        Available on request
+        (<a href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20ROR%20migration%20artifacts">contact@beshu.tech</a>):
       </p>
 
       <ul>
-        <li>The migration script (open source)</li>
+        <li>The migration script</li>
         <li>The per-version manifest (CSV)</li>
-        <li>The SHA-256 verification script</li>
-        <li>A tarball with raw results so anyone can verify</li>
+        <li>The SHA-256 verification script and raw results</li>
       </ul>
 
     </section>

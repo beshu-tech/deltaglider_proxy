@@ -66,17 +66,19 @@ const description =
       <div class="in-progress-grid">
         <div class="narrative-col">
           <span class="section-eyebrow">Dogfooding</span>
-          <h2>In progress: ReadonlyREST's build catalog → Hetzner</h2>
+          <h2>ReadonlyREST's build catalog now lives on Hetzner</h2>
 
           <p>
-            Beshu Tech is migrating its own ReadonlyREST build catalog off
-            AWS S3 to Hetzner via DeltaGlider.
+            Beshu Tech migrated its own ReadonlyREST build catalog —
+            1.71 TB on AWS S3 — to Hetzner via DeltaGlider. It is stored
+            in 134 GB, roughly 1,270% smaller, and serves production
+            downloads today.
           </p>
           <p class="case-study-link">→ <a href="/case-studies/readonlyrest-builds">Read full case study</a></p>
         </div>
 
         <div class="data-col glass-card">
-          <h3 class="card-title">Latest test runs</h3>
+          <h3 class="card-title">Verified results</h3>
           <CompressionResultsTable detailed={false} />
         </div>
       </div>

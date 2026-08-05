@@ -191,7 +191,7 @@ export default function PricingCalculator() {
                   aria-label="Bytes saved by compression (50% to 99%)"
                 />
                 <p className="field-help">
-                  Conservative default. Verified ReadonlyREST migration ratios so far:
+                  Conservative default. Verified ReadonlyREST migration ratios:
                   74%, 76%, 99%. Run the free build's Delta Efficiency Panel on
                   your bucket for a real number.
                 </p>
