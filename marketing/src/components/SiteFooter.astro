@@ -1,0 +1,182 @@
+---
+// SiteFooter.astro — the site-wide footer, on every page.
+// Link columns come from src/lib/nav.ts (shared with the header).
+// Owns its own chrome: gradient base, drifting aurora, top seam.
+
+import BrandMark from './BrandMark.astro';
+import { FOOTER_COLUMNS } from '../lib/nav';
+---
+
+<footer class="site-footer" aria-label="Footer">
+  <div class="footer-grid">
+    <div>
+      <div class="footer-brand-row">
+        <BrandMark />
+        <span>DeltaGlider</span>
+      </div>
+      <p class="footer-tagline">
+        Storage compression for S3, behind the same S3 API.
+        Source-available (BUSL-1.1).
+      </p>
+    </div>
+
+    {FOOTER_COLUMNS.map((col) => (
+      <div class="footer-col">
+        <h4 class="footer-col-title">{col.title}</h4>
+        <ul>
+          {col.links.map((l) => (
+            <li><a href={l.href}>{l.label}</a></li>
+          ))}
+        </ul>
+      </div>
+    ))}
+  </div>
+
+  <div class="footer-bottom">
+    <span>© Beshu Limited · BUSL-1.1 · London, UK</span>
+    <span>
+      Managed cloud: under consideration —
+      <a href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20Managed%20cloud%20interest">email us</a>.
+    </span>
+  </div>
+</footer>
+
+<style>
+  .site-footer {
+    margin-top: 5rem;
+    padding: 3.5rem 0 2rem 0;
+    color: var(--ink-soft);
+    font-size: 0.9rem;
+    position: relative;
+    overflow: hidden;
+    /* deep navy base with a cyan→fuchsia top edge, away from the flat ink slab */
+    background:
+      linear-gradient(180deg, rgba(34, 211, 238, 0.05), transparent 28%),
+      linear-gradient(180deg, #0a1322 0%, #070b14 100%);
+    border-top: 1px solid rgba(34, 211, 238, 0.22);
+  }
+
+  /* a slow drifting aurora of brand glows behind the footer content */
+  .site-footer::before {
+    content: "";
+    position: absolute; inset: -40% -10% auto -10%; height: 180%;
+    z-index: 0; pointer-events: none;
+    background:
+      radial-gradient(38% 60% at 12% 0%, rgba(34, 211, 238, 0.14), transparent 70%),
+      radial-gradient(34% 55% at 85% 10%, rgba(217, 70, 239, 0.12), transparent 70%),
+      radial-gradient(30% 50% at 55% -5%, rgba(103, 232, 249, 0.08), transparent 70%);
+    animation: footer-aurora 18s ease-in-out infinite alternate;
+  }
+
+  @keyframes footer-aurora {
+    0%   { transform: translate3d(-3%, 0, 0) scale(1);    opacity: 0.85; }
+    50%  { transform: translate3d(4%, -2%, 0) scale(1.08); opacity: 1; }
+    100% { transform: translate3d(-2%, 1%, 0) scale(1.03); opacity: 0.9; }
+  }
+
+  /* a hairline gradient seam glowing along the very top edge */
+  .site-footer::after {
+    content: "";
+    position: absolute; top: 0; left: 0; right: 0; height: 1px; z-index: 1;
+    background: linear-gradient(90deg, transparent, var(--brand) 30%, var(--accent) 70%, transparent);
+    opacity: 0.5;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .site-footer::before { animation: none; }
+  }
+
+  .site-footer a {
+    color: var(--ink-700);
+    text-decoration: none;
+    border-bottom: 1px dotted var(--ink-400);
+    transition: color 0.15s, border-color 0.15s;
+  }
+
+  .site-footer a:hover {
+    color: var(--brand-dark);
+    border-bottom-color: var(--brand);
+  }
+
+  .footer-grid {
+    max-width: var(--shell);
+    margin: 0 auto;
+    padding: 0 1.25rem;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 2rem;
+    position: relative;
+    z-index: 2;
+  }
+
+  @media (min-width: 768px) {
+    .footer-grid {
+      padding: 0 2rem;
+      grid-template-columns: 1.4fr 1fr 1fr 1fr;
+    }
+  }
+
+  .footer-brand-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+    color: var(--ink-strong);
+    font-weight: 700;
+    font-size: 1.1rem;
+    letter-spacing: -0.01em;
+  }
+
+  /* brand bolt gets a gentle glow so the colour reads as alive */
+  .footer-brand-row :global(.brand-mark) {
+    filter: drop-shadow(0 0 6px rgba(34, 211, 238, 0.45));
+  }
+
+  .footer-tagline {
+    color: var(--ink-mute);
+    font-size: 0.85rem;
+    line-height: 1.5;
+    max-width: 28ch;
+    margin: 0.5rem 0 0 0;
+  }
+
+  .footer-col-title {
+    font-weight: 700;
+    color: var(--ink-700);
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin: 0 0 0.85rem 0;
+  }
+
+  .footer-col ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+
+  .footer-col li {
+    margin: 0.4rem 0;
+  }
+
+  .footer-bottom {
+    max-width: var(--shell);
+    margin: 2.5rem auto 0 auto;
+    padding: 1.5rem 1.25rem 0 1.25rem;
+    border-top: 1px solid var(--rule);
+    font-size: 0.8rem;
+    color: var(--ink-mute);
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 1rem;
+    position: relative;
+    z-index: 2;
+  }
+
+  @media (min-width: 768px) {
+    .footer-bottom {
+      padding: 1.5rem 2rem 0 2rem;
+    }
+  }
+</style>

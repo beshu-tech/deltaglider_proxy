@@ -1,0 +1,23 @@
+---
+// BrandMark.astro — the DeltaGlider bolt, matching the favicon.
+// Single home for the logo SVG so header, footer, and any future
+// surface stay in sync.
+---
+
+<svg
+  class="brand-mark"
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 64 64"
+  aria-hidden="true"
+>
+  <polygon points="12,46 32,16 52,46 40,46 32,34 24,46" fill="var(--brand)" />
+</svg>
+
+<style>
+  .brand-mark {
+    width: 28px;
+    height: 28px;
+    display: inline-block;
+    flex-shrink: 0;
+  }
+</style>

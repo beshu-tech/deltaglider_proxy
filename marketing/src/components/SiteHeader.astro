@@ -1,0 +1,222 @@
+---
+// SiteHeader.astro — the sticky primary navigation, on every page.
+// Links come from src/lib/nav.ts (shared with the footer). Below the
+// breakpoint the link row collapses into a hamburger-toggled panel;
+// the toggle script is tiny, dependency-free, and accessible
+// (aria-expanded, Escape, click-outside, closes on navigation).
+
+import BrandMark from './BrandMark.astro';
+import { NAV_LINKS } from '../lib/nav';
+---
+
+<header class="site-header">
+  <nav class="site-nav" aria-label="Primary">
+    <a href="/" class="brand" aria-label="DeltaGlider home">
+      <BrandMark />
+      <span>
+        <span class="brand-mute">Beshu</span>
+        DeltaGlider
+      </span>
+    </a>
+
+    <button
+      type="button"
+      class="nav-toggle"
+      aria-expanded="false"
+      aria-controls="site-menu"
+      aria-label="Open menu"
+    >
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+        <g class="nav-toggle-bars" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <line x1="4" y1="6" x2="20" y2="6" />
+          <line x1="4" y1="12" x2="20" y2="12" />
+          <line x1="4" y1="18" x2="20" y2="18" />
+        </g>
+        <g class="nav-toggle-cross" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+          <line x1="6" y1="6" x2="18" y2="18" />
+          <line x1="18" y1="6" x2="6" y2="18" />
+        </g>
+      </svg>
+    </button>
+
+    <ul class="site-nav-links" id="site-menu">
+      {NAV_LINKS.map((l) => (
+        <li><a href={l.href}>{l.label}</a></li>
+      ))}
+    </ul>
+  </nav>
+</header>
+
+<script>
+  const header = document.querySelector('.site-header')!;
+  const toggle = header.querySelector<HTMLButtonElement>('.nav-toggle')!;
+
+  const setOpen = (open: boolean) => {
+    header.classList.toggle('nav-open', open);
+    toggle.setAttribute('aria-expanded', String(open));
+    toggle.setAttribute('aria-label', open ? 'Close menu' : 'Open menu');
+  };
+
+  toggle.addEventListener('click', () => {
+    setOpen(!header.classList.contains('nav-open'));
+  });
+
+  // Navigating away or clicking a link closes the panel.
+  header.querySelector('#site-menu')!.addEventListener('click', (e) => {
+    if ((e.target as HTMLElement).closest('a')) setOpen(false);
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') setOpen(false);
+  });
+
+  document.addEventListener('click', (e) => {
+    if (header.classList.contains('nav-open') && !header.contains(e.target as Node)) {
+      setOpen(false);
+    }
+  });
+</script>
+
+<style>
+  .site-header {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    background: rgba(11, 15, 25, 0.7);
+    backdrop-filter: saturate(180%) blur(16px);
+    -webkit-backdrop-filter: saturate(180%) blur(16px);
+    border-bottom: 1px solid var(--rule);
+  }
+
+  .site-nav {
+    max-width: var(--shell);
+    margin: 0 auto;
+    padding: 0.85rem 1.25rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    position: relative;
+  }
+
+  @media (min-width: 768px) {
+    .site-nav {
+      padding: 0.85rem 2rem;
+    }
+  }
+
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    text-decoration: none;
+    color: var(--ink);
+    font-weight: 600;
+    font-size: 1.02rem;
+    white-space: nowrap;
+  }
+
+  .brand:hover {
+    color: var(--brand-dark);
+    text-decoration: none;
+  }
+
+  .brand-mute {
+    color: var(--ink-faint);
+    font-weight: 500;
+  }
+
+  .site-nav-links {
+    list-style: none;
+    display: flex;
+    gap: 1.25rem;
+    margin: 0;
+    padding: 0;
+    font-size: 0.92rem;
+  }
+
+  .site-nav-links a {
+    color: var(--ink-strong);
+    text-decoration: none;
+    padding: 0.25rem 0;
+    border-bottom: 1px solid transparent;
+  }
+
+  .site-nav-links a:hover {
+    color: var(--brand-dark);
+    border-bottom-color: var(--brand);
+  }
+
+  /* --- Hamburger --- */
+
+  .nav-toggle {
+    display: none;
+    background: none;
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    color: var(--ink-strong);
+    padding: 0.4rem 0.5rem;
+    line-height: 0;
+    cursor: pointer;
+  }
+
+  .nav-toggle:hover {
+    color: var(--brand-dark);
+    border-color: var(--rule-strong);
+  }
+
+  .nav-toggle-cross {
+    display: none;
+  }
+
+  :global(.site-header.nav-open) .nav-toggle-bars {
+    display: none;
+  }
+
+  :global(.site-header.nav-open) .nav-toggle-cross {
+    display: initial;
+  }
+
+  @media (max-width: 879px) {
+    .nav-toggle {
+      display: inline-flex;
+    }
+
+    .site-nav-links {
+      display: none;
+      position: absolute;
+      top: 100%;
+      left: 0;
+      right: 0;
+      flex-direction: column;
+      gap: 0;
+      background: var(--bg, #0b0f19);
+      border-bottom: 1px solid var(--rule);
+      box-shadow: var(--shadow-lg);
+      padding: 0.4rem 1.25rem 0.8rem;
+      font-size: 1rem;
+    }
+
+    .site-nav-links li {
+      margin: 0;
+    }
+
+    :global(.site-header.nav-open) .site-nav-links {
+      display: flex;
+    }
+
+    .site-nav-links a {
+      display: block;
+      padding: 0.7rem 0.25rem;
+      border-bottom: 1px solid var(--rule);
+    }
+
+    .site-nav-links li:last-child a {
+      border-bottom-color: transparent;
+    }
+
+    .site-nav-links a:hover {
+      border-bottom-color: var(--brand);
+    }
+  }
+</style>

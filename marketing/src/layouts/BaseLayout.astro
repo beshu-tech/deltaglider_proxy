@@ -9,6 +9,8 @@
 
 import '../styles/global.css';
 import { SITE } from '../lib/seo';
+import SiteHeader from '../components/SiteHeader.astro';
+import SiteFooter from '../components/SiteFooter.astro';
 
 interface Props {
   title: string;
@@ -73,96 +75,12 @@ const ogImageUrl = new URL(ogImage, Astro.site).toString();
     <slot name="head" />
   </head>
   <body>
-    <header class="site-header">
-      <nav class="site-nav" aria-label="Primary">
-        <a href="/" class="brand" aria-label="DeltaGlider home">
-          <svg
-            class="brand-mark"
-            xmlns="http://www.w3.org/2000/svg"
-            viewBox="0 0 64 64"
-            aria-hidden="true"
-          >
-            <polygon points="12,46 32,16 52,46 40,46 32,34 24,46" fill="var(--brand)" />
-          </svg>
-          <span>
-            <span class="brand-mute">Beshu</span>
-            DeltaGlider
-          </span>
-        </a>
-        <ul class="site-nav-links">
-          <li><a href="/saas">SaaS</a></li>
-          <li><a href="/regulated">Regulated</a></li>
-          <li><a href="/pricing">Pricing</a></li>
-          <li><a href="/docs">Docs</a></li>
-          <li><a href="/trial">Trial</a></li>
-          <li><a href="https://github.com/beshu-tech/deltaglider_proxy">GitHub</a></li>
-        </ul>
-      </nav>
-    </header>
+    <SiteHeader />
 
     <main>
       <slot />
     </main>
 
-    <footer class="site-footer" aria-label="Footer">
-      <div class="footer-grid">
-        <div>
-          <div class="footer-brand-row">
-            <svg
-              class="brand-mark"
-              xmlns="http://www.w3.org/2000/svg"
-              viewBox="0 0 64 64"
-              aria-hidden="true"
-            >
-              <polygon points="12,46 32,16 52,46 40,46 32,34 24,46" fill="var(--brand)" />
-            </svg>
-            <span>DeltaGlider</span>
-          </div>
-          <p class="footer-tagline">
-            Storage compression for S3, behind the same S3 API.
-            Source-available (BUSL-1.1).
-          </p>
-        </div>
-
-        <div class="footer-col">
-          <h4 class="footer-col-title">Product</h4>
-          <ul>
-            <li><a href="/saas">For SaaS</a></li>
-            <li><a href="/regulated">For regulated</a></li>
-            <li><a href="/pricing">Pricing</a></li>
-            <li><a href="/trial">30-day trial</a></li>
-            <li><a href="/case-studies">Case studies</a></li>
-          </ul>
-        </div>
-
-        <div class="footer-col">
-          <h4 class="footer-col-title">Resources</h4>
-          <ul>
-            <li><a href="https://github.com/beshu-tech/deltaglider_proxy">GitHub</a></li>
-            <li><a href="/docs">Documentation</a></li>
-            <li><a href="/docs/tutorials/first-delta-savings">Quickstart</a></li>
-            <li><a href="/docs/reference">Reference docs</a></li>
-            <li><a href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20General%20inquiry">Contact</a></li>
-          </ul>
-        </div>
-
-        <div class="footer-col">
-          <h4 class="footer-col-title">Beshu Tech</h4>
-          <ul>
-            <li><a href="https://beshu.tech">beshu.tech</a></li>
-            <li><a href="https://readonlyrest.com">ReadonlyREST</a></li>
-            <li><a href="https://anaphora.beshu.tech">Anaphora</a></li>
-          </ul>
-        </div>
-      </div>
-
-      <div class="footer-bottom">
-        <span>© Beshu Limited · BUSL-1.1 · London, UK</span>
-        <span>
-          Managed cloud: under consideration —
-          <a href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20Managed%20cloud%20interest">email us</a>.
-        </span>
-      </div>
-    </footer>
+    <SiteFooter />
   </body>
 </html>
