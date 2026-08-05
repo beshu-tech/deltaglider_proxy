@@ -31,7 +31,7 @@ const description =
   <section class="hero">
     <div class="shell reg-hero-grid">
       <div class="reg-hero-copy">
-        <h1>Use cheap S3-compatible storage without giving the provider your data.</h1>
+        <h1>Encrypt objects before they reach the bucket. Keep the key.</h1>
 
         <p class="hero-lede">
           DeltaGlider encrypts every object with AES-256-GCM before it
@@ -41,11 +41,10 @@ const description =
         </p>
 
         <p>
-          Built by <a href="https://beshu.tech">Beshu Tech</a> — 10 senior
-          engineers, since 2017. Same team behind
-          <a href="https://readonlyrest.com">ReadonlyREST</a> (Elasticsearch
-          security) and Anaphora (dashboard-to-PDF reporting), in production
-          at:
+          Built by <a href="https://beshu.tech">Beshu Tech</a> — the team
+          behind <a href="https://readonlyrest.com">ReadonlyREST</a>
+          (Elasticsearch security), since 2017. Customer references are in
+          the sidebar.
         </p>
       </div>
 
@@ -104,11 +103,10 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
             reads pass.
           </li>
           <li>
-            Every S3 operation lands in the structured stdout log. There
-            is no per-decrypt audit event in proxy-AES mode — the key
-            never leaves the process, so there's nothing to log it
-            against. If you need "who decrypted what, when," use
-            <code>sse-kms</code> and read CloudTrail.
+            Every S3 operation lands in the structured stdout log.
+            Proxy-AES mode does not emit per-decrypt audit events; if you
+            need "who decrypted what, when," use <code>sse-kms</code> and
+            read CloudTrail.
           </li>
         </ul>
       </section>
@@ -145,8 +143,8 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
           <li>
             <strong>"GDPR-compliant"</strong> — DeltaGlider supports
             right-to-be-forgotten propagation via replication-delete and
-            lifecycle expiration. The compliance regime is your problem;
-            the technical primitives are ours.
+            lifecycle expiration. We provide the technical controls;
+            compliance certification is yours to obtain.
           </li>
         </ul>
       </section>
@@ -177,9 +175,8 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
         <h2>Talk to sales</h2>
 
         <p>
-          Buying for a regulated environment? Talk to us about the
-          Commercial plan. Contract terms are tailored to your
-          jurisdiction, audit posture, and procurement workflow.
+          Commercial contract terms are negotiable — jurisdiction, audit
+          requirements, procurement workflow. Email us.
         </p>
 
         <div class="hero-ctas">

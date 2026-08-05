@@ -72,11 +72,9 @@ const dateModified = '2026-05-14';
       <h2>Why migrate at all</h2>
 
       <p>
-        Versioned artifact storage compounds. The same set of Kibana
-        plugin variants is uploaded for every release across 8 years
-        of 1.12.x → 1.69.0. Most of the bytes are identical between
-        versions. Storing each release as a full copy is paying to
-        store the same bytes hundreds of times.
+        We uploaded near-identical Kibana plugin files 145 times over
+        8 years of releases (1.12.x → 1.69.0), and paid to store every
+        full copy. Most of the bytes are identical between versions.
       </p>
 
       <p>
@@ -126,12 +124,12 @@ const dateModified = '2026-05-14';
       <CompressionResultsTable detailed={true} includeTotalRow={false} />
 
       <p>
-        The 1.38.0 result is publishable as-is because it tells the
-        truth: the legacy deltaspace mixes ES 6/7/8 Kibana plugins —
-        structurally dissimilar artifacts. The root deltaspace stored
-        1,520% smaller; the legacy deltaspace only 270% smaller. The Delta Efficiency Panel
-        correctly classifies legacy as "Fair, near Poor." Useful
-        signal for an operator who wants to fix it.
+        1.38.0 compressed worse than the others because its
+        <code>legacy/</code> folder mixes ES 6, 7, and 8 Kibana plugins,
+        which are not similar to each other: the root folder stored
+        1,520% smaller, the legacy folder only 270% smaller. The admin
+        UI's Delta Efficiency Panel flags exactly this ("Fair, near
+        Poor"), so you can spot it in your own buckets.
       </p>
     </section>
 
@@ -139,8 +137,7 @@ const dateModified = '2026-05-14';
       <h2>What broke and how I fixed it</h2>
 
       <p>
-        Real migrations don't go in a straight line. Here's what
-        tripped me:
+        Four things broke:
       </p>
 
       <h3>Bug 1: deltaglider CLI hardcoded <code>/tmp</code></h3>
@@ -224,18 +221,7 @@ const dateModified = '2026-05-14';
 
       <p>
         No exceptions logged so far. Bit-perfect round-trip on every
-        sampled object (root, legacy, universal deltaspaces).
-      </p>
-    </section>
-
-    <section class="final">
-      <h2>Final ratio</h2>
-
-      <p>
-        Published when the full 145-version migration completes. The
-        mix of "Excellent" newer versions and "Fair" older cross-major
-        versions means the average will be somewhere between 1,000%
-        and 5,000% smaller. Watch this page.
+        sampled object, across all three folders (root, legacy, universal).
       </p>
     </section>
 
@@ -253,17 +239,13 @@ const dateModified = '2026-05-14';
         <li>A tarball with raw results so anyone can verify</li>
       </ul>
 
-      <p>
-        This is the kind of case study that's hard to fake. That's the
-        point.
-      </p>
     </section>
 
     <section class="cta">
       <h2>Try the same migration on your data</h2>
 
       <div class="hero-ctas">
-        <a href="/pricing#calculator" class="btn btn-primary">See what it'd save you</a>
+        <a href="/pricing#calculator" class="btn btn-primary">Calculate your savings</a>
         <a href="/trial" class="btn">Start a 30-day trial</a>
         <a href="/docs/tutorials/first-delta-savings" class="btn">Run it free</a>
       </div>

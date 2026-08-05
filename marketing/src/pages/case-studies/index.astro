@@ -2,8 +2,8 @@
 // /case-studies — index page for the case-studies section.
 // Created to make the BreadcrumbList /case-studies entry resolve to a real
 // URL (Google Search Console flags unresolvable breadcrumb items as
-// schema errors). Also sets us up to grow the section: Postgres-daily-
-// backup (Week 3-4) and Maven-mirror (Week 5-6) case studies land here.
+// schema errors). More case studies land here as they
+// are written.
 
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import JsonLd from '../../components/JsonLd.astro';
@@ -30,8 +30,8 @@ const description =
       <h1>Case Studies</h1>
 
       <p class="hero-lede">
-        Deep dives into how organizations are using DeltaGlider to cut
-        storage costs and take custody of their data.
+        Engineering write-ups from real migrations — including the bugs
+        we hit and how we fixed them.
       </p>
     </div>
   </section>
@@ -46,7 +46,7 @@ const description =
         </h2>
         <p class="study-meta">
           <span class="study-status status-in-progress">In progress</span>
-          · 145 versions · 8 years of release history · ~$11 in compute so far
+          · 145 versions · 8 years of release history · ~$11 in compute and restore costs so far
         </p>
         <p>
           Beshu Tech is migrating its own ReadonlyREST build catalog
@@ -60,33 +60,6 @@ const description =
         </p>
       </article>
 
-      <article class="study study-planned">
-        <h2>Postgres daily-backup deduplication</h2>
-        <p class="study-meta">
-          <span class="study-status status-planned">Planned</span>
-          · Weeks 3-4 of the launch plan
-        </p>
-        <p>
-          A synthesized scenario: daily Postgres dumps stored as
-          deltas against the previous day. Expected result: 500%–5,000%
-          smaller, depending on workload churn. Reproducible end-to-end
-          with a single Docker compose.
-        </p>
-      </article>
-
-      <article class="study study-planned">
-        <h2>Maven artifact mirror</h2>
-        <p class="study-meta">
-          <span class="study-status status-planned">Planned</span>
-          · Weeks 5-6 of the launch plan
-        </p>
-        <p>
-          A Maven artifact mirror with thousands of JAR versions per
-          package. Most JARs share 90%+ bytes with adjacent versions
-          (signatures, manifests, embedded CSS). Expected result:
-          1,000%–5,000% smaller.
-        </p>
-      </article>
     </section>
   </div>
 </BaseLayout>
@@ -142,13 +115,4 @@ const description =
     border-color: var(--accent);
   }
 
-  .status-planned {
-    background: var(--bg-soft);
-    color: var(--ink-faint);
-  }
-
-  .study-planned {
-    border-left-color: var(--rule);
-    opacity: 0.75;
-  }
 </style>

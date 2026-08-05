@@ -15,8 +15,7 @@ import Glyph from './Glyph.astro';
         <p class="dropin-lede">
           It speaks the S3 protocol your tools already speak — SigV4
           signing, multipart uploads, range reads, presigned URLs.
-          Repoint the endpoint; the SDKs, CI scripts, and backup jobs
-          never notice.
+          Repoint the endpoint; nothing else changes.
         </p>
       </div>
 
@@ -44,15 +43,14 @@ import Glyph from './Glyph.astro';
         <div>
           <strong>One binary carries everything.</strong> Proxy, web UI,
           IAM, jobs, metrics — run it with Docker, a bare binary, or Helm.
-          No sidecar zoo.
         </div>
       </li>
       <li>
         <Glyph name="escape" size={38} />
         <div>
-          <strong>No format hostage-taking.</strong> Stored deltas are
+          <strong>No lock-in.</strong> Stored deltas are
           standard <code>xdelta3</code> files next to a plain reference
-          object — the stock CLI can rebuild every version without the
+          object — the stock CLI can rebuild every file without the
           proxy running.
         </div>
       </li>

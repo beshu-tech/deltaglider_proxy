@@ -4,30 +4,23 @@
 ---
 
 <section class="mechanism fade-up delay-1">
-  <span class="section-eyebrow">The proof</span>
-  <h2>Yes — it even shrinks already-compressed archives</h2>
-
-  <p class="mechanism-lede">
-    The obvious objection: diffing should fail on ZIPs and JARs —
-    they're already compressed.
-  </p>
-
-  <p>
-    It would, on random data. But versioned archives aren't random.
-    Version to version, the same JAR signatures land in the same order,
-    the same <code>manifest.mf</code>, the same icons, the same bundled
-    CSS. The bytes repeat — so the delta against the previous version
-    is tiny.
-  </p>
+  <span class="section-eyebrow">The mechanism</span>
+  <h2>It works on already-compressed archives</h2>
 
   <div class="mechanism-stat">
     <div class="stat-number">61,400%</div>
     <div class="stat-label">
-      smaller on compressed input — a 91 MB versioned ZIP encoded as
-      a 148 KB delta against the previous version, on a real
-      ReadonlyREST ES plugin.
+      smaller on compressed input — a 91 MB ZIP (a real ReadonlyREST
+      plugin) stored as a 148 KB diff against the previous release.
     </div>
   </div>
+
+  <p>
+    Release after release, a ZIP or JAR contains the same entries in the
+    same order — same <code>manifest.mf</code>, same icons, same bundled
+    CSS. The bytes repeat, so the binary diff between two releases stays
+    tiny even though each file is internally compressed.
+  </p>
 
   <p>
     → <a href="/docs/explanation/delta-compression">Read the engineering note</a>
@@ -35,11 +28,6 @@
 </section>
 
 <style>
-  .mechanism-lede {
-    font-size: 1.05rem;
-    color: var(--ink-strong);
-  }
-
   .mechanism-stat {
     margin: 2rem 0;
     padding: 2rem;

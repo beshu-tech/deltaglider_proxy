@@ -12,7 +12,7 @@ import { webPageSchema, breadcrumbListSchema } from '../lib/seo';
 
 const title = 'DeltaGlider for SaaS — cut S3 storage cost on versioned artifacts';
 const description =
-  'Your CI ships a new build every commit. Most share 99% of their bytes. DeltaGlider stores the 1%. Same S3 API, same SDKs, same workflow. Source-available, free up to 15 TB.';
+  'An S3 proxy that stores similar builds as small binary diffs instead of full copies. Same S3 API, zero client changes. Source-available, free up to 15 TB.';
 ---
 
 <BaseLayout title={title} description={description}>
@@ -28,17 +28,18 @@ const description =
   <section class="saas-hero">
     <div class="shell hero-grid">
       <div class="hero-content fade-up">
-        <h1>Stop paying AWS to store the same JAR a thousand times.</h1>
+        <h1>Cut the S3 bill for your build artifacts.</h1>
 
         <p class="hero-lede">
-          Your CI pipeline ships a new build every commit. Most of those
-          builds share 99% of their bytes with the previous one.
-          DeltaGlider stores the 1% and reconstructs the rest. Same S3 API.
-          Same SDKs. Same workflow.
+          DeltaGlider is an S3 proxy that spots similar files and stores
+          them as small binary diffs instead of full copies. Each build
+          your CI ships shares most of its bytes with the previous one;
+          DeltaGlider stores the difference and rebuilds the rest on read.
+          Same S3 API — your SDKs don't change.
         </p>
 
         <div class="hero-ctas">
-          <a href="/pricing#calculator" class="btn btn-primary">See what it'd save you</a>
+          <a href="/pricing#calculator" class="btn btn-primary">Calculate your savings</a>
           <a href="/trial" class="btn">30-day trial</a>
           <a href="/docs/tutorials/first-delta-savings" class="btn">docker run</a>
         </div>
@@ -59,6 +60,8 @@ const description =
   </section>
 
   <div class="shell">
+    <MechanismExplanation />
+
     <section class="in-progress fade-up delay-2">
       <div class="in-progress-grid">
         <div class="narrative-col">
@@ -69,14 +72,6 @@ const description =
             Beshu Tech is migrating its own ReadonlyREST build catalog off
             AWS S3 to Hetzner via DeltaGlider.
           </p>
-          <p>
-            Why is 1.38.0 only 410% smaller? Because the legacy deltaspace mixes ES
-            6, 7, and 8 Kibana plugins — structurally dissimilar artifacts
-            in one prefix. The Delta Efficiency Panel correctly classifies
-            it as "Fair, near Poor." We'd rather tell you that than gloss
-            over it.
-          </p>
-
           <p class="case-study-link">→ <a href="/case-studies/readonlyrest-builds">Read full case study</a></p>
         </div>
 
@@ -87,7 +82,6 @@ const description =
       </div>
     </section>
 
-    <MechanismExplanation />
 
     <section class="playbook fade-up delay-3">
       <span class="section-eyebrow">Playbook</span>
@@ -144,9 +138,8 @@ const description =
 
       <div class="playbook-footer">
         <p>
-          The Commercial plan's support helps you with each of these. See
-          <a href="/trial">/trial</a> for the 30-day try-the-relationship
-          offer.
+          The Commercial plan's support helps with each of these steps.
+          See <a href="/trial">/trial</a> for the 30-day trial.
         </p>
       </div>
     </section>

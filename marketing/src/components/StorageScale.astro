@@ -17,8 +17,8 @@ const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
     <h2 class="scale-title">What ten releases do to a bucket</h2>
     <p class="scale-sub">
       The same ten uploads of a 91&nbsp;MB build artifact, stored two ways.
-      The bars are proportional — we had to give the deltas a two-pixel
-      floor so you could see them at all.
+      The bars are proportional; the deltas are drawn with a two-pixel
+      floor, or they would be invisible.
     </p>
 
     <div
@@ -72,10 +72,9 @@ const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
     </p>
 
     <p class="scale-mech">
-      The mechanism, in one sentence: each upload is stored as a binary
-      diff against a full reference copy kept beside it, and every read
-      rebuilds the exact original — behind the same S3 API your tools
-      already speak.
+      Each upload is stored as a binary diff against a full reference
+      copy kept beside it, and every read rebuilds the exact original —
+      behind the same S3 API your tools already speak.
     </p>
 
     <aside class="scale-objection">

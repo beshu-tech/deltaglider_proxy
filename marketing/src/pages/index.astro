@@ -32,7 +32,7 @@ import {
 
 <BaseLayout
   title="DeltaGlider Proxy — store a hundred versions, pay for one"
-  description="A drop-in S3 proxy that stores each new version of a binary artifact as a tiny delta. Same S3 API, zero client changes — plus IAM, SSO, replication, lifecycle, and encryption at rest on any S3-compatible backend. Source-available, free up to 15 TB."
+  description="An S3 proxy that spots similar files and stores them as small binary diffs instead of full copies. Same S3 API, zero client changes — plus IAM, SSO, replication, and encryption on any S3-compatible backend. Source-available, free up to 15 TB."
 >
   <Fragment slot="json-ld">
     <JsonLd schema={organizationSchema()} />
@@ -63,19 +63,12 @@ import {
         <h1>Store a hundred versions. Pay&nbsp;for&nbsp;one.</h1>
 
         <p class="hero-lede">
-          Every build, dump, and firmware image you ship is mostly the one
-          before it — and your bucket bills you full price for every copy.
-          DeltaGlider Proxy is a <strong>drop-in S3 proxy</strong> that
-          stores each new version as a tiny delta against the last full
-          copy. Same S3 API, same buckets, <strong>zero client
-          changes</strong>.
-        </p>
-
-        <p class="hero-lede hero-lede-secondary">
-          And since every byte already flows through it, it's also your
-          storage control plane: per-user IAM and SSO, replication,
-          lifecycle, encryption at rest — on any S3-compatible backend,
-          including the cheap ones.
+          DeltaGlider is an <strong>S3 proxy</strong> that spots similar
+          files in a bucket and stores them as small binary diffs of each
+          other instead of full copies. Each build, dump, or firmware
+          image you upload is mostly the same bytes as the one before it,
+          so the diffs are tiny. Same S3 API, <strong>zero client
+          changes</strong> — your storage bill drops.
         </p>
 
         <div class="hero-ctas">
@@ -85,10 +78,10 @@ import {
         </div>
 
         <p class="hero-trust">
-          Built by <strong>Beshu Tech</strong> — the
-          <a href="https://readonlyrest.com">ReadonlyREST</a> team, since
-          2017. Our own 1.71&nbsp;TB build catalog is migrating through it
-          <a href="/case-studies/readonlyrest-builds">in public, bugs and all</a>.
+          Built by <strong>Beshu Tech</strong> (the
+          <a href="https://readonlyrest.com">ReadonlyREST</a> team), which is
+          <a href="/case-studies/readonlyrest-builds">migrating its own
+          1.71&nbsp;TB build catalog through it</a>.
         </p>
       </div>
     </div>
@@ -113,7 +106,7 @@ import {
       <h2>The questions you'd ask anyway</h2>
 
       <p>
-        Answered with links, so you can check instead of believe.
+        Answered with links, so you can check for yourself.
       </p>
 
       <div class="dd-grid">
@@ -151,9 +144,8 @@ import {
         <article class="dd-card" data-n="04">
           <h3 class="dd-q">Who answers when it breaks at 2 a.m.?</h3>
           <p class="dd-a">
-            The people whose names are in <code>git log</code>. No
-            outsourced first line, no chatbot — your mail lands with the
-            engineers who wrote the code.
+            The people whose names are in <code>git log</code>. Your mail
+            lands directly with the engineers who wrote the code.
           </p>
           <a class="dd-link" href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20General%20inquiry">contact@beshu.tech →</a>
         </article>
@@ -171,9 +163,8 @@ import {
 
       <p class="fit-next">
         Then put your real numbers into the
-        <a href="/pricing">savings calculator</a> — it answers in 30
-        seconds. There's also a longer pitch
-        <a href="/saas">for platform teams</a> and one
+        <a href="/pricing">savings calculator</a>. More detail:
+        <a href="/saas">for CI &amp; build artifacts</a> ·
         <a href="/regulated">for regulated buyers</a>.
       </p>
     </div>
@@ -213,11 +204,6 @@ import {
 </BaseLayout>
 
 <style>
-  .hero-lede-secondary {
-    font-size: 0.98rem;
-    margin-top: 0.75rem;
-  }
-
   .dd-grid {
     display: grid;
     grid-template-columns: 1fr;
