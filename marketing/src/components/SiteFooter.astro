@@ -51,9 +51,9 @@ import { FOOTER_COLUMNS } from '../lib/nav';
     overflow: hidden;
     /* deep navy base with a cyan→fuchsia top edge, away from the flat ink slab */
     background:
-      linear-gradient(180deg, rgba(34, 211, 238, 0.05), transparent 28%),
+      linear-gradient(180deg, var(--brand-tint), transparent 28%),
       linear-gradient(180deg, #0a1322 0%, #070b14 100%);
-    border-top: 1px solid rgba(34, 211, 238, 0.22);
+    border-top: 1px solid var(--brand-line-soft);
   }
 
   /* a slow drifting aurora of brand glows behind the footer content */
@@ -62,9 +62,9 @@ import { FOOTER_COLUMNS } from '../lib/nav';
     position: absolute; inset: -40% -10% auto -10%; height: 180%;
     z-index: 0; pointer-events: none;
     background:
-      radial-gradient(38% 60% at 12% 0%, rgba(34, 211, 238, 0.14), transparent 70%),
-      radial-gradient(34% 55% at 85% 10%, rgba(217, 70, 239, 0.12), transparent 70%),
-      radial-gradient(30% 50% at 55% -5%, rgba(103, 232, 249, 0.08), transparent 70%);
+      radial-gradient(38% 60% at 12% 0%, var(--brand-wash), transparent 70%),
+      radial-gradient(34% 55% at 85% 10%, var(--accent-wash), transparent 70%),
+      radial-gradient(30% 50% at 55% -5%, var(--brand-tint), transparent 70%);
     animation: footer-aurora 18s ease-in-out infinite alternate;
   }
 
@@ -129,7 +129,7 @@ import { FOOTER_COLUMNS } from '../lib/nav';
 
   /* brand bolt gets a gentle glow so the colour reads as alive */
   .footer-brand-row :global(.brand-mark) {
-    filter: drop-shadow(0 0 6px rgba(34, 211, 238, 0.45));
+    filter: drop-shadow(0 0 6px var(--brand-glow));
   }
 
   .footer-tagline {

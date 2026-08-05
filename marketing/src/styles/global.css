@@ -1,3 +1,5 @@
+@import './theme.css';
+
 /* global.css — visual foundation for the marketing site.
  *
  * Design rules:
@@ -44,57 +46,6 @@
 
 /* === Brand tokens === */
 
-:root {
-  /* Brand primary - Vibrant Cyan */
-  --brand: #22d3ee;
-  --brand-dark: #67e8f9;
-  --brand-soft: rgba(34, 211, 238, 0.1);
-  
-  /* Ink — dark mode text ramp (light to dark) */
-  --ink-50:  #020617;
-  --ink-100: #0f172a;
-  --ink-200: #1e293b;
-  --ink-300: #334155;
-  --ink-400: #475569;
-  --ink-500: #94a3b8;
-  --ink-600: #cbd5e1;
-  --ink-700: #e2e8f0;
-  --ink-800: #f1f5f9;
-  --ink-900: #f8fafc; /* Lightest text */
-
-  /* Accents */
-  --accent: #d946ef; /* Fuchsia */
-  --accent-soft: rgba(217, 70, 239, 0.1);
-
-  /* Semantic aliases */
-  --ink: var(--ink-900);
-  --ink-strong: #ffffff;
-  --ink-soft: var(--ink-600);
-  --ink-faint: var(--ink-500);
-  --ink-mute: var(--ink-400);
-  
-  --bg: #141a2b;
-  --bg-soft: rgba(15, 23, 42, 0.4);
-  --bg-card: rgba(30, 41, 59, 0.5);
-  --bg-alt: #1e293b;
-  --rule: rgba(255, 255, 255, 0.1);
-  --rule-strong: rgba(255, 255, 255, 0.2);
-
-  /* Type */
-  --font-sans: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'Menlo', 'Monaco', monospace;
-
-  /* Layout */
-  --shell: 1100px;
-  --measure: 68ch;
-  --measure-wide: 88ch;
-
-  /* Glowing Shadows for dark mode */
-  --shadow-sm: 0 4px 6px -1px rgba(0, 0, 0, 0.3), 0 2px 4px -1px rgba(0, 0, 0, 0.2);
-  --shadow-md: 0 10px 15px -3px rgba(0, 0, 0, 0.4), 0 4px 6px -2px rgba(0, 0, 0, 0.2);
-  --shadow-lg: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.3);
-  --shadow-glow: 0 0 15px rgba(34, 211, 238, 0.4);
-}
 
 * { box-sizing: border-box; }
 
@@ -164,11 +115,11 @@ a {
   text-decoration: underline;
   text-underline-offset: 0.18em;
   text-decoration-thickness: 1px;
-  text-decoration-color: var(--teal-300);
+  text-decoration-color: var(--brand-line);
 }
 
 a:hover {
-  color: var(--teal-800);
+  color: var(--brand);
   text-decoration-color: var(--brand);
 }
 
@@ -289,8 +240,7 @@ hr {
 @media (min-width: 768px) {
   .shell {
     padding: 0 2rem;
-  }
-}
+  }}
 
 /* === Hero === */
 
@@ -298,8 +248,8 @@ hr {
   position: relative;
   padding: 6rem 0 5rem 0;
   background:
-    radial-gradient(40% 40% at 80% 20%, rgba(34, 211, 238, 0.15), transparent 100%),
-    radial-gradient(35% 35% at 10% 80%, rgba(217, 70, 239, 0.12), transparent 100%),
+    radial-gradient(40% 40% at 80% 20%, var(--brand-wash), transparent 100%),
+    radial-gradient(35% 35% at 10% 80%, var(--accent-wash), transparent 100%),
     var(--bg);
   border-bottom: 1px solid var(--rule);
   overflow: hidden;
@@ -358,8 +308,7 @@ hr {
    screenshot did — start the plate earlier and let it run to the edge. */
 .hero--walkthrough .hero-plate { left: 50%; }
 @media (max-width: 1200px) {
-  .hero--walkthrough .hero-plate { left: 54%; }
-}
+  .hero--walkthrough .hero-plate { left: 54%; }}
 /* The copy column is width:100% at z-index 2, so its transparent right half
    covers the frame and would eat its clicks. Make the column pass-through and
    re-enable only the actual copy (text + CTAs). */
@@ -397,45 +346,12 @@ hr {
 /* On the dark hero the eyebrow needs a lighter treatment than the
    light-bg default. */
 .hero--full .hero-eyebrow {
-  background: rgba(34, 211, 238, 0.14);
-  border-color: rgba(34, 211, 238, 0.35);
+  background: var(--brand-wash);
+  border-color: var(--brand-line);
   color: #7dd3fc;
 }
 .hero--full .hero-lede { color: rgba(226, 232, 240, 0.92); }
 .hero--full .hero-trust { color: rgba(148, 163, 184, 0.9); }
-
-/* Backdrop variant of the slideshow: chromeless, image covers the
-   plate, crossfade only. */
-.hero-slideshow--backdrop,
-.hero-slideshow--backdrop .hero-slideshow__window,
-.hero-slideshow--backdrop .hero-slideshow__stage {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  max-width: none;
-  margin: 0;
-  border-radius: 0;
-  box-shadow: none;
-  background: transparent;
-  animation: none;           /* kill the float bob from the framed variant */
-  cursor: default;
-}
-.hero-slideshow--backdrop .hero-slideshow__window { border: none; }
-.hero-slideshow--backdrop .hero-slideshow__stage { aspect-ratio: auto; }
-.hero-slideshow--backdrop .hero-slideshow__slide { inset: 0; }
-.hero-slideshow--backdrop .hero-slideshow__slide img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  /* Anchor the right edge of the dashboard to the right viewport edge so
-     the WITH/WITHOUT bars and the billboard number stay in frame. */
-  object-position: left center;
-}
-/* No hover-zoom on a background. */
-.hero-slideshow--backdrop:hover .hero-slideshow__slide.is-active img {
-  transform: none;
-}
 
 /* Animated walkthrough — a device-framed viewport floating in the plate.
    The 16:9 composition is CONTAIN-fit (never cropped) and maximized to the
@@ -466,8 +382,8 @@ hr {
   z-index: 0;
   pointer-events: none;
   background:
-    radial-gradient(60% 55% at 60% 45%, rgba(34, 211, 238, 0.30), transparent 70%),
-    radial-gradient(50% 60% at 40% 72%, rgba(217, 70, 239, 0.16), transparent 72%);
+    radial-gradient(60% 55% at 60% 45%, var(--brand-line-soft), transparent 70%),
+    radial-gradient(50% 60% at 40% 72%, var(--accent-wash), transparent 72%);
   filter: blur(44px);
 }
 
@@ -484,7 +400,7 @@ hr {
   box-shadow:
     0 0 0 1px rgba(255, 255, 255, 0.06),
     0 40px 80px -28px rgba(0, 0, 0, 0.7),
-    0 18px 50px -24px rgba(34, 211, 238, 0.4);
+    0 18px 50px -24px var(--brand-glow);
   isolation: isolate;
   /* The frame is clear of the copy column (verified gap), so make it
      interactive — its children (scene dots, play/pause) become clickable while
@@ -530,8 +446,7 @@ hr {
 @media (max-width: 900px) {
   .hero--full { min-height: auto; }
   .hero-plate { display: none; }
-  .hero-full-inner .hero-copy { padding: 3rem 0; max-width: none; }
-}
+  .hero-full-inner .hero-copy { padding: 3rem 0; max-width: none; }}
 
 /* Two-column hero: punchy copy left, screenshot slideshow right. Stacks on
    narrow screens (slideshow drops below the copy). */
@@ -545,8 +460,7 @@ hr {
   .hero-grid {
     grid-template-columns: minmax(0, 1.02fr) minmax(0, 1fr);
     gap: 3.5rem;
-  }
-}
+  }}
 .hero-copy { min-width: 0; }
 .hero-visual { min-width: 0; }
 
@@ -565,16 +479,7 @@ hr {
     z-index: 1;
     margin-right: calc(50% - 50vw);
     margin-left: -6rem;
-  }
-  .hero-visual--bleed .hero-slideshow {
-    max-width: none;
-    mask-image: linear-gradient(90deg, transparent 0, rgba(0,0,0,0.55) 14%, #000 30%);
-    -webkit-mask-image: linear-gradient(90deg, transparent 0, rgba(0,0,0,0.55) 14%, #000 30%);
-  }
-  .hero-visual--bleed .hero-slideshow__window {
-    border-radius: 16px 0 0 16px;
-  }
-}
+  }}
 
 .hero h1 {
   max-width: 15ch;
@@ -590,7 +495,7 @@ hr {
   gap: 0.4rem;
   padding: 0.3rem 0.75rem;
   background: var(--brand-soft);
-  border: 1px solid var(--teal-200);
+  border: 1px solid var(--brand-line-soft);
   border-radius: 999px;
   font-size: 0.78rem;
   font-weight: 600;
@@ -681,14 +586,14 @@ hr {
 .btn-brand {
   background: var(--brand);
   border-color: var(--brand);
-  color: #141a2b;
+  color: var(--bg);
   box-shadow: var(--shadow-glow);
 }
 
 .btn-brand:hover {
   background: var(--brand-dark);
   border-color: var(--brand-dark);
-  color: #141a2b;
+  color: var(--bg);
   transform: translateY(-2px) scale(1.02);
 }
 
@@ -742,219 +647,11 @@ section { scroll-margin-top: 5rem; }
   font-weight: 600;
   color: var(--brand-dark);
   background: var(--brand-soft);
-  border: 1px solid var(--teal-200);
+  border: 1px solid var(--brand-line-soft);
   border-radius: 999px;
   padding: 0.15rem 0.65rem;
   margin-bottom: 0.75rem;
 }
-
-/* ====================================================================
-   Hero slideshow — faux app-window carousel
-   ==================================================================== */
-
-.hero-slideshow {
-  position: relative;
-  width: 100%;
-  max-width: 600px;
-  margin: 0 auto;
-  isolation: isolate;
-  animation: hero-slideshow-float 9s ease-in-out infinite;
-}
-
-@keyframes hero-slideshow-float {
-  0%, 100% { transform: translateY(0) rotate(0deg); }
-  50%      { transform: translateY(-10px) rotate(-0.15deg); }
-}
-
-.hero-slideshow__stack { position: absolute; inset: 0; z-index: -1; pointer-events: none; }
-.hero-slideshow__plate {
-  position: absolute; inset: 0; border-radius: 16px;
-  border: 1px solid var(--rule); background: var(--bg-card); transform-origin: center;
-}
-.hero-slideshow__plate--1 { transform: translate(14px, 18px) scale(0.97) rotate(1.4deg); opacity: 0.55; }
-.hero-slideshow__plate--2 { transform: translate(28px, 36px) scale(0.94) rotate(2.8deg); opacity: 0.3; }
-
-.hero-slideshow__window {
-  position: relative; border-radius: 16px; overflow: hidden;
-  background: var(--ink-100);
-  border: 1px solid rgba(34, 211, 238, 0.28);
-  box-shadow:
-    var(--shadow-lg),
-    0 0 0 1px rgba(255, 255, 255, 0.02) inset,
-    0 0 24px rgba(34, 211, 238, 0.18);
-}
-@media (min-width: 1000px) {
-  .hero-slideshow__window {
-    transform: perspective(1600px) rotateY(-5deg) rotateX(1.5deg);
-    transition: transform 0.6s cubic-bezier(0.16, 1, 0.3, 1);
-  }
-  .hero-slideshow:hover .hero-slideshow__window {
-    transform: perspective(1600px) rotateY(0deg) rotateX(0deg);
-  }
-}
-
-.hero-slideshow__chrome {
-  display: flex; align-items: center; gap: 0.75rem; padding: 0.6rem 0.85rem;
-  background: linear-gradient(180deg, rgba(30, 41, 59, 0.9), rgba(15, 23, 42, 0.9));
-  border-bottom: 1px solid var(--rule);
-}
-.hero-slideshow__dots { display: inline-flex; gap: 7px; flex: 0 0 auto; }
-.hero-slideshow__dots i { width: 11px; height: 11px; border-radius: 50%; background: #475569; }
-.hero-slideshow__dots i:nth-child(1) { background: #ff5f57; }
-.hero-slideshow__dots i:nth-child(2) { background: #febc2e; }
-.hero-slideshow__dots i:nth-child(3) { background: #28c840; }
-.hero-slideshow__titlebar {
-  flex: 1 1 auto; display: inline-flex; align-items: baseline; justify-content: center;
-  gap: 0.5ch; min-width: 0;
-  font-family: var(--font-mono); font-size: 0.72rem; letter-spacing: 0.02em;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.hero-slideshow__app, .hero-slideshow__sep { color: var(--ink-mute); }
-.hero-slideshow__label { color: var(--brand); font-weight: 600; }
-.hero-slideshow__chrome-spacer { flex: 0 0 auto; width: 39px; }
-
-/* Stage is a <button> now (click → lightbox). Reset native button chrome. */
-.hero-slideshow__stage {
-  position: relative; aspect-ratio: 1 / 1; background: var(--ink-100);
-  overflow: hidden; display: block; width: 100%; padding: 0; margin: 0;
-  border: none; cursor: zoom-in; appearance: none; text-align: left;
-}
-.hero-slideshow__stage:focus-visible { outline: 2px solid var(--brand); outline-offset: 3px; }
-.hero-slideshow__slide {
-  position: absolute; inset: 0; margin: 0;
-  opacity: 0; visibility: hidden; transform: scale(1.02);
-  transition:
-    opacity 0.8s cubic-bezier(0.16, 1, 0.3, 1),
-    transform 1.2s cubic-bezier(0.16, 1, 0.3, 1),
-    visibility 0s linear 0.8s;
-}
-.hero-slideshow__slide.is-active {
-  opacity: 1; visibility: visible; transform: scale(1);
-  transition: opacity 0.8s cubic-bezier(0.16, 1, 0.3, 1), transform 6s ease-out, visibility 0s;
-  z-index: 1;
-}
-.hero-slideshow__slide img {
-  width: 100%; height: 100%; object-fit: cover; object-position: top center; display: block;
-  transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
-}
-/* zoom-on-hover: the active image scales up inside the frame */
-.hero-slideshow__stage:hover .hero-slideshow__slide.is-active img,
-.hero-slideshow__stage:focus-visible .hero-slideshow__slide.is-active img {
-  transform: scale(1.08);
-}
-/* zoom hint glyph, appears on hover */
-.hero-slideshow__zoomhint {
-  position: absolute; top: 12px; right: 12px; z-index: 4;
-  width: 30px; height: 30px; display: grid; place-items: center;
-  border-radius: 8px; font-size: 1rem; line-height: 1;
-  color: var(--ink-strong); background: rgba(8, 13, 24, 0.7);
-  border: 1px solid var(--rule-strong); backdrop-filter: blur(4px);
-  opacity: 0; transform: translateY(-3px); transition: opacity 0.2s, transform 0.2s;
-}
-.hero-slideshow__stage:hover .hero-slideshow__zoomhint,
-.hero-slideshow__stage:focus-visible .hero-slideshow__zoomhint {
-  opacity: 1; transform: translateY(0);
-}
-.hero-slideshow__caption {
-  position: absolute; left: 0; right: 0; bottom: 0; padding: 1.6rem 1rem 0.95rem;
-  font-family: var(--font-mono); font-size: 0.85rem; letter-spacing: 0.01em;
-  color: var(--ink-soft); text-align: center;
-  background: linear-gradient(180deg, transparent, rgba(11, 15, 25, 0.92) 65%); z-index: 2;
-}
-.hero-slideshow__sheen {
-  position: absolute; inset: 0; z-index: 3; pointer-events: none;
-  background: linear-gradient(115deg, transparent 30%, rgba(34, 211, 238, 0.06) 45%, transparent 60%);
-  background-size: 250% 100%; animation: hero-slideshow-sheen 7s ease-in-out infinite;
-}
-@keyframes hero-slideshow-sheen {
-  0%, 100% { background-position: 120% 0; }
-  50%      { background-position: -20% 0; }
-}
-
-/* Prev / next arrow nav + counter (replaces the dot indicators). */
-.hero-slideshow__nav {
-  display: flex; align-items: center; justify-content: center;
-  gap: 1.1rem; margin-top: 1.1rem;
-}
-.hero-slideshow__arrow {
-  display: grid; place-items: center;
-  width: 38px; height: 38px; padding: 0;
-  border-radius: 50%; cursor: pointer;
-  color: var(--ink-soft); background: var(--bg-card);
-  border: 1px solid var(--rule-strong);
-  transition: color 0.15s, border-color 0.15s, background 0.15s, transform 0.15s;
-}
-.hero-slideshow__arrow:hover {
-  color: var(--bg); background: var(--brand); border-color: var(--brand);
-  transform: translateY(-1px); box-shadow: 0 0 14px rgba(34, 211, 238, 0.45);
-}
-.hero-slideshow__arrow:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
-.hero-slideshow__counter {
-  font-family: var(--font-mono); font-size: 0.82rem; color: var(--ink-soft);
-  min-width: 3.5ch; text-align: center; font-variant-numeric: tabular-nums;
-}
-.hero-slideshow__counter-sep { color: var(--ink-mute); margin: 0 0.15rem; }
-
-/* ---------- Lightbox ---------- */
-.hero-lightbox {
-  position: fixed; inset: 0; z-index: 1000;
-  display: flex; align-items: center; justify-content: center;
-  gap: 1rem; padding: clamp(1rem, 4vw, 3rem);
-  background: rgba(5, 8, 14, 0.86); backdrop-filter: blur(8px);
-  cursor: zoom-out;
-  animation: hero-lightbox-in 0.2s ease both;
-}
-@keyframes hero-lightbox-in { from { opacity: 0; } to { opacity: 1; } }
-.hero-lightbox__figure {
-  margin: 0; max-width: min(1100px, 92vw); max-height: 86vh;
-  display: flex; flex-direction: column; gap: 0.7rem; cursor: default;
-  animation: hero-lightbox-pop 0.25s cubic-bezier(0.16, 1, 0.3, 1) both;
-}
-@keyframes hero-lightbox-pop { from { transform: scale(0.96); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-.hero-lightbox__figure img {
-  max-width: 100%; max-height: 78vh; object-fit: contain;
-  border-radius: 12px; border: 1px solid var(--rule-strong);
-  box-shadow: 0 30px 80px -20px rgba(0, 0, 0, 0.8);
-}
-.hero-lightbox__figure figcaption {
-  font-family: var(--font-mono); font-size: 0.8rem; color: var(--ink-soft);
-  text-align: center;
-}
-.hero-lightbox__close {
-  position: absolute; top: clamp(0.75rem, 2vw, 1.5rem); right: clamp(0.75rem, 2vw, 1.5rem);
-  width: 42px; height: 42px; border-radius: 50%;
-  font-size: 1.5rem; line-height: 1; cursor: pointer;
-  color: var(--ink-soft); background: var(--bg-card); border: 1px solid var(--rule-strong);
-  transition: color 0.15s, background 0.15s, border-color 0.15s;
-}
-.hero-lightbox__close:hover { color: var(--ink-strong); border-color: var(--brand); }
-.hero-lightbox__arrow {
-  flex: 0 0 auto; display: grid; place-items: center;
-  width: 48px; height: 48px; border-radius: 50%; cursor: pointer;
-  color: var(--ink-soft); background: var(--bg-card); border: 1px solid var(--rule-strong);
-  transition: color 0.15s, background 0.15s, border-color 0.15s, transform 0.15s;
-}
-.hero-lightbox__arrow:hover {
-  color: var(--bg); background: var(--brand); border-color: var(--brand); transform: scale(1.06);
-}
-.hero-lightbox__arrow:focus-visible,
-.hero-lightbox__close:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
-@media (max-width: 640px) {
-  .hero-lightbox__arrow { width: 40px; height: 40px; }
-}
-
-.hero-slideshow.is-reduced,
-.hero-slideshow.is-reduced .hero-slideshow__window { animation: none; transform: none; }
-.hero-slideshow.is-reduced .hero-slideshow__sheen { display: none; }
-.hero-slideshow.is-reduced .hero-slideshow__slide,
-.hero-slideshow.is-reduced .hero-slideshow__slide.is-active { transition: none; transform: none; }
-.hero-slideshow.is-reduced .hero-slideshow__stage:hover .hero-slideshow__slide.is-active img { transform: none; }
-
-@media (max-width: 999px) {
-  .hero-slideshow { max-width: 520px; margin-top: 0.5rem; }
-  .hero-slideshow__plate--2 { display: none; }
-}
-
 
 
 /* === Reduced-motion === */
@@ -965,5 +662,4 @@ section { scroll-margin-top: 5rem; }
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
-  html { scroll-behavior: auto; }
-}
+  html { scroll-behavior: auto; }}

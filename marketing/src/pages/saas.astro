@@ -175,7 +175,7 @@ const description =
   /* === Hero Section === */
   .saas-hero {
     padding: 6rem 0 4rem;
-    background: radial-gradient(circle at 80% -20%, rgba(25, 230, 203, 0.1), transparent 50%),
+    background: radial-gradient(circle at 80% -20%, var(--brand-soft), transparent 50%),
                 var(--bg);
     overflow: hidden;
   }
@@ -241,8 +241,8 @@ const description =
     font-family: var(--font-mono);
     text-transform: uppercase;
   }
-  .jar-2 { transform: translateY(26px) scale(0.95) translateZ(-20px); opacity: 0.45; border-color: rgba(25, 230, 203, 0.2); }
-  .jar-3 { transform: translateY(52px) scale(0.9); opacity: 0.85; border-color: rgba(25, 230, 203, 0.4); }
+  .jar-2 { transform: translateY(26px) scale(0.95) translateZ(-20px); opacity: 0.45; border-color: var(--brand-line-soft); }
+  .jar-3 { transform: translateY(52px) scale(0.9); opacity: 0.85; border-color: var(--brand-glow); }
 
   .delta-block {
     position: absolute;
@@ -250,12 +250,12 @@ const description =
     left: 25px;
     width: 310px;
     padding: 2.2rem;
-    background: rgba(25, 230, 203, 0.15);
+    background: var(--brand-wash);
     backdrop-filter: blur(8px);
     -webkit-backdrop-filter: blur(8px);
     border: 1px solid var(--brand);
     border-radius: 16px;
-    box-shadow: 0 14px 44px rgba(25, 230, 203, 0.25);
+    box-shadow: 0 14px 44px var(--brand-line-soft);
     text-align: center;
     z-index: 10;
   }

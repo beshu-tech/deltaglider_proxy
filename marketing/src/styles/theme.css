@@ -1,0 +1,68 @@
+/* theme.css — the design-token layer, and the ONLY file where colours
+   are spelled out as literals. Everything else — global.css, the
+   feature stylesheets, and every component's scoped styles — consumes
+   these tokens with var(). To retheme the site, edit this file alone.
+
+   The site deliberately commits to a single dark theme (the product's
+   visual world); color-scheme tells the browser so native form
+   controls and scrollbars follow. */
+
+:root {
+  color-scheme: dark;
+
+  /* Brand primary - Vibrant Cyan */
+  --brand: #22d3ee;
+  --brand-dark: #67e8f9;
+  --brand-soft: rgba(34, 211, 238, 0.1);
+  /* Brand alpha tiers — the ONLY place translucent brand colour is
+     spelled out. tint < wash < line-soft < line < glow. */
+  --brand-tint: rgba(34, 211, 238, 0.07);
+  --brand-wash: rgba(34, 211, 238, 0.14);
+  --brand-line-soft: rgba(34, 211, 238, 0.25);
+  --brand-line: rgba(34, 211, 238, 0.35);
+  --brand-glow: rgba(34, 211, 238, 0.45);
+  
+  /* Ink — dark mode text ramp (light to dark) */
+  --ink-100: #0f172a;
+  --ink-200: #1e293b;
+  --ink-400: #475569;
+  --ink-500: #94a3b8;
+  --ink-600: #cbd5e1;
+  --ink-700: #e2e8f0;
+  --ink-800: #f1f5f9;
+  --ink-900: #f8fafc; /* Lightest text */
+
+  /* Accents */
+  --accent: #d946ef; /* Fuchsia */
+  --accent-wash: rgba(217, 70, 239, 0.11);
+  --accent-strong: rgba(217, 70, 239, 0.5);
+
+  /* Semantic aliases */
+  --ink: var(--ink-900);
+  --ink-strong: #ffffff;
+  --ink-soft: var(--ink-600);
+  --ink-faint: var(--ink-500);
+  --ink-mute: var(--ink-400);
+  
+  --bg: #141a2b;
+  --bg-soft: rgba(15, 23, 42, 0.4);
+  --bg-card: rgba(30, 41, 59, 0.5);
+  --bg-alt: #1e293b;
+  --rule: rgba(255, 255, 255, 0.1);
+  --rule-strong: rgba(255, 255, 255, 0.2);
+
+  /* Type */
+  --font-sans: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'Menlo', 'Monaco', monospace;
+
+  /* Layout */
+  --shell: 1100px;
+  --measure: 68ch;
+  --measure-wide: 88ch;
+
+  /* Glowing Shadows for dark mode */
+  --shadow-sm: 0 4px 6px -1px rgba(0, 0, 0, 0.3), 0 2px 4px -1px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 10px 15px -3px rgba(0, 0, 0, 0.4), 0 4px 6px -2px rgba(0, 0, 0, 0.2);
+  --shadow-lg: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.3);
+  --shadow-glow: 0 0 15px var(--brand-glow);
+}

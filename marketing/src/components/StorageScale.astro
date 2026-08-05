@@ -173,8 +173,8 @@ const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
 
   .fill-ref {
     width: 100%;
-    background: rgba(217, 70, 239, 0.16);
-    border: 1px solid rgba(217, 70, 239, 0.45);
+    background: var(--accent-wash);
+    border: 1px solid var(--accent-strong);
     color: #f0abfc;
   }
 
@@ -183,7 +183,7 @@ const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
     width: max(3px, 0.163%);
     padding: 0;
     background: var(--brand);
-    box-shadow: 0 0 10px rgba(34, 211, 238, 0.7);
+    box-shadow: 0 0 10px var(--brand-glow);
   }
 
   .d-label {
@@ -228,7 +228,7 @@ const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
   }
   .total-b {
     color: var(--brand-dark);
-    text-shadow: 0 0 24px rgba(34, 211, 238, 0.45);
+    text-shadow: 0 0 24px var(--brand-glow);
   }
 
   .scale-projection {

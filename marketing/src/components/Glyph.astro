@@ -99,17 +99,17 @@ const PATHS: Record<string, string> = {
     height: calc(var(--glyph-size) + 18px);
     border-radius: 14px;
     background:
-      radial-gradient(70% 70% at 50% 35%, rgba(34, 211, 238, 0.12), transparent 75%),
+      radial-gradient(70% 70% at 50% 35%, var(--brand-wash), transparent 75%),
       rgba(30, 41, 59, 0.45);
-    border: 1px solid rgba(34, 211, 238, 0.22);
+    border: 1px solid var(--brand-line-soft);
     flex: 0 0 auto;
   }
   .dg-glyph svg {
-    stroke: var(--brand-dark, #67e8f9);
-    filter: drop-shadow(0 0 6px rgba(34, 211, 238, 0.35));
+    stroke: var(--brand-dark, var(--brand-dark));
+    filter: drop-shadow(0 0 6px var(--brand-line));
   }
   .dg-glyph svg .a {
     stroke: #f0abfc;
-    filter: drop-shadow(0 0 5px rgba(217, 70, 239, 0.4));
+    filter: drop-shadow(0 0 5px var(--accent-strong));
   }
 </style>

@@ -379,7 +379,7 @@ function renderDescription(id: string, description: string): string {
     color: var(--brand);
     text-decoration: underline;
     text-underline-offset: 4px;
-    text-decoration-color: rgba(25, 230, 203, 0.3);
+    text-decoration-color: var(--brand-line-soft);
     transition: text-decoration-color 0.2s ease;
   }
 
@@ -399,7 +399,7 @@ function renderDescription(id: string, description: string): string {
   .calculator-hero {
     padding: 6rem 0 8rem; /* Extra padding at bottom for the overlapping calculator */
     text-align: center;
-    background: radial-gradient(circle at 50% -20%, rgba(25, 230, 203, 0.15), transparent 60%),
+    background: radial-gradient(circle at 50% -20%, var(--brand-wash), transparent 60%),
                 var(--bg);
     border-bottom: 1px solid var(--rule); /* Establish a solid "hero line" */
   }

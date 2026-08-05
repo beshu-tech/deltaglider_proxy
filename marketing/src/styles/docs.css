@@ -18,14 +18,14 @@
 
   --doc-grid-line: rgba(148, 163, 184, 0.05);
   --doc-grid-size: 30px;
-  --doc-glow: rgba(34, 211, 238, 0.07);
-  --doc-glow-accent: rgba(217, 70, 239, 0.04);
+  --doc-glow: var(--brand-tint);
+  --doc-glow-accent: var(--accent-wash);
 
   --doc-rule: var(--rule);
-  --doc-callout-bg: rgba(34, 211, 238, 0.06);
+  --doc-callout-bg: var(--brand-tint);
   --doc-measure: 70ch;
 
-  /* Code panel: lighter than the page (--bg #141a2b) so the "this is a
+  /* Code panel: lighter than the page (--bg var(--bg)) so the "this is a
      copyable command" surface reads as a distinct panel, not a void. Must stay
      a step above --bg — if it ever drops below it the boundary disappears
      (the old #070a12-on-#0b0f19 was ~1.03:1, invisible). Keep in lockstep with
@@ -34,12 +34,12 @@
   --doc-code-border: #323c54;
 
   /* A softer, desaturated blue used as an ACCENT on small eyebrow text —
-     replaces raw brand cyan (#22d3ee), which vibrates on near-black at small
+     replaces raw brand cyan (var(--brand)), which vibrates on near-black at small
      sizes. Syntax-token colours (shiki) are untouched; this is chrome only. */
   --doc-accent-blue: #7dd3fc;
 
   /* In-prose link colour. Deliberately a CORNFLOWER BLUE, not cyan/teal — the
-     inline-code chips are cyan (--brand-dark #67e8f9), so links get a clearly
+     inline-code chips are cyan (--brand-dark var(--brand-dark)), so links get a clearly
      different hue (blue, not green-blue) to stay unconfusable while still
      reading as "this is a link" via colour, not just the underline. */
   --doc-link: #8ab4ff;
@@ -453,7 +453,7 @@
   color: var(--ink-700); border-bottom: 1px solid var(--doc-grid-line);
 }
 .docs-prose tbody tr:last-child td { border-bottom: none; }
-.docs-prose tbody tr:hover td { background: rgba(34, 211, 238, 0.03); }
+.docs-prose tbody tr:hover td { background: var(--brand-tint); }
 
 /* ── Horizontal rule → surveyor's divider ──────────────────────────────── */
 .docs-prose hr {
