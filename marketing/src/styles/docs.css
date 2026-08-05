@@ -44,6 +44,20 @@
      reading as "this is a link" via colour, not just the underline. */
   --doc-link: #8ab4ff;
   --doc-link-hover: #b3ccff;
+  --doc-link-line: rgba(138, 180, 255, 0.45);
+  --doc-link-line-strong: rgba(138, 180, 255, 0.6);
+}
+
+/* Light-theme overrides for the docs-only tokens. The code panel keeps
+   its dark surface in both themes (shiki writes dark syntax colours
+   inline; code reads as code), so --doc-code-* stay put. */
+:root[data-theme='light'] {
+  --doc-grid-line: rgba(15, 23, 42, 0.05);
+  --doc-accent-blue: #155e75;
+  --doc-link: #2451b2;
+  --doc-link-hover: #16327a;
+  --doc-link-line: rgba(36, 81, 178, 0.45);
+  --doc-link-line-strong: rgba(36, 81, 178, 0.6);
 }
 
 /* ── Layout shell ──────────────────────────────────────────────────────── */
@@ -298,13 +312,13 @@
 .docs-prose a {
   color: var(--doc-link);
   text-decoration: underline; text-decoration-thickness: 1px;
-  text-underline-offset: 0.2em; text-decoration-color: rgba(138, 180, 255, 0.45);
+  text-underline-offset: 0.2em; text-decoration-color: var(--doc-link-line);
   transition: color 0.14s ease, text-decoration-color 0.14s ease;
 }
 .docs-prose a:hover { color: var(--doc-link-hover); text-decoration-color: var(--doc-link-hover); }
 /* An inline-code chip that is ITSELF a link keeps the cyan chip but signals the
    link with an underline, so a linked command still reads as clickable. */
-.docs-prose a > code, .docs-prose a code { text-decoration: underline; text-decoration-color: rgba(138, 180, 255, 0.6); }
+.docs-prose a > code, .docs-prose a code { text-decoration: underline; text-decoration-color: var(--doc-link-line-strong); }
 
 /* Lists — squared cyan tick + zero-padded ordered counters */
 .docs-prose ul { list-style: none; padding-left: 1.4em; margin: 0 0 18px; }

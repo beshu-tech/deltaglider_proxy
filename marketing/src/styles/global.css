@@ -325,9 +325,9 @@ hr {
   pointer-events: none;
   background: linear-gradient(90deg,
     var(--bg) 0%,
-    rgba(11, 15, 25, 0.92) 10%,
-    rgba(11, 15, 25, 0.70) 30%,
-    rgba(11, 15, 25, 0.0) 56%);
+    var(--fade-90) 10%,
+    var(--fade-70) 30%,
+    var(--fade-0) 56%);
 }
 
 /* Copy column: fixed distance from the LEFT viewport edge, capped width
@@ -348,10 +348,10 @@ hr {
 .hero--full .hero-eyebrow {
   background: var(--brand-wash);
   border-color: var(--brand-line);
-  color: #7dd3fc;
+  color: var(--brand-bright);
 }
-.hero--full .hero-lede { color: rgba(226, 232, 240, 0.92); }
-.hero--full .hero-trust { color: rgba(148, 163, 184, 0.9); }
+.hero--full .hero-lede { color: var(--ink-soft); }
+.hero--full .hero-trust { color: var(--ink-faint); }
 
 /* Animated walkthrough — a device-framed viewport floating in the plate.
    The 16:9 composition is CONTAIN-fit (never cropped) and maximized to the
@@ -371,8 +371,8 @@ hr {
 .hero--walkthrough .hero-plate-fade {
   background: linear-gradient(90deg,
     var(--bg) 0%,
-    rgba(11, 15, 25, 0.5) 8%,
-    rgba(11, 15, 25, 0.0) 22%);
+    var(--fade-50) 8%,
+    var(--fade-0) 22%);
 }
 
 /* Soft teal halo behind the frame, bleeding into the dark background. */
@@ -398,8 +398,8 @@ hr {
   background: #ecf3f4;
   border: 1px solid rgba(14, 42, 50, 0.5);
   box-shadow:
-    0 0 0 1px rgba(255, 255, 255, 0.06),
-    0 40px 80px -28px rgba(0, 0, 0, 0.7),
+    0 0 0 1px var(--surface-tint-strong),
+    0 40px 80px -28px var(--scrim-strong),
     0 18px 50px -24px var(--brand-glow);
   isolation: isolate;
   /* The frame is clear of the copy column (verified gap), so make it

@@ -3,16 +3,24 @@
    feature stylesheets, and every component's scoped styles — consumes
    these tokens with var(). To retheme the site, edit this file alone.
 
-   The site deliberately commits to a single dark theme (the product's
-   visual world); color-scheme tells the browser so native form
-   controls and scrollbars follow. */
+   Two themes. Dark is the default; a tiny boot script in BaseLayout
+   stamps data-theme on <html> before first paint (stored preference,
+   falling back to the OS prefers-color-scheme), and the header toggle
+   flips it. Rules:
+   - `:root` and `:root[data-theme="dark"]` carry the dark palette.
+   - `:root[data-theme="light"]` overrides every colour token.
+   - Code and terminal panels deliberately stay dark in BOTH themes
+     (code reads as code); they are built from the ink ramp, which the
+     light palette inverts, so this falls out automatically. */
 
-:root {
+:root,
+:root[data-theme='dark'] {
   color-scheme: dark;
 
   /* Brand primary - Vibrant Cyan */
   --brand: #22d3ee;
   --brand-dark: #67e8f9;
+  --brand-bright: #7dd3fc;
   --brand-soft: rgba(34, 211, 238, 0.1);
   /* Brand alpha tiers — the ONLY place translucent brand colour is
      spelled out. tint < wash < line-soft < line < glow. */
@@ -21,8 +29,8 @@
   --brand-line-soft: rgba(34, 211, 238, 0.25);
   --brand-line: rgba(34, 211, 238, 0.35);
   --brand-glow: rgba(34, 211, 238, 0.45);
-  
-  /* Ink — dark mode text ramp (light to dark) */
+
+  /* Ink — text ramp (dark theme: low numbers dark, high numbers light) */
   --ink-100: #0f172a;
   --ink-200: #1e293b;
   --ink-400: #475569;
@@ -43,13 +51,37 @@
   --ink-soft: var(--ink-600);
   --ink-faint: var(--ink-500);
   --ink-mute: var(--ink-400);
-  
+
   --bg: #141a2b;
   --bg-soft: rgba(15, 23, 42, 0.4);
   --bg-card: rgba(30, 41, 59, 0.5);
   --bg-alt: #1e293b;
   --rule: rgba(255, 255, 255, 0.1);
   --rule-strong: rgba(255, 255, 255, 0.2);
+
+  /* Chrome surfaces */
+  --header-bg: rgba(11, 15, 25, 0.7);
+  --footer-bg-1: #0a1322;
+  --footer-bg-2: #070b14;
+  /* Neutral tints laid over surfaces (flip polarity per theme) */
+  --surface-tint: rgba(255, 255, 255, 0.03);
+  --surface-tint-strong: rgba(255, 255, 255, 0.06);
+  /* Darkening scrims behind/inside panels */
+  --scrim: rgba(0, 0, 0, 0.22);
+  --scrim-strong: rgba(0, 0, 0, 0.6);
+  /* Page-bg-coloured fade stops (hero plate blends into the page) */
+  --fade-90: rgba(11, 15, 25, 0.92);
+  --fade-70: rgba(11, 15, 25, 0.7);
+  --fade-50: rgba(11, 15, 25, 0.5);
+  --fade-0: rgba(11, 15, 25, 0);
+
+
+  /* Always-dark panel inks — terminals and ciphertext panes keep a dark
+     surface in BOTH themes, so their text must not follow the ink ramp. */
+  --panel-dark-bg: rgba(8, 13, 24, 0.9);
+  --panel-dark-ink: #cbd5e1;
+  --panel-dark-ink-dim: #7c8aa0;
+  --panel-dark-accent: #22d3ee;
 
   /* Type */
   --font-sans: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -65,4 +97,70 @@
   --shadow-md: 0 10px 15px -3px rgba(0, 0, 0, 0.4), 0 4px 6px -2px rgba(0, 0, 0, 0.2);
   --shadow-lg: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 10px 10px -5px rgba(0, 0, 0, 0.3);
   --shadow-glow: 0 0 15px var(--brand-glow);
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  /* Brand — darker cyan so text and lines keep contrast on white */
+  --brand: #0891b2;
+  --brand-dark: #0e7490;
+  --brand-bright: #155e75;
+  --brand-soft: rgba(8, 145, 178, 0.1);
+  --brand-tint: rgba(8, 145, 178, 0.07);
+  --brand-wash: rgba(8, 145, 178, 0.13);
+  --brand-line-soft: rgba(8, 145, 178, 0.25);
+  --brand-line: rgba(8, 145, 178, 0.35);
+  --brand-glow: rgba(8, 145, 178, 0.3);
+
+  /* Ink ramp inverted: low numbers light, high numbers dark */
+  --ink-100: #f1f5f9;
+  --ink-200: #e2e8f0;
+  --ink-400: #94a3b8;
+  --ink-500: #64748b;
+  --ink-600: #475569;
+  --ink-700: #334155;
+  --ink-800: #1e293b;
+  --ink-900: #0f172a; /* Darkest text */
+
+  --accent: #c026d3;
+  --accent-wash: rgba(192, 38, 211, 0.1);
+  --accent-strong: rgba(192, 38, 211, 0.45);
+
+  --ink: var(--ink-900);
+  --ink-strong: #020617;
+  --ink-soft: var(--ink-600);
+  --ink-faint: var(--ink-500);
+  --ink-mute: var(--ink-500);
+
+  --bg: #f4f7fb;
+  --bg-soft: rgba(148, 163, 184, 0.14);
+  --bg-card: rgba(255, 255, 255, 0.85);
+  --bg-alt: #e2e8f0;
+  --rule: rgba(15, 23, 42, 0.12);
+  --rule-strong: rgba(15, 23, 42, 0.22);
+
+  --header-bg: rgba(244, 247, 251, 0.8);
+  --footer-bg-1: #e9eff8;
+  --footer-bg-2: #dee8f4;
+  --surface-tint: rgba(15, 23, 42, 0.04);
+  --surface-tint-strong: rgba(15, 23, 42, 0.07);
+  --scrim: rgba(15, 23, 42, 0.05);
+  --scrim-strong: rgba(15, 23, 42, 0.55);
+  --fade-90: rgba(244, 247, 251, 0.92);
+  --fade-70: rgba(244, 247, 251, 0.7);
+  --fade-50: rgba(244, 247, 251, 0.5);
+  --fade-0: rgba(244, 247, 251, 0);
+
+  --shadow-sm: 0 4px 6px -1px rgba(15, 23, 42, 0.08), 0 2px 4px -1px rgba(15, 23, 42, 0.05);
+  --shadow-md: 0 10px 15px -3px rgba(15, 23, 42, 0.1), 0 4px 6px -2px rgba(15, 23, 42, 0.05);
+  --shadow-lg: 0 20px 25px -5px rgba(15, 23, 42, 0.12), 0 10px 10px -5px rgba(15, 23, 42, 0.06);
+  --shadow-glow: 0 0 15px var(--brand-glow);
+
+  /* Always-dark panel inks — terminals and ciphertext panes keep a dark
+     surface in BOTH themes, so their text must not follow the ink ramp. */
+  --panel-dark-bg: rgba(8, 13, 24, 0.9);
+  --panel-dark-ink: #cbd5e1;
+  --panel-dark-ink-dim: #7c8aa0;
+  --panel-dark-accent: #22d3ee;
 }

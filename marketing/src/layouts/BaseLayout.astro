@@ -37,6 +37,20 @@ const ogImageUrl = new URL(ogImage, Astro.site).toString();
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="theme-color" content="#141a2b" />
+    {/* Theme boot — runs before first paint so there is no flash of the
+        wrong theme. Stored preference wins; otherwise the OS setting. */}
+    <script is:inline>
+      (() => {
+        let t;
+        try { t = localStorage.getItem('dgp-theme'); } catch {}
+        if (t !== 'light' && t !== 'dark') {
+          t = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+        }
+        document.documentElement.dataset.theme = t;
+        const m = document.querySelector('meta[name="theme-color"]');
+        if (m) m.content = t === 'light' ? '#f4f7fb' : '#141a2b';
+      })();
+    </script>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
 
     {/* Manrope — display sans. Spectral + Hanken Grotesk — hero walkthrough.
