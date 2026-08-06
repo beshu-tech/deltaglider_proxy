@@ -66,13 +66,16 @@ import {
         <HeroOrbit />
 
         <p class="hero-lede">
-          DeltaGlider is an <strong>S3 proxy</strong> that spots similar
-          files in a bucket and stores them as small binary diffs of each
-          other instead of full copies. Each build, dump, or firmware
-          image you upload is mostly the same bytes as the one before it,
-          so the diffs are tiny. Same S3 API, <strong>zero client
-          changes</strong> — your storage bill drops.
+          An S3 proxy in front of your bucket — same API,
+          <strong>zero client changes</strong>:
         </p>
+
+        <ul class="hero-points">
+          <li><strong>Compression</strong> — similar files are stored as tiny binary diffs, not full copies.</li>
+          <li><strong>Encryption</strong> — AES-256 before bytes reach the bucket; the key never leaves you.</li>
+          <li><strong>Multi-cloud</strong> — the same S3 API on AWS, Hetzner, Wasabi, or MinIO, with cross-cloud replication.</li>
+          <li><strong>Security</strong> — per-user IAM, SSO, and audit logs on any backend.</li>
+        </ul>
 
         <div class="hero-ctas">
           <a href="/trial" class="btn btn-brand">Start free trial&nbsp;&rarr;</a>
@@ -207,6 +210,41 @@ import {
 </BaseLayout>
 
 <style>
+  .hero-points {
+    list-style: none;
+    margin: 0.9rem 0 0;
+    padding: 0;
+    display: grid;
+    gap: 0.55rem;
+    max-width: 33rem;
+  }
+
+  .hero-points li {
+    margin: 0;
+    max-width: none;
+    color: var(--ink-soft);
+    font-size: 1.02rem;
+    line-height: 1.55;
+    padding-left: 1.1rem;
+    position: relative;
+  }
+
+  .hero-points li::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0.62em;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--brand);
+    box-shadow: 0 0 8px var(--brand-glow);
+  }
+
+  .hero-points strong {
+    color: var(--ink-strong);
+  }
+
   .dd-grid {
     display: grid;
     grid-template-columns: 1fr;
