@@ -2,10 +2,11 @@
 // /trial — 30-day Commercial-plan trial. The software is BUSL-1.1 and
 // free under the 15 TB grant regardless; the trial is for the support
 // relationship (direct engineering email + 12h SLA + arch review call).
-// Frame C: trial the relationship, not the software. v2 layout: hero illustration
-// (Gemini-generated, brand palette, /illustrations/trial-pairing.jpg),
-// glyph cards for what's included, a visual 30-day timeline, honesty
-// columns. We do NOT promise Slack channels or operating migrations.
+// Frame C: trial the relationship, not the software. Hero visual: a real
+// product screenshot (the Proxy Dashboard savings view — the thing the
+// architecture-review call is about), glyph cards for what's included, a
+// visual 30-day timeline, honesty columns. We do NOT promise Slack
+// channels or operating migrations.
 
 import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
@@ -109,10 +110,10 @@ const timeline = [
 
       <div class="trial-hero-visual">
         <img
-          src="/illustrations/trial-pairing.jpg"
-          alt="Illustration: two engineers at a shared terminal reviewing a glowing storage diagram together, with a chat panel beside them"
-          width="1200"
-          height="896"
+          src="/screenshots/analytics-hero.jpg"
+          alt="The DeltaGlider Proxy Dashboard: total savings of 1,174% smaller on disk, a with/without comparison bar, and per-bucket savings for releases, db-archive, ml-models, and downloads"
+          width="2288"
+          height="2120"
           loading="eager"
           decoding="async"
         />
