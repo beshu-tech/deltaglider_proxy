@@ -295,6 +295,18 @@ function renderDescription(id: string, description: string): string {
         </div>
 
         <div class="faq-item">
+          <h3>What does it cost in speed?</h3>
+          <p>
+            The compute tax lands on writes, once: delta-encoding makes a
+            single-stream upload roughly twelve times slower, on the CI
+            path nobody waits on. Reads pay about 30% on time to first
+            byte when cold and nothing when warm; encryption is
+            effectively free. Measured numbers and methodology:
+            <a href="/docs/explanation/the-compute-tax">the compute tax</a>.
+          </p>
+        </div>
+
+        <div class="faq-item">
           <h3>What stops me from just using the free grant forever?</h3>
           <p>
             Nothing, if you stay under it — that's the point. The grant

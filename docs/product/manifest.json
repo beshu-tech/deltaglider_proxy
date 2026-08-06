@@ -320,6 +320,11 @@
       "path": "explanation/the-deltaglider-license",
       "group": "Concepts",
       "order": 60
+    },
+    {
+      "path": "explanation/the-compute-tax",
+      "group": "Concepts",
+      "order": 3
     }
   ]
 }

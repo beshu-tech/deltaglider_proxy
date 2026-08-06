@@ -62,6 +62,39 @@ const description =
   <div class="shell">
     <MechanismExplanation />
 
+    <section class="compute-tax fade-up delay-2">
+      <span class="section-eyebrow">The cost</span>
+      <h2>What it costs in speed</h2>
+
+      <p>
+        Measured with the repo's own benchmark harness — same artifacts,
+        four modes, one Hetzner region, single stream:
+      </p>
+
+      <table>
+        <thead>
+          <tr><th>Mode</th><th>PUT</th><th>Cold GET</th><th>Warm GET</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Passthrough (baseline)</td><td>106 MB/s</td><td>97 MB/s</td><td>90 MB/s</td></tr>
+          <tr><td>Encryption only</td><td>94 MB/s</td><td>no slowdown</td><td>no slowdown</td></tr>
+          <tr><td>Delta compression</td><td>9 MB/s</td><td>89 MB/s</td><td>no slowdown</td></tr>
+        </tbody>
+      </table>
+
+      <p>
+        The tax lands on the write path, once, where CI is the one
+        waiting: the xdelta3 encode makes a single-stream upload roughly
+        twelve times slower. Reads — the path a person actually feels —
+        pay about 30% on time to first byte when cold and nothing once
+        the reference is warm. Encryption is effectively free.
+      </p>
+
+      <p class="case-study-link">
+        → <a href="/docs/explanation/the-compute-tax">The full numbers and methodology</a>
+      </p>
+    </section>
+
     <section class="in-progress fade-up delay-2">
       <div class="in-progress-grid">
         <div class="narrative-col">
