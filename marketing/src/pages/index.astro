@@ -19,6 +19,7 @@ import JsonLd from '../components/JsonLd.astro';
 import TestimonialsBlock from '../components/TestimonialsBlock.astro';
 import WorkloadFitTable from '../components/WorkloadFitTable.astro';
 import HeroWalkthrough from '../components/HeroWalkthrough.tsx';
+import HeroOrbit from '../components/HeroOrbit.astro';
 import DemoVideo from '../components/DemoVideo.astro';
 import StorageScale from '../components/StorageScale.astro';
 import DropIn from '../components/DropIn.astro';
@@ -31,7 +32,7 @@ import {
 ---
 
 <BaseLayout
-  title="DeltaGlider Proxy — multi-cloud, compression, encryption, security layer for S3"
+  title="DeltaGlider Proxy — the object storage control plane"
   description="An S3 proxy that spots similar files and stores them as small binary diffs instead of full copies. Same S3 API, zero client changes — plus IAM, SSO, replication, and encryption on any S3-compatible backend. Source-available, free up to 15 TB."
 >
   <Fragment slot="json-ld">
@@ -60,7 +61,9 @@ import {
           Source-available · free up to 15 TB · one binary
         </span>
 
-        <h1>Multi-cloud, compression, encryption, security layer for&nbsp;S3</h1>
+        <h1>The object storage control&nbsp;plane</h1>
+
+        <HeroOrbit />
 
         <p class="hero-lede">
           DeltaGlider is an <strong>S3 proxy</strong> that spots similar

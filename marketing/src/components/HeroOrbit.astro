@@ -1,0 +1,109 @@
+---
+// HeroOrbit.astro — the brand bolt with the four capability pills
+// orbiting it on a slow elliptical path. Sits between the hero H1 and
+// the lede. Pure CSS: an @property-registered angle animated through
+// cos()/sin(), so the labels stay upright without counter-rotation.
+// Under prefers-reduced-motion the pills freeze at their positions.
+
+import BrandMark from './BrandMark.astro';
+
+const PILLS = ['Multi-cloud', 'Compression', 'Encryption', 'Security'];
+---
+
+<div class="orbit" role="img" aria-label="Multi-cloud, compression, encryption, and security around one proxy">
+  <span class="orbit-ring" aria-hidden="true"></span>
+  <span class="orbit-core">
+    <BrandMark />
+  </span>
+  {PILLS.map((label, i) => (
+    <span class="orbit-pill" style={`--a0: ${i * 90}deg; animation-delay: ${i * -0.35}s`} aria-hidden="true">{label}</span>
+  ))}
+</div>
+
+<style>
+  @property --a {
+    syntax: '<angle>';
+    inherits: false;
+    initial-value: 0deg;
+  }
+
+  .orbit {
+    position: relative;
+    height: 190px;
+    margin: 1.6rem 0 0.4rem;
+    /* horizontal orbit radius; shrinks with the viewport */
+    --rx: min(180px, 38vw);
+    --ry: 62px;
+  }
+
+  .orbit-ring {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: calc(var(--rx) * 2 + 36px);
+    height: calc(var(--ry) * 2 + 24px);
+    transform: translate(-50%, -50%);
+    border: 1px dashed var(--rule-strong);
+    border-radius: 50%;
+  }
+
+  .orbit-core {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    display: grid;
+    place-items: center;
+    width: 74px;
+    height: 74px;
+    border-radius: 20px;
+    background:
+      radial-gradient(70% 70% at 50% 35%, var(--brand-wash), transparent 75%),
+      var(--bg-card);
+    border: 1px solid var(--brand-line-soft);
+    box-shadow: var(--shadow-md), 0 0 28px var(--brand-wash);
+  }
+
+  .orbit-core :global(.brand-mark) {
+    width: 42px;
+    height: 42px;
+    filter: drop-shadow(0 0 8px var(--brand-glow));
+  }
+
+  .orbit-pill {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    --a: 0deg;
+    transform:
+      translate(-50%, -50%)
+      translate(
+        calc(cos(calc(var(--a) + var(--a0))) * var(--rx)),
+        calc(sin(calc(var(--a) + var(--a0))) * var(--ry))
+      );
+    animation: orbit-turn 42s linear infinite;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    color: var(--ink-strong);
+    background: var(--bg-card);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid var(--brand-line-soft);
+    border-radius: 999px;
+    padding: 0.32rem 0.75rem;
+    box-shadow: var(--shadow-sm);
+  }
+
+  @keyframes orbit-turn {
+    from { --a: 0deg; }
+    to { --a: 360deg; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .orbit-pill { animation: none; }
+  }
+</style>
