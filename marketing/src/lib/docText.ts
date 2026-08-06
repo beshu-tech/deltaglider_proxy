@@ -13,7 +13,9 @@ export function extractTitle(markdown: string): string {
 
 /** First paragraph (plain text, truncated) — used as the meta description. */
 export function extractSummary(markdown: string, max = 155): string {
-  const lines = markdown.split('\n');
+  // HTML comments (e.g. the generated-file banner in changelog.md) are
+  // invisible on the rendered page and must not leak into summaries.
+  const lines = markdown.replace(/<!--[\s\S]*?-->/g, '').split('\n');
   let started = false;
   const para: string[] = [];
   for (const raw of lines) {

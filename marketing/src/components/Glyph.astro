@@ -100,7 +100,7 @@ const PATHS: Record<string, string> = {
     border-radius: 14px;
     background:
       radial-gradient(70% 70% at 50% 35%, var(--brand-wash), transparent 75%),
-      rgba(30, 41, 59, 0.45);
+      var(--bg-card);
     border: 1px solid var(--brand-line-soft);
     flex: 0 0 auto;
   }
@@ -109,7 +109,7 @@ const PATHS: Record<string, string> = {
     filter: drop-shadow(0 0 6px var(--brand-line));
   }
   .dg-glyph svg .a {
-    stroke: #f0abfc;
+    stroke: var(--accent);
     filter: drop-shadow(0 0 5px var(--accent-strong));
   }
 </style>
