@@ -60,3 +60,8 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+        with:
+          # Pages queue congestion can exceed the 10-min default; aborting
+          # cancels the queued deployment and wedges the queue for the next
+          # run, so wait out slow queues instead (30 min).
+          timeout: '1800000'
