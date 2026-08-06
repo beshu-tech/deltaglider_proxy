@@ -31,8 +31,10 @@ const PILLS = ['Multi-cloud', 'Compression', 'Encryption', 'Security'];
     position: relative;
     height: 190px;
     margin: 1.6rem 0 0.4rem;
+    /* match the lede's measure so the ellipse centres on the text column */
+    max-width: 33rem;
     /* horizontal orbit radius; shrinks with the viewport */
-    --rx: min(180px, 38vw);
+    --rx: min(170px, 30vw);
     --ry: 62px;
   }
 
@@ -54,9 +56,9 @@ const PILLS = ['Multi-cloud', 'Compression', 'Encryption', 'Security'];
     transform: translate(-50%, -50%);
     display: grid;
     place-items: center;
-    width: 74px;
-    height: 74px;
-    border-radius: 20px;
+    width: 76px;
+    height: 76px;
+    border-radius: 50%;
     background:
       radial-gradient(70% 70% at 50% 35%, var(--brand-wash), transparent 75%),
       var(--bg-card);
