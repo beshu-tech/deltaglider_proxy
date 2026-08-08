@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.18.0 — 2026-08-08
+
 ### Added — Signed release provenance and a published security policy
 
 Every release now carries Sigstore-backed build provenance: the binary
