@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Added — Signed release provenance and a published security policy
+
+Every release now carries Sigstore-backed build provenance: the binary
+tarballs, the SHA-256 checksum file, and the SBOM are attested by the
+release pipeline, and any downloaded artifact can be verified with
+`gh attestation verify <file> --repo beshu-tech/deltaglider_proxy`.
+A new `SECURITY.md` documents private vulnerability reporting (GitHub
+advisories or email), concrete response targets — acknowledgement
+within 2 business days, a fix or documented mitigation for critical
+issues targeted within 14 days — and direct notification for
+Commercial-plan customers when a security release ships. Together with
+the SBOM that releases already carried, this makes the "signed builds,
+SBOM, CVE response commitment" line on the pricing page a shipped fact
+rather than a promise.
+
 ### Changed — License: GPL-3.0 → Business Source License 1.1
 
 DeltaGlider Proxy is now licensed under the Business Source License 1.1

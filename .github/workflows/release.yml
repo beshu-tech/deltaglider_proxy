@@ -541,6 +541,19 @@ jobs:
           cargo sbom --output-format spdx_json_2_3 > artifacts/sbom-spdx.json
           echo "SBOM generated ($(wc -c < artifacts/sbom-spdx.json) bytes)"
 
+      # Sigstore-backed provenance for everything a user downloads: the
+      # binary tarballs, the checksum file, and the SBOM. Verifiable with
+      # `gh attestation verify <file> --repo beshu-tech/deltaglider_proxy`.
+      # This is the "signed builds" half of the Commercial assurance story
+      # (SECURITY.md is the other half).
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS.txt
+            artifacts/sbom-spdx.json
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
         with:
