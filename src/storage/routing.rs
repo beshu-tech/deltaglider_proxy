@@ -460,13 +460,35 @@ impl RoutingBackend {
             };
             return (route.backend_name.clone(), backend, real);
         }
+        // A head_bucket ERROR (503/timeout) is NOT "bucket absent" — same
+        // hazard as `resolve_existing`: collapsing the error to `false` with
+        // `unwrap_or(false)` silently reroutes the multipart operation to the
+        // WRONG backend, so a transient blip on the bucket's real home can
+        // split one deltaspace's reference.bin and deltas across two same-named
+        // buckets. On error, route to THIS backend (the op re-hits it and
+        // surfaces the real error to the client); only a clean Ok(false) means
+        // "genuinely not here, keep looking".
         let default = self.default_backend();
-        if default.head_bucket(virtual_bucket).await.unwrap_or(false) {
-            return (
-                self.default_backend.clone(),
-                default,
-                Cow::Borrowed(virtual_bucket),
-            );
+        match default.head_bucket(virtual_bucket).await {
+            Ok(true) => {
+                return (
+                    self.default_backend.clone(),
+                    default,
+                    Cow::Borrowed(virtual_bucket),
+                )
+            }
+            Err(e) => {
+                warn!(
+                    "resolve_existing_named: default backend head_bucket({virtual_bucket}) failed \
+                     transiently ({e}); routing to default rather than mis-routing"
+                );
+                return (
+                    self.default_backend.clone(),
+                    default,
+                    Cow::Borrowed(virtual_bucket),
+                );
+            }
+            Ok(false) => {}
         }
         let mut names: Vec<&String> = self.backends.keys().collect();
         names.sort();
@@ -475,8 +497,16 @@ impl RoutingBackend {
                 continue;
             }
             let backend = self.backends[name].as_ref().as_ref();
-            if backend.head_bucket(virtual_bucket).await.unwrap_or(false) {
-                return (name.clone(), backend, Cow::Borrowed(virtual_bucket));
+            match backend.head_bucket(virtual_bucket).await {
+                Ok(true) => return (name.clone(), backend, Cow::Borrowed(virtual_bucket)),
+                Err(e) => {
+                    warn!(
+                        "resolve_existing_named: backend '{name}' head_bucket({virtual_bucket}) \
+                         failed transiently ({e}); routing here rather than mis-routing to default"
+                    );
+                    return (name.clone(), backend, Cow::Borrowed(virtual_bucket));
+                }
+                Ok(false) => {}
             }
         }
         (
@@ -1147,6 +1177,10 @@ mod tests {
         /// When true, list_buckets(_with_dates) returns an error — models an
         /// upstream backend 503-ing. Shared so a test can flip it mid-test.
         fail_list: Arc<StdMutex<bool>>,
+        /// When true, head_bucket returns an error — models a transient 503 on
+        /// the bucket-existence probe, to exercise the resolver's "route here on
+        /// error, don't mis-route" branch.
+        fail_head: Arc<StdMutex<bool>>,
         /// Count of list_buckets calls — asserts the cooldown skips a backend.
         list_calls: Arc<std::sync::atomic::AtomicUsize>,
         /// Optional gate awaited INSIDE list_buckets after the call is counted:
@@ -1163,6 +1197,7 @@ mod tests {
                 )),
                 create_calls: Arc::new(StdMutex::new(Vec::new())),
                 fail_list: Arc::new(StdMutex::new(false)),
+                fail_head: Arc::new(StdMutex::new(false)),
                 list_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 list_gate: Arc::new(StdMutex::new(None)),
             }
@@ -1171,6 +1206,13 @@ mod tests {
         fn failing() -> Self {
             let b = Self::with_buckets(&[]);
             *b.fail_list.lock().unwrap() = true;
+            b
+        }
+
+        /// A backend whose head_bucket probe transiently errors (503/timeout).
+        fn failing_head() -> Self {
+            let b = Self::with_buckets(&[]);
+            *b.fail_head.lock().unwrap() = true;
             b
         }
 
@@ -1213,6 +1255,9 @@ mod tests {
         }
 
         async fn head_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
+            if *self.fail_head.lock().unwrap() {
+                return Err(StorageError::S3("simulated head_bucket outage".into()));
+            }
             Ok(self.buckets.lock().unwrap().contains(bucket))
         }
 
@@ -1476,6 +1521,46 @@ mod tests {
             "create_bucket must not create a duplicate on the default backend"
         );
         assert_eq!(archive_probe.create_calls(), vec!["shared".to_string()]);
+    }
+
+    /// Regression: a transient head_bucket error on the bucket's real home must
+    /// NOT be collapsed to "bucket absent" and mis-route the multipart op to the
+    /// default backend. `resolve_existing_named` must route to the backend that
+    /// errored (so the op re-hits it and surfaces the real error) instead of
+    /// silently splitting the deltaspace onto the default backend.
+    #[tokio::test]
+    async fn resolve_existing_named_routes_to_erroring_backend_not_default() {
+        // Default is a clean empty backend (Ok(false) on head); the secondary
+        // "archive" backend transiently 503s on its head probe.
+        let primary = Arc::new(Box::new(TestBackend::with_buckets(&[])) as Box<dyn StorageBackend>);
+        let archive = Arc::new(Box::new(TestBackend::failing_head()) as Box<dyn StorageBackend>);
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), primary);
+        backends.insert("archive".to_string(), archive);
+        let routing = RoutingBackend::new(backends, HashMap::new(), "primary".to_string())
+            .expect("routing backend");
+
+        let (name, _, _) = routing.resolve_existing_named("shared").await;
+        assert_eq!(
+            name, "archive",
+            "must route to the erroring backend, not fall through to default"
+        );
+
+        // And when the DEFAULT backend itself errors, route to it (not scan on).
+        let primary = Arc::new(Box::new(TestBackend::failing_head()) as Box<dyn StorageBackend>);
+        let archive =
+            Arc::new(Box::new(TestBackend::with_buckets(&["shared"])) as Box<dyn StorageBackend>);
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), primary);
+        backends.insert("archive".to_string(), archive);
+        let routing = RoutingBackend::new(backends, HashMap::new(), "primary".to_string())
+            .expect("routing backend");
+
+        let (name, _, _) = routing.resolve_existing_named("shared").await;
+        assert_eq!(
+            name, "primary",
+            "default-backend head error must route to default, not mis-route elsewhere"
+        );
     }
 
     /// Regression (prod RCA 2026-07-05): when EVERY backend errors on

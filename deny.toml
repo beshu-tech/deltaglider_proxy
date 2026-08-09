@@ -1,14 +1,37 @@
 # cargo-deny configuration
 # https://embarkstudios.github.io/cargo-deny/
+#
+# Schema: cargo-deny >= 0.16 (the pre-0.14 keys `vulnerability`,
+# `unmaintained`, `notice`, `unlicensed`, and `copyleft` were REMOVED and now
+# hard-error on parse). Under the current schema: security advisories for
+# vulnerabilities are denied by default, and any license NOT in the `allow`
+# list below is denied — so copyleft is refused by omission, not a flag.
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+# RUSTSEC advisory DB. Vulnerabilities are denied by default. `yanked` is a
+# warning, not a hard error: the only yanked crates in the tree are transitive
+# `spin` versions pinned deep under aws-sdk-s3 / s3s / multer, which we cannot
+# unpin without upstream releases — a hard fail here would wedge the gate on
+# something we can't fix, defeating the point of un-masking it.
 yanked = "warn"
-notice = "warn"
+# Each entry is a KNOWN advisory with no fix available to us today, documented
+# so the gate still fails on any NEW/unlisted advisory (the whole point of
+# un-masking `cargo deny`). Re-audit on every dependency bump.
+ignore = [
+    # quick-xml <0.41 XML-parsing DoS (quadratic dup-attribute scan / unbounded
+    # namespace allocation). Pulled transitively by s3s 0.14, which pins
+    # quick-xml ^0.40 — cannot upgrade without an s3s bump (tracked separately).
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # rustls-pemfile unmaintained (repo archived Aug 2025); thin wrapper pulled
+    # transitively by axum-server, no safe upgrade published yet.
+    "RUSTSEC-2025-0134",
+]
 
 [licenses]
-unlicensed = "deny"
+# Any license outside this allow-list is DENIED (this is what keeps GPL and
+# other copyleft licenses out of the BUSL-1.1 binary). Keep in sync with the
+# licenses actually pulled by `cargo tree`.
 allow = [
     "MIT",
     "Apache-2.0",
@@ -22,8 +45,12 @@ allow = [
     "BSL-1.0",
     "CC0-1.0",
     "MPL-2.0",
+    # This crate's own license — the proxy ships under BUSL-1.1.
+    "BUSL-1.1",
+    # Permissive data license carried by webpki-roots (transitive via reqwest/rustls).
+    "CDLA-Permissive-2.0",
 ]
-copyleft = "deny"
+confidence-threshold = 0.8
 
 [bans]
 multiple-versions = "warn"

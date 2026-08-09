@@ -10,10 +10,13 @@ Clients see a standard S3 API. The proxy silently deduplicates using xdelta3 aga
 docker run -d \
   -p 9000:9000 \
   -v dgp-data:/data \
+  -e DGP_ACCESS_KEY_ID=dgpadmin \
+  -e DGP_SECRET_ACCESS_KEY=change-me-please \
   beshultd/deltaglider_proxy
 ```
 
 - **Port 9000** — S3-compatible API + Admin GUI (everything on one port)
+- **`DGP_ACCESS_KEY_ID` / `DGP_SECRET_ACCESS_KEY`** — the S3 credentials clients present to the proxy. These are required: the proxy refuses to start without authentication configured (unless you explicitly set `DGP_AUTHENTICATION=none` for local development). Choose your own values.
 
 Then open `http://localhost:9000/_/` for the built-in browser and dashboard.
 
@@ -22,6 +25,8 @@ Then open `http://localhost:9000/_/` for the built-in browser and dashboard.
 ```bash
 docker run -d \
   -p 9000:9000 \
+  -e DGP_ACCESS_KEY_ID=dgpadmin \
+  -e DGP_SECRET_ACCESS_KEY=change-me-please \
   -e DGP_S3_ENDPOINT=http://minio:9000 \
   -e DGP_S3_REGION=us-east-1 \
   -e DGP_BE_AWS_ACCESS_KEY_ID=minioadmin \
@@ -29,6 +34,8 @@ docker run -d \
   -e DGP_CACHE_MB=1024 \
   beshultd/deltaglider_proxy
 ```
+
+The `DGP_ACCESS_KEY_ID` / `DGP_SECRET_ACCESS_KEY` pair is the S3 credential clients present to the proxy (required to start). The `DGP_BE_AWS_*` pair is separate: it authenticates the proxy to the MinIO backend behind it.
 
 ## Docker Compose
 

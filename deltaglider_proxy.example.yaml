@@ -140,7 +140,10 @@ storage:
 #   metadata_cache_mb: 50
 #
 #   # TLS — both S3 and admin GUI served over HTTPS on the same port.
+#   # `enabled: true` is REQUIRED to serve HTTPS: supplying the paths alone
+#   # does not turn TLS on, so without it the server keeps serving plain HTTP.
 #   # tls:
+#   #   enabled: true
 #   #   cert_path: /etc/ssl/certs/deltaglider.crt
 #   #   key_path: /etc/ssl/private/deltaglider.key
 #
