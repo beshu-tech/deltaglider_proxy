@@ -294,10 +294,8 @@ impl s3s::S3 for DeltaGliderS3Service {
             .await
             .map_err(engine_error_to_s3s)?;
         if let Some(ListScope::Filtered { user }) = list_scope {
-            let requested_prefix = input.prefix.as_deref().unwrap_or("");
-            page.objects.retain(|(key, _)| {
-                user_can_see_listed_key(&user, &input.bucket, key, requested_prefix)
-            });
+            page.objects
+                .retain(|(key, _)| user_can_see_listed_key(&user, &input.bucket, key));
             page.common_prefixes
                 .retain(|prefix| user_can_see_common_prefix(&user, &input.bucket, prefix));
         }
@@ -362,10 +360,8 @@ impl s3s::S3 for DeltaGliderS3Service {
             .await
             .map_err(engine_error_to_s3s)?;
         if let Some(ListScope::Filtered { user }) = list_scope {
-            let requested_prefix = input.prefix.as_deref().unwrap_or("");
-            page.objects.retain(|(key, _)| {
-                user_can_see_listed_key(&user, &input.bucket, key, requested_prefix)
-            });
+            page.objects
+                .retain(|(key, _)| user_can_see_listed_key(&user, &input.bucket, key));
             page.common_prefixes
                 .retain(|prefix| user_can_see_common_prefix(&user, &input.bucket, prefix));
         }
@@ -1327,10 +1323,25 @@ impl s3s::S3 for DeltaGliderS3Service {
             input.copy_source_if_modified_since.as_ref(),
             input.copy_source_if_unmodified_since.as_ref(),
         )?;
+        // `engine.retrieve` buffers the ENTIRE source object into a heap Vec
+        // (delta reconstruction can't stream, and passthrough is collected too),
+        // and `copy_source_range` is sliced only AFTER that buffer exists — so a
+        // small requested part does NOT bound memory. Passthrough objects are
+        // stored up to `max_passthrough_object_size` (64 GiB default), so without
+        // this gate a standard aws-cli/boto3 managed copy (which auto-issues
+        // UploadPartCopy per chunk, each re-buffering the whole source) would OOM
+        // the shared process. Mirror `copy_object`'s guard: reject oversized
+        // sources with EntityTooLarge before and after the buffering read.
+        if source_meta.file_size > engine.max_object_size() {
+            return Err(s3s::s3_error!(EntityTooLarge));
+        }
         let (data, _) = engine
             .retrieve(&source_bucket, &source_key)
             .await
             .map_err(engine_error_to_s3s)?;
+        if data.len() as u64 > engine.max_object_size() {
+            return Err(s3s::s3_error!(EntityTooLarge));
+        }
         let part = if let Some(range) = input.copy_source_range.as_deref() {
             let (start, end) = parse_copy_range(range, data.len())?;
             bytes::Bytes::from(data[start..=end].to_vec())

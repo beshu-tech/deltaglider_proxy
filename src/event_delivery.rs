@@ -528,13 +528,18 @@ pub async fn dispatch_once(
         ) {
             warn!("Event outbox delivered count-prune failed: {}", err);
         }
-        // Also prune any-status rows fully below the floor (consumed by every
-        // active listener), so pending rows that were consumed but not
-        // delivered don't accumulate.
-        if let Err(err) = db.event_outbox_prune_below_floor(min_keep_id, config.prune_batch) {
-            warn!("Event outbox floor prune failed: {}", err);
-        }
     }
+    // NOTE: no any-status `prune_below_floor` here. When delivery is ACTIVE every
+    // claimed row ends `delivered` or `failed` (a filtered-out event is marked
+    // delivered — see `deliver_slack`'s "consume without posting"), so nothing
+    // stays consumed-but-pending on this path; the delivered/failed prunes above
+    // bound the outbox. An any-status prune here would delete rows still
+    // `pending`/retrying below the replication floor (target down) BEFORE webhook
+    // delivery resolves them — breaking the at-least-once contract. The
+    // consumed-but-never-delivered accumulation the floor prune guards against
+    // only arises when delivery is DISABLED, and the disabled branch of
+    // `run_event_delivery_dispatcher` handles that via the standalone
+    // `prune_below_floor`.
 }
 
 pub(crate) fn dispatcher_tick(config: &EventDeliveryConfig) -> Duration {
@@ -792,6 +797,39 @@ mod tests {
         assert_eq!(row.status, STATUS_DELIVERED);
         assert_eq!(row.attempts, 1);
         assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Regression (at-least-once): a row still awaiting webhook delivery must
+    /// survive a dispatch pass even when the replication listener has already
+    /// consumed past it. Previously an any-status floor prune in the active
+    /// path deleted such rows below the replication cursor, dropping the event
+    /// before delivery ever succeeded.
+    #[tokio::test]
+    async fn dispatch_keeps_undelivered_row_below_replication_floor() {
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let id = {
+            let db = db.lock().await;
+            let id = db.event_outbox_insert(&event("down")).unwrap();
+            // Replication (a faster listener) has consumed through this row.
+            db.listener_cursor_advance("replication", id, 200).unwrap();
+            id
+        };
+        // Delivery target is down: every attempt fails, so after one pass the
+        // row is PENDING/retrying (max_attempts=2 → attempt 1 reschedules).
+        let client = FakeClient {
+            failures_before_success: 99,
+            calls: AtomicUsize::new(0),
+        };
+
+        dispatch_once(&db, &client, &cfg(), "test-worker", 200).await;
+
+        let rows = db.lock().await.event_outbox_recent(10).unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.id == id)
+            .expect("undelivered row must NOT be pruned below the replication floor");
+        assert_eq!(row.status, STATUS_PENDING);
+        assert!(row.next_attempt_at.is_some(), "row is still owed a retry");
     }
 
     #[tokio::test]
