@@ -24,11 +24,13 @@
 pub mod capability;
 pub mod health;
 pub mod lease;
+pub mod reference_lock;
 pub mod s3_lease;
 
 pub use capability::{BackendCapabilityCache, CapabilityVerdict, VerifiedVia};
 pub use health::{BackendHealthCache, HealthVerdict};
 pub use lease::{CoordinationLease, LeaseSubsystem, LocalLease};
+pub use reference_lock::{ReferenceLock, S3ReferenceLock};
 pub use s3_lease::S3Lease;
 
 /// A durable-per-node identity for lease ownership provenance + self-reclaim.

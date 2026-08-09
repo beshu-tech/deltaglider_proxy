@@ -169,7 +169,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Acquire per-deltaspace lock to prevent concurrent reference overwrites.
         // The critical section: has_reference check → set_reference → store_delta
         // must be atomic per-prefix to avoid two writers both creating a reference.
+        // The in-process mutex serializes same-node threads; the cross-instance
+        // lock (multi-instance only, inert otherwise) serializes across nodes.
         let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
+        let _xnode_guard = self.acquire_reference_lock(bucket, &deltaspace_id).await?;
 
         let ctx = StoreContext {
             bucket,
@@ -394,9 +397,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Ok(result.with_accounting(prior_for_counter, 0));
         }
 
-        // B1 (open): this lock is IN-PROCESS only — two instances writing the
-        // same deltaspace can corrupt reference.bin (see CLAUDE.md HA contract).
+        // B1: the in-process mutex serializes same-node threads; the
+        // cross-instance lock (multi-instance only, inert single-instance)
+        // serializes across NODES, so two instances can no longer both create a
+        // baseline and corrupt reference.bin (see CLAUDE.md HA contract).
         let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
+        let _xnode_guard = self.acquire_reference_lock(bucket, &deltaspace_id).await?;
         // Write path: a backend error must abort, not read as "no reference".
         let has_existing_reference = self.storage.has_reference(bucket, &deltaspace_id).await?;
 
@@ -536,9 +542,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         match encode_res {
             None => {
                 // Ratio lost → passthrough from the body spool.
-                // Drop the prefix lock FIRST — store_passthrough_file re-acquires
-                // it internally, so holding it here would re-entrant-deadlock.
-                drop((ref_spool, delta_spool, _guard));
+                // Drop BOTH locks FIRST — store_passthrough_file re-acquires the
+                // prefix lock internally, so holding it here would re-entrant-
+                // deadlock; the cross-node lock is released too (passthrough does
+                // not touch reference.bin, so it needs no cross-node exclusion).
+                drop((ref_spool, delta_spool, _guard, _xnode_guard));
                 let result = self
                     .store_passthrough_file_with_multipart_etag(
                         bucket,
@@ -588,7 +596,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         multipart_etag.clone(),
                     )
                     .await?;
-                drop((ref_spool, delta_spool, _guard));
+                drop((ref_spool, delta_spool, _guard, _xnode_guard));
                 self.metadata_cache
                     .insert(bucket, key, result.metadata.clone());
                 Ok(result.with_accounting(prior_for_counter, 0))

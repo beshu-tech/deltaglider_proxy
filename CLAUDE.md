@@ -242,10 +242,23 @@ single-instance planes below are addressed.
   DELETE/PUT on A leaves B serving stale existence/size for up to 10 min.
 - **Rate limiter** (`rate_limiter.rs`, per-instance) — effective limit is N× the
   configured cap across N nodes.
-- **Maintenance write-gate busy-set**, **delta-reference RMW lock**
-  (`engine/mod.rs` `prefix_locks`, in-process) — concurrent same-prefix PUTs on
-  two nodes can corrupt `reference.bin`. Single-writer per deltaspace assumed —
-  the operator's directory-hash router (bullet above) satisfies it by routing.
+- **Maintenance write-gate busy-set** (`engine/mod.rs`, in-process) — still
+  node-local.
+- **Delta-reference RMW lock** — the in-process `prefix_locks` mutex
+  (`engine/mod.rs`) serializes same-node threads; when a `config_sync_bucket` is
+  configured it is now ALSO wrapped by a CROSS-INSTANCE per-deltaspace mutex
+  (`src/coordination/reference_lock.rs`, `S3ReferenceLock`) held around the
+  reference read-modify-write in the two delta-baseline paths (`store_inner`,
+  `store_spooled_delta`), so two nodes can no longer both create a `reference.bin`
+  baseline and corrupt it (closes B1). It is a short-lived S3-CAS lock object
+  (`_dgp/locks/reference/<hash>.json`, create-if-absent / steal-on-TTL-expiry /
+  owner-scoped release), NOT the 300s leader lease; a peer holding it past the
+  acquire timeout fails the PUT closed rather than risk a second baseline.
+  Single-instance (no coordination bucket) → the field is `None`, in-process lock
+  only, zero S3 round-trips. The operator's directory-hash router is still the
+  recommended topology (it also handles multipart + metadata-cache locality), but
+  reference.bin integrity no longer DEPENDS on it. Tunables:
+  `DGP_REFERENCE_LOCK_TTL_SECS` (120), `DGP_REFERENCE_LOCK_ACQUIRE_TIMEOUT_SECS` (30).
 
 **Hard prerequisites for any multi-instance deployment:**
 - **All instances MUST share the same `DGP_BOOTSTRAP_PASSWORD_HASH`** — it

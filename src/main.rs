@@ -494,9 +494,14 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // --- Engine ---
+    // Cross-instance reference lock (multi-instance only; None single-instance).
+    // Built from config before the engine so it can be attached at construction
+    // and re-attached on every rebuild via AppState, exactly like bucket_usage.
+    let reference_lock = build_reference_lock(&config).await;
     let engine = DynEngine::new(&config, Some(metrics.clone()))
         .await?
-        .with_bucket_usage(bucket_usage.clone());
+        .with_bucket_usage(bucket_usage.clone())
+        .with_reference_lock(reference_lock.clone());
     // #63: create dirs for buckets DECLARED in storage.buckets that route to a
     // filesystem backend, so their first write doesn't 404. Only declared intent
     // (no write-path auto-create, no remote S3 side effects — other backends
@@ -684,6 +689,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         metrics: metrics.clone(),
         usage_scanner: usage_scanner.clone(),
         bucket_usage: bucket_usage.clone(),
+        reference_lock: reference_lock.clone(),
         config_db: config_db.clone(),
         maintenance_gate: maintenance_gate.clone(),
         maintenance_notify: maintenance_notify.clone(),

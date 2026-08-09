@@ -34,8 +34,11 @@ pub async fn rebuild_engine_only(
 ) -> Result<(), String> {
     match DynEngine::new(cfg, Some(app.metrics.clone())).await {
         Ok(new_engine) => {
-            // Re-attach the usage counter — a rebuild must not drop it.
-            let new_engine = new_engine.with_bucket_usage(app.bucket_usage.clone());
+            // Re-attach the usage counter and cross-instance reference lock —
+            // a rebuild must not drop either.
+            let new_engine = new_engine
+                .with_bucket_usage(app.bucket_usage.clone())
+                .with_reference_lock(app.reference_lock.clone());
             app.engine.store(Arc::new(new_engine));
             tracing::info!("{}", context);
             Ok(())
