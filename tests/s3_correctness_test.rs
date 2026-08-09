@@ -189,9 +189,24 @@ async fn test_upload_part_to_deleted_bucket_returns_nosuchbucket() {
 
     assert!(res.is_err(), "UploadPart must fail on missing bucket");
     let err_msg = format!("{:?}", res.unwrap_err());
+    // The proxy may surface the rejection two equally-valid ways, and which one
+    // the client observes is a timing race on a multi-MB body: (a) it drains the
+    // request and replies `404 NoSuchBucket`, or (b) it rejects and closes the
+    // connection before consuming the whole body, so the client's in-flight body
+    // write fails at the transport layer (`DispatchFailure` / `BrokenPipe` /
+    // connection reset). Both mean "the missing bucket was NOT silently accepted"
+    // — which is the property under test (guaranteed by `res.is_err()` above; a
+    // silent accept would make `res` Ok). Accept either surface so this test is
+    // not flaky. See nightly run 31242363756 (BrokenPipe surfaced instead of 404).
+    let rejected_cleanly = err_msg.contains("NoSuchBucket") || err_msg.contains("404");
+    let rejected_at_transport = err_msg.contains("DispatchFailure")
+        || err_msg.contains("BrokenPipe")
+        || err_msg.contains("broken pipe")
+        || err_msg.contains("connection")
+        || err_msg.contains("reset");
     assert!(
-        err_msg.contains("NoSuchBucket") || err_msg.contains("404"),
-        "expected NoSuchBucket / 404, got {}",
+        rejected_cleanly || rejected_at_transport,
+        "expected NoSuchBucket/404 or a transport-level rejection, got {}",
         err_msg
     );
 }
