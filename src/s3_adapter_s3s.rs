@@ -1496,6 +1496,9 @@ async fn recursive_delete_prefix_s3s(
     let mut deleted = 0u32;
     let mut denied = 0u32;
     let mut next_token: Option<String> = None;
+    // Deltaspaces touched by the sweep — reference reclamation runs once per
+    // deltaspace at the end rather than once per deleted object.
+    let mut swept_deltaspaces: std::collections::BTreeSet<String> = Default::default();
 
     loop {
         let page = engine
@@ -1517,12 +1520,18 @@ async fn recursive_delete_prefix_s3s(
                     continue;
                 }
             }
-            match engine.delete(bucket, obj_key).await {
+            // `delete_in_sweep` skips the per-object "is this deltaspace empty?"
+            // scan, which lists the WHOLE deltaspace and made a prefix sweep
+            // O(N²) in directory reads (a 1100-object prefix took minutes and
+            // tripped the request timeout). We reclaim the reference once below.
+            match engine.delete_in_sweep(bucket, obj_key).await {
                 Ok(_) | Err(crate::deltaglider::EngineError::NotFound(_)) => {
                     deleted = deleted.saturating_add(1);
                 }
                 Err(e) => return Err(engine_error_to_s3s(e)),
             }
+            swept_deltaspaces
+                .insert(crate::types::ObjectKey::parse(bucket, obj_key).deltaspace_id());
         }
 
         if !page.is_truncated {
@@ -1531,6 +1540,16 @@ async fn recursive_delete_prefix_s3s(
         next_token = page.next_continuation_token;
         if next_token.is_none() {
             break;
+        }
+    }
+
+    // Reference reclamation, ONCE per touched deltaspace, after the sweep.
+    // Best-effort: the objects are already gone, so a failed reclaim leaves an
+    // orphan reference.bin (harmless — reclaimed by the next delete) rather
+    // than failing a delete the client already succeeded at.
+    for ds in &swept_deltaspaces {
+        if let Err(e) = engine.reclaim_empty_deltaspace(bucket, ds).await {
+            tracing::warn!("post-sweep reference reclaim failed for {bucket}/{ds}: {e}");
         }
     }
 

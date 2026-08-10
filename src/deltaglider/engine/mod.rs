@@ -1739,6 +1739,66 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Delete an object
     #[instrument(skip(self))]
     pub async fn delete(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {
+        self.delete_inner(bucket, key, /* reclaim_reference = */ true)
+            .await
+    }
+
+    /// Delete one member of a prefix sweep, SKIPPING the per-object
+    /// "is the deltaspace empty now?" reference-reclamation scan.
+    ///
+    /// That scan lists the WHOLE deltaspace, so running it per object makes a
+    /// prefix sweep O(N²) in directory reads (1100 objects ≈ 600k entry reads —
+    /// enough to blow past the request timeout). A sweep is deleting everything
+    /// anyway, so the caller runs [`Self::reclaim_empty_deltaspace`] ONCE when
+    /// the sweep finishes. Semantics are otherwise identical to [`Self::delete`].
+    pub async fn delete_in_sweep(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<FileMetadata, EngineError> {
+        self.delete_inner(bucket, key, /* reclaim_reference = */ false)
+            .await
+    }
+
+    /// Reclaim a deltaspace's `reference.bin` if no non-reference object remains.
+    /// The tail half of [`Self::delete`], callable once after a prefix sweep.
+    /// Idempotent and safe when the deltaspace still holds objects (no-op).
+    pub async fn reclaim_empty_deltaspace(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+    ) -> Result<(), EngineError> {
+        let _guard = self.acquire_prefix_lock(deltaspace_id).await;
+        let remaining = self.storage.scan_deltaspace(bucket, deltaspace_id).await?;
+        let has_objects = remaining
+            .iter()
+            .any(|m| !matches!(m.storage_info, StorageInfo::Reference { .. }));
+        if has_objects || !self.storage.has_reference(bucket, deltaspace_id).await? {
+            return Ok(());
+        }
+        let reclaimed_ref_bytes = remaining
+            .iter()
+            .find(|m| matches!(m.storage_info, StorageInfo::Reference { .. }))
+            .map(|m| m.file_size)
+            .unwrap_or(0);
+        self.storage.delete_reference(bucket, deltaspace_id).await?;
+        self.cache
+            .invalidate(&Self::cache_key(bucket, deltaspace_id));
+        // Mirror `delete`'s accounting: the reclaimed reference bytes leave
+        // stored_bytes (no object count change — the objects were counted as
+        // they were individually deleted).
+        if let Some(u) = &self.bucket_usage {
+            u.apply_net(bucket, None, None, -(reclaimed_ref_bytes as i64));
+        }
+        Ok(())
+    }
+
+    async fn delete_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        reclaim_reference: bool,
+    ) -> Result<FileMetadata, EngineError> {
         let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
 
         info!("Deleting {}/{}", bucket, key);
@@ -1795,15 +1855,26 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
         }
 
-        // If this deltaspace no longer has any objects, clean up its reference baseline.
-        let remaining = self.storage.scan_deltaspace(bucket, &deltaspace_id).await?;
-        let has_objects = remaining
-            .iter()
-            .any(|m| !matches!(m.storage_info, StorageInfo::Reference { .. }));
+        // If this deltaspace no longer has any objects, clean up its reference
+        // baseline. SKIPPED for prefix sweeps (`delete_in_sweep`): this scan
+        // lists the entire deltaspace, so running it per object makes a sweep
+        // O(N²) in directory reads. The sweep caller reclaims once at the end
+        // via `reclaim_empty_deltaspace`.
         // Bytes of a reclaimed reference.bin (stored-only) — subtracted from the
         // counter so stored_bytes stays exact when the last delta is removed.
         let mut reclaimed_ref_bytes = 0u64;
-        if !has_objects && self.storage.has_reference(bucket, &deltaspace_id).await? {
+        let remaining = if reclaim_reference {
+            self.storage.scan_deltaspace(bucket, &deltaspace_id).await?
+        } else {
+            Vec::new()
+        };
+        let has_objects = remaining
+            .iter()
+            .any(|m| !matches!(m.storage_info, StorageInfo::Reference { .. }));
+        if reclaim_reference
+            && !has_objects
+            && self.storage.has_reference(bucket, &deltaspace_id).await?
+        {
             reclaimed_ref_bytes = remaining
                 .iter()
                 .find(|m| matches!(m.storage_info, StorageInfo::Reference { .. }))
