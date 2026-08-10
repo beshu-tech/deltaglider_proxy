@@ -413,6 +413,7 @@ jobs:
             --test config_sync_ha_test \
             --test config_sync_test \
             --test coordination_lease_test \
+            --test reference_lock_race_test \
             --test encryption_test \
             --test external_auth_test \
             --test iam_declarative_reconcile_test \
