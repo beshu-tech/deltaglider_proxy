@@ -1490,7 +1490,14 @@ async fn recursive_delete_prefix_s3s(
     bucket: &str,
     prefix: &str,
 ) -> s3s::S3Result<(u32, u32)> {
-    const DELETE_PAGE_SIZE: u32 = 1000;
+    // Objects listed+deleted per page of the sweep. Bounded (not `u32::MAX`) so a
+    // prefix with millions of keys can't balloon proxy memory before the first
+    // delete. Configurable via `DGP_RECURSIVE_DELETE_PAGE_SIZE` (default 1000):
+    // operators on memory-constrained nodes can lower it, and tests use a small
+    // window to exercise the continuation-token loop without seeding thousands
+    // of objects. Clamped to >= 1 so a zero can't wedge the loop.
+    let delete_page_size: u32 =
+        crate::config::env_parse_with_default("DGP_RECURSIVE_DELETE_PAGE_SIZE", 1000u32).max(1);
 
     let engine = state.engine.load();
     let mut deleted = 0u32;
@@ -1506,7 +1513,7 @@ async fn recursive_delete_prefix_s3s(
                 bucket,
                 prefix,
                 None,
-                DELETE_PAGE_SIZE,
+                delete_page_size,
                 next_token.as_deref(),
                 false,
             )

@@ -395,6 +395,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Server",
     },
     EnvVarEntry {
+        name: "DGP_RECURSIVE_DELETE_PAGE_SIZE",
+        description: "Objects listed+deleted per page of a recursive prefix delete. Lower it on memory-constrained nodes; bounded so a huge prefix can't balloon memory (default: 1000)",
+        example: "1000",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_READY_TIMEOUT_SECS",
         description: "Per-attempt backend timeout for the /_/ready probe (default: 3)",
         example: "3",
@@ -2991,14 +2997,15 @@ mod tests {
             "DGP_MAX_CONCURRENT_REQUESTS",           // startup::build_s3_router()
             "DGP_CORS_PERMISSIVE",                   // demo::ui_router()
             "DGP_REQUEST_TIMEOUT_SECS",              // startup::build_s3_router()
-            "DGP_READY_TIMEOUT_SECS",                // api::handlers::status::readiness_check()
-            "DGP_READY_RETRIES",                     // api::handlers::status::readiness_check()
-            "DGP_CODEC_TIMEOUT_SECS",                // deltaglider::codec::codec_timeout()
-            "DGP_CODEC_STALL_SECS",                  // deltaglider::codec::codec_stall_timeout()
-            "DGP_CODEC_ABSOLUTE_SECS",               // deltaglider::codec::codec_absolute_ceiling()
-            "DGP_SPOOL_DIR",                         // deltaglider::spool::SpoolDir::from_env()
-            "DGP_SPOOL_MAX_BYTES",                   // deltaglider::spool::SpoolDir::from_env()
-            "DGP_SPOOL_THRESHOLD_BYTES",             // engine::retrieve::spool_threshold()
+            "DGP_RECURSIVE_DELETE_PAGE_SIZE", // s3_adapter_s3s::recursive_delete_prefix_s3s()
+            "DGP_READY_TIMEOUT_SECS",         // api::handlers::status::readiness_check()
+            "DGP_READY_RETRIES",              // api::handlers::status::readiness_check()
+            "DGP_CODEC_TIMEOUT_SECS",         // deltaglider::codec::codec_timeout()
+            "DGP_CODEC_STALL_SECS",           // deltaglider::codec::codec_stall_timeout()
+            "DGP_CODEC_ABSOLUTE_SECS",        // deltaglider::codec::codec_absolute_ceiling()
+            "DGP_SPOOL_DIR",                  // deltaglider::spool::SpoolDir::from_env()
+            "DGP_SPOOL_MAX_BYTES",            // deltaglider::spool::SpoolDir::from_env()
+            "DGP_SPOOL_THRESHOLD_BYTES",      // engine::retrieve::spool_threshold()
             "DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", // engine::retrieve::reconstruct_delta_to_spool()
             "DGP_RATE_LIMIT_MAX_ATTEMPTS",    // rate_limiter::default_auth()
             "DGP_RATE_LIMIT_WINDOW_SECS",     // rate_limiter::default_auth()
