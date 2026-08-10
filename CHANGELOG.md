@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v1.19.0 — 2026-08-10
+
 ### Added — Cross-instance protection for the delta reference baseline
 
 Each deltaspace keeps one `reference.bin` baseline, and every delta in that
