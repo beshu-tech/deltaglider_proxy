@@ -407,6 +407,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Server",
     },
     EnvVarEntry {
+        name: "DGP_READY_CACHE_TTL_SECS",
+        description: "Last-known-good window for /_/ready. 0 (default) = strict: the ListBuckets probe must succeed. When >0, a throttled list falls back to a cheap HEAD reachability check, then to a backend call that succeeded within this many seconds — so a provider LIST throttle doesn't pull a serving node out of rotation",
+        example: "300",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_READY_RETRIES",
         description: "Extra /_/ready backend attempts after the first before reporting not-ready, with a short backoff (default: 2)",
         example: "2",
@@ -3000,6 +3006,7 @@ mod tests {
             "DGP_RECURSIVE_DELETE_PAGE_SIZE", // s3_adapter_s3s::recursive_delete_prefix_s3s()
             "DGP_READY_TIMEOUT_SECS",         // api::handlers::status::readiness_check()
             "DGP_READY_RETRIES",              // api::handlers::status::readiness_check()
+            "DGP_READY_CACHE_TTL_SECS",       // api::handlers::status::readiness_check()
             "DGP_CODEC_TIMEOUT_SECS",         // deltaglider::codec::codec_timeout()
             "DGP_CODEC_STALL_SECS",           // deltaglider::codec::codec_stall_timeout()
             "DGP_CODEC_ABSOLUTE_SECS",        // deltaglider::codec::codec_absolute_ceiling()
