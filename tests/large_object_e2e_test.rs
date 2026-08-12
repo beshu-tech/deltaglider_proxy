@@ -18,8 +18,8 @@ mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{
-    admin_http_client, big_passthrough_body, metrics_snapshot, minio_endpoint_url, wait_for_run,
-    TestServer,
+    admin_http_client, big_passthrough_body, latest_run_id, metrics_snapshot, minio_endpoint_url,
+    wait_for_run_after, TestServer,
 };
 use serde_json::Value;
 
@@ -53,17 +53,38 @@ replication:
 /// Trigger the replication rule synchronously and assert it succeeded.
 async fn run_now_ok(server: &TestServer) -> Value {
     let admin = admin_http_client(&server.endpoint()).await;
-    let resp = admin
-        .post(format!(
-            "{}/_/api/admin/jobs/replication:e2e/run-now",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .expect("run-now request");
-    // Fire-and-forget (202); poll the run history for the settled outcome.
-    assert_eq!(resp.status().as_u16(), 202, "run-now accepted");
-    let run = wait_for_run(&admin, &server.endpoint(), "e2e").await;
+    let url = format!(
+        "{}/_/api/admin/jobs/replication:e2e/run-now",
+        server.endpoint()
+    );
+    // Baseline the run history BEFORE triggering so we wait for a run NEWER than
+    // any already present — never a stale scheduled run.
+    let baseline = latest_run_id(&admin, &server.endpoint(), "e2e").await;
+    // The background scheduler ticks every 30s (DEFAULT_TICK) and may grab the
+    // rule's run lease just before us, so run-now transiently returns 409 ("a
+    // run or verify in progress" — the H14 double-run guard). That is a race,
+    // not a failure: retry with a short backoff until the in-flight run releases
+    // the lease and OUR run-now is accepted (202), so we still observe a fresh
+    // run reflecting the state we just seeded. Bounded so a genuine, persistent
+    // conflict (e.g. globally disabled) still surfaces as a test failure.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let resp = admin.post(&url).send().await.expect("run-now request");
+        let code = resp.status().as_u16();
+        if code == 202 {
+            break;
+        }
+        assert!(
+            code == 409 && std::time::Instant::now() < deadline,
+            "run-now not accepted: HTTP {code} — {}",
+            resp.text().await.unwrap_or_default()
+        );
+        // Visible in CI logs when the scheduler race actually fires, so the
+        // retry isn't silently masking a change in run-now's semantics.
+        eprintln!("run-now returned 409 (scheduler holds the lease) — retrying");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let run = wait_for_run_after(&admin, &server.endpoint(), "e2e", baseline).await;
     assert_eq!(run["status"].as_str(), Some("succeeded"), "run: {run}");
     run
 }
