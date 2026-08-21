@@ -1359,6 +1359,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         )
     }
 
+    /// Drop the cached metadata for one key. Used by the metadata-backfill
+    /// job after an in-place metadata rewrite — the 10-minute cache would
+    /// otherwise keep serving the pre-backfill (fallback) metadata on LIST.
+    pub fn invalidate_metadata_cache(&self, bucket: &str, key: &str) {
+        self.metadata_cache.invalidate(bucket, key);
+    }
+
     pub async fn head(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {
         // Note: we do NOT use the metadata cache for HEAD. The cache is used for
         // LIST enrichment and file_size correction, but HEAD must always verify

@@ -531,6 +531,70 @@ impl S3Backend {
         metadata.to_bare_metadata_map()
     }
 
+    /// Rewrite an object's metadata WITHOUT moving its bytes: a server-side
+    /// self-copy with `MetadataDirective: REPLACE`. Shared by
+    /// `put_reference_metadata` and `put_object_metadata`.
+    ///
+    /// x-amz-copy-source is URL-DECODED server-side, so the source must be
+    /// percent-encoded — a legal key char like '%', '?', '+' or '#' (e.g.
+    /// "sale 50% off/") would otherwise be an invalid escape and AWS/MinIO
+    /// reject the CopyObject with 400. Encoded per path segment so the '/'
+    /// separators are preserved.
+    ///
+    /// REPLACE resets content-type along with the metadata, so the metadata's
+    /// content_type is re-asserted explicitly. Native SSE headers are applied
+    /// the same way the PUT path does — a bucket policy that enforces
+    /// encryption would otherwise reject the copy. CopyObject caps at 5 GiB
+    /// on AWS; larger objects fail here with the service error (callers
+    /// record it per-object rather than aborting a whole job).
+    async fn replace_metadata_in_place(
+        &self,
+        bucket: &str,
+        key: &str,
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        let copy_source = format!("{}/{}", bucket, encode_copy_source_key(key));
+        let headers = self.metadata_to_headers(metadata);
+
+        let mut request = self
+            .client
+            .copy_object()
+            .bucket(bucket)
+            .copy_source(&copy_source)
+            .key(key)
+            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace);
+        if let Some(ct) = metadata.content_type.as_deref() {
+            request = request.content_type(ct);
+        }
+        {
+            use aws_sdk_s3::types::ServerSideEncryption;
+            match &self.native_encryption {
+                NativeEncryptionConfig::None => {}
+                NativeEncryptionConfig::SseS3 => {
+                    request = request.server_side_encryption(ServerSideEncryption::Aes256);
+                }
+                NativeEncryptionConfig::SseKms {
+                    kms_key_id,
+                    bucket_key_enabled,
+                } => {
+                    request = request
+                        .server_side_encryption(ServerSideEncryption::AwsKms)
+                        .ssekms_key_id(kms_key_id.clone())
+                        .bucket_key_enabled(*bucket_key_enabled);
+                }
+            }
+        }
+
+        for (k, v) in headers {
+            request = request.metadata(k, v);
+        }
+
+        request.send().await.map_err(|e| {
+            Self::classify_s3_error(bucket, &e, S3Op::Other("copy_object (metadata update)"))
+        })?;
+        Ok(())
+    }
+
     /// Convert S3 metadata headers to FileMetadata
     /// `created_at_fallback` is the object's stable S3 `LastModified`, used when
     /// the DG metadata omits `dg-created-at`. NEVER fall back to `Utc::now()`
@@ -1411,31 +1475,24 @@ impl StorageBackend for S3Backend {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let key = self.reference_key(prefix);
-        // x-amz-copy-source is URL-DECODED server-side, so the caller must
-        // percent-encode it — a legal key char like '%', '?', '+' or '#' in the
-        // prefix (e.g. "sale 50% off/") would otherwise be an invalid escape and
-        // AWS/MinIO reject the CopyObject with 400. Encode per path segment so
-        // the '/' separators are preserved.
-        let copy_source = format!("{}/{}", bucket, encode_copy_source_key(&key));
-        let headers = self.metadata_to_headers(metadata);
-
-        let mut request = self
-            .client
-            .copy_object()
-            .bucket(bucket)
-            .copy_source(&copy_source)
-            .key(&key)
-            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace);
-
-        for (k, v) in headers {
-            request = request.metadata(k, v);
-        }
-
-        request.send().await.map_err(|e| {
-            Self::classify_s3_error(bucket, &e, S3Op::Other("copy_object (metadata update)"))
-        })?;
-
+        self.replace_metadata_in_place(bucket, &key, metadata)
+            .await?;
         debug!("Updated reference metadata for {}/{}", bucket, prefix);
+        Ok(())
+    }
+
+    #[instrument(skip(self, metadata))]
+    async fn put_passthrough_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        let key = self.passthrough_key(prefix, filename);
+        self.replace_metadata_in_place(bucket, &key, metadata)
+            .await?;
+        debug!("Updated passthrough metadata for {}/{}", bucket, key);
         Ok(())
     }
 

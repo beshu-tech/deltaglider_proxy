@@ -421,6 +421,7 @@ jobs:
             --test iam_mode_test \
             --test iam_variables_clone_test \
             --test lifecycle_test \
+            --test maintenance_backfill_test \
             --test maintenance_reencrypt_test \
             --test migrate_job_test \
             --test mismatch_boot_test \

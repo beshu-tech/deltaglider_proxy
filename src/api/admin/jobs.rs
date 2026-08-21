@@ -281,6 +281,13 @@ fn maintenance_job_view(j: &MaintenanceJob) -> JobView {
             ),
             Err(_) => (None, serde_json::json!({})),
         },
+        ("backfill-metadata", Some(p)) => match crate::maintenance::backfill::parse_params(p) {
+            Ok(bp) => (
+                None,
+                serde_json::json!({ "refresh_last_modified": bp.refresh_last_modified }),
+            ),
+            Err(_) => (None, serde_json::json!({})),
+        },
         _ => (None, serde_json::json!({})),
     };
     JobView {

@@ -2,13 +2,18 @@
 
 //! One-off bucket maintenance jobs.
 //!
-//! v1 ships a single kind: **`reencrypt`** — rewrite every object in a
-//! bucket through the engine so its at-rest encryption state matches the
-//! backend's CURRENT config. One uniform, canned procedure covers all
-//! three transitions: enable (encrypt plaintext objects), rotate
-//! (re-encrypt under the new key), disable (decrypt back to plaintext).
-//! Objects already in the desired state are skipped, which makes the job
-//! idempotent and resumable.
+//! Three kinds:
+//!
+//! - **`reencrypt`** — rewrite every object in a bucket through the engine
+//!   so its at-rest encryption state matches the backend's CURRENT config.
+//!   One uniform, canned procedure covers all three transitions: enable
+//!   (encrypt plaintext objects), rotate (re-encrypt under the new key),
+//!   disable (decrypt back to plaintext). Objects already in the desired
+//!   state are skipped, which makes the job idempotent and resumable.
+//! - **`migrate`** (see [`migrate`]) — move a bucket to another backend.
+//! - **`backfill-metadata`** (see [`backfill`]) — stamp the canonical DG
+//!   metadata onto passthrough objects that lack it, in place (S3
+//!   self-copy / xattr write), reading bytes only to compute the hashes.
 //!
 //! Architecture (mirrors `src/replication/` / `src/lifecycle/`):
 //!
@@ -35,6 +40,7 @@
 //! already have. The leader lease prevents double-running on one
 //! instance's DB, nothing more.
 
+pub mod backfill;
 pub mod gate;
 pub mod migrate;
 pub mod store;

@@ -206,6 +206,8 @@ export function kindLabel(kind: JobKind): string {
       return 'Re-encrypt';
     case 'migrate':
       return 'Migrate';
+    case 'backfill-metadata':
+      return 'Backfill metadata';
     default:
       return kind;
   }

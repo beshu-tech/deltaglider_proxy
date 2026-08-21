@@ -120,7 +120,11 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                             Err(LEASE_LOST) on refused renewal → phase stops, row NOT settled), migrate.rs (kind=migrate: stage→copy→verify→
                             flip→cleanup, transient __dgmigrate_* routes — gated from creation, filtered out of all bucket listings, cleared at
                             flip; pre-flip cancel unwind; cleanup re-checks routed_to_target PER SWEEP; cancel-in-cleanup settles completed with
-                            a note), mod.rs (pure: resolve_desired/needs_rewrite/progress_percent/display_percent)
+                            a note), backfill.rs (kind=backfill-metadata: stamp canonical DG metadata onto foreign/pre-proxy passthrough objects
+                            IN PLACE — bytes read once to hash, written never: S3 self-copy REPLACE / xattr rewrite via
+                            StorageBackend::put_passthrough_metadata; dg-created-at pinned to the pre-job time unless refresh_last_modified,
+                            multipart ETag preserved via dg-multipart-etag; POST /jobs/backfill-metadata),
+                            mod.rs (pure: resolve_desired/needs_rewrite/progress_percent/display_percent)
   → config_apply.rs         ConfigMutator: mutate → rebuild engine (rollback on failure) → persist, for BACKGROUND tasks (migrate flips);
                             admin rebuild_engine delegates to rebuild_engine_only
   → job_loop.rs             THE canonical pagination state machine (Pager): token threading, resume detection, poison-token

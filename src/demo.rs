@@ -329,6 +329,10 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             "/_/api/admin/jobs/reencrypt",
             post(admin::maintenance_start_reencrypt),
         )
+        .route(
+            "/_/api/admin/jobs/backfill-metadata",
+            post(admin::maintenance_start_backfill),
+        )
         .route("/_/api/admin/jobs/:id/runs", get(admin::jobs_runs))
         .route("/_/api/admin/jobs/:id/failures", get(admin::jobs_failures))
         // `verify` is a LITERAL segment handling BOTH GET (poll status) and POST

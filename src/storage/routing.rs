@@ -922,6 +922,23 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, get_passthrough_metadata, prefix, filename)
     }
 
+    async fn put_passthrough_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        route_existing!(
+            self,
+            bucket,
+            put_passthrough_metadata,
+            prefix,
+            filename,
+            metadata
+        )
+    }
+
     async fn delete_passthrough(
         &self,
         bucket: &str,
