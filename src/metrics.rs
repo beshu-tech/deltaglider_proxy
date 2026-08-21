@@ -532,6 +532,20 @@ impl Metrics {
             .unwrap()
         );
 
+        // Delegated-listing request-amplification counters (issue #82). These
+        // live as statics in `storage::s3` (the backend has no Metrics handle);
+        // registering the clones here puts them on the same /_/metrics scrape.
+        registry
+            .register(Box::new(
+                crate::storage::DELEGATED_LIST_UPSTREAM_PAGES.clone(),
+            ))
+            .expect("duplicate metric name");
+        registry
+            .register(Box::new(
+                crate::storage::DELEGATED_LIST_PROBE_REQUESTS.clone(),
+            ))
+            .expect("duplicate metric name");
+
         Metrics {
             registry,
             process_start_time_seconds,

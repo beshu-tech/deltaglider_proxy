@@ -46,6 +46,32 @@ use std::collections::{HashMap, HashSet};
 
 use tracing::{debug, instrument, warn};
 
+/// Upstream `ListObjectsV2` pages fetched by `list_objects_delegated`'s loop.
+/// Observable request-amplification counter (issue #82): a healthy anchored
+/// listing costs ~1 page per served page; a subtree drain costs O(subtree).
+/// Registered into the Prometheus registry by `Metrics::new()`; a static so
+/// the backend needs no `Metrics` handle. Tests gate on counts, never
+/// wall-clock (same doctrine as `replication_list_calls_total`).
+pub static DELEGATED_LIST_UPSTREAM_PAGES: std::sync::LazyLock<prometheus::IntCounter> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounter::new(
+            "deltaglider_delegated_list_upstream_pages_total",
+            "Upstream ListObjectsV2 pages fetched by delegated listings",
+        )
+        .expect("valid metric")
+    });
+
+/// Exact-key confirmation probes issued after an anchored early exit
+/// (`confirmable_candidates`). Bounded per page by the anchor's length.
+pub static DELEGATED_LIST_PROBE_REQUESTS: std::sync::LazyLock<prometheus::IntCounter> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounter::new(
+            "deltaglider_delegated_list_probe_requests_total",
+            "Exact-key confirmation probes issued by delegated listings",
+        )
+        .expect("valid metric")
+    });
+
 /// Resolve an object's `created_at` from its (optional) `dg-created-at`
 /// metadata value, falling back to `fallback` (the object's stable S3
 /// `LastModified`) when the value is absent OR unparseable.
@@ -2108,7 +2134,7 @@ impl StorageBackend for S3Backend {
     ) -> Result<Option<DelegatedListResult>, StorageError> {
         // We need to over-fetch from upstream because internal files
         // (reference.bin, .delta suffixes) inflate the key count — but only
-        // until the page is provably complete (see fetch_boundary below), not
+        // until the page is provably complete (see `list_anchor` below), not
         // until the prefix is exhausted (the old behaviour materialised the
         // whole subtree on delimiter-less lists — the audit's memory HIGH).
         let mut all_common_prefixes = std::collections::BTreeSet::new();
@@ -2146,6 +2172,7 @@ impl StorageBackend for S3Backend {
                 .send()
                 .await
                 .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))?;
+            DELEGATED_LIST_UPSTREAM_PAGES.inc();
 
             // Collect CommonPrefixes, skipping ONLY the `.dg/` internal deltaspace
             // directory (never a user-visible key). Deliberately narrow: an
@@ -2199,40 +2226,64 @@ impl StorageBackend for S3Backend {
             }
         }
 
-        // The loop stopped at the anchor, so any raw key of the form
-        // `p + ".delta"` (p a prefix of the anchor) that sorts above the anchor
-        // has not been read yet, and each one still belongs on the page. Confirm
-        // that bounded set with one exact request each. Reading forward to their
-        // maximum instead is what made a delimiter-less listing walk the whole
-        // subtree (issue #82).
+        // The loop stopped at the anchor, so a raw key of the form
+        // `p + ".delta"` (p a proper prefix of the anchor) that sorts above the
+        // anchor may not have been read yet, and each one still belongs on the
+        // page. Confirm that bounded set with one exact request each — reading
+        // forward to their maximum instead is what made a delimiter-less
+        // listing walk the whole subtree (issue #82). `confirmable_candidates`
+        // owns the eligibility decision (request-prefix scope, delimiter
+        // collapse, already-read skip) so it stays unit-testable.
         if let Some(anchor) = settled_anchor {
-            let candidates = late_delta_candidates(&anchor);
-            let mut added = false;
-            for candidate in candidates {
-                let found = self
-                    .client
-                    .list_objects_v2()
-                    .bucket(bucket)
-                    .prefix(&candidate)
-                    .max_keys(1)
-                    .send()
-                    .await
-                    .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))?;
-                if let Some(contents) = found.contents {
-                    for obj in contents {
-                        if obj.key.as_deref() == Some(candidate.as_str()) {
-                            if let Some(listed) = S3ListedObject::from_s3_object(obj) {
-                                raw_objects.push(listed);
-                                added = true;
-                            }
-                        }
-                    }
+            let last_read = raw_objects.last().map(|o| o.key.clone());
+            let candidates =
+                confirmable_candidates(&anchor, prefix, delimiter, last_read.as_deref());
+            // Probes are independent; run them concurrently (bounded, same
+            // doctrine as `bounded_head_calls` — never blast the backend).
+            // A probe error fails the listing closed, deliberately: silently
+            // skipping a candidate would drop a user-visible key, and the
+            // probes are the same failure class as the page fetches above.
+            let probes = candidates.into_iter().map(|candidate| {
+                let client = self.client.clone();
+                let bucket = bucket.to_string();
+                async move {
+                    DELEGATED_LIST_PROBE_REQUESTS.inc();
+                    // `max_keys(3)`: the exact key sorts first among keys
+                    // sharing its prefix, and the next slots catch foreign
+                    // multi-suffix forms (`candidate + ".delta"…`) that
+                    // classification also maps to the candidate's user key.
+                    let found = client
+                        .list_objects_v2()
+                        .bucket(&bucket)
+                        .prefix(&candidate)
+                        .max_keys(3)
+                        .send()
+                        .await
+                        .map_err(|e| Self::classify_s3_error(&bucket, &e, S3Op::ListObjects))?;
+                    let hits: Vec<S3ListedObject> = found
+                        .contents
+                        .into_iter()
+                        .flatten()
+                        .filter(|obj| {
+                            obj.key
+                                .as_deref()
+                                .is_some_and(|k| probe_hit_serves_candidate(k, &candidate))
+                        })
+                        .filter_map(S3ListedObject::from_s3_object)
+                        .collect();
+                    Ok::<_, StorageError>(hits)
                 }
-            }
-            // Downstream classification and pagination assume ascending key
-            // order, which the upstream pages gave us for free until now.
-            if added {
-                raw_objects.sort_by(|a, b| a.key.cmp(&b.key));
+            });
+            let results: Vec<Result<Vec<S3ListedObject>, StorageError>> =
+                futures::stream::iter(probes)
+                    .buffer_unordered(Self::MAX_CONCURRENT_HEADS)
+                    .collect()
+                    .await;
+            for result in results {
+                // No ordering fix-up needed: `dedup_keep_latest` keys by user
+                // key and `interleave_and_paginate` sorts every entry itself —
+                // ordering (and duplicate absorption) is owned downstream.
+                raw_objects.extend(result?);
             }
         }
 
@@ -2302,21 +2353,16 @@ impl StorageBackend for S3Backend {
 
 /// Early-exit decision for the delegated-listing fetch loop.
 ///
-/// Given the raw keys + common prefixes fetched so far, returns the raw-key
-/// boundary past which the final page of `max_keys` user-visible entries is
-/// provably complete — or `None` when more candidates are still needed.
-///
-/// The horizon is `max(p + ".delta")` over EVERY prefix `p` of the anchor key
-/// `U` (the (max_keys+1)-th distinct user key — its existence also proves
-/// `is_truncated`). A raw key maps to a user key by at most stripping
-/// `.delta`, so a raw key whose user key `u` sorts ≤ U is either `u` itself
-/// (≤ U ≤ horizon) or `u + ".delta"`; if `u` is not a prefix of U the suffix
-/// never gets compared (`u.delta` < U ≤ horizon), and if it IS a prefix it is
-/// covered by the max. The naive `U + ".delta"` horizon is WRONG for
-/// prefix-sharing names — "v1" < "v1.2" but "v1.delta" > "v1.2.delta" — so a
-/// page containing `v1` would early-exit before its raw key `v1.delta`
-/// arrived and silently drop the object (see
-/// `boundary_prefix_chain_regression`).
+/// Given the raw keys + common prefixes fetched so far, returns the anchor —
+/// the (max_keys+1)-th distinct user-visible key past the continuation token
+/// (its existence also proves `is_truncated`) — or `None` when more
+/// candidates are still needed. The fetch loop stops as soon as the last raw
+/// key read sorts above the anchor: everything the page can still be missing
+/// at that point is the bounded set `confirmable_candidates` enumerates, and
+/// the caller confirms those with one exact request each. Raw sort order is
+/// NOT user sort order for `.delta` keys ("v1" < "v1.2" but "v1.delta" >
+/// "v1.2.delta"), which is why stopping at the anchor alone would drop keys
+/// (see `late_candidates_cover_the_prefix_chain_regression`).
 ///
 /// Distinct counting matters too: `k` and `k.delta` dedup into one entry, so
 /// counting duplicates could stop the fetch with an under-filled page and a
@@ -2335,10 +2381,11 @@ fn list_anchor<'a>(
             continue;
         }
         // Strip ALL trailing `.delta` (not just one) so this matches the
-        // classification path (trim_end_matches at s3.rs:1019/1170). Otherwise a
-        // foreign pair `b.delta` + `b.delta.delta` counts as TWO distinct
-        // candidates here but dedups to ONE served entry, over-counting the
-        // anchor and risking a dropped page tail.
+        // classification path (`trim_end_matches` in `classify_listed_objects`
+        // and the lite-metadata builder). Otherwise a foreign pair `b.delta` +
+        // `b.delta.delta` counts as TWO distinct candidates here but dedups to
+        // ONE served entry, over-counting the anchor and risking a dropped
+        // page tail.
         let user_key: &str = key.trim_end_matches(".delta");
         if user_key > token {
             candidates.insert(user_key);
@@ -2357,28 +2404,100 @@ fn list_anchor<'a>(
         .map(|s| (*s).to_string())
 }
 
-/// Raw keys that can sort ABOVE `anchor` and still map to a user key at or
-/// below it — the only keys the fetch loop can still be missing once it has
-/// passed the anchor.
+/// Raw keys that can sort ABOVE `anchor` and still map to a user key BELOW
+/// it — the only keys the fetch loop can still be missing once it has passed
+/// the anchor.
 ///
-/// Such a key must be `p + ".delta"` for some prefix `p` of `anchor`. If the
-/// user key `u` is NOT a prefix of the anchor, the first differing character
-/// already decides the order, so `u + ".delta"` stays below the anchor as well
-/// and has therefore already arrived. The set is never larger than the anchor
-/// is long, and every member is an EXACT key, so each one costs a single cheap
-/// request to confirm.
+/// Such a key must be `p + ".delta"` for some PROPER prefix `p` of `anchor`.
+/// If the user key `u` is not a prefix of the anchor, the first differing
+/// character already decides the order, so `u + ".delta"` stays below the
+/// anchor as well and has therefore already arrived. The full-anchor form
+/// `anchor + ".delta"` is deliberately excluded: its user key IS the anchor,
+/// which is already represented (the anchor was derived from a raw key or
+/// common prefix the loop has read), so probing it is a guaranteed no-op.
+/// The set is never larger than the anchor is long, and every member is an
+/// EXACT key, so each one costs a single cheap request to confirm.
 ///
 /// This replaces the old horizon, which was the MAXIMUM of this same set. That
 /// maximum is correct but unreachable for hierarchical keys: for the anchor
 /// `ror/builds/1.0.1/app.zip` it is `ror/builds/1.delta`, which sorts after the
 /// complete `ror/builds/1.*` subtree, so the loop read the whole subtree before
 /// it could stop (issue #82).
+///
+/// This is pure candidate arithmetic; `confirmable_candidates` applies the
+/// request-scope filters before any probe is issued.
 fn late_delta_candidates(anchor: &str) -> Vec<String> {
-    (1..=anchor.len())
+    (1..anchor.len())
         .filter(|&n| anchor.is_char_boundary(n))
         .map(|n| format!("{}.delta", &anchor[..n]))
         .filter(|candidate| candidate.as_str() > anchor)
         .collect()
+}
+
+/// The late-delta candidates that are actually worth a confirmation probe for
+/// THIS request. Pure — the whole eligibility decision is unit-testable.
+///
+/// Three filters on top of `late_delta_candidates`:
+///
+/// 1. **Request-prefix scope.** The fetch loop only ever reads keys under
+///    `request_prefix`, but a candidate built from a prefix of the anchor
+///    SHORTER than the request prefix names a key OUTSIDE the listing scope
+///    (e.g. anchor `app-v1/b-2/x` yields `app.delta`). Probing it would
+///    inject a foreign object into the page, violating the S3 Prefix
+///    contract.
+/// 2. **Delimiter collapse.** With a delimiter, a candidate whose user key
+///    contains the delimiter beyond the request prefix lives inside a
+///    collapsed subtree: upstream reports it as a CommonPrefix (always the
+///    anchor's own covering prefix, already collected), never as Contents.
+///    Probing it would serve the same name as both an object and a
+///    CommonPrefix.
+/// 3. **Already read.** The loop breaks at an upstream page boundary, so raw
+///    keys up to `last_read` are all in hand. If a candidate sorts below
+///    `last_read` and is not a prefix of it, every key extending the
+///    candidate also sorts below `last_read` — the probe cannot find
+///    anything new. (When the candidate IS a prefix of `last_read`, foreign
+///    multi-suffix forms may still lie beyond it, so the probe stays.)
+fn confirmable_candidates(
+    anchor: &str,
+    request_prefix: &str,
+    delimiter: Option<&str>,
+    last_read: Option<&str>,
+) -> Vec<String> {
+    late_delta_candidates(anchor)
+        .into_iter()
+        .filter(|c| c.starts_with(request_prefix))
+        .filter(|c| match delimiter {
+            Some(d) if !d.is_empty() => {
+                // `c` = user key + ".delta" by construction (single suffix).
+                let user = c.strip_suffix(".delta").unwrap_or(c);
+                !user
+                    .get(request_prefix.len().min(user.len())..)
+                    .unwrap_or("")
+                    .contains(d)
+            }
+            _ => true,
+        })
+        .filter(|c| match last_read {
+            Some(last) => c.as_str() >= last || last.starts_with(c.as_str()),
+            None => true,
+        })
+        .collect()
+}
+
+/// Does a key returned by a `prefix(candidate)` probe serve the candidate's
+/// user key? True for the exact candidate and for foreign multi-suffix forms
+/// (`candidate + ".delta"`, `candidate + ".delta.delta"`, …), which the
+/// classification path (`trim_end_matches(".delta")`) maps to the same user
+/// key. Anything else under the prefix (`p.deltafoo`, `p.delta/x`) is a
+/// different user key and must not be injected here.
+fn probe_hit_serves_candidate(key: &str, candidate: &str) -> bool {
+    key.strip_prefix(candidate).is_some_and(|rest| {
+        rest.len() % ".delta".len() == 0
+            && rest
+                .as_bytes()
+                .chunks(".delta".len())
+                .all(|c| c == b".delta")
+    })
 }
 
 /// Apply native S3 encryption headers to a PutObject builder in
@@ -2551,6 +2670,94 @@ mod tests {
         assert!(c.len() <= a.len());
         // The specific key the old horizon reached forward to.
         assert!(c.contains(&"ror/builds/1.delta".to_string()), "{c:?}");
+        // The full-anchor form is a guaranteed no-op (its user key IS the
+        // anchor, already represented) and must be excluded.
+        assert!(!c.contains(&format!("{a}.delta")), "{c:?}");
+    }
+
+    #[test]
+    fn late_candidates_dot_anchor_keeps_the_bare_extension_edge() {
+        // The `candidate > anchor` filter's equal-until-extension edge: for
+        // anchor "a." the candidate "a.delta" shares the whole "a." and wins
+        // only as a proper extension. A tightened comparison (>=, prefix
+        // compare, trim-based) would drop it — and with it user key "a."'s
+        // sibling "a" from delimiter-less listings.
+        let c = late_delta_candidates("a.");
+        assert!(c.contains(&"a.delta".to_string()), "{c:?}");
+        // The full-anchor form "a..delta" (user key = the anchor "a.") is
+        // excluded like every other full-anchor form.
+        assert!(!c.contains(&"a..delta".to_string()), "{c:?}");
+    }
+
+    #[test]
+    fn confirmable_candidates_never_escape_the_request_prefix() {
+        // Regression: bucket holds user object `app` (raw `app.delta`) next to
+        // an `app-v1/` subtree. A listing scoped to `app-v1/` must NOT probe
+        // `app.delta` — serving it would inject a key from outside the
+        // requested prefix into the page ('.' 0x2E > '-' 0x2D makes it sort
+        // above the anchor, so only the scope filter stands in the way).
+        let anchor = "app-v1/b-2/x";
+        let unscoped = confirmable_candidates(anchor, "", None, None);
+        assert!(unscoped.contains(&"app.delta".to_string()), "{unscoped:?}");
+        let scoped = confirmable_candidates(anchor, "app-v1/", None, None);
+        assert!(!scoped.contains(&"app.delta".to_string()), "{scoped:?}");
+        // In-scope candidates survive the filter.
+        assert!(scoped.contains(&"app-v1/b.delta".to_string()), "{scoped:?}");
+    }
+
+    #[test]
+    fn confirmable_candidates_skip_delimiter_collapsed_subtrees() {
+        // With a delimiter, a candidate whose user key lives below a collapsed
+        // CommonPrefix must not be probed: upstream reports that subtree as
+        // the CP itself, and serving the raw key as Contents would list the
+        // same name twice. Anchor is the CP `P/dir-x/s-1/`; candidate
+        // `P/dir-x/s.delta` sorts above it ('.' > '-') but its user key
+        // `P/dir-x/s` is inside the collapsed `P/dir-x/` subtree.
+        let anchor = "P/dir-x/s-1/";
+        let no_delim = confirmable_candidates(anchor, "P/", None, None);
+        assert!(
+            no_delim.contains(&"P/dir-x/s.delta".to_string()),
+            "{no_delim:?}"
+        );
+        let delim = confirmable_candidates(anchor, "P/", Some("/"), None);
+        assert!(!delim.contains(&"P/dir-x/s.delta".to_string()), "{delim:?}");
+    }
+
+    #[test]
+    fn confirmable_candidates_skip_keys_already_read() {
+        // The loop breaks at an upstream page boundary, so keys up to the last
+        // raw key read are in hand. A candidate strictly below it (and not a
+        // prefix of it) cannot yield anything new — no probe. A candidate that
+        // IS a prefix of the last-read key stays probed: foreign multi-suffix
+        // forms can still lie beyond the boundary.
+        let anchor = "v1.2.3";
+        let all = confirmable_candidates(anchor, "", None, None);
+        assert!(all.contains(&"v1.2.delta".to_string()), "{all:?}");
+        // last read past v1.2.delta and not extending it → skip.
+        let skipped = confirmable_candidates(anchor, "", None, Some("v1.2.x"));
+        assert!(!skipped.contains(&"v1.2.delta".to_string()), "{skipped:?}");
+        // last read extends the candidate → keep probing beyond it.
+        let kept = confirmable_candidates(anchor, "", None, Some("v1.2.delta.5"));
+        assert!(kept.contains(&"v1.2.delta".to_string()), "{kept:?}");
+        // last read below the candidate → nothing above it was read → keep.
+        let below = confirmable_candidates(anchor, "", None, Some("v1.2.4"));
+        assert!(below.contains(&"v1.2.delta".to_string()), "{below:?}");
+    }
+
+    #[test]
+    fn probe_hit_accepts_exact_and_foreign_multi_suffix_forms_only() {
+        // The classification path strips ALL trailing ".delta" repetitions,
+        // so a foreign `p.delta.delta` serves user key `p` exactly like
+        // `p.delta` does — the probe must accept it or the key vanishes from
+        // anchored listings. Anything else under the prefix is a different
+        // user key.
+        assert!(probe_hit_serves_candidate("p.delta", "p.delta"));
+        assert!(probe_hit_serves_candidate("p.delta.delta", "p.delta"));
+        assert!(probe_hit_serves_candidate("p.delta.delta.delta", "p.delta"));
+        assert!(!probe_hit_serves_candidate("p.deltafoo", "p.delta"));
+        assert!(!probe_hit_serves_candidate("p.delta.x", "p.delta"));
+        assert!(!probe_hit_serves_candidate("p.delta/x", "p.delta"));
+        assert!(!probe_hit_serves_candidate("q.delta", "p.delta"));
     }
 
     #[test]
