@@ -44,6 +44,11 @@ struct StoreContext<'a> {
     /// (H1 correctness fix). Normal single-PUT writes pass `None` and
     /// get the standard full-body-MD5 ETag.
     multipart_etag: Option<String>,
+    /// 256-bit SimHash similarity sketch (hex-encoded) computed from the
+    /// object's own bytes. Stamped on every `FileMetadata` produced by
+    /// this PUT so future reference-selection logic can find the most
+    /// similar historical object without reading file contents.
+    sketch: Option<String>,
 }
 
 /// Apply continuation-token filtering and max-keys truncation to a sorted list.

@@ -492,6 +492,7 @@ jobs:
             --test delta_test \
             --test optimization_test \
             --test memory_test \
+            --test sketch_metadata_test \
             -- --nocapture
 
   e2e-smoke:

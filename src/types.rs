@@ -38,6 +38,7 @@ pub mod meta_keys {
     pub const REF_SHA256: &str = "dg-ref-sha256";
     pub const DELTA_SIZE: &str = "dg-delta-size";
     pub const DELTA_CMD: &str = "dg-delta-cmd";
+    pub const SKETCH: &str = "dg-sketch";
 
     /// S3 response header prefix for user-defined metadata.
     pub const AMZ_META_PREFIX: &str = "x-amz-meta-";
@@ -232,6 +233,15 @@ pub struct FileMetadata {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub user_metadata: HashMap<String, String>,
 
+    /// 256-bit SimHash similarity sketch (hex-encoded, 64 chars) computed from
+    /// the object's own bytes via FastCDC content-defined chunking + SimHash.
+    /// Intrinsic to the object — does NOT depend on which reference was chosen
+    /// for delta encoding. Used by future reference-selection logic to find the
+    /// most similar historical object for a new PUT. Absent on legacy objects
+    /// (deserializes as `None`); populated on every new delta-eligible PUT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sketch: Option<String>,
+
     /// Storage type specific fields
     #[serde(flatten)]
     pub storage_info: StorageInfo,
@@ -309,6 +319,7 @@ impl FileMetadata {
             created_at: Utc::now(),
             content_type,
             user_metadata: HashMap::new(),
+            sketch: None,
             storage_info: StorageInfo::Reference { source_name },
         }
     }
@@ -339,6 +350,7 @@ impl FileMetadata {
             created_at: Utc::now(),
             content_type,
             user_metadata: HashMap::new(),
+            sketch: None,
             storage_info: StorageInfo::Delta {
                 ref_path,
                 ref_sha256,
@@ -366,6 +378,7 @@ impl FileMetadata {
             created_at: Utc::now(),
             content_type,
             user_metadata: HashMap::new(),
+            sketch: None,
             storage_info: StorageInfo::Passthrough,
         }
     }
@@ -391,6 +404,7 @@ impl FileMetadata {
             created_at,
             content_type,
             user_metadata: HashMap::new(),
+            sketch: None,
             storage_info,
         }
     }
@@ -407,6 +421,7 @@ impl FileMetadata {
             created_at: Utc::now(),
             content_type: Some("application/x-directory".to_string()),
             user_metadata: HashMap::new(),
+            sketch: None,
             storage_info: StorageInfo::Passthrough,
         }
     }
@@ -431,6 +446,9 @@ impl FileMetadata {
         }
         if let Some(ref ct) = self.content_type {
             map.insert("content-type".to_string(), ct.clone());
+        }
+        if let Some(ref sketch) = self.sketch {
+            map.insert(mk::SKETCH.to_string(), sketch.clone());
         }
         map.insert(
             mk::CREATED_AT.to_string(),

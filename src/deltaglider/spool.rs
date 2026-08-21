@@ -78,6 +78,7 @@ impl SpoolDir {
         })
     }
 
+    #[allow(dead_code)]
     pub fn max_bytes(&self) -> u64 {
         self.max_bytes
     }

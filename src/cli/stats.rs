@@ -675,6 +675,7 @@ mod tests {
             created_at: Utc::now(),
             content_type: None,
             user_metadata: Default::default(),
+            sketch: None,
             storage_info: info,
         }
     }

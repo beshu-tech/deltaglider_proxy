@@ -716,6 +716,7 @@ impl S3Backend {
             // `.cloned()` would yield Some("") and emit a blank content-type.
             content_type: get_value(&["content-type"]),
             user_metadata,
+            sketch: get_value(&["dg-sketch"]),
             storage_info,
         })
     }
