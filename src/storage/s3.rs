@@ -531,6 +531,41 @@ impl S3Backend {
         metadata.to_bare_metadata_map()
     }
 
+    /// Headers for a write (PUT / CreateMultipartUpload): the DG metadata
+    /// plus the native-encryption marker, trimmed to the S3 user-metadata
+    /// budget by [`fit_user_metadata_budget`].
+    fn write_headers(
+        &self,
+        bucket: &str,
+        key: &str,
+        metadata: &FileMetadata,
+    ) -> Result<HashMap<String, String>, StorageError> {
+        let mut headers = self.metadata_to_headers(metadata);
+        // Stamp the native-encryption marker so reads know this object
+        // was encrypted by AWS (not by the proxy's `EncryptingBackend`
+        // wrapper). The marker is plaintext in user-metadata — SSE-KMS
+        // does NOT encrypt `x-amz-meta-*` headers, only the body.
+        // This is acceptable because DG metadata is never considered
+        // secret (see docs/product/reference/encryption-at-rest.md).
+        if let Some(marker) = self.native_encryption.marker() {
+            headers.insert("dg-encrypted-native".to_string(), marker.to_string());
+        }
+        match fit_user_metadata_budget(&mut headers) {
+            Ok(Some(dropped)) => debug!(
+                "{}/{}: user metadata over S3's 2 KiB budget — dropped advisory {}",
+                bucket, key, dropped
+            ),
+            Ok(None) => {}
+            Err(size) => {
+                return Err(StorageError::Other(format!(
+                    "DG metadata exceeds S3's 2KB limit ({} bytes) for {}/{}",
+                    size, bucket, key
+                )));
+            }
+        }
+        Ok(headers)
+    }
+
     /// Rewrite an object's metadata WITHOUT moving its bytes: a server-side
     /// self-copy with `MetadataDirective: REPLACE`. Shared by
     /// `put_reference_metadata` and `put_object_metadata`.
@@ -733,25 +768,7 @@ impl S3Backend {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let mut headers = self.metadata_to_headers(metadata);
-        // Stamp the native-encryption marker so reads know this object
-        // was encrypted by AWS (not by the proxy's `EncryptingBackend`
-        // wrapper). The marker is plaintext in user-metadata — SSE-KMS
-        // does NOT encrypt `x-amz-meta-*` headers, only the body.
-        // This is acceptable because DG metadata is never considered
-        // secret (see docs/product/reference/encryption-at-rest.md).
-        if let Some(marker) = self.native_encryption.marker() {
-            headers.insert("dg-encrypted-native".to_string(), marker.to_string());
-        }
-
-        // S3 has a 2KB limit on total user metadata size. Warn if we're close.
-        let total_meta_size: usize = headers.iter().map(|(k, v)| k.len() + v.len()).sum();
-        if total_meta_size > 2048 {
-            return Err(StorageError::Other(format!(
-                "DG metadata exceeds S3's 2KB limit ({} bytes) for {}/{}",
-                total_meta_size, bucket, key
-            )));
-        }
+        let headers = self.write_headers(bucket, key, metadata)?;
 
         let backoff_ms = [100, 200, 400];
 
@@ -836,17 +853,7 @@ impl S3Backend {
         source_path: &std::path::Path,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let mut headers = self.metadata_to_headers(metadata);
-        if let Some(marker) = self.native_encryption.marker() {
-            headers.insert("dg-encrypted-native".to_string(), marker.to_string());
-        }
-        let total_meta_size: usize = headers.iter().map(|(k, v)| k.len() + v.len()).sum();
-        if total_meta_size > 2048 {
-            return Err(StorageError::Other(format!(
-                "DG metadata exceeds S3's 2KB limit ({} bytes) for {}/{}",
-                total_meta_size, bucket, key
-            )));
-        }
+        let headers = self.write_headers(bucket, key, metadata)?;
 
         let backoff_ms = [100, 200, 400];
         for attempt in 0..=backoff_ms.len() {
@@ -1793,17 +1800,7 @@ impl StorageBackend for S3Backend {
         metadata: &FileMetadata,
     ) -> Result<MultipartUpload, StorageError> {
         let key = self.passthrough_key(prefix, filename);
-        let mut headers = self.metadata_to_headers(metadata);
-        if let Some(marker) = self.native_encryption.marker() {
-            headers.insert("dg-encrypted-native".to_string(), marker.to_string());
-        }
-        let total_meta_size: usize = headers.iter().map(|(k, v)| k.len() + v.len()).sum();
-        if total_meta_size > 2048 {
-            return Err(StorageError::Other(format!(
-                "DG metadata exceeds S3's 2KB limit ({} bytes) for {}/{}",
-                total_meta_size, bucket, key
-            )));
-        }
+        let headers = self.write_headers(bucket, &key, metadata)?;
 
         let mut request = self
             .client
@@ -2632,6 +2629,41 @@ fn apply_native_encryption_mpu(
 // in-tree via existing transitive dependencies, and constructing a
 // ServiceError for a classifier test is ~3 lines, not a mock server.
 // ────────────────────────────────────────────────────────────────────
+/// S3 caps user metadata at 2 KiB: the sum of every `x-amz-meta-` key and
+/// value length (prefix excluded).
+pub const S3_USER_METADATA_LIMIT: usize = 2048;
+
+/// Total user-metadata size as S3 counts it.
+fn user_metadata_size(headers: &HashMap<String, String>) -> usize {
+    headers.iter().map(|(k, v)| k.len() + v.len()).sum()
+}
+
+/// Fit the write headers into the S3 user-metadata budget.
+///
+/// The similarity sketch (`dg-sketch`, 9 + 64 = 73 bytes) is advisory:
+/// an object without it is still readable and reconstructable, it is only
+/// absent from the similarity index. So it is the first (and only) field
+/// dropped when the total would exceed [`S3_USER_METADATA_LIMIT`] — an
+/// object whose metadata fit before the sketch existed must still store.
+///
+/// Returns `Ok(None)` when nothing was dropped, `Ok(Some(key))` with the
+/// dropped key, or `Err(size)` when the headers are over budget even
+/// without the sketch (the caller fails the write, as before).
+pub(crate) fn fit_user_metadata_budget(
+    headers: &mut HashMap<String, String>,
+) -> Result<Option<&'static str>, usize> {
+    use crate::types::meta_keys as mk;
+    if user_metadata_size(headers) <= S3_USER_METADATA_LIMIT {
+        return Ok(None);
+    }
+    let dropped = headers.remove(mk::SKETCH).map(|_| mk::SKETCH);
+    let size = user_metadata_size(headers);
+    if size > S3_USER_METADATA_LIMIT {
+        return Err(size);
+    }
+    Ok(dropped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2639,6 +2671,79 @@ mod tests {
     use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
     use aws_smithy_runtime_api::http::StatusCode;
     use aws_smithy_types::body::SdkBody;
+
+    // ── user-metadata budget: the sketch is the first field dropped ──
+
+    /// A delta object whose DG headers land exactly on the old ceiling
+    /// (no sketch) — the worst case the sketch must not push over.
+    fn headers_at_budget_without_sketch() -> HashMap<String, String> {
+        let meta = FileMetadata::new_delta(
+            "x".repeat(200),
+            "a".repeat(64),
+            "b".repeat(32),
+            123_456,
+            "y".repeat(200),
+            "c".repeat(64),
+            4_321,
+            Some("application/octet-stream".to_string()),
+        );
+        let mut headers = meta.to_bare_metadata_map();
+        // Pad with user metadata until the budget is exactly full WITHOUT
+        // the sketch (the pre-sketch ceiling).
+        let pad = S3_USER_METADATA_LIMIT - user_metadata_size(&headers) - "user-pad".len();
+        headers.insert("user-pad".to_string(), "p".repeat(pad));
+        assert_eq!(user_metadata_size(&headers), S3_USER_METADATA_LIMIT);
+        headers
+    }
+
+    #[test]
+    fn budget_keeps_sketch_when_it_fits() {
+        let mut headers = headers_at_budget_without_sketch();
+        headers.remove("user-pad");
+        headers.insert(crate::types::meta_keys::SKETCH.to_string(), "d".repeat(64));
+        assert_eq!(fit_user_metadata_budget(&mut headers), Ok(None));
+        assert!(headers.contains_key(crate::types::meta_keys::SKETCH));
+    }
+
+    #[test]
+    fn budget_drops_sketch_first_so_objects_at_the_old_ceiling_still_store() {
+        let mut headers = headers_at_budget_without_sketch();
+        headers.insert(crate::types::meta_keys::SKETCH.to_string(), "d".repeat(64));
+        assert_eq!(
+            user_metadata_size(&headers),
+            S3_USER_METADATA_LIMIT + 73,
+            "dg-sketch costs 9 + 64 bytes"
+        );
+        assert_eq!(
+            fit_user_metadata_budget(&mut headers),
+            Ok(Some(crate::types::meta_keys::SKETCH))
+        );
+        assert!(!headers.contains_key(crate::types::meta_keys::SKETCH));
+        assert_eq!(user_metadata_size(&headers), S3_USER_METADATA_LIMIT);
+        // Every non-advisory field survives.
+        for k in [
+            crate::types::meta_keys::FILE_SHA256,
+            crate::types::meta_keys::FILE_SIZE,
+            crate::types::meta_keys::MD5,
+            crate::types::meta_keys::REF_PATH,
+            "user-pad",
+        ] {
+            assert!(headers.contains_key(k), "{k} must survive the trim");
+        }
+    }
+
+    #[test]
+    fn budget_still_fails_when_over_without_sketch() {
+        let mut headers = headers_at_budget_without_sketch();
+        headers.insert("user-more".to_string(), "m".repeat(10));
+        headers.insert(crate::types::meta_keys::SKETCH.to_string(), "d".repeat(64));
+        assert_eq!(
+            fit_user_metadata_budget(&mut headers),
+            Err(S3_USER_METADATA_LIMIT + 19),
+            "over budget even after the sketch is dropped: hard error, size reported without sketch"
+        );
+        assert!(!headers.contains_key(crate::types::meta_keys::SKETCH));
+    }
 
     // ── delegated-listing early exit: anchor + late-candidate set (issue #82) ──
 
