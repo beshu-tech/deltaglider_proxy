@@ -16,16 +16,29 @@ use common::TestServer;
 /// `DELETE /bucket/prefix/` (trailing slash). Verify every object is
 /// gone and the response JSON reports the right count.
 ///
-/// Run with 2100 objects so we exercise the third page of the 1000-key
-/// pagination window (two full + one partial).
+/// The property under test is the PAGINATED sweep (the continuation-token
+/// loop, not materialising the whole listing). Rather than seed >1000 objects
+/// to force a second page of the default 1000-key window — slow to seed and
+/// prone to tripping the request timeout on loaded CI hosts — we shrink the
+/// window with `DGP_RECURSIVE_DELETE_PAGE_SIZE` so a small N exercises MORE
+/// pages: N=120 over a 50-key window is three pages (50 + 50 + 20).
 #[tokio::test]
 async fn test_recursive_delete_paginates_and_deletes_all() {
-    let server = TestServer::filesystem().await;
+    const DELETE_PAGE_SIZE: usize = 50;
+    let server = TestServer::builder()
+        .env(
+            "DGP_RECURSIVE_DELETE_PAGE_SIZE",
+            &DELETE_PAGE_SIZE.to_string(),
+        )
+        .build()
+        .await;
     let client = reqwest::Client::new();
 
-    // 1100 forces a second page of the 1000-key pagination window while
-    // still being quick to seed. Exercises the continuation-token loop.
-    const N: usize = 1100;
+    // 120 objects over a 50-key delete window → three pages through the loop
+    // (50 + 50 + 20), while staying fast to seed and delete (no timeout
+    // fragility). Compile-time check that N genuinely spans ≥3 pages.
+    const N: usize = 120;
+    const _: () = assert!(N > DELETE_PAGE_SIZE * 2);
     let bucket = server.bucket();
 
     // Seed concurrently to keep the test quick, but cap in-flight requests with

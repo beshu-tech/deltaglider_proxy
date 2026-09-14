@@ -294,10 +294,8 @@ impl s3s::S3 for DeltaGliderS3Service {
             .await
             .map_err(engine_error_to_s3s)?;
         if let Some(ListScope::Filtered { user }) = list_scope {
-            let requested_prefix = input.prefix.as_deref().unwrap_or("");
-            page.objects.retain(|(key, _)| {
-                user_can_see_listed_key(&user, &input.bucket, key, requested_prefix)
-            });
+            page.objects
+                .retain(|(key, _)| user_can_see_listed_key(&user, &input.bucket, key));
             page.common_prefixes
                 .retain(|prefix| user_can_see_common_prefix(&user, &input.bucket, prefix));
         }
@@ -362,10 +360,8 @@ impl s3s::S3 for DeltaGliderS3Service {
             .await
             .map_err(engine_error_to_s3s)?;
         if let Some(ListScope::Filtered { user }) = list_scope {
-            let requested_prefix = input.prefix.as_deref().unwrap_or("");
-            page.objects.retain(|(key, _)| {
-                user_can_see_listed_key(&user, &input.bucket, key, requested_prefix)
-            });
+            page.objects
+                .retain(|(key, _)| user_can_see_listed_key(&user, &input.bucket, key));
             page.common_prefixes
                 .retain(|prefix| user_can_see_common_prefix(&user, &input.bucket, prefix));
         }
@@ -1327,10 +1323,25 @@ impl s3s::S3 for DeltaGliderS3Service {
             input.copy_source_if_modified_since.as_ref(),
             input.copy_source_if_unmodified_since.as_ref(),
         )?;
+        // `engine.retrieve` buffers the ENTIRE source object into a heap Vec
+        // (delta reconstruction can't stream, and passthrough is collected too),
+        // and `copy_source_range` is sliced only AFTER that buffer exists — so a
+        // small requested part does NOT bound memory. Passthrough objects are
+        // stored up to `max_passthrough_object_size` (64 GiB default), so without
+        // this gate a standard aws-cli/boto3 managed copy (which auto-issues
+        // UploadPartCopy per chunk, each re-buffering the whole source) would OOM
+        // the shared process. Mirror `copy_object`'s guard: reject oversized
+        // sources with EntityTooLarge before and after the buffering read.
+        if source_meta.file_size > engine.max_object_size() {
+            return Err(s3s::s3_error!(EntityTooLarge));
+        }
         let (data, _) = engine
             .retrieve(&source_bucket, &source_key)
             .await
             .map_err(engine_error_to_s3s)?;
+        if data.len() as u64 > engine.max_object_size() {
+            return Err(s3s::s3_error!(EntityTooLarge));
+        }
         let part = if let Some(range) = input.copy_source_range.as_deref() {
             let (start, end) = parse_copy_range(range, data.len())?;
             bytes::Bytes::from(data[start..=end].to_vec())
@@ -1479,12 +1490,22 @@ async fn recursive_delete_prefix_s3s(
     bucket: &str,
     prefix: &str,
 ) -> s3s::S3Result<(u32, u32)> {
-    const DELETE_PAGE_SIZE: u32 = 1000;
+    // Objects listed+deleted per page of the sweep. Bounded (not `u32::MAX`) so a
+    // prefix with millions of keys can't balloon proxy memory before the first
+    // delete. Configurable via `DGP_RECURSIVE_DELETE_PAGE_SIZE` (default 1000):
+    // operators on memory-constrained nodes can lower it, and tests use a small
+    // window to exercise the continuation-token loop without seeding thousands
+    // of objects. Clamped to >= 1 so a zero can't wedge the loop.
+    let delete_page_size: u32 =
+        crate::config::env_parse_with_default("DGP_RECURSIVE_DELETE_PAGE_SIZE", 1000u32).max(1);
 
     let engine = state.engine.load();
     let mut deleted = 0u32;
     let mut denied = 0u32;
     let mut next_token: Option<String> = None;
+    // Deltaspaces touched by the sweep — reference reclamation runs once per
+    // deltaspace at the end rather than once per deleted object.
+    let mut swept_deltaspaces: std::collections::BTreeSet<String> = Default::default();
 
     loop {
         let page = engine
@@ -1492,7 +1513,7 @@ async fn recursive_delete_prefix_s3s(
                 bucket,
                 prefix,
                 None,
-                DELETE_PAGE_SIZE,
+                delete_page_size,
                 next_token.as_deref(),
                 false,
             )
@@ -1506,12 +1527,18 @@ async fn recursive_delete_prefix_s3s(
                     continue;
                 }
             }
-            match engine.delete(bucket, obj_key).await {
+            // `delete_in_sweep` skips the per-object "is this deltaspace empty?"
+            // scan, which lists the WHOLE deltaspace and made a prefix sweep
+            // O(N²) in directory reads (a 1100-object prefix took minutes and
+            // tripped the request timeout). We reclaim the reference once below.
+            match engine.delete_in_sweep(bucket, obj_key).await {
                 Ok(_) | Err(crate::deltaglider::EngineError::NotFound(_)) => {
                     deleted = deleted.saturating_add(1);
                 }
                 Err(e) => return Err(engine_error_to_s3s(e)),
             }
+            swept_deltaspaces
+                .insert(crate::types::ObjectKey::parse(bucket, obj_key).deltaspace_id());
         }
 
         if !page.is_truncated {
@@ -1520,6 +1547,16 @@ async fn recursive_delete_prefix_s3s(
         next_token = page.next_continuation_token;
         if next_token.is_none() {
             break;
+        }
+    }
+
+    // Reference reclamation, ONCE per touched deltaspace, after the sweep.
+    // Best-effort: the objects are already gone, so a failed reclaim leaves an
+    // orphan reference.bin (harmless — reclaimed by the next delete) rather
+    // than failing a delete the client already succeeded at.
+    for ds in &swept_deltaspaces {
+        if let Err(e) = engine.reclaim_empty_deltaspace(bucket, ds).await {
+            tracing::warn!("post-sweep reference reclaim failed for {bucket}/{ds}: {e}");
         }
     }
 

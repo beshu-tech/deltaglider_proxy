@@ -4,11 +4,6 @@ ignore = [
     # Upstream needs to migrate to rustls-pki-types PemObject.
     "RUSTSEC-2025-0134",
 
-    # rand 0.8.5 / 0.9.2 (unsound): custom-logger + `rand::rng()` interaction.
-    # We never set a custom global logger, so the unsoundness can't be
-    # triggered. Waiting for rand 0.9.3+.
-    "RUSTSEC-2026-0097",
-
     # quick-xml 0.40.1 (memory-exhaustion + quadratic-runtime XML DoS): a
     # TRANSITIVE pin of `s3s = 0.14.0` (the S3 protocol adapter), which requires
     # `quick-xml ^0.40.1` and so excludes the fixed 0.41.0. No route to bump

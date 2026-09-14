@@ -8,7 +8,109 @@ Every released version of DeltaGlider Proxy, newest first. Versions
 follow [semantic versioning](https://semver.org/); the Docker image
 `beshultd/deltaglider_proxy:<version>` is published for each tag.
 
-_Last updated: 2026-08-08_
+_Last updated: 2026-08-10_
+
+## v1.19.0 — 2026-08-10
+
+### Added — Cross-instance protection for the delta reference baseline
+
+Each deltaspace keeps one `reference.bin` baseline, and every delta in that
+prefix is decoded against it. Until now the read-modify-write that creates
+this baseline was guarded only by a lock held inside a single process, so two
+proxy instances that wrote into the same prefix at the same time could each
+observe that no reference existed and each write a baseline. The second write
+replaced the first, and every delta that pointed at the replaced bytes became
+unreadable. Multi-instance deployments therefore depended entirely on the
+operator routing every request for a prefix to the same instance.
+
+When a coordination bucket is configured (`config_sync_bucket`), the proxy now
+also takes a cross-instance lock around that read-modify-write. The lock is a
+short-lived object in the coordination bucket, created with a conditional write
+so that exactly one instance can hold it, and released as soon as the baseline
+is written. A holder that dies without releasing the lock stops blocking other
+instances once the lock expires. If another instance holds the lock for longer
+than the acquire timeout, the upload fails with a clear error instead of
+risking a second baseline.
+
+Single-instance deployments are unaffected and pay no additional requests: with
+no coordination bucket the in-process lock remains the only lock. Two settings
+tune the behaviour: `DGP_REFERENCE_LOCK_TTL_SECS` (default 120) and
+`DGP_REFERENCE_LOCK_ACQUIRE_TIMEOUT_SECS` (default 30).
+
+### Fixed — Anonymous listings could reveal keys under private sibling prefixes
+
+A public prefix such as `releases/` grants anonymous read and list access to the
+objects below it. The per-key filter that enforces this compared the requested
+prefix, rather than each returned key, against the grant. An unauthenticated
+request for `?prefix=releases` without a delimiter therefore returned every key
+that begins with that text, which includes a private sibling prefix such as
+`releases-internal/`. Object contents stayed protected, but the key names and
+their metadata were disclosed. The filter now evaluates each key, so a sibling
+prefix that merely shares the name is excluded.
+
+### Fixed — Server-side copies of large objects could exhaust proxy memory
+
+`UploadPartCopy` read the whole source object into memory before it applied the
+requested byte range, and it did not check the source size first. Because
+pass-through objects may be stored up to 64 GiB, a routine multipart copy issued
+by the AWS CLI or by boto3 could exhaust the memory of the proxy process. The
+handler now rejects an oversized source with `EntityTooLarge`, which matches the
+check that `CopyObject` already performed.
+
+### Fixed — Webhook events could be discarded before they were delivered
+
+The event outbox pruned rows below the position reached by the replication
+consumer on every delivery pass, without regard to delivery status. When a
+webhook target was unavailable and its events were waiting for a retry, those
+events were removed before they were delivered, which broke the at-least-once
+guarantee. The prune no longer runs while delivery is active; the existing
+prunes for delivered and failed rows continue to bound the size of the outbox.
+
+### Fixed — Replicated copies of encrypted objects could be unreadable
+
+Replication and lifecycle copies carried the encryption markers of the source
+object into the destination. When the destination does not encrypt on write,
+those markers described an encryption that the stored bytes no longer had, and
+reads of the replica failed. The copy paths now remove the markers, which is
+what the client-facing copy handler already did.
+
+### Fixed — A transient backend error could route a multipart upload elsewhere
+
+While resolving which backend holds a bucket, a failed existence request was
+treated as proof that the bucket was absent, and the request continued to the
+next backend. A short outage on the backend that actually holds the bucket could
+therefore send an upload to a different backend with the same bucket name. The
+resolver now distinguishes a failed request from a negative answer and stays on
+the backend that returned the error.
+
+### Changed — Object writes and prefix deletions are substantially faster
+
+Two problems on the write path are corrected. The counter database that records
+per-bucket usage was opened with the default SQLite settings, so every object
+upload and every deletion waited for its own flush to disk. It now uses
+write-ahead logging, which removes that wait. Separately, deleting an object
+listed the entire deltaspace to decide whether the reference baseline could be
+reclaimed; during a recursive deletion this repeated for every object, so the
+work grew with the square of the object count. The reclamation now runs once,
+after the sweep. Deleting a prefix of 1100 objects previously exceeded the
+request timeout and returned an error; it now finishes in about 45 seconds.
+
+### Changed — The supply-chain gate is enforced again
+
+`cargo deny` was configured for a version of the tool that no longer accepts
+those settings, so the check failed to start, and the nightly workflow ignored
+its result. The configuration is updated, the result is no longer ignored, and
+the `rand` dependency is updated to clear an advisory. Known advisories that
+have no available fix are listed explicitly, so any new advisory fails the
+workflow.
+
+### Fixed — Documentation that did not match the software
+
+The Docker quick-start commands omitted the credentials that the proxy requires,
+so the container stopped immediately on startup; the credentials are now
+included and explained. The example configuration showed a TLS section without
+`enabled: true`, so following it produced plain HTTP while appearing to
+configure HTTPS; the required setting is now shown.
 
 ## v1.18.0 — 2026-08-08
 

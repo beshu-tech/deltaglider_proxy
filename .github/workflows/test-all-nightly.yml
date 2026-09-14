@@ -137,5 +137,5 @@ jobs:
       - name: cargo audit
         run: cargo audit
       - name: cargo deny check
-        run: cargo deny check 2>&1 || true
+        run: cargo deny check
 

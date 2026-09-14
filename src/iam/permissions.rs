@@ -616,15 +616,23 @@ fn allow_references_common_prefix(
 ///   keys; `AuthenticatedUser::can` re-evaluates the full policy graph
 ///   each call, and inlining here lets LLVM consolidate the checks.
 /// - It's unit-testable as a pure function without an HTTP stack.
-pub fn user_can_see_listed_key(
-    user: &super::AuthenticatedUser,
-    bucket: &str,
-    key: &str,
-    requested_prefix: &str,
-) -> bool {
+pub fn user_can_see_listed_key(user: &super::AuthenticatedUser, bucket: &str, key: &str) -> bool {
     user.can(S3Action::Read, bucket, key)
         || user.can(S3Action::List, bucket, key)
-        || can_list_prefix_with_context(user, bucket, requested_prefix)
+        // Prefix-conditioned list grants (the `$anonymous` public-prefix user,
+        // and IAM users whose `list` permission carries an `s3:prefix`
+        // StringLike condition on the bucket ARN) are NOT resolved by the two
+        // `can(...)` calls above, which evaluate per-key with no request
+        // context. This third disjunct must therefore test THIS KEY against the
+        // grant — NOT the request's `prefix` query parameter. Testing the
+        // requested prefix waved through every key the backend returned for a
+        // string-prefix match, so `?prefix=releases` (no delimiter, no auth)
+        // leaked keys under a private sibling like `releases-internal/` that
+        // merely shares the public prefix's name. A StringLike `releases/*`
+        // does not match `releases-internal/...`, and the bare `releases`
+        // pattern matches only the literal prefix object — so per-key
+        // evaluation keeps legitimate keys visible while denying siblings.
+        || can_list_prefix_with_context(user, bucket, key)
 }
 
 /// Pure predicate: can this user see/navigate a returned CommonPrefix?
@@ -1316,31 +1324,16 @@ mod tests {
     #[test]
     fn test_user_can_see_listed_key_unrestricted_user() {
         let user = make_user("alice", vec!["prod/*"], vec!["read", "list"]);
-        assert!(user_can_see_listed_key(&user, "prod", "alice/file.txt", ""));
-        assert!(user_can_see_listed_key(
-            &user,
-            "prod",
-            "anything/else.bin",
-            ""
-        ));
+        assert!(user_can_see_listed_key(&user, "prod", "alice/file.txt"));
+        assert!(user_can_see_listed_key(&user, "prod", "anything/else.bin"));
     }
 
     #[test]
     fn test_user_can_see_listed_key_prefix_scoped() {
         let user = make_user("alice", vec!["prod/alice/*"], vec!["read"]);
-        assert!(user_can_see_listed_key(
-            &user,
-            "prod",
-            "alice/file.txt",
-            "alice/"
-        ));
-        assert!(!user_can_see_listed_key(
-            &user,
-            "prod",
-            "bob/file.txt",
-            "bob/"
-        ));
-        assert!(!user_can_see_listed_key(&user, "prod", "secret.bin", ""));
+        assert!(user_can_see_listed_key(&user, "prod", "alice/file.txt"));
+        assert!(!user_can_see_listed_key(&user, "prod", "bob/file.txt"));
+        assert!(!user_can_see_listed_key(&user, "prod", "secret.bin"));
     }
 
     #[test]
@@ -1348,24 +1341,64 @@ mod tests {
         // List-only permission should let the user see keys in listings
         // (they can't Read them, but they can discover them).
         let user = make_user("alice", vec!["prod/public/*"], vec!["list"]);
-        assert!(user_can_see_listed_key(
-            &user,
-            "prod",
-            "public/x.txt",
-            "public/"
-        ));
-        assert!(!user_can_see_listed_key(
-            &user,
-            "prod",
-            "private/x.txt",
-            "private/"
-        ));
+        assert!(user_can_see_listed_key(&user, "prod", "public/x.txt"));
+        assert!(!user_can_see_listed_key(&user, "prod", "private/x.txt"));
     }
 
     #[test]
     fn test_user_cannot_see_keys_in_different_bucket() {
         let user = make_user("alice", vec!["prod/*"], vec!["read", "list"]);
-        assert!(!user_can_see_listed_key(&user, "staging", "anything", ""));
+        assert!(!user_can_see_listed_key(&user, "staging", "anything"));
+    }
+
+    #[test]
+    fn test_prefix_conditioned_list_does_not_leak_sibling_keys() {
+        // Regression: the `$anonymous` public-prefix user for `releases/` carries
+        // a key-scoped read grant (`bucket/releases/*`) plus a bucket-ARN list
+        // grant gated by `StringLike s3:prefix: ["releases", "releases/*"]`. An
+        // unauthenticated `?prefix=releases` request with no delimiter makes the
+        // backend return every key that string-starts with "releases", including
+        // a PRIVATE sibling `releases-internal/secret.txt`. Per-key evaluation
+        // must hide the sibling while still showing real keys under `releases/`.
+        let user = make_user_with_permissions(
+            "$anonymous",
+            vec![
+                Permission {
+                    id: 0,
+                    effect: "Allow".into(),
+                    actions: vec!["read".into()],
+                    resources: vec!["downloads/releases/*".into()],
+                    conditions: None,
+                },
+                Permission {
+                    id: 0,
+                    effect: "Allow".into(),
+                    actions: vec!["list".into()],
+                    resources: vec!["downloads/*".into()],
+                    conditions: Some(serde_json::json!({
+                        "StringLike": { "s3:prefix": ["releases", "releases/*"] }
+                    })),
+                },
+            ],
+        );
+        // Legitimate keys under the public prefix stay visible.
+        assert!(user_can_see_listed_key(
+            &user,
+            "downloads",
+            "releases/v1.0/app.zip"
+        ));
+        assert!(user_can_see_listed_key(&user, "downloads", "releases"));
+        // Private siblings that merely share the prefix's name must NOT leak.
+        assert!(!user_can_see_listed_key(
+            &user,
+            "downloads",
+            "releases-internal/secret.txt"
+        ));
+        assert!(!user_can_see_listed_key(
+            &user,
+            "downloads",
+            "releases-old.zip"
+        ));
     }
 
     #[test]

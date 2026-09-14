@@ -44,7 +44,7 @@ use super::{needs_rewrite, resolve_desired, strip_encryption_markers, DesiredEnc
 
 const POLL_INTERVAL_SECS: u64 = 3;
 const LEASE_TTL_SECS: i64 = 60;
-const PAGE_SIZE: u32 = 1000;
+pub(crate) const PAGE_SIZE: u32 = 1000;
 const MAX_FAILURES_RETAINED: usize = 200;
 const DRAIN_POLL_MS: u64 = 250;
 
@@ -161,6 +161,9 @@ async fn run_job(
         "migrate" => {
             super::migrate::execute_migrate_phases(mutator, db, state, instance_id, &job).await
         }
+        super::backfill::KIND => {
+            super::backfill::execute_backfill_phases(db, state, instance_id, &job).await
+        }
         other => Err(format!("unknown maintenance job kind '{other}'")),
     };
 
@@ -240,48 +243,7 @@ async fn execute_phases(
 
     // ── Phase: counting ──
     if phase == "counting" {
-        let mut count: i64 = 0;
-        let mut pager = Pager::resuming(resume_token.clone());
-        while pager.begin_page().is_some() {
-            check_cancel(db, job.id).await?;
-            let engine = state.engine.load().clone();
-            let page = match engine
-                .list_objects(bucket, "", None, PAGE_SIZE, pager.token(), false)
-                .await
-            {
-                Ok(p) => p,
-                Err(e) if pager.poisoned_resume_token() => {
-                    // The persisted cursor is the prime suspect — drop it,
-                    // persist the clean cursor (a crash mid-retry must not
-                    // re-poison), and recount from page 0 (idempotent).
-                    warn!(
-                        "maintenance: job #{} counting resume token rejected ({e}); restarting phase fresh",
-                        job.id
-                    );
-                    pager.restart_fresh();
-                    count = 0;
-                    persist(db, job, "counting", Some(0), 0, 0, 0, 0, None).await;
-                    continue;
-                }
-                Err(e) => return Err(format!("counting list failed: {e}")),
-            };
-            count += page
-                .objects
-                .iter()
-                .filter(|(k, _)| !k.ends_with('/'))
-                .count() as i64;
-            let more = pager.advance(page.is_truncated, page.next_continuation_token);
-            persist(db, job, "counting", Some(count), 0, 0, 0, 0, pager.token()).await;
-            heartbeat(db, job.id, instance_id).await?;
-            if !more {
-                break;
-            }
-        }
-        if pager.truncated_by_page_budget() {
-            return Err("counting stopped at the page budget with more pages \
-                 pending — bucket too large for one pass; job left resumable"
-                .to_string());
-        }
+        let count = counting_phase(db, state, instance_id, job, resume_token.clone()).await?;
         total = Some(count);
         phase = "objects".to_string();
         (done, skipped, failed, bytes) = (0, 0, 0, 0);
@@ -445,6 +407,63 @@ async fn execute_phases(
     }
 
     Ok(())
+}
+
+/// The shared `counting` phase: one LIST sweep for the exact object total
+/// (the write gate freezes the write set, so the total cannot drift and
+/// the progress bar is honest). Persists progress + cursor per page; used
+/// by the reencrypt AND backfill-metadata kinds.
+pub(crate) async fn counting_phase(
+    db: &Arc<Mutex<ConfigDb>>,
+    state: &Arc<AppState>,
+    instance_id: &str,
+    job: &MaintenanceJob,
+    resume_token: Option<String>,
+) -> Result<i64, String> {
+    let bucket = &job.bucket;
+    let mut count: i64 = 0;
+    let mut pager = Pager::resuming(resume_token);
+    while pager.begin_page().is_some() {
+        check_cancel(db, job.id).await?;
+        let engine = state.engine.load().clone();
+        let page = match engine
+            .list_objects(bucket, "", None, PAGE_SIZE, pager.token(), false)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) if pager.poisoned_resume_token() => {
+                // The persisted cursor is the prime suspect — drop it,
+                // persist the clean cursor (a crash mid-retry must not
+                // re-poison), and recount from page 0 (idempotent).
+                warn!(
+                    "maintenance: job #{} counting resume token rejected ({e}); restarting phase fresh",
+                    job.id
+                );
+                pager.restart_fresh();
+                count = 0;
+                persist(db, job, "counting", Some(0), 0, 0, 0, 0, None).await;
+                continue;
+            }
+            Err(e) => return Err(format!("counting list failed: {e}")),
+        };
+        count += page
+            .objects
+            .iter()
+            .filter(|(k, _)| !k.ends_with('/'))
+            .count() as i64;
+        let more = pager.advance(page.is_truncated, page.next_continuation_token);
+        persist(db, job, "counting", Some(count), 0, 0, 0, 0, pager.token()).await;
+        heartbeat(db, job.id, instance_id).await?;
+        if !more {
+            break;
+        }
+    }
+    if pager.truncated_by_page_budget() {
+        return Err("counting stopped at the page budget with more pages \
+             pending — bucket too large for one pass; job left resumable"
+            .to_string());
+    }
+    Ok(count)
 }
 
 /// Re-store a deltaspace's reference blob through the (encrypting)

@@ -240,6 +240,15 @@ async fn copy_object_once(
     for key in request.strip_user_metadata_keys {
         user_metadata.remove(*key);
     }
+    // The source's `dg-encrypted` / `dg-encryption-key-id` markers describe the
+    // SOURCE object's at-rest encryption, which is meaningless for the freshly
+    // re-stored destination: `engine.retrieve` already returned plaintext bytes.
+    // If the destination backend encrypts, its wrapper re-stamps the correct
+    // marker on store; if it does NOT (a plaintext backend, or a decrypt-only
+    // PassThrough shim during a migration), a stale marker makes the replica
+    // undecryptable on read. Strip unconditionally — matching the client-facing
+    // CopyObject handler and the delta fast path.
+    crate::storage::encrypting::strip_encryption_markers(&mut user_metadata);
 
     if let Some(mp_etag) = meta.multipart_etag.clone() {
         engine
@@ -332,6 +341,10 @@ async fn stream_copy_passthrough(
     for key in request.strip_user_metadata_keys {
         user_metadata.remove(*key);
     }
+    // Strip the source's at-rest encryption markers (see `copy_object_once`):
+    // the destination re-stamps its own on store, and a stale marker on a
+    // non-encrypting destination yields an undecryptable replica.
+    crate::storage::encrypting::strip_encryption_markers(&mut user_metadata);
 
     let handle = engine
         .begin_passthrough_multipart(
@@ -1212,6 +1225,10 @@ async fn spooled_copy(
     for key in request.strip_user_metadata_keys {
         user_metadata.remove(*key);
     }
+    // Strip the source's at-rest encryption markers (see `copy_object_once`):
+    // the destination re-stamps its own on store, and a stale marker on a
+    // non-encrypting destination yields an undecryptable replica.
+    crate::storage::encrypting::strip_encryption_markers(&mut user_metadata);
 
     engine
         .store_spooled_delta(

@@ -184,7 +184,15 @@ impl TestServer {
             // tests deliberately spawn against dead/absent endpoints and must
             // not exit(1) or pay probe timeouts. Gate tests opt back in via
             // .env("DGP_BOOT_BACKEND_PROBE", "enforce").
-            .env("DGP_BOOT_BACKEND_PROBE", "off");
+            .env("DGP_BOOT_BACKEND_PROBE", "off")
+            // Local endpoints (http://127.0.0.1 MinIO, private IPs) are the norm
+            // for tests, and the proxy otherwise refuses them at startup with
+            // "URL scheme 'http' is not allowed". CI sets this for the whole job
+            // (ci.yml), so WITHOUT it here the same test passes in CI and dies
+            // locally with an opaque "exited before becoming ready" — the trap
+            // that made several tests carry their own copy of this line.
+            // Set before `extra_env` so a test can still override it.
+            .env("DGP_BACKEND_ALLOW_LOCAL", "true");
         if let Some(ref key) = encryption_key {
             cmd.env("DGP_ENCRYPTION_KEY", key);
         }
@@ -230,10 +238,21 @@ impl TestServer {
             // know (classic cause of "AccessDenied" with no obvious
             // explanation).
             if let Ok(Some(status)) = self.process.try_wait() {
+                // The child inherits stderr, so its OWN error line (the real
+                // cause) is already in this test's output — but it is printed
+                // when the child dies, which with parallel tests can be many
+                // lines above this panic. Point at it instead of asserting a
+                // single cause: this message used to claim a port collision,
+                // which sent readers chasing `lsof` while the actual failure
+                // was a startup validation error sitting further up the log.
                 panic!(
-                    "Test proxy on port {} exited before becoming ready: {status}. \
-                     Usually means another process was already listening on this \
-                     port — check with `lsof -i :{}`.",
+                    "Test proxy on port {} exited before becoming ready: {status}.\n\
+                     Look for the proxy's own `Error:`/`FATAL` line ABOVE this panic — \
+                     that is the real cause. Common ones:\n\
+                     - config/backend validation rejected the config (e.g. an http:// \
+                       S3 endpoint without DGP_BACKEND_ALLOW_LOCAL=true)\n\
+                     - a required credential/env var missing for this test's config\n\
+                     - the port really is taken by a stray process (`lsof -i :{}`)",
                     self.port, self.port
                 );
             }
@@ -364,7 +383,15 @@ impl TestServer {
             // tests deliberately spawn against dead/absent endpoints and must
             // not exit(1) or pay probe timeouts. Gate tests opt back in via
             // .env("DGP_BOOT_BACKEND_PROBE", "enforce").
-            .env("DGP_BOOT_BACKEND_PROBE", "off");
+            .env("DGP_BOOT_BACKEND_PROBE", "off")
+            // Local endpoints (http://127.0.0.1 MinIO, private IPs) are the norm
+            // for tests, and the proxy otherwise refuses them at startup with
+            // "URL scheme 'http' is not allowed". CI sets this for the whole job
+            // (ci.yml), so WITHOUT it here the same test passes in CI and dies
+            // locally with an opaque "exited before becoming ready" — the trap
+            // that made several tests carry their own copy of this line.
+            // Set before `extra_env` so a test can still override it.
+            .env("DGP_BACKEND_ALLOW_LOCAL", "true");
         for (key, value) in &self.extra_env {
             cmd.env(key, value);
         }
@@ -1430,7 +1457,15 @@ impl TestServer {
             // tests deliberately spawn against dead/absent endpoints and must
             // not exit(1) or pay probe timeouts. Gate tests opt back in via
             // .env("DGP_BOOT_BACKEND_PROBE", "enforce").
-            .env("DGP_BOOT_BACKEND_PROBE", "off");
+            .env("DGP_BOOT_BACKEND_PROBE", "off")
+            // Local endpoints (http://127.0.0.1 MinIO, private IPs) are the norm
+            // for tests, and the proxy otherwise refuses them at startup with
+            // "URL scheme 'http' is not allowed". CI sets this for the whole job
+            // (ci.yml), so WITHOUT it here the same test passes in CI and dies
+            // locally with an opaque "exited before becoming ready" — the trap
+            // that made several tests carry their own copy of this line.
+            // Set before `extra_env` so a test can still override it.
+            .env("DGP_BACKEND_ALLOW_LOCAL", "true");
         for (key, value) in &self.extra_env {
             cmd.env(key, value);
         }

@@ -120,7 +120,11 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                             Err(LEASE_LOST) on refused renewal → phase stops, row NOT settled), migrate.rs (kind=migrate: stage→copy→verify→
                             flip→cleanup, transient __dgmigrate_* routes — gated from creation, filtered out of all bucket listings, cleared at
                             flip; pre-flip cancel unwind; cleanup re-checks routed_to_target PER SWEEP; cancel-in-cleanup settles completed with
-                            a note), mod.rs (pure: resolve_desired/needs_rewrite/progress_percent/display_percent)
+                            a note), backfill.rs (kind=backfill-metadata: stamp canonical DG metadata onto foreign/pre-proxy passthrough objects
+                            IN PLACE — bytes read once to hash, written never: S3 self-copy REPLACE / xattr rewrite via
+                            StorageBackend::put_passthrough_metadata; dg-created-at pinned to the pre-job time unless refresh_last_modified,
+                            multipart ETag preserved via dg-multipart-etag; POST /jobs/backfill-metadata),
+                            mod.rs (pure: resolve_desired/needs_rewrite/progress_percent/display_percent)
   → config_apply.rs         ConfigMutator: mutate → rebuild engine (rollback on failure) → persist, for BACKGROUND tasks (migrate flips);
                             admin rebuild_engine delegates to rebuild_engine_only
   → job_loop.rs             THE canonical pagination state machine (Pager): token threading, resume detection, poison-token
@@ -242,10 +246,23 @@ single-instance planes below are addressed.
   DELETE/PUT on A leaves B serving stale existence/size for up to 10 min.
 - **Rate limiter** (`rate_limiter.rs`, per-instance) — effective limit is N× the
   configured cap across N nodes.
-- **Maintenance write-gate busy-set**, **delta-reference RMW lock**
-  (`engine/mod.rs` `prefix_locks`, in-process) — concurrent same-prefix PUTs on
-  two nodes can corrupt `reference.bin`. Single-writer per deltaspace assumed —
-  the operator's directory-hash router (bullet above) satisfies it by routing.
+- **Maintenance write-gate busy-set** (`engine/mod.rs`, in-process) — still
+  node-local.
+- **Delta-reference RMW lock** — the in-process `prefix_locks` mutex
+  (`engine/mod.rs`) serializes same-node threads; when a `config_sync_bucket` is
+  configured it is now ALSO wrapped by a CROSS-INSTANCE per-deltaspace mutex
+  (`src/coordination/reference_lock.rs`, `S3ReferenceLock`) held around the
+  reference read-modify-write in the two delta-baseline paths (`store_inner`,
+  `store_spooled_delta`), so two nodes can no longer both create a `reference.bin`
+  baseline and corrupt it (closes B1). It is a short-lived S3-CAS lock object
+  (`_dgp/locks/reference/<hash>.json`, create-if-absent / steal-on-TTL-expiry /
+  owner-scoped release), NOT the 300s leader lease; a peer holding it past the
+  acquire timeout fails the PUT closed rather than risk a second baseline.
+  Single-instance (no coordination bucket) → the field is `None`, in-process lock
+  only, zero S3 round-trips. The operator's directory-hash router is still the
+  recommended topology (it also handles multipart + metadata-cache locality), but
+  reference.bin integrity no longer DEPENDS on it. Tunables:
+  `DGP_REFERENCE_LOCK_TTL_SECS` (120), `DGP_REFERENCE_LOCK_ACQUIRE_TIMEOUT_SECS` (30).
 
 **Hard prerequisites for any multi-instance deployment:**
 - **All instances MUST share the same `DGP_BOOTSTRAP_PASSWORD_HASH`** — it
@@ -316,6 +333,17 @@ Async rebuild barrier: after any IAM mutation, use `get_iam_version(&http, &endp
 Property tests via `proptest` (dev-dep) live in the same module as the pure functions they exercise (see `src/security.rs` for `validate_bucket_name` / `bucket_name_is_ip_like`). Coverage is collected via `cargo-llvm-cov` as a non-blocking CI job — use it as signal, not a gate.
 
 **Prod-config regression** is two-layered: `prod_shape_tests` in `src/config.rs` (lib tests, in the CI gate) validate `tests/fixtures/prod_shape_config.yaml` — a SANITIZED, structure-true snapshot of the production config (declarative IAM + conditions + `${iam:username}`, OIDC + mapping rules, s3 + encrypted-filesystem backends, routing, public_prefixes, replication/lifecycle rules) — through parse, reconciler validation, auth classification, and canonical-export round-trip. Update the fixture deliberately when prod adopts new features; keep it sanitized (public repo). `scripts/test-prod-config.sh` (local-only, pre-release) boots the current branch's release binary against the REAL prod state (backup zip, or a clone of `/private/tmp/dgp-prod-local` incl. the `.deltaglider_bootstrap_hash` sidecar) with expectations derived dynamically from the prod YAML itself; it only ever writes to filesystem-routed buckets, never to remote backends.
+
+## Git workflow (READ FIRST)
+
+**Commit directly to `main`. Do NOT create feature branches or PRs.** Simone is
+the only person working in this repo (with Claude); branch-and-PR ceremony is
+pure overhead here. Push to `main` as work completes, and cut a release every now
+and then (see `scripts/release-prep.sh` + the `Prepare Release` workflow).
+
+Corollary: **there is no "someone else's code" in this repo.** A red test, a
+flaky test, or a pre-existing failure is ours to fix — never leave it red on the
+grounds that another commit introduced it.
 
 ## Conventions
 

@@ -1003,6 +1003,7 @@ Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_
 | `DGP_REQUEST_TIMEOUT_SECS` | 300 | Per-request timeout (returns 504) |
 | `DGP_READY_TIMEOUT_SECS` | 3 | Per-attempt backend timeout for the `/_/ready` probe |
 | `DGP_READY_RETRIES` | 2 | Extra `/_/ready` backend attempts before reporting not-ready (short backoff) |
+| `DGP_READY_CACHE_TTL_SECS` | 0 | Last-known-good window for `/_/ready`, in seconds. `0` keeps the strict behaviour: the `ListBuckets` probe must succeed or the node reports not-ready. When you set a value above zero and the list fails, the proxy first tries a much cheaper `HeadBucket` reachability check, and then accepts a backend call that succeeded within this many seconds. A storage provider that throttles `ListBuckets` therefore does not pull a node out of rotation while that node is still serving reads and writes. |
 | `DGP_MAX_CONCURRENT_REQUESTS` | 1024 | Tower concurrency limit |
 | `DGP_MAX_MULTIPART_UPLOADS` | 1000 | Concurrent multipart upload cap |
 | `DGP_DEBUG_HEADERS` | false | Expose fingerprinting headers |

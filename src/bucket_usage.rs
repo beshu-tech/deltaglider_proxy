@@ -103,8 +103,26 @@ pub struct BucketUsage {
 
 impl BucketUsage {
     /// Open (creating if absent) the usage DB at `path` and run migrations.
+    ///
+    /// PERF: every object PUT/DELETE applies a counter delta here, so this DB is
+    /// on the hot S3 write path. With SQLite's defaults (`journal_mode=DELETE`,
+    /// `synchronous=FULL`) each of those is a separate fsync'd commit — measured
+    /// at ~270ms per object on a loaded host, which made a 1100-object prefix
+    /// sweep take over 300s and trip the request timeout. WAL + `synchronous
+    /// = NORMAL` removes the per-write fsync.
+    ///
+    /// This is the right durability trade for THIS DB specifically: it is a
+    /// best-effort derived counter, not a source of truth. Every call site
+    /// already treats a failure as non-fatal (warn-and-continue), and drift is
+    /// repairable on demand by the usage scanner's Refresh. The worst case on a
+    /// power cut is a few lost counter deltas that a Refresh reconciles — which
+    /// is exactly what the existing drift-reconciliation path exists to fix.
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(path)?;
+        // Best-effort: a backend that refuses WAL (rare, e.g. some network FS)
+        // still works correctly, just slower — never fail startup over a pragma.
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
         let db = Self {
             conn: Mutex::new(conn),
         };

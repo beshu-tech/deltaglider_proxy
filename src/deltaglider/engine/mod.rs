@@ -269,6 +269,11 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     /// Per-deltaspace locks preventing concurrent reference overwrites.
     /// Uses DashMap for lock-free shard-level lookups (different prefixes never contend).
     prefix_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Optional CROSS-INSTANCE per-deltaspace lock (multi-instance only; `None`
+    /// single-instance → zero S3 round-trips). Held INSIDE `prefix_locks` around
+    /// the reference read-modify-write so two nodes cannot both create a
+    /// `reference.bin` baseline for the same deltaspace and corrupt it.
+    reference_lock: Option<Arc<dyn crate::coordination::ReferenceLock>>,
     /// Optional Prometheus metrics (None in tests).
     metrics: Option<Arc<Metrics>>,
     /// In-memory cache for object metadata (eliminates HEAD requests).
@@ -282,6 +287,30 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     /// delta GETs decode to a spool file here, then stream the file to the
     /// client — bounded memory regardless of object size.
     spool: Arc<crate::deltaglider::spool::SpoolDir>,
+}
+
+/// RAII guard for the optional cross-instance reference lock. Held for the
+/// duration of a reference read-modify-write, inside the in-process prefix
+/// mutex. On drop it spawns a best-effort async release (Drop cannot be async);
+/// the lock's TTL backstops a release that never completes (crash / shutdown /
+/// no runtime). Inert (`release: None`) for single-instance deployments.
+pub(crate) struct ReferenceLockGuard {
+    release: Option<(Arc<dyn crate::coordination::ReferenceLock>, String, String)>,
+}
+
+impl Drop for ReferenceLockGuard {
+    fn drop(&mut self) {
+        if let Some((lock, key, owner)) = self.release.take() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    if let Err(e) = lock.release(&key, &owner).await {
+                        tracing::warn!("reference lock release failed for {key}: {e}");
+                    }
+                });
+            }
+            // No runtime available (dropped during shutdown) → rely on the TTL.
+        }
+    }
 }
 
 /// Type alias for engine with dynamic backend dispatch
@@ -702,6 +731,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             max_passthrough_object_size: config.max_passthrough_object_size,
             codec_semaphore: Arc::new(Semaphore::new(codec_concurrency)),
             prefix_locks: DashMap::new(),
+            reference_lock: None,
             metrics,
             metadata_cache: MetadataCache::new((config.metadata_cache_mb as u64) * 1024 * 1024),
             bucket_policies: crate::bucket_policy::BucketPolicyRegistry::new(
@@ -724,6 +754,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         usage: Option<Arc<crate::bucket_usage::BucketUsage>>,
     ) -> Self {
         self.bucket_usage = usage;
+        self
+    }
+
+    /// Attach the cross-instance reference lock (builder; re-attached on engine
+    /// rebuild, mirroring `with_bucket_usage`). `None` keeps single-instance
+    /// behavior — the in-process `prefix_locks` mutex is the only lock and no S3
+    /// round-trip is paid.
+    pub fn with_reference_lock(
+        mut self,
+        lock: Option<Arc<dyn crate::coordination::ReferenceLock>>,
+    ) -> Self {
+        self.reference_lock = lock;
         self
     }
 
@@ -974,6 +1016,50 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         mutex.lock_owned().await
+    }
+
+    /// Acquire the CROSS-INSTANCE reference lock for a deltaspace, INSIDE the
+    /// in-process `prefix_locks` mutex (which the caller must already hold), so
+    /// two nodes cannot both create/overwrite a deltaspace's `reference.bin`.
+    ///
+    /// Single-instance (`reference_lock == None`) → an inert guard, zero S3
+    /// round-trips. Multi-instance → block up to the lock's acquire timeout; if a
+    /// peer holds it that long (or the coordination bucket errors), FAIL the
+    /// write closed (`EngineError`) rather than risk a second baseline. The
+    /// returned guard releases the lock (best-effort) on drop; the lock's TTL
+    /// backstops a release that never runs (crash / shutdown).
+    async fn acquire_reference_lock(
+        &self,
+        bucket: &str,
+        deltaspace: &str,
+    ) -> Result<ReferenceLockGuard, EngineError> {
+        let Some(lock) = self.reference_lock.clone() else {
+            return Ok(ReferenceLockGuard { release: None });
+        };
+        let key = crate::coordination::reference_lock::lock_object_key(bucket, deltaspace);
+        let owner = format!("ref-{}", uuid::Uuid::new_v4());
+        let deadline = std::time::Instant::now() + lock.acquire_timeout();
+        let now_fn = || crate::event_outbox::current_unix_seconds();
+        match crate::coordination::reference_lock::acquire_blocking(
+            lock.as_ref(),
+            &key,
+            &owner,
+            deadline,
+            &now_fn,
+        )
+        .await
+        {
+            Ok(true) => Ok(ReferenceLockGuard {
+                release: Some((lock, key, owner)),
+            }),
+            Ok(false) => Err(EngineError::Storage(StorageError::Other(format!(
+                "reference lock for deltaspace '{bucket}/{deltaspace}' held by another instance; \
+                 write timed out to avoid corrupting reference.bin"
+            )))),
+            Err(e) => Err(EngineError::Storage(StorageError::Other(format!(
+                "reference lock acquire failed for deltaspace '{bucket}/{deltaspace}': {e}"
+            )))),
+        }
     }
 
     /// Prune prefix lock entries that are no longer actively held.
@@ -1276,6 +1362,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             &meta.storage_info,
             crate::types::StorageInfo::Delta { ref_sha256, .. } if ref_sha256.is_empty()
         )
+    }
+
+    /// Drop the cached metadata for one key. Used by the metadata-backfill
+    /// job after an in-place metadata rewrite — the 10-minute cache would
+    /// otherwise keep serving the pre-backfill (fallback) metadata on LIST.
+    pub fn invalidate_metadata_cache(&self, bucket: &str, key: &str) {
+        self.metadata_cache.invalidate(bucket, key);
     }
 
     pub async fn head(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {
@@ -1658,6 +1751,66 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Delete an object
     #[instrument(skip(self))]
     pub async fn delete(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {
+        self.delete_inner(bucket, key, /* reclaim_reference = */ true)
+            .await
+    }
+
+    /// Delete one member of a prefix sweep, SKIPPING the per-object
+    /// "is the deltaspace empty now?" reference-reclamation scan.
+    ///
+    /// That scan lists the WHOLE deltaspace, so running it per object makes a
+    /// prefix sweep O(N²) in directory reads (1100 objects ≈ 600k entry reads —
+    /// enough to blow past the request timeout). A sweep is deleting everything
+    /// anyway, so the caller runs [`Self::reclaim_empty_deltaspace`] ONCE when
+    /// the sweep finishes. Semantics are otherwise identical to [`Self::delete`].
+    pub async fn delete_in_sweep(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<FileMetadata, EngineError> {
+        self.delete_inner(bucket, key, /* reclaim_reference = */ false)
+            .await
+    }
+
+    /// Reclaim a deltaspace's `reference.bin` if no non-reference object remains.
+    /// The tail half of [`Self::delete`], callable once after a prefix sweep.
+    /// Idempotent and safe when the deltaspace still holds objects (no-op).
+    pub async fn reclaim_empty_deltaspace(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+    ) -> Result<(), EngineError> {
+        let _guard = self.acquire_prefix_lock(deltaspace_id).await;
+        let remaining = self.storage.scan_deltaspace(bucket, deltaspace_id).await?;
+        let has_objects = remaining
+            .iter()
+            .any(|m| !matches!(m.storage_info, StorageInfo::Reference { .. }));
+        if has_objects || !self.storage.has_reference(bucket, deltaspace_id).await? {
+            return Ok(());
+        }
+        let reclaimed_ref_bytes = remaining
+            .iter()
+            .find(|m| matches!(m.storage_info, StorageInfo::Reference { .. }))
+            .map(|m| m.file_size)
+            .unwrap_or(0);
+        self.storage.delete_reference(bucket, deltaspace_id).await?;
+        self.cache
+            .invalidate(&Self::cache_key(bucket, deltaspace_id));
+        // Mirror `delete`'s accounting: the reclaimed reference bytes leave
+        // stored_bytes (no object count change — the objects were counted as
+        // they were individually deleted).
+        if let Some(u) = &self.bucket_usage {
+            u.apply_net(bucket, None, None, -(reclaimed_ref_bytes as i64));
+        }
+        Ok(())
+    }
+
+    async fn delete_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        reclaim_reference: bool,
+    ) -> Result<FileMetadata, EngineError> {
         let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
 
         info!("Deleting {}/{}", bucket, key);
@@ -1714,15 +1867,26 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             }
         }
 
-        // If this deltaspace no longer has any objects, clean up its reference baseline.
-        let remaining = self.storage.scan_deltaspace(bucket, &deltaspace_id).await?;
-        let has_objects = remaining
-            .iter()
-            .any(|m| !matches!(m.storage_info, StorageInfo::Reference { .. }));
+        // If this deltaspace no longer has any objects, clean up its reference
+        // baseline. SKIPPED for prefix sweeps (`delete_in_sweep`): this scan
+        // lists the entire deltaspace, so running it per object makes a sweep
+        // O(N²) in directory reads. The sweep caller reclaims once at the end
+        // via `reclaim_empty_deltaspace`.
         // Bytes of a reclaimed reference.bin (stored-only) — subtracted from the
         // counter so stored_bytes stays exact when the last delta is removed.
         let mut reclaimed_ref_bytes = 0u64;
-        if !has_objects && self.storage.has_reference(bucket, &deltaspace_id).await? {
+        let remaining = if reclaim_reference {
+            self.storage.scan_deltaspace(bucket, &deltaspace_id).await?
+        } else {
+            Vec::new()
+        };
+        let has_objects = remaining
+            .iter()
+            .any(|m| !matches!(m.storage_info, StorageInfo::Reference { .. }));
+        if reclaim_reference
+            && !has_objects
+            && self.storage.has_reference(bucket, &deltaspace_id).await?
+        {
             reclaimed_ref_bytes = remaining
                 .iter()
                 .find(|m| matches!(m.storage_info, StorageInfo::Reference { .. }))

@@ -85,8 +85,8 @@ pub use jobs::{
 };
 pub use logs::{get_logs, get_logs_stream};
 pub use maintenance::{
-    bucket_status as maintenance_bucket_status, start_migrate as maintenance_start_migrate,
-    start_reencrypt as maintenance_start_reencrypt,
+    bucket_status as maintenance_bucket_status, start_backfill as maintenance_start_backfill,
+    start_migrate as maintenance_start_migrate, start_reencrypt as maintenance_start_reencrypt,
 };
 pub use objects::{
     bulk_delete as bulk_delete_objects, copy_objects, download_zip, list_all as list_all_objects,

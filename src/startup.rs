@@ -1345,6 +1345,62 @@ pub async fn build_coordination_lease(
     }
 }
 
+/// Build the CROSS-INSTANCE reference lock (the mutex-shaped guard that closes
+/// `B1`: concurrent same-deltaspace `reference.bin` writes from two nodes).
+///
+/// Gated exactly like the job-plane lease: no `config_sync_bucket` → `None`
+/// (single-instance; the engine's in-process prefix mutex is the whole story,
+/// zero S3 traffic). With a coordination bucket set, build a CAS client against
+/// it and return an [`S3ReferenceLock`]. This does NOT re-validate the bucket's
+/// CAS support — [`build_coordination_lease`] already did (and `exit(1)`s a
+/// silent-clobber backend), so by the time the engine writes a reference the
+/// bucket is known-good. A client-build failure is non-fatal (`None`, warn):
+/// same "never a SPOF" stance as the lease builder — a transient blip must not
+/// wedge startup, and the single-writer routing contract still applies.
+pub async fn build_reference_lock(
+    config: &Config,
+) -> Option<Arc<dyn deltaglider_proxy::coordination::ReferenceLock>> {
+    use deltaglider_proxy::coordination::{durable_node_id, S3ReferenceLock};
+
+    let sync_bucket = match &config.config_sync_bucket {
+        Some(b) if !b.is_empty() => b.clone(),
+        _ => {
+            info!("Reference lock: in-process only (single-instance; no coordination bucket)");
+            return None;
+        }
+    };
+    let node_id = durable_node_id(
+        config_db_path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+    );
+    let ttl_secs: i64 =
+        deltaglider_proxy::config::env_parse_with_default("DGP_REFERENCE_LOCK_TTL_SECS", 120);
+    let acquire_timeout_secs: u64 = deltaglider_proxy::config::env_parse_with_default(
+        "DGP_REFERENCE_LOCK_ACQUIRE_TIMEOUT_SECS",
+        30,
+    );
+    match ConfigDbSync::build_client(&config.backend).await {
+        Ok(client) => {
+            info!(
+                "Reference lock: S3-CAS on bucket '{sync_bucket}' (cross-node reference.bin \
+                 protection, node_id={node_id})"
+            );
+            Some(Arc::new(
+                S3ReferenceLock::new(client, sync_bucket, node_id)
+                    .with_tunables(ttl_secs, acquire_timeout_secs),
+            ))
+        }
+        Err(e) => {
+            warn!(
+                "Reference lock: coordination client build failed ({e}) — in-process fallback \
+                 (relies on single-writer-per-deltaspace routing for cross-node safety)"
+            );
+            None
+        }
+    }
+}
+
 /// Startup gate (guard B): under multi-instance, every NAMED S3 backend that
 /// hosts a client-writable routed bucket must enforce conditional writes —
 /// without CAS, two nodes' concurrent same-deltaspace PUTs can corrupt

@@ -194,6 +194,28 @@ pub trait StorageBackend: Send + Sync {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError>;
 
+    /// Update a passthrough object's DG metadata IN PLACE, without
+    /// transferring the object's bytes through the proxy (S3: server-side
+    /// self-copy with `MetadataDirective: REPLACE`; filesystem: xattr
+    /// rewrite). Same (bucket, prefix, filename) addressing as
+    /// `get_passthrough_metadata`.
+    ///
+    /// Used by the metadata-backfill maintenance job. Backends that cannot
+    /// do this keep the default `Other` error; the job records it as a
+    /// per-object failure instead of aborting.
+    async fn put_passthrough_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        let _ = (bucket, prefix, filename, metadata);
+        Err(StorageError::Other(
+            "put_passthrough_metadata is not supported by this backend".to_string(),
+        ))
+    }
+
     /// Get reference file metadata
     async fn get_reference_metadata(
         &self,
@@ -733,6 +755,17 @@ macro_rules! impl_storage_backend_for_box {
             ) -> Result<(), StorageError> {
                 (**self)
                     .put_reference_metadata(bucket, prefix, metadata)
+                    .await
+            }
+            async fn put_passthrough_metadata(
+                &self,
+                bucket: &str,
+                prefix: &str,
+                filename: &str,
+                metadata: &FileMetadata,
+            ) -> Result<(), StorageError> {
+                (**self)
+                    .put_passthrough_metadata(bucket, prefix, filename, metadata)
                     .await
             }
             async fn get_reference_metadata(

@@ -867,6 +867,25 @@ impl StorageBackend for FilesystemBackend {
         xattr_meta::write_metadata(&self.reference_path(bucket, prefix), metadata).await
     }
 
+    async fn put_passthrough_metadata(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        metadata: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        self.require_bucket_exists(bucket).await?;
+        let path = self.passthrough_path(bucket, prefix, filename);
+        if !path.exists() {
+            return Err(StorageError::NotFound(format!(
+                "{bucket}/{prefix}/{filename}"
+            )));
+        }
+        // xattr write only — bytes and mtime untouched (setxattr changes
+        // ctime, not mtime), so the served LastModified is stable.
+        xattr_meta::write_metadata(&path, metadata).await
+    }
+
     #[instrument(skip(self))]
     async fn get_reference_metadata(
         &self,

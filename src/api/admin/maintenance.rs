@@ -10,6 +10,10 @@
 //!   (none / aes256-gcm-proxy), must not already have an active job.
 //!   The write gate arms at CREATION (not at worker start) so there is
 //!   no window where a write slips in between create and claim.
+//! - `POST /_/api/admin/jobs/backfill-metadata`
+//!   `{buckets: [..], refresh_last_modified?: bool}` — create
+//!   metadata-backfill jobs (admin tier). Same gating and one-active-job
+//!   rule; no config-mode precondition.
 //! - `POST /_/api/admin/jobs/maintenance:<id>/cancel` (admin tier, via jobs.rs).
 //! - `GET  /_/api/admin/jobs/bucket/:bucket` — the bucket's active
 //!   job, if any. Registered on the SESSION-LIGHT tier (S3BrowserLift
@@ -187,6 +191,113 @@ pub async fn start_reencrypt(
         info!("maintenance: re-encrypt requested for {:?}", names);
         super::audit_log(
             "maintenance_reencrypt_requested",
+            "admin",
+            &names.join(","),
+            &headers,
+        );
+    }
+
+    Ok(Json(ReencryptResponse { started, errors }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BackfillRequest {
+    pub buckets: Vec<String>,
+    /// `false` (default): the LastModified the proxy serves is unchanged
+    /// (`dg-created-at` pinned to the pre-job value). `true`: backfilled
+    /// objects read as modified at rewrite time.
+    #[serde(default)]
+    pub refresh_last_modified: bool,
+}
+
+/// POST /_/api/admin/jobs/backfill-metadata — create metadata-backfill
+/// jobs. Same shape and gating as re-encrypt: per-bucket validation, the
+/// write gate arms at CREATION, one active job per bucket. No
+/// config-mode precondition — the job derives everything from the
+/// objects themselves.
+pub async fn start_backfill(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+    Json(req): Json<BackfillRequest>,
+) -> Result<Json<ReencryptResponse>, (StatusCode, String)> {
+    if req.buckets.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "no buckets given".into()));
+    }
+    if req.buckets.len() > 100 {
+        return Err((StatusCode::BAD_REQUEST, "too many buckets (max 100)".into()));
+    }
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or((StatusCode::NOT_FOUND, "config DB unavailable".to_string()))?;
+
+    let engine = state.s3_state.engine.load().clone();
+    let real: std::collections::HashSet<String> = engine
+        .list_bucket_origins()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to list buckets: {e}"),
+            )
+        })?
+        .into_iter()
+        .map(|b| b.name.to_ascii_lowercase())
+        .collect();
+
+    let params = serde_json::to_string(&crate::maintenance::backfill::BackfillParams {
+        refresh_last_modified: req.refresh_last_modified,
+    })
+    .expect("params serialize");
+
+    let mut started = Vec::new();
+    let mut errors = Vec::new();
+    for bucket in &req.buckets {
+        let key = bucket.to_ascii_lowercase();
+        if !real.contains(&key) {
+            errors.push(ReencryptError {
+                bucket: bucket.clone(),
+                error: "bucket not found".into(),
+            });
+            continue;
+        }
+        let created = {
+            let db = db.lock().await;
+            db.maintenance_create_job(
+                crate::maintenance::backfill::KIND,
+                &key,
+                "counting",
+                Some(&params),
+                "admin",
+                current_unix_seconds(),
+            )
+        };
+        match created {
+            Ok(Some(job_id)) => {
+                // Gate from CREATION: no create→claim window for writes.
+                state.s3_state.maintenance_gate.set_busy(&key);
+                started.push(ReencryptStarted {
+                    bucket: bucket.clone(),
+                    job_id,
+                });
+            }
+            Ok(None) => errors.push(ReencryptError {
+                bucket: bucket.clone(),
+                error: "a maintenance job is already active for this bucket".into(),
+            }),
+            Err(e) => errors.push(ReencryptError {
+                bucket: bucket.clone(),
+                error: format!("failed to create job: {e}"),
+            }),
+        }
+    }
+
+    if !started.is_empty() {
+        state.s3_state.maintenance_notify.notify_one();
+        let names: Vec<&str> = started.iter().map(|s| s.bucket.as_str()).collect();
+        info!("maintenance: metadata backfill requested for {:?}", names);
+        super::audit_log(
+            "maintenance_backfill_requested",
             "admin",
             &names.join(","),
             &headers,

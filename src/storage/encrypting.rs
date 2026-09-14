@@ -1695,6 +1695,28 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     ) -> Result<FileMetadata, StorageError> {
         self.inner.get_passthrough_metadata(b, p, f).await
     }
+    async fn put_passthrough_metadata(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+        m: &FileMetadata,
+    ) -> Result<(), StorageError> {
+        // Metadata itself is not encrypted, but the RAW object carries the
+        // encryption markers, and a caller-supplied FileMetadata built from a
+        // decrypted read may lack them. Re-assert the markers from the raw
+        // object so a metadata-only rewrite can NEVER strip what makes the
+        // object decryptable on read.
+        let mut meta = m.clone();
+        if let Ok(raw) = self.inner.get_passthrough_metadata(b, p, f).await {
+            for key in [ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY] {
+                if let Some(v) = raw.user_metadata.get(key) {
+                    meta.user_metadata.insert(key.to_string(), v.clone());
+                }
+            }
+        }
+        self.inner.put_passthrough_metadata(b, p, f, &meta).await
+    }
     async fn put_reference_metadata(
         &self,
         b: &str,
