@@ -392,9 +392,6 @@ mod tests {
         assert_eq!(t.compression_ratio(), Some(1.0));
     }
 
-    /// Regression: `user_visible_count` must NEVER include reference
-    /// baselines — they're internal. Without this pin, someone could
-    /// "fix" the counter and silently inflate "objects" headline.
     #[test]
     fn merge_of_disjoint_scopes_equals_one_pass_over_both() {
         // The property that makes `merge` worth having: accumulating two
@@ -450,6 +447,9 @@ mod tests {
         assert_eq!(a.passthrough_count, 2);
     }
 
+    /// Regression: `user_visible_count` must NEVER include reference
+    /// baselines — they're internal. Without this pin, someone could
+    /// "fix" the counter and silently inflate "objects" headline.
     #[test]
     fn user_visible_count_excludes_references() {
         let mut t = SavingsTotals::default();
