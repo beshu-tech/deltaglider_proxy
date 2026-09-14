@@ -24,6 +24,10 @@ pub struct PassthroughMultipartHandle {
     total_size: u64,
     content_type: Option<String>,
     user_metadata: HashMap<String, String>,
+    /// Similarity sketch of the bytes being uploaded (the copy source's, on
+    /// the streaming copy path). Stamped at create time (S3 writes user
+    /// metadata only then) and again on the final `FileMetadata`.
+    sketch: Option<String>,
     upload: MultipartUpload,
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -859,8 +863,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.storage
             .get_reference_to_file(bucket, deltaspace_id, spool.path())
             .await?;
-        let (sha256, md5, size, _heal_sketch) = Self::hash_spool_file(spool.path()).await?;
-        let healed = FileMetadata::new_reference(
+        let (sha256, md5, size, sketch) = Self::hash_spool_file(spool.path()).await?;
+        let mut healed = FileMetadata::new_reference(
             Self::INTERNAL_REFERENCE_NAME.to_string(),
             // source_name is cosmetic (display/label only; not used by decode,
             // verify, or replication compare). A stable placeholder that equals
@@ -871,6 +875,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             size,
             ref_meta.content_type.clone(),
         );
+        // Same streaming pass as the hashes — stamp it like the fresh-reference
+        // path does, or the healed reference drops out of the similarity index.
+        healed.sketch = Some(sketch);
         self.storage
             .put_reference_from_file(bucket, deltaspace_id, spool.path(), &healed)
             .await?;
@@ -1244,7 +1251,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// holds it for the lifetime of the returned handle, mirroring
     /// `store_passthrough_chunked_inner`. The caller drives parts via
     /// [`Self::upload_passthrough_part`] then finalizes with
-    /// [`Self::finish_passthrough_multipart`] (or aborts).
+    /// [`Self::finish_passthrough_multipart`] (or aborts). `sketch` is the
+    /// similarity sketch of the bytes about to be uploaded (a streaming copy
+    /// passes the source's); `None` leaves the object out of the index.
     #[allow(clippy::too_many_arguments)]
     pub async fn begin_passthrough_multipart(
         &self,
@@ -1253,6 +1262,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         total_size: u64,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
+        sketch: Option<String>,
     ) -> Result<PassthroughMultipartHandle, EngineError> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
@@ -1270,6 +1280,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             content_type.clone(),
         );
         create_meta.user_metadata = user_metadata.clone();
+        create_meta.sketch = sketch.clone();
 
         let upload = self
             .storage
@@ -1284,6 +1295,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             total_size,
             content_type,
             user_metadata,
+            sketch,
             upload,
             _guard: guard,
         })
@@ -1345,6 +1357,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
         metadata.user_metadata = std::mem::take(&mut handle.user_metadata);
         metadata.multipart_etag = multipart_etag;
+        metadata.sketch = handle.sketch.take();
 
         if let Err(e) = self
             .storage

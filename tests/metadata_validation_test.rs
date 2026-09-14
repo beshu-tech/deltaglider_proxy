@@ -534,6 +534,13 @@ async fn test_store_heals_stripped_reference_metadata_preserving_bytes() {
             .is_some_and(|s| !s.is_empty()),
         "healed reference carries a non-empty sha256: {meta}"
     );
+    // The heal re-hashes the reference bytes in one streaming pass; the
+    // sketch from that pass must be stamped too (v1 is the reference).
+    assert_eq!(
+        meta.get("sketch").and_then(|v| v.as_str()),
+        Some(deltaglider_proxy::deltaglider::sketch::sketch_hex(&v1).as_str()),
+        "healed reference carries the sketch of its bytes: {meta}"
+    );
 
     // Bytes UNCHANGED — existing deltas were encoded against these bytes.
     let ref_after = ref_bytes(&data_dir, &bucket, prefix);

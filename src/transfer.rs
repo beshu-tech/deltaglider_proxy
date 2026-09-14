@@ -353,6 +353,9 @@ async fn stream_copy_passthrough(
             total,
             source_head.content_type.clone(),
             user_metadata,
+            // A copy keeps the source's sketch (same bytes, no recompute),
+            // like the hashes below.
+            source_head.sketch.clone(),
         )
         .await
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -1576,17 +1579,24 @@ mod multipart_abort_tests {
         slow_parts: AtomicBool,
         fail_complete: AtomicBool,
         aborts: Mutex<Vec<String>>,
+        /// Metadata the engine handed to `create_multipart_upload` (S3
+        /// persists user metadata at create time only).
+        create_meta: Mutex<Option<FileMetadata>>,
+        /// Metadata the engine handed to `complete_multipart_upload`
+        /// (buffering backends persist it here).
+        complete_meta: Mutex<Option<FileMetadata>>,
     }
 
     impl AbortSpy {
         fn new(src_bytes: Vec<u8>) -> Self {
-            let meta = FileMetadata::new_passthrough(
+            let mut meta = FileMetadata::new_passthrough(
                 "src.bin".to_string(),
                 "0".repeat(64),
                 "0".repeat(32),
                 src_bytes.len() as u64,
                 Some("application/octet-stream".to_string()),
             );
+            meta.sketch = Some(crate::deltaglider::sketch::sketch_hex(&src_bytes));
             Self {
                 src_bytes,
                 src_meta: meta,
@@ -1594,6 +1604,8 @@ mod multipart_abort_tests {
                 slow_parts: AtomicBool::new(false),
                 fail_complete: AtomicBool::new(false),
                 aborts: Mutex::new(Vec::new()),
+                create_meta: Mutex::new(None),
+                complete_meta: Mutex::new(None),
             }
         }
     }
@@ -1609,8 +1621,9 @@ mod multipart_abort_tests {
             bucket: &str,
             _: &str,
             _: &str,
-            _: &FileMetadata,
+            meta: &FileMetadata,
         ) -> Result<MultipartUpload, StorageError> {
+            *self.create_meta.lock().unwrap() = Some(meta.clone());
             Ok(MultipartUpload {
                 bucket: bucket.to_string(),
                 upload_id: "spy-upload-1".to_string(),
@@ -1644,11 +1657,12 @@ mod multipart_abort_tests {
             _: &str,
             _: &[UploadedPart],
             _: &[Bytes],
-            _: &FileMetadata,
+            meta: &FileMetadata,
         ) -> Result<String, StorageError> {
             if self.fail_complete.load(Ordering::Relaxed) {
                 return Err(StorageError::Other("injected complete failure".into()));
             }
+            *self.complete_meta.lock().unwrap() = Some(meta.clone());
             Ok("final-etag".to_string())
         }
         async fn abort_multipart_upload(
@@ -2009,6 +2023,43 @@ mod multipart_abort_tests {
             operation: "test",
             upload_concurrency: Some(2),
         }
+    }
+
+    /// The streaming copy keeps the source's sketch (same bytes, so the
+    /// same sketch — no recompute). It must reach BOTH backend hooks: S3
+    /// persists user metadata at create time only, buffering backends at
+    /// complete time. Neither replication nor the engine recomputes it
+    /// after the multipart completes.
+    #[tokio::test]
+    async fn streamed_copy_carries_the_source_sketch() {
+        let spy = AbortSpy::new(vec![7u8; 64]);
+        let (engine, spy) = spy_engine(spy);
+        let meta = spy.src_meta.clone();
+        let expected = meta.sketch.clone().expect("source carries a sketch");
+
+        stream_copy_passthrough(&engine, copy_request(), &meta)
+            .await
+            .expect("copy succeeds");
+
+        let create = spy
+            .create_meta
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("create called");
+        assert_eq!(create.sketch.as_deref(), Some(expected.as_str()));
+        let complete = spy
+            .complete_meta
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("complete called");
+        assert_eq!(complete.sketch.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            complete.file_sha256, meta.file_sha256,
+            "hashes ride along the same way"
+        );
+        assert!(spy.aborts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
