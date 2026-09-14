@@ -28,6 +28,11 @@
 //! and persisted as part of the DG metadata JSON (xattr / S3 user metadata).
 //! It is backward-compatible: existing objects without the field deserialize
 //! with `None` and are simply absent from the similarity index.
+//!
+//! The bit layout is part of the persisted format. `vote()` changed before
+//! the first release that ships the sketch (PR #83: per-quarter mixing), so
+//! sketches written by earlier builds of that branch are not comparable and
+//! must be recomputed.
 
 use std::path::Path;
 
@@ -202,19 +207,44 @@ fn chunk_hash(chunk: &[u8]) -> u64 {
     h
 }
 
+/// One odd multiplier per 64-bit quarter of the sketch. Each quarter votes
+/// on its own mix of the chunk hash, so the four quarters are independent
+/// and the 256 bits carry 256 bits of entropy. (Reading `hash >> (i % 64)`
+/// for all 256 positions gives positions i, i+64, i+128 and i+192 the same
+/// vote: the hex output repeats with period 16 and only 64 bits are real.)
+const QUARTER_MIX: [u64; 4] = [
+    0x9E37_79B9_7F4A_7C15,
+    0xBF58_476D_1CE4_E5B9,
+    0x94D0_49BB_1331_11EB,
+    0xD6E8_FEB8_6659_FD93,
+];
+
+/// Derive the 64 vote bits for `quarter` from a chunk hash: a SplitMix64-
+/// style finalizer whose first multiplier is per-quarter. The xor-shifts
+/// fold the high bits back down, so no output bit is a plain copy of an
+/// input bit shared across quarters (an odd multiply alone leaves bit 0
+/// equal to bit 0 of the input in every quarter).
+#[inline]
+fn mix(hash: u64, quarter: usize) -> u64 {
+    let mut z = (hash ^ (hash >> 30)).wrapping_mul(QUARTER_MIX[quarter]);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 /// Cast a chunk's hash as a weighted vote into the accumulator.
 /// For each of the 256 SimHash bit positions, if the corresponding bit of
-/// the chunk hash is 1, increment the accumulator; otherwise decrement.
-/// The chunk hash is 64 bits, so we cycle through it 4 times to cover all
-/// 256 positions.
+/// the (per-quarter mixed) chunk hash is 1, increment the accumulator;
+/// otherwise decrement.
 #[inline]
 fn vote(acc: &mut [i64; SIMHASH_BITS], hash: u64) {
-    for (i, val) in acc.iter_mut().enumerate() {
-        let bit = (hash >> (i % 64)) & 1;
-        if bit == 1 {
-            *val += 1;
-        } else {
-            *val -= 1;
+    for (quarter, slots) in acc.chunks_mut(64).enumerate() {
+        let h = mix(hash, quarter);
+        for (i, val) in slots.iter_mut().enumerate() {
+            if (h >> i) & 1 == 1 {
+                *val += 1;
+            } else {
+                *val -= 1;
+            }
         }
     }
 }
@@ -467,6 +497,53 @@ mod tests {
         let from_file = sketch_file_hex(tmp.path()).unwrap();
         let from_bytes = sketch_hex(&data);
         assert_eq!(from_file, from_bytes);
+    }
+
+    /// Deterministic pseudo-random bytes (xorshift64*) for entropy tests.
+    fn pseudo_random_bytes(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
+            })
+            .collect()
+    }
+
+    /// The four 64-bit quarters of the sketch must be independent. A vote
+    /// that reads `hash >> (i % 64)` gives positions i, i+64, i+128 and
+    /// i+192 the same bit, so the 256-bit sketch would carry only 64 bits
+    /// of entropy (the hex would repeat with period 16).
+    #[test]
+    fn test_quarters_are_independent() {
+        for seed in 1..=8u64 {
+            let data = pseudo_random_bytes(400_000, seed * 0x9E37_79B9);
+            let sketch = sketch_bytes(&data);
+            let quarters: Vec<&[u8]> = sketch.chunks(8).collect();
+            for a in 0..4 {
+                for b in (a + 1)..4 {
+                    assert_ne!(
+                        quarters[a],
+                        quarters[b],
+                        "seed {seed}: quarter {a} equals quarter {b} in {}",
+                        hex::encode(sketch)
+                    );
+                    // Independent 64-bit halves differ in ~32 bits (sd 4);
+                    // 8..=56 is a >5 sd band on both sides.
+                    let d: u32 = quarters[a]
+                        .iter()
+                        .zip(quarters[b])
+                        .map(|(x, y)| (x ^ y).count_ones())
+                        .sum();
+                    assert!(
+                        (8..=56).contains(&d),
+                        "seed {seed}: quarters {a}/{b} differ in {d} bits, expected ~32"
+                    );
+                }
+            }
+        }
     }
 
     /// Determinism: same input always produces the same sketch.
