@@ -5,9 +5,10 @@
 //! Produces a 32-byte fingerprint of a file's *content* that is:
 //! - **Intrinsic**: computed solely from the object's own bytes. Does not
 //!   depend on which reference was (or will be) chosen for delta encoding.
-//! - **Position-robust**: a 1-byte insertion near the start only shifts
-//!   chunks locally; downstream chunks have byte-identical boundaries
-//!   because FastCDC cut points are content-defined, not offset-defined.
+//! - **Position-robust where the content has cut points**: FastCDC cut
+//!   points are content-defined, so a 1-byte insertion only shifts the
+//!   chunk that contains it; downstream chunks keep byte-identical
+//!   boundaries. See the limit below.
 //! - **Cheap to compare**: Hamming distance (XOR + popcount) on two 256-bit
 //!   sketches is O(1), regardless of file size.
 //! - **Compact**: 32 bytes per object — fits in S3 user metadata or an
@@ -21,6 +22,23 @@
 //! boundaries (gear-table rolling hash), so an insertion only shifts
 //! chunks near the insertion point. SimHash folds all chunk hashes into a
 //! single 256-bit value where Hamming distance ≈ dissimilarity.
+//!
+//! ## Limit: periodic and constant content
+//!
+//! A cut fires when the low 13 bits of the gear hash are clear, and those
+//! bits depend on the last 13 bytes only. Content whose 13-byte windows
+//! take few distinct values (constant fill, a short repeating pattern,
+//! zeroed disk-image regions) has a good chance of never producing a cut
+//! (period-256 data: 256 windows, each a 1/8192 chance).
+//! Every chunk is then a `CDC_MAX` hard cut at a fixed offset, and a 1-byte
+//! insertion at the front shifts every chunk: the two sketches look
+//! unrelated (measured ~126/256 for period-256 data, versus ~27 for random
+//! data with the same insertion; pinned by
+//! `test_periodic_content_loses_position_robustness`).
+//! Constant fill degenerates further: every chunk has the same hash, so the
+//! sketch is shift-invariant but carries no similarity signal. Reference
+//! selection must therefore treat the sketch as one signal and fall back
+//! to size and recency when sketches disagree.
 //!
 //! ## Storage
 //!
@@ -544,6 +562,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Documents the limit in the module docstring: content with no CDC cut
+    /// points falls back to fixed 64 KiB hard cuts, so a 1-byte insertion
+    /// at the front shifts every chunk and the sketch looks unrelated.
+    /// Random content with the same insertion stays close. If a chunker
+    /// change makes the periodic case robust, lower the bound here and
+    /// update the docstring.
+    #[test]
+    fn test_periodic_content_loses_position_robustness() {
+        fn prepend_distance(base: &[u8]) -> u32 {
+            let mut shifted = vec![0x5Au8];
+            shifted.extend_from_slice(base);
+            hamming_distance_hex(&sketch_hex(base), &sketch_hex(&shifted)).unwrap()
+        }
+
+        let periodic: Vec<u8> = (0..320_000u32).map(|i| (i % 256) as u8).collect();
+        let periodic_dist = prepend_distance(&periodic);
+        assert!(
+            periodic_dist > 96,
+            "periodic content: 1-byte prepend gave distance {periodic_dist}; \
+             expected near-unrelated (> 96) because every chunk is a hard cut"
+        );
+
+        let random = pseudo_random_bytes(320_000, 0xABCDEF);
+        let random_dist = prepend_distance(&random);
+        assert!(
+            random_dist < 48,
+            "random content: 1-byte prepend gave distance {random_dist}; \
+             expected small (< 48) because CDC re-syncs after the first chunk"
+        );
+
+        // Constant fill: every hard-cut chunk hashes the same, so the shift
+        // is invisible — but the sketch carries no similarity signal.
+        let constant = vec![0x42u8; 320_000];
+        assert_eq!(prepend_distance(&constant), 0);
     }
 
     /// Determinism: same input always produces the same sketch.
