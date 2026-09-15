@@ -304,11 +304,15 @@ impl BucketUsage {
     /// Read one bucket's counters (clamped at 0), merging any un-flushed
     /// pending delta. `None` only when the bucket has neither a stored row
     /// NOR pending activity.
+    ///
+    /// Holds the connection lock across the pending read: `flush_pending`
+    /// takes the same lock before draining, so this ordering (conn → pending)
+    /// makes it impossible to read a stored row that predates a flush and
+    /// then miss the delta that flush just moved out of `pending` (#85
+    /// review). No site takes `pending → conn`, so there is no deadlock.
     pub fn read(&self, bucket: &str) -> Result<Option<BucketUsageRow>, rusqlite::Error> {
-        let stored = self
-            .conn
-            .lock()
-            .unwrap()
+        let conn = self.conn.lock().unwrap();
+        let stored = conn
             .query_row(
                 "SELECT object_count, logical_bytes, stored_bytes, last_scan_at
                    FROM bucket_usage WHERE bucket = ?1",
@@ -321,6 +325,7 @@ impl BucketUsage {
                 other => Err(other),
             })?;
         let (dc, dl, ds) = self.pending_for(bucket);
+        drop(conn);
         let Some(mut row) = stored else {
             if dc == 0 && dl == 0 && ds == 0 {
                 return Ok(None);
@@ -340,7 +345,8 @@ impl BucketUsage {
     }
 
     /// Read every bucket's counters (for the aggregate `/_/stats`), merging
-    /// un-flushed pending deltas over the stored rows.
+    /// un-flushed pending deltas over the stored rows. Holds the connection
+    /// across the pending read for the same reason as [`Self::read`].
     pub fn read_all(&self) -> Result<Vec<(String, BucketUsageRow)>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -353,8 +359,7 @@ impl BucketUsage {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
-        drop(conn);
-        // Buckets with a stored row: merge pending over it.
+        // Merge pending while still holding `conn` (see `read`).
         for (bucket, row) in rows.iter_mut() {
             let (dc, dl, ds) = self.pending_for(bucket);
             row.object_count = row.object_count.saturating_add_signed(dc);

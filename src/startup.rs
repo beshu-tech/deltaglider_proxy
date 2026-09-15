@@ -1767,23 +1767,19 @@ pub fn spawn_periodic(interval: Duration, f: impl Fn() + Send + 'static) {
 /// and the replay-cache retain produced interval-aligned P99 spikes).
 /// Awaiting the join also serialises ticks, so a long job cannot
 /// overlap itself; the next tick fires after the current one finishes.
-pub fn spawn_periodic_blocking(interval: Duration, f: impl Fn() + Send + 'static) {
-    // Mutex only serialises tick dispatch (never held across the work
-    // itself), which the spawn_blocking join already serialises anyway —
-    // it exists purely to give spawn_blocking an owned 'static callable.
-    let f: std::sync::Arc<std::sync::Mutex<Box<dyn Fn() + Send>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Box::new(f)));
+///
+/// `f` is stored in an `Arc` (not a `Mutex`): a panic inside the closure
+/// unwinds through `spawn_blocking` and is reported as a `JoinError`,
+/// after which the next tick still runs — no lock can be poisoned, so the
+/// sweep can never be permanently disabled by one bad tick.
+pub fn spawn_periodic_blocking(interval: Duration, f: impl Fn() + Send + Sync + 'static) {
+    let f = std::sync::Arc::new(f);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         loop {
             tick.tick().await;
             let f = std::sync::Arc::clone(&f);
-            let result = tokio::task::spawn_blocking(move || {
-                let f = f.lock().unwrap();
-                f();
-            })
-            .await;
-            if let Err(e) = result {
+            if let Err(e) = tokio::task::spawn_blocking(move || f()).await {
                 tracing::error!("periodic blocking task failed: {}", e);
             }
         }
@@ -2052,6 +2048,31 @@ mod tests {
             start_time > 0.0,
             "process_start_time_seconds should be initialised to a positive UNIX timestamp, \
              got {start_time}"
+        );
+    }
+
+    /// #86 review: a panic inside one tick must not disable the periodic job.
+    /// The closure is held in an `Arc` (no `Mutex`), so there is no lock to
+    /// poison — later ticks still run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_periodic_blocking_survives_a_panicking_tick() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc as StdArc;
+        let runs = StdArc::new(AtomicUsize::new(0));
+        let r = StdArc::clone(&runs);
+        spawn_periodic_blocking(Duration::from_millis(10), move || {
+            if r.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("first tick blows up");
+            }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while runs.load(Ordering::SeqCst) < 3 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            runs.load(Ordering::SeqCst) >= 3,
+            "later ticks must still run after a panicking tick (got {})",
+            runs.load(Ordering::SeqCst)
         );
     }
 }

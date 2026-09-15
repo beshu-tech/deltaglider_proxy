@@ -1052,6 +1052,15 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     }
 
+    // #85: drain any un-flushed bucket-usage deltas. The periodic task runs
+    // every DGP_BUCKET_USAGE_FLUSH_SECS; without this, a clean exit
+    // (restart, deploy, SIGTERM) discards up to that window, where the old
+    // write-through design lost nothing. Best-effort: a crash still loses
+    // the window and Refresh reconciles it.
+    if let Some(usage) = bucket_usage.as_ref() {
+        usage.flush_pending();
+    }
+
     info!("Server shutdown complete");
     Ok(())
 }

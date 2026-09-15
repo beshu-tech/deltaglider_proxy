@@ -399,6 +399,23 @@ pub fn export_as_declarative(db: &ConfigDb) -> Result<DeclarativeIam, String> {
     export_as_declarative_inner(db, false)
 }
 
+/// The first user name that appears twice in a snapshot, if any.
+///
+/// The reconciler keys users by NAME, so a database that holds a same-name
+/// pair (a `local` and an `external` row for the same person — allowed, since
+/// only `access_key_id` is UNIQUE) cannot be represented in the full-IAM
+/// YAML: the import rejects duplicate names. The export refuses such a
+/// snapshot rather than emit a file that cannot be re-imported (#71 review).
+pub fn duplicate_user_name(snapshot: &DeclarativeIam) -> Option<&str> {
+    let mut seen = HashSet::new();
+    for u in &snapshot.users {
+        if !seen.insert(u.name.as_str()) {
+            return Some(u.name.as_str());
+        }
+    }
+    None
+}
+
 /// Like [`export_as_declarative`] but optionally emits the REAL secrets
 /// (`secret_access_key` / `client_secret`) instead of redacting them.
 ///
@@ -1007,6 +1024,18 @@ pub fn diff_iam(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<IamDiff, Strin
                     return Err(format!(
                         "user '{}': YAML marks an existing local user as external — \
                          provenance is DB-owned; remove auth_source or recreate the user",
+                        yu.name
+                    ));
+                }
+            }
+        }
+        // Symmetric: an explicit `local` must not downgrade an external row.
+        if yu.auth_source.as_deref() == Some("local") {
+            if let Some(du) = db.users.iter().find(|du| du.name == yu.name) {
+                if du.auth_source == "external" {
+                    return Err(format!(
+                        "user '{}': YAML sets auth_source: local on an existing external \
+                         row — provenance is DB-owned; remove auth_source or recreate the user",
                         yu.name
                     ));
                 }
@@ -2510,11 +2539,73 @@ mod tests {
         assert_eq!(ident.user_id, reuser.id);
         assert_eq!(ident.email.as_deref(), Some("dana@example.com"));
 
-        // Idempotency: re-importing must not duplicate anything.
+        // Idempotency: re-importing must be a TRUE no-op — no user churn,
+        // no binding churn (a bindings-only recount would push config sync
+        // and break the documented round-trippability, #71 review).
         let stats2 = reconcile_declarative_iam(&restored, &snapshot).unwrap();
         assert_eq!(stats2.users_created.len(), 0);
+        assert_eq!(
+            stats2.external_identities_applied, 0,
+            "unchanged bindings must not count as applied"
+        );
+        assert!(
+            stats2.is_noop(),
+            "re-apply of an unchanged export is a no-op"
+        );
         let all = restored.list_external_identities().unwrap();
         assert_eq!(all.len(), 1, "upsert keyed on (provider, subject)");
+    }
+
+    #[test]
+    fn duplicate_user_name_is_detected() {
+        // The reporter's case: one local + one external record with the same
+        // display name, different access keys. The name-keyed reconciler
+        // cannot represent it, so the export must refuse (tested here on the
+        // pure detector; the handler maps it to 409).
+        let snapshot = DeclarativeIam {
+            users: vec![
+                DeclarativeUser {
+                    name: "dana@example.com".into(),
+                    access_key_id: "AKIALOCAL".into(),
+                    ..yu("dana@example.com", "AKIALOCAL")
+                },
+                DeclarativeUser {
+                    name: "dana@example.com".into(),
+                    access_key_id: "AKIAEXTERNAL".into(),
+                    auth_source: Some("external".into()),
+                    ..yu("dana@example.com", "AKIAEXTERNAL")
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(duplicate_user_name(&snapshot), Some("dana@example.com"));
+        let unique = DeclarativeIam {
+            users: vec![yu("a", "KA"), yu("b", "KB")],
+            ..Default::default()
+        };
+        assert_eq!(duplicate_user_name(&unique), None);
+    }
+
+    #[test]
+    fn yaml_cannot_downgrade_an_external_user_to_local() {
+        // The promotion guard's symmetric twin: explicit `local` on an
+        // existing external row is rejected, so provenance stays DB-owned.
+        let yaml = DeclarativeIam {
+            users: vec![DeclarativeUser {
+                auth_source: Some("local".into()),
+                ..yu("oauth-bob", "K_OB")
+            }],
+            ..Default::default()
+        };
+        let current = CurrentIam {
+            users: vec![db_external_user(5, "oauth-bob", "K_OB")],
+            ..empty_db()
+        };
+        let err = diff_iam(&yaml, &current).unwrap_err();
+        assert!(
+            err.contains("local on an existing external row"),
+            "downgrade must be rejected before any write: {err}"
+        );
     }
 
     #[test]

@@ -308,6 +308,22 @@ impl ConfigDb {
                     .raw_claims
                     .as_ref()
                     .map(|v| serde_json::to_string(v).unwrap_or_default());
+                let verified = ident.email_verified.unwrap_or(false);
+                // Idempotency: only count (and write) a binding whose stored
+                // row differs. Re-applying an unchanged lossless export must
+                // stay a no-op — the docstring promises it.
+                if external_identity_matches(
+                    &tx,
+                    *pid,
+                    &ident.subject,
+                    *uid,
+                    ident.email.as_deref(),
+                    ident.display_name.as_deref(),
+                    claims_json.as_deref(),
+                    verified,
+                )? {
+                    continue;
+                }
                 tx.execute(
                     "INSERT INTO external_identities \
                      (user_id, provider_id, external_sub, email, display_name, raw_claims, email_verified) \
@@ -325,7 +341,7 @@ impl ConfigDb {
                         ident.email,
                         ident.display_name,
                         claims_json,
-                        ident.email_verified.unwrap_or(false) as i32,
+                        verified as i32,
                     ],
                 )?;
                 stats.external_identities_applied += 1;
@@ -445,4 +461,46 @@ fn query_user_id_by_access_key(
     )
     .optional()
     .map_err(ConfigDbError::from)
+}
+
+/// True when the stored external identity for `(provider_id, subject)` already
+/// equals the incoming fields — the reconcile then skips the write so a
+/// re-apply of an unchanged full-IAM export stays a true no-op (#71 review).
+#[allow(clippy::too_many_arguments)]
+fn external_identity_matches(
+    tx: &rusqlite::Transaction<'_>,
+    provider_id: i64,
+    subject: &str,
+    user_id: i64,
+    email: Option<&str>,
+    display_name: Option<&str>,
+    raw_claims: Option<&str>,
+    email_verified: bool,
+) -> Result<bool, ConfigDbError> {
+    let existing = tx
+        .query_row(
+            "SELECT user_id, email, display_name, raw_claims, email_verified \
+             FROM external_identities WHERE provider_id = ?1 AND external_sub = ?2",
+            params![provider_id, subject],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, i64>(4)? != 0,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(match existing {
+        Some((u, e, d, c, v)) => {
+            u == user_id
+                && e == email.map(str::to_string)
+                && d == display_name.map(str::to_string)
+                && c == raw_claims.map(str::to_string)
+                && v == email_verified
+        }
+        None => false,
+    })
 }

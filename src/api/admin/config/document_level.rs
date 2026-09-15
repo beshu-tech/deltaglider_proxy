@@ -703,6 +703,22 @@ pub async fn export_declarative_iam(
                 .into_response();
         }
     };
+    // #71 review: the reconciler keys users by NAME. A DB holding a same-name
+    // local+external pair (allowed — only access_key_id is UNIQUE) cannot be
+    // represented in this YAML, and the import would reject it. Refuse loudly
+    // rather than hand back a file that cannot be re-imported.
+    if let Some(name) = crate::iam::duplicate_user_name(&snapshot) {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "full-IAM export cannot represent two users named '{name}': the reconciler \
+                 keys users by name, so this database's same-name pair would not round-trip. \
+                 Use the admin backup (POST /_/api/admin/backup) for a lossless artifact, or \
+                 rename one of the users."
+            ),
+        )
+            .into_response();
+    }
     drop(db);
 
     // Emit a minimal YAML with `access.iam_mode: declarative` + the
