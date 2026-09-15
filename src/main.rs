@@ -390,6 +390,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(bt) = pre_config.blocking_threads {
         runtime_builder.max_blocking_threads(bt);
     }
+    // #87: poll-time histogram instrumentation — the sampler in
+    // `metrics::spawn_tokio_runtime_metrics_sampler` reads it. Both sides of
+    // the same cfg, so a default build pays nothing and a
+    // `--cfg tokio_unstable` build gets the full series.
+    #[cfg(tokio_unstable)]
+    {
+        runtime_builder.enable_metrics_poll_time_histogram();
+    }
     let runtime = runtime_builder.build()?;
 
     runtime.block_on(async_main(cli))
@@ -728,6 +736,9 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Background monitors ---
     spawn_cache_monitor(&state, &metrics);
+    // #87: Tokio runtime sampler — a no-op call unless built with
+    // `--cfg tokio_unstable` (see src/metrics.rs for the gating rationale).
+    deltaglider_proxy::metrics::spawn_tokio_runtime_metrics_sampler(&metrics);
 
     // Resolve the authoritative config-file path ONCE, before anything that
     // persists config (the maintenance worker's migrate jobs AND AdminState

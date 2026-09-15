@@ -120,6 +120,43 @@ jobs:
           path: /tmp/lcov.info
           if-no-files-found: ignore
 
+  # ── tokio_unstable type-check + smoke (#87): the runtime-metrics sampler
+  #    (src/metrics.rs, cfg-gated) and the poll-time-histogram builder opt-in
+  #    only compile when RUSTFLAGS carries --cfg tokio_unstable. The PR gate
+  #    must NOT require the flag (plain cargo build stays the dev default),
+  #    so the gated code is type-checked HERE nightly instead. ──
+  tokio-unstable:
+    name: tokio_unstable build + tests (nightly)
+    runs-on: k3s
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      options: --ulimit nofile=1048576:1048576
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
+      SCCACHE_BUCKET: sccache-rust
+      SCCACHE_ENDPOINT: http://sccache-minio.sccache.svc.cluster.local:9000
+      SCCACHE_REGION: auto
+      SCCACHE_S3_USE_SSL: "false"
+      AWS_ACCESS_KEY_ID: sccache
+      AWS_SECRET_ACCESS_KEY: sccache-secret-key
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build demo UI (rust-embed)
+        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - name: clippy with --cfg tokio_unstable (gated code must stay clean)
+        env:
+          RUSTFLAGS: "--cfg tokio_unstable"
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: lib tests with --cfg tokio_unstable
+        env:
+          RUSTFLAGS: "--cfg tokio_unstable"
+        run: cargo test --lib --locked
+
   supply-chain:
     name: Supply-chain (audit + deny)
     runs-on: k3s

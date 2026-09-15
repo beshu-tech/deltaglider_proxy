@@ -740,6 +740,90 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
     (StatusCode::OK, [("content-type", TEXT_FORMAT)], buffer).into_response()
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Tokio runtime metrics (#87)
+//
+// Compiled ONLY under `--cfg tokio_unstable` (docs: the RuntimeMetrics API
+// is unstable and gated). A default build registers nothing and spawns no
+// task — /metrics simply omits the series, which is the honest signal that
+// the binary was built without the flag. The nightly workflow builds with
+// RUSTFLAGS="--cfg tokio_unstable" so the series type-checks + works there.
+//
+// This is the diagnostic layer behind #85/#86: poll-time shows whether
+// workers run long polls (blocking work inside async), queue depths show
+// saturation, budget-yield counts show tasks hogging workers until the
+// scheduler forces them off.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Spawn the runtime-metrics sampler (1s cadence). No-op unless the binary
+/// was built with `--cfg tokio_unstable`.
+#[cfg(tokio_unstable)]
+pub fn spawn_tokio_runtime_metrics_sampler(metrics: &Arc<Metrics>) {
+    use prometheus::Gauge;
+    use std::sync::OnceLock;
+
+    static SAMPLER: OnceLock<()> = OnceLock::new();
+    if SAMPLER.set(()).is_err() {
+        return; // engine rebuilds re-init metrics; sample only once per process
+    }
+
+    let rt = tokio::runtime::Handle::current().metrics();
+    let registry = &metrics.registry;
+
+    let g = |name: &str, help: &str| -> Gauge {
+        let gauge = Gauge::new(name, help).unwrap();
+        // Best-effort: a duplicate name would mean a programmer error in a
+        // single-sampler world; ignore rather than crash the proxy.
+        let _ = registry.register(Box::new(gauge.clone()));
+        gauge
+    };
+
+    let worker_mean_poll_seconds = g(
+        "deltaglider_tokio_worker_mean_poll_seconds",
+        "Mean task poll duration per worker (EWMA). Long polls = blocking work inside async context.",
+    );
+    let global_queue_depth = g(
+        "deltaglider_tokio_global_queue_depth",
+        "Tasks pending in the runtime global (injection) queue. Sustained depth = saturation.",
+    );
+    let blocking_queue_depth = g(
+        "deltaglider_tokio_blocking_queue_depth",
+        "Tasks pending in the blocking pool. Sustained depth = spawn_blocking saturation.",
+    );
+    let budget_forced_yields_total = g(
+        "deltaglider_tokio_budget_forced_yields_total",
+        "Cumulative polls the scheduler force-yielded after exhausting their budget.",
+    );
+    let workers_total = g("deltaglider_tokio_workers", "Runtime worker threads.");
+
+    workers_total.set(rt.num_workers() as f64);
+
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            // Per-worker mean poll time, averaged across workers: a single
+            // poisoned worker should stay visible, so use the MAX (the worst
+            // worker), not the mean-of-means.
+            let mut worst_secs = 0f64;
+            for w in 0..rt.num_workers() {
+                let secs = rt.worker_mean_poll_time(w).as_secs_f64();
+                if secs > worst_secs {
+                    worst_secs = secs;
+                }
+            }
+            worker_mean_poll_seconds.set(worst_secs);
+            global_queue_depth.set(rt.global_queue_depth() as f64);
+            blocking_queue_depth.set(rt.blocking_queue_depth() as f64);
+            budget_forced_yields_total.set(rt.budget_forced_yield_count() as f64);
+        }
+    });
+}
+
+/// Compiled-out stub so call sites never need their own cfg.
+#[cfg(not(tokio_unstable))]
+pub fn spawn_tokio_runtime_metrics_sampler(_metrics: &Arc<Metrics>) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
