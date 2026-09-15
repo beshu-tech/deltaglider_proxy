@@ -283,6 +283,12 @@ impl ConfigDb {
                 .filter(|u| !diff.users_to_delete.iter().any(|(id, _)| *id == u.id))
                 .map(|u| (u.name.clone(), u.id))
                 .collect();
+            // Users UPDATED by step 7 may have been renamed — their new name
+            // only exists in the diff, not in `current`. Insert it so a
+            // binding referencing the new name resolves.
+            for (uid, u) in &diff.users_to_update {
+                user_name_to_id.insert(u.name.clone(), *uid);
+            }
             for u in &diff.users_to_create {
                 if let Some(uid) = query_user_id_by_access_key(&tx, &u.access_key_id)? {
                     user_name_to_id.insert(u.name.clone(), uid);

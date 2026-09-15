@@ -783,6 +783,8 @@ pub struct IamImportSummary {
     pub providers_updated: usize,
     pub providers_deleted: usize,
     pub mapping_rules_replaced: usize,
+    /// OAuth login bindings upserted (#71).
+    pub external_identities_applied: usize,
     /// True when applying this YAML would change nothing.
     pub no_changes: bool,
 }
@@ -901,6 +903,7 @@ fn summarise_diff(diff: &crate::iam::IamDiff) -> IamImportSummary {
             crate::iam::MappingRulesAction::ClearAll => 0,
             crate::iam::MappingRulesAction::Keep => 0,
         },
+        external_identities_applied: diff.external_identities.len(),
         no_changes: false,
     };
     let no_changes = s.users_created == 0
@@ -912,7 +915,8 @@ fn summarise_diff(diff: &crate::iam::IamDiff) -> IamImportSummary {
         && s.providers_created == 0
         && s.providers_updated == 0
         && s.providers_deleted == 0
-        && s.mapping_rules_replaced == 0;
+        && s.mapping_rules_replaced == 0
+        && s.external_identities_applied == 0;
     IamImportSummary { no_changes, ..s }
 }
 
@@ -928,6 +932,7 @@ fn summarise_stats(stats: &crate::iam::ReconcileStats) -> IamImportSummary {
         providers_updated: stats.providers_updated.len(),
         providers_deleted: stats.providers_deleted.len(),
         mapping_rules_replaced: stats.mapping_rules_replaced,
+        external_identities_applied: stats.external_identities_applied,
         no_changes: stats.is_noop(),
     }
 }
@@ -1028,6 +1033,36 @@ access:
         assert!(s.no_changes);
         assert_eq!(s.users_created, 0);
         assert_eq!(s.mapping_rules_replaced, 0);
+    }
+
+    #[test]
+    fn summarise_diff_bindings_only_is_not_no_changes() {
+        // A full-IAM import that only restores OAuth bindings (users/groups
+        // match, rules Keep) writes rows — it must not report no_changes.
+        use crate::iam::DeclarativeExternalIdentity as EI;
+        let diff = IamDiff {
+            external_identities: vec![EI {
+                user: "dana".into(),
+                provider: "okta".into(),
+                subject: "sub".into(),
+                email: None,
+                display_name: None,
+                email_verified: None,
+                raw_claims: None,
+            }],
+            ..IamDiff::default()
+        };
+        let s = summarise_diff(&diff);
+        assert!(!s.no_changes, "bindings-only import is a real change");
+        assert_eq!(s.external_identities_applied, 1);
+    }
+
+    #[test]
+    fn summarise_diff_empty_bindings_is_no_changes() {
+        let diff = IamDiff::default();
+        let s = summarise_diff(&diff);
+        assert!(s.no_changes);
+        assert_eq!(s.external_identities_applied, 0);
     }
 
     #[test]

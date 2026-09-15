@@ -985,18 +985,48 @@ pub fn diff_iam(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<IamDiff, Strin
         }
     }
 
+    // `auth_source` is provenance the DB owns. YAML may restate it (a
+    // full-IAM export round-trip) and may set `external` on a user it
+    // CREATES (wipe restore), but it must not flip an existing LOCAL row to
+    // external: that would let a later "user absent from YAML" take the
+    // benign external-cull path instead of the destructive local delete the
+    // unattended-startup guard refuses on (#71 review).
+    for yu in &yaml.users {
+        match yu.auth_source.as_deref() {
+            None | Some("local") | Some("external") => {}
+            Some(other) => {
+                return Err(format!(
+                    "user '{}': auth_source must be 'local' or 'external', got '{}'",
+                    yu.name, other
+                ));
+            }
+        }
+        if yu.auth_source.as_deref() == Some("external") {
+            if let Some(du) = db.users.iter().find(|du| du.name == yu.name) {
+                if du.auth_source != "external" {
+                    return Err(format!(
+                        "user '{}': YAML marks an existing local user as external — \
+                         provenance is DB-owned; remove auth_source or recreate the user",
+                        yu.name
+                    ));
+                }
+            }
+        }
+    }
+
     Ok(diff)
 }
 
 // ───── Equality predicates ─────────────────────────────────────────────
 
 fn desired_existing_user(db: &IamUser, yaml: &DeclarativeUser) -> DeclarativeUser {
-    if !yaml.secret_access_key.is_empty() {
-        return yaml.clone();
-    }
     // A silent (or genuinely local) YAML auth_source must not downgrade an
     // external row: hand-authored YAML has no idea about provenance, so the
-    // DB value wins unless the export explicitly restates it (#71).
+    // DB value wins unless the export explicitly restates it (#71). Computed
+    // BEFORE the secret early-return so a secret ROTATION (which bypasses
+    // the redaction-preserve branch below) cannot carry a silent None
+    // through to the UPDATE — that path previously downgraded an external
+    // row to local, losing the external-preserve delete semantics.
     let auth_source = match &yaml.auth_source {
         Some(_) => yaml.auth_source.clone(),
         None => {
@@ -1007,6 +1037,12 @@ fn desired_existing_user(db: &IamUser, yaml: &DeclarativeUser) -> DeclarativeUse
             }
         }
     };
+    if !yaml.secret_access_key.is_empty() {
+        return DeclarativeUser {
+            auth_source,
+            ..yaml.clone()
+        };
+    }
     DeclarativeUser {
         secret_access_key: db.secret_access_key.clone(),
         auth_source,
@@ -1278,8 +1314,13 @@ impl ReconcileStats {
     }
 
     /// True when the reconcile made zero changes (pure idempotent apply).
+    /// `external_identities_applied` counts: a bindings-only import (users/
+    /// groups already match, rules `Keep`) is NOT a no-op — it writes rows,
+    /// must push config sync, and must appear in the apply summary (#71).
     pub fn is_noop(&self) -> bool {
-        self.total_named_changes() == 0 && self.mapping_rules_replaced == 0
+        self.total_named_changes() == 0
+            && self.mapping_rules_replaced == 0
+            && self.external_identities_applied == 0
     }
 
     /// Human-readable one-liner for the log / apply-response warning.
@@ -1298,7 +1339,7 @@ impl ReconcileStats {
             self.providers_updated.len(),
             self.providers_deleted.len(),
             self.mapping_rules_replaced,
-        )
+        ) + &format!(" external_identities={}", self.external_identities_applied)
     }
 }
 
@@ -2504,5 +2545,83 @@ mod tests {
         let yaml = DeclarativeIam::default();
         let diff = diff_iam(&yaml, &empty_db()).unwrap();
         assert!(diff.external_identities.is_empty());
+    }
+    // ───── #71 review follow-ups ─────────────────────────────────────
+
+    #[test]
+    fn rotation_silent_on_auth_source_keeps_external_provenance() {
+        // A secret rotation (non-empty YAML secret) must not bypass the
+        // auth_source preservation: an external row stays external.
+        let yaml = DeclarativeIam {
+            users: vec![DeclarativeUser {
+                secret_access_key: "rotated".into(),
+                ..yu("oauth-bob", "K_OB")
+            }],
+            ..Default::default()
+        };
+        let current = CurrentIam {
+            users: vec![db_external_user(5, "oauth-bob", "K_OB")],
+            ..empty_db()
+        };
+        let diff = diff_iam(&yaml, &current).unwrap();
+        let (_, desired) = diff
+            .users_to_update
+            .first()
+            .expect("rotation must produce an update");
+        assert_eq!(
+            desired.auth_source.as_deref(),
+            Some("external"),
+            "rotation must preserve external provenance"
+        );
+        assert_eq!(desired.secret_access_key, "rotated");
+    }
+
+    #[test]
+    fn yaml_cannot_promote_an_existing_local_user_to_external() {
+        // The unattended-startup guard refuses on local-user deletes. If YAML
+        // could mark a local row external, a later removal would take the
+        // benign external-cull path and the guard would never fire.
+        let yaml = DeclarativeIam {
+            users: vec![DeclarativeUser {
+                auth_source: Some("external".into()),
+                ..yu("alice", "AKIA1")
+            }],
+            ..Default::default()
+        };
+        let current = CurrentIam {
+            users: vec![db_user(7, "alice", "AKIA1")],
+            ..empty_db()
+        };
+        let err = diff_iam(&yaml, &current).unwrap_err();
+        assert!(
+            err.contains("local user as external"),
+            "promotion must be rejected before any write: {err}"
+        );
+    }
+
+    #[test]
+    fn rejected_auth_source_value_is_an_error() {
+        let yaml = DeclarativeIam {
+            users: vec![DeclarativeUser {
+                auth_source: Some("oauth".into()),
+                ..yu("alice", "AKIA1")
+            }],
+            ..Default::default()
+        };
+        let err = diff_iam(&yaml, &empty_db()).unwrap_err();
+        assert!(err.contains("auth_source must be"), "{err}");
+    }
+
+    #[test]
+    fn reconcile_stats_bindings_only_is_not_a_noop() {
+        let stats = ReconcileStats {
+            external_identities_applied: 1,
+            ..Default::default()
+        };
+        assert!(
+            !stats.is_noop(),
+            "a bindings-only import writes rows and must push config sync"
+        );
+        assert!(stats.summary_line().contains("external_identities=1"));
     }
 }

@@ -97,9 +97,12 @@ Mapping rules are wipe-and-rebuild (no stable per-row identity beyond the tuple 
 
 ## External identities
 
-External identities (runtime OAuth byproducts — a user's Google identity binding, for instance) are **not reconciled** from YAML. They are created at runtime by the OAuth callback flow and live only in the DB.
+There are two distinct surfaces, and the distinction matters:
 
-The reconciler's contract:
+- The **main config file** and the declarative config-apply path never touch external identities. They are created at runtime by the OAuth callback flow and live in the database. The reconciler's contract below describes this surface.
+- The **full-IAM import artifact** (`declarative-iam-validate` / `-apply`) does restore them, because that artifact exists to make a wipe lossless. See "Full-IAM round-trip" below.
+
+The reconciler's contract for the main config / config-apply surface:
 
 - `external_identities` are preserved through user UPDATEs (same DB id → same bindings).
 - `external_identities` are cascade-deleted when a YAML-authoritative delete removes the user or provider they reference — the user is gone, so the binding is meaningless.

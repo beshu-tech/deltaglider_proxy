@@ -341,6 +341,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Server",
     },
     EnvVarEntry {
+        name: "DGP_BUCKET_USAGE_FLUSH_SECS",
+        description: "Bucket-usage counter flush interval in seconds (default: 10)",
+        example: "10",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_MULTIPART_SWEEP_MAX_AGE_SECS",
         description: "Multipart max age cutoff for Open uploads in seconds (default: 3600)",
         example: "3600",
@@ -2994,6 +3000,7 @@ mod tests {
             "DGP_SESSION_TTL_HOURS",                 // session::default_session_ttl()
             "DGP_MAX_MULTIPART_UPLOADS",             // multipart::default_max_uploads()
             "DGP_MULTIPART_SWEEP_INTERVAL_SECS",     // main multipart sweeper cadence
+            "DGP_BUCKET_USAGE_FLUSH_SECS",           // main bucket-usage flush cadence (#85)
             "DGP_MULTIPART_SWEEP_MAX_AGE_SECS",      // main multipart sweeper max-age cutoff
             "DGP_MULTIPART_COMPLETING_TIMEOUT_SECS", // main multipart Completing timeout
             "DGP_MAX_TOTAL_MULTIPART_BYTES",         // multipart::max_total_multipart_bytes()

@@ -218,6 +218,12 @@ impl BucketUsage {
     /// re-queued (pushed back into pending) so a transient SQLite error does
     /// not silently lose counts a caller believed applied.
     pub fn flush_pending(&self) {
+        // Hold the connection lock ACROSS the drain and the upserts. A
+        // concurrent `read` takes the same lock first, so it can never
+        // observe the interval where a delta has left `pending` but has not
+        // yet landed in SQLite. Lock order is conn → pending everywhere
+        // (`read`, `read_all`, this), so there is no inverse to deadlock on.
+        let conn = self.conn.lock().unwrap();
         // Two-phase drain: a DashMap iterator holds each shard's READ lock, so
         // calling remove() on the same key inside the iteration deadlocks.
         // Collect keys first (locks released after the collect), then remove
@@ -233,7 +239,6 @@ impl BucketUsage {
         }
         let drained_len = drained.len();
         let mut flushed_ok = 0usize;
-        let conn = self.conn.lock().unwrap();
         for (bucket, (d_count, d_logical, d_stored)) in drained {
             let upsert = conn.query_row(
                 "INSERT INTO bucket_usage (bucket, object_count, logical_bytes, stored_bytes)
@@ -382,10 +387,12 @@ impl BucketUsage {
 
     /// Overwrite a bucket's row with full-scan ground truth + stamp `last_scan_at`.
     ///
-    /// Flushes the pending map FIRST: the scan is authoritative, but any
-    /// delta that raced the scan must land (and then be superseded by the
-    /// REPLACE) rather than survive in pending and later double-apply on top
-    /// of the fresh ground truth.
+    /// Flushes any OTHER bucket's pending deltas first, then DISCARDS this
+    /// bucket's pending entry before the REPLACE. The scan is authoritative,
+    /// so a stale delta must not survive to double-apply on top of the fresh
+    /// ground truth — including one a failed flush re-queued. (Dropping it
+    /// matches the old write-through behaviour, where the REPLACE clobbered
+    /// whatever the counter had accumulated.)
     pub fn overwrite_from_scan(
         &self,
         bucket: &str,
@@ -393,6 +400,9 @@ impl BucketUsage {
         now: i64,
     ) -> Result<(), rusqlite::Error> {
         self.flush_pending();
+        // Scan supersedes: drop this bucket's pending entry (a delta raced in
+        // during the scan, or a flush failure re-queued one).
+        self.pending.remove(bucket);
         // object_count = user-visible only (delta + passthrough); logical =
         // original_bytes; stored = stored_bytes (incl references). Same
         // interpretation as usage_delta_for, so inline + scan agree.

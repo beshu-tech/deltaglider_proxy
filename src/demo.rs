@@ -369,6 +369,15 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             admin_state.clone(),
             admin::require_admin_gui_session,
         ))
+        // Full-IAM import/export bodies can exceed axum's 2 MB default: a
+        // large IAM export (many users, each with an OAuth binding and its
+        // `raw_claims`) would otherwise fail with an opaque 413. Match the
+        // backup-import bound (MAX_IMPORT_BODY_BYTES) already applied to the
+        // `iam_gated` subrouter. Admin-session-gated, so this raises the
+        // bound only for authenticated operators, not the S3 surface.
+        .layer(axum::extract::DefaultBodyLimit::max(
+            admin::MAX_IMPORT_BODY_BYTES,
+        ))
         .with_state(admin_state.clone());
 
     // Grab S3 state before admin_state is moved
