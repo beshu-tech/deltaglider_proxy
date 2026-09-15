@@ -106,6 +106,15 @@ The reconciler's contract:
 
 If an OAuth callback is in-flight when a reconcile fires, the callback inserts the external identity into a user row that the reconcile may then delete (if YAML doesn't list that user). The callback flow fails; the next login creates a fresh external user (if auto-provisioning is enabled and matching mapping rules exist).
 
+### Full-IAM round-trip
+
+The full-IAM export (`GET /_/api/admin/config/declarative-iam-export?include_secrets=true`) is the one surface that *does* carry the DB-only state, so a committed export is genuinely lossless:
+
+- Every user carries `auth_source` (`"external"` for OAuth-provisioned rows); the import restores the provenance instead of downgrading the row to `local`.
+- The export emits an `external_identities` list — user and provider referenced **by name**, plus the IdP `subject`, email, and claims. The import upserts each binding keyed on `(provider, subject)`, the exact pair the OAuth callback looks up, so a recovered database re-links the binding to the freshly created user row instead of letting the next login provision a duplicate user.
+- Bindings are never deleted by the reconciler. An `external_identities` list that is absent (hand-authored YAML, or a redacted export — `include_secrets=false` drops the bindings because `raw_claims` can carry IdP personal data) means "leave the database alone", never "delete the missing rows".
+- The main config file rejects `access.external_identities` outright — that file never manages OAuth bindings, and silently dropping them from a pasted full-IAM export would be a data-loss trap.
+
 ## Secrets in exports
 
 The canonical exporter redacts every secret on the way out — a YAML pulled from `/config/export` has:

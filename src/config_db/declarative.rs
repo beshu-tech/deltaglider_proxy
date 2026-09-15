@@ -27,7 +27,7 @@
 //!   8. **Re-insert mapping rules** (replace-all) with names
 //!      resolved via the two name→id maps.
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use std::collections::HashMap;
 
 use crate::iam::{
@@ -177,16 +177,19 @@ impl ConfigDb {
         }
 
         // ── 7. Create + update users. Resolve `groups` names via the
-        //      group_name_to_id map built above.
+        //      group_name_to_id map built above. `auth_source` rides the
+        //      row verbatim (default 'local' when the YAML was silent) so
+        //      a full-IAM round-trip restores OAuth rows as external (#71).
         for u in &diff.users_to_create {
             tx.execute(
-                "INSERT INTO users (name, access_key_id, secret_access_key, enabled) \
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO users (name, access_key_id, secret_access_key, enabled, auth_source) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     u.name,
                     u.access_key_id,
                     u.secret_access_key,
                     u.enabled as i32,
+                    u.auth_source.clone().unwrap_or_else(|| "local".into()),
                 ],
             )?;
             let uid = tx.last_insert_rowid();
@@ -197,13 +200,15 @@ impl ConfigDb {
         for (uid, u) in &diff.users_to_update {
             tx.execute(
                 "UPDATE users SET \
-                   name = ?1, access_key_id = ?2, secret_access_key = ?3, enabled = ?4 \
-                 WHERE id = ?5",
+                   name = ?1, access_key_id = ?2, secret_access_key = ?3, enabled = ?4, \
+                   auth_source = ?5 \
+                 WHERE id = ?6",
                 params![
                     u.name,
                     u.access_key_id,
                     u.secret_access_key,
                     u.enabled as i32,
+                    u.auth_source.clone().unwrap_or_else(|| "local".into()),
                     uid,
                 ],
             )?;
@@ -257,6 +262,68 @@ impl ConfigDb {
             // old count cheaply (it's in `current.mapping_rules` but
             // re-reading after DELETE would be silly); use its len.
             stats.mapping_rules_replaced = current.mapping_rules.len();
+        }
+
+        // ── 9. Upsert OAuth login bindings (#71). Keyed by
+        //      (provider_id, external_sub) — the pair the OAuth callback
+        //      looks up, so an upsert of the SAME subject can never
+        //      create a duplicate binding, and a restore after a DB wipe
+        //      re-links to the freshly-created user id. Bindings absent
+        //      from the YAML are left alone (never deleted — hand-
+        //      authored YAML and redacted exports don't carry them, and
+        //      deletes already cascade through user/provider deletes).
+        if !diff.external_identities.is_empty() {
+            // Post-commit-writes state: created users/providers are in the
+            // maps from steps 6-7; deleted ones were filtered out there.
+            // Created users' ids resolve by UNIQUE access_key_id (rule INSERTs
+            // interleave, so last_insert_rowid is unreliable here).
+            let mut user_name_to_id: HashMap<String, i64> = current
+                .users
+                .iter()
+                .filter(|u| !diff.users_to_delete.iter().any(|(id, _)| *id == u.id))
+                .map(|u| (u.name.clone(), u.id))
+                .collect();
+            for u in &diff.users_to_create {
+                if let Some(uid) = query_user_id_by_access_key(&tx, &u.access_key_id)? {
+                    user_name_to_id.insert(u.name.clone(), uid);
+                }
+            }
+            for ident in &diff.external_identities {
+                let Some(uid) = user_name_to_id.get(&ident.user) else {
+                    // Validation rejects unknown refs; defensive skip keeps
+                    // a restore applying even if a binding names a user the
+                    // snapshot omitted.
+                    continue;
+                };
+                let Some(pid) = provider_name_to_id.get(&ident.provider) else {
+                    continue;
+                };
+                let claims_json: Option<String> = ident
+                    .raw_claims
+                    .as_ref()
+                    .map(|v| serde_json::to_string(v).unwrap_or_default());
+                tx.execute(
+                    "INSERT INTO external_identities \
+                     (user_id, provider_id, external_sub, email, display_name, raw_claims, email_verified) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                     ON CONFLICT(provider_id, external_sub) DO UPDATE SET \
+                       user_id = excluded.user_id, \
+                       email = excluded.email, \
+                       display_name = excluded.display_name, \
+                       raw_claims = excluded.raw_claims, \
+                       email_verified = excluded.email_verified",
+                    params![
+                        uid,
+                        pid,
+                        ident.subject,
+                        ident.email,
+                        ident.display_name,
+                        claims_json,
+                        ident.email_verified.unwrap_or(false) as i32,
+                    ],
+                )?;
+                stats.external_identities_applied += 1;
+            }
         }
 
         tx.commit()?;
@@ -355,4 +422,21 @@ fn replace_user_group_memberships(
         )?;
     }
     Ok(())
+}
+
+/// Resolve a user's id by their UNIQUE access_key_id, inside the reconcile
+/// transaction. Used by the external-identity upsert to map a created user's
+/// NAME to its fresh id — `last_insert_rowid` is unreliable there because
+/// group/rule INSERTs interleave between user INSERTs.
+fn query_user_id_by_access_key(
+    tx: &rusqlite::Transaction<'_>,
+    access_key_id: &str,
+) -> Result<Option<i64>, ConfigDbError> {
+    tx.query_row(
+        "SELECT id FROM users WHERE access_key_id = ?1",
+        params![access_key_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(ConfigDbError::from)
 }

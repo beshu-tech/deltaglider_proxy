@@ -1078,6 +1078,7 @@ fn init_config_db_attempt(
                     &config.iam_groups,
                     &config.auth_providers,
                     &config.group_mapping_rules,
+                    &[],
                 );
                 // Preview the diff (no writes), then apply the pure policy.
                 let diff = match deltaglider_proxy::iam::preview_declarative_iam(&db, &yaml) {

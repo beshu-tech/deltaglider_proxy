@@ -547,6 +547,7 @@ async fn apply_section(
                     &new_cfg.iam_groups,
                     &new_cfg.auth_providers,
                     &new_cfg.group_mapping_rules,
+                    &[],
                 );
                 // Empty-gate preview: the live apply would refuse
                 // this, so surface it at dry-run time too.
@@ -1511,6 +1512,7 @@ mod diff_fingerprint_tests {
                 enabled: true,
                 groups: vec![],
                 permissions: vec![],
+                auth_source: None,
             }];
             c
         };

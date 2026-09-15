@@ -399,6 +399,7 @@ pub(crate) async fn apply_config_transition(
             &new_cfg.iam_groups,
             &new_cfg.auth_providers,
             &new_cfg.group_mapping_rules,
+            &[],
         );
 
         // Short-circuit when the target mode is unchanged AND the IAM
@@ -552,6 +553,7 @@ async fn declarative_iam_precommit_gate(
         &new_cfg.iam_groups,
         &new_cfg.auth_providers,
         &new_cfg.group_mapping_rules,
+        &[],
     );
 
     if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui) && yaml_snapshot.is_empty()

@@ -3679,6 +3679,7 @@ storage:
                     resources: vec!["scrap/customers/${username}/*".into()],
                     conditions: None,
                 }],
+                auth_source: None,
             }],
             ..Config::default()
         };
@@ -5076,6 +5077,7 @@ mod prod_shape_tests {
             &cfg.iam_groups,
             &cfg.auth_providers,
             &cfg.group_mapping_rules,
+            &[],
         );
         let diff = crate::iam::declarative::diff_iam(
             &snapshot,

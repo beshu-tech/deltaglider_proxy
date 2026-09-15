@@ -94,6 +94,14 @@ pub struct DeclarativeUser {
     /// authz evaluator unions both.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permissions: Vec<Permission>,
+    /// Where this user came from: `"local"` (hand/admin-created) or
+    /// `"external"` (auto-provisioned by an OAuth login). Absent =
+    /// `"local"`, so hand-authored YAML never needs the field. The
+    /// full-IAM export emits the real value so a round-trip restores
+    /// OAuth-provisioned rows as external instead of downgrading them
+    /// to local (#71).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_source: Option<String>,
 }
 
 /// One entry in `access.iam_groups`.
@@ -149,6 +157,34 @@ pub struct DeclarativeMappingRule {
     pub group: String,
 }
 
+/// One OAuth login binding: which IdP `subject` maps to which user.
+/// User and provider referenced by NAME (stable across DB wipes — the
+/// whole point of the YAML round-trip). Emitted only by the full-IAM
+/// export and consumed by its import; hand-authored YAML never needs
+/// these (the OAuth flow creates them at login). Restoring them is what
+/// keeps a recovered DB from re-provisioning duplicate users on next
+/// login (#71).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DeclarativeExternalIdentity {
+    pub user: String,
+    pub provider: String,
+    /// Stable unique subject from the IdP (`external_sub`).
+    pub subject: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// IdP-asserted email-verification at export time. Absent = unknown
+    /// (reads fail-closed as `false`, same as pre-v20 DB rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email_verified: Option<bool>,
+    /// The IdP claims blob captured at the last login. Drives group
+    /// re-mapping on restore; redacted exports may drop it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_claims: Option<serde_json::Value>,
+}
+
 // Provider/mapping serde defaults are shared with the config-DB shapes
 // (`config_db::auth_providers`) so the two representations can't drift.
 use crate::config_db::auth_providers::{default_email, default_scopes};
@@ -162,6 +198,11 @@ pub struct DeclarativeIam {
     pub groups: Vec<DeclarativeGroup>,
     pub auth_providers: Vec<DeclarativeAuthProvider>,
     pub mapping_rules: Vec<DeclarativeMappingRule>,
+    /// OAuth login bindings. Populated only by the full-IAM export (the
+    /// lossless `include_secrets=true` artifact); hand-authored YAML
+    /// leaves it empty and the reconciler then never touches existing
+    /// bindings (same preserve-externals philosophy as the user cull).
+    pub external_identities: Vec<DeclarativeExternalIdentity>,
 }
 
 impl DeclarativeIam {
@@ -170,6 +211,7 @@ impl DeclarativeIam {
             && self.groups.is_empty()
             && self.auth_providers.is_empty()
             && self.mapping_rules.is_empty()
+            && self.external_identities.is_empty()
     }
 }
 
@@ -243,6 +285,14 @@ pub struct IamDiff {
     /// (correctness x-ray C1: any re-apply of a non-empty rule set
     /// silently dropped the table).
     pub mapping_rules: MappingRulesAction,
+
+    /// OAuth login bindings carried through VERBATIM from the YAML
+    /// snapshot (not diffed — they are upsert-by-(provider,subject)
+    /// in the transaction, so "absent from YAML" means "leave the DB
+    /// alone", never delete). Empty when the YAML didn't carry them
+    /// (hand-authored YAML, redacted export) — the preserve-externals
+    /// philosophy. Only the full-IAM import path populates this (#71).
+    pub external_identities: Vec<DeclarativeExternalIdentity>,
 }
 
 /// What the reconciler should do with `group_mapping_rules`. Built
@@ -404,6 +454,14 @@ pub fn export_as_declarative_inner(
                 enabled: u.enabled,
                 groups,
                 permissions: u.permissions.clone(),
+                // #71: emit the real provenance so a round-trip restores
+                // OAuth-provisioned rows as external (not downgraded to
+                // local, which would break the next-login identity match).
+                auth_source: if u.auth_source == "external" {
+                    Some(u.auth_source.clone())
+                } else {
+                    None
+                },
             }
         })
         .collect();
@@ -457,11 +515,41 @@ pub fn export_as_declarative_inner(
         })
         .collect();
 
+    // #71: OAuth login bindings, by NAME so the YAML survives a DB wipe
+    // (ids are recreated by the reconcile). Dropped from redacted exports —
+    // `raw_claims` can embed IdP PII, and the lossless mode is the one that
+    // needs them anyway.
+    let external_identities = if include_secrets {
+        db.list_external_identities()
+            .map_err(|e| format!("load external identities: {e}"))?
+            .into_iter()
+            .filter_map(|ident| {
+                let user_name = db_users
+                    .iter()
+                    .find(|u| u.id == ident.user_id)
+                    .map(|u| u.name.clone())?;
+                let provider_name = provider_id_to_name.get(&ident.provider_id).cloned()?;
+                Some(DeclarativeExternalIdentity {
+                    user: user_name,
+                    provider: provider_name,
+                    subject: ident.external_sub.clone(),
+                    email: ident.email.clone(),
+                    display_name: ident.display_name.clone(),
+                    email_verified: Some(ident.email_verified),
+                    raw_claims: ident.raw_claims.clone(),
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     Ok(DeclarativeIam {
         users,
         groups,
         auth_providers,
         mapping_rules,
+        external_identities,
     })
 }
 
@@ -858,6 +946,45 @@ pub fn diff_iam(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<IamDiff, Strin
         MappingRulesAction::ReplaceWith(yaml.mapping_rules.clone())
     };
 
+    // #71: OAuth bindings ride through verbatim — the transaction
+    // upserts by (provider, subject), so there is nothing to diff.
+    // Empty (hand-authored YAML / redacted export) = "leave DB alone".
+    diff.external_identities = yaml.external_identities.clone();
+
+    // Ref validation (fail BEFORE any DB write, same contract as the
+    // group/provider refs above): every binding must name a user and a
+    // provider that the snapshot declares (or that already exist in the
+    // DB — a redacted export round-trip may carry only the bindings).
+    let yaml_user_names: HashSet<&str> = yaml.users.iter().map(|u| u.name.as_str()).collect();
+    let db_user_names: HashSet<&str> = db.users.iter().map(|u| u.name.as_str()).collect();
+    let yaml_provider_names: HashSet<&str> = yaml
+        .auth_providers
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect();
+    let db_provider_names: HashSet<&str> =
+        db.auth_providers.iter().map(|p| p.name.as_str()).collect();
+    for ident in &yaml.external_identities {
+        if !yaml_user_names.contains(ident.user.as_str())
+            && !db_user_names.contains(ident.user.as_str())
+        {
+            return Err(format!(
+                "external identity references unknown user '{}' — add the user to \
+                 iam_users or remove the binding",
+                ident.user
+            ));
+        }
+        if !yaml_provider_names.contains(ident.provider.as_str())
+            && !db_provider_names.contains(ident.provider.as_str())
+        {
+            return Err(format!(
+                "external identity references unknown provider '{}' — add the \
+                 provider to auth_providers or remove the binding",
+                ident.provider
+            ));
+        }
+    }
+
     Ok(diff)
 }
 
@@ -867,8 +994,22 @@ fn desired_existing_user(db: &IamUser, yaml: &DeclarativeUser) -> DeclarativeUse
     if !yaml.secret_access_key.is_empty() {
         return yaml.clone();
     }
+    // A silent (or genuinely local) YAML auth_source must not downgrade an
+    // external row: hand-authored YAML has no idea about provenance, so the
+    // DB value wins unless the export explicitly restates it (#71).
+    let auth_source = match &yaml.auth_source {
+        Some(_) => yaml.auth_source.clone(),
+        None => {
+            if db.auth_source == "external" {
+                Some(db.auth_source.clone())
+            } else {
+                None
+            }
+        }
+    };
     DeclarativeUser {
         secret_access_key: db.secret_access_key.clone(),
+        auth_source,
         ..yaml.clone()
     }
 }
@@ -929,6 +1070,7 @@ fn user_equal(
         || db.secret_access_key != yaml.secret_access_key
         || db.enabled != yaml.enabled
         || !permissions_equal(&db.permissions, &yaml.permissions)
+        || db.auth_source != yaml.auth_source.clone().unwrap_or_else(|| "local".into())
     {
         return false;
     }
@@ -1093,6 +1235,10 @@ pub struct ReconcileStats {
     pub providers_updated: Vec<String>,
     pub providers_deleted: Vec<String>,
     pub mapping_rules_replaced: usize,
+    /// OAuth bindings upserted by the full-IAM import path (#71). A
+    /// count, not a name list — subjects are IdP identifiers, not
+    /// display names, and don't belong in audit lines.
+    pub external_identities_applied: usize,
 }
 
 impl ReconcileStats {
@@ -1164,12 +1310,14 @@ pub fn snapshot_from_access(
     groups: &[DeclarativeGroup],
     auth_providers: &[DeclarativeAuthProvider],
     mapping_rules: &[DeclarativeMappingRule],
+    external_identities: &[DeclarativeExternalIdentity],
 ) -> DeclarativeIam {
     DeclarativeIam {
         users: users.to_vec(),
         groups: groups.to_vec(),
         auth_providers: auth_providers.to_vec(),
         mapping_rules: mapping_rules.to_vec(),
+        external_identities: external_identities.to_vec(),
     }
 }
 
@@ -1223,6 +1371,7 @@ mod tests {
             enabled: true,
             groups: vec![],
             permissions: vec![],
+            auth_source: None,
         }
     }
     fn yg(name: &str) -> DeclarativeGroup {
@@ -1366,6 +1515,7 @@ mod tests {
                 enabled: true,
                 groups: vec!["admins".into()],
                 permissions: vec![perm(&["*"], &["*"])],
+                auth_source: None,
             }],
             groups: vec![DeclarativeGroup {
                 name: "admins".into(),
@@ -2196,5 +2346,163 @@ mod tests {
             !external_user_is_reconstructable(&user_loaded, &got),
             "external user reachable only via a disabled provider must be preserved"
         );
+    }
+
+    // ───── #71: full-IAM export/import round-trip fidelity ───────────
+
+    #[test]
+    fn export_carries_auth_source_and_identities() {
+        use crate::config_db::auth_providers::CreateAuthProviderRequest;
+        use crate::config_db::ConfigDb;
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+
+        let provider = db
+            .create_auth_provider(&CreateAuthProviderRequest {
+                name: "okta".into(),
+                provider_type: "oidc".into(),
+                enabled: true,
+                priority: 0,
+                display_name: None,
+                client_id: None,
+                client_secret: Some("cs".into()),
+                issuer_url: None,
+                scopes: "openid".into(),
+                extra_config: None,
+            })
+            .unwrap();
+        let user = db
+            .create_external_user("dana@example.com", "AKIADANA", "sk-dana")
+            .unwrap();
+        db.create_external_identity(
+            user.id,
+            provider.id,
+            "sub-123",
+            Some("dana@example.com"),
+            Some("Dana"),
+            Some(&serde_json::json!({"sub": "sub-123"})),
+            true,
+        )
+        .unwrap();
+
+        let snapshot = export_as_declarative_inner(&db, true).unwrap();
+        let exported_user = snapshot
+            .users
+            .iter()
+            .find(|u| u.name == "dana@example.com")
+            .expect("external user exported");
+        assert_eq!(
+            exported_user.auth_source.as_deref(),
+            Some("external"),
+            "provenance must ride the export"
+        );
+        assert_eq!(snapshot.external_identities.len(), 1);
+        let ident = &snapshot.external_identities[0];
+        assert_eq!(ident.user, "dana@example.com");
+        assert_eq!(ident.provider, "okta");
+        assert_eq!(ident.subject, "sub-123");
+        assert_eq!(ident.email_verified, Some(true));
+
+        // Redacted export: bindings dropped (raw_claims can carry IdP PII).
+        let redacted = export_as_declarative_inner(&db, false).unwrap();
+        assert!(redacted.external_identities.is_empty());
+    }
+
+    #[test]
+    fn import_restores_binding_and_auth_source_after_wipe() {
+        use crate::config_db::auth_providers::CreateAuthProviderRequest;
+        use crate::config_db::ConfigDb;
+        // Source DB: provider + external user + binding.
+        let source = ConfigDb::in_memory("test-pass").unwrap();
+        let provider = source
+            .create_auth_provider(&CreateAuthProviderRequest {
+                name: "okta".into(),
+                provider_type: "oidc".into(),
+                enabled: true,
+                priority: 0,
+                display_name: None,
+                client_id: None,
+                client_secret: Some("cs".into()),
+                issuer_url: None,
+                scopes: "openid".into(),
+                extra_config: None,
+            })
+            .unwrap();
+        let user = source
+            .create_external_user("dana@example.com", "AKIADANA", "sk-dana")
+            .unwrap();
+        source
+            .create_external_identity(
+                user.id,
+                provider.id,
+                "sub-123",
+                Some("dana@example.com"),
+                None,
+                None,
+                true,
+            )
+            .unwrap();
+        let snapshot = export_as_declarative_inner(&source, true).unwrap();
+
+        // Wipe: a brand-new DB. Import the snapshot via the real orchestrator.
+        let restored = ConfigDb::in_memory("test-pass2").unwrap();
+        let stats = reconcile_declarative_iam(&restored, &snapshot).unwrap();
+        assert!(stats.external_identities_applied >= 1);
+
+        // auth_source survived the round-trip as external, not local.
+        let reuser = restored
+            .get_user_by_access_key("AKIADANA")
+            .expect("user restored")
+            .expect("user restored");
+        assert_eq!(reuser.auth_source, "external");
+
+        // The binding is restorable by (provider, subject) — the exact
+        // lookup the OAuth callback performs — so the next login finds
+        // the user instead of provisioning a duplicate.
+        let reprovider = restored
+            .get_auth_provider_by_name("okta")
+            .unwrap()
+            .expect("provider restored");
+        let ident = restored
+            .find_external_identity(reprovider.id, "sub-123")
+            .unwrap()
+            .expect("binding restored");
+        assert_eq!(ident.user_id, reuser.id);
+        assert_eq!(ident.email.as_deref(), Some("dana@example.com"));
+
+        // Idempotency: re-importing must not duplicate anything.
+        let stats2 = reconcile_declarative_iam(&restored, &snapshot).unwrap();
+        assert_eq!(stats2.users_created.len(), 0);
+        let all = restored.list_external_identities().unwrap();
+        assert_eq!(all.len(), 1, "upsert keyed on (provider, subject)");
+    }
+
+    #[test]
+    fn import_rejects_identity_referencing_unknown_user() {
+        let yaml = DeclarativeIam {
+            external_identities: vec![DeclarativeExternalIdentity {
+                user: "ghost".into(),
+                provider: "okta".into(),
+                subject: "sub-1".into(),
+                email: None,
+                display_name: None,
+                email_verified: None,
+                raw_claims: None,
+            }],
+            ..Default::default()
+        };
+        let err = diff_iam(&yaml, &empty_db()).unwrap_err();
+        assert!(
+            err.contains("unknown user 'ghost'"),
+            "validation must fail before any DB write: {err}"
+        );
+    }
+
+    #[test]
+    fn hand_authored_yaml_never_touches_bindings() {
+        // Empty external_identities (hand-authored YAML) + a DB that HAS
+        // bindings: diff carries none, nothing is deleted on apply.
+        let yaml = DeclarativeIam::default();
+        let diff = diff_iam(&yaml, &empty_db()).unwrap();
+        assert!(diff.external_identities.is_empty());
     }
 }

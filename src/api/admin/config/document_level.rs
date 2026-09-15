@@ -728,6 +728,14 @@ pub async fn export_declarative_iam(
         serde_yaml::Value::String("group_mapping_rules".into()),
         serde_yaml::to_value(&snapshot.mapping_rules).unwrap_or(serde_yaml::Value::Null),
     );
+    // #71: OAuth bindings ride along so the lossless export is genuinely
+    // lossless — without them, a DB wipe re-provisions duplicate users on
+    // the next OAuth login. (Empty for redacted exports; skip_serializing
+    // keeps hand-authored YAML clean either way.)
+    access_map.insert(
+        serde_yaml::Value::String("external_identities".into()),
+        serde_yaml::to_value(&snapshot.external_identities).unwrap_or(serde_yaml::Value::Null),
+    );
 
     let mut root = serde_yaml::Mapping::new();
     root.insert(
@@ -790,6 +798,7 @@ fn parse_iam_yaml(yaml: &str) -> Result<crate::iam::DeclarativeIam, String> {
         &access.iam_groups,
         &access.auth_providers,
         &access.group_mapping_rules,
+        &access.external_identities,
     ))
 }
 
@@ -985,6 +994,7 @@ access:
             enabled: true,
             groups: vec![],
             permissions: vec![],
+            auth_source: None,
         });
         diff.users_to_update.push((
             1,
@@ -995,6 +1005,7 @@ access:
                 enabled: true,
                 groups: vec![],
                 permissions: vec![],
+                auth_source: None,
             },
         ));
         diff.users_to_delete.push((2, "c".into()));
