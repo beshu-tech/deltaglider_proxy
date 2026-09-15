@@ -492,6 +492,17 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+    // #85: counter deltas fold into an in-process pending map on the S3 path
+    // (never SQLite, never a global lock); this background task is the single
+    // writer that drains the map into the DB. SQLite under the connection
+    // mutex runs here, on the blocking pool — never on a request worker.
+    if let Some(ref usage) = bucket_usage {
+        let usage = Arc::clone(usage);
+        let flush_interval_secs: u64 = env_parse_with_default("DGP_BUCKET_USAGE_FLUSH_SECS", 10);
+        spawn_periodic_blocking(Duration::from_secs(flush_interval_secs.max(1)), move || {
+            usage.flush_pending();
+        });
+    }
 
     // --- Engine ---
     // Cross-instance reference lock (multi-instance only; None single-instance).
