@@ -571,7 +571,9 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    spawn_periodic(multipart_sweep_interval, {
+    // #86: the sweep walks + removes relay dirs on the filesystem — run it
+    // on the blocking pool, not inline on a worker.
+    spawn_periodic_blocking(multipart_sweep_interval, {
         let mp = multipart.clone();
         let metrics = metrics.clone();
         move || {

@@ -253,7 +253,9 @@ pub fn init_replay_cache() -> deltaglider_proxy::api::auth::ReplayCache {
     // within the valid clock-skew window, allowing replayed requests to succeed.
     let replay_window_secs: u64 =
         deltaglider_proxy::config::env_parse_with_default("DGP_CLOCK_SKEW_SECONDS", 300);
-    spawn_periodic(Duration::from_secs(60), {
+    // #86: the retain is an O(live-signatures) walk — up to 500k shards under
+    // load (MAX_REPLAY_ENTRIES) — so it runs on the blocking pool.
+    spawn_periodic_blocking(Duration::from_secs(60), {
         let cache = replay_cache.clone();
         move || {
             let cutoff = std::time::Instant::now() - Duration::from_secs(replay_window_secs);
@@ -1742,12 +1744,47 @@ pub async fn init_tls(
 // ---------------------------------------------------------------------------
 
 /// Spawn a background task that runs `f` every `interval`.
+///
+/// For closures that are trivial (atomics, small-map retains) only — the
+/// closure runs INLINE on a Tokio worker. Anything that touches the
+/// filesystem or walks a large collection belongs in
+/// [`spawn_periodic_blocking`] instead, or it stalls request handling
+/// for the duration of the tick's work (#86).
 pub fn spawn_periodic(interval: Duration, f: impl Fn() + Send + 'static) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         loop {
             tick.tick().await;
             f();
+        }
+    });
+}
+
+/// Like [`spawn_periodic`], but each tick's work runs on the blocking
+/// pool via `spawn_blocking` — a filesystem sweep or a large-collection
+/// walk never occupies a Tokio worker (#86: the multipart relay sweep
+/// and the replay-cache retain produced interval-aligned P99 spikes).
+/// Awaiting the join also serialises ticks, so a long job cannot
+/// overlap itself; the next tick fires after the current one finishes.
+pub fn spawn_periodic_blocking(interval: Duration, f: impl Fn() + Send + 'static) {
+    // Mutex only serialises tick dispatch (never held across the work
+    // itself), which the spawn_blocking join already serialises anyway —
+    // it exists purely to give spawn_blocking an owned 'static callable.
+    let f: std::sync::Arc<std::sync::Mutex<Box<dyn Fn() + Send>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Box::new(f)));
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            let f = std::sync::Arc::clone(&f);
+            let result = tokio::task::spawn_blocking(move || {
+                let f = f.lock().unwrap();
+                f();
+            })
+            .await;
+            if let Err(e) = result {
+                tracing::error!("periodic blocking task failed: {}", e);
+            }
         }
     });
 }
