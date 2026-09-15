@@ -759,12 +759,15 @@ pub async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRes
 /// was built with `--cfg tokio_unstable`.
 #[cfg(tokio_unstable)]
 pub fn spawn_tokio_runtime_metrics_sampler(metrics: &Arc<Metrics>) {
-    use prometheus::Gauge;
     use std::sync::OnceLock;
 
     static SAMPLER: OnceLock<()> = OnceLock::new();
+    // Defensive only: a second call would double-register the metric names.
+    // Nothing calls this twice today (`main.rs` calls it once), so this makes
+    // the single-sampler assumption explicit rather than papering over a
+    // real re-init path.
     if SAMPLER.set(()).is_err() {
-        return; // engine rebuilds re-init metrics; sample only once per process
+        return;
     }
 
     let rt = tokio::runtime::Handle::current().metrics();
@@ -780,7 +783,7 @@ pub fn spawn_tokio_runtime_metrics_sampler(metrics: &Arc<Metrics>) {
 
     let worker_mean_poll_seconds = g(
         "deltaglider_tokio_worker_mean_poll_seconds",
-        "Mean task poll duration per worker (EWMA). Long polls = blocking work inside async context.",
+        "Worst worker's mean task poll duration (EWMA). Long polls = blocking work inside async context.",
     );
     let global_queue_depth = g(
         "deltaglider_tokio_global_queue_depth",
@@ -790,21 +793,63 @@ pub fn spawn_tokio_runtime_metrics_sampler(metrics: &Arc<Metrics>) {
         "deltaglider_tokio_blocking_queue_depth",
         "Tasks pending in the blocking pool. Sustained depth = spawn_blocking saturation.",
     );
-    let budget_forced_yields_total = g(
-        "deltaglider_tokio_budget_forced_yields_total",
-        "Cumulative polls the scheduler force-yielded after exhausting their budget.",
-    );
     let workers_total = g("deltaglider_tokio_workers", "Runtime worker threads.");
-
     workers_total.set(rt.num_workers() as f64);
+
+    // Cumulatives are COUNTERS, not gauges: we sample the absolute total and
+    // `inc_by` the delta, so `rate()`/`increase()` see a real monotonic
+    // counter. (A `_total` gauge misleads Prometheus tooling.)
+    let budget_forced_yields_total = {
+        let c = IntCounter::new(
+            "deltaglider_tokio_budget_forced_yields_total",
+            "Polls the scheduler force-yielded after exhausting their budget.",
+        )
+        .unwrap();
+        let _ = registry.register(Box::new(c.clone()));
+        c
+    };
+
+    // Poll-time histogram: this is the series `enable_metrics_poll_time_histogram()`
+    // in `main.rs` turns on, and it is what exposes the TAIL a mean hides.
+    // Bucket boundaries are runtime-configured, so build one child counter
+    // per range and label by range.
+    let poll_hist = if rt.poll_time_histogram_enabled() {
+        let n = rt.poll_time_histogram_num_buckets();
+        let ranges: Vec<String> = (0..n)
+            .map(|i| {
+                let r = rt.poll_time_histogram_bucket_range(i);
+                format!("{}-{}us", r.start.as_micros(), r.end.as_micros())
+            })
+            .collect();
+        let v = IntCounterVec::new(
+            Opts::new(
+                "deltaglider_tokio_poll_time_range_total",
+                "Task polls per duration range, summed across workers. \
+                 Counts in the high ranges are long polls.",
+            ),
+            &["range"],
+        )
+        .unwrap();
+        // Pre-create the children so every range appears from the first
+        // scrape, including ranges that have seen no polls yet.
+        for r in &ranges {
+            v.with_label_values(&[r.as_str()]);
+        }
+        let _ = registry.register(Box::new(v.clone()));
+        Some((v, ranges))
+    } else {
+        None
+    };
 
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut prev_budget: u64 = 0;
+        let mut prev_buckets: Vec<u64> =
+            vec![0; poll_hist.as_ref().map(|(_, r)| r.len()).unwrap_or(0)];
         loop {
             tick.tick().await;
-            // Per-worker mean poll time, averaged across workers: a single
-            // poisoned worker should stay visible, so use the MAX (the worst
-            // worker), not the mean-of-means.
+            // Worst (not mean-of-means) worker: a single poisoned worker must
+            // stay visible.
             let mut worst_secs = 0f64;
             for w in 0..rt.num_workers() {
                 let secs = rt.worker_mean_poll_time(w).as_secs_f64();
@@ -815,7 +860,24 @@ pub fn spawn_tokio_runtime_metrics_sampler(metrics: &Arc<Metrics>) {
             worker_mean_poll_seconds.set(worst_secs);
             global_queue_depth.set(rt.global_queue_depth() as f64);
             blocking_queue_depth.set(rt.blocking_queue_depth() as f64);
-            budget_forced_yields_total.set(rt.budget_forced_yield_count() as f64);
+
+            let cur_budget = rt.budget_forced_yield_count();
+            if cur_budget >= prev_budget {
+                budget_forced_yields_total.inc_by(cur_budget - prev_budget);
+                prev_budget = cur_budget;
+            }
+            if let Some((hist, ranges)) = poll_hist.as_ref() {
+                for (i, range) in ranges.iter().enumerate() {
+                    let cur: u64 = (0..rt.num_workers())
+                        .map(|w| rt.poll_time_histogram_bucket_count(w, i))
+                        .sum();
+                    if cur >= prev_buckets[i] {
+                        hist.with_label_values(&[range.as_str()])
+                            .inc_by(cur - prev_buckets[i]);
+                        prev_buckets[i] = cur;
+                    }
+                }
+            }
         }
     });
 }
@@ -866,5 +928,56 @@ mod tests {
             classify_s3_operation("GET", "/mybucket/deep/nested/key"),
             "get_object"
         );
+    }
+
+    /// #87: the sampler must actually export the series it claims, including
+    /// the poll-time histogram it enables. Runs only under `--cfg
+    /// tokio_unstable` (the whole code path is gated there).
+    #[cfg(tokio_unstable)]
+    #[test]
+    fn runtime_metrics_sampler_exports_series() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .enable_metrics_poll_time_histogram()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let m = Arc::new(Metrics::new());
+            spawn_tokio_runtime_metrics_sampler(&m);
+            // Let at least one tick run (interval fires immediately, but give
+            // the task a moment to be polled).
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let names: Vec<String> = m
+                .registry
+                .gather()
+                .iter()
+                .map(|f| f.name().to_string())
+                .collect();
+            for expected in [
+                "deltaglider_tokio_workers",
+                "deltaglider_tokio_global_queue_depth",
+                "deltaglider_tokio_blocking_queue_depth",
+                "deltaglider_tokio_budget_forced_yields_total",
+                "deltaglider_tokio_poll_time_range_total",
+            ] {
+                assert!(
+                    names.iter().any(|n| n == expected),
+                    "sampler must export {expected}; got {names:?}"
+                );
+            }
+            // The histogram counter must carry a range label.
+            let hist = m
+                .registry
+                .gather()
+                .into_iter()
+                .find(|f| f.name() == "deltaglider_tokio_poll_time_range_total")
+                .expect("histogram family present");
+            let has_range = hist
+                .get_metric()
+                .iter()
+                .any(|mm| mm.get_label().iter().any(|l| l.name() == "range"));
+            assert!(has_range, "poll-time counter must be labelled by range");
+        });
     }
 }

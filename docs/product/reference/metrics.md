@@ -150,13 +150,14 @@ These series exist only when the binary is built with `RUSTFLAGS="--cfg tokio_un
 
 | Series | Gauge | Meaning |
 |---|---|---|
-| `deltaglider_tokio_worker_mean_poll_seconds` | per-worker worst | How long the average task poll runs on the busiest worker. Polls should run microseconds-to-low-milliseconds; a sustained value in the tens of milliseconds means blocking work runs inside the async context. |
-| `deltaglider_tokio_global_queue_depth` | instantaneous | Tasks pending in the runtime's global queue. A healthy runtime keeps this near zero; sustained depth means the workers cannot drain the schedule. |
-| `deltaglider_tokio_blocking_queue_depth` | instantaneous | Tasks waiting for a `spawn_blocking` thread. Sustained depth means the blocking pool (size `DGP_BLOCKING_THREADS`) is saturated. |
-| `deltaglider_tokio_budget_forced_yields_total` | cumulative | Polls the scheduler force-yielded after exhausting their budget. Rapid growth points at a task hogging a worker in a tight loop. |
-| `deltaglider_tokio_workers` | constant | Worker thread count, for context when reading the per-worker series. |
+| `deltaglider_tokio_worker_mean_poll_seconds` | gauge | Worst worker's mean task poll duration (EWMA). Polls should run microseconds-to-low-milliseconds; a sustained value in the tens of milliseconds means blocking work runs inside the async context. |
+| `deltaglider_tokio_global_queue_depth` | gauge | Tasks pending in the runtime's global queue. A healthy runtime keeps this near zero; sustained depth means the workers cannot drain the schedule. |
+| `deltaglider_tokio_blocking_queue_depth` | gauge | Tasks waiting for a `spawn_blocking` thread. Sustained depth means the blocking pool (size `DGP_BLOCKING_THREADS`) is saturated. |
+| `deltaglider_tokio_budget_forced_yields_total` | counter | Polls the scheduler force-yielded after exhausting their budget. Rapid growth points at a task hogging a worker in a tight loop. Use `rate()`/`increase()`. |
+| `deltaglider_tokio_poll_time_range_total{range}` | counter | Task polls per poll-duration range (label `range`, for example `10-100us`), summed across workers. Counts in the high ranges are the long polls the mean hides. Use `rate()`/`increase()`. |
+| `deltaglider_tokio_workers` | gauge | Worker thread count, for context when reading the per-worker series. |
 
-Reading guidance: start with `worker_mean_poll_seconds` — if it is high, request handling contains inline blocking work (the class of problem behind the bucket-usage and periodic-sweep fixes). If it is low but latency is still poor, check the two queue depths for saturation, then the budget-yield counter for CPU-hogging loops.
+Reading guidance: start with `worker_mean_poll_seconds` — if it is high, request handling contains inline blocking work (the class of problem behind the bucket-usage and periodic-sweep fixes). The mean hides the tail, so confirm with `deltaglider_tokio_poll_time_range_total`: growth in the high `range` buckets is what a few long polls look like. If the mean is low and the tail is flat but latency is still poor, check the two queue depths for saturation, then the budget-yield counter for CPU-hogging loops.
 
 ## What's NOT in `/_/metrics`
 

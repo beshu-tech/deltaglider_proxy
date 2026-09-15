@@ -390,10 +390,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(bt) = pre_config.blocking_threads {
         runtime_builder.max_blocking_threads(bt);
     }
-    // #87: poll-time histogram instrumentation — the sampler in
-    // `metrics::spawn_tokio_runtime_metrics_sampler` reads it. Both sides of
-    // the same cfg, so a default build pays nothing and a
-    // `--cfg tokio_unstable` build gets the full series.
+    // #87: enable the per-poll duration histogram. The sampler in
+    // `metrics::spawn_tokio_runtime_metrics_sampler` exports its bucket
+    // counts as `deltaglider_tokio_poll_time_range_total`. This costs two
+    // `Instant::now()` per poll, so it is gated behind the same cfg as the
+    // sampler: a default build pays nothing.
     #[cfg(tokio_unstable)]
     {
         runtime_builder.enable_metrics_poll_time_histogram();
