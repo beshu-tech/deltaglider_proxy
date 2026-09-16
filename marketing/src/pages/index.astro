@@ -88,6 +88,9 @@ import {
           <a href="https://readonlyrest.com">ReadonlyREST</a> team), which
           <a href="/case-studies/readonlyrest-builds">serves its own
           1.71&nbsp;TB build catalog through the proxy in production</a>.
+          Our engineers write it with Claude as a coding aid, and we say
+          so in the
+          <a href="https://github.com/beshu-tech/deltaglider_proxy/commits/main">commit trailers</a>.
         </p>
       </div>
     </div>
@@ -154,6 +157,26 @@ import {
             goes directly to the engineers who wrote the code.
           </p>
           <a class="dd-link" href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20General%20inquiry">contact@beshu.tech</a>
+        </article>
+
+        <article class="dd-card dd-card--wide" data-n="05">
+          <h3 class="dd-q">Who wrote it, engineers or an AI?</h3>
+          <p class="dd-a">
+            The engineers in <code>git log</code>, with help from Claude
+            (Fable 5.x today); most of the commits are by Simone Scarduzio,
+            the founder of Beshu Tech. About four in five commits on
+            <code>main</code> carry a <code>Co-Authored-By: Claude</code>
+            trailer that names the model used for that commit, starting
+            with the first release in December 2025. The engineers make
+            the commits and answer for them; the model works from
+            <code>CLAUDE.md</code>, a public file in the repo with the
+            architecture rules and the design decisions it may not change
+            (shelling out to the xdelta3 CLI is one). Every commit, with
+            or without Claude, goes through the same gate: more than 1,100
+            unit tests, the MinIO integration matrix, clippy with warnings
+            as errors, a RustSec audit, and cargo-deny.
+          </p>
+          <a class="dd-link" href="https://github.com/beshu-tech/deltaglider_proxy/blob/main/CLAUDE.md">Read the instructions we give the model: CLAUDE.md</a>
         </article>
       </div>
 
@@ -276,6 +299,11 @@ import {
   .dd-card--accent:hover {
     border-color: var(--accent-strong);
   }
+
+  /* the provenance card spans both columns; give its text more room */
+  .dd-card--wide { grid-column: 1 / -1; }
+  .dd-card--wide .dd-q { max-width: 30ch; }
+  .dd-card--wide .dd-a { max-width: var(--measure); }
 
   /* giant watermark number — graphic weight without clutter */
   .dd-card::before {
