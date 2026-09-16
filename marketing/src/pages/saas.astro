@@ -10,9 +10,9 @@ import MechanismExplanation from '../components/MechanismExplanation.astro';
 import CompressionResultsTable from '../components/CompressionResultsTable.astro';
 import { webPageSchema, breadcrumbListSchema } from '../lib/seo';
 
-const title = 'DeltaGlider for SaaS — cut S3 storage cost on versioned artifacts';
+const title = 'DeltaGlider for SaaS: cut S3 storage cost on versioned artifacts';
 const description =
-  'An S3 proxy that stores similar builds as small binary diffs instead of full copies. Same S3 API, zero client changes. Source-available, free up to 15 TB.';
+  'An S3 proxy that stores similar builds as small binary diffs instead of full copies. Your clients keep the same S3 API. It is source-available and free up to 15 TB.';
 ---
 
 <BaseLayout title={title} description={description}>
@@ -33,9 +33,9 @@ const description =
         <p class="hero-lede">
           DeltaGlider is an S3 proxy that spots similar files and stores
           them as small binary diffs instead of full copies. Each build
-          your CI ships shares most of its bytes with the previous one;
+          your CI ships shares most of its bytes with the previous one, so
           DeltaGlider stores the difference and rebuilds the rest on read.
-          Same S3 API — your SDKs don't change.
+          The S3 API is the same and your SDKs don't change.
         </p>
 
         <div class="hero-ctas">
@@ -67,8 +67,9 @@ const description =
       <h2>What it costs in speed</h2>
 
       <p>
-        Measured with the repo's own benchmark harness — same artifacts,
-        four modes, one Hetzner region, single stream:
+        We measured these numbers by running the repo's own benchmark
+        harness on the same artifacts in four modes, in one Hetzner
+        region, over a single stream:
       </p>
 
       <table>
@@ -84,14 +85,14 @@ const description =
 
       <p>
         The tax lands on the write path, once, where CI is the one
-        waiting: the xdelta3 encode makes a single-stream upload roughly
-        twelve times slower. Reads — the path a person actually feels —
-        pay about 30% on time to first byte when cold and nothing once
-        the reference is warm. Encryption is effectively free.
+        waiting: the xdelta3 encode makes a single-stream upload about
+        twelve times slower. Reads are the path a person feels. They
+        pay about 30% on time to first byte when the reference is cold
+        and nothing when it is warm. Encryption is effectively free.
       </p>
 
       <p class="case-study-link">
-        → <a href="/docs/explanation/the-compute-tax">The full numbers and methodology</a>
+        <a href="/docs/explanation/the-compute-tax">The full numbers and methodology</a>
       </p>
     </section>
 
@@ -102,12 +103,12 @@ const description =
           <h2>ReadonlyREST's build catalog now lives on Hetzner</h2>
 
           <p>
-            Beshu Tech migrated its own ReadonlyREST build catalog —
-            1.71 TB on AWS S3 — to Hetzner via DeltaGlider. It is stored
-            in 134 GB, roughly 1,270% smaller, and serves production
-            downloads today.
+            Beshu Tech migrated its own ReadonlyREST build catalog,
+            1.71 TB on AWS S3, to Hetzner through DeltaGlider. The
+            catalog now takes 134 GB, roughly 1,270% smaller, and serves
+            production downloads today.
           </p>
-          <p class="case-study-link">→ <a href="/case-studies/readonlyrest-builds">Read full case study</a></p>
+          <p class="case-study-link"><a href="/case-studies/readonlyrest-builds">Read the full case study</a></p>
         </div>
 
         <div class="data-col glass-card">
@@ -128,8 +129,8 @@ const description =
           <h3>Deploy</h3>
           <p>
             Run DeltaGlider in your VPC. Point it at your existing AWS
-            bucket — or a new Hetzner / Backblaze / Cloudflare bucket —
-            anything S3-compatible.
+            bucket, or at a new Hetzner, Backblaze, or Cloudflare bucket.
+            Anything S3-compatible works.
           </p>
         </div>
         
@@ -137,8 +138,9 @@ const description =
           <div class="step-number">02</div>
           <h3>Scan</h3>
           <p>
-            Use the Delta Efficiency Panel to scan a sample prefix.
-            Verify compression is in the range that justifies migration.
+            Use the Delta Efficiency Panel to scan a sample prefix and
+            check that the compression is in the range that justifies the
+            migration.
           </p>
         </div>
 
@@ -146,8 +148,8 @@ const description =
           <div class="step-number">03</div>
           <h3>Stage</h3>
           <p>
-            Stage migration bucket-by-bucket using per-bucket aliases.
-            Freeze writes during the window with
+            Stage the migration one bucket at a time with per-bucket
+            aliases. Freeze writes during the window with
             <code>quota_bytes: 0</code>.
           </p>
         </div>
@@ -156,8 +158,8 @@ const description =
           <div class="step-number">04</div>
           <h3>Cutover</h3>
           <p>
-            Cut over your apps' S3 endpoint to DeltaGlider. Your SDKs
-            don't change.
+            Cut over your apps' S3 endpoint to DeltaGlider. The SDKs
+            stay as they are.
           </p>
         </div>
 
@@ -165,8 +167,8 @@ const description =
           <div class="step-number">05</div>
           <h3>Replicate</h3>
           <p>
-            Run replication rules to mirror new writes to a DR region if
-            you need one.
+            If you need a DR region, run replication rules to mirror new
+            writes to it.
           </p>
         </div>
       </div>

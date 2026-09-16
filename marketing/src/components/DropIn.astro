@@ -13,7 +13,7 @@ import Glyph from './Glyph.astro';
         <span class="section-eyebrow">Drop-in</span>
         <h2 class="dropin-title">Adopting it is one line of config</h2>
         <p class="dropin-lede">
-          It speaks the S3 protocol your tools already speak — SigV4
+          It speaks the S3 protocol your tools already speak: SigV4
           signing, multipart uploads, range reads, presigned URLs.
           Repoint the endpoint; nothing else changes.
         </p>
@@ -33,16 +33,17 @@ import Glyph from './Glyph.astro';
       <li>
         <Glyph name="verify" size={38} />
         <div>
-          <strong>Reads are verified, not assumed.</strong> Every delta read
-          rebuilds the original and checks it against the SHA-256 recorded
-          at upload before serving it.
+          <strong>Reads are verified.</strong> Each delta read rebuilds
+          the original and checks it against the SHA-256 recorded at
+          upload before the proxy serves it.
         </div>
       </li>
       <li>
         <Glyph name="binary" size={38} />
         <div>
-          <strong>One binary carries everything.</strong> Proxy, web UI,
-          IAM, jobs, metrics — run it with Docker, a bare binary, or Helm.
+          <strong>Everything is in one binary.</strong> The proxy, the web
+          UI, IAM, jobs, and metrics ship together. Run it with Docker, as
+          a bare binary, or with Helm.
         </div>
       </li>
       <li>
@@ -50,7 +51,7 @@ import Glyph from './Glyph.astro';
         <div>
           <strong>No lock-in.</strong> Stored deltas are
           standard <code>xdelta3</code> files next to a plain reference
-          object — the stock CLI can rebuild every file without the
+          object, so the stock CLI can rebuild every file without the
           proxy running.
         </div>
       </li>

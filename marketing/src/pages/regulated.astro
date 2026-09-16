@@ -13,9 +13,9 @@ import CustomerSegmentBlock from '../components/CustomerSegmentBlock.astro';
 import { webPageSchema, breadcrumbListSchema } from '../lib/seo';
 
 const title =
-  'DeltaGlider for regulated buyers — encrypt-before-the-backend on cheap S3-compatible storage';
+  'DeltaGlider for regulated buyers: encrypt before the backend on cheap S3-compatible storage';
 const description =
-  'AES-256-GCM encryption before objects hit the bucket. Your key stays in your runtime. The backend sees ciphertext. Built by Beshu Tech — the team behind ReadonlyREST, trusted since 2017 by CERN, EU institutions, and 2× of the S&P 500 top 5.';
+  'DeltaGlider encrypts objects with AES-256-GCM before they reach the bucket. Your key stays in your runtime, so the backend sees only ciphertext. Built by Beshu Tech, the team behind ReadonlyREST, used since 2017 by CERN, EU institutions, and 2× of the S&P 500 top 5.';
 ---
 
 <BaseLayout title={title} description={description}>
@@ -35,15 +35,16 @@ const description =
 
         <p class="hero-lede">
           DeltaGlider encrypts every object with AES-256-GCM before it
-          reaches the bucket. Your encryption key lives in your runtime;
-          the storage provider — Hetzner, Wasabi, Cloudflare, an offshore
-          mirror — sees ciphertext only.
+          reaches the bucket. Your encryption key lives in your runtime.
+          The storage provider (Hetzner, Wasabi, Cloudflare, an offshore
+          mirror) sees only ciphertext.
         </p>
 
         <p>
-          Built by <a href="https://beshu.tech">Beshu Tech</a> — the team
-          behind <a href="https://readonlyrest.com">ReadonlyREST</a>
-          (Elasticsearch security), since 2017. Customer references are in
+          <a href="https://beshu.tech">Beshu Tech</a> built DeltaGlider.
+          We are the team behind
+          <a href="https://readonlyrest.com">ReadonlyREST</a>
+          (Elasticsearch security) since 2017. Customer references are in
           the sidebar.
         </p>
       </div>
@@ -57,7 +58,7 @@ const description =
           </div>
           <div class="enc-keyrow">
             <span class="enc-key-chip">⚿ AES-256 key</span>
-            <span class="enc-key-note">lives here. Never uploaded.</span>
+            <span class="enc-key-note">lives here and is never uploaded.</span>
           </div>
         </div>
 
@@ -71,7 +72,7 @@ const description =
           <pre class="enc-cipher">9f 2e 41 c7 88 0a d3 5b 6c e1 74 92 fb 08 1d a6
 33 c9 5e 07 b4 8f 2a d1 66 0b 9c e8 45 71 af 12
 de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
-          <span class="enc-cipher-note">ciphertext only — on Hetzner, Wasabi, anywhere</span>
+          <span class="enc-cipher-note">ciphertext only, on Hetzner, Wasabi, or any other provider</span>
         </div>
       </div>
     </div>
@@ -83,29 +84,32 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
         <h2>How the encryption works</h2>
 
         <ul>
-          <li>AES-256-GCM, per-object IV, applied after delta compression</li>
           <li>
-            Four modes, set per backend: <code>none</code>,
+            The proxy uses AES-256-GCM with a per-object IV and applies it
+            after delta compression.
+          </li>
+          <li>
+            There are four modes, set per backend: <code>none</code>,
             <code>aes256-gcm-proxy</code>, <code>sse-kms</code>,
-            <code>sse-s3</code>. No SSE-C.
+            <code>sse-s3</code>. We don't support SSE-C.
           </li>
           <li>
-            In proxy-AES mode the key is supplied per backend — env var
-            or <code>{'${env:...}'}</code> reference — and stripped from
-            config exports. The backend (S3, Hetzner, Wasabi, etc.) sees
-            ciphertext only.
+            In proxy-AES mode you supply the key per backend, as an env var
+            or a <code>{'${env:...}'}</code> reference, and the proxy strips
+            it from config exports. The backend (S3, Hetzner, Wasabi, etc.)
+            sees only ciphertext.
           </li>
           <li>
-            Key rotation is per backend, not in-place: the old key stays
-            as a decrypt-only shim while a background re-encrypt job
-            rewrites historical objects, then you delete it. Writes to a
-            bucket being re-encrypted get 503 until the job finishes;
-            reads pass.
+            Key rotation happens per backend and does not replace the old
+            key in place. The old key stays as a decrypt-only shim while a
+            background re-encrypt job rewrites historical objects. When
+            the job finishes, you delete the old key. While a bucket is
+            being re-encrypted, writes to it get 503 and reads pass.
           </li>
           <li>
-            Every S3 operation lands in the structured stdout log.
-            Proxy-AES mode does not emit per-decrypt audit events; if you
-            need "who decrypted what, when," use <code>sse-kms</code> and
+            Every S3 request lands in the structured stdout log.
+            Proxy-AES mode does not emit per-decrypt audit events. If you
+            need "who decrypted what, when", use <code>sse-kms</code> and
             read CloudTrail.
           </li>
         </ul>
@@ -116,13 +120,13 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
 
         <ul>
           <li>
-            Proxy runs in YOUR VPC / on YOUR Kubernetes / on YOUR bare
-            metal
+            The proxy runs in your VPC, on your Kubernetes, or on your bare
+            metal.
           </li>
-          <li>In proxy-AES mode, the encryption key never leaves the proxy process</li>
-          <li>Backend credentials never leave the proxy process</li>
-          <li>No phone-home, no telemetry, no SaaS dependency</li>
-          <li>Source code is public (BUSL-1.1) — your security team can read every line</li>
+          <li>In proxy-AES mode, the encryption key never leaves the proxy process.</li>
+          <li>Backend credentials never leave the proxy process.</li>
+          <li>The proxy does not phone home, sends no telemetry, and has no SaaS dependency.</li>
+          <li>The source code is public (BUSL-1.1), so your security team can read every line.</li>
         </ul>
       </section>
 
@@ -131,20 +135,21 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
 
         <ul>
           <li>
-            <strong>"SOC 2 compliant"</strong> — DeltaGlider produces audit
+            We don't claim "SOC 2 compliant". DeltaGlider produces audit
             logs you can ship into a SOC-2-attested SIEM. The proxy itself
             is software, not a compliance regime.
           </li>
           <li>
-            <strong>"FIPS 140-3 validated"</strong> — we use the RustCrypto
+            We don't claim "FIPS 140-3 validated". We use the RustCrypto
             <code>aes-gcm</code> crate for AES-256-GCM. If you need FIPS,
             ship the FIPS-validated crypto layer underneath us.
           </li>
           <li>
-            <strong>"GDPR-compliant"</strong> — DeltaGlider supports
-            right-to-be-forgotten propagation via replication-delete and
-            lifecycle expiration. We provide the technical controls;
-            compliance certification is yours to obtain.
+            "GDPR-compliant" is also not ours to claim. DeltaGlider
+            supports right-to-be-forgotten propagation through
+            replication-delete and lifecycle expiration. We provide the
+            technical controls; the compliance certification is yours to
+            obtain.
           </li>
         </ul>
       </section>
@@ -152,31 +157,33 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
       <section class="evaluation">
         <h2>How a regulated buyer evaluates DeltaGlider</h2>
 
-        <p><strong>Week 1.</strong> Code review. The proxy's full source
-        is public (BUSL-1.1). The encryption module is in
-        <code>src/storage/encrypting.rs</code>. The IAM model is in
-        <code>src/iam/</code>. The admin API surface is in
-        <code>src/api/admin/</code>. Your security team's questions:
+        <p>In week 1, your security team reviews the code. The proxy's
+        full source is public (BUSL-1.1). The encryption module is in
+        <code>src/storage/encrypting.rs</code>, the IAM model in
+        <code>src/iam/</code>, and the admin API surface in
+        <code>src/api/admin/</code>. Send their questions to
         <a href="mailto:contact@beshu.tech">contact@beshu.tech</a>.</p>
 
-        <p><strong>Week 2.</strong> Dev-environment deployment. Point a
-        test bucket at the proxy. Run your existing security automation
-        against it (key rotation, audit log validation, IdP integration
-        smoke).</p>
+        <p>In week 2, you deploy in a dev environment. Point a test
+        bucket at the proxy and run your existing security automation
+        against it (key rotation, audit log validation, an IdP integration
+        smoke test).</p>
 
-        <p><strong>Week 3.</strong> Small production pilot on one
+        <p>In week 3, you run a small production pilot on one
         non-critical bucket.</p>
 
-        <p><strong>Week 4.</strong> Full deployment plan with Beshu
-        engineering support — via the 30-day Commercial trial.</p>
+        <p>In week 4, you write the full deployment plan with Beshu
+        engineering support, which comes with the 30-day Commercial
+        trial.</p>
       </section>
 
       <section class="cta">
         <h2>Talk to sales</h2>
 
         <p>
-          Commercial contract terms are negotiable — jurisdiction, audit
-          requirements, procurement workflow. Email us.
+          Commercial contract terms are negotiable, including
+          jurisdiction, audit requirements, and procurement workflow, so
+          email us.
         </p>
 
         <div class="hero-ctas">
