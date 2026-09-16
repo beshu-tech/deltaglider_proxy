@@ -106,7 +106,7 @@ export default function PricingCalculator() {
               aria-label="Source TB (logarithmic slider, 1 TB to 3000 TB)"
             />
             <p className="field-help">
-              What <code>aws s3 ls --summarize</code> shows today across your bucket.
+              This is what <code>aws s3 ls --summarize</code> shows today across your bucket.
             </p>
           </div>
 
@@ -130,8 +130,8 @@ export default function PricingCalculator() {
               ))}
             </div>
             <p className="field-help">
-              How many regions you replicate this data to. Each adds full
-              storage cost.
+              Enter how many regions you replicate this data to. Each region
+              holds a full copy, so each one adds the full storage cost.
             </p>
           </div>
 
@@ -191,9 +191,9 @@ export default function PricingCalculator() {
                   aria-label="Bytes saved by compression (50% to 99%)"
                 />
                 <p className="field-help">
-                  Conservative default. Verified ReadonlyREST migration ratios:
-                  74%, 76%, 99%. Run the free build's Delta Efficiency Panel on
-                  your bucket for a real number.
+                  The default is conservative. On ReadonlyREST migrations we
+                  measured 74%, 76%, and 99%. Run the free build's Delta
+                  Efficiency Panel on your bucket for a real number.
                 </p>
               </div>
 
@@ -308,9 +308,10 @@ function ProviderComparison({ sourceGb, storedGb, selectedId, onSelect }: Provid
         ))}
       </ul>
       <p className="provider-compare-note">
-        Costs normalised to USD/month for comparison (€-priced providers tagged).
-        Min-billing floors mean some bars can't shrink below ~$6–8/mo — DeltaGlider
-        helps most where you store far above the floor. Egress & API fees excluded.
+        We normalise costs to USD per month for comparison and tag the providers
+        priced in €. Minimum billing floors mean some bars can't shrink below
+        about $6 to $8 a month, so DeltaGlider helps most where you store far
+        above the floor. We leave egress and API fees out.
       </p>
     </div>
   );
@@ -333,11 +334,11 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
         <h3 id="calc-result-heading">DeltaGlider isn't worth it for you yet</h3>
         <p>
           At under 1 TB of source artifacts, the savings are too small to
-          matter. Come back at 5 TB+, or run the free build anyway — it
+          matter. Come back at 5 TB+, or run the free build anyway; it
           costs nothing at this size.
         </p>
         <p>
-          → <a href="https://github.com/beshu-tech/deltaglider_proxy">Run it free</a>
+          <a href="https://github.com/beshu-tech/deltaglider_proxy">Run it free</a>
         </p>
       </div>
     );
@@ -348,9 +349,9 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
       <div className="card card-disqualify">
         <h3 id="calc-result-heading">Savings would not cover the license</h3>
         <p>
-          At this scale (savings ≈ <strong>{formatUsd(result.savings)}/yr</strong>),
-          the Commercial plan (<strong>{formatUsd(result.licenseCost)}/yr</strong>)
-          would cost more than the storage you'd save. Talk to us about a
+          At this scale you'd save about <strong>{formatUsd(result.savings)}/yr</strong> in
+          storage, and the Commercial plan costs <strong>{formatUsd(result.licenseCost)}/yr</strong>,
+          so the plan would cost more than it saves you. Talk to us about a
           different fit.
         </p>
         <div className="card-ctas">
@@ -369,12 +370,12 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
     return (
       <div className="card card-ok">
         <h3 id="calc-result-heading" className="calc-hero-heading">
-          You'd save approximately <strong className="calc-hero-number">{formatUsd(result.savings, { compact: true })}/year</strong>
+          You'd save about <strong className="calc-hero-number">{formatUsd(result.savings, { compact: true })}/year</strong>
         </h3>
         <p className="calc-hero-subtext">
-          Your compressed footprint stays under the <strong>15 TB free
-          grant</strong>, so DeltaGlider costs you <strong className="calc-hero-net">nothing</strong> —
-          the savings above are the whole story.
+          Your compressed footprint stays under the 15 TB free grant, so
+          DeltaGlider costs you <strong className="calc-hero-net">nothing</strong> and
+          the figure above is your net saving.
         </p>
         <div className="card-ctas">
           <a className="btn btn-brand" href="https://github.com/beshu-tech/deltaglider_proxy">
@@ -393,13 +394,13 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
   return (
     <div className="card card-ok">
       <h3 id="calc-result-heading" className="calc-hero-heading">
-        You'd save approximately <strong className="calc-hero-number">{formatUsd(result.savings, { compact: true })}/year</strong>
+        You'd save about <strong className="calc-hero-number">{formatUsd(result.savings, { compact: true })}/year</strong>
       </h3>
       <p className="calc-hero-subtext">
-        After the <strong>{result.bracket.name}</strong> plan at{' '}
-        <strong>{result.bracket.priceLabel}</strong> (your compressed footprint
-        is above the 15 TB free grant),
-        net annual savings: <strong className="calc-hero-net">{formatUsd(result.netSavings)}</strong>.
+        Your compressed footprint is above the 15 TB free grant, so the{' '}
+        <strong>{result.bracket.name}</strong> plan at{' '}
+        <strong>{result.bracket.priceLabel}</strong> applies. After the license,
+        your net annual savings are <strong className="calc-hero-net">{formatUsd(result.netSavings)}</strong>.
       </p>
 
       {result.warnings.length > 0 && (
@@ -407,9 +408,9 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
           {result.warnings.map((w) => (
             <li key={w} className="warning-chip">
               {w === 'lowCompressionRatio' &&
-                'Your data compresses below 67% bytes saved — DeltaGlider may not be the right fit. Run the free build + Delta Efficiency Panel on your own data to verify.'}
+                'Your data compresses below 67% bytes saved. At that ratio DeltaGlider may not be worth it for you. Run the free build and its Delta Efficiency Panel on your own data to check.'}
               {w === 'cheapBackendAlready' &&
-                "You're already on cheap object storage — savings will be smaller, but data sovereignty and lock-in benefits still apply."}
+                "You're already on cheap object storage, so the savings will be smaller. The data sovereignty and lock-in benefits still apply."}
             </li>
           ))}
         </ul>
@@ -474,8 +475,8 @@ function Formula() {
   return (
     <div className="formula-body">
       <p>
-        All math in USD. AWS S3 inter-region replication egress is $0.02/GB.
-        1 TB = 1024 GB.
+        All the math is in USD. AWS S3 inter-region replication egress is $0.02/GB.
+        We count 1 TB as 1024 GB.
       </p>
       <pre>
 {`stored_footprint   = source_tb / compression_ratio
@@ -489,9 +490,9 @@ license_cost       = 0 if stored_footprint ≤ 15 TB, else $5k (Commercial)
 net_savings        = savings − license_cost`}
       </pre>
       <p>
-        License lookup: the BUSL-1.1 grant makes production use free up to
-        15 TB of compressed stored data; above that, the flat Commercial
-        plan at $5k/year applies.
+        The license cost comes from the BUSL-1.1 grant. Production use is free
+        up to 15 TB of compressed stored data, and above that the flat
+        Commercial plan at $5k/year applies.
       </p>
     </div>
   );

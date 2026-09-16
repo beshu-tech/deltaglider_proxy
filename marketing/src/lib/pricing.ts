@@ -123,7 +123,7 @@ export function calculate(inputs: CalculatorInputs): CalculatorResult {
       dgp: dgpStorageTotal,
     },
     { label: 'Replication egress (new artifacts)', today: todayEgress, dgp: dgpEgress },
-    { label: 'Subtotal — storage + transfer', today: todaySubtotal, dgp: dgpSubtotal },
+    { label: 'Subtotal: storage + transfer', today: todaySubtotal, dgp: dgpSubtotal },
   ];
 
   // Tier selection based on the compressed stored footprint — the
