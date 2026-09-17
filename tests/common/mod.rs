@@ -47,6 +47,21 @@ pub const TEST_BOOTSTRAP_PASSWORD_HASH: &str =
 /// MinIO configuration constants
 pub const MINIO_BUCKET: &str = "deltaglider-test";
 
+/// A bucket name that is unique per call within this process AND across
+/// processes: nanosecond timestamp plus a process-wide counter, so two calls
+/// in the same clock tick (parallel tests start within microseconds of each
+/// other) still get different names.
+pub fn unique_bucket(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::SeqCst);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{prefix}-{ts}-{n}")
+}
+
 /// MinIO endpoint — reads MINIO_ENDPOINT env var, falls back to localhost:9000
 pub fn minio_endpoint_url() -> String {
     std::env::var("MINIO_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string())
@@ -228,13 +243,11 @@ impl TestServer {
             .build()
             .expect("health check client");
 
-        // 60 s budget (600 x 100 ms). The old 15 s was enough on an idle
-        // box but not on the shared CI host, where three concurrent runs
-        // pushed the load average past 50 and a debug proxy took longer than
-        // that to answer /_/health — 30 tests of one binary then failed with
-        // "Timed out waiting for server health" while the backend was fine.
-        // A proxy that actually exits is still caught immediately below.
-        for _ in 0..600 {
+        // 60 s wall-clock budget. The old 15 s was enough on an idle box but
+        // not on the shared CI host under a load average past 50. A proxy
+        // that actually exits is still caught immediately below.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             // Check the child process FIRST. If an earlier stray
             // server is holding our port, our child will fail to bind
             // and exit non-zero — we must detect that before the
