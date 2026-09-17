@@ -228,7 +228,13 @@ impl TestServer {
             .build()
             .expect("health check client");
 
-        for _ in 0..150 {
+        // 60 s budget (600 x 100 ms). The old 15 s was enough on an idle
+        // box but not on the shared CI host, where three concurrent runs
+        // pushed the load average past 50 and a debug proxy took longer than
+        // that to answer /_/health — 30 tests of one binary then failed with
+        // "Timed out waiting for server health" while the backend was fine.
+        // A proxy that actually exits is still caught immediately below.
+        for _ in 0..600 {
             // Check the child process FIRST. If an earlier stray
             // server is holding our port, our child will fail to bind
             // and exit non-zero — we must detect that before the
