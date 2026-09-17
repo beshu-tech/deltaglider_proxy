@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
+use common::{s3_test_endpoint_url, S3_TEST_ACCESS_KEY, S3_TEST_SECRET_KEY};
 use deltaglider_proxy::cli::cp::{run as cp_run, CpArgs};
 use deltaglider_proxy::cli::migrate::{run as migrate_run, MigrateArgs};
 
@@ -32,11 +32,11 @@ fn cp_args(src: String, dst: String) -> CpArgs {
         content_type: None,
         metadata: vec![],
         quiet: true,
-        endpoint_url: Some(minio_endpoint_url()),
+        endpoint_url: Some(s3_test_endpoint_url()),
         region: Some("us-east-1".into()),
         profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
+        access_key_id: Some(S3_TEST_ACCESS_KEY.into()),
+        secret_access_key: Some(S3_TEST_SECRET_KEY.into()),
         force_path_style: true,
         max_object_size_mb: None,
     }
@@ -54,19 +54,19 @@ fn migrate_args(src: String, dst: String) -> MigrateArgs {
         max_ratio: None,
         no_delta: false,
         quiet: true,
-        endpoint_url: Some(minio_endpoint_url()),
+        endpoint_url: Some(s3_test_endpoint_url()),
         source_endpoint_url: None,
         region: Some("us-east-1".into()),
         profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
+        access_key_id: Some(S3_TEST_ACCESS_KEY.into()),
+        secret_access_key: Some(S3_TEST_SECRET_KEY.into()),
         force_path_style: true,
         max_object_size_mb: None,
     }
 }
 
 async fn cleanup(bucket: &str) {
-    let s3 = common::minio_client().await;
+    let s3 = common::s3_test_client().await;
     // Empty the bucket the rough way — list everything, delete each key.
     if let Ok(out) = s3.list_objects_v2().bucket(bucket).send().await {
         for obj in out.contents() {
@@ -80,10 +80,10 @@ async fn cleanup(bucket: &str) {
 
 #[tokio::test]
 async fn migrate_dry_run_lists_without_copying() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let src_bucket = unique_bucket("src");
     let dst_bucket = unique_bucket("dst");
-    let s3 = common::minio_client().await;
+    let s3 = common::s3_test_client().await;
     // Create BOTH buckets — cp doesn't auto-create the source bucket.
     s3.create_bucket().bucket(&src_bucket).send().await.unwrap();
     s3.create_bucket().bucket(&dst_bucket).send().await.unwrap();
@@ -132,10 +132,10 @@ async fn migrate_dry_run_lists_without_copying() {
 
 #[tokio::test]
 async fn migrate_copies_with_preserve_prefix() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let src_bucket = unique_bucket("src");
     let dst_bucket = unique_bucket("dst");
-    let s3 = common::minio_client().await;
+    let s3 = common::s3_test_client().await;
     // Create BOTH buckets — cp doesn't auto-create the source bucket.
     s3.create_bucket().bucket(&src_bucket).send().await.unwrap();
     s3.create_bucket().bucket(&dst_bucket).send().await.unwrap();
@@ -196,10 +196,10 @@ async fn migrate_copies_with_preserve_prefix() {
 
 #[tokio::test]
 async fn migrate_skips_already_present_objects_on_resume() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let src_bucket = unique_bucket("src");
     let dst_bucket = unique_bucket("dst");
-    let s3 = common::minio_client().await;
+    let s3 = common::s3_test_client().await;
     s3.create_bucket().bucket(&src_bucket).send().await.unwrap();
     s3.create_bucket().bucket(&dst_bucket).send().await.unwrap();
 

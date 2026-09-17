@@ -6,7 +6,7 @@
 //! reference re-encryption, and the decrypt-on-disable marker-stripping
 //! regression.
 //!
-//! Filesystem backend only — no MinIO needed.
+//! Filesystem backend only — no SeaweedFS needed.
 
 mod common;
 

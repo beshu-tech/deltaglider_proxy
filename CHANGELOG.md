@@ -65,6 +65,18 @@ genuine client-side routes (`browse`, `upload`, `metrics`, `docs`, `admin`) now
 fall back to the app shell. Unmatched paths under `/_/api/` return a JSON 404
 and everything else returns a plain 404.
 
+### Changed — The development and CI S3 backend is SeaweedFS
+
+The integration tests, the nightly full run, and the two Docker Compose files
+used to start MinIO as the S3 backend. The `minio/minio` and `minio/mc` images
+disappeared from Docker Hub in September 2026, so every one of those paths
+broke at once. They now start a single-node SeaweedFS (`chrislusf/seaweedfs`,
+pinned) with its S3 gateway on the same port, the same two test buckets, and a
+neutral credential pair, and SSE-S3 enabled so the server-side encryption
+round-trip is now exercised in CI too. The proxy itself is unchanged: MinIO
+remains a supported backend for deployments that already run it, and every
+S3-dependent test binary passes against SeaweedFS.
+
 ## v1.19.0 — 2026-08-10
 
 ### Added — Cross-instance protection for the delta reference baseline

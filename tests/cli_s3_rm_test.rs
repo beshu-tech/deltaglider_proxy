@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Integration tests for `deltaglider_proxy rm` against MinIO.
+//! Integration tests for `deltaglider_proxy rm` against SeaweedFS.
 
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{minio_client, minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
+use common::{s3_test_client, s3_test_endpoint_url, S3_TEST_ACCESS_KEY, S3_TEST_SECRET_KEY};
 use deltaglider_proxy::cli::rm::{run, RmArgs};
 
 fn unique_bucket(prefix: &str) -> String {
@@ -27,20 +27,20 @@ fn make_args(url: String) -> RmArgs {
         exclude: vec![],
         dryrun: false,
         quiet: false,
-        endpoint_url: Some(minio_endpoint_url()),
+        endpoint_url: Some(s3_test_endpoint_url()),
         region: Some("us-east-1".into()),
         profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
+        access_key_id: Some(S3_TEST_ACCESS_KEY.into()),
+        secret_access_key: Some(S3_TEST_SECRET_KEY.into()),
         force_path_style: true,
     }
 }
 
 #[tokio::test]
 async fn rm_deletes_a_single_key() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("single");
-    let s3 = minio_client().await;
+    let s3 = s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
     s3.put_object()
         .bucket(&bucket)
@@ -54,7 +54,7 @@ async fn rm_deletes_a_single_key() {
     let code = run(args).await;
     assert_eq!(code, deltaglider_proxy::cli::config::EXIT_OK);
 
-    // Verify gone via the direct MinIO client.
+    // Verify gone via the direct SeaweedFS client.
     let head = s3
         .head_object()
         .bucket(&bucket)
@@ -68,9 +68,9 @@ async fn rm_deletes_a_single_key() {
 
 #[tokio::test]
 async fn rm_recursive_with_include_only_touches_matching_keys() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("recursive");
-    let s3 = minio_client().await;
+    let s3 = s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     // Mix: 3 .zip, 2 .txt — the include filter should hit only .zip.

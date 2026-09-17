@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
+use common::{s3_test_endpoint_url, S3_TEST_ACCESS_KEY, S3_TEST_SECRET_KEY};
 use deltaglider_proxy::cli::sync::{run as sync_run, SyncArgs};
 
 fn unique_bucket(prefix: &str) -> String {
@@ -30,18 +30,18 @@ fn sync_args(src: String, dst: String) -> SyncArgs {
         exclude: vec![],
         no_delta: false,
         quiet: true,
-        endpoint_url: Some(minio_endpoint_url()),
+        endpoint_url: Some(s3_test_endpoint_url()),
         region: Some("us-east-1".into()),
         profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
+        access_key_id: Some(S3_TEST_ACCESS_KEY.into()),
+        secret_access_key: Some(S3_TEST_SECRET_KEY.into()),
         force_path_style: true,
         max_object_size_mb: None,
     }
 }
 
 async fn cleanup(bucket: &str) {
-    let s3 = common::minio_client().await;
+    let s3 = common::s3_test_client().await;
     if let Ok(out) = s3.list_objects_v2().bucket(bucket).send().await {
         for obj in out.contents() {
             if let Some(k) = obj.key() {
@@ -54,9 +54,9 @@ async fn cleanup(bucket: &str) {
 
 #[tokio::test]
 async fn sync_local_to_s3_uploads_new_files() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("up");
-    let s3 = common::minio_client().await;
+    let s3 = common::s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -85,9 +85,9 @@ async fn sync_local_to_s3_uploads_new_files() {
 
 #[tokio::test]
 async fn sync_s3_to_local_downloads_missing_files() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("down");
-    let s3 = common::minio_client().await;
+    let s3 = common::s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     // Seed bucket via direct PUT (skip the engine route since we just
@@ -128,9 +128,9 @@ async fn sync_s3_to_local_downloads_missing_files() {
 
 #[tokio::test]
 async fn sync_with_delete_removes_orphans_on_dst() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("del");
-    let s3 = common::minio_client().await;
+    let s3 = common::s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -178,7 +178,7 @@ async fn sync_with_delete_removes_orphans_on_dst() {
 
 #[tokio::test]
 async fn sync_local_to_local_is_rejected() {
-    // No MinIO needed — pure usage-error path.
+    // No SeaweedFS needed — pure usage-error path.
     let tmp1 = tempfile::tempdir().unwrap();
     let tmp2 = tempfile::tempdir().unwrap();
     let args = sync_args(

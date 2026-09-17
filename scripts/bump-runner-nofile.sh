@@ -4,7 +4,7 @@
 # WHY: the runners are Ryzen LXC containers (the `k3s` label is a historical
 # alias — no Kubernetes). LXC inherits a low default nofile (~1024). The CI
 # integration job runs ~35 test binaries in parallel, each with its own proxy +
-# MinIO sockets, so the aggregate fd count crosses 1024 and fails as
+# S3-backend sockets, so the aggregate fd count crosses 1024 and fails as
 # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
 # See docs/dev/ci-infra.md → "Open-file limit (nofile)".
 #

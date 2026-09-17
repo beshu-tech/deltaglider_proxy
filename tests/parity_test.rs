@@ -15,7 +15,7 @@
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{admin_http_client, minio_endpoint_url, wait_for_run, TestServer, MINIO_BUCKET};
+use common::{admin_http_client, s3_test_endpoint_url, wait_for_run, TestServer, S3_TEST_BUCKET};
 use serde_json::Value;
 
 // Replication rule + a lifecycle rule (the latter only to assert that
@@ -276,7 +276,7 @@ async fn test_parity_audit_lifecycle() {
 /// finding.
 #[tokio::test]
 async fn test_parity_orphan_source_absence_on_s3() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let uniq = format!("{}", std::process::id());
     let src = format!("parity-s3-src-{uniq}");
     let dst = format!("parity-s3-dst-{uniq}");
@@ -297,8 +297,8 @@ replication:
     );
     let server = TestServer::builder()
         .auth("bootstrap_key", "bootstrap_secret")
-        .s3_endpoint(&minio_endpoint_url())
-        .bucket(MINIO_BUCKET)
+        .s3_endpoint(&s3_test_endpoint_url())
+        .bucket(S3_TEST_BUCKET)
         .extra_yaml_storage_section(&rule_yaml)
         .build()
         .await;

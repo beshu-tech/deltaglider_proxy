@@ -5,7 +5,7 @@
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
+use common::{s3_test_endpoint_url, S3_TEST_ACCESS_KEY, S3_TEST_SECRET_KEY};
 use deltaglider_proxy::cli::cp::{run as cp_run, CpArgs};
 use deltaglider_proxy::cli::verify::{run as verify_run, VerifyArgs};
 
@@ -33,11 +33,11 @@ fn cp_args(src: String, dst: String) -> CpArgs {
         content_type: None,
         metadata: vec![],
         quiet: true,
-        endpoint_url: Some(minio_endpoint_url()),
+        endpoint_url: Some(s3_test_endpoint_url()),
         region: Some("us-east-1".into()),
         profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
+        access_key_id: Some(S3_TEST_ACCESS_KEY.into()),
+        secret_access_key: Some(S3_TEST_SECRET_KEY.into()),
         force_path_style: true,
         max_object_size_mb: None,
     }
@@ -46,21 +46,21 @@ fn cp_args(src: String, dst: String) -> CpArgs {
 fn verify_args(url: String) -> VerifyArgs {
     VerifyArgs {
         url,
-        endpoint_url: Some(minio_endpoint_url()),
+        endpoint_url: Some(s3_test_endpoint_url()),
         region: Some("us-east-1".into()),
         profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
+        access_key_id: Some(S3_TEST_ACCESS_KEY.into()),
+        secret_access_key: Some(S3_TEST_SECRET_KEY.into()),
         force_path_style: true,
     }
 }
 
 #[tokio::test]
 async fn verify_ok_after_round_trip() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("ok");
     // cp doesn't auto-create the destination bucket.
-    let s3 = common::minio_client().await;
+    let s3 = common::s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -94,9 +94,9 @@ async fn verify_ok_after_round_trip() {
 
 #[tokio::test]
 async fn verify_returns_not_found_for_missing_object() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("missing");
-    let s3 = common::minio_client().await;
+    let s3 = common::s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     // We don't upload anything — verify should return NOT_FOUND.
@@ -110,11 +110,11 @@ async fn verify_returns_not_found_for_missing_object() {
 async fn verify_detects_passthrough_byte_corruption() {
     // Belt-and-suspenders test: upload a `.txt` file (so it's stored
     // as passthrough — no engine-side delta reconstruction), then
-    // corrupt a byte directly via the MinIO client. `verify` should
+    // corrupt a byte directly via the SeaweedFS client. `verify` should
     // catch the SHA256 drift even though no codec ran.
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("corrupt");
-    let s3 = common::minio_client().await;
+    let s3 = common::s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     let tmp = tempfile::tempdir().unwrap();

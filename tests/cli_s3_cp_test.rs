@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Integration tests for `deltaglider_proxy s3 cp` against MinIO.
+//! Integration tests for `deltaglider_proxy s3 cp` against SeaweedFS.
 //!
 //! The QA pyramid here is intentional:
 //! - Bottom (unit tests in `src/cli/cp.rs`): pure decision functions
@@ -8,14 +8,14 @@
 //!   exit-code derivation.
 //! - Middle (this file): each direction (upload, download, S3→S3),
 //!   each major optional flag (recursive+exclude, --no-delta, --dryrun)
-//!   exercised end-to-end against a real MinIO so the engine →
+//!   exercised end-to-end against a real SeaweedFS so the engine →
 //!   storage → wire path is locked in.
 //! - Top (binary-spawn tests): see `tests/cli_admin_test.rs` style
 //!   if/when we add binary-level smoke for the s3 subgroup.
 
 mod common;
 
-use common::{minio_client, minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
+use common::{s3_test_client, s3_test_endpoint_url, S3_TEST_ACCESS_KEY, S3_TEST_SECRET_KEY};
 use deltaglider_proxy::cli::cp::{run, CpArgs};
 
 fn unique_bucket(prefix: &str) -> String {
@@ -42,11 +42,11 @@ fn default_args(src: String, dst: String) -> CpArgs {
         content_type: None,
         metadata: vec![],
         quiet: false,
-        endpoint_url: Some(minio_endpoint_url()),
+        endpoint_url: Some(s3_test_endpoint_url()),
         region: Some("us-east-1".into()),
         profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
+        access_key_id: Some(S3_TEST_ACCESS_KEY.into()),
+        secret_access_key: Some(S3_TEST_SECRET_KEY.into()),
         force_path_style: true,
         max_object_size_mb: None,
     }
@@ -54,9 +54,9 @@ fn default_args(src: String, dst: String) -> CpArgs {
 
 #[tokio::test]
 async fn cp_uploads_a_single_local_file_to_s3() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("upload");
-    let s3 = minio_client().await;
+    let s3 = s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -70,7 +70,7 @@ async fn cp_uploads_a_single_local_file_to_s3() {
     let code = run(args).await;
     assert_eq!(code, deltaglider_proxy::cli::config::EXIT_OK);
 
-    // Verify via the direct MinIO client through the engine's stored
+    // Verify via the direct SeaweedFS client through the engine's stored
     // bytes — we don't decode deltas here (the engine handles small
     // text files as passthrough by default), so a direct GET should
     // come back with our original payload.
@@ -100,9 +100,9 @@ async fn cp_uploads_a_single_local_file_to_s3() {
 
 #[tokio::test]
 async fn cp_recursive_upload_respects_exclude_filter() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("recursive");
-    let s3 = minio_client().await;
+    let s3 = s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     // Local tree:
@@ -126,7 +126,7 @@ async fn cp_recursive_upload_respects_exclude_filter() {
     let code = run(args).await;
     assert_eq!(code, deltaglider_proxy::cli::config::EXIT_OK);
 
-    // Inspect via MinIO direct: there should be exactly 3 keys, all
+    // Inspect via SeaweedFS direct: there should be exactly 3 keys, all
     // ending in `.txt`. No `.tmp` survives the filter.
     let listing = s3
         .list_objects_v2()
@@ -160,9 +160,9 @@ async fn cp_recursive_upload_respects_exclude_filter() {
 /// path).
 #[tokio::test]
 async fn cp_downloads_a_single_s3_object_to_local() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("download");
-    let s3 = minio_client().await;
+    let s3 = s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     // Seed the bucket via cp upload (exercising the same metadata
@@ -216,10 +216,10 @@ async fn cp_downloads_a_single_s3_object_to_local() {
 /// observable outcome (object lands on dst with original bytes).
 #[tokio::test]
 async fn cp_copies_between_two_s3_locations() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let src_bucket = unique_bucket("s3src");
     let dst_bucket = unique_bucket("s3dst");
-    let s3 = minio_client().await;
+    let s3 = s3_test_client().await;
     s3.create_bucket().bucket(&src_bucket).send().await.unwrap();
     s3.create_bucket().bucket(&dst_bucket).send().await.unwrap();
 
@@ -288,9 +288,9 @@ async fn cp_copies_between_two_s3_locations() {
 /// `binary/octet-stream` defaults and misroute file handlers.
 #[tokio::test]
 async fn cp_content_type_flag_forwarded_to_storage() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("ctype");
-    let s3 = minio_client().await;
+    let s3 = s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -363,9 +363,9 @@ async fn cp_content_type_flag_forwarded_to_storage() {
 /// the dryrun.
 #[tokio::test]
 async fn cp_dryrun_does_not_write_to_destination() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("dryrun");
-    let s3 = minio_client().await;
+    let s3 = s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     let tmp = tempfile::tempdir().unwrap();
