@@ -15,13 +15,13 @@ version can restore the label with `DGP_METRICS_EXPOSE_VERSION=true`. The admin
 dashboard reads the version from the authenticated identity instead of the
 scrape.
 
-### Changed — Production images ship no frontend source maps
+### Changed — No build of the proxy ships frontend source maps
 
-The Docker build passes `PROD=true` to the UI build stage, and the Vite config
-emits source maps only when that variable is unset. A source map in the
-embedded bundle handed the full UI source to anyone who could reach `/_/`.
-A plain local `npm run build` still emits maps for debugging, and
-`--build-arg PROD=false` restores them in a debug image.
+A source map in the embedded bundle handed the full UI source to anyone who
+could reach `/_/`. Source maps are now opt-in for the UI build
+(`DGP_UI_SOURCEMAP=1`), so the Docker image, the release tarballs and the
+demo image all embed none without any per-channel flag. A local debugging
+build sets the variable.
 
 ### Fixed — Unknown paths under `/_/` returned the app shell with status 200
 
@@ -31,7 +31,9 @@ did not recognise, including mistyped admin API paths such as
 HTML page instead of an error, and scanners saw every probe succeed. Only the
 genuine client-side routes (`browse`, `upload`, `metrics`, `docs`, `admin`) now
 fall back to the app shell. Unmatched paths under `/_/api/` return a JSON 404
-and everything else returns a plain 404.
+for every HTTP method, and everything else returns a plain 404; both carry
+`Cache-Control: no-store` so a cache in front of a mixed-version fleet never
+keeps a 404 for an asset a newer instance serves.
 
 ### Changed — MinIO images for tests and the demo come from `pgsty/silo`
 

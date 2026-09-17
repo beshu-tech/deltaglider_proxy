@@ -16,7 +16,7 @@ Endpoints documented here are **admin** only. The S3-compatible API lives under 
 | `GET` | `/_/api/admin/session` | `{valid, admin_gui}` |
 | `POST` | `/_/api/admin/session/browser-connect` | Issue a limited browser-lift session for an IAM non-admin (S3 browse only) |
 | `POST` | `/_/api/admin/session/open-browser-connect` | Browser-lift session when `authentication: none` |
-| `GET` | `/_/api/whoami` | `{mode, user, external_providers, version}` — `version` is present only when the request carries a live session; anonymous callers get `mode` and the provider list but not the build version |
+| `GET` | `/_/api/whoami` | `{mode, user, external_providers, version}` — `version` is present for authenticated callers only (a live session, or verified IAM credentials on `POST /_/api/iam/identity`); anonymous callers get `mode` and the provider list but not the build version |
 | `POST` | `/_/api/admin/recover-db` | Reset the config DB when the bootstrap hash doesn't match (public, rate-limited) |
 | `PUT` | `/_/api/admin/password` | Change the bootstrap password — re-encrypts the SQLCipher DB atomically |
 

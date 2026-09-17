@@ -68,7 +68,8 @@ pub struct WhoamiUserInfo {
 #[derive(Serialize)]
 pub struct WhoamiResponse {
     mode: String,
-    /// Exact build version — present only for callers with a live session
+    /// Exact build version — present for authenticated callers only: a live
+    /// session here, or verified IAM credentials on `POST /_/api/iam/identity`
     /// (see [`build_version_for`]); omitted for anonymous callers.
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
@@ -478,14 +479,16 @@ pub async fn whoami(
     };
 
     let client_ip = request_client_ip(&headers, connect_info.as_ref());
-    // Any live session (admin GUI, S3-browser lift, open-mode lift) may learn
-    // the version; an anonymous caller may not.
-    let session_valid = extract_session_token(&headers)
-        .map(|t| state.sessions.validate(&t, client_ip))
-        .unwrap_or(false);
-
-    // If caller has a valid session, resolve user identity.
-    let user = resolve_session_user(&state, &headers, client_ip).await;
+    // One session lookup answers both questions: is there a live session
+    // (any kind — admin GUI, S3-browser lift, open-mode lift — may learn the
+    // version; an anonymous caller may not), and who is it.
+    let session =
+        extract_session_token(&headers).and_then(|t| state.sessions.auth_method(&t, client_ip));
+    let session_valid = session.is_some();
+    let user = match session {
+        Some(method) => session_user_info(&state, method).await,
+        None => None,
+    };
 
     // Include enabled external auth providers so the login page can show OAuth buttons.
     let external_providers = if let Some(ref ext_auth) = state.external_auth {
@@ -574,14 +577,12 @@ pub async fn resolve_iam_identity(
     }))
 }
 
-/// Resolve user info from the session cookie (if present and valid).
-async fn resolve_session_user(
+/// User info for a live session's auth method (`None` for an open-mode lift,
+/// which has no user).
+async fn session_user_info(
     state: &AdminState,
-    headers: &HeaderMap,
-    client_ip: Option<IpAddr>,
+    auth_method: crate::session::AuthMethod,
 ) -> Option<WhoamiUserInfo> {
-    let token = extract_session_token(headers)?;
-    let auth_method = state.sessions.auth_method(&token, client_ip)?;
     match auth_method {
         crate::session::AuthMethod::OpenLift => None,
         crate::session::AuthMethod::Bootstrap => Some(WhoamiUserInfo {

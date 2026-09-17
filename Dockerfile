@@ -14,11 +14,8 @@ COPY docs/ /app/docs/
 # the vite define, so __BUILD_TIME__ stays honest across version bumps
 # instead of freezing at the first-ever-built timestamp.
 COPY Cargo.toml /app/Cargo.toml
-# Production image: no frontend source maps (they would ship the full UI
-# source to anonymous callers — see vite.config.ts). `--build-arg PROD=false`
-# restores them for a debug image.
-ARG PROD=true
-ENV PROD=${PROD}
+# No frontend source maps: they are opt-in in vite.config.ts (DGP_UI_SOURCEMAP=1)
+# because dist/ is embedded and served to anonymous callers.
 RUN npm run build
 
 # ── Build stage: Rust ──

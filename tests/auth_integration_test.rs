@@ -854,18 +854,51 @@ async fn test_unknown_ui_paths_are_404_not_spa_fallback() {
     let http = reqwest::Client::new();
     let get = |p: &str| http.get(format!("{}{}", server.endpoint(), p)).send();
 
-    let api = get("/_/api/admin/does-not-exist").await.unwrap();
-    assert_eq!(api.status(), StatusCode::NOT_FOUND);
-    assert_eq!(
-        api.json::<serde_json::Value>().await.unwrap()["error"],
-        "not_found"
-    );
+    // Every method, not only GET: a GET-only catch-all made axum answer
+    // POST/PUT/DELETE on a mistyped path with 405 `Allow: GET,HEAD`, which
+    // reads as "resource exists".
+    for method in [
+        reqwest::Method::GET,
+        reqwest::Method::POST,
+        reqwest::Method::PUT,
+        reqwest::Method::DELETE,
+    ] {
+        let api = http
+            .request(
+                method.clone(),
+                format!("{}/_/api/admin/does-not-exist", server.endpoint()),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::NOT_FOUND, "{method}");
+        assert_eq!(
+            api.headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "{method}: a 404 must not be cacheable"
+        );
+        assert_eq!(
+            api.json::<serde_json::Value>().await.unwrap()["error"],
+            "not_found",
+            "{method}"
+        );
+    }
 
     for p in ["/_/assets/index-deadbeef.js.map", "/_/no-such-view"] {
+        let resp = get(p).await.unwrap();
         assert_eq!(
-            get(p).await.unwrap().status(),
+            resp.status(),
             StatusCode::NOT_FOUND,
             "{p} must be a 404, not the SPA shell"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "{p}: a 404 must not be cacheable"
         );
     }
 
@@ -889,6 +922,20 @@ async fn test_unknown_ui_paths_are_404_not_spa_fallback() {
     assert!(
         content_type.starts_with("text/html"),
         "SPA shell must be HTML, got {content_type}"
+    );
+
+    // No source map for any REAL chunk either. The shell names its entry
+    // chunk; that chunk's `.map` must be absent, not only a made-up name.
+    let chunk = body
+        .split("/_/assets/")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("index.html references an /_/assets/ chunk");
+    let map = get(&format!("/_/assets/{chunk}.map")).await.unwrap();
+    assert_eq!(
+        map.status(),
+        StatusCode::NOT_FOUND,
+        "source map for the entry chunk {chunk} must not be served"
     );
 }
 
