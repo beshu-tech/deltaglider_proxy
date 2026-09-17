@@ -206,13 +206,14 @@ Integration tests need an S3-compatible backend. A **separate, ephemeral** singl
       -e WEED_S3_SSE_KEY=dgp-test-sse-key \
       chrislusf/seaweedfs:4.47 server -dir=/data -ip.bind=0.0.0.0 \
         -master.port=29333 -volume.port=28080 -filer.port=28888 \
-        -s3 -s3.port=9000 -s3.allowDeleteBucketNotEmpty=false
+        -s3 -s3.port=9000 -s3.port.grpc=39000 -s3.port.iceberg=0 -s3.port.lance=0 \
+        -s3.allowDeleteBucketNotEmpty=false
     # wait for HTTP 403 on http://localhost:9000/ (auth is up), then:
     docker exec seaweedfs-ci sh -c "echo 's3.bucket.create -name deltaglider-test' | weed shell -master=localhost:29333"
     echo "S3_TEST_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
 ```
 
-The `--network container:$(hostname)` flag shares the runner's network namespace with the SeaweedFS container, making the S3 gateway reachable at `localhost:9000` from the job container. This is necessary because GitHub Actions `container:` jobs run inside Docker, and `services:` cannot pass CMD arguments. The master/volume/filer ports are moved to 2xxxx (their gRPC twins land on 3xxxx) so they never collide with the 19000+ and 29500+ ports the test harness hands out. The `AWS_*` pair is the gateway's single admin identity — the same pair `tests/common/mod.rs` signs with.
+The `--network container:$(hostname)` flag shares the runner's network namespace with the SeaweedFS container, making the S3 gateway reachable at `localhost:9000` from the job container. This is necessary because GitHub Actions `container:` jobs run inside Docker, and `services:` cannot pass CMD arguments. The master/volume/filer ports are moved to 2xxxx (their gRPC twins land on 3xxxx) so they never collide with the 19000+ and 29500+ ports the test harness hands out; the S3 gRPC port is pinned as well because its default, `s3.port + 10000` = 19000, is the harness's first proxy port, and the Iceberg/Lance catalogue listeners (8181/9101) are disabled. The `AWS_*` pair is the gateway's single admin identity — the same pair `tests/common/mod.rs` signs with.
 
 **This SeaweedFS is completely separate from the sccache MinIO.** Different credentials, different lifecycle. It is destroyed at the end of every test job.
 
