@@ -1,7 +1,7 @@
 # Docker Compose configuration for DeltaGlider Proxy development and testing
 #
 # Usage:
-#   docker compose up -d          # Start MinIO
+#   docker compose up -d          # Start MinIO (pgsty/silo build)
 #   docker compose down           # Stop MinIO
 #   docker compose logs -f minio  # View MinIO logs
 #
@@ -10,7 +10,9 @@
 
 services:
   minio:
-    image: quay.io/minio/minio:latest
+    # pgsty/silo: maintained MinIO fork with the MINIO_* env and S3/admin API
+    # unchanged (minio/minio left Docker Hub). Bundles the client as `mcli`.
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
     container_name: deltaglider-minio
     ports:
       - "9000:9000"   # S3 API
@@ -22,23 +24,23 @@ services:
     volumes:
       - minio-data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "mcli", "ready", "local"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   # Create test bucket on startup
   minio-setup:
-    image: quay.io/minio/mc:latest
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
     container_name: deltaglider-minio-setup
     depends_on:
       minio:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      mc alias set local http://minio:9000 minioadmin minioadmin;
-      mc mb --ignore-existing local/deltaglider-data;
-      mc mb --ignore-existing local/deltaglider-test;
+      mcli alias set local http://minio:9000 minioadmin minioadmin;
+      mcli mb --ignore-existing local/deltaglider-data;
+      mcli mb --ignore-existing local/deltaglider-test;
       echo 'Buckets created successfully';
       exit 0;
       "

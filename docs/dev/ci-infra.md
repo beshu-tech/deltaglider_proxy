@@ -195,7 +195,7 @@ Jobs that don't compile Rust (fmt, audit) override `RUSTC_WRAPPER: ""` at the st
 
 ### 4. Test MinIO (Ephemeral)
 
-Integration tests need an S3-compatible backend. A **separate, ephemeral** MinIO instance is started per test job:
+Integration tests need an S3-compatible backend. A **separate, ephemeral** MinIO instance — the `pgsty/silo` build, a maintained MinIO fork with the same `MINIO_*` env and API (`minio/minio` left Docker Hub in September 2026) — is started per test job:
 
 ```yaml
 - name: Start MinIO for tests
@@ -204,7 +204,7 @@ Integration tests need an S3-compatible backend. A **separate, ephemeral** MinIO
     docker run -d --name minio-ci --network container:$(hostname) \
       -e MINIO_ROOT_USER=minioadmin \
       -e MINIO_ROOT_PASSWORD=minioadmin \
-      quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z.hotfix.7aa24e772 server /data
+      pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data
 ```
 
 The `--network container:$(hostname)` flag shares the runner pod's network namespace with the MinIO container, making it reachable at `localhost:9000` from the job container. This is necessary because GitHub Actions `container:` jobs run inside Docker, and `services:` cannot pass CMD arguments (MinIO needs `server /data`).
@@ -338,11 +338,11 @@ kubectl apply -f .github/k8s/sccache-minio.yaml
 Then create the bucket and lifecycle rule:
 
 ```bash
-kubectl run minio-setup --image=quay.io/minio/mc:latest --restart=Never \
+kubectl run minio-setup --image=pgsty/silo:RELEASE.2026-09-16T00-00-00Z --restart=Never \
   --namespace=sccache --command -- sh -c '
-    mc alias set sccache http://sccache-minio:9000 sccache sccache-secret-key &&
-    mc mb --ignore-existing sccache/sccache-rust &&
-    mc ilm rule add sccache/sccache-rust --expire-days 30
+    mcli alias set sccache http://sccache-minio:9000 sccache sccache-secret-key &&
+    mcli mb --ignore-existing sccache/sccache-rust &&
+    mcli ilm rule add sccache/sccache-rust --expire-days 30
   '
 ```
 
@@ -400,7 +400,7 @@ The `container:` job shares the runner pod's network namespace, so k8s DNS and C
 
 The ephemeral test MinIO must share the runner pod's network namespace:
 ```bash
-docker run -d --network container:$(hostname) quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z.hotfix.7aa24e772 server /data
+docker run -d --network container:$(hostname) pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data
 ```
 
 Do **not** use `--network host` — that puts MinIO on the k3s node's network, not the pod's.
