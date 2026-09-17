@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     lld \
     pkg-config \
+    unzip \
     wget \
     xdelta3=3.0.11-dfsg-1.2 \
   && rm -rf /var/lib/apt/lists/*
@@ -60,8 +61,17 @@ RUN cargo install cargo-audit --locked \
   && rm -rf "$CARGO_HOME"/registry "$CARGO_HOME"/git
 
 # ── MinIO client (mc) ──────────────────────────────────────────────
-RUN curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc \
-  && chmod +x /usr/local/bin/mc
+# dl.min.io stopped serving mc (HTTP 410, September 2026). pgsty/mc is the
+# maintained fork; its release ships the client as `mcli`, installed here
+# under the `mc` name so ci.yml and the nightly keep their commands.
+ARG MCLI_RELEASE=RELEASE.2026-09-16T00-00-00Z
+ARG MCLI_VERSION=20260916000000.0.0
+ARG MCLI_SHA256=4ba2814fd5507fbe6b4d237c359750b9119d28d7217495fa5b48002fcbd397ef
+RUN curl -fsSL "https://github.com/pgsty/mc/releases/download/${MCLI_RELEASE}/mcli_${MCLI_VERSION}_linux_amd64.tar.gz" -o /tmp/mcli.tgz \
+  && echo "${MCLI_SHA256}  /tmp/mcli.tgz" | sha256sum -c - \
+  && tar -xzf /tmp/mcli.tgz -C /tmp mcli \
+  && install -m 0755 /tmp/mcli /usr/local/bin/mc \
+  && rm -f /tmp/mcli.tgz /tmp/mcli
 
 # ── Verify everything is in place ──────────────────────────────────
 RUN echo "--- Builder image verification ---" \

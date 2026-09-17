@@ -21,7 +21,7 @@ graph TD
     SCC --> MINIO["sccache-minio<br/><i>persistent MinIO, 10Gi PVC</i><br/>Bucket: sccache-rust (30-day expiry)"]
 ```
 
-All CI jobs run inside a custom **builder image** (`ghcr.io/beshu-tech/deltaglider_proxy/builder:latest`) pulled as a `container:` job. The image is based on Ubuntu 24.04 with all tools pre-installed: Rust stable, Node.js 20, clippy, rustfmt, cargo-audit, cargo-sbom, sccache, xdelta3, Docker CLI, and MinIO client (mc).
+All CI jobs run inside a custom **builder image** (`ghcr.io/beshu-tech/deltaglider_proxy/builder:latest`) pulled as a `container:` job. The image is based on Ubuntu 24.04 with all tools pre-installed: Rust stable, Node.js 20, clippy, rustfmt, cargo-audit, cargo-sbom, sccache, xdelta3, Docker CLI, unzip, and the MinIO client (`mc`, built from the `pgsty/mc` fork's `mcli` release because dl.min.io stopped serving it).
 
 ## Performance Evolution
 
@@ -75,7 +75,8 @@ The image is a plain Ubuntu 24.04 with every tool pre-installed. This means zero
 - Node.js 20 + npm
 - xdelta3
 - Docker CLI (static binary, not the daemon)
-- MinIO client (mc)
+- MinIO client (`mc` = pgsty/mc `mcli`)
+- unzip (the Claude action's Bun bootstrap needs it)
 
 **Size optimization:**
 - `--profile minimal` for rustup (skips docs/man)

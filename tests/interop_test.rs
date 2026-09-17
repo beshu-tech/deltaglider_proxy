@@ -219,12 +219,20 @@ impl TestProxyServer {
             .spawn()
             .expect("Failed to start proxy server");
 
-        // Wait for server to be ready (max 15s)
+        // Wait for server to be ready: 60 s wall-clock, the same budget as
+        // `TestServer::wait_ready` in tests/common/mod.rs (the shared CI host
+        // can sit at a load average past 50).
         let addr = format!("127.0.0.1:{}", port);
         let mut ready = false;
-        for i in 0..150 {
+        let started = std::time::Instant::now();
+        let deadline = started + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
             if std::net::TcpStream::connect(&addr).is_ok() {
-                println!("Proxy ready on port {} after {}ms", port, i * 100);
+                println!(
+                    "Proxy ready on port {} after {}ms",
+                    port,
+                    started.elapsed().as_millis()
+                );
                 ready = true;
                 break;
             }
@@ -234,7 +242,7 @@ impl TestProxyServer {
             // Dump proxy stderr for diagnosis
             let stderr_log = std::fs::read_to_string(&stderr_path).unwrap_or_default();
             panic!(
-                "Proxy server failed to start on port {} within 15 seconds.\nProxy stderr:\n{}",
+                "Proxy server failed to start on port {} within 60 seconds.\nProxy stderr:\n{}",
                 port,
                 &stderr_log[..stderr_log.len().min(4096)]
             );
