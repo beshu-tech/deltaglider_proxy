@@ -42,6 +42,11 @@ jobs:
         with:
           fetch-depth: 1
 
+      # The action bootstraps Bun through setup-bun, which shells out to
+      # `unzip`; the builder image does not ship it.
+      - name: Install unzip for the action's Bun bootstrap
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends unzip >/dev/null
+
       - name: Run Claude Code Review
         id: claude-review
         uses: anthropics/claude-code-action@v1
