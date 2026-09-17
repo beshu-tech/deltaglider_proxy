@@ -10,7 +10,7 @@
 
 services:
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
     container_name: deltaglider-minio
     ports:
       - "9000:9000"   # S3 API
@@ -29,7 +29,7 @@ services:
 
   # Create test bucket on startup
   minio-setup:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     container_name: deltaglider-minio-setup
     depends_on:
       minio:

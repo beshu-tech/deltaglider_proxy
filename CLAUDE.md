@@ -326,7 +326,7 @@ Admin API at `/_/api/admin/*` (login, login-as, whoami, users CRUD, groups, conf
 
 Tests in `tests/` use a `TestServer` harness (`tests/common/mod.rs`) that spawns a real proxy instance with a temp directory (filesystem backend) or MinIO (S3 backend). Port allocation uses an atomic counter starting at 19000. `wait_ready` checks `process.try_wait()` BEFORE the health probe so a stray proxy holding the test port fails loudly (`lsof -i :<port>`) instead of silently intercepting requests.
 
-S3 integration tests require MinIO running on localhost:9000. CI starts MinIO automatically; locally, use `docker run -p 9000:9000 minio/minio server /data`.
+S3 integration tests require MinIO running on localhost:9000. CI starts MinIO automatically; locally, use `docker run -p 9000:9000 quay.io/minio/minio server /data`.
 
 Async rebuild barrier: after any IAM mutation, use `get_iam_version(&http, &endpoint).await` BEFORE the call and `wait_for_iam_rebuild(&http, &endpoint, before_version).await` AFTER. Backed by a monotonic `AtomicU64` exposed at `GET /_/api/admin/iam/version` — replaces blind `sleep(1s)` with a ~50ms deterministic poll. HA sync is exercised via `POST /api/admin/config/sync-now` in `tests/config_sync_ha_test.rs`.
 
