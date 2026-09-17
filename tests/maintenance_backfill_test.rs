@@ -7,8 +7,8 @@
 //! bytes untouched, with the served LastModified preserved by default and
 //! moved only when `refresh_last_modified: true` is requested.
 //!
-//! Mostly filesystem-backed (no SeaweedFS needed); the last test exercises the
-//! S3 backend's server-side self-copy path against SeaweedFS (skipped without
+//! Mostly filesystem-backed (no MinIO needed); the last test exercises the
+//! S3 backend's server-side self-copy path against MinIO (skipped without
 //! it), including multipart-ETag stability across the copy.
 
 mod common;
@@ -230,12 +230,12 @@ async fn backfill_refresh_last_modified_moves_the_served_time() {
 /// `dg-multipart-etag` override, alongside the preserved LastModified.
 #[tokio::test]
 async fn backfill_s3_self_copy_preserves_etag_and_served_time() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
     let bucket = "backfill-s3-test";
-    let server = TestServer::s3_with_endpoint(&common::s3_test_endpoint_url(), bucket).await;
+    let server = TestServer::s3_with_endpoint(&common::minio_endpoint_url(), bucket).await;
     let admin = admin_http_client(&server.endpoint()).await;
     let client = server.s3_client().await;
-    let raw = common::s3_test_client().await;
+    let raw = common::minio_client().await;
 
     // Foreign multipart upload straight into the backend: no dg metadata,
     // and an ETag of the "…-2" multipart shape.

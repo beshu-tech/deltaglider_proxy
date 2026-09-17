@@ -11,13 +11,13 @@
 //! 3. Files compressed by this proxy can be read/reconstructed by original CLI
 //!
 //! Usage:
-//!   docker compose up -d                    # Start SeaweedFS
+//!   docker compose up -d                    # Start MinIO
 //!   pip install deltaglider                 # Install CLI
 //!   cargo test --test interop_test -- --ignored --nocapture
 //!   docker compose down
 //!
 //! Requirements:
-//! - SeaweedFS running on localhost:9000
+//! - MinIO running on localhost:9000
 //! - `deltaglider` CLI on PATH (pip install deltaglider)
 
 use aws_credential_types::Credentials;
@@ -42,23 +42,23 @@ static TEST_PREFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 mod common;
 
-const S3_TEST_BUCKET: &str = "deltaglider-test";
+const MINIO_BUCKET: &str = "deltaglider-test";
 
-/// Delegates to shared `common::s3_test_endpoint_url()` — single source of truth.
-fn s3_test_endpoint() -> String {
-    common::s3_test_endpoint_url()
+/// Delegates to shared `common::minio_endpoint_url()` — single source of truth.
+fn minio_endpoint() -> String {
+    common::minio_endpoint_url()
 }
-// Re-export shared SeaweedFS constants for local use
-const S3_TEST_ACCESS_KEY: &str = "dgp-test-key";
-const S3_TEST_SECRET_KEY: &str = "dgp-test-secret";
+// Re-export shared MinIO constants for local use
+const MINIO_ACCESS_KEY: &str = "minioadmin";
+const MINIO_SECRET_KEY: &str = "minioadmin";
 
-/// Build a `Command` for the DeltaGlider CLI with standard SeaweedFS env vars.
+/// Build a `Command` for the DeltaGlider CLI with standard MinIO env vars.
 /// Uses the native `deltaglider` binary (install via `pip install deltaglider`).
 fn deltaglider_cmd() -> std::process::Command {
     let mut cmd = std::process::Command::new("deltaglider");
-    cmd.env("AWS_ACCESS_KEY_ID", S3_TEST_ACCESS_KEY);
-    cmd.env("AWS_SECRET_ACCESS_KEY", S3_TEST_SECRET_KEY);
-    cmd.env("AWS_ENDPOINT_URL", s3_test_endpoint());
+    cmd.env("AWS_ACCESS_KEY_ID", MINIO_ACCESS_KEY);
+    cmd.env("AWS_SECRET_ACCESS_KEY", MINIO_SECRET_KEY);
+    cmd.env("AWS_ENDPOINT_URL", minio_endpoint());
     cmd.env("DG_LOG_LEVEL", "INFO");
     cmd
 }
@@ -113,14 +113,14 @@ fn mutate_archive(data: &[u8], change_ratio: f64, seed: u64) -> Vec<u8> {
     result
 }
 
-/// Check if SeaweedFS is available
-async fn s3_backend_available() -> bool {
-    let credentials = Credentials::new(S3_TEST_ACCESS_KEY, S3_TEST_SECRET_KEY, None, None, "test");
+/// Check if MinIO is available
+async fn minio_available() -> bool {
+    let credentials = Credentials::new(MINIO_ACCESS_KEY, MINIO_SECRET_KEY, None, None, "test");
 
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
-        .endpoint_url(s3_test_endpoint())
+        .endpoint_url(minio_endpoint())
         .credentials_provider(credentials)
         .force_path_style(true)
         .build();
@@ -144,14 +144,14 @@ fn deltaglider_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Create S3 client for SeaweedFS
-async fn s3_test_client() -> Client {
-    let credentials = Credentials::new(S3_TEST_ACCESS_KEY, S3_TEST_SECRET_KEY, None, None, "test");
+/// Create S3 client for MinIO
+async fn minio_client() -> Client {
+    let credentials = Credentials::new(MINIO_ACCESS_KEY, MINIO_SECRET_KEY, None, None, "test");
 
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
-        .endpoint_url(s3_test_endpoint())
+        .endpoint_url(minio_endpoint())
         .credentials_provider(credentials)
         .force_path_style(true)
         .build();
@@ -167,7 +167,7 @@ struct TestProxyServer {
 }
 
 impl TestProxyServer {
-    /// Start proxy server with S3 backend pointing to SeaweedFS
+    /// Start proxy server with S3 backend pointing to MinIO
     async fn start_with_s3_backend() -> Self {
         let port = INTEROP_PORT.fetch_add(1, Ordering::SeqCst);
         let data_dir = TempDir::new().expect("Failed to create temp dir");
@@ -198,13 +198,13 @@ impl TestProxyServer {
             .env("DGP_LISTEN_ADDR", format!("127.0.0.1:{}", port))
             .env("DGP_CONFIG", config_path.to_str().unwrap())
             .env("DGP_AUTHENTICATION", "none")
-            .env("DGP_S3_ENDPOINT", s3_test_endpoint())
+            .env("DGP_S3_ENDPOINT", minio_endpoint())
             .env("DGP_S3_REGION", "us-east-1")
             .env("DGP_S3_PATH_STYLE", "true")
-            .env("DGP_BE_AWS_ACCESS_KEY_ID", S3_TEST_ACCESS_KEY)
-            .env("DGP_BE_AWS_SECRET_ACCESS_KEY", S3_TEST_SECRET_KEY)
+            .env("DGP_BE_AWS_ACCESS_KEY_ID", MINIO_ACCESS_KEY)
+            .env("DGP_BE_AWS_SECRET_ACCESS_KEY", MINIO_SECRET_KEY)
             // Wave-1 SSRF guard rejects http://localhost endpoints by
-            // default; CI SeaweedFS needs the opt-in. This survives the
+            // default; CI MinIO needs the opt-in. This survives the
             // env_clear() above (parent env isn't propagated to the
             // spawned proxy). See src/storage/s3.rs:244 for the gate.
             .env("DGP_BACKEND_ALLOW_LOCAL", "true")
@@ -284,10 +284,10 @@ impl Drop for TestProxyServer {
 /// This test verifies that files uploaded via the original DeltaGlider CLI
 /// follow the expected storage format that our proxy can understand.
 #[tokio::test]
-#[ignore = "Requires SeaweedFS and deltaglider CLI: docker compose up -d && pip install deltaglider"]
+#[ignore = "Requires MinIO and deltaglider CLI: docker compose up -d && pip install deltaglider"]
 async fn test_original_cli_upload_metadata_structure() {
-    if !s3_backend_available().await {
-        eprintln!("SeaweedFS not available, skipping test");
+    if !minio_available().await {
+        eprintln!("MinIO not available, skipping test");
         return;
     }
     if !deltaglider_available() {
@@ -296,7 +296,7 @@ async fn test_original_cli_upload_metadata_structure() {
     }
 
     let prefix = unique_prefix();
-    let client = s3_test_client().await;
+    let client = minio_client().await;
 
     // Create test file locally and upload via original CLI
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -307,7 +307,7 @@ async fn test_original_cli_upload_metadata_structure() {
 
     // Upload via original DeltaGlider CLI using cp
     // The CLI expects: deltaglider cp <local-path> s3://bucket/key
-    let s3_dest = format!("s3://{}/{}/v1.zip", S3_TEST_BUCKET, prefix);
+    let s3_dest = format!("s3://{}/{}/v1.zip", MINIO_BUCKET, prefix);
     let local_path = test_file.display().to_string();
 
     let result = deltaglider_cmd()
@@ -333,10 +333,10 @@ async fn test_original_cli_upload_metadata_structure() {
         );
     }
 
-    // List what was actually stored in SeaweedFS
+    // List what was actually stored in MinIO
     let list_result = client
         .list_objects_v2()
-        .bucket(S3_TEST_BUCKET)
+        .bucket(MINIO_BUCKET)
         .prefix(&prefix)
         .send()
         .await
@@ -365,7 +365,7 @@ async fn test_original_cli_upload_metadata_structure() {
     // Get the object and check its metadata
     let head_result = client
         .head_object()
-        .bucket(S3_TEST_BUCKET)
+        .bucket(MINIO_BUCKET)
         .key(format!("{}/reference.bin", prefix))
         .send()
         .await;
@@ -397,10 +397,10 @@ async fn test_original_cli_upload_metadata_structure() {
 
 /// Test 2: Files compressed by original CLI can be downloaded and match checksum
 #[tokio::test]
-#[ignore = "Requires SeaweedFS and deltaglider CLI: docker compose up -d && pip install deltaglider"]
+#[ignore = "Requires MinIO and deltaglider CLI: docker compose up -d && pip install deltaglider"]
 async fn test_original_cli_download_checksum_match() {
-    if !s3_backend_available().await {
-        eprintln!("SeaweedFS not available, skipping test");
+    if !minio_available().await {
+        eprintln!("MinIO not available, skipping test");
         return;
     }
     if !deltaglider_available() {
@@ -426,7 +426,7 @@ async fn test_original_cli_download_checksum_match() {
     // Upload both via original CLI
     for (_file, name) in [(&v1_file, "v1.zip"), (&v2_file, "v2.zip")] {
         let local_path = temp_dir.path().join(name).display().to_string();
-        let s3_path = format!("s3://{}/{}/{}", S3_TEST_BUCKET, prefix, name);
+        let s3_path = format!("s3://{}/{}/{}", MINIO_BUCKET, prefix, name);
         let result = deltaglider_cmd()
             .arg("cp")
             .arg(&local_path)
@@ -448,7 +448,7 @@ async fn test_original_cli_download_checksum_match() {
     let download_dir = TempDir::new().expect("Failed to create download dir");
 
     for (name, expected_sha256) in [("v1.zip", &v1_sha256), ("v2.zip", &v2_sha256)] {
-        let s3_src = format!("s3://{}/{}/{}", S3_TEST_BUCKET, prefix, name);
+        let s3_src = format!("s3://{}/{}/{}", MINIO_BUCKET, prefix, name);
         let dest = download_dir.path().join(name).display().to_string();
 
         let result = deltaglider_cmd()
@@ -484,10 +484,10 @@ async fn test_original_cli_download_checksum_match() {
 
 /// Test 3: Files uploaded via this proxy can be read by original CLI
 #[tokio::test]
-#[ignore = "Requires SeaweedFS and deltaglider CLI: docker compose up -d && pip install deltaglider"]
+#[ignore = "Requires MinIO and deltaglider CLI: docker compose up -d && pip install deltaglider"]
 async fn test_proxy_upload_original_cli_download() {
-    if !s3_backend_available().await {
-        eprintln!("SeaweedFS not available, skipping test");
+    if !minio_available().await {
+        eprintln!("MinIO not available, skipping test");
         return;
     }
     if !deltaglider_available() {
@@ -530,11 +530,11 @@ async fn test_proxy_upload_original_cli_download() {
         .expect("Failed to upload v2.zip via proxy");
     println!("Uploaded v2.zip via proxy");
 
-    // List what the proxy stored in SeaweedFS (for debugging)
-    let s3_test_client = s3_test_client().await;
-    let list_result = s3_test_client
+    // List what the proxy stored in MinIO (for debugging)
+    let minio_client = minio_client().await;
+    let list_result = minio_client
         .list_objects_v2()
-        .bucket(S3_TEST_BUCKET)
+        .bucket(MINIO_BUCKET)
         .prefix(&prefix)
         .send()
         .await
@@ -583,10 +583,10 @@ async fn test_proxy_upload_original_cli_download() {
 /// This is the critical interoperability test: upload via one tool,
 /// download via the other, verify byte-exact match.
 #[tokio::test]
-#[ignore = "Requires SeaweedFS and deltaglider CLI: docker compose up -d && pip install deltaglider"]
+#[ignore = "Requires MinIO and deltaglider CLI: docker compose up -d && pip install deltaglider"]
 async fn test_cross_tool_delta_reconstruction() {
-    if !s3_backend_available().await {
-        eprintln!("SeaweedFS not available, skipping test");
+    if !minio_available().await {
+        eprintln!("MinIO not available, skipping test");
         return;
     }
     if !deltaglider_available() {
@@ -617,7 +617,7 @@ async fn test_cross_tool_delta_reconstruction() {
     // Upload via original CLI
     for name in ["v1.zip", "v2.zip"] {
         let local_path = temp_dir.path().join(name).display().to_string();
-        let s3_path = format!("s3://{}/{}/{}", S3_TEST_BUCKET, prefix_cli, name);
+        let s3_path = format!("s3://{}/{}/{}", MINIO_BUCKET, prefix_cli, name);
         let result = deltaglider_cmd()
             .arg("cp")
             .arg(&local_path)
@@ -628,15 +628,15 @@ async fn test_cross_tool_delta_reconstruction() {
         assert!(result.status.success(), "CLI upload {} failed", name);
     }
 
-    // Download via our proxy (reading CLI-uploaded data directly from SeaweedFS)
+    // Download via our proxy (reading CLI-uploaded data directly from MinIO)
     // Note: The proxy would need to understand CLI's storage format
-    // For now, we verify via direct SeaweedFS access
-    let s3_test_client = s3_test_client().await;
+    // For now, we verify via direct MinIO access
+    let minio_client = minio_client().await;
 
     // The original CLI stores files differently - let's see what it stored
-    let list_result = s3_test_client
+    let list_result = minio_client
         .list_objects_v2()
-        .bucket(S3_TEST_BUCKET)
+        .bucket(MINIO_BUCKET)
         .prefix(&prefix_cli)
         .send()
         .await
@@ -648,9 +648,9 @@ async fn test_cross_tool_delta_reconstruction() {
         println!("  - {} ({} bytes)", key, obj.size().unwrap_or(0));
 
         // Get metadata for each object
-        if let Ok(head) = s3_test_client
+        if let Ok(head) = minio_client
             .head_object()
-            .bucket(S3_TEST_BUCKET)
+            .bucket(MINIO_BUCKET)
             .key(key)
             .send()
             .await
@@ -683,9 +683,9 @@ async fn test_cross_tool_delta_reconstruction() {
         .expect("Proxy upload v2 failed");
 
     // List what proxy stored
-    let list_result = s3_test_client
+    let list_result = minio_client
         .list_objects_v2()
-        .bucket(S3_TEST_BUCKET)
+        .bucket(MINIO_BUCKET)
         .prefix(&prefix_proxy)
         .send()
         .await
@@ -703,7 +703,7 @@ async fn test_cross_tool_delta_reconstruction() {
     // Note: The CLI may not understand proxy's .meta sidecar format
     // This test documents the compatibility gap if any
     for name in ["v1.zip", "v2.zip"] {
-        let s3_src = format!("s3://{}/{}/{}", S3_TEST_BUCKET, prefix_proxy, name);
+        let s3_src = format!("s3://{}/{}/{}", MINIO_BUCKET, prefix_proxy, name);
         let dest = download_dir.path().join(name).display().to_string();
 
         let result = deltaglider_cmd()
@@ -755,10 +755,10 @@ async fn test_cross_tool_delta_reconstruction() {
 
 /// Test 5: Verify the proxy can read original CLI's storage format
 #[tokio::test]
-#[ignore = "Requires SeaweedFS and deltaglider CLI: docker compose up -d && pip install deltaglider"]
+#[ignore = "Requires MinIO and deltaglider CLI: docker compose up -d && pip install deltaglider"]
 async fn test_proxy_reads_cli_format() {
-    if !s3_backend_available().await {
-        eprintln!("SeaweedFS not available, skipping test");
+    if !minio_available().await {
+        eprintln!("MinIO not available, skipping test");
         return;
     }
     if !deltaglider_available() {
@@ -781,7 +781,7 @@ async fn test_proxy_reads_cli_format() {
     // Upload via original CLI to establish baseline format
     for name in ["v1.zip", "v2.zip"] {
         let local_path = temp_dir.path().join(name).display().to_string();
-        let s3_path = format!("s3://{}/{}/{}", S3_TEST_BUCKET, prefix, name);
+        let s3_path = format!("s3://{}/{}/{}", MINIO_BUCKET, prefix, name);
         let result = deltaglider_cmd()
             .arg("cp")
             .arg(&local_path)
@@ -798,7 +798,7 @@ async fn test_proxy_reads_cli_format() {
     }
 
     // Now start proxy and try to serve these files
-    // The proxy reads from the same SeaweedFS bucket
+    // The proxy reads from the same MinIO bucket
     let proxy = TestProxyServer::start_with_s3_backend().await;
     let proxy_client = proxy.s3_client().await;
 
@@ -872,10 +872,10 @@ async fn test_proxy_reads_cli_format() {
 
 /// Test 6: Document the storage format differences
 #[tokio::test]
-#[ignore = "Requires SeaweedFS and deltaglider CLI: docker compose up -d && pip install deltaglider"]
+#[ignore = "Requires MinIO and deltaglider CLI: docker compose up -d && pip install deltaglider"]
 async fn test_document_storage_format_differences() {
-    if !s3_backend_available().await {
-        eprintln!("SeaweedFS not available, skipping test");
+    if !minio_available().await {
+        eprintln!("MinIO not available, skipping test");
         return;
     }
     if !deltaglider_available() {
@@ -897,7 +897,7 @@ async fn test_document_storage_format_differences() {
     // Upload via CLI
     for name in ["v1.zip", "v2.zip"] {
         let local_path = temp_dir.path().join(name).display().to_string();
-        let s3_path = format!("s3://{}/{}/{}", S3_TEST_BUCKET, prefix_cli, name);
+        let s3_path = format!("s3://{}/{}/{}", MINIO_BUCKET, prefix_cli, name);
         let _ = deltaglider_cmd()
             .arg("cp")
             .arg(&local_path)
@@ -920,16 +920,16 @@ async fn test_document_storage_format_differences() {
     }
 
     // Document differences
-    let backend = s3_test_client().await;
+    let minio = minio_client().await;
 
     println!("\n========================================");
     println!("STORAGE FORMAT COMPARISON");
     println!("========================================\n");
 
     println!("--- Original DeltaGlider CLI Format ---");
-    let cli_objects = backend
+    let cli_objects = minio
         .list_objects_v2()
-        .bucket(S3_TEST_BUCKET)
+        .bucket(MINIO_BUCKET)
         .prefix(&prefix_cli)
         .send()
         .await
@@ -940,9 +940,9 @@ async fn test_document_storage_format_differences() {
         println!("\nObject: {}", key);
         println!("  Size: {} bytes", obj.size().unwrap_or(0));
 
-        if let Ok(head) = backend
+        if let Ok(head) = minio
             .head_object()
-            .bucket(S3_TEST_BUCKET)
+            .bucket(MINIO_BUCKET)
             .key(key)
             .send()
             .await
@@ -958,9 +958,9 @@ async fn test_document_storage_format_differences() {
     }
 
     println!("\n--- DeltaGlider Proxy Format ---");
-    let proxy_objects = backend
+    let proxy_objects = minio
         .list_objects_v2()
-        .bucket(S3_TEST_BUCKET)
+        .bucket(MINIO_BUCKET)
         .prefix(&prefix_proxy)
         .send()
         .await
@@ -973,9 +973,9 @@ async fn test_document_storage_format_differences() {
 
         // If it's a .meta file, print its contents
         if key.ends_with(".meta") {
-            if let Ok(get) = backend
+            if let Ok(get) = minio
                 .get_object()
-                .bucket(S3_TEST_BUCKET)
+                .bucket(MINIO_BUCKET)
                 .key(key)
                 .send()
                 .await
@@ -996,9 +996,9 @@ async fn test_document_storage_format_differences() {
                     }
                 }
             }
-        } else if let Ok(head) = backend
+        } else if let Ok(head) = minio
             .head_object()
-            .bucket(S3_TEST_BUCKET)
+            .bucket(MINIO_BUCKET)
             .key(key)
             .send()
             .await

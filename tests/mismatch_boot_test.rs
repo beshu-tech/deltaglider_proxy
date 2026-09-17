@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Bootstrap-password-mismatch boot lifecycle (filesystem backend, no SeaweedFS).
+//! Bootstrap-password-mismatch boot lifecycle (filesystem backend, no MinIO).
 //!
 //! Regression: boot 1 with a wrong `DGP_BOOTSTRAP_PASSWORD_HASH` parks the
 //! good config DB as `.db.bak` and creates an empty wrong-key DB; boot 2 with

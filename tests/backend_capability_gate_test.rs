@@ -2,7 +2,7 @@
 
 //! Guard B integration tests: the startup backend write-capability gate and
 //! the hot-apply pre-commit gate. A real non-CAS backend can't exist in the
-//! SeaweedFS-only harness, so the documented `DGP_TEST_FORCE_NONCAS_BACKEND` seam
+//! MinIO-only harness, so the documented `DGP_TEST_FORCE_NONCAS_BACKEND` seam
 //! forces the verdict — the gates' decision + observability (doc-linked FATAL,
 //! apply rejection) are what these tests prove.
 

@@ -1,57 +1,49 @@
 # Docker Compose configuration for DeltaGlider Proxy development and testing
 #
 # Usage:
-#   docker compose up -d               # Start SeaweedFS (S3 backend for tests)
-#   docker compose down                # Stop it
-#   docker compose logs -f seaweedfs   # View logs
+#   docker compose up -d          # Start MinIO (pgsty/silo build)
+#   docker compose down           # Stop MinIO
+#   docker compose logs -f minio  # View MinIO logs
 #
-# S3 API: http://localhost:9000  (credentials below — the same pair the test
-# harness in tests/common/mod.rs signs with)
-# Admin:  docker exec deltaglider-seaweedfs sh -c 'echo "s3.bucket.list" | weed shell'
+# MinIO Console: http://localhost:9001
+# MinIO API:     http://localhost:9000
 
 services:
-  seaweedfs:
-    # Single-node SeaweedFS: master + volume + filer + S3 gateway in one process.
-    image: chrislusf/seaweedfs:4.47
-    container_name: deltaglider-seaweedfs
-    # allowDeleteBucketNotEmpty=false: AWS semantics (DeleteBucket on a
-    # non-empty bucket fails with BucketNotEmpty); SeaweedFS defaults to a
-    # recursive delete.
-    command: server -dir=/data -ip.bind=0.0.0.0 -s3 -s3.port=9000 -s3.port.iceberg=0 -s3.port.lance=0 -s3.allowDeleteBucketNotEmpty=false
+  minio:
+    # pgsty/silo: maintained MinIO fork with the MINIO_* env and S3/admin API
+    # unchanged (minio/minio left Docker Hub). Bundles the client as `mcli`.
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
+    container_name: deltaglider-minio
     ports:
       - "9000:9000"   # S3 API
+      - "9001:9001"   # Console
     environment:
-      # The one admin identity of the S3 gateway.
-      AWS_ACCESS_KEY_ID: dgp-test-key
-      AWS_SECRET_ACCESS_KEY: dgp-test-secret
-      # Enables SSE-S3 on the gateway (any secret string; a 256-bit key is
-      # derived) — needed only by the ignored SSE-S3 round-trip test.
-      WEED_S3_SSE_KEY: dgp-test-sse-key
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
     volumes:
-      - seaweedfs-data:/data
+      - minio-data:/data
     healthcheck:
-      # The gateway answers 403 to an unsigned request once auth is up.
-      test: ["CMD-SHELL", "wget -q -S -O /dev/null http://localhost:9000/ 2>&1 | grep -q ' 403 '"]
+      test: ["CMD", "mcli", "ready", "local"]
       interval: 5s
       timeout: 5s
-      retries: 12
+      retries: 5
 
-  # Create the test buckets on startup (weed shell talks to the master, which
-  # forwards the bucket creation to the filer).
-  seaweedfs-setup:
-    image: chrislusf/seaweedfs:4.47
-    container_name: deltaglider-seaweedfs-setup
+  # Create test bucket on startup
+  minio-setup:
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
+    container_name: deltaglider-minio-setup
     depends_on:
-      seaweedfs:
+      minio:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      for b in deltaglider-data deltaglider-test; do
-        echo \"s3.bucket.create -name $$b\" | weed shell -master=seaweedfs:9333;
-      done;
+      mcli alias set local http://minio:9000 minioadmin minioadmin;
+      mcli mb --ignore-existing local/deltaglider-data;
+      mcli mb --ignore-existing local/deltaglider-test;
       echo 'Buckets created successfully';
       exit 0;
       "
 
 volumes:
-  seaweedfs-data:
+  minio-data:

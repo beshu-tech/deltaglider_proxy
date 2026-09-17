@@ -16,7 +16,7 @@ graph TD
     ARC --> CTRL["actions-runner-controller<br/><i>summerwind ARC v0.27.6</i>"]
     ARC --> RS["RunnerSet: 4 runner pods<br/>label: 'k3s'"]
     RS --> PVC["Per-pod PVC<br/><i>local-path, 15Gi each, direct SSD</i>"]
-    RS --> DKR["Docker sidecar<br/><i>for container: jobs + test SeaweedFS</i>"]
+    RS --> DKR["Docker sidecar<br/><i>for container: jobs + test MinIO</i>"]
 
     SCC --> MINIO["sccache-minio<br/><i>persistent MinIO, 10Gi PVC</i><br/>Bucket: sccache-rust (30-day expiry)"]
 ```
@@ -110,7 +110,7 @@ Rust compilation creates thousands of intermediate files (`.o`, `.rlib`, `.rmeta
 The runners execute inside **Ryzen LXC containers** (the `k3s` label is a historical
 alias — there is no Kubernetes anymore). An LXC container inherits a **low default
 `nofile` (~1024)** unless raised. The integration job runs **~35 test binaries in one
-`cargo test` invocation**, each spawning its own proxy + SeaweedFS sockets, so the *aggregate*
+`cargo test` invocation**, each spawning its own proxy + MinIO sockets, so the *aggregate*
 open-fd count easily crosses 1024 and surfaces — non-deterministically, under load — as:
 
 ```
@@ -193,29 +193,23 @@ env:
 
 Jobs that don't compile Rust (fmt, audit) override `RUSTC_WRAPPER: ""` at the step level.
 
-### 4. Test SeaweedFS (Ephemeral)
+### 4. Test MinIO (Ephemeral)
 
-Integration tests need an S3-compatible backend. A **separate, ephemeral** single-node SeaweedFS (master + volume + filer + S3 gateway in one process) is started per test job. MinIO used to fill this role; its Docker Hub images disappeared in September 2026, and SeaweedFS passes the same suite.
+Integration tests need an S3-compatible backend. A **separate, ephemeral** MinIO instance — the `pgsty/silo` build, a maintained MinIO fork with the same `MINIO_*` env and API (`minio/minio` left Docker Hub in September 2026) — is started per test job:
 
 ```yaml
-- name: Start SeaweedFS for tests
+- name: Start MinIO for tests
   run: |
-    docker run -d --name seaweedfs-ci --network container:$(hostname) \
-      -e AWS_ACCESS_KEY_ID=dgp-test-key \
-      -e AWS_SECRET_ACCESS_KEY=dgp-test-secret \
-      -e WEED_S3_SSE_KEY=dgp-test-sse-key \
-      chrislusf/seaweedfs:4.47 server -dir=/data -ip.bind=0.0.0.0 \
-        -master.port=29333 -volume.port=28080 -filer.port=28888 \
-        -s3 -s3.port=9000 -s3.port.grpc=39000 -s3.port.iceberg=0 -s3.port.lance=0 \
-        -s3.allowDeleteBucketNotEmpty=false
-    # wait for HTTP 403 on http://localhost:9000/ (auth is up), then:
-    docker exec seaweedfs-ci sh -c "echo 's3.bucket.create -name deltaglider-test' | weed shell -master=localhost:29333"
-    echo "S3_TEST_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
+    # Ephemeral MinIO for integration tests — NOT the sccache MinIO
+    docker run -d --name minio-ci --network container:$(hostname) \
+      -e MINIO_ROOT_USER=minioadmin \
+      -e MINIO_ROOT_PASSWORD=minioadmin \
+      pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data
 ```
 
-The `--network container:$(hostname)` flag shares the runner's network namespace with the SeaweedFS container, making the S3 gateway reachable at `localhost:9000` from the job container. This is necessary because GitHub Actions `container:` jobs run inside Docker, and `services:` cannot pass CMD arguments. The master/volume/filer ports are moved to 2xxxx (their gRPC twins land on 3xxxx) so they never collide with the 19000+ and 29500+ ports the test harness hands out; the S3 gRPC port is pinned as well because its default, `s3.port + 10000` = 19000, is the harness's first proxy port, and the Iceberg/Lance catalogue listeners (8181/9101) are disabled. The `AWS_*` pair is the gateway's single admin identity — the same pair `tests/common/mod.rs` signs with.
+The `--network container:$(hostname)` flag shares the runner pod's network namespace with the MinIO container, making it reachable at `localhost:9000` from the job container. This is necessary because GitHub Actions `container:` jobs run inside Docker, and `services:` cannot pass CMD arguments (MinIO needs `server /data`).
 
-**This SeaweedFS is completely separate from the sccache MinIO.** Different credentials, different lifecycle. It is destroyed at the end of every test job.
+**This MinIO is completely separate from the sccache MinIO.** Different namespace, different credentials, different lifecycle. It is destroyed at the end of every test job.
 
 ## Workflow Files
 
@@ -344,11 +338,11 @@ kubectl apply -f .github/k8s/sccache-minio.yaml
 Then create the bucket and lifecycle rule:
 
 ```bash
-kubectl run minio-setup --image=quay.io/minio/mc:latest --restart=Never \
+kubectl run minio-setup --image=pgsty/silo:RELEASE.2026-09-16T00-00-00Z --restart=Never \
   --namespace=sccache --command -- sh -c '
-    mc alias set sccache http://sccache-minio:9000 sccache sccache-secret-key &&
-    mc mb --ignore-existing sccache/sccache-rust &&
-    mc ilm rule add sccache/sccache-rust --expire-days 30
+    mcli alias set sccache http://sccache-minio:9000 sccache sccache-secret-key &&
+    mcli mb --ignore-existing sccache/sccache-rust &&
+    mcli ilm rule add sccache/sccache-rust --expire-days 30
   '
 ```
 
@@ -402,14 +396,14 @@ sccache --show-stats
 
 The `container:` job shares the runner pod's network namespace, so k8s DNS and ClusterIP services are accessible.
 
-### Test SeaweedFS unreachable at localhost:9000
+### Test MinIO unreachable at localhost:9000
 
-The ephemeral test SeaweedFS must share the runner pod's network namespace:
+The ephemeral test MinIO must share the runner pod's network namespace:
 ```bash
-docker run -d --network container:$(hostname) chrislusf/seaweedfs:4.47 server -dir=/data -ip.bind=0.0.0.0 -s3 -s3.port=9000
+docker run -d --network container:$(hostname) pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data
 ```
 
-Do **not** use `--network host` — that puts SeaweedFS on the k3s node's network, not the pod's. An unsigned `curl http://localhost:9000/` answering `403` means the gateway is up with auth enabled; `000` means it is not listening yet.
+Do **not** use `--network host` — that puts MinIO on the k3s node's network, not the pod's.
 
 ## Alternatives Considered
 
