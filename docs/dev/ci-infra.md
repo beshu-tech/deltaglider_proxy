@@ -21,7 +21,7 @@ graph TD
     SCC --> MINIO["sccache-minio<br/><i>persistent MinIO, 10Gi PVC</i><br/>Bucket: sccache-rust (30-day expiry)"]
 ```
 
-All CI jobs run inside a custom **builder image** (`ghcr.io/beshu-tech/deltaglider_proxy/builder:latest`) pulled as a `container:` job. The image is based on Ubuntu 24.04 with all tools pre-installed: Rust stable, Node.js 20, clippy, rustfmt, cargo-audit, cargo-sbom, sccache, xdelta3, Docker CLI, and MinIO client (mc).
+All CI jobs run inside a custom **builder image** (`ghcr.io/beshu-tech/deltaglider_proxy/builder:latest`) pulled as a `container:` job. The image is based on Ubuntu 24.04 with all tools pre-installed: Rust stable, Node.js 20, clippy, rustfmt, cargo-audit, cargo-sbom, sccache, xdelta3, Docker CLI, unzip, and the MinIO client (`mc`, built from the `pgsty/mc` fork's `mcli` release because dl.min.io stopped serving it).
 
 ## Performance Evolution
 
@@ -75,7 +75,8 @@ The image is a plain Ubuntu 24.04 with every tool pre-installed. This means zero
 - Node.js 20 + npm
 - xdelta3
 - Docker CLI (static binary, not the daemon)
-- MinIO client (mc)
+- MinIO client (`mc` = pgsty/mc `mcli`)
+- unzip (the Claude action's Bun bootstrap needs it)
 
 **Size optimization:**
 - `--profile minimal` for rustup (skips docs/man)
@@ -195,7 +196,7 @@ Jobs that don't compile Rust (fmt, audit) override `RUSTC_WRAPPER: ""` at the st
 
 ### 4. Test MinIO (Ephemeral)
 
-Integration tests need an S3-compatible backend. A **separate, ephemeral** MinIO instance is started per test job:
+Integration tests need an S3-compatible backend. A **separate, ephemeral** MinIO instance — the `pgsty/silo` build, a maintained MinIO fork with the same `MINIO_*` env and API (`minio/minio` left Docker Hub in September 2026) — is started per test job:
 
 ```yaml
 - name: Start MinIO for tests
@@ -204,7 +205,7 @@ Integration tests need an S3-compatible backend. A **separate, ephemeral** MinIO
     docker run -d --name minio-ci --network container:$(hostname) \
       -e MINIO_ROOT_USER=minioadmin \
       -e MINIO_ROOT_PASSWORD=minioadmin \
-      minio/minio:latest server /data
+      pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data
 ```
 
 The `--network container:$(hostname)` flag shares the runner pod's network namespace with the MinIO container, making it reachable at `localhost:9000` from the job container. This is necessary because GitHub Actions `container:` jobs run inside Docker, and `services:` cannot pass CMD arguments (MinIO needs `server /data`).
@@ -338,11 +339,11 @@ kubectl apply -f .github/k8s/sccache-minio.yaml
 Then create the bucket and lifecycle rule:
 
 ```bash
-kubectl run minio-setup --image=minio/mc:latest --restart=Never \
+kubectl run minio-setup --image=pgsty/silo:RELEASE.2026-09-16T00-00-00Z --restart=Never \
   --namespace=sccache --command -- sh -c '
-    mc alias set sccache http://sccache-minio:9000 sccache sccache-secret-key &&
-    mc mb --ignore-existing sccache/sccache-rust &&
-    mc ilm rule add sccache/sccache-rust --expire-days 30
+    mcli alias set sccache http://sccache-minio:9000 sccache sccache-secret-key &&
+    mcli mb --ignore-existing sccache/sccache-rust &&
+    mcli ilm rule add sccache/sccache-rust --expire-days 30
   '
 ```
 
@@ -400,7 +401,7 @@ The `container:` job shares the runner pod's network namespace, so k8s DNS and C
 
 The ephemeral test MinIO must share the runner pod's network namespace:
 ```bash
-docker run -d --network container:$(hostname) minio/minio:latest server /data
+docker run -d --network container:$(hostname) pgsty/silo:RELEASE.2026-09-16T00-00-00Z server /data
 ```
 
 Do **not** use `--network host` — that puts MinIO on the k3s node's network, not the pod's.

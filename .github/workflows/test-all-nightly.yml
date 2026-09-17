@@ -53,12 +53,14 @@ jobs:
         run: |
           rm -f deltaglider_config.db deltaglider_config.db.bak .deltaglider_bootstrap_hash
           rm -f /tmp/deltaglider_config.db /tmp/deltaglider_config.db.bak /tmp/.deltaglider_bootstrap_hash
+      # pgsty/silo: maintained MinIO fork (minio/minio left Docker Hub), pinned
+      # by digest = tag RELEASE.2026-09-16T00-00-00Z (see ci.yml).
       - name: Start MinIO
         run: |
           docker run -d --name minio-nightly --network container:$(hostname) \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
+            pgsty/silo@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46 server /data
           for i in $(seq 1 30); do
             mc alias set local http://localhost:9000 minioadmin minioadmin 2>/dev/null && break
             sleep 1

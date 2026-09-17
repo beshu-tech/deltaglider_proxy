@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed — MinIO images for tests and the demo come from `pgsty/silo`
+
+The `minio/minio` and `minio/mc` images disappeared from Docker Hub in
+September 2026. The integration tests, the nightly run, the two Docker
+Compose files, and the Docker Hub README example now start `pgsty/silo`, a
+maintained fork of the MinIO server that keeps the `MINIO_*` variables, the
+`server /data` command, the S3 and admin APIs, and the storage format, and
+bundles the client as `mcli`. Nothing changes for the proxy itself or for
+deployments that run their own MinIO.
+
 ## v1.19.0 — 2026-08-10
 
 ### Added — Cross-instance protection for the delta reference baseline
