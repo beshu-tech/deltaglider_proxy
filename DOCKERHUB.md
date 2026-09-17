@@ -45,7 +45,7 @@ services:
     # Single-node SeaweedFS with its S3 gateway on :9000 (any S3-compatible
     # store works here). AWS_* is the gateway's one admin identity.
     image: chrislusf/seaweedfs:4.47
-    command: server -dir=/data -ip.bind=0.0.0.0 -s3 -s3.port=9000 -s3.allowDeleteBucketNotEmpty=false
+    command: server -dir=/data -ip.bind=0.0.0.0 -s3 -s3.port=9000 -s3.port.iceberg=0 -s3.port.lance=0 -s3.allowDeleteBucketNotEmpty=false
     environment:
       AWS_ACCESS_KEY_ID: backend-key
       AWS_SECRET_ACCESS_KEY: backend-secret

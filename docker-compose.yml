@@ -17,7 +17,7 @@ services:
     # allowDeleteBucketNotEmpty=false: AWS semantics (DeleteBucket on a
     # non-empty bucket fails with BucketNotEmpty); SeaweedFS defaults to a
     # recursive delete.
-    command: server -dir=/data -ip.bind=0.0.0.0 -s3 -s3.port=9000 -s3.allowDeleteBucketNotEmpty=false
+    command: server -dir=/data -ip.bind=0.0.0.0 -s3 -s3.port=9000 -s3.port.iceberg=0 -s3.port.lance=0 -s3.allowDeleteBucketNotEmpty=false
     ports:
       - "9000:9000"   # S3 API
     environment:
