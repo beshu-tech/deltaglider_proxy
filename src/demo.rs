@@ -7,8 +7,8 @@ use axum::{
     http::{header, StatusCode},
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{delete, get, post, put},
-    Router,
+    routing::{any, delete, get, post, put},
+    Json, Router,
 };
 use rust_embed::Embed;
 use std::sync::Arc;
@@ -482,6 +482,12 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // name, so this can never shadow a real object route.
         .route("/_", get(|| async { Redirect::permanent("/_/") }))
         .route("/_/", get(index))
+        // Unknown API paths answer a JSON 404 for EVERY method. Without this
+        // the GET-only catch-all below made axum answer POST/PUT/DELETE on a
+        // mistyped admin path with `405 Allow: GET,HEAD`, which tells a client
+        // (and a scanner) that the resource exists. Registered routes win
+        // over this catch-all, so real endpoints keep their own 405s.
+        .route("/_/api/*rest", any(api_not_found))
         .route("/_/*path", get(static_or_fallback));
 
     Router::new()
@@ -520,7 +526,60 @@ async fn static_or_fallback(Path(path): Path<String>) -> impl IntoResponse {
             .unwrap()
             .into_response()
     } else {
-        serve_index().into_response()
+        match fallback_for(&path) {
+            Fallback::SpaIndex => serve_index().into_response(),
+            Fallback::ApiNotFound => api_not_found().await,
+            // `no-store`: a CDN in front of a mixed-version fleet must not
+            // cache a 404 for a hashed asset that a newer instance serves.
+            Fallback::NotFound => (
+                StatusCode::NOT_FOUND,
+                [(header::CACHE_CONTROL, "no-store")],
+                "not found",
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// JSON 404 for an unmatched admin/API path, any method. Never `index.html`,
+/// so API clients and scanners get an honest answer instead of a 200 HTML
+/// page; `no-store` so nothing in front caches it.
+async fn api_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({ "error": "not_found" })),
+    )
+        .into_response()
+}
+
+/// What `/_/<path>` serves when `<path>` is not an embedded asset.
+#[derive(Debug, PartialEq, Eq)]
+enum Fallback {
+    /// A client-side route of the SPA: serve `index.html` and let the
+    /// browser router take over (deep links, hard refresh).
+    SpaIndex,
+    /// The bare `/_/api` or `/_/api/` path (deeper API misses are caught by
+    /// the `/_/api/*rest` route for every method): a JSON 404.
+    ApiNotFound,
+    /// Anything else (a missing asset, a source map, a typo): plain 404.
+    NotFound,
+}
+
+/// First URL segments the SPA router owns — mirrors `SEGMENT_TO_VIEW` in
+/// `demo/s3-browser/ui/src/urlState.ts`. Everything else under `/_/` is
+/// either an embedded asset or a 404.
+const SPA_ROUTE_SEGMENTS: &[&str] = &["browse", "upload", "metrics", "docs", "admin"];
+
+fn fallback_for(path: &str) -> Fallback {
+    if path == "api" || path.starts_with("api/") {
+        return Fallback::ApiNotFound;
+    }
+    let first = path.split('/').next().unwrap_or("");
+    if SPA_ROUTE_SEGMENTS.contains(&first) {
+        Fallback::SpaIndex
+    } else {
+        Fallback::NotFound
     }
 }
 
@@ -535,5 +594,75 @@ fn serve_index() -> Response {
                 .into_response()
         }
         None => (StatusCode::NOT_FOUND, "Demo UI not built").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spa_routes_fall_back_to_index() {
+        for p in [
+            "browse",
+            "browse/bucket/dir",
+            "upload",
+            "metrics/x",
+            "docs/how-to/x",
+            "admin/users",
+        ] {
+            assert_eq!(fallback_for(p), Fallback::SpaIndex, "{p}");
+        }
+    }
+
+    #[test]
+    fn unmatched_api_paths_are_json_404() {
+        assert_eq!(
+            fallback_for("api/admin/does-not-exist"),
+            Fallback::ApiNotFound
+        );
+        assert_eq!(fallback_for("api"), Fallback::ApiNotFound);
+    }
+
+    /// `SPA_ROUTE_SEGMENTS` is a hand copy of `SEGMENT_TO_VIEW` in the UI's
+    /// urlState.ts. The Vite dev server has its own SPA fallback, so a view
+    /// added to the UI but not here would break only in the embedded build,
+    /// on hard refresh or a shared link. Read the TS table and compare.
+    #[test]
+    fn spa_route_segments_match_the_ui_router_table() {
+        let ts = include_str!("../demo/s3-browser/ui/src/urlState.ts");
+        let table = ts
+            .split("const SEGMENT_TO_VIEW")
+            .nth(1)
+            .and_then(|s| s.split("};").next())
+            .expect("SEGMENT_TO_VIEW table in urlState.ts");
+        let mut ui: Vec<&str> = table
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let key = l.split(':').next()?.trim().trim_matches('\'');
+                (!key.is_empty() && !l.starts_with("//")).then_some(key)
+            })
+            .collect();
+        ui.sort_unstable();
+        let mut ours: Vec<&str> = SPA_ROUTE_SEGMENTS.to_vec();
+        ours.sort_unstable();
+        assert_eq!(
+            ours, ui,
+            "SPA_ROUTE_SEGMENTS must equal the keys of SEGMENT_TO_VIEW (minus '')"
+        );
+    }
+
+    #[test]
+    fn everything_else_is_404() {
+        for p in [
+            "assets/index-abc.js.map",
+            "nope",
+            "index.htm",
+            "browsex",
+            "apix/y",
+        ] {
+            assert_eq!(fallback_for(p), Fallback::NotFound, "{p}");
+        }
     }
 }

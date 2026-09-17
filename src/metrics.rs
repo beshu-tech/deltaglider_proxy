@@ -109,6 +109,22 @@ impl Default for Metrics {
     }
 }
 
+/// Value of the `version` label on `deltaglider_build_info`.
+///
+/// `/_/metrics` is unauthenticated (Prometheus cannot log in), so the exact
+/// build version is exposed there only when the operator opts in with
+/// `DGP_METRICS_EXPOSE_VERSION=true`. Otherwise the label is empty — which
+/// Prometheus treats as absent, so the series keeps its shape for existing
+/// dashboards. The authenticated admin API (`GET /_/api/whoami` with a
+/// session) always reports the version.
+pub fn build_info_version_label(expose: bool) -> &'static str {
+    if expose {
+        env!("CARGO_PKG_VERSION")
+    } else {
+        ""
+    }
+}
+
 /// Helper: create a metric, register it, and return the clone.
 /// Panics only on duplicate metric names (programmer bug, not runtime failure).
 macro_rules! register {
@@ -889,6 +905,12 @@ pub fn spawn_tokio_runtime_metrics_sampler(_metrics: &Arc<Metrics>) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_info_version_label_is_empty_unless_opted_in() {
+        assert_eq!(build_info_version_label(false), "");
+        assert_eq!(build_info_version_label(true), env!("CARGO_PKG_VERSION"));
+    }
 
     #[test]
     fn test_classify_s3_operation() {

@@ -68,7 +68,11 @@ pub struct WhoamiUserInfo {
 #[derive(Serialize)]
 pub struct WhoamiResponse {
     mode: String,
-    version: String,
+    /// Exact build version — present for authenticated callers only: a live
+    /// session here, or verified IAM credentials on `POST /_/api/iam/identity`
+    /// (see [`build_version_for`]); omitted for anonymous callers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<WhoamiUserInfo>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -80,6 +84,14 @@ pub struct WhoamiResponse {
     lock_state: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     external_providers: Vec<ExternalProviderInfo>,
+}
+
+/// The `version` field of [`WhoamiResponse`]: the exact build version goes
+/// only to callers that hold a live session. The login page calls
+/// `/_/api/whoami` before any login (it needs `mode` and the provider list),
+/// so anonymous callers must not be able to fingerprint the deployment.
+fn build_version_for(session_valid: bool) -> Option<String> {
+    session_valid.then(|| env!("CARGO_PKG_VERSION").to_string())
 }
 
 /// Map the config-DB lock flag to the typed `lock_state` whoami field.
@@ -466,13 +478,17 @@ pub async fn whoami(
         IamState::Iam(_) => "iam",
     };
 
-    // If caller has a valid session, resolve user identity.
-    let user = resolve_session_user(
-        &state,
-        &headers,
-        request_client_ip(&headers, connect_info.as_ref()),
-    )
-    .await;
+    let client_ip = request_client_ip(&headers, connect_info.as_ref());
+    // One session lookup answers both questions: is there a live session
+    // (any kind — admin GUI, S3-browser lift, open-mode lift — may learn the
+    // version; an anonymous caller may not), and who is it.
+    let session =
+        extract_session_token(&headers).and_then(|t| state.sessions.auth_method(&t, client_ip));
+    let session_valid = session.is_some();
+    let user = match session {
+        Some(method) => session_user_info(&state, method).await,
+        None => None,
+    };
 
     // Include enabled external auth providers so the login page can show OAuth buttons.
     let external_providers = if let Some(ref ext_auth) = state.external_auth {
@@ -500,7 +516,7 @@ pub async fn whoami(
 
     Json(WhoamiResponse {
         mode: mode.into(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: build_version_for(session_valid),
         user,
         config_db_mismatch: state.config_db_mismatch,
         lock_state: lock_state_for(state.config_db_mismatch),
@@ -547,7 +563,8 @@ pub async fn resolve_iam_identity(
     let is_admin = crate::iam::permissions::is_admin(&user.permissions);
     Ok(Json(WhoamiResponse {
         mode: "iam".into(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        // The IAM credentials were verified just above — an authenticated caller.
+        version: build_version_for(true),
         user: Some(WhoamiUserInfo {
             name: user.name,
             access_key_id: user.access_key_id,
@@ -560,14 +577,12 @@ pub async fn resolve_iam_identity(
     }))
 }
 
-/// Resolve user info from the session cookie (if present and valid).
-async fn resolve_session_user(
+/// User info for a live session's auth method (`None` for an open-mode lift,
+/// which has no user).
+async fn session_user_info(
     state: &AdminState,
-    headers: &HeaderMap,
-    client_ip: Option<IpAddr>,
+    auth_method: crate::session::AuthMethod,
 ) -> Option<WhoamiUserInfo> {
-    let token = extract_session_token(headers)?;
-    let auth_method = state.sessions.auth_method(&token, client_ip)?;
     match auth_method {
         crate::session::AuthMethod::OpenLift => None,
         crate::session::AuthMethod::Bootstrap => Some(WhoamiUserInfo {
@@ -1220,6 +1235,15 @@ mod tests {
             .iter()
             .any(|p| p.actions == vec!["write"]));
         assert_eq!(effective.iam_policies.len(), 2);
+    }
+
+    #[test]
+    fn build_version_only_with_a_live_session() {
+        assert_eq!(build_version_for(false), None);
+        assert_eq!(
+            build_version_for(true).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     /// Adversarial: the session cookie must carry SameSite=Strict

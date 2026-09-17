@@ -22,7 +22,7 @@ curl -s http://localhost:9000/_/metrics | promtool check metrics
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `process_start_time_seconds` | Gauge | — | Unix timestamp when the process started |
-| `deltaglider_build_info` | Gauge | `version`, `backend_type` | Always 1; labels carry build metadata |
+| `deltaglider_build_info` | Gauge | `version`, `backend_type` | Always 1. `version` is empty unless `DGP_METRICS_EXPOSE_VERSION=true`, because this endpoint is unauthenticated; the authenticated admin API (`GET /_/api/whoami` with a session) always reports the running version |
 | `process_peak_rss_bytes` | Gauge | — | Peak resident set size (updated on scrape) |
 | `process_*` (Linux only) | various | — | Standard process collector: RSS, CPU seconds, open FDs, virtual memory |
 

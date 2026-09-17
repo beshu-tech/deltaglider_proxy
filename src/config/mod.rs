@@ -395,6 +395,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Server",
     },
     EnvVarEntry {
+        name: "DGP_METRICS_EXPOSE_VERSION",
+        description: "Put the exact build version in the `version` label of `deltaglider_build_info` on the unauthenticated /_/metrics endpoint (default: false — the label is empty; the version stays available through the authenticated admin API)",
+        example: "true",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_REQUEST_TIMEOUT_SECS",
         description: "Per-request timeout in seconds (default: 300)",
         example: "300",
@@ -3009,6 +3015,7 @@ mod tests {
             "DGP_CLOCK_SKEW_SECONDS",                // api::auth + startup replay cache
             "DGP_MAX_CONCURRENT_REQUESTS",           // startup::build_s3_router()
             "DGP_CORS_PERMISSIVE",                   // demo::ui_router()
+            "DGP_METRICS_EXPOSE_VERSION",            // startup::init_metrics()
             "DGP_REQUEST_TIMEOUT_SECS",              // startup::build_s3_router()
             "DGP_RECURSIVE_DELETE_PAGE_SIZE", // s3_adapter_s3s::recursive_delete_prefix_s3s()
             "DGP_READY_TIMEOUT_SECS",         // api::handlers::status::readiness_check()

@@ -29,6 +29,15 @@ function resolveBuildVersion(): string {
   return '?'
 }
 
+// Source maps are OPT-IN. DemoAssets embeds all of dist/ into the binary and
+// serves it to anonymous callers, so a map in dist/ is the full UI source on
+// every deployment — the Docker image, the release tarballs and the demo
+// image alike. No build channel has to remember a flag: set
+// DGP_UI_SOURCEMAP=1 for a local debugging build.
+function sourcemapOptIn(): boolean {
+  return ['1', 'true', 'yes', 'on'].includes((process.env.DGP_UI_SOURCEMAP ?? '').trim().toLowerCase())
+}
+
 export default defineConfig({
   plugins: [react()],
   base: '/_/',
@@ -42,9 +51,7 @@ export default defineConfig({
     __BUILD_VERSION__: JSON.stringify(resolveBuildVersion()),
   },
   build: {
-    // Kept ON for debugging the embedded admin UI; maps DO ship in the binary
-    // (DemoAssets embeds all of dist/) — an accepted tradeoff.
-    sourcemap: true,
+    sourcemap: sourcemapOptIn(),
     //
     // manualChunks: split heavy vendor libs out of the main shell so
     // the file-browser entry only downloads what it needs on first
