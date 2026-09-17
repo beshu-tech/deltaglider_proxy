@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Integration tests for `deltaglider_proxy ls` against the shared
-//! MinIO instance (`MINIO_ENDPOINT`, default localhost:9000). Each
+//! SeaweedFS instance (`S3_TEST_ENDPOINT`, default localhost:9000). Each
 //! test creates its own bucket so cross-test contamination is bounded.
 
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{minio_client, minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
+use common::{s3_test_client, s3_test_endpoint_url, S3_TEST_ACCESS_KEY, S3_TEST_SECRET_KEY};
 use deltaglider_proxy::cli::ls::{run, LsArgs};
 
 /// Build a fresh bucket name for one test. Uniqueness comes from the
@@ -32,20 +32,20 @@ fn make_args(url: Option<String>) -> LsArgs {
         human_readable: false,
         summarize: false,
         page_size: 1000,
-        endpoint_url: Some(minio_endpoint_url()),
+        endpoint_url: Some(s3_test_endpoint_url()),
         region: Some("us-east-1".into()),
         profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
+        access_key_id: Some(S3_TEST_ACCESS_KEY.into()),
+        secret_access_key: Some(S3_TEST_SECRET_KEY.into()),
         force_path_style: true,
     }
 }
 
 #[tokio::test]
 async fn ls_non_recursive_emits_common_prefixes_and_objects() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("noncr");
-    let s3 = minio_client().await;
+    let s3 = s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     // Seed: 1 top-level object + 1 object inside a sub-prefix. The
@@ -92,9 +92,9 @@ async fn ls_non_recursive_emits_common_prefixes_and_objects() {
 
 #[tokio::test]
 async fn ls_recursive_walks_all_pages() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("recursive");
-    let s3 = minio_client().await;
+    let s3 = s3_test_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
     // Seed: 5 objects across two sub-prefixes — `-r` should see them

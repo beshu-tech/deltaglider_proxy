@@ -383,7 +383,7 @@ async fn test_50mb_single_put_byte_exact_roundtrip() {
         put_hash, got_hash
     );
 
-    // Cleanup — large object on shared MinIO bucket; explicit delete
+    // Cleanup — large object on shared SeaweedFS bucket; explicit delete
     // so other tests aren't polluted.
     client
         .delete_object()

@@ -10,7 +10,7 @@ Thanks for your interest in contributing! Whether it's a bug report, feature ide
 
 - **Rust stable** — install via [rustup](https://rustup.rs/) (the repo's `rust-toolchain.toml` pins the channel automatically)
 - **Node.js 20+** — needed to build the embedded demo UI
-- **Docker** — optional, used for running MinIO in integration tests
+- **Docker** — optional, used for running SeaweedFS (the S3 backend) in integration tests
 
 ### Building from Source
 
@@ -34,17 +34,17 @@ The S3 API and demo UI both start on `http://localhost:9000`. The UI is availabl
 ### Running Tests
 
 ```bash
-# Unit tests (no MinIO)
+# Unit tests (no S3 backend needed)
 cargo test --lib --locked
 
-# One integration binary (many need MinIO on localhost:9000 — see tests/common/mod.rs)
+# One integration binary (many need SeaweedFS on localhost:9000 — `docker compose up -d`; see tests/common/mod.rs)
 cargo test --locked --test s3_integration_test
 
 # Full matrix (run before a release or after changing shared test harness / CI lists)
 cargo test --all --locked
 ```
 
-PR CI does **not** run `cargo test --all` (wall-clock); it runs `cargo test --lib` plus **explicit** integration binaries listed in `.github/workflows/ci.yml`. Every `tests/<name>.rs` must appear there — `./scripts/check-integration-tests-in-ci.sh` enforces it. A **nightly** workflow (`test-all-nightly.yml`) runs `cargo test --all` with MinIO.
+PR CI does **not** run `cargo test --all` (wall-clock); it runs `cargo test --lib` plus **explicit** integration binaries listed in `.github/workflows/ci.yml`. Every `tests/<name>.rs` must appear there — `./scripts/check-integration-tests-in-ci.sh` enforces it. A **nightly** workflow (`test-all-nightly.yml`) runs `cargo test --all` with SeaweedFS.
 
 ### Code Quality Checks
 
@@ -57,7 +57,7 @@ cargo test --lib --locked
 ./scripts/check-integration-tests-in-ci.sh
 cd demo/s3-browser/ui && npm ci && npm run build && npm run lint && npm run typecheck && npm run knip \
   && npm run test:permissions && npm run test:storage-path
-# Optional local parity with CI integration batches (needs MinIO):
+# Optional local parity with CI integration batches (needs SeaweedFS):
 cargo test --locked --test s3_integration_test
 ```
 

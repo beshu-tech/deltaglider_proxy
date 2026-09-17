@@ -295,7 +295,8 @@ async fn test_unencrypted_still_readable() {
 // ═══════════════════════════════════════════════════
 // Step 4: native S3 server-side encryption (SSE-S3)
 //
-// MinIO implements SSE-S3 natively. We test that:
+// SSE-S3 needs a backend with server-side encryption keys: the compose /
+// CI SeaweedFS sets WEED_S3_SSE_KEY (MinIO needed KES). We test that:
 //   1. A PUT with SSE-S3 configured produces an object that round-trips
 //      through the proxy (AWS transparently decrypts).
 //   2. The `dg-encrypted-native: sse-s3` user-metadata marker is
@@ -308,16 +309,16 @@ async fn test_unencrypted_still_readable() {
 // Proxy-side AES-256-GCM continues to work in parallel; SSE-S3 is a
 // distinct per-backend choice.
 //
-// Requires MinIO running at the default endpoint. Skipped when absent.
+// Requires SeaweedFS running at the default endpoint. Skipped when absent.
 // ═══════════════════════════════════════════════════
 
-#[ignore = "Requires MinIO running at http://localhost:9000 (docker compose up)"]
+#[ignore = "Requires an S3 backend with SSE-S3 keys at http://localhost:9000 (docker compose up sets WEED_S3_SSE_KEY); CI runs it with --ignored"]
 #[tokio::test]
 async fn test_sse_s3_roundtrip_through_s3_backend() {
     let server = TestServer::builder()
         .bucket(BUCKET)
         .auth("SSES3K", "SSES3SECRET")
-        .s3_endpoint(&common::minio_endpoint_url())
+        .s3_endpoint(&common::s3_test_endpoint_url())
         .sse_s3()
         .build()
         .await;
@@ -325,19 +326,22 @@ async fn test_sse_s3_roundtrip_through_s3_backend() {
     let plaintext = b"hello sse-s3";
     put_object(&server, "sse-s3-target.txt", plaintext).await;
 
-    // Read back through the proxy — MinIO decrypts transparently.
+    // Read back through the proxy — SeaweedFS decrypts transparently.
     let got = get_object(&server, "sse-s3-target.txt").await;
     assert_eq!(got, plaintext);
 
-    // Verify the dg-encrypted-native marker was stamped (via HEAD).
-    let client = server.s3_client().await;
-    let head = client
+    // Verify the dg-encrypted-native marker was stamped on the stored
+    // object. HEAD the backend DIRECTLY: the proxy's own responses drop the
+    // internal `dg-*` user-metadata keys, so the marker is only visible on
+    // the backend side (where the read-side sniffers look for it).
+    let backend = common::s3_test_client().await;
+    let head = backend
         .head_object()
         .bucket(BUCKET)
         .key("sse-s3-target.txt")
         .send()
         .await
-        .expect("HEAD should succeed");
+        .expect("HEAD on the backend should succeed");
     // AWS SDK surfaces user-metadata as a lowercase-keyed map.
     let dg_native = head
         .metadata

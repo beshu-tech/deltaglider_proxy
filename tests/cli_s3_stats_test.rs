@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
+use common::{s3_test_endpoint_url, S3_TEST_ACCESS_KEY, S3_TEST_SECRET_KEY};
 use deltaglider_proxy::cli::cp::{run as cp_run, CpArgs};
 use deltaglider_proxy::cli::stats::{run as stats_run, StatsArgs};
 
@@ -38,11 +38,11 @@ fn cp_args(src: String, dst: String) -> CpArgs {
         content_type: None,
         metadata: vec![],
         quiet: true,
-        endpoint_url: Some(minio_endpoint_url()),
+        endpoint_url: Some(s3_test_endpoint_url()),
         region: Some("us-east-1".into()),
         profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
+        access_key_id: Some(S3_TEST_ACCESS_KEY.into()),
+        secret_access_key: Some(S3_TEST_SECRET_KEY.into()),
         force_path_style: true,
         max_object_size_mb: None,
     }
@@ -67,11 +67,11 @@ fn stats_args(bucket: String, opts: StatsOpts) -> StatsArgs {
         refresh: opts.refresh,
         no_cache: opts.no_cache,
         json: opts.json,
-        endpoint_url: Some(minio_endpoint_url()),
+        endpoint_url: Some(s3_test_endpoint_url()),
         region: Some("us-east-1".into()),
         profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
+        access_key_id: Some(S3_TEST_ACCESS_KEY.into()),
+        secret_access_key: Some(S3_TEST_SECRET_KEY.into()),
         force_path_style: true,
     }
 }
@@ -91,7 +91,7 @@ async fn seed_delta_bucket(bucket: &str) {
     // cp doesn't auto-create the destination bucket; create it ourselves
     // before seeding. Idempotent: BucketAlreadyOwnedByYou is ignored so
     // callers can use this on a pre-existing bucket too.
-    let s3 = common::minio_client().await;
+    let s3 = common::s3_test_client().await;
     let _ = s3.create_bucket().bucket(bucket).send().await;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -120,7 +120,7 @@ async fn seed_delta_bucket(bucket: &str) {
 }
 
 async fn cleanup_bucket(bucket: &str, keys: &[&str]) {
-    let s3 = common::minio_client().await;
+    let s3 = common::s3_test_client().await;
     for k in keys {
         s3.delete_object().bucket(bucket).key(*k).send().await.ok();
     }
@@ -138,7 +138,7 @@ async fn cleanup_bucket(bucket: &str, keys: &[&str]) {
 
 #[tokio::test]
 async fn stats_reports_savings_for_delta_compressed_bucket() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("savings");
     seed_delta_bucket(&bucket).await;
 
@@ -163,7 +163,7 @@ async fn stats_reports_savings_for_delta_compressed_bucket() {
 /// detailed mode. The contract here is "all modes terminate cleanly".)
 #[tokio::test]
 async fn stats_three_modes_all_succeed() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("modes");
     seed_delta_bucket(&bucket).await;
 
@@ -198,11 +198,11 @@ async fn stats_three_modes_all_succeed() {
 /// (proven by inspecting the cache file presence on S3 between runs).
 #[tokio::test]
 async fn stats_cache_roundtrips_through_s3() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let bucket = unique_bucket("cache");
     seed_delta_bucket(&bucket).await;
 
-    let s3 = common::minio_client().await;
+    let s3 = common::s3_test_client().await;
     let cache_key = ".deltaglider/stats_detailed.json";
 
     // Pre-flight: cache file should not exist yet.

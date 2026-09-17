@@ -7,40 +7,38 @@
 # Ports:
 #   9002 - DeltaGlider Proxy (S3 API)
 #   9003 - Embedded Demo UI
-#   9000 - MinIO S3 API (internal)
-#   9001 - MinIO Console
+#   9000 - SeaweedFS S3 API (backend)
 
 services:
-  minio:
-    image: quay.io/minio/minio:latest
-    container_name: s3browser-minio
+  seaweedfs:
+    # Single-node SeaweedFS: master + volume + filer + S3 gateway in one process.
+    image: chrislusf/seaweedfs:4.47
+    container_name: s3browser-seaweedfs
+    command: server -dir=/data -ip.bind=0.0.0.0 -s3 -s3.port=9000 -s3.allowDeleteBucketNotEmpty=false
     ports:
       - "9000:9000"
-      - "9001:9001"
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
+      AWS_ACCESS_KEY_ID: dgp-test-key
+      AWS_SECRET_ACCESS_KEY: dgp-test-secret
     volumes:
-      - minio-data:/data
+      - seaweedfs-data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD-SHELL", "wget -q -S -O /dev/null http://localhost:9000/ 2>&1 | grep -q ' 403 '"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 12
     networks:
       - demo
 
-  minio-setup:
-    image: quay.io/minio/mc:latest
-    container_name: s3browser-minio-setup
+  seaweedfs-setup:
+    image: chrislusf/seaweedfs:4.47
+    container_name: s3browser-seaweedfs-setup
     depends_on:
-      minio:
+      seaweedfs:
         condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      mc alias set local http://minio:9000 minioadmin minioadmin;
-      mc mb --ignore-existing local/deltaglider-data;
+      echo 's3.bucket.create -name deltaglider-data' | weed shell -master=seaweedfs:9333;
       echo 'Bucket created: deltaglider-data';
       exit 0;
       "
@@ -58,17 +56,17 @@ services:
       - "9003:9003"
     environment:
       DGP_LISTEN_ADDR: "0.0.0.0:9002"
-      DGP_S3_ENDPOINT: "http://minio:9000"
+      DGP_S3_ENDPOINT: "http://seaweedfs:9000"
       DGP_S3_REGION: "us-east-1"
       DGP_S3_PATH_STYLE: "true"
       DGP_MAX_DELTA_RATIO: "0.9"
       DGP_MAX_OBJECT_SIZE: "104857600"
       DGP_CACHE_MB: "100"
-      DGP_BE_AWS_ACCESS_KEY_ID: minioadmin
-      DGP_BE_AWS_SECRET_ACCESS_KEY: minioadmin
+      DGP_BE_AWS_ACCESS_KEY_ID: dgp-test-key
+      DGP_BE_AWS_SECRET_ACCESS_KEY: dgp-test-secret
       RUST_LOG: info
     depends_on:
-      minio-setup:
+      seaweedfs-setup:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9002/health"]
@@ -80,7 +78,7 @@ services:
       - demo
 
 volumes:
-  minio-data:
+  seaweedfs-data:
 
 networks:
   demo:
