@@ -495,6 +495,10 @@ fn is_form_post_policy_candidate(request: &Request<Body>) -> bool {
 ///
 /// Inserted as a layer around the router. If `auth` is `None` (no credentials
 /// configured), all requests pass through unchanged.
+// `Err` is the early-response short-circuit axum middleware idiom; boxing an
+// `http::Response` on the per-request hot path to please `result_large_err`
+// (clippy ≥ 1.98) buys nothing.
+#[allow(clippy::result_large_err)]
 pub async fn sigv4_auth_middleware(
     mut request: Request<Body>,
     next: Next,
