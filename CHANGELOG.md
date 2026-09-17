@@ -31,9 +31,10 @@ Every one of them is now closed:
   (`/_/api/admin/policies`) moved behind the session for the same reason.
 - Every object the proxy stores carries `dg-tool = deltaglider_proxy/<version>`
   as provenance, and a HEAD, GET, or `metadata=true` LIST returned it as
-  `x-amz-meta-dg-tool` to anonymous readers of a public prefix. Anonymous
-  requests (and every request in open-access mode) no longer receive that
-  key; authenticated principals still do.
+  `x-amz-meta-dg-tool` to anonymous readers of a public prefix. Those
+  anonymous requests no longer receive that key; authenticated principals,
+  and open-access mode (`authentication: none`, where nothing is private
+  and the proxy's own tooling reads the `dg-*` keys), still do.
 - `DGP_METRICS_BEARER_TOKEN` (new, optional) makes `/_/metrics` require
   `Authorization: Bearer <token>` — the Prometheus `authorization:` scrape
   setting — or an admin session. Unset keeps the endpoint public.

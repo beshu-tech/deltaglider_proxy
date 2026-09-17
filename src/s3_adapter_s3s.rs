@@ -2095,18 +2095,20 @@ fn head_object_output_from_metadata(
     })
 }
 
-/// Drop deployment provenance from metadata bound for an unauthenticated
-/// caller. Every object the proxy stores carries `dg-tool =
-/// deltaglider_proxy/<version>`; an anonymous reader of a public prefix — or
-/// any caller in open-access mode, where there is no principal at all — must
+/// Drop deployment provenance from metadata bound for the anonymous
+/// public-prefix reader. Every object the proxy stores carries `dg-tool =
+/// deltaglider_proxy/<version>`; the synthesized `$anonymous` principal must
 /// not learn the exact running build from a HEAD, GET, or `metadata=true`
-/// LIST. Authenticated principals keep the full provenance. Handles both the
-/// bare-key map (HEAD/GET) and the `x-amz-meta-*` map (LIST extension).
+/// LIST. Authenticated principals keep the full provenance, and so does
+/// open-access mode (`authentication: none`, no principal at all): that mode
+/// is a deliberate dev/test setting where every byte is public already and
+/// the proxy's own tooling reads the `dg-*` keys. Handles both the bare-key
+/// map (HEAD/GET) and the `x-amz-meta-*` map (LIST extension).
 fn strip_fingerprint_metadata(
     metadata: &mut std::collections::HashMap<String, String>,
     auth_user: Option<&AuthenticatedUser>,
 ) {
-    if auth_user.is_some_and(|u| !u.is_anonymous()) {
+    if !auth_user.is_some_and(|u| u.is_anonymous()) {
         return;
     }
     metadata.remove(crate::types::meta_keys::TOOL);
@@ -2367,8 +2369,8 @@ mod tests {
         let mut no_principal = stamped.clone();
         strip_fingerprint_metadata(&mut no_principal, None);
         assert!(
-            !no_principal.contains_key(mk::TOOL),
-            "open-access mode has no principal: still anonymous"
+            no_principal.contains_key(mk::TOOL),
+            "open-access mode (no principal) keeps the provenance: nothing is private there"
         );
 
         let mut for_user = stamped;
