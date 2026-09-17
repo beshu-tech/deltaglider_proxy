@@ -204,7 +204,7 @@ Integration tests need an S3-compatible backend. A **separate, ephemeral** MinIO
     docker run -d --name minio-ci --network container:$(hostname) \
       -e MINIO_ROOT_USER=minioadmin \
       -e MINIO_ROOT_PASSWORD=minioadmin \
-      minio/minio:latest server /data
+      quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z.hotfix.7aa24e772 server /data
 ```
 
 The `--network container:$(hostname)` flag shares the runner pod's network namespace with the MinIO container, making it reachable at `localhost:9000` from the job container. This is necessary because GitHub Actions `container:` jobs run inside Docker, and `services:` cannot pass CMD arguments (MinIO needs `server /data`).
@@ -338,7 +338,7 @@ kubectl apply -f .github/k8s/sccache-minio.yaml
 Then create the bucket and lifecycle rule:
 
 ```bash
-kubectl run minio-setup --image=minio/mc:latest --restart=Never \
+kubectl run minio-setup --image=quay.io/minio/mc:latest --restart=Never \
   --namespace=sccache --command -- sh -c '
     mc alias set sccache http://sccache-minio:9000 sccache sccache-secret-key &&
     mc mb --ignore-existing sccache/sccache-rust &&
@@ -400,7 +400,7 @@ The `container:` job shares the runner pod's network namespace, so k8s DNS and C
 
 The ephemeral test MinIO must share the runner pod's network namespace:
 ```bash
-docker run -d --network container:$(hostname) minio/minio:latest server /data
+docker run -d --network container:$(hostname) quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z.hotfix.7aa24e772 server /data
 ```
 
 Do **not** use `--network host` — that puts MinIO on the k3s node's network, not the pod's.
