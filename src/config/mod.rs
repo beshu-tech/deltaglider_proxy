@@ -395,6 +395,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Server",
     },
     EnvVarEntry {
+        name: "DGP_METRICS_BEARER_TOKEN",
+        description: "When set, /_/metrics requires `Authorization: Bearer <token>` (Prometheus `authorization:` scrape setting) or an admin session; unset keeps the scrape endpoint public",
+        example: "a-long-random-scrape-token",
+        category: "Security",
+    },
+    EnvVarEntry {
         name: "DGP_METRICS_EXPOSE_VERSION",
         description: "Put the exact build version in the `version` label of `deltaglider_build_info` on the unauthenticated /_/metrics endpoint (default: false — the label is empty; the version stays available through the authenticated admin API)",
         example: "true",
@@ -3016,6 +3022,7 @@ mod tests {
             "DGP_MAX_CONCURRENT_REQUESTS",           // startup::build_s3_router()
             "DGP_CORS_PERMISSIVE",                   // demo::ui_router()
             "DGP_METRICS_EXPOSE_VERSION",            // startup::init_metrics()
+            "DGP_METRICS_BEARER_TOKEN",              // api::admin::auth::metrics_bearer_token()
             "DGP_REQUEST_TIMEOUT_SECS",              // startup::build_s3_router()
             "DGP_RECURSIVE_DELETE_PAGE_SIZE", // s3_adapter_s3s::recursive_delete_prefix_s3s()
             "DGP_READY_TIMEOUT_SECS",         // api::handlers::status::readiness_check()

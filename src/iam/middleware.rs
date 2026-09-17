@@ -64,6 +64,10 @@ fn parse_bucket_key(path: &str) -> (&str, &str) {
 ///
 /// In legacy mode or open access, no `AuthenticatedUser` is present and
 /// the request passes through unchecked.
+// `Err` is the early-response short-circuit axum middleware idiom; boxing an
+// `http::Response` on the per-request hot path to please `result_large_err`
+// (clippy ≥ 1.98) buys nothing.
+#[allow(clippy::result_large_err)]
 pub async fn authorization_middleware(
     mut request: Request<Body>,
     next: Next,
@@ -208,7 +212,7 @@ pub async fn authorization_middleware(
         } else if user.is_explicitly_denied(action, bucket, key, &context) {
             // An explicit Deny matched (possibly via condition) — blocked
             (false, None)
-        } else if user.name == "$anonymous" {
+        } else if user.is_anonymous() {
             // Anonymous users must NOT use the can_see_bucket fallback —
             // it would allow unscoped LIST, leaking keys outside public prefixes.
             (false, None)

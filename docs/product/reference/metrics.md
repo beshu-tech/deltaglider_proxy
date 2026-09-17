@@ -26,6 +26,8 @@ curl -s http://localhost:9000/_/metrics | promtool check metrics
 | `process_peak_rss_bytes` | Gauge | — | Peak resident set size (updated on scrape) |
 | `process_*` (Linux only) | various | — | Standard process collector: RSS, CPU seconds, open FDs, virtual memory |
 
+The endpoint is public by default so that any Prometheus can scrape it. Set `DGP_METRICS_BEARER_TOKEN` to require `Authorization: Bearer <token>` (or an admin session, which the dashboard uses); anonymous callers then receive `401` and cannot read the metric set, which changes from release to release. See [Monitor with Prometheus](../how-to/monitor-with-prometheus.md).
+
 ## HTTP requests
 
 | Metric | Type | Labels | Description |

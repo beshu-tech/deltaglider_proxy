@@ -19,6 +19,14 @@ use deltaglider_proxy::api::admin::{self, AdminState};
 #[folder = "demo/s3-browser/ui/dist"]
 struct DemoAssets;
 
+/// The product docs (markdown + manifest), embedded from `docs/product/` so
+/// the UI fetches them at runtime behind a session instead of inlining them
+/// into the JS bundle — where the changelog named the running version to
+/// anyone who could fetch a static asset.
+#[derive(Embed)]
+#[folder = "docs/product"]
+struct ProductDocs;
+
 /// Build the UI + admin API router, mounted under `/_/`.
 ///
 /// This router is merged into the main S3 router BEFORE auth middleware,
@@ -129,6 +137,12 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
     let session_light = Router::new()
         .route("/_/api/admin/logout", post(admin::logout))
         .route("/_/api/admin/session", get(admin::check_session))
+        // Product docs + manifest, one payload. Not secret, but they name
+        // every release — so a session, never anonymous.
+        .route("/_/api/docs", get(product_docs_bundle))
+        // Canned IAM policies: consumed by the user form only. The policy
+        // set changes across releases, so it stays off the anonymous surface.
+        .route("/_/api/admin/policies", get(admin::get_canned_policies))
         // Bucket maintenance status is session-light ON PURPOSE: non-admin
         // browser users (S3BrowserLift) need to see "busy + progress" for
         // the bucket they are viewing. The view carries only job
@@ -396,7 +410,6 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             post(admin::open_browser_connect),
         )
         .route("/_/api/iam/identity", post(admin::resolve_iam_identity))
-        .route("/_/api/admin/policies", get(admin::get_canned_policies))
         // Monotonic rebuild counter. Public by design — exposes an opaque
         // number and is consumed by integration tests + internal tooling
         // to barrier on IAM mutations without a blind `sleep(1s)`.
@@ -457,11 +470,22 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .route(
             "/_/ready",
             get(deltaglider_proxy::api::handlers::readiness_check).with_state(s3_state.clone()),
-        )
+        );
+
+    // Prometheus scrape. Public by default (scrapers cannot log in); with
+    // DGP_METRICS_BEARER_TOKEN set it demands that token or an admin session,
+    // so a hardened deployment does not advertise its metric set — which
+    // changes with every release — to anonymous callers.
+    let metrics_route = Router::new()
         .route(
             "/_/metrics",
             get(deltaglider_proxy::metrics::metrics_handler).with_state(s3_state.clone()),
-        );
+        )
+        .layer(middleware::from_fn_with_state(
+            admin_state.clone(),
+            admin::require_metrics_access,
+        ))
+        .with_state(admin_state.clone());
 
     // Stats endpoint — session-protected (reveals per-bucket storage sizes)
     let stats_route = Router::new()
@@ -495,6 +519,7 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .merge(admin_gui_protected)
         .merge(public_admin)
         .merge(operational_routes)
+        .merge(metrics_route)
         .merge(stats_route)
         .merge(static_routes)
         .layer({
@@ -581,6 +606,33 @@ fn fallback_for(path: &str) -> Fallback {
     } else {
         Fallback::NotFound
     }
+}
+
+/// GET /_/api/docs — every product doc plus the manifest in one payload.
+/// Session-gated by the router (see `session_light`).
+async fn product_docs_bundle() -> Response {
+    let manifest: serde_json::Value = ProductDocs::get("manifest.json")
+        .and_then(|f| serde_json::from_slice(&f.data).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let docs: Vec<serde_json::Value> = ProductDocs::iter()
+        .filter(|p| p.ends_with(".md"))
+        .filter_map(|p| {
+            let file = ProductDocs::get(&p)?;
+            Some(serde_json::json!({
+                "path": p.trim_end_matches(".md"),
+                "content": String::from_utf8_lossy(&file.data),
+            }))
+        })
+        .collect();
+    // `no-cache`: the URL carries no version, so a cached copy would serve
+    // the previous release's docs (and changelog) for the cache lifetime
+    // after an upgrade. React Query already avoids refetches within a page
+    // load (`staleTime: Infinity`), so an HTTP max-age buys nothing.
+    (
+        [(header::CACHE_CONTROL, "private, no-cache")],
+        Json(serde_json::json!({ "manifest": manifest, "docs": docs })),
+    )
+        .into_response()
 }
 
 fn serve_index() -> Response {

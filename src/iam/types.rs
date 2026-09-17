@@ -123,6 +123,10 @@ impl S3Action {
     }
 }
 
+/// Name of the principal synthesized for unauthenticated requests that hit a
+/// public prefix (see `api/auth.rs`). Compared by [`AuthenticatedUser::is_anonymous`].
+pub const ANONYMOUS_USER_NAME: &str = "$anonymous";
+
 /// Resolved identity after SigV4 authentication.
 /// Inserted into request extensions by the SigV4 middleware.
 #[derive(Debug, Clone)]
@@ -135,6 +139,12 @@ pub struct AuthenticatedUser {
 }
 
 impl AuthenticatedUser {
+    /// The synthesized public-prefix reader (`$anonymous`). Anonymous callers
+    /// get the bytes they are allowed to read, never deployment provenance.
+    pub fn is_anonymous(&self) -> bool {
+        self.name == ANONYMOUS_USER_NAME
+    }
+
     /// Check if this user is allowed to perform the given action on the given resource.
     /// Uses iam-rs for evaluation when policies are available (supports conditions),
     /// falls back to legacy evaluation otherwise.

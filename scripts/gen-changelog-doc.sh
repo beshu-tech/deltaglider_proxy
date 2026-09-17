@@ -3,7 +3,7 @@
 #
 # The root CHANGELOG.md is the single source of truth. This script
 # projects it into the shared docs pipeline (manifest.json +
-# docs-imports.ts) so the changelog renders on BOTH the marketing site
+# rust-embed in src/demo.rs, served at GET /_/api/docs) so the changelog renders on BOTH the marketing site
 # (/docs/changelog) and the in-product docs viewer (/_/docs/changelog),
 # using the same renderer/styling as every other doc.
 #
