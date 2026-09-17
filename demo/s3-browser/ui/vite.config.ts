@@ -10,15 +10,6 @@ function sourcemapOptIn(): boolean {
   return ['1', 'true', 'yes', 'on'].includes((process.env.DGP_UI_SOURCEMAP ?? '').trim().toLowerCase())
 }
 
-// Source maps are OPT-IN. DemoAssets embeds all of dist/ into the binary and
-// serves it to anonymous callers, so a map in dist/ is the full UI source on
-// every deployment — the Docker image, the release tarballs and the demo
-// image alike. No build channel has to remember a flag: set
-// DGP_UI_SOURCEMAP=1 for a local debugging build.
-function sourcemapOptIn(): boolean {
-  return ['1', 'true', 'yes', 'on'].includes((process.env.DGP_UI_SOURCEMAP ?? '').trim().toLowerCase())
-}
-
 export default defineConfig({
   plugins: [react()],
   base: '/_/',
