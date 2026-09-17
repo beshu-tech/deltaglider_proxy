@@ -20,50 +20,48 @@ docker run -d \
 
 Then open `http://localhost:9000/_/` for the built-in browser and dashboard.
 
-## With SeaweedFS as Backend
+## With MinIO as Backend
 
 ```bash
 docker run -d \
   -p 9000:9000 \
   -e DGP_ACCESS_KEY_ID=dgpadmin \
   -e DGP_SECRET_ACCESS_KEY=change-me-please \
-  -e DGP_S3_ENDPOINT=http://seaweedfs:9000 \
+  -e DGP_S3_ENDPOINT=http://minio:9000 \
   -e DGP_S3_REGION=us-east-1 \
-  -e DGP_BE_AWS_ACCESS_KEY_ID=backend-key \
-  -e DGP_BE_AWS_SECRET_ACCESS_KEY=backend-secret \
+  -e DGP_BE_AWS_ACCESS_KEY_ID=minioadmin \
+  -e DGP_BE_AWS_SECRET_ACCESS_KEY=minioadmin \
   -e DGP_CACHE_MB=1024 \
   beshultd/deltaglider_proxy
 ```
 
-The `DGP_ACCESS_KEY_ID` / `DGP_SECRET_ACCESS_KEY` pair is the S3 credential clients present to the proxy (required to start). The `DGP_BE_AWS_*` pair is separate: it authenticates the proxy to the S3 backend behind it (SeaweedFS in this example; any S3-compatible store works).
+The `DGP_ACCESS_KEY_ID` / `DGP_SECRET_ACCESS_KEY` pair is the S3 credential clients present to the proxy (required to start). The `DGP_BE_AWS_*` pair is separate: it authenticates the proxy to the MinIO backend behind it.
 
 ## Docker Compose
 
 ```yaml
 services:
-  seaweedfs:
-    # Single-node SeaweedFS with its S3 gateway on :9000 (any S3-compatible
-    # store works here). AWS_* is the gateway's one admin identity.
-    image: chrislusf/seaweedfs:4.47
-    command: server -dir=/data -ip.bind=0.0.0.0 -s3 -s3.port=9000 -s3.allowDeleteBucketNotEmpty=false
+  minio:
+    image: quay.io/minio/minio
+    command: server /data
     environment:
-      AWS_ACCESS_KEY_ID: backend-key
-      AWS_SECRET_ACCESS_KEY: backend-secret
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
 
   deltaglider:
     image: beshultd/deltaglider_proxy
     ports:
       - "9000:9000"
     environment:
-      DGP_S3_ENDPOINT: http://seaweedfs:9000
+      DGP_S3_ENDPOINT: http://minio:9000
       DGP_S3_REGION: us-east-1
-      DGP_BE_AWS_ACCESS_KEY_ID: backend-key
-      DGP_BE_AWS_SECRET_ACCESS_KEY: backend-secret
+      DGP_BE_AWS_ACCESS_KEY_ID: minioadmin
+      DGP_BE_AWS_SECRET_ACCESS_KEY: minioadmin
       DGP_ACCESS_KEY_ID: myproxykey
       DGP_SECRET_ACCESS_KEY: myproxysecret
       DGP_CACHE_MB: 1024
     depends_on:
-      - seaweedfs
+      - minio
 ```
 
 ## How It Works

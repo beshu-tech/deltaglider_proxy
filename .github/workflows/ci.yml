@@ -151,7 +151,7 @@ jobs:
       # Raise the open-file limit. These jobs run on the self-hosted
       # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + SeaweedFS sockets, so the
+      # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
       # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
       # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
@@ -180,7 +180,7 @@ jobs:
       # Raise the open-file limit. These jobs run on the self-hosted
       # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + SeaweedFS sockets, so the
+      # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
       # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
       # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
@@ -256,7 +256,7 @@ jobs:
       # Raise the open-file limit. These jobs run on the self-hosted
       # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + SeaweedFS sockets, so the
+      # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
       # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
       # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
@@ -284,9 +284,9 @@ jobs:
     name: Integration Tests
     # Always run on PRs (review gate), workflow_dispatch (operator opt-in),
     # and workflow_call (downstream caller). On direct push to main the
-    # SeaweedFS suite is skipped UNLESS the commit message contains
+    # MinIO suite is skipped UNLESS the commit message contains
     # `[ci-integration]` — opt-in keyword so noisy main-branch chores
-    # don't burn ~10 minutes of SeaweedFS time when they don't need it.
+    # don't burn ~10 minutes of MinIO time when they don't need it.
     if: >-
       github.event_name != 'push' ||
       contains(github.event.head_commit.message, '[ci-integration]')
@@ -298,7 +298,7 @@ jobs:
       # Raise the open-file limit. These jobs run on the self-hosted
       # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + SeaweedFS sockets, so the
+      # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
       # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
       # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
@@ -309,10 +309,10 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
       # Wave-1 security (commit 3ff9edc) rejects http:// + private-IP S3
-      # endpoints by default to close SSRF surface. The SeaweedFS under test
+      # endpoints by default to close SSRF surface. The MinIO under test
       # serves on http://localhost:9000, so we explicitly opt in here.
       # The CLI's `engine_factory` auto-sets this when it detects a
-      # SeaweedFS/dev endpoint; the proxy's `S3Backend::build_client` does
+      # MinIO/dev endpoint; the proxy's `S3Backend::build_client` does
       # NOT, because the proxy is the thing being hardened.
       DGP_BACKEND_ALLOW_LOCAL: "true"
       # Wave-3 security (commit 9f2e085) caches GET/HEAD SigV4
@@ -337,38 +337,19 @@ jobs:
         run: |
           rm -f deltaglider_config.db deltaglider_config.db.bak .deltaglider_bootstrap_hash
           rm -f /tmp/deltaglider_config.db /tmp/deltaglider_config.db.bak /tmp/.deltaglider_bootstrap_hash
-      - name: Start SeaweedFS for tests
+      - name: Start MinIO for tests
         run: |
-          # Ephemeral single-node SeaweedFS: master + volume + filer + S3 gateway
-          # in one process. The AWS_* env pair is the one admin identity the
-          # harness signs with (tests/common/mod.rs). Shares the runner's network
-          # namespace, so the S3 gateway is localhost:9000 for the job; the other
-          # daemons sit on 2xxxx (their gRPC twins on 3xxxx) so they never collide
-          # with the 19000+ / 29500+ ports the test harness hands out.
-          # WEED_S3_SSE_KEY: enables SSE-S3 (any secret string; the key is derived),
-          # so the SSE-S3 round-trip test can run against this backend.
-          # allowDeleteBucketNotEmpty=false: AWS semantics for DeleteBucket
-          # (BucketNotEmpty instead of SeaweedFS's default recursive delete).
-          docker run -d --name seaweedfs-ci --network container:$(hostname) \
-            -e AWS_ACCESS_KEY_ID=dgp-test-key \
-            -e AWS_SECRET_ACCESS_KEY=dgp-test-secret \
-            -e WEED_S3_SSE_KEY=dgp-test-sse-key \
-            chrislusf/seaweedfs:4.47 server -dir=/data -ip.bind=0.0.0.0 \
-              -master.port=29333 -volume.port=28080 -filer.port=28888 \
-              -s3 -s3.port=9000 -s3.allowDeleteBucketNotEmpty=false
-          code=000
-          for i in $(seq 1 60); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9000/ || true)
-            [ "$code" = "403" ] && break
+          docker run -d --name minio-ci --network container:$(hostname) \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z.hotfix.7aa24e772 server /data
+          for i in $(seq 1 30); do
+            mc alias set local http://localhost:9000 minioadmin minioadmin 2>/dev/null && break
             sleep 1
           done
-          if [ "$code" != "403" ]; then
-            echo "SeaweedFS S3 gateway did not come up (last HTTP $code)"; docker logs seaweedfs-ci | tail -50; exit 1
-          fi
-          for b in deltaglider-test deltaglider-data; do
-            docker exec seaweedfs-ci sh -c "echo 's3.bucket.create -name $b' | weed shell -master=localhost:29333"
-          done
-          echo "S3_TEST_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
+          mc mb --ignore-existing local/deltaglider-test
+          mc mb --ignore-existing local/deltaglider-data
+          echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
       - name: Install DeltaGlider CLI
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -406,9 +387,6 @@ jobs:
           RUST_BACKTRACE: "1"
         run: |
           cargo test --locked --test interop_test -- --include-ignored --nocapture
-          # SSE-S3 round-trip: ignored by default (needs a backend with SSE-S3 keys —
-          # this SeaweedFS has WEED_S3_SSE_KEY), so run it explicitly here.
-          cargo test --locked --test encryption_test -- --ignored --nocapture
       - name: Integration tests (admin, IAM, replication, lifecycle, …)
         env:
           RUST_BACKTRACE: "1"
@@ -468,10 +446,14 @@ jobs:
             --test recursive_delete_test \
             --test s3_correctness_test \
             -- --nocapture
-      # The backend is ephemeral: removing the container drops its data too.
-      - name: Stop SeaweedFS
+      - name: Clean up MinIO test data
         if: always()
-        run: docker rm -f seaweedfs-ci 2>/dev/null || true
+        run: |
+          mc rm --recursive --force local/deltaglider-test/ 2>/dev/null || true
+          mc rm --recursive --force local/deltaglider-data/ 2>/dev/null || true
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio-ci 2>/dev/null || true
 
   test-delta:
     name: Delta & Optimization Tests
@@ -483,7 +465,7 @@ jobs:
       # Raise the open-file limit. These jobs run on the self-hosted
       # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + SeaweedFS sockets, so the
+      # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
       # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
       # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
@@ -522,7 +504,7 @@ jobs:
       # Raise the open-file limit. These jobs run on the self-hosted
       # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + SeaweedFS sockets, so the
+      # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
       # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
       # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
@@ -562,7 +544,7 @@ jobs:
       # Raise the open-file limit. These jobs run on the self-hosted
       # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + SeaweedFS sockets, so the
+      # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
       # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
       # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
@@ -652,7 +634,7 @@ jobs:
       # Raise the open-file limit. These jobs run on the self-hosted
       # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + SeaweedFS sockets, so the
+      # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
       # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
       # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
@@ -737,7 +719,7 @@ jobs:
       # Raise the open-file limit. These jobs run on the self-hosted
       # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + SeaweedFS sockets, so the
+      # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
       # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
       # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the

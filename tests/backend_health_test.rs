@@ -9,7 +9,7 @@
 //! 2. When ALL configured backends fail the boot probe under the default
 //!    `enforce` policy, the proxy refuses to start (exit code 1).
 //!
-//! No SeaweedFS needed: the dead backend is a connection-refused local port.
+//! No MinIO needed: the dead backend is a connection-refused local port.
 
 mod common;
 

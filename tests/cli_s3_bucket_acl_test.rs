@@ -2,18 +2,17 @@
 
 //! Integration test for `deltaglider_proxy {get,put}-bucket-acl`.
 //!
-//! S3-compatible backends (SeaweedFS in CI, MinIO before it) expose a
-//! limited ACL surface — a canned ACL is accepted but not every dimension
-//! is honoured. We assert what we can:
+//! MinIO's ACL surface is limited (it canonicalises everything to
+//! `Private` regardless of what you set). We assert what we can:
 //!
 //! 1. `put-bucket-acl --acl private` succeeds against a fresh bucket
 //!    (the API call itself round-trips and exits 0).
-//! 2. `get-bucket-acl` returns a non-empty grants list (the backend
-//!    always emits the owner's full-control grant).
+//! 2. `get-bucket-acl` returns a non-empty grants list (MinIO always
+//!    emits the owner's full-control grant).
 
 mod common;
 
-use common::{s3_test_endpoint_url, S3_TEST_ACCESS_KEY, S3_TEST_SECRET_KEY};
+use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
 use deltaglider_proxy::cli::bucket_acl::{get_run, put_run, GetArgs, PutArgs};
 
 fn unique_bucket(prefix: &str) -> String {
@@ -30,11 +29,11 @@ fn unique_bucket(prefix: &str) -> String {
 fn get_args(bucket: &str) -> GetArgs {
     GetArgs {
         url: format!("s3://{bucket}"),
-        endpoint_url: Some(s3_test_endpoint_url()),
+        endpoint_url: Some(minio_endpoint_url()),
         region: Some("us-east-1".into()),
         profile: None,
-        access_key_id: Some(S3_TEST_ACCESS_KEY.into()),
-        secret_access_key: Some(S3_TEST_SECRET_KEY.into()),
+        access_key_id: Some(MINIO_ACCESS_KEY.into()),
+        secret_access_key: Some(MINIO_SECRET_KEY.into()),
         force_path_style: true,
     }
 }
@@ -48,23 +47,23 @@ fn put_args(bucket: &str, canned: Option<&str>) -> PutArgs {
         grant_read_acp: None,
         grant_write: None,
         grant_write_acp: None,
-        endpoint_url: Some(s3_test_endpoint_url()),
+        endpoint_url: Some(minio_endpoint_url()),
         region: Some("us-east-1".into()),
         profile: None,
-        access_key_id: Some(S3_TEST_ACCESS_KEY.into()),
-        secret_access_key: Some(S3_TEST_SECRET_KEY.into()),
+        access_key_id: Some(MINIO_ACCESS_KEY.into()),
+        secret_access_key: Some(MINIO_SECRET_KEY.into()),
         force_path_style: true,
     }
 }
 
 #[tokio::test]
 async fn put_then_get_bucket_acl_roundtrips() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
     let bucket = unique_bucket("rt");
-    let s3 = common::s3_test_client().await;
+    let s3 = common::minio_client().await;
     s3.create_bucket().bucket(&bucket).send().await.unwrap();
 
-    // PUT a canned private ACL — the backend accepts this even though it
+    // PUT a canned private ACL — MinIO accepts this even though it
     // doesn't honour every dimension. We're testing the API plumbing,
     // not the back-end semantics.
     assert_eq!(
@@ -86,7 +85,7 @@ async fn put_then_get_bucket_acl_roundtrips() {
 /// with EXIT_USAGE — there's nothing to apply.
 #[tokio::test]
 async fn put_bucket_acl_rejects_empty_request() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
     let code = put_run(put_args("some-bucket", None)).await;
     assert_eq!(code, deltaglider_proxy::cli::config::EXIT_USAGE);
 }

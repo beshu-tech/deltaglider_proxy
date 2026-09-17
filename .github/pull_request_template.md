@@ -8,4 +8,4 @@
 - [ ] `cargo test --lib --locked`
 - [ ] If you added `tests/<something>_test.rs`: `./scripts/check-integration-tests-in-ci.sh` and a matching `--test` line in `.github/workflows/ci.yml`
 - [ ] `cd demo/s3-browser/ui && npm run build && npm run lint && npm run typecheck && npm run knip`
-- [ ] **Before merge / release**: `cargo test --all --locked` (SeaweedFS on `localhost:9000` — `docker compose up -d`) or rely on nightly `test-all-nightly.yml` after merge
+- [ ] **Before merge / release**: `cargo test --all --locked` (MinIO on `localhost:9000`) or rely on nightly `test-all-nightly.yml` after merge

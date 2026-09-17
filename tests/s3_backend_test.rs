@@ -6,19 +6,19 @@
 //! S3-plumbing smoke test and the delta+S3 interaction that no other suite
 //! covers. NOT a re-run of s3_api_test's operations — those trait-level
 //! behaviours are guaranteed by the AWS SDK + the filesystem suites, so we
-//! don't re-pay a SeaweedFS round-trip for them. Both gated with
-//! skip_unless_s3_backend!() — skip gracefully without SeaweedFS.
+//! don't re-pay a MinIO round-trip for them. Both gated with
+//! skip_unless_minio!() — skip gracefully without MinIO.
 
 mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{generate_binary, mutate_binary, s3_test_client, TestServer, S3_TEST_BUCKET};
+use common::{generate_binary, minio_client, mutate_binary, TestServer, MINIO_BUCKET};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Counter for unique test prefixes
 static PREFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Generate a unique prefix to isolate each test's data in the shared SeaweedFS bucket
+/// Generate a unique prefix to isolate each test's data in the shared MinIO bucket
 fn unique_prefix() -> String {
     let counter = PREFIX_COUNTER.fetch_add(1, Ordering::SeqCst);
     let timestamp = std::time::SystemTime::now()
@@ -30,7 +30,7 @@ fn unique_prefix() -> String {
 
 #[tokio::test]
 async fn test_s3_put_get_roundtrip() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
     let server = TestServer::s3().await;
     let client = server.s3_client().await;
     let prefix = unique_prefix();
@@ -70,13 +70,13 @@ async fn test_s3_put_get_roundtrip() {
 // test_s3_etag_consistent, and test_s3_unicode_key each verified
 // `StorageBackend` trait behaviour that is already guaranteed by the
 // filesystem-backed s3_api_test + s3_compat_test + s3_integration_test
-// suites. Every such test spent a SeaweedFS round-trip to re-verify trait
+// suites. Every such test spent a MinIO round-trip to re-verify trait
 // semantics; S3-level differences are an AWS-SDK guarantee, not a
 // proxy-level regression surface.
 //
 // What stayed, and why:
 //   - test_s3_put_get_roundtrip  — smoke test for the S3-plumbing path
-//     (SigV4 to SeaweedFS, body bytestream, no delta pipeline). One
+//     (SigV4 to MinIO, body bytestream, no delta pipeline). One
 //     failure here tells you "the S3 backend is wired up at all."
 //   - test_s3_delta_similar_files — real delta+S3 interaction: the
 //     store.rs path that compresses v2 against v1's reference and
@@ -92,7 +92,7 @@ async fn test_s3_put_get_roundtrip() {
 
 #[tokio::test]
 async fn test_s3_delta_similar_files() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
     let server = TestServer::s3().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -160,15 +160,15 @@ async fn test_s3_delta_similar_files() {
 /// subtree scan this issue is about.
 #[tokio::test]
 async fn delimiterless_list_stops_early_without_dropping_late_delta_key() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
     let server = TestServer::s3().await;
     let client = server.s3_client().await;
     let prefix = unique_prefix();
 
     // Seed raw keys straight into the backend (no proxy round-trip per object).
-    // Seed with a DIRECT SeaweedFS client: these are internal raw keys (`.delta`),
+    // Seed with a DIRECT MinIO client: these are internal raw keys (`.delta`),
     // which the proxy refuses on the client-facing API by design.
-    let raw = s3_test_client().await;
+    let raw = minio_client().await;
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
     let mut seeds: Vec<String> = (0..1100)
         .map(|n| format!("{prefix}/1.0.{n:04}/app.zip.delta"))
@@ -180,7 +180,7 @@ async fn delimiterless_list_stops_early_without_dropping_late_delta_key() {
     seeds.push(format!("{}.delta", prefix.rsplit_once('-').unwrap().0));
     let mut handles = Vec::new();
     for key in seeds {
-        let (c, b, s) = (raw.clone(), S3_TEST_BUCKET.to_string(), sem.clone());
+        let (c, b, s) = (raw.clone(), MINIO_BUCKET.to_string(), sem.clone());
         handles.push(tokio::spawn(async move {
             let _p = s.acquire().await.unwrap();
             c.put_object()

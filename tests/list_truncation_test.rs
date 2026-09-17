@@ -301,12 +301,12 @@ async fn test_list_with_delimiter_filesystem() {
 }
 
 // ============================================================================
-// S3 backend tests (require SeaweedFS on localhost:9000)
+// S3 backend tests (require MinIO on localhost:9000)
 // ============================================================================
 
 #[tokio::test]
 async fn test_list_no_truncation_s3() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
 
     let server = TestServer::s3().await;
     let client = server.s3_client().await;
@@ -343,12 +343,12 @@ async fn test_list_no_truncation_s3() {
 }
 
 #[tokio::test]
-async fn test_list_proxy_vs_direct_backend() {
-    skip_unless_s3_backend!();
+async fn test_list_proxy_vs_direct_minio() {
+    skip_unless_minio!();
 
     let server = TestServer::s3().await;
     let proxy_client = server.s3_client().await;
-    let direct_client = common::s3_test_client().await;
+    let direct_client = common::minio_client().await;
     let prefix = format!("proxy_vs_direct_{}", std::process::id());
 
     let expected = upload_test_tree(&proxy_client, server.bucket(), &prefix).await;
@@ -368,7 +368,7 @@ async fn test_list_proxy_vs_direct_backend() {
         "Proxy listing should match expected uploads"
     );
 
-    // List directly from SeaweedFS — should see MORE keys (internal .dg files)
+    // List directly from MinIO — should see MORE keys (internal .dg files)
     let (direct_keys, _) = list_all_objects(
         &direct_client,
         server.bucket(),
@@ -380,7 +380,7 @@ async fn test_list_proxy_vs_direct_backend() {
 
     assert!(
         direct_keys.len() > expected.len(),
-        "Direct SeaweedFS should have more keys than proxy ({} vs {}), \
+        "Direct MinIO should have more keys than proxy ({} vs {}), \
          proving internal files (reference.bin, .delta) exist and are filtered",
         direct_keys.len(),
         expected.len(),
@@ -392,17 +392,17 @@ async fn test_list_proxy_vs_direct_backend() {
     let has_delta = direct_set.iter().any(|k| k.ends_with(".delta"));
     assert!(
         has_reference,
-        "Direct SeaweedFS listing should contain reference.bin files"
+        "Direct MinIO listing should contain reference.bin files"
     );
     assert!(
         has_delta,
-        "Direct SeaweedFS listing should contain .delta files"
+        "Direct MinIO listing should contain .delta files"
     );
 }
 
 #[tokio::test]
 async fn test_list_with_delimiter_s3() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
 
     let server = TestServer::s3().await;
     let client = server.s3_client().await;
@@ -488,7 +488,7 @@ async fn test_list_with_delimiter_s3() {
 
 #[tokio::test]
 async fn test_list_small_pages_s3() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
 
     let server = TestServer::s3().await;
     let client = server.s3_client().await;
@@ -542,7 +542,7 @@ async fn list_objects_v1_raw(endpoint: &str, bucket: &str, qs: Option<&str>) -> 
 /// V1 against a unique empty PREFIX — must return 200 + empty
 /// Contents under that prefix, `IsTruncated=false`. We use a
 /// unique prefix (UUID-based) rather than relying on an empty
-/// bucket, because the shared SeaweedFS `deltaglider-test` bucket
+/// bucket, because the shared MinIO `deltaglider-test` bucket
 /// is polluted by other tests running in parallel. The semantic
 /// being pinned is the same: "no objects matching the request
 /// produces an empty Contents-less response."
@@ -611,7 +611,7 @@ async fn test_v1_list_objects_nonexistent_bucket_returns_404() {
 
 /// V1 with `max-keys=1` against a populated unique-prefix slice —
 /// must return exactly 1 key + `IsTruncated=true` + a pageable
-/// marker. The shared SeaweedFS bucket is polluted by parallel tests,
+/// marker. The shared MinIO bucket is polluted by parallel tests,
 /// so we scope to a unique prefix and use `prefix=` filter on both
 /// pages to isolate from cross-test contamination.
 #[tokio::test]
