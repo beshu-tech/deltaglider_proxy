@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+### Changed — The build version is no longer advertised to anonymous callers
+
+`GET /_/api/whoami` returns `version` only when the request carries a live
+session. The login page still receives the auth mode and the list of external
+login providers, which it needs before any login, but an unauthenticated caller
+can no longer read the exact running version. The `version` label of
+`deltaglider_build_info` on the unauthenticated `/_/metrics` endpoint is now
+empty by default, which Prometheus treats as an absent label, so existing
+dashboards keep their series shape. Operators whose fleet dashboards key on the
+version can restore the label with `DGP_METRICS_EXPOSE_VERSION=true`. The admin
+dashboard reads the version from the authenticated identity instead of the
+scrape.
+
+### Changed — Production images ship no frontend source maps
+
+The Docker build passes `PROD=true` to the UI build stage, and the Vite config
+emits source maps only when that variable is unset. A source map in the
+embedded bundle handed the full UI source to anyone who could reach `/_/`.
+A plain local `npm run build` still emits maps for debugging, and
+`--build-arg PROD=false` restores them in a debug image.
+
+### Fixed — Unknown paths under `/_/` returned the app shell with status 200
+
+The catch-all route for the embedded UI served `index.html` for every path it
+did not recognise, including mistyped admin API paths such as
+`/_/api/admin/does-not-exist` and missing assets. API clients received a 200
+HTML page instead of an error, and scanners saw every probe succeed. Only the
+genuine client-side routes (`browse`, `upload`, `metrics`, `docs`, `admin`) now
+fall back to the app shell. Unmatched paths under `/_/api/` return a JSON 404
+and everything else returns a plain 404.
+
 ## v1.19.0 — 2026-08-10
 
 ### Added — Cross-instance protection for the delta reference baseline

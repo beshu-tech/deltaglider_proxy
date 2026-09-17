@@ -8,7 +8,7 @@ use axum::{
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
     routing::{delete, get, post, put},
-    Router,
+    Json, Router,
 };
 use rust_embed::Embed;
 use std::sync::Arc;
@@ -520,7 +520,45 @@ async fn static_or_fallback(Path(path): Path<String>) -> impl IntoResponse {
             .unwrap()
             .into_response()
     } else {
-        serve_index().into_response()
+        match fallback_for(&path) {
+            Fallback::SpaIndex => serve_index().into_response(),
+            Fallback::ApiNotFound => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not_found" })),
+            )
+                .into_response(),
+            Fallback::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
+        }
+    }
+}
+
+/// What `/_/<path>` serves when `<path>` is not an embedded asset.
+#[derive(Debug, PartialEq, Eq)]
+enum Fallback {
+    /// A client-side route of the SPA: serve `index.html` and let the
+    /// browser router take over (deep links, hard refresh).
+    SpaIndex,
+    /// An unmatched admin/API path: a JSON 404, never `index.html`, so API
+    /// clients and scanners get an honest answer instead of a 200 HTML page.
+    ApiNotFound,
+    /// Anything else (a missing asset, a source map, a typo): plain 404.
+    NotFound,
+}
+
+/// First URL segments the SPA router owns — mirrors `SEGMENT_TO_VIEW` in
+/// `demo/s3-browser/ui/src/urlState.ts`. Everything else under `/_/` is
+/// either an embedded asset or a 404.
+const SPA_ROUTE_SEGMENTS: &[&str] = &["browse", "upload", "metrics", "docs", "admin"];
+
+fn fallback_for(path: &str) -> Fallback {
+    if path == "api" || path.starts_with("api/") {
+        return Fallback::ApiNotFound;
+    }
+    let first = path.split('/').next().unwrap_or("");
+    if SPA_ROUTE_SEGMENTS.contains(&first) {
+        Fallback::SpaIndex
+    } else {
+        Fallback::NotFound
     }
 }
 
@@ -535,5 +573,46 @@ fn serve_index() -> Response {
                 .into_response()
         }
         None => (StatusCode::NOT_FOUND, "Demo UI not built").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spa_routes_fall_back_to_index() {
+        for p in [
+            "browse",
+            "browse/bucket/dir",
+            "upload",
+            "metrics/x",
+            "docs/how-to/x",
+            "admin/users",
+        ] {
+            assert_eq!(fallback_for(p), Fallback::SpaIndex, "{p}");
+        }
+    }
+
+    #[test]
+    fn unmatched_api_paths_are_json_404() {
+        assert_eq!(
+            fallback_for("api/admin/does-not-exist"),
+            Fallback::ApiNotFound
+        );
+        assert_eq!(fallback_for("api"), Fallback::ApiNotFound);
+    }
+
+    #[test]
+    fn everything_else_is_404() {
+        for p in [
+            "assets/index-abc.js.map",
+            "nope",
+            "index.htm",
+            "browsex",
+            "apix/y",
+        ] {
+            assert_eq!(fallback_for(p), Fallback::NotFound, "{p}");
+        }
     }
 }

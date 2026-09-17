@@ -29,6 +29,14 @@ function resolveBuildVersion(): string {
   return '?'
 }
 
+// Production builds ship no source maps: a map in the embedded bundle hands
+// the full UI source to anonymous callers. The Dockerfile sets PROD=true for
+// its UI build stage (`--build-arg PROD=false` restores the maps for a debug
+// image); a plain local `npm run build` keeps them.
+function isProdBuild(): boolean {
+  return ['1', 'true', 'yes', 'on'].includes((process.env.PROD ?? '').trim().toLowerCase())
+}
+
 export default defineConfig({
   plugins: [react()],
   base: '/_/',
@@ -42,9 +50,9 @@ export default defineConfig({
     __BUILD_VERSION__: JSON.stringify(resolveBuildVersion()),
   },
   build: {
-    // Kept ON for debugging the embedded admin UI; maps DO ship in the binary
-    // (DemoAssets embeds all of dist/) — an accepted tradeoff.
-    sourcemap: true,
+    // ON for dev builds (debugging the embedded admin UI), OFF under PROD —
+    // DemoAssets embeds all of dist/, so a map in dist/ is a map on prod.
+    sourcemap: !isProdBuild(),
     //
     // manualChunks: split heavy vendor libs out of the main shell so
     // the file-browser entry only downloads what it needs on first

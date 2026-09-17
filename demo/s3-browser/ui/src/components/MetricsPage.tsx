@@ -24,6 +24,7 @@ import { useVisiblePolling } from '../useVisiblePolling';
 import AnalyticsSection from './AnalyticsSection';
 import BucketScanCard from './BucketScanCard';
 import { useAdminConfig } from '../queries/config';
+import { useWhoami } from '../queries/whoami';
 import {
   AreaChart, Area, BarChart, Bar, Cell,
   XAxis, YAxis, Tooltip as RTooltip, ResponsiveContainer,
@@ -181,6 +182,7 @@ export default function MetricsPage({ onBack, embedded, search }: Props) {
   // Admin config is shared across panels; the cached read deduplicates
   // with whoever else mounted recently (CredentialsModePanel, etc.).
   const { data: adminConfigData } = useAdminConfig();
+  const { data: identity } = useWhoami();
   const adminConfig = adminConfigData ?? null;
   const prevRef = useRef<{ hits: number; misses: number; http: number; latencySum: number; latencyCount: number } | null>(null);
 
@@ -281,7 +283,12 @@ export default function MetricsPage({ onBack, embedded, search }: Props) {
     : '—';
 
   const buildMetric = m.get('deltaglider_build_info');
-  const buildVersion = buildMetric?.samples[0]?.labels.version || '?';
+  // The public /_/metrics scrape carries no build version by default (it
+  // would fingerprint the deployment for anonymous callers); the
+  // session-authenticated whoami does. The metric label stays as a fallback
+  // for operators who opted in with DGP_METRICS_EXPOSE_VERSION, then the
+  // UI's own build version.
+  const buildVersion = identity?.version || buildMetric?.samples[0]?.labels.version || __BUILD_VERSION__;
   const backendType = buildMetric?.samples[0]?.labels.backend_type || '?';
 
   const authAttempts = m.get('deltaglider_auth_attempts_total')?.samples.reduce((a, s) => a + s.value, 0) ?? 0;

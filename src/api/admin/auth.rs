@@ -68,7 +68,10 @@ pub struct WhoamiUserInfo {
 #[derive(Serialize)]
 pub struct WhoamiResponse {
     mode: String,
-    version: String,
+    /// Exact build version — present only for callers with a live session
+    /// (see [`build_version_for`]); omitted for anonymous callers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<WhoamiUserInfo>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -80,6 +83,14 @@ pub struct WhoamiResponse {
     lock_state: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     external_providers: Vec<ExternalProviderInfo>,
+}
+
+/// The `version` field of [`WhoamiResponse`]: the exact build version goes
+/// only to callers that hold a live session. The login page calls
+/// `/_/api/whoami` before any login (it needs `mode` and the provider list),
+/// so anonymous callers must not be able to fingerprint the deployment.
+fn build_version_for(session_valid: bool) -> Option<String> {
+    session_valid.then(|| env!("CARGO_PKG_VERSION").to_string())
 }
 
 /// Map the config-DB lock flag to the typed `lock_state` whoami field.
@@ -466,13 +477,15 @@ pub async fn whoami(
         IamState::Iam(_) => "iam",
     };
 
+    let client_ip = request_client_ip(&headers, connect_info.as_ref());
+    // Any live session (admin GUI, S3-browser lift, open-mode lift) may learn
+    // the version; an anonymous caller may not.
+    let session_valid = extract_session_token(&headers)
+        .map(|t| state.sessions.validate(&t, client_ip))
+        .unwrap_or(false);
+
     // If caller has a valid session, resolve user identity.
-    let user = resolve_session_user(
-        &state,
-        &headers,
-        request_client_ip(&headers, connect_info.as_ref()),
-    )
-    .await;
+    let user = resolve_session_user(&state, &headers, client_ip).await;
 
     // Include enabled external auth providers so the login page can show OAuth buttons.
     let external_providers = if let Some(ref ext_auth) = state.external_auth {
@@ -500,7 +513,7 @@ pub async fn whoami(
 
     Json(WhoamiResponse {
         mode: mode.into(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: build_version_for(session_valid),
         user,
         config_db_mismatch: state.config_db_mismatch,
         lock_state: lock_state_for(state.config_db_mismatch),
@@ -547,7 +560,8 @@ pub async fn resolve_iam_identity(
     let is_admin = crate::iam::permissions::is_admin(&user.permissions);
     Ok(Json(WhoamiResponse {
         mode: "iam".into(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        // The IAM credentials were verified just above — an authenticated caller.
+        version: build_version_for(true),
         user: Some(WhoamiUserInfo {
             name: user.name,
             access_key_id: user.access_key_id,
@@ -1220,6 +1234,15 @@ mod tests {
             .iter()
             .any(|p| p.actions == vec!["write"]));
         assert_eq!(effective.iam_policies.len(), 2);
+    }
+
+    #[test]
+    fn build_version_only_with_a_live_session() {
+        assert_eq!(build_version_for(false), None);
+        assert_eq!(
+            build_version_for(true).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 
     /// Adversarial: the session cookie must carry SameSite=Strict

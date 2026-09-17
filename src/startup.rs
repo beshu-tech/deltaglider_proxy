@@ -238,9 +238,13 @@ pub fn init_metrics(config: &Config) -> Arc<Metrics> {
         BackendConfig::Filesystem { .. } => "filesystem",
         BackendConfig::S3 { .. } => "s3",
     };
+    // The public scrape carries the exact version only on operator opt-in.
+    let version = deltaglider_proxy::metrics::build_info_version_label(
+        deltaglider_proxy::config::env_bool("DGP_METRICS_EXPOSE_VERSION", false),
+    );
     metrics
         .build_info
-        .with_label_values(&[env!("CARGO_PKG_VERSION"), backend_type])
+        .with_label_values(&[version, backend_type])
         .set(1.0);
     metrics
 }

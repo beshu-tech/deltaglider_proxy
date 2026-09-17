@@ -771,6 +771,127 @@ async fn test_metrics_endpoint_no_auth_needed() {
     );
 }
 
+/// Anonymous callers must not learn the exact build version: `/_/api/whoami`
+/// carries `version` only for a live session, and `deltaglider_build_info` on
+/// the public `/_/metrics` has an empty `version` label unless the operator
+/// opts in with `DGP_METRICS_EXPOSE_VERSION=true`.
+#[tokio::test]
+async fn test_build_version_is_not_disclosed_to_anonymous_callers() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let version = env!("CARGO_PKG_VERSION");
+    let whoami_url = format!("{}/_/api/whoami", server.endpoint());
+
+    let anon: serde_json::Value = reqwest::Client::new()
+        .get(&whoami_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        anon.get("version").is_none(),
+        "anonymous whoami leaked the version: {anon}"
+    );
+    assert!(
+        anon.get("mode").is_some(),
+        "the login page still needs `mode` before login: {anon}"
+    );
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let authed: serde_json::Value = admin
+        .get(&whoami_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        authed["version"], version,
+        "a live session must see the running version"
+    );
+
+    let metrics = metrics_text(&server.endpoint()).await;
+    assert!(
+        metrics.contains("deltaglider_build_info{"),
+        "build_info series must survive"
+    );
+    assert!(
+        !metrics.contains(&format!("version=\"{version}\"")),
+        "public /_/metrics leaked the version:\n{metrics}"
+    );
+}
+
+/// `DGP_METRICS_EXPOSE_VERSION=true` restores the `version` label for
+/// operators whose fleet dashboards key on it.
+#[tokio::test]
+async fn test_metrics_build_info_version_on_operator_opt_in() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_METRICS_EXPOSE_VERSION", "true")
+        .build()
+        .await;
+    let metrics = metrics_text(&server.endpoint()).await;
+    assert!(
+        metrics.contains(&format!("version=\"{}\"", env!("CARGO_PKG_VERSION"))),
+        "opt-in must put the version back on build_info:\n{metrics}"
+    );
+}
+
+/// Unknown paths under `/_/` are honest 404s — only genuine SPA routes fall
+/// back to `index.html`. A mistyped admin API path or a source map that is
+/// not shipped must not come back as a 200 HTML page.
+#[tokio::test]
+async fn test_unknown_ui_paths_are_404_not_spa_fallback() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let http = reqwest::Client::new();
+    let get = |p: &str| http.get(format!("{}{}", server.endpoint(), p)).send();
+
+    let api = get("/_/api/admin/does-not-exist").await.unwrap();
+    assert_eq!(api.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        api.json::<serde_json::Value>().await.unwrap()["error"],
+        "not_found"
+    );
+
+    for p in ["/_/assets/index-deadbeef.js.map", "/_/no-such-view"] {
+        assert_eq!(
+            get(p).await.unwrap().status(),
+            StatusCode::NOT_FOUND,
+            "{p} must be a 404, not the SPA shell"
+        );
+    }
+
+    // A genuine SPA route still serves the app. CI builds the UI before the
+    // Rust tests; a local checkout without `dist/` gets the explicit
+    // "Demo UI not built" 404 from `serve_index`, which is not a regression.
+    let spa = get("/_/browse").await.unwrap();
+    let status = spa.status();
+    let content_type = spa
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = spa.text().await.unwrap();
+    if status == StatusCode::NOT_FOUND && body == "Demo UI not built" {
+        eprintln!("skipping SPA-route assertion: demo UI not built");
+        return;
+    }
+    assert_eq!(status, StatusCode::OK, "/_/browse must serve the SPA shell");
+    assert!(
+        content_type.starts_with("text/html"),
+        "SPA shell must be HTML, got {content_type}"
+    );
+}
+
 /// HEAD / (connection probe) should be accessible without auth.
 #[tokio::test]
 async fn test_head_root_no_auth_needed() {
