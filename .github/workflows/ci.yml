@@ -18,10 +18,7 @@ permissions:
 env:
   BUILDER_IMAGE: ghcr.io/${{ github.repository }}/builder:latest
   # ── sccache: local MinIO compilation cache (NOT the CI test MinIO) ──
-  # TEMPORARY (measurement): sccache's store lives on the ryzen host and is
-  # unreachable from Ubicloud runners, so jobs compile cold. Restore
-  # `RUSTC_WRAPPER: sccache` together with `runs-on: k3s` before merging.
-  RUSTC_WRAPPER: ""
+  RUSTC_WRAPPER: sccache
   CARGO_INCREMENTAL: "0"
   SCCACHE_BUCKET: sccache-rust
   SCCACHE_ENDPOINT: http://sccache-minio.sccache.svc.cluster.local:9000
@@ -38,7 +35,7 @@ jobs:
   # re-running `npm ci` / `cargo build --release`.
   build-ui:
     name: Build UI (dist artifact)
-    runs-on: ubicloud-standard-4  # TEMPORARY (measurement): was k3s
+    runs-on: k3s
     timeout-minutes: 10
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -65,7 +62,7 @@ jobs:
 
   build-bin:
     name: Build release binary (artifact)
-    runs-on: ubicloud-standard-4  # TEMPORARY (measurement): was k3s
+    runs-on: k3s
     timeout-minutes: 20
     needs: build-ui
     container:
@@ -152,7 +149,7 @@ jobs:
 
   fmt:
     name: Rustfmt
-    runs-on: ubicloud-standard-4  # TEMPORARY (measurement): was k3s
+    runs-on: k3s
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       # Raise the open-file limit. These jobs run on the self-hosted
@@ -180,7 +177,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubicloud-standard-4  # TEMPORARY (measurement): was k3s
+    runs-on: k3s
     needs: build-ui
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -255,7 +252,7 @@ jobs:
 
   test-unit:
     name: Unit Tests
-    runs-on: ubicloud-standard-4  # TEMPORARY (measurement): was k3s
+    runs-on: k3s
     needs: build-ui
     timeout-minutes: 15
     container:
@@ -297,7 +294,7 @@ jobs:
     if: >-
       github.event_name != 'push' ||
       contains(github.event.head_commit.message, '[ci-integration]')
-    runs-on: ubicloud-standard-4  # TEMPORARY (measurement): was k3s
+    runs-on: k3s
     needs: build-ui
     timeout-minutes: 50
     container:
@@ -466,7 +463,7 @@ jobs:
 
   test-delta:
     name: Delta & Optimization Tests
-    runs-on: ubicloud-standard-4  # TEMPORARY (measurement): was k3s
+    runs-on: k3s
     needs: build-ui
     timeout-minutes: 15
     container:
@@ -505,7 +502,7 @@ jobs:
 
   e2e-smoke:
     name: E2E smoke (embedded UI)
-    runs-on: ubicloud-standard-4  # TEMPORARY (measurement): was k3s
+    runs-on: k3s
     needs: build-bin
     timeout-minutes: 35
     container:
@@ -547,7 +544,7 @@ jobs:
 
   frontend-lint:
     name: Frontend Lint
-    runs-on: ubicloud-standard-4  # TEMPORARY (measurement): was k3s
+    runs-on: k3s
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       # Raise the open-file limit. These jobs run on the self-hosted
@@ -632,7 +629,7 @@ jobs:
 
   docs:
     name: Docs bundling + link check + YAML examples
-    runs-on: ubicloud-standard-4  # TEMPORARY (measurement): was k3s
+    runs-on: k3s
     needs: build-bin
     # The from-scratch release build (the old dominant cost) is gone — the
     # config-lint now consumes the shared build-bin artifact. Only the docs
@@ -721,7 +718,7 @@ jobs:
 
   config-schema:
     name: Config JSON Schema
-    runs-on: ubicloud-standard-4  # TEMPORARY (measurement): was k3s
+    runs-on: k3s
     needs: build-bin
     timeout-minutes: 10
     container:
