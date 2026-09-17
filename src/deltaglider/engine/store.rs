@@ -24,6 +24,10 @@ pub struct PassthroughMultipartHandle {
     total_size: u64,
     content_type: Option<String>,
     user_metadata: HashMap<String, String>,
+    /// Similarity sketch of the bytes being uploaded (the copy source's, on
+    /// the streaming copy path). Stamped at create time (S3 writes user
+    /// metadata only then) and again on the final `FileMetadata`.
+    sketch: Option<String>,
     upload: MultipartUpload,
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
@@ -115,6 +119,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Calculate hashes
         let sha256 = hex::encode(Sha256::digest(data));
         let md5 = hex::encode(Md5::digest(data));
+        let sketch = Some(crate::deltaglider::sketch::sketch_hex(data));
 
         info!(
             "Storing {}/{} ({} bytes, sha256={})",
@@ -148,6 +153,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 content_type,
                 user_metadata,
                 multipart_etag: multipart_etag.clone(),
+                sketch: sketch.clone(),
             };
             let result = self.store_passthrough(ctx).await?;
             // Write succeeded — now safe to clean up old delta variant
@@ -184,6 +190,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             content_type,
             user_metadata,
             multipart_etag,
+            sketch,
         };
 
         // Check if deltaspace already has a reference (existing deltaspace).
@@ -366,7 +373,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // `size` (source overwritten mid-stream, or a stale/corrupt xattr
         // file_size on a filesystem source) — else we'd stamp file_size=declared
         // over a sha256 of DIFFERENT bytes. Matches the multipart-relay guard.
-        let (sha256, md5, observed) = Self::hash_spool_file(body.path()).await?;
+        let (sha256, md5, observed, sketch) = Self::hash_spool_file(body.path()).await?;
         if observed != size {
             return Err(EngineError::Storage(StorageError::Other(format!(
                 "Spooled object size mismatch: declared {size}, observed {observed}"
@@ -412,7 +419,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // path below: the first member self-deltas (tiny) against its own fresh
         // reference, exactly like the buffered baseline branch.
         if !has_existing_reference {
-            let ref_meta = FileMetadata::new_reference(
+            let mut ref_meta = FileMetadata::new_reference(
                 Self::INTERNAL_REFERENCE_NAME.to_string(),
                 obj_key.full_key(),
                 sha256.clone(),
@@ -420,6 +427,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 size,
                 content_type.clone(),
             );
+            ref_meta.sketch = Some(sketch.clone());
             self.storage
                 .put_reference_from_file(bucket, &deltaspace_id, body.path(), &ref_meta)
                 .await?;
@@ -594,6 +602,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         content_type.clone(),
                         user_metadata.clone(),
                         multipart_etag.clone(),
+                        Some(sketch.clone()),
                     )
                     .await?;
                 drop((ref_spool, delta_spool, _guard, _xnode_guard));
@@ -621,6 +630,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: Option<String>,
+        sketch: Option<String>,
     ) -> Result<StoreResult, EngineError> {
         let ref_meta = self
             .storage
@@ -643,6 +653,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
         metadata.user_metadata = user_metadata;
         metadata.multipart_etag = multipart_etag;
+        metadata.sketch = sketch;
         let stored_size = delta.len() as u64;
         self.storage
             .put_delta(bucket, deltaspace_id, &obj_key.filename, &delta, &metadata)
@@ -750,6 +761,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
         metadata.user_metadata = ctx.user_metadata;
         metadata.multipart_etag = ctx.multipart_etag;
+        metadata.sketch = ctx.sketch.clone();
 
         // Write delta first, then clean up old passthrough variant
         self.storage
@@ -779,7 +791,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self,
         ctx: &StoreContext<'_>,
     ) -> Result<FileMetadata, EngineError> {
-        let metadata = FileMetadata::new_reference(
+        let mut metadata = FileMetadata::new_reference(
             Self::INTERNAL_REFERENCE_NAME.to_string(),
             ctx.obj_key.full_key(),
             ctx.sha256.clone(),
@@ -787,6 +799,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ctx.data.len() as u64,
             ctx.content_type.clone(),
         );
+        metadata.sketch = ctx.sketch.clone();
 
         self.storage
             .put_reference(ctx.bucket, ctx.deltaspace_id, ctx.data, &metadata)
@@ -850,8 +863,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.storage
             .get_reference_to_file(bucket, deltaspace_id, spool.path())
             .await?;
-        let (sha256, md5, size) = Self::hash_spool_file(spool.path()).await?;
-        let healed = FileMetadata::new_reference(
+        let (sha256, md5, size, sketch) = Self::hash_spool_file(spool.path()).await?;
+        let mut healed = FileMetadata::new_reference(
             Self::INTERNAL_REFERENCE_NAME.to_string(),
             // source_name is cosmetic (display/label only; not used by decode,
             // verify, or replication compare). A stable placeholder that equals
@@ -862,6 +875,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             size,
             ref_meta.content_type.clone(),
         );
+        // Same streaming pass as the hashes — stamp it like the fresh-reference
+        // path does, or the healed reference drops out of the similarity index.
+        healed.sketch = Some(sketch);
         self.storage
             .put_reference_from_file(bucket, deltaspace_id, spool.path(), &healed)
             .await?;
@@ -870,16 +886,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(healed)
     }
 
-    /// Stream-hash a spool file → (sha256_hex, md5_hex, byte_len). Bounded
-    /// memory (256KiB chunks). Shared by the store hash path and the reference
-    /// heal.
-    async fn hash_spool_file(path: &Path) -> Result<(String, String, u64), EngineError> {
+    /// Stream-hash a spool file → (sha256_hex, md5_hex, byte_len, sketch_hex).
+    /// Bounded memory (256KiB chunks). The sketch is computed in the same
+    /// streaming pass as the hashes — zero extra I/O. Shared by the store
+    /// hash path and the reference heal.
+    async fn hash_spool_file(path: &Path) -> Result<(String, String, u64, String), EngineError> {
         let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || -> std::io::Result<(String, String, u64)> {
+        tokio::task::spawn_blocking(move || -> std::io::Result<(String, String, u64, String)> {
             use std::io::Read;
             let mut f = std::fs::File::open(&path)?;
             let mut sh = Sha256::new();
             let mut mh = Md5::new();
+            let mut sketch_builder = crate::deltaglider::sketch::SketchBuilder::new();
             let mut observed: u64 = 0;
             let mut buf = vec![0u8; 256 * 1024];
             loop {
@@ -890,11 +908,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 observed = observed.saturating_add(n as u64);
                 sh.update(&buf[..n]);
                 mh.update(&buf[..n]);
+                sketch_builder.update(&buf[..n]);
             }
             Ok((
                 hex::encode(sh.finalize()),
                 hex::encode(mh.finalize()),
                 observed,
+                hex::encode(sketch_builder.finalize()),
             ))
         })
         .await
@@ -998,15 +1018,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         let (obj_key, deltaspace_id) = Self::validated_key_ingest(bucket, key)?;
 
-        // Compute SHA256 + MD5 incrementally across chunks
+        // Compute SHA256 + MD5 + sketch incrementally across chunks
         let mut sha256_hasher = Sha256::new();
         let mut md5_hasher = Md5::new();
+        let mut sketch_builder = crate::deltaglider::sketch::SketchBuilder::new();
         for chunk in chunks {
             sha256_hasher.update(chunk);
             md5_hasher.update(chunk);
+            sketch_builder.update(chunk);
         }
         let sha256 = hex::encode(sha256_hasher.finalize());
         let md5 = hex::encode(md5_hasher.finalize());
+        let sketch = hex::encode(sketch_builder.finalize());
 
         info!(
             "Storing chunked {}/{} ({} bytes, {} chunks, sha256={})",
@@ -1028,6 +1051,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
         metadata.user_metadata = user_metadata;
         metadata.multipart_etag = multipart_etag;
+        metadata.sketch = Some(sketch);
 
         self.storage
             .put_passthrough_chunked(bucket, &deltaspace_id, &obj_key.filename, chunks, &metadata)
@@ -1071,6 +1095,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         let mut sha256_hasher = Sha256::new();
         let mut md5_hasher = Md5::new();
+        let mut sketch_builder = crate::deltaglider::sketch::SketchBuilder::new();
         let mut observed = 0u64;
         let mut buf = vec![0u8; 1024 * 1024];
         for path in part_paths {
@@ -1085,6 +1110,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 observed = observed.saturating_add(n as u64);
                 sha256_hasher.update(&buf[..n]);
                 md5_hasher.update(&buf[..n]);
+                sketch_builder.update(&buf[..n]);
             }
         }
         if observed != total_size {
@@ -1095,6 +1121,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
         let sha256 = hex::encode(sha256_hasher.finalize());
         let md5 = hex::encode(md5_hasher.finalize());
+        let sketch = hex::encode(sketch_builder.finalize());
         let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
 
         let mut metadata = FileMetadata::new_passthrough(
@@ -1106,6 +1133,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
         metadata.user_metadata = user_metadata;
         metadata.multipart_etag = Some(multipart_etag);
+        metadata.sketch = Some(sketch);
 
         self.storage
             .put_passthrough_parts(
@@ -1158,6 +1186,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let mut buf = vec![0u8; 1024 * 1024];
         let mut sha256_hasher = Sha256::new();
         let mut md5_hasher = Md5::new();
+        let mut sketch_builder = crate::deltaglider::sketch::SketchBuilder::new();
         let mut observed = 0u64;
         loop {
             let n = file.read(&mut buf).await.map_err(StorageError::from)?;
@@ -1167,6 +1196,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             observed = observed.saturating_add(n as u64);
             sha256_hasher.update(&buf[..n]);
             md5_hasher.update(&buf[..n]);
+            sketch_builder.update(&buf[..n]);
         }
         if observed != total_size {
             return Err(EngineError::Storage(StorageError::Other(format!(
@@ -1176,6 +1206,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
         let sha256 = hex::encode(sha256_hasher.finalize());
         let md5 = hex::encode(md5_hasher.finalize());
+        let sketch = hex::encode(sketch_builder.finalize());
         let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
 
         let mut metadata = FileMetadata::new_passthrough(
@@ -1187,6 +1218,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
         metadata.user_metadata = user_metadata;
         metadata.multipart_etag = Some(multipart_etag);
+        metadata.sketch = Some(sketch);
 
         self.storage
             .put_passthrough_file(
@@ -1219,7 +1251,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// holds it for the lifetime of the returned handle, mirroring
     /// `store_passthrough_chunked_inner`. The caller drives parts via
     /// [`Self::upload_passthrough_part`] then finalizes with
-    /// [`Self::finish_passthrough_multipart`] (or aborts).
+    /// [`Self::finish_passthrough_multipart`] (or aborts). `sketch` is the
+    /// similarity sketch of the bytes about to be uploaded (a streaming copy
+    /// passes the source's); `None` leaves the object out of the index.
     #[allow(clippy::too_many_arguments)]
     pub async fn begin_passthrough_multipart(
         &self,
@@ -1228,6 +1262,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         total_size: u64,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
+        sketch: Option<String>,
     ) -> Result<PassthroughMultipartHandle, EngineError> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
@@ -1245,6 +1280,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             content_type.clone(),
         );
         create_meta.user_metadata = user_metadata.clone();
+        create_meta.sketch = sketch.clone();
 
         let upload = self
             .storage
@@ -1259,6 +1295,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             total_size,
             content_type,
             user_metadata,
+            sketch,
             upload,
             _guard: guard,
         })
@@ -1320,6 +1357,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
         metadata.user_metadata = std::mem::take(&mut handle.user_metadata);
         metadata.multipart_etag = multipart_etag;
+        metadata.sketch = handle.sketch.take();
 
         if let Err(e) = self
             .storage
@@ -1387,6 +1425,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         );
         metadata.user_metadata = ctx.user_metadata;
         metadata.multipart_etag = ctx.multipart_etag;
+        metadata.sketch = ctx.sketch.clone();
 
         self.storage
             .put_passthrough(

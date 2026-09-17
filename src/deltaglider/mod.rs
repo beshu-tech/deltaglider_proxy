@@ -7,6 +7,7 @@ mod codec;
 mod engine;
 mod file_router;
 pub mod savings;
+pub mod sketch;
 pub mod spool;
 
 pub use cache::ReferenceCache;
