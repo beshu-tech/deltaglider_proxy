@@ -18,15 +18,13 @@ jobs:
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
     runs-on: k3s
-    # Same builder container as ci.yml, on purpose. The k3s runners persist one
-    # checkout per repo, and the ci.yml container jobs write it as root. On the
-    # bare runner actions/checkout itself succeeds (it adds a temporary
-    # safe.directory and removes it again in its `finally`), but the action's
-    # own `git config user.name` that follows runs without that entry, git
-    # treats the foreign-owned checkout as no repository, and the job dies with
-    # "fatal: not in a git directory". Inside the container every job runs as
-    # the same uid, so the ownership check never fires. (`unzip`, which the
-    # action's Bun bootstrap needs, is baked into the image.)
+    # Same builder container as ci.yml so the toolchain (and `unzip` for the
+    # action's Bun bootstrap) is the image's, not a per-run apt-get. The
+    # checkout under /__w is written by the bare runner as `runner`, and the
+    # container runs as root, so git treats it as foreign-owned; actions/checkout
+    # adds a temporary safe.directory for its own commands and removes it in
+    # its `finally`, so the action's later `git config user.name` fails with
+    # "fatal: not in a git directory" unless we add the entry ourselves.
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
@@ -50,6 +48,9 @@ jobs:
       # image. A no-op when the image already has it.
       - name: Make sure unzip is present
         run: command -v unzip >/dev/null || (apt-get update -qq && apt-get install -y -qq --no-install-recommends unzip >/dev/null)
+
+      - name: Trust the checkout for the action's own git commands
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Run Claude Code
         id: claude
