@@ -12,14 +12,9 @@ COPY docs/ /app/docs/
 # guard below reads it to prove the built dist/ carries neither. Copying it
 # also makes a version bump invalidate this layer.
 COPY Cargo.toml /app/Cargo.toml
-COPY scripts/check-bundle-fingerprints.sh /app/scripts/check-bundle-fingerprints.sh
-# Production image: no frontend source maps (they would ship the full UI
-# source to anonymous callers — see vite.config.ts). `--build-arg PROD=false`
-# restores them for a debug image (the guard then reports them and the build
-# fails — a debug image is not a release image).
-ARG PROD=true
-ENV PROD=${PROD}
-RUN npm run build && /app/scripts/check-bundle-fingerprints.sh dist /app/Cargo.toml
+# No frontend source maps: they are opt-in in vite.config.ts (DGP_UI_SOURCEMAP=1)
+# because dist/ is embedded and served to anonymous callers.
+RUN npm run build
 
 # ── Build stage: Rust ──
 # Pin the Rust toolchain (the floating `rust:1-bookworm` tag drifts and has
@@ -50,6 +45,11 @@ COPY docs/product/ docs/product/
 # failure — the bench was added to Cargo.toml but never copied into the image.
 COPY benches/ benches/
 COPY --from=ui-build /app/demo/s3-browser/ui/dist demo/s3-browser/ui/dist
+# Fingerprint guard on the dist this binary embeds. It runs HERE, not in the
+# node:alpine UI stage: that image has no bash and its BusyBox grep has no
+# --include, which would make the script fail (or, worse, pass vacuously).
+COPY scripts/check-bundle-fingerprints.sh scripts/check-bundle-fingerprints.sh
+RUN ./scripts/check-bundle-fingerprints.sh demo/s3-browser/ui/dist Cargo.toml
 RUN cargo build --release
 
 # ── Runtime ──

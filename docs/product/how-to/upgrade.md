@@ -206,7 +206,7 @@ With `DGP_ENCRYPTION_KEY` in the environment unchanged.
 After any upgrade or migration:
 
 - [ ] `/_/health` returns HTTP 200.
-- [ ] `/_/api/whoami` reports the expected `version`.
+- [ ] `/_/api/whoami` (with an admin session cookie — anonymous callers do not get `version`) reports the expected `version`.
 - [ ] An existing object downloads byte-identical: `aws s3 cp s3://releases/known-file ./out && sha256sum out` matches the known checksum.
 - [ ] The admin UI logs in with the bootstrap password (or OAuth) on the first try.
 - [ ] `/_/admin/diagnostics/audit` shows recent entries — the audit ring is populating.

@@ -19,12 +19,15 @@ jobs:
     #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
 
     runs-on: k3s
-    # Same builder container as ci.yml, on purpose: the k3s runners persist
-    # one shared checkout per repo, and the ci.yml container jobs write it as
-    # root. A job that runs on the bare runner (uid `runner`) then finds
-    # root-owned .git files and every git command — including
-    # actions/checkout's own safe.directory setup — fails with
-    # "fatal: not in a git directory". One uid for every job removes that.
+    # Same builder container as ci.yml, on purpose. The k3s runners persist one
+    # checkout per repo, and the ci.yml container jobs write it as root. On the
+    # bare runner actions/checkout itself succeeds (it adds a temporary
+    # safe.directory and removes it again in its `finally`), but the action's
+    # own `git config user.name` that follows runs without that entry, git
+    # treats the foreign-owned checkout as no repository, and the job dies with
+    # "fatal: not in a git directory". Inside the container every job runs as
+    # the same uid, so the ownership check never fires. (`unzip`, which the
+    # action's Bun bootstrap needs, is baked into the image.)
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
@@ -41,11 +44,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-
-      # The action bootstraps Bun through setup-bun, which shells out to
-      # `unzip`; the builder image does not ship it.
-      - name: Install unzip for the action's Bun bootstrap
-        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends unzip >/dev/null
 
       - name: Run Claude Code Review
         id: claude-review
