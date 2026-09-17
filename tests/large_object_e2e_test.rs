@@ -25,9 +25,36 @@ use serde_json::Value;
 
 const MIB: usize = 1024 * 1024;
 
+/// Per-test bucket pair on the shared S3 backend.
+///
+/// The tests in this binary run in parallel against ONE backend and seed the
+/// same deterministic body (`big_passthrough_body` is a fixed xorshift
+/// stream, so every `big.bin` has the same ETag). On shared buckets a
+/// sibling's replication run can land `big.bin` in the destination first;
+/// this test's run then sees nothing newer to copy and reports 0 parts —
+/// which is exactly what a fast runner exposed. A unique pair per test keeps
+/// the assertions about this test's own run.
+struct Buckets {
+    src: String,
+    dst: String,
+}
+
+impl Buckets {
+    fn unique() -> Self {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        Self {
+            src: format!("e2e-src-{suffix}"),
+            dst: format!("e2e-dst-{suffix}"),
+        }
+    }
+}
+
 /// Replication rule (src → dst) with the given object/part concurrency,
 /// substituted into the storage section so each test shapes its own geometry.
-fn rule_yaml(transfers: u32, upload_concurrency: u32) -> String {
+fn rule_yaml(b: &Buckets, transfers: u32, upload_concurrency: u32) -> String {
     format!(
         "
 replication:
@@ -39,14 +66,16 @@ replication:
     - name: e2e
       enabled: true
       source:
-        bucket: e2e-src
+        bucket: {src}
         prefix: \"\"
       destination:
-        bucket: e2e-dst
+        bucket: {dst}
         prefix: \"\"
       interval: \"1h\"
       batch_size: 100
-"
+",
+        src = b.src,
+        dst = b.dst,
     )
 }
 
@@ -89,16 +118,16 @@ async fn run_now_ok(server: &TestServer) -> Value {
     run
 }
 
-/// Seed one passthrough `.bin` into the source bucket.
-async fn seed_passthrough(server: &TestServer, key: &str, len: usize) -> Vec<u8> {
+/// Seed one passthrough `.bin` into this test's source bucket.
+async fn seed_passthrough(server: &TestServer, b: &Buckets, key: &str, len: usize) -> Vec<u8> {
     let body = big_passthrough_body(len);
     let client = server.s3_client().await;
-    for b in ["e2e-src", "e2e-dst"] {
-        client.create_bucket().bucket(b).send().await.ok();
+    for bucket in [&b.src, &b.dst] {
+        client.create_bucket().bucket(bucket).send().await.ok();
     }
     client
         .put_object()
-        .bucket("e2e-src")
+        .bucket(&b.src)
         .key(key)
         .body(ByteStream::from(body.clone()))
         .send()
@@ -118,17 +147,18 @@ async fn seed_passthrough(server: &TestServer, key: &str, len: usize) -> Vec<u8>
 #[tokio::test]
 async fn memory_bounded_resident_part_bytes() {
     skip_unless_minio!();
+    let b = Buckets::unique();
     let obj_size = 64 * MIB;
     let server = TestServer::builder()
         .auth("k", "s")
         .s3_endpoint(&minio_endpoint_url())
-        .extra_yaml_storage_section(&rule_yaml(1, 2))
+        .extra_yaml_storage_section(&rule_yaml(&b, 1, 2))
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576") // 1 MiB
         .env("DGP_MULTIPART_PART_SIZE", "5242880") // 5 MiB (S3 min)
         .build()
         .await;
 
-    seed_passthrough(&server, "big.bin", obj_size).await;
+    seed_passthrough(&server, &b, "big.bin", obj_size).await;
     run_now_ok(&server).await;
 
     let m = metrics_snapshot(&server.endpoint()).await;
@@ -159,18 +189,19 @@ async fn memory_bounded_resident_part_bytes() {
 #[tokio::test]
 async fn part_count_matches_plan() {
     skip_unless_minio!();
+    let b = Buckets::unique();
     let obj_size = 64 * MIB;
     let part_size: u64 = 5 * MIB as u64;
     let server = TestServer::builder()
         .auth("k", "s")
         .s3_endpoint(&minio_endpoint_url())
-        .extra_yaml_storage_section(&rule_yaml(1, 2))
+        .extra_yaml_storage_section(&rule_yaml(&b, 1, 2))
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576")
         .env("DGP_MULTIPART_PART_SIZE", &part_size.to_string())
         .build()
         .await;
 
-    seed_passthrough(&server, "big.bin", obj_size).await;
+    seed_passthrough(&server, &b, "big.bin", obj_size).await;
     run_now_ok(&server).await;
 
     let expected = deltaglider_proxy::transfer_plan::plan_parts(obj_size as u64, part_size).len();
@@ -192,12 +223,13 @@ async fn part_count_matches_plan() {
 #[tokio::test]
 async fn inflight_parts_reach_concurrency() {
     skip_unless_minio!();
+    let b = Buckets::unique();
     let concurrency: u32 = 3;
     let obj_size = 32 * MIB; // 5 MiB parts → ~7 parts, >= concurrency
     let server = TestServer::builder()
         .auth("k", "s")
         .s3_endpoint(&minio_endpoint_url())
-        .extra_yaml_storage_section(&rule_yaml(1, concurrency))
+        .extra_yaml_storage_section(&rule_yaml(&b, 1, concurrency))
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576")
         .env("DGP_MULTIPART_PART_SIZE", "5242880")
         .env("DGP_TEST_PART_BARRIER", "1")
@@ -205,7 +237,7 @@ async fn inflight_parts_reach_concurrency() {
         .build()
         .await;
 
-    seed_passthrough(&server, "big.bin", obj_size).await;
+    seed_passthrough(&server, &b, "big.bin", obj_size).await;
     run_now_ok(&server).await;
 
     let m = metrics_snapshot(&server.endpoint()).await;
@@ -226,10 +258,11 @@ async fn inflight_parts_reach_concurrency() {
 #[tokio::test]
 async fn inflight_objects_overlap() {
     skip_unless_minio!();
+    let b = Buckets::unique();
     let server = TestServer::builder()
         .auth("k", "s")
         .s3_endpoint(&minio_endpoint_url())
-        .extra_yaml_storage_section(&rule_yaml(2, 2))
+        .extra_yaml_storage_section(&rule_yaml(&b, 2, 2))
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576")
         .env("DGP_MULTIPART_PART_SIZE", "5242880")
         .env("DGP_TEST_OBJECT_BARRIER", "1")
@@ -239,7 +272,7 @@ async fn inflight_objects_overlap() {
 
     // Three objects so a transfers=2 batch must overlap at least two.
     for i in 0..3 {
-        seed_passthrough(&server, &format!("obj-{i}.bin"), 8 * MIB).await;
+        seed_passthrough(&server, &b, &format!("obj-{i}.bin"), 8 * MIB).await;
     }
     run_now_ok(&server).await;
 
@@ -263,18 +296,19 @@ async fn inflight_objects_overlap() {
 #[tokio::test]
 async fn per_part_resume_single_retry() {
     skip_unless_minio!();
+    let b = Buckets::unique();
     let obj_size = 32 * MIB;
     let server = TestServer::builder()
         .auth("k", "s")
         .s3_endpoint(&minio_endpoint_url())
-        .extra_yaml_storage_section(&rule_yaml(1, 2))
+        .extra_yaml_storage_section(&rule_yaml(&b, 1, 2))
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576")
         .env("DGP_MULTIPART_PART_SIZE", "5242880")
         .env("DGP_TEST_FAIL_PART_ONCE", "2") // fail part #2 exactly once
         .build()
         .await;
 
-    let body = seed_passthrough(&server, "big.bin", obj_size).await;
+    let body = seed_passthrough(&server, &b, "big.bin", obj_size).await;
     run_now_ok(&server).await;
 
     let m = metrics_snapshot(&server.endpoint()).await;
@@ -288,7 +322,7 @@ async fn per_part_resume_single_retry() {
     let client = server.s3_client().await;
     let got = client
         .get_object()
-        .bucket("e2e-dst")
+        .bucket(&b.dst)
         .key("big.bin")
         .send()
         .await
