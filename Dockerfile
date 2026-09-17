@@ -4,22 +4,22 @@ WORKDIR /app/demo/s3-browser/ui
 COPY demo/s3-browser/ui/package.json demo/s3-browser/ui/package-lock.json ./
 RUN npm ci
 COPY demo/s3-browser/ui/ ./
-# docs/ is referenced by src/docs-imports.ts via relative path (../../../../docs/)
+# docs/screenshots/ is synced into the UI by scripts/copy-screenshots.mjs
+# (prebuild hook). The markdown itself is NOT bundled — see the Rust stage.
 COPY docs/ /app/docs/
-# Cargo.toml is the single source of truth for the version string.
-# vite.config.ts reads it at build time to embed __BUILD_VERSION__ into
-# the bundle (see `resolveBuildVersion()` there). Copying it here also
-# doubles as a cache key: a version bump invalidates this layer and
-# forces `npm run build` to run — which re-evaluates `new Date()` in
-# the vite define, so __BUILD_TIME__ stays honest across version bumps
-# instead of freezing at the first-ever-built timestamp.
+# Cargo.toml is the single source of truth for the version string. The
+# bundle deliberately does NOT embed it (nor a build time): the fingerprint
+# guard below reads it to prove the built dist/ carries neither. Copying it
+# also makes a version bump invalidate this layer.
 COPY Cargo.toml /app/Cargo.toml
+COPY scripts/check-bundle-fingerprints.sh /app/scripts/check-bundle-fingerprints.sh
 # Production image: no frontend source maps (they would ship the full UI
 # source to anonymous callers — see vite.config.ts). `--build-arg PROD=false`
-# restores them for a debug image.
+# restores them for a debug image (the guard then reports them and the build
+# fails — a debug image is not a release image).
 ARG PROD=true
 ENV PROD=${PROD}
-RUN npm run build
+RUN npm run build && /app/scripts/check-bundle-fingerprints.sh dist /app/Cargo.toml
 
 # ── Build stage: Rust ──
 # Pin the Rust toolchain (the floating `rust:1-bookworm` tag drifts and has
@@ -41,6 +41,9 @@ RUN apt-get -o Acquire::Retries=3 update && apt-get install -y --no-install-reco
 WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
+# Product docs are embedded in the binary (rust-embed in src/demo.rs) and
+# served session-gated at /_/api/docs.
+COPY docs/product/ docs/product/
 # Cargo.toml declares `[[bench]] name = "codec"` → cargo needs benches/codec.rs
 # present to even PARSE the manifest (without it: "can't find `codec` bench …
 # failed to parse manifest"). This was the real cause of the release build

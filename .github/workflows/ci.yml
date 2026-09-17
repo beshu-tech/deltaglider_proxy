@@ -48,7 +48,11 @@ jobs:
         run: rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Build demo UI
-        run: cd demo/s3-browser/ui && npm ci && npm run build
+        run: cd demo/s3-browser/ui && npm ci && PROD=true npm run build
+      # The built dist/ is served to anonymous callers: it must carry no
+      # version, build time, inlined docs, or source maps.
+      - name: Bundle fingerprint guard
+        run: ./scripts/check-bundle-fingerprints.sh demo/s3-browser/ui/dist Cargo.toml
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ui-dist
@@ -578,6 +582,7 @@ jobs:
         run: |
           cd demo/s3-browser/ui
           npm run test:permissions
+          npm run test:docs-bundle
           npm run test:storage-path
           npm run test:page-size
           npm run test:condition-prefix-rows
@@ -649,9 +654,9 @@ jobs:
         run: |
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      # ── Blocking: every .md under docs/product/ is registered in
-      #    demo/s3-browser/ui/src/docs-imports.ts, and no dev docs
-      #    (docs/dev/**) sneak into the product bundle. ──
+      # ── Blocking: every .md under docs/product/ has a manifest entry
+      #    (and vice versa) — the binary embeds that folder and serves it
+      #    at /_/api/docs — and no dev docs (docs/dev/**) sneak in. ──
       - name: Docs registry allow-list
         run: ./scripts/check-docs-registry.sh
       # ── Blocking: the bundled changelog doc (docs/product/changelog.md)

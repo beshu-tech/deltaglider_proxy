@@ -4,7 +4,9 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeSlug from 'rehype-slug';
 import mermaid from 'mermaid';
-import { DOCS, DOC_GROUPS, findDocByFilename, type DocEntry } from '../docs-imports';
+import { Spin } from 'antd';
+import { findDocByFilename, type DocEntry } from '../docsBundle';
+import { useDocs } from '../queries/docs';
 import { useColors, useTheme } from '../ThemeContext';
 import FullScreenHeader from './FullScreenHeader';
 import DocSearch from './DocSearch';
@@ -203,9 +205,19 @@ interface Props {
   onShowShortcuts?: () => void;
 }
 
+const EMPTY_DOCS: DocEntry[] = [];
+const EMPTY_GROUPS: readonly string[] = [];
+
 export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }: Props) {
   const colors = useColors();
   const { navigate } = useNavigation();
+
+  // Docs arrive at runtime from the session-gated /_/api/docs (see
+  // docsBundle.ts for why they are not in the bundle). Until they land,
+  // DOCS is empty and the page shows a spinner instead of the landing.
+  const { data: bundle, isError: docsFailed } = useDocs();
+  const DOCS = bundle?.docs ?? EMPTY_DOCS;
+  const DOC_GROUPS = bundle?.groups ?? EMPTY_GROUPS;
 
   // Resolve doc ID: URL-driven if provided, else default to first doc
   const resolvedId = (docId && DOCS.some(d => d.id === docId)) ? docId : DOCS[0]?.id || '';
@@ -220,7 +232,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
     } else if (!docId) {
       setSelectedIdState(DOCS[0]?.id || '');
     }
-  }, [docId]);
+  }, [docId, DOCS]);
 
   // Navigate + update state when user selects a doc
   const setSelectedId = useCallback((id: string) => {
@@ -230,7 +242,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
   const [activeHeading, setActiveHeading] = useState('');
   const contentRef = useRef<HTMLDivElement>(null);
 
-  const selectedDoc = useMemo(() => DOCS.find(d => d.id === selectedId), [selectedId]);
+  const selectedDoc = useMemo(() => DOCS.find(d => d.id === selectedId), [selectedId, DOCS]);
   const headings = useMemo(() => selectedDoc ? extractHeadings(selectedDoc.content) : [], [selectedDoc]);
 
   // Scroll to top when doc changes
@@ -263,13 +275,13 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
 
   // Inter-page link handler
   const handleLinkClick = useCallback((href: string) => {
-    const doc = findDocByFilename(href);
+    const doc = findDocByFilename(DOCS, href);
     if (doc) {
       setSelectedId(doc.id);
       return true;
     }
     return false;
-  }, [setSelectedId]);
+  }, [setSelectedId, DOCS]);
 
   // Group docs by category, sort within each group by the `order`
   // field (stable across title edits).
@@ -282,7 +294,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
     }
     for (const [, docs] of map) docs.sort((a, b) => a.order - b.order);
     return map;
-  }, []);
+  }, [DOCS, DOC_GROUPS]);
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
@@ -299,7 +311,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
         display: 'flex',
         flexDirection: 'column',
       }}>
-        <DocSearch onSelect={setSelectedId} />
+        <DocSearch docs={DOCS} onSelect={setSelectedId} />
         <div style={{ padding: '0 0 16px', flex: 1, overflowY: 'auto' }}>
         {Array.from(grouped.entries()).map(([group, docs]) => (
           <div key={group} style={{ marginBottom: 16 }}>
@@ -358,9 +370,13 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
       >
         <div style={{ display: 'flex', gap: 40, maxWidth: 1200, margin: '0 auto' }}>
           {/* Landing page for overview, markdown for everything else */}
-          {selectedId === 'readme' || !selectedDoc ? (
+          {!bundle ? (
+            <div style={{ flex: 1, minWidth: 0, display: 'flex', justifyContent: 'center', padding: 60, color: colors.TEXT_MUTED }}>
+              {docsFailed ? <span>Documentation needs a signed-in session.</span> : <Spin />}
+            </div>
+          ) : selectedId === 'readme' || !selectedDoc ? (
             <div style={{ flex: 1, minWidth: 0 }}>
-              <DocsLanding onSelectDoc={setSelectedId} />
+              <DocsLanding bundle={bundle} onSelectDoc={setSelectedId} />
             </div>
           ) : selectedDoc && (
             <article className="docs-content" style={{ flex: 1, minWidth: 0 }}>

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# =============================================================================
+# check-bundle-fingerprints.sh <dist-dir> <Cargo.toml>
+# -----------------------------------------------------------------------------
+# Everything under dist/ is served to ANONYMOUS callers at /_/. This guard
+# fails the build when the bundle would let them fingerprint the deployment:
+#   1. the crate version string (a Vite `define`, a hard-coded chip, ...)
+#   2. a build timestamp literal (ISO 8601 with a trailing Z)
+#   3. product docs inlined at build time (the changelog names every release)
+#   4. source maps (the full UI source)
+# The running version and build time reach the UI only through the
+# session-authenticated /_/api/whoami, and the docs through /_/api/docs.
+# Runs after `npm run build`: wired into the Dockerfile UI stage and CI.
+#
+# Library code can legitimately contain a dotted number equal to our version
+# (a dependency at the same version). Match 1 is boundary-aware and prints the
+# file; if that ever collides, widen the check rather than drop it.
+# =============================================================================
+set -euo pipefail
+
+dist="${1:?usage: $0 <dist-dir> <Cargo.toml>}"
+cargo_toml="${2:?usage: $0 <dist-dir> <Cargo.toml>}"
+[ -d "$dist" ] || { echo "check-bundle-fingerprints: no such dist dir: $dist" >&2; exit 2; }
+version=$(grep -m1 -E '^version *= *"' "$cargo_toml" | sed -E 's/.*"([^"]+)".*/\1/')
+[ -n "$version" ] || { echo "check-bundle-fingerprints: cannot read version from $cargo_toml" >&2; exit 2; }
+
+fail=0
+report() { echo "FINGERPRINT: $1" >&2; fail=1; }
+hits_of() { grep -rlE "$1" "$dist" --include='*.js' --include='*.html' --include='*.css' --include='*.json' 2>/dev/null || true; }
+
+# 1. The crate version, standalone (not a longer dotted number).
+escaped=$(printf '%s' "$version" | sed 's/\./\\./g')
+hits=$(hits_of "(^|[^0-9.])${escaped}([^0-9.]|$)")
+[ -z "$hits" ] || report "crate version ${version} baked into: $(echo "$hits" | tr '\n' ' ')"
+
+# 2. Build timestamp literals.
+hits=$(hits_of '20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z')
+[ -z "$hits" ] || report "build timestamp literal in: $(echo "$hits" | tr '\n' ' ')"
+
+# 3. Product docs inlined: these strings exist only under docs/product/.
+for needle in 'Single source of truth for product-docs grouping' '## v[0-9]+\.[0-9]+\.[0-9]+ '; do
+  hits=$(hits_of "$needle")
+  [ -z "$hits" ] || report "product docs inlined (matched '$needle') in: $(echo "$hits" | tr '\n' ' ')"
+done
+
+# 4. Source maps.
+maps=$(find "$dist" -name '*.map' -print)
+[ -z "$maps" ] || report "source maps present: $(echo "$maps" | tr '\n' ' ')"
+
+if [ "$fail" -ne 0 ]; then
+  echo "check-bundle-fingerprints: FAILED - the bundle identifies the build to anonymous callers" >&2
+  exit 1
+fi
+echo "check-bundle-fingerprints: OK (no version, build time, docs, or source maps in $dist)"

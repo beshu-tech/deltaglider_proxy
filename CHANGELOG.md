@@ -15,6 +15,38 @@ version can restore the label with `DGP_METRICS_EXPOSE_VERSION=true`. The admin
 dashboard reads the version from the authenticated identity instead of the
 scrape.
 
+### Changed — Nothing served to anonymous callers identifies the build
+
+A deployment could still be fingerprinted from surfaces that need no login.
+Every one of them is now closed:
+
+- The JS bundle embedded a build version and a build timestamp as Vite
+  constants. Both are gone. The sidebar and the dashboard read the running
+  version and build time from `GET /_/api/whoami`, which reports them only to a
+  live session.
+- The product docs, including the changelog that names every release, were
+  inlined into the bundle as static assets. They are now embedded in the
+  binary and served by `GET /_/api/docs` to a live session only; the docs
+  viewer fetches them at runtime. The canned IAM policy catalogue
+  (`/_/api/admin/policies`) moved behind the session for the same reason.
+- Every object the proxy stores carries `dg-tool = deltaglider_proxy/<version>`
+  as provenance, and a HEAD, GET, or `metadata=true` LIST returned it as
+  `x-amz-meta-dg-tool` to anonymous readers of a public prefix. Anonymous
+  requests (and every request in open-access mode) no longer receive that
+  key; authenticated principals still do.
+- `DGP_METRICS_BEARER_TOKEN` (new, optional) makes `/_/metrics` require
+  `Authorization: Bearer <token>` — the Prometheus `authorization:` scrape
+  setting — or an admin session. Unset keeps the endpoint public.
+- A build guard, `scripts/check-bundle-fingerprints.sh`, runs in the Docker
+  image build and in CI after the UI build. It fails the build if the
+  bundle contains the crate version, a build timestamp, inlined docs, or a
+  source map.
+
+The static asset names still carry a content hash, and third-party libraries
+embed their own version strings. Those identify a build only to someone who
+already holds a copy of every release; nothing in the bundle states the
+version outright.
+
 ### Changed — Production images ship no frontend source maps
 
 The Docker build passes `PROD=true` to the UI build stage, and the Vite config

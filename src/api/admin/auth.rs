@@ -72,6 +72,9 @@ pub struct WhoamiResponse {
     /// (see [`build_version_for`]); omitted for anonymous callers.
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
+    /// UTC build timestamp of the running binary — same gate as `version`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<WhoamiUserInfo>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -91,6 +94,81 @@ pub struct WhoamiResponse {
 /// so anonymous callers must not be able to fingerprint the deployment.
 fn build_version_for(session_valid: bool) -> Option<String> {
     session_valid.then(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// Same gate as [`build_version_for`] for the build timestamp (stamped by
+/// `build.rs`). The UI shows it in the sidebar; it used to be a Vite `define`
+/// baked into the public JS bundle, which dated the build for anyone.
+fn build_time_for(session_valid: bool) -> Option<String> {
+    session_valid.then(|| env!("DGP_BUILD_TIME").to_string())
+}
+
+/// `DGP_METRICS_BEARER_TOKEN`: when set, `/_/metrics` answers only to a
+/// matching `Authorization: Bearer <token>` (the Prometheus `authorization:`
+/// scrape setting) or to a live admin-GUI session (the dashboard). Unset —
+/// the default — keeps the endpoint public for scrapers. Read once: the
+/// token is deployment infrastructure, not hot-reloadable config.
+fn metrics_bearer_token() -> Option<&'static str> {
+    static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            std::env::var("DGP_METRICS_BEARER_TOKEN")
+                .ok()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+        })
+        .as_deref()
+}
+
+/// Constant-time check of the request's bearer token against `token`.
+fn bearer_matches(headers: &HeaderMap, token: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let Some(value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let Some(presented) = value.strip_prefix("Bearer ") else {
+        return false;
+    };
+    let presented = presented.trim();
+    presented.len() == token.len() && bool::from(presented.as_bytes().ct_eq(token.as_bytes()))
+}
+
+/// Middleware for `/_/metrics` — see [`metrics_bearer_token`]. A pass-through
+/// when no token is configured.
+pub async fn require_metrics_access(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> impl IntoResponse {
+    let Some(token) = metrics_bearer_token() else {
+        return next.run(request).await.into_response();
+    };
+    if bearer_matches(&headers, token) {
+        return next.run(request).await.into_response();
+    }
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let client_ip = rate_limiter::extract_client_ip_with_peer(&headers, peer_ip);
+    let admin_session = extract_session_token(&headers)
+        .map(|t| {
+            state.sessions.validate(&t, client_ip) && state.sessions.allows_admin_gui(&t, client_ip)
+        })
+        .unwrap_or(false);
+    if admin_session {
+        return next.run(request).await.into_response();
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer realm=\"metrics\"")],
+        "metrics require the configured bearer token or an admin session\n",
+    )
+        .into_response()
 }
 
 /// Map the config-DB lock flag to the typed `lock_state` whoami field.
@@ -514,6 +592,7 @@ pub async fn whoami(
     Json(WhoamiResponse {
         mode: mode.into(),
         version: build_version_for(session_valid),
+        build_time: build_time_for(session_valid),
         user,
         config_db_mismatch: state.config_db_mismatch,
         lock_state: lock_state_for(state.config_db_mismatch),
@@ -562,6 +641,7 @@ pub async fn resolve_iam_identity(
         mode: "iam".into(),
         // The IAM credentials were verified just above — an authenticated caller.
         version: build_version_for(true),
+        build_time: build_time_for(true),
         user: Some(WhoamiUserInfo {
             name: user.name,
             access_key_id: user.access_key_id,
@@ -1243,6 +1323,23 @@ mod tests {
             build_version_for(true).as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
+        assert_eq!(build_time_for(false), None);
+        assert_eq!(
+            build_time_for(true).as_deref(),
+            Some(env!("DGP_BUILD_TIME"))
+        );
+    }
+
+    #[test]
+    fn metrics_bearer_check_is_exact() {
+        let mut h = HeaderMap::new();
+        assert!(!bearer_matches(&h, "scrape-me"), "no header");
+        h.insert(header::AUTHORIZATION, "Bearer scrape-me".parse().unwrap());
+        assert!(bearer_matches(&h, "scrape-me"));
+        assert!(!bearer_matches(&h, "scrape-me-2"), "length differs");
+        assert!(!bearer_matches(&h, "scrape-mf"), "same length, wrong byte");
+        h.insert(header::AUTHORIZATION, "Basic scrape-me".parse().unwrap());
+        assert!(!bearer_matches(&h, "scrape-me"), "wrong scheme");
     }
 
     /// Adversarial: the session cookie must carry SameSite=Strict

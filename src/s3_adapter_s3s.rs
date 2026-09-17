@@ -122,6 +122,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         &self,
         req: s3s::S3Request<s3s::dto::HeadObjectInput>,
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::HeadObjectOutput>> {
+        let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
         let input = req.input;
         let meta = self
             .state
@@ -139,6 +140,9 @@ impl s3s::S3 for DeltaGliderS3Service {
         )?;
 
         let mut output = head_object_output_from_metadata(&meta)?;
+        if let Some(map) = output.metadata.as_mut() {
+            strip_fingerprint_metadata(map, auth_user.as_ref());
+        }
         let mut status = None;
         if let Some(range) = input.range.as_ref() {
             let checked = range
@@ -165,6 +169,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         &self,
         req: s3s::S3Request<s3s::dto::GetObjectInput>,
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetObjectOutput>> {
+        let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
         let input = req.input;
         let engine = self.state.engine.load();
         let head = engine
@@ -194,6 +199,9 @@ impl s3s::S3 for DeltaGliderS3Service {
             {
                 let body = s3s::dto::StreamingBlob::new(SyncStorageStream::new(stream));
                 let mut output = get_object_output_from_metadata(&metadata, body)?;
+                if let Some(map) = output.metadata.as_mut() {
+                    strip_fingerprint_metadata(map, auth_user.as_ref());
+                }
                 output.content_length = Some(i64::try_from(content_length).unwrap_or(i64::MAX));
                 output.content_range = Some(content_range);
                 apply_get_response_overrides(&input, &mut output);
@@ -222,6 +230,9 @@ impl s3s::S3 for DeltaGliderS3Service {
             );
             let body = s3s::dto::StreamingBlob::from(s3s::Body::from(sliced));
             let mut output = get_object_output_from_metadata(&metadata, body)?;
+            if let Some(map) = output.metadata.as_mut() {
+                strip_fingerprint_metadata(map, auth_user.as_ref());
+            }
             let range_len = checked.end.saturating_sub(checked.start);
             output.content_length = Some(i64::try_from(range_len).unwrap_or(i64::MAX));
             output.content_range = Some(content_range);
@@ -252,6 +263,9 @@ impl s3s::S3 for DeltaGliderS3Service {
             }
         };
         let mut output = get_object_output_from_metadata(&metadata, body)?;
+        if let Some(map) = output.metadata.as_mut() {
+            strip_fingerprint_metadata(map, auth_user.as_ref());
+        }
         apply_get_response_overrides(&input, &mut output);
         let mut resp = s3s::S3Response::new(output);
         add_storage_debug_headers(&mut resp.headers, &metadata);
@@ -342,6 +356,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         req: s3s::S3Request<s3s::dto::ListObjectsV2Input>,
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListObjectsV2Output>> {
         let list_scope = req.extensions.get::<ListScope>().cloned();
+        let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
         let include_metadata = query_flag(&req.uri, "metadata", "true");
         let input = req.input;
         let max_keys = input.max_keys.unwrap_or(1000).clamp(1, 1000) as u32;
@@ -369,7 +384,11 @@ impl s3s::S3 for DeltaGliderS3Service {
             ListMetadataXmlExtensions(
                 page.objects
                     .iter()
-                    .map(|(key, meta)| (key.clone(), meta.all_amz_metadata()))
+                    .map(|(key, meta)| {
+                        let mut amz = meta.all_amz_metadata();
+                        strip_fingerprint_metadata(&mut amz, auth_user.as_ref());
+                        (key.clone(), amz)
+                    })
                     .collect(),
             )
         });
@@ -2076,6 +2095,24 @@ fn head_object_output_from_metadata(
     })
 }
 
+/// Drop deployment provenance from metadata bound for an unauthenticated
+/// caller. Every object the proxy stores carries `dg-tool =
+/// deltaglider_proxy/<version>`; an anonymous reader of a public prefix — or
+/// any caller in open-access mode, where there is no principal at all — must
+/// not learn the exact running build from a HEAD, GET, or `metadata=true`
+/// LIST. Authenticated principals keep the full provenance. Handles both the
+/// bare-key map (HEAD/GET) and the `x-amz-meta-*` map (LIST extension).
+fn strip_fingerprint_metadata(
+    metadata: &mut std::collections::HashMap<String, String>,
+    auth_user: Option<&AuthenticatedUser>,
+) {
+    if auth_user.is_some_and(|u| !u.is_anonymous()) {
+        return;
+    }
+    metadata.remove(crate::types::meta_keys::TOOL);
+    metadata.remove(crate::types::meta_keys::H_TOOL);
+}
+
 fn response_metadata_map(meta: &FileMetadata) -> std::collections::HashMap<String, String> {
     let mut map = meta.to_bare_metadata_map();
     map.remove("content-type");
@@ -2302,6 +2339,48 @@ mod tests {
     #[test]
     fn adapter_type_implements_s3_trait() {
         assert_s3_service::<DeltaGliderS3Service>();
+    }
+
+    #[test]
+    fn anonymous_metadata_drops_the_tool_stamp() {
+        use crate::types::meta_keys as mk;
+        let stamped = std::collections::HashMap::from([
+            (mk::TOOL.to_string(), "deltaglider_proxy/9.9.9".to_string()),
+            (
+                mk::H_TOOL.to_string(),
+                "deltaglider_proxy/9.9.9".to_string(),
+            ),
+            (mk::FILE_SIZE.to_string(), "1".to_string()),
+        ]);
+        let anon = AuthenticatedUser {
+            name: crate::iam::types::ANONYMOUS_USER_NAME.into(),
+            access_key_id: String::new(),
+            permissions: vec![],
+            iam_policies: vec![],
+        };
+
+        let mut for_anon = stamped.clone();
+        strip_fingerprint_metadata(&mut for_anon, Some(&anon));
+        assert!(!for_anon.contains_key(mk::TOOL) && !for_anon.contains_key(mk::H_TOOL));
+        assert_eq!(for_anon.get(mk::FILE_SIZE).map(String::as_str), Some("1"));
+
+        let mut no_principal = stamped.clone();
+        strip_fingerprint_metadata(&mut no_principal, None);
+        assert!(
+            !no_principal.contains_key(mk::TOOL),
+            "open-access mode has no principal: still anonymous"
+        );
+
+        let mut for_user = stamped;
+        let user = AuthenticatedUser {
+            name: "alice".into(),
+            ..anon
+        };
+        strip_fingerprint_metadata(&mut for_user, Some(&user));
+        assert_eq!(
+            for_user.get(mk::TOOL).map(String::as_str),
+            Some("deltaglider_proxy/9.9.9")
+        );
     }
 
     #[test]

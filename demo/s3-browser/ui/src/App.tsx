@@ -695,6 +695,7 @@ export default function App() {
             onClose={() => setSiderOpen(false)}
             isMobile={isMobile}
             proxyVersion={identity?.version}
+            proxyBuildTime={identity?.build_time}
           />
         )}
 

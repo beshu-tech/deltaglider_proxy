@@ -286,9 +286,9 @@ export default function MetricsPage({ onBack, embedded, search }: Props) {
   // The public /_/metrics scrape carries no build version by default (it
   // would fingerprint the deployment for anonymous callers); the
   // session-authenticated whoami does. The metric label stays as a fallback
-  // for operators who opted in with DGP_METRICS_EXPOSE_VERSION, then the
-  // UI's own build version.
-  const buildVersion = identity?.version || buildMetric?.samples[0]?.labels.version || __BUILD_VERSION__;
+  // for operators who opted in with DGP_METRICS_EXPOSE_VERSION. There is no
+  // build-time constant to fall back to on purpose — see vite.config.ts.
+  const buildVersion = identity?.version || buildMetric?.samples[0]?.labels.version || '—';
   const backendType = buildMetric?.samples[0]?.labels.backend_type || '?';
 
   const authAttempts = m.get('deltaglider_auth_attempts_total')?.samples.reduce((a, s) => a + s.value, 0) ?? 0;

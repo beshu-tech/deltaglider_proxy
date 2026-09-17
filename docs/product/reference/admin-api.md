@@ -16,7 +16,8 @@ Endpoints documented here are **admin** only. The S3-compatible API lives under 
 | `GET` | `/_/api/admin/session` | `{valid, admin_gui}` |
 | `POST` | `/_/api/admin/session/browser-connect` | Issue a limited browser-lift session for an IAM non-admin (S3 browse only) |
 | `POST` | `/_/api/admin/session/open-browser-connect` | Browser-lift session when `authentication: none` |
-| `GET` | `/_/api/whoami` | `{mode, user, external_providers, version}` — `version` is present only when the request carries a live session; anonymous callers get `mode` and the provider list but not the build version |
+| `GET` | `/_/api/whoami` | `{mode, user, external_providers, version, build_time}` — `version` and `build_time` are present only when the request carries a live session; anonymous callers get `mode` and the provider list but nothing that identifies the build |
+| `GET` | `/_/api/docs` | Session-gated: every product doc plus `docs/product/manifest.json` as one JSON payload (`{manifest, docs: [{path, content}]}`). The embedded docs viewer fetches it at runtime; the markdown is not part of the public JS bundle |
 | `POST` | `/_/api/admin/recover-db` | Reset the config DB when the bootstrap hash doesn't match (public, rate-limited) |
 | `PUT` | `/_/api/admin/password` | Change the bootstrap password — re-encrypts the SQLCipher DB atomically |
 
@@ -95,7 +96,7 @@ deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.e
 | `POST` | `/_/api/admin/groups/:id/members` | Add user to group |
 | `DELETE` | `/_/api/admin/groups/:id/members/:user_id` | Remove user from group |
 | `GET` | `/_/api/admin/iam/version` | Monotonic IAM-index rebuild counter for deterministic diagnostics/tests |
-| `GET` | `/_/api/admin/policies` | List canned policy templates (public, no session) |
+| `GET` | `/_/api/admin/policies` | List canned policy templates (any live session; was public before the fingerprint hardening) |
 
 ## External auth (OAuth / OIDC)
 

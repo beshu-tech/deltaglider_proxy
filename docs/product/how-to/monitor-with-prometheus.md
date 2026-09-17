@@ -32,6 +32,20 @@ scrape_configs:
 
 The `/_/metrics` endpoint is exempt from SigV4 auth, so Prometheus doesn't need credentials. Bare `/metrics` is part of the S3-compatible namespace — do not scrape it.
 
+If the proxy is reachable from the internet, you can stop anonymous callers from reading the metric set (which identifies the release) by setting `DGP_METRICS_BEARER_TOKEN` on the proxy and giving Prometheus the same token:
+
+```yaml
+scrape_configs:
+  - job_name: deltaglider
+    metrics_path: /_/metrics
+    authorization:
+      credentials: "the-same-long-random-token"
+    static_configs:
+      - targets: ["s3.acme.example:9000"]
+```
+
+With the token set, a request without it receives `401`. The admin dashboard keeps working because it presents its session instead of the token.
+
 If you don't have a Prometheus + Grafana stack yet, this starter compose gets you one:
 
 ```yaml

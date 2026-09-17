@@ -14,6 +14,7 @@ export const qk = {
   // ── Auth / session ──────────────────────────────────────────────
   whoami: () => ['whoami'] as const,
   session: () => ['session'] as const,
+  docs: () => ['docs'] as const,
 
   // ── Config ──────────────────────────────────────────────────────
   config: () => ['config'] as const,

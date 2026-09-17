@@ -278,7 +278,7 @@ fn build_anonymous_user(bucket: &str, public_prefixes: &[String]) -> Authenticat
     }
 
     AuthenticatedUser {
-        name: "$anonymous".into(),
+        name: crate::iam::types::ANONYMOUS_USER_NAME.into(),
         access_key_id: String::new(),
         permissions,
         iam_policies,

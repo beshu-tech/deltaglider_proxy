@@ -20,7 +20,7 @@ const url = await loadModule('../src/linkifyDocUrl.ts', 'linkifyDocUrl.ts');
 const { docsUrlToInAppHref, splitLinkSegments } = await import(url);
 
 // --- docsUrlToInAppHref ------------------------------------------------------
-// The doc-link rewrite mirrors docs-imports.ts pathToId flattening (slash → dash).
+// The doc-link rewrite mirrors docsBundle.ts pathToId flattening (slash → dash).
 assert.equal(
   docsUrlToInAppHref('https://deltaglider.com/docs/how-to/backend-capability-validation'),
   '/_/docs/how-to-backend-capability-validation'

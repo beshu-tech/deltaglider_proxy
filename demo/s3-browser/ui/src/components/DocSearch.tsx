@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { Input } from 'antd';
 import { SearchOutlined, CloseCircleFilled } from '@ant-design/icons';
 import MiniSearch from 'minisearch';
-import { DOCS } from '../docs-imports';
+import type { DocEntry } from '../docsBundle';
 import { useColors } from '../ThemeContext';
 
 interface SearchResult {
@@ -47,10 +47,11 @@ function getSnippet(text: string, query: string, maxLen = 120): string {
 }
 
 interface Props {
+  docs: readonly DocEntry[];
   onSelect: (docId: string) => void;
 }
 
-export default function DocSearch({ onSelect }: Props) {
+export default function DocSearch({ docs, onSelect }: Props) {
   const colors = useColors();
   const [query, setQuery] = useState('');
   const [focused, setFocused] = useState(false);
@@ -68,23 +69,21 @@ export default function DocSearch({ onSelect }: Props) {
       },
     });
 
-    const docs = DOCS.map(d => ({
+    index.addAll(docs.map(d => ({
       id: d.id,
       title: d.title,
       headings: extractHeadingText(d.content),
       body: stripMarkdown(d.content),
-    }));
-
-    index.addAll(docs);
+    })));
     return index;
-  }, []);
+  }, [docs]);
 
   // Search results
   const results: SearchResult[] = useMemo(() => {
     if (!query.trim()) return [];
     const raw = searchIndex.search(query, { combineWith: 'AND' });
     return raw.slice(0, 8).map(r => {
-      const doc = DOCS.find(d => d.id === r.id)!;
+      const doc = docs.find(d => d.id === r.id)!;
       const bodyText = stripMarkdown(doc.content);
       return {
         docId: r.id,
@@ -94,7 +93,7 @@ export default function DocSearch({ onSelect }: Props) {
         score: r.score,
       };
     });
-  }, [query, searchIndex]);
+  }, [query, searchIndex, docs]);
 
   // Cmd+K / Ctrl+K shortcut
   useEffect(() => {

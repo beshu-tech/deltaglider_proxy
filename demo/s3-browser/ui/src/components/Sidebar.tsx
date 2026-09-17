@@ -23,14 +23,15 @@ import CreateBucketModal from './CreateBucketModal';
 const { Sider } = Layout;
 const { Text } = Typography;
 
-/** Format the compile-time ISO timestamp into a human-readable string. */
-function formatBuildTime(): string {
+/** Format the server-reported ISO build timestamp for the sidebar footer. */
+function formatBuildTime(iso: string): string {
   try {
-    const d = new Date(__BUILD_TIME__);
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
     return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
       + ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
   } catch {
-    return __BUILD_TIME__;
+    return iso;
   }
 }
 
@@ -52,6 +53,7 @@ interface Props {
   onClose: () => void;
   isMobile: boolean;
   proxyVersion?: string;
+  proxyBuildTime?: string;
 }
 
 export default function Sidebar({
@@ -68,6 +70,7 @@ export default function Sidebar({
   onClose,
   isMobile,
   proxyVersion,
+  proxyBuildTime,
 }: Props) {
   const {
     BG_SIDEBAR, BORDER, TEXT_PRIMARY, TEXT_SECONDARY,
@@ -452,13 +455,10 @@ export default function Sidebar({
           >
             Object storage control plane
           </div>
-          {/* Prefer the server-reported version (whoami) since it
-              reflects the actual running Rust binary; fall back to
-              the build-time constant (read from Cargo.toml by Vite)
-              so the sidebar still shows SOMETHING before whoami
-              resolves — or if the API has diverged in a way that
-              drops the field. The two should always agree in a
-              healthy deployment. */}
+          {/* Version + build time come from the session-authenticated
+              whoami — never from a build-time constant, which would bake
+              the build identity into the public JS bundle. Blank until
+              whoami resolves. */}
           <div
             style={{
               display: 'flex',
@@ -472,10 +472,12 @@ export default function Sidebar({
               letterSpacing: 0.3,
             }}
           >
-            <span style={{ fontWeight: 400, letterSpacing: 0.5, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>
-              v{proxyVersion || __BUILD_VERSION__}
-            </span>
-            <span>{formatBuildTime()}</span>
+            {proxyVersion && (
+              <span style={{ fontWeight: 400, letterSpacing: 0.5, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>
+                v{proxyVersion}
+              </span>
+            )}
+            {proxyBuildTime && <span>{formatBuildTime(proxyBuildTime)}</span>}
           </div>
         </div>
       </div>{/* end bottom group */}

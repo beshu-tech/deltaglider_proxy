@@ -892,6 +892,109 @@ async fn test_unknown_ui_paths_are_404_not_spa_fallback() {
     );
 }
 
+/// `DGP_METRICS_BEARER_TOKEN` turns the public scrape into a token-gated
+/// one: Prometheus presents the token, the admin dashboard presents its
+/// session, and anonymous callers get a 401 with no metric names to
+/// fingerprint the release by.
+#[tokio::test]
+async fn test_metrics_bearer_token_gate() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_METRICS_BEARER_TOKEN", "scrape-me-7")
+        .build()
+        .await;
+    let url = format!("{}/_/metrics", server.endpoint());
+    let http = reqwest::Client::new();
+
+    let anon = http.get(&url).send().await.unwrap();
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+    assert!(anon
+        .headers()
+        .contains_key(reqwest::header::WWW_AUTHENTICATE));
+    assert!(
+        !anon.text().await.unwrap().contains("deltaglider_"),
+        "no metric names for anonymous callers"
+    );
+
+    let wrong = http
+        .get(&url)
+        .bearer_auth("scrape-me-8")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    let right = http
+        .get(&url)
+        .bearer_auth("scrape-me-7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(right.status(), StatusCode::OK);
+    assert!(right
+        .text()
+        .await
+        .unwrap()
+        .contains("deltaglider_build_info"));
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    assert_eq!(
+        admin.get(&url).send().await.unwrap().status(),
+        StatusCode::OK,
+        "the admin dashboard scrapes with its session"
+    );
+}
+
+/// The product docs and the canned-policy catalogue both change with every
+/// release, so they are served only to a live session.
+#[tokio::test]
+async fn test_docs_and_policies_require_a_session() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let http = reqwest::Client::new();
+    for path in ["/_/api/docs", "/_/api/admin/policies"] {
+        let resp = http
+            .get(format!("{}{}", server.endpoint(), path))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{path} must not be anonymous"
+        );
+    }
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let docs: serde_json::Value = admin
+        .get(format!("{}/_/api/docs", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let groups = docs["manifest"]["groups"]
+        .as_array()
+        .expect("manifest groups");
+    assert!(!groups.is_empty(), "manifest groups must be served");
+    let entries = docs["docs"].as_array().expect("docs array");
+    assert!(
+        entries.len() > 10,
+        "expected the full product docs, got {}",
+        entries.len()
+    );
+    assert!(
+        entries.iter().any(|d| d["path"] == "changelog"),
+        "the changelog is served — behind the session"
+    );
+    assert!(entries
+        .iter()
+        .all(|d| d["content"].as_str().is_some_and(|c| !c.is_empty())));
+}
+
 /// HEAD / (connection probe) should be accessible without auth.
 #[tokio::test]
 async fn test_head_root_no_auth_needed() {
