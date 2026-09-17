@@ -20,7 +20,7 @@
 //!   4. ETag no-op — calling sync-now when already current is a
 //!      cheap HEAD that does no DB reopen.
 //!
-//! All tests require SeaweedFS and share the storage bucket with the
+//! All tests require MinIO and share the storage bucket with the
 //! sync bucket. Each test uses a unique `config_sync_object_key` under
 //! `.deltaglider/` (UUID-based) so parallel integration-test binaries
 //! do not clobber the same object in `deltaglider-test`.
@@ -28,22 +28,22 @@
 mod common;
 
 use common::{
-    admin_http_client, admin_http_client_with_password, s3_test_endpoint_url, TestServer,
-    S3_TEST_BUCKET,
+    admin_http_client, admin_http_client_with_password, minio_endpoint_url, TestServer,
+    MINIO_BUCKET,
 };
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
 /// Monotonic prefix for the S3 user names used in these tests. The
-/// sync bucket is shared (it's S3_TEST_BUCKET), so each test seeds
+/// sync bucket is shared (it's MINIO_BUCKET), so each test seeds
 /// uniquely-named users to avoid cross-test contamination when run
 /// in parallel.
 static TEST_USER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Globally unique object key: CI runs many integration test binaries in
 /// parallel (separate processes), so timestamp + per-process counters can
-/// still collide across crates sharing `S3_TEST_BUCKET`.
+/// still collide across crates sharing `MINIO_BUCKET`.
 fn unique_config_sync_object_key() -> String {
     format!(".deltaglider/ha-ci-{}.db", Uuid::new_v4())
 }
@@ -67,16 +67,16 @@ fn unique_user_name(prefix: &str) -> String {
 /// manual backup/restore admin endpoint.
 #[tokio::test]
 async fn ha_startup_replica_pulls_state_from_s3() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
 
     let sync_key = unique_config_sync_object_key();
 
     // Server A: creates a user, which triggers an upload to S3.
     let server_a = TestServer::builder()
         .auth("HAKEY-A", "HASECRET-A-1234567890")
-        .s3_endpoint(&s3_test_endpoint_url())
-        .bucket(S3_TEST_BUCKET)
-        .config_sync_bucket(S3_TEST_BUCKET)
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
         .config_sync_object_key(&sync_key)
         .build()
         .await;
@@ -95,7 +95,7 @@ async fn ha_startup_replica_pulls_state_from_s3() {
     assert_eq!(resp.status().as_u16(), 201, "create user on A must succeed");
 
     // trigger_config_sync() fires a background tokio::spawn; wait for
-    // the S3 PUT to land. 2s is a generous upper bound (SeaweedFS local is
+    // the S3 PUT to land. 2s is a generous upper bound (MinIO local is
     // typically <50ms). The s3_client view is authoritative, so we
     // just HEAD the sync key until it appears.
     let s3 = server_a.s3_client().await;
@@ -103,7 +103,7 @@ async fn ha_startup_replica_pulls_state_from_s3() {
     loop {
         let head = s3
             .head_object()
-            .bucket(S3_TEST_BUCKET)
+            .bucket(MINIO_BUCKET)
             .key(&sync_key)
             .send()
             .await;
@@ -120,9 +120,9 @@ async fn ha_startup_replica_pulls_state_from_s3() {
     // Its startup sync should download A's DB and rebuild IAM.
     let server_b = TestServer::builder()
         .auth("HAKEY-B", "HASECRET-B-1234567890")
-        .s3_endpoint(&s3_test_endpoint_url())
-        .bucket(S3_TEST_BUCKET)
-        .config_sync_bucket(S3_TEST_BUCKET)
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
         .config_sync_object_key(&sync_key)
         .build()
         .await;
@@ -150,23 +150,23 @@ async fn ha_startup_replica_pulls_state_from_s3() {
 /// they want immediate propagation.
 #[tokio::test]
 async fn ha_sync_now_propagates_post_startup_mutation() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
 
     let sync_key = unique_config_sync_object_key();
 
     let server_a = TestServer::builder()
         .auth("HAKEY-A2", "HASECRET-A2-1234567890")
-        .s3_endpoint(&s3_test_endpoint_url())
-        .bucket(S3_TEST_BUCKET)
-        .config_sync_bucket(S3_TEST_BUCKET)
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
         .config_sync_object_key(&sync_key)
         .build()
         .await;
     let server_b = TestServer::builder()
         .auth("HAKEY-B2", "HASECRET-B2-1234567890")
-        .s3_endpoint(&s3_test_endpoint_url())
-        .bucket(S3_TEST_BUCKET)
-        .config_sync_bucket(S3_TEST_BUCKET)
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
         .config_sync_object_key(&sync_key)
         .build()
         .await;
@@ -203,7 +203,7 @@ async fn ha_sync_now_propagates_post_startup_mutation() {
     loop {
         let head = s3
             .head_object()
-            .bucket(S3_TEST_BUCKET)
+            .bucket(MINIO_BUCKET)
             .key(&sync_key)
             .send()
             .await;
@@ -256,15 +256,15 @@ async fn ha_sync_now_propagates_post_startup_mutation() {
 /// scale.
 #[tokio::test]
 async fn ha_sync_now_is_noop_when_etag_unchanged() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
 
     let sync_key = unique_config_sync_object_key();
 
     let server_a = TestServer::builder()
         .auth("HAKEY-A3", "HASECRET-A3-1234567890")
-        .s3_endpoint(&s3_test_endpoint_url())
-        .bucket(S3_TEST_BUCKET)
-        .config_sync_bucket(S3_TEST_BUCKET)
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
         .config_sync_object_key(&sync_key)
         .build()
         .await;
@@ -285,7 +285,7 @@ async fn ha_sync_now_is_noop_when_etag_unchanged() {
     loop {
         if s3
             .head_object()
-            .bucket(S3_TEST_BUCKET)
+            .bucket(MINIO_BUCKET)
             .key(&sync_key)
             .send()
             .await
@@ -301,9 +301,9 @@ async fn ha_sync_now_is_noop_when_etag_unchanged() {
 
     let server_b = TestServer::builder()
         .auth("HAKEY-B3", "HASECRET-B3-1234567890")
-        .s3_endpoint(&s3_test_endpoint_url())
-        .bucket(S3_TEST_BUCKET)
-        .config_sync_bucket(S3_TEST_BUCKET)
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
         .config_sync_object_key(&sync_key)
         .build()
         .await;
@@ -350,15 +350,15 @@ async fn ha_sync_now_is_noop_when_etag_unchanged() {
 /// via sync-now, refreshes its revocation snapshot, and 401s the cookie.
 #[tokio::test]
 async fn ha_revocation_reaches_peer() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
 
     let sync_key = unique_config_sync_object_key();
 
     let server_a = TestServer::builder()
         .auth("HAKEY-A5", "HASECRET-A5-1234567890")
-        .s3_endpoint(&s3_test_endpoint_url())
-        .bucket(S3_TEST_BUCKET)
-        .config_sync_bucket(S3_TEST_BUCKET)
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
         .config_sync_object_key(&sync_key)
         .build()
         .await;
@@ -386,7 +386,7 @@ async fn ha_revocation_reaches_peer() {
     loop {
         if s3
             .head_object()
-            .bucket(S3_TEST_BUCKET)
+            .bucket(MINIO_BUCKET)
             .key(&sync_key)
             .send()
             .await
@@ -403,9 +403,9 @@ async fn ha_revocation_reaches_peer() {
     // Replica B pulls A's state at startup, so login-as works there.
     let server_b = TestServer::builder()
         .auth("HAKEY-B5", "HASECRET-B5-1234567890")
-        .s3_endpoint(&s3_test_endpoint_url())
-        .bucket(S3_TEST_BUCKET)
-        .config_sync_bucket(S3_TEST_BUCKET)
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
         .config_sync_object_key(&sync_key)
         .build()
         .await;
@@ -505,15 +505,15 @@ async fn ha_revocation_reaches_peer() {
 /// even after the (failed) download.
 #[tokio::test]
 async fn ha_replica_with_wrong_password_preserves_local_state() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
 
     let sync_key = unique_config_sync_object_key();
 
     let server_a = TestServer::builder()
         .auth("HAKEY-A4", "HASECRET-A4-1234567890")
-        .s3_endpoint(&s3_test_endpoint_url())
-        .bucket(S3_TEST_BUCKET)
-        .config_sync_bucket(S3_TEST_BUCKET)
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
         .config_sync_object_key(&sync_key)
         .build()
         .await;
@@ -534,7 +534,7 @@ async fn ha_replica_with_wrong_password_preserves_local_state() {
     loop {
         if s3
             .head_object()
-            .bucket(S3_TEST_BUCKET)
+            .bucket(MINIO_BUCKET)
             .key(&sync_key)
             .send()
             .await
@@ -553,9 +553,9 @@ async fn ha_replica_with_wrong_password_preserves_local_state() {
     let wrong_password = "different-password-that-wont-match-A";
     let server_b = TestServer::builder()
         .auth("HAKEY-B4", "HASECRET-B4-1234567890")
-        .s3_endpoint(&s3_test_endpoint_url())
-        .bucket(S3_TEST_BUCKET)
-        .config_sync_bucket(S3_TEST_BUCKET)
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
         .bootstrap_password(wrong_password)
         .config_sync_object_key(&sync_key)
         .build()
@@ -594,14 +594,14 @@ async fn ha_replica_with_wrong_password_preserves_local_state() {
 /// sync-enabled node and asserts every one survives in that node's own DB.
 #[tokio::test]
 async fn ha_concurrent_same_node_creates_do_not_self_clobber() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
 
     let sync_key = unique_config_sync_object_key();
     let server = TestServer::builder()
         .auth("HAKEY-SC", "HASECRET-SC-1234567890")
-        .s3_endpoint(&s3_test_endpoint_url())
-        .bucket(S3_TEST_BUCKET)
-        .config_sync_bucket(S3_TEST_BUCKET)
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
         .config_sync_object_key(&sync_key)
         .build()
         .await;

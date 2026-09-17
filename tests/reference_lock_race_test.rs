@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! Cross-instance reference-lock integration tests against a REAL CAS-enforcing
-//! backend (SeaweedFS). The pure `plan_lock_acquire` kernel and the `acquire_blocking`
+//! backend (MinIO). The pure `plan_lock_acquire` kernel and the `acquire_blocking`
 //! loop are unit-tested with mocks in `src/coordination/reference_lock.rs`; this
 //! file proves the actual S3 I/O — the `If-None-Match:*` create, `If-Match` steal,
 //! and delete-if-owner release — enforces MUTUAL EXCLUSION between two instances
@@ -10,13 +10,13 @@
 //! baseline. If the S3 CAS lock excludes them here, the engine (which holds this
 //! lock around its reference read-modify-write) cannot double-baseline.
 //!
-//! Requires SeaweedFS (the CI `deltaglider-test` bucket). Each test targets a unique
+//! Requires MinIO (the CI `deltaglider-test` bucket). Each test targets a unique
 //! deltaspace (UUID) so parallel crates sharing the bucket never collide on a
 //! lock object under `_dgp/locks/reference/`.
 
 mod common;
 
-use common::{s3_backend_available, s3_test_client, S3_TEST_BUCKET};
+use common::{minio_available, minio_client, MINIO_BUCKET};
 use deltaglider_proxy::coordination::reference_lock::lock_object_key;
 use deltaglider_proxy::coordination::{ReferenceLock, S3ReferenceLock};
 
@@ -25,12 +25,12 @@ fn unique_key() -> String {
     lock_object_key("race-bucket", &format!("prefix/{}", uuid::Uuid::new_v4()))
 }
 
-/// Build an `S3ReferenceLock` over SeaweedFS with a given durable node id. The
-/// coordination bucket is the shared SeaweedFS test bucket.
+/// Build an `S3ReferenceLock` over MinIO with a given durable node id. The
+/// coordination bucket is the shared MinIO test bucket.
 async fn lock_for(node_id: &str) -> S3ReferenceLock {
     S3ReferenceLock::new(
-        s3_test_client().await,
-        S3_TEST_BUCKET.to_string(),
+        minio_client().await,
+        MINIO_BUCKET.to_string(),
         node_id.to_string(),
     )
 }
@@ -44,8 +44,8 @@ async fn cleanup(lock: &S3ReferenceLock, key: &str) {
 
 #[tokio::test]
 async fn reference_lock_mutual_exclusion_lifecycle() {
-    if !s3_backend_available().await {
-        eprintln!("Skipping reference_lock_mutual_exclusion_lifecycle: SeaweedFS not available");
+    if !minio_available().await {
+        eprintln!("Skipping reference_lock_mutual_exclusion_lifecycle: MinIO not available");
         return;
     }
     let key = unique_key();
@@ -80,9 +80,9 @@ async fn reference_lock_mutual_exclusion_lifecycle() {
 
 #[tokio::test]
 async fn reference_lock_concurrent_acquire_exactly_one_wins() {
-    if !s3_backend_available().await {
+    if !minio_available().await {
         eprintln!(
-            "Skipping reference_lock_concurrent_acquire_exactly_one_wins: SeaweedFS not available"
+            "Skipping reference_lock_concurrent_acquire_exactly_one_wins: MinIO not available"
         );
         return;
     }
@@ -117,8 +117,8 @@ async fn reference_lock_concurrent_acquire_exactly_one_wins() {
 
 #[tokio::test]
 async fn reference_lock_steals_after_ttl_expiry() {
-    if !s3_backend_available().await {
-        eprintln!("Skipping reference_lock_steals_after_ttl_expiry: SeaweedFS not available");
+    if !minio_available().await {
+        eprintln!("Skipping reference_lock_steals_after_ttl_expiry: MinIO not available");
         return;
     }
     // Crash backstop: a holder that dies mid-critical-section never releases, so
@@ -148,8 +148,8 @@ async fn reference_lock_steals_after_ttl_expiry() {
 
 #[tokio::test]
 async fn reference_lock_self_reclaims_same_node() {
-    if !s3_backend_available().await {
-        eprintln!("Skipping reference_lock_self_reclaims_same_node: SeaweedFS not available");
+    if !minio_available().await {
+        eprintln!("Skipping reference_lock_self_reclaims_same_node: MinIO not available");
         return;
     }
     // A same-node re-acquire (re-entrancy, or a crash-restart with the same
@@ -178,8 +178,8 @@ async fn reference_lock_self_reclaims_same_node() {
 
 #[tokio::test]
 async fn reference_lock_release_is_owner_scoped() {
-    if !s3_backend_available().await {
-        eprintln!("Skipping reference_lock_release_is_owner_scoped: SeaweedFS not available");
+    if !minio_available().await {
+        eprintln!("Skipping reference_lock_release_is_owner_scoped: MinIO not available");
         return;
     }
     // A stale release from a previous owner must NOT delete a lock a peer now

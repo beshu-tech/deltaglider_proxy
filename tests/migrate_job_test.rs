@@ -6,7 +6,7 @@
 //! reads stay up, the route flips + persists on success, transients never
 //! leak, and pre-flip cancellation leaves the source authoritative.
 //!
-//! Two filesystem backends — no SeaweedFS needed.
+//! Two filesystem backends — no MinIO needed.
 
 mod common;
 

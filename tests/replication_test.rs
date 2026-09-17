@@ -1517,12 +1517,12 @@ replication:
 /// Both shapes are exercised to document the scope:
 ///  - `artifact.zip` is delta-ELIGIBLE → LIST HEADs it → touches the fixed path.
 ///  - `artifact.sha1` is NON-eligible → LIST lite (no-HEAD) path, already stable.
-/// Requires SeaweedFS.
+/// Requires MinIO.
 #[tokio::test]
 async fn test_replication_foreign_object_missing_created_at_converges_on_second_run() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
     let server = TestServer::builder()
-        .s3_endpoint(&common::s3_test_endpoint_url())
+        .s3_endpoint(&common::minio_endpoint_url())
         .env("DGP_BACKEND_ALLOW_LOCAL", "true")
         .bucket("fk-src")
         .auth("bootstrap_key", "bootstrap_secret")
@@ -1531,19 +1531,19 @@ async fn test_replication_foreign_object_missing_created_at_converges_on_second_
         .await;
 
     // Buckets via the proxy (single S3 backend → identity routing, same names
-    // on SeaweedFS).
+    // on MinIO).
     let proxy = server.s3_client().await;
     for b in ["fk-src", "fk-dst"] {
         proxy.create_bucket().bucket(b).send().await.ok();
     }
 
-    // RAW client straight to SeaweedFS, bypassing the proxy, so we can plant objects
+    // RAW client straight to MinIO, bypassing the proxy, so we can plant objects
     // with PARTIAL DG metadata and NO dg-created-at (the proxy would always
     // stamp dg-created-at on a normal PUT).
     let raw = {
         let creds = aws_sdk_s3::config::Credentials::new(
-            common::S3_TEST_ACCESS_KEY,
-            common::S3_TEST_SECRET_KEY,
+            common::MINIO_ACCESS_KEY,
+            common::MINIO_SECRET_KEY,
             None,
             None,
             "test",
@@ -1551,7 +1551,7 @@ async fn test_replication_foreign_object_missing_created_at_converges_on_second_
         let cfg = aws_sdk_s3::Config::builder()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
-            .endpoint_url(common::s3_test_endpoint_url())
+            .endpoint_url(common::minio_endpoint_url())
             .credentials_provider(creds)
             .force_path_style(true)
             .build();

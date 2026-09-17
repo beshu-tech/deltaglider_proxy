@@ -9,7 +9,7 @@
 //! in-flight peaks, retry counts the algorithm controls). NEVER on wall-clock
 //! or raw RSS (those are informational via `eprintln!` only).
 //!
-//! All streaming tests use a SeaweedFS (native-multipart) backend: the streaming
+//! All streaming tests use a MinIO (native-multipart) backend: the streaming
 //! multipart copy path is only taken for native destinations (a filesystem
 //! dest now correctly routes to the bounded spooled path — see the streaming
 //! destination-matrix fix), so the per-part gauges are exercised only there.
@@ -18,7 +18,7 @@ mod common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{
-    admin_http_client, big_passthrough_body, latest_run_id, metrics_snapshot, s3_test_endpoint_url,
+    admin_http_client, big_passthrough_body, latest_run_id, metrics_snapshot, minio_endpoint_url,
     wait_for_run_after, TestServer,
 };
 use serde_json::Value;
@@ -117,11 +117,11 @@ async fn seed_passthrough(server: &TestServer, key: &str, len: usize) -> Vec<u8>
 // independent — they are byte counts the algorithm controls.
 #[tokio::test]
 async fn memory_bounded_resident_part_bytes() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
     let obj_size = 64 * MIB;
     let server = TestServer::builder()
         .auth("k", "s")
-        .s3_endpoint(&s3_test_endpoint_url())
+        .s3_endpoint(&minio_endpoint_url())
         .extra_yaml_storage_section(&rule_yaml(1, 2))
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576") // 1 MiB
         .env("DGP_MULTIPART_PART_SIZE", "5242880") // 5 MiB (S3 min)
@@ -158,12 +158,12 @@ async fn memory_bounded_resident_part_bytes() {
 // Same pure fn both sides. Single-PUT regression → 1 part → FALSE.
 #[tokio::test]
 async fn part_count_matches_plan() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
     let obj_size = 64 * MIB;
     let part_size: u64 = 5 * MIB as u64;
     let server = TestServer::builder()
         .auth("k", "s")
-        .s3_endpoint(&s3_test_endpoint_url())
+        .s3_endpoint(&minio_endpoint_url())
         .extra_yaml_storage_section(&rule_yaml(1, 2))
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576")
         .env("DGP_MULTIPART_PART_SIZE", &part_size.to_string())
@@ -191,12 +191,12 @@ async fn part_count_matches_plan() {
 // Serialized pipeline caps the peak at 1 → FALSE.
 #[tokio::test]
 async fn inflight_parts_reach_concurrency() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
     let concurrency: u32 = 3;
     let obj_size = 32 * MIB; // 5 MiB parts → ~7 parts, >= concurrency
     let server = TestServer::builder()
         .auth("k", "s")
-        .s3_endpoint(&s3_test_endpoint_url())
+        .s3_endpoint(&minio_endpoint_url())
         .extra_yaml_storage_section(&rule_yaml(1, concurrency))
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576")
         .env("DGP_MULTIPART_PART_SIZE", "5242880")
@@ -225,10 +225,10 @@ async fn inflight_parts_reach_concurrency() {
 // Lost object concurrency → 1 → FALSE.
 #[tokio::test]
 async fn inflight_objects_overlap() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
     let server = TestServer::builder()
         .auth("k", "s")
-        .s3_endpoint(&s3_test_endpoint_url())
+        .s3_endpoint(&minio_endpoint_url())
         .extra_yaml_storage_section(&rule_yaml(2, 2))
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576")
         .env("DGP_MULTIPART_PART_SIZE", "5242880")
@@ -262,11 +262,11 @@ async fn inflight_objects_overlap() {
 // serialization is needed.
 #[tokio::test]
 async fn per_part_resume_single_retry() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
     let obj_size = 32 * MIB;
     let server = TestServer::builder()
         .auth("k", "s")
-        .s3_endpoint(&s3_test_endpoint_url())
+        .s3_endpoint(&minio_endpoint_url())
         .extra_yaml_storage_section(&rule_yaml(1, 2))
         .env("DGP_STREAM_COPY_THRESHOLD", "1048576")
         .env("DGP_MULTIPART_PART_SIZE", "5242880")
@@ -301,17 +301,17 @@ async fn per_part_resume_single_retry() {
     assert_eq!(&got[..], &body[..], "dest byte-identical after resume");
 }
 
-// ── Test 6: delta byte-savings on replicate (SeaweedFS) ─────────────────────
+// ── Test 6: delta byte-savings on replicate (MinIO) ─────────────────────
 //
 // GATING: delta_bytes_saved_total delta > 0 AND the v2 delta is < logical/10
 // bytes-on-wire. saved = logical - stored, so saved > logical*9/10 ⇒
 // stored < logical/10. Reconstruct-and-reship full bytes → FALSE.
 #[tokio::test]
 async fn delta_savings_below_fraction() {
-    skip_unless_s3_backend!();
+    skip_unless_minio!();
 
     let v_size = 8 * MIB;
-    // Two SeaweedFS buckets on the same backend, isolated per run.
+    // Two MinIO buckets on the same backend, isolated per run.
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -342,9 +342,9 @@ replication:
 
     let server = TestServer::builder()
         .auth("k", "s")
-        .s3_endpoint(&common::s3_test_endpoint_url())
+        .s3_endpoint(&common::minio_endpoint_url())
         // CI sets this job-wide; set it per-server so the test is also
-        // self-contained locally (http:// SeaweedFS endpoint).
+        // self-contained locally (http:// MinIO endpoint).
         .env("DGP_BACKEND_ALLOW_LOCAL", "true")
         .extra_yaml_storage_section(&rule)
         .build()
