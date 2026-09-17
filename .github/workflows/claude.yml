@@ -44,6 +44,13 @@ jobs:
         with:
           fetch-depth: 1
 
+      # `unzip` (the action's Bun bootstrap) is baked into the builder image
+      # by .github/builder/Dockerfile, but that image only rebuilds on a push
+      # to main, so a branch that changes the Dockerfile runs against the old
+      # image. A no-op when the image already has it.
+      - name: Make sure unzip is present
+        run: command -v unzip >/dev/null || (apt-get update -qq && apt-get install -y -qq --no-install-recommends unzip >/dev/null)
+
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
