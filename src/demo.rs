@@ -624,8 +624,12 @@ async fn product_docs_bundle() -> Response {
             }))
         })
         .collect();
+    // `no-cache`: the URL carries no version, so a cached copy would serve
+    // the previous release's docs (and changelog) for the cache lifetime
+    // after an upgrade. React Query already avoids refetches within a page
+    // load (`staleTime: Infinity`), so an HTTP max-age buys nothing.
     (
-        [(header::CACHE_CONTROL, "private, max-age=3600")],
+        [(header::CACHE_CONTROL, "private, no-cache")],
         Json(serde_json::json!({ "manifest": manifest, "docs": docs })),
     )
         .into_response()

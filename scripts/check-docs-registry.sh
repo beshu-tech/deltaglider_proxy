@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Enforce docs bundling integrity. Both the in-product viewer
-# (demo/s3-browser/ui/src/docs-imports.ts) and the marketing site
+# (rust-embed of docs/product/ in src/demo.rs, served at GET /_/api/docs) and the marketing site
 # (marketing/src/lib/docContent.ts) load docs via a Vite glob over
 # `docs/product/**/*.md`, so the only file allowed into the bundle is one
 # that lives under docs/product/. That leaves two things to enforce:
@@ -36,7 +36,7 @@ done < <(find "$PRODUCT_DIR" -type l -print0 2>/dev/null)
 
 # (1) manifest.json ↔ disk parity. The manifest (docs/product/manifest.json)
 #     is the SHARED source of truth for grouping + ordering, read by BOTH the
-#     in-product viewer (docs-imports.ts) and the marketing website
+#     in-product viewer (src/demo.rs rust-embed → GET /_/api/docs) and the marketing website
 #     (marketing/src/lib/docs.ts). A doc that exists on disk but is missing
 #     from the manifest would render with no group/order in both surfaces (or
 #     not at all on the website); a manifest path with no file is a dangling

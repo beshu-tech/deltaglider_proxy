@@ -15,15 +15,17 @@ export interface LinkSegment {
 export const CAPABILITY_DOC_URL =
   'https://deltaglider.com/docs/how-to/backend-capability-validation';
 
+import { pathToId } from './docsBundle';
+
 const DOCS_URL_RE = /^https:\/\/(?:www\.)?deltaglider\.com\/docs\/([A-Za-z0-9/_.-]+)$/;
 
-/** deltaglider.com/docs/<path> → in-app docs route (`/_/docs/<flattened-id>`),
- *  mirroring the `pathToId` flattening in docsBundle.ts (slashes → dashes).
+/** deltaglider.com/docs/<path> → in-app docs route (`/_/docs/<id>`), using the
+ *  one `pathToId` the docs bundle itself uses, so the two cannot disagree.
  *  @public — exercised by scripts/linkify-regression-test.mjs (dynamic import). */
 export function docsUrlToInAppHref(url: string): string | null {
   const m = url.match(DOCS_URL_RE);
   if (!m) return null;
-  return `/_/docs/${m[1].replace(/\//g, '-')}`;
+  return `/_/docs/${pathToId(m[1])}`;
 }
 
 /** Split a plain message into text/link segments. Trailing prose punctuation

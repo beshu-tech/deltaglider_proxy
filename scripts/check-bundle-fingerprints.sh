@@ -24,9 +24,23 @@ cargo_toml="${2:?usage: $0 <dist-dir> <Cargo.toml>}"
 version=$(grep -m1 -E '^version *= *"' "$cargo_toml" | sed -E 's/.*"([^"]+)".*/\1/')
 [ -n "$version" ] || { echo "check-bundle-fingerprints: cannot read version from $cargo_toml" >&2; exit 2; }
 
+# GNU grep is required (`--include`). BusyBox grep rejects the option, and a
+# swallowed error here would turn the guard into a silent pass, so probe once
+# and fail loudly. (This is why the Dockerfile runs the guard in the Debian
+# Rust stage, not in the node:alpine UI stage.)
+if ! grep --version 2>/dev/null | grep -q 'GNU grep'; then
+  echo "check-bundle-fingerprints: GNU grep required (BusyBox grep has no --include)" >&2; exit 2
+fi
+
 fail=0
 report() { echo "FINGERPRINT: $1" >&2; fail=1; }
-hits_of() { grep -rlE "$1" "$dist" --include='*.js' --include='*.html' --include='*.css' --include='*.json' 2>/dev/null || true; }
+# grep exits 1 on "no match" (fine) and 2 on an error (not fine).
+hits_of() {
+  local out
+  out=$(grep -rlE "$1" "$dist" --include='*.js' --include='*.html' --include='*.css' --include='*.json'); local rc=$?
+  if [ "$rc" -gt 1 ]; then echo "check-bundle-fingerprints: grep failed (rc=$rc) for pattern: $1" >&2; exit 2; fi
+  printf '%s' "$out"
+}
 
 # 1. The crate version, standalone (not a longer dotted number).
 escaped=$(printf '%s' "$version" | sed 's/\./\\./g')

@@ -24,7 +24,8 @@ deltaglider_proxy.toml
 # Debugging artifacts
 .playwright-mcp/
 
-# Docs — keep docs/ for UI build (docs-imports.ts reads markdown from docs/)
+# Docs — keep docs/: docs/screenshots/ feeds the UI build and docs/product/ is
+# rust-embedded by the Rust stage (served at GET /_/api/docs)
 # and screenshots for the embedded docs landing page
 *.md
 !docs/*.md

@@ -303,4 +303,26 @@ async fn anonymous_object_metadata_has_no_tool_stamp() {
         .and_then(|m| m.get("dg-tool"))
         .expect("a signed caller keeps the dg-tool provenance");
     assert!(tool.starts_with("deltaglider_proxy/"), "{tool}");
+
+    // A presigned URL authenticates as the signer, but whoever holds the
+    // link is an anonymous party (the docs recommend presigned links for
+    // third parties). The link holder must not get the provenance either.
+    let presigned = signed
+        .get_object()
+        .bucket("testbk")
+        .key("ror/libs/alpha.txt")
+        .presigned(
+            aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(
+                300,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let resp = anon.get(presigned.uri()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "presigned GET must work");
+    assert!(
+        resp.headers().get("x-amz-meta-dg-tool").is_none(),
+        "presigned GET leaked dg-tool to the link holder"
+    );
 }

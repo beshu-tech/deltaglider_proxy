@@ -215,7 +215,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
   // Docs arrive at runtime from the session-gated /_/api/docs (see
   // docsBundle.ts for why they are not in the bundle). Until they land,
   // DOCS is empty and the page shows a spinner instead of the landing.
-  const { data: bundle, isError: docsFailed } = useDocs();
+  const { data: bundle, error: docsError } = useDocs();
   const DOCS = bundle?.docs ?? EMPTY_DOCS;
   const DOC_GROUPS = bundle?.groups ?? EMPTY_GROUPS;
 
@@ -275,13 +275,13 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
 
   // Inter-page link handler
   const handleLinkClick = useCallback((href: string) => {
-    const doc = findDocByFilename(DOCS, href);
+    const doc = findDocByFilename(DOCS, href, selectedDoc?.filename);
     if (doc) {
       setSelectedId(doc.id);
       return true;
     }
     return false;
-  }, [setSelectedId, DOCS]);
+  }, [setSelectedId, DOCS, selectedDoc]);
 
   // Group docs by category, sort within each group by the `order`
   // field (stable across title edits).
@@ -372,7 +372,7 @@ export default function DocsPage({ docId, onBack, accountMenu, onShowShortcuts }
           {/* Landing page for overview, markdown for everything else */}
           {!bundle ? (
             <div style={{ flex: 1, minWidth: 0, display: 'flex', justifyContent: 'center', padding: 60, color: colors.TEXT_MUTED }}>
-              {docsFailed ? <span>Documentation needs a signed-in session.</span> : <Spin />}
+              {docsError ? <span>Could not load the documentation: {docsError.message}</span> : <Spin />}
             </div>
           ) : selectedId === 'readme' || !selectedDoc ? (
             <div style={{ flex: 1, minWidth: 0 }}>

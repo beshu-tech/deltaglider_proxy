@@ -8,6 +8,20 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// Constant-time equality for secrets of unequal length.
+///
+/// `subtle::ConstantTimeEq` on two slices short-circuits on a length
+/// mismatch, which leaks the secret's length through timing. Hashing both
+/// sides first feeds two fixed `[u8; 32]` arrays into `ct_eq`, so neither
+/// length nor prefix is observable. Every secret compare in the crate
+/// (bootstrap access key, IAM secret key, metrics bearer token) goes
+/// through here.
+pub fn secret_eq(a: &[u8], b: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    use subtle::ConstantTimeEq;
+    Sha256::digest(a).ct_eq(&Sha256::digest(b)).into()
+}
+
 /// What an outbound URL is going to be used for. Drives policy:
 /// production callers (`Backend`, `Oidc`, `Webhook`) require HTTPS and
 /// reject private address ranges; `BackendDev` keeps the door open for
@@ -379,6 +393,15 @@ impl reqwest::dns::Resolve for SsrfGuardedResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_eq_ignores_length_and_matches_exactly() {
+        assert!(secret_eq(b"abc", b"abc"));
+        assert!(!secret_eq(b"abc", b"abd"));
+        assert!(!secret_eq(b"abc", b"abcd"), "length differs");
+        assert!(!secret_eq(b"", b"a"));
+        assert!(secret_eq(b"", b""));
+    }
 
     #[test]
     fn backend_dev_allows_kubernetes_cluster_dns_but_never_metadata() {

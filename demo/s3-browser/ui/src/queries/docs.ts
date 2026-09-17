@@ -4,14 +4,12 @@
  * bundle — see docsBundle.ts for why). Only `useDocs` is exported.
  */
 import { useQuery } from '@tanstack/react-query';
-import { adminFetch, safeJson } from '../adminApi/core';
-import { buildDocsBundle, type DocsBundle, type DocsPayload } from '../docsBundle';
+import { getDocs } from '../adminApi/docs';
+import { buildDocsBundle, type DocsBundle } from '../docsBundle';
 import { qk } from './keys';
 
 async function fetchDocs(): Promise<DocsBundle> {
-  const res = await adminFetch('/api/docs');
-  if (!res.ok) throw new Error(`docs: HTTP ${res.status}`);
-  return buildDocsBundle((await safeJson(res)) as DocsPayload);
+  return buildDocsBundle(await getDocs());
 }
 
 export function useDocs() {

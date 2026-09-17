@@ -12,8 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use subtle::ConstantTimeEq;
-
 use crate::iam::{Group, IamIndex, IamState, IamUser};
 use crate::rate_limiter;
 use crate::session::{AuthMethod, S3SessionCredentials, SessionKind};
@@ -33,10 +31,10 @@ pub(crate) fn iam_user_secret_valid(user: &IamUser, secret_access_key: &str) -> 
     if !user.enabled {
         return false;
     }
-    use sha2::{Digest, Sha256};
-    let stored_hash = Sha256::digest(user.secret_access_key.as_bytes());
-    let provided_hash = Sha256::digest(secret_access_key.as_bytes());
-    stored_hash.ct_eq(&provided_hash).into()
+    crate::security::secret_eq(
+        user.secret_access_key.as_bytes(),
+        secret_access_key.as_bytes(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -121,20 +119,20 @@ fn metrics_bearer_token() -> Option<&'static str> {
         .as_deref()
 }
 
-/// Constant-time check of the request's bearer token against `token`.
-fn bearer_matches(headers: &HeaderMap, token: &str) -> bool {
-    use subtle::ConstantTimeEq;
-    let Some(value) = headers
+/// The bearer token a request presents, if it presents one.
+fn presented_bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-    else {
-        return false;
-    };
-    let Some(presented) = value.strip_prefix("Bearer ") else {
-        return false;
-    };
-    let presented = presented.trim();
-    presented.len() == token.len() && bool::from(presented.as_bytes().ct_eq(token.as_bytes()))
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+}
+
+/// Constant-time check of the request's bearer token against `token`
+/// (length-oblivious, see [`crate::security::secret_eq`]).
+fn bearer_matches(headers: &HeaderMap, token: &str) -> bool {
+    presented_bearer(headers)
+        .is_some_and(|presented| crate::security::secret_eq(presented.as_bytes(), token.as_bytes()))
 }
 
 /// Middleware for `/_/metrics` — see [`metrics_bearer_token`]. A pass-through
@@ -148,18 +146,37 @@ pub async fn require_metrics_access(
     let Some(token) = metrics_bearer_token() else {
         return next.run(request).await.into_response();
     };
-    if bearer_matches(&headers, token) {
-        return next.run(request).await.into_response();
-    }
     let peer_ip = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
+    // A presented bearer is a credential check like login: it enters the
+    // per-IP rate limiter, and a wrong token counts as a failure (lockout +
+    // SECURITY log line). A request with no Authorization header is the
+    // dashboard's session path and is not counted.
+    if presented_bearer(&headers).is_some() {
+        let guard = match rate_limiter::RateLimitGuard::enter(
+            &state.rate_limiter,
+            &headers,
+            peer_ip,
+            "metrics",
+        )
+        .await
+        {
+            Ok(g) => g,
+            Err(_blocked) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+        };
+        if bearer_matches(&headers, token) {
+            guard.record_success();
+            return next.run(request).await.into_response();
+        }
+        guard.record_failure();
+    }
     let client_ip = rate_limiter::extract_client_ip_with_peer(&headers, peer_ip);
+    // `allows_admin_gui` already requires a live entry (same `entry_valid`
+    // check as `validate`), so one call is the whole test.
     let admin_session = extract_session_token(&headers)
-        .map(|t| {
-            state.sessions.validate(&t, client_ip) && state.sessions.allows_admin_gui(&t, client_ip)
-        })
+        .map(|t| state.sessions.allows_admin_gui(&t, client_ip))
         .unwrap_or(false);
     if admin_session {
         return next.run(request).await.into_response();

@@ -62,4 +62,32 @@ assert.equal(findDocByFilename(docs, 'https://example.com/readme.md'), undefined
 assert.equal(findDocByFilename(docs, 'Reference/Metrics'), undefined, 'links must carry .md');
 assert.equal(findDocByFilename([], 'readme.md'), undefined);
 
+// --- folder-relative links (the most common shape in docs/product) --------
+const tree = buildDocsBundle({
+  manifest: {
+    groups: [{ id: 'g', tagline: '' }],
+    docs: [
+      { path: 'how-to/go-to-production', group: 'g', order: 1 },
+      { path: 'how-to/serve-tls', group: 'g', order: 2 },
+      { path: 'reference/metrics', group: 'g', order: 3 },
+      { path: 'faq', group: 'g', order: 4 },
+    ],
+  },
+  docs: [
+    { path: 'how-to/go-to-production', content: '# Go' },
+    { path: 'how-to/serve-tls', content: '# TLS' },
+    { path: 'reference/metrics', content: '# Metrics' },
+    { path: 'faq', content: '# FAQ' },
+  ],
+}).docs;
+const fromHowTo = 'how-to/go-to-production.md';
+assert.equal(findDocByFilename(tree, 'serve-tls.md', fromHowTo)?.id, 'how-to-serve-tls', 'same-folder sibling');
+assert.equal(findDocByFilename(tree, './serve-tls.md#anchor', fromHowTo)?.id, 'how-to-serve-tls');
+assert.equal(findDocByFilename(tree, '../reference/metrics.md', fromHowTo)?.id, 'reference-metrics', 'sibling folder');
+assert.equal(findDocByFilename(tree, '../faq.md', fromHowTo)?.id, 'faq', 'back to top');
+assert.equal(findDocByFilename(tree, 'reference/metrics.md', 'faq.md')?.id, 'reference-metrics', 'from top into a folder');
+assert.equal(findDocByFilename(tree, 'serve-tls.md')?.id, 'how-to-serve-tls', 'no context: bare-filename fallback');
+assert.equal(findDocByFilename(tree, 'nope.md', fromHowTo), undefined);
+assert.equal(findDocByFilename(tree, 'https://example.com/serve-tls.md', fromHowTo), undefined, 'absolute URLs are not docs');
+
 console.log('docs-bundle regression test: OK');

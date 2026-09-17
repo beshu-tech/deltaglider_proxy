@@ -2,10 +2,15 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import ts from 'typescript';
 
-// Transpile a TS module to an importable data: URL (no bundler).
-async function loadModule(relPath, fileName) {
+// Transpile a TS module to an importable data: URL (no bundler). A data: URL
+// cannot resolve a relative import, so `deps` maps a module specifier used by
+// the source (e.g. './docsBundle') to an already-loaded data: URL.
+async function loadModule(relPath, fileName, deps = {}) {
   const url = new URL(relPath, import.meta.url);
-  const source = await readFile(url, 'utf8');
+  let source = await readFile(url, 'utf8');
+  for (const [spec, target] of Object.entries(deps)) {
+    source = source.split(`'${spec}'`).join(`'${target}'`);
+  }
   const { outputText } = ts.transpileModule(source, {
     compilerOptions: {
       module: ts.ModuleKind.ES2020,
@@ -16,7 +21,8 @@ async function loadModule(relPath, fileName) {
   return `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
 }
 
-const url = await loadModule('../src/linkifyDocUrl.ts', 'linkifyDocUrl.ts');
+const bundleUrl = await loadModule('../src/docsBundle.ts', 'docsBundle.ts');
+const url = await loadModule('../src/linkifyDocUrl.ts', 'linkifyDocUrl.ts', { './docsBundle': bundleUrl });
 const { docsUrlToInAppHref, splitLinkSegments } = await import(url);
 
 // --- docsUrlToInAppHref ------------------------------------------------------
