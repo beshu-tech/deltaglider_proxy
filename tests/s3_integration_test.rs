@@ -1,26 +1,27 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! S3 integration tests against an external MinIO.
+//! S3 integration tests against an external SeaweedFS.
 //!
 //! Comprehensive tests covering bucket CRUD, delta compression, metadata,
 //! file integrity, and cross-cutting scenarios.
 //!
 //! Test data is isolated via unique per-test prefixes / unique bucket
-//! names — multiple test binaries can hit the same MinIO concurrently.
+//! names — multiple test binaries can hit the same SeaweedFS concurrently.
 //!
-//! Expects MinIO at $MINIO_ENDPOINT (default: http://localhost:9000).
+//! Expects SeaweedFS at $S3_TEST_ENDPOINT (default: http://localhost:9000).
 //! Each test creates whatever bucket it needs via `ensure_bucket()`.
-//! CI brings up MinIO via the standard service container; locally
-//! run `docker run -p 9000:9000 quay.io/minio/minio server /data`. Tests
-//! call `skip_unless_minio!()` and exit gracefully when MinIO is
+//! CI brings up SeaweedFS via the standard service container; locally
+//! run `docker compose up -d` at the repo root. Tests
+//! call `skip_unless_s3_backend!()` and exit gracefully when SeaweedFS is
 //! unreachable.
 
 mod common;
 
 use bytes::Bytes;
 use common::{
-    generate_binary, get_bytes, head_headers, list_objects_raw, minio_endpoint_url, mutate_binary,
-    put_and_get_storage_type, TestServer, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
+    generate_binary, get_bytes, head_headers, list_objects_raw, mutate_binary,
+    put_and_get_storage_type, s3_test_endpoint_url, TestServer, S3_TEST_ACCESS_KEY,
+    S3_TEST_SECRET_KEY,
 };
 use deltaglider_proxy::multipart::MultipartStore;
 use sha2::{Digest, Sha256};
@@ -45,17 +46,17 @@ fn unique_prefix() -> String {
     format!("itest-{}-{}", timestamp, counter)
 }
 
-/// MinIO endpoint for the integration tests — same `MINIO_ENDPOINT`
+/// SeaweedFS endpoint for the integration tests — same `S3_TEST_ENDPOINT`
 /// env (default localhost:9000) the rest of the suite uses.
-fn minio_endpoint() -> String {
-    minio_endpoint_url()
+fn s3_test_endpoint() -> String {
+    s3_test_endpoint_url()
 }
 
-/// Create an S3 client pointed directly at the MinIO container (not through proxy)
-async fn minio_direct_client(endpoint: &str) -> aws_sdk_s3::Client {
+/// Create an S3 client pointed directly at the SeaweedFS container (not through proxy)
+async fn backend_direct_client(endpoint: &str) -> aws_sdk_s3::Client {
     let credentials = aws_credential_types::Credentials::new(
-        MINIO_ACCESS_KEY,
-        MINIO_SECRET_KEY,
+        S3_TEST_ACCESS_KEY,
+        S3_TEST_SECRET_KEY,
         None,
         None,
         "test",
@@ -72,15 +73,15 @@ async fn minio_direct_client(endpoint: &str) -> aws_sdk_s3::Client {
     aws_sdk_s3::Client::from_conf(config)
 }
 
-/// Ensure the test bucket exists in MinIO (idempotent)
+/// Ensure the test bucket exists in SeaweedFS (idempotent)
 async fn ensure_bucket(endpoint: &str) {
-    let client = minio_direct_client(endpoint).await;
+    let client = backend_direct_client(endpoint).await;
     let _ = client.create_bucket().bucket(TEST_BUCKET).send().await;
 }
 
-/// Start a proxy server pointed at the ephemeral MinIO, return (TestServer, endpoint)
+/// Start a proxy server pointed at the ephemeral SeaweedFS, return (TestServer, endpoint)
 async fn proxy_server() -> TestServer {
-    let endpoint = minio_endpoint();
+    let endpoint = s3_test_endpoint();
     ensure_bucket(&endpoint).await;
     TestServer::s3_with_endpoint(&endpoint, TEST_BUCKET).await
 }
@@ -91,9 +92,9 @@ async fn proxy_server() -> TestServer {
 
 #[tokio::test]
 async fn test_create_and_head_bucket() {
-    skip_unless_minio!();
-    let endpoint = minio_endpoint();
-    let client = minio_direct_client(&endpoint).await;
+    skip_unless_s3_backend!();
+    let endpoint = s3_test_endpoint();
+    let client = backend_direct_client(&endpoint).await;
     let bucket_name = format!("test-bucket-{}", unique_prefix());
 
     client
@@ -112,9 +113,9 @@ async fn test_create_and_head_bucket() {
 
 #[tokio::test]
 async fn test_list_buckets_includes_created() {
-    skip_unless_minio!();
-    let endpoint = minio_endpoint();
-    let client = minio_direct_client(&endpoint).await;
+    skip_unless_s3_backend!();
+    let endpoint = s3_test_endpoint();
+    let client = backend_direct_client(&endpoint).await;
     let bucket_name = format!("list-test-{}", unique_prefix());
 
     client
@@ -143,9 +144,9 @@ async fn test_list_buckets_includes_created() {
 
 #[tokio::test]
 async fn test_head_bucket_nonexistent() {
-    skip_unless_minio!();
-    let endpoint = minio_endpoint();
-    let client = minio_direct_client(&endpoint).await;
+    skip_unless_s3_backend!();
+    let endpoint = s3_test_endpoint();
+    let client = backend_direct_client(&endpoint).await;
 
     let result = client
         .head_bucket()
@@ -157,9 +158,9 @@ async fn test_head_bucket_nonexistent() {
 
 #[tokio::test]
 async fn test_delete_empty_bucket() {
-    skip_unless_minio!();
-    let endpoint = minio_endpoint();
-    let client = minio_direct_client(&endpoint).await;
+    skip_unless_s3_backend!();
+    let endpoint = s3_test_endpoint();
+    let client = backend_direct_client(&endpoint).await;
     let bucket_name = format!("del-empty-{}", unique_prefix());
 
     client
@@ -182,9 +183,9 @@ async fn test_delete_empty_bucket() {
 
 #[tokio::test]
 async fn test_delete_nonempty_bucket_fails() {
-    skip_unless_minio!();
-    let endpoint = minio_endpoint();
-    let client = minio_direct_client(&endpoint).await;
+    skip_unless_s3_backend!();
+    let endpoint = s3_test_endpoint();
+    let client = backend_direct_client(&endpoint).await;
     let bucket_name = format!("del-nonempty-{}", unique_prefix());
 
     client
@@ -222,7 +223,7 @@ async fn test_delete_nonempty_bucket_fails() {
 
 #[tokio::test]
 async fn test_multi_version_delta_compression() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -311,7 +312,7 @@ async fn test_multi_version_delta_compression() {
 
 #[tokio::test]
 async fn test_two_deltaspaces_independent() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix_a = format!("{}/project-a", unique_prefix());
@@ -407,7 +408,7 @@ async fn test_two_deltaspaces_independent() {
 
 #[tokio::test]
 async fn test_delta_reconstruction_sha256() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -473,7 +474,7 @@ async fn test_delta_reconstruction_sha256() {
 
 #[tokio::test]
 async fn test_head_returns_dg_metadata_headers() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -557,7 +558,7 @@ async fn test_head_returns_dg_metadata_headers() {
 
 #[tokio::test]
 async fn test_metadata_for_all_storage_types() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -632,7 +633,7 @@ async fn test_metadata_for_all_storage_types() {
 
 #[tokio::test]
 async fn test_text_file_passthrough_roundtrip() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -662,7 +663,7 @@ async fn test_text_file_passthrough_roundtrip() {
 
 #[tokio::test]
 async fn test_multiple_text_files_roundtrip() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -736,7 +737,7 @@ async fn test_multiple_text_files_roundtrip() {
 
 #[tokio::test]
 async fn test_mixed_file_types_same_prefix() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -795,7 +796,7 @@ async fn test_mixed_file_types_same_prefix() {
 
 #[tokio::test]
 async fn test_full_lifecycle_with_delete() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let client = server.s3_client().await;
@@ -1006,7 +1007,7 @@ async fn complete_multipart_upload(
 
 #[tokio::test]
 async fn test_multipart_basic_roundtrip() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1078,7 +1079,7 @@ async fn test_multipart_basic_roundtrip() {
 
 #[tokio::test]
 async fn test_multipart_single_part() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1115,7 +1116,7 @@ async fn test_multipart_single_part() {
 
 #[tokio::test]
 async fn test_multipart_abort() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1162,7 +1163,7 @@ async fn test_multipart_abort() {
 
 #[tokio::test]
 async fn test_multipart_list_parts() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1219,7 +1220,7 @@ async fn test_multipart_list_parts() {
 
 #[tokio::test]
 async fn test_multipart_list_uploads() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1283,7 +1284,7 @@ async fn test_multipart_list_uploads() {
 
 #[tokio::test]
 async fn test_multipart_delta_compression() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1365,8 +1366,8 @@ async fn test_multipart_delta_compression() {
 
 #[tokio::test]
 async fn test_multipart_large_zip_forces_passthrough_on_s3_backend() {
-    skip_unless_minio!();
-    let endpoint = minio_endpoint();
+    skip_unless_s3_backend!();
+    let endpoint = s3_test_endpoint();
     ensure_bucket(&endpoint).await;
     let server = TestServer::builder()
         .s3_endpoint(&endpoint)
@@ -1509,7 +1510,7 @@ fn test_completing_timeout_reclaims_stuck_upload() {
 
 #[tokio::test]
 async fn test_multipart_invalid_upload_id() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1554,7 +1555,7 @@ async fn test_multipart_invalid_upload_id() {
 
 #[tokio::test]
 async fn test_multipart_aws_sdk_compat() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let prefix = unique_prefix();
     let key = format!("{}/sdk-multipart.bin", prefix);
@@ -1676,7 +1677,7 @@ async fn test_multipart_aws_sdk_compat() {
 // Group 7: Multi-Bucket
 // ============================================================================
 
-/// Create a bucket through the proxy endpoint (not directly on MinIO)
+/// Create a bucket through the proxy endpoint (not directly on SeaweedFS)
 async fn ensure_bucket_via_proxy(client: &reqwest::Client, endpoint: &str, bucket: &str) {
     let url = format!("{}/{}", endpoint, bucket);
     let resp = client.put(&url).send().await.expect("CREATE bucket failed");
@@ -1691,7 +1692,7 @@ async fn ensure_bucket_via_proxy(client: &reqwest::Client, endpoint: &str, bucke
 
 #[tokio::test]
 async fn test_multi_bucket_create_and_list() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1726,7 +1727,7 @@ async fn test_multi_bucket_create_and_list() {
 
 #[tokio::test]
 async fn test_multi_bucket_put_get_isolation() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1780,7 +1781,7 @@ async fn test_multi_bucket_put_get_isolation() {
 
 #[tokio::test]
 async fn test_multi_bucket_list_objects_isolation() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1852,7 +1853,7 @@ async fn test_multi_bucket_list_objects_isolation() {
 
 #[tokio::test]
 async fn test_multi_bucket_cross_bucket_copy() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1902,7 +1903,7 @@ async fn test_multi_bucket_cross_bucket_copy() {
 
 #[tokio::test]
 async fn test_multi_bucket_delete_bucket() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -1956,7 +1957,7 @@ async fn test_multi_bucket_delete_bucket() {
 
 #[tokio::test]
 async fn test_list_objects_reports_original_sizes() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -2035,7 +2036,7 @@ async fn test_list_objects_reports_original_sizes() {
 
 #[tokio::test]
 async fn test_list_objects_delimiter_common_prefixes() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -2088,7 +2089,7 @@ async fn test_list_objects_delimiter_common_prefixes() {
 
 #[tokio::test]
 async fn test_list_objects_pagination() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     let server = proxy_server().await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
@@ -2174,10 +2175,10 @@ async fn test_list_objects_pagination() {
 
 #[tokio::test]
 async fn test_first_file_bad_delta_ratio_passthrough() {
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
     // Use a very low max_delta_ratio so the identity delta (first file against itself)
     // exceeds the threshold and triggers the passthrough fallback
-    let endpoint = minio_endpoint();
+    let endpoint = s3_test_endpoint();
     ensure_bucket(&endpoint).await;
     let server = TestServer::s3_with_endpoint_and_delta_ratio(&endpoint, TEST_BUCKET, 0.001).await;
     let http = reqwest::Client::new();

@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 //! S3-object leader-lease integration tests against a REAL CAS-enforcing backend
-//! (MinIO). The pure acquire/renew/steal DECISION kernels are unit-tested in
+//! (SeaweedFS). The pure acquire/renew/steal DECISION kernels are unit-tested in
 //! `src/coordination/s3_lease.rs`; this file proves the actual S3 I/O — the
 //! `If-None-Match:*` create, `If-Match` steal/renew, and 412 handling — behaves
 //! correctly end-to-end, which is the half a fake store can't validate.
 //!
-//! Requires MinIO (the CI `deltaglider-test` bucket). Each test uses a unique
+//! Requires SeaweedFS (the CI `deltaglider-test` bucket). Each test uses a unique
 //! rule name (UUID) so parallel crates sharing the bucket never collide on a
 //! lease object under `_dgp/leases/`.
 
 mod common;
 
-use common::{minio_available, minio_client, MINIO_BUCKET};
+use common::{s3_backend_available, s3_test_client, S3_TEST_BUCKET};
 use deltaglider_proxy::coordination::{CoordinationLease, LeaseSubsystem, S3Lease};
 
 fn unique_rule() -> String {
@@ -21,19 +21,19 @@ fn unique_rule() -> String {
 
 const SUB: LeaseSubsystem = LeaseSubsystem::Replication;
 
-/// Build an S3Lease over MinIO with a given durable node id.
+/// Build an S3Lease over SeaweedFS with a given durable node id.
 async fn lease_for(node_id: &str) -> S3Lease {
     S3Lease::new(
-        minio_client().await,
-        MINIO_BUCKET.to_string(),
+        s3_test_client().await,
+        S3_TEST_BUCKET.to_string(),
         node_id.to_string(),
     )
 }
 
 #[tokio::test]
 async fn s3_lease_full_failover_lifecycle() {
-    if !minio_available().await {
-        eprintln!("Skipping s3_lease_full_failover_lifecycle: MinIO not available");
+    if !s3_backend_available().await {
+        eprintln!("Skipping s3_lease_full_failover_lifecycle: SeaweedFS not available");
         return;
     }
     let rule = unique_rule();
@@ -102,8 +102,8 @@ async fn s3_lease_full_failover_lifecycle() {
 
 #[tokio::test]
 async fn s3_lease_self_reclaim_after_restart() {
-    if !minio_available().await {
-        eprintln!("Skipping s3_lease_self_reclaim_after_restart: MinIO not available");
+    if !s3_backend_available().await {
+        eprintln!("Skipping s3_lease_self_reclaim_after_restart: SeaweedFS not available");
         return;
     }
     // E7: a rebooted NODE (same durable node_id, new task owner) reclaims its own
@@ -146,8 +146,8 @@ async fn s3_lease_self_reclaim_after_restart() {
 
 #[tokio::test]
 async fn s3_lease_concurrent_acquire_exactly_one_wins() {
-    if !minio_available().await {
-        eprintln!("Skipping s3_lease_concurrent_acquire_exactly_one_wins: MinIO not available");
+    if !s3_backend_available().await {
+        eprintln!("Skipping s3_lease_concurrent_acquire_exactly_one_wins: SeaweedFS not available");
         return;
     }
     // E2: N nodes race to acquire a FREE lease concurrently → exactly one wins

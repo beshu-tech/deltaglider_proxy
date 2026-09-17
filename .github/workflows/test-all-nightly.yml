@@ -1,4 +1,4 @@
-# Full `cargo test --all` against MinIO. Scheduled so PR CI can stay
+# Full `cargo test --all` against SeaweedFS. Scheduled so PR CI can stay
 # a curated fast subset; this catches drift if a crate is dropped from
 # the main workflow by mistake.
 name: Test all (nightly)
@@ -37,7 +37,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     env:
-      # See ci.yml `test-integration` for rationale: MinIO under test
+      # See ci.yml `test-integration` for rationale: SeaweedFS under test
       # serves http://localhost:9000, which the wave-1 SSRF guard
       # rejects unless this is set. DGP_REPLAY_WINDOW_SECS=0 disables
       # the wave-3 GET/HEAD replay cache for tests that legitimately
@@ -53,26 +53,45 @@ jobs:
         run: |
           rm -f deltaglider_config.db deltaglider_config.db.bak .deltaglider_bootstrap_hash
           rm -f /tmp/deltaglider_config.db /tmp/deltaglider_config.db.bak /tmp/.deltaglider_bootstrap_hash
-      - name: Start MinIO
+      - name: Start SeaweedFS for tests
         run: |
-          docker run -d --name minio-nightly --network container:$(hostname) \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z.hotfix.7aa24e772 server /data
-          for i in $(seq 1 30); do
-            mc alias set local http://localhost:9000 minioadmin minioadmin 2>/dev/null && break
+          # Ephemeral single-node SeaweedFS: master + volume + filer + S3 gateway
+          # in one process. The AWS_* env pair is the one admin identity the
+          # harness signs with (tests/common/mod.rs). Shares the runner's network
+          # namespace, so the S3 gateway is localhost:9000 for the job; the other
+          # daemons sit on 2xxxx (their gRPC twins on 3xxxx) so they never collide
+          # with the 19000+ / 29500+ ports the test harness hands out.
+          # WEED_S3_SSE_KEY: enables SSE-S3 (any secret string; the key is derived),
+          # so the SSE-S3 round-trip test can run against this backend.
+          # allowDeleteBucketNotEmpty=false: AWS semantics for DeleteBucket
+          # (BucketNotEmpty instead of SeaweedFS's default recursive delete).
+          docker run -d --name seaweedfs-nightly --network container:$(hostname) \
+            -e AWS_ACCESS_KEY_ID=dgp-test-key \
+            -e AWS_SECRET_ACCESS_KEY=dgp-test-secret \
+            -e WEED_S3_SSE_KEY=dgp-test-sse-key \
+            chrislusf/seaweedfs:4.47 server -dir=/data -ip.bind=0.0.0.0 \
+              -master.port=29333 -volume.port=28080 -filer.port=28888 \
+              -s3 -s3.port=9000 -s3.allowDeleteBucketNotEmpty=false
+          code=000
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:9000/ || true)
+            [ "$code" = "403" ] && break
             sleep 1
           done
-          mc mb --ignore-existing local/deltaglider-test
-          mc mb --ignore-existing local/deltaglider-data
-          echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
+          if [ "$code" != "403" ]; then
+            echo "SeaweedFS S3 gateway did not come up (last HTTP $code)"; docker logs seaweedfs-nightly | tail -50; exit 1
+          fi
+          for b in deltaglider-test deltaglider-data; do
+            docker exec seaweedfs-nightly sh -c "echo 's3.bucket.create -name $b' | weed shell -master=localhost:29333"
+          done
+          echo "S3_TEST_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
       - name: cargo test --all --locked
         env:
           RUST_BACKTRACE: "1"
         run: cargo test --all --locked -- --nocapture
-      - name: Stop MinIO
+      - name: Stop SeaweedFS
         if: always()
-        run: docker rm -f minio-nightly 2>/dev/null || true
+        run: docker rm -f seaweedfs-nightly 2>/dev/null || true
 
   # ── Moved off the PR critical path (were `continue-on-error` on ci.yml,
   #    i.e. non-gating). Coverage re-runs the whole --lib suite under

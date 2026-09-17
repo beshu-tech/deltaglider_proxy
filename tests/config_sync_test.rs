@@ -2,7 +2,7 @@
 
 //! Integration tests for config DB backup/restore — the manual equivalent of
 //! config sync. Tests the full IAM state export/import flow across two server instances.
-//! Requires MinIO for S3 backend tests.
+//! Requires SeaweedFS for S3 backend tests.
 
 mod common;
 
@@ -13,11 +13,11 @@ use serde_json::json;
 async fn test_config_db_backup_export_import() {
     // Export IAM state from server A, import into server B.
     // This is the real code path for config sync portability.
-    skip_unless_minio!();
+    skip_unless_s3_backend!();
 
     let server = TestServer::builder()
         .auth("BKKEY1", "BKSECRET1")
-        .s3_endpoint(&common::minio_endpoint_url())
+        .s3_endpoint(&common::s3_test_endpoint_url())
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
@@ -59,7 +59,7 @@ async fn test_config_db_backup_export_import() {
     // Start a SECOND server and import the backup
     let server2 = TestServer::builder()
         .auth("BKKEY2", "BKSECRET2")
-        .s3_endpoint(&common::minio_endpoint_url())
+        .s3_endpoint(&common::s3_test_endpoint_url())
         .build()
         .await;
     let admin2 = admin_http_client(&server2.endpoint()).await;

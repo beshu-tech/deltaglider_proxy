@@ -3,7 +3,7 @@
 //! Shared test infrastructure for integration tests
 //!
 //! Provides TestServer (filesystem and S3 backends), data generators,
-//! and MinIO availability gating.
+//! and SeaweedFS availability gating.
 
 #![allow(dead_code)]
 
@@ -44,15 +44,15 @@ pub const TEST_BOOTSTRAP_PASSWORD: &str = "testpass";
 pub const TEST_BOOTSTRAP_PASSWORD_HASH: &str =
     "$2b$04$s7/yy6Z363jZoQodArpuDeP00U.zE1QPi0bxM/o9BOZDs6tDbss5q";
 
-/// MinIO configuration constants
-pub const MINIO_BUCKET: &str = "deltaglider-test";
+/// SeaweedFS configuration constants
+pub const S3_TEST_BUCKET: &str = "deltaglider-test";
 
-/// MinIO endpoint — reads MINIO_ENDPOINT env var, falls back to localhost:9000
-pub fn minio_endpoint_url() -> String {
-    std::env::var("MINIO_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string())
+/// SeaweedFS endpoint — reads S3_TEST_ENDPOINT env var, falls back to localhost:9000
+pub fn s3_test_endpoint_url() -> String {
+    std::env::var("S3_TEST_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string())
 }
-pub const MINIO_ACCESS_KEY: &str = "minioadmin";
-pub const MINIO_SECRET_KEY: &str = "minioadmin";
+pub const S3_TEST_ACCESS_KEY: &str = "dgp-test-key";
+pub const S3_TEST_SECRET_KEY: &str = "dgp-test-secret";
 
 /// Test server wrapper that spawns a real deltaglider_proxy binary
 pub struct TestServer {
@@ -104,11 +104,11 @@ impl TestServer {
         Self::builder().codec_concurrency(concurrency).build().await
     }
 
-    /// Start a test server with S3 backend (needs MinIO running)
+    /// Start a test server with S3 backend (needs SeaweedFS running)
     pub async fn s3() -> Self {
         Self::builder()
-            .s3_endpoint(&minio_endpoint_url())
-            .bucket(MINIO_BUCKET)
+            .s3_endpoint(&s3_test_endpoint_url())
+            .bucket(S3_TEST_BUCKET)
             .build()
             .await
     }
@@ -185,7 +185,7 @@ impl TestServer {
             // not exit(1) or pay probe timeouts. Gate tests opt back in via
             // .env("DGP_BOOT_BACKEND_PROBE", "enforce").
             .env("DGP_BOOT_BACKEND_PROBE", "off")
-            // Local endpoints (http://127.0.0.1 MinIO, private IPs) are the norm
+            // Local endpoints (http://127.0.0.1 SeaweedFS, private IPs) are the norm
             // for tests, and the proxy otherwise refuses them at startup with
             // "URL scheme 'http' is not allowed". CI sets this for the whole job
             // (ci.yml), so WITHOUT it here the same test passes in CI and dies
@@ -384,7 +384,7 @@ impl TestServer {
             // not exit(1) or pay probe timeouts. Gate tests opt back in via
             // .env("DGP_BOOT_BACKEND_PROBE", "enforce").
             .env("DGP_BOOT_BACKEND_PROBE", "off")
-            // Local endpoints (http://127.0.0.1 MinIO, private IPs) are the norm
+            // Local endpoints (http://127.0.0.1 SeaweedFS, private IPs) are the norm
             // for tests, and the proxy otherwise refuses them at startup with
             // "URL scheme 'http' is not allowed". CI sets this for the whole job
             // (ci.yml), so WITHOUT it here the same test passes in CI and dies
@@ -420,7 +420,7 @@ pub struct TestServerBuilder {
     /// Native SSE mode tag for the singleton backend (Step 4). When
     /// set, emits `[backend_encryption] mode = "<value>"` into the
     /// generated config; the S3Backend then applies SSE headers per
-    /// PutObject. `"sse-s3"` is tested against MinIO; `"sse-kms"`
+    /// PutObject. `"sse-s3"` is tested against SeaweedFS; `"sse-kms"`
     /// would need an ARN and is out of scope for the test harness.
     native_sse_mode: Option<String>,
     /// S3 bucket for config DB sync (multi-replica HA mode). When set,
@@ -676,7 +676,7 @@ impl TestServerBuilder {
                     "  access_key_id: \"{}\"\n",
                     "  secret_access_key: \"{}\"\n",
                 ),
-                endpoint, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
+                endpoint, S3_TEST_ACCESS_KEY, S3_TEST_SECRET_KEY,
             ));
             if let Some(ref mode) = self.native_sse_mode {
                 config.push_str(&format!("backend_encryption:\n  mode: {}\n", mode));
@@ -1334,25 +1334,25 @@ pub fn mutate_binary(data: &[u8], change_ratio: f64) -> Vec<u8> {
     result
 }
 
-// === MinIO gating ===
+// === SeaweedFS gating ===
 
-/// Create an S3 client pointing directly at MinIO (not through the proxy)
-pub async fn minio_client() -> Client {
-    let credentials = Credentials::new(MINIO_ACCESS_KEY, MINIO_SECRET_KEY, None, None, "test");
+/// Create an S3 client pointing directly at SeaweedFS (not through the proxy)
+pub async fn s3_test_client() -> Client {
+    let credentials = Credentials::new(S3_TEST_ACCESS_KEY, S3_TEST_SECRET_KEY, None, None, "test");
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
-        .endpoint_url(minio_endpoint_url())
+        .endpoint_url(s3_test_endpoint_url())
         .credentials_provider(credentials)
         .force_path_style(true)
         .build();
     Client::from_conf(config)
 }
 
-/// Check if MinIO is available (TCP probe + HeadBucket with 2s timeout)
-pub async fn minio_available() -> bool {
+/// Check if SeaweedFS is available (TCP probe + HeadBucket with 2s timeout)
+pub async fn s3_backend_available() -> bool {
     // Quick TCP check first — parse host:port from endpoint URL
-    let endpoint = minio_endpoint_url();
+    let endpoint = s3_test_endpoint_url();
     let addr = endpoint
         .trim_start_matches("http://")
         .trim_start_matches("https://");
@@ -1360,24 +1360,24 @@ pub async fn minio_available() -> bool {
         return false;
     }
 
-    let client = minio_client().await;
+    let client = s3_test_client().await;
 
     // Verify the specific test bucket exists (not just any S3-compatible service)
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        client.head_bucket().bucket(MINIO_BUCKET).send(),
+        client.head_bucket().bucket(S3_TEST_BUCKET).send(),
     )
     .await;
     matches!(result, Ok(Ok(_)))
 }
 
-/// Macro to skip a test if MinIO is not available.
-/// Use at the start of any test that requires MinIO.
+/// Macro to skip a test if SeaweedFS is not available.
+/// Use at the start of any test that requires SeaweedFS.
 #[macro_export]
-macro_rules! skip_unless_minio {
+macro_rules! skip_unless_s3_backend {
     () => {
-        if !common::minio_available().await {
-            eprintln!("MinIO not available, skipping test");
+        if !common::s3_backend_available().await {
+            eprintln!("SeaweedFS not available, skipping test");
             return;
         }
     };
@@ -1458,7 +1458,7 @@ impl TestServer {
             // not exit(1) or pay probe timeouts. Gate tests opt back in via
             // .env("DGP_BOOT_BACKEND_PROBE", "enforce").
             .env("DGP_BOOT_BACKEND_PROBE", "off")
-            // Local endpoints (http://127.0.0.1 MinIO, private IPs) are the norm
+            // Local endpoints (http://127.0.0.1 SeaweedFS, private IPs) are the norm
             // for tests, and the proxy otherwise refuses them at startup with
             // "URL scheme 'http' is not allowed". CI sets this for the whole job
             // (ci.yml), so WITHOUT it here the same test passes in CI and dies
