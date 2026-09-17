@@ -42,7 +42,7 @@ The `DGP_ACCESS_KEY_ID` / `DGP_SECRET_ACCESS_KEY` pair is the S3 credential clie
 ```yaml
 services:
   minio:
-    image: minio/minio
+    image: quay.io/minio/minio
     command: server /data
     environment:
       MINIO_ROOT_USER: minioadmin
