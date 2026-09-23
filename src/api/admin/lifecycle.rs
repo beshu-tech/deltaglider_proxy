@@ -4,16 +4,14 @@
 
 use super::AdminState;
 use crate::lifecycle;
-use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
 use std::sync::Arc;
 use tracing::info;
 
 pub async fn preview(
-    Path(name): Path<String>,
-    State(state): State<Arc<AdminState>>,
-) -> Result<Json<lifecycle::LifecycleRunOutcome>, (StatusCode, String)> {
+    state: Arc<AdminState>,
+    name: String,
+) -> Result<lifecycle::LifecycleRunOutcome, (StatusCode, String)> {
     let lifecycle_cfg = { state.config.read().await.lifecycle.clone() };
     let rule = lifecycle_cfg
         .rules
@@ -45,24 +43,25 @@ pub async fn preview(
     let engine = state.s3_state.engine.load().clone();
     lifecycle::preview_rule(&engine, &rule, lifecycle_cfg.max_failures_retained as usize)
         .await
-        .map(Json)
         .map_err(|err| (lifecycle::classify_lifecycle_run_error(&err), err))
 }
 
 /// Pause a lifecycle rule (scheduler skips it; run-now 409s).
 pub async fn pause(
-    Path(name): Path<String>,
-    State(state): State<Arc<AdminState>>,
+    state: Arc<AdminState>,
+    name: String,
+    headers: &HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    set_paused(&state, &name, true, "lifecycle_pause").await
+    set_paused(&state, &name, true, "lifecycle_pause", headers).await
 }
 
 /// Resume a paused lifecycle rule.
 pub async fn resume(
-    Path(name): Path<String>,
-    State(state): State<Arc<AdminState>>,
+    state: Arc<AdminState>,
+    name: String,
+    headers: &HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    set_paused(&state, &name, false, "lifecycle_resume").await
+    set_paused(&state, &name, false, "lifecycle_resume", headers).await
 }
 
 async fn set_paused(
@@ -70,6 +69,7 @@ async fn set_paused(
     name: &str,
     paused: bool,
     audit_action: &str,
+    headers: &HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let in_config = {
         let cfg = state.config.read().await;
@@ -92,14 +92,15 @@ async fn set_paused(
     let _ = db.lifecycle_ensure_state(name, lifecycle::current_unix_seconds());
     db.lifecycle_set_paused(name, paused)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
-    crate::audit::audit_log(audit_action, "admin", name, &HeaderMap::new(), "", "");
+    crate::audit::audit_log(audit_action, "admin", name, headers, "", "");
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn run_now(
-    Path(name): Path<String>,
-    State(state): State<Arc<AdminState>>,
-) -> Result<Json<lifecycle::LifecycleRunOutcome>, (StatusCode, String)> {
+    state: Arc<AdminState>,
+    name: String,
+    headers: &HeaderMap,
+) -> Result<lifecycle::LifecycleRunOutcome, (StatusCode, String)> {
     let lifecycle_cfg = { state.config.read().await.lifecycle.clone() };
     let rule = lifecycle_cfg
         .rules
@@ -241,10 +242,10 @@ pub async fn run_now(
         "lifecycle_run_now",
         "admin",
         &name,
-        &HeaderMap::new(),
+        headers,
         &rule.bucket,
         &rule.prefix,
     );
 
-    Ok(Json(outcome))
+    Ok(outcome)
 }

@@ -441,10 +441,30 @@ lifecycle:
             "{}/_/api/admin/jobs/lifecycle:pause-me/pause",
             server.endpoint()
         ))
+        .header("user-agent", "dgp-audit-probe/1")
         .send()
         .await
         .unwrap();
     assert!(pause.status().is_success(), "pause: {}", pause.status());
+
+    // The audit entry carries the REAL request's client info, not the empty
+    // headers the job action used to pass.
+    let audit: Value = admin
+        .get(format!("{}/_/api/admin/audit?limit=50", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = audit["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "lifecycle_pause")
+        .expect("pause is audited")
+        .clone();
+    assert_eq!(entry["ua"], "dgp-audit-probe/1", "{entry}");
 
     let run = admin
         .post(format!(

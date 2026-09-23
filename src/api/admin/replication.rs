@@ -8,9 +8,7 @@
 use super::AdminState;
 use crate::config_sections::{ReplicationConfig, ReplicationRule};
 use crate::replication;
-use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
 use serde::Serialize;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -44,9 +42,10 @@ async fn snapshot_and_find_rule(
 }
 
 pub async fn run_now(
-    Path(name): Path<String>,
-    State(state): State<Arc<AdminState>>,
-) -> Result<(StatusCode, Json<RunNowResponse>), (StatusCode, String)> {
+    state: Arc<AdminState>,
+    name: String,
+    headers: &HeaderMap,
+) -> Result<(StatusCode, RunNowResponse), (StatusCode, String)> {
     let (repl, rule) = snapshot_and_find_rule(&state, &name).await?;
 
     // The GLOBAL kill-switch (`replication.enabled`) stays a hard block — it's
@@ -170,7 +169,7 @@ pub async fn run_now(
         "replication_run_now",
         "admin",
         &name,
-        &HeaderMap::new(),
+        headers,
         &rule.source.bucket,
         &rule.source.prefix,
     );
@@ -232,7 +231,7 @@ pub async fn run_now(
     // progress and the final outcome. Totals are 0 here (not yet known).
     Ok((
         StatusCode::ACCEPTED,
-        Json(RunNowResponse {
+        RunNowResponse {
             run_id: 0,
             status: "running".to_string(),
             objects_scanned: 0,
@@ -240,7 +239,7 @@ pub async fn run_now(
             objects_skipped: 0,
             bytes_copied: 0,
             errors: 0,
-        }),
+        },
     ))
 }
 
@@ -306,9 +305,10 @@ fn parity_status_from_row(
 /// `GET verify`. Gated only on rule existence (auditing a disabled rule is
 /// valid). Idempotent under the lease — a second POST won't double-scan.
 pub async fn verify(
-    Path(name): Path<String>,
-    State(state): State<Arc<AdminState>>,
-) -> Result<(StatusCode, Json<ParityStatusResponse>), (StatusCode, String)> {
+    state: Arc<AdminState>,
+    name: String,
+    headers: &HeaderMap,
+) -> Result<(StatusCode, ParityStatusResponse), (StatusCode, String)> {
     let (_repl, rule) = snapshot_and_find_rule(&state, &name).await?;
     let Some(db_arc) = state.config_db.clone() else {
         // No config DB → fall back to a synchronous in-request audit (dev/no-DB).
@@ -324,14 +324,14 @@ pub async fn verify(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
         return Ok((
             StatusCode::OK,
-            Json(ParityStatusResponse {
+            ParityStatusResponse {
                 status: "done".into(),
                 progress_scanned: outcome.source_objects as i64,
                 progress_total: outcome.source_objects as i64,
                 scanned_at: Some(outcome.scanned_at),
                 outcome: Some(outcome),
                 error: None,
-            }),
+            },
         ));
     };
 
@@ -392,7 +392,7 @@ pub async fn verify(
         if resp.status == "idle" || resp.status == "failed" {
             resp.status = "running".to_string();
         }
-        return Ok((StatusCode::ACCEPTED, Json(resp)));
+        return Ok((StatusCode::ACCEPTED, resp));
     }
 
     {
@@ -420,7 +420,7 @@ pub async fn verify(
         "replication_verify",
         "admin",
         &name,
-        &HeaderMap::new(),
+        headers,
         &rule.source.bucket,
         &rule.source.prefix,
     );
@@ -543,15 +543,15 @@ pub async fn verify(
         let db = db_arc.lock().await;
         db.parity_result_load(&rule.name).ok().flatten()
     };
-    Ok((StatusCode::ACCEPTED, Json(parity_status_from_row(row))))
+    Ok((StatusCode::ACCEPTED, parity_status_from_row(row)))
 }
 
 /// GET: poll the current parity audit status / last result (server-side, so it
 /// survives navigation + restart). No scan is started here.
 pub async fn verify_status(
-    Path(name): Path<String>,
-    State(state): State<Arc<AdminState>>,
-) -> Result<Json<ParityStatusResponse>, (StatusCode, String)> {
+    state: Arc<AdminState>,
+    name: String,
+) -> Result<ParityStatusResponse, (StatusCode, String)> {
     let _ = snapshot_and_find_rule(&state, &name).await?;
     let row = match &state.config_db {
         Some(db_arc) => {
@@ -564,7 +564,7 @@ pub async fn verify_status(
         }
         None => None,
     };
-    Ok(Json(parity_status_from_row(row)))
+    Ok(parity_status_from_row(row))
 }
 
 /// POST: request cancellation of a running parity audit. Flips the row to
@@ -572,9 +572,9 @@ pub async fn verify_status(
 /// settling the row to 'cancelled'. Returns the current status either way
 /// (idempotent — cancelling an idle/done audit is a no-op).
 pub async fn verify_cancel(
-    Path(name): Path<String>,
-    State(state): State<Arc<AdminState>>,
-) -> Result<Json<ParityStatusResponse>, (StatusCode, String)> {
+    state: Arc<AdminState>,
+    name: String,
+) -> Result<ParityStatusResponse, (StatusCode, String)> {
     let _ = snapshot_and_find_rule(&state, &name).await?;
     // Fast in-process signal: a local scan checks this every page without a lock.
     if let Some(flag) = state.parity_cancels.lock().unwrap().get(&name) {
@@ -590,7 +590,7 @@ pub async fn verify_cancel(
         }
         None => None,
     };
-    Ok(Json(parity_status_from_row(row)))
+    Ok(parity_status_from_row(row))
 }
 
 /// Background-job lease TTL for a parity audit. Long enough to cover a large
@@ -608,8 +608,9 @@ async fn rule_in_config(state: &AdminState, name: &str) -> bool {
 }
 
 pub async fn pause(
-    Path(name): Path<String>,
-    State(state): State<Arc<AdminState>>,
+    state: Arc<AdminState>,
+    name: String,
+    headers: &HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
     if !rule_in_config(&state, &name).await {
         return Err((StatusCode::NOT_FOUND, "rule not found".to_string()));
@@ -628,20 +629,14 @@ pub async fn pause(
     let _ = db.replication_ensure_state(&name, replication::current_unix_seconds());
     db.replication_set_paused(&name, true)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
-    crate::audit::audit_log(
-        "replication_pause",
-        "admin",
-        &name,
-        &HeaderMap::new(),
-        "",
-        "",
-    );
+    crate::audit::audit_log("replication_pause", "admin", &name, headers, "", "");
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn resume(
-    Path(name): Path<String>,
-    State(state): State<Arc<AdminState>>,
+    state: Arc<AdminState>,
+    name: String,
+    headers: &HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
     if !rule_in_config(&state, &name).await {
         return Err((StatusCode::NOT_FOUND, "rule not found".to_string()));
@@ -660,14 +655,7 @@ pub async fn resume(
     let _ = db.replication_ensure_state(&name, replication::current_unix_seconds());
     db.replication_set_paused(&name, false)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
-    crate::audit::audit_log(
-        "replication_resume",
-        "admin",
-        &name,
-        &HeaderMap::new(),
-        "",
-        "",
-    );
+    crate::audit::audit_log("replication_resume", "admin", &name, headers, "", "");
     Ok(StatusCode::NO_CONTENT)
 }
 

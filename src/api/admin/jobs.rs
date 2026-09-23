@@ -521,7 +521,7 @@ pub async fn job_verify_status(
     if sub != JobSubsystem::Replication {
         return Err(not_found());
     }
-    let Json(resp) = super::replication::verify_status(Path(key.to_string()), State(state)).await?;
+    let resp = super::replication::verify_status(state, key.to_string()).await?;
     Ok(Json(serde_json::to_value(resp).map_err(internal)?))
 }
 
@@ -531,13 +531,13 @@ pub async fn job_verify_status(
 pub async fn job_verify_start(
     Path(id): Path<String>,
     State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
     if sub != JobSubsystem::Replication {
         return Err(not_found());
     }
-    let (code, Json(resp)) =
-        super::replication::verify(Path(key.to_string()), State(state)).await?;
+    let (code, resp) = super::replication::verify(state, key.to_string(), &headers).await?;
     Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)))
 }
 
@@ -551,7 +551,7 @@ pub async fn job_verify_cancel(
     if sub != JobSubsystem::Replication {
         return Err(not_found());
     }
-    let Json(resp) = super::replication::verify_cancel(Path(key.to_string()), State(state)).await?;
+    let resp = super::replication::verify_cancel(state, key.to_string()).await?;
     Ok(Json(serde_json::to_value(resp).map_err(internal)?))
 }
 
@@ -755,40 +755,40 @@ pub async fn job_action(
     let name = key.to_string();
     match (sub, action) {
         (JobSubsystem::Replication, JobAction::Pause) => {
-            super::replication::pause(Path(name), State(state)).await?;
+            super::replication::pause(state, name, &headers).await?;
             Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
         }
         (JobSubsystem::Replication, JobAction::Resume) => {
-            super::replication::resume(Path(name), State(state)).await?;
+            super::replication::resume(state, name, &headers).await?;
             Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
         }
         (JobSubsystem::Replication, JobAction::RunNow) => {
             // Background run — returns 202 + the (running) status immediately.
-            let (code, Json(resp)) = super::replication::run_now(Path(name), State(state)).await?;
+            let (code, resp) = super::replication::run_now(state, name, &headers).await?;
             Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)))
         }
         (JobSubsystem::Replication, JobAction::Verify) => {
             // Kicks off a BACKGROUND audit; returns 202 + the (running) status.
-            let (code, Json(resp)) = super::replication::verify(Path(name), State(state)).await?;
+            let (code, resp) = super::replication::verify(state, name, &headers).await?;
             Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)))
         }
         (JobSubsystem::Lifecycle, JobAction::Pause) => {
-            super::lifecycle::pause(Path(name), State(state)).await?;
+            super::lifecycle::pause(state, name, &headers).await?;
             Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
         }
         (JobSubsystem::Lifecycle, JobAction::Resume) => {
-            super::lifecycle::resume(Path(name), State(state)).await?;
+            super::lifecycle::resume(state, name, &headers).await?;
             Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
         }
         (JobSubsystem::Lifecycle, JobAction::RunNow) => {
-            let Json(resp) = super::lifecycle::run_now(Path(name), State(state)).await?;
+            let resp = super::lifecycle::run_now(state, name, &headers).await?;
             Ok((
                 StatusCode::OK,
                 Json(serde_json::to_value(resp).map_err(internal)?),
             ))
         }
         (JobSubsystem::Lifecycle, JobAction::Preview) => {
-            let Json(resp) = super::lifecycle::preview(Path(name), State(state)).await?;
+            let resp = super::lifecycle::preview(state, name).await?;
             Ok((
                 StatusCode::OK,
                 Json(serde_json::to_value(resp).map_err(internal)?),
