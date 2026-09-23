@@ -267,7 +267,9 @@ fn parse_and_validate_yaml(yaml: &str) -> Result<(crate::config::Config, Vec<Str
             cfg.log_level
         ));
     }
-    let warnings = cfg.check();
+    let warnings = cfg
+        .check_all()
+        .map_err(|fatal| format!("config refused: {}", fatal.join("; ")))?;
     // Lifecycle fatality is decided by the callers via `lifecycle_gate` (needs
     // the RUNNING config to tell a new defect from a pre-existing one).
     Ok((cfg, warnings))
@@ -1175,5 +1177,20 @@ access:
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `/config/validate` must refuse what boot and apply refuse.
+    #[test]
+    fn validate_rejects_route_to_undefined_backend() {
+        let err = parse_and_validate_yaml(
+            "storage:\n  buckets:\n    releases: { backend: hetzner-fsn1 }\n",
+        )
+        .expect_err("fatal config must not validate");
+        assert!(err.contains("undefined backend 'hetzner-fsn1'"), "{err}");
     }
 }

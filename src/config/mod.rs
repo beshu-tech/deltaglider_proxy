@@ -1729,7 +1729,7 @@ impl Config {
     /// [`Self::validate`] which is a thin wrapper that logs each warning to
     /// stderr; the admin API calls `check` directly to return warnings as
     /// structured data.
-    pub fn check(&mut self) -> Vec<String> {
+    fn check(&mut self) -> Vec<String> {
         let mut warnings = Vec::new();
         // NaN and infinity are valid YAML float literals (`.nan` / `.inf`) but
         // break the downstream ratio test: NaN comparisons are always false, so
@@ -1752,26 +1752,8 @@ impl Config {
         if self.max_object_size == 0 {
             warnings.push("max_object_size=0 will reject all uploads".to_string());
         }
-        // Reject duplicate backend names. The routing layer keys on name, so
-        // a second `{ name: "x", ... }` silently shadows the first — and if
-        // the list is ever reordered (sort, filter, de-dup elsewhere) routing
-        // changes without warning. Warn so operators know a duplicate is
-        // present; the first entry wins at runtime.
-        if self.backends.len() > 1 {
-            let mut seen = std::collections::HashSet::new();
-            let mut duplicates = std::collections::BTreeSet::new();
-            for backend in &self.backends {
-                if !seen.insert(backend.name.as_str()) {
-                    duplicates.insert(backend.name.as_str());
-                }
-            }
-            if !duplicates.is_empty() {
-                warnings.push(format!(
-                    "duplicate backend name(s) found: {:?} — the first entry wins at routing time; remove duplicates to silence this warning",
-                    duplicates.iter().collect::<Vec<_>>()
-                ));
-            }
-        }
+        // Duplicate backend names and routes to undefined backends are FATAL,
+        // not warnings: see `check_fatal`, which `check_all` runs first.
 
         if let Some(ref default) = self.default_backend {
             if !self.backends.is_empty() && !self.backends.iter().any(|b| &b.name == default) {
@@ -1783,17 +1765,6 @@ impl Config {
                 self.default_backend = None;
             }
         }
-        for (bucket, policy) in &self.buckets {
-            if let Some(ref backend) = policy.backend {
-                if !self.backends.is_empty() && !self.backends.iter().any(|b| &b.name == backend) {
-                    warnings.push(format!(
-                        "bucket '{}' routes to unknown backend '{}' — route will be ignored",
-                        bucket, backend
-                    ));
-                }
-            }
-        }
-
         // replication_target_only coherence. The marker's safety argument is
         // "replication is the SINGLE writer"; warn on configs that weaken it.
         // See docs/product/how-to/backend-capability-validation.md.
@@ -2058,6 +2029,19 @@ impl Config {
         }
     }
 
+    /// THE validation entry point for every surface that judges a config
+    /// before it runs (`config lint`, `/config/validate`, section
+    /// validate/apply). `Err` carries the fatal errors that boot and apply
+    /// refuse; `Ok` carries the warnings. Running both here keeps lint and
+    /// validate from passing a config the server rejects.
+    pub fn check_all(&mut self) -> Result<Vec<String>, Vec<String>> {
+        let fatal = self.check_fatal();
+        if !fatal.is_empty() {
+            return Err(fatal);
+        }
+        Ok(self.check())
+    }
+
     /// FATAL config errors — graph states the proxy must never run with,
     /// as opposed to [`Self::check`]'s advisory warnings:
     ///
@@ -2084,8 +2068,14 @@ impl Config {
             if let Some(ref backend) = policy.backend {
                 // "default" is the SYNTHESIZED name of the singleton
                 // `storage.backend` (what the GUI displays and the admin API
-                // accepts) — always resolvable, never in `backends[]`.
-                if backend != "default" && !self.backends.iter().any(|b| &b.name == backend) {
+                // accepts). It exists only while `backends[]` is empty; with
+                // named backends, `RoutingBackend::new` refuses it.
+                let routable = if self.backends.is_empty() {
+                    backend == "default"
+                } else {
+                    self.backends.iter().any(|b| &b.name == backend)
+                };
+                if !routable {
                     errors.push(format!(
                         "bucket '{bucket}' routes to undefined backend '{backend}' — \
                          define the backend under storage.backends or remove the route \
@@ -3599,6 +3589,37 @@ storage:
         assert!(cfg.check_fatal().is_empty());
     }
 
+    /// `"default"` names the singleton backend. With named backends it is
+    /// not routable (`RoutingBackend::new` refuses it), so it is fatal.
+    #[test]
+    fn check_fatal_default_route_is_valid_only_without_named_backends() {
+        let singleton = Config::from_yaml_str(
+            r#"
+storage:
+  buckets:
+    releases: { backend: default }
+"#,
+        )
+        .expect("parses");
+        assert!(singleton.check_fatal().is_empty());
+
+        let named = Config::from_yaml_str(
+            r#"
+storage:
+  backends:
+    - name: local-disk
+      type: filesystem
+      path: /tmp/x
+  buckets:
+    releases: { backend: default }
+"#,
+        )
+        .expect("parses");
+        let errors = named.check_fatal();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("undefined backend 'default'"));
+    }
+
     #[test]
     fn test_is_valid_key_id_charset() {
         assert!(is_valid_key_id("eu-2026-04"));
@@ -4231,7 +4252,7 @@ storage:
     }
 
     #[test]
-    fn test_check_warns_on_duplicate_backend_names() {
+    fn test_check_all_rejects_duplicate_backend_names() {
         // Routing keys on backend.name. A duplicate silently shadows the
         // second entry; the first wins at runtime. Warn so the operator
         // knows the config is ambiguous.
@@ -4255,12 +4276,12 @@ storage:
             ],
             ..Config::default()
         };
-        let warnings = cfg.check();
+        let fatal = cfg.check_all().expect_err("duplicate names are fatal");
         assert!(
-            warnings
+            fatal
                 .iter()
-                .any(|w| w.contains("duplicate backend name") && w.contains("shared")),
-            "expected duplicate-name warning, got {warnings:?}"
+                .any(|e| e.contains("duplicate backend name") && e.contains("shared")),
+            "expected duplicate-name error, got {fatal:?}"
         );
     }
 
@@ -4281,7 +4302,7 @@ storage:
             ],
             ..Config::default()
         };
-        let warnings = cfg.check();
+        let warnings = cfg.check_all().expect("unique names are not fatal");
         assert!(
             !warnings.iter().any(|w| w.contains("duplicate")),
             "no duplicate warning expected when names are unique, got {warnings:?}"

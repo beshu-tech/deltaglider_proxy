@@ -151,11 +151,20 @@ pub fn lint(file: &str) -> i32 {
         }
     };
 
-    // Run the same `check()` the admin API's /validate uses. It
-    // mutates fields that can't be satisfied (e.g. clears an
-    // unresolved default_backend) and returns human-readable
-    // warnings.
-    let warnings = cfg.check();
+    // Run the same `check_all()` the admin API's /validate uses: fatal
+    // errors (the ones boot and apply refuse) reject with exit 6;
+    // otherwise it mutates fields that can't be satisfied (e.g. clears an
+    // unresolved default_backend) and returns human-readable warnings.
+    let warnings = match cfg.check_all() {
+        Ok(w) => w,
+        Err(fatal) => {
+            for e in &fatal {
+                eprintln!("error: {e}");
+            }
+            eprintln!("{file}: rejected — {} fatal config error(s)", fatal.len());
+            return EXIT_REJECTED;
+        }
+    };
 
     // Log-filter check: /validate rejects malformed filters with 400.
     // Here we surface it as exit 6.
@@ -672,6 +681,23 @@ admission:
         // must name the offending block for operator grep.
         let code = lint(path.to_str().unwrap());
         assert_eq!(code, EXIT_PARSE);
+    }
+
+    /// A config the server refuses to boot must not lint clean.
+    #[test]
+    fn lint_rejects_route_to_undefined_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.yaml");
+        std::fs::write(
+            &path,
+            r#"
+storage:
+  buckets:
+    releases: { backend: hetzner-fsn1 }
+"#,
+        )
+        .unwrap();
+        assert_eq!(lint(path.to_str().unwrap()), EXIT_REJECTED);
     }
 
     #[test]

@@ -445,9 +445,26 @@ async fn apply_section(
             .into_response();
     }
 
-    // Validate semantically via `Config::check` (runs the same
-    // warnings pipeline the document-level apply runs).
-    let mut warnings_from_check = new_cfg.check();
+    // Validate semantically via `Config::check_all` (the same fatal gate
+    // and warnings pipeline the document-level apply runs), so a dry-run
+    // cannot pass a section the real apply refuses.
+    let mut warnings_from_check = match new_cfg.check_all() {
+        Ok(w) => w,
+        Err(fatal) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(SectionApplyResponse {
+                    ok: false,
+                    warnings: removed_warnings,
+                    requires_restart: false,
+                    persisted_path: None,
+                    error: Some(format!("config refused: {}", fatal.join("; "))),
+                    diff: None,
+                }),
+            )
+                .into_response();
+        }
+    };
 
     // Lifecycle gate — the SAME changed-only gate the document-level apply runs.
     // The GUI's Jobs/Storage editor saves through THIS section path, so without
