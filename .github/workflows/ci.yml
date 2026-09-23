@@ -35,7 +35,7 @@ jobs:
   # re-running `npm ci` / `cargo build --release`.
   build-ui:
     name: Build UI (dist artifact)
-    runs-on: k3s
+    runs-on: homelab
     timeout-minutes: 10
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -62,7 +62,7 @@ jobs:
 
   build-bin:
     name: Build release binary (artifact)
-    runs-on: k3s
+    runs-on: homelab
     timeout-minutes: 20
     needs: build-ui
     container:
@@ -149,11 +149,11 @@ jobs:
 
   fmt:
     name: Rustfmt
-    runs-on: k3s
+    runs-on: homelab
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       # Raise the open-file limit. These jobs run on the self-hosted
-      # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
+      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
       # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
@@ -177,12 +177,12 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: k3s
+    runs-on: homelab
     needs: build-ui
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       # Raise the open-file limit. These jobs run on the self-hosted
-      # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
+      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
       # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
@@ -252,13 +252,13 @@ jobs:
 
   test-unit:
     name: Unit Tests
-    runs-on: k3s
+    runs-on: homelab
     needs: build-ui
     timeout-minutes: 15
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       # Raise the open-file limit. These jobs run on the self-hosted
-      # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
+      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
       # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
@@ -294,13 +294,13 @@ jobs:
     if: >-
       github.event_name != 'push' ||
       contains(github.event.head_commit.message, '[ci-integration]')
-    runs-on: k3s
+    runs-on: homelab
     needs: build-ui
     timeout-minutes: 50
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       # Raise the open-file limit. These jobs run on the self-hosted
-      # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
+      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
       # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
@@ -466,13 +466,13 @@ jobs:
 
   test-delta:
     name: Delta & Optimization Tests
-    runs-on: k3s
+    runs-on: homelab
     needs: build-ui
     timeout-minutes: 15
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       # Raise the open-file limit. These jobs run on the self-hosted
-      # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
+      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
       # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
@@ -505,13 +505,13 @@ jobs:
 
   e2e-smoke:
     name: E2E smoke (embedded UI)
-    runs-on: k3s
+    runs-on: homelab
     needs: build-bin
     timeout-minutes: 35
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       # Raise the open-file limit. These jobs run on the self-hosted
-      # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
+      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
       # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
@@ -547,11 +547,11 @@ jobs:
 
   frontend-lint:
     name: Frontend Lint
-    runs-on: k3s
+    runs-on: homelab
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       # Raise the open-file limit. These jobs run on the self-hosted
-      # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
+      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
       # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
@@ -633,7 +633,7 @@ jobs:
 
   docs:
     name: Docs bundling + link check + YAML examples
-    runs-on: k3s
+    runs-on: homelab
     needs: build-bin
     # The from-scratch release build (the old dominant cost) is gone — the
     # config-lint now consumes the shared build-bin artifact. Only the docs
@@ -643,7 +643,7 @@ jobs:
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       # Raise the open-file limit. These jobs run on the self-hosted
-      # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
+      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
       # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
@@ -722,13 +722,13 @@ jobs:
 
   config-schema:
     name: Config JSON Schema
-    runs-on: k3s
+    runs-on: homelab
     needs: build-bin
     timeout-minutes: 10
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       # Raise the open-file limit. These jobs run on the self-hosted
-      # `k3s`-labelled Ryzen LXC runners, where the container inherits a low
+      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
       # default nofile (~1024). The integration suite spawns ~35 test
       # binaries in parallel, each with its own proxy + MinIO sockets, so the
       # aggregate fd count blows past 1024 and surfaces as
