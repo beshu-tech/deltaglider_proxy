@@ -278,12 +278,18 @@ fn build_anonymous_user(bucket: &str, public_prefixes: &[String]) -> Authenticat
     }
 
     AuthenticatedUser {
-        name: "$anonymous".into(),
+        name: crate::iam::types::ANONYMOUS_USER_NAME.into(),
         access_key_id: String::new(),
         permissions,
         iam_policies,
     }
 }
+
+/// Request-extension marker: this request was authenticated through a
+/// presigned URL (query-string SigV4), i.e. by the link holder, not by a
+/// caller who holds the signer's credentials.
+#[derive(Debug, Clone, Copy)]
+pub struct PresignedRequest;
 
 /// Common intermediate representation for SigV4 parameters,
 /// populated from either Authorization header or presigned URL query params.
@@ -489,6 +495,10 @@ fn is_form_post_policy_candidate(request: &Request<Body>) -> bool {
 ///
 /// Inserted as a layer around the router. If `auth` is `None` (no credentials
 /// configured), all requests pass through unchanged.
+// `Err` is the early-response short-circuit axum middleware idiom; boxing an
+// `http::Response` on the per-request hot path to please `result_large_err`
+// (clippy ≥ 1.98) buys nothing.
+#[allow(clippy::result_large_err)]
 pub async fn sigv4_auth_middleware(
     mut request: Request<Body>,
     next: Next,
@@ -725,11 +735,10 @@ pub async fn sigv4_auth_middleware(
             // leaky on existence (DashMap shards), but the bootstrap
             // path is hot enough to be a measurable oracle without
             // this guard.
-            use sha2::{Digest, Sha256};
-            use subtle::ConstantTimeEq;
-            let provided_hash = Sha256::digest(params.access_key.as_bytes());
-            let configured_hash = Sha256::digest(auth.access_key_id.as_bytes());
-            let matches: bool = provided_hash.ct_eq(&configured_hash).into();
+            let matches = crate::security::secret_eq(
+                params.access_key.as_bytes(),
+                auth.access_key_id.as_bytes(),
+            );
             if !matches {
                 debug!("SigV4: access key mismatch (legacy mode)");
                 record_auth_failure("invalid_access_key");
@@ -885,6 +894,13 @@ pub async fn sigv4_auth_middleware(
     if let Some(user) = authenticated_user {
         debug!("SigV4: authenticated user '{}'", user.name);
         request.extensions_mut().insert(user);
+    }
+    // A presigned URL authenticates as its SIGNER, but whoever holds the link
+    // is an anonymous party (the docs recommend presigned links over public
+    // prefixes for third parties). Handlers that hide deployment provenance
+    // from anonymous readers check this marker alongside `$anonymous`.
+    if is_presigned {
+        request.extensions_mut().insert(PresignedRequest);
     }
 
     // Stash the resolved client IP so handlers running a SECONDARY authz the

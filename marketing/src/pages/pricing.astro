@@ -22,7 +22,7 @@ import '../styles/calculator.css';
 
 const title = 'Pricing — DeltaGlider';
 const description =
-  `Free up to ${FREE_GRANT_TB} TB of compressed data. One flat Commercial plan at $5k/year — license, support, and signed builds included. Calculator shows your annual savings live.`;
+  `Free up to ${FREE_GRANT_TB} TB of compressed data. One flat Commercial plan at $5k/year covers the license, support, and signed builds. The calculator shows annual savings live.`;
 
 // Schema generator wants {sku, name, price, description}. Adapt from
 // the rich Bracket shape — single source of truth lives in brackets.ts.
@@ -73,8 +73,8 @@ function renderDescription(id: string, description: string): string {
       <div class="calculator-hero-inner measure-wide">
         <h2>What does DeltaGlider save you?</h2>
         <p>
-          Type the numbers from your current AWS S3 bill. Get an honest answer in 30
-          seconds. No email required.
+          Type the numbers from your current AWS S3 bill and get an answer in 30
+          seconds, even when the answer is no. We don't ask for your email.
         </p>
       </div>
     </section>
@@ -151,20 +151,20 @@ function renderDescription(id: string, description: string): string {
       <h2>What we mean by "compressed stored footprint"</h2>
 
       <p>
-        Compressed stored footprint = the bytes physically stored on your
-        backend across all DeltaGlider-managed buckets, after
-        DeltaGlider's compression. This is the number the license grant
-        is measured on, and it is the number DeltaGlider already shows
-        you — in the admin dashboard and at <code>/_/stats</code>. It is
-        not your source (logical) bytes, and it is not ingress or egress.
-        Storage-layer replicas (whatever your backend does under the
-        hood) don't count.
+        The compressed stored footprint is the number of bytes your
+        backend physically stores across all DeltaGlider-managed buckets,
+        after DeltaGlider's compression. This is the number we count
+        against the license grant, and the one DeltaGlider already shows
+        you in the admin dashboard and at <code>/_/stats</code>. Your
+        source (logical) bytes, ingress, and egress don't count, and
+        neither do storage-layer replicas (whatever your backend does
+        under the hood).
       </p>
 
       <p>
         We don't collect telemetry and the software never phones home.
         Your own dashboard tells you which side of the {FREE_GRANT_TB} TB
-        line you are on; you self-report, and we cross-check via the
+        line you are on. You self-report, and we cross-check against the
         <code>/_/stats</code> endpoint only if you give us read access
         during the conversation.
       </p>
@@ -176,7 +176,7 @@ function renderDescription(id: string, description: string): string {
       <p>
         DeltaGlider is source-available under the
         <a href="https://github.com/beshu-tech/deltaglider_proxy/blob/main/LICENSE">Business Source License 1.1</a>.
-        The license itself grants free production use to most deployments,
+        The license grants free production use to most deployments,
         and every release becomes Apache-2.0 open source two years after
         it ships. You need a paid license only if one of these applies:
       </p>
@@ -184,29 +184,28 @@ function renderDescription(id: string, description: string): string {
       <ul>
         <li>
           Your total compressed stored footprint exceeds
-          {FREE_GRANT_TB} TB per organization — that's the Commercial
-          plan, at the flat published price above
+          {FREE_GRANT_TB} TB per organization. This is the Commercial
+          plan, at the flat published price above.
         </li>
         <li>
           You offer DeltaGlider itself to your customers as a hosted or
-          managed service — that's an OEM conversation
+          managed service. That needs an OEM license.
         </li>
         <li>
-          You embed DeltaGlider in a proprietary product you distribute —
-          also an OEM conversation
+          The same applies when you embed DeltaGlider in a proprietary
+          product you distribute.
         </li>
       </ul>
 
       <p>
         Everything else is free: internal infrastructure under the grant,
         development, testing, evaluation at any size. If your compressed
-        footprint is above {FREE_GRANT_TB} TB, DeltaGlider is saving you
-        far more than the plan costs — that is exactly what the
+        footprint is above {FREE_GRANT_TB} TB, DeltaGlider saves you
+        far more than the plan costs. That is exactly what the
         calculator above shows.
       </p>
 
       <p>
-        →
         <a href="mailto:sales@beshu.tech?subject=DeltaGlider%20-%20OEM%20license%20inquiry">
           Talk to sales about OEM
         </a>
@@ -222,23 +221,23 @@ function renderDescription(id: string, description: string): string {
         <div class="faq-item">
           <h3>Is DeltaGlider still open source?</h3>
           <p>
-            It is source-available: the full source is public, you can
-            read and build every line, and nothing is gated behind a
-            license key. It is not open source by the OSI definition —
-            but every release automatically becomes Apache-2.0, a fully
-            open license, two years after it ships. Releases up to
-            v1.17.0 were GPL-3.0 and stay GPL-3.0 forever.
+            DeltaGlider is source-available. You can read and build every
+            line of the public source, and there are no license keys. The
+            license doesn't meet the OSI definition of open source. Every
+            release automatically becomes Apache-2.0, an open source
+            license, two years after it ships. Releases up to v1.17.0
+            were GPL-3.0 and stay GPL-3.0 forever.
           </p>
         </div>
 
         <div class="faq-item">
           <h3>Why one flat price instead of brackets?</h3>
           <p>
-            Because support effort doesn't scale with your bytes, and
-            charging more the better the compression works taxed the
-            product for doing its job. Above the free grant, every
-            deployment gets the same plan: license, support, signed
-            builds, everything. If your savings are $200k/yr, good — the
+            Support effort doesn't scale with your bytes, and charging
+            more the better the compression works taxed the product for
+            doing its job. Above the free grant, every deployment
+            gets the same plan, with the license, support, and signed
+            builds all included. If your savings are $200k/yr, good: the
             price stays $5k.
           </p>
         </div>
@@ -246,39 +245,41 @@ function renderDescription(id: string, description: string): string {
         <div class="faq-item">
           <h3>Why is the plan $5k? That feels high for "support."</h3>
           <p>
-            It isn't support alone — it's the license above the
-            {FREE_GRANT_TB} TB grant, an SLA on critical infrastructure,
-            and a direct email line to the engineers who wrote the proxy.
-            Above the grant your compressed footprint implies hundreds of
-            terabytes of source data, and the calculator above typically
-            shows savings 10 to 40 times the plan price.
+            Support is only part of what you pay for. The $5k buys the
+            license above the {FREE_GRANT_TB} TB grant, an SLA on critical
+            infrastructure, and a direct email line to the engineers who
+            wrote the proxy. Above the grant your compressed footprint
+            implies hundreds of terabytes of source data, and the
+            calculator above typically shows savings 10 to 40 times the
+            plan price.
           </p>
         </div>
 
         <div class="faq-item">
           <h3>What happens if I cross the {FREE_GRANT_TB} TB line mid-year?</h3>
           <p>
-            Nothing breaks and nothing gets gated. The software keeps
-            working; the admin dashboard shows your footprint. You buy
-            the Commercial plan when you cross the line — measured
-            honestly, no surprise invoices, no phone-home.
+            Nothing breaks and no feature switches off. The software keeps
+            working, and the admin dashboard shows your footprint, so you
+            can see when you cross the line. At that point you buy the
+            Commercial plan. The proxy doesn't phone home, and we send no
+            surprise invoices.
           </p>
         </div>
 
         <div class="faq-item">
-          <h3>Replication doubles my footprint — am I being double-counted?</h3>
+          <h3>Replication doubles my footprint. Do you count it twice?</h3>
           <p>
-            No. We count logical compressed bytes managed by DeltaGlider.
-            Storage-layer replicas don't count.
+            No. We count the logical compressed bytes that DeltaGlider
+            manages. Storage-layer replicas don't count.
           </p>
         </div>
 
         <div class="faq-item">
-          <h3>I'm under the grant — do I still get the trial?</h3>
+          <h3>I'm under the grant. Do I still get the trial?</h3>
           <p>
-            Yes. The 30-day trial gives you the Commercial plan's
-            support relationship regardless of your size, so you can try
-            it before you need it. <a href="/trial">/trial</a>
+            Yes. The 30-day trial gives you the Commercial plan's support
+            regardless of your size, so you can try it before you need
+            it. See <a href="/trial">/trial</a>.
           </p>
         </div>
 
@@ -297,11 +298,12 @@ function renderDescription(id: string, description: string): string {
         <div class="faq-item">
           <h3>What does it cost in speed?</h3>
           <p>
-            The compute tax lands on writes, once: delta-encoding makes a
+            The compute tax lands on writes, once: delta encoding makes a
             single-stream upload roughly twelve times slower, on the CI
-            path nobody waits on. Reads pay about 30% on time to first
-            byte when cold and nothing when warm; encryption is
-            effectively free. Measured numbers and methodology:
+            path, where nobody waits on it. Reads pay about 30% on time
+            to first byte when cold and nothing when warm. Encryption is
+            effectively free. The measured numbers and the methodology
+            are in
             <a href="/docs/explanation/the-compute-tax">the compute tax</a>.
           </p>
         </div>
@@ -309,11 +311,11 @@ function renderDescription(id: string, description: string): string {
         <div class="faq-item">
           <h3>What stops me from just using the free grant forever?</h3>
           <p>
-            Nothing, if you stay under it — that's the point. The grant
-            exists so that small teams, homelabs, and startups never pay.
-            Above it, the license text itself requires a commercial
-            license; whether you honor that is a question for your
-            compliance process, not for our software.
+            Nothing, if you stay under it. The grant exists so that small
+            teams, homelabs, and startups never pay. Above it, the license
+            text itself requires a commercial license. The software doesn't
+            enforce that, so whether you honor it is a question for your
+            compliance process.
           </p>
         </div>
       </div>

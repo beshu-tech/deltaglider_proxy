@@ -154,9 +154,15 @@ interface Snapshot {
 
 const MAX_HISTORY = 60;
 
-interface Props { onBack: () => void; embedded?: boolean; search?: string; }
+interface Props {
+  onBack: () => void;
+  embedded?: boolean;
+  search?: string;
+  /** Running proxy version from the session-authenticated whoami (App owns it, as for Sidebar). */
+  proxyVersion?: string;
+}
 
-export default function MetricsPage({ onBack, embedded, search }: Props) {
+export default function MetricsPage({ onBack, embedded, search, proxyVersion }: Props) {
   const colors = useColors();
   const { navigate } = useNavigation();
   const [metricsMap, setMetricsMap] = useState<Map<string, ParsedMetric>>(new Map());
@@ -281,7 +287,16 @@ export default function MetricsPage({ onBack, embedded, search }: Props) {
     : '—';
 
   const buildMetric = m.get('deltaglider_build_info');
-  const buildVersion = buildMetric?.samples[0]?.labels.version || '?';
+  // The public /_/metrics scrape carries no build version by default (it
+  // would fingerprint the deployment for anonymous callers); the
+  // The public /_/metrics scrape carries no build version by default (it
+  // would fingerprint the deployment for anonymous callers); the
+  // session-authenticated whoami does, and App passes it down exactly as it
+  // does for Sidebar — one identity source. The metric label stays as a
+  // fallback for operators who opted in with DGP_METRICS_EXPOSE_VERSION.
+  // There is no build-time constant to fall back to on purpose — see
+  // vite.config.ts.
+  const buildVersion = proxyVersion || buildMetric?.samples[0]?.labels.version || '—';
   const backendType = buildMetric?.samples[0]?.labels.backend_type || '?';
 
   const authAttempts = m.get('deltaglider_auth_attempts_total')?.samples.reduce((a, s) => a + s.value, 0) ?? 0;

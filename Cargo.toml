@@ -10,6 +10,12 @@ edition = "2021"
 [package.metadata.cargo-machete]
 ignored = ["md-5"]
 
+# `tokio_unstable` is passed via RUSTFLAGS (nightly workflow + opt-in builds)
+# to unlock tokio's RuntimeMetrics API — the #87 runtime sampler. Declared
+# here so `unexpected_cfgs` doesn't warn on every build.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
 [dependencies]
 # Web framework
 axum = "0.7"

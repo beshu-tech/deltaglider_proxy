@@ -12,8 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
-use subtle::ConstantTimeEq;
-
 use crate::iam::{Group, IamIndex, IamState, IamUser};
 use crate::rate_limiter;
 use crate::session::{AuthMethod, S3SessionCredentials, SessionKind};
@@ -33,10 +31,10 @@ pub(crate) fn iam_user_secret_valid(user: &IamUser, secret_access_key: &str) -> 
     if !user.enabled {
         return false;
     }
-    use sha2::{Digest, Sha256};
-    let stored_hash = Sha256::digest(user.secret_access_key.as_bytes());
-    let provided_hash = Sha256::digest(secret_access_key.as_bytes());
-    stored_hash.ct_eq(&provided_hash).into()
+    crate::security::secret_eq(
+        user.secret_access_key.as_bytes(),
+        secret_access_key.as_bytes(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -68,7 +66,14 @@ pub struct WhoamiUserInfo {
 #[derive(Serialize)]
 pub struct WhoamiResponse {
     mode: String,
-    version: String,
+    /// Exact build version — present for authenticated callers only: a live
+    /// session here, or verified IAM credentials on `POST /_/api/iam/identity`
+    /// (see [`build_version_for`]); omitted for anonymous callers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    /// UTC build timestamp of the running binary — same gate as `version`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    build_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<WhoamiUserInfo>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -80,6 +85,108 @@ pub struct WhoamiResponse {
     lock_state: Option<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     external_providers: Vec<ExternalProviderInfo>,
+}
+
+/// The `version` field of [`WhoamiResponse`]: the exact build version goes
+/// only to callers that hold a live session. The login page calls
+/// `/_/api/whoami` before any login (it needs `mode` and the provider list),
+/// so anonymous callers must not be able to fingerprint the deployment.
+fn build_version_for(session_valid: bool) -> Option<String> {
+    session_valid.then(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// Same gate as [`build_version_for`] for the build timestamp (stamped by
+/// `build.rs`). The UI shows it in the sidebar; it used to be a Vite `define`
+/// baked into the public JS bundle, which dated the build for anyone.
+fn build_time_for(session_valid: bool) -> Option<String> {
+    session_valid.then(|| env!("DGP_BUILD_TIME").to_string())
+}
+
+/// `DGP_METRICS_BEARER_TOKEN`: when set, `/_/metrics` answers only to a
+/// matching `Authorization: Bearer <token>` (the Prometheus `authorization:`
+/// scrape setting) or to a live admin-GUI session (the dashboard). Unset —
+/// the default — keeps the endpoint public for scrapers. Read once: the
+/// token is deployment infrastructure, not hot-reloadable config.
+fn metrics_bearer_token() -> Option<&'static str> {
+    static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            std::env::var("DGP_METRICS_BEARER_TOKEN")
+                .ok()
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+        })
+        .as_deref()
+}
+
+/// The bearer token a request presents, if it presents one.
+fn presented_bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+}
+
+/// Constant-time check of the request's bearer token against `token`
+/// (length-oblivious, see [`crate::security::secret_eq`]).
+fn bearer_matches(headers: &HeaderMap, token: &str) -> bool {
+    presented_bearer(headers)
+        .is_some_and(|presented| crate::security::secret_eq(presented.as_bytes(), token.as_bytes()))
+}
+
+/// Middleware for `/_/metrics` — see [`metrics_bearer_token`]. A pass-through
+/// when no token is configured.
+pub async fn require_metrics_access(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> impl IntoResponse {
+    let Some(token) = metrics_bearer_token() else {
+        return next.run(request).await.into_response();
+    };
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    // A presented bearer is a credential check like login: it enters the
+    // per-IP rate limiter, and a wrong token counts as a failure (lockout +
+    // SECURITY log line). A request with no Authorization header is the
+    // dashboard's session path and is not counted.
+    if presented_bearer(&headers).is_some() {
+        let guard = match rate_limiter::RateLimitGuard::enter(
+            &state.rate_limiter,
+            &headers,
+            peer_ip,
+            "metrics",
+        )
+        .await
+        {
+            Ok(g) => g,
+            Err(_blocked) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+        };
+        if bearer_matches(&headers, token) {
+            guard.record_success();
+            return next.run(request).await.into_response();
+        }
+        guard.record_failure();
+    }
+    let client_ip = rate_limiter::extract_client_ip_with_peer(&headers, peer_ip);
+    // `allows_admin_gui` already requires a live entry (same `entry_valid`
+    // check as `validate`), so one call is the whole test.
+    let admin_session = extract_session_token(&headers)
+        .map(|t| state.sessions.allows_admin_gui(&t, client_ip))
+        .unwrap_or(false);
+    if admin_session {
+        return next.run(request).await.into_response();
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer realm=\"metrics\"")],
+        "metrics require the configured bearer token or an admin session\n",
+    )
+        .into_response()
 }
 
 /// Map the config-DB lock flag to the typed `lock_state` whoami field.
@@ -466,13 +573,17 @@ pub async fn whoami(
         IamState::Iam(_) => "iam",
     };
 
-    // If caller has a valid session, resolve user identity.
-    let user = resolve_session_user(
-        &state,
-        &headers,
-        request_client_ip(&headers, connect_info.as_ref()),
-    )
-    .await;
+    let client_ip = request_client_ip(&headers, connect_info.as_ref());
+    // One session lookup answers both questions: is there a live session
+    // (any kind — admin GUI, S3-browser lift, open-mode lift — may learn the
+    // version; an anonymous caller may not), and who is it.
+    let session =
+        extract_session_token(&headers).and_then(|t| state.sessions.auth_method(&t, client_ip));
+    let session_valid = session.is_some();
+    let user = match session {
+        Some(method) => session_user_info(&state, method).await,
+        None => None,
+    };
 
     // Include enabled external auth providers so the login page can show OAuth buttons.
     let external_providers = if let Some(ref ext_auth) = state.external_auth {
@@ -500,7 +611,8 @@ pub async fn whoami(
 
     Json(WhoamiResponse {
         mode: mode.into(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: build_version_for(session_valid),
+        build_time: build_time_for(session_valid),
         user,
         config_db_mismatch: state.config_db_mismatch,
         lock_state: lock_state_for(state.config_db_mismatch),
@@ -547,7 +659,9 @@ pub async fn resolve_iam_identity(
     let is_admin = crate::iam::permissions::is_admin(&user.permissions);
     Ok(Json(WhoamiResponse {
         mode: "iam".into(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        // The IAM credentials were verified just above — an authenticated caller.
+        version: build_version_for(true),
+        build_time: build_time_for(true),
         user: Some(WhoamiUserInfo {
             name: user.name,
             access_key_id: user.access_key_id,
@@ -560,14 +674,12 @@ pub async fn resolve_iam_identity(
     }))
 }
 
-/// Resolve user info from the session cookie (if present and valid).
-async fn resolve_session_user(
+/// User info for a live session's auth method (`None` for an open-mode lift,
+/// which has no user).
+async fn session_user_info(
     state: &AdminState,
-    headers: &HeaderMap,
-    client_ip: Option<IpAddr>,
+    auth_method: crate::session::AuthMethod,
 ) -> Option<WhoamiUserInfo> {
-    let token = extract_session_token(headers)?;
-    let auth_method = state.sessions.auth_method(&token, client_ip)?;
     match auth_method {
         crate::session::AuthMethod::OpenLift => None,
         crate::session::AuthMethod::Bootstrap => Some(WhoamiUserInfo {
@@ -1220,6 +1332,32 @@ mod tests {
             .iter()
             .any(|p| p.actions == vec!["write"]));
         assert_eq!(effective.iam_policies.len(), 2);
+    }
+
+    #[test]
+    fn build_version_only_with_a_live_session() {
+        assert_eq!(build_version_for(false), None);
+        assert_eq!(
+            build_version_for(true).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(build_time_for(false), None);
+        assert_eq!(
+            build_time_for(true).as_deref(),
+            Some(env!("DGP_BUILD_TIME"))
+        );
+    }
+
+    #[test]
+    fn metrics_bearer_check_is_exact() {
+        let mut h = HeaderMap::new();
+        assert!(!bearer_matches(&h, "scrape-me"), "no header");
+        h.insert(header::AUTHORIZATION, "Bearer scrape-me".parse().unwrap());
+        assert!(bearer_matches(&h, "scrape-me"));
+        assert!(!bearer_matches(&h, "scrape-me-2"), "length differs");
+        assert!(!bearer_matches(&h, "scrape-mf"), "same length, wrong byte");
+        h.insert(header::AUTHORIZATION, "Basic scrape-me".parse().unwrap());
+        assert!(!bearer_matches(&h, "scrape-me"), "wrong scheme");
     }
 
     /// Adversarial: the session cookie must carry SameSite=Strict

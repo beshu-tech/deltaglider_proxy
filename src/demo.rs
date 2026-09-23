@@ -7,8 +7,8 @@ use axum::{
     http::{header, StatusCode},
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
-    routing::{delete, get, post, put},
-    Router,
+    routing::{any, delete, get, post, put},
+    Json, Router,
 };
 use rust_embed::Embed;
 use std::sync::Arc;
@@ -18,6 +18,14 @@ use deltaglider_proxy::api::admin::{self, AdminState};
 #[derive(Embed)]
 #[folder = "demo/s3-browser/ui/dist"]
 struct DemoAssets;
+
+/// The product docs (markdown + manifest), embedded from `docs/product/` so
+/// the UI fetches them at runtime behind a session instead of inlining them
+/// into the JS bundle — where the changelog named the running version to
+/// anyone who could fetch a static asset.
+#[derive(Embed)]
+#[folder = "docs/product"]
+struct ProductDocs;
 
 /// Build the UI + admin API router, mounted under `/_/`.
 ///
@@ -129,6 +137,12 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
     let session_light = Router::new()
         .route("/_/api/admin/logout", post(admin::logout))
         .route("/_/api/admin/session", get(admin::check_session))
+        // Product docs + manifest, one payload. Not secret, but they name
+        // every release — so a session, never anonymous.
+        .route("/_/api/docs", get(product_docs_bundle))
+        // Canned IAM policies: consumed by the user form only. The policy
+        // set changes across releases, so it stays off the anonymous surface.
+        .route("/_/api/admin/policies", get(admin::get_canned_policies))
         // Bucket maintenance status is session-light ON PURPOSE: non-admin
         // browser users (S3BrowserLift) need to see "busy + progress" for
         // the bucket they are viewing. The view carries only job
@@ -369,6 +383,15 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             admin_state.clone(),
             admin::require_admin_gui_session,
         ))
+        // Full-IAM import/export bodies can exceed axum's 2 MB default: a
+        // large IAM export (many users, each with an OAuth binding and its
+        // `raw_claims`) would otherwise fail with an opaque 413. Match the
+        // backup-import bound (MAX_IMPORT_BODY_BYTES) already applied to the
+        // `iam_gated` subrouter. Admin-session-gated, so this raises the
+        // bound only for authenticated operators, not the S3 surface.
+        .layer(axum::extract::DefaultBodyLimit::max(
+            admin::MAX_IMPORT_BODY_BYTES,
+        ))
         .with_state(admin_state.clone());
 
     // Grab S3 state before admin_state is moved
@@ -387,7 +410,6 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             post(admin::open_browser_connect),
         )
         .route("/_/api/iam/identity", post(admin::resolve_iam_identity))
-        .route("/_/api/admin/policies", get(admin::get_canned_policies))
         // Monotonic rebuild counter. Public by design — exposes an opaque
         // number and is consumed by integration tests + internal tooling
         // to barrier on IAM mutations without a blind `sleep(1s)`.
@@ -448,11 +470,22 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .route(
             "/_/ready",
             get(deltaglider_proxy::api::handlers::readiness_check).with_state(s3_state.clone()),
-        )
+        );
+
+    // Prometheus scrape. Public by default (scrapers cannot log in); with
+    // DGP_METRICS_BEARER_TOKEN set it demands that token or an admin session,
+    // so a hardened deployment does not advertise its metric set — which
+    // changes with every release — to anonymous callers.
+    let metrics_route = Router::new()
         .route(
             "/_/metrics",
             get(deltaglider_proxy::metrics::metrics_handler).with_state(s3_state.clone()),
-        );
+        )
+        .layer(middleware::from_fn_with_state(
+            admin_state.clone(),
+            admin::require_metrics_access,
+        ))
+        .with_state(admin_state.clone());
 
     // Stats endpoint — session-protected (reveals per-bucket storage sizes)
     let stats_route = Router::new()
@@ -473,6 +506,12 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // name, so this can never shadow a real object route.
         .route("/_", get(|| async { Redirect::permanent("/_/") }))
         .route("/_/", get(index))
+        // Unknown API paths answer a JSON 404 for EVERY method. Without this
+        // the GET-only catch-all below made axum answer POST/PUT/DELETE on a
+        // mistyped admin path with `405 Allow: GET,HEAD`, which tells a client
+        // (and a scanner) that the resource exists. Registered routes win
+        // over this catch-all, so real endpoints keep their own 405s.
+        .route("/_/api/*rest", any(api_not_found))
         .route("/_/*path", get(static_or_fallback));
 
     Router::new()
@@ -480,6 +519,7 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .merge(admin_gui_protected)
         .merge(public_admin)
         .merge(operational_routes)
+        .merge(metrics_route)
         .merge(stats_route)
         .merge(static_routes)
         .layer({
@@ -511,8 +551,88 @@ async fn static_or_fallback(Path(path): Path<String>) -> impl IntoResponse {
             .unwrap()
             .into_response()
     } else {
-        serve_index().into_response()
+        match fallback_for(&path) {
+            Fallback::SpaIndex => serve_index().into_response(),
+            Fallback::ApiNotFound => api_not_found().await,
+            // `no-store`: a CDN in front of a mixed-version fleet must not
+            // cache a 404 for a hashed asset that a newer instance serves.
+            Fallback::NotFound => (
+                StatusCode::NOT_FOUND,
+                [(header::CACHE_CONTROL, "no-store")],
+                "not found",
+            )
+                .into_response(),
+        }
     }
+}
+
+/// JSON 404 for an unmatched admin/API path, any method. Never `index.html`,
+/// so API clients and scanners get an honest answer instead of a 200 HTML
+/// page; `no-store` so nothing in front caches it.
+async fn api_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({ "error": "not_found" })),
+    )
+        .into_response()
+}
+
+/// What `/_/<path>` serves when `<path>` is not an embedded asset.
+#[derive(Debug, PartialEq, Eq)]
+enum Fallback {
+    /// A client-side route of the SPA: serve `index.html` and let the
+    /// browser router take over (deep links, hard refresh).
+    SpaIndex,
+    /// The bare `/_/api` or `/_/api/` path (deeper API misses are caught by
+    /// the `/_/api/*rest` route for every method): a JSON 404.
+    ApiNotFound,
+    /// Anything else (a missing asset, a source map, a typo): plain 404.
+    NotFound,
+}
+
+/// First URL segments the SPA router owns — mirrors `SEGMENT_TO_VIEW` in
+/// `demo/s3-browser/ui/src/urlState.ts`. Everything else under `/_/` is
+/// either an embedded asset or a 404.
+const SPA_ROUTE_SEGMENTS: &[&str] = &["browse", "upload", "metrics", "docs", "admin"];
+
+fn fallback_for(path: &str) -> Fallback {
+    if path == "api" || path.starts_with("api/") {
+        return Fallback::ApiNotFound;
+    }
+    let first = path.split('/').next().unwrap_or("");
+    if SPA_ROUTE_SEGMENTS.contains(&first) {
+        Fallback::SpaIndex
+    } else {
+        Fallback::NotFound
+    }
+}
+
+/// GET /_/api/docs — every product doc plus the manifest in one payload.
+/// Session-gated by the router (see `session_light`).
+async fn product_docs_bundle() -> Response {
+    let manifest: serde_json::Value = ProductDocs::get("manifest.json")
+        .and_then(|f| serde_json::from_slice(&f.data).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let docs: Vec<serde_json::Value> = ProductDocs::iter()
+        .filter(|p| p.ends_with(".md"))
+        .filter_map(|p| {
+            let file = ProductDocs::get(&p)?;
+            Some(serde_json::json!({
+                "path": p.trim_end_matches(".md"),
+                "content": String::from_utf8_lossy(&file.data),
+            }))
+        })
+        .collect();
+    // `no-cache`: the URL carries no version, so a cached copy would serve
+    // the previous release's docs (and changelog) for the cache lifetime
+    // after an upgrade. React Query already avoids refetches within a page
+    // load (`staleTime: Infinity`), so an HTTP max-age buys nothing.
+    (
+        [(header::CACHE_CONTROL, "private, no-cache")],
+        Json(serde_json::json!({ "manifest": manifest, "docs": docs })),
+    )
+        .into_response()
 }
 
 fn serve_index() -> Response {
@@ -526,5 +646,75 @@ fn serve_index() -> Response {
                 .into_response()
         }
         None => (StatusCode::NOT_FOUND, "Demo UI not built").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spa_routes_fall_back_to_index() {
+        for p in [
+            "browse",
+            "browse/bucket/dir",
+            "upload",
+            "metrics/x",
+            "docs/how-to/x",
+            "admin/users",
+        ] {
+            assert_eq!(fallback_for(p), Fallback::SpaIndex, "{p}");
+        }
+    }
+
+    #[test]
+    fn unmatched_api_paths_are_json_404() {
+        assert_eq!(
+            fallback_for("api/admin/does-not-exist"),
+            Fallback::ApiNotFound
+        );
+        assert_eq!(fallback_for("api"), Fallback::ApiNotFound);
+    }
+
+    /// `SPA_ROUTE_SEGMENTS` is a hand copy of `SEGMENT_TO_VIEW` in the UI's
+    /// urlState.ts. The Vite dev server has its own SPA fallback, so a view
+    /// added to the UI but not here would break only in the embedded build,
+    /// on hard refresh or a shared link. Read the TS table and compare.
+    #[test]
+    fn spa_route_segments_match_the_ui_router_table() {
+        let ts = include_str!("../demo/s3-browser/ui/src/urlState.ts");
+        let table = ts
+            .split("const SEGMENT_TO_VIEW")
+            .nth(1)
+            .and_then(|s| s.split("};").next())
+            .expect("SEGMENT_TO_VIEW table in urlState.ts");
+        let mut ui: Vec<&str> = table
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let key = l.split(':').next()?.trim().trim_matches('\'');
+                (!key.is_empty() && !l.starts_with("//")).then_some(key)
+            })
+            .collect();
+        ui.sort_unstable();
+        let mut ours: Vec<&str> = SPA_ROUTE_SEGMENTS.to_vec();
+        ours.sort_unstable();
+        assert_eq!(
+            ours, ui,
+            "SPA_ROUTE_SEGMENTS must equal the keys of SEGMENT_TO_VIEW (minus '')"
+        );
+    }
+
+    #[test]
+    fn everything_else_is_404() {
+        for p in [
+            "assets/index-abc.js.map",
+            "nope",
+            "index.htm",
+            "browsex",
+            "apix/y",
+        ] {
+            assert_eq!(fallback_for(p), Fallback::NotFound, "{p}");
+        }
     }
 }

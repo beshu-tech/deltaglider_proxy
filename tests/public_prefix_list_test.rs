@@ -240,3 +240,89 @@ async fn authenticated_admin_sees_full_bucket_regardless_of_public_prefix() {
     assert!(keys.iter().any(|k| k == "ror/libs/alpha.txt"));
     assert!(keys.iter().any(|k| k == "private/secret.txt"));
 }
+
+/// Object metadata for an anonymous reader must not carry the proxy's
+/// `dg-tool = deltaglider_proxy/<version>` stamp — it names the exact build.
+/// A signed principal keeps the full provenance.
+#[tokio::test]
+async fn anonymous_object_metadata_has_no_tool_stamp() {
+    let (server, anon) = server_with_public_prefix("testbk", "ror/libs/").await;
+    let url = format!("{}/testbk/ror/libs/alpha.txt", server.endpoint());
+
+    for method in [reqwest::Method::HEAD, reqwest::Method::GET] {
+        let resp = anon.request(method.clone(), &url).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{method}");
+        assert!(
+            resp.headers().get("x-amz-meta-dg-tool").is_none(),
+            "{method} leaked dg-tool to an anonymous caller"
+        );
+        assert!(
+            resp.headers().get("x-amz-meta-dg-file-size").is_some(),
+            "{method} must keep the rest of the metadata"
+        );
+    }
+
+    let list = anon
+        .get(format!(
+            "{}/testbk?list-type=2&prefix=ror/libs/&metadata=true",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    assert!(
+        !list.text().await.unwrap().contains("dg-tool"),
+        "metadata=true LIST leaked dg-tool to an anonymous caller"
+    );
+
+    let signed = aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::Config::builder()
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "admin",
+                "admin-secret-1234567890",
+                None,
+                None,
+                "test",
+            ))
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(server.endpoint())
+            .force_path_style(true)
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .build(),
+    );
+    let head = signed
+        .head_object()
+        .bucket("testbk")
+        .key("ror/libs/alpha.txt")
+        .send()
+        .await
+        .unwrap();
+    let tool = head
+        .metadata()
+        .and_then(|m| m.get("dg-tool"))
+        .expect("a signed caller keeps the dg-tool provenance");
+    assert!(tool.starts_with("deltaglider_proxy/"), "{tool}");
+
+    // A presigned URL authenticates as the signer, but whoever holds the
+    // link is an anonymous party (the docs recommend presigned links for
+    // third parties). The link holder must not get the provenance either.
+    let presigned = signed
+        .get_object()
+        .bucket("testbk")
+        .key("ror/libs/alpha.txt")
+        .presigned(
+            aws_sdk_s3::presigning::PresigningConfig::expires_in(std::time::Duration::from_secs(
+                300,
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let resp = anon.get(presigned.uri()).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "presigned GET must work");
+    assert!(
+        resp.headers().get("x-amz-meta-dg-tool").is_none(),
+        "presigned GET leaked dg-tool to the link holder"
+    );
+}

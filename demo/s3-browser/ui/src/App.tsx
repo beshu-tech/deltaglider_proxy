@@ -451,6 +451,7 @@ export default function App() {
             accountMenu={accountMenu()}
             canAdmin={canAdmin}
             onShowShortcuts={showShortcuts}
+            proxyVersion={identity?.version}
           />
         </Suspense>
       );
@@ -470,7 +471,7 @@ export default function App() {
       }
       return (
         <Suspense fallback={LAZY_FALLBACK}>
-          <MetricsPage onBack={navigateToBrowse} search={search} />
+          <MetricsPage onBack={navigateToBrowse} search={search} proxyVersion={identity?.version} />
         </Suspense>
       );
     }
@@ -695,6 +696,7 @@ export default function App() {
             onClose={() => setSiderOpen(false)}
             isMobile={isMobile}
             proxyVersion={identity?.version}
+            proxyBuildTime={identity?.build_time}
           />
         )}
 

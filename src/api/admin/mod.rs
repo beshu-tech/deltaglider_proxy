@@ -41,8 +41,8 @@ use crate::usage_scanner::UsageScanner;
 pub use audit::get_audit;
 pub use auth::{
     browser_session_connect, check_session, clear_s3_session_creds, get_s3_session_creds, login,
-    login_as, logout, open_browser_connect, require_admin_gui_session, require_not_declarative,
-    require_session, resolve_iam_identity, set_s3_session_creds, whoami,
+    login_as, logout, open_browser_connect, require_admin_gui_session, require_metrics_access,
+    require_not_declarative, require_session, resolve_iam_identity, set_s3_session_creds, whoami,
     BrowserSessionConnectRequest, LoginAsRequest, LoginResponse, OpenBrowserConnectRequest,
     ResolveIamIdentityRequest, SessionResponse, WhoamiResponse,
 };

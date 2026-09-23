@@ -2,6 +2,84 @@
 
 ## Unreleased
 
+### Changed — The build version is no longer advertised to anonymous callers
+
+`GET /_/api/whoami` returns `version` only when the request carries a live
+session. The login page still receives the auth mode and the list of external
+login providers, which it needs before any login, but an unauthenticated caller
+can no longer read the exact running version. The `version` label of
+`deltaglider_build_info` on the unauthenticated `/_/metrics` endpoint is now
+empty by default, which Prometheus treats as an absent label, so existing
+dashboards keep their series shape. Operators whose fleet dashboards key on the
+version can restore the label with `DGP_METRICS_EXPOSE_VERSION=true`. The admin
+dashboard reads the version from the authenticated identity instead of the
+scrape.
+
+### Changed — Nothing served to anonymous callers identifies the build
+
+A deployment could still be fingerprinted from surfaces that need no login.
+Every one of them is now closed:
+
+- The JS bundle embedded a build version and a build timestamp as Vite
+  constants. Both are gone. The sidebar and the dashboard read the running
+  version and build time from `GET /_/api/whoami`, which reports them only to a
+  live session.
+- The product docs, including the changelog that names every release, were
+  inlined into the bundle as static assets. They are now embedded in the
+  binary and served by `GET /_/api/docs` to a live session only; the docs
+  viewer fetches them at runtime. The canned IAM policy catalogue
+  (`/_/api/admin/policies`) moved behind the session for the same reason.
+- Every object the proxy stores carries `dg-tool = deltaglider_proxy/<version>`
+  as provenance, and a HEAD, GET, or `metadata=true` LIST returned it as
+  `x-amz-meta-dg-tool` to anonymous readers of a public prefix. Those
+  anonymous requests no longer receive that key; authenticated principals,
+  and open-access mode (`authentication: none`, where nothing is private
+  and the proxy's own tooling reads the `dg-*` keys), still do.
+- `DGP_METRICS_BEARER_TOKEN` (new, optional) makes `/_/metrics` require
+  `Authorization: Bearer <token>` — the Prometheus `authorization:` scrape
+  setting — or an admin session. Unset keeps the endpoint public.
+- A build guard, `scripts/check-bundle-fingerprints.sh`, runs in the Docker
+  image build and in CI after the UI build. It fails the build if the
+  bundle contains the crate version, a build timestamp, inlined docs, or a
+  source map.
+
+The static asset names still carry a content hash, third-party libraries
+embed their own version strings, and a presigned URL for an object returns the
+writer's `dg-tool` metadata to whoever holds the link (a signed request, not an
+anonymous one). Those identify a build only to someone who
+already holds a copy of every release; nothing in the bundle states the
+version outright.
+
+### Changed — No build of the proxy ships frontend source maps
+
+A source map in the embedded bundle handed the full UI source to anyone who
+could reach `/_/`. Source maps are now opt-in for the UI build
+(`DGP_UI_SOURCEMAP=1`), so the Docker image, the release tarballs and the
+demo image all embed none without any per-channel flag. A local debugging
+build sets the variable.
+
+### Fixed — Unknown paths under `/_/` returned the app shell with status 200
+
+The catch-all route for the embedded UI served `index.html` for every path it
+did not recognise, including mistyped admin API paths such as
+`/_/api/admin/does-not-exist` and missing assets. API clients received a 200
+HTML page instead of an error, and scanners saw every probe succeed. Only the
+genuine client-side routes (`browse`, `upload`, `metrics`, `docs`, `admin`) now
+fall back to the app shell. Unmatched paths under `/_/api/` return a JSON 404
+for every HTTP method, and everything else returns a plain 404; both carry
+`Cache-Control: no-store` so a cache in front of a mixed-version fleet never
+keeps a 404 for an asset a newer instance serves.
+
+### Changed — MinIO images for tests and the demo come from `pgsty/silo`
+
+The `minio/minio` and `minio/mc` images disappeared from Docker Hub in
+September 2026. The integration tests, the nightly run, the two Docker
+Compose files, and the Docker Hub README example now start `pgsty/silo`, a
+maintained fork of the MinIO server that keeps the `MINIO_*` variables, the
+`server /data` command, the S3 and admin APIs, and the storage format, and
+bundles the client as `mcli`. Nothing changes for the proxy itself or for
+deployments that run their own MinIO.
+
 ## v1.19.0 — 2026-08-10
 
 ### Added — Cross-instance protection for the delta reference baseline

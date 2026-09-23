@@ -78,9 +78,11 @@ interface AdminPageProps {
   canAdmin?: boolean;
   /** Open the app-wide keyboard-shortcuts modal (owned by App). */
   onShowShortcuts: () => void;
+  /** Running proxy version from whoami (App owns identity). */
+  proxyVersion?: string;
 }
 
-export default function AdminPage({ onBack, onSessionExpired, subPath, search, accountMenu, canAdmin = false, onShowShortcuts }: AdminPageProps) {
+export default function AdminPage({ onBack, onSessionExpired, subPath, search, accountMenu, canAdmin = false, onShowShortcuts, proxyVersion }: AdminPageProps) {
   const colors = useColors();
   const { navigate } = useNavigation();
   // Declarative IAM: the IAM-writing backup-restore modes (full / iam-only /
@@ -506,7 +508,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
       // already carries title + live indicator + tab switcher +
       // refresh controls. Rendering both would duplicate the
       // page-level identity and steal vertical real estate.
-      return <MetricsPage onBack={onBack} embedded search={search} />;
+      return <MetricsPage onBack={onBack} embedded search={search} proxyVersion={proxyVersion} />;
     }
     if (adminPath === 'diagnostics/trace') {
       return (
@@ -674,7 +676,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
     // Unknown path — land on dashboard
     return (
       <>
-        <MetricsPage onBack={onBack} embedded search={search} />
+        <MetricsPage onBack={onBack} embedded search={search} proxyVersion={proxyVersion} />
       </>
     );
   };

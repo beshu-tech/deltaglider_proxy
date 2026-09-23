@@ -123,7 +123,7 @@ export function calculate(inputs: CalculatorInputs): CalculatorResult {
       dgp: dgpStorageTotal,
     },
     { label: 'Replication egress (new artifacts)', today: todayEgress, dgp: dgpEgress },
-    { label: 'Subtotal — storage + transfer', today: todaySubtotal, dgp: dgpSubtotal },
+    { label: 'Subtotal: storage + transfer', today: todaySubtotal, dgp: dgpSubtotal },
   ];
 
   // Tier selection based on the compressed stored footprint — the
@@ -211,28 +211,28 @@ export function buildMarkdown(inputs: CalculatorInputs, result: CalculatorResult
   if (result.kind === 'belowThreshold') {
     lines.push('## Verdict');
     lines.push('');
-    lines.push('Below 1 TB — DeltaGlider isn\'t worth it at this scale. Run the free build anyway if you like; it costs nothing.');
+    lines.push('Below 1 TB, DeltaGlider isn\'t worth it for you yet. Run the free build anyway if you like; it costs nothing at this size.');
     return lines.join('\n');
   }
   if (result.kind === 'negativeNet') {
     lines.push('## Verdict');
     lines.push('');
-    lines.push(`Storage savings (${formatUsd(result.savings)}) would be less than the Commercial plan (${formatUsd(result.licenseCost)}). Talk to us about a different fit, or reduce scope until you fit the free 15 TB grant.`);
+    lines.push(`At this scale you'd save about ${formatUsd(result.savings)} in storage, and the Commercial plan costs ${formatUsd(result.licenseCost)}, so the plan would cost more than it saves you. Talk to us about a different fit, or reduce scope until you fit the free 15 TB grant.`);
     return lines.join('\n');
   }
   if (result.kind === 'free') {
     lines.push('## Verdict');
     lines.push('');
-    lines.push(`Approximate annual storage savings: **${formatUsd(result.savings)}**.`);
+    lines.push(`You'd save about **${formatUsd(result.savings)}** a year in storage.`);
     lines.push('');
-    lines.push(`Your compressed footprint stays under the ${FREE_GRANT_TB} TB free grant — DeltaGlider costs you nothing. The savings above are the whole story.`);
+    lines.push(`Your compressed footprint stays under the ${FREE_GRANT_TB} TB free grant, so DeltaGlider costs you nothing and the figure above is your net saving.`);
     return lines.join('\n');
   }
   // OK case
   lines.push('## Verdict');
   lines.push('');
-  lines.push(`Approximate annual storage savings: **${formatUsd(result.savings)}**.`);
-  lines.push(`License: ${result.bracket.name} plan at ${result.bracket.priceLabel} (compressed footprint above the ${FREE_GRANT_TB} TB free grant).`);
+  lines.push(`You'd save about **${formatUsd(result.savings)}** a year in storage.`);
+  lines.push(`Your compressed footprint is above the ${FREE_GRANT_TB} TB free grant, so the ${result.bracket.name} plan at ${result.bracket.priceLabel} applies.`);
   lines.push(`Net annual savings after the license: **${formatUsd(result.netSavings)}**.`);
   lines.push('');
   lines.push('## Breakdown');
@@ -247,6 +247,6 @@ export function buildMarkdown(inputs: CalculatorInputs, result: CalculatorResult
   lines.push('');
   lines.push('---');
   lines.push('');
-  lines.push('Conservative assumptions. Real numbers depend on your data — run the free build (`docker run --rm -it -p 9000:9000 -v dgp-data:/data -e DGP_AUTHENTICATION=none beshultd/deltaglider_proxy`) against a sample of your data and read the Delta Efficiency Panel for a verified compression ratio.');
+  lines.push('These are conservative assumptions, and the real numbers depend on your data. Run the free build (`docker run --rm -it -p 9000:9000 -v dgp-data:/data -e DGP_AUTHENTICATION=none beshultd/deltaglider_proxy`) against a sample of your data and read the Delta Efficiency Panel for a measured compression ratio.');
   return lines.join('\n');
 }

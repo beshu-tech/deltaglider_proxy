@@ -10,7 +10,10 @@ export interface ExternalProviderInfo {
 
 export interface WhoamiResponse {
   mode: 'bootstrap' | 'iam' | 'open';
+  /** Running proxy version — only present when the request carried a live session. */
   version?: string;
+  /** UTC build timestamp of the running binary — same gate as `version`. */
+  build_time?: string;
   user: { name: string; access_key_id: string; is_admin: boolean; permissions?: IamPermission[] } | null;
   config_db_mismatch?: boolean;
   /** Typed lock signal from the server: 'locked' when the config DB is

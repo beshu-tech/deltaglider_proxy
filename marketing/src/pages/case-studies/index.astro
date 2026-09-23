@@ -11,7 +11,7 @@ import { webPageSchema, breadcrumbListSchema } from '../../lib/seo';
 
 const title = 'Case studies — DeltaGlider';
 const description =
-  'Engineering retrospectives from real DeltaGlider deployments. In-progress and complete migrations, with the bugs we hit and how we fixed them.';
+  'Engineering retrospectives from real DeltaGlider deployments. We cover migrations in progress and complete ones, with the bugs we hit and how we fixed them.';
 ---
 
 <BaseLayout title={title} description={description}>
@@ -27,11 +27,11 @@ const description =
 
   <section class="hero">
     <div class="shell">
-      <h1>Case Studies</h1>
+      <h1>Case studies</h1>
 
       <p class="hero-lede">
-        Engineering write-ups from real migrations — including the bugs
-        we hit and how we fixed them.
+        Each case study is an engineering write-up from a real migration.
+        It covers the bugs we hit and how we fixed them.
       </p>
     </div>
   </section>
@@ -51,12 +51,12 @@ const description =
         <p>
           Beshu Tech migrated its own ReadonlyREST build catalog
           from AWS S3 (eu-west-1) to Hetzner Object Storage (hel1)
-          via DeltaGlider. The catalog went from 1.71 TB to 134 GB —
-          roughly 1,270% smaller. Sample: a 2.8 GB plugin reduced to
-          32 MB, bit-perfect on SHA-256 round-trip.
+          through DeltaGlider. The catalog went from 1.71 TB to 134 GB,
+          roughly 1,270% smaller. One example is a 2.8 GB plugin that
+          shrank to 32 MB and came back bit-perfect on a SHA-256 round-trip.
         </p>
         <p>
-          → <a href="/case-studies/readonlyrest-builds">Read the migration log</a>
+          <a href="/case-studies/readonlyrest-builds">Read the migration log</a>
         </p>
       </article>
 

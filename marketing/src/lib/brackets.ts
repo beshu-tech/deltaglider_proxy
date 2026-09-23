@@ -42,7 +42,7 @@ export const BRACKETS: readonly Bracket[] = [
     priceUsd: 0,
     priceLabel: '$0',
     description:
-      'The full product, self-hosted, with community support on GitHub. Production use is free up to 15 TB of compressed stored data per organization. Nothing is gated and there are no license keys. Every release becomes Apache-2.0 two years after it ships.',
+      'You get the full product and host it yourself, with community support on GitHub. Production use is free up to 15 TB of compressed stored data per organization. Nothing is held back and there are no license keys. Every release becomes Apache-2.0 two years after it ships.',
   },
   {
     id: 'trial',
@@ -50,7 +50,7 @@ export const BRACKETS: readonly Bracket[] = [
     priceUsd: 0,
     priceLabel: 'Free, 30 days',
     description:
-      'The full Commercial plan for 30 days: direct engineering email, 12h response SLA, one architecture review call. See /trial.',
+      'For 30 days you get the full Commercial plan: direct engineering email, a 12h response SLA, and one architecture review call. See /trial.',
   },
   {
     id: 'commercial',
@@ -58,7 +58,7 @@ export const BRACKETS: readonly Bracket[] = [
     priceUsd: COMMERCIAL_PRICE_USD,
     priceLabel: '$5k/year',
     description:
-      'Per production deployment, everything included: use beyond the 15 TB grant, direct engineering email with a 12h business-hours response SLA, signed builds with an SBOM, a CVE response commitment, and every new capability as it ships.',
+      'The price is per production deployment and it includes everything: use beyond the 15 TB grant, direct engineering email with a 12h business-hours response SLA, signed builds with an SBOM, a CVE response commitment, and every new feature as it ships.',
   },
   {
     id: 'oem',
@@ -66,7 +66,7 @@ export const BRACKETS: readonly Bracket[] = [
     priceUsd: null,
     priceLabel: 'Talk to sales',
     description:
-      'For embedding DeltaGlider in a proprietary product, or offering it to your customers as a hosted or managed service. Pricing depends on use case, not footprint.',
+      'This plan is for embedding DeltaGlider in a proprietary product, or for offering it to your customers as a hosted or managed service. The price depends on your use case, and your footprint does not change it.',
   },
 ] as const;
 
