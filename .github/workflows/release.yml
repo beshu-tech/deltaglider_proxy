@@ -288,15 +288,24 @@ jobs:
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
+      packages: write  # BuildKit layer cache in GHCR (see BUILDCACHE_REF)
     env:
       RUSTC_WRAPPER: ""  # Docker build has its own caching
+      # BuildKit layer cache, one tag per architecture. A registry cache
+      # survives between runs on the self-hosted homelab runners, where the
+      # `gha` cache backend is slow and size-capped. It lives in GHCR (next
+      # to the builder image), so cache tags never appear in the public
+      # DockerHub repo.
+      BUILDCACHE_REF: ghcr.io/${{ github.repository }}/buildcache:release-${{ matrix.arch }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: linux/amd64
-            runner: k3s
+            arch: amd64
+            runner: homelab
           - platform: linux/arm64
+            arch: arm64
             runner: blacksmith-4vcpu-ubuntu-2404-arm
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -315,6 +324,13 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Log in to GHCR (build cache)
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
@@ -330,8 +346,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.DOCKERHUB_REPO }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,scope=${{ matrix.platform }},mode=max
+          cache-from: type=registry,ref=${{ env.BUILDCACHE_REF }}
+          cache-to: type=registry,ref=${{ env.BUILDCACHE_REF }},mode=max,image-manifest=true,oci-mediatypes=true
           # Disable provenance / SBOM attestations. With them enabled,
           # build-push-action publishes both the canonical image AND an
           # attestation sidecar — and the merge step below picks up the
@@ -357,8 +373,8 @@ jobs:
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.DOCKERHUB_REPO }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,scope=${{ matrix.platform }},mode=max
+          cache-from: type=registry,ref=${{ env.BUILDCACHE_REF }}
+          cache-to: type=registry,ref=${{ env.BUILDCACHE_REF }},mode=max,image-manifest=true,oci-mediatypes=true
           provenance: false
           sbom: false
 
