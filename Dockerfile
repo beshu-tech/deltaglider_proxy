@@ -4,16 +4,16 @@ WORKDIR /app/demo/s3-browser/ui
 COPY demo/s3-browser/ui/package.json demo/s3-browser/ui/package-lock.json ./
 RUN npm ci
 COPY demo/s3-browser/ui/ ./
-# docs/ is referenced by src/docs-imports.ts via relative path (../../../../docs/)
+# docs/screenshots/ is synced into the UI by scripts/copy-screenshots.mjs
+# (prebuild hook). The markdown itself is NOT bundled — see the Rust stage.
 COPY docs/ /app/docs/
-# Cargo.toml is the single source of truth for the version string.
-# vite.config.ts reads it at build time to embed __BUILD_VERSION__ into
-# the bundle (see `resolveBuildVersion()` there). Copying it here also
-# doubles as a cache key: a version bump invalidates this layer and
-# forces `npm run build` to run — which re-evaluates `new Date()` in
-# the vite define, so __BUILD_TIME__ stays honest across version bumps
-# instead of freezing at the first-ever-built timestamp.
+# Cargo.toml is the single source of truth for the version string. The
+# bundle deliberately does NOT embed it (nor a build time): the fingerprint
+# guard below reads it to prove the built dist/ carries neither. Copying it
+# also makes a version bump invalidate this layer.
 COPY Cargo.toml /app/Cargo.toml
+# No frontend source maps: they are opt-in in vite.config.ts (DGP_UI_SOURCEMAP=1)
+# because dist/ is embedded and served to anonymous callers.
 RUN npm run build
 
 # ── Build stage: Rust ──
@@ -36,12 +36,20 @@ RUN apt-get -o Acquire::Retries=3 update && apt-get install -y --no-install-reco
 WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
+# Product docs are embedded in the binary (rust-embed in src/demo.rs) and
+# served session-gated at /_/api/docs.
+COPY docs/product/ docs/product/
 # Cargo.toml declares `[[bench]] name = "codec"` → cargo needs benches/codec.rs
 # present to even PARSE the manifest (without it: "can't find `codec` bench …
 # failed to parse manifest"). This was the real cause of the release build
 # failure — the bench was added to Cargo.toml but never copied into the image.
 COPY benches/ benches/
 COPY --from=ui-build /app/demo/s3-browser/ui/dist demo/s3-browser/ui/dist
+# Fingerprint guard on the dist this binary embeds. It runs HERE, not in the
+# node:alpine UI stage: that image has no bash and its BusyBox grep has no
+# --include, which would make the script fail (or, worse, pass vacuously).
+COPY scripts/check-bundle-fingerprints.sh scripts/check-bundle-fingerprints.sh
+RUN ./scripts/check-bundle-fingerprints.sh demo/s3-browser/ui/dist Cargo.toml
 RUN cargo build --release
 
 # ── Runtime ──

@@ -33,7 +33,7 @@ import {
 
 <BaseLayout
   title="DeltaGlider Proxy — the object storage control plane"
-  description="An S3 proxy that spots similar files and stores them as small binary diffs instead of full copies. Same S3 API, zero client changes — plus IAM, SSO, replication, and encryption on any S3-compatible backend. Source-available, free up to 15 TB."
+  description="An S3 proxy that spots similar files and stores them as small binary diffs instead of full copies. The S3 API stays the same and clients don't change. It adds IAM, SSO, replication, and encryption on any S3-compatible backend. Source-available and free up to 15 TB."
 >
   <Fragment slot="json-ld">
     <JsonLd schema={organizationSchema()} />
@@ -66,28 +66,31 @@ import {
         <HeroOrbit />
 
         <p class="hero-lede">
-          An S3 proxy in front of your bucket — same API,
-          <strong>zero client changes</strong>:
+          An S3 proxy in front of your bucket, with the same API and no
+          changes to your clients:
         </p>
 
         <ul class="hero-points">
-          <li><strong>Compression</strong> — similar files are stored as tiny binary diffs, not full copies.</li>
-          <li><strong>Encryption</strong> — AES-256 before bytes reach the bucket; the key never leaves you.</li>
-          <li><strong>Multi-cloud</strong> — the same S3 API on AWS, Hetzner, Wasabi, or MinIO, with cross-cloud replication.</li>
-          <li><strong>Security</strong> — per-user IAM, SSO, and audit logs on any backend.</li>
+          <li>Similar files are stored as small binary diffs instead of full copies.</li>
+          <li>The proxy applies AES-256 before the bytes reach the bucket, and the key never leaves you.</li>
+          <li>You get the same S3 API on AWS, Hetzner, Wasabi, or MinIO, with cross-cloud replication.</li>
+          <li>Per-user IAM, SSO, and audit logs work on any backend.</li>
         </ul>
 
         <div class="hero-ctas">
-          <a href="/trial" class="btn btn-brand">Start free trial&nbsp;&rarr;</a>
-          <a href="#demo-video" class="btn">90s&nbsp;Video</a>
+          <a href="/trial" class="btn btn-brand">Start free trial</a>
+          <a href="#demo-video" class="btn">90s&nbsp;video</a>
           <a href="https://github.com/beshu-tech/deltaglider_proxy" class="btn btn-ghost">GitHub</a>
         </div>
 
         <p class="hero-trust">
-          Built by <strong>Beshu Tech</strong> (the
+          Built by Beshu Tech (the
           <a href="https://readonlyrest.com">ReadonlyREST</a> team), which
           <a href="/case-studies/readonlyrest-builds">serves its own
-          1.71&nbsp;TB build catalog through it in production</a>.
+          1.71&nbsp;TB build catalog through the proxy in production</a>.
+          Our engineers write it with Claude as a coding aid, and we say
+          so in the
+          <a href="https://github.com/beshu-tech/deltaglider_proxy/commits/main">commit trailers</a>.
         </p>
       </div>
     </div>
@@ -112,48 +115,68 @@ import {
       <h2>The questions you'd ask anyway</h2>
 
       <p>
-        Answered with links, so you can check for yourself.
+        Each answer links to something you can check yourself.
       </p>
 
       <div class="dd-grid">
         <article class="dd-card" data-n="01">
           <h3 class="dd-q">Will it corrupt my artifacts?</h3>
           <p class="dd-a">
-            Every delta read is rebuilt and SHA-256-checked against the
-            hash recorded at upload — and 1,100+ unit tests plus an
-            integration matrix against real MinIO gate every merge.
+            Every delta read is rebuilt and checked with SHA-256 against
+            the hash recorded at upload. More than 1,100 unit tests and an
+            integration matrix against a real MinIO must pass before every
+            merge.
           </p>
-          <a class="dd-link" href="https://github.com/beshu-tech/deltaglider_proxy">Read the source — every line is public →</a>
+          <a class="dd-link" href="https://github.com/beshu-tech/deltaglider_proxy">Read the source: every line is public</a>
         </article>
 
         <article class="dd-card dd-card--accent" data-n="02">
           <h3 class="dd-q">What breaks in production?</h3>
           <p class="dd-a">
-            Here's what broke in ours: we pushed our own 1.71&nbsp;TB
-            release catalog through it and published every bug we hit —
-            upstream TMPDIR, proxy timeouts, EBS exhaustion — with the
-            fixes.
+            We pushed our own 1.71&nbsp;TB release catalog through the
+            proxy. Upstream TMPDIR, proxy timeouts, and EBS exhaustion
+            broke along the way, and we published every bug with its fix.
           </p>
-          <a class="dd-link" href="/case-studies/readonlyrest-builds">Read the migration log →</a>
+          <a class="dd-link" href="/case-studies/readonlyrest-builds">Read the migration log</a>
         </article>
 
         <article class="dd-card dd-card--accent" data-n="03">
-          <h3 class="dd-q">Will bugs get fixed — or hidden?</h3>
+          <h3 class="dd-q">Will bugs get fixed, or hidden?</h3>
           <p class="dd-a">
-            A five-investigator correctness audit surfaced 10 bugs; all
-            fixed, each pinned by a regression test, written up
-            bug-by-bug where you can read them.
+            A correctness audit by five investigators found 10 bugs. We
+            fixed all of them, pinned each one with a regression test, and
+            wrote them up bug by bug where you can read them.
           </p>
-          <a class="dd-link" href="https://github.com/beshu-tech/deltaglider_proxy/blob/main/CHANGELOG.md">The bug-by-bug CHANGELOG →</a>
+          <a class="dd-link" href="https://github.com/beshu-tech/deltaglider_proxy/blob/main/CHANGELOG.md">The bug-by-bug CHANGELOG</a>
         </article>
 
         <article class="dd-card" data-n="04">
           <h3 class="dd-q">Who answers when it breaks at 2 a.m.?</h3>
           <p class="dd-a">
             The people whose names are in <code>git log</code>. Your mail
-            lands directly with the engineers who wrote the code.
+            goes directly to the engineers who wrote the code.
           </p>
-          <a class="dd-link" href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20General%20inquiry">contact@beshu.tech →</a>
+          <a class="dd-link" href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20General%20inquiry">contact@beshu.tech</a>
+        </article>
+
+        <article class="dd-card dd-card--wide" data-n="05">
+          <h3 class="dd-q">Who wrote it, engineers or an AI?</h3>
+          <p class="dd-a">
+            The engineers in <code>git log</code>, with help from Claude
+            (Fable 5.x today); most of the commits are by Simone Scarduzio,
+            the founder of Beshu Tech. About four in five commits on
+            <code>main</code> carry a <code>Co-Authored-By: Claude</code>
+            trailer that names the model used for that commit, starting
+            with the first release in December 2025. The engineers make
+            the commits and answer for them; the model works from
+            <code>CLAUDE.md</code>, a public file in the repo with the
+            architecture rules and the design decisions it may not change
+            (shelling out to the xdelta3 CLI is one). Every commit, with
+            or without Claude, goes through the same gate: more than 1,100
+            unit tests, the MinIO integration matrix, clippy with warnings
+            as errors, a RustSec audit, and cargo-deny.
+          </p>
+          <a class="dd-link" href="https://github.com/beshu-tech/deltaglider_proxy/blob/main/CLAUDE.md">Read the instructions we give the model: CLAUDE.md</a>
         </article>
       </div>
 
@@ -164,13 +187,13 @@ import {
   {/* ============================ HONEST FIT ========================== */}
   <section class="section">
     <div class="shell">
-      <span class="section-eyebrow">Honest positioning</span>
+      <span class="section-eyebrow">Workload fit</span>
       <WorkloadFitTable />
 
       <p class="fit-next">
         Then put your real numbers into the
-        <a href="/pricing">savings calculator</a>. More detail:
-        <a href="/saas">for CI &amp; build artifacts</a> ·
+        <a href="/pricing">savings calculator</a>. There is more detail
+        <a href="/saas">for CI &amp; build artifacts</a> and
         <a href="/regulated">for regulated buyers</a>.
       </p>
     </div>
@@ -195,7 +218,7 @@ import {
       <p>
         Open <code>http://localhost:9000/_/</code> for the browser, or
         point any S3 SDK at <code>http://localhost:9000</code>. Open
-        access is for a localhost first look —
+        access is meant for a first look on localhost;
         <a href="/docs/tutorials/secure-your-proxy">the second tutorial
         locks it down</a>.
       </p>
@@ -276,6 +299,11 @@ import {
   .dd-card--accent:hover {
     border-color: var(--accent-strong);
   }
+
+  /* the provenance card spans both columns; give its text more room */
+  .dd-card--wide { grid-column: 1 / -1; }
+  .dd-card--wide .dd-q { max-width: 30ch; }
+  .dd-card--wide .dd-a { max-width: var(--measure); }
 
   /* giant watermark number — graphic weight without clutter */
   .dd-card::before {

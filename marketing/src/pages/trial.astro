@@ -19,46 +19,46 @@ import {
 
 const title = '30-day Commercial trial — DeltaGlider';
 const description =
-  "Direct engineering email, a 12-hour response SLA, one architecture review call. The software stays free under the 15 TB grant regardless.";
+  "The trial gives you direct engineering email, a 12-hour response SLA, and one architecture review call. The software stays free under the 15 TB grant regardless.";
 
 const included = [
   {
     glyph: 'pulse',
     title: 'Direct engineering email',
-    desc: 'Named senior engineers on the other end of the address — the people whose names are in git log. No outsourced first line.',
+    desc: 'You write to named senior engineers, the people whose names are in git log, with no outsourced first-line support in between.',
   },
   {
     glyph: 'clock',
     title: '12h response SLA',
-    desc: '12-hour email response commitment on questions and issues, business hours, from day one.',
+    desc: 'We respond to questions and issues by email within 12 hours, during business hours, from day one.',
   },
   {
     glyph: 'bulb',
     title: 'Architecture review call',
-    desc: '60 minutes on your deployment: what’s standard, what’s risky, what’s suboptimal, what’s outright broken.',
+    desc: "We spend 60 minutes on your deployment and tell you what's standard, what's risky, what's suboptimal, and what's outright broken.",
   },
 ] as const;
 
 const timeline = [
   {
     day: 'Day 0',
-    text: 'You email contact@beshu.tech with subject “DeltaGlider — Commercial trial.” We respond within 1 business day with a scheduling link for the review call.',
+    text: 'You email contact@beshu.tech with the subject "DeltaGlider - Commercial trial". We respond within 1 business day with a scheduling link for the review call.',
   },
   {
-    day: 'Days 1–7',
-    text: 'Email onboarding. We learn your deployment shape, the workload, the storage backend, your SLOs.',
+    day: 'Days 1-7',
+    text: 'We onboard you by email and learn your deployment shape, the workload, the storage backend, and your SLOs.',
   },
   {
-    day: 'Days 8–14',
-    text: 'Architecture review call (60 min). Output: a short written summary of recommendations, by email.',
+    day: 'Days 8-14',
+    text: 'We hold the 60-minute architecture review call, then send you a short written summary of recommendations by email.',
   },
   {
-    day: 'Days 15–29',
-    text: 'Ongoing email support. You ask questions, file issues, get answers from the senior engineers who wrote the code.',
+    day: 'Days 15-29',
+    text: 'You keep asking questions and filing issues by email, and the senior engineers who wrote the code answer them.',
   },
   {
     day: 'Day 30',
-    text: 'Conversion conversation. Sign the Commercial plan ($5k/year, everything included) — or thank us, exit, and keep running the free build. Under the 15 TB grant, nothing changes on your side at all.',
+    text: 'We talk about converting. You either sign the Commercial plan ($5k/year, everything included) or you thank us and keep running the free build. Under the 15 TB grant, nothing changes on your side at all.',
   },
 ] as const;
 ---
@@ -86,11 +86,10 @@ const timeline = [
 
         <p>
           DeltaGlider is free for production use up to 15 TB of compressed
-          data, and nothing in the software is ever gated. The trial isn't
-          for the software. It's for the Commercial plan's support
-          relationship: a direct email line to Beshu Tech's senior
-          engineers, a 12-hour response SLA, and one architecture review
-          call.
+          data, and nothing in the software is ever locked. The trial
+          covers the Commercial plan's support relationship: a direct
+          email line to Beshu Tech's senior engineers, a 12-hour response
+          SLA, and one architecture review call.
         </p>
 
         <p class="trial-no-strings">
@@ -111,7 +110,7 @@ const timeline = [
       <div class="trial-hero-visual">
         <img
           src="/screenshots/analytics-hero.jpg"
-          alt="The DeltaGlider Proxy Dashboard: total savings of 1,174% smaller on disk, a with/without comparison bar, and per-bucket savings for releases, db-archive, ml-models, and downloads"
+          alt="The DeltaGlider Proxy Dashboard: a Total savings card reading 1,174% smaller on disk, a with/without comparison bar, and per-bucket savings for releases, db-archive, ml-models, and downloads"
           width="2288"
           height="2120"
           loading="eager"
@@ -139,7 +138,7 @@ const timeline = [
     </section>
 
     <section class="schedule">
-      <h2>What the 30 days actually look like</h2>
+      <h2>What the 30 days look like</h2>
 
       <ol class="tl">
         {timeline.map((t) => (
@@ -157,8 +156,8 @@ const timeline = [
           <h2>What we don't do during the trial</h2>
           <ul class="x-list">
             <li>
-              We don't get root on your infrastructure. The trial is async
-              help, not managed services.
+              We don't get root on your infrastructure. The trial is
+              asynchronous help, and it doesn't include managed services.
             </li>
             <li>
               We don't operate migrations or cutovers for you. We advise;
@@ -166,7 +165,7 @@ const timeline = [
             </li>
             <li>
               We don't sign DPAs / MSAs for the trial itself. Those come
-              with a paid contract — a separate
+              with a paid contract, which is a separate
               <a href="mailto:sales@beshu.tech?subject=DeltaGlider%20-%20Contract%20inquiry">sales conversation</a>.
             </li>
             <li>
@@ -180,19 +179,20 @@ const timeline = [
           <h2>When the trial isn't right for you</h2>
           <ul class="x-list">
             <li>
-              You haven't deployed DeltaGlider yet — start with
-              <a href="/docs/tutorials/first-delta-savings">the first tutorial</a>.
-              There's no point trialing support for software you haven't
-              tried.
+              You don't run DeltaGlider yet. Start with
+              <a href="/docs/tutorials/first-delta-savings">the first tutorial</a>,
+              because there's no point in trialing support for software
+              you never tried.
             </li>
             <li>
-              You need 24/7 on-call coverage — the trial is business-hours
-              only, and so is the standard Commercial plan. 24/7 is a
-              custom conversation with sales.
+              You need 24/7 on-call coverage. The trial is business hours
+              only, and so is the standard Commercial plan. 24/7 coverage
+              is a custom arrangement, so it needs its own conversation
+              with sales.
             </li>
             <li>
-              You need a contract signed before any interaction — skip the
-              trial,
+              You need a contract signed before any interaction. Skip the
+              trial and
               <a href="mailto:sales@beshu.tech?subject=DeltaGlider%20-%20Sales%20inquiry">talk to sales directly</a>.
             </li>
           </ul>
@@ -204,16 +204,16 @@ const timeline = [
       <h2>Why this isn't a software trial</h2>
 
       <p>
-        There is nothing to gate: no time-locked feature flag, no
-        expiring license key, no phone-home. The license is legal text
-        you can read, not a technical lock. And every release becomes
-        Apache-2.0 open source two years after it ships.
+        There is nothing to lock. The software has no time-locked
+        feature flag, no expiring license key, and no phone-home. The
+        license is legal text you can read, and no code enforces it.
+        Every release becomes Apache-2.0 open source two years after it
+        ships.
       </p>
 
       <p>
-        So the trial is the support relationship. Trying us out for 30
-        days is the cheapest way for both sides to find out if we're a
-        fit.
+        So the trial is for the support relationship, and 30 days is
+        the cheapest way for both sides to find out if we're a fit.
       </p>
     </section>
 

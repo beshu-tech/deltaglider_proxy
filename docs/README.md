@@ -31,6 +31,6 @@ See [product/README.md](product/README.md) — that file is also the landing pag
 
 Three blocking checks in [.github/workflows/ci.yml](../.github/workflows/ci.yml) keep this tree honest:
 
-1. **`scripts/check-docs-registry.sh`** — every `.md` under `docs/product/` must be imported in [demo/s3-browser/ui/src/docs-imports.ts](../demo/s3-browser/ui/src/docs-imports.ts). Anything under `docs/dev/` that sneaks into the registry fails CI.
+1. **`scripts/check-docs-registry.sh`** — every `.md` under `docs/product/` must have a `manifest.json` entry and vice versa. The proxy embeds the whole folder (`src/demo.rs`) and serves it session-gated at `GET /_/api/docs`; the marketing site globs the same files. Anything under `docs/dev/` that sneaks into the registry fails CI.
 2. **`scripts/check-docs-yaml-examples.sh`** — every fenced `yaml` block marked `# validate` must pass `deltaglider_proxy config lint`. Prevents example drift.
 3. **lychee** — every inter-doc link resolves; no broken references.

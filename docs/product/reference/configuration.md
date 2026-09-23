@@ -1008,6 +1008,8 @@ Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_
 | `DGP_MAX_MULTIPART_UPLOADS` | 1000 | Concurrent multipart upload cap |
 | `DGP_DEBUG_HEADERS` | false | Expose fingerprinting headers |
 | `DGP_CORS_PERMISSIVE` | false | Enable permissive CORS (dev only) |
+| `DGP_METRICS_EXPOSE_VERSION` | false | Put the exact build version in the `version` label of `deltaglider_build_info` on the unauthenticated `/_/metrics` endpoint. Off by default so that anonymous callers cannot fingerprint the deployment; the version stays available through the authenticated admin API |
+| `DGP_METRICS_BEARER_TOKEN` | unset | When set, `/_/metrics` answers only to `Authorization: Bearer <token>` (the Prometheus `authorization:` scrape setting) or to an admin session. Unset keeps the scrape endpoint public. See [Monitor with Prometheus](../how-to/monitor-with-prometheus.md) |
 
 ### Delta engine
 

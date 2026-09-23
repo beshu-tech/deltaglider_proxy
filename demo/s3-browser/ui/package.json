@@ -17,6 +17,7 @@
     "lint": "eslint 'src/**/*.{ts,tsx}'",
     "lint:strict": "eslint 'src/**/*.{ts,tsx}' --max-warnings 0",
     "test:permissions": "node scripts/permissions-regression-test.mjs",
+  "test:docs-bundle": "node scripts/docs-bundle-regression-test.mjs",
     "test:writable-prefixes": "node scripts/writable-prefixes-regression-test.mjs",
     "test:virtual-prefix-scan": "node scripts/virtual-prefix-scan-regression-test.mjs",
     "test:storage-path": "node scripts/storage-path-regression-test.mjs",

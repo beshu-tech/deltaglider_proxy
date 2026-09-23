@@ -19,6 +19,10 @@ fn main() {
     // tracking each file. So we walk dist/ and emit a rerun line per file.
     println!("cargo:rerun-if-changed=demo/s3-browser/ui/dist");
     emit_rerun_for_tree("demo/s3-browser/ui/dist");
+    // The product docs are embedded too (served at /_/api/docs), and they
+    // have stable names — same per-file tracking.
+    println!("cargo:rerun-if-changed=docs/product");
+    emit_rerun_for_tree("docs/product");
 }
 
 /// Recursively emit `cargo:rerun-if-changed` for every file under `root` so a

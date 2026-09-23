@@ -220,6 +220,7 @@ mod tests {
             enabled: true,
             groups: vec![],
             permissions: vec![perm(resources)],
+            auth_source: None,
         }
     }
 

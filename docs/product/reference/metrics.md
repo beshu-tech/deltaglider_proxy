@@ -22,9 +22,11 @@ curl -s http://localhost:9000/_/metrics | promtool check metrics
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `process_start_time_seconds` | Gauge | — | Unix timestamp when the process started |
-| `deltaglider_build_info` | Gauge | `version`, `backend_type` | Always 1; labels carry build metadata |
+| `deltaglider_build_info` | Gauge | `version`, `backend_type` | Always 1. `version` is empty unless `DGP_METRICS_EXPOSE_VERSION=true`, because this endpoint is unauthenticated; the authenticated admin API (`GET /_/api/whoami` with a session) always reports the running version |
 | `process_peak_rss_bytes` | Gauge | — | Peak resident set size (updated on scrape) |
 | `process_*` (Linux only) | various | — | Standard process collector: RSS, CPU seconds, open FDs, virtual memory |
+
+The endpoint is public by default so that any Prometheus can scrape it. Set `DGP_METRICS_BEARER_TOKEN` to require `Authorization: Bearer <token>` (or an admin session, which the dashboard uses); anonymous callers then receive `401` and cannot read the metric set, which changes from release to release. See [Monitor with Prometheus](../how-to/monitor-with-prometheus.md).
 
 ## HTTP requests
 
@@ -139,10 +141,25 @@ All label sets are bounded:
 | `status` | ~15 HTTP status codes in practice |
 | `operation` | 15 (see table above) |
 | `decision` | 3 (delta, passthrough, reference) |
-| `result` | 2 (success, failure) |
+| `result` | 2 (success or failure) |
 | `reason` | 3 (missing_header, invalid_presigned, invalid_signature) |
 
 No bucket names, no object keys in labels. No unbounded cardinality.
+
+## Tokio runtime series (opt-in build flag)
+
+These series exist only when the binary is built with `RUSTFLAGS="--cfg tokio_unstable"`. A default build omits them entirely, and the operator pages should treat that as "not compiled in", not "all zeros".
+
+| Series | Gauge | Meaning |
+|---|---|---|
+| `deltaglider_tokio_worker_mean_poll_seconds` | gauge | Worst worker's mean task poll duration (EWMA). Polls should run microseconds-to-low-milliseconds; a sustained value in the tens of milliseconds means blocking work runs inside the async context. |
+| `deltaglider_tokio_global_queue_depth` | gauge | Tasks pending in the runtime's global queue. A healthy runtime keeps this near zero; sustained depth means the workers cannot drain the schedule. |
+| `deltaglider_tokio_blocking_queue_depth` | gauge | Tasks waiting for a `spawn_blocking` thread. Sustained depth means the blocking pool (size `DGP_BLOCKING_THREADS`) is saturated. |
+| `deltaglider_tokio_budget_forced_yields_total` | counter | Polls the scheduler force-yielded after exhausting their budget. Rapid growth points at a task hogging a worker in a tight loop. Use `rate()`/`increase()`. |
+| `deltaglider_tokio_poll_time_range_total{range}` | counter | Task polls per poll-duration range (label `range`, for example `10-100us`), summed across workers. Counts in the high ranges are the long polls the mean hides. Use `rate()`/`increase()`. |
+| `deltaglider_tokio_workers` | gauge | Worker thread count, for context when reading the per-worker series. |
+
+Reading guidance: start with `worker_mean_poll_seconds` — if it is high, request handling contains inline blocking work (the class of problem behind the bucket-usage and periodic-sweep fixes). The mean hides the tail, so confirm with `deltaglider_tokio_poll_time_range_total`: growth in the high `range` buckets is what a few long polls look like. If the mean is low and the tail is flat but latency is still poor, check the two queue depths for saturation, then the budget-yield counter for CPU-hogging loops.
 
 ## What's NOT in `/_/metrics`
 

@@ -390,6 +390,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(bt) = pre_config.blocking_threads {
         runtime_builder.max_blocking_threads(bt);
     }
+    // #87: enable the per-poll duration histogram. The sampler in
+    // `metrics::spawn_tokio_runtime_metrics_sampler` exports its bucket
+    // counts as `deltaglider_tokio_poll_time_range_total`. This costs two
+    // `Instant::now()` per poll, so it is gated behind the same cfg as the
+    // sampler: a default build pays nothing.
+    #[cfg(tokio_unstable)]
+    {
+        runtime_builder.enable_metrics_poll_time_histogram();
+    }
     let runtime = runtime_builder.build()?;
 
     runtime.block_on(async_main(cli))
@@ -492,6 +501,17 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+    // #85: counter deltas fold into an in-process pending map on the S3 path
+    // (never SQLite, never a global lock); this background task is the single
+    // writer that drains the map into the DB. SQLite under the connection
+    // mutex runs here, on the blocking pool — never on a request worker.
+    if let Some(ref usage) = bucket_usage {
+        let usage = Arc::clone(usage);
+        let flush_interval_secs: u64 = env_parse_with_default("DGP_BUCKET_USAGE_FLUSH_SECS", 10);
+        spawn_periodic_blocking(Duration::from_secs(flush_interval_secs.max(1)), move || {
+            usage.flush_pending();
+        });
+    }
 
     // --- Engine ---
     // Cross-instance reference lock (multi-instance only; None single-instance).
@@ -571,7 +591,9 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    spawn_periodic(multipart_sweep_interval, {
+    // #86: the sweep walks + removes relay dirs on the filesystem — run it
+    // on the blocking pool, not inline on a worker.
+    spawn_periodic_blocking(multipart_sweep_interval, {
         let mp = multipart.clone();
         let metrics = metrics.clone();
         move || {
@@ -715,6 +737,9 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Background monitors ---
     spawn_cache_monitor(&state, &metrics);
+    // #87: Tokio runtime sampler — a no-op call unless built with
+    // `--cfg tokio_unstable` (see src/metrics.rs for the gating rationale).
+    deltaglider_proxy::metrics::spawn_tokio_runtime_metrics_sampler(&metrics);
 
     // Resolve the authoritative config-file path ONCE, before anything that
     // persists config (the maintenance worker's migrate jobs AND AdminState
@@ -1025,6 +1050,15 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    }
+
+    // #85: drain any un-flushed bucket-usage deltas. The periodic task runs
+    // every DGP_BUCKET_USAGE_FLUSH_SECS; without this, a clean exit
+    // (restart, deploy, SIGTERM) discards up to that window, where the old
+    // write-through design lost nothing. Best-effort: a crash still loses
+    // the window and Refresh reconciles it.
+    if let Some(usage) = bucket_usage.as_ref() {
+        usage.flush_pending();
     }
 
     info!("Server shutdown complete");

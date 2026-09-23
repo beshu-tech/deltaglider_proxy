@@ -771,6 +771,314 @@ async fn test_metrics_endpoint_no_auth_needed() {
     );
 }
 
+/// Anonymous callers must not learn the exact build version: `/_/api/whoami`
+/// carries `version` only for a live session, and `deltaglider_build_info` on
+/// the public `/_/metrics` has an empty `version` label unless the operator
+/// opts in with `DGP_METRICS_EXPOSE_VERSION=true`.
+#[tokio::test]
+async fn test_build_version_is_not_disclosed_to_anonymous_callers() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let version = env!("CARGO_PKG_VERSION");
+    let whoami_url = format!("{}/_/api/whoami", server.endpoint());
+
+    let anon: serde_json::Value = reqwest::Client::new()
+        .get(&whoami_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        anon.get("version").is_none(),
+        "anonymous whoami leaked the version: {anon}"
+    );
+    assert!(
+        anon.get("mode").is_some(),
+        "the login page still needs `mode` before login: {anon}"
+    );
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let authed: serde_json::Value = admin
+        .get(&whoami_url)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        authed["version"], version,
+        "a live session must see the running version"
+    );
+
+    let metrics = metrics_text(&server.endpoint()).await;
+    assert!(
+        metrics.contains("deltaglider_build_info{"),
+        "build_info series must survive"
+    );
+    assert!(
+        !metrics.contains(&format!("version=\"{version}\"")),
+        "public /_/metrics leaked the version:\n{metrics}"
+    );
+}
+
+/// `DGP_METRICS_EXPOSE_VERSION=true` restores the `version` label for
+/// operators whose fleet dashboards key on it.
+#[tokio::test]
+async fn test_metrics_build_info_version_on_operator_opt_in() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_METRICS_EXPOSE_VERSION", "true")
+        .build()
+        .await;
+    let metrics = metrics_text(&server.endpoint()).await;
+    assert!(
+        metrics.contains(&format!("version=\"{}\"", env!("CARGO_PKG_VERSION"))),
+        "opt-in must put the version back on build_info:\n{metrics}"
+    );
+}
+
+/// Unknown paths under `/_/` are honest 404s — only genuine SPA routes fall
+/// back to `index.html`. A mistyped admin API path or a source map that is
+/// not shipped must not come back as a 200 HTML page.
+#[tokio::test]
+async fn test_unknown_ui_paths_are_404_not_spa_fallback() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let http = reqwest::Client::new();
+    let get = |p: &str| http.get(format!("{}{}", server.endpoint(), p)).send();
+
+    // Every method, not only GET: a GET-only catch-all made axum answer
+    // POST/PUT/DELETE on a mistyped path with 405 `Allow: GET,HEAD`, which
+    // reads as "resource exists".
+    for method in [
+        reqwest::Method::GET,
+        reqwest::Method::POST,
+        reqwest::Method::PUT,
+        reqwest::Method::DELETE,
+    ] {
+        let api = http
+            .request(
+                method.clone(),
+                format!("{}/_/api/admin/does-not-exist", server.endpoint()),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(api.status(), StatusCode::NOT_FOUND, "{method}");
+        assert_eq!(
+            api.headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "{method}: a 404 must not be cacheable"
+        );
+        assert_eq!(
+            api.json::<serde_json::Value>().await.unwrap()["error"],
+            "not_found",
+            "{method}"
+        );
+    }
+
+    for p in ["/_/assets/index-deadbeef.js.map", "/_/no-such-view"] {
+        let resp = get(p).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "{p} must be a 404, not the SPA shell"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "{p}: a 404 must not be cacheable"
+        );
+    }
+
+    // A genuine SPA route still serves the app. CI builds the UI before the
+    // Rust tests; a local checkout without `dist/` gets the explicit
+    // "Demo UI not built" 404 from `serve_index`, which is not a regression.
+    let spa = get("/_/browse").await.unwrap();
+    let status = spa.status();
+    let content_type = spa
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let body = spa.text().await.unwrap();
+    if status == StatusCode::NOT_FOUND && body == "Demo UI not built" {
+        eprintln!("skipping SPA-route assertion: demo UI not built");
+        return;
+    }
+    assert_eq!(status, StatusCode::OK, "/_/browse must serve the SPA shell");
+    assert!(
+        content_type.starts_with("text/html"),
+        "SPA shell must be HTML, got {content_type}"
+    );
+
+    // No source map for any REAL chunk either. The shell names its entry
+    // chunk; that chunk's `.map` must be absent, not only a made-up name.
+    let chunk = body
+        .split("/_/assets/")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("index.html references an /_/assets/ chunk");
+    let map = get(&format!("/_/assets/{chunk}.map")).await.unwrap();
+    assert_eq!(
+        map.status(),
+        StatusCode::NOT_FOUND,
+        "source map for the entry chunk {chunk} must not be served"
+    );
+}
+
+/// `DGP_METRICS_BEARER_TOKEN` turns the public scrape into a token-gated
+/// one: Prometheus presents the token, the admin dashboard presents its
+/// session, and anonymous callers get a 401 with no metric names to
+/// fingerprint the release by.
+#[tokio::test]
+async fn test_metrics_bearer_token_gate() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_METRICS_BEARER_TOKEN", "scrape-me-7")
+        .build()
+        .await;
+    let url = format!("{}/_/metrics", server.endpoint());
+    let http = reqwest::Client::new();
+
+    let anon = http.get(&url).send().await.unwrap();
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+    assert!(anon
+        .headers()
+        .contains_key(reqwest::header::WWW_AUTHENTICATE));
+    assert!(
+        !anon.text().await.unwrap().contains("deltaglider_"),
+        "no metric names for anonymous callers"
+    );
+
+    let wrong = http
+        .get(&url)
+        .bearer_auth("scrape-me-8")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+    let right = http
+        .get(&url)
+        .bearer_auth("scrape-me-7")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(right.status(), StatusCode::OK);
+    assert!(right
+        .text()
+        .await
+        .unwrap()
+        .contains("deltaglider_build_info"));
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    assert_eq!(
+        admin.get(&url).send().await.unwrap().status(),
+        StatusCode::OK,
+        "the admin dashboard scrapes with its session"
+    );
+}
+
+/// A wrong bearer is a failed credential check like a wrong password: it
+/// counts against the per-IP limiter and locks the caller out.
+#[tokio::test]
+async fn test_metrics_bearer_token_is_rate_limited() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_METRICS_BEARER_TOKEN", "scrape-me-9")
+        .env("DGP_RATE_LIMIT_MAX_ATTEMPTS", "3")
+        .build()
+        .await;
+    let url = format!("{}/_/metrics", server.endpoint());
+    let http = reqwest::Client::new();
+
+    let mut statuses = Vec::new();
+    for i in 0..5 {
+        let resp = http
+            .get(&url)
+            .bearer_auth(format!("wrong-{i}"))
+            .send()
+            .await
+            .unwrap();
+        statuses.push(resp.status().as_u16());
+    }
+    assert!(
+        statuses.iter().take(3).all(|s| *s == 401) && statuses.iter().skip(3).all(|s| *s == 429),
+        "3 wrong tokens then lockout, got {statuses:?}"
+    );
+
+    // The dashboard path (no Authorization header at all) is not a
+    // credential check and is not counted: an anonymous scrape is still a
+    // plain 401, not a 429.
+    assert_eq!(
+        http.get(&url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// The product docs and the canned-policy catalogue both change with every
+/// release, so they are served only to a live session.
+#[tokio::test]
+async fn test_docs_and_policies_require_a_session() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let http = reqwest::Client::new();
+    for path in ["/_/api/docs", "/_/api/admin/policies"] {
+        let resp = http
+            .get(format!("{}{}", server.endpoint(), path))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{path} must not be anonymous"
+        );
+    }
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    let docs: serde_json::Value = admin
+        .get(format!("{}/_/api/docs", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let groups = docs["manifest"]["groups"]
+        .as_array()
+        .expect("manifest groups");
+    assert!(!groups.is_empty(), "manifest groups must be served");
+    let entries = docs["docs"].as_array().expect("docs array");
+    assert!(
+        entries.len() > 10,
+        "expected the full product docs, got {}",
+        entries.len()
+    );
+    assert!(
+        entries.iter().any(|d| d["path"] == "changelog"),
+        "the changelog is served — behind the session"
+    );
+    assert!(entries
+        .iter()
+        .all(|d| d["content"].as_str().is_some_and(|c| !c.is_empty())));
+}
+
 /// HEAD / (connection probe) should be accessible without auth.
 #[tokio::test]
 async fn test_head_root_no_auth_needed() {

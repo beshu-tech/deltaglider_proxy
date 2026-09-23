@@ -97,14 +97,27 @@ Mapping rules are wipe-and-rebuild (no stable per-row identity beyond the tuple 
 
 ## External identities
 
-External identities (runtime OAuth byproducts — a user's Google identity binding, for instance) are **not reconciled** from YAML. They are created at runtime by the OAuth callback flow and live only in the DB.
+There are two distinct surfaces, and the distinction matters:
 
-The reconciler's contract:
+- The **main config file** and the declarative config-apply path never touch external identities. They are created at runtime by the OAuth callback flow and live in the database. The reconciler's contract below describes this surface.
+- The **full-IAM import artifact** (`declarative-iam-validate` / `-apply`) does restore them, because that artifact exists to make a wipe lossless. See "Full-IAM round-trip" below.
+
+The reconciler's contract for the main config / config-apply surface:
 
 - `external_identities` are preserved through user UPDATEs (same DB id → same bindings).
 - `external_identities` are cascade-deleted when a YAML-authoritative delete removes the user or provider they reference — the user is gone, so the binding is meaningless.
 
 If an OAuth callback is in-flight when a reconcile fires, the callback inserts the external identity into a user row that the reconcile may then delete (if YAML doesn't list that user). The callback flow fails; the next login creates a fresh external user (if auto-provisioning is enabled and matching mapping rules exist).
+
+### Full-IAM round-trip
+
+The full-IAM export (`GET /_/api/admin/config/declarative-iam-export?include_secrets=true`) is the one surface that *does* carry the DB-only state, so a committed export is genuinely lossless:
+
+- Every user carries `auth_source` (`"external"` for OAuth-provisioned rows); the import restores the provenance instead of downgrading the row to `local`.
+- The export emits an `external_identities` list — user and provider referenced **by name**, plus the IdP `subject`, email, and claims. The import upserts each binding keyed on `(provider, subject)`, the exact pair the OAuth callback looks up, so a recovered database re-links the binding to the freshly created user row instead of letting the next login provision a duplicate user.
+- Bindings are never deleted by the reconciler. An `external_identities` list that is absent (hand-authored YAML, or a redacted export — `include_secrets=false` drops the bindings because `raw_claims` can carry IdP personal data) means "leave the database alone", never "delete the missing rows".
+- The main config file rejects `access.external_identities` outright — that file never manages OAuth bindings, and silently dropping them from a pasted full-IAM export would be a data-loss trap.
+- The export refuses (HTTP 409) when two users share a name. The reconciler keys users by name, and the database allows a same-name local/external pair (only `access_key_id` is unique). Such a pair cannot round-trip through YAML. For a database in that state, use the admin backup (`POST /_/api/admin/backup`), which handles external identities by database id, or rename one of the users.
 
 ## Secrets in exports
 

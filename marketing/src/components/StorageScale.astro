@@ -16,9 +16,9 @@ const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
     <span class="section-eyebrow">Drawn to scale</span>
     <h2 class="scale-title">What ten releases do to a bucket</h2>
     <p class="scale-sub">
-      The same ten uploads of a 91&nbsp;MB build artifact, stored two ways.
-      The bars are proportional; the deltas are drawn with a two-pixel
-      floor, or they would be invisible.
+      These are the same ten uploads of a 91&nbsp;MB build artifact, stored
+      two ways. The bars are proportional. We draw the deltas with a
+      two-pixel floor, or they would be invisible.
     </p>
 
     <div
@@ -65,31 +65,32 @@ const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
     </div>
 
     <p class="scale-projection">
-      The gap widens with every release. By v100 it's <strong>9.1&nbsp;GB</strong>
-      against <strong>~106&nbsp;MB</strong> — 8,600% less. Our own release catalog
-      landed at <a href="/case-studies/readonlyrest-builds">8,850% smaller on a
+      The gap widens with every release. By v100 it's 9.1&nbsp;GB against
+      about 106&nbsp;MB, which is 8,600% less. Our own release catalog landed
+      at <a href="/case-studies/readonlyrest-builds">8,850% smaller on a
       real release line</a>.
     </p>
 
     <p class="scale-mech">
-      Each upload is stored as a binary diff against a full reference
-      copy kept beside it, and every read rebuilds the exact original —
-      behind the same S3 API your tools already speak.
+      The proxy stores each upload as a binary diff against a full
+      reference copy that it keeps beside it, and every read rebuilds the
+      exact original. All of this sits behind the same S3 API your tools
+      already speak.
     </p>
 
     <aside class="scale-objection">
       <p class="objection-q">
-        “Our artifacts are ZIPs and JARs. They're already compressed —
+        “Our artifacts are ZIPs and JARs. They're already compressed, so
         diffing them should do nothing.”
       </p>
       <p class="objection-a">
-        It would, on random bytes. But versioned archives aren't random:
-        version to version, the same entries land in the same order — same
-        manifest, same icons, same bundled CSS — so the binary diff stays
-        tiny. The 91&nbsp;MB artifact in the chart <em>is</em> a compressed
-        ZIP — a real ReadonlyREST plugin, stored 61,400% smaller.
+        It would, on random bytes. But versioned archives aren't random.
+        From one version to the next, the same entries land in the same
+        order (the manifest, the icons, the bundled CSS), so the binary diff
+        stays tiny. The 91&nbsp;MB artifact in the chart <em>is</em> a
+        compressed ZIP: a real ReadonlyREST plugin, stored 61,400% smaller.
         <a href="/docs/explanation/delta-compression">The engineering
-        note</a> walks through why.
+        note</a> explains why.
       </p>
     </aside>
   </div>

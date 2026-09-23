@@ -703,6 +703,22 @@ pub async fn export_declarative_iam(
                 .into_response();
         }
     };
+    // #71 review: the reconciler keys users by NAME. A DB holding a same-name
+    // local+external pair (allowed — only access_key_id is UNIQUE) cannot be
+    // represented in this YAML, and the import would reject it. Refuse loudly
+    // rather than hand back a file that cannot be re-imported.
+    if let Some(name) = crate::iam::duplicate_user_name(&snapshot) {
+        return (
+            StatusCode::CONFLICT,
+            format!(
+                "full-IAM export cannot represent two users named '{name}': the reconciler \
+                 keys users by name, so this database's same-name pair would not round-trip. \
+                 Use the admin backup (POST /_/api/admin/backup) for a lossless artifact, or \
+                 rename one of the users."
+            ),
+        )
+            .into_response();
+    }
     drop(db);
 
     // Emit a minimal YAML with `access.iam_mode: declarative` + the
@@ -727,6 +743,14 @@ pub async fn export_declarative_iam(
     access_map.insert(
         serde_yaml::Value::String("group_mapping_rules".into()),
         serde_yaml::to_value(&snapshot.mapping_rules).unwrap_or(serde_yaml::Value::Null),
+    );
+    // #71: OAuth bindings ride along so the lossless export is genuinely
+    // lossless — without them, a DB wipe re-provisions duplicate users on
+    // the next OAuth login. (Empty for redacted exports; skip_serializing
+    // keeps hand-authored YAML clean either way.)
+    access_map.insert(
+        serde_yaml::Value::String("external_identities".into()),
+        serde_yaml::to_value(&snapshot.external_identities).unwrap_or(serde_yaml::Value::Null),
     );
 
     let mut root = serde_yaml::Mapping::new();
@@ -775,6 +799,8 @@ pub struct IamImportSummary {
     pub providers_updated: usize,
     pub providers_deleted: usize,
     pub mapping_rules_replaced: usize,
+    /// OAuth login bindings upserted (#71).
+    pub external_identities_applied: usize,
     /// True when applying this YAML would change nothing.
     pub no_changes: bool,
 }
@@ -790,6 +816,7 @@ fn parse_iam_yaml(yaml: &str) -> Result<crate::iam::DeclarativeIam, String> {
         &access.iam_groups,
         &access.auth_providers,
         &access.group_mapping_rules,
+        &access.external_identities,
     ))
 }
 
@@ -892,6 +919,7 @@ fn summarise_diff(diff: &crate::iam::IamDiff) -> IamImportSummary {
             crate::iam::MappingRulesAction::ClearAll => 0,
             crate::iam::MappingRulesAction::Keep => 0,
         },
+        external_identities_applied: diff.external_identities.len(),
         no_changes: false,
     };
     let no_changes = s.users_created == 0
@@ -903,7 +931,8 @@ fn summarise_diff(diff: &crate::iam::IamDiff) -> IamImportSummary {
         && s.providers_created == 0
         && s.providers_updated == 0
         && s.providers_deleted == 0
-        && s.mapping_rules_replaced == 0;
+        && s.mapping_rules_replaced == 0
+        && s.external_identities_applied == 0;
     IamImportSummary { no_changes, ..s }
 }
 
@@ -919,6 +948,7 @@ fn summarise_stats(stats: &crate::iam::ReconcileStats) -> IamImportSummary {
         providers_updated: stats.providers_updated.len(),
         providers_deleted: stats.providers_deleted.len(),
         mapping_rules_replaced: stats.mapping_rules_replaced,
+        external_identities_applied: stats.external_identities_applied,
         no_changes: stats.is_noop(),
     }
 }
@@ -985,6 +1015,7 @@ access:
             enabled: true,
             groups: vec![],
             permissions: vec![],
+            auth_source: None,
         });
         diff.users_to_update.push((
             1,
@@ -995,6 +1026,7 @@ access:
                 enabled: true,
                 groups: vec![],
                 permissions: vec![],
+                auth_source: None,
             },
         ));
         diff.users_to_delete.push((2, "c".into()));
@@ -1017,6 +1049,36 @@ access:
         assert!(s.no_changes);
         assert_eq!(s.users_created, 0);
         assert_eq!(s.mapping_rules_replaced, 0);
+    }
+
+    #[test]
+    fn summarise_diff_bindings_only_is_not_no_changes() {
+        // A full-IAM import that only restores OAuth bindings (users/groups
+        // match, rules Keep) writes rows — it must not report no_changes.
+        use crate::iam::DeclarativeExternalIdentity as EI;
+        let diff = IamDiff {
+            external_identities: vec![EI {
+                user: "dana".into(),
+                provider: "okta".into(),
+                subject: "sub".into(),
+                email: None,
+                display_name: None,
+                email_verified: None,
+                raw_claims: None,
+            }],
+            ..IamDiff::default()
+        };
+        let s = summarise_diff(&diff);
+        assert!(!s.no_changes, "bindings-only import is a real change");
+        assert_eq!(s.external_identities_applied, 1);
+    }
+
+    #[test]
+    fn summarise_diff_empty_bindings_is_no_changes() {
+        let diff = IamDiff::default();
+        let s = summarise_diff(&diff);
+        assert!(s.no_changes);
+        assert_eq!(s.external_identities_applied, 0);
     }
 
     #[test]

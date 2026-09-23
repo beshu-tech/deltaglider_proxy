@@ -341,6 +341,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Server",
     },
     EnvVarEntry {
+        name: "DGP_BUCKET_USAGE_FLUSH_SECS",
+        description: "Bucket-usage counter flush interval in seconds (default: 10)",
+        example: "10",
+        category: "Server",
+    },
+    EnvVarEntry {
         name: "DGP_MULTIPART_SWEEP_MAX_AGE_SECS",
         description: "Multipart max age cutoff for Open uploads in seconds (default: 3600)",
         example: "3600",
@@ -385,6 +391,18 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     EnvVarEntry {
         name: "DGP_CORS_PERMISSIVE",
         description: "Enable permissive CORS for dev mode (default: false)",
+        example: "true",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_METRICS_BEARER_TOKEN",
+        description: "When set, /_/metrics requires `Authorization: Bearer <token>` (Prometheus `authorization:` scrape setting) or an admin session; unset keeps the scrape endpoint public",
+        example: "a-long-random-scrape-token",
+        category: "Security",
+    },
+    EnvVarEntry {
+        name: "DGP_METRICS_EXPOSE_VERSION",
+        description: "Put the exact build version in the `version` label of `deltaglider_build_info` on the unauthenticated /_/metrics endpoint (default: false — the label is empty; the version stays available through the authenticated admin API)",
         example: "true",
         category: "Server",
     },
@@ -2994,6 +3012,7 @@ mod tests {
             "DGP_SESSION_TTL_HOURS",                 // session::default_session_ttl()
             "DGP_MAX_MULTIPART_UPLOADS",             // multipart::default_max_uploads()
             "DGP_MULTIPART_SWEEP_INTERVAL_SECS",     // main multipart sweeper cadence
+            "DGP_BUCKET_USAGE_FLUSH_SECS",           // main bucket-usage flush cadence (#85)
             "DGP_MULTIPART_SWEEP_MAX_AGE_SECS",      // main multipart sweeper max-age cutoff
             "DGP_MULTIPART_COMPLETING_TIMEOUT_SECS", // main multipart Completing timeout
             "DGP_MAX_TOTAL_MULTIPART_BYTES",         // multipart::max_total_multipart_bytes()
@@ -3002,6 +3021,8 @@ mod tests {
             "DGP_CLOCK_SKEW_SECONDS",                // api::auth + startup replay cache
             "DGP_MAX_CONCURRENT_REQUESTS",           // startup::build_s3_router()
             "DGP_CORS_PERMISSIVE",                   // demo::ui_router()
+            "DGP_METRICS_EXPOSE_VERSION",            // startup::init_metrics()
+            "DGP_METRICS_BEARER_TOKEN",              // api::admin::auth::metrics_bearer_token()
             "DGP_REQUEST_TIMEOUT_SECS",              // startup::build_s3_router()
             "DGP_RECURSIVE_DELETE_PAGE_SIZE", // s3_adapter_s3s::recursive_delete_prefix_s3s()
             "DGP_READY_TIMEOUT_SECS",         // api::handlers::status::readiness_check()
@@ -3679,6 +3700,7 @@ storage:
                     resources: vec!["scrap/customers/${username}/*".into()],
                     conditions: None,
                 }],
+                auth_source: None,
             }],
             ..Config::default()
         };
@@ -5076,6 +5098,7 @@ mod prod_shape_tests {
             &cfg.iam_groups,
             &cfg.auth_providers,
             &cfg.group_mapping_rules,
+            &[],
         );
         let diff = crate::iam::declarative::diff_iam(
             &snapshot,

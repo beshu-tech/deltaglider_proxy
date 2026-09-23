@@ -10,8 +10,9 @@
 //!
 //! Expects MinIO at $MINIO_ENDPOINT (default: http://localhost:9000).
 //! Each test creates whatever bucket it needs via `ensure_bucket()`.
-//! CI brings up MinIO via the standard service container; locally
-//! run `docker run -p 9000:9000 minio/minio server /data`. Tests
+//! CI starts it with `docker run` sharing the job's network namespace (see
+//! ci.yml `Start MinIO for tests`); locally
+//! run `docker compose up -d` at the repo root (pgsty/silo, a MinIO fork). Tests
 //! call `skip_unless_minio!()` and exit gracefully when MinIO is
 //! unreachable.
 

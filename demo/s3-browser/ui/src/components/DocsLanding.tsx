@@ -1,8 +1,9 @@
 import { useColors } from '../ThemeContext';
-import { DOCS, DOC_GROUPS, GROUP_TAGLINE, type DocGroup } from '../docs-imports';
+import type { DocsBundle, DocGroup } from '../docsBundle';
 import Lightbox from './Lightbox';
 
 interface Props {
+  bundle: DocsBundle;
   onSelectDoc: (id: string) => void;
 }
 
@@ -16,11 +17,12 @@ interface Props {
  * not every docs load. The one-paragraph hero + two screenshots
  * carry orientation; everything below is task-oriented navigation.
  *
- * Sort within each group uses the `order` field from docs-imports,
+ * Sort within each group uses the `order` field from the docs bundle,
  * not the title — titles change, order stays stable.
  */
-export default function DocsLanding({ onSelectDoc }: Props) {
+export default function DocsLanding({ bundle, onSelectDoc }: Props) {
   const colors = useColors();
+  const { docs: DOCS, groups: DOC_GROUPS, taglines: GROUP_TAGLINE } = bundle;
 
   const card = {
     background: colors.BG_CARD,

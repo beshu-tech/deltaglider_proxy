@@ -29,10 +29,11 @@ use tracing::warn;
 
 // Re-export everything at crate::iam level for backward compatibility
 pub use declarative::{
-    diff_iam, export_as_declarative, export_as_declarative_inner, preview_declarative_iam,
-    reconcile_declarative_iam, snapshot_from_access, validate_declarative_iam, CurrentIam,
-    DeclarativeAuthProvider, DeclarativeGroup, DeclarativeIam, DeclarativeMappingRule,
-    DeclarativeUser, IamDiff, MappingRulesAction, ReconcileStats,
+    diff_iam, duplicate_user_name, export_as_declarative, export_as_declarative_inner,
+    preview_declarative_iam, reconcile_declarative_iam, snapshot_from_access,
+    validate_declarative_iam, CurrentIam, DeclarativeAuthProvider, DeclarativeExternalIdentity,
+    DeclarativeGroup, DeclarativeIam, DeclarativeMappingRule, DeclarativeUser, IamDiff,
+    MappingRulesAction, ReconcileStats,
 };
 pub use keygen::{generate_access_key_id, generate_secret_access_key};
 pub use middleware::authorization_middleware;

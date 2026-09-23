@@ -180,6 +180,11 @@ pub struct AccessSection {
     /// providers + groups by NAME.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub group_mapping_rules: Vec<crate::iam::DeclarativeMappingRule>,
+    /// OAuth login bindings (user ↔ IdP subject). Emitted only by the
+    /// full-IAM export; hand-authored YAML leaves this empty and the
+    /// reconciler then never touches existing bindings (#71).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_identities: Vec<crate::iam::DeclarativeExternalIdentity>,
 }
 
 /// Source-of-truth selector for IAM state. See
@@ -1388,6 +1393,11 @@ impl SectionedConfig {
                 iam_groups: flat.iam_groups.clone(),
                 auth_providers: flat.auth_providers.clone(),
                 group_mapping_rules: flat.group_mapping_rules.clone(),
+                // Not represented in the flat Config — the flat shape is
+                // operator-authored YAML; bindings only ride the full-IAM
+                // import path (document_level.rs parses the sectioned shape
+                // directly). from_flat therefore always projects them away.
+                external_identities: Vec::new(),
             },
             storage: StorageSection {
                 backend: flat.backend.clone(),
@@ -1472,6 +1482,18 @@ impl SectionedConfig {
                 blocks: section.blocks.clone(),
             };
             spec.validate()?;
+        }
+        // #71: bindings belong ONLY to the full-IAM import artifact. A main
+        // config file carrying them means someone pasted a full-IAM export
+        // into deltaglider_proxy.yaml — reject loudly instead of silently
+        // dropping them in the flat projection (into_flat_unchecked).
+        if !self.access.external_identities.is_empty() {
+            return Err(format!(
+                "access.external_identities is only valid in a full-IAM import file \
+                 (POST /_/api/admin/config/declarative-iam-validate|apply) — the main \
+                 config file does not manage OAuth bindings ({} found)",
+                self.access.external_identities.len()
+            ));
         }
         Ok(self.into_flat_unchecked())
     }

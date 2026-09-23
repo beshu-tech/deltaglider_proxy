@@ -9,22 +9,22 @@ const features = [
   {
     glyph: 'shield-key',
     title: 'Per-user auth & access control',
-    desc: 'IAM with fine-grained ABAC permissions, plus OAuth/OIDC SSO with group mapping — an access layer your budget object store doesn’t have.',
+    desc: 'You get IAM with fine-grained ABAC permissions, plus OAuth/OIDC SSO with group mapping. That’s an access layer your budget object store doesn’t have.',
   },
   {
     glyph: 'replicate',
     title: 'Cross-cloud replication',
-    desc: 'Replicate buckets between providers — event-driven or scheduled, with pause/resume. Migrate or run multi-cloud, without lock-in.',
+    desc: 'Replicate buckets between providers, event-driven or scheduled, with pause and resume. Use it to migrate or to run multi-cloud without lock-in.',
   },
   {
     glyph: 'lock',
     title: 'Encryption at rest',
-    desc: 'AES-256-GCM before objects hit the bucket. Your key stays in your runtime; the backend only ever sees ciphertext.',
+    desc: 'The proxy encrypts objects with AES-256-GCM before they hit the bucket. Your key stays in your runtime, so the backend only ever sees ciphertext.',
   },
   {
     glyph: 'pulse',
     title: 'Jobs, events & audit',
-    desc: 'Replication, lifecycle, migrations, and re-encryption run as resumable jobs with run history. Webhook or Slack on every event; an audit trail on every admin action; live operational logs you can tail and filter in the browser.',
+    desc: 'Replication, lifecycle, migrations, and re-encryption run as resumable jobs with run history. The proxy can send every event to a webhook or to Slack. It keeps an audit trail of each admin action, and it shows live operational logs that you can tail and filter in the browser.',
   },
 ] as const;
 
@@ -37,12 +37,12 @@ const shots = [
   {
     src: '/screenshots/object-replication.jpg',
     alt: 'Jobs screen showing replication and lifecycle rules',
-    caption: 'One Jobs screen: replication, lifecycle, migrations.',
+    caption: 'One Jobs screen for replication, lifecycle, and migrations.',
   },
   {
     src: '/screenshots/analytics.jpg',
     alt: 'Storage analytics dashboard with per-bucket savings',
-    caption: 'Per-bucket savings, measured live — not estimated.',
+    caption: 'Per-bucket savings, measured live.',
   },
 ];
 import Glyph from './Glyph.astro';
@@ -56,7 +56,7 @@ import Glyph from './Glyph.astro';
         It also does the jobs a cheap bucket can't
       </h2>
       <p class="cp-intro">
-        Point it at Hetzner, Wasabi, MinIO, or AWS — per-user IAM, SSO,
+        Point it at Hetzner, Wasabi, MinIO, or AWS. Per-user IAM, SSO,
         replication, lifecycle, and encryption at rest ship in the same
         binary.
       </p>
@@ -76,8 +76,8 @@ import Glyph from './Glyph.astro';
     </div>
 
     <p class="cp-proof-lede">
-      None of it is a separate product: these screens ship inside the
-      binary you download. Click to inspect.
+      These screens ship inside the binary you download. Click one to
+      enlarge it.
     </p>
     <div class="shots">
       {shots.map((s) => (
