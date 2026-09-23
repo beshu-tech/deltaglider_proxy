@@ -194,9 +194,18 @@ async fn test_marked_bucket_rejects_client_writes_replication_still_works() {
         .await
         .expect_err("DeleteBucket on marked bucket must fail");
     assert_access_denied(&err, "DeleteBucket");
+    // The setup at the top of this test sent the same CreateBucket. If both
+    // land in the same clock second they carry the same SigV4 signature, and
+    // the proxy's replay guard rightly rejects the second PUT. A signed
+    // nonce header makes this request distinct without changing its meaning.
     client
         .create_bucket()
         .bucket("rto-dst")
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut()
+                .insert("x-amz-meta-dgp-test-nonce", "recreate");
+        })
         .send()
         .await
         .expect("CreateBucket on an existing marked bucket must be allowed");
