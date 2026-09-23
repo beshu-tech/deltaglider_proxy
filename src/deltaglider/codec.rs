@@ -425,6 +425,52 @@ pub struct DeltaCodec {
     armor_supported: bool,
 }
 
+/// Which way an xdelta3 run goes.
+#[derive(Clone, Copy, Debug)]
+enum Mode {
+    Encode,
+    Decode,
+}
+
+impl Mode {
+    fn flag(self) -> &'static str {
+        match self {
+            Mode::Encode => "-e",
+            Mode::Decode => "-d",
+        }
+    }
+
+    fn error(self, msg: String) -> CodecError {
+        match self {
+            Mode::Encode => CodecError::EncodeFailed(msg),
+            Mode::Decode => CodecError::DecodeFailed(msg),
+        }
+    }
+
+    /// Map the child's exit status: success, or the mode's error with stderr.
+    fn check_exit(self, status: std::process::ExitStatus, stderr: &[u8]) -> Result<(), CodecError> {
+        if status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(stderr);
+        let op = match self {
+            Mode::Encode => "encode",
+            Mode::Decode => "decode",
+        };
+        warn!("xdelta3 CLI {} failed: {}", op, stderr);
+        Err(self.error(format!("xdelta3 CLI failed: {}", stderr)))
+    }
+}
+
+/// A spawned xdelta3 child with its three pipes taken.
+struct Xdelta3Process {
+    child: std::process::Child,
+    id: u32,
+    stdin: std::process::ChildStdin,
+    stdout: std::process::ChildStdout,
+    stderr: std::process::ChildStderr,
+}
+
 impl DeltaCodec {
     /// Create a new codec with size limit.
     /// Probes for the xdelta3 CLI binary once at construction.
@@ -545,7 +591,7 @@ impl DeltaCodec {
             target.len()
         );
 
-        let output = self.run_xdelta3("-e", source, target)?;
+        let output = self.run_xdelta3(Mode::Encode, source, target)?;
 
         debug!(
             "Delta encoded: {} bytes (ratio: {:.2}%)",
@@ -575,7 +621,7 @@ impl DeltaCodec {
             delta.len()
         );
 
-        let output = self.run_xdelta3("-d", source, delta)?;
+        let output = self.run_xdelta3(Mode::Decode, source, delta)?;
 
         debug!("Delta decoded: {} bytes", output.len());
         Ok(output)
@@ -583,37 +629,51 @@ impl DeltaCodec {
 
     /// Run xdelta3 in encode (`-e`) or decode (`-d`) mode.
     ///
-    /// Shared implementation for `encode()` and `decode()`. The `mode` argument
-    /// is either `"-e"` (encode) or `"-d"` (decode).
+    /// Shared implementation for `encode()` and `decode()`.
     ///
     /// PERF: Source MUST remain a temp file — xdelta3 needs random-access (mmap)
     /// to the source for its sliding-window algorithm. Do NOT try to pipe it via
     /// stdin; xdelta3 can only read source from a seekable file descriptor.
     /// The input (target for encode, delta for decode) is piped via stdin;
     /// output comes from stdout (`-c` flag).
-    fn run_xdelta3(&self, mode: &str, source: &[u8], input: &[u8]) -> Result<Vec<u8>, CodecError> {
-        let make_error = |msg: String| -> CodecError {
-            if mode == "-e" {
-                CodecError::EncodeFailed(msg)
-            } else {
-                CodecError::DecodeFailed(msg)
-            }
-        };
-
-        if !self.cli_available {
-            return Err(make_error(
-                "xdelta3 CLI binary is not available".to_string(),
-            ));
-        }
-
+    fn run_xdelta3(&self, mode: Mode, source: &[u8], input: &[u8]) -> Result<Vec<u8>, CodecError> {
         let mut source_file = NamedTempFile::new()?;
         source_file.write_all(source)?;
         source_file.flush()?;
 
-        let source_path = source_file
-            .path()
+        let mut proc = self.spawn_xdelta3(mode, source_file.path())?;
+        let (write_result, output, stderr_result) = pipe_stdin_stdout_stderr(
+            proc.stdin,
+            proc.stdout,
+            proc.stderr,
+            input,
+            self.max_size,
+            proc.id,
+            codec_timeout(),
+        );
+        write_result?;
+        let output = output?;
+        let stderr_bytes = stderr_result.unwrap_or_default();
+
+        let status = wait_with_timeout(&mut proc.child, codec_timeout())?;
+        mode.check_exit(status, &stderr_bytes)?;
+        Ok(output)
+    }
+
+    /// THE xdelta3 invocation: argument construction and process spawn for
+    /// both the buffered and the streaming drivers. The drivers own only the
+    /// pump and the timeout policy. `source_path` must be a seekable file.
+    fn spawn_xdelta3(
+        &self,
+        mode: Mode,
+        source_path: &std::path::Path,
+    ) -> Result<Xdelta3Process, CodecError> {
+        if !self.cli_available {
+            return Err(mode.error("xdelta3 CLI binary is not available".to_string()));
+        }
+        let source_str = source_path
             .to_str()
-            .ok_or_else(|| make_error("temp file path is not valid UTF-8".to_string()))?;
+            .ok_or_else(|| mode.error("source path is not valid UTF-8".to_string()))?;
 
         // Base args. -D is critical for transparent object storage: xdelta3
         // otherwise auto-decompresses recognised compressed inputs (gzip/xz/etc.)
@@ -633,56 +693,31 @@ impl DeltaCodec {
         // ship today) has no -a and would ERROR on it, so we only pass it when
         // `armor_supported` (probed at construction). On 3.0.x there's no armor
         // to disable anyway.
-        let mut args: Vec<&str> = vec![mode, "-D"];
+        let mut args: Vec<&str> = vec![mode.flag(), "-D"];
         if self.armor_supported {
             args.push("-a");
         }
-        args.extend(["-s", source_path, "-c"]);
-        let result = Command::new("xdelta3")
+        args.extend(["-s", source_str, "-c"]);
+
+        let mut child = Command::new("xdelta3")
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn();
-
-        let op_name = if mode == "-e" { "encode" } else { "decode" };
-
-        match result {
-            Ok(mut child) => {
-                let child_id = child.id();
-                // These .expect() calls are safe: we configured piped stdin/stdout/stderr
-                // above, so .take() only returns None if called twice (which we don't).
-                let child_stdin = child.stdin.take().expect("piped stdin");
-                let child_stdout = child.stdout.take().expect("piped stdout");
-                let child_stderr = child.stderr.take().expect("piped stderr");
-
-                let (write_result, output, stderr_result) = pipe_stdin_stdout_stderr(
-                    child_stdin,
-                    child_stdout,
-                    child_stderr,
-                    input,
-                    self.max_size,
-                    child_id,
-                    codec_timeout(),
-                );
-                write_result?;
-                let output = output?;
-                let stderr_bytes = stderr_result.unwrap_or_default();
-
-                let status = wait_with_timeout(&mut child, codec_timeout())?;
-                if status.success() {
-                    Ok(output)
-                } else {
-                    let stderr = String::from_utf8_lossy(&stderr_bytes);
-                    warn!("xdelta3 CLI {} failed: {}", op_name, stderr);
-                    Err(make_error(format!("xdelta3 CLI failed: {}", stderr)))
-                }
-            }
-            Err(e) => {
+            .spawn()
+            .map_err(|e| {
                 warn!("Failed to execute xdelta3 CLI: {}", e);
-                Err(make_error(format!("xdelta3 CLI not available: {}", e)))
-            }
-        }
+                mode.error(format!("xdelta3 CLI not available: {}", e))
+            })?;
+        // These .expect() calls are safe: we configured piped stdin/stdout/stderr
+        // above, so .take() only returns None if called twice (which we don't).
+        Ok(Xdelta3Process {
+            id: child.id(),
+            stdin: child.stdin.take().expect("piped stdin"),
+            stdout: child.stdout.take().expect("piped stdout"),
+            stderr: child.stderr.take().expect("piped stderr"),
+            child,
+        })
     }
 
     /// STREAMING decode: reconstruct target from a source FILE + a streamed
@@ -698,7 +733,7 @@ impl DeltaCodec {
         delta: R,
         out: W,
     ) -> Result<u64, CodecError> {
-        self.run_xdelta3_streaming("-d", source_path, delta, out)
+        self.run_xdelta3_streaming(Mode::Decode, source_path, delta, out)
     }
 
     /// STREAMING encode: produce a delta of a streamed target against a source
@@ -712,64 +747,29 @@ impl DeltaCodec {
         target: R,
         out: W,
     ) -> Result<u64, CodecError> {
-        self.run_xdelta3_streaming("-e", source_path, target, out)
+        self.run_xdelta3_streaming(Mode::Encode, source_path, target, out)
     }
 
     /// Shared streaming driver for `decode_to_writer` / `encode_from_reader`.
-    /// Mirrors `run_xdelta3` (same args, same -a/armor logic) but drives the
-    /// STALL-based streaming pump instead of the buffered one, and takes the
-    /// source as a path the caller owns rather than a `&[u8]` it copies.
+    /// Spawns through the same `spawn_xdelta3` as the buffered path but drives
+    /// the STALL-based streaming pump, and takes the source as a path the
+    /// caller owns rather than a `&[u8]` it copies.
     fn run_xdelta3_streaming<R: Read + Send, W: Write + Send>(
         &self,
-        mode: &str,
+        mode: Mode,
         source_path: &std::path::Path,
         input: R,
         mut out: W,
     ) -> Result<u64, CodecError> {
-        let make_error = |msg: String| -> CodecError {
-            if mode == "-e" {
-                CodecError::EncodeFailed(msg)
-            } else {
-                CodecError::DecodeFailed(msg)
-            }
-        };
-        if !self.cli_available {
-            return Err(make_error(
-                "xdelta3 CLI binary is not available".to_string(),
-            ));
-        }
-        let source_str = source_path
-            .to_str()
-            .ok_or_else(|| make_error("source path is not valid UTF-8".to_string()))?;
-
-        // Same arg construction as the buffered path (incl. version-aware -a).
-        let mut args: Vec<&str> = vec![mode, "-D"];
-        if self.armor_supported {
-            args.push("-a");
-        }
-        args.extend(["-s", source_str, "-c"]);
-
-        let mut child = Command::new("xdelta3")
-            .args(&args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| make_error(format!("xdelta3 CLI not available: {}", e)))?;
-
-        let child_id = child.id();
-        let child_stdin = child.stdin.take().expect("piped stdin");
-        let child_stdout = child.stdout.take().expect("piped stdout");
-        let child_stderr = child.stderr.take().expect("piped stderr");
-
+        let mut proc = self.spawn_xdelta3(mode, source_path)?;
         let progress = ProgressClock::new();
         let (write_result, total, stderr_result) = pipe_streaming(
-            child_stdin,
-            child_stdout,
-            child_stderr,
+            proc.stdin,
+            proc.stdout,
+            proc.stderr,
             input,
             |chunk: &[u8]| out.write_all(chunk),
-            child_id,
+            proc.id,
             codec_stall_timeout(),
             codec_absolute_ceiling(),
             &progress,
@@ -780,16 +780,10 @@ impl DeltaCodec {
 
         // The streaming watchdog uses raw kill(); reap the child here (its
         // wall-clock is bounded by the absolute ceiling the watchdog enforces).
-        let status = wait_with_timeout(&mut child, codec_absolute_ceiling())?;
-        if status.success() {
-            out.flush()?;
-            Ok(total)
-        } else {
-            let stderr = String::from_utf8_lossy(&stderr_bytes);
-            let op = if mode == "-e" { "encode" } else { "decode" };
-            warn!("xdelta3 streaming {} failed: {}", op, stderr);
-            Err(make_error(format!("xdelta3 CLI failed: {}", stderr)))
-        }
+        let status = wait_with_timeout(&mut proc.child, codec_absolute_ceiling())?;
+        mode.check_exit(status, &stderr_bytes)?;
+        out.flush()?;
+        Ok(total)
     }
 
     /// Calculate compression ratio (delta_size / original_size)
