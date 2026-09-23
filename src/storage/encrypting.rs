@@ -380,6 +380,17 @@ struct ChunkFramer {
 }
 
 impl ChunkFramer {
+    /// A framer with a fresh random per-object base IV, plus the wire-format
+    /// header (`[magic][base_iv]`) that must precede its frames.
+    fn with_random_iv() -> (Self, Vec<u8>) {
+        let mut base_iv = [0u8; IV_LEN];
+        rand::rngs::OsRng.fill_bytes(&mut base_iv);
+        let mut header = Vec::with_capacity(CHUNK_HEADER_LEN);
+        header.extend_from_slice(&CHUNK_MAGIC);
+        header.extend_from_slice(&base_iv);
+        (Self::new(base_iv), header)
+    }
+
     fn new(base_iv: [u8; IV_LEN]) -> Self {
         Self {
             base_iv,
@@ -899,28 +910,26 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         Self { inner, config }
     }
 
-    fn current_key(&self) -> Option<EncryptionKey> {
-        self.config.load().key.clone()
+    /// THE write-side decision: the (key, key_id) to encrypt a write with,
+    /// or `None` to write plaintext. `None` under `WriteMode::PassThrough`
+    /// even when a key is present (the decrypt-only shim for proxy-AES →
+    /// native-SSE transitions: the inner backend encrypts natively). One
+    /// `ArcSwap` load, so a concurrent hot-reload cannot pair one config's
+    /// key with another config's key_id. Every write path goes through here.
+    fn write_key(&self) -> Option<(EncryptionKey, Option<String>)> {
+        let cfg = self.config.load();
+        if cfg.write_mode == WriteMode::PassThrough {
+            return None;
+        }
+        cfg.key.clone().map(|key| (key, cfg.key_id.clone()))
     }
 
-    /// Snapshot the wrapper's configured key_id. Called on writes
-    /// (to stamp) and reads (to compare). Captured before the encrypt/
-    /// decrypt call so a concurrent hot-reload flip between key-check
-    /// and AEAD-op doesn't produce spurious "mismatch" errors.
-    fn current_key_id(&self) -> Option<String> {
-        self.config.load().key_id.clone()
-    }
-
-    fn current_write_mode(&self) -> WriteMode {
-        self.config.load().write_mode
-    }
-
-    /// True when this wrapper encrypts object bodies in-process (proxy-AES
-    /// with `WriteMode::Encrypt` + a key). Gates the streaming multipart
-    /// path OFF — whole-object GCM framing doesn't map onto independent S3
-    /// parts — so those copies fall back to the buffered/chunked path.
+    /// True when this wrapper encrypts object bodies in-process. Gates the
+    /// streaming multipart path OFF — whole-object GCM framing doesn't map
+    /// onto independent S3 parts — so those copies fall back to the
+    /// buffered/chunked path.
     fn actively_encrypts(&self) -> bool {
-        self.current_write_mode() == WriteMode::Encrypt && self.current_key().is_some()
+        self.write_key().is_some()
     }
 
     fn encrypt_if_enabled(
@@ -928,19 +937,13 @@ impl<B: StorageBackend> EncryptingBackend<B> {
         data: &[u8],
         metadata: &mut FileMetadata,
     ) -> Result<Vec<u8>, StorageError> {
-        // WriteMode::PassThrough short-circuits encryption even when
-        // a `key` is present — the decrypt-only-shim case for
-        // proxy-AES → native-SSE transitions. The inner S3Backend is
-        // already doing native encryption at its layer.
-        if self.current_write_mode() == WriteMode::PassThrough {
-            return Ok(data.to_vec());
-        }
-        if let Some(key) = self.current_key() {
-            let encrypted = encrypt(&key, data)?;
-            mark_encrypted(metadata, self.current_key_id().as_deref());
-            Ok(encrypted)
-        } else {
-            Ok(data.to_vec())
+        match self.write_key() {
+            Some((key, key_id)) => {
+                let encrypted = encrypt(&key, data)?;
+                mark_encrypted(metadata, key_id.as_deref());
+                Ok(encrypted)
+            }
+            None => Ok(data.to_vec()),
         }
     }
 
@@ -1133,20 +1136,13 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         source_path: &std::path::Path,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        if self.current_write_mode() == WriteMode::PassThrough {
-            return self
-                .inner
-                .put_passthrough_file(bucket, prefix, filename, source_path, metadata)
-                .await;
-        }
-        let Some(key) = self.current_key() else {
+        let Some((key, key_id)) = self.write_key() else {
             return self
                 .inner
                 .put_passthrough_file(bucket, prefix, filename, source_path, metadata)
                 .await;
         };
 
-        let key_id = self.current_key_id();
         let src = source_path.to_path_buf();
         // Encrypt source → chunked temp file on a blocking thread (file I/O +
         // AES). Returns the temp file so its lifetime spans the inner PUT.
@@ -1155,17 +1151,12 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                 use std::io::{Read, Write};
                 let mut input = std::fs::File::open(&src).map_err(io_to_storage_error)?;
                 let mut tmp = tempfile::NamedTempFile::new().map_err(io_to_storage_error)?;
-                let mut base_iv = [0u8; IV_LEN];
-                rand::rngs::OsRng.fill_bytes(&mut base_iv);
-                let mut header = Vec::with_capacity(CHUNK_HEADER_LEN);
-                header.extend_from_slice(&CHUNK_MAGIC);
-                header.extend_from_slice(&base_iv);
+                let (mut framer, header) = ChunkFramer::with_random_iv();
                 tmp.write_all(&header).map_err(io_to_storage_error)?;
 
                 // Read the source in 64 KiB windows; ChunkFramer owns the
                 // is_final/index framing so this path just feeds windows and
                 // writes the frames it hands back.
-                let mut framer = ChunkFramer::new(base_iv);
                 let mut buf = vec![0u8; CHUNK_PLAINTEXT_SIZE];
                 loop {
                     // Fill a full window (short read only at EOF).
@@ -1220,7 +1211,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         part_paths: &[std::path::PathBuf],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        if self.current_write_mode() == WriteMode::PassThrough || self.current_key().is_none() {
+        if self.write_key().is_none() {
             return self
                 .inner
                 .put_passthrough_parts(bucket, prefix, filename, part_paths, metadata)
@@ -1262,22 +1253,16 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         chunks: &[Bytes],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let Some(key) = self.current_key() else {
+        let Some((key, key_id)) = self.write_key() else {
             return self
                 .inner
                 .put_passthrough_chunked(bucket, prefix, filename, chunks, metadata)
                 .await;
         };
 
-        // Random per-object base IV. Each chunk's nonce is derived from
-        // this + the chunk index.
-        let mut base_iv = [0u8; IV_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut base_iv);
-
-        // Emit the wire-format header first: [magic][base_iv].
-        let mut header = Vec::with_capacity(CHUNK_HEADER_LEN);
-        header.extend_from_slice(&CHUNK_MAGIC);
-        header.extend_from_slice(&base_iv);
+        // Random per-object base IV (each chunk's nonce derives from it +
+        // the chunk index); the wire-format header goes out first.
+        let (mut framer, header) = ChunkFramer::with_random_iv();
         let mut out_frames: Vec<Bytes> = Vec::with_capacity(chunks.len() + 4);
         out_frames.push(Bytes::from(header));
 
@@ -1286,7 +1271,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         // and drive them through ChunkFramer — which owns the is_final/index
         // invariant and the zero-byte / sub-window / boundary tail cases that
         // used to be a 5-branch hand-rolled block here.
-        let mut framer = ChunkFramer::new(base_iv);
         let mut pt_window: Vec<u8> = Vec::with_capacity(CHUNK_PLAINTEXT_SIZE);
         for incoming in chunks {
             let mut remaining: &[u8] = incoming.as_ref();
@@ -1314,7 +1298,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         out_frames.push(Bytes::from(framer.finish(&key)?));
 
         let mut meta = metadata.clone();
-        mark_chunked_encrypted(&mut meta, self.current_key_id().as_deref());
+        mark_chunked_encrypted(&mut meta, key_id.as_deref());
         self.inner
             .put_passthrough_chunked(bucket, prefix, filename, &out_frames, &meta)
             .await
@@ -3214,6 +3198,59 @@ mod tests {
         assert!(
             msg.contains("rotated") || msg.contains("legacy-shim"),
             "mismatch error must point to the rotation/routing remedies, got: {msg}"
+        );
+    }
+
+    /// Every write path must honour `WriteMode::PassThrough` even when a key
+    /// is configured (the proxy-AES → native-SSE transition). The chunked
+    /// path used to check only for the key.
+    #[tokio::test]
+    async fn chunked_write_honours_passthrough_mode_with_a_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = crate::storage::FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        inner.create_bucket("enc-bkt").await.unwrap();
+        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key: Some(test_key()),
+            key_id: Some("current".into()),
+            write_mode: WriteMode::PassThrough,
+            ..Default::default()
+        })));
+        let wrapper = EncryptingBackend::new(inner, cfg);
+        let plaintext = b"chunked plaintext".to_vec();
+        let meta = FileMetadata::new_passthrough(
+            "obj.bin".into(),
+            "0".repeat(64),
+            "0".repeat(32),
+            plaintext.len() as u64,
+            None,
+        );
+        wrapper
+            .put_passthrough_chunked(
+                "enc-bkt",
+                "",
+                "obj.bin",
+                &[Bytes::from(plaintext.clone())],
+                &meta,
+            )
+            .await
+            .unwrap();
+
+        let raw = wrapper
+            .inner
+            .get_passthrough("enc-bkt", "", "obj.bin")
+            .await
+            .unwrap();
+        assert_eq!(raw, plaintext, "PassThrough must store the plaintext");
+        let stored = wrapper
+            .inner
+            .get_passthrough_metadata("enc-bkt", "", "obj.bin")
+            .await
+            .unwrap();
+        assert!(
+            !is_encrypted(&stored),
+            "PassThrough must not stamp a marker"
         );
     }
 }
