@@ -166,6 +166,17 @@ fn resource_to_arn(resource: &str) -> String {
     }
 }
 
+/// Put `aws:SourceIp` into a policy context so IP-scoped conditions fire. With
+/// no IP the key stays absent (iam-rs then skips the condition).
+pub fn insert_source_ip(context: &mut iam_rs::Context, ip: Option<std::net::IpAddr>) {
+    if let Some(ip) = ip {
+        context.insert(
+            "aws:SourceIp".to_string(),
+            iam_rs::ContextValue::String(ip.to_string()),
+        );
+    }
+}
+
 /// Convert a `Permission` to an `IAMPolicy` for iam-rs evaluation.
 pub fn permission_to_iam_policy(perm: &Permission) -> IAMPolicy {
     let effect = if perm.effect == "Deny" {

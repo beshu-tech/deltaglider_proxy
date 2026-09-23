@@ -745,24 +745,7 @@ pub async fn sigv4_auth_middleware(
                 return Err(S3Error::AccessDenied.into_response());
             }
             // Legacy user gets full access via wildcard permissions
-            let bootstrap_perms = vec![Permission {
-                id: 0,
-                effect: "Allow".to_string(),
-                actions: vec!["*".to_string()],
-                resources: vec!["*".to_string()],
-                conditions: None,
-            }];
-            let bootstrap_policies: Vec<iam_rs::IAMPolicy> = bootstrap_perms
-                .iter()
-                .map(crate::iam::permissions::permission_to_iam_policy)
-                .collect();
-            let auth_user = AuthenticatedUser {
-                name: "$bootstrap".to_string(),
-                access_key_id: auth.access_key_id.clone(),
-                permissions: bootstrap_perms,
-                iam_policies: bootstrap_policies,
-            };
-            Some(auth_user)
+            Some(AuthenticatedUser::bootstrap(&auth.access_key_id))
         }
         AuthGateDecision::Iam(index) => {
             let user = match index.get(&params.access_key) {
@@ -778,13 +761,7 @@ pub async fn sigv4_auth_middleware(
                 record_auth_failure("user_disabled");
                 return Err(S3Error::AccessDenied.into_response());
             }
-            let auth_user = AuthenticatedUser {
-                name: user.name.clone(),
-                access_key_id: user.access_key_id.clone(),
-                permissions: user.permissions.clone(),
-                iam_policies: user.iam_policies.clone(),
-            };
-            Some(auth_user)
+            Some(AuthenticatedUser::from(user))
         }
     };
 

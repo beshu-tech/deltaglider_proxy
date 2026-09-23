@@ -155,12 +155,10 @@ pub async fn authorization_middleware(
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0.ip());
-    if let Some(ip) = crate::rate_limiter::extract_client_ip_with_peer(request.headers(), peer_ip) {
-        context.insert(
-            "aws:SourceIp".to_string(),
-            iam_rs::ContextValue::String(ip.to_string()),
-        );
-    }
+    super::permissions::insert_source_ip(
+        &mut context,
+        crate::rate_limiter::extract_client_ip_with_peer(request.headers(), peer_ip),
+    );
 
     // ListObjects (GET /bucket) — four-way evaluation with post-auth scope marker:
     //

@@ -40,7 +40,7 @@ use super::object_helpers::{check_client_write_allowed, check_quota, enqueue_obj
 use super::{audit_log_s3, ensure_bucket_exists, AppState};
 use crate::api::errors::S3Error;
 use crate::event_outbox::{current_unix_seconds, EventKind, EventSource, NewEvent};
-use crate::iam::{AuthenticatedUser, IamState, Permission, S3Action, SharedIamState};
+use crate::iam::{AuthenticatedUser, IamState, S3Action, SharedIamState};
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -598,28 +598,14 @@ fn authenticate_form_post(
     let (secret_access_key, auth_user) = match snapshot.as_ref() {
         IamState::Disabled => unreachable!("checked above"),
         IamState::Legacy(auth) => {
-            if auth.access_key_id != access_key {
+            // Constant-time, like the SigV4 path: a plain `!=` leaks how many
+            // leading bytes of the bootstrap key a guess got right.
+            if !crate::security::secret_eq(access_key.as_bytes(), auth.access_key_id.as_bytes()) {
                 return Err(S3Error::AccessDenied);
             }
-            let bootstrap_perms = vec![Permission {
-                id: 0,
-                effect: "Allow".to_string(),
-                actions: vec!["*".to_string()],
-                resources: vec!["*".to_string()],
-                conditions: None,
-            }];
-            let bootstrap_policies: Vec<iam_rs::IAMPolicy> = bootstrap_perms
-                .iter()
-                .map(crate::iam::permissions::permission_to_iam_policy)
-                .collect();
             (
                 auth.secret_access_key.clone(),
-                AuthenticatedUser {
-                    name: "$bootstrap".to_string(),
-                    access_key_id: auth.access_key_id.clone(),
-                    permissions: bootstrap_perms,
-                    iam_policies: bootstrap_policies,
-                },
+                AuthenticatedUser::bootstrap(&auth.access_key_id),
             )
         }
         IamState::Iam(index) => {
@@ -629,12 +615,7 @@ fn authenticate_form_post(
                 .ok_or(S3Error::AccessDenied)?;
             (
                 user.secret_access_key.clone(),
-                AuthenticatedUser {
-                    name: user.name.clone(),
-                    access_key_id: user.access_key_id.clone(),
-                    permissions: user.permissions.clone(),
-                    iam_policies: user.iam_policies.clone(),
-                },
+                AuthenticatedUser::from(user),
             )
         }
     };
@@ -697,12 +678,7 @@ fn authenticate_form_post(
     // on the target prefix fire for browser uploads too — the context-free can()
     // silently ignored them (a SigV4 PUT through the middleware would honor them).
     let mut context = iam_rs::Context::new();
-    if let Some(ip) = client_ip {
-        context.insert(
-            "aws:SourceIp".to_string(),
-            iam_rs::ContextValue::String(ip.to_string()),
-        );
-    }
+    crate::iam::permissions::insert_source_ip(&mut context, client_ip);
     if !auth_user.can_with_context(S3Action::Write, bucket, &parsed.resolved_key, &context) {
         tracing::warn!(
             "form-POST DENY | reason=iam_no_write | bucket={bucket} key={} user={}",

@@ -1607,12 +1607,7 @@ fn check_copy_source_access_s3s(
     // source (e.g. Deny read unless from an office CIDR) actually fire. Using
     // the context-free can() here silently ignored those conditions (X-ray H17).
     let mut context = iam_rs::Context::new();
-    if let Some(ip) = client_ip {
-        context.insert(
-            "aws:SourceIp".to_string(),
-            iam_rs::ContextValue::String(ip.to_string()),
-        );
-    }
+    crate::iam::permissions::insert_source_ip(&mut context, client_ip);
     if user.can_with_context(S3Action::Read, source_bucket, source_key, &context) {
         return Ok(());
     }

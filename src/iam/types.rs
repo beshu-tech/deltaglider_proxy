@@ -8,6 +8,17 @@ use serde::{Deserialize, Serialize};
 
 use super::permissions;
 
+impl From<&IamUser> for AuthenticatedUser {
+    fn from(user: &IamUser) -> Self {
+        Self {
+            name: user.name.clone(),
+            access_key_id: user.access_key_id.clone(),
+            permissions: user.permissions.clone(),
+            iam_policies: user.iam_policies.clone(),
+        }
+    }
+}
+
 /// Shared auth configuration extracted from Config at startup.
 #[derive(Clone)]
 pub struct AuthConfig {
@@ -138,7 +149,33 @@ pub struct AuthenticatedUser {
     pub iam_policies: Vec<IAMPolicy>,
 }
 
+/// Principal name of the bootstrap (single-credential, legacy-mode) user.
+pub const BOOTSTRAP_USER_NAME: &str = "$bootstrap";
+
 impl AuthenticatedUser {
+    /// The bootstrap principal: full access to everything. THE one definition,
+    /// shared by SigV4 auth and browser form-POST, so the two cannot drift
+    /// into different privileges.
+    pub fn bootstrap(access_key_id: &str) -> Self {
+        let permissions = vec![Permission {
+            id: 0,
+            effect: "Allow".to_string(),
+            actions: vec!["*".to_string()],
+            resources: vec!["*".to_string()],
+            conditions: None,
+        }];
+        let iam_policies = permissions
+            .iter()
+            .map(permissions::permission_to_iam_policy)
+            .collect();
+        Self {
+            name: BOOTSTRAP_USER_NAME.to_string(),
+            access_key_id: access_key_id.to_string(),
+            permissions,
+            iam_policies,
+        }
+    }
+
     /// The synthesized public-prefix reader (`$anonymous`). Anonymous callers
     /// get the bytes they are allowed to read, never deployment provenance.
     pub fn is_anonymous(&self) -> bool {
@@ -249,5 +286,49 @@ impl IamUser {
     /// A user with actions=["*"] on a specific bucket is NOT considered admin.
     pub fn is_admin(&self) -> bool {
         permissions::is_admin(&self.permissions)
+    }
+}
+
+#[cfg(test)]
+mod principal_tests {
+    use super::*;
+
+    /// The bootstrap principal is full access. SigV4 and form-POST both build
+    /// it here, so this pins the privilege both paths get.
+    #[test]
+    fn bootstrap_has_full_access() {
+        let user = AuthenticatedUser::bootstrap("AKBOOT");
+        assert_eq!(user.name, BOOTSTRAP_USER_NAME);
+        assert_eq!(user.access_key_id, "AKBOOT");
+        assert!(user.is_admin());
+        for action in [
+            S3Action::Read,
+            S3Action::Write,
+            S3Action::Delete,
+            S3Action::List,
+        ] {
+            assert!(user.can(action, "releases", "any/key.zip"), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn from_iam_user_copies_identity_and_policies() {
+        let mut iam: IamUser = serde_json::from_value(serde_json::json!({
+            "name": "ci-uploader",
+            "access_key_id": "AKCI",
+            "secret_access_key": "secret",
+            "permissions": [{ "actions": ["read"], "resources": ["releases/*"] }],
+        }))
+        .unwrap();
+        iam.iam_policies = iam
+            .permissions
+            .iter()
+            .map(permissions::permission_to_iam_policy)
+            .collect();
+        let user = AuthenticatedUser::from(&iam);
+        assert_eq!(user.name, "ci-uploader");
+        assert_eq!(user.access_key_id, "AKCI");
+        assert!(user.can(S3Action::Read, "releases", "v1.zip"));
+        assert!(!user.can(S3Action::Write, "releases", "v1.zip"));
     }
 }
