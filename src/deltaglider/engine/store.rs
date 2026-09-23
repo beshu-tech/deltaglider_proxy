@@ -337,6 +337,34 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: Option<String>,
     ) -> Result<StoreResult, EngineError> {
+        let result = self
+            .store_spooled_delta_inner(
+                bucket,
+                key,
+                body,
+                size,
+                content_type,
+                user_metadata,
+                multipart_etag,
+            )
+            .await?;
+        self.record_store(bucket, &result);
+        Ok(result)
+    }
+
+    /// Body of [`Self::store_spooled_delta`]. Does NOT record the counter (the
+    /// public entry point does, exactly once); it attaches the accounting.
+    #[allow(clippy::too_many_arguments)]
+    async fn store_spooled_delta_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: &crate::deltaglider::spool::Spool,
+        size: u64,
+        content_type: Option<String>,
+        user_metadata: std::collections::HashMap<String, String>,
+        multipart_etag: Option<String>,
+    ) -> Result<StoreResult, EngineError> {
         use tokio::io::AsyncReadExt;
 
         self.metadata_cache.invalidate(bucket, key);
@@ -382,7 +410,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // (2) Not delta-eligible → passthrough from the body spool.
         if is_passthrough {
             let result = self
-                .store_passthrough_file_with_multipart_etag(
+                .store_passthrough_file_inner(
                     bucket,
                     key,
                     body.path(),
@@ -405,6 +433,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let _xnode_guard = self.acquire_reference_lock(bucket, &deltaspace_id).await?;
         // Write path: a backend error must abort, not read as "no reference".
         let has_existing_reference = self.storage.has_reference(bucket, &deltaspace_id).await?;
+        // A fresh baseline stays in place on both branches below (even when the
+        // ratio loses — see the NOTE there), so its bytes are always counted.
+        let reference_created_bytes = if has_existing_reference { 0 } else { size };
 
         // No reference yet → this object becomes the deltaspace baseline. Stream
         // the reference into place from the spool (put_reference_from_file: no
@@ -548,7 +579,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // not touch reference.bin, so it needs no cross-node exclusion).
                 drop((ref_spool, delta_spool, _guard, _xnode_guard));
                 let result = self
-                    .store_passthrough_file_with_multipart_etag(
+                    .store_passthrough_file_inner(
                         bucket,
                         key,
                         body.path(),
@@ -571,7 +602,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // the deltaspace empties. Correctness over a minor cleanup.
                 self.metadata_cache
                     .insert(bucket, key, result.metadata.clone());
-                Ok(result.with_accounting(prior_for_counter, 0))
+                Ok(result.with_accounting(prior_for_counter, reference_created_bytes))
             }
             Some(delta_size) => {
                 // Delta wins → read the delta spool (small, < cap) + commit it.
@@ -599,7 +630,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 drop((ref_spool, delta_spool, _guard, _xnode_guard));
                 self.metadata_cache
                     .insert(bucket, key, result.metadata.clone());
-                Ok(result.with_accounting(prior_for_counter, 0))
+                Ok(result.with_accounting(prior_for_counter, reference_created_bytes))
             }
         }
     }
@@ -920,8 +951,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
     ) -> Result<StoreResult, EngineError> {
-        let result = self
-            .store_passthrough_chunked_inner(
+        self.store_recorded(
+            bucket,
+            key,
+            self.store_passthrough_chunked_inner(
                 bucket,
                 key,
                 chunks,
@@ -929,10 +962,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 content_type,
                 user_metadata,
                 None,
-            )
-            .await?;
-        self.record_store(bucket, &result);
-        Ok(result)
+            ),
+        )
+        .await
     }
 
     /// Multipart-aware variant of [`Self::store_passthrough_chunked`]. The
@@ -950,8 +982,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: HashMap<String, String>,
         multipart_etag: String,
     ) -> Result<StoreResult, EngineError> {
-        let result = self
-            .store_passthrough_chunked_inner(
+        self.store_recorded(
+            bucket,
+            key,
+            self.store_passthrough_chunked_inner(
                 bucket,
                 key,
                 chunks,
@@ -959,8 +993,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 content_type,
                 user_metadata,
                 Some(multipart_etag),
-            )
-            .await?;
+            ),
+        )
+        .await
+    }
+
+    /// Run a non-recording passthrough store and record it in the usage
+    /// counter exactly once. The prior object is resolved BEFORE `store` is
+    /// polled (futures are lazy), so an overwrite nets to +0 objects.
+    async fn store_recorded(
+        &self,
+        bucket: &str,
+        key: &str,
+        store: impl std::future::Future<Output = Result<StoreResult, EngineError>>,
+    ) -> Result<StoreResult, EngineError> {
+        let prior = self.prior_for_counter(bucket, key).await;
+        let result = store.await?.with_accounting(prior, 0);
         self.record_store(bucket, &result);
         Ok(result)
     }
@@ -1064,6 +1112,34 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: HashMap<String, String>,
         multipart_etag: String,
     ) -> Result<StoreResult, EngineError> {
+        self.store_recorded(
+            bucket,
+            key,
+            self.store_passthrough_relayed_parts_inner(
+                bucket,
+                key,
+                part_paths,
+                total_size,
+                content_type,
+                user_metadata,
+                multipart_etag,
+            ),
+        )
+        .await
+    }
+
+    /// Body of [`Self::store_passthrough_relayed_parts_with_multipart_etag`]; does not record the counter.
+    #[allow(clippy::too_many_arguments)]
+    async fn store_passthrough_relayed_parts_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        part_paths: &[PathBuf],
+        total_size: u64,
+        content_type: Option<String>,
+        user_metadata: HashMap<String, String>,
+        multipart_etag: String,
+    ) -> Result<StoreResult, EngineError> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
         self.metadata_cache.invalidate(bucket, key);
@@ -1129,7 +1205,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let result = StoreResult::new(metadata, total_size);
         self.metadata_cache
             .insert(bucket, key, result.metadata.clone());
-        self.record_store(bucket, &result);
+        // NB: recorded in the public wrapper, not here (shared inner).
         Ok(result)
     }
 
@@ -1138,6 +1214,34 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[instrument(skip(self, user_metadata, multipart_etag))]
     #[allow(clippy::too_many_arguments)]
     pub async fn store_passthrough_file_with_multipart_etag(
+        &self,
+        bucket: &str,
+        key: &str,
+        source_path: &Path,
+        total_size: u64,
+        content_type: Option<String>,
+        user_metadata: HashMap<String, String>,
+        multipart_etag: String,
+    ) -> Result<StoreResult, EngineError> {
+        self.store_recorded(
+            bucket,
+            key,
+            self.store_passthrough_file_inner(
+                bucket,
+                key,
+                source_path,
+                total_size,
+                content_type,
+                user_metadata,
+                multipart_etag,
+            ),
+        )
+        .await
+    }
+
+    /// Body of [`Self::store_passthrough_file_with_multipart_etag`]; does not record the counter.
+    #[allow(clippy::too_many_arguments)]
+    async fn store_passthrough_file_inner(
         &self,
         bucket: &str,
         key: &str,
@@ -1210,7 +1314,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let result = StoreResult::new(metadata, total_size);
         self.metadata_cache
             .insert(bucket, key, result.metadata.clone());
-        self.record_store(bucket, &result);
+        // NB: recorded in the public wrapper, not here (shared inner).
         Ok(result)
     }
 
@@ -1353,8 +1457,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             StoreResult::new(metadata, handle.total_size).with_accounting(prior_for_counter, 0);
         self.metadata_cache
             .insert(&handle.bucket, &handle.key, result.metadata.clone());
-        // This is the 7th store-completing path (streaming multipart, used by
-        // large replication/lifecycle copies) — record like the other 6.
+        // Streaming multipart (large replication/lifecycle copies). Every
+        // public store entry point records exactly once; `counter_tests`
+        // pins the accounting against the buffered `store()` oracle.
         self.record_store(&handle.bucket, &result);
         Ok(result)
     }
@@ -1551,5 +1656,192 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
 
         Ok((migrated, skipped, errors))
+    }
+}
+
+/// Usage-counter accounting across every public store entry point. The
+/// buffered `store()` path is the oracle: any other path that stores the same
+/// bytes under the same keys must leave the counter in the same state.
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+    use crate::bucket_usage::{BucketUsage, BucketUsageRow};
+    use crate::config::Config;
+    use crate::storage::FilesystemBackend;
+
+    const BUCKET: &str = "counter-bkt";
+
+    struct Harness {
+        _tmp: tempfile::TempDir,
+        usage: Arc<BucketUsage>,
+        engine: DeltaGliderEngine<FilesystemBackend>,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        backend.create_bucket(BUCKET).await.unwrap();
+        let usage = Arc::new(BucketUsage::in_memory().unwrap());
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
+                .with_bucket_usage(Some(usage.clone()));
+        Harness {
+            _tmp: tmp,
+            usage,
+            engine,
+        }
+    }
+
+    fn row(h: &Harness) -> (u64, u64, u64) {
+        h.usage.flush_pending();
+        let r: BucketUsageRow = h.usage.read(BUCKET).unwrap().unwrap_or(BucketUsageRow {
+            object_count: 0,
+            logical_bytes: 0,
+            stored_bytes: 0,
+            last_scan_at: None,
+        });
+        (r.object_count, r.logical_bytes, r.stored_bytes)
+    }
+
+    /// Two versions of a delta-eligible artifact: v2 is v1 with a small edit.
+    fn versions() -> (Vec<u8>, Vec<u8>) {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let v1: Vec<u8> = (0..200_000)
+            .map(|_| {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
+            })
+            .collect();
+        let mut v2 = v1.clone();
+        v2[100_000..100_100].fill(0xAB);
+        (v1, v2)
+    }
+
+    async fn buffered(h: &Harness, key: &str, data: &[u8]) {
+        h.engine
+            .store(BUCKET, key, data, None, HashMap::new())
+            .await
+            .unwrap();
+    }
+
+    async fn spooled(h: &Harness, key: &str, data: &[u8]) {
+        let spool = h.engine.spool_acquire(data.len() as u64).await.unwrap();
+        tokio::fs::write(spool.path(), data).await.unwrap();
+        h.engine
+            .store_spooled_delta(
+                BUCKET,
+                key,
+                &spool,
+                data.len() as u64,
+                None,
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn relayed(h: &Harness, key: &str, data: &[u8]) {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = data.split_at(data.len() / 2);
+        let paths = vec![dir.path().join("p1"), dir.path().join("p2")];
+        tokio::fs::write(&paths[0], a).await.unwrap();
+        tokio::fs::write(&paths[1], b).await.unwrap();
+        h.engine
+            .store_passthrough_relayed_parts_with_multipart_etag(
+                BUCKET,
+                key,
+                &paths,
+                data.len() as u64,
+                None,
+                HashMap::new(),
+                "\"0123456789abcdef0123456789abcdef-2\"".to_string(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn file(h: &Harness, key: &str, data: &[u8]) {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(f.path(), data).await.unwrap();
+        h.engine
+            .store_passthrough_file_with_multipart_etag(
+                BUCKET,
+                key,
+                f.path(),
+                data.len() as u64,
+                None,
+                HashMap::new(),
+                "\"0123456789abcdef0123456789abcdef-1\"".to_string(),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn chunked(h: &Harness, key: &str, data: &[u8]) {
+        let chunks: Vec<Bytes> = data.chunks(64 * 1024).map(Bytes::copy_from_slice).collect();
+        h.engine
+            .store_passthrough_chunked_with_multipart_etag(
+                BUCKET,
+                key,
+                &chunks,
+                data.len() as u64,
+                None,
+                HashMap::new(),
+                "\"0123456789abcdef0123456789abcdef-3\"".to_string(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Streaming delta PUTs: a fresh baseline, a sibling delta, then an
+    /// overwrite. Pre-fix the delta-win branch never recorded (count 0).
+    #[tokio::test]
+    async fn spooled_delta_matches_buffered() {
+        let (v1, v2) = versions();
+        let (oracle, h) = (harness().await, harness().await);
+        for (key, data) in [("rel/a.zip", &v1), ("rel/b.zip", &v2), ("rel/b.zip", &v1)] {
+            buffered(&oracle, key, data).await;
+            spooled(&h, key, data).await;
+        }
+        assert_eq!(row(&oracle).0, 2, "oracle: two keys");
+        assert_eq!(row(&h), row(&oracle));
+    }
+
+    /// Streaming PUT of a non-delta-eligible key, then an overwrite. Pre-fix
+    /// the overwrite counted a second object.
+    #[tokio::test]
+    async fn spooled_passthrough_overwrite_matches_buffered() {
+        let (v1, v2) = versions();
+        let (oracle, h) = (harness().await, harness().await);
+        for data in [&v1, &v2] {
+            buffered(&oracle, "img/a.jpg", data).await;
+            spooled(&h, "img/a.jpg", data).await;
+        }
+        assert_eq!(row(&oracle).0, 1);
+        assert_eq!(row(&h), row(&oracle));
+    }
+
+    /// Every multipart passthrough sink must net an overwrite to +0 objects.
+    #[tokio::test]
+    async fn multipart_sinks_overwrite_counts_one_object() {
+        let (v1, v2) = versions();
+        for sink in ["relayed", "file", "chunked"] {
+            let h = harness().await;
+            for data in [&v1, &v2] {
+                match sink {
+                    "relayed" => relayed(&h, "img/a.jpg", data).await,
+                    "file" => file(&h, "img/a.jpg", data).await,
+                    _ => chunked(&h, "img/a.jpg", data).await,
+                }
+            }
+            let (count, logical, _) = row(&h);
+            assert_eq!(count, 1, "{sink}: overwrite must not add an object");
+            assert_eq!(logical, v2.len() as u64, "{sink}: logical bytes of v2 only");
+        }
     }
 }
