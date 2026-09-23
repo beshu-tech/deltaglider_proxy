@@ -99,10 +99,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             // Storage(NotFound) — NOT EngineError::NotFound. Matching only the
             // latter made this whole retry dead code, so a stale entry became a
             // hard 500 instead of recovering (X-ray H11).
-            Err(EngineError::NotFound(_))
-            | Err(EngineError::Storage(StorageError::NotFound(_)))
-                if from_cache =>
-            {
+            Err(e) if from_cache && e.is_not_found() => {
                 // Stale cache entry — the object's storage type may have changed
                 // (e.g., passthrough → delta) during a concurrent PUT. Invalidate
                 // the cache and retry with fresh metadata from storage.

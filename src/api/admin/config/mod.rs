@@ -990,22 +990,8 @@ pub async fn test_s3_connection(
             })
         }
         Ok(Err(e)) => {
-            let err_str = format!("{}", e);
-            let kind = if err_str.contains("credentials")
-                || err_str.contains("InvalidAccessKeyId")
-                || err_str.contains("SignatureDoesNotMatch")
-                || err_str.contains("403")
-            {
-                "credentials"
-            } else if err_str.contains("connect")
-                || err_str.contains("Connection refused")
-                || err_str.contains("dns")
-                || err_str.contains("resolve")
-            {
-                "connection"
-            } else {
-                "unknown"
-            };
+            let err_str = crate::config_db_sync::describe_sdk_error(&e);
+            let kind = probe_error_kind(&e);
             Json(TestS3Response {
                 success: false,
                 buckets: None,
@@ -1019,6 +1005,52 @@ pub async fn test_s3_connection(
             error: Some("Connection timed out after 10 seconds".to_string()),
             error_kind: Some("timeout".to_string()),
         }),
+    }
+}
+
+/// Classify a failed test-connection `ListBuckets` for the GUI:
+/// "credentials", "connection", "timeout", or "unknown".
+fn probe_error_kind<E>(e: &aws_sdk_s3::error::SdkError<E>) -> &'static str
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata + std::error::Error + 'static,
+{
+    use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
+    match e {
+        SdkError::TimeoutError(_) => "timeout",
+        SdkError::DispatchFailure(d) if d.is_timeout() => "timeout",
+        SdkError::DispatchFailure(d) if d.is_io() => "connection",
+        SdkError::ServiceError(svc) => {
+            let status = svc.raw().status().as_u16();
+            let credential_code = matches!(
+                e.code(),
+                Some(
+                    "InvalidAccessKeyId"
+                        | "SignatureDoesNotMatch"
+                        | "AccessDenied"
+                        | "ExpiredToken"
+                        | "InvalidToken"
+                )
+            );
+            if credential_code || status == 401 || status == 403 {
+                "credentials"
+            } else {
+                "unknown"
+            }
+        }
+        // Construction failures carry their cause (e.g. no credentials
+        // provider) only in the source chain.
+        _ => {
+            let chain = aws_sdk_s3::error::DisplayErrorContext(e)
+                .to_string()
+                .to_ascii_lowercase();
+            if chain.contains("credential") {
+                "credentials"
+            } else if chain.contains("dns") || chain.contains("connect") {
+                "connection"
+            } else {
+                "unknown"
+            }
+        }
     }
 }
 
@@ -1412,5 +1444,52 @@ mod preserve_tests {
             new2.webhook_url.as_deref(),
             Some("https://hooks.slack.com/services/NEW")
         );
+    }
+}
+
+#[cfg(test)]
+mod probe_error_tests {
+    use super::*;
+    use aws_sdk_s3::error::SdkError;
+    use aws_sdk_s3::operation::list_buckets::ListBucketsError;
+    use aws_smithy_runtime_api::http::{Response, StatusCode};
+    use aws_smithy_types::body::SdkBody;
+
+    fn service_error(status: u16, code: &str) -> SdkError<ListBucketsError> {
+        let inner = ListBucketsError::generic(
+            aws_smithy_types::error::ErrorMetadata::builder()
+                .code(code)
+                .build(),
+        );
+        let resp = Response::new(StatusCode::try_from(status).unwrap(), SdkBody::empty());
+        SdkError::service_error(inner, resp)
+    }
+
+    /// `SdkError`'s Display is only "service error", so the kind must come
+    /// from the status and code.
+    #[test]
+    fn wrong_credentials_classify_as_credentials() {
+        assert_eq!(
+            probe_error_kind(&service_error(403, "InvalidAccessKeyId")),
+            "credentials"
+        );
+        assert_eq!(
+            probe_error_kind(&service_error(403, "SignatureDoesNotMatch")),
+            "credentials"
+        );
+        assert_eq!(
+            probe_error_kind(&service_error(500, "InternalError")),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn dispatch_failure_classifies_as_connection() {
+        let err: SdkError<ListBucketsError> =
+            SdkError::dispatch_failure(aws_smithy_runtime_api::client::result::ConnectorError::io(
+                std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "Connection refused")
+                    .into(),
+            ));
+        assert_eq!(probe_error_kind(&err), "connection");
     }
 }

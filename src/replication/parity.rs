@@ -1057,14 +1057,10 @@ async fn head_burst(
     let mut stream = futures::stream::iter(owned.iter().cloned().map(|key| async move {
         let outcome = match engine.head(bucket, &key).await {
             Ok(m) => HeadOutcome::Resolved(Box::new(m)),
-            Err(e) => {
-                let s = e.to_string().to_ascii_lowercase();
-                if s.contains("not found") || s.contains("nosuchkey") {
-                    HeadOutcome::Gone
-                } else {
-                    HeadOutcome::Unresolved
-                }
-            }
+            // Only a missing OBJECT is "gone". A missing bucket or any other
+            // failure is unresolved, so both sides drop the key (#H5).
+            Err(e) if e.is_not_found() => HeadOutcome::Gone,
+            Err(_) => HeadOutcome::Unresolved,
         };
         (key, outcome)
     }))

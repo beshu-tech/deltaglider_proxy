@@ -101,12 +101,11 @@ pub async fn run(args: VerifyArgs) -> i32 {
     let (data, metadata) = match engine.retrieve(&loc.bucket, &loc.key).await {
         Ok(t) => t,
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("NoSuchKey") || msg.contains("not found") {
-                eprintln!("error: object not found: {}", args.url);
+            if let Some(what) = super::missing(&e) {
+                eprintln!("error: {what} not found: {}", args.url);
                 return cli_exit::EXIT_NOT_FOUND;
             }
-            if msg.contains("ChecksumMismatch") || msg.contains("checksum mismatch") {
+            if matches!(e, crate::deltaglider::EngineError::ChecksumMismatch { .. }) {
                 // The engine itself caught the mismatch during
                 // reconstruction — surface it as the integrity error.
                 eprintln!("MISMATCH: engine reported checksum mismatch: {e}");

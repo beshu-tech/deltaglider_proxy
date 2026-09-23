@@ -171,6 +171,19 @@ pub enum EngineError {
     Overloaded(String),
 }
 
+impl EngineError {
+    /// The object does not exist. The engine reports a missing object as
+    /// EITHER a top-level `NotFound` OR a storage-level `NotFound` (a stale
+    /// cached storage type reads the wrong path), so callers must accept both.
+    /// Decide on the variant, never on the Display text.
+    pub fn is_not_found(&self) -> bool {
+        matches!(
+            self,
+            EngineError::NotFound(_) | EngineError::Storage(StorageError::NotFound(_))
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ListObjectsPage {
     /// Direct objects at this level (after delimiter collapsing, if delimiter was provided)

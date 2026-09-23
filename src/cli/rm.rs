@@ -135,9 +135,8 @@ async fn rm_one(engine: &DynEngine, args: &RmArgs, bucket: &str, key: &str) -> i
     match engine.delete(bucket, key).await {
         Ok(_) => cli_exit::EXIT_OK,
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("NoSuchKey") || msg.contains("not found") {
-                eprintln!("error: object not found: s3://{bucket}/{key}");
+            if let Some(what) = super::missing(&e) {
+                eprintln!("error: {what} not found: s3://{bucket}/{key}");
                 cli_exit::EXIT_NOT_FOUND
             } else {
                 eprintln!("error: delete failed: {e}");

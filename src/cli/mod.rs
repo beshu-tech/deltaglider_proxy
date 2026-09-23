@@ -23,3 +23,17 @@ pub mod s3_url;
 pub mod stats;
 pub mod sync;
 pub mod verify;
+
+/// What an engine error says is missing, if anything: `Some("object")` or
+/// `Some("bucket")`. Decided on the error variant, never on its text.
+pub(crate) fn missing(e: &crate::deltaglider::EngineError) -> Option<&'static str> {
+    use crate::deltaglider::EngineError;
+    use crate::storage::StorageError;
+    if e.is_not_found() {
+        Some("object")
+    } else if matches!(e, EngineError::Storage(StorageError::BucketNotFound(_))) {
+        Some("bucket")
+    } else {
+        None
+    }
+}

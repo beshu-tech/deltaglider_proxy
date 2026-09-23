@@ -209,18 +209,17 @@ impl ConfigDbSync {
         let remote_etag = match head_result {
             Ok(head) => head.e_tag().map(|s| s.to_string()),
             Err(e) => {
-                let err_str = format!("{}", e);
-                if err_str.contains("404")
-                    || err_str.contains("NoSuchKey")
-                    || err_str.contains("Not Found")
-                {
+                if head_error_is_absent(&e) {
                     debug!(
                         "Config DB not found in S3 (bucket={}) — using local copy",
                         self.bucket
                     );
                     return Ok(None);
                 }
-                return Err(format!("Failed to HEAD config DB in S3: {}", e));
+                return Err(format!(
+                    "Failed to HEAD config DB in S3: {}",
+                    describe_sdk_error(&e)
+                ));
             }
         };
 
@@ -240,7 +239,12 @@ impl ConfigDbSync {
             .key(&self.object_key)
             .send()
             .await
-            .map_err(|e| format!("Failed to download config DB from S3: {}", e))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to download config DB from S3: {}",
+                    describe_sdk_error(&e)
+                )
+            })?;
 
         let get_etag = get_result.e_tag().map(|s| s.to_string());
         if get_etag != remote_etag {
@@ -410,7 +414,12 @@ impl ConfigDbSync {
             .key(&self.object_key)
             .send()
             .await
-            .map_err(|e| format!("Failed to download config DB from S3: {}", e))?;
+            .map_err(|e| {
+                format!(
+                    "Failed to download config DB from S3: {}",
+                    describe_sdk_error(&e)
+                )
+            })?;
 
         let body = get_result
             .body
@@ -686,6 +695,31 @@ where
     }
 }
 
+/// Is this HeadObject error "the config DB object does not exist yet"?
+fn head_error_is_absent<E>(e: &aws_sdk_s3::error::SdkError<E>) -> bool
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata,
+{
+    // Classify on status + code: `SdkError`'s Display for a service error is
+    // only "service error", with no status or code in it.
+    is_object_absent(&sdk_error_signal(e))
+}
+
+/// Human-readable form of an SDK error for logs and API responses: the
+/// status + code signal, then the full source chain. `SdkError`'s own
+/// Display is only "service error" / "dispatch failure", which tells an
+/// operator nothing.
+pub(crate) fn describe_sdk_error<E>(e: &aws_sdk_s3::error::SdkError<E>) -> String
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata + std::error::Error + 'static,
+{
+    format!(
+        "{} ({})",
+        aws_sdk_s3::error::DisplayErrorContext(e),
+        sdk_error_signal(e)
+    )
+}
+
 /// Pure classifier: does this stringified S3 SDK error represent a failed
 /// conditional-write precondition (HTTP 412)?
 ///
@@ -902,6 +936,29 @@ pub async fn reopen_and_rebuild_iam(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn head_error(
+        status: u16,
+    ) -> aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::head_object::HeadObjectError> {
+        use aws_smithy_runtime_api::http::{Response, StatusCode};
+        let inner = aws_sdk_s3::operation::head_object::HeadObjectError::NotFound(
+            aws_sdk_s3::types::error::NotFound::builder().build(),
+        );
+        let resp = Response::new(
+            StatusCode::try_from(status).unwrap(),
+            aws_smithy_types::body::SdkBody::empty(),
+        );
+        aws_sdk_s3::error::SdkError::service_error(inner, resp)
+    }
+
+    /// A first boot against an empty sync bucket gets HeadObject 404. The
+    /// SDK's Display for a service error is just "service error", so the
+    /// decision must come from the status and code, not the message.
+    #[test]
+    fn head_404_is_absent_and_403_is_not() {
+        assert!(head_error_is_absent(&head_error(404)));
+        assert!(!head_error_is_absent(&head_error(403)));
+    }
 
     #[test]
     fn witness_freshness_truth_table() {

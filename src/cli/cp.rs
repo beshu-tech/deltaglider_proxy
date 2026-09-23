@@ -448,9 +448,8 @@ async fn download_one(
     let (data, _meta) = match engine.retrieve(bucket, key).await {
         Ok(t) => t,
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("NoSuchKey") || msg.contains("not found") {
-                eprintln!("error: object not found: s3://{bucket}/{key}");
+            if let Some(what) = super::missing(&e) {
+                eprintln!("error: {what} not found: s3://{bucket}/{key}");
                 return cli_exit::EXIT_NOT_FOUND;
             }
             eprintln!("error: retrieve {} failed: {e}", key);
