@@ -29,7 +29,7 @@ env:
 jobs:
   test-all-default-features:
     name: cargo test --all (default features)
-    runs-on: k3s
+    runs-on: homelab
     timeout-minutes: 120
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -82,7 +82,7 @@ jobs:
   #    Tools (cargo-llvm-cov, cargo-deny) are baked into the builder image. ──
   coverage:
     name: Unit Coverage (nightly)
-    runs-on: k3s
+    runs-on: homelab
     timeout-minutes: 20
     continue-on-error: true
     container:
@@ -129,7 +129,7 @@ jobs:
   #    so the gated code is type-checked HERE nightly instead. ──
   tokio-unstable:
     name: tokio_unstable build + tests (nightly)
-    runs-on: k3s
+    runs-on: homelab
     timeout-minutes: 30
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -161,7 +161,7 @@ jobs:
 
   supply-chain:
     name: Supply-chain (audit + deny)
-    runs-on: k3s
+    runs-on: homelab
     timeout-minutes: 10
     continue-on-error: true
     container:
