@@ -16,6 +16,7 @@ import IamSourceBanner from './IamSourceBanner';
 import { normalizeUiError } from '../errorHandling';
 import { useNavigation } from '../NavigationContext';
 import { buildViewUrl, parseAdminQuery } from '../urlState';
+import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 
 const { Text, Title } = Typography;
 
@@ -63,11 +64,7 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   // Bubble a 401 up so the login screen can take over. Must run as an effect,
   // not in the render body: react-query keeps `error` populated across renders,
   // so a render-phase navigate would fire a setState during render.
-  useEffect(() => {
-    if (rawError instanceof Error && rawError.message.includes('401')) {
-      onSessionExpired?.();
-    }
-  }, [rawError, onSessionExpired]);
+  useSessionExpiredOn(rawError, onSessionExpired);
 
   // Navigate to a specific group when coming from UserForm. Only act once the
   // requested group is actually present in the loaded list — checking

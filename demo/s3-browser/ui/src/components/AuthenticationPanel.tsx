@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Button, Typography, Input, Alert, Switch, Divider, Spin, message } from 'antd';
 import { PlusOutlined, SearchOutlined, CopyOutlined, SafetyOutlined, CheckCircleOutlined, CloseCircleOutlined, SyncOutlined } from '@ant-design/icons';
 import {
@@ -18,6 +18,7 @@ import MappingRuleRow from './MappingRuleRow';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { normalizeUiError } from '../errorHandling';
+import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 
 const { Text } = Typography;
 
@@ -50,11 +51,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   // Bubble a 401 up so the login screen can take over. Effect, not render-body:
   // react-query keeps `error` populated across renders, so navigating in render
   // would fire a setState during render.
-  useEffect(() => {
-    if (rawError instanceof Error && rawError.message.includes('401')) {
-      onSessionExpired?.();
-    }
-  }, [rawError, onSessionExpired]);
+  useSessionExpiredOn(rawError, onSessionExpired);
 
   const qc = useQueryClient();
 

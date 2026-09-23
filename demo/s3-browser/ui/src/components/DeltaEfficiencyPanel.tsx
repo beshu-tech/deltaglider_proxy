@@ -30,6 +30,7 @@ import { useBucketNames } from '../queries/backends';
 import HoverHint from './HoverHint';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
+import { isSessionExpired } from '../errorHandling';
 
 /**
  * Per-row verification state, keyed by prefix. Stored at the
@@ -158,7 +159,7 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
     } catch (e) {
       if (scanIdRef.current !== scanId) return;
       const msg = normalizeUiError(e, String(e));
-      if (/401|session/i.test(msg)) onSessionExpired?.();
+      if (isSessionExpired(e)) onSessionExpired?.();
       setError(`Scan failed: ${msg}`);
     } finally {
       // Only the latest scan owns the shared loading/scanning flags;

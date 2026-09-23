@@ -41,6 +41,7 @@ import { getSection, putSection, validateSection } from './adminApi';
 import { qk } from './queries/keys';
 import { useApplyHandler, useDirtySection } from './useDirtySection';
 import { normalizeUiError } from './errorHandling';
+import { isSessionExpired } from './errorHandling';
 
 interface UseSectionEditorOptions<Wire, Local = Wire> {
   section: SectionName;
@@ -182,7 +183,7 @@ export function useSectionEditor<Wire, Local = Wire>(
       }
       setError(null);
     } catch (e) {
-      if (e instanceof Error && e.message.includes('401')) {
+      if (isSessionExpired(e)) {
         onSessionExpired?.();
         return;
       }

@@ -21,6 +21,7 @@ import {
 } from '../adminApi';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
+import { isSessionExpired } from '../errorHandling';
 
 const { Text } = Typography;
 const DEFAULT_PAGE_SIZE = 50;
@@ -100,7 +101,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       setError(null);
     } catch (e) {
       if (gen !== fetchGen.current) return;
-      if (e instanceof Error && e.message.includes('401')) {
+      if (isSessionExpired(e)) {
         onSessionExpired?.();
         return;
       }
@@ -281,7 +282,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       message.success(`Requeued ${res.requeued} event`);
       await refresh();
     } catch (e) {
-      if (e instanceof Error && e.message.includes('401')) {
+      if (isSessionExpired(e)) {
         onSessionExpired?.();
         return;
       }
@@ -299,7 +300,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       message.success(`Requeued ${res.requeued} failed event${res.requeued === 1 ? '' : 's'}`);
       await refresh();
     } catch (e) {
-      if (e instanceof Error && e.message.includes('401')) {
+      if (isSessionExpired(e)) {
         onSessionExpired?.();
         return;
       }
@@ -319,7 +320,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       message.success(`Purged ${res.purged} failed event${res.purged === 1 ? '' : 's'}`);
       await refresh();
     } catch (e) {
-      if (e instanceof Error && e.message.includes('401')) {
+      if (isSessionExpired(e)) {
         onSessionExpired?.();
         return;
       }

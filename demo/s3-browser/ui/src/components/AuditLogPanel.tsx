@@ -36,6 +36,7 @@ import { LoadingState } from './StatePlaceholders';
 import { relativeTime } from '../utils';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
+import { isSessionExpired } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -85,7 +86,7 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
       setNow(new Date());
       setError(null);
     } catch (e) {
-      if (e instanceof Error && e.message.includes('401')) {
+      if (isSessionExpired(e)) {
         onSessionExpired?.();
         return;
       }

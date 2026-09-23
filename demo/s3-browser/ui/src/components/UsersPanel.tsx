@@ -16,6 +16,7 @@ import IamSourceBanner from './IamSourceBanner';
 import { normalizeUiError } from '../errorHandling';
 import { useNavigation } from '../NavigationContext';
 import { buildViewUrl, parseAdminQuery } from '../urlState';
+import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 
 const { Text } = Typography;
 
@@ -63,11 +64,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   // Bubble up 401 to the parent so the login screen can take over. Effect, not
   // render-body: react-query keeps `error` populated across renders, so calling
   // it in render would fire a setState (navigation) during render.
-  useEffect(() => {
-    if (rawError instanceof Error && rawError.message.includes('401')) {
-      onSessionExpired?.();
-    }
-  }, [rawError, onSessionExpired]);
+  useSessionExpiredOn(rawError, onSessionExpired);
 
   // URL → state: when the query string changes (direct load, Back/Forward),
   // re-select that user. Only acts when a ?user= param is present so local

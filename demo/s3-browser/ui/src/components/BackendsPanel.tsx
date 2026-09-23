@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { LinkifiedText } from './LinkifiedText';
 import { CAPABILITY_DOC_URL } from '../linkifyDocUrl';
 import { useQueryClient } from '@tanstack/react-query';
@@ -19,6 +19,8 @@ import BackendEncryptionEditor, { type BackendEncryptionPatch } from './BackendE
 import { buildEncryptionSectionBody } from '../backendEncryptionPayload';
 import MaskedSecretInput from './MaskedSecretInput';
 import { normalizeUiError } from '../errorHandling';
+import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
+import { isSessionExpired } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -113,13 +115,9 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   // else renders in the Alert below).
   const loadError = backendsQuery.error;
   // Effect, not render-body: react-query keeps `error` populated across renders.
-  useEffect(() => {
-    if (loadError instanceof Error && loadError.message.includes('401')) {
-      onSessionExpired?.();
-    }
-  }, [loadError, onSessionExpired]);
+  useSessionExpiredOn(loadError, onSessionExpired);
   const error =
-    loadError && !(loadError instanceof Error && loadError.message.includes('401'))
+    loadError && !isSessionExpired(loadError)
       ? normalizeUiError(loadError, 'Failed to load backends')
       : null;
 

@@ -12,6 +12,7 @@ import { ReloadOutlined, LogoutOutlined } from '@ant-design/icons';
 import { listSessions, revokeSession, revokeUserSessions, type SessionSummary } from '../adminApi';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
+import { isSessionExpired } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -32,7 +33,7 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
     try {
       setRows(await listSessions());
     } catch (e) {
-      if (e instanceof Error && e.message.includes('401')) { onSessionExpired?.(); return; }
+      if (isSessionExpired(e)) { onSessionExpired?.(); return; }
       message.error(normalizeUiError(e, 'Failed to load sessions'));
     } finally {
       setLoading(false);

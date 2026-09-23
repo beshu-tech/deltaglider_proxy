@@ -84,6 +84,26 @@ async function readResponseBodyMessage(res: Response): Promise<{ code?: string; 
   return { message: trimOneLine(body) };
 }
 
+/**
+ * An HTTP failure from the proxy. The message keeps its operator-facing shape;
+ * `status` and `detail` carry the facts that code decides on, so no caller
+ * has to parse the message text.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  readonly code?: string;
+  /** The server's error string (JSON `error`/`message`), when it sent one. */
+  readonly detail?: string;
+
+  constructor(message: string, status: number, code?: string, detail?: string) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+    this.detail = detail;
+  }
+}
+
 export async function throwApiError(res: Response, context: string): Promise<never> {
   const requestId = res.headers.get('x-amz-request-id') || res.headers.get('x-request-id') || '';
   const { code, message } = await readResponseBodyMessage(res.clone());
@@ -91,7 +111,22 @@ export async function throwApiError(res: Response, context: string): Promise<nev
   const main = message || hint || `HTTP ${res.status}`;
   const codePart = code ? ` [${code}]` : '';
   const reqPart = requestIdSuffix(requestId);
-  throw new Error(`${context} failed (${res.status})${codePart}: ${main}${reqPart}`);
+  throw new ApiError(
+    `${context} failed (${res.status})${codePart}: ${main}${reqPart}`,
+    res.status,
+    code,
+    message,
+  );
+}
+
+/**
+ * THE rule for "send the user back to sign-in": a 401, or a 403 whose body is
+ * `admin_session_required` (a browser-only session on an admin route).
+ * Decided on the status and the server's error string, never on message text.
+ */
+export function isSessionExpired(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return false;
+  return err.status === 401 || (err.status === 403 && err.detail === 'admin_session_required');
 }
 
 function stringifyUnknown(err: unknown): string {

@@ -23,6 +23,7 @@ import { useColors } from '../ThemeContext';
 import { relativeTime } from '../utils';
 import { fetchLogs, streamLogs, type LogEntry, type LogFilters } from '../adminApi';
 import { normalizeUiError } from '../errorHandling';
+import { isSessionExpired } from '../errorHandling';
 
 const { Text } = Typography;
 const RING_CAP = 2000; // client-side trim ceiling for the live tail
@@ -71,7 +72,7 @@ export default function LogsPanel({ onSessionExpired }: Props) {
       setError(null);
     } catch (e) {
       const msg = normalizeUiError(e, 'fetch failed');
-      if (/401|unauth/i.test(msg)) onSessionExpired?.();
+      if (isSessionExpired(e)) onSessionExpired?.();
       setError(msg);
     }
   }, [filters, onSessionExpired]);
