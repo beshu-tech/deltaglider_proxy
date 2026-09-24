@@ -24,8 +24,8 @@
  * beforeunload, and Cmd/Ctrl+S behave like the rest of Configuration.
  */
 import { useCallback, useRef, useState } from 'react';
-import { Alert, Button, Space, Typography, message } from 'antd';
-import { PlusOutlined } from '@ant-design/icons';
+import { Alert, Dropdown, Typography, message } from 'antd';
+import { DownOutlined, PlusOutlined } from '@ant-design/icons';
 import { LoadingState } from './StatePlaceholders';
 import type { AdminConfig } from '../adminApi';
 import { useQueryClient } from '@tanstack/react-query';
@@ -34,6 +34,7 @@ import { useBackends, useBucketNames } from '../queries/backends';
 import { qk } from '../queries/keys';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import ApplyDialog from './ApplyDialog';
+import StickyDirtyBar from './StickyDirtyBar';
 import BucketCard from './BucketCard';
 import CreateBucketModal from './CreateBucketModal';
 import ReencryptProposalModal from './ReencryptProposalModal';
@@ -232,25 +233,6 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
         gap: 16,
       }}
     >
-      {dirty && (
-        <Alert
-          type="warning"
-          showIcon
-          message="Unsaved changes"
-          description="Review the diff before applying — nothing is live yet."
-          action={
-            <Space>
-              <Button size="small" onClick={discard} disabled={applying}>
-                Discard
-              </Button>
-              <Button type="primary" size="small" onClick={runApply} loading={applying}>
-                Review &amp; apply
-              </Button>
-            </Space>
-          }
-        />
-      )}
-
       <div style={cardStyle}>
         {/* The page TabHeader already carries the "Buckets" title + description,
             so this is just the dynamic count line (no duplicate heading). */}
@@ -313,40 +295,35 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
             />
           ))}
 
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, rowGap: 6, marginTop: 4, flexWrap: 'wrap' }}>
-            <Button
+          {/* ONE call to action. Pre-provisioning (settings for a bucket
+              that does not exist yet) is its secondary option, not a second
+              competing button. */}
+          <div style={{ marginTop: 4 }}>
+            <Dropdown.Button
               data-testid="buckets-create"
               aria-label="Create bucket"
-              icon={<PlusOutlined />}
               onClick={() => setCreateOpen(true)}
-              style={{ borderRadius: 8, fontFamily: 'var(--font-ui)', flexShrink: 0 }}
-              type="dashed"
+              icon={<DownOutlined />}
+              menu={{
+                items: [
+                  { key: 'draft', label: 'Add settings for a bucket that does not exist yet' },
+                ],
+                onClick: () => addDraft(),
+              }}
             >
-              Create bucket
-            </Button>
-            <Button
-              type="link"
-              size="small"
-              style={{ fontSize: 11, padding: 0, whiteSpace: 'normal', textAlign: 'left', height: 'auto' }}
-              onClick={addDraft}
-            >
-              Pre-provision settings for a bucket that doesn&rsquo;t exist yet
-            </Button>
+              <PlusOutlined /> Create bucket
+            </Dropdown.Button>
           </div>
         </div>
-
-        {dirty && (
-          <Button
-            type="primary"
-            onClick={runApply}
-            loading={applying}
-            style={{ marginTop: 16, borderRadius: 8, fontWeight: 600 }}
-            block
-          >
-            Review &amp; apply changes
-          </Button>
-        )}
       </div>
+
+      <StickyDirtyBar
+        visible={dirty}
+        applying={applying}
+        onDiscard={discard}
+        onApply={() => void runApply()}
+        floating
+      />
 
       <ReencryptProposalModal
         open={reencryptBucket !== null}

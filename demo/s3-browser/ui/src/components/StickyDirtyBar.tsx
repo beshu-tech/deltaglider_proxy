@@ -119,10 +119,7 @@ export default function StickyDirtyBar({
               {errorCount} issue{errorCount === 1 ? '' : 's'} to fix
             </span>
           ) : (
-            <>
-              Unsaved changes
-              <span style={{ color: c.TEXT_MUTED }}> · applies live</span>
-            </>
+            'Unsaved changes'
           )}
         </span>
         <Space size={8} style={{ marginLeft: 4 }}>
@@ -135,9 +132,13 @@ export default function StickyDirtyBar({
             onClick={onApply}
             disabled={applying || hasErrors}
             loading={applying}
-            title={hasErrors ? 'Resolve the issues above before applying' : 'Apply changes'}
+            title={
+              hasErrors
+                ? 'Resolve the issues above before applying'
+                : 'Review the changes, then apply them to the running proxy'
+            }
           >
-            Apply
+            Review &amp; apply
           </Button>
         </Space>
       </div>

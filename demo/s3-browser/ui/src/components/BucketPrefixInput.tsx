@@ -84,7 +84,7 @@ export default function BucketPrefixInput({
           style={{ width: '100%' }}
         />
         <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 4 }}>
-          {buckets.length > 0 ? `${buckets.length} discovered bucket${buckets.length === 1 ? '' : 's'} available.` : 'Type a bucket name; suggestions appear when the API can list buckets.'}
+          {buckets.length > 0 ? `${buckets.length} discovered bucket${buckets.length === 1 ? '' : 's'} available.` : 'Type a bucket name; suggestions appear when the proxy can list buckets.'}
         </Text>
       </div>
       <div>

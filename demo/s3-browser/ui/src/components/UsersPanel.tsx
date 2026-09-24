@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState, useCallback } from 'react';
 import { Button, Typography, message } from 'antd';
-import { PlusOutlined, TeamOutlined, DeleteOutlined, CopyOutlined } from '@ant-design/icons';
+import { TeamOutlined, CopyOutlined } from '@ant-design/icons';
 import { useQueryClient } from '@tanstack/react-query';
 import { getUsers } from '../adminApi';
 import type { IamUser } from '../adminApi';
 import { useColors } from '../ThemeContext';
-import { useUsers, useDeleteUser, useCloneUser } from '../queries/users';
+import { useUsers, useCloneUser } from '../queries/users';
 import { useIamMode } from '../queries/config';
 import { qk } from '../queries/keys';
 import { userPermissionSummary, filterItems } from '../masterDetailFilter';
@@ -77,7 +77,6 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
     setNewCreds(null);
   }, [urlUserId]);
 
-  const deleteMutation = useDeleteUser();
   const cloneMutation = useCloneUser();
 
   const selectedUser = users.find(u => u.id === selectedId) ?? null;
@@ -194,11 +193,11 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
             {users.length === 0 ? (
               <>
                 <TeamOutlined style={{ fontSize: 40, marginBottom: 12, color: colors.TEXT_MUTED }} />
-                <div><Text type="secondary" style={{ fontSize: 15, fontWeight: 500 }}>Multi-User Access Control</Text></div>
+                <div><Text type="secondary" style={{ fontSize: 15, fontWeight: 500 }}>{readOnly ? 'No users declared' : 'Create the first user'}</Text></div>
                 <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
                   {readOnly
-                    ? 'No IAM users in your YAML config. Add them under access.iam_users and apply.'
-                    : 'Create your first IAM user to enable per-user credentials and permissions. Your current login credentials will be preserved as an admin account automatically.'}
+                    ? 'Your YAML config has no users. Add them under access.iam_users and apply.'
+                    : 'Click New to create the first user. Each user gets its own credentials and permissions. Your current credentials are kept as an admin user.'}
                 </Text>
               </>
             ) : (
@@ -233,23 +232,11 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
       onSearchChange={setFilterText}
       loading={loading}
       error={error}
+      // ONE empty state (the detail pane explains) and ONE call to action
+      // (the list's "New" button): the list only says it is empty.
       listEmptyState={(
         <div style={{ padding: 20, textAlign: 'center' }}>
-          <Text type="secondary" style={{ fontSize: 13, display: 'block', marginBottom: 8 }}>No IAM users yet</Text>
-          {readOnly ? (
-            <Text type="secondary" style={{ fontSize: 11, display: 'block' }}>
-              Add users under access.iam_users in your YAML config and apply.
-            </Text>
-          ) : (
-            <>
-              <Text type="secondary" style={{ fontSize: 11, display: 'block', marginBottom: 12 }}>
-                Your current credentials will be migrated automatically as an admin user.
-              </Text>
-              <Button type="primary" size="small" icon={<PlusOutlined />} onClick={handleCreate}>
-                Set Up IAM
-              </Button>
-            </>
-          )}
+          <Text type="secondary" style={{ fontSize: 13 }}>No users yet</Text>
         </div>
       )}
       renderRowBody={user => {
@@ -285,26 +272,6 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
                     onClick={(e) => {
                       e.stopPropagation();
                       void handleClone(user);
-                    }}
-                    style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0, flexShrink: 0 }}
-                    onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
-                    onMouseLeave={e => { e.currentTarget.style.opacity = '0.5'; }}
-                  />
-                  <Button
-                    type="text"
-                    danger
-                    size="small"
-                    icon={<DeleteOutlined />}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      // Capture this row's identity up front so the confirm dialog and
-                      // the mutation can't disagree if the list reorders mid-handler.
-                      const { id, name } = user;
-                      if (!window.confirm(`Delete "${name}"? This cannot be undone.`)) return;
-                      deleteMutation.mutate(id, {
-                        onSuccess: handleDeleted,
-                        onError: (err) => console.error('Delete user failed:', err),
-                      });
                     }}
                     style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0, flexShrink: 0 }}
                     onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}

@@ -1,3 +1,4 @@
+import { CONTENT_WIDE } from './shared-styles';
 import type { ReactNode } from 'react';
 import { Button, Typography, Alert, Input } from 'antd';
 import { PlusOutlined, SearchOutlined } from '@ant-design/icons';
@@ -89,6 +90,10 @@ export default function MasterDetailPanel<T>({
           flexDirection: 'column',
           height: '100%',
           overflow: 'hidden',
+          // The shared wide content column, like every other admin page.
+          width: '100%',
+          maxWidth: CONTENT_WIDE,
+          margin: '0 auto',
           '--dg-md-border': colors.BORDER,
         } as React.CSSProperties
       }

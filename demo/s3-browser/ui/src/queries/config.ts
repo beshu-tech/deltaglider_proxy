@@ -8,6 +8,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { getAdminConfig, type AdminConfig, type IamMode } from '../adminApi';
 import { normalizeUiError } from '../errorHandling';
+import { findEnvOverride, type EnvOverride } from '../envOverrides';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { qk } from './keys';
 
@@ -45,4 +46,14 @@ export function useIamMode(onSessionExpired?: () => void): {
     readOnly: !data || data.iam_mode === 'declarative',
     loadError: error ? normalizeUiError(error, 'Failed to load the IAM mode') : '',
   };
+}
+
+/**
+ * The environment override for one field (by YAML path, or by variable name
+ * for env-only settings), or null. Reads the shared cached config query, so
+ * every FormField on a page costs one request in total.
+ */
+export function useEnvOverride(yamlPath?: string, envVar?: string): EnvOverride | null {
+  const { data } = useAdminConfig({ enabled: yamlPath !== undefined || envVar !== undefined });
+  return findEnvOverride(data?.env_overrides, yamlPath, envVar);
 }

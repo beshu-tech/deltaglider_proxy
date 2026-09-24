@@ -9,26 +9,22 @@ interface Props {
   icon: React.ReactNode;
   title: string;
   description: string;
-  /** Save-model badge: tells the operator the page's edit contract. */
-  saveModel?: 'immediate' | 'review';
 }
 
-export default function TabHeader({ icon, title, description, saveModel }: Props) {
+/**
+ * No page-level save-model badge: a page often mixes staged editors and
+ * buttons that act at once, so a single page label contradicted some of its
+ * own actions (#92 item 13). Each staged editor's dirty bar carries a
+ * "Review & apply" button instead; immediate buttons say what they do.
+ */
+export default function TabHeader({ icon, title, description }: Props) {
   const colors = useColors();
-  const badge =
-    saveModel === 'immediate'
-      ? { text: 'Saves immediately', tone: colors.ACCENT_BLUE }
-      : saveModel === 'review'
-        ? { text: 'Review & apply', tone: colors.ACCENT_AMBER }
-        : null;
 
   return (
     <div
       style={{
         display: 'flex',
         alignItems: 'center',
-        // Wrap so the save-model badge drops below the title on a very narrow
-        // viewport instead of overflowing.
         flexWrap: 'wrap',
         gap: 10,
         rowGap: 6,
@@ -88,29 +84,6 @@ export default function TabHeader({ icon, title, description, saveModel }: Props
           {description}
         </div>
       </div>
-      {badge && (
-        <span
-          title={
-            badge.text === 'Saves immediately'
-              ? 'Every change on this page takes effect as soon as you make it.'
-              : 'Changes are staged; nothing is live until you review the diff and Apply.'
-          }
-          style={{
-            flexShrink: 0,
-            fontSize: 10,
-            fontWeight: 700,
-            letterSpacing: 0.5,
-            textTransform: 'uppercase',
-            padding: '3px 10px',
-            borderRadius: 10,
-            background: `${badge.tone}18`,
-            color: badge.tone,
-            whiteSpace: 'nowrap',
-          }}
-        >
-          {badge.text}
-        </span>
-      )}
     </div>
   );
 }

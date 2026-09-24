@@ -19,6 +19,7 @@ import { Alert, Button, Dropdown, Space, Spin, Tag, Typography, message } from '
 import {
   CaretRightOutlined,
   DeleteOutlined,
+  EllipsisOutlined,
   EyeOutlined,
   PauseOutlined,
   PlayCircleOutlined,
@@ -114,6 +115,9 @@ const ACTION_META: Record<
     done: 'Rule deleted',
   },
 };
+
+/** Destructive row actions: shown in the row's "⋯" menu, not as buttons. */
+const MENU_ACTIONS: readonly JobAction[] = ['kill', 'delete'];
 
 export default function JobsPanel({ onSessionExpired, search }: Props) {
   const { cardStyle, inputRadius } = useCardStyles();
@@ -508,38 +512,70 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
           <span />
         ) : (
           <Space size={2} onClick={(e) => e.stopPropagation()}>
-            {availableActions(d.row).map((a) => {
-              // A one-off on a disabled/paused rule reads as "Run once" (it runs
-              // the rule a single time without re-enabling/resuming it).
-              const oneOff =
-                a === 'run-now' && (d.row.enabled === false || d.row.paused === true);
-              const label = oneOff ? 'Run once' : ACTION_META[a].label;
-              const blocked = draftBlocksAction(a, d.row.kind, {
-                replication: repl.isDirty,
-                lifecycle: lc.isDirty,
-              });
-              const title = oneOff
-                ? 'Run this rule once now — does not enable or resume it'
-                : label;
-              return (
+            {availableActions(d.row)
+              .filter((a) => !MENU_ACTIONS.includes(a))
+              .map((a) => {
+                // A one-off on a disabled/paused rule reads as "Run once" (it runs
+                // the rule a single time without re-enabling/resuming it).
+                const oneOff =
+                  a === 'run-now' && (d.row.enabled === false || d.row.paused === true);
+                const label = oneOff ? 'Run once' : ACTION_META[a].label;
+                const blocked = draftBlocksAction(a, d.row.kind, {
+                  replication: repl.isDirty,
+                  lifecycle: lc.isDirty,
+                });
+                const title = oneOff
+                  ? 'Run this rule once now — does not enable or resume it'
+                  : label;
+                return (
+                  <Button
+                    key={a}
+                    size="small"
+                    type="text"
+                    danger={ACTION_META[a].danger}
+                    icon={ACTION_META[a].icon}
+                    loading={actionBusy === `${d.row.id}:${a}`}
+                    disabled={blocked !== null}
+                    title={blocked ?? title}
+                    aria-label={title}
+                    onClick={() => void runAction(d.row, a)}
+                  >
+                    {/* Icon-only on the wide table (label in the tooltip); the
+                        caption returns on the narrow stacked card. */}
+                    <span className="dg-action-label">{label}</span>
+                  </Button>
+                );
+              })}
+            {/* Destructive actions (delete, kill) live behind "⋯", not as a
+                red icon on every row; runAction still confirms each one. */}
+            {availableActions(d.row).some((a) => MENU_ACTIONS.includes(a)) && (
+              <Dropdown
+                trigger={['click']}
+                menu={{
+                  items: availableActions(d.row)
+                    .filter((a) => MENU_ACTIONS.includes(a))
+                    .map((a) => ({
+                      key: a,
+                      danger: true,
+                      icon: ACTION_META[a].icon,
+                      label: `${ACTION_META[a].label}…`,
+                    })),
+                  onClick: ({ key, domEvent }) => {
+                    domEvent.stopPropagation();
+                    void runAction(d.row, key as JobAction);
+                  },
+                }}
+              >
                 <Button
-                  key={a}
                   size="small"
                   type="text"
-                  danger={ACTION_META[a].danger}
-                  icon={ACTION_META[a].icon}
-                  loading={actionBusy === `${d.row.id}:${a}`}
-                  disabled={blocked !== null}
-                  title={blocked ?? title}
-                  aria-label={title}
-                  onClick={() => void runAction(d.row, a)}
-                >
-                  {/* Icon-only on the wide table (label in the tooltip); the
-                      caption returns on the narrow stacked card. */}
-                  <span className="dg-action-label">{label}</span>
-                </Button>
-              );
-            })}
+                  icon={<EllipsisOutlined />}
+                  loading={MENU_ACTIONS.some((a) => actionBusy === `${d.row.id}:${a}`)}
+                  title="More actions"
+                  aria-label={`More actions for ${d.row.name}`}
+                />
+              </Dropdown>
+            )}
           </Space>
         ),
     },

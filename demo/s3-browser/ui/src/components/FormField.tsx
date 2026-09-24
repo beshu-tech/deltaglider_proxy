@@ -36,6 +36,8 @@
 import type { CSSProperties, ReactNode } from 'react';
 import { Tag } from 'antd';
 import { useColors } from '../ThemeContext';
+import { useEnvOverride } from '../queries/config';
+import { envOverrideText } from '../envOverrides';
 
 interface FormFieldProps {
   /**
@@ -67,6 +69,11 @@ interface FormFieldProps {
    * Rendered inline with the label.
    */
   ownerBadge?: string;
+  /**
+   * For a setting that exists ONLY as an environment variable (no YAML key):
+   * its name. The field then always renders read-only with an env badge.
+   */
+  envVar?: string;
   /** Override indicator bar colour; defaults to amber. */
   overrideColour?: string;
   /** The input element itself. */
@@ -84,11 +91,21 @@ export default function FormField({
   onExampleClick,
   overrideActive = false,
   ownerBadge,
+  envVar,
   overrideColour,
   children,
   style,
 }: FormFieldProps) {
   const { TEXT_PRIMARY: TEXT, TEXT_MUTED, TEXT_FAINT, BG_CARD, BORDER, ACCENT_AMBER } = useColors();
+  // THE env rule: a field that a `DGP_*` variable controls shows the
+  // effective value read-only with a "from env" badge, never an empty or
+  // editable-looking input (an edit would be overridden again at restart).
+  const envOverride = useEnvOverride(yamlPath, envVar);
+  const envBadge = envOverride
+    ? `from env ${envOverride.env}`
+    : envVar
+      ? `set with env ${envVar}`
+      : undefined;
   const barColour = overrideColour || ACCENT_AMBER; // amber — matches §2.6 "override" indicator
   // Tight groups, air between: the label→input→help unit hugs together; the
   // BIG gap lives at the bottom of the group so each field reads as one chunk.
@@ -149,7 +166,7 @@ export default function FormField({
             {yamlPath}
           </code>
         )}
-        {ownerBadge && (
+        {(envBadge ?? ownerBadge) && (
           <Tag
             style={{
               fontSize: 10,
@@ -161,15 +178,40 @@ export default function FormField({
               background: BG_CARD,
             }}
           >
-            {ownerBadge}
+            {envBadge ?? ownerBadge}
           </Tag>
         )}
       </div>
-      {/* Input — hugs the label above it */}
-      <div>{children}</div>
+      {/* Input — hugs the label above it. An env-controlled field shows its
+          effective value instead of the editor. */}
+      {envOverride ? (
+        <div
+          data-testid="env-override-value"
+          style={{
+            fontFamily: 'var(--font-mono)',
+            fontSize: 13,
+            color: envOverride.secret ? TEXT_MUTED : TEXT,
+            background: BG_CARD,
+            border: `1px dashed ${BORDER}`,
+            borderRadius: 6,
+            padding: '5px 11px',
+            wordBreak: 'break-all',
+          }}
+        >
+          {envOverrideText(envOverride)}
+        </div>
+      ) : (
+        <div>{children}</div>
+      )}
       {/* Help text — clearly subordinate: smaller, fainter, tight line-height.
           Example chips share this row. */}
-      {(helpText || defaultPlaceholder || (examples && examples.length > 0)) && (
+      {envOverride && (
+        <div style={{ marginTop: 6, fontSize: 12.5, color: TEXT_MUTED, lineHeight: 1.4 }}>
+          The <code>{envOverride.env}</code> environment variable sets this value. Change it
+          there and restart the proxy.
+        </div>
+      )}
+      {(helpText || (!envOverride && (defaultPlaceholder || (examples && examples.length > 0)))) && (
         <div
           style={{
             marginTop: 6,
@@ -183,7 +225,7 @@ export default function FormField({
           }}
         >
           {helpText && <span>{helpText}</span>}
-          {defaultPlaceholder && (
+          {!envOverride && defaultPlaceholder && (
             <span
               style={{
                 fontFamily: 'var(--font-mono)',
@@ -195,7 +237,7 @@ export default function FormField({
               default: {defaultPlaceholder}
             </span>
           )}
-          {examples && examples.length > 0 && (
+          {!envOverride && examples && examples.length > 0 && (
             <span style={{ display: 'inline-flex', gap: 4, flexWrap: 'wrap' }}>
               {examples.map((ex) => (
                 <button

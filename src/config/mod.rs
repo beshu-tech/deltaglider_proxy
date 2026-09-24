@@ -4,6 +4,7 @@
 
 pub mod advisories;
 mod env;
+pub mod env_overrides;
 mod expansion;
 
 pub use env::*;

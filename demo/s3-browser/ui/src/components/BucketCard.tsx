@@ -22,8 +22,8 @@
  */
 import { useState } from 'react';
 import { CAPABILITY_DOC_URL, docsUrlToInAppHref } from '../linkifyDocUrl';
-import { Button, Collapse, Input, InputNumber, Modal, Progress, Radio, Select, Typography } from 'antd';
-import { DownOutlined, RightOutlined, SyncOutlined } from '@ant-design/icons';
+import { Button, Collapse, Dropdown, Input, InputNumber, Modal, Progress, Radio, Select, Typography } from 'antd';
+import { DownOutlined, EllipsisOutlined, RightOutlined, SyncOutlined } from '@ant-design/icons';
 import type { BackendInfo } from '../adminApi';
 import { resolveBackendFor, describeEncryption } from '../encryptionUi';
 import { useColors } from '../ThemeContext';
@@ -231,7 +231,8 @@ export default function BucketCard({
   );
   if (eff.quota_bytes != null) {
     chips.push(
-      <Chip key="quota" tone={colors.ACCENT_AMBER} title="Storage quota">
+      // A quota is a normal setting, not a problem: neutral, not amber.
+      <Chip key="quota" tone={colors.TEXT_MUTED} title="Storage quota">
         ≤ {formatBytes(eff.quota_bytes)}
       </Chip>
     );
@@ -599,7 +600,7 @@ export default function BucketCard({
                       />
                     </div>
                     <div style={formRow(8, { flexWrap: 'wrap' })}>
-                      <Text style={{ fontSize: 12, color: eff.quota_bytes != null ? colors.ACCENT_AMBER : colors.TEXT_MUTED, width: 150 }}>
+                      <Text style={{ fontSize: 12, color: colors.TEXT_MUTED, width: 150 }}>
                         Quota
                       </Text>
                       <InputNumber
@@ -634,27 +635,51 @@ export default function BucketCard({
                   Re-encrypt existing objects
                 </Button>
               )}
-              {hasOverrides && (
-                <Button
-                  size="small"
-                  type="text"
-                  danger
-                  style={{ fontSize: 11, padding: '0 4px' }}
-                  onClick={() => onPatch({ ...DEFAULT_ROW_FIELDS })}
+              {/* Destructive actions sit behind a "⋯" menu, never as red
+                  buttons on the row, and each one is confirmed. */}
+              {(hasOverrides || onRemoveDraft) && (
+                <Dropdown
+                  trigger={['click']}
+                  menu={{
+                    items: [
+                      ...(hasOverrides
+                        ? [{ key: 'reset', danger: true, label: 'Reset to defaults…' }]
+                        : []),
+                      ...(onRemoveDraft
+                        ? [{ key: 'remove', danger: true, label: 'Remove these settings…' }]
+                        : []),
+                    ],
+                    onClick: ({ key }) => {
+                      if (key === 'reset') {
+                        Modal.confirm({
+                          title: `Reset ${name || 'this bucket'} to defaults?`,
+                          content:
+                            'Public access, routing, quota, and compression go back to the defaults. Nothing changes until you review and apply.',
+                          okText: 'Reset',
+                          okButtonProps: { danger: true },
+                          onOk: () => onPatch({ ...DEFAULT_ROW_FIELDS }),
+                        });
+                      } else if (key === 'remove' && onRemoveDraft) {
+                        Modal.confirm({
+                          title: 'Remove these settings?',
+                          content: 'The settings for this bucket name are removed when you review and apply.',
+                          okText: 'Remove',
+                          okButtonProps: { danger: true },
+                          onOk: onRemoveDraft,
+                        });
+                      }
+                    },
+                  }}
                 >
-                  Reset to defaults
-                </Button>
-              )}
-              {onRemoveDraft && (
-                <Button
-                  size="small"
-                  type="text"
-                  danger
-                  style={{ fontSize: 11, padding: '0 4px' }}
-                  onClick={onRemoveDraft}
-                >
-                  Remove draft
-                </Button>
+                  <Button
+                    size="small"
+                    type="text"
+                    icon={<EllipsisOutlined />}
+                    aria-label="More bucket actions"
+                    title="More actions"
+                    style={{ marginLeft: 'auto' }}
+                  />
+                </Dropdown>
               )}
             </div>
           )}

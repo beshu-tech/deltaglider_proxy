@@ -411,7 +411,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                   {b.is_synthesized && (
                     <span
                       style={{ fontSize: 10, color: colors.ACCENT_AMBER, marginLeft: 8, fontWeight: 600 }}
-                      title="Virtual projection of the legacy singleton `storage.backend` in YAML. Not a real named backend; cannot be deleted. Add a named backend to migrate."
+                      title="This entry stands for the single backend defined under storage.backend in YAML. It is not a named backend, so you cannot delete it. Add a named backend to migrate."
                     >
                       LEGACY SINGLETON
                     </span>
@@ -466,7 +466,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                   message={b.health.status === 'erroring' ? 'Backend degraded' : 'Backend unavailable'}
                   description={
                     b.health.status === 'erroring'
-                      ? `${healthLabel(b.health)}. Requests are NOT blocked — the backend is reachable but failing some calls. Re-probed every 30s.`
+                      ? `${healthLabel(b.health)}. Requests are NOT blocked — the backend is reachable but fails some requests. Re-probed every 30s.`
                       : `${healthLabel(b.health)}. Buckets routed to this backend answer 503 until it recovers — re-probed every 30s, or use 'Test connection' after fixing it.`
                   }
                   style={{ marginTop: 8, borderRadius: 6 }}

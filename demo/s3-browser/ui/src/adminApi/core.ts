@@ -1,5 +1,6 @@
 // Admin API client core: shared fetch glue + cross-cutting types.
 import { ApiError, isSessionExpired, normalizeUiError, throwApiError } from '../errorHandling';
+import type { EnvOverride } from '../envOverrides';
 import { BASE as APP_BASE } from '../urlState';
 
 /** API path prefix: the SPA base without its trailing slash (`/_`). One
@@ -162,6 +163,8 @@ export interface AdminConfig {
   iam_mode: IamMode;
   // Taint detection
   tainted_fields: string[];
+  /** Fields a `DGP_*` environment variable controls (secrets carry no value). */
+  env_overrides?: EnvOverride[];
 }
 
 export type IamMode = 'gui' | 'declarative';

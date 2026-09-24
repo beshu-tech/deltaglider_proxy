@@ -455,10 +455,10 @@ function VerifyExplainer() {
         the ratio of each prefix's typical delta to its reference baseline.
         It flags wrong-baseline cases reliably but
         {' '}<b>can't tell you whether DG is actually saving bytes versus storing
-        originals as-is</b>, because that needs per-file HEAD calls the bulk
+        originals as-is</b>, because that needs per-file HEAD requests the bulk
         scan deliberately skips.
         <br />
-        Click <b>▶ Verify</b> on any row to fire those HEAD calls just for
+        Click <b>▶ Verify</b> on any row to send those HEAD requests just for
         that prefix (~1 second for a few hundred files). You'll get the true
         savings number — positive (DG is helping) or negative (you'd be
         better off without DG on this prefix).
@@ -864,7 +864,7 @@ function RatioRow({
           hint={
             verified
               ? 'Re-verify (re-fetch originals)'
-              : `Verify true savings (fires ${r.deltas.toLocaleString()} HEAD calls — should land in ~1s)`
+              : `Verify true savings (sends ${r.deltas.toLocaleString()} HEAD requests — takes about 1s)`
           }
         >
           <Button
@@ -984,7 +984,7 @@ function VerifiedStoredVsOriginal({ verified }: { verified: VerifyDeltaEfficienc
       hint={
         <>
           <div>
-            <b>Verified from {verified.deltas.toLocaleString()} HEAD calls.</b>
+            <b>Verified from {verified.deltas.toLocaleString()} HEAD requests.</b>
           </div>
           <div style={{ marginTop: 4 }}>
             Originals total: <b>{formatBytes(verified.total_original_bytes)}</b>

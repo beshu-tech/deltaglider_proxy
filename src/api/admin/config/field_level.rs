@@ -84,6 +84,10 @@ pub struct ConfigResponse {
     iam_mode: crate::config_sections::IamMode,
     // Fields that differ from the config file on disk
     tainted_fields: Vec<String>,
+    // Fields whose value a `DGP_*` environment variable currently controls
+    // (secrets carry no value). The GUI shows them read-only with a
+    // "from env" badge instead of an empty, editable-looking input.
+    env_overrides: Vec<crate::config::env_overrides::EnvOverride>,
 }
 
 /// Per-backend encryption status summary. Exposed in
@@ -555,6 +559,7 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         // UI can drive the `iam_mode: declarative` banner + toggle.
         iam_mode: cfg.iam_mode,
         tainted_fields,
+        env_overrides: crate::config::env_overrides::process_env_overrides(),
         // Encryption status is now per-backend. Each `BackendInfoResponse`
         // in `backends` carries an `encryption: BackendEncryptionSummary`
         // non-secret summary. The former top-level `encryption_enabled`

@@ -52,7 +52,7 @@ deltaglider_proxy admission trace --method PUT --path /downloads/public/installe
 
 Expect a `deny` decision naming `deny-anonymous-writes-downloads`. Re-run with `--authenticated`: the block no longer matches (its `authenticated: false` predicate fails), and the request falls through to SigV4 authentication.
 
-The same tool lives in the UI at **Settings → Observability → Rule tester** — it renders the decision path, the matched block, and ready-made example requests, with a Copy-as-JSON button:
+The same tool lives in the UI at **Settings → Observability → Request rule tester** — it renders the decision path, the matched block, and ready-made example requests, with a Copy-as-JSON button:
 
 ![Request trace diagnostics](/_/screenshots/request-trace.jpg)
 

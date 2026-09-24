@@ -75,7 +75,10 @@
     "test:log-level-radio": "node scripts/log-level-radio-regression-test.mjs",
     "e2e": "playwright test",
     "typecheck": "tsc --noEmit",
-    "knip": "knip"
+    "knip": "knip",
+    "test:env-overrides": "node scripts/env-overrides-regression-test.mjs",
+    "test:source-ip-field": "node scripts/source-ip-field-regression-test.mjs",
+    "test:ui-copy": "node scripts/ui-copy-regression-test.mjs"
   },
   "dependencies": {
     "@ant-design/icons": "^6.1.0",
