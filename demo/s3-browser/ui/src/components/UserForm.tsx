@@ -8,6 +8,7 @@ import { useGroups } from '../queries/groups';
 import { setCredentials, getCredentials } from '../s3client';
 import { useCardStyles } from './shared-styles';
 import FormLabel from './FormLabel';
+import MaskedSecretInput from './MaskedSecretInput';
 import { useColors } from '../ThemeContext';
 import PermissionEditor from './PermissionEditor';
 import PermissionSummarySection from './PermissionSummarySection';
@@ -249,13 +250,14 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
 
       {!readOnly && (
         <div style={{ marginBottom: 16 }}>
-          <FormLabel text="Secret Access Key" hint={isEdit ? '(leave empty to keep current)' : '(auto-generated if empty)'} />
+          <FormLabel text="Secret Access Key" hint={isEdit ? undefined : '(auto-generated if empty)'} />
           <Space.Compact style={{ width: '100%' }}>
-            <Input.Password
+            <MaskedSecretInput
+              mode={isEdit ? 'blank-keeps' : 'new'}
               value={secretKey}
-              onChange={e => setSecretKey(e.target.value)}
-              placeholder={isEdit ? 'Enter new secret or leave empty' : 'e.g. mysecretkey or leave empty'}
-              style={{ ...inputRadius, fontFamily: 'var(--font-mono)' }}
+              onChange={setSecretKey}
+              placeholder={isEdit ? undefined : 'e.g. mysecretkey or leave empty'}
+              style={{ ...inputRadius }}
             />
             <Button icon={<ThunderboltOutlined />} onClick={() => setSecretKey(generateSecret())} title="Generate random secret" />
           </Space.Compact>

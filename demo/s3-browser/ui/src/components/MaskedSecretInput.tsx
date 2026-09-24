@@ -24,6 +24,14 @@
  *   "keep the existing secret", a non-blank input rotates it. The field shows
  *   `value` verbatim with a "(leave blank to keep existing)" placeholder.
  *
+ * - **`mode="new"`** — a create form: there is no existing secret to keep, so
+ *   a blank input never means "keep". The consumer decides what blank means
+ *   (rejected, or auto-generated) and says so with its own placeholder.
+ *
+ * `autoComplete` defaults to `"new-password"` in every mode, so a browser
+ * password manager does not fill a saved login password into a credential
+ * field (and then save or rotate it). Callers can override it.
+ *
  * Styling comes from `useColors()` tokens — no hardcoded hex — and the usual
  * mono font / radius pass-throughs the call sites already used.
  */
@@ -69,14 +77,22 @@ interface BlankKeepsProps extends BaseProps {
   masked?: never;
 }
 
-type MaskedSecretInputProps = SentinelProps | BlankKeepsProps;
+interface NewSecretProps extends BaseProps {
+  mode: 'new';
+  /** Shown verbatim; no existing secret stands behind a blank value. */
+  value: string;
+  masked?: never;
+}
+
+type MaskedSecretInputProps = SentinelProps | BlankKeepsProps | NewSecretProps;
 
 const SENTINEL_PLACEHOLDER = '•••••••• (unchanged — type to replace)';
 const BLANK_KEEPS_PLACEHOLDER = '(leave blank to keep existing)';
+const NEW_PLACEHOLDER = 'Secret';
 
 export default function MaskedSecretInput(props: MaskedSecretInputProps) {
   const colors = useColors();
-  const { onChange, placeholder, size, style, autoComplete, reveal } = props;
+  const { onChange, placeholder, size, style, autoComplete = 'new-password', reveal } = props;
 
   // In sentinel mode a masked field renders EMPTY (never the sentinel, never a
   // real token); once the operator types it unmasks and shows the live value.
@@ -88,7 +104,9 @@ export default function MaskedSecretInput(props: MaskedSecretInputProps) {
       ? props.masked
         ? SENTINEL_PLACEHOLDER
         : 'Bearer …'
-      : BLANK_KEEPS_PLACEHOLDER);
+      : props.mode === 'new'
+        ? NEW_PLACEHOLDER
+        : BLANK_KEEPS_PLACEHOLDER);
 
   const Field = reveal ? Input : Input.Password;
 

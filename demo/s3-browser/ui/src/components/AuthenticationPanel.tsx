@@ -15,6 +15,7 @@ import { useFormLabelStyle, contentColumn, CONTENT_FORM } from './shared-styles'
 import SectionHeader from './SectionHeader';
 import IamSourceBanner from './IamSourceBanner';
 import MappingRuleRow from './MappingRuleRow';
+import MaskedSecretInput from './MaskedSecretInput';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { normalizeUiError } from '../errorHandling';
@@ -532,10 +533,11 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
       {!readOnly && (
         <>
           <div style={label}>Client Secret</div>
-          <Input.Password
+          <MaskedSecretInput
+            mode={isEdit ? 'blank-keeps' : 'new'}
             value={formClientSecret}
-            onChange={e => setFormClientSecret(e.target.value)}
-            placeholder={isEdit ? '(leave blank to keep existing)' : 'Client secret'}
+            onChange={setFormClientSecret}
+            placeholder={isEdit ? undefined : 'Client secret'}
             style={{ marginBottom: 12 }}
           />
         </>

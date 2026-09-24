@@ -572,8 +572,9 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                     <Input value={formAccessKey} onChange={(e) => setFormAccessKey(e.target.value)} placeholder="AKIAIOSFODNN7EXAMPLE" style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }} />
                   </FormField>
                   <FormField label="Secret Access Key" yamlPath="storage.backends[].secret_access_key">
+                    {/* Create-only form: no existing secret to keep, and blank is rejected. */}
                     <MaskedSecretInput
-                      mode="blank-keeps"
+                      mode="new"
                       value={formSecretKey}
                       onChange={setFormSecretKey}
                       placeholder="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLE"
