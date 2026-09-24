@@ -23,12 +23,11 @@
  *      `ApplyDialog`, on confirm call `putSection`.
  *   4. Discard: revert the dirty state to the last-applied snapshot.
  */
-import { useRef, useState } from 'react';
-import { Button, Typography, Modal } from 'antd';
+import { useState } from 'react';
+import { Button, Typography } from 'antd';
 import {
   PlusOutlined,
   InfoCircleOutlined,
-  ExclamationCircleOutlined,
 } from '@ant-design/icons';
 import type { AdmissionBlock } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
@@ -130,34 +129,11 @@ export default function AdmissionPanel({
     closeEditor();
   };
 
-  // Dedupe Modal.confirm: a rapid double-click on Delete must NOT
-  // queue two stacked modals — both would call `setBlocks` in order
-  // and, with index-based splices, drop the wrong block. Keying the
-  // removal by name makes it idempotent (a second confirm filtering an
-  // already-gone name is a no-op), but we still guard with a ref so the
-  // operator never sees two stacked confirms.
-  const deleteInFlightRef = useRef(false);
+  // The row's "⋯" menu confirms before this runs. Removal is keyed by name,
+  // so it can never drop the wrong rule after a reorder.
   const handleDelete = (i: number) => {
-    if (deleteInFlightRef.current) return;
-    const block = blocks[i];
-    if (!block) return;
-    deleteInFlightRef.current = true;
-    const name = block.name;
-    Modal.confirm({
-      title: `Remove rule "${name}"?`,
-      icon: <ExclamationCircleOutlined />,
-      content:
-        'The rule is removed from this page only. Nothing changes until you review and apply.',
-      okText: 'Remove',
-      okButtonProps: { danger: true },
-      cancelText: 'Cancel',
-      onOk: () => {
-        setBlocks(blocks.filter((b) => b.name !== name));
-      },
-      afterClose: () => {
-        deleteInFlightRef.current = false;
-      },
-    });
+    const name = blocks[i]?.name;
+    if (name !== undefined) setBlocks(blocks.filter((b) => b.name !== name));
   };
 
   const otherNames = blocks
