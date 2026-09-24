@@ -132,7 +132,7 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
           ) : (
             <>
               <Breadcrumb bucket={bucket} prefix={prefix} onNavigate={onNavigate} canAdmin={canAdmin} />
-              {bucket && <BucketUsageChip bucket={bucket} canAdmin={canAdmin} />}
+              {bucket && <BucketUsageChip bucket={bucket} canAdmin={canAdmin} inFolder={!!prefix} />}
               <DeltaSavingsChip summary={deltaSummary} />
             </>
           )

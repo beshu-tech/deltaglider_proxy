@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { message } from 'antd';
+import { useQueryClient } from '@tanstack/react-query';
+import { qk } from './queries/keys';
 import { listObjects, getBucket, setBucket, headObject, hasCredentials } from './s3client';
 import { buildBrowserUrl } from './urlState';
 import {
@@ -136,6 +138,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   // guard, which silently dropped concurrent loads (e.g. fast prefix/bucket
   // changes), letting the older request commit stale data into state.
   const loadSeq = useRef(0);
+  const queryClient = useQueryClient();
 
   const load = useCallback(() => {
     if (!hasCredentials()) {
@@ -181,6 +184,10 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
         setConnected(true);
         setError(null);
         reconcile(objs, mergedFolders);
+        // Every browser mutation (upload, delete, copy/move, new folder) ends
+        // in a reload, so this is the one place the TopBar size/count pill
+        // learns the bucket changed — it has no other trigger to refetch.
+        void queryClient.invalidateQueries({ queryKey: qk.bucketUsage(listBucket) });
       })
       .catch((err) => {
         if (seq !== loadSeq.current) return; // stale error — drop silently
@@ -195,7 +202,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
         setLoading(false);
         setRefreshing(false);
       });
-  }, [bucket, prefix, reconcile, writablePrefixes]);
+  }, [bucket, prefix, reconcile, writablePrefixes, queryClient]);
 
   useEffect(load, [load, refreshTrigger]);
 
