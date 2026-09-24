@@ -22,7 +22,7 @@ export default function RecoveryPanel({ onExportBackup, onImportBackup }: Recove
         {/* The zip is not encrypted: secrets.json and iam.json carry every
             access key, user secret and backend credential in plain text. */}
         <Text type="secondary">
-          The file holds every access key and backend credential in plain text. Store it like a password.
+          The file holds the access keys, user secrets and backend credentials in plain text. Store it like a password. Secrets that come from environment variables are not in the file.
         </Text>
         <Space wrap>
           <Button type="primary" icon={<DownloadOutlined />} onClick={onExportBackup}>
