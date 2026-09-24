@@ -165,6 +165,10 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
         const noActions = effectiveActions(row.actions).size === 0;
         const noResource = row.resources.every((r) => r.trim() === '');
         const isIncomplete = noActions || noResource;
+        // A brand-new, untouched row is not an error yet: amber warnings on a
+        // form nobody has filled in read as "you already did something
+        // wrong". Show neutral guidance until one half is filled in.
+        const pristine = noActions && noResource;
 
         return (
           <div key={id} style={{
@@ -311,11 +315,13 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                   />
                   <div style={{
                     fontSize: 11,
-                    color: row.actions.length === 0 ? colors.ACCENT_AMBER : colors.TEXT_MUTED,
+                    color: row.actions.length === 0 && !pristine ? colors.ACCENT_AMBER : colors.TEXT_MUTED,
                     marginTop: 6,
                     lineHeight: 1.45,
                   }}>
-                    {grantSummary(row.actions)}
+                    {pristine
+                      ? 'Choose a bucket and what this rule allows. An empty rule is ignored when you save.'
+                      : grantSummary(row.actions)}
                   </div>
                   {row.actions.includes('*') && (
                     <Alert
@@ -390,7 +396,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
               </div>
             )}
 
-            {isIncomplete && (
+            {isIncomplete && !pristine && (
               <div style={{
                 marginTop: 10,
                 fontSize: 11,
