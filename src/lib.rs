@@ -60,6 +60,47 @@ mod source_guards {
         }
     }
 
+    /// Every object HEAD the server sends is counted in
+    /// `deltaglider_backend_head_requests_total`, so the counter can prove
+    /// that a path (a client LIST, the folder-size scan) sends none. The CLI
+    /// runs in its own process and has no metrics endpoint.
+    #[test]
+    fn every_server_head_request_is_counted() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_files(&root.join("src"), &mut files);
+        let mut offenders = Vec::new();
+        for file in files {
+            let rel = file
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.starts_with("src/cli/") || rel == "src/lib.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (n, line) in lines.iter().enumerate() {
+                if !line.contains(".head_object()") || line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let window = &lines[n.saturating_sub(8)..n];
+                if !window
+                    .iter()
+                    .any(|l| l.contains("BACKEND_HEAD_REQUESTS.inc()"))
+                {
+                    offenders.push(format!("{rel}:{}", n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "increment BACKEND_HEAD_REQUESTS right before each head_object():\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// Errors are classified on their type, status, or code, never on their
     /// Display text. `SdkError`'s Display is only "service error" (so a 404
     /// check on it never matches), and a typed engine error's text drifts

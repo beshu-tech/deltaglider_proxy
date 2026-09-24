@@ -1,9 +1,10 @@
 /**
  * Folder-size wording. A folder-size scan never sends a request per object,
  * so it can miss the original size of some objects (a delta or an encrypted
- * object that this proxy has not read or written since it started) and then
- * counts their smaller stored size. It can also stop at its object limit.
- * In both cases the total is a lower bound, and the UI must say so.
+ * object that this proxy has not read or written since it started). Those
+ * count their stored size instead: smaller for a delta, slightly larger for
+ * an encrypted object, so the total is approximate. A scan can also stop at
+ * its object limit, and then the total is a lower bound. The UI must say so.
  */
 
 interface ScanFlags {
@@ -11,23 +12,38 @@ interface ScanFlags {
   sizes_estimated?: boolean;
 }
 
-/** True when the size shown for a folder is only a lower bound. */
-export function folderSizeIsLowerBound(entry: ScanFlags, child?: { sizes_estimated?: boolean }): boolean {
-  if (entry.truncated) return true;
-  return child ? Boolean(child.sizes_estimated) : Boolean(entry.sizes_estimated);
+/** How exact a folder size is. */
+export type FolderSizeBound = 'exact' | 'atLeast' | 'about';
+
+/**
+ * `about` wins over `atLeast`: an approximate total (which can be too large
+ * on an encrypted backend) is not a proven lower bound, even when the scan
+ * was also truncated.
+ */
+export function folderSizeBound(entry: ScanFlags, child?: { sizes_estimated?: boolean }): FolderSizeBound {
+  const estimated = child ? Boolean(child.sizes_estimated) : Boolean(entry.sizes_estimated);
+  if (estimated) return 'about';
+  return entry.truncated ? 'atLeast' : 'exact';
 }
 
-/** Cell text: `≥ 12 MB` for a lower bound, else the size. */
-export function folderSizeText(formattedSize: string, lowerBound: boolean): string {
-  return lowerBound ? `≥ ${formattedSize}` : formattedSize;
+/** Cell text: `≈ 12 MB`, `≥ 12 MB`, or the size. */
+export function folderSizeText(formattedSize: string, bound: FolderSizeBound = 'exact'): string {
+  if (bound === 'about') return `≈ ${formattedSize}`;
+  if (bound === 'atLeast') return `≥ ${formattedSize}`;
+  return formattedSize;
 }
 
 /** Hover text for a computed folder size. */
-export function folderSizeTitle(files: number, lowerBound: boolean): string {
+export function folderSizeTitle(files: number, bound: FolderSizeBound = 'exact'): string {
   const count = `${files.toLocaleString()} ${files === 1 ? 'file' : 'files'}`;
-  if (!lowerBound) return `${count}. Original size of the files.`;
-  return (
-    `${count}. At least this size: the original size of some files is not known yet, ` +
-    'so they count their smaller stored size. Open or download a file to learn its size.'
-  );
+  if (bound === 'about') {
+    return (
+      `${count}. About this size: the original size of some files is not known yet, ` +
+      'so they count their stored size, which can be smaller or larger. Open or download a file to learn its size.'
+    );
+  }
+  if (bound === 'atLeast') {
+    return `${count} counted. At least this size: the folder has more files than one scan counts.`;
+  }
+  return `${count}. Original size of the files.`;
 }

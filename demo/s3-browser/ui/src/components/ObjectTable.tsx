@@ -126,10 +126,10 @@ function FolderSizeCell({
   if (sizeState?.progress?.done) {
     return (
       <span
-        title={folderSizeTitle(sizeState.progress.totalFiles, Boolean(sizeState.progress.lowerBound))}
+        title={folderSizeTitle(sizeState.progress.totalFiles, sizeState.progress.bound)}
         style={{ ...MONO_CELL_STYLE, color: TEXT_SECONDARY, cursor: 'default' }}
       >
-        {folderSizeText(formatBytes(sizeState.progress.totalSize), Boolean(sizeState.progress.lowerBound))}
+        {folderSizeText(formatBytes(sizeState.progress.totalSize), sizeState.progress.bound)}
       </span>
     );
   }

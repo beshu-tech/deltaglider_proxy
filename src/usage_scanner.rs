@@ -83,8 +83,9 @@ pub struct UsageEntry {
     /// True when the original size of some objects is not known to this
     /// proxy (a delta, or an encrypted object, that no request through this
     /// proxy has read or written since it started), so those objects count
-    /// their stored size, which is smaller. `total_size` is then a lower
-    /// bound. The scan never sends a metadata request per object to find out.
+    /// their stored size instead: smaller for a delta, slightly larger for an
+    /// encrypted object. `total_size` is then approximate. The scan never
+    /// sends a metadata request per object to find out.
     #[serde(default)]
     pub sizes_estimated: bool,
 }
@@ -123,6 +124,9 @@ fn child_prefix_of(prefix: &str, key: &str) -> Option<String> {
 /// Fold listed objects and delta baselines into logical + stored totals,
 /// grouped by immediate child prefix. Pure; unit-tested.
 ///
+/// * `stored[i]` is the stored size of `objects[i]` as LISTED, taken before
+///   the listing-size cache replaced `file_size` with the logical size (for
+///   an encrypted object `stored_size()` would then report the plaintext).
 /// * `sizes[i]` says whether the logical size of `objects[i]` is known. An
 ///   object whose size is not known counts its stored size for both totals
 ///   and sets `sizes_estimated` (on the total and on its child).
@@ -135,6 +139,7 @@ fn child_prefix_of(prefix: &str, key: &str) -> Option<String> {
 pub(crate) fn aggregate_usage(
     prefix: &str,
     objects: &[(String, crate::types::FileMetadata)],
+    stored: &[u64],
     sizes: &[ListedSize],
     baselines: &[(String, u64)],
 ) -> UsageTotals {
@@ -143,7 +148,7 @@ pub(crate) fn aggregate_usage(
         if !key.starts_with(prefix) {
             continue;
         }
-        let stored = meta.stored_size();
+        let stored = stored.get(i).copied().unwrap_or_else(|| meta.stored_size());
         // A missing entry (callers pass one per object) is treated as unknown.
         let known = sizes.get(i).is_some_and(|s| s.is_known());
         let logical = if known { meta.file_size } else { stored };
@@ -402,12 +407,14 @@ impl UsageScanner {
             );
             objects.truncate(MAX_SCAN_OBJECTS);
         }
+        // Stored sizes as listed, before the cache swaps in logical sizes.
+        let stored: Vec<u64> = objects.iter().map(|(_, m)| m.stored_size()).collect();
         let sizes = engine
             .storage()
             .resolve_listed_sizes(bucket, &mut objects)
             .await;
 
-        let totals = aggregate_usage(prefix, &objects, &sizes, &listing.baselines);
+        let totals = aggregate_usage(prefix, &objects, &stored, &sizes, &listing.baselines);
         Ok(UsageEntry {
             prefix: prefix.to_string(),
             bucket: bucket.to_string(),
@@ -532,6 +539,23 @@ mod tests {
             .collect()
     }
 
+    fn listed(objects: &[(String, FileMetadata)]) -> Vec<u64> {
+        objects.iter().map(|(_, m)| m.stored_size()).collect()
+    }
+
+    /// Round-2 review: on a cache hit an encrypted object's `file_size`
+    /// becomes the plaintext, so `stored_size()` would count plaintext as
+    /// stored bytes. The listed (ciphertext) size is used instead.
+    #[test]
+    fn stored_bytes_are_the_listed_ones_even_after_a_cache_hit() {
+        let mut enc = plain("e/a.bin", 1_000);
+        enc.1.file_size = 972; // plaintext, set by the listing-size cache
+        let t = aggregate_usage("", &[enc], &[1_000], &[ListedSize::Cached], &[]);
+        assert_eq!(t.total_size, 972);
+        assert_eq!(t.stored_size, 1_000);
+        assert!(!t.sizes_estimated);
+    }
+
     fn child(size: u64, stored_size: u64, objects: u64, sizes_estimated: bool) -> ChildUsage {
         ChildUsage {
             size,
@@ -553,7 +577,7 @@ mod tests {
         ];
         let sizes = known(&objects);
         let refs = vec![("firmware/v1/reference.bin".to_string(), 3_000_000)];
-        let t = aggregate_usage("", &objects, &sizes, &refs);
+        let t = aggregate_usage("", &objects, &listed(&objects), &sizes, &refs);
         assert_eq!(t.total_size, 3_000_000 + 3_100_000 + 36 + 10);
         assert_eq!(t.stored_size, 46 + 28_000 + 36 + 10 + 3_000_000);
         assert_eq!(t.total_objects, 4);
@@ -569,7 +593,7 @@ mod tests {
         );
         assert_eq!(t.children.len(), 1, "top-level file forms no child");
 
-        let t = aggregate_usage("firmware/", &objects, &sizes, &refs);
+        let t = aggregate_usage("firmware/", &objects, &listed(&objects), &sizes, &refs);
         assert_eq!(t.total_size, 3_000_000 + 3_100_000 + 36);
         assert_eq!(t.total_objects, 3);
         assert_eq!(
@@ -586,12 +610,12 @@ mod tests {
     fn baseline_of_the_scanned_folder_is_not_a_child() {
         let objects = vec![delta("fw/a.tar", 100, 5)];
         let refs = vec![("fw/reference.bin".to_string(), 100)];
-        let t = aggregate_usage("fw/", &objects, &known(&objects), &refs);
+        let t = aggregate_usage("fw/", &objects, &listed(&objects), &known(&objects), &refs);
         assert_eq!(t.stored_size, 105);
         assert!(t.children.is_empty(), "{:?}", t.children);
         let objects = vec![delta("a.tar", 100, 5)];
         let refs = vec![("reference.bin".to_string(), 100)];
-        let t = aggregate_usage("", &objects, &known(&objects), &refs);
+        let t = aggregate_usage("", &objects, &listed(&objects), &known(&objects), &refs);
         assert_eq!(t.stored_size, 105);
         assert!(t.children.is_empty());
     }
@@ -607,7 +631,7 @@ mod tests {
             ("fw2/reference.bin".to_string(), 200),
             ("other/reference.bin".to_string(), 999),
         ];
-        let t = aggregate_usage("fw", &objects, &known(&objects), &refs);
+        let t = aggregate_usage("fw", &objects, &listed(&objects), &known(&objects), &refs);
         assert_eq!(t.total_size, 300);
         assert_eq!(t.stored_size, 5 + 7 + 100 + 200);
     }
@@ -615,7 +639,7 @@ mod tests {
     #[test]
     fn unknown_sizes_count_stored_bytes_and_flag_the_estimate() {
         let objects = vec![stub("d/a.tar", 46), delta("e/b.tar", 1000, 9)];
-        let t = aggregate_usage("", &objects, &known(&objects), &[]);
+        let t = aggregate_usage("", &objects, &listed(&objects), &known(&objects), &[]);
         assert_eq!(t.total_size, 46 + 1000);
         assert!(t.sizes_estimated);
         assert!(t.children["d/"].sizes_estimated);
@@ -626,7 +650,7 @@ mod tests {
         // An object the cache resolved counts its logical size.
         let mut resolved = stub("d/a.tar", 46);
         resolved.1.file_size = 3_000;
-        let t = aggregate_usage("", &[resolved], &[ListedSize::Cached], &[]);
+        let t = aggregate_usage("", &[resolved], &[46], &[ListedSize::Cached], &[]);
         assert_eq!(t.total_size, 3_000);
         assert_eq!(t.stored_size, 46);
         assert!(!t.sizes_estimated);
@@ -635,7 +659,7 @@ mod tests {
     #[test]
     fn sizes_saturate_instead_of_wrapping() {
         let objects = vec![plain("a", u64::MAX), plain("b", 5)];
-        let t = aggregate_usage("", &objects, &known(&objects), &[]);
+        let t = aggregate_usage("", &objects, &listed(&objects), &known(&objects), &[]);
         assert_eq!(t.total_size, u64::MAX);
         assert_eq!(t.stored_size, u64::MAX);
     }

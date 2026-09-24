@@ -198,6 +198,7 @@ impl ConfigDbSync {
     /// Returns `None` when the local copy is already current.
     pub async fn download_if_newer(&self) -> Result<Option<DownloadedDb>, String> {
         // HEAD to get current ETag
+        crate::storage::BACKEND_HEAD_REQUESTS.inc();
         let head_result = self
             .s3_client
             .head_object()
