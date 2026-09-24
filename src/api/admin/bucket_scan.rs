@@ -528,7 +528,7 @@ async fn run_scan(
         .list_deltaspace_references(bucket, "", None)
         .await
         .map_err(|e| ScanFailure::Error(e.to_string()))?;
-    for meta in &refs.references {
+    for (_, meta) in &refs.references {
         totals.accumulate(meta);
     }
 

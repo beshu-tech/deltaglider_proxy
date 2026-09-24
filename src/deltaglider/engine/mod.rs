@@ -204,7 +204,10 @@ pub struct ListObjectsPage {
 /// "scope truncated" rather than implying the number is exact.
 #[derive(Debug, Clone, Default)]
 pub struct ReferenceScan {
-    pub references: Vec<FileMetadata>,
+    /// `(deltaspace prefix, reference metadata)`. The prefix has no trailing
+    /// slash (`""` is the bucket root), so callers can attribute each baseline
+    /// to the folder that holds it.
+    pub references: Vec<(String, FileMetadata)>,
     pub truncated: bool,
 }
 
@@ -1366,10 +1369,57 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// shape with empty `ref_sha256`. Its `file_size` is the STORED (delta)
     /// size, not the original, so it must never be cached as authoritative.
     fn is_unresolved_delta_stub(meta: &FileMetadata) -> bool {
-        matches!(
-            &meta.storage_info,
-            crate::types::StorageInfo::Delta { ref_sha256, .. } if ref_sha256.is_empty()
-        )
+        meta.is_unresolved_delta_stub()
+    }
+
+    /// Replace every unresolved delta stub in `objects` with its real metadata,
+    /// so the entry reports the ORIGINAL (logical) size and ETag instead of the
+    /// stored delta's.
+    ///
+    /// A lite LIST on the S3 backend knows only the `.delta` object's own size.
+    /// A client LIST that returns that size breaks transparency: a 3 MB
+    /// `firmware.tar` lists as `46 B` once its metadata-cache entry expires, and
+    /// a size-comparing sync tool re-copies it on every run. The metadata cache
+    /// resolves most entries for free; the rest cost one bounded HEAD each, and
+    /// the result is cached. Only true stubs are touched (the filesystem backend
+    /// and passthrough objects already carry the real size), so a listing
+    /// without S3 deltas does no extra I/O. When the backend throttles the
+    /// HEADs, the stub stays (best effort, never an error).
+    pub async fn resolve_listed_sizes(
+        &self,
+        bucket: &str,
+        objects: Vec<(String, FileMetadata)>,
+    ) -> Result<Vec<(String, FileMetadata)>, EngineError> {
+        if !objects
+            .iter()
+            .any(|(_, m)| Self::is_unresolved_delta_stub(m))
+        {
+            return Ok(objects);
+        }
+        let mut out: Vec<Option<(String, FileMetadata)>> = Vec::with_capacity(objects.len());
+        let mut misses: Vec<(String, FileMetadata)> = Vec::new();
+        let mut miss_slots: Vec<usize> = Vec::new();
+        for (key, meta) in objects {
+            if !Self::is_unresolved_delta_stub(&meta) {
+                out.push(Some((key, meta)));
+            } else if let Some(cached) = self.metadata_cache.get(bucket, &key) {
+                out.push(Some((key, cached)));
+            } else {
+                miss_slots.push(out.len());
+                out.push(None);
+                misses.push((key, meta));
+            }
+        }
+        if !misses.is_empty() {
+            let enriched = self.storage.enrich_list_metadata(bucket, misses).await?;
+            for (slot, (key, meta)) in miss_slots.into_iter().zip(enriched) {
+                if !Self::is_unresolved_delta_stub(&meta) {
+                    self.metadata_cache.insert(bucket, &key, meta.clone());
+                }
+                out[slot] = Some((key, meta));
+            }
+        }
+        Ok(out.into_iter().flatten().collect())
     }
 
     /// Drop the cached metadata for one key. Used by the metadata-backfill
@@ -1600,7 +1650,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 break;
             }
             match self.storage.get_reference_metadata(bucket, &prefix).await {
-                Ok(meta) => references.push(meta),
+                Ok(meta) => references.push((prefix.clone(), meta)),
                 Err(e) => {
                     tracing::warn!(
                         "list_deltaspace_references: skipping {}/{} ({}). \
@@ -2758,6 +2808,67 @@ legacy_key_id: "old-kid"
                 &delta(),
             )
         );
+    }
+
+    /// Issue #92: a client LIST must report the ORIGINAL size of a delta,
+    /// never the stored delta size of a lite-listed stub. A cached resolution
+    /// replaces the stub, non-stubs are left untouched, order is preserved,
+    /// and a stub the backend cannot resolve stays (best effort).
+    #[tokio::test]
+    async fn resolve_listed_sizes_replaces_stubs_with_cached_originals() {
+        use crate::types::StorageInfo;
+        let dir = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
+        let meta = |size: u64, info: StorageInfo| {
+            FileMetadata::fallback(
+                "f".into(),
+                size,
+                "etag".into(),
+                chrono::Utc::now(),
+                None,
+                info,
+            )
+        };
+        let resolved = meta(
+            3_145_728,
+            StorageInfo::Delta {
+                ref_path: "reference.bin".into(),
+                ref_sha256: "sha".into(),
+                delta_size: 46,
+                delta_cmd: "xdelta3".into(),
+            },
+        );
+        engine
+            .metadata_cache
+            .insert("b", "fw/a.tar", resolved.clone());
+        let listed = vec![
+            (
+                "fw/a.tar".to_string(),
+                meta(46, StorageInfo::delta_stub(46)),
+            ),
+            ("fw/b.txt".to_string(), meta(10, StorageInfo::Passthrough)),
+            (
+                "fw/c.tar".to_string(),
+                meta(52, StorageInfo::delta_stub(52)),
+            ),
+        ];
+        let out = engine.resolve_listed_sizes("b", listed).await.unwrap();
+        let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["fw/a.tar", "fw/b.txt", "fw/c.tar"]);
+        assert_eq!(
+            out[0].1.file_size, 3_145_728,
+            "stub replaced by cached original"
+        );
+        assert_eq!(out[1].1.file_size, 10);
+        assert!(
+            out[2].1.is_unresolved_delta_stub(),
+            "an unresolvable stub stays, and is never cached"
+        );
+        assert!(engine.metadata_cache.get("b", "fw/c.tar").is_none());
     }
 
     /// X-ray H3: a throttle-aborted HEAD sweep returns delta STUBS (empty

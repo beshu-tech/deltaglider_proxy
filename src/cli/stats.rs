@@ -257,7 +257,7 @@ async fn fold_in_references(
             eprintln!("warning: failed to enumerate references for {bucket}: {e}");
             cli_exit::EXIT_HTTP
         })?;
-    for meta in &scan.references {
+    for (_, meta) in &scan.references {
         // The reference key shape is `<prefix>reference.bin` — we use
         // the prefix as the deltaspace id elsewhere; here we just need
         // the per-object savings contribution, so any key in the right

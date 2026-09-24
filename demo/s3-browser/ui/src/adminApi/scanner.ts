@@ -3,18 +3,29 @@ import { ApiError } from '../errorHandling';
 import { adminJson, adminRequest } from './core';
 
 interface ChildUsage {
+  /** Logical (original) bytes — what the folder "is", same as a file's size. */
   size: number;
+  /** Bytes stored on the backend, delta baselines included. */
+  stored_size: number;
   objects: number;
 }
 
 interface UsageEntry {
   prefix: string;
   bucket: string;
+  /** Logical (original) bytes. */
   total_size: number;
+  /** Bytes stored on the backend, delta baselines included. */
+  stored_size: number;
   total_objects: number;
   children: Record<string, ChildUsage>;
   computed_at: string;
+  age_seconds: number;
+  /** Seconds past the cache TTL; 0 while fresh. */
   stale_seconds: number;
+  truncated: boolean;
+  /** Some delta sizes could not be resolved; total_size is a lower bound. */
+  sizes_estimated: boolean;
 }
 
 /** Trigger a background usage scan for a bucket/prefix. */

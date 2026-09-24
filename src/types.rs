@@ -512,6 +512,13 @@ impl FileMetadata {
         matches!(self.storage_info, StorageInfo::Delta { .. })
     }
 
+    /// A delta entry built from LIST data alone (no HEAD): the `delta_stub`
+    /// shape with an empty `ref_sha256`. Its `file_size` is the STORED (delta)
+    /// size, not the original one.
+    pub fn is_unresolved_delta_stub(&self) -> bool {
+        matches!(&self.storage_info, StorageInfo::Delta { ref_sha256, .. } if ref_sha256.is_empty())
+    }
+
     /// Get the delta size if this is a delta file
     pub fn delta_size(&self) -> Option<u64> {
         match &self.storage_info {

@@ -243,7 +243,7 @@ async fn scan_bucket_totals(
         .list_deltaspace_references(bucket, "", None)
         .await
         .map_err(|e| e.to_string())?;
-    for meta in &ref_scan.references {
+    for (_, meta) in &ref_scan.references {
         totals.accumulate(meta);
     }
     Ok(totals)
