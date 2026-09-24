@@ -35,6 +35,7 @@ import { useUrlRouter } from './useUrlRouter';
 import { buildViewUrl, buildBrowserUrl, type View } from './urlState';
 import { useOverlayClose } from './hooks/useOverlayClose';
 import type { S3Object } from './types';
+import { parentPrefix } from './utils';
 import { writeStorage } from './safeStorage';
 import { pageTitle } from './pageTitle';
 import { headerForPath } from './components/adminNavigation';
@@ -606,17 +607,32 @@ export default function App() {
             </div>
           ) : isEmpty ? (
             <Empty
-              description={
+              description={<span style={{ display: 'inline-block', maxWidth: 520 }}>{
                 s3.searchQuery
                   ? `No results for "${s3.searchQuery}"`
                   : hasNoBuckets
                     ? 'Create a bucket before uploading objects or generating demo data.'
                     : s3.prefix
-                      ? 'This folder is empty.'
+                      // The proxy stores no folder markers: a folder exists
+                      // only while it holds files, so an empty listing here
+                      // is as likely a typo in the path as an empty folder.
+                      ? `Nothing is stored under ${activeBucket}/${s3.prefix}. A folder exists only while it holds files, so check the path for a typo${canUploadToActiveBucket ? ', or upload files to create it' : ''}.`
                       : 'No objects yet. Upload files or generate demo data.'
-              }
+              }</span>}
               style={{ padding: '64px 0' }}
             >
+              {s3.prefix && !s3.searchQuery && (
+                <Space size={16} wrap style={{ justifyContent: 'center' }}>
+                  {canUploadToActiveBucket && (
+                    <Button type="primary" onClick={openUpload}>
+                      Upload files here
+                    </Button>
+                  )}
+                  <Button onClick={() => s3.navigate(parentPrefix(s3.prefix))}>
+                    {parentPrefix(s3.prefix) ? 'Go to the parent folder' : `Go to ${activeBucket}`}
+                  </Button>
+                </Space>
+              )}
               {hasNoBuckets && canCreateBucket && (
                 <Button type="link" onClick={requestCreateBucket} style={{ paddingInline: 0 }}>
                   Create a bucket
