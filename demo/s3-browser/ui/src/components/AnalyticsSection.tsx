@@ -55,6 +55,7 @@ import BucketFleetList from './BucketFleetList';
 import ScanStatusBanner from './ScanStatusBanner';
 import { isScanStale } from './scanFreshness';
 import { SORT_LABELS, type TopBucketsSortKey } from './topBucketsSort';
+import { readStorage, writeStorage } from '../safeStorage';
 
 /** Row shape consumed by chart + table. Derived from cache + live progress. */
 export interface BucketRow {
@@ -77,24 +78,6 @@ interface Props {
 }
 
 // COST_PRESETS now lives in HeroSavingsPanel.tsx (sole consumer).
-
-// localStorage can be missing or throw (private mode, blocked site data);
-// these preferences are conveniences, so failures fall back silently.
-function readStored(key: string): string | null {
-  try {
-    return localStorage.getItem(key);
-  } catch {
-    return null;
-  }
-}
-
-function writeStored(key: string, value: string): void {
-  try {
-    localStorage.setItem(key, value);
-  } catch {
-    // Preference not persisted; the in-memory value still applies.
-  }
-}
 
 export default function AnalyticsSection({ config }: Props) {
   const colors = useColors();
@@ -128,15 +111,15 @@ export default function AnalyticsSection({ config }: Props) {
    * visit gets annoying.
    */
   const [topBucketsSort, setTopBucketsSort] = useState<TopBucketsSortKey>(() => {
-    const saved = readStored('dgp-top-sort');
+    const saved = readStorage('dgp-top-sort');
     return saved && saved in SORT_LABELS ? (saved as TopBucketsSortKey) : 'original';
   });
   useEffect(() => {
-    writeStored('dgp-top-sort', topBucketsSort);
+    writeStorage('dgp-top-sort', topBucketsSort);
   }, [topBucketsSort]);
   const unsubRef = useRef<(() => void) | null>(null);
 
-  const [costRate, setCostRate] = useState(() => parseCostRate(readStored('dg-cost-per-gb')));
+  const [costRate, setCostRate] = useState(() => parseCostRate(readStorage('dg-cost-per-gb')));
   // The cost-rate cog popover (and the COST_PRESETS list, and the
   // localStorage setter) all live inside HeroSavingsPanel now —
   // AnalyticsSection just owns the rate value + the save callback so
@@ -144,7 +127,7 @@ export default function AnalyticsSection({ config }: Props) {
 
   const saveCostRate = (rate: number) => {
     setCostRate(rate);
-    writeStored('dg-cost-per-gb', String(rate));
+    writeStorage('dg-cost-per-gb', String(rate));
   };
 
   /**

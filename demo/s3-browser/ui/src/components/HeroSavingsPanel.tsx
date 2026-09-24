@@ -44,6 +44,7 @@ import { formatBytes, clamp } from '../utils';
 import { heroFontPx } from '../heroNumberSize';
 import { monthlyCost } from '../savings';
 import { useFixedOverlayPosition } from '../useFixedOverlayPosition';
+import { readStorage, writeStorage } from '../safeStorage';
 
 /** Cost rate presets. */
 const COST_PRESETS = [
@@ -135,9 +136,7 @@ function HeroInner({
     const prefersReduced =
       typeof window !== 'undefined' &&
       window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const alreadyPlayed =
-      typeof sessionStorage !== 'undefined' &&
-      sessionStorage.getItem(SESSION_GATE_KEY) === '1';
+    const alreadyPlayed = readStorage(SESSION_GATE_KEY, 'session') === '1';
     const skipAnim = prefersReduced || alreadyPlayed || liveScanning;
 
     if (skipAnim) {
@@ -160,9 +159,7 @@ function HeroInner({
 
     const settleTimer = window.setTimeout(() => {
       setSettled(true);
-      if (typeof sessionStorage !== 'undefined') {
-        sessionStorage.setItem(SESSION_GATE_KEY, '1');
-      }
+      writeStorage(SESSION_GATE_KEY, '1', 'session');
     }, ANIMATION_MS + 150);
 
     return () => {
