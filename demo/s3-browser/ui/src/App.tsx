@@ -548,6 +548,7 @@ export default function App() {
             onDownloadZip={canReadSelected && hasAdminSession ? s3.downloadZip : undefined}
             deleting={s3.deleting}
             currentPrefix={s3.prefix}
+            selectionKeys={s3.selectedKeys}
             hint={
               hasAdminSession
                 ? undefined

@@ -19,3 +19,38 @@ export function normalizeDestPrefix(input: string): string {
     .replace(/\/+$/, '')
     .replace(/\/{2,}/g, '/');
 }
+
+/**
+ * The folder an item lands under when copied: a file keeps its basename, a
+ * selected folder (`folder:<prefix>/`) keeps its own name, so both resolve
+ * relative to their PARENT folder (see `expandSelection`).
+ */
+function parentFolder(selectionKey: string): string {
+  if (selectionKey.startsWith('folder:')) {
+    const pfx = selectionKey.slice('folder:'.length);
+    return pfx.slice(0, pfx.slice(0, -1).lastIndexOf('/') + 1);
+  }
+  return selectionKey.slice(0, selectionKey.lastIndexOf('/') + 1);
+}
+
+/**
+ * True when a copy/move to `destBucket`/`destPrefix` would write every
+ * selected item back onto its own key: a move then does nothing and a copy
+ * rewrites each object in place. `destPrefix` is the user's raw input.
+ */
+export function destinationIsSource(
+  sourceBucket: string,
+  selectionKeys: Iterable<string>,
+  destBucket: string,
+  destPrefix: string,
+): boolean {
+  if (sourceBucket !== destBucket) return false;
+  const clean = normalizeDestPrefix(destPrefix);
+  const dest = clean ? `${clean}/` : '';
+  let any = false;
+  for (const k of selectionKeys) {
+    any = true;
+    if (parentFolder(k) !== dest) return false;
+  }
+  return any;
+}

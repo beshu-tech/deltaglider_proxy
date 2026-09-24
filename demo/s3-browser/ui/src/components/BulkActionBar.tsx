@@ -18,12 +18,14 @@ interface Props {
   onDownloadZip?: () => Promise<void>;
   /** The folder being browsed: the copy/move destination starts there. */
   currentPrefix?: string;
+  /** The raw selection keys: the destination picker refuses to copy them onto themselves. */
+  selectionKeys?: Iterable<string>;
   deleting: boolean;
   /** Shown when bulk handlers are omitted (user signed in for files only). */
   hint?: string;
 }
 
-export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, onDelete, onCopy, onMove, onDownloadZip, deleting, hint, currentPrefix }: Props) {
+export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, onDelete, onCopy, onMove, onDownloadZip, deleting, hint, currentPrefix, selectionKeys }: Props) {
   const colors = useColors();
   const [modal, setModal] = useState<'copy' | 'move' | null>(null);
   const [operating, setOperating] = useState(false);
@@ -157,6 +159,7 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
         onCancel={closeModal}
         loading={operating}
         currentPrefix={currentPrefix}
+        selectionKeys={selectionKeys}
       />
     </>
   );
