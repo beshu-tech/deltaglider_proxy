@@ -16,8 +16,7 @@
 // - bulkZipDownloadUrl: returns a same-origin URL the browser can use
 //   directly with `<a href download>` — server streams the archive.
 // =============================================================================
-import { throwApiError } from '../errorHandling';
-import { BASE, adminFetch, fetchJson, safeJson } from './core';
+import { BASE, adminJson } from './core';
 
 interface BulkCopyItem {
   source_key: string;
@@ -50,16 +49,12 @@ interface BulkMoveResponse extends BulkCopyResponse {
 
 /** Requires administrator sign-in in Settings (`403 admin_session_required` otherwise). */
 export async function bulkCopyObjects(req: BulkCopyRequest): Promise<BulkCopyResponse> {
-  const res = await adminFetch('/api/admin/objects/copy', 'POST', req);
-  if (!res.ok) await throwApiError(res, 'Bulk copy');
-  return safeJson(res);
+  return adminJson('/api/admin/objects/copy', { method: 'POST', body: req, context: 'Bulk copy' });
 }
 
 /** Admin GUI session required. */
 export async function bulkMoveObjects(req: BulkCopyRequest): Promise<BulkMoveResponse> {
-  const res = await adminFetch('/api/admin/objects/move', 'POST', req);
-  if (!res.ok) await throwApiError(res, 'Bulk move');
-  return safeJson(res);
+  return adminJson('/api/admin/objects/move', { method: 'POST', body: req, context: 'Bulk move' });
 }
 
 interface BulkDeleteRequest {
@@ -75,9 +70,7 @@ interface BulkDeleteResponse {
 
 /** Admin GUI session required. */
 export async function bulkDeleteObjects(req: BulkDeleteRequest): Promise<BulkDeleteResponse> {
-  const res = await adminFetch('/api/admin/objects/delete', 'POST', req);
-  if (!res.ok) await throwApiError(res, 'Bulk delete');
-  return safeJson(res);
+  return adminJson('/api/admin/objects/delete', { method: 'POST', body: req, context: 'Bulk delete' });
 }
 
 interface ListAllResponse {
@@ -95,7 +88,7 @@ interface ListAllResponse {
 export async function listAllUnderPrefix(bucket: string, prefix: string): Promise<ListAllResponse> {
   if (!prefix) throw new Error('listAllUnderPrefix: prefix must be non-empty');
   const qs = new URLSearchParams({ bucket, prefix });
-  return fetchJson(`/api/admin/objects/list?${qs.toString()}`, 'List under prefix');
+  return adminJson(`/api/admin/objects/list?${qs.toString()}`, { context: 'List under prefix' });
 }
 
 /**

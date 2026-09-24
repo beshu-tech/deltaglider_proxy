@@ -65,12 +65,6 @@ export async function adminJson<T>(path: string, opts: AdminRequestOptions = {})
   return safeJson<T>(await adminRequest(path, opts));
 }
 
-/** @deprecated Use `adminJson(path, { context })`. Kept only for
- *  `bulkObjects.ts`, which another change owns. */
-export async function fetchJson<T>(path: string, errorContext: string): Promise<T> {
-  return adminJson<T>(path, { context: errorContext });
-}
-
 export async function adminLogin(password: string): Promise<{ ok: boolean; error?: string }> {
   const res = await adminFetch('/api/admin/login', 'POST', { password });
   if (res.ok) return { ok: true };
@@ -362,9 +356,7 @@ export async function updateAdminConfig(updates: Record<string, unknown>): Promi
  * callers detect an expired session with `isSessionExpired`.
  */
 export async function traceAdmission<T>(body: unknown): Promise<T> {
-  const res = await adminFetch('/api/admin/config/trace', 'POST', body);
-  if (!res.ok) await throwApiError(res, 'Trace');
-  return safeJson<T>(res);
+  return adminJson<T>('/api/admin/config/trace', { method: 'POST', body, context: 'Trace' });
 }
 
 /**

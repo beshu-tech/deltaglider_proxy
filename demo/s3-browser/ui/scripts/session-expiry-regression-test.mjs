@@ -151,11 +151,10 @@ for (const status of [429, 500, 503]) {
 // Every adminApi module goes through adminJson / adminRequest (core.ts), which
 // throw an ApiError with a status. A module that hand-rolls `fetch(` or
 // `throwApiError(` can drift back to a bare Error or a hard-coded '/_' base.
-// bulkObjects.ts is owned by a separate change and is exempt until it migrates.
 const adminApiDir = new URL('../src/adminApi/', import.meta.url);
 const shapeOffenders = [];
 for (const d of await readdir(adminApiDir)) {
-  if (d === 'core.ts' || d === 'bulkObjects.ts') continue;
+  if (d === 'core.ts') continue;
   const text = await readFile(new URL(d, adminApiDir), 'utf8');
   text.split('\n').forEach((line, i) => {
     if (/\bthrowApiError\(|(^|[^.\w])fetch\(|['"`]\/_\//.test(line)) {
