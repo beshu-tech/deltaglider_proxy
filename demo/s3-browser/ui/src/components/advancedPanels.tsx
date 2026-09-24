@@ -23,7 +23,7 @@
  * ApplyDialog renders it as a blue banner.
  */
 import { useState } from 'react';
-import { Alert, Input, InputNumber, Radio, Switch, Typography } from 'antd';
+import { Alert, Input, InputNumber, Radio, Switch } from 'antd';
 import {
   CloudServerOutlined,
   DatabaseOutlined,
@@ -45,7 +45,6 @@ import { LoadingState } from './StatePlaceholders';
 import { CUSTOM_LOG_LEVEL, LOG_LEVEL_PRESETS, logLevelRadio } from './admin/logLevelPresets';
 import { normalizeUiError } from '../errorHandling';
 
-const { Text } = Typography;
 
 // ───────────────────────────────────────────────────────────
 // Shared primitives
@@ -382,6 +381,7 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
               value={value.cache_size_mb ?? undefined}
               onChange={(v) => setValue({ ...value, cache_size_mb: v ?? undefined })}
               min={16}
+              placeholder="100"
               style={{ width: 180, ...inputRadius }}
               addonAfter="MB"
             />
@@ -399,6 +399,7 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
               value={value.metadata_cache_mb ?? undefined}
               onChange={(v) => setValue({ ...value, metadata_cache_mb: v ?? undefined })}
               min={1}
+              placeholder="50"
               style={{ width: 180, ...inputRadius }}
               addonAfter="MB"
             />
@@ -456,8 +457,8 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
 // ───────────────────────────────────────────────────────────
 
 export function LimitsPanel({ onSessionExpired }: PanelProps) {
-  const { cardStyle, inputRadius } = useCardStyles();
-  const { TEXT_MUTED } = useColors();
+  const { cardStyle } = useCardStyles();
+  const { TEXT_PRIMARY } = useColors();
   // Read-only env-var view of the running config (cached react-query read).
   // A 401 surfaces as `queryError`; useAdminConfig routes it to onSessionExpired.
   const { data: config, error: queryError, isError } = useAdminConfig({ onSessionExpired });
@@ -468,27 +469,18 @@ export function LimitsPanel({ onSessionExpired }: PanelProps) {
   });
   if (gate || !config) return gate;
 
-  // label + read-only value + one help line; the env var name rides in the help
-  // as a mono chip. The card header states restart-required once for all fields.
+  // Env-only settings: FormField's env rule renders the badge (the variable
+  // name, and "from env" when it is set). The value is plain text, not an
+  // input — nothing here is editable in the GUI.
   const readOnlyField = (
     label: string,
     value: string | number,
     helpText: string,
     envName: string
   ) => (
-    <div style={{ marginTop: 16 }}>
-      <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: 0.5, textTransform: 'uppercase', color: TEXT_MUTED, marginBottom: 4 }}>
-        {label}
-      </div>
-      <Input
-        value={String(value)}
-        readOnly
-        style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13, opacity: 0.7 }}
-      />
-      <Text type="secondary" style={{ fontSize: 12, fontFamily: 'var(--font-ui)', display: 'block', marginTop: 4 }}>
-        {helpText} Set with <Text code style={{ fontSize: 11 }}>{envName}</Text>.
-      </Text>
-    </div>
+    <FormField label={label} helpText={helpText} envVar={envName}>
+      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 13, color: TEXT_PRIMARY }}>{String(value)}</div>
+    </FormField>
   );
 
   return (
@@ -556,7 +548,7 @@ export function LoggingPanel({ onSessionExpired }: PanelProps) {
           title="Log level"
           description="tracing-subscriber EnvFilter string. Hot-reloadable: changes take effect on the next request after Apply."
         />
-        <div>
+        <FormField label="Level" yamlPath="advanced.log_level" style={{ marginBottom: 0 }}>
           <Radio.Group
             value={radio.value}
             onChange={(e) => {
@@ -582,7 +574,6 @@ export function LoggingPanel({ onSessionExpired }: PanelProps) {
           {radio.custom && (
             <FormField
               label="Custom EnvFilter"
-              yamlPath="advanced.log_level"
               helpText="Comma-separated tracing directives. See https://docs.rs/tracing-subscriber for syntax."
               examples={[
                 'deltaglider_proxy=debug,tower_http=info',
@@ -599,7 +590,7 @@ export function LoggingPanel({ onSessionExpired }: PanelProps) {
               />
             </FormField>
           )}
-        </div>
+        </FormField>
       </div>
     </PanelShell>
   );

@@ -47,6 +47,7 @@ import type { IamMode } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import { useSectionEditor } from '../useSectionEditor';
+import { useAdminConfig } from '../queries/config';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
 import ApplyDialog from './ApplyDialog';
@@ -103,6 +104,10 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
     onSessionExpired,
     noun: 'access',
   });
+
+  // The RUNNING auth state (env variables included), so the page never
+  // implies auth is off while an env-provided key keeps SigV4 on.
+  const { data: runtimeConfig } = useAdminConfig({ onSessionExpired });
 
   // Derive the auth-mode radio from the `authentication` string. The
   // server stores it as `Option<String>` — absent / `null` means
@@ -248,6 +253,18 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
           title="S3 authentication mode"
           description="Whether clients must sign their requests with SigV4."
         />
+        {runtimeConfig && (
+          <Alert
+            type={runtimeConfig.auth_enabled ? 'success' : 'warning'}
+            showIcon
+            style={{ marginBottom: 16, borderRadius: 8 }}
+            title={
+              runtimeConfig.auth_enabled
+                ? 'SigV4 authentication is on. Every S3 request must be signed.'
+                : 'SigV4 authentication is off. Anyone who can reach the proxy can read and write.'
+            }
+          />
+        )}
         <div>
           <Radio.Group
             value={authMode}
@@ -258,9 +275,8 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
               <div>
                 <div style={{ fontWeight: 600 }}>Auto-detect (recommended)</div>
                 <Text type="secondary" style={{ fontSize: 12 }}>
-                  Authentication is required when credentials are set
-                  (IAM users or bootstrap SigV4 pair). Leaving the
-                  credentials empty turns auth off.
+                  Clients must sign their requests when IAM users or
+                  bootstrap credentials exist.
                 </Text>
               </div>
             </Radio>
@@ -333,10 +349,9 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
               style={{ ...inputRadius }}
             />
           </FormField>
-          <Text type="secondary" style={{ fontSize: 11, marginTop: -4 }}>
-            Redacted on GET — the section API preserves the current
-            secret when this field is empty on PUT. Set both fields
-            together to rotate, or both to empty to clear.
+          <Text type="secondary" style={{ fontSize: 12, marginTop: -4 }}>
+            The current secret is never shown. To rotate the credentials,
+            set both fields. To remove them, clear both fields.
           </Text>
         </div>
       </div>
