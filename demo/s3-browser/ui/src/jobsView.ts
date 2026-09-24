@@ -260,7 +260,10 @@ export function triggerLabel(trigger: string): string {
 export function availableActions(row: JobRow): JobAction[] {
   const out: JobAction[] = [];
   if (row.kind === 'replication' || row.kind === 'lifecycle') {
-    out.push(row.paused ? 'resume' : 'pause');
+    // Pause is meaningless on a disabled rule (the scheduler never runs it);
+    // resume stays so a paused-and-disabled rule can still clear its flag.
+    if (row.paused) out.push('resume');
+    else if (row.enabled !== false) out.push('pause');
     if (row.kind === 'lifecycle') out.push('preview');
     // run-now availability differs by kind (matches the backend contract):
     //  - replication: a deliberate ONE-OFF that runs even a disabled/paused
@@ -279,6 +282,22 @@ export function availableActions(row: JobRow): JobAction[] {
   }
   if (isActiveJobStatus(row.status) && row.status !== 'cancelling') out.push('cancel');
   return out;
+}
+
+/**
+ * Preview and run-now act on the SAVED rule. While that kind's editor has
+ * unsaved edits they would silently use the old definition — a lifecycle
+ * run could delete by the rule the operator just changed — so they wait
+ * until the edits are applied or discarded. Returns the reason, or null.
+ */
+export function draftBlocksAction(
+  action: JobAction,
+  kind: JobKind,
+  dirty: { replication: boolean; lifecycle: boolean },
+): string | null {
+  if (action !== 'preview' && action !== 'run-now') return null;
+  const isDirty = kind === 'replication' ? dirty.replication : kind === 'lifecycle' ? dirty.lifecycle : false;
+  return isDirty ? 'Apply or discard your unsaved rule edits first — this would use the saved rule.' : null;
 }
 
 /**

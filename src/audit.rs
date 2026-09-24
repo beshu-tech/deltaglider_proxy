@@ -146,6 +146,22 @@ pub fn recent_audit(limit: usize) -> Vec<AuditEntry> {
     guard.iter().rev().take(take).cloned().collect()
 }
 
+/// A log filter spec with the audit trail pinned at INFO. `audit_log`
+/// emits at INFO, so the GUI's Warn/Error presets
+/// (`deltaglider_proxy=warn,…`) silently dropped every AUDIT line that log
+/// shippers rely on. The more specific `deltaglider_proxy::audit` directive
+/// wins over the crate-wide level; a spec that already names `audit` is
+/// left as the operator wrote it. Used by every place that builds the filter.
+pub fn with_audit_directive(spec: &str) -> String {
+    if spec.contains("audit") {
+        spec.to_string()
+    } else if spec.trim().is_empty() {
+        "deltaglider_proxy::audit=info".to_string()
+    } else {
+        format!("{spec},deltaglider_proxy::audit=info")
+    }
+}
+
 /// Emit a structured audit log line for any mutation operation.
 ///
 /// Format: `AUDIT | action=X | user=X | target=X | ip=X | ua=X | bucket=X | path=X`
@@ -194,4 +210,25 @@ pub fn audit_log(
         bucket: s_bucket,
         path: s_path,
     });
+}
+
+#[cfg(test)]
+mod audit_filter_tests {
+    #[test]
+    fn audit_directive_survives_quiet_presets() {
+        assert_eq!(
+            super::with_audit_directive("deltaglider_proxy=warn,tower_http=warn"),
+            "deltaglider_proxy=warn,tower_http=warn,deltaglider_proxy::audit=info"
+        );
+        // An operator who names audit explicitly keeps their choice.
+        assert_eq!(
+            super::with_audit_directive("deltaglider_proxy::audit=off"),
+            "deltaglider_proxy::audit=off"
+        );
+        let f: tracing_subscriber::EnvFilter =
+            super::with_audit_directive("deltaglider_proxy=warn")
+                .parse()
+                .unwrap();
+        assert!(f.to_string().contains("deltaglider_proxy::audit=info"));
+    }
 }

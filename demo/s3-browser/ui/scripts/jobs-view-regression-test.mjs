@@ -16,6 +16,7 @@ const {
   kindLabel,
   triggerLabel,
   availableActions,
+  draftBlocksAction,
   progressLabel,
   busyJobForBucket,
   mergeDraftRules,
@@ -75,7 +76,19 @@ assert.equal(kindLabel('reencrypt'), 'Re-encrypt');
 assert.equal(kindLabel('migrate'), 'Migrate');
 assert.equal(triggerLabel('oneoff'), 'one-off');
 
+// ── draftBlocksAction: preview/run-now never run a stale definition ─────────
+{
+  const clean = { replication: false, lifecycle: false };
+  assert.equal(draftBlocksAction('preview', 'lifecycle', clean), null);
+  assert.match(draftBlocksAction('preview', 'lifecycle', { ...clean, lifecycle: true }), /saved rule/);
+  assert.match(draftBlocksAction('run-now', 'replication', { ...clean, replication: true }), /saved rule/);
+  assert.equal(draftBlocksAction('run-now', 'replication', { ...clean, lifecycle: true }), null, 'only its own kind');
+  assert.equal(draftBlocksAction('pause', 'lifecycle', { replication: true, lifecycle: true }), null);
+}
+
 // ── availableActions matrix ─────────────────────────────────────────────────
+// A disabled rule that is ALSO paused still offers resume (clears the flag).
+assert.deepEqual(availableActions(row({ enabled: false, paused: true })), ['resume', 'run-now', 'delete']);
 assert.deepEqual(availableActions(row()), ['pause', 'run-now', 'delete']);
 // run-now is a one-off: available even when paused or disabled (backend runs it
 // once without flipping the flag). Only a RUNNING rule has nothing to trigger.
@@ -91,8 +104,8 @@ assert.deepEqual(
 );
 assert.deepEqual(
   availableActions(row({ enabled: false })),
-  ['pause', 'run-now', 'delete'],
-  'disabled still allows a one-off run'
+  ['run-now', 'delete'],
+  'disabled still allows a one-off run; pausing a rule that never runs is noise'
 );
 assert.deepEqual(
   availableActions(row({ kind: 'lifecycle' })),
@@ -112,7 +125,7 @@ assert.deepEqual(
 );
 assert.deepEqual(
   availableActions(row({ kind: 'lifecycle', enabled: false })),
-  ['pause', 'preview', 'delete'],
+  ['preview', 'delete'],
   'disabled lifecycle: no run-now (backend 409s it)'
 );
 // Replication one-off is unchanged: paused/disabled still runnable.

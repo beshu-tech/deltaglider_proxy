@@ -2005,13 +2005,16 @@ pub fn validate_event_delivery(cfg: &EventDeliveryConfig) -> Vec<String> {
         if url.trim().is_empty() {
             continue;
         }
-        match reqwest::Url::parse(url) {
-            Ok(parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => {}
-            Ok(parsed) => warnings.push(format!(
-                "{label} uses unsupported scheme '{}'; expected http or https",
-                parsed.scheme(),
-            )),
-            Err(e) => warnings.push(format!("{label} is invalid: {e}")),
+        // The SAME policy the dispatcher enforces at delivery time (https
+        // only, no loopback/private/metadata hosts). This used to accept any
+        // http(s) URL, so an http:// endpoint applied cleanly and then every
+        // event failed and retried with "scheme 'http' is not allowed".
+        if let Err(e) =
+            crate::security::validate_outbound_url(url, crate::security::UrlKind::Webhook)
+        {
+            warnings.push(format!(
+                "{label} {url:?} will be refused when events are delivered: {e}"
+            ));
         }
     }
 
@@ -2196,6 +2199,32 @@ pub(crate) fn detect_replication_cycles(rules: &[ReplicationRule]) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Validation must agree with the delivery-time URL policy: an http:// or
+    /// loopback webhook applied cleanly and then failed every event.
+    #[test]
+    fn event_delivery_warns_about_urls_the_dispatcher_refuses() {
+        let cfg = EventDeliveryConfig {
+            enabled: true,
+            webhook_urls: vec![
+                "http://hooks.example.com/x".into(),
+                "https://127.0.0.1/x".into(),
+                "https://hooks.example.com/ok".into(),
+            ],
+            ..Default::default()
+        };
+        let w = validate_event_delivery(&cfg);
+        assert!(
+            w.iter()
+                .any(|m| m.contains("http://hooks.example.com/x") && m.contains("scheme 'http'")),
+            "{w:?}"
+        );
+        assert!(w.iter().any(|m| m.contains("https://127.0.0.1/x")), "{w:?}");
+        assert!(
+            !w.iter().any(|m| m.contains("/ok")),
+            "a valid https URL is fine: {w:?}"
+        );
+    }
     use crate::config::Config;
 
     #[test]

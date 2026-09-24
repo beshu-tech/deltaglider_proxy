@@ -4,7 +4,7 @@ import { getBucketUsage, refreshBucketUsage } from '../adminApi';
 import { useBucketOrigins } from '../queries/backends';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
-import { formatBytes } from '../utils';
+import { formatBytes, noun } from '../utils';
 import { relativeTime } from '../utils';
 
 /**
@@ -18,9 +18,14 @@ import { relativeTime } from '../utils';
 export default function BucketUsageChip({
   bucket,
   canAdmin,
+  inFolder = false,
 }: {
   bucket: string;
   canAdmin: boolean;
+  /** True when the breadcrumb shows a folder: the pill sits right after it
+   *  but counts the WHOLE bucket, so it says so instead of reading as the
+   *  folder's own size. */
+  inFolder?: boolean;
 }) {
   const c = useColors();
   const qc = useQueryClient();
@@ -73,10 +78,12 @@ export default function BucketUsageChip({
     );
   }
 
+  const scope = `Whole bucket "${bucket}" (all folders). `;
   const scannedTitle =
-    data.last_scan_at != null
+    scope +
+    (data.last_scan_at != null
       ? `Last full scan ${relativeTime(data.last_scan_at * 1000)}`
-      : 'Never scanned — running total maintained on every write/delete; ⟳ to reconcile';
+      : 'Never scanned — running total maintained on every write/delete; ⟳ to reconcile');
 
   return (
     <span
@@ -95,12 +102,13 @@ export default function BucketUsageChip({
         cursor: 'default',
       }}
     >
+      {inFolder && <span style={{ color: c.TEXT_MUTED }}>Bucket total</span>}
       <strong style={{ color: c.TEXT_PRIMARY, fontVariantNumeric: 'tabular-nums' }}>
         {formatBytes(data.logical_bytes)}
       </strong>
       <span style={{ color: c.TEXT_MUTED }}>·</span>
       <span style={{ fontVariantNumeric: 'tabular-nums' }}>
-        {data.object_count.toLocaleString()} objects
+        {data.object_count.toLocaleString()} {noun(data.object_count, 'object')}
       </span>
       <ReloadOutlined
         spin={refresh.isPending}

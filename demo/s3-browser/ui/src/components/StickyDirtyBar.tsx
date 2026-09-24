@@ -88,6 +88,10 @@ export default function StickyDirtyBar({
         transition: 'opacity 160ms ease, transform 160ms ease',
       }}
       aria-hidden={!visible}
+      // A collapsed bar is still mounted (for the fade), and aria-hidden
+      // alone left its Discard/Apply buttons in the Tab order: keyboard users
+      // landed on invisible buttons on a page with nothing to apply.
+      inert={!visible}
     >
       <div
         style={{

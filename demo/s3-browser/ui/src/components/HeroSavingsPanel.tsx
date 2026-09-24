@@ -40,7 +40,7 @@ import {
 } from 'motion/react';
 import { SettingOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
-import { formatBytes, clamp } from '../utils';
+import { formatBytes, clamp, noun } from '../utils';
 import { heroFontPx } from '../heroNumberSize';
 import { monthlyCost } from '../savings';
 import { useFixedOverlayPosition } from '../useFixedOverlayPosition';
@@ -735,7 +735,7 @@ function HeroInner({
           marginTop: -2,
         }}
       >
-        <FooterFact text={`${totalObjects.toLocaleString()} objects`} />
+        <FooterFact text={`${totalObjects.toLocaleString()} ${noun(totalObjects, 'object')}`} />
         <Dot colors={colors} />
         <FooterFact text={`${bucketCount} bucket${bucketCount === 1 ? '' : 's'}`} />
         {biggestSave && biggestSave.bytes > 0 && (

@@ -360,3 +360,47 @@ async fn test_quota_zero_blocks_complete_multipart_upload() {
         complete
     );
 }
+
+// ═══════════════════════════════════════════════════
+// Quota counts the stored footprint INCLUDING delta baselines
+// ═══════════════════════════════════════════════════
+
+/// One build per folder is the common release layout: every folder is its own
+/// deltaspace, so each upload stores a full `reference.bin` baseline plus a
+/// tiny delta. The quota used to sum only the per-object stored sizes (the
+/// deltas, tens of bytes) and never saw the baselines, so a 5 MB quota let
+/// through any number of 3 MB builds. It must also answer 403 (documented),
+/// not a 500 that SDKs retry as a server fault.
+#[tokio::test]
+async fn test_quota_counts_delta_baselines_and_answers_403() {
+    let server = TestServer::builder()
+        .bucket(BUCKET)
+        .auth("TESTKEY", "TESTSECRET")
+        .bucket_policy(BUCKET, "quota_bytes: 5242880") // 5 MiB
+        .build()
+        .await;
+
+    let three_mib = 3 * 1024 * 1024;
+    put_sized(&server, "builds/v1/firmware.tar", three_mib)
+        .await
+        .expect("first 3 MiB build fits a 5 MiB quota");
+
+    let client = server.s3_client().await;
+    let err = client
+        .put_object()
+        .bucket(server.bucket())
+        .key("builds/v2/firmware.tar")
+        .body(aws_sdk_s3::primitives::ByteStream::from(vec![
+            1u8;
+            three_mib
+        ]))
+        .send()
+        .await
+        .expect_err("a second 3 MiB baseline must exceed a 5 MiB quota");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    assert_eq!(
+        status,
+        Some(403),
+        "quota rejection must be 403, got {status:?}: {err:?}"
+    );
+}

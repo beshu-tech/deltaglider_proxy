@@ -37,6 +37,8 @@ import { buildViewUrl, buildBrowserUrl, type View } from './urlState';
 import { useOverlayClose } from './hooks/useOverlayClose';
 import type { S3Object } from './types';
 import { writeStorage } from './safeStorage';
+import { pageTitle } from './pageTitle';
+import { headerForPath } from './components/adminNavigation';
 
 const { Content } = Layout;
 const { useBreakpoint } = Grid;
@@ -124,6 +126,7 @@ export default function App() {
   );
   const s3 = useS3Browser({
     writablePrefixes,
+    adminSession: hasAdminSession,
     bucket: browser.bucket,
     prefix: browser.prefix,
     q: browser.q,
@@ -295,17 +298,13 @@ export default function App() {
     setPreviewObject(null);
   }, [cancelFolderSizes, s3.prefix, browser.bucket]);
 
-  // Dynamic page title on view change
+  // Tab title follows the view, the bucket and the admin page. Keep the
+  // unsaved-edits "● " marker that useDirtyGlobalIndicators owns.
   useEffect(() => {
-    const titles: Record<View, string> = {
-      browser: `${getBucket()} — DeltaGlider Proxy`,
-      upload: 'Upload — DeltaGlider Proxy',
-      metrics: 'Metrics — DeltaGlider Proxy',
-      docs: 'API Reference — DeltaGlider Proxy',
-      admin: 'Admin Settings — DeltaGlider Proxy',
-    };
-    document.title = titles[view];
-  }, [view]);
+    const label = view === 'admin' ? headerForPath(subPath)?.title : undefined;
+    const marker = document.title.startsWith('● ') ? '● ' : '';
+    document.title = marker + pageTitle(view, activeBucket, label);
+  }, [view, activeBucket, subPath]);
 
   // Focus management: move focus to main content area on view change
   useEffect(() => {
@@ -557,6 +556,7 @@ export default function App() {
         {s3.selectedKeys.size > 0 && (
           <BulkActionBar
             selectedCount={s3.selectedKeys.size}
+            selectedFolderCount={[...s3.selectedKeys].filter((k) => k.startsWith('folder:')).length}
             onDelete={canDeleteSelected && hasAdminSession ? s3.bulkDelete : undefined}
             onCopy={canCopyFromActiveBucket && hasAdminSession ? s3.bulkCopy : undefined}
             onMove={canMoveFromActiveBucket && hasAdminSession ? s3.bulkMove : undefined}
@@ -733,7 +733,7 @@ export default function App() {
           )}
 
           <main id="main-content" ref={mainRef} tabIndex={-1} style={{ outline: 'none', flex: 1, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
-            <Content style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+            <Content style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, position: 'relative' }}>
               <FileBrowserSessionTip visible={view === 'browser' && sessionCaps.signedInForFilesOnly} />
               {renderContent()}
             </Content>

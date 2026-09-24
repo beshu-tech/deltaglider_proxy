@@ -3,7 +3,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Table, Typography, Alert, Progress, Checkbox, theme, Button, Select } from 'antd';
 import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
-import { formatBytes, relativeTime } from '../utils';
+import { formatBytes, relativeTime, noun } from '../utils';
 import type { ColumnsType, TableProps } from 'antd/es/table';
 import type { GetRef } from 'antd';
 import { useColors } from '../ThemeContext';
@@ -125,7 +125,7 @@ function FolderSizeCell({
   if (sizeState?.progress?.done) {
     return (
       <span
-        title={`${sizeState.progress.totalFiles.toLocaleString()} files — stored (compressed) size`}
+        title={`${sizeState.progress.totalFiles.toLocaleString()} ${noun(sizeState.progress.totalFiles, 'file')} — stored (compressed) size`}
         style={{ ...MONO_CELL_STYLE, color: TEXT_SECONDARY, cursor: 'default' }}
       >
         {formatBytes(sizeState.progress.totalSize)}
@@ -366,9 +366,19 @@ export default function ObjectTable({
       ),
       key: 'select',
       width: 40,
+      // The whole cell is the hit target, and a click here never reaches the
+      // row handler (which opens the inspector).
+      onCell: (record: RowData) => ({
+        onClick: (e: React.MouseEvent) => {
+          e.stopPropagation();
+          onToggleKey(record.key);
+        },
+        style: { cursor: 'pointer' },
+      }),
       render: (_: unknown, record: RowData) => (
         <Checkbox
           checked={selectedKeys.has(record.key)}
+          onClick={(e) => e.stopPropagation()}
           onChange={() => onToggleKey(record.key)}
           aria-label={`Select ${record.name}`}
         />

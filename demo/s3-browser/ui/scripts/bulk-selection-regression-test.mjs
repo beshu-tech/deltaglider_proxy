@@ -13,7 +13,7 @@ const { outputText } = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ES2020, target: ts.ScriptTarget.ES2020 },
   fileName: 'bulkSelection.ts',
 });
-const { expandSelection } = await import(
+const { expandSelection, bulkDeleteConfirmText } = await import(
   `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`
 );
 
@@ -28,19 +28,26 @@ const lister = async (pfx) => {
   return { keys: tree[pfx] ?? [], truncated: pfx === 'big/' };
 };
 
-// --- folders expand; relative suffix is the path under the selected folder ---
+// --- folders expand and KEEP their own name: copying folder a/ into dest/
+//     yields dest/a/..., like any file manager (it used to flatten into dest/,
+//     so two selected folders' same-named files overwrote each other) ---------
 assert.deepEqual(await expandSelection(['folder:a/', 'top.bin', 'd/e/f.txt'], lister), [
-  { source: 'a/', relative: '' },
-  { source: 'a/x.txt', relative: 'x.txt' },
-  { source: 'a/sub/y.txt', relative: 'sub/y.txt' },
+  { source: 'a/', relative: 'a/' },
+  { source: 'a/x.txt', relative: 'a/x.txt' },
+  { source: 'a/sub/y.txt', relative: 'a/sub/y.txt' },
   { source: 'top.bin', relative: 'top.bin' },
   { source: 'd/e/f.txt', relative: 'f.txt' },
 ]);
 
 // --- overlapping selections dedupe; the FIRST relative suffix wins ------------
 assert.deepEqual(await expandSelection(['folder:a/', 'folder:a/sub/', 'a/x.txt'], lister), [
-  { source: 'a/', relative: '' },
-  { source: 'a/x.txt', relative: 'x.txt' },
+  { source: 'a/', relative: 'a/' },
+  { source: 'a/x.txt', relative: 'a/x.txt' },
+  { source: 'a/sub/y.txt', relative: 'a/sub/y.txt' },
+]);
+
+// --- a nested folder keeps only its own name, not its parents ----------------
+assert.deepEqual(await expandSelection(['folder:a/sub/'], lister), [
   { source: 'a/sub/y.txt', relative: 'sub/y.txt' },
 ]);
 
@@ -55,5 +62,10 @@ await assert.rejects(
   (e) => e instanceof Error && /Folder big\/ has more than 10,000 objects; narrow the selection/.test(e.message),
   'truncated listing must throw',
 );
+
+// --- the delete confirmation names folders (their contents go too) ---------
+assert.equal(bulkDeleteConfirmText(2, 0), 'Delete 2 selected items? This cannot be undone.');
+assert.equal(bulkDeleteConfirmText(1, 1), 'Delete 1 selected item? It is a folder: everything inside is deleted too. This cannot be undone.');
+assert.equal(bulkDeleteConfirmText(3, 1), 'Delete 3 selected items? 1 of them is a folder: everything inside is deleted too. This cannot be undone.');
 
 console.log('bulk-selection regression checks passed');

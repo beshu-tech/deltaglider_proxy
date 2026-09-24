@@ -15,6 +15,11 @@ export default function RecoveryPanel({ onExportBackup, onImportBackup }: Recove
         <Text type="secondary">
           Download a full backup bundle (config + IAM/control-plane data), or restore from a previous export.
         </Text>
+        {/* The zip is not encrypted: secrets.json and iam.json carry every
+            access key, user secret and backend credential in plain text. */}
+        <Text type="secondary">
+          The file holds every access key and backend credential in plain text. Store it like a password.
+        </Text>
         <Space wrap>
           <Button type="primary" icon={<DownloadOutlined />} onClick={onExportBackup}>
             Download backup

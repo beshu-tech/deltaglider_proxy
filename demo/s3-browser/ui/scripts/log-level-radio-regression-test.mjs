@@ -25,7 +25,11 @@ assert.deepEqual(logLevelRadio(INFO, true), { value: '__custom__', custom: true 
 // THE bug: after Discard the value is the preset again and the pick is
 // cleared, so the radio must show the preset, not a stuck "Custom".
 assert.deepEqual(logLevelRadio(INFO, false), { value: INFO, custom: false });
-// Unset (server default) shows no preset selected.
-assert.deepEqual(logLevelRadio(undefined, false), { value: null, custom: false });
+// The section API omits a default-valued log_level: absent means the
+// server default (Debug), not "nothing selected".
+assert.deepEqual(logLevelRadio(undefined, false), {
+  value: 'deltaglider_proxy=debug,tower_http=debug',
+  custom: false,
+});
 
 console.log('log-level radio regression checks passed');

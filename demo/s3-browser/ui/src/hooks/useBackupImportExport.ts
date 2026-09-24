@@ -5,7 +5,7 @@
  * panel refetches.
  */
 import { useCallback, useState } from 'react';
-import { message } from 'antd';
+import { Modal, message } from 'antd';
 import { exportBackup, importBackup, ImportBackupError, type ImportBackupMode } from '../adminApi';
 import { isZipFile } from '../components/admin/backupFile';
 import { normalizeUiError } from '../errorHandling';
@@ -34,10 +34,14 @@ export function useBackupImportExport() {
         ? await importBackup(file, mode)
         : await importBackup(JSON.parse(await file.text()), 'iam-only');
       const ext = result.external_identities_created ?? 0;
-      message.success(
-        `Imported: ${result.users_created} users, ${result.groups_created} groups, ${ext} OIDC identities (${result.users_skipped} skipped)`
-      );
-      window.location.reload();
+      // The page reloads to pick up the restored state; a toast followed by
+      // an immediate reload was never seen, so the outcome waits for an OK.
+      Modal.success({
+        title: 'Backup restored',
+        content: `${result.users_created} users, ${result.groups_created} groups and ${ext} OIDC identities imported (${result.users_skipped} skipped). The page reloads to show the restored state.`,
+        okText: 'Reload',
+        onOk: () => window.location.reload(),
+      });
     } catch (e) {
       if (e instanceof ImportBackupError) {
         console.error('Full backup restore failed', {

@@ -579,6 +579,47 @@ pub async fn bulk_delete(
 // zip is a future improvement — for now we match the v1 contract so
 // the migration is a drop-in replacement.
 
+/// ZIP entry names for `(bucket, key)` pairs: each key's path below the
+/// deepest folder shared by the whole selection, so a zipped folder keeps its
+/// structure (`release-3.0/docs/NOTES.md`) and distinct keys can never
+/// collide. With keys from several buckets the bucket name leads.
+///
+/// It used to name entries by basename and "de-duplicate" the later one as
+/// `key.replace('/', "_")` — which for a top-level key is the basename again,
+/// so selecting `README.md` next to a folder holding another `README.md`
+/// failed the whole download with a 500 "Duplicate filename".
+fn zip_entry_names(items: &[(String, String)]) -> Vec<String> {
+    let multi_bucket = items.windows(2).any(|w| w[0].0 != w[1].0);
+    let full: Vec<String> = items
+        .iter()
+        .map(|(b, k)| {
+            if multi_bucket {
+                format!("{b}/{k}")
+            } else {
+                k.clone()
+            }
+        })
+        .collect();
+    // Longest shared directory prefix (whole path segments only).
+    let dir_of = |p: &str| p.rfind('/').map_or(0, |i| i + 1);
+    let mut common = full.first().map_or(0, |p| dir_of(p));
+    for p in &full {
+        let limit = common.min(dir_of(p));
+        let first = &full[0];
+        let mut n = 0;
+        for (i, (a, b)) in first[..limit].bytes().zip(p[..limit].bytes()).enumerate() {
+            if a != b {
+                break;
+            }
+            if a == b'/' {
+                n = i + 1;
+            }
+        }
+        common = n;
+    }
+    full.into_iter().map(|p| p[common..].to_string()).collect()
+}
+
 pub async fn download_zip(
     Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
@@ -613,19 +654,10 @@ pub async fn download_zip(
     }
 
     let engine = state.s3_state.engine.load();
-    let mut name_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let names = zip_entry_names(&parsed);
     let mut bytes_total: u64 = 0;
     let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(parsed.len());
-    for (bucket, key) in &parsed {
-        let basename = key.rsplit('/').next().unwrap_or(key).to_string();
-        // Same de-duplication policy the browser used: when two entries
-        // share a basename, the LATER one gets prefixed by its full key
-        // (slashes-flattened) so it doesn't collide.
-        let zip_name = if name_seen.insert(basename.clone()) {
-            basename
-        } else {
-            key.replace('/', "_")
-        };
+    for ((bucket, key), zip_name) in parsed.iter().zip(names) {
         match engine.retrieve(bucket, key).await {
             Ok((data, _meta)) => {
                 bytes_total += data.len() as u64;
@@ -770,6 +802,41 @@ pub async fn list_all(
 
 #[cfg(test)]
 mod tests {
+    fn names(items: &[(&str, &str)]) -> Vec<String> {
+        let owned: Vec<(String, String)> = items
+            .iter()
+            .map(|(b, k)| (b.to_string(), k.to_string()))
+            .collect();
+        super::zip_entry_names(&owned)
+    }
+
+    #[test]
+    fn zip_names_keep_structure_and_never_collide() {
+        // The reported 500: a top-level README.md next to a folder that also
+        // holds one.
+        assert_eq!(
+            names(&[
+                ("b", "rel/README.md"),
+                ("b", "rel/docs/N.md"),
+                ("b", "README.md")
+            ]),
+            ["rel/README.md", "rel/docs/N.md", "README.md"]
+        );
+        // Selecting inside a folder drops the shared folder path.
+        assert_eq!(
+            names(&[("b", "fw/v1/a.tar"), ("b", "fw/v1/sub/b.tar")]),
+            ["a.tar", "sub/b.tar"]
+        );
+        // Shared directory is by whole segment, not by characters.
+        assert_eq!(names(&[("b", "fw1/a"), ("b", "fw2/a")]), ["fw1/a", "fw2/a"]);
+        assert_eq!(names(&[("b", "one/x.bin")]), ["x.bin"]);
+        // Two buckets: the bucket leads, so same keys stay distinct.
+        assert_eq!(
+            names(&[("a", "k.txt"), ("b", "k.txt")]),
+            ["a/k.txt", "b/k.txt"]
+        );
+    }
+
     use super::{dest_key, is_same_location_move};
 
     #[test]

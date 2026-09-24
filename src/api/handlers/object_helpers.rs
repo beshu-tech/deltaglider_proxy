@@ -87,35 +87,98 @@ pub(crate) fn check_client_write_allowed(
 /// bucket past its `quota_bytes` policy, or when quota is set to 0
 /// (the "freeze the bucket" override).
 ///
-/// Uses cached usage data; if the cache is cold we trigger a
-/// background scan and allow this single write through optimistically.
-/// Operators who want strict enforcement scan the bucket first via
-/// `POST /_/api/admin/usage/scan`.
+/// "Used" is the bucket's STORED footprint from the O(1) running counter
+/// (`bucket_usage`, updated inline on every write/delete and including the
+/// delta baselines). The usage scanner is only a fallback when no counter row
+/// exists yet: it sums per-object stored sizes WITHOUT the `reference.bin`
+/// baselines, so a bucket of one-build-per-folder uploads (each a 3 MB
+/// baseline + a 46-byte delta) looked almost empty and the quota never bit.
+/// With neither source warm the write is let through optimistically.
 pub(crate) fn check_quota(
     state: &Arc<AppState>,
     bucket: &str,
     incoming_bytes: u64,
 ) -> Result<(), S3Error> {
     let engine = state.engine.load();
-    if let Some(quota) = engine.bucket_policy_registry().quota_bytes(bucket) {
-        // quota=0 means freeze — always reject, even without usage data.
-        if quota == 0 {
-            return Err(S3Error::InternalError(
-                "Bucket is frozen (quota = 0)".into(),
-            ));
-        }
-        // get_or_scan: returns cached usage if available, otherwise triggers a
-        // background scan and returns None (first PUT is optimistic).
-        if let Some(usage) = state.usage_scanner.get_or_scan(state, bucket, "") {
-            if usage.total_size.saturating_add(incoming_bytes) > quota {
-                let used_mb = usage.total_size / (1024 * 1024);
-                let quota_mb = quota / (1024 * 1024);
-                return Err(S3Error::InternalError(format!(
-                    "Bucket quota exceeded: {} MB used of {} MB limit",
-                    used_mb, quota_mb,
-                )));
-            }
-        }
+    let Some(quota) = engine.bucket_policy_registry().quota_bytes(bucket) else {
+        return Ok(());
+    };
+    let used = state
+        .bucket_usage
+        .as_ref()
+        .and_then(|u| u.read(bucket).ok().flatten())
+        .map(|row| row.stored_bytes)
+        .or_else(|| {
+            state
+                .usage_scanner
+                .get_or_scan(state, bucket, "")
+                .map(|u| u.total_size)
+        });
+    quota_decision(quota, used, incoming_bytes).map_err(S3Error::AccessDeniedReason)
+}
+
+fn human_bytes(b: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if b >= 1024 * MIB {
+        format!("{:.1} GB", b as f64 / (1024 * MIB) as f64)
+    } else if b >= MIB {
+        format!("{:.1} MB", b as f64 / MIB as f64)
+    } else {
+        format!("{} KB", b.div_ceil(1024))
     }
-    Ok(())
+}
+
+/// Pure quota verdict. `Err` carries the operator-facing reason; the caller
+/// maps it to 403 AccessDenied (the documented status — it used to be a 500
+/// InternalError, which S3 SDKs retry as a server fault).
+pub(crate) fn quota_decision(quota: u64, used: Option<u64>, incoming: u64) -> Result<(), String> {
+    if quota == 0 {
+        return Err("Bucket is frozen (quota = 0)".into());
+    }
+    match used {
+        // Say why THIS write fails: "24 MB used of 25 MB" alone reads as
+        // if there were still room.
+        Some(used) if used.saturating_add(incoming) > quota => Err(format!(
+            "Bucket quota exceeded: {} used + {} upload > {} limit",
+            human_bytes(used),
+            human_bytes(incoming),
+            human_bytes(quota),
+        )),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::quota_decision;
+
+    #[test]
+    fn frozen_bucket_rejects_everything() {
+        assert!(quota_decision(0, None, 0).is_err());
+        assert!(quota_decision(0, Some(0), 1).is_err());
+    }
+
+    #[test]
+    fn cold_usage_is_optimistic() {
+        assert!(quota_decision(1, None, 10_000).is_ok());
+    }
+
+    #[test]
+    fn enforces_against_used_plus_incoming() {
+        assert!(
+            quota_decision(100, Some(50), 50).is_ok(),
+            "exactly at the limit is allowed"
+        );
+        let e = quota_decision(100, Some(50), 51).unwrap_err();
+        assert!(e.starts_with("Bucket quota exceeded"), "{e}");
+        let mib = 1024 * 1024;
+        assert_eq!(
+            quota_decision(25 * mib, Some(24 * mib), 3 * mib).unwrap_err(),
+            "Bucket quota exceeded: 24.0 MB used + 3.0 MB upload > 25.0 MB limit"
+        );
+        assert!(
+            quota_decision(100, Some(u64::MAX), 1).is_err(),
+            "saturating, never wraps"
+        );
+    }
 }

@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { message } from 'antd';
+import { useQueryClient } from '@tanstack/react-query';
+import { qk } from './queries/keys';
 import { listObjects, getBucket, setBucket, headObject, hasCredentials } from './s3client';
 import { buildBrowserUrl } from './urlState';
 import {
@@ -24,6 +26,9 @@ const MAX_HEAD_CACHE_SIZE = 5000;
 
 interface UseS3BrowserOptions {
   writablePrefixes?: string[];
+  /** The savings chip reads an admin-only endpoint: without an admin session
+   *  every folder visit logged a 403, so skip the request instead. */
+  adminSession?: boolean;
   /**
    * The browser location, derived from the URL by `useUrlRouter().browser`.
    * The URL is the single source of truth for where-am-I: bucket / current
@@ -42,6 +47,7 @@ interface UseS3BrowserOptions {
 export default function useS3Browser(options: UseS3BrowserOptions) {
   const {
     writablePrefixes = [],
+    adminSession = false,
     bucket,
     prefix,
     q,
@@ -57,7 +63,17 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   const [isTruncated, setIsTruncated] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [connected, setConnected] = useState(hasCredentials());
-  const searchQuery = q;
+  // The search box shows a local draft; the URL's ?q= follows 200ms later
+  // (debounced replace, see setSearchQuery). Binding the box to ?q= directly
+  // made each keystroke edit the value from BEFORE the previous one, so at
+  // normal typing speed characters vanished ("09-03" → "3"). An external ?q=
+  // change (Back, a link) resets the draft unless the user is mid-typing.
+  const qDebounce = useRef<number | null>(null);
+  const [draftQ, setDraftQ] = useState(q);
+  useEffect(() => {
+    if (qDebounce.current === null) setDraftQ(q);
+  }, [q]);
+  const searchQuery = draftQ;
   const [showHidden, setShowHiddenState] = useState(() => readStorage('dg-show-hidden') === 'true');
   const setShowHidden = useCallback((v: boolean) => {
     setShowHiddenState(v);
@@ -136,6 +152,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   // guard, which silently dropped concurrent loads (e.g. fast prefix/bucket
   // changes), letting the older request commit stale data into state.
   const loadSeq = useRef(0);
+  const queryClient = useQueryClient();
 
   const load = useCallback(() => {
     if (!hasCredentials()) {
@@ -181,6 +198,10 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
         setConnected(true);
         setError(null);
         reconcile(objs, mergedFolders);
+        // Every browser mutation (upload, delete, copy/move, new folder) ends
+        // in a reload, so this is the one place the TopBar size/count pill
+        // learns the bucket changed — it has no other trigger to refetch.
+        void queryClient.invalidateQueries({ queryKey: qk.bucketUsage(listBucket) });
       })
       .catch((err) => {
         if (seq !== loadSeq.current) return; // stale error — drop silently
@@ -195,7 +216,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
         setLoading(false);
         setRefreshing(false);
       });
-  }, [bucket, prefix, reconcile, writablePrefixes]);
+  }, [bucket, prefix, reconcile, writablePrefixes, queryClient]);
 
   useEffect(load, [load, refreshTrigger]);
 
@@ -305,8 +326,8 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   // typing doesn't spam the history stack (each keystroke swaps the current
   // entry rather than pushing). REPLACE also means Back from a filtered view
   // leaves the folder rather than undoing keystrokes.
-  const qDebounce = useRef<number | null>(null);
   const setSearchQuery = useCallback((next: string) => {
+    setDraftQ(next);
     if (qDebounce.current !== null) window.clearTimeout(qDebounce.current);
     qDebounce.current = window.setTimeout(() => {
       qDebounce.current = null;
@@ -474,6 +495,10 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     // state here raced the setBucket() sync effect: switching bucket A→B without
     // changing prefix would fetch A's savings and commit them under B's view.
     if (!bucket) return;
+    if (!adminSession) {
+      setDeltaSummary(null);
+      return;
+    }
     let cancelled = false;
     setDeltaSummary((prev) => (prev ? { ...prev, loading: true } : null));
     getPrefixSavings(bucket, prefix)
@@ -494,7 +519,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     return () => {
       cancelled = true;
     };
-  }, [connected, bucket, prefix, refreshTrigger]);
+  }, [connected, bucket, prefix, refreshTrigger, adminSession]);
 
   return {
     // Data

@@ -21,6 +21,19 @@ use tokio::time::sleep;
 /// Single port per server (UI served under /_/ on the same port).
 static PORT_COUNTER: AtomicU16 = AtomicU16::new(19000);
 
+/// Next counter port that is free right now. The counter alone kept tests
+/// apart from each other but not from anything else on the machine: on a
+/// dev box with another project's container on :19025, whichever test drew
+/// that port died with AddrInUse. Probe-bind and skip taken ports.
+fn next_free_port() -> u16 {
+    loop {
+        let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
 /// Known bootstrap password used by all test servers.
 pub const TEST_BOOTSTRAP_PASSWORD: &str = "testpass";
 
@@ -163,7 +176,7 @@ impl TestServer {
         encryption_key: Option<String>,
         extra_env: Vec<(String, String)>,
     ) -> Self {
-        let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let port = next_free_port();
 
         // Build full config with listen_addr prepended (flat YAML shape).
         let full_config = format!("listen_addr: \"127.0.0.1:{}\"\n{}", port, config_body);

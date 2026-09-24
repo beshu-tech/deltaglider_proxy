@@ -143,6 +143,10 @@ export default function AdminSidebar({ activePath, onNavigate }: Props) {
     <nav
       style={{
         width: 220,
+        // Fill the column: sized to its links, the card background stopped
+        // ~800px down and left a differently coloured band on tall windows.
+        height: '100%',
+        boxSizing: 'border-box',
         borderRight: `1px solid ${BORDER}`,
         background: BG_CARD,
         padding: '12px 0',

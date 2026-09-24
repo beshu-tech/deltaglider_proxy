@@ -17,7 +17,7 @@ import { useState } from 'react';
 import { PlayCircleOutlined, StopOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import type { AdminConfig } from '../adminApi';
-import { formatBytes, relativeTime } from '../utils';
+import { formatBytes, relativeTime, noun } from '../utils';
 import { fmtNum } from './dashboard/chartDefaults';
 import type { BucketRow } from './AnalyticsSection';
 
@@ -208,7 +208,7 @@ function FleetRow({
             <span style={{ color: colors.ACCENT_AMBER }}>not scanned</span>
           ) : (
             <>
-              {fmtNum(b.objectCount)} objects
+              {fmtNum(b.objectCount)} {noun(b.objectCount, 'object')}
               {b.completedAt && (
                 <>
                   {' '}·{' '}

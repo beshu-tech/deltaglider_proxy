@@ -181,60 +181,41 @@ impl IamIndex {
 }
 
 /// Return predefined policy templates for the admin UI.
+///
+/// A strict ladder, least privilege first. `write` never includes `delete`
+/// and only `*` grants `admin` (bucket create/delete + the admin API). The
+/// old "Read/Write (No Delete)" was `Allow *` + `Deny delete` — i.e. an
+/// administrator — while reading like a narrower Read/Write.
 pub fn canned_policies() -> Vec<CannedPolicy> {
+    fn allow(actions: &[&str]) -> Vec<Permission> {
+        vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: actions.iter().map(|a| (*a).into()).collect(),
+            resources: vec!["*".into()],
+            conditions: None,
+        }]
+    }
     vec![
         CannedPolicy {
-            name: "Full Access",
-            description: "All S3 operations on all resources",
-            permissions: vec![Permission {
-                id: 0,
-                effect: "Allow".into(),
-                actions: vec!["*".into()],
-                resources: vec!["*".into()],
-                conditions: None,
-            }],
-        },
-        CannedPolicy {
             name: "Read Only",
-            description: "Read and list all resources",
-            permissions: vec![Permission {
-                id: 0,
-                effect: "Allow".into(),
-                actions: vec!["read".into(), "list".into()],
-                resources: vec!["*".into()],
-                conditions: None,
-            }],
+            description: "List and download objects in every bucket",
+            permissions: allow(&["read", "list"]),
         },
         CannedPolicy {
-            name: "Read/Write",
-            description: "Read, write, and list all resources",
-            permissions: vec![Permission {
-                id: 0,
-                effect: "Allow".into(),
-                actions: vec!["read".into(), "write".into(), "list".into()],
-                resources: vec!["*".into()],
-                conditions: None,
-            }],
+            name: "Read/Write (no delete)",
+            description: "List, download and upload; cannot delete objects",
+            permissions: allow(&["read", "write", "list"]),
         },
         CannedPolicy {
-            name: "Read/Write (No Delete)",
-            description: "Full access except delete operations are denied",
-            permissions: vec![
-                Permission {
-                    id: 0,
-                    effect: "Allow".into(),
-                    actions: vec!["*".into()],
-                    resources: vec!["*".into()],
-                    conditions: None,
-                },
-                Permission {
-                    id: 0,
-                    effect: "Deny".into(),
-                    actions: vec!["delete".into()],
-                    resources: vec!["*".into()],
-                    conditions: None,
-                },
-            ],
+            name: "Read/Write/Delete",
+            description: "List, download, upload and delete objects; no bucket or admin operations",
+            permissions: allow(&["read", "write", "delete", "list"]),
+        },
+        CannedPolicy {
+            name: "Full Access (admin)",
+            description: "Every operation, including bucket management and the admin API",
+            permissions: allow(&["*"]),
         },
     ]
 }
@@ -250,6 +231,39 @@ pub struct CannedPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the preset that says "admin" may grant `*`; every other preset
+    /// is Allow-only and delete appears only where the name says so.
+    #[test]
+    fn canned_policies_do_not_hide_admin() {
+        for p in canned_policies() {
+            let grants_star = p
+                .permissions
+                .iter()
+                .any(|r| r.effect == "Allow" && r.actions.iter().any(|a| a == "*"));
+            assert_eq!(
+                grants_star,
+                p.name.contains("admin"),
+                "{}: `*` only in the admin preset",
+                p.name
+            );
+            assert!(
+                p.permissions.iter().all(|r| r.effect == "Allow"),
+                "{}: no Allow-*/Deny tricks",
+                p.name
+            );
+            let deletes = p
+                .permissions
+                .iter()
+                .any(|r| r.actions.iter().any(|a| a == "delete" || a == "*"));
+            assert_eq!(
+                deletes,
+                !p.name.contains("no delete") && p.name != "Read Only",
+                "{}: delete matches the name",
+                p.name
+            );
+        }
+    }
 
     #[test]
     fn test_iam_index_lookup() {

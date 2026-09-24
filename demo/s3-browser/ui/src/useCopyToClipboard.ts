@@ -7,7 +7,8 @@
  * never reported success, only one had a download fallback.
  *
  * Contract:
- *   - `copy(text, opts?)` writes via `navigator.clipboard.writeText`.
+ *   - `copy(text, opts?)` writes via `navigator.clipboard.writeText`, or the
+ *     legacy `execCommand('copy')` outside a secure context (plain HTTP).
  *   - On success: surfaces `message.success` and flips `copied` to true
  *     for `resetMs` (default 1800ms), then back to false.
  *   - On failure / missing Clipboard API: surfaces `message.error` so the
@@ -43,6 +44,40 @@ function downloadText(text: string, filename: string, mimeType: string): void {
   }
 }
 
+/**
+ * `navigator.clipboard` exists only in a secure context (HTTPS or
+ * localhost). A proxy reached over plain HTTP on a LAN/VPN address has
+ * none, so fall back to the legacy `execCommand('copy')` on a hidden
+ * textarea, which browsers still honour inside a user gesture. The textarea
+ * goes next to the focused element so an open modal's focus trap keeps it.
+ */
+async function writeClipboard(text: string): Promise<void> {
+  if (window.isSecureContext && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      /* permission denied / not focused — try the legacy path */
+    }
+  }
+  const active = document.activeElement as HTMLElement | null;
+  const host = active?.closest('.ant-modal, .ant-drawer') ?? document.body;
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.setAttribute('readonly', '');
+  ta.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;';
+  host.appendChild(ta);
+  ta.select();
+  let ok: boolean;
+  try {
+    ok = document.execCommand('copy');
+  } finally {
+    ta.remove();
+    active?.focus?.();
+  }
+  if (!ok) throw new Error('the browser blocked clipboard access');
+}
+
 export function useCopyToClipboard() {
   const [copied, setCopied] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -73,12 +108,8 @@ export function useCopyToClipboard() {
       }
     };
 
-    if (!navigator.clipboard?.writeText) {
-      fallback('Clipboard API unavailable. Check your browser permissions');
-      return false;
-    }
     try {
-      await navigator.clipboard.writeText(text);
+      await writeClipboard(text);
       if (!mountedRef.current) return true;
       message.success(successMessage);
       setCopied(true);
@@ -88,7 +119,7 @@ export function useCopyToClipboard() {
       }, resetMs);
       return true;
     } catch (e) {
-      fallback(`Copy failed: ${normalizeUiError(e, 'unknown error')}`);
+      fallback(`Copy failed (${normalizeUiError(e, 'unknown error')}) — select the text and copy it manually`);
       return false;
     }
   }, []);

@@ -18,8 +18,17 @@ use std::sync::Arc;
 use super::{audit_log, AdminState};
 
 /// GET /api/admin/sessions — list live (non-expired) sessions, redacted.
-pub async fn list_sessions(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
-    let sessions = state.sessions.list();
+pub async fn list_sessions(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let own = super::auth::extract_session_token(&headers);
+    let mut sessions = state.sessions.list();
+    for s in &mut sessions {
+        s.current = own
+            .as_deref()
+            .is_some_and(|t| state.sessions.session_id_matches(t, &s.id));
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({ "sessions": sessions })),

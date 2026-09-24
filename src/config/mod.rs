@@ -1649,6 +1649,22 @@ impl Config {
     /// actionable message ([`TOML_REMOVED_MSG`]). Falling back to defaults
     /// for a removed format would silently ignore the operator's intent.
     pub fn load() -> Self {
+        let mut config = Self::load_unchecked();
+        config.validate();
+        config
+    }
+
+    /// [`Self::load`] without printing warnings (fields are still clamped by
+    /// `check`). For `main`'s early load that only reads the blocking-thread
+    /// count: the full load in `async_main` prints them, and printing both
+    /// showed every config warning twice at startup.
+    pub fn load_quiet() -> Self {
+        let mut config = Self::load_unchecked();
+        let _ = config.check();
+        config
+    }
+
+    fn load_unchecked() -> Self {
         let mut config = if let Ok(path) = std::env::var("DGP_CONFIG") {
             if path_is_toml(&path) {
                 eprintln!("ERROR: DGP_CONFIG points at '{path}': {TOML_REMOVED_MSG}");
@@ -1700,7 +1716,6 @@ impl Config {
 
         // Environment variables always override file config
         config.apply_env_overrides();
-        config.validate();
         config
     }
 
@@ -1718,6 +1733,15 @@ impl Config {
         let mut config = Self::from_file(path)?;
         config.apply_env_overrides();
         config.validate();
+        Ok(config)
+    }
+
+    /// [`Self::load_from_path`] without printing warnings — see
+    /// [`Self::load_quiet`].
+    pub fn load_from_path_quiet(path: &str) -> Result<Self, ConfigError> {
+        let mut config = Self::from_file(path)?;
+        config.apply_env_overrides();
+        let _ = config.check();
         Ok(config)
     }
 

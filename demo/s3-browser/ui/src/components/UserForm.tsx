@@ -28,9 +28,10 @@ const { Text, Title } = Typography;
 
 // Fallback presets used if the API is unavailable
 const FALLBACK_PRESETS: Record<string, PermissionRow[]> = {
-  'Full Admin': [{ effect: 'Allow', actions: ['*'], resources: ['*'] }],
-  'Read/Write': [{ effect: 'Allow', actions: ['read', 'write', 'list'], resources: ['*'] }],
   'Read Only': [{ effect: 'Allow', actions: ['read', 'list'], resources: ['*'] }],
+  'Read/Write (no delete)': [{ effect: 'Allow', actions: ['read', 'write', 'list'], resources: ['*'] }],
+  'Read/Write/Delete': [{ effect: 'Allow', actions: ['read', 'write', 'delete', 'list'], resources: ['*'] }],
+  'Full Access (admin)': [{ effect: 'Allow', actions: ['*'], resources: ['*'] }],
 };
 
 interface UserFormProps {
@@ -67,7 +68,11 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
   const [permissions, setPermissions] = useState<PermissionRow[]>(() =>
     user
       ? permissionsToRows(user.permissions)
-      : [{ _uiId: freshPermissionRowId(), effect: 'Allow', actions: ['*'], resources: ['*'] }],
+      // Least privilege by default: a user saved without touching this
+      // section used to be a full admin (every action on every bucket).
+      // The bootstrap admin is migrated separately; nobody needs admin here
+      // by accident. The presets above one-click to broader access.
+      : [{ _uiId: freshPermissionRowId(), effect: 'Allow', actions: ['read', 'list'], resources: ['*'] }],
   );
   const [saving, setSavingState] = useState(false);
   const [deleting, setDeletingState] = useState(false);

@@ -41,7 +41,7 @@ import {
 } from '../../queries/jobs';
 import { useColors } from '../../ThemeContext';
 import { useTweenedCount } from '../../hooks/useTweenedCount';
-import { relativeTime } from '../../utils';
+import { relativeTime, noun } from '../../utils';
 import { normalizeUiError } from '../../errorHandling';
 
 const { Text } = Typography;
@@ -144,7 +144,7 @@ function headlineFor(o: ParityOutcome): string {
 
 /** Derived body sentence for pre-field (legacy) outcomes with no summary. */
 function legacyBody(o: ParityOutcome): string {
-  if (o.in_sync) return `All ${o.matched.toLocaleString()} objects match. No missing files, no extras.`;
+  if (o.in_sync) return `All ${o.matched.toLocaleString()} ${noun(o.matched, 'object')} match. No missing files, no extras.`;
   const realDiffs = o.missing_on_dest + o.orphan_on_dest + o.checksum_mismatch;
   if (realDiffs === 0)
     return `Nothing is missing or different, but some objects couldn't be fully verified.`;
@@ -742,7 +742,7 @@ export function ParityResult({
               outcome.cap_hit ? (
                 <>
                   The audit stopped after the first{' '}
-                  {(outcome.source_objects + outcome.dest_objects).toLocaleString()} objects — the
+                  {(outcome.source_objects + outcome.dest_objects).toLocaleString()} {noun(outcome.source_objects + outcome.dest_objects, 'object')} — the
                   rest are <strong>unverified</strong>, not proven complete. Counts and findings
                   below cover only the scanned portion. Raise the cap with the{' '}
                   <code>DGP_PARITY_MAX_OBJECTS</code> environment variable to scan more.
@@ -780,7 +780,7 @@ export function ParityResult({
               type="info"
               showIcon
               style={{ borderRadius: 8, marginTop: 14 }}
-              message={`${outcome.unverifiable.toLocaleString()} objects match on size, not checksum`}
+              message={`${outcome.unverifiable.toLocaleString()} ${noun(outcome.unverifiable, 'object matches', 'objects match')} on size, not checksum`}
               description="Their sizes match on both sides, but there was no comparable checksum to prove the bytes are identical — usually because they were written to the backend directly (not through the proxy), or the two sides store them differently. This is not a mismatch; re-write them through the proxy if you want full checksum parity."
             />
           )}

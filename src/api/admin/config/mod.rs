@@ -299,7 +299,7 @@ pub(crate) async fn apply_config_transition(
     //    this matches the existing behavior where an invalid log level
     //    keeps the old filter but doesn't block the config change.
     if old_cfg.log_level != new_cfg.log_level {
-        match new_cfg.log_level.parse::<EnvFilter>() {
+        match crate::audit::with_audit_directive(&new_cfg.log_level).parse::<EnvFilter>() {
             Ok(new_filter) => {
                 if let Err(e) = state.log_reload.reload(new_filter) {
                     warnings.push(format!("Failed to reload log filter: {}", e));
