@@ -37,6 +37,8 @@ import { buildViewUrl, buildBrowserUrl, type View } from './urlState';
 import { useOverlayClose } from './hooks/useOverlayClose';
 import type { S3Object } from './types';
 import { writeStorage } from './safeStorage';
+import { pageTitle } from './pageTitle';
+import { headerForPath } from './components/adminNavigation';
 
 const { Content } = Layout;
 const { useBreakpoint } = Grid;
@@ -295,17 +297,13 @@ export default function App() {
     setPreviewObject(null);
   }, [cancelFolderSizes, s3.prefix, browser.bucket]);
 
-  // Dynamic page title on view change
+  // Tab title follows the view, the bucket and the admin page. Keep the
+  // unsaved-edits "● " marker that useDirtyGlobalIndicators owns.
   useEffect(() => {
-    const titles: Record<View, string> = {
-      browser: `${getBucket()} — DeltaGlider Proxy`,
-      upload: 'Upload — DeltaGlider Proxy',
-      metrics: 'Metrics — DeltaGlider Proxy',
-      docs: 'API Reference — DeltaGlider Proxy',
-      admin: 'Admin Settings — DeltaGlider Proxy',
-    };
-    document.title = titles[view];
-  }, [view]);
+    const label = view === 'admin' ? headerForPath(subPath)?.title : undefined;
+    const marker = document.title.startsWith('● ') ? '● ' : '';
+    document.title = marker + pageTitle(view, activeBucket, label);
+  }, [view, activeBucket, subPath]);
 
   // Focus management: move focus to main content area on view change
   useEffect(() => {
