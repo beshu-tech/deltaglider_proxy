@@ -14,7 +14,9 @@
  * unicode; `/` is the folder delimiter and is the only reserved char).
  */
 
-export type View = 'browser' | 'upload' | 'metrics' | 'docs' | 'admin';
+// No 'metrics' view: the proxy's Prometheus endpoint owns /_/metrics, so an
+// SPA page there was unreachable. The dashboard lives at /_/admin/dashboard.
+export type View = 'browser' | 'upload' | 'docs' | 'admin';
 
 /** URL path prefix the SPA is served under. `_` is not a valid S3 bucket char. */
 export const BASE = '/_/';
@@ -23,7 +25,6 @@ const SEGMENT_TO_VIEW: Record<string, View> = {
   '': 'browser',
   browse: 'browser',
   upload: 'upload',
-  metrics: 'metrics',
   docs: 'docs',
   admin: 'admin',
 };
@@ -32,7 +33,6 @@ const SEGMENT_TO_VIEW: Record<string, View> = {
 const VIEW_TO_SEGMENT: Record<View, string> = {
   browser: 'browse',
   upload: 'upload',
-  metrics: 'metrics',
   docs: 'docs',
   admin: 'admin',
 };
@@ -79,7 +79,7 @@ function safeDecode(segment: string): string {
   }
 }
 
-/** Parse a pathname into view + opaque sub-path (admin/docs/metrics use subPath). */
+/** Parse a pathname into view + opaque sub-path (admin/docs use subPath). */
 export function parseViewLocation(pathname: string): ViewLocation {
   const path = stripBase(pathname);
   const segments = path.split('/');
@@ -151,7 +151,7 @@ export function buildBrowserUrl(loc: Partial<BrowserLocation>): string {
 }
 
 /**
- * Build a non-browser view URL (admin/docs/metrics/upload) from a sub-path
+ * Build a non-browser view URL (admin/docs/upload) from a sub-path
  * and optional query params. The inverse of `parseViewLocation` + the query
  * string: `buildViewUrl('admin', 'jobs', { job: 'replication:foo', tab: 'runs' })`
  * → `/_/admin/jobs?job=replication%3Afoo&tab=runs`.

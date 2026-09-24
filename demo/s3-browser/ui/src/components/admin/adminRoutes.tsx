@@ -65,7 +65,7 @@ const ADMIN_ROUTES: Record<string, AdminRoute> = {
   // switcher + refresh controls; an outer header would duplicate it.
   'dashboard': {
     header: false,
-    render: (c) => <MetricsPage onBack={c.onBack} embedded search={c.search} proxyVersion={c.proxyVersion} />,
+    render: (c) => <MetricsPage search={c.search} proxyVersion={c.proxyVersion} />,
   },
   'diagnostics/trace': {
     render: (c) => <TracePanel onSessionExpired={c.onSessionExpired} />,

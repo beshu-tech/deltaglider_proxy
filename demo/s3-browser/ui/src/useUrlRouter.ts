@@ -11,7 +11,7 @@ import {
 
 /**
  * The full app location derived from `window.location`. `view` / `subPath`
- * drive the top-level view switch (admin/docs/metrics/upload) exactly as the
+ * drive the top-level view switch (admin/docs/upload) exactly as the
  * old inline `usePathRouter` did; `browser` carries the bucket-browser state
  * (bucket / prefix / q / object) parsed from the path + query string;
  * `search` exposes the raw query string for non-browser views (admin deep-

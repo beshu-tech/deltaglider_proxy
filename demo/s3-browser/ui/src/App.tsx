@@ -12,10 +12,9 @@ import FilePreview from './components/FilePreview';
 import DropZone from './components/DropZone';
 import UploadPage from './components/UploadPage';
 import ConnectPage, { type ConnectOutcome } from './components/ConnectPage';
-// Heavy admin/docs/metrics pages are lazy-loaded so the file-browser
+// Heavy admin/docs pages are lazy-loaded so the file-browser
 // shell doesn't pay for Monaco / mermaid / recharts on first paint.
 const AdminPage = lazy(() => import('./components/AdminPage'));
-const MetricsPage = lazy(() => import('./components/MetricsPage'));
 const DocsPage = lazy(() => import('./components/DocsPage'));
 import FileBrowserSessionTip from './components/FileBrowserSessionTip';
 import AccountMenu from './components/AccountMenu';
@@ -46,7 +45,7 @@ const { useBreakpoint } = Grid;
 /** Full-screen views hide the main sidebar and TopBar */
 const FULLSCREEN_VIEWS: Set<View> = new Set(['admin', 'docs']);
 
-// Shared Suspense fallback for lazy admin / metrics / docs page chunks.
+// Shared Suspense fallback for lazy admin / docs page chunks.
 // Module-scope so we don't reallocate it on every render.
 const LAZY_FALLBACK = (
   <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 48 }}>
@@ -463,25 +462,6 @@ export default function App() {
             onShowShortcuts={showShortcuts}
             proxyVersion={identity?.version}
           />
-        </Suspense>
-      );
-    }
-
-    if (view === 'metrics') {
-      if (!hasAdminSession) {
-        return (
-          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 48 }}>
-            <Empty
-              description="Sign in through Settings to view metrics and analytics. You are currently signed in for browsing files only (for example after using an access key on the sign-in screen)."
-            >
-              <Button type="primary" onClick={navigateToBrowse}>Back to Browser</Button>
-            </Empty>
-          </div>
-        );
-      }
-      return (
-        <Suspense fallback={LAZY_FALLBACK}>
-          <MetricsPage onBack={navigateToBrowse} search={search} proxyVersion={identity?.version} />
         </Suspense>
       );
     }
