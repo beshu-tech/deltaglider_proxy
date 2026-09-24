@@ -46,6 +46,7 @@ type SaveFilePicker = (opts: {
   types?: { description: string; accept: Record<string, string[]> }[];
 }) => Promise<{
   createWritable: () => Promise<WritableStream<Uint8Array>>;
+  getFile?: () => Promise<{ size: number }>;
   /** Deletes the file (Chrome 110+). */
   remove?: () => Promise<void>;
 }>;
@@ -103,13 +104,18 @@ export async function downloadZip(
     return startAnchorDownload(url, filename);
   }
 
-  // The picker already created the file (or picked one to overwrite). When
-  // no archive arrives, delete it: an empty file must not look like a ZIP.
+  // Choosing a NEW name makes the picker create an empty file; choosing an
+  // existing file leaves its content alone until a writable is committed.
+  // So nothing is written before the archive arrives, and on failure only a
+  // file that was empty before the request is deleted: an existing file the
+  // user picked to overwrite keeps its content.
+  const sizeBefore = await handle.getFile?.().then((f) => f.size).catch(() => undefined);
   const discard = async () => {
+    if (sizeBefore !== 0) return;
     try {
       await handle.remove?.();
     } catch {
-      /* the file stays; the error below still explains why */
+      /* the empty file stays; the error below still explains why */
     }
   };
   let res: Response;
@@ -134,8 +140,9 @@ export async function downloadZip(
     throw new Error('ZIP download failed: the server sent no data.');
   }
   const writable = await handle.createWritable();
-  // pipeTo closes the file on success and aborts it (discarding the partial
-  // file) when the connection breaks.
+  // pipeTo closes the writable on success and aborts it when the connection
+  // breaks: an aborted writable discards what it wrote and leaves the file's
+  // previous content.
   await res.body.pipeTo(writable);
   return 'saved';
 }
