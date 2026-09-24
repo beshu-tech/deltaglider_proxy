@@ -51,7 +51,7 @@ const CELL_TRUNCATE_STYLE = {
  *  The action column sizes to its widest tag, so a long action such as
  *  `apply_config_section:admission` never runs into the user column. */
 const AUDIT_COLUMNS =
-  '110px max-content minmax(100px, 180px) minmax(90px, 140px) minmax(80px, 140px) minmax(160px, 1fr)';
+  '110px minmax(120px, max-content) minmax(100px, 180px) minmax(90px, 140px) minmax(80px, 140px) minmax(160px, 1fr)';
 
 /** A header or data row: a subgrid that spans every column of the table. */
 const AUDIT_ROW = {
