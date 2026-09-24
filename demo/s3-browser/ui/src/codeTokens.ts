@@ -6,16 +6,18 @@
  */
 export type TextSegment = { kind: 'text' | 'code'; text: string };
 
-const TOKEN = /(?<![\w-])(--[a-z][a-z0-9-]*|DGP_[A-Z0-9_]+)/g;
+// Group 1 is the character before the token (or the start). A lookbehind
+// would be shorter, but Safari < 16.4 cannot parse one (ESLint forbids it).
+const TOKEN = /(^|[^\w-])(--[a-z][a-z0-9-]*|DGP_[A-Z0-9_]+)/g;
 
 export function splitCodeTokens(text: string): TextSegment[] {
   const out: TextSegment[] = [];
   let last = 0;
   for (const m of text.matchAll(TOKEN)) {
-    const at = m.index ?? 0;
+    const at = (m.index ?? 0) + m[1].length;
     if (at > last) out.push({ kind: 'text', text: text.slice(last, at) });
-    out.push({ kind: 'code', text: m[0] });
-    last = at + m[0].length;
+    out.push({ kind: 'code', text: m[2] });
+    last = at + m[2].length;
   }
   if (last < text.length) out.push({ kind: 'text', text: text.slice(last) });
   return out;
