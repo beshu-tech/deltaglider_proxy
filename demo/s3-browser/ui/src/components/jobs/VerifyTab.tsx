@@ -6,8 +6,9 @@
  * framed panel (NOT a generic AntD success Alert) — a soft green halo around a
  * large ✓, the matched count as the visual anchor, an honest provenance footnote.
  *
- * Owns its own state via a useMutation (no poll, no auto-run on mount); it does
- * NOT touch the editable Definition form.
+ * Server-side state: `useParityStatus` gives the cached verdict on mount and
+ * polls while a scan runs; `useStartVerify` kicks one off. No auto-run on
+ * mount, and it does NOT touch the editable Definition form.
  */
 import { useEffect, useRef, useState } from 'react';
 import { Alert, Button, Tag, Typography } from 'antd';
@@ -21,9 +22,19 @@ import {
   WarningOutlined,
 } from '@ant-design/icons';
 import type { ParityFinding, ParityOutcome, Verifier } from '../../adminApi';
-import { computeRate, conflictPolicyLabel, deriveVerifyProgress, fixActionMeta, parityKindMeta, rerunVerdictMeta } from '../../jobsView';
+import type { PendingReverify } from '../../jobsView';
+import {
+  computeRate,
+  conflictPolicyLabel,
+  deriveVerifyProgress,
+  fixActionMeta,
+  parityKindMeta,
+  rerunVerdictMeta,
+  stepPendingReverify,
+} from '../../jobsView';
 import {
   useCancelVerify,
+  useJobs,
   useParityStatus,
   useRunReplicationNow,
   useStartVerify,
@@ -31,6 +42,7 @@ import {
 import { useColors } from '../../ThemeContext';
 import { useTweenedCount } from '../../hooks/useTweenedCount';
 import { timeAgo } from '../../utils';
+import { normalizeUiError } from '../../errorHandling';
 
 const { Text } = Typography;
 
@@ -147,6 +159,22 @@ export default function VerifyTab({ ruleName }: Props) {
   const start = useStartVerify(ruleName);
   const cancel = useCancelVerify(ruleName);
   const runNow = useRunReplicationNow();
+  // The rule's jobs-list row (shared, already-polled query) tells when the
+  // run started by "Run now" settles.
+  const jobs = useJobs();
+  const ruleRow = jobs.data?.jobs.find((j) => j.id === `replication:${ruleName}`) ?? null;
+  const [pendingReverify, setPendingReverify] = useState<PendingReverify | null>(null);
+  const startVerify = start.mutate;
+  useEffect(() => {
+    if (!pendingReverify) return;
+    const step = stepPendingReverify(pendingReverify, ruleRow);
+    if (step.start) {
+      setPendingReverify(null);
+      startVerify();
+    } else if (step.next !== pendingReverify) {
+      setPendingReverify(step.next);
+    }
+  }, [pendingReverify, ruleRow, startVerify]);
 
   const s = status.data;
   const cancelling = s?.status === 'cancelling' || cancel.isPending;
@@ -155,121 +183,167 @@ export default function VerifyTab({ ruleName }: Props) {
 
   const run = () => start.mutate();
   const onCancel = () => cancel.mutate();
-  // The one executable per-finding fix: run the rule, then re-verify.
-  const onRunNow = () => runNow.mutate(ruleName, { onSuccess: () => start.mutate() });
+  // The one executable per-finding fix: run the rule, then re-verify once the
+  // run settles. Run-now answers 202 while the run still holds the lease, and
+  // the verify endpoint 409s until that lease is released.
+  const onRunNow = () =>
+    runNow.mutate(ruleName, {
+      onSuccess: () =>
+        setPendingReverify({ baselineLastRunAt: ruleRow?.last_run_at ?? null, sawActive: false }),
+    });
 
-  // ── first load (no server state yet) ───────────────────────────────────────
-  if (status.isLoading) {
-    return <LoadingBlock c={c} label="Loading verification status…" />;
-  }
-
-  // ── running with NO prior result → live progress + cancel ──────────────────
-  if (running && !outcome) {
-    // Phase label: an unknown/zero denominator means we're still LISTING (the
-    // dominant early cost on a big bucket); a known total means COMPARING. This
-    // explains the early indeterminate span instead of reading as "frozen".
-    const listing = !s?.progress_total || s.progress_total <= 0;
-    return (
-      <LoadingBlock
-        c={c}
-        label={
-          cancelling
-            ? 'Cancelling…'
-            : listing
-              ? 'Listing objects…'
-              : 'Comparing source and destination…'
-        }
-        scanned={s?.progress_scanned}
-        total={s?.progress_total}
-        onCancel={cancelling ? undefined : onCancel}
-      />
-    );
-  }
-
-  // ── cancelled (and no prior result to show) ───────────────────────────────
-  if (s?.status === 'cancelled' && !outcome) {
-    return (
-      <div style={{ padding: '8px 4px' }}>
-        <Alert
-          type="info"
-          showIcon
-          message="Verification cancelled"
-          description="The parity audit was cancelled before it finished."
-          style={{ borderRadius: 8, marginBottom: 16 }}
-        />
-        <Button
-          type="primary"
-          icon={<SafetyCertificateOutlined />}
-          onClick={run}
-          loading={start.isPending}
-        >
-          Run verification
-        </Button>
-      </div>
-    );
-  }
-
-  // ── failed (and no prior result to show) ───────────────────────────────────
-  if (s?.status === 'failed' && !outcome) {
-    return (
-      <div style={{ padding: '8px 4px' }}>
+  const banners = (
+    <>
+      {runNow.error && (
         <Alert
           type="error"
           showIcon
-          message="Verification failed"
-          description={s.error || 'The parity audit could not complete.'}
-          style={{ borderRadius: 8, marginBottom: 16 }}
+          message={normalizeUiError(runNow.error, 'Run now failed')}
+          style={{ borderRadius: 8, marginBottom: 12 }}
         />
-        <Button icon={<ReloadOutlined />} onClick={run} loading={start.isPending}>
-          Retry
-        </Button>
-      </div>
-    );
-  }
+      )}
+      {start.error && (
+        <Alert
+          type="error"
+          showIcon
+          message={normalizeUiError(start.error, 'Could not start verification')}
+          style={{ borderRadius: 8, marginBottom: 12 }}
+        />
+      )}
+      {pendingReverify && (
+        <Alert
+          type="info"
+          showIcon
+          message="Run started — verification re-runs when it finishes."
+          style={{ borderRadius: 8, marginBottom: 12 }}
+        />
+      )}
+    </>
+  );
 
-  // ── idle, never run ────────────────────────────────────────────────────────
-  if (!outcome) {
-    return (
-      <div style={{ padding: '8px 4px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-          <SafetyCertificateOutlined style={{ fontSize: 18, color: c.ACCENT_BLUE }} />
-          <Text strong style={{ fontSize: 15 }}>
-            Audit replication parity
-          </Text>
+  // Body per state; the banners above it show in every state.
+  const renderBody = () => {
+
+    // ── first load (no server state yet) ───────────────────────────────────────
+    if (status.isLoading) {
+      return <LoadingBlock c={c} label="Loading verification status…" />;
+    }
+
+    // ── running with NO prior result → live progress + cancel ──────────────────
+    if (running && !outcome) {
+      // Phase label: an unknown/zero denominator means we're still LISTING (the
+      // dominant early cost on a big bucket); a known total means COMPARING. This
+      // explains the early indeterminate span instead of reading as "frozen".
+      const listing = !s?.progress_total || s.progress_total <= 0;
+      return (
+        <LoadingBlock
+          c={c}
+          label={
+            cancelling
+              ? 'Cancelling…'
+              : listing
+                ? 'Listing objects…'
+                : 'Comparing source and destination…'
+          }
+          scanned={s?.progress_scanned}
+          total={s?.progress_total}
+          onCancel={cancelling ? undefined : onCancel}
+        />
+      );
+    }
+
+    // ── cancelled (and no prior result to show) ───────────────────────────────
+    if (s?.status === 'cancelled' && !outcome) {
+      return (
+        <div style={{ padding: '8px 4px' }}>
+          <Alert
+            type="info"
+            showIcon
+            message="Verification cancelled"
+            description="The parity audit was cancelled before it finished."
+            style={{ borderRadius: 8, marginBottom: 16 }}
+          />
+          <Button
+            type="primary"
+            icon={<SafetyCertificateOutlined />}
+            onClick={run}
+            loading={start.isPending}
+          >
+            Run verification
+          </Button>
         </div>
-        <Text style={{ display: 'block', color: c.TEXT_SECONDARY, lineHeight: 1.5, marginBottom: 4 }}>
-          A fast <strong>metadata audit</strong>: it checks that every source object exists on the
-          destination and that their recorded checksums and sizes agree.
-        </Text>
-        <Text type="secondary" style={{ display: 'block', fontSize: 12.5, marginBottom: 18 }}>
-          No downloads — it does not re-read the destination's bytes. Runs in the background;
-          the result is saved, so you can leave this page and come back.
-        </Text>
-        <Button
-          type="primary"
-          icon={<SafetyCertificateOutlined />}
-          onClick={run}
-          loading={start.isPending}
-        >
-          Run audit
-        </Button>
-      </div>
-    );
-  }
+      );
+    }
 
-  // ── result (cached verdict; may be re-verifying in the background) ─────────
+    // ── failed (and no prior result to show) ───────────────────────────────────
+    if (s?.status === 'failed' && !outcome) {
+      return (
+        <div style={{ padding: '8px 4px' }}>
+          <Alert
+            type="error"
+            showIcon
+            message="Verification failed"
+            description={s.error || 'The parity audit could not complete.'}
+            style={{ borderRadius: 8, marginBottom: 16 }}
+          />
+          <Button icon={<ReloadOutlined />} onClick={run} loading={start.isPending}>
+            Retry
+          </Button>
+        </div>
+      );
+    }
+
+    // ── idle, never run ────────────────────────────────────────────────────────
+    if (!outcome) {
+      return (
+        <div style={{ padding: '8px 4px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+            <SafetyCertificateOutlined style={{ fontSize: 18, color: c.ACCENT_BLUE }} />
+            <Text strong style={{ fontSize: 15 }}>
+              Audit replication parity
+            </Text>
+          </div>
+          <Text style={{ display: 'block', color: c.TEXT_SECONDARY, lineHeight: 1.5, marginBottom: 4 }}>
+            A fast <strong>metadata audit</strong>: it checks that every source object exists on the
+            destination and that their recorded checksums and sizes agree.
+          </Text>
+          <Text type="secondary" style={{ display: 'block', fontSize: 12.5, marginBottom: 18 }}>
+            No downloads — it does not re-read the destination's bytes. Runs in the background;
+            the result is saved, so you can leave this page and come back.
+          </Text>
+          <Button
+            type="primary"
+            icon={<SafetyCertificateOutlined />}
+            onClick={run}
+            loading={start.isPending}
+          >
+            Run audit
+          </Button>
+        </div>
+      );
+    }
+
+    // ── result (cached verdict; may be re-verifying in the background) ─────────
+    return (
+      <ParityResult
+        outcome={outcome}
+        reverifying={running}
+        reverifyScanned={running ? s?.progress_scanned : undefined}
+        reverifyTotal={running ? s?.progress_total : undefined}
+        onReverify={run}
+        onCancelReverify={cancelling ? undefined : onCancel}
+        onRunNow={onRunNow}
+        runNowPending={runNow.isPending || pendingReverify != null}
+        c={c}
+      />
+    );
+  };
+
   return (
-    <ParityResult
-      outcome={outcome}
-      reverifying={running}
-      reverifyScanned={running ? s?.progress_scanned : undefined}
-      reverifyTotal={running ? s?.progress_total : undefined}
-      onReverify={run}
-      onCancelReverify={cancelling ? undefined : onCancel}
-      onRunNow={onRunNow}
-      runNowPending={runNow.isPending}
-      c={c}
-    />
+    <>
+      {banners}
+      {renderBody()}
+    </>
   );
 }
 

@@ -29,6 +29,7 @@ const {
   jobStrategyMix,
   planRuleDeleteSync,
   editorAfterDiscard,
+  stepPendingReverify,
 } = await import(moduleUrl);
 
 const row = (over = {}) => ({
@@ -395,5 +396,26 @@ assert.equal(jobStrategyMix({ objects_processed: 0 }), null, 'nothing copied →
 // a plain discard would bring it back — refresh from the server instead.
 assert.equal(editorAfterDiscard(false), 'discard');
 assert.equal(editorAfterDiscard(true), 'refresh');
+
+// ── stepPendingReverify (run-now → verify after the run settles) ────────────
+{
+  const p0 = { baselineLastRunAt: 100, sawActive: false };
+  // Row not loaded yet → keep waiting.
+  assert.deepEqual(stepPendingReverify(p0, null), { next: p0, start: false });
+  // Still idle, last_run_at unchanged (run not picked up yet) → wait.
+  assert.deepEqual(stepPendingReverify(p0, { status: 'idle', last_run_at: 100 }), { next: p0, start: false });
+  // Run observed active → remember it, do not start (409 while the lease is held).
+  const p1 = stepPendingReverify(p0, { status: 'running', last_run_at: 100 });
+  assert.deepEqual(p1, { next: { baselineLastRunAt: 100, sawActive: true }, start: false });
+  // active → terminal edge → start verify, clear pending.
+  assert.deepEqual(stepPendingReverify(p1.next, { status: 'succeeded', last_run_at: 100 }), { next: null, start: true });
+  // A fast run that finished between polls (never seen active): last_run_at moved.
+  assert.deepEqual(stepPendingReverify(p0, { status: 'succeeded', last_run_at: 250 }), { next: null, start: true });
+  // No prior run at all.
+  assert.deepEqual(
+    stepPendingReverify({ baselineLastRunAt: null, sawActive: false }, { status: 'failed', last_run_at: 5 }),
+    { next: null, start: true },
+  );
+}
 
 console.log('jobs view regression checks passed');

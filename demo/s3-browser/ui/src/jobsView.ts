@@ -505,6 +505,31 @@ export function editorAfterDiscard(baselineStale: boolean): 'discard' | 'refresh
   return baselineStale ? 'refresh' : 'discard';
 }
 
+/**
+ * "Run now → re-verify" waits for the run to settle: the verify endpoint 409s
+ * while the replication run holds its lease, and run-now returns 202 at once.
+ * Fed each jobs-list sample of `replication:<rule>`; `start` is true on the
+ * active→terminal edge, or when `last_run_at` moved past the value captured at
+ * click time (a fast run that finished between two polls, never seen active).
+ */
+export interface PendingReverify {
+  baselineLastRunAt: number | null;
+  sawActive: boolean;
+}
+
+export function stepPendingReverify(
+  p: PendingReverify,
+  row: Pick<JobRow, 'status' | 'last_run_at'> | null,
+): { next: PendingReverify | null; start: boolean } {
+  if (!row) return { next: p, start: false };
+  if (isActiveJobStatus(row.status)) {
+    return { next: p.sawActive ? p : { ...p, sawActive: true }, start: false };
+  }
+  const ranSince = (row.last_run_at ?? 0) > (p.baselineLastRunAt ?? 0);
+  if (p.sawActive || ranSince) return { next: null, start: true };
+  return { next: p, start: false };
+}
+
 // ── Outcome meter (the calm-by-default run-result visual) ─────────────────
 export type MeterState = 'in-sync' | 'copied' | 'errors' | 'mixed' | 'running' | 'idle';
 
