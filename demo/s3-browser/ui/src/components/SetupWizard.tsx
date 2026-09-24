@@ -637,8 +637,9 @@ function ConfigureBackendStep({
           style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
         />
       </FormField>
-      <div style={{ display: 'flex', gap: 12 }}>
+      <div style={{ display: 'flex', flexWrap: 'wrap', columnGap: 12 }}>
         <FormField
+          style={{ flex: '1 1 220px', minWidth: 0 }}
           label="Access key ID"
           yamlPath="storage.backend.access_key_id"
           helpText="Access key the proxy uses to reach the upstream S3 backend."
@@ -651,6 +652,7 @@ function ConfigureBackendStep({
           />
         </FormField>
         <FormField
+          style={{ flex: '1 1 220px', minWidth: 0 }}
           label="Secret access key"
           yamlPath="storage.backend.secret_access_key"
           helpText="Secret paired with the access key ID. Stored in the backend config; never exposed to S3 clients."
