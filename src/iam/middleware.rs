@@ -12,9 +12,15 @@ use tracing::debug;
 use super::types::{AuthenticatedUser, ListScope, S3Action};
 use crate::metrics::{record_http_request_total, Metrics};
 
-/// Map an HTTP method + path to an S3 action.
+/// Map an HTTP method + DECODED path to an S3 action. Bucket-level vs
+/// object-level comes from `RequestTarget::bucket_and_key`, the same split
+/// the resource check uses, so the two can never disagree about a path.
 fn classify_action(method: &axum::http::Method, path: &str) -> S3Action {
-    let is_bucket_level = path.trim_matches('/').split('/').count() <= 1;
+    let target = crate::api::request_target::RequestTarget {
+        path: path.to_string(),
+        query: Vec::new(),
+    };
+    let is_bucket_level = target.bucket_and_key().1.is_empty();
 
     match *method {
         axum::http::Method::GET | axum::http::Method::HEAD => {
@@ -47,15 +53,6 @@ fn classify_action(method: &axum::http::Method, path: &str) -> S3Action {
     }
 }
 
-/// Extract bucket and key from the URI path (path-style: /{bucket}/{key...}).
-fn parse_bucket_key(path: &str) -> (&str, &str) {
-    let trimmed = path.trim_start_matches('/');
-    match trimmed.split_once('/') {
-        Some((bucket, key)) => (bucket, key),
-        None => (trimmed, ""),
-    }
-}
-
 /// Axum middleware that checks IAM permissions after SigV4 authentication.
 ///
 /// If an `AuthenticatedUser` is present in request extensions (inserted by
@@ -84,28 +81,35 @@ pub async fn authorization_middleware(
     };
 
     let method = request.method().clone();
-    let path = request.uri().path().to_string();
-    let query = request.uri().query().unwrap_or("");
+    // Authorize the resource s3s will SERVE: its decoded path and query, not
+    // the raw text (`/bucket%2Fkey` is an object read, `%70refix=` is
+    // `prefix=`). A path that does not decode is refused here; s3s would
+    // refuse it too.
+    let target = match crate::api::request_target::RequestTarget::from_uri(request.uri()) {
+        Ok(target) => target,
+        Err(_) => {
+            return Err(
+                crate::api::S3Error::InvalidArgument("Invalid URI encoding".into()).into_response(),
+            )
+        }
+    };
+    let path = target.path.as_str();
 
     // Determine the S3 action
-    let mut action = classify_action(&method, &path);
+    let mut action = classify_action(&method, path);
 
     // POST /{bucket}?delete is a batch DELETE, not a write.
-    // Must check for exact "delete" query parameter, not substring
-    // (otherwise ?delimiter= would also match).
-    if method == axum::http::Method::POST
-        && query
-            .split('&')
-            .any(|p| p == "delete" || p.starts_with("delete="))
-    {
+    if method == axum::http::Method::POST && target.has_query("delete") {
         action = S3Action::Delete;
     }
 
-    let (bucket, key) = parse_bucket_key(&path);
+    let (bucket, key) = target.bucket_and_key();
 
     // ListBuckets (GET /) is filtered at the handler level, not denied outright.
-    // This lets IAM users see only the buckets they have permissions on.
-    if bucket.is_empty() && action == S3Action::List {
+    // This lets IAM users see only the buckets they have permissions on. Only
+    // the real service root: `//x` has an empty bucket too, but it is not
+    // ListBuckets and must not skip IAM.
+    if path == "/" && action == S3Action::List {
         return Ok(next.run(request).await);
     }
 
@@ -122,26 +126,23 @@ pub async fn authorization_middleware(
             "s3:prefix".to_string(),
             iam_rs::ContextValue::String(String::new()),
         );
-        if let Some(query_str) = request.uri().query() {
-            for param in query_str.split('&') {
-                if let Some(value) = param.strip_prefix("prefix=") {
-                    let decoded = urlencoding::decode(value).unwrap_or_default();
-                    context.insert(
-                        "s3:prefix".to_string(),
-                        iam_rs::ContextValue::String(decoded.into_owned()),
-                    );
-                } else if let Some(value) = param.strip_prefix("delimiter=") {
-                    let decoded = urlencoding::decode(value).unwrap_or_default();
-                    context.insert(
-                        "s3:delimiter".to_string(),
-                        iam_rs::ContextValue::String(decoded.into_owned()),
-                    );
-                } else if let Some(value) = param.strip_prefix("max-keys=") {
-                    if let Ok(n) = value.parse::<f64>() {
-                        context.insert("s3:max-keys".to_string(), iam_rs::ContextValue::Number(n));
-                    }
-                }
-            }
+        if let Some(prefix) = target.query_value("prefix") {
+            context.insert(
+                "s3:prefix".to_string(),
+                iam_rs::ContextValue::String(prefix.to_string()),
+            );
+        }
+        if let Some(delimiter) = target.query_value("delimiter") {
+            context.insert(
+                "s3:delimiter".to_string(),
+                iam_rs::ContextValue::String(delimiter.to_string()),
+            );
+        }
+        if let Some(n) = target
+            .query_value("max-keys")
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            context.insert("s3:max-keys".to_string(), iam_rs::ContextValue::Number(n));
         }
     }
 
@@ -184,7 +185,7 @@ pub async fn authorization_middleware(
     // that the handler must FILTER, not return everything wholesale.
     let (allowed, list_scope) = if action == S3Action::List && key.is_empty() {
         // Extract the requested prefix (may be empty).
-        let requested_prefix = extract_prefix_from_query(request.uri().query());
+        let requested_prefix = target.query_value("prefix").unwrap_or_default().to_string();
 
         if user.can_with_context(action, bucket, key, &context) {
             // Policies matched with the prefix-aware context. Decide whether
@@ -239,7 +240,7 @@ pub async fn authorization_middleware(
             record_http_request_total(
                 metrics,
                 method.as_str(),
-                path.as_str(),
+                path,
                 axum::http::StatusCode::FORBIDDEN,
             );
         }
@@ -287,20 +288,6 @@ pub async fn authorization_middleware(
     Ok(next.run(request).await)
 }
 
-/// Extract the URL-decoded `prefix` query parameter, if present.
-/// Returns an empty string when no prefix is given.
-fn extract_prefix_from_query(query: Option<&str>) -> String {
-    let Some(q) = query else {
-        return String::new();
-    };
-    for param in q.split('&') {
-        if let Some(value) = param.strip_prefix("prefix=") {
-            return urlencoding::decode(value).unwrap_or_default().into_owned();
-        }
-    }
-    String::new()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,17 +298,6 @@ mod tests {
         assert_eq!(action, S3Action::Admin);
         let action = classify_action(&axum::http::Method::TRACE, "/bucket/key");
         assert_eq!(action, S3Action::Admin);
-    }
-
-    #[test]
-    fn test_parse_bucket_key() {
-        assert_eq!(
-            parse_bucket_key("/my-bucket/key.txt"),
-            ("my-bucket", "key.txt")
-        );
-        assert_eq!(parse_bucket_key("/my-bucket/"), ("my-bucket", ""));
-        assert_eq!(parse_bucket_key("/my-bucket"), ("my-bucket", ""));
-        assert_eq!(parse_bucket_key("/"), ("", ""));
     }
 
     #[test]
@@ -357,6 +333,16 @@ mod tests {
         assert_eq!(
             classify_action(&axum::http::Method::POST, "/bucket/key"),
             S3Action::Write
+        );
+        // Same split as the resource check: `//x` is an object in bucket "",
+        // `/b//k` is object `k`.
+        assert_eq!(
+            classify_action(&axum::http::Method::GET, "//x"),
+            S3Action::Read
+        );
+        assert_eq!(
+            classify_action(&axum::http::Method::GET, "/b//k"),
+            S3Action::Read
         );
     }
 }

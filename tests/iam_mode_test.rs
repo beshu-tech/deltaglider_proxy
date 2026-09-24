@@ -16,7 +16,7 @@
 //! 4. Legacy-migrate is also gated (IAM mutation).
 //! 5. Non-IAM routes (config, backend, session) are unaffected.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, TestServer};
 use reqwest::StatusCode;

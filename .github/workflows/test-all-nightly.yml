@@ -17,6 +17,16 @@ permissions:
   packages: read
 
 env:
+  # Measured on the homelab runners (5 GB RAM, full nightly job): with one test
+  # binary, -j16 is the fastest setting and peaks at ~4.7-4.8 GB. Line tables keep
+  # file:line backtraces; unpacked split debuginfo trims ~0.3 GB off the peak
+  # (sccache still caches it). The peak is two ~2 GB rustc (lib unit tests +
+  # tests/all) overlapping, so lowering -j does not reduce it further.
+  CARGO_BUILD_JOBS: "16"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
+  CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: unpacked
   RUSTC_WRAPPER: sccache
   CARGO_INCREMENTAL: "0"
   SCCACHE_BUCKET: sccache-rust

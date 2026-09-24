@@ -7,7 +7,7 @@
 //! session. Non-admin browser users depend on this to enable only the controls
 //! their prefix-scoped permissions allow.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, TestServer};
 use reqwest::StatusCode;

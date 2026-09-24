@@ -6,7 +6,7 @@
 //! through the proxy never silently drops objects, regardless of pagination
 //! settings or backend type.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;

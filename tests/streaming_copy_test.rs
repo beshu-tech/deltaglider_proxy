@@ -10,7 +10,7 @@
 //! The threshold + part size are lowered via env so the test object stays
 //! small (~6 MiB) while still routing through `plan_parts` → multipart.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{

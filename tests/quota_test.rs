@@ -2,7 +2,7 @@
 
 //! Integration tests for per-bucket storage quotas.
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 
@@ -178,9 +178,14 @@ async fn test_quota_delete_frees_space() {
         .build()
         .await;
 
-    // Fill bucket well over quota
-    put_sized(&server, "fill1.bin", 8000).await.ok();
-    put_sized(&server, "fill2.bin", 8000).await.ok();
+    // Go over quota with ONE object larger than the quota. The first PUT is
+    // allowed optimistically (see test_quota_first_put_optimistic). Two
+    // smaller fills are not reliable: once the usage cache knows the first,
+    // the quota check rejects the second up front (403), which leaves the
+    // bucket UNDER quota and the probe below is never blocked.
+    put_sized(&server, "fill1.bin", 12000)
+        .await
+        .expect("first PUT is allowed optimistically");
 
     // Signal-driven poll for the scanner to catch up and enforce quota.
     let http = reqwest::Client::new();
@@ -205,7 +210,6 @@ async fn test_quota_delete_frees_space() {
 
     // Delete files to free space
     delete(&server, "fill1.bin").await;
-    delete(&server, "fill2.bin").await;
 
     // Signal-driven poll until scanner refreshes and allows writes again.
     // Scanner cache TTL is 5 minutes, but get_or_scan re-triggers scan when stale.

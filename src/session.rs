@@ -291,16 +291,16 @@ impl SessionStore {
             .unwrap_or(false)
     }
 
-    /// Full admin GUI (config, IAM, operator APIs). `S3BrowserLift` sessions return false.
-    pub fn allows_admin_gui(&self, token: &str, ip: Option<IpAddr>) -> bool {
+    /// The auth method of a live `AdminGui` session, read under ONE lock (so
+    /// the kind and the principal come from the same entry). `None` for an
+    /// unknown, expired, revoked or browser-lift session. The admin gate
+    /// (`admin_gui_session_ok`) must still check the principal against the
+    /// live IAM index: the kind alone is fixed at mint time.
+    pub fn admin_gui_auth_method(&self, token: &str, ip: Option<IpAddr>) -> Option<AuthMethod> {
         let sessions = self.sessions.read();
-        let Some(info) = sessions.get(token) else {
-            return false;
-        };
-        if !self.entry_valid(info, ip) {
-            return false;
-        }
-        info.kind == SessionKind::AdminGui
+        let info = sessions.get(token)?;
+        (self.entry_valid(info, ip) && info.kind == SessionKind::AdminGui)
+            .then(|| info.auth_method.clone())
     }
 
     /// Remove a session (logout).
@@ -648,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn test_allows_admin_gui_rejects_browser_lift() {
+    fn test_admin_gui_auth_method_rejects_browser_lift() {
         let store = SessionStore::new();
         let admin_t = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
         let lift_t = store.create_session(
@@ -658,8 +658,12 @@ mod tests {
             },
             SessionKind::S3BrowserLift,
         );
-        assert!(store.allows_admin_gui(&admin_t, None));
-        assert!(!store.allows_admin_gui(&lift_t, None));
+        assert!(matches!(
+            store.admin_gui_auth_method(&admin_t, None),
+            Some(AuthMethod::Bootstrap)
+        ));
+        assert!(store.admin_gui_auth_method(&lift_t, None).is_none());
+        assert!(store.admin_gui_auth_method("no-such-token", None).is_none());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 //! Integration tests for `deltaglider_proxy sync`.
 
-mod common;
+use crate::common;
 
 use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
 use deltaglider_proxy::cli::sync::{run as sync_run, SyncArgs};

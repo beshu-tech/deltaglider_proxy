@@ -149,6 +149,24 @@ pub struct AuthenticatedUser {
     pub iam_policies: Vec<IAMPolicy>,
 }
 
+/// `$`-prefixed user names are reserved for synthetic principals
+/// (`$anonymous`, `$bootstrap`). Every path that names a stored user refuses
+/// them, or (OAuth auto-provisioning, where the IdP picks the name) strips
+/// them with [`strip_reserved_principal_prefix`].
+pub fn is_reserved_principal_name(name: &str) -> bool {
+    name.starts_with('$')
+}
+
+/// `name` with every reserved prefix removed, so that
+/// `is_reserved_principal_name` is false for the result.
+pub fn strip_reserved_principal_prefix(name: &str) -> &str {
+    let mut name = name;
+    while is_reserved_principal_name(name) {
+        name = &name[1..];
+    }
+    name
+}
+
 /// Principal name of the bootstrap (single-credential, legacy-mode) user.
 pub const BOOTSTRAP_USER_NAME: &str = "$bootstrap";
 
@@ -178,8 +196,13 @@ impl AuthenticatedUser {
 
     /// The synthesized public-prefix reader (`$anonymous`). Anonymous callers
     /// get the bytes they are allowed to read, never deployment provenance.
+    ///
+    /// Structural, not by name alone: the synthetic principal is the only one
+    /// with no access key. A stored IAM user always has one, so a user who is
+    /// NAMED `$anonymous` (a reserved name that slipped in) is not anonymous
+    /// and never skips signature checks.
     pub fn is_anonymous(&self) -> bool {
-        self.name == ANONYMOUS_USER_NAME
+        self.name == ANONYMOUS_USER_NAME && self.access_key_id.is_empty()
     }
 
     /// Check if this user is allowed to perform the given action on the given resource.
@@ -292,6 +315,27 @@ impl IamUser {
 #[cfg(test)]
 mod principal_tests {
     use super::*;
+
+    /// Only the synthetic principal (no access key) is anonymous. A stored
+    /// user who is merely NAMED `$anonymous` keeps full signature checks.
+    #[test]
+    fn anonymous_is_structural_not_a_name() {
+        let named = |name: &str, ak: &str| AuthenticatedUser {
+            name: name.into(),
+            access_key_id: ak.into(),
+            permissions: vec![],
+            iam_policies: vec![],
+        };
+        assert!(named(ANONYMOUS_USER_NAME, "").is_anonymous());
+        assert!(!named(ANONYMOUS_USER_NAME, "AKREAL").is_anonymous());
+        assert!(!named("alice", "").is_anonymous());
+        assert!(is_reserved_principal_name("$anonymous"));
+        assert!(is_reserved_principal_name("$x"));
+        assert!(!is_reserved_principal_name("dana$"));
+        assert_eq!(strip_reserved_principal_prefix("$$anonymous"), "anonymous");
+        assert_eq!(strip_reserved_principal_prefix("dana"), "dana");
+        assert_eq!(strip_reserved_principal_prefix("$"), "");
+    }
 
     /// The bootstrap principal is full access. SigV4 and form-POST both build
     /// it here, so this pins the privilege both paths get.

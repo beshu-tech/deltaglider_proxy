@@ -12,7 +12,7 @@
 //!    exhaustively; these tests add trace-vs-live parity checks so the
 //!    trace endpoint never lies.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, metrics_text, prometheus_counter_has_labels, TestServer};
 use reqwest::StatusCode;

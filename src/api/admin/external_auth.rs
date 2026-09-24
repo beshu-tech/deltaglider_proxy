@@ -469,10 +469,13 @@ pub async fn oauth_callback(
         }
         Ok(None) => {
             // First login — auto-provision local IAM user
+            // The IdP controls this string: strip a reserved prefix.
             let display_name = identity
                 .name
                 .as_deref()
                 .or(identity.email.as_deref())
+                .map(crate::iam::types::strip_reserved_principal_prefix)
+                .filter(|n| !n.is_empty())
                 .unwrap_or("external-user");
 
             let ak = keygen::generate_access_key_id();
@@ -563,6 +566,21 @@ pub async fn oauth_callback(
     // Successful OAuth login — reset rate limiter for this IP
     guard.record_success();
 
+    // Only an EFFECTIVE admin (direct or group-inherited permissions, read
+    // from the index rebuilt above) gets the admin surface. Everyone else gets
+    // the browser-only session kind, the same as an IAM non-admin's
+    // browser-connect: stored S3 credentials, no admin API.
+    let auth_method = AuthMethod::External {
+        provider_name: pending.provider_name.clone(),
+        user_id: user.id,
+    };
+    let is_admin = super::auth::session_principal_is_admin(&auth_method, &state.iam_state.load());
+    let session_kind = if is_admin {
+        crate::session::SessionKind::AdminGui
+    } else {
+        crate::session::SessionKind::S3BrowserLift
+    };
+
     // Rotate the session via the single mint constructor (drop→create order).
     // The IP is recomputed from the same (headers, peer) inputs used for
     // rate-limiting above, so session validation sees the same value.
@@ -570,11 +588,8 @@ pub async fn oauth_callback(
         &state,
         &req_headers,
         connect_info.as_ref(),
-        AuthMethod::External {
-            provider_name: pending.provider_name.clone(),
-            user_id: user.id,
-        },
-        crate::session::SessionKind::AdminGui,
+        auth_method,
+        session_kind,
         &user.name,
     );
 
@@ -595,7 +610,6 @@ pub async fn oauth_callback(
     // 1. Use the `next` param from the original authorize request (stored in PendingAuth)
     // 2. If `next` points to admin and user isn't admin, fall back to browse
     // 3. Default to browse
-    let is_admin = user.is_admin();
     let redirect_to = pending
         .redirect_to
         .as_deref()

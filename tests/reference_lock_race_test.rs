@@ -14,7 +14,7 @@
 //! deltaspace (UUID) so parallel crates sharing the bucket never collide on a
 //! lock object under `_dgp/locks/reference/`.
 
-mod common;
+use crate::common;
 
 use common::{minio_available, minio_client, MINIO_BUCKET};
 use deltaglider_proxy::coordination::reference_lock::lock_object_key;

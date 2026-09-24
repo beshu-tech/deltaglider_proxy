@@ -1,4 +1,6 @@
 [package]
+# All integration tests build into ONE binary (tests/all.rs): one link instead of ~70.
+autotests = false
 name = "deltaglider_proxy"
 version = "1.19.0"
 description = "S3-compatible proxy with transparent delta compression"
@@ -9,6 +11,18 @@ edition = "2021"
 # md-5's import name is `md5`, which cargo-machete can't match to the crate.
 [package.metadata.cargo-machete]
 ignored = ["md-5"]
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+# Third-party crates carry no debug info: they dominated link memory and CI OOMs.
+# Workspace crates keep line tables only: backtraces still name file and line.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 # `tokio_unstable` is passed via RUSTFLAGS (nightly workflow + opt-in builds)
 # to unlock tokio's RuntimeMetrics API — the #87 runtime sampler. Declared
@@ -152,16 +166,11 @@ proptest = "1"
 # are slow + machine-dependent, treated like coverage). Run with
 # `cargo bench --bench codec`.
 criterion = "0.5"
+# HMAC-SHA1 for crafting SigV2 requests in auth regression tests. Already in
+# the lockfile through rustls; hmac 0.12 cannot pair with the sha1 0.11 in tree.
+ring = "0.17"
 
 [[bench]]
 name = "codec"
 harness = false
 
-
-# Dev builds keep line tables only: backtraces still name file and line, and
-# links and target directories shrink a lot. Dependencies carry no debug info.
-[profile.dev]
-debug = "line-tables-only"
-
-[profile.dev.package."*"]
-debug = false

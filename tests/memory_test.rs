@@ -12,7 +12,7 @@
 //! `getrusage(RUSAGE_SELF).ru_maxrss`) which captures even microsecond-lived
 //! allocations — no polling or timing sensitivity.
 
-mod common;
+use crate::common;
 
 use common::{generate_binary, get_bytes, TestServer};
 use sha2::{Digest, Sha256};

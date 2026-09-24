@@ -13,7 +13,7 @@
 //! when the scope is `Filtered`. These tests exercise that end-to-end
 //! against a real spawned proxy.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{admin_http_client, TestServer};

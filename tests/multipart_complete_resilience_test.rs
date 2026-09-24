@@ -11,7 +11,7 @@
 //! tombstone). `DGP_TEST_COMPLETE_STALL_MS` holds the store window open so these
 //! tests can hit it deterministically.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::TestServer;

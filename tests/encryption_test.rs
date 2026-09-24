@@ -3,7 +3,7 @@
 //! Integration tests for transparent encryption at rest.
 //! All tests spawn a REAL proxy with DGP_ENCRYPTION_KEY set.
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 

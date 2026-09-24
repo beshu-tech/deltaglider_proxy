@@ -3,7 +3,7 @@
 //! Integration tests for admin config hot-reload and backend CRUD.
 //! All tests spawn a real proxy process and make real HTTP requests.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, TestServer};
 use reqwest::StatusCode;

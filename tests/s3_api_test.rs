@@ -5,7 +5,7 @@
 //! These tests verify S3 protocol compliance through the AWS SDK.
 //! All use TestServer::filesystem() — no Docker needed.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};

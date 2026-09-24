@@ -28,7 +28,7 @@
 //! unit tests. Adding them back at this layer only earns its cost
 //! on a genuinely new request-pipeline seam.
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 use reqwest::StatusCode;

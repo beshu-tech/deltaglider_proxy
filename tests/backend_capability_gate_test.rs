@@ -6,7 +6,7 @@
 //! forces the verdict — the gates' decision + observability (doc-linked FATAL,
 //! apply rejection) are what these tests prove.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, TestServer};
 

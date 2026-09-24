@@ -14,7 +14,7 @@
 //! 2. Backend guard: `FilesystemBackend::require_bucket_exists` fires if
 //!    somehow a caller bypasses the handler layer (defence in depth).
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 

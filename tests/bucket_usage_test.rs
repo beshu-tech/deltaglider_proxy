@@ -10,7 +10,7 @@
 //! references still form, and the counter lives at the engine layer so the
 //! backend choice is irrelevant to what's under test.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, delete_object, put_object, TestServer};
 

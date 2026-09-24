@@ -7,7 +7,7 @@
 //! together. Skeleton: seed a rule in YAML, seed source objects, trigger
 //! run-now, verify destination + status + history + counters.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{admin_http_client, latest_run_id, wait_for_run_after, TestServer};
@@ -1483,6 +1483,72 @@ async fn test_event_driven_replication_copies_and_deletes() {
         deleted,
         "delete should propagate to ev-dst (replicate_deletes: true)"
     );
+}
+
+/// Pausing a rule must stop the event consumer too, not only the scheduler:
+/// while the rule is paused, a delete on the source must not reach the
+/// replica. (Pause DELAYS: resume makes the rule due, and its reconcile run
+/// then applies whatever the source says, deletes included under
+/// `replicate_deletes`. To keep deleted objects, turn `replicate_deletes` off.)
+#[tokio::test]
+async fn test_paused_rule_event_consumer_does_not_propagate_deletes() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(EVENT_DRIVEN_RULE_YAML)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["ev-src", "ev-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    let endpoint = server.endpoint();
+    let http = reqwest::Client::new();
+    let admin = admin_http_client(&endpoint).await;
+
+    let before = common::get_replication_event_version(&http, &endpoint).await;
+    client
+        .put_object()
+        .bucket("ev-src")
+        .key("keep/obj.txt")
+        .body(ByteStream::from(b"precious".to_vec()))
+        .send()
+        .await
+        .expect("put source object");
+    common::wait_for_replication_event(&http, &endpoint, before).await;
+    client
+        .head_object()
+        .bucket("ev-dst")
+        .key("keep/obj.txt")
+        .send()
+        .await
+        .expect("replicated before the pause");
+
+    let resp = admin
+        .post(format!(
+            "{endpoint}/_/api/admin/jobs/replication:ev-a-to-b/pause"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 204, "pause accepted");
+
+    let before = common::get_replication_event_version(&http, &endpoint).await;
+    client
+        .delete_object()
+        .bucket("ev-src")
+        .key("keep/obj.txt")
+        .send()
+        .await
+        .expect("delete source object");
+    common::wait_for_replication_event(&http, &endpoint, before).await;
+
+    client
+        .head_object()
+        .bucket("ev-dst")
+        .key("keep/obj.txt")
+        .send()
+        .await
+        .expect("a paused rule must not propagate the delete to the replica");
 }
 
 const FOREIGN_RULE_YAML: &str = "

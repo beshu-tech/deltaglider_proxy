@@ -15,6 +15,7 @@
 //! redundancy (and the source of a hand-rolled/s3s divergence hazard), so the
 //! canonical-request + HMAC machinery was removed.
 
+use super::request_target::RequestTarget;
 use super::S3Error;
 use crate::iam::{AuthenticatedUser, IamState, Permission, SharedIamState};
 use crate::metrics::Metrics;
@@ -110,6 +111,34 @@ pub enum ReplayVerdict {
     /// Replaying these has real side effects (double-write, double-delete), so
     /// reject. This is the actual replay-attack surface the guard protects.
     Reject,
+}
+
+/// Whether the identity this middleware resolved may act, given the access
+/// key whose signature s3s actually verified (`None` = s3s saw no usable
+/// credentials and verified nothing).
+///
+/// This middleware resolves identity from the request text; s3s is the only
+/// signature authority. The two parse the request independently, so they can
+/// disagree: with two `Authorization` headers s3s sees none (`get_unique`),
+/// and a SigV2 query is verified by s3s while we read the v4 header. Either
+/// way the resolved user is honoured only when s3s verified THAT user's key.
+///
+/// - No resolved user: nothing is granted here (open mode, `HEAD /` probe,
+///   CORS preflight, form-POST policy deferral) — allow.
+/// - `$anonymous` (admission allow-anonymous): carries only public-prefix
+///   rights, needs no signature — allow.
+/// - Any other user: s3s must have verified the same access key.
+pub fn resolved_identity_is_verified(
+    resolved: Option<&AuthenticatedUser>,
+    verified_access_key: Option<&str>,
+) -> bool {
+    match resolved {
+        None => true,
+        Some(user) if user.is_anonymous() => true,
+        Some(user) => verified_access_key.is_some_and(|verified| {
+            crate::security::secret_eq(verified.as_bytes(), user.access_key_id.as_bytes())
+        }),
+    }
 }
 
 /// Pure replay decision. `is_duplicate` is whether this signature was already
@@ -353,21 +382,15 @@ impl SigV4Params {
     /// Extract SigV4 parameters from presigned URL query params.
     #[allow(clippy::result_large_err)]
     fn from_query(request: &Request<Body>) -> Result<Self, Response> {
-        let query_string = request.uri().query().unwrap_or("");
+        let target = RequestTarget::from_uri(request.uri()).map_err(|_| {
+            S3Error::InvalidArgument("Invalid URI encoding".to_string()).into_response()
+        })?;
+        let param = |name: &str| target.query_value(name).unwrap_or_default().to_string();
 
-        let params: std::collections::HashMap<String, String> = query_string
-            .split('&')
-            .filter(|s| !s.is_empty())
-            .filter_map(|pair| {
-                let (k, v) = pair.split_once('=')?;
-                Some((percent_decode(k), percent_decode(v)))
-            })
-            .collect();
-
-        let credential = params.get("X-Amz-Credential").cloned().unwrap_or_default();
-        let signature = params.get("X-Amz-Signature").cloned().unwrap_or_default();
-        let amz_date = params.get("X-Amz-Date").cloned().unwrap_or_default();
-        let expires = params.get("X-Amz-Expires").cloned().unwrap_or_default();
+        let credential = param("X-Amz-Credential");
+        let signature = param("X-Amz-Signature");
+        let amz_date = param("X-Amz-Date");
+        let expires = param("X-Amz-Expires");
 
         if credential.is_empty() || signature.is_empty() {
             debug!("SigV4 presigned: missing credential or signature");
@@ -464,10 +487,7 @@ impl SigV4Params {
 /// Check whether the query string contains presigned URL parameters.
 /// Uses proper key-level parsing instead of substring matching.
 fn has_presigned_query_params(query: &str) -> bool {
-    query.split('&').filter(|s| !s.is_empty()).any(|pair| {
-        let key = pair.split_once('=').map(|(k, _)| k).unwrap_or(pair);
-        percent_decode(key) == "X-Amz-Algorithm"
-    })
+    RequestTarget::parse("/", Some(query)).is_ok_and(|t| t.is_presigned_v4())
 }
 
 /// Bucket-level HTML form upload candidates (`POST /bucket` with multipart form-data)
@@ -721,7 +741,9 @@ pub async fn sigv4_auth_middleware(
     // rejects a forged/absent-secret signature before any handler runs (proven:
     // tests/auth_integration_test.rs::test_forged_*). This middleware no longer
     // re-derives the signature; it produces the AuthenticatedUser + payload-hash
-    // that the authz middleware and handlers consume.
+    // that the authz middleware and handlers consume. s3s parses the request on
+    // its own, so the s3s access hook (`resolved_identity_is_verified`) refuses
+    // the request unless s3s verified the SAME access key resolved here.
     let authenticated_user = match auth_config {
         AuthGateDecision::Locked | AuthGateDecision::Open => {
             return Err(S3Error::AccessDenied.into_response());
@@ -949,34 +971,45 @@ fn parse_auth_header(header: &str) -> Option<ParsedAuthHeader> {
     })
 }
 
-/// Percent-decode a URI component (e.g. `%2F` → `/`).
-///
-/// Lossy on invalid UTF-8 sequences (substitutes `U+FFFD`). This function
-/// is the canonical decoder used across the request path — SigV4 query
-/// parsing, admission middleware, and the admin trace endpoint all call
-/// it so their decoding semantics are identical by construction.
-pub fn percent_decode(input: &str) -> String {
-    let mut result = Vec::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
-                result.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        result.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&result).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// Truth table for binding the resolved identity to the s3s-verified key.
+    #[test]
+    fn resolved_identity_must_match_verified_key() {
+        let alice = AuthenticatedUser::bootstrap("AKALICE");
+        let anon = build_anonymous_user("b", &["pub/".to_string()]);
+
+        // Nothing resolved: nothing granted, allow.
+        assert!(resolved_identity_is_verified(None, None));
+        assert!(resolved_identity_is_verified(None, Some("AKALICE")));
+        // Anonymous needs no signature.
+        assert!(resolved_identity_is_verified(Some(&anon), None));
+        // A real user needs s3s to have verified that same key.
+        assert!(resolved_identity_is_verified(Some(&alice), Some("AKALICE")));
+        // Duplicate Authorization headers: s3s verified nothing.
+        assert!(!resolved_identity_is_verified(Some(&alice), None));
+        // A stored user NAMED `$anonymous` is not the anonymous principal.
+        let named_anon = AuthenticatedUser {
+            name: crate::iam::types::ANONYMOUS_USER_NAME.into(),
+            access_key_id: "AKREAL".into(),
+            permissions: vec![],
+            iam_policies: vec![],
+        };
+        assert!(!resolved_identity_is_verified(Some(&named_anon), None));
+        // SigV2 query signed by another key.
+        assert!(!resolved_identity_is_verified(
+            Some(&alice),
+            Some("AKMALLORY")
+        ));
+        assert!(!resolved_identity_is_verified(Some(&alice), Some("")));
+        assert!(!resolved_identity_is_verified(
+            Some(&alice),
+            Some("AKALICE ")
+        ));
+    }
 
     /// Discriminant for asserting `classify_auth_gate` outcomes without
     /// constructing/comparing the borrowed payloads.
@@ -1056,12 +1089,12 @@ mod tests {
     #[test]
     fn test_has_presigned_query_params() {
         assert!(has_presigned_query_params(
-            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=foo"
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=foo&X-Amz-Signature=ab"
         ));
         assert!(!has_presigned_query_params("list-type=2&prefix=test"));
         assert!(!has_presigned_query_params(""));
-        // Should not match substring (e.g. a value containing "X-Amz-Algorithm=")
-        assert!(!has_presigned_query_params("foo=X-Amz-Algorithm%3Dbar"));
+        // Should not match substring (e.g. a value containing "X-Amz-Signature=")
+        assert!(!has_presigned_query_params("foo=X-Amz-Signature%3Dbar"));
     }
     #[test]
     fn replay_cache_pruning_enforces_hard_cap() {

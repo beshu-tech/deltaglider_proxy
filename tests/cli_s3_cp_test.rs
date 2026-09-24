@@ -13,7 +13,7 @@
 //! - Top (binary-spawn tests): see `tests/cli_admin_test.rs` style
 //!   if/when we add binary-level smoke for the s3 subgroup.
 
-mod common;
+use crate::common;
 
 use common::{minio_client, minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
 use deltaglider_proxy::cli::cp::{run, CpArgs};

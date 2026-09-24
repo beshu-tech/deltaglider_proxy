@@ -11,7 +11,7 @@
 //!
 //! No MinIO needed: the dead backend is a connection-refused local port.
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 

@@ -160,20 +160,16 @@ impl Drop for WriteGuard {
     }
 }
 
-/// First path segment of an S3 request = the bucket (lowercased).
-/// Root-level requests (ListBuckets, health) have no bucket.
+/// First path segment of an S3 request = the bucket (lowercased), decoded
+/// as s3s decodes it (`/rele%61ses/k` is bucket `releases`). Root-level
+/// requests (ListBuckets, health) have no bucket. A path that does not
+/// decode has none either: s3s rejects it with `InvalidURI`.
 /// Shared with the backend-health gate (`coordination::health`).
 pub(crate) fn bucket_from_path(path: &str) -> Option<String> {
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        return None;
-    }
-    let bucket = trimmed.split('/').next().unwrap_or(trimmed);
-    if bucket.is_empty() {
-        None
-    } else {
-        Some(bucket.to_ascii_lowercase())
-    }
+    crate::api::request_target::RequestTarget::parse(path, None)
+        .ok()?
+        .bucket()
+        .map(str::to_ascii_lowercase)
 }
 
 fn is_write_method(method: &Method) -> bool {
@@ -338,6 +334,8 @@ mod tests {
         assert_eq!(bucket_from_path("/"), None);
         assert_eq!(bucket_from_path(""), None);
         assert_eq!(bucket_from_path("/Bucket"), Some("bucket".into()));
+        assert_eq!(bucket_from_path("/rele%61ses/k"), Some("releases".into()));
+        assert_eq!(bucket_from_path("/b%2Fk"), Some("b".into()));
         assert_eq!(
             bucket_from_path("/bucket/key/with/slashes"),
             Some("bucket".into())

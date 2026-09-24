@@ -65,8 +65,28 @@ fn validate_condition_templates(value: &serde_json::Value) -> Result<(), String>
     }
 }
 
-fn encode_template_value(value: &str) -> String {
-    urlencoding::encode(value).into_owned()
+/// Substitute an identity value into a policy pattern.
+///
+/// Authorization compares policies against the DECODED key (the resource s3s
+/// serves), so the value goes in verbatim: `dana@corp.com` must match the key
+/// `home/dana@corp.com/…`.
+///
+/// A value holding a character that changes what the pattern means — `/` (a
+/// path level), `*` and `?` (globs), `$`, `{`, `}` (policy variables) or `%`
+/// — cannot be inserted safely: iam-rs has no escape syntax, so an escaped
+/// form could never match a real key, and a templated Deny would silently
+/// stop denying. Such a value is an ERROR; the index then gives the user no
+/// permissions at all (fail closed).
+fn encode_template_value(value: &str) -> Result<&str, String> {
+    match value
+        .chars()
+        .find(|c| matches!(c, '/' | '*' | '?' | '$' | '{' | '}' | '%'))
+    {
+        Some(c) => Err(format!(
+            "identity value {value:?} contains {c:?}, which a policy template cannot hold"
+        )),
+        None => Ok(value),
+    }
 }
 
 fn expand_template_value(
@@ -75,12 +95,17 @@ fn expand_template_value(
     access_key_id: &str,
 ) -> Result<String, String> {
     validate_template_vars(value)?;
-    Ok(value
-        .replace("${iam:username}", &encode_template_value(username))
-        .replace(
+    let mut out = value.to_string();
+    if out.contains("${iam:username}") {
+        out = out.replace("${iam:username}", encode_template_value(username)?);
+    }
+    if out.contains("${iam:access_key_id}") {
+        out = out.replace(
             "${iam:access_key_id}",
-            &encode_template_value(access_key_id),
-        ))
+            encode_template_value(access_key_id)?,
+        );
+    }
+    Ok(out)
 }
 
 fn expand_condition_templates(
@@ -116,8 +141,10 @@ fn expand_condition_templates(
 /// Expand identity templates in effective permissions for one authenticated user.
 ///
 /// Stored DB/YAML permissions remain raw templates. At index-build time,
-/// `${iam:username}` and `${iam:access_key_id}` are substituted with percent-encoded
-/// identity values so user-controlled names cannot inject `/` or `*`.
+/// `${iam:username}` and `${iam:access_key_id}` are substituted with the
+/// identity values verbatim. A value that holds a pattern metacharacter is an
+/// error (see [`encode_template_value`]), so user-controlled names cannot
+/// inject `/` or `*`, and cannot defeat a templated Deny either.
 pub fn expand_permission_templates(
     permissions: &[Permission],
     username: &str,
@@ -1899,38 +1926,83 @@ mod tests {
         );
     }
 
+    /// Names with ordinary punctuation go in verbatim, because authorization
+    /// matches the DECODED key: an OAuth user `dana@corp.com` must reach
+    /// `home/dana@corp.com/`.
     #[test]
-    fn test_expand_permission_templates_percent_encodes_identity_values() {
-        let perms = vec![Permission {
+    fn test_expand_permission_templates_keeps_plain_punctuation_verbatim() {
+        let perm = vec![Permission {
             id: 0,
             effect: "Allow".into(),
-            actions: vec!["read".into(), "list".into()],
-            resources: vec![
-                "bucket/home/${iam:username}/*".into(),
-                "bucket/keys/${iam:access_key_id}/*".into(),
-            ],
+            actions: vec!["read".into()],
+            resources: vec!["bucket/home/${iam:username}/*".into()],
             conditions: Some(serde_json::json!({
-                "StringLike": {
-                    "s3:prefix": ["home/${iam:username}/*", "keys/${iam:access_key_id}/*"]
-                }
+                "StringLike": { "s3:prefix": ["home/${iam:username}/*"] }
             })),
         }];
-
-        let expanded = expand_permission_templates(&perms, "alice/slash*star", "AK/STAR*").unwrap();
-        assert_eq!(
-            expanded[0].resources,
-            vec![
-                "bucket/home/alice%2Fslash%2Astar/*",
-                "bucket/keys/AK%2FSTAR%2A/*"
-            ]
-        );
+        let expanded = expand_permission_templates(&perm, "dana@corp.com", "AK").unwrap();
+        assert_eq!(expanded[0].resources, vec!["bucket/home/dana@corp.com/*"]);
         assert_eq!(
             expanded[0].conditions,
             Some(serde_json::json!({
-                "StringLike": {
-                    "s3:prefix": ["home/alice%2Fslash%2Astar/*", "keys/AK%2FSTAR%2A/*"]
-                }
+                "StringLike": { "s3:prefix": ["home/dana@corp.com/*"] }
             }))
         );
+        let expanded = expand_permission_templates(&perm, "Dana Smith", "AK").unwrap();
+        assert_eq!(expanded[0].resources, vec!["bucket/home/Dana Smith/*"]);
+
+        let read_perm = vec![Permission {
+            conditions: None,
+            ..perm[0].clone()
+        }];
+        let expanded = expand_permission_templates(&read_perm, "dana@corp.com", "AK").unwrap();
+        let user = crate::iam::AuthenticatedUser {
+            name: "dana@corp.com".into(),
+            access_key_id: "AK".into(),
+            iam_policies: expanded.iter().map(permission_to_iam_policy).collect(),
+            permissions: expanded,
+        };
+        assert!(user.can(S3Action::Read, "bucket", "home/dana@corp.com/f.txt"));
+        assert!(!user.can(S3Action::Read, "bucket", "home/other/f.txt"));
+    }
+
+    /// A name holding a pattern metacharacter cannot be inserted into a
+    /// template: it could either widen an Allow (`*`, `/`) or, escaped, never
+    /// match and so disable a Deny. Expansion fails (the index then denies
+    /// the user everything); a permission WITHOUT a template is unaffected.
+    #[test]
+    fn test_expand_permission_templates_refuses_metacharacter_identities() {
+        let templated = vec![Permission {
+            id: 0,
+            effect: "Deny".into(),
+            actions: vec!["read".into()],
+            resources: vec!["bucket/private/${iam:username}/*".into()],
+            conditions: None,
+        }];
+        for name in [
+            "a*",
+            "q?",
+            "a/b",
+            "svc$x",
+            "x{y}",
+            "50%off",
+            "x${iam:username}",
+        ] {
+            assert!(
+                expand_permission_templates(&templated, name, "AK").is_err(),
+                "{name:?} must not expand"
+            );
+        }
+        assert!(expand_permission_templates(&templated, "bob", "AK/STAR*").is_ok());
+        let keyed = vec![Permission {
+            resources: vec!["bucket/keys/${iam:access_key_id}/*".into()],
+            ..templated[0].clone()
+        }];
+        assert!(expand_permission_templates(&keyed, "bob", "AK/STAR*").is_err());
+        let plain = vec![Permission {
+            resources: vec!["bucket/*".into()],
+            ..templated[0].clone()
+        }];
+        assert!(expand_permission_templates(&plain, "a*", "AK").is_ok());
     }
 }

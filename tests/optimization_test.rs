@@ -6,7 +6,7 @@
 //! piped codec, moka cache, DashMap prefix locks, zero-copy streams, Bytes boundaries,
 //! body_to_utf8 zero-copy, itoa header formatting, and bounded codec concurrency.
 
-mod common;
+use crate::common;
 
 use common::{
     delete_object, generate_binary, get_bytes, head_headers, mutate_binary, put_object, TestServer,

@@ -8,7 +8,7 @@
 //! Tests here run against a spawned proxy (filesystem backend) with
 //! enough objects to force at least two pages through the loop.
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 

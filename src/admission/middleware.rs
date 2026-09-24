@@ -144,9 +144,8 @@ pub async fn admission_middleware(mut request: Request<Body>, next: Next) -> Res
 /// synthetic inputs (via its own adapter — trace takes a JSON payload,
 /// not a live request).
 ///
-/// Bucket and key parsing mirrors the logic the old inline SigV4 bypass
-/// used (`trim_start_matches('/')` + `split_once('/')`), so the admission
-/// chain sees exactly what that code did.
+/// Bucket, key and list prefix come from `RequestTarget`, decoded as s3s
+/// decodes them, so a block matches the resource s3s will serve.
 ///
 /// Source IP comes from the same extractor the rate limiter uses
 /// (`rate_limiter::extract_client_ip`) — honors `DGP_TRUST_PROXY_HEADERS`
@@ -202,10 +201,9 @@ impl OwnedRequestInfo {
     /// Build an `OwnedRequestInfo` from already-extracted raw inputs.
     ///
     /// - `method` — uppercased via `to_ascii_uppercase`.
-    /// - `path` — leading `/` trimmed; `bucket/key` split on the
-    ///   first remaining `/`; bucket lowercased; key percent-decoded.
-    /// - `query` — accepts both `?prefix=…` and bare `prefix=…`;
-    ///   `prefix` value is percent-decoded.
+    /// - `path` / `query` — decoded through `RequestTarget` exactly as s3s
+    ///   decodes them (`%2F` is a separator, query names decoded, `+` is a
+    ///   space); bucket lowercased. The query may carry a leading `?`.
     /// - `authenticated` — caller's responsibility to determine
     ///   (Authorization header or presigned query param for the
     ///   HTTP path; explicit body field for trace).
@@ -221,26 +219,19 @@ impl OwnedRequestInfo {
         authenticated: bool,
         source_ip: Option<std::net::IpAddr>,
     ) -> Self {
-        let trimmed_path = path.trim_start_matches('/');
-        let (bucket_raw, key_raw) = match trimmed_path.split_once('/') {
-            Some((b, k)) => (b.to_string(), percent_decode(k)),
-            None => (trimmed_path.to_string(), String::new()),
-        };
-
         // Tolerate a leading `?` on the query, matching the trace
         // endpoint's operator-convenience behavior.
         let query_trimmed = query.strip_prefix('?').unwrap_or(query);
-        let list_prefix = query_trimmed
-            .split('&')
-            .find_map(|pair| {
-                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-                if k == "prefix" {
-                    Some(percent_decode(v))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
+        // Decode bucket, key and query exactly as s3s will, so a block that
+        // names `prod` also matches `/pro%64/...`. A target that does not
+        // decode matches no bucket: s3s refuses it with `InvalidURI`.
+        let target = RequestTarget::parse(path, Some(query_trimmed)).unwrap_or(RequestTarget {
+            path: String::new(),
+            query: Vec::new(),
+        });
+        let (bucket_raw, key_raw) = target.bucket_and_key();
+        let (bucket_raw, key_raw) = (bucket_raw.to_string(), key_raw.to_string());
+        let list_prefix = target.query_value("prefix").unwrap_or_default().to_string();
 
         OwnedRequestInfo {
             method: method.to_ascii_uppercase(),
@@ -272,45 +263,44 @@ impl OwnedRequestInfo {
     }
 }
 
-/// Percent-decoder shared with the SigV4 middleware — see
-/// [`crate::api::auth::percent_decode`]. Aliased here so the admission
-/// module doesn't leak `api` paths into its call sites, but behaviorally
-/// identical to the SigV4 path's decoder (critical for the refactor: the
-/// old inline public-prefix handling in SigV4 used that exact decoder).
-use crate::api::auth::percent_decode;
+use crate::api::request_target::RequestTarget;
 
-/// Detects whether the URL query carries a SigV4 presigned-URL
-/// `X-Amz-Credential` parameter. Mirrors `has_presigned_query_params` in
-/// `api/auth.rs` — kept inline here so admission doesn't import SigV4's
-/// private parser (tight coupling to query-string layout), and because
-/// this check is trivially a two-liner.
+/// Whether s3s treats the query as SigV4-presigned
+/// (`RequestTarget::is_presigned_v4`: `X-Amz-Signature`, name decoded,
+/// case-sensitive).
 fn has_presigned_query_params(query: &str) -> bool {
-    query.split('&').any(|pair| {
-        let key = pair.split_once('=').map(|(k, _)| k).unwrap_or(pair);
-        key.eq_ignore_ascii_case("X-Amz-Credential")
-    })
+    RequestTarget::parse("/", Some(query)).is_ok_and(|t| t.is_presigned_v4())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Same test as the SigV4 middleware and s3s: the `X-Amz-Signature`
+    /// parameter (see `RequestTarget::is_presigned_v4`).
     #[test]
-    fn has_presigned_detects_case_insensitive() {
+    fn has_presigned_matches_s3s() {
         assert!(has_presigned_query_params(
-            "X-Amz-Credential=AKIA%2F...&X-Amz-Date=..."
-        ));
-        assert!(has_presigned_query_params(
-            "x-amz-credential=AKIA&x-amz-date=..."
+            "X-Amz-Credential=AKIA%2F...&X-Amz-Date=...&X-Amz-Signature=ab"
         ));
         assert!(!has_presigned_query_params("prefix=releases/&marker=x"));
         assert!(!has_presigned_query_params(""));
+        assert!(!has_presigned_query_params("foo=X-Amz-Signature"));
     }
 
+    /// Admission matches the bucket and key s3s will serve, not the raw
+    /// text: a block naming `prod` must also see `/pro%64/...`.
     #[test]
-    fn has_presigned_ignores_values_that_look_like_credentials() {
-        // The key must be X-Amz-Credential, not the value.
-        assert!(!has_presigned_query_params("foo=X-Amz-Credential"));
+    fn from_raw_decodes_bucket_key_and_prefix_like_s3s() {
+        let info = OwnedRequestInfo::from_raw("get", "/pro%64/secre%74.txt", "", false, None);
+        assert_eq!(
+            (info.bucket.as_str(), info.key.as_str()),
+            ("prod", "secret.txt")
+        );
+        let info = OwnedRequestInfo::from_raw("GET", "/prod%2Fk", "", false, None);
+        assert_eq!((info.bucket.as_str(), info.key.as_str()), ("prod", "k"));
+        let info = OwnedRequestInfo::from_raw("GET", "/prod", "?%70refix=a+b", false, None);
+        assert_eq!(info.list_prefix, "a b");
     }
 
     #[test]

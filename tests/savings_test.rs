@@ -27,7 +27,7 @@
 //! same prefix. Same family as the smoke uploads that surfaced the
 //! original bug.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, put_object, TestServer, TEST_BOOTSTRAP_PASSWORD};
 

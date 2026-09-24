@@ -4,7 +4,7 @@
 //! MinIO instance (`MINIO_ENDPOINT`, default localhost:9000). Each
 //! test creates its own bucket so cross-test contamination is bounded.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{minio_client, minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};

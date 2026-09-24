@@ -8,7 +8,7 @@
 //!    on roughly the same numbers for the same bucket.
 //! 3. The on-bucket cache round-trips: write on first run, read on second.
 
-mod common;
+use crate::common;
 
 use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
 use deltaglider_proxy::cli::cp::{run as cp_run, CpArgs};

@@ -9,7 +9,7 @@
 //! don't re-pay a MinIO round-trip for them. Both gated with
 //! skip_unless_minio!() — skip gracefully without MinIO.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{generate_binary, minio_client, mutate_binary, TestServer, MINIO_BUCKET};

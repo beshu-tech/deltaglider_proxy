@@ -19,7 +19,7 @@
 //!   * YAML-format response for the UI's per-section Copy-as-YAML button,
 //!   * trace GET variant produces identical output to POST.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, TestServer};
 use reqwest::StatusCode;
