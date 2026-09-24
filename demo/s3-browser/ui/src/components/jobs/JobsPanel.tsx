@@ -402,7 +402,8 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     {
       key: 'job',
       label: 'Job',
-      track: 'minmax(160px,1.3fr)',
+      // The name is what operators scan for; Status is usually one short tag.
+      track: 'minmax(200px,2fr)',
       render: (d) => (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
           <Tag color={kindTone(d.row.kind)} style={{ margin: 0, flexShrink: 0 }}>
@@ -455,7 +456,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     {
       key: 'status',
       label: 'Status',
-      track: 'minmax(0,1.4fr)',
+      track: 'minmax(0,1fr)',
       render: (d) => {
         const live = d.row.trigger === 'oneoff' && isActiveJobStatus(d.row.status);
         return (
