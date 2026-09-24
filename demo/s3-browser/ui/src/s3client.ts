@@ -91,18 +91,27 @@ export function getCredentials(): { accessKeyId: string; secretAccessKey: string
   };
 }
 
-export function setCredentials(accessKeyId: string, secretAccessKey: string) {
+/**
+ * Switch the in-memory credentials (synchronously, before the first await) and
+ * persist them to the server-side session, which is what survives a reload.
+ * Resolves false (and logs) when that save failed: the connection works now
+ * but a reload will ask for a sign-in again. Callers that can, tell the user.
+ */
+export async function setCredentials(accessKeyId: string, secretAccessKey: string): Promise<boolean> {
   activeAccessKeyId = accessKeyId;
   activeSecretAccessKey = secretAccessKey;
   cachedClient = null;
-  // Persist to server-side session (fire-and-forget)
-  storeSessionCredentials({
+  const saved = await storeSessionCredentials({
     endpoint: activeEndpoint,
     region: activeRegion,
     bucket: activeBucket,
     access_key_id: accessKeyId,
     secret_access_key: secretAccessKey,
   });
+  if (!saved) {
+    console.warn('Could not save S3 credentials to the server session; a reload will need a new sign-in.');
+  }
+  return saved;
 }
 
 export function hasCredentials(): boolean {

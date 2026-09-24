@@ -267,7 +267,14 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       let iamOutcome: ConnectOutcome = { kind: 'admin' };
       const loginAsRes = await loginAs(trimmedAk, trimmedSk);
       if (loginAsRes.ok) {
-        setCredentials(trimmedAk, trimmedSk);
+        if (!(await setCredentials(trimmedAk, trimmedSk))) {
+          // Static `message`, not messageApi: this page unmounts on connect,
+          // which would take a context-bound toast with it.
+          message.warning(
+            'Connected, but the server session did not save your credentials. A page reload will ask you to sign in again.',
+            8,
+          );
+        }
       } else if (!isNotAdminDenial(loginAsRes)) {
         setError(loginAsRes.error);
         setLoading(false);
