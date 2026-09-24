@@ -268,6 +268,7 @@ export default function MetricsPage({ onBack, embedded, search, proxyVersion }: 
   }
   const httpChartData = Object.entries(httpByOp).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
   const totalHttp = httpChartData.reduce((a, d) => a + d.value, 0);
+  const errorCount = (httpByStatus['4xx'] ?? 0) + (httpByStatus['5xx'] ?? 0);
   const errorRate = totalHttp > 0 ? ((httpByStatus['4xx'] ?? 0) + (httpByStatus['5xx'] ?? 0)) / totalHttp : 0;
 
   const latencyStats = histStats(m, 'deltaglider_http_request_duration_seconds');
@@ -310,7 +311,7 @@ export default function MetricsPage({ onBack, embedded, search, proxyVersion }: 
     <div className="animate-fade-in" style={{ width: '100%', padding: 'clamp(14px, 1.8vw, 24px) clamp(12px, 1.6vw, 20px)' }}>
       <DashboardToolbar
         title="Proxy Dashboard"
-        meta={<>v{buildVersion} · {backendType} backend · up {uptimeStr}</>}
+        meta={<>v{buildVersion} · {backendType === 'mixed' ? 'mixed backends' : `${backendType} backend`} · up {uptimeStr}</>}
         view={activeView}
         onView={(v) => {
           setActiveView(v);
@@ -430,7 +431,7 @@ export default function MetricsPage({ onBack, embedded, search, proxyVersion }: 
             <StatValue
               value={totalHttp > 0 ? fmtPct(errorRate) : '—'}
               tone={errorRate > 0.05 ? 'bad' : errorRate > 0.01 ? 'warn' : 'good'}
-              hint={`${fmtNum((httpByStatus['4xx'] ?? 0) + (httpByStatus['5xx'] ?? 0))} errors of ${fmtNum(totalHttp)} requests`}
+              hint={`${fmtNum(errorCount)} ${errorCount === 1 ? 'error' : 'errors'} of ${fmtNum(totalHttp)} requests`}
             />
             {totalHttp > 0 && Object.keys(httpByStatus).length > 0 && (
               <div style={{ marginTop: 'auto' }}>

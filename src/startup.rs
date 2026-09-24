@@ -234,10 +234,7 @@ pub fn init_metrics(config: &Config) -> Arc<Metrics> {
             .unwrap_or_default()
             .as_secs_f64(),
     );
-    let backend_type = match &config.backend {
-        BackendConfig::Filesystem { .. } => "filesystem",
-        BackendConfig::S3 { .. } => "s3",
-    };
+    let backend_type = backend_type_label(config);
     // The public scrape carries the exact version only on operator opt-in.
     let version = deltaglider_proxy::metrics::build_info_version_label(
         deltaglider_proxy::config::env_bool("DGP_METRICS_EXPOSE_VERSION", false),
@@ -247,6 +244,25 @@ pub fn init_metrics(config: &Config) -> Arc<Metrics> {
         .with_label_values(&[version, backend_type])
         .set(1.0);
     metrics
+}
+
+/// `build_info`'s `backend_type` label. With named `backends` configured the
+/// legacy singleton `backend` is ignored at runtime, so reading it labelled a
+/// two-backend (S3 + filesystem) deployment "filesystem" — and the dashboard
+/// header repeated it. Mixed types report "mixed".
+fn backend_type_label(config: &Config) -> &'static str {
+    fn kind(b: &BackendConfig) -> &'static str {
+        match b {
+            BackendConfig::Filesystem { .. } => "filesystem",
+            BackendConfig::S3 { .. } => "s3",
+        }
+    }
+    let mut kinds = config.backends.iter().map(|b| kind(&b.backend));
+    match kinds.next() {
+        None => kind(&config.backend),
+        Some(first) if kinds.all(|k| k == first) => first,
+        Some(_) => "mixed",
+    }
 }
 
 /// Create the replay-attack detection cache and spawn its periodic cleanup.
@@ -2032,6 +2048,41 @@ mod tests {
             matches!(loaded.as_ref(), IamState::Disabled),
             "half-configured creds (secret only) must yield Disabled"
         );
+    }
+
+    /// A named-backends deployment ignores the legacy singleton `backend`, so
+    /// the label must come from `backends` (an S3 + filesystem pair used to be
+    /// labelled "filesystem" from the unused default singleton).
+    #[test]
+    fn backend_type_label_follows_named_backends() {
+        use deltaglider_proxy::config::NamedBackendConfig;
+        let fs = |name: &str| NamedBackendConfig {
+            name: name.into(),
+            backend: BackendConfig::Filesystem {
+                path: "/tmp/x".into(),
+            },
+            encryption: Default::default(),
+        };
+        let s3 = |name: &str| NamedBackendConfig {
+            name: name.into(),
+            backend: BackendConfig::S3 {
+                endpoint: None,
+                region: "us-east-1".into(),
+                force_path_style: true,
+                access_key_id: None,
+                secret_access_key: None,
+                allow_local: false,
+            },
+            encryption: Default::default(),
+        };
+        let mut cfg = Config::default();
+        assert_eq!(backend_type_label(&cfg), "filesystem", "singleton default");
+        cfg.backends = vec![s3("a")];
+        assert_eq!(backend_type_label(&cfg), "s3");
+        cfg.backends = vec![s3("a"), s3("b")];
+        assert_eq!(backend_type_label(&cfg), "s3");
+        cfg.backends = vec![s3("a"), fs("b")];
+        assert_eq!(backend_type_label(&cfg), "mixed");
     }
 
     /// Metrics labeling: `build_info` must carry the right
