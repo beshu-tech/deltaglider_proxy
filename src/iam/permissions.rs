@@ -65,8 +65,23 @@ fn validate_condition_templates(value: &serde_json::Value) -> Result<(), String>
     }
 }
 
+/// Substitute an identity value into a policy pattern.
+///
+/// Authorization compares policies against the DECODED key (the resource s3s
+/// serves), so the value goes in verbatim: `dana@corp.com` must match the key
+/// `home/dana@corp.com/…`. Only the characters that would change what the
+/// pattern means are escaped: `/` (a path level), `*` and `?` (globs), `$`,
+/// `{` and `}` (policy variables), and `%` itself so two different names can
+/// never escape to the same text (`a*` → `a%2A`, `a%2A` → `a%252A`).
 fn encode_template_value(value: &str) -> String {
-    urlencoding::encode(value).into_owned()
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '%' | '/' | '*' | '?' | '$' | '{' | '}' => out.push_str(&format!("%{:02X}", c as u32)),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn expand_template_value(
@@ -116,8 +131,9 @@ fn expand_condition_templates(
 /// Expand identity templates in effective permissions for one authenticated user.
 ///
 /// Stored DB/YAML permissions remain raw templates. At index-build time,
-/// `${iam:username}` and `${iam:access_key_id}` are substituted with percent-encoded
-/// identity values so user-controlled names cannot inject `/` or `*`.
+/// `${iam:username}` and `${iam:access_key_id}` are substituted with the
+/// identity values, pattern metacharacters escaped (see
+/// [`encode_template_value`]) so user-controlled names cannot inject `/` or `*`.
 pub fn expand_permission_templates(
     permissions: &[Permission],
     username: &str,
@@ -1897,6 +1913,44 @@ mod tests {
             ),
             "unparseable Deny condition must drop the statement, not broaden to unconditional deny"
         );
+    }
+
+    /// Names with ordinary punctuation go in verbatim, because authorization
+    /// matches the DECODED key: an OAuth user `dana@corp.com` must reach
+    /// `home/dana@corp.com/`. Escaping is injective (no two names collide).
+    #[test]
+    fn test_expand_permission_templates_keeps_plain_punctuation_verbatim() {
+        let perm = vec![Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into()],
+            resources: vec!["bucket/home/${iam:username}/*".into()],
+            conditions: None,
+        }];
+        let expand = |name: &str| {
+            expand_permission_templates(&perm, name, "AK").unwrap()[0].resources[0].clone()
+        };
+        assert_eq!(expand("dana@corp.com"), "bucket/home/dana@corp.com/*");
+        assert_eq!(expand("Dana Smith"), "bucket/home/Dana Smith/*");
+        assert_eq!(expand("a*"), "bucket/home/a%2A/*");
+        assert_eq!(expand("a%2A"), "bucket/home/a%252A/*");
+        assert_eq!(
+            expand("x${iam:username}"),
+            "bucket/home/x%24%7Biam:username%7D/*"
+        );
+
+        let user = crate::iam::AuthenticatedUser {
+            name: "dana@corp.com".into(),
+            access_key_id: "AK".into(),
+            iam_policies: expand_permission_templates(&perm, "dana@corp.com", "AK")
+                .unwrap()
+                .iter()
+                .map(permission_to_iam_policy)
+                .collect(),
+            permissions: expand_permission_templates(&perm, "dana@corp.com", "AK").unwrap(),
+        };
+        assert!(user.can(S3Action::Read, "bucket", "home/dana@corp.com/f.txt"));
+        assert!(!user.can(S3Action::Read, "bucket", "home/other/f.txt"));
     }
 
     #[test]

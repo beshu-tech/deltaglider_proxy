@@ -345,21 +345,6 @@ async fn seed_cursor_if_absent(db: &Arc<Mutex<ConfigDb>>) {
     }
 }
 
-/// Whether `rule` is paused. A state read that fails counts as paused: the
-/// consumer must never copy or delete on a rule it cannot prove is live, and
-/// the reconcile run covers anything skipped.
-fn rule_is_paused(db: &ConfigDb, rule: &str) -> bool {
-    match db.replication_load_state(rule) {
-        Ok(state) => state.is_some_and(|st| st.paused),
-        Err(e) => {
-            warn!(
-                "event consumer: cannot read state of rule '{rule}' ({e}); treating it as paused"
-            );
-            true
-        }
-    }
-}
-
 /// One drain pass: read new events, group + compact per key, route to rules,
 /// act (copy/delete) under the per-rule lease, and advance the cursor to the
 /// highest CONTIGUOUS fully-handled id.
@@ -471,24 +456,37 @@ async fn drain_once(
                         continue;
                     }
                     // A paused rule does nothing — copies or deletes. Checked
-                    // under the lease, like the scheduler. The events count as
-                    // handled: holding them would pin the shared cursor and
-                    // stall every other rule, and the reconcile run after
-                    // resume brings the destination back in sync.
-                    let paused = {
+                    // under the lease (the scheduler checks before taking it).
+                    // The events count as handled: holding them would pin the
+                    // shared cursor and stall every other rule. Resume makes
+                    // the rule due at once, so its reconcile run catches up.
+                    // A state read that FAILS is not "paused": like the lease
+                    // DB error below, abort the drain and hold the cursor.
+                    let state = {
                         let dbg = db.lock().await;
-                        let paused = rule_is_paused(&dbg, &rule.name);
-                        if paused {
+                        let state = dbg.replication_load_state(&rule.name);
+                        if matches!(state, Ok(Some(ref st)) if st.paused) || state.is_err() {
                             let _ = dbg.replication_release_lease(&rule.name, instance_id);
                         }
-                        paused
+                        state
                     };
-                    if paused {
-                        debug!(
-                            "event consumer: rule '{}' is paused — skipping {}/{}",
-                            rule.name, bucket, key
-                        );
-                        continue;
+                    match state {
+                        Ok(Some(st)) if st.paused => {
+                            debug!(
+                                "event consumer: rule '{}' is paused — skipping {}/{}",
+                                rule.name, bucket, key
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!(
+                                "event consumer: cannot read state of rule '{}' ({e}); \
+                                 aborting drain, cursor held at {cursor}",
+                                rule.name
+                            );
+                            return;
+                        }
                     }
                 }
                 Ok(false) => {

@@ -2429,6 +2429,24 @@ async fn test_percent_encoded_path_cannot_escape_authorization() {
     // An encoded key character must not escape a key-scoped Deny.
     let resp = get(format!("/{b}/secre%74.txt"), &denied).await.unwrap();
     assert_ne!(resp.status(), StatusCode::OK, "Deny bypassed by encoding");
+
+    // Extra leading slashes on the key: the engine serves `/k` as `k`.
+    for wire in [format!("/{b}//secret.txt"), format!("/{b}/%2Fsecret.txt")] {
+        let resp = signed_encoded(
+            reqwest::Method::GET,
+            &server.endpoint(),
+            &wire,
+            &format!("/{b}//secret.txt"),
+            "",
+            "",
+            &denied.access_key_id,
+            &denied.secret_access_key,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK, "Deny bypassed by {wire}");
+    }
 }
 
 /// A Deny on LIST with an `s3:prefix` condition must also match when the
