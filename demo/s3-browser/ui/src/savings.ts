@@ -86,7 +86,7 @@ export function summarizeScopeSavings(
  * + the post-upload batch summary in UploadPage. Differs from
  * `summarizeScopeSavings` in two ways that matter to the user:
  *
- *   - `pct` is rendered as a fractional number (one decimal place) and
+ *   - `pct` is a fractional number floored to one decimal place and
  *     capped at 99.9 — for a single object users expect to see "99.9%
  *     saved" on tiny deltas; the chip-style integer cap is for
  *     aggregations across many objects.
@@ -108,9 +108,12 @@ export function summarizeObjectSavings(
   }
   const saved = Math.max(0, originalSize - storedSize);
   const rawPct = (saved / originalSize) * 100;
-  // Cap at 99.9 unless the stored size is *literally* 0 — only then
-  // is 100% honest. For everything else the reference and/or non-zero
-  // delta still consumes bytes.
-  const pct = rawPct >= 100 && storedSize !== 0 ? 99.9 : Math.max(0, rawPct);
+  // Floor to one decimal (same rule as `summarizeScopeSavings`) so a raw
+  // 99.95..99.99 never renders "100.0" through `toFixed(1)`, then cap at
+  // 99.9 unless the stored size is *literally* 0 — only then is 100%
+  // honest. For everything else the reference and/or non-zero delta
+  // still consumes bytes.
+  const floored = Math.floor(Math.max(0, rawPct) * 10) / 10;
+  const pct = storedSize !== 0 && floored > 99.9 ? 99.9 : floored;
   return { pct, savedBytes: saved, empty: false };
 }

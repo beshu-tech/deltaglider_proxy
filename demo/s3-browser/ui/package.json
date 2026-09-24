@@ -36,6 +36,7 @@
     "test:yaml-utils": "node scripts/yaml-utils-regression-test.mjs",
     "test:linkify": "node scripts/linkify-regression-test.mjs",
     "test:utils": "node scripts/utils-regression-test.mjs",
+    "test:savings": "node scripts/savings-regression-test.mjs",
     "test:request-id-suffix": "node scripts/request-id-suffix-regression-test.mjs",
     "test:session-expiry": "node scripts/session-expiry-regression-test.mjs",
     "test:storage-section-payload": "node scripts/storage-section-payload-regression-test.mjs",
