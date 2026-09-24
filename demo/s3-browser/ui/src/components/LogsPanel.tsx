@@ -224,7 +224,9 @@ export default function LogsPanel({ onSessionExpired }: Props) {
                 </Tag>
                 <span
                   title={new Date(e.ts).toLocaleString()}
-                  style={{ color: c.TEXT_MUTED, width: 40, flexShrink: 0 }}
+                  // Width in `ch` (monospace): the longest relativeTime output,
+                  // "23h 59m ago", is 11 characters.
+                  style={{ color: c.TEXT_MUTED, width: '11ch', flexShrink: 0 }}
                 >
                   {relativeTime(e.ts, { now })}
                 </span>
