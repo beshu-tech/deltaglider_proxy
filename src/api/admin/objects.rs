@@ -658,6 +658,7 @@ pub async fn download_zip(
     let mut bytes_total: u64 = 0;
     let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(parsed.len());
     let mut skipped: Vec<(String, String)> = Vec::new();
+    let mut failures: Vec<ZipFailure> = Vec::new();
     for ((bucket, key), zip_name) in parsed.iter().zip(names) {
         match engine.retrieve(bucket, key).await {
             Ok((data, _meta)) => {
@@ -672,13 +673,17 @@ pub async fn download_zip(
             }
             Err(e) => {
                 debug!("zip: skipping {}/{}: {}", bucket, key, e);
+                failures.push(zip_failure_kind(&e));
                 skipped.push((format!("{bucket}/{key}"), e.to_string()));
             }
         }
     }
     match zip_skip_report(parsed.len(), &skipped) {
-        Err(msg) => return Err((StatusCode::NOT_FOUND, msg)),
-        Ok(Some(report)) => entries.push((ZIP_SKIP_REPORT_NAME.to_string(), report.into_bytes())),
+        Err(msg) => return Err((zip_all_failed_status(&failures), msg)),
+        Ok(Some(report)) => {
+            let taken: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+            entries.push((zip_skip_report_name(&taken), report.into_bytes()));
+        }
         Ok(None) => {}
     }
 
@@ -737,6 +742,63 @@ pub async fn download_zip(
 
 /// Archive entry that lists the files a partial ZIP could not include.
 const ZIP_SKIP_REPORT_NAME: &str = "_deltaglider-skipped-files.txt";
+
+/// A name for the skip report that no archive entry already uses: a selected
+/// file can itself be called `_deltaglider-skipped-files.txt`, and a duplicate
+/// entry name fails the whole archive.
+fn zip_skip_report_name(taken: &[&str]) -> String {
+    let mut name = ZIP_SKIP_REPORT_NAME.to_string();
+    let mut n = 2;
+    while taken.contains(&name.as_str()) {
+        name = format!("_deltaglider-skipped-files-{n}.txt");
+        n += 1;
+    }
+    name
+}
+
+/// Why one file of a ZIP could not be read, as far as the status goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ZipFailure {
+    NotFound,
+    AccessDenied,
+    Other,
+}
+
+fn zip_failure_kind(e: &crate::deltaglider::EngineError) -> ZipFailure {
+    use crate::deltaglider::EngineError;
+    use crate::storage::StorageError;
+    if e.is_not_found() {
+        return ZipFailure::NotFound;
+    }
+    match e {
+        EngineError::Storage(StorageError::Io(io))
+            if io.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            ZipFailure::AccessDenied
+        }
+        // An object-level 403 from an S3 backend has no variant of its own:
+        // `classify_s3_error` keeps it as `S3("… (status=403) …")`.
+        EngineError::Storage(StorageError::S3(msg))
+            if msg.contains("status=403") || msg.contains("AccessDenied") =>
+        {
+            ZipFailure::AccessDenied
+        }
+        _ => ZipFailure::Other,
+    }
+}
+
+/// Status of a ZIP request where no selected file could be read: 404 only
+/// when every file is missing, 403 when access was denied to any, and 502
+/// (the backend failed) otherwise. It used to be 404 for every cause.
+fn zip_all_failed_status(failures: &[ZipFailure]) -> StatusCode {
+    if !failures.is_empty() && failures.iter().all(|f| *f == ZipFailure::NotFound) {
+        StatusCode::NOT_FOUND
+    } else if failures.contains(&ZipFailure::AccessDenied) {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
 
 /// Decide what a ZIP says about files it could not read. None read: an
 /// error, not an empty archive. Some read: a report entry inside the
@@ -855,6 +917,60 @@ mod tests {
         let report = super::zip_skip_report(3, &[skip("b/x")]).unwrap().unwrap();
         assert!(report.starts_with("1 of 3 selected files"), "{report}");
         assert!(report.contains("b/x: not found"), "{report}");
+    }
+
+    #[test]
+    fn zip_skip_report_name_never_collides_with_a_selected_file() {
+        assert_eq!(
+            super::zip_skip_report_name(&["a.txt"]),
+            "_deltaglider-skipped-files.txt"
+        );
+        assert_eq!(
+            super::zip_skip_report_name(&[
+                "_deltaglider-skipped-files.txt",
+                "_deltaglider-skipped-files-2.txt"
+            ]),
+            "_deltaglider-skipped-files-3.txt"
+        );
+    }
+
+    #[test]
+    fn zip_all_failed_status_follows_the_cause() {
+        use super::ZipFailure::*;
+        use axum::http::StatusCode;
+        let st = super::zip_all_failed_status;
+        assert_eq!(st(&[NotFound, NotFound]), StatusCode::NOT_FOUND);
+        assert_eq!(st(&[NotFound, AccessDenied]), StatusCode::FORBIDDEN);
+        assert_eq!(st(&[NotFound, Other]), StatusCode::BAD_GATEWAY);
+        assert_eq!(st(&[Other]), StatusCode::BAD_GATEWAY);
+        assert_eq!(st(&[]), StatusCode::BAD_GATEWAY);
+
+        use crate::deltaglider::EngineError;
+        use crate::storage::StorageError;
+        let kind = super::zip_failure_kind;
+        assert_eq!(kind(&EngineError::NotFound("k".into())), NotFound);
+        assert_eq!(
+            kind(&EngineError::Storage(StorageError::NotFound("k".into()))),
+            NotFound
+        );
+        assert_eq!(
+            kind(&EngineError::Storage(StorageError::S3(
+                "GetObject failed (status=403): AccessDenied".into()
+            ))),
+            AccessDenied
+        );
+        assert_eq!(
+            kind(&EngineError::Storage(StorageError::Io(
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+            ))),
+            AccessDenied
+        );
+        assert_eq!(
+            kind(&EngineError::Storage(StorageError::S3(
+                "GetObject failed (status=500)".into()
+            ))),
+            Other
+        );
     }
 
     #[test]
