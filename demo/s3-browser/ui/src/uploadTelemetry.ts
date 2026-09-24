@@ -17,6 +17,33 @@ export interface ThroughputSample {
   loadedBytes: number;
 }
 
+// Failures that come back the same on every attempt: permission and quota
+// rejections (403), a malformed request, a missing bucket, an object above the
+// size limit. Offering "Retry" for these only invites a second failure.
+const PERMANENT_UPLOAD_STATUSES = new Set([400, 403, 404, 405, 411, 413]);
+const PERMANENT_UPLOAD_CODES = new Set([
+  'AccessDenied',
+  'EntityTooLarge',
+  'InvalidArgument',
+  'InvalidBucketName',
+  'NoSuchBucket',
+  'QuotaExceeded',
+]);
+
+/** True when retrying a failed upload can succeed: network errors, timeouts,
+ *  throttling and server errors. `status` undefined = no HTTP answer. */
+export function isRetryableUploadFailure(status?: number, code?: string): boolean {
+  if (code && PERMANENT_UPLOAD_CODES.has(code)) return false;
+  if (status !== undefined && PERMANENT_UPLOAD_STATUSES.has(status)) return false;
+  return true;
+}
+
+/** The queue label: the path under the destination folder, so two README.md
+ *  files from different subfolders of a folder upload can be told apart. */
+export function uploadDisplayPath(key: string, destination: string): string {
+  return destination && key.startsWith(`${destination}/`) ? key.slice(destination.length + 1) : key;
+}
+
 export function clampPercent(value: number): number {
   return clamp(value, 0, 100);
 }

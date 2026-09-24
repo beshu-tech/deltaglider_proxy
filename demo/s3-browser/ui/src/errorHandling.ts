@@ -150,7 +150,34 @@ type S3LikeError = {
   };
 };
 
-export function normalizeS3Error(err: unknown, context: string): Error {
+/**
+ * A failed S3 request. The message is the operator-facing text; `status`
+ * and `code` carry the facts that code decides on (for example whether a
+ * failed upload is worth retrying), so no caller parses the message.
+ */
+export class S3RequestError extends Error {
+  readonly status?: number;
+  readonly code?: string;
+
+  constructor(message: string, status?: number, code?: string) {
+    super(message);
+    this.name = 'S3RequestError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export function normalizeS3Error(err: unknown, context: string): S3RequestError {
+  const e = err as S3LikeError;
+  const prior = err instanceof S3RequestError ? err : undefined;
+  return new S3RequestError(
+    describeS3Error(err, context).message,
+    prior?.status ?? e?.$metadata?.httpStatusCode,
+    prior?.code ?? (e?.Code || e?.code || e?.name),
+  );
+}
+
+function describeS3Error(err: unknown, context: string): Error {
   const e = err as S3LikeError;
   const raw = stringifyUnknown(err);
   const status = e?.$metadata?.httpStatusCode;

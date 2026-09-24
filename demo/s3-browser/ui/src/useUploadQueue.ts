@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { headObject, uploadObject, type UploadTelemetry } from './s3client';
 import { uploadSessionStats } from './uploadStats';
 import { isBaselineObject } from './savings';
-import { clampPercent, mergeTotalBytes, type UploadStatus } from './uploadTelemetry';
-import { normalizeUiError } from './errorHandling';
+import { clampPercent, isRetryableUploadFailure, mergeTotalBytes, type UploadStatus } from './uploadTelemetry';
+import { S3RequestError, normalizeUiError } from './errorHandling';
 
 export interface UploadQueueItem {
   id: string;
@@ -30,6 +30,8 @@ export interface UploadQueueItem {
   /** Set when this upload became its folder's baseline (see uploadStats.ts). */
   baselineKey?: string;
   error?: string;
+  /** False when the failure repeats on every attempt (403, 413, …): no Retry. */
+  retryable?: boolean;
 }
 
 export default function useUploadQueue(destination: string) {
@@ -204,6 +206,9 @@ export default function useUploadQueue(destination: string) {
                   ...entry,
                   status: 'error',
                   error: normalizeUiError(err, 'Upload failed'),
+                  retryable: err instanceof S3RequestError
+                    ? isRetryableUploadFailure(err.status, err.code)
+                    : true,
                   inFlightParts: 0,
                   activeConnections: 0,
                   speedBytesPerSec: 0,
@@ -263,6 +268,7 @@ export default function useUploadQueue(destination: string) {
               activeConnections: 0,
               currentPart: null,
               error: undefined,
+              retryable: undefined,
               startedAtMs: null,
               completingSinceMs: null,
               updatedAtMs: null,
