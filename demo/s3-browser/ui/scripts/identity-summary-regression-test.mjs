@@ -25,4 +25,12 @@ assert.deepEqual(identitySummary(user, undefined), { name: 'ci-uploader', detail
 // IAM mode before the user resolved: fall back to the access key.
 assert.deepEqual(identitySummary({ mode: 'iam', user: null }, 'AK2'), { name: 'AK2', detail: 'User (IAM) · key AK2' });
 
+// Bootstrap password in IAM mode: whoami reports a synthetic 'admin' user
+// with access key 'bootstrap'. It is not an IAM user and has no key.
+const bootstrapInIam = { mode: 'iam', user: { name: 'admin', access_key_id: 'bootstrap', is_admin: true } };
+assert.deepEqual(identitySummary(bootstrapInIam, undefined), {
+  name: 'Administrator',
+  detail: 'Signed in with the bootstrap password, not as an IAM user.',
+});
+
 console.log('identity-summary regression checks passed');
