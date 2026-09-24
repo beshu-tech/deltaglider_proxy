@@ -1,16 +1,74 @@
 // Admin API client core: shared fetch glue + cross-cutting types.
 import { throwApiError } from '../errorHandling';
+import { BASE as APP_BASE } from '../urlState';
 
-export const BASE = '/_';
+/** API path prefix: the SPA base without its trailing slash (`/_`). One
+ *  source — `urlState.BASE` — so the app routes and the API cannot drift. */
+export const BASE = APP_BASE.replace(/\/+$/, '');
 
-/** Shared fetch wrapper — handles credentials, JSON serialization, content-type. */
-export async function adminFetch(path: string, method = 'GET', body?: unknown): Promise<Response> {
+/** A request body sent verbatim (not JSON-encoded), with its content type. */
+interface RawBody {
+  raw: BodyInit;
+  contentType: string;
+}
+
+/**
+ * Shared fetch wrapper — handles credentials, JSON serialization, content-type.
+ * A `rawBody` is sent as-is instead of a JSON `body` (e.g. a backup zip).
+ */
+export async function adminFetch(
+  path: string,
+  method = 'GET',
+  body?: unknown,
+  rawBody?: RawBody,
+): Promise<Response> {
   const opts: RequestInit = { method, credentials: 'include' };
-  if (body !== undefined) {
+  if (rawBody) {
+    opts.headers = { 'Content-Type': rawBody.contentType };
+    opts.body = rawBody.raw;
+  } else if (body !== undefined) {
     opts.headers = { 'Content-Type': 'application/json' };
     opts.body = JSON.stringify(body);
   }
   return fetch(`${BASE}${path}`, opts);
+}
+
+interface AdminRequestOptions {
+  method?: string;
+  /** JSON-encoded request body. */
+  body?: unknown;
+  /** Operator-facing prefix of the error message ("Delete user 4 failed (409): …").
+   *  Defaults to `API <path>`, the shape `safeJson` always produced. */
+  context?: string;
+}
+
+function defaultContext(path: string): string {
+  return `API ${BASE}${path.split('?')[0]}`;
+}
+
+/**
+ * THE admin request helper: sends the request and throws an `ApiError`
+ * (status + server detail, via `throwApiError`) on any non-2xx response.
+ * Returns the raw `Response` for non-JSON bodies (text, blob, 204).
+ */
+export async function adminRequest(
+  path: string,
+  { method = 'GET', body, context }: AdminRequestOptions = {},
+): Promise<Response> {
+  const res = await adminFetch(path, method, body);
+  if (!res.ok) await throwApiError(res, context ?? defaultContext(path));
+  return res;
+}
+
+/** `adminRequest` + parse the JSON body. Use this for every JSON endpoint. */
+export async function adminJson<T>(path: string, opts: AdminRequestOptions = {}): Promise<T> {
+  return safeJson<T>(await adminRequest(path, opts));
+}
+
+/** @deprecated Use `adminJson(path, { context })`. Kept only for
+ *  `bulkObjects.ts`, which another change owns. */
+export async function fetchJson<T>(path: string, errorContext: string): Promise<T> {
+  return adminJson<T>(path, { context: errorContext });
 }
 
 export async function adminLogin(password: string): Promise<{ ok: boolean; error?: string }> {
@@ -287,22 +345,8 @@ export async function safeJson<T>(res: Response): Promise<T> {
   }
 }
 
-/**
- * GET a path and parse the JSON body, throwing an actionable error
- * (via `throwApiError`) on a non-2xx status. Collapses the ubiquitous
- * `adminFetch → if (!res.ok) throwApiError → safeJson` triple. Only for
- * the plain happy-path shape — callsites with bespoke fallback handling
- * (null-on-404, try/catch defaults, custom error bodies) stay explicit.
- */
-export async function fetchJson<T>(path: string, errorContext: string): Promise<T> {
-  const res = await adminFetch(path);
-  if (!res.ok) await throwApiError(res, errorContext);
-  return safeJson<T>(res);
-}
-
 export async function updateAdminConfig(updates: Record<string, unknown>): Promise<ConfigUpdateResponse> {
-  const res = await adminFetch('/api/admin/config', 'PUT', updates);
-  return safeJson(res);
+  return adminJson('/api/admin/config', { method: 'PUT', body: updates });
 }
 
 /**
@@ -323,8 +367,7 @@ export async function traceAdmission<T>(body: unknown): Promise<T> {
  * syntax-highlighted in a modal.
  */
 export async function exportConfigYaml(): Promise<string> {
-  const res = await adminFetch('/api/admin/config/export');
-  if (!res.ok) await throwApiError(res, 'Config export');
+  const res = await adminRequest('/api/admin/config/export', { context: 'Config export' });
   return res.text();
 }
 
@@ -340,8 +383,7 @@ interface ConfigValidateResponse {
  * showing a confirm-apply dialog.
  */
 export async function validateConfigYaml(yaml: string): Promise<ConfigValidateResponse> {
-  const res = await adminFetch('/api/admin/config/validate', 'POST', { yaml });
-  return safeJson(res);
+  return adminJson('/api/admin/config/validate', { method: 'POST', body: { yaml } });
 }
 
 export interface ConfigApplyResponse {
@@ -360,8 +402,7 @@ export interface ConfigApplyResponse {
  * "Paste YAML" flows both terminate here.
  */
 export async function applyConfigYaml(yaml: string): Promise<ConfigApplyResponse> {
-  const res = await adminFetch('/api/admin/config/apply', 'POST', { yaml });
-  return safeJson(res);
+  return adminJson('/api/admin/config/apply', { method: 'POST', body: { yaml } });
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -383,8 +424,9 @@ export async function applyConfigYaml(yaml: string): Promise<ConfigApplyResponse
  */
 export async function exportFullIamYaml(includeSecrets = true): Promise<string> {
   const qs = includeSecrets ? '?include_secrets=true' : '';
-  const res = await adminFetch(`/api/admin/config/declarative-iam-export${qs}`);
-  if (!res.ok) await throwApiError(res, 'Full IAM export');
+  const res = await adminRequest(`/api/admin/config/declarative-iam-export${qs}`, {
+    context: 'Full IAM export',
+  });
   return res.text();
 }
 
@@ -409,9 +451,11 @@ export interface IamImportSummary {
  * confirm-before-apply preview.
  */
 export async function validateFullIamYaml(yaml: string): Promise<IamImportSummary> {
-  const res = await adminFetch('/api/admin/config/declarative-iam-validate', 'POST', { yaml });
-  if (!res.ok) await throwApiError(res, 'Full IAM import validation');
-  return safeJson(res);
+  return adminJson('/api/admin/config/declarative-iam-validate', {
+    method: 'POST',
+    body: { yaml },
+    context: 'Full IAM import validation',
+  });
 }
 
 /**
@@ -420,9 +464,11 @@ export async function validateFullIamYaml(yaml: string): Promise<IamImportSummar
  * peers, and audit each mutation. Returns the applied change summary.
  */
 export async function applyFullIamYaml(yaml: string): Promise<IamImportSummary> {
-  const res = await adminFetch('/api/admin/config/declarative-iam-apply', 'POST', { yaml });
-  if (!res.ok) await throwApiError(res, 'Full IAM import apply');
-  return safeJson(res);
+  return adminJson('/api/admin/config/declarative-iam-apply', {
+    method: 'POST',
+    body: { yaml },
+    context: 'Full IAM import apply',
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -462,7 +508,9 @@ export interface SectionApplyResponse {
  * value.
  */
 export async function getSection<T = unknown>(section: SectionName): Promise<T> {
-  return fetchJson(`/api/admin/config/section/${section}`, `Section fetch (${section})`);
+  return adminJson(`/api/admin/config/section/${section}`, {
+    context: `Section fetch (${section})`,
+  });
 }
 
 /**
@@ -470,8 +518,9 @@ export async function getSection<T = unknown>(section: SectionName): Promise<T> 
  * variant). Backs the per-section Copy-as-YAML button.
  */
 export async function getSectionYaml(section: SectionName): Promise<string> {
-  const res = await adminFetch(`/api/admin/config/section/${section}?format=yaml`);
-  if (!res.ok) await throwApiError(res, `Section YAML fetch (${section})`);
+  const res = await adminRequest(`/api/admin/config/section/${section}?format=yaml`, {
+    context: `Section YAML fetch (${section})`,
+  });
   return res.text();
 }
 
@@ -485,8 +534,7 @@ export async function putSection<T = unknown>(
   section: SectionName,
   body: T
 ): Promise<SectionApplyResponse> {
-  const res = await adminFetch(`/api/admin/config/section/${section}`, 'PUT', body);
-  return safeJson(res);
+  return adminJson(`/api/admin/config/section/${section}`, { method: 'PUT', body });
 }
 
 /**
@@ -498,12 +546,7 @@ export async function validateSection<T = unknown>(
   section: SectionName,
   body: T
 ): Promise<SectionApplyResponse> {
-  const res = await adminFetch(
-    `/api/admin/config/section/${section}/validate`,
-    'POST',
-    body
-  );
-  return safeJson(res);
+  return adminJson(`/api/admin/config/section/${section}/validate`, { method: 'POST', body });
 }
 
 interface PasswordChangeResponse {
@@ -527,17 +570,15 @@ export interface TestS3Response {
 }
 
 export async function testS3Connection(req: TestS3Request): Promise<TestS3Response> {
-  const res = await adminFetch('/api/admin/test-s3', 'POST', req);
-  return safeJson(res);
+  return adminJson('/api/admin/test-s3', { method: 'POST', body: req });
 }
 
 export async function changeAdminPassword(
   currentPassword: string,
   newPassword: string
 ): Promise<PasswordChangeResponse> {
-  const res = await adminFetch('/api/admin/password', 'PUT', {
-    current_password: currentPassword,
-    new_password: newPassword,
+  return adminJson('/api/admin/password', {
+    method: 'PUT',
+    body: { current_password: currentPassword, new_password: newPassword },
   });
-  return safeJson(res);
 }

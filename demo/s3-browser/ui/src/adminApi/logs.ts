@@ -2,7 +2,7 @@
 // Operational logs (Diagnostics → Logs panel) — backlog + live tail.
 // Server-side types: src/logs.rs::LogEntry. Keep in sync.
 // ─────────────────────────────────────────────────────────────
-import { fetchJson, BASE } from './core';
+import { adminJson, BASE } from './core';
 
 export interface LogEntry {
   ts: string; // ISO-8601 UTC
@@ -35,7 +35,7 @@ function filterParams(f: LogFilters): URLSearchParams {
 export async function fetchLogs(filters: LogFilters = {}, limit = 200): Promise<LogsResponse> {
   const p = filterParams(filters);
   p.set('limit', String(limit));
-  return fetchJson(`/api/admin/logs?${p}`, 'Logs fetch');
+  return adminJson(`/api/admin/logs?${p}`, { context: 'Logs fetch' });
 }
 
 /**

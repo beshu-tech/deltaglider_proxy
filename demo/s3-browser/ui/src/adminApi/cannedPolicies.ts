@@ -1,5 +1,5 @@
 // === Canned Policies ===
-import { adminFetch, safeJson } from './core';
+import { adminJson } from './core';
 import type { IamPermission } from './users';
 
 export interface CannedPolicy {
@@ -10,9 +10,7 @@ export interface CannedPolicy {
 
 export async function getCannedPolicies(): Promise<CannedPolicy[]> {
   try {
-    const res = await adminFetch('/api/admin/policies');
-    if (!res.ok) return [];
-    return safeJson(res);
+    return await adminJson<CannedPolicy[]>('/api/admin/policies');
   } catch {
     return [];
   }

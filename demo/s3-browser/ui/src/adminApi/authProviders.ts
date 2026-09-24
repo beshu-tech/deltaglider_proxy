@@ -1,6 +1,5 @@
 // === External Auth (OAuth/OIDC) ===
-import { throwApiError } from '../errorHandling';
-import { adminFetch, fetchJson, safeJson } from './core';
+import { adminJson, adminRequest } from './core';
 
 export interface AuthProvider {
   id: number;
@@ -52,28 +51,35 @@ export interface ProviderTestResult {
 }
 
 export async function getAuthProviders(): Promise<AuthProvider[]> {
-  return fetchJson('/api/admin/ext-auth/providers', 'Load auth providers');
+  return adminJson('/api/admin/ext-auth/providers', { context: 'Load auth providers' });
 }
 
 export async function createAuthProvider(req: CreateAuthProviderRequest): Promise<AuthProvider> {
-  const res = await adminFetch('/api/admin/ext-auth/providers', 'POST', req);
-  if (!res.ok) await throwApiError(res, 'Create auth provider');
-  return safeJson(res);
+  return adminJson('/api/admin/ext-auth/providers', {
+    method: 'POST',
+    body: req,
+    context: 'Create auth provider',
+  });
 }
 
 export async function updateAuthProvider(id: number, req: UpdateAuthProviderRequest): Promise<AuthProvider> {
-  const res = await adminFetch(`/api/admin/ext-auth/providers/${id}`, 'PUT', req);
-  if (!res.ok) await throwApiError(res, 'Update auth provider');
-  return safeJson(res);
+  return adminJson(`/api/admin/ext-auth/providers/${id}`, {
+    method: 'PUT',
+    body: req,
+    context: 'Update auth provider',
+  });
 }
 
 export async function deleteAuthProvider(id: number): Promise<void> {
-  const res = await adminFetch(`/api/admin/ext-auth/providers/${id}`, 'DELETE');
-  if (!res.ok) await throwApiError(res, 'Delete auth provider');
+  await adminRequest(`/api/admin/ext-auth/providers/${id}`, {
+    method: 'DELETE',
+    context: 'Delete auth provider',
+  });
 }
 
 export async function testAuthProvider(id: number): Promise<ProviderTestResult> {
-  const res = await adminFetch(`/api/admin/ext-auth/providers/${id}/test`, 'POST');
-  if (!res.ok) await throwApiError(res, 'Test auth provider');
-  return safeJson(res);
+  return adminJson(`/api/admin/ext-auth/providers/${id}/test`, {
+    method: 'POST',
+    context: 'Test auth provider',
+  });
 }

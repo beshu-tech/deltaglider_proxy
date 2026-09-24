@@ -1,6 +1,5 @@
 // === Group Mapping Rules ===
-import { throwApiError } from '../errorHandling';
-import { adminFetch, fetchJson, safeJson } from './core';
+import { adminJson, adminRequest } from './core';
 
 export interface MappingRule {
   id: number;
@@ -32,24 +31,30 @@ interface UpdateMappingRuleRequest {
 }
 
 export async function getMappingRules(): Promise<MappingRule[]> {
-  return fetchJson('/api/admin/ext-auth/mappings', 'Load group mappings');
+  return adminJson('/api/admin/ext-auth/mappings', { context: 'Load group mappings' });
 }
 
 export async function createMappingRule(req: CreateMappingRuleRequest): Promise<MappingRule> {
-  const res = await adminFetch('/api/admin/ext-auth/mappings', 'POST', req);
-  if (!res.ok) await throwApiError(res, 'Create group mapping');
-  return safeJson(res);
+  return adminJson('/api/admin/ext-auth/mappings', {
+    method: 'POST',
+    body: req,
+    context: 'Create group mapping',
+  });
 }
 
 export async function updateMappingRule(id: number, req: UpdateMappingRuleRequest): Promise<MappingRule> {
-  const res = await adminFetch(`/api/admin/ext-auth/mappings/${id}`, 'PUT', req);
-  if (!res.ok) await throwApiError(res, 'Update group mapping');
-  return safeJson(res);
+  return adminJson(`/api/admin/ext-auth/mappings/${id}`, {
+    method: 'PUT',
+    body: req,
+    context: 'Update group mapping',
+  });
 }
 
 export async function deleteMappingRule(id: number): Promise<void> {
-  const res = await adminFetch(`/api/admin/ext-auth/mappings/${id}`, 'DELETE');
-  if (!res.ok) await throwApiError(res, 'Delete group mapping');
+  await adminRequest(`/api/admin/ext-auth/mappings/${id}`, {
+    method: 'DELETE',
+    context: 'Delete group mapping',
+  });
 }
 
 interface MappingPreviewResponse {
@@ -58,7 +63,9 @@ interface MappingPreviewResponse {
 }
 
 export async function previewMapping(email: string): Promise<MappingPreviewResponse> {
-  const res = await adminFetch('/api/admin/ext-auth/mappings/preview', 'POST', { email });
-  if (!res.ok) await throwApiError(res, 'Mapping preview');
-  return safeJson(res);
+  return adminJson('/api/admin/ext-auth/mappings/preview', {
+    method: 'POST',
+    body: { email },
+    context: 'Mapping preview',
+  });
 }

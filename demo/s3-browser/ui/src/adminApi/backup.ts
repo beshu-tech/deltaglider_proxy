@@ -4,8 +4,7 @@
 // iam.json + secrets.json + manifest.json. The legacy IAM-only JSON
 // export stays addressable via `?format=json` for backwards compat,
 // but every admin GUI flow uses the zip exclusively.
-import { throwApiError } from '../errorHandling';
-import { adminFetch } from './core';
+import { adminFetch, adminRequest } from './core';
 
 /**
  * Download the Full Backup as a zip Blob. Callers pipe this into a
@@ -13,8 +12,7 @@ import { adminFetch } from './core';
  * filename (typically derived from the Content-Disposition header).
  */
 export async function exportBackup(): Promise<{ blob: Blob; filename: string }> {
-  const res = await adminFetch('/api/admin/backup');
-  if (!res.ok) await throwApiError(res, 'Export');
+  const res = await adminRequest('/api/admin/backup', { context: 'Export' });
   // Parse the server-suggested filename from Content-Disposition
   // (server emits `attachment; filename="dgp-backup-vX.Y.Z-<utc>.zip"`).
   const cd = res.headers.get('content-disposition') ?? '';
@@ -91,11 +89,9 @@ export async function importBackup(
   const body = isBlob ? data : JSON.stringify(data);
   const contentType = isBlob ? 'application/zip' : 'application/json';
   const qs = new URLSearchParams({ mode });
-  const res = await fetch(`/_/api/admin/backup?${qs.toString()}`, {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'content-type': contentType },
-    body,
+  const res = await adminFetch(`/api/admin/backup?${qs.toString()}`, 'POST', undefined, {
+    raw: body,
+    contentType,
   });
   if (!res.ok) {
     const err = await parseImportBackupError(res);

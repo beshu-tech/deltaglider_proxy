@@ -1,5 +1,5 @@
 // === Config DB Recovery ===
-import { adminFetch, safeJson } from './core';
+import { adminJson } from './core';
 
 interface RecoverDbResponse {
   success: boolean;
@@ -9,8 +9,8 @@ interface RecoverDbResponse {
 }
 
 export async function recoverDb(candidatePassword: string): Promise<RecoverDbResponse> {
-  const res = await adminFetch('/api/admin/recover-db', 'POST', {
-    candidate_password: candidatePassword,
+  return adminJson('/api/admin/recover-db', {
+    method: 'POST',
+    body: { candidate_password: candidatePassword },
   });
-  return safeJson(res);
 }

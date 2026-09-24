@@ -1,6 +1,5 @@
 // === IAM Group Management ===
-import { throwApiError } from '../errorHandling';
-import { adminFetch, safeJson } from './core';
+import { adminJson, adminRequest } from './core';
 import type { IamPermission } from './users';
 
 export interface IamGroup {
@@ -25,39 +24,42 @@ interface UpdateGroupRequest {
 }
 
 export async function getGroups(): Promise<IamGroup[]> {
-  const res = await adminFetch('/api/admin/groups');
-  return safeJson(res);
+  return adminJson('/api/admin/groups');
 }
 
 export async function createGroup(req: CreateGroupRequest): Promise<IamGroup> {
-  const res = await adminFetch('/api/admin/groups', 'POST', req);
-  return safeJson(res);
+  return adminJson('/api/admin/groups', { method: 'POST', body: req });
 }
 
 export async function cloneGroup(
   id: number,
   req: { name?: string; copy_members?: boolean } = {},
 ): Promise<IamGroup> {
-  const res = await adminFetch(`/api/admin/groups/${id}/clone`, 'POST', req);
-  return safeJson(res);
+  return adminJson(`/api/admin/groups/${id}/clone`, { method: 'POST', body: req });
 }
 
 export async function updateGroup(id: number, req: UpdateGroupRequest): Promise<IamGroup> {
-  const res = await adminFetch(`/api/admin/groups/${id}`, 'PUT', req);
-  return safeJson(res);
+  return adminJson(`/api/admin/groups/${id}`, { method: 'PUT', body: req });
 }
 
 export async function deleteGroup(id: number): Promise<void> {
-  const res = await adminFetch(`/api/admin/groups/${id}`, 'DELETE');
-  if (!res.ok) await throwApiError(res, `Delete group ${id}`);
+  await adminRequest(`/api/admin/groups/${id}`, {
+    method: 'DELETE',
+    context: `Delete group ${id}`,
+  });
 }
 
 export async function addGroupMember(groupId: number, userId: number): Promise<void> {
-  const res = await adminFetch(`/api/admin/groups/${groupId}/members`, 'POST', { user_id: userId });
-  if (!res.ok) await throwApiError(res, `Add member ${userId} to group ${groupId}`);
+  await adminRequest(`/api/admin/groups/${groupId}/members`, {
+    method: 'POST',
+    body: { user_id: userId },
+    context: `Add member ${userId} to group ${groupId}`,
+  });
 }
 
 export async function removeGroupMember(groupId: number, userId: number): Promise<void> {
-  const res = await adminFetch(`/api/admin/groups/${groupId}/members/${userId}`, 'DELETE');
-  if (!res.ok) await throwApiError(res, `Remove member ${userId} from group ${groupId}`);
+  await adminRequest(`/api/admin/groups/${groupId}/members/${userId}`, {
+    method: 'DELETE',
+    context: `Remove member ${userId} from group ${groupId}`,
+  });
 }

@@ -4,8 +4,7 @@
 // a bucket (paginated via list_objects) and produces an honest
 // `total_objects`/`total_original_bytes`/`total_stored_bytes`. Results
 // persist to disk on the server and survive restarts; there is no TTL.
-import { throwApiError } from '../errorHandling';
-import { adminFetch, fetchJson, safeJson } from './core';
+import { adminJson, BASE } from './core';
 
 /** Completed scan record returned by /scan/status (state="done"). */
 export interface BucketScanResult {
@@ -54,7 +53,7 @@ export async function getAllBucketScans(): Promise<{
   buckets: Record<string, BucketScanResult>;
   running?: Record<string, BucketScanProgress>;
 }> {
-  return fetchJson('/api/admin/diagnostics/scan/status', 'Bucket scan status (all)');
+  return adminJson('/api/admin/diagnostics/scan/status', { context: 'Bucket scan status (all)' });
 }
 
 /**
@@ -65,24 +64,20 @@ export async function getAllBucketScans(): Promise<{
 export async function startBucketScan(
   bucket: string,
 ): Promise<BucketScanProgress> {
-  const res = await adminFetch(
-    `/api/admin/diagnostics/scan/start?bucket=${encodeURIComponent(bucket)}`,
-    'POST',
-  );
-  if (!res.ok) await throwApiError(res, 'Bucket scan start');
-  return safeJson(res);
+  return adminJson(`/api/admin/diagnostics/scan/start?bucket=${encodeURIComponent(bucket)}`, {
+    method: 'POST',
+    context: 'Bucket scan start',
+  });
 }
 
 /** Cancel a running scan. No-op if nothing is running. */
 export async function stopBucketScan(
   bucket: string,
 ): Promise<{ cancelled: boolean }> {
-  const res = await adminFetch(
-    `/api/admin/diagnostics/scan/stop?bucket=${encodeURIComponent(bucket)}`,
-    'POST',
-  );
-  if (!res.ok) await throwApiError(res, 'Bucket scan stop');
-  return safeJson(res);
+  return adminJson(`/api/admin/diagnostics/scan/stop?bucket=${encodeURIComponent(bucket)}`, {
+    method: 'POST',
+    context: 'Bucket scan stop',
+  });
 }
 
 /**
@@ -101,7 +96,7 @@ export function subscribeBucketScan(
   onProgress: (frame: BucketScanProgress) => void,
   onError?: (err: Event) => void,
 ): () => void {
-  const url = `/_/api/admin/diagnostics/scan/stream?bucket=${encodeURIComponent(bucket)}`;
+  const url = `${BASE}/api/admin/diagnostics/scan/stream?bucket=${encodeURIComponent(bucket)}`;
   const source = new EventSource(url, { withCredentials: true });
   const parseAndDispatch = (msg: MessageEvent) => {
     try {

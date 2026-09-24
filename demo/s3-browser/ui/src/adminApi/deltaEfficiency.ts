@@ -1,8 +1,7 @@
 // ─────────────────────────────────────────────────────────────
 // Compression health diagnostics
 // ─────────────────────────────────────────────────────────────
-import { throwApiError } from '../errorHandling';
-import { adminFetch, safeJson } from './core';
+import { adminJson } from './core';
 
 /**
  * Coarse health classification for a single deltaspace, mirroring the
@@ -105,12 +104,11 @@ export async function fetchDeltaEfficiency(
     bucket,
     min_deltas: String(minDeltas),
   });
-  const res = await adminFetch(`/api/admin/diagnostics/delta-efficiency?${qs.toString()}`);
-  if (res.status === 202) {
-    return safeJson(res) as Promise<DeltaEfficiencyScanning>;
-  }
-  if (!res.ok) await throwApiError(res, 'Compression health fetch');
-  return safeJson(res);
+  // 202 (scan enqueued) is a 2xx, so it parses like the 200 result; the
+  // caller tells them apart with `'scanning' in r`.
+  return adminJson(`/api/admin/diagnostics/delta-efficiency?${qs.toString()}`, {
+    context: 'Compression health fetch',
+  });
 }
 
 /**
@@ -121,13 +119,11 @@ export async function triggerDeltaEfficiencyScan(
   bucket: string,
   minDeltas = 3,
 ): Promise<DeltaEfficiencyScanning> {
-  const res = await adminFetch(
-    '/api/admin/diagnostics/delta-efficiency/scan',
-    'POST',
-    { bucket, min_deltas: minDeltas },
-  );
-  if (!res.ok && res.status !== 202) await throwApiError(res, 'Compression health scan trigger');
-  return safeJson(res);
+  return adminJson('/api/admin/diagnostics/delta-efficiency/scan', {
+    method: 'POST',
+    body: { bucket, min_deltas: minDeltas },
+    context: 'Compression health scan trigger',
+  });
 }
 
 /**
@@ -185,11 +181,9 @@ export async function verifyDeltaEfficiency(
   bucket: string,
   prefix: string,
 ): Promise<VerifyDeltaEfficiencyResponse> {
-  const res = await adminFetch(
-    '/api/admin/diagnostics/delta-efficiency/verify',
-    'POST',
-    { bucket, prefix },
-  );
-  if (!res.ok) await throwApiError(res, 'Compression health verify');
-  return safeJson(res);
+  return adminJson('/api/admin/diagnostics/delta-efficiency/verify', {
+    method: 'POST',
+    body: { bucket, prefix },
+    context: 'Compression health verify',
+  });
 }

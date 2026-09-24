@@ -1,6 +1,5 @@
 // === IAM User Management ===
-import { throwApiError } from '../errorHandling';
-import { adminFetch, safeJson } from './core';
+import { adminJson, adminRequest } from './core';
 
 export interface IamPermission {
   id: number;
@@ -41,31 +40,26 @@ export interface UpdateUserRequest {
 }
 
 export async function getUsers(): Promise<IamUser[]> {
-  const res = await adminFetch('/api/admin/users');
-  return safeJson(res);
+  return adminJson('/api/admin/users');
 }
 
 export async function createUser(req: CreateUserRequest): Promise<IamUser> {
-  const res = await adminFetch('/api/admin/users', 'POST', req);
-  return safeJson(res);
+  return adminJson('/api/admin/users', { method: 'POST', body: req });
 }
 
 export async function cloneUser(
   id: number,
   req: { name?: string; copy_group_memberships?: boolean } = {},
 ): Promise<IamUser> {
-  const res = await adminFetch(`/api/admin/users/${id}/clone`, 'POST', req);
-  return safeJson(res);
+  return adminJson(`/api/admin/users/${id}/clone`, { method: 'POST', body: req });
 }
 
 export async function updateUser(id: number, req: UpdateUserRequest): Promise<IamUser> {
-  const res = await adminFetch(`/api/admin/users/${id}`, 'PUT', req);
-  return safeJson(res);
+  return adminJson(`/api/admin/users/${id}`, { method: 'PUT', body: req });
 }
 
 export async function deleteUser(id: number): Promise<void> {
-  const res = await adminFetch(`/api/admin/users/${id}`, 'DELETE');
-  if (!res.ok) await throwApiError(res, `Delete user ${id}`);
+  await adminRequest(`/api/admin/users/${id}`, { method: 'DELETE', context: `Delete user ${id}` });
 }
 
 export async function rotateUserKeys(
@@ -76,10 +70,8 @@ export async function rotateUserKeys(
   const body: Record<string, string> = {};
   if (accessKeyId) body.access_key_id = accessKeyId;
   if (secretAccessKey) body.secret_access_key = secretAccessKey;
-  const res = await adminFetch(
-    `/api/admin/users/${id}/rotate-keys`,
-    'POST',
-    Object.keys(body).length > 0 ? body : undefined,
-  );
-  return safeJson(res);
+  return adminJson(`/api/admin/users/${id}/rotate-keys`, {
+    method: 'POST',
+    body: Object.keys(body).length > 0 ? body : undefined,
+  });
 }

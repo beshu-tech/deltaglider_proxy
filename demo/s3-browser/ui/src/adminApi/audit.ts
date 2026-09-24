@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────
 // Audit log (Wave 11 — Diagnostics → Audit panel)
 // ─────────────────────────────────────────────────────────────
-import { fetchJson } from './core';
+import { adminJson } from './core';
 
 /**
  * One entry from the in-memory audit ring. Server-side type lives
@@ -30,5 +30,7 @@ interface AuditResponse {
  * governed by `DGP_AUDIT_RING_SIZE` (default 500).
  */
 export async function fetchAudit(limit = 100): Promise<AuditResponse> {
-  return fetchJson(`/api/admin/audit?limit=${encodeURIComponent(limit)}`, 'Audit fetch');
+  return adminJson(`/api/admin/audit?limit=${encodeURIComponent(limit)}`, {
+    context: 'Audit fetch',
+  });
 }

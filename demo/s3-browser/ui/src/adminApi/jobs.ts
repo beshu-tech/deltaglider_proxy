@@ -1,6 +1,5 @@
 // === Unified jobs API (replication / lifecycle / reencrypt / migrate) ===
-import { throwApiError } from '../errorHandling';
-import { adminFetch, fetchJson, safeJson } from './core';
+import { adminJson, adminRequest, safeJson } from './core';
 import type { JobAction, JobRow } from '../jobsView';
 
 interface JobsOverview {
@@ -162,7 +161,7 @@ export interface ParityOutcome {
 type Verdict = 'safe' | 'incomplete' | 'at_risk';
 
 export async function getJobs(): Promise<JobsOverview> {
-  return fetchJson('/api/admin/jobs', 'Jobs');
+  return adminJson('/api/admin/jobs', { context: 'Jobs' });
 }
 
 /**
@@ -183,44 +182,43 @@ export interface ParityStatus {
 
 /** POST: start (or report) the background parity audit. */
 export async function startVerifyParity(ruleName: string): Promise<ParityStatus> {
-  const res = await adminFetch(
-    `/api/admin/jobs/replication:${encodeURIComponent(ruleName)}/verify`,
-    'POST'
-  );
-  if (!res.ok) await throwApiError(res, 'Verify replication parity');
-  return safeJson(res);
+  return adminJson(`/api/admin/jobs/replication:${encodeURIComponent(ruleName)}/verify`, {
+    method: 'POST',
+    context: 'Verify replication parity',
+  });
 }
 
 /** GET: poll the current parity audit status / last result (no scan started). */
 export async function getVerifyStatus(ruleName: string): Promise<ParityStatus> {
-  return fetchJson(
-    `/api/admin/jobs/replication:${encodeURIComponent(ruleName)}/verify`,
-    'Verify status'
-  );
+  return adminJson(`/api/admin/jobs/replication:${encodeURIComponent(ruleName)}/verify`, {
+    context: 'Verify status',
+  });
 }
 
 /** POST: cancel a running parity audit. */
 export async function cancelVerifyParity(ruleName: string): Promise<ParityStatus> {
-  const res = await adminFetch(
-    `/api/admin/jobs/replication:${encodeURIComponent(ruleName)}/verify/cancel`,
-    'POST'
-  );
-  if (!res.ok) await throwApiError(res, 'Cancel verification');
-  return safeJson(res);
+  return adminJson(`/api/admin/jobs/replication:${encodeURIComponent(ruleName)}/verify/cancel`, {
+    method: 'POST',
+    context: 'Cancel verification',
+  });
 }
 
 export async function getJobRuns(id: string): Promise<{ runs: JobRunEntry[] }> {
-  return fetchJson(`/api/admin/jobs/${encodeURIComponent(id)}/runs`, 'Job runs');
+  return adminJson(`/api/admin/jobs/${encodeURIComponent(id)}/runs`, { context: 'Job runs' });
 }
 
 export async function getJobFailures(id: string): Promise<{ failures: JobFailureEntry[] }> {
-  return fetchJson(`/api/admin/jobs/${encodeURIComponent(id)}/failures`, 'Job failures');
+  return adminJson(`/api/admin/jobs/${encodeURIComponent(id)}/failures`, {
+    context: 'Job failures',
+  });
 }
 
 /** Uniform action dispatch; returns the action's JSON payload (if any). */
 export async function runJobAction(id: string, action: JobAction): Promise<unknown> {
-  const res = await adminFetch(`/api/admin/jobs/${encodeURIComponent(id)}/${action}`, 'POST');
-  if (!res.ok) await throwApiError(res, `Job ${action}`);
+  const res = await adminRequest(`/api/admin/jobs/${encodeURIComponent(id)}/${action}`, {
+    method: 'POST',
+    context: `Job ${action}`,
+  });
   if (res.status === 204) return null;
   return safeJson(res);
 }
@@ -230,9 +228,11 @@ export async function startReencrypt(buckets: string[]): Promise<{
   started: Array<{ bucket: string; job_id: number }>;
   errors: Array<{ bucket: string; error: string }>;
 }> {
-  const res = await adminFetch('/api/admin/jobs/reencrypt', 'POST', { buckets });
-  if (!res.ok) await throwApiError(res, 'Start re-encryption');
-  return safeJson(res);
+  return adminJson('/api/admin/jobs/reencrypt', {
+    method: 'POST',
+    body: { buckets },
+    context: 'Start re-encryption',
+  });
 }
 
 /** Create a durable migrate job; returns 202 with the job id. */
@@ -241,10 +241,9 @@ export async function createMigrateJob(
   targetBackend: string,
   deleteSource: boolean
 ): Promise<{ job_id: number; id: string; bucket: string; from_backend: string; to_backend: string }> {
-  const res = await adminFetch(`/api/admin/buckets/${encodeURIComponent(bucket)}/migrate`, 'POST', {
-    target_backend: targetBackend,
-    delete_source: deleteSource,
+  return adminJson(`/api/admin/buckets/${encodeURIComponent(bucket)}/migrate`, {
+    method: 'POST',
+    body: { target_backend: targetBackend, delete_source: deleteSource },
+    context: `Migrate ${bucket}`,
   });
-  if (!res.ok) await throwApiError(res, `Migrate ${bucket}`);
-  return safeJson(res);
 }

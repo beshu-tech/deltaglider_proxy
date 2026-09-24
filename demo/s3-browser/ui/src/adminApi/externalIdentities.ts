@@ -1,6 +1,5 @@
 // === External Identities ===
-import { throwApiError } from '../errorHandling';
-import { adminFetch, fetchJson, safeJson } from './core';
+import { adminJson } from './core';
 
 export interface ExternalIdentity {
   id: number;
@@ -15,7 +14,7 @@ export interface ExternalIdentity {
 }
 
 export async function getExternalIdentities(): Promise<ExternalIdentity[]> {
-  return fetchJson('/api/admin/ext-auth/identities', 'Load external identities');
+  return adminJson('/api/admin/ext-auth/identities', { context: 'Load external identities' });
 }
 
 interface SyncResult {
@@ -24,7 +23,8 @@ interface SyncResult {
 }
 
 export async function syncMemberships(): Promise<SyncResult> {
-  const res = await adminFetch('/api/admin/ext-auth/sync-memberships', 'POST');
-  if (!res.ok) await throwApiError(res, 'Config sync now');
-  return safeJson(res);
+  return adminJson('/api/admin/ext-auth/sync-memberships', {
+    method: 'POST',
+    context: 'Config sync now',
+  });
 }

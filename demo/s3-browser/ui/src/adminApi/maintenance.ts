@@ -1,5 +1,5 @@
 // === Bucket maintenance status (session-light browser banner) ===
-import { fetchJson } from './core';
+import { adminJson } from './core';
 import type { MaintenanceJobView } from '../maintenanceStatus';
 
 /**
@@ -9,8 +9,7 @@ import type { MaintenanceJobView } from '../maintenanceStatus';
 export async function getBucketMaintenance(
   bucket: string
 ): Promise<{ active: MaintenanceJobView | null }> {
-  return fetchJson(
-    `/api/admin/jobs/bucket/${encodeURIComponent(bucket)}`,
-    'Bucket maintenance status'
-  );
+  return adminJson(`/api/admin/jobs/bucket/${encodeURIComponent(bucket)}`, {
+    context: 'Bucket maintenance status',
+  });
 }

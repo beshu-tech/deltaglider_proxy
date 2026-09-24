@@ -1,6 +1,5 @@
 // === Multi-Backend Management ===
-import { throwApiError } from '../errorHandling';
-import { adminFetch, fetchJson, safeJson } from './core';
+import { adminJson } from './core';
 import type { BackendInfo } from './core';
 
 interface BackendListResponse {
@@ -38,35 +37,32 @@ export interface CreateBackendRequest {
 }
 
 export async function getBackends(): Promise<BackendListResponse> {
-  return fetchJson('/api/admin/backends', 'Load backends');
+  return adminJson('/api/admin/backends', { context: 'Load backends' });
 }
 
 export async function getBucketOrigins(): Promise<BucketOriginListResponse> {
-  return fetchJson('/api/admin/buckets', 'Load bucket origins');
+  return adminJson('/api/admin/buckets', { context: 'Load bucket origins' });
 }
 
 export async function createBucketOnBackend(
   name: string,
   backendName: string,
 ): Promise<{ success: boolean; bucket: string; backend_name: string }> {
-  const res = await adminFetch('/api/admin/buckets', 'POST', {
-    name,
-    backend_name: backendName,
+  return adminJson('/api/admin/buckets', {
+    method: 'POST',
+    body: { name, backend_name: backendName },
+    context: `Create bucket ${name}`,
   });
-  if (!res.ok) await throwApiError(res, `Create bucket ${name}`);
-  return safeJson(res);
 }
 
 
 
 export async function createBackend(req: CreateBackendRequest): Promise<{ success: boolean; error?: string }> {
-  const res = await adminFetch('/api/admin/backends', 'POST', req);
-  return safeJson(res);
+  return adminJson('/api/admin/backends', { method: 'POST', body: req });
 }
 
 export async function deleteBackend(name: string): Promise<{ success: boolean; error?: string }> {
-  const res = await adminFetch(`/api/admin/backends/${encodeURIComponent(name)}`, 'DELETE');
-  return safeJson(res);
+  return adminJson(`/api/admin/backends/${encodeURIComponent(name)}`, { method: 'DELETE' });
 }
 
 /** "Test connection": live connectivity/credentials probe of one backend;
@@ -74,7 +70,8 @@ export async function deleteBackend(name: string): Promise<{ success: boolean; e
 export async function probeBackend(
   name: string,
 ): Promise<import('./core').BackendHealthEntry> {
-  const res = await adminFetch(`/api/admin/backends/${encodeURIComponent(name)}/probe`, 'POST');
-  if (!res.ok) await throwApiError(res, `Test connection to ${name}`);
-  return safeJson(res);
+  return adminJson(`/api/admin/backends/${encodeURIComponent(name)}/probe`, {
+    method: 'POST',
+    context: `Test connection to ${name}`,
+  });
 }

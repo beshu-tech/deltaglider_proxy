@@ -1,8 +1,7 @@
 // ─────────────────────────────────────────────────────────────
 // Event outbox diagnostics
 // ─────────────────────────────────────────────────────────────
-import { throwApiError } from '../errorHandling';
-import { adminFetch, fetchJson, safeJson } from './core';
+import { adminJson } from './core';
 
 export type EventOutboxStatus = 'pending' | 'in_progress' | 'delivered' | 'failed';
 
@@ -62,23 +61,27 @@ export async function fetchEventOutbox(
     order,
   });
   if (status && status !== 'all') qs.set('status', status);
-  return fetchJson(`/api/admin/event-outbox?${qs.toString()}`, 'Event outbox fetch');
+  return adminJson(`/api/admin/event-outbox?${qs.toString()}`, { context: 'Event outbox fetch' });
 }
 
 export async function requeueEventOutbox(id: number): Promise<EventOutboxRequeueResponse> {
-  const res = await adminFetch(`/api/admin/event-outbox/${encodeURIComponent(id)}/requeue`, 'POST');
-  if (!res.ok) await throwApiError(res, 'Event outbox requeue');
-  return safeJson(res);
+  return adminJson(`/api/admin/event-outbox/${encodeURIComponent(id)}/requeue`, {
+    method: 'POST',
+    context: 'Event outbox requeue',
+  });
 }
 
 export async function requeueEventOutboxMany(ids: number[]): Promise<EventOutboxRequeueResponse> {
-  const res = await adminFetch('/api/admin/event-outbox/requeue', 'POST', { ids });
-  if (!res.ok) await throwApiError(res, 'Event outbox bulk requeue');
-  return safeJson(res);
+  return adminJson('/api/admin/event-outbox/requeue', {
+    method: 'POST',
+    body: { ids },
+    context: 'Event outbox bulk requeue',
+  });
 }
 
 export async function purgeFailedEventOutbox(): Promise<{ purged: number }> {
-  const res = await adminFetch('/api/admin/event-outbox/purge-failed', 'POST');
-  if (!res.ok) await throwApiError(res, 'Event outbox purge failed');
-  return safeJson(res);
+  return adminJson('/api/admin/event-outbox/purge-failed', {
+    method: 'POST',
+    context: 'Event outbox purge failed',
+  });
 }

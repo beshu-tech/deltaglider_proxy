@@ -1,6 +1,5 @@
 // === Admin session management (list + force-logout) ===
-import { throwApiError } from '../errorHandling';
-import { adminFetch, fetchJson, safeJson } from './core';
+import { adminJson, adminRequest } from './core';
 
 export interface SessionSummary {
   id: string;
@@ -12,13 +11,17 @@ export interface SessionSummary {
 }
 
 export async function listSessions(): Promise<SessionSummary[]> {
-  const res = await fetchJson<{ sessions: SessionSummary[] }>('/api/admin/sessions', 'List sessions');
+  const res = await adminJson<{ sessions: SessionSummary[] }>('/api/admin/sessions', {
+    context: 'List sessions',
+  });
   return res.sessions;
 }
 
 export async function revokeSession(id: string): Promise<void> {
-  const res = await adminFetch(`/api/admin/sessions/${encodeURIComponent(id)}`, 'DELETE');
-  if (!res.ok) await throwApiError(res, 'Revoke session');
+  await adminRequest(`/api/admin/sessions/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+    context: 'Revoke session',
+  });
 }
 
 export interface RevokeUserResult {
@@ -30,7 +33,9 @@ export interface RevokeUserResult {
 }
 
 export async function revokeUserSessions(identity: string): Promise<RevokeUserResult> {
-  const res = await adminFetch('/api/admin/sessions/revoke-user', 'POST', { identity });
-  if (!res.ok) await throwApiError(res, 'Revoke user sessions');
-  return safeJson(res);
+  return adminJson('/api/admin/sessions/revoke-user', {
+    method: 'POST',
+    body: { identity },
+    context: 'Revoke user sessions',
+  });
 }
