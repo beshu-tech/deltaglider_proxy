@@ -4,6 +4,7 @@ import { useColors } from '../ThemeContext';
 import { buildBrowserUrl } from '../urlState';
 import { useBucketOrigins } from '../queries/backends';
 import BucketBackendBadge from './BucketBackendBadge';
+import { showBackendChips } from '../bucketBackend';
 import type { BucketBackendOrigin } from '../types';
 
 interface Props {
@@ -50,9 +51,11 @@ export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = fals
   // dedupes this with the Backends panel's useBucketOrigins(); `enabled` keeps
   // non-admins from firing the (403-ing) request.
   const originsQuery = useBucketOrigins({ enabled: canAdmin && !compact && Boolean(bucket) });
+  const originRows = originsQuery.data?.buckets ?? [];
+  const multiBackend = showBackendChips(originRows.map((b) => ({ backendName: b.backend_name || undefined })));
   const activeOrigin: BucketBackendOrigin | undefined = (() => {
-    const row = originsQuery.data?.buckets?.find((b) => b.name === bucket);
-    if (!row) return undefined;
+    const row = originRows.find((b) => b.name === bucket);
+    if (!row || !multiBackend) return undefined;
     return {
       backendName: row.backend_name || undefined,
       backendType: row.backend_type || undefined,
