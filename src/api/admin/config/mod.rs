@@ -579,16 +579,53 @@ async fn declarative_iam_precommit_gate(
 }
 
 /// Re-apply the `DGP_*` overrides to an edited config (env wins at runtime,
-/// see `Config::reapply_env_overrides`) and return one warning per
-/// env-controlled field the edit changed.
+/// see `Config::reapply_env_overrides`) and return the operator warnings:
+/// one per env-controlled field the edit changed, one per secret now written
+/// as an `${env:NAME}` reference. With `document`, also one per field the
+/// document set to exactly its env value (the file keeps its old value).
 pub(crate) fn reapply_env(
     running: &crate::config::Config,
     edited: &mut crate::config::Config,
+    document: bool,
 ) -> Result<Vec<String>, String> {
-    let fields = edited
+    let report = edited
         .reapply_env_overrides(running, &crate::config::process_env)
         .map_err(|e| format!("environment overrides could not be applied: {e}"))?;
-    Ok(fields.into_iter().map(|f| env_edit_warning(&f)).collect())
+    Ok(env_reapply_warnings(&report, document))
+}
+
+/// Pure: the warnings for an [`crate::config::EnvReapply`] report.
+pub(crate) fn env_reapply_warnings(
+    report: &crate::config::EnvReapply,
+    document: bool,
+) -> Vec<String> {
+    let mut out: Vec<String> = report.edited.iter().map(|f| env_edit_warning(f)).collect();
+    for name in &report.refs_added {
+        out.push(format!(
+            "The value of the secret environment variable {name} is saved to the config file \
+             as the reference ${{env:{name}}}, never as the value. Keep {name} set."
+        ));
+    }
+    if document {
+        // Secrets are excluded: a redacted secret is filled in from the
+        // running (env) value on purpose, which looks the same.
+        const SECRET_LEAVES: &[&str] = &[
+            "secret_access_key",
+            "key",
+            "legacy_key",
+            "bootstrap_password_hash",
+        ];
+        for f in &report.echoed_over_file {
+            let leaf = f.rsplit('.').next().unwrap_or(f);
+            if !SECRET_LEAVES.contains(&leaf) {
+                out.push(format!(
+                    "The document sets {f} to the value of its environment variable. The config \
+                     file keeps its previous value for {f}; the environment value stays in effect."
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// The warning for an edit to a field an environment variable controls.
@@ -1582,5 +1619,287 @@ mod probe_error_tests {
                     .into(),
             ));
         assert_eq!(probe_error_kind(&err), "connection");
+    }
+}
+
+/// Class guard for issue #92 H1/H2/M1: every admin edit path, run against a
+/// config whose every `DGP_*` input carries a distinct sentinel, must persist
+/// a file that contains none of the sentinels.
+#[cfg(test)]
+pub(crate) mod env_leak_probe {
+    use crate::config::{BackendConfig, BackendEncryptionConfig, Config};
+    use std::cell::RefCell;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const FILE: &str = r#"
+access:
+  access_key_id: FILEAKID
+  secret_access_key: file-secret-0001
+storage:
+  backend:
+    type: filesystem
+    path: /srv/file-data
+  backend_encryption:
+    mode: aes256-gcm-proxy
+    key: "1111111111111111111111111111111111111111111111111111111111111111"
+  backends:
+    - name: eu-archive
+      type: s3
+      endpoint: http://file-endpoint:9000
+      region: eu-file-1
+      access_key_id: FILEBEAKID
+      secret_access_key: file-be-secret
+      encryption:
+        mode: aes256-gcm-proxy
+        key: "2222222222222222222222222222222222222222222222222222222222222222"
+    - name: kms-one
+      type: filesystem
+      path: /srv/kms
+      encryption:
+        mode: sse-kms
+        kms_key_id: arn:file
+advanced:
+  cache_size_mb: 100
+"#;
+
+    /// Variables whose value cannot be a sentinel (booleans).
+    const BOOLEANS: &[&str] = &[
+        "DGP_TLS_ENABLED",
+        "DGP_S3_PATH_STYLE",
+        "DGP_BACKEND_ALLOW_LOCAL",
+    ];
+
+    fn sentinel_for(name: &str, i: usize) -> String {
+        match name {
+            "DGP_TLS_ENABLED" | "DGP_S3_PATH_STYLE" => "true".into(),
+            "DGP_BACKEND_ALLOW_LOCAL" => "false".into(),
+            "DGP_LISTEN_ADDR" => "127.0.0.9:7701".into(),
+            "DGP_MAX_DELTA_RATIO" => "0.3713".into(),
+            n if n.ends_with("ENCRYPTION_KEY") => format!("{:064x}", 0xabcdef00_u64 + i as u64),
+            n if n.ends_with("_MB")
+                || n.ends_with("_SIZE")
+                || n.ends_with("CONCURRENCY")
+                || n.ends_with("THREADS") =>
+            {
+                format!("{}", 770_000 + i)
+            }
+            n => format!("SENTINEL-{n}-q7"),
+        }
+    }
+
+    /// `(lookup map, sentinels to look for)`: every variable the override
+    /// code reads for the probe config, each with a distinct value.
+    pub fn sentinel_env() -> (BTreeMap<String, String>, Vec<(String, String)>) {
+        let names = RefCell::new(BTreeSet::new());
+        let record = |n: &str| {
+            names.borrow_mut().insert(n.to_string());
+            Some("1".to_string())
+        };
+        Config::from_yaml_str(FILE)
+            .unwrap()
+            .apply_env_overrides_with(&record);
+        let env: BTreeMap<String, String> = names
+            .into_inner()
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let v = sentinel_for(&n, i);
+                (n, v)
+            })
+            .collect();
+        let check = env
+            .iter()
+            .filter(|(n, _)| !BOOLEANS.contains(&n.as_str()))
+            // DGP_ADMIN_PASSWORD_HASH is shadowed by DGP_BOOTSTRAP_PASSWORD_HASH.
+            .filter(|(n, _)| n.as_str() != "DGP_ADMIN_PASSWORD_HASH")
+            .map(|(n, v)| (n.clone(), v.clone()))
+            .collect();
+        (env, check)
+    }
+
+    pub fn running(env: &BTreeMap<String, String>) -> Config {
+        let mut cfg = Config::from_yaml_str(FILE).unwrap();
+        cfg.apply_env_overrides_at_load(&|n: &str| env.get(n).cloned());
+        cfg
+    }
+
+    /// Re-apply env to `edited`, persist it, and assert no sentinel reached
+    /// the file. The persist runs WITHOUT the leak guard first (the pipeline
+    /// itself must be clean), then with it (it must not refuse a clean file).
+    pub fn assert_no_leak(
+        label: &str,
+        running: &Config,
+        mut edited: Config,
+        env: &BTreeMap<String, String>,
+        check: &[(String, String)],
+    ) {
+        let lookup = |n: &str| env.get(n).cloned();
+        edited.reapply_env_overrides(running, &lookup).unwrap();
+        let file = edited
+            .to_canonical_yaml_for_persist_with(&|_| None)
+            .unwrap();
+        for (name, value) in check {
+            assert!(
+                !file.contains(value.as_str()),
+                "{label}: the value of {name} ({value}) reached the file:\n{file}"
+            );
+        }
+        edited
+            .to_canonical_yaml_for_persist_with(&lookup)
+            .unwrap_or_else(|e| panic!("{label}: guard refused a clean file: {e}"));
+        // And the env still wins at runtime.
+        assert_eq!(
+            edited.secret_access_key.as_deref(),
+            env.get("DGP_SECRET_ACCESS_KEY").map(String::as_str),
+            "{label}"
+        );
+    }
+
+    fn preserve_all(new: &mut Config, old: &Config) {
+        let mut w = Vec::new();
+        super::preserve_sigv4_pair(
+            &mut new.access_key_id,
+            &mut new.secret_access_key,
+            &old.access_key_id,
+            &old.secret_access_key,
+            "proxy-level",
+            &mut w,
+        );
+        super::preserve_primary_backend_creds(new, old, &mut w);
+        super::preserve_named_backends_creds(new, old, &mut w);
+        let probe = super::section_level::BackendKeyPresence::default();
+        super::section_level::preserve_backend_encryption_secrets(
+            &mut new.backend_encryption,
+            &old.backend_encryption,
+            probe,
+        );
+        for n in &mut new.backends {
+            if let Some(o) = old.backends.iter().find(|o| o.name == n.name) {
+                super::section_level::preserve_backend_encryption_secrets(
+                    &mut n.encryption,
+                    &o.encryption,
+                    probe,
+                );
+            }
+        }
+    }
+
+    fn set_region(cfg: &mut Config) {
+        if let BackendConfig::S3 { region, .. } = &mut cfg.backend {
+            *region = "eu-edit-1".into();
+        }
+    }
+
+    #[test]
+    fn no_edit_path_writes_an_env_value_into_the_file() {
+        let (env, check) = sentinel_env();
+        assert!(check.len() >= 20, "too few sentinels: {check:?}");
+        let run = running(&env);
+
+        // Section PUT whose body echoes the RUNNING values, one member edited.
+        let mut e = crate::config_sections::SectionedConfig::from_flat(&run)
+            .into_flat()
+            .unwrap();
+        set_region(&mut e);
+        preserve_all(&mut e, &run);
+        assert_no_leak(
+            "section PUT (runtime echo, region edit)",
+            &run,
+            e,
+            &env,
+            &check,
+        );
+
+        // Section PUT from the GUI's redacted GET (the file view).
+        let mut e = crate::config_sections::SectionedConfig::from_flat(&run.redact_all_secrets())
+            .into_flat()
+            .unwrap();
+        e.cache_size_mb = 55;
+        e.max_delta_ratio = 0.5;
+        preserve_all(&mut e, &run);
+        assert_no_leak("section PUT (redacted GET)", &run, e, &env, &check);
+
+        // Field PATCH of one backend member.
+        let mut e = run.clone();
+        let req: super::ConfigUpdateRequest =
+            serde_json::from_value(serde_json::json!({ "backend_region": "eu-edit-1" })).unwrap();
+        let mut w = Vec::new();
+        super::field_level::apply_backend_patch(&mut e.backend, &req, &mut w).unwrap();
+        assert_no_leak("field PATCH region", &run, e, &env, &check);
+
+        // Document apply of the export (redacted secrets refilled from the
+        // running config).
+        let yaml = run.to_canonical_yaml_with(&|_| None).unwrap();
+        let mut e = Config::from_yaml_str(&yaml).unwrap();
+        super::document_level::preserve_runtime_secrets(&mut e, &run, &yaml);
+        assert_no_leak("document apply", &run, e, &env, &check);
+
+        // Encryption mode flip away from proxy AES (singleton + named).
+        let mut e = run.clone();
+        e.backend_encryption = BackendEncryptionConfig::default();
+        for n in &mut e.backends {
+            if n.name == "eu-archive" {
+                n.encryption = BackendEncryptionConfig::default();
+            }
+        }
+        preserve_all(&mut e, &run);
+        assert_no_leak("encryption mode flip", &run, e, &env, &check);
+    }
+
+    #[test]
+    fn a_promoted_env_key_is_written_as_a_reference() {
+        let (env, _) = sentinel_env();
+        let run = running(&env);
+        let mut e = run.clone();
+        e.backend_encryption = BackendEncryptionConfig::default();
+        preserve_all(&mut e, &run);
+        let report = e
+            .reapply_env_overrides(&run, &|n: &str| env.get(n).cloned())
+            .unwrap();
+        assert_eq!(report.refs_added, vec!["DGP_ENCRYPTION_KEY".to_string()]);
+        let file = e.to_canonical_yaml_for_persist_with(&|_| None).unwrap();
+        assert!(
+            file.contains("legacy_key: ${env:DGP_ENCRYPTION_KEY}"),
+            "{file}"
+        );
+        // Reloading the file against the same environment gives the key back.
+        let lookup = |n: &str| env.get(n).cloned();
+        let text = crate::config::expand_env_with(&file, lookup).unwrap();
+        let back = Config::from_yaml_str(&text).unwrap();
+        assert_eq!(
+            back.backend_encryption.legacy_key(),
+            env.get("DGP_ENCRYPTION_KEY").map(String::as_str)
+        );
+    }
+
+    #[test]
+    fn persist_and_export_refuse_a_secret_env_value() {
+        let (env, _) = sentinel_env();
+        let lookup = |n: &str| env.get(n).cloned();
+        let mut run = running(&env);
+        // Simulate a future path that forgets the file view: a secret env
+        // value copied into a field no env variable controls.
+        run.event_delivery.slack_bot_token = env.get("DGP_SECRET_ACCESS_KEY").cloned();
+        let err = run.to_canonical_yaml_for_persist_with(&lookup).unwrap_err();
+        assert!(err.to_string().contains("DGP_SECRET_ACCESS_KEY"), "{err}");
+        // A value the FILE itself holds is not a leak, even when an env
+        // variable has the same value: here the named backend's secret
+        // equals DGP_BE_AWS_SECRET_ACCESS_KEY (one MinIO, two definitions).
+        let same = [
+            ("DGP_S3_ENDPOINT", "http://env-minio:9000"),
+            ("DGP_BE_AWS_SECRET_ACCESS_KEY", "file-be-secret"),
+        ];
+        let same = |n: &str| {
+            same.iter()
+                .find(|(k, _)| *k == n)
+                .map(|(_, v)| v.to_string())
+        };
+        let mut cfg = Config::from_yaml_str(FILE).unwrap();
+        cfg.apply_env_overrides_at_load(&same);
+        cfg.to_canonical_yaml_for_persist_with(&same).unwrap();
+        let mut edit = cfg.clone();
+        edit.cache_size_mb = 7;
+        edit.reapply_env_overrides(&cfg, &same).unwrap();
+        edit.to_canonical_yaml_for_persist_with(&same).unwrap();
     }
 }
