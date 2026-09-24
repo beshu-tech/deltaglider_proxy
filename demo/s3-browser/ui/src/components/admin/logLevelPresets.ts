@@ -27,6 +27,11 @@ export function findMatchingPreset(logLevel: string): string | null {
   return null;
 }
 
+/** The server's default filter (`default_log_level` in src/config/mod.rs).
+ *  The section API omits default-valued fields, so an absent log_level means
+ *  THIS — showing no selection made the running level look unknown. */
+export const DEFAULT_LOG_LEVEL = 'deltaglider_proxy=debug,tower_http=debug';
+
 /** Radio value of the "Custom" button. */
 export const CUSTOM_LOG_LEVEL = '__custom__';
 
@@ -40,7 +45,8 @@ export function logLevelRadio(
   logLevel: string | undefined,
   customPicked: boolean
 ): { value: string | null; custom: boolean } {
-  const preset = logLevel ? findMatchingPreset(logLevel) : null;
-  const custom = customPicked || (!!logLevel && preset === null);
+  const effective = logLevel || DEFAULT_LOG_LEVEL;
+  const preset = findMatchingPreset(effective);
+  const custom = customPicked || preset === null;
   return { value: custom ? CUSTOM_LOG_LEVEL : preset, custom };
 }
