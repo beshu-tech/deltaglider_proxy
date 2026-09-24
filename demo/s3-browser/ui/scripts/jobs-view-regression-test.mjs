@@ -31,6 +31,9 @@ const {
   editorAfterDiscard,
   stepPendingReverify,
   runNowMessage,
+  jobsPollInterval,
+  ACTIVE_POLL_MS,
+  IDLE_POLL_MS,
 } = await import(moduleUrl);
 
 const row = (over = {}) => ({
@@ -430,5 +433,15 @@ assert.equal(editorAfterDiscard(true), 'refresh');
   assert.equal(runNowMessage('lifecycle', { objects_affected: 1 }), 'Run finished: 1 object processed');
   assert.equal(runNowMessage('lifecycle', null), 'Run finished');
 }
+
+// ── jobsPollInterval (idle floor: scheduled runs must still appear) ─────────
+assert.equal(ACTIVE_POLL_MS, 2000);
+assert.equal(IDLE_POLL_MS, 60_000);
+assert.equal(jobsPollInterval([row({ status: 'running' })]), ACTIVE_POLL_MS);
+assert.equal(jobsPollInterval([row({ status: 'idle' }), row({ status: 'queued' })]), ACTIVE_POLL_MS);
+// Regression: all idle used to return `false` (never refetch), so a run the
+// scheduler started never showed on an open Jobs page.
+assert.equal(jobsPollInterval([row({ status: 'idle' })]), IDLE_POLL_MS);
+assert.equal(jobsPollInterval([]), IDLE_POLL_MS);
 
 console.log('jobs view regression checks passed');

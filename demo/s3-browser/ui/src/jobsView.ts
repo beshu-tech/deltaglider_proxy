@@ -50,6 +50,19 @@ export function isActiveJobStatus(status: string): boolean {
   return status === 'queued' || status === 'running' || status === 'cancelling';
 }
 
+/** Poll cadence while any job/run is live (progress bars move). */
+export const ACTIVE_POLL_MS = 2000;
+/**
+ * Idle floor for job polls: with nothing running, a slow poll still catches a
+ * job that STARTS elsewhere (scheduler tick, another operator) without a reload.
+ */
+export const IDLE_POLL_MS = 60_000;
+
+/** refetchInterval for the unified jobs list. */
+export function jobsPollInterval(jobs: Pick<JobRow, 'status'>[]): number {
+  return jobs.some((j) => isActiveJobStatus(j.status)) ? ACTIVE_POLL_MS : IDLE_POLL_MS;
+}
+
 export type InFlightCopy = { key: string; size: number; started_unix: number };
 
 /**

@@ -1,6 +1,7 @@
 /**
  * Unified jobs queries. The list polls fast (2s) while anything is live
- * — a running one-off or a running rule — and goes quiet otherwise.
+ * — a running one-off or a running rule — and slowly (60s) otherwise, so a
+ * scheduled run still shows up on an open Jobs page.
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -13,10 +14,8 @@ import {
   startVerifyParity,
 } from '../adminApi';
 import type { ParityStatus } from '../adminApi';
-import { isActiveJobStatus } from '../jobsView';
+import { jobsPollInterval } from '../jobsView';
 import { qk } from './keys';
-
-const POLL_MS = 2000;
 
 /**
  * Faster poll for the parity-verify progress bar (800ms vs 2s generic).
@@ -31,10 +30,7 @@ export function useJobs(opts?: { enabled?: boolean }) {
     queryKey: qk.jobs.list(),
     queryFn: getJobs,
     enabled: opts?.enabled ?? true,
-    refetchInterval: (query) => {
-      const jobs = query.state.data?.jobs ?? [];
-      return jobs.some((j) => isActiveJobStatus(j.status)) ? POLL_MS : false;
-    },
+    refetchInterval: (query) => jobsPollInterval(query.state.data?.jobs ?? []),
   });
 }
 
