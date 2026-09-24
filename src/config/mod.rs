@@ -5,6 +5,7 @@
 pub mod advisories;
 mod env;
 pub mod env_overrides;
+pub mod env_shadow;
 mod expansion;
 
 pub use env::*;
@@ -232,6 +233,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         name: "DGP_S3_PATH_STYLE",
         description: "Use path-style URLs (true/1 for MinIO/LocalStack)",
         example: "true",
+        category: "S3 Backend",
+    },
+    EnvVarEntry {
+        name: "DGP_BACKEND_ALLOW_LOCAL",
+        description: "Allow http:// and private-IP endpoints for the S3 backend (MinIO, dev, CI)",
+        example: "false",
         category: "S3 Backend",
     },
     EnvVarEntry {
@@ -795,6 +802,14 @@ pub struct Config {
     #[serde(skip)]
     #[schemars(skip)]
     pub env_refs: std::collections::BTreeMap<String, String>,
+
+    /// What the config FILE had in every slot a `DGP_*` variable overrode
+    /// (see [`env_shadow`]). NEVER serialized. Persist and export restore
+    /// these values ([`Self::file_view`]) so an env value — a secret above
+    /// all — never reaches the YAML file.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub env_shadow: env_shadow::EnvShadow,
 }
 
 /// Per-backend encryption-at-rest configuration.
@@ -1048,8 +1063,37 @@ pub(crate) fn env_suffix_for_backend_name(name: &str) -> String {
 /// Only touches the SECRET fields (`key`, `kms_key_id`) — the mode
 /// itself stays authoritative in YAML. Called once per backend
 /// (including the synthetic "default" for the singleton path).
-pub(crate) fn apply_backend_encryption_env(backend_name: &str, enc: &mut BackendEncryptionConfig) {
-    let (key_env, kms_env): (String, String) = if backend_name == "default" {
+/// Apply the per-backend encryption env var to `enc`. Returns the name of
+/// the field it set (`key` or `kms_key_id`), or `None` when nothing applied.
+pub(crate) fn apply_backend_encryption_env(
+    backend_name: &str,
+    enc: &mut BackendEncryptionConfig,
+    env: EnvLookup,
+) -> Option<&'static str> {
+    let (key_env, kms_env) = backend_encryption_env_names(backend_name);
+    let set = |name: &str| env(name).filter(|v| !v.is_empty());
+    match enc {
+        BackendEncryptionConfig::Aes256GcmProxy { key, .. } => {
+            let v = set(&key_env)?;
+            *key = Some(v);
+            Some("key")
+        }
+        BackendEncryptionConfig::SseKms { kms_key_id, .. } => {
+            let v = set(&kms_env)?;
+            *kms_key_id = v;
+            Some("kms_key_id")
+        }
+        // None and SseS3 carry no secrets beyond the legacy shim;
+        // env vars for primary-key material are silently ignored
+        // (the shim key stays in YAML/config and is not env-overridden).
+        BackendEncryptionConfig::None { .. } | BackendEncryptionConfig::SseS3 { .. } => None,
+    }
+}
+
+/// `(encryption key var, SSE-KMS key id var)` for a backend. The singleton
+/// ("default") uses the unadorned names.
+pub(crate) fn backend_encryption_env_names(backend_name: &str) -> (String, String) {
+    if backend_name == "default" {
         (
             "DGP_ENCRYPTION_KEY".to_string(),
             "DGP_SSE_KMS_KEY_ID".to_string(),
@@ -1060,27 +1104,6 @@ pub(crate) fn apply_backend_encryption_env(backend_name: &str, enc: &mut Backend
             format!("DGP_BACKEND_{}_ENCRYPTION_KEY", suf),
             format!("DGP_BACKEND_{}_SSE_KMS_KEY_ID", suf),
         )
-    };
-
-    match enc {
-        BackendEncryptionConfig::Aes256GcmProxy { key, .. } => {
-            if let Ok(env_key) = std::env::var(&key_env) {
-                if !env_key.is_empty() {
-                    *key = Some(env_key);
-                }
-            }
-        }
-        BackendEncryptionConfig::SseKms { kms_key_id, .. } => {
-            if let Ok(env_arn) = std::env::var(&kms_env) {
-                if !env_arn.is_empty() {
-                    *kms_key_id = env_arn;
-                }
-            }
-        }
-        // None and SseS3 carry no secrets beyond the legacy shim;
-        // env vars for primary-key material are silently ignored
-        // (the shim key stays in YAML/config and is not env-overridden).
-        BackendEncryptionConfig::None { .. } | BackendEncryptionConfig::SseS3 { .. } => {}
     }
 }
 
@@ -1252,6 +1275,7 @@ impl Default for Config {
             auth_providers: Vec::new(),
             group_mapping_rules: Vec::new(),
             env_refs: std::collections::BTreeMap::new(),
+            env_shadow: env_shadow::EnvShadow::default(),
         }
     }
 }
@@ -1500,84 +1524,184 @@ impl Config {
 
     /// Apply environment variable overrides on top of existing config.
     /// Environment variables always take precedence over file-based config.
+    ///
+    /// Records what the file had in every overridden slot
+    /// ([`Self::env_shadow`]), so persist and export write the file's value
+    /// back instead of the env value.
     fn apply_env_overrides(&mut self) {
-        if let Ok(addr) = std::env::var("DGP_LISTEN_ADDR") {
+        self.apply_env_overrides_tracked(&process_env);
+    }
+
+    /// [`Self::apply_env_overrides`] over an injected lookup: applies the
+    /// overrides and REPLACES [`Self::env_shadow`] with the file values of
+    /// the slots that were overridden. `self` must be the file view.
+    pub(crate) fn apply_env_overrides_tracked(&mut self, env: EnvLookup) {
+        let before = serde_yaml::to_value(&*self).ok();
+        let applied = self.apply_env_overrides_with(env);
+        self.env_shadow = match before {
+            Some(tree) => env_shadow::capture(&tree, &applied),
+            None => {
+                // Unreachable in practice (Config always serializes). Without
+                // the file view, persist could only write env values — so
+                // record every applied slot as absent: the file then omits
+                // them rather than leak an env secret.
+                tracing::error!("config did not serialize; env-controlled fields will be omitted from the persisted file");
+                env_shadow::EnvShadow(applied.into_iter().map(|s| (s, None)).collect())
+            }
+        };
+    }
+
+    /// Re-apply the env overrides to an edited config that is about to
+    /// replace `running` (item: env wins consistently, not only at boot).
+    ///
+    /// The edit is first turned into its file view: a slot whose value still
+    /// equals the running env value is an echo and takes the file's value
+    /// from `running`'s shadow; a slot the edit changed keeps the edit. Then
+    /// the env overrides are applied on top and the shadow is recaptured.
+    ///
+    /// Returns the env-controlled fields the edit changed (dotted flat
+    /// paths): the edit reaches the file, but the env value stays in effect.
+    pub(crate) fn reapply_env_overrides(
+        &mut self,
+        running: &Config,
+        env: EnvLookup,
+    ) -> Result<Vec<String>, ConfigError> {
+        let env_refs = std::mem::take(&mut self.env_refs);
+        let mut tree =
+            serde_yaml::to_value(&*self).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let running_tree =
+            serde_yaml::to_value(running).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let edited = env_shadow::unapply_echoes(&mut tree, &running_tree, &running.env_shadow);
+        let mut file_view: Config =
+            serde_yaml::from_value(tree).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        file_view.env_refs = env_refs;
+        file_view.apply_env_overrides_tracked(env);
+        *self = file_view;
+        Ok(edited.iter().map(|p| env_shadow::display(p)).collect())
+    }
+
+    /// The config as the FILE describes it: every env-overridden slot holds
+    /// the file's value again (see [`Self::env_shadow`]). The result carries
+    /// no shadow, so applying it twice is a no-op. Persist and every export
+    /// start from here — an env value, secret or not, never reaches a file.
+    pub fn file_view(&self) -> Result<Config, ConfigError> {
+        if self.env_shadow.is_empty() {
+            return Ok(self.clone());
+        }
+        let mut tree = serde_yaml::to_value(self).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        env_shadow::restore(&mut tree, &self.env_shadow);
+        let mut cfg: Config =
+            serde_yaml::from_value(tree).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        cfg.env_refs = self.env_refs.clone();
+        Ok(cfg)
+    }
+
+    /// Last-resort fallback when [`Self::file_view`] fails: remove every
+    /// env-controlled slot, so a secret from the environment still never
+    /// leaves the process.
+    fn clear_env_slots(&mut self) {
+        let Ok(mut tree) = serde_yaml::to_value(&*self) else {
+            return;
+        };
+        for path in self.env_shadow.0.keys() {
+            env_shadow::put(&mut tree, path, None);
+        }
+        if let Ok(mut cfg) = serde_yaml::from_value::<Config>(tree) {
+            cfg.env_refs = std::mem::take(&mut self.env_refs);
+            *self = cfg;
+        } else {
+            self.access_key_id = None;
+            self.secret_access_key = None;
+        }
+    }
+
+    /// The env overrides themselves. Returns the slot of every field it
+    /// changed (see [`env_shadow`]). Pure apart from the warnings it prints.
+    pub(crate) fn apply_env_overrides_with(&mut self, env: EnvLookup) -> Vec<env_shadow::EnvSlot> {
+        use env_shadow::slot;
+        let mut applied = Vec::new();
+
+        if let Some(addr) = env("DGP_LISTEN_ADDR") {
             match addr.parse() {
-                Ok(parsed) => self.listen_addr = parsed,
+                Ok(parsed) => {
+                    self.listen_addr = parsed;
+                    applied.push(slot(&["listen_addr"]));
+                }
                 Err(e) => eprintln!("Warning: ignoring invalid DGP_LISTEN_ADDR=\"{addr}\": {e}"),
             }
         }
 
-        // Check for S3 backend configuration
-        if std::env::var("DGP_S3_ENDPOINT").is_ok() || std::env::var("DGP_S3_REGION").is_ok() {
+        // The legacy singleton backend: an S3 activator replaces the WHOLE
+        // block (unset members take their defaults), DGP_DATA_DIR replaces
+        // it with a filesystem backend.
+        if env("DGP_S3_ENDPOINT").is_some() || env("DGP_S3_REGION").is_some() {
             self.backend = BackendConfig::S3 {
-                endpoint: std::env::var("DGP_S3_ENDPOINT").ok(),
-                region: std::env::var("DGP_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-                force_path_style: env_bool("DGP_S3_PATH_STYLE", true),
-                access_key_id: std::env::var("DGP_BE_AWS_ACCESS_KEY_ID").ok(),
-                secret_access_key: std::env::var("DGP_BE_AWS_SECRET_ACCESS_KEY").ok(),
-                allow_local: env_bool("DGP_BACKEND_ALLOW_LOCAL", false),
+                endpoint: env("DGP_S3_ENDPOINT"),
+                region: env("DGP_S3_REGION").unwrap_or_else(|| "us-east-1".to_string()),
+                force_path_style: lookup_bool(env, "DGP_S3_PATH_STYLE", true),
+                access_key_id: env("DGP_BE_AWS_ACCESS_KEY_ID"),
+                secret_access_key: env("DGP_BE_AWS_SECRET_ACCESS_KEY"),
+                allow_local: lookup_bool(env, "DGP_BACKEND_ALLOW_LOCAL", false),
             };
-        } else if let Ok(dir) = std::env::var("DGP_DATA_DIR") {
+            applied.push(slot(&["backend"]));
+        } else if let Some(dir) = env("DGP_DATA_DIR") {
             self.backend = BackendConfig::Filesystem {
                 path: PathBuf::from(dir),
             };
+            applied.push(slot(&["backend"]));
         }
 
-        if let Some(v) = env_parse::<f32>("DGP_MAX_DELTA_RATIO") {
-            self.max_delta_ratio = v;
+        macro_rules! parsed {
+            ($var:literal, $ty:ty, $field:ident, $wrap:expr) => {
+                if let Some(v) = lookup_parse::<$ty>(env, $var) {
+                    self.$field = $wrap(v);
+                    applied.push(slot(&[stringify!($field)]));
+                }
+            };
         }
-        if let Some(v) = env_parse::<u64>("DGP_MAX_OBJECT_SIZE") {
-            self.max_object_size = v;
+        macro_rules! text {
+            ($var:literal, $field:ident, $wrap:expr) => {
+                if let Some(v) = env($var) {
+                    self.$field = $wrap(v);
+                    applied.push(slot(&[stringify!($field)]));
+                }
+            };
         }
-        if let Some(v) = env_parse::<u64>("DGP_MAX_PASSTHROUGH_OBJECT_SIZE") {
-            self.max_passthrough_object_size = v;
-        }
-        if let Some(v) = env_parse::<usize>("DGP_CACHE_MB") {
-            self.cache_size_mb = v;
-        }
-        if let Some(v) = env_parse::<usize>("DGP_METADATA_CACHE_MB") {
-            self.metadata_cache_mb = v;
-        }
-        if let Some(v) = env_parse::<usize>("DGP_CODEC_CONCURRENCY") {
-            self.codec_concurrency = Some(v);
-        }
-        if let Some(v) = env_parse::<usize>("DGP_BLOCKING_THREADS") {
-            self.blocking_threads = Some(v);
-        }
+        parsed!("DGP_MAX_DELTA_RATIO", f32, max_delta_ratio, |v| v);
+        parsed!("DGP_MAX_OBJECT_SIZE", u64, max_object_size, |v| v);
+        parsed!(
+            "DGP_MAX_PASSTHROUGH_OBJECT_SIZE",
+            u64,
+            max_passthrough_object_size,
+            |v| v
+        );
+        parsed!("DGP_CACHE_MB", usize, cache_size_mb, |v| v);
+        parsed!("DGP_METADATA_CACHE_MB", usize, metadata_cache_mb, |v| v);
+        parsed!("DGP_CODEC_CONCURRENCY", usize, codec_concurrency, Some);
+        parsed!("DGP_BLOCKING_THREADS", usize, blocking_threads, Some);
 
-        // Authentication mode
-        if let Ok(v) = std::env::var("DGP_AUTHENTICATION") {
-            self.authentication = Some(v);
-        }
-
-        // Proxy authentication credentials
-        if let Ok(v) = std::env::var("DGP_ACCESS_KEY_ID") {
-            self.access_key_id = Some(v);
-        }
-        if let Ok(v) = std::env::var("DGP_SECRET_ACCESS_KEY") {
-            self.secret_access_key = Some(v);
-        }
+        // Authentication mode + proxy SigV4 credentials.
+        text!("DGP_AUTHENTICATION", authentication, Some);
+        text!("DGP_ACCESS_KEY_ID", access_key_id, Some);
+        text!("DGP_SECRET_ACCESS_KEY", secret_access_key, Some);
 
         // Admin GUI password hash
-        if let Ok(v) = std::env::var("DGP_BOOTSTRAP_PASSWORD_HASH")
-            .or_else(|_| std::env::var("DGP_ADMIN_PASSWORD_HASH"))
+        if let Some(v) =
+            env("DGP_BOOTSTRAP_PASSWORD_HASH").or_else(|| env("DGP_ADMIN_PASSWORD_HASH"))
         {
             self.bootstrap_password_hash = Some(v);
+            applied.push(slot(&["bootstrap_password_hash"]));
         }
 
         // Log level (runtime operational)
-        if let Ok(level) = std::env::var("DGP_LOG_LEVEL") {
-            self.log_level = level;
-        }
+        text!("DGP_LOG_LEVEL", log_level, |v| v);
 
         // Config DB S3 sync
-        if let Ok(bucket) = std::env::var("DGP_CONFIG_SYNC_BUCKET") {
-            self.config_sync_bucket = Some(bucket);
-        }
-        if let Ok(key) = std::env::var("DGP_CONFIG_SYNC_KEY") {
+        text!("DGP_CONFIG_SYNC_BUCKET", config_sync_bucket, Some);
+        if let Some(key) = env("DGP_CONFIG_SYNC_KEY") {
             if !key.trim().is_empty() {
                 self.config_sync_object_key = Some(key);
+                applied.push(slot(&["config_sync_object_key"]));
             }
         }
 
@@ -1596,21 +1720,37 @@ impl Config {
         // mode itself — that stays authoritative in YAML. Keeps env-
         // based secret injection orthogonal to structural config.
         for named in self.backends.iter_mut() {
-            apply_backend_encryption_env(&named.name, &mut named.encryption);
+            if let Some(field) =
+                apply_backend_encryption_env(&named.name, &mut named.encryption, env)
+            {
+                applied.push(vec![
+                    env_shadow::SlotSeg::Key("backends".into()),
+                    env_shadow::SlotSeg::Named(named.name.clone()),
+                    env_shadow::SlotSeg::Key("encryption".into()),
+                    env_shadow::SlotSeg::Key(field.into()),
+                ]);
+            }
         }
         // Singleton backend path: uses the unadorned `DGP_ENCRYPTION_KEY`
         // / `DGP_SSE_KMS_KEY_ID` so single-backend deployments keep a
         // short env-var name. The synthetic backend name is "default".
-        apply_backend_encryption_env("default", &mut self.backend_encryption);
+        if let Some(field) =
+            apply_backend_encryption_env("default", &mut self.backend_encryption, env)
+        {
+            applied.push(slot(&["backend_encryption", field]));
+        }
 
-        // TLS configuration
-        if env_bool("DGP_TLS_ENABLED", false) {
+        // TLS: a truthy flag replaces the WHOLE block (unset paths → None,
+        // which means a generated self-signed certificate).
+        if lookup_bool(env, "DGP_TLS_ENABLED", false) {
             self.tls = Some(TlsConfig {
                 enabled: true,
-                cert_path: std::env::var("DGP_TLS_CERT").ok(),
-                key_path: std::env::var("DGP_TLS_KEY").ok(),
+                cert_path: env("DGP_TLS_CERT"),
+                key_path: env("DGP_TLS_KEY"),
             });
+            applied.push(slot(&["tls"]));
         }
+        applied
     }
 
     /// Resolve the path to the active config file on disk.
@@ -2394,9 +2534,11 @@ impl Config {
             });
         match substituted {
             Ok(mut cfg) => {
-                // `env_refs` is #[serde(skip)] — restore it so chained
-                // serializers (and future persists) keep the provenance.
+                // `env_refs` / `env_shadow` are #[serde(skip)] — restore them
+                // so chained serializers (and future persists) keep the
+                // provenance.
                 cfg.env_refs = self.env_refs.clone();
+                cfg.env_shadow = self.env_shadow.clone();
                 cfg
             }
             Err(e) => {
@@ -2469,6 +2611,7 @@ impl Config {
         let mut resolved: Config =
             serde_yaml::from_value(tree).map_err(|e| ConfigError::Parse(e.to_string()))?;
         resolved.env_refs = refs;
+        resolved.env_shadow = std::mem::take(&mut self.env_shadow);
         *self = resolved;
         Ok(())
     }
@@ -2568,7 +2711,15 @@ impl Config {
         // Reinsert env refs FIRST: callers chain `redact_all_secrets()` into
         // `to_canonical_yaml()`, and clearing a materialized secret before
         // reinsertion could match it would lose the reference.
-        let mut export = self.with_env_refs_reinserted().redact_for_export();
+        // Start from the FILE view: an env-overridden field shows what the
+        // file says, never the env value (see [`Self::file_view`]).
+        let file_view = self.file_view().unwrap_or_else(|e| {
+            tracing::error!("file view failed ({e}); exporting with env-controlled fields cleared");
+            let mut c = self.clone();
+            c.clear_env_slots();
+            c
+        });
+        let mut export = file_view.with_env_refs_reinserted().redact_for_export();
         if let BackendConfig::S3 {
             ref mut access_key_id,
             ref mut secret_access_key,
@@ -2652,7 +2803,10 @@ impl Config {
     /// we only ever *emit* sectioned — legacy readers eventually disappear,
     /// the canonical artifact must be forward-shaped.
     pub fn to_canonical_yaml(&self) -> Result<String, ConfigError> {
-        let export = self.with_env_refs_reinserted().redact_for_export();
+        let export = self
+            .file_view()?
+            .with_env_refs_reinserted()
+            .redact_for_export();
         let sectioned = crate::config_sections::SectionedConfig::from_flat(&export);
         serde_yaml::to_string(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))
     }
@@ -2669,7 +2823,12 @@ impl Config {
     /// plaintext. The operator's in-memory state is correct but their
     /// on-disk source of truth disagrees.
     fn to_canonical_yaml_for_persist(&self) -> Result<String, ConfigError> {
-        let export = self.with_env_refs_reinserted().redact_for_persist();
+        // The FILE view: env-overridden fields get the file's value back, so
+        // an env value (a secret above all) never lands in the file.
+        let export = self
+            .file_view()?
+            .with_env_refs_reinserted()
+            .redact_for_persist();
         let sectioned = crate::config_sections::SectionedConfig::from_flat(&export);
         // The load path expands the WHOLE file text (`$$`→`$`, `${env:NAME}`→
         // value). A runtime-entered literal containing `$$` or a `${env:...}`-
@@ -2983,6 +3142,7 @@ mod tests {
             "DGP_S3_ENDPOINT",
             "DGP_S3_REGION",
             "DGP_S3_PATH_STYLE",
+            "DGP_BACKEND_ALLOW_LOCAL",
             "DGP_BE_AWS_ACCESS_KEY_ID",
             "DGP_BE_AWS_SECRET_ACCESS_KEY",
             "DGP_DATA_DIR",
@@ -5432,5 +5592,143 @@ storage:
         // An unresolvable ref fails loudly.
         cfg.access_key_id = Some("${env:DGP_DOES_NOT_EXIST_ANYWHERE}".into());
         assert!(cfg.resolve_env_ref_scalars().is_err());
+    }
+}
+
+#[cfg(test)]
+mod env_shadow_config_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn lookup(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |name: &str| map.get(name).cloned()
+    }
+
+    const FILE: &str = r#"
+access:
+  access_key_id: FILEKEY
+  secret_access_key: file-secret
+storage:
+  backend:
+    type: filesystem
+    path: /srv/file-data
+  backends:
+    - name: eu-archive
+      type: filesystem
+      path: /srv/eu
+      encryption:
+        mode: aes256-gcm-proxy
+advanced:
+  cache_size_mb: 100
+"#;
+
+    fn loaded(env: &[(&str, &str)]) -> Config {
+        let mut cfg = Config::from_yaml_str(FILE).unwrap();
+        cfg.apply_env_overrides_tracked(&lookup(env));
+        cfg
+    }
+
+    const ENV: &[(&str, &str)] = &[
+        ("DGP_SECRET_ACCESS_KEY", "env-secret"),
+        ("DGP_CACHE_MB", "777"),
+        ("DGP_S3_ENDPOINT", "http://minio:9000"),
+        ("DGP_BE_AWS_SECRET_ACCESS_KEY", "env-be-secret"),
+        ("DGP_TLS_ENABLED", "true"),
+        ("DGP_BACKEND_EU_ARCHIVE_ENCRYPTION_KEY", "env-enc-key"),
+        ("DGP_BOOTSTRAP_PASSWORD_HASH", "env-hash"),
+    ];
+
+    fn assert_no_env_value(text: &str) {
+        for leak in [
+            "env-secret",
+            "777",
+            "minio",
+            "env-be-secret",
+            "env-enc-key",
+            "env-hash",
+        ] {
+            assert!(!text.contains(leak), "{leak} leaked:\n{text}");
+        }
+    }
+
+    #[test]
+    fn runtime_holds_env_values_and_the_file_view_holds_file_values() {
+        let cfg = loaded(ENV);
+        assert_eq!(cfg.secret_access_key.as_deref(), Some("env-secret"));
+        assert_eq!(cfg.cache_size_mb, 777);
+        assert!(matches!(cfg.backend, BackendConfig::S3 { .. }));
+        assert!(cfg.tls.is_some());
+
+        let file = cfg.file_view().unwrap();
+        assert_eq!(file.secret_access_key.as_deref(), Some("file-secret"));
+        assert_eq!(file.access_key_id.as_deref(), Some("FILEKEY"));
+        assert_eq!(file.cache_size_mb, 100);
+        assert_eq!(
+            file.backend,
+            BackendConfig::Filesystem {
+                path: "/srv/file-data".into()
+            }
+        );
+        assert!(file.tls.is_none());
+        assert!(file.env_shadow.is_empty());
+        match &file.backends[0].encryption {
+            BackendEncryptionConfig::Aes256GcmProxy { key, .. } => assert_eq!(*key, None),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn persist_and_every_export_write_the_file_view() {
+        let cfg = loaded(ENV);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.yaml");
+        cfg.persist_to_file(path.to_str().unwrap()).unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_no_env_value(&on_disk);
+        assert!(on_disk.contains("file-secret"), "{on_disk}");
+        assert_no_env_value(&cfg.to_canonical_yaml().unwrap());
+        assert_no_env_value(&cfg.redact_all_secrets().to_canonical_yaml().unwrap());
+        // Reloading the persisted file and re-applying the env reproduces
+        // the runtime exactly.
+        let mut again = Config::from_yaml_str(&on_disk).unwrap();
+        again.apply_env_overrides_tracked(&lookup(ENV));
+        assert_eq!(again.secret_access_key, cfg.secret_access_key);
+        assert_eq!(again.backend, cfg.backend);
+    }
+
+    #[test]
+    fn reapply_keeps_env_winning_and_the_file_view_stable() {
+        let running = loaded(ENV);
+        // An edit built from the running config: env values echoed back,
+        // one unrelated field changed, one env-controlled field edited.
+        let mut edit = running.clone();
+        edit.env_shadow = Default::default();
+        edit.max_delta_ratio = 0.5;
+        edit.cache_size_mb = 50;
+        let edited = edit.reapply_env_overrides(&running, &lookup(ENV)).unwrap();
+        assert_eq!(edited, vec!["cache_size_mb".to_string()]);
+
+        // Runtime: env still wins, the unrelated edit applies.
+        assert_eq!(edit.cache_size_mb, 777);
+        assert_eq!(edit.secret_access_key.as_deref(), Some("env-secret"));
+        assert_eq!(edit.max_delta_ratio, 0.5);
+        // File: echoes keep the file's values, the edit to the env-controlled
+        // field is what the operator authored for the file.
+        let file = edit.file_view().unwrap();
+        assert_eq!(file.secret_access_key.as_deref(), Some("file-secret"));
+        assert_eq!(file.cache_size_mb, 50);
+        assert_eq!(file.max_delta_ratio, 0.5);
+        assert!(matches!(file.backend, BackendConfig::Filesystem { .. }));
+    }
+
+    #[test]
+    fn no_environment_means_no_shadow_and_identity_file_view() {
+        let cfg = loaded(&[]);
+        assert!(cfg.env_shadow.is_empty());
+        assert_eq!(cfg.file_view().unwrap(), cfg);
     }
 }

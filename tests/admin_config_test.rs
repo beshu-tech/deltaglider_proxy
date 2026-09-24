@@ -1468,3 +1468,38 @@ secret_access_key: "LEGACYSECRET"
         cfg["max_delta_ratio"]
     );
 }
+
+/// Full-document validate and apply split warnings like the section
+/// endpoints: a standing problem of the running config is "existing", not a
+/// warning of the imported document (issue #92).
+#[tokio::test]
+async fn document_validate_and_apply_report_standing_warnings_apart() {
+    let server = TestServer::builder()
+        .auth("SPLITKEY", "SPLITSECRET")
+        .max_delta_ratio(1.5)
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let yaml = std::fs::read_to_string(server.config_path()).unwrap();
+
+    for path in ["validate", "apply"] {
+        let body: serde_json::Value = admin
+            .post(format!("{}/_/api/admin/config/{path}", server.endpoint()))
+            .json(&serde_json::json!({ "yaml": yaml }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let text = |k: &str| body[k].to_string();
+        assert!(
+            text("existing_warnings").contains("max_delta_ratio"),
+            "{path}: standing warning must be existing: {body}"
+        );
+        assert!(
+            !text("warnings").contains("max_delta_ratio"),
+            "{path}: standing warning reported as new: {body}"
+        );
+    }
+}

@@ -331,6 +331,10 @@ pub struct ConfigUpdateResponse {
 /// Compare the runtime config against the config file on disk.
 /// Returns a list of field names where the runtime value differs from disk.
 fn compute_tainted_fields(runtime: &crate::config::Config) -> Vec<String> {
+    // Compare the FILE view: an env-controlled field differs from the file on
+    // purpose, and is shown through `env_overrides`, not as unsaved.
+    let file_view = runtime.file_view().unwrap_or_else(|_| runtime.clone());
+    let runtime = &file_view;
     let disk = match crate::config::Config::resolve_config_path() {
         Some(path) => match crate::config::Config::from_file(&path) {
             Ok(cfg) => cfg,
@@ -559,7 +563,7 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         // UI can drive the `iam_mode: declarative` banner + toggle.
         iam_mode: cfg.iam_mode,
         tainted_fields,
-        env_overrides: crate::config::env_overrides::process_env_overrides(),
+        env_overrides: crate::config::env_overrides::process_env_overrides(&cfg),
         // Encryption status is now per-backend. Each `BackendInfoResponse`
         // in `backends` carries an `encryption: BackendEncryptionSummary`
         // non-secret summary. The former top-level `encryption_enabled`
@@ -706,6 +710,24 @@ pub async fn update_config(
     // be honored. Roll back the in-memory mutation and surface a warning,
     // preserving the legacy PATCH contract ("success: true, warnings: [...]")
     // instead of returning a 5xx like apply_config_doc does.
+    // Env wins consistently: re-apply the `DGP_*` overrides (see
+    // `Config::reapply_env_overrides`); an edit to an env-controlled field
+    // reaches the file only.
+    match super::reapply_env(&old_cfg, &mut cfg) {
+        Ok(env_warnings) => warnings.extend(env_warnings),
+        Err(e) => {
+            *cfg = old_cfg;
+            warnings.push(format!(
+                "Failed to apply config patch: {e}. Pre-patch config restored."
+            ));
+            return Json(ConfigUpdateResponse {
+                success: true,
+                warnings,
+                requires_restart: false,
+            });
+        }
+    }
+
     match apply_config_transition(&state, &old_cfg, &cfg).await {
         Ok((transition_warnings, requires_restart)) => {
             warnings.extend(transition_warnings);

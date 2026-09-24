@@ -578,6 +578,27 @@ async fn declarative_iam_precommit_gate(
         .map_err(|e| format!("declarative IAM reconcile failed (no state changed): {e}"))
 }
 
+/// Re-apply the `DGP_*` overrides to an edited config (env wins at runtime,
+/// see `Config::reapply_env_overrides`) and return one warning per
+/// env-controlled field the edit changed.
+pub(crate) fn reapply_env(
+    running: &crate::config::Config,
+    edited: &mut crate::config::Config,
+) -> Result<Vec<String>, String> {
+    let fields = edited
+        .reapply_env_overrides(running, &crate::config::process_env)
+        .map_err(|e| format!("environment overrides could not be applied: {e}"))?;
+    Ok(fields.into_iter().map(|f| env_edit_warning(&f)).collect())
+}
+
+/// The warning for an edit to a field an environment variable controls.
+pub(crate) fn env_edit_warning(field: &str) -> String {
+    format!(
+        "An environment variable sets {field}. The new value is saved to the config file, \
+         but the environment value stays in effect."
+    )
+}
+
 /// Split the advisory warnings of the RESULTING config into those this change
 /// introduces and those the CURRENT config already produces. Pure; unit-tested.
 ///

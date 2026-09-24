@@ -425,13 +425,21 @@ async fn apply_section(
     // real bearer token. (Headers the operator retyped or removed pass through.)
     super::preserve_event_delivery_secrets(&mut new_cfg.event_delivery, &old_cfg.event_delivery);
 
+    // Env wins consistently: re-apply the `DGP_*` overrides so an edit to an
+    // env-controlled field does not take effect at runtime until the next
+    // restart undoes it. The edit (if any) is kept for the file only.
+    let env_warnings = match super::reapply_env(&old_cfg, &mut new_cfg) {
+        Ok(w) => w,
+        Err(e) => return reject(StatusCode::INTERNAL_SERVER_ERROR, e.as_str()),
+    };
+
     // The `removed_warnings` name is preserved here for readability of the
     // downstream call sites that thread it into `SectionApplyResponse`.
     // It now carries the FULL cred-preservation warning bag
     // (asymmetric SigV4, type-flips, renamed/removed backends) emitted
     // by the shared helpers above — same warning surface the
     // document-level apply path produces for equivalent edits.
-    let removed_warnings = cred_warnings;
+    let removed_warnings: Vec<String> = cred_warnings.into_iter().chain(env_warnings).collect();
 
     // Y1: normalise shorthand forms (bucket `public: true`, storage
     // `s3:`/`filesystem:` — anything `Config::normalize_shorthands`
@@ -656,7 +664,7 @@ async fn apply_section(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(SectionApplyResponse {
                         ok: false,
-                        existing_warnings: Vec::new(),
+                        existing_warnings,
                         warnings: removed_warnings
                             .into_iter()
                             .chain(warnings_from_check)

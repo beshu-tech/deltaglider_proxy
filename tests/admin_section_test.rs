@@ -1273,3 +1273,105 @@ async fn section_put_storage_rejects_fatal_lifecycle_rule_with_400() {
         "error must name the missing field: {body}"
     );
 }
+
+// ═══════════════════════════════════════════════════
+// Env-controlled fields never reach the YAML file
+// ═══════════════════════════════════════════════════
+
+/// `DGP_*` variables win over the file at load. Persisting the running
+/// config after an unrelated section apply must write the value the FILE
+/// had for every env-controlled field — never the env value, and above all
+/// never a secret from the environment. The export follows the same rule.
+#[tokio::test]
+async fn section_put_never_persists_env_values_into_the_yaml_file() {
+    let server = TestServer::builder()
+        .auth("FILEKEY", "file-secret-value")
+        .env("DGP_ACCESS_KEY_ID", "ENVKEY")
+        .env("DGP_SECRET_ACCESS_KEY", "env-secret-must-not-leak")
+        .env("DGP_CACHE_MB", "777")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+
+    // An unrelated section apply triggers a persist.
+    let resp = admin
+        .put(format!(
+            "{}/_/api/admin/config/section/advanced",
+            server.endpoint()
+        ))
+        .json(&json!({ "max_delta_ratio": 0.42 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true, "{body}");
+
+    let on_disk = std::fs::read_to_string(server.config_path()).unwrap();
+    assert!(
+        !on_disk.contains("env-secret-must-not-leak"),
+        "env secret persisted into the YAML file:\n{on_disk}"
+    );
+    assert!(
+        !on_disk.contains("ENVKEY"),
+        "env key id persisted:\n{on_disk}"
+    );
+    assert!(
+        !on_disk.contains("777"),
+        "env cache size persisted:\n{on_disk}"
+    );
+    // The file's own values survive, and the edit itself landed.
+    assert!(on_disk.contains("FILEKEY"), "{on_disk}");
+    assert!(on_disk.contains("file-secret-value"), "{on_disk}");
+    let doc: serde_yaml::Value = serde_yaml::from_str(&on_disk).unwrap();
+    let ratio = doc["advanced"]["max_delta_ratio"].as_f64().unwrap();
+    assert!((ratio - 0.42).abs() < 1e-3, "{on_disk}");
+
+    // The runtime still runs with the env values (env wins).
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cfg["cache_size_mb"], 777, "{cfg}");
+
+    // Editing the env-controlled field changes the FILE only: the env value
+    // keeps winning at runtime instead of until the next restart.
+    let resp = admin
+        .put(format!(
+            "{}/_/api/admin/config/section/advanced",
+            server.endpoint()
+        ))
+        .json(&json!({ "cache_size_mb": 555 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cfg["cache_size_mb"], 777, "{cfg}");
+    let on_disk = std::fs::read_to_string(server.config_path()).unwrap();
+    assert!(on_disk.contains("cache_size_mb: 555"), "{on_disk}");
+    assert!(!on_disk.contains("env-secret-must-not-leak"), "{on_disk}");
+
+    // The downloadable export describes the file, not the environment.
+    let export = admin
+        .get(format!("{}/_/api/admin/config/export", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!export.contains("env-secret-must-not-leak"), "{export}");
+    assert!(!export.contains("ENVKEY"), "{export}");
+}

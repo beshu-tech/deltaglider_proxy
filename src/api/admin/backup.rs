@@ -1391,6 +1391,16 @@ async fn apply_secrets(
                 hydrate_s3_backend_credentials(&mut named.backend, s);
             }
         }
+        // Env wins consistently: the restored secrets reach the file, but an
+        // env-controlled field keeps its env value at runtime.
+        if let Err(e) = crate::api::admin::config::reapply_env(&old_cfg, &mut cfg) {
+            tracing::error!("Full-backup import: env overrides could not be re-applied: {e}");
+            *cfg = old_cfg.clone();
+            return Err(BackupSecretApplyError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to re-apply environment overrides after restoring backup secrets",
+            ));
+        }
         cfg.clone()
     }; // release write lock before touching config_db
 
