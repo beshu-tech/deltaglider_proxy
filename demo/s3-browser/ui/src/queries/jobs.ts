@@ -96,7 +96,8 @@ export function useCancelVerify(ruleName: string) {
 /**
  * Run a replication rule now — the ONLY executable per-finding fix in the
  * Verify tab (re-uses the shared run-now action; everything else is guidance).
- * Invalidates the jobs list so the row's status reflects the run.
+ * Invalidates every jobs query (list, runs, failures, verify) so the row's
+ * status AND the drawer's Runs tab reflect the run.
  */
 export function useRunReplicationNow() {
   const qc = useQueryClient();
@@ -104,7 +105,7 @@ export function useRunReplicationNow() {
     mutationFn: (ruleName: string) =>
       runJobAction(`replication:${ruleName}`, 'run-now'),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: qk.jobs.list() });
+      qc.invalidateQueries({ queryKey: qk.jobs.all() });
     },
   });
 }
