@@ -71,6 +71,24 @@ assert.deepEqual(parseAdminQuery('job=replication%3Afoo'), { job: 'replication:f
 assert.deepEqual(parseAdminQuery(''), {});
 assert.deepEqual(parseAdminQuery('?'), {});
 
+// --- Malformed percent-escapes never throw -----------------------------------
+// A stray `%` (a hand-typed URL, a truncated paste) made decodeURIComponent
+// throw a URIError during render, which blanked the whole app. Such a segment
+// falls back to its raw text.
+assert.deepEqual(parseBrowserLocation('/_/browse/beshu/100%/', ''), {
+  bucket: 'beshu', prefix: '100%/', q: '', object: '', preview: '',
+});
+assert.deepEqual(parseBrowserLocation('/_/browse/bad%zzname/', ''), {
+  bucket: 'bad%zzname', prefix: '', q: '', object: '', preview: '',
+});
+assert.deepEqual(parseBrowserLocation('/_/browse/beshu/ok%20dir/50%off/', ''), {
+  bucket: 'beshu', prefix: 'ok dir/50%off/', q: '', object: '', preview: '',
+});
+// A lone surrogate escape is also a URIError.
+assert.deepEqual(parseBrowserLocation('/_/browse/beshu/%E0%A4%A/', ''), {
+  bucket: 'beshu', prefix: '%E0%A4%A/', q: '', object: '', preview: '',
+});
+
 // --- ROUND TRIP: parse(build(x)) === x (the core invariant) -------------------
 const cases = [
   { bucket: '', prefix: '', q: '', object: '', preview: '' },

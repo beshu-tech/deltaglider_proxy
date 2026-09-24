@@ -66,6 +66,19 @@ function stripBase(pathname: string): string {
   return path.replace(/\/+$/, '');
 }
 
+/**
+ * `decodeURIComponent` that never throws. A malformed escape (a stray `%` in a
+ * hand-typed or truncated URL) throws a URIError; raised during render, that
+ * blanks the whole app. Such a segment falls back to its raw text.
+ */
+function safeDecode(segment: string): string {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
 /** Parse a pathname into view + opaque sub-path (admin/docs/metrics use subPath). */
 export function parseViewLocation(pathname: string): ViewLocation {
   const path = stripBase(pathname);
@@ -88,11 +101,11 @@ export function parseBrowserLocation(pathname: string, search: string): BrowserL
   let bucket = '';
   let prefix = '';
   if (isBrowse && segments.length > 1) {
-    bucket = decodeURIComponent(segments[1]);
+    bucket = safeDecode(segments[1]);
     if (segments.length > 2) {
       // Re-join the remaining segments as the folder prefix, with a trailing
       // slash (S3 common-prefix shape). Each segment is individually decoded.
-      const parts = segments.slice(2).map((s) => decodeURIComponent(s));
+      const parts = segments.slice(2).map(safeDecode);
       prefix = `${parts.join('/')}/`;
     }
   }
