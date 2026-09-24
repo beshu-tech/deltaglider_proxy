@@ -53,7 +53,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -664,9 +664,11 @@ pub async fn delete_scan(
 /// Server-Sent Events stream of [`ScanProgress`] frames. If no scan
 /// is currently running for the bucket, this kicks one off
 /// implicitly — the dashboard treats opening the stream as "start
-/// and watch". Closes when the scan ends (success, cancel, error).
+/// and watch". Closes when the scan ends (success, cancel, error), or when
+/// the session stops being an admin session (the scan itself goes on).
 pub async fn get_scan_stream(
     State(state): State<Arc<AdminState>>,
+    Extension(session): Extension<super::auth::AdminSessionCheck>,
     Query(q): Query<BucketQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = state
@@ -711,7 +713,8 @@ pub async fn get_scan_stream(
         },
     );
 
-    Sse::new(stream).keep_alive(KeepAlive::new())
+    Sse::new(super::auth::end_when_admin_session_lapses(stream, session))
+        .keep_alive(KeepAlive::new())
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────

@@ -25,6 +25,47 @@ use super::{audit_log, AdminState};
 #[derive(Clone, Copy, Debug)]
 pub struct AdminGuiGate;
 
+/// The session behind an admin request, inserted by
+/// [`require_admin_gui_session`]. A long-lived response (an SSE stream) holds
+/// it to re-run the same admin check while it streams: the gate runs once per
+/// request, and a stream is one request that can last for hours.
+#[derive(Clone)]
+pub struct AdminSessionCheck {
+    state: Arc<AdminState>,
+    token: String,
+    client_ip: Option<IpAddr>,
+}
+
+impl AdminSessionCheck {
+    /// The same rule as the gate: a live AdminGui session whose principal is
+    /// still an enabled admin.
+    pub fn still_admin(&self) -> bool {
+        admin_gui_session_ok(&self.state, &self.token, self.client_ip)
+    }
+}
+
+/// How often a streaming admin response re-checks its session.
+const STREAM_SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// End `stream` when its session stops passing the admin check (logout,
+/// revocation, expiry, or the principal disabled or demoted). The check runs
+/// on a timer, so an idle stream ends too, not only at the next frame.
+pub(crate) fn end_when_admin_session_lapses<S: futures::Stream>(
+    stream: S,
+    session: AdminSessionCheck,
+) -> impl futures::Stream<Item = S::Item> {
+    use futures::StreamExt;
+    stream.take_until(async move {
+        let mut tick = tokio::time::interval(STREAM_SESSION_RECHECK);
+        loop {
+            tick.tick().await;
+            if !session.still_admin() {
+                break;
+            }
+        }
+    })
+}
+
 /// Constant-time secret check + `enabled` gate for IAM index users.
 /// Shared by `login-as`, `browser-session-connect`, and `POST /api/iam/identity`.
 pub(crate) fn iam_user_secret_valid(user: &IamUser, secret_access_key: &str) -> bool {
@@ -1196,6 +1237,11 @@ pub async fn require_admin_gui_session(
     }
 
     request.extensions_mut().insert(AdminGuiGate);
+    request.extensions_mut().insert(AdminSessionCheck {
+        state: state.clone(),
+        token,
+        client_ip,
+    });
     next.run(request).await.into_response()
 }
 
@@ -1372,6 +1418,39 @@ mod tests {
         assert!(login_audit_fields(&AuthMethod::Bootstrap, "")
             .0
             .starts_with("login"));
+    }
+
+    /// Every admin SSE response must end when its session stops being an
+    /// admin session: the gate runs once, and a stream can last for hours.
+    #[test]
+    fn every_admin_sse_stream_rechecks_its_session() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/admin");
+        let needle = concat!("Sse", "::new(");
+        let mut found = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).unwrap();
+            for (i, _) in src.match_indices(needle) {
+                found += 1;
+                let rest = &src[i + needle.len()..];
+                assert!(
+                    rest.trim_start()
+                        .starts_with("end_when_admin_session_lapses(")
+                        || rest
+                            .trim_start()
+                            .starts_with("super::auth::end_when_admin_session_lapses("),
+                    "{}: an admin SSE stream must be wrapped in end_when_admin_session_lapses",
+                    path.display()
+                );
+            }
+        }
+        assert!(
+            found >= 2,
+            "expected the log and scan streams, found {found}"
+        );
     }
 
     /// Regression: SharedAuthConfig must reflect credential updates immediately.

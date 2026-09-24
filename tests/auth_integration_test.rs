@@ -2563,6 +2563,83 @@ async fn test_dot_and_empty_key_segments_cannot_escape_deny_on_filesystem() {
     assert_eq!(&body[..], b"top secret");
 }
 
+/// An SSE response is one request that can last for hours, so the per-request
+/// admin gate alone does not cut it. The log stream must end soon after its
+/// admin is disabled.
+#[tokio::test]
+async fn test_admin_log_stream_ends_when_admin_is_disabled() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let before = get_iam_version(&admin, &server.endpoint()).await;
+    let ops = create_user(
+        &admin,
+        &server,
+        "ops",
+        vec![json!({"actions": ["*"], "resources": ["*"]})],
+    )
+    .await;
+    wait_for_iam_rebuild(&admin, &server.endpoint(), before).await;
+
+    let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+    let ops_session = reqwest::Client::builder()
+        .cookie_provider(jar)
+        .build()
+        .unwrap();
+    let resp = ops_session
+        .post(format!("{}/_/api/admin/login-as", server.endpoint()))
+        .json(&json!({
+            "access_key_id": ops.access_key_id,
+            "secret_access_key": ops.secret_access_key,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "login-as");
+    let mut stream = ops_session
+        .get(format!("{}/_/api/admin/logs/stream", server.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+
+    // While ops is an admin, the stream stays open.
+    let open = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while stream.chunk().await.unwrap().is_some() {}
+    })
+    .await;
+    assert!(
+        open.is_err(),
+        "the stream ended while the session was valid"
+    );
+
+    let before = get_iam_version(&admin, &server.endpoint()).await;
+    let resp = admin
+        .put(format!(
+            "{}/_/api/admin/users/{}",
+            server.endpoint(),
+            ops.id
+        ))
+        .json(&json!({"enabled": false}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "disable: {}", resp.status());
+    wait_for_iam_rebuild(&admin, &server.endpoint(), before).await;
+
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        // Drain whatever was in flight; `None` (or a read error) = closed.
+        while let Ok(Some(_)) = stream.chunk().await {}
+    })
+    .await;
+    assert!(
+        ended.is_ok(),
+        "the log stream kept running after its admin was disabled"
+    );
+}
+
 /// `$`-prefixed names are reserved: a rename to one is refused. A row that
 /// already carries such a name stays editable when the name is unchanged.
 #[tokio::test]

@@ -10,7 +10,7 @@
 //! Captured at an INFO+ floor (see `crate::logs`); the ring is bounded and
 //! per-instance — a GUI convenience for incident debugging, not a log store.
 
-use axum::extract::Query;
+use axum::extract::{Extension, Query};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -18,6 +18,7 @@ use axum::Json;
 use futures::stream::{self, Stream};
 use serde::Deserialize;
 
+use super::auth::{end_when_admin_session_lapses, AdminSessionCheck};
 use crate::logs::{self, LogQuery};
 
 const MAX_LIMIT: usize = 2000;
@@ -57,8 +58,10 @@ pub async fn get_logs(Query(params): Query<LogsQueryParams>) -> impl IntoRespons
     )
 }
 
-/// GET /_/api/admin/logs/stream — SSE live tail (filtered).
+/// GET /_/api/admin/logs/stream — SSE live tail (filtered). Ends when the
+/// session stops being an admin session.
 pub async fn get_logs_stream(
+    Extension(session): Extension<AdminSessionCheck>,
     Query(params): Query<LogsQueryParams>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let query = params.to_log_query();
@@ -96,5 +99,5 @@ pub async fn get_logs_stream(
         }
     });
 
-    Sse::new(stream).keep_alive(KeepAlive::new())
+    Sse::new(end_when_admin_session_lapses(stream, session)).keep_alive(KeepAlive::new())
 }
