@@ -372,11 +372,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `from_file(path).unwrap_or_else(load)` path quietly dropped env
     // overrides when the file parsed, which broke `DGP_BOOTSTRAP_PASSWORD`
     // specifically — documented in the revamp plan's risks table.)
+    // Quiet: `async_main` loads again and prints the warnings once.
     let pre_config = if let Some(ref path) = cli.config {
-        deltaglider_proxy::config::Config::load_from_path(path)
-            .unwrap_or_else(|_| deltaglider_proxy::config::Config::load())
+        deltaglider_proxy::config::Config::load_from_path_quiet(path)
+            .unwrap_or_else(|_| deltaglider_proxy::config::Config::load_quiet())
     } else {
-        deltaglider_proxy::config::Config::load()
+        deltaglider_proxy::config::Config::load_quiet()
     };
 
     // PERF: Explicit runtime builder instead of `#[tokio::main]` so we can
