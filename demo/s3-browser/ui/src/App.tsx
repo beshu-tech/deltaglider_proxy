@@ -60,7 +60,7 @@ export default function App() {
 
   const { view, subPath, browser, navigate, search } = useUrlRouter();
   // Stable "go back to browser" callback. Previously inlined into
-  // AdminPage / MetricsPage props as `() => navigate('browse')`, which
+  // AdminPage props as `() => navigate('browse')`, which
   // allocated a fresh arrow every App render and propagated as
   // `onBack` / `onSessionExpired` to ~10 admin panels. Each panel's
   // `loadData` `useCallback` lists `onSessionExpired` in its deps,
@@ -354,6 +354,8 @@ export default function App() {
   }, [changeS3Bucket]);
 
   const isEmpty = s3.objects.length === 0 && s3.folders.length === 0;
+  // Empty only because "Show system files" is off (the folder holds .dg/ etc.).
+  const onlyHiddenEntries = isEmpty && !s3.searchQuery && !s3.showHidden && s3.allFolders.length > 0;
   const hasBuckets = (bucketCount ?? 0) > 0;
   const hasNoBuckets = bucketCount === 0;
   const isRootBucketEmpty = hasBuckets && s3.prefix === '' && !s3.searchQuery && isEmpty && !s3.loading;
@@ -386,13 +388,15 @@ export default function App() {
   const canReadActiveBucket = !activeBucket || canUse(identity, 'read', activeBucket, s3.prefix) || canUse(identity, 'list', activeBucket, s3.prefix);
   const who = identitySummary(identity, currentAccessKey);
   const openSettings = () => navigate(buildViewUrl('admin'));
-  const accountMenu = (includeBrowserToggles = false) => (
+  // Settings has ONE entry point per screen: the labelled TopBar button when
+  // it is there (visible, one click), else the account-menu entry.
+  const accountMenu = (includeBrowserToggles = false, topBarHasSettings = false) => (
     <AccountMenu
       identityLabel={who.name}
       identityDetail={who.detail}
       canAdmin={canAdmin}
       onBrowserClick={view === 'browser' ? undefined : () => navigate(buildViewUrl('browser'))}
-      onSettingsClick={view === 'admin' ? undefined : openSettings}
+      onSettingsClick={view === 'admin' || topBarHasSettings ? undefined : openSettings}
       onDocsClick={view === 'docs' ? undefined : () => navigate(buildViewUrl('docs'))}
       onLogout={handleLogout}
       showHidden={includeBrowserToggles ? s3.showHidden : undefined}
@@ -622,7 +626,9 @@ export default function App() {
                   ? `No results for "${s3.searchQuery}"`
                   : hasNoBuckets
                     ? 'Create a bucket before uploading objects or generating demo data.'
-                    : s3.prefix
+                    : onlyHiddenEntries
+                      ? 'This folder holds only hidden system files. Turn on "Show system files" in the account menu to see them.'
+                      : s3.prefix
                       // The proxy stores no folder markers: a folder exists
                       // only while it holds files, so an empty listing here
                       // is as likely a typo in the path as an empty folder.
@@ -737,7 +743,7 @@ export default function App() {
               refreshing={s3.refreshing}
               canAdmin={canAdmin}
               onShowShortcuts={showShortcuts}
-              accountMenu={accountMenu(true)}
+              accountMenu={accountMenu(true, canAdmin)}
               onOpenSettings={canAdmin ? openSettings : undefined}
               deltaSummary={view === 'browser' ? s3.deltaSummary : null}
             />

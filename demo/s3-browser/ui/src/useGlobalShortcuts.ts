@@ -1,7 +1,7 @@
 /**
  * App-wide keyboard shortcuts, mounted once at the App root.
  *
- * These work in EVERY view (browser, docs, metrics, upload, admin) — unlike the
+ * These work in EVERY view (browser, docs, upload, admin) — unlike the
  * admin-only ⌘K/⌘S palette shortcuts that live inside AdminPage. They use the
  * cross-platform command modifier (⌘ on Apple, Ctrl elsewhere; the listener
  * accepts both — see `isCommandCombo`):
