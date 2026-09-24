@@ -1,0 +1,59 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import ts from 'typescript';
+
+// Regression guard for BULK-TRUNCATED-EXPANSION: the server's folder listing
+// (`GET /api/admin/objects/list`) stops at 10,000 keys and returns
+// truncated:true. Bulk delete/copy/move/ZIP used to read only `keys`, so they
+// acted on the first 10,000 objects and left the rest behind without a word.
+// expandSelection must throw on a truncated folder BEFORE any mutation starts.
+
+const source = await readFile(new URL('../src/bulkSelection.ts', import.meta.url), 'utf8');
+const { outputText } = ts.transpileModule(source, {
+  compilerOptions: { module: ts.ModuleKind.ES2020, target: ts.ScriptTarget.ES2020 },
+  fileName: 'bulkSelection.ts',
+});
+const { expandSelection } = await import(
+  `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`
+);
+
+const tree = {
+  'a/': ['a/', 'a/x.txt', 'a/sub/y.txt'],
+  'a/sub/': ['a/sub/y.txt'],
+  'big/': Array.from({ length: 10_000 }, (_, i) => `big/${i}`),
+};
+const calls = [];
+const lister = async (pfx) => {
+  calls.push(pfx);
+  return { keys: tree[pfx] ?? [], truncated: pfx === 'big/' };
+};
+
+// --- folders expand; relative suffix is the path under the selected folder ---
+assert.deepEqual(await expandSelection(['folder:a/', 'top.bin', 'd/e/f.txt'], lister), [
+  { source: 'a/', relative: '' },
+  { source: 'a/x.txt', relative: 'x.txt' },
+  { source: 'a/sub/y.txt', relative: 'sub/y.txt' },
+  { source: 'top.bin', relative: 'top.bin' },
+  { source: 'd/e/f.txt', relative: 'f.txt' },
+]);
+
+// --- overlapping selections dedupe; the FIRST relative suffix wins ------------
+assert.deepEqual(await expandSelection(['folder:a/', 'folder:a/sub/', 'a/x.txt'], lister), [
+  { source: 'a/', relative: '' },
+  { source: 'a/x.txt', relative: 'x.txt' },
+  { source: 'a/sub/y.txt', relative: 'sub/y.txt' },
+]);
+
+// --- the empty prefix is never listed (no whole-bucket expansion) ------------
+calls.length = 0;
+assert.deepEqual(await expandSelection(['folder:'], lister), []);
+assert.deepEqual(calls, [], 'empty folder prefix must not reach the lister');
+
+// --- a truncated folder aborts the whole expansion with a clear message ------
+await assert.rejects(
+  expandSelection(['folder:a/', 'folder:big/'], lister),
+  (e) => e instanceof Error && /Folder big\/ has more than 10,000 objects; narrow the selection/.test(e.message),
+  'truncated listing must throw',
+);
+
+console.log('bulk-selection regression checks passed');

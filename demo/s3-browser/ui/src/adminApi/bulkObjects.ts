@@ -4,8 +4,8 @@
 // Routes: `POST|GET /_/api/admin/objects/{copy,move,delete,zip,list}`.
 // **Trust model:** `require_admin_gui_session` only (not access-key file-browser
 // sign-in). Handlers call the engine directly; there is no per-key IAM
-// inside these endpoints. See `deriveSessionCapabilities` / `canBulkOps` in
-// the UI — never call these without a full admin session.
+// inside these endpoints. The UI gates them on `deriveSessionCapabilities(...)
+// .adminGui` — never call these without a full admin session.
 //
 // - bulkCopyObjects / bulkMoveObjects: previously per-key for-loops with
 //   silent partial-failure recovery. Now atomic on the server.
@@ -88,6 +88,8 @@ interface ListAllResponse {
 /**
  * Recursively expand `prefix` to its absolute key list. Server-side
  * equivalent of the previous browser-side `listAllKeys`.
+ * The server stops at 10,000 keys and sets `truncated`; callers go through
+ * `expandSelection` (bulkSelection.ts), which refuses a truncated folder.
  * Admin GUI session required.
  */
 export async function listAllUnderPrefix(bucket: string, prefix: string): Promise<ListAllResponse> {

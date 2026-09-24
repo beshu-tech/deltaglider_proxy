@@ -15,7 +15,8 @@ import { normalizeUiError } from './errorHandling';
 import { useOverlayClose } from './hooks/useOverlayClose';
 import useSelection from './useSelection';
 import { virtualWritableChildren } from './permissions';
-// Bulk actions → admin objects API; gate with `sessionCapabilities.canBulkOps` / `adminGui`.
+import { expandSelection } from './bulkSelection';
+// Bulk actions → admin objects API; App gates them on `sessionCaps.adminGui`.
 import type { S3Object } from './types';
 
 const MAX_HEAD_CACHE_SIZE = 5000;
@@ -324,59 +325,23 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     setRefreshTrigger((k) => k + 1);
   }, [resetBrowseState]);
 
-  const bulkDelete = useCallback(async () => {
-    if (selectedKeys.size === 0) return;
-    setDeleting(true);
-    try {
-      // Server-side bulk delete: collect every absolute key, expand
-      // folder selections via the same admin /list endpoint we use
-      // for copy/move, then a single batched POST. Replaces what used
-      // to be `s3client.deleteObjects` (SDK 1000-key batches) plus a
-      // per-folder `deletePrefix` call.
-      const bucket = getBucket();
-      const allKeys = new Set<string>();
-      for (const k of selectedKeys) {
-        if (k.startsWith('folder:')) {
-          const pfx = k.slice('folder:'.length);
-          if (!pfx) continue;
-          const { keys } = await listAllUnderPrefix(bucket, pfx);
-          for (const nk of keys) allKeys.add(nk);
-        } else {
-          allKeys.add(k);
-        }
-      }
-      if (allKeys.size > 0) {
-        await bulkDeleteObjects({ bucket, keys: Array.from(allKeys) });
-      }
-      clearSelection();
-      refresh();
-    } catch (e) {
-      const msg = normalizeUiError(e, 'Bulk delete failed');
-      setError(msg);
-      message.error(msg);
-    } finally {
-      setDeleting(false);
-    }
-  }, [clearSelection, refresh, selectedKeys]);
+  /**
+   * Expand the selection against `currentBucket` via the ONE shared expander.
+   * Throws (before any mutation) when a folder has more keys than the server
+   * lists, so no bulk action runs on a partial folder.
+   */
+  const expandSelected = useCallback(
+    (currentBucket: string) =>
+      expandSelection(selectedKeys, (pfx) => listAllUnderPrefix(currentBucket, pfx)),
+    [selectedKeys],
+  );
 
-  /** Get all object keys from the selection, expanding folders recursively. */
-  /** Resolve selected keys, expanding folders recursively. Deduplicates overlapping folders. */
-  const resolveSelectedKeys = useCallback(async (currentBucket: string): Promise<string[]> => {
-    const keySet = new Set<string>();
-    for (const k of selectedKeys) {
-      if (k.startsWith('folder:')) {
-        const pfx = k.slice('folder:'.length);
-        if (!pfx) continue; // Reject empty prefix to avoid listing entire bucket
-        // Server-side recursion (replaces the previous AWS-SDK
-        // listObjectsV2 loop the browser used to run).
-        const { keys: nested } = await listAllUnderPrefix(currentBucket, pfx);
-        for (const nk of nested) keySet.add(nk);
-      } else {
-        keySet.add(k);
-      }
-    }
-    return Array.from(keySet);
-  }, [selectedKeys]);
+  /** Absolute keys for the selection (folders expanded, deduped). */
+  const resolveSelectedKeys = useCallback(
+    async (currentBucket: string): Promise<string[]> =>
+      (await expandSelected(currentBucket)).map((i) => i.source),
+    [expandSelected],
+  );
 
   /**
    * Resolve the selection into [absolute-source-key, relative-dest-suffix] pairs.
@@ -388,36 +353,35 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
    *   `destPrefix + relative-suffix`, preserving the folder structure.
    * - When the user selects a single object directly, the relative-suffix is
    *   just its basename (matches the previous flat behavior for direct picks).
-   * - If two different sources resolve to the same destination key, throw
-   *   loudly BEFORE any copy starts. The previous code would silently overwrite
-   *   when two siblings shared a basename across nested folders.
+   * - The folder's own marker key (`foo/`, empty suffix) is not copied.
    */
-  const resolveSelectionWithRelativeKeys = useCallback(async (currentBucket: string): Promise<Array<{ source: string; relative: string }>> => {
-    // dedupe by absolute source key while keeping the FIRST relative suffix we
-    // saw — later overlapping folder selections shouldn't shorten a prefix that
-    // an earlier folder already established.
-    const seen = new Map<string, string>();
-    for (const k of selectedKeys) {
-      if (k.startsWith('folder:')) {
-        const pfx = k.slice('folder:'.length);
-        if (!pfx) continue; // Reject empty prefix to avoid listing entire bucket
-        const { keys: nested } = await listAllUnderPrefix(currentBucket, pfx);
-        for (const nk of nested) {
-          if (seen.has(nk)) continue;
-          // Strip the selected folder prefix; if for some reason the listing
-          // doesn't start with `pfx` (shouldn't happen, but be defensive),
-          // fall back to the basename so we at least don't blow up.
-          const relative = nk.startsWith(pfx) ? nk.slice(pfx.length) : (nk.split('/').pop() || nk);
-          if (relative) seen.set(nk, relative);
-        }
-      } else {
-        if (seen.has(k)) continue;
-        const filename = k.split('/').pop() || k;
-        seen.set(k, filename);
+  const resolveSelectionWithRelativeKeys = useCallback(
+    async (currentBucket: string) =>
+      (await expandSelected(currentBucket)).filter((i) => i.relative !== ''),
+    [expandSelected],
+  );
+
+  const bulkDelete = useCallback(async () => {
+    if (selectedKeys.size === 0) return;
+    setDeleting(true);
+    try {
+      // Server-side bulk delete: expand every folder first (aborts on a
+      // truncated folder before anything is deleted), then one batched POST.
+      const bucket = getBucket();
+      const keys = await resolveSelectedKeys(bucket);
+      if (keys.length > 0) {
+        await bulkDeleteObjects({ bucket, keys });
       }
+      clearSelection();
+      refresh();
+    } catch (e) {
+      const msg = normalizeUiError(e, 'Bulk delete failed');
+      setError(msg);
+      message.error(msg);
+    } finally {
+      setDeleting(false);
     }
-    return Array.from(seen, ([source, relative]) => ({ source, relative }));
-  }, [selectedKeys]);
+  }, [clearSelection, refresh, resolveSelectedKeys, selectedKeys]);
 
   const bulkCopy = useCallback(async (destBucket: string, destPrefix: string) => {
     // Phase B: server-side orchestration. The proxy's engine handles
