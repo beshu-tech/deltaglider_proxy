@@ -52,7 +52,7 @@ const admissionMatchSchema = z
       .optional(),
     source_ip_list: z
       .array(z.string().trim().min(1, 'entry must not be empty').max(64))
-      .max(4096, 'source_ip_list accepts at most 4096 entries')
+      .max(4096, 'Enter at most 4096 source IPs.')
       .optional(),
     bucket: z
       .string()
@@ -117,7 +117,7 @@ export const admissionBlockSchema = z.object({
     )
     .refine((n) => !n.startsWith(RESERVED_NAME_PREFIX), {
       message:
-        'names starting with "public-prefix:" are reserved for synthesised blocks',
+        'Names starting with "public-prefix:" are reserved for public-access rules.',
     }),
   match: admissionMatchSchema,
   action: admissionActionSchema,
