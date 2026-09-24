@@ -13,7 +13,7 @@ const { outputText } = ts.transpileModule(source, {
   fileName: 'utils.ts',
 });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
-const { clamp, formatDuration, relativeTime, formatBytes, getFileName, pluralize, parentPrefix } = await import(moduleUrl);
+const { clamp, formatDuration, relativeTime, formatBytes, getFileName, pluralize, noun, parentPrefix } = await import(moduleUrl);
 
 // --- clamp -------------------------------------------------------------------
 assert.equal(clamp(50, 0, 100), 50);
@@ -88,6 +88,11 @@ assert.equal(getFileName('flat.bin'), 'flat.bin');
 assert.equal(getFileName('deep/nested/path/'), 'deep/nested/path/'); // trailing slash -> falls back to key
 assert.equal(getFileName(''), '');
 assert.equal(getFileName('no-slash'), 'no-slash');
+
+// --- noun: the word alone ("1 objects" was shown in six places) --------------
+assert.equal(noun(1, 'object'), 'object');
+assert.equal(noun(0, 'object'), 'objects');
+assert.equal(noun(2, 'object matches', 'objects match'), 'objects match');
 
 // --- pluralize ---------------------------------------------------------------
 assert.equal(pluralize(1, 'item'), '1 item');

@@ -3,7 +3,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Table, Typography, Alert, Progress, Checkbox, theme, Button, Select } from 'antd';
 import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
-import { formatBytes, relativeTime } from '../utils';
+import { formatBytes, relativeTime, noun } from '../utils';
 import type { ColumnsType, TableProps } from 'antd/es/table';
 import type { GetRef } from 'antd';
 import { useColors } from '../ThemeContext';
@@ -125,7 +125,7 @@ function FolderSizeCell({
   if (sizeState?.progress?.done) {
     return (
       <span
-        title={`${sizeState.progress.totalFiles.toLocaleString()} files — stored (compressed) size`}
+        title={`${sizeState.progress.totalFiles.toLocaleString()} ${noun(sizeState.progress.totalFiles, 'file')} — stored (compressed) size`}
         style={{ ...MONO_CELL_STYLE, color: TEXT_SECONDARY, cursor: 'default' }}
       >
         {formatBytes(sizeState.progress.totalSize)}

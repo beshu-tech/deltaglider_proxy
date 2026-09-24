@@ -38,6 +38,12 @@ export function pluralize(count: number, singular: string, plural = singular + '
   return `${count} ${count === 1 ? singular : plural}`;
 }
 
+/** The noun alone, for callers that format the number themselves:
+ *  `${n.toLocaleString()} ${noun(n, 'object')}`. */
+export function noun(count: number, singular: string, plural = singular + 's'): string {
+  return count === 1 ? singular : plural;
+}
+
 /** Split a prefix path into breadcrumb segments */
 export function prefixSegments(prefix: string): { label: string; prefix: string }[] {
   if (!prefix) return [];

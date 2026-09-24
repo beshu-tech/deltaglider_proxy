@@ -1,7 +1,7 @@
 import { Button } from 'antd';
 import { ClockCircleOutlined, PlayCircleOutlined, StopOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
-import { formatBytes, relativeTime } from '../utils';
+import { formatBytes, relativeTime, noun } from '../utils';
 import { fmtNum } from './dashboard/chartDefaults';
 import type { BucketScanProgress } from '../adminApi';
 
@@ -75,7 +75,7 @@ export default function ScanStatusBanner({
             <span style={{ color: colors.ACCENT_BLUE, fontWeight: 700 }}>
               Scanning {liveProgress.bucket}
             </span>{' '}
-            · {fmtNum(liveProgress.objects)} objects ·{' '}
+            · {fmtNum(liveProgress.objects)} {noun(liveProgress.objects, 'object')} ·{' '}
             {formatBytes(liveProgress.original_bytes)} seen ·{' '}
             {liveProgress.pages_done} pages
             {queue.length > 1 && (

@@ -4,7 +4,7 @@ import { getBucketUsage, refreshBucketUsage } from '../adminApi';
 import { useBucketOrigins } from '../queries/backends';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
-import { formatBytes } from '../utils';
+import { formatBytes, noun } from '../utils';
 import { relativeTime } from '../utils';
 
 /**
@@ -108,7 +108,7 @@ export default function BucketUsageChip({
       </strong>
       <span style={{ color: c.TEXT_MUTED }}>·</span>
       <span style={{ fontVariantNumeric: 'tabular-nums' }}>
-        {data.object_count.toLocaleString()} objects
+        {data.object_count.toLocaleString()} {noun(data.object_count, 'object')}
       </span>
       <ReloadOutlined
         spin={refresh.isPending}
