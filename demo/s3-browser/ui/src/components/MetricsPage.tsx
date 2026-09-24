@@ -20,7 +20,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Typography, Spin, Progress } from 'antd';
 import { useColors } from '../ThemeContext';
 import { formatBytes } from '../utils';
-import { serverErrorSeverity } from '../statusTone';
+import { cacheMissSeverity, serverErrorSeverity } from '../statusTone';
 import { useVisiblePolling } from '../useVisiblePolling';
 import AnalyticsSection from './AnalyticsSection';
 import BucketScanCard from './BucketScanCard';
@@ -267,10 +267,14 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
   }
   const httpChartData = Object.entries(httpByOp).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
   const totalHttp = httpChartData.reduce((a, d) => a + d.value, 0);
-  const errorCount = (httpByStatus['4xx'] ?? 0) + (httpByStatus['5xx'] ?? 0);
-  const errorRate = totalHttp > 0 ? ((httpByStatus['4xx'] ?? 0) + (httpByStatus['5xx'] ?? 0)) / totalHttp : 0;
-  // Colour follows server errors only (see serverErrorSeverity).
-  const errorSeverity = serverErrorSeverity(httpByStatus['5xx'] ?? 0, totalHttp);
+  // The headline and its colour both use server errors (5xx) only: S3
+  // clients answer many requests with a 4xx as a normal step (see
+  // serverErrorSeverity). Client errors are listed separately.
+  const serverErrors = httpByStatus['5xx'] ?? 0;
+  const clientErrors = httpByStatus['4xx'] ?? 0;
+  const errorRate = totalHttp > 0 ? serverErrors / totalHttp : 0;
+  const errorSeverity = serverErrorSeverity(serverErrors, totalHttp);
+  const cacheSeverity = cacheMissSeverity(cacheMissRate, cacheTotal);
 
   const latencyStats = histStats(m, 'deltaglider_http_request_duration_seconds');
   const reqSizeStats = histStats(m, 'deltaglider_http_request_size_bytes');
@@ -361,7 +365,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
           <Panel title="Total requests" colSpan={3}>
             <StatValue
               value={fmtNum(totalHttp)}
-              hint={`Avg latency ${fmtDuration(latencyStats.avg)}${errorSeverity === 'bad' ? ` · ${fmtPct(errorRate)} errors` : ''}`}
+              hint={`Avg latency ${fmtDuration(latencyStats.avg)}${errorSeverity === 'bad' ? ` · ${fmtPct(errorRate)} server errors` : ''}`}
               tone={errorSeverity === 'bad' ? 'bad' : 'neutral'}
             />
           </Panel>
@@ -396,8 +400,8 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             )}
           </Panel>
           <Panel
-            title="Error rate"
-            subtitle="Share of 4xx + 5xx responses"
+            title="Server error rate"
+            subtitle="Share of responses with a 5xx status"
             colSpan={4}
             rowSpan={2}
             accent={errorSeverity === 'bad' ? 'red' : errorSeverity === 'warn' ? 'amber' : 'green'}
@@ -405,7 +409,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             <StatValue
               value={totalHttp > 0 ? fmtPct(errorRate) : '—'}
               tone={errorSeverity}
-              hint={`${fmtNum(errorCount)} ${errorCount === 1 ? 'error' : 'errors'} of ${fmtNum(totalHttp)} requests`}
+              hint={`${fmtNum(serverErrors)} of ${fmtNum(totalHttp)} requests. Client errors (4xx), not counted: ${fmtNum(clientErrors)}.`}
             />
             {totalHttp > 0 && Object.keys(httpByStatus).length > 0 && (
               <div style={{ marginTop: 'auto' }}>
@@ -457,12 +461,18 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
             title="Cache hit rate"
             subtitle={`${fmtNum(cacheHits)} hits · ${fmtNum(cacheMisses)} misses`}
             colSpan={4}
-            accent={cacheMissRate > 0.5 ? 'red' : cacheMissRate > 0.2 ? 'amber' : 'green'}
+            accent={cacheSeverity === 'bad' ? 'red' : cacheSeverity === 'warn' ? 'amber' : cacheSeverity === 'good' ? 'green' : undefined}
           >
             <StatValue
               value={cacheTotal > 0 ? fmtPct(1 - cacheMissRate) : '—'}
-              tone={cacheMissRate > 0.5 ? 'bad' : cacheMissRate > 0.2 ? 'warn' : 'good'}
-              hint={cacheMissRate > 0.5 ? 'More than half of lookups miss — cache undersized' : 'Each miss forces a full backend read'}
+              tone={cacheSeverity}
+              hint={
+                cacheSeverity === 'neutral' && cacheTotal > 0
+                  ? 'Too few lookups yet to judge the cache'
+                  : cacheSeverity === 'bad'
+                    ? 'More than half of lookups miss — cache undersized'
+                    : 'Each miss forces a full backend read'
+              }
             />
           </Panel>
           <Panel

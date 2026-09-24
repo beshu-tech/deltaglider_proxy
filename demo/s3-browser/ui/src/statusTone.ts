@@ -44,3 +44,18 @@ export function serverErrorSeverity(count5xx: number, total: number): 'good' | '
   if (share > 0.01) return 'warn';
   return 'good';
 }
+
+/** Fewest cache lookups before the hit rate may turn amber or red. */
+const MIN_CACHE_SAMPLE = 20;
+
+/**
+ * Severity of the dashboard cache hit rate. Right after a start every lookup
+ * misses (1 miss of 1 lookup is a 100 % miss rate), so the card stays
+ * neutral until there are enough lookups to mean something.
+ */
+export function cacheMissSeverity(missRate: number, lookups: number): 'neutral' | 'good' | 'warn' | 'bad' {
+  if (lookups < MIN_CACHE_SAMPLE) return 'neutral';
+  if (missRate > 0.5) return 'bad';
+  if (missRate > 0.2) return 'warn';
+  return 'good';
+}
