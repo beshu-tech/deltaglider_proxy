@@ -70,6 +70,7 @@
     "test:upload-stats": "node scripts/upload-stats-regression-test.mjs",
     "test:modal-history": "node scripts/modal-history-regression-test.mjs",
     "test:query-keys": "node scripts/query-keys-regression-test.mjs",
+    "test:admin-page": "node scripts/admin-page-regression-test.mjs",
     "e2e": "playwright test",
     "typecheck": "tsc --noEmit",
     "knip": "knip"

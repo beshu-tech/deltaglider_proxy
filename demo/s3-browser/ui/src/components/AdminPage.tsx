@@ -1,30 +1,14 @@
 import { cloneElement, isValidElement, useState, useEffect, useCallback, useMemo } from 'react';
-import { Typography, Button, Input, Alert, Space, Spin, Drawer, message, Modal } from 'antd';
-import { checkSession, adminLogin, whoami, loginAs, isNotAdminDenial, exportBackup, importBackup, ImportBackupError, type ExternalProviderInfo, type ImportBackupMode, type LoginAsResult } from '../adminApi';
-import { getCredentials, initFromSession } from '../s3client';
-import { LockOutlined, MenuOutlined } from '@ant-design/icons';
+import { Button, Spin, Drawer } from 'antd';
+import { checkSession, whoami, loginAs, isNotAdminDenial, type ExternalProviderInfo, type LoginAsResult } from '../adminApi';
+import { getCredentials } from '../s3client';
+import { MenuOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { useIsNarrow } from '../useIsNarrow';
 import FullScreenHeader from './FullScreenHeader';
-import UsersPanel from './UsersPanel';
-import GroupsPanel from './GroupsPanel';
-import AuthenticationPanel from './AuthenticationPanel';
-import BackendsPanel from './BackendsPanel';
-import MetricsPage from './MetricsPage';
-import OAuthProviderList from './OAuthProviderList';
 import AdminSidebar from './AdminSidebar';
-import { headerForPath, ADMIN_IA } from './adminNavigation';
+import { ADMIN_IA } from './adminNavigation';
 import { findEntry } from '../adminNavTree';
-import AdmissionPanel from './AdmissionPanel';
-import SessionsPanel from './SessionsPanel';
-import CredentialsModePanel from './CredentialsModePanel';
-import BucketsPanel from './BucketsPanel';
-import SetupWizard from './SetupWizard';
-import TracePanel from './TracePanel';
-import AuditLogPanel from './AuditLogPanel';
-import LogsPanel from './LogsPanel';
-import DeltaEfficiencyPanel from './DeltaEfficiencyPanel';
-import EventOutboxPanel from './EventOutboxPanel';
 import CommandPalette, {
   FileTextOutlined as PaletteFileTextOutlined,
   ImportOutlined as PaletteImportOutlined,
@@ -32,33 +16,21 @@ import CommandPalette, {
   LogoutOutlined,
   QuestionCircleOutlined,
 } from './CommandPalette';
-import JobsPanel from './jobs/JobsPanel';
-import SystemPanel from './SystemPanel';
-import WebhookDeliveryPanel from './WebhookDeliveryPanel';
-import { useIamMode } from '../queries/config';
 import { useNavigation } from '../NavigationContext';
 import { resolveAdminPath as remapAdminPath } from '../adminPathRemap';
 import { buildViewUrl, parseAdminQuery } from '../urlState';
 import { useOverlayClose } from '../hooks/useOverlayClose';
-import TabHeader from './TabHeader';
+import { useBackupImportExport } from '../hooks/useBackupImportExport';
 import { YamlImportExportModal } from './YamlImportExportModal';
 import { FullIamYamlModal } from './FullIamYamlModal';
 import { useDirtyGlobalIndicators, requestApplyFirst } from '../useDirtySection';
 import type { SectionName } from '../adminApi';
 import type { AccountMenuConfigProps } from './AccountMenu';
 import { normalizeUiError } from '../errorHandling';
+import { AdminRouteContent, type AdminRouteContext } from './admin/adminRoutes';
+import { AdminAccessDenied, AdminLoginGate } from './admin/AdminLoginGate';
+import RestoreBackupModal from './admin/RestoreBackupModal';
 
-const { Text } = Typography;
-
-
-/**
- * Viewport-narrow detection hook (Wave 10.1 §10.4). Returns true
- * when the window is below `breakpoint` pixels wide — used to
- * swap the persistent sidebar for an AntD Drawer. Listens to
- * `resize` so toggling dev-tools / rotating the device is picked
- * up live without a full reload. 900px matches the plan's promise
- * ("sidebar collapses to drawer at <900px").
- */
 /**
  * Resolve an incoming `subPath` to a canonical leaf of the 7-group IA.
  * The exhaustive old→new table lives in `adminPathRemap.ts` (regression-
@@ -85,13 +57,6 @@ interface AdminPageProps {
 export default function AdminPage({ onBack, onSessionExpired, subPath, search, accountMenu, canAdmin = false, onShowShortcuts, proxyVersion }: AdminPageProps) {
   const colors = useColors();
   const { navigate } = useNavigation();
-  // Declarative IAM: the IAM-writing backup-restore modes (full / iam-only /
-  // preserve-bootstrap) would 403 server-side, so the restore modal offers only
-  // Config Only. An unknown mode (config not loaded) gets the same treatment.
-  // Read from the shared config query (cached). No expiry callback here: this
-  // also runs behind the login gate, where a 401 is expected.
-  const { iamMode, readOnly: iamWritesOff, loadError: iamLoadError } = useIamMode();
-  const iamDeclarative = iamMode === 'declarative';
   // Hook up the `● ` tab-title prefix + beforeunload guard for any
   // section with unsaved edits. Mounting at AdminPage is the single
   // sensible home; moving higher would fire the guard on non-admin
@@ -158,8 +123,6 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
   const [accessDenied, setAccessDenied] = useState(false);
   /** Valid session from access-key / open connect — file browser only, not Settings sign-in. */
   const [s3BrowserSessionOnly, setS3BrowserSessionOnly] = useState(false);
-  const [password, setPassword] = useState('');
-  const [loginLoading, setLoginLoading] = useState(false);
   const [pendingGroupId, setPendingGroupId] = useState<number | null>(null);
   const [loginError, setLoginError] = useState('');
   // YAML import/export modal state. Mode flips between 'import'
@@ -167,7 +130,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
   // canonical YAML → copy to clipboard).
   const [yamlModalMode, setYamlModalMode] = useState<'import' | 'export' | null>(null);
   const [iamYamlMode, setIamYamlMode] = useState<'import' | 'export' | null>(null);
-  const [restoreFile, setRestoreFile] = useState<File | null>(null);
+  const backup = useBackupImportExport();
 
   // Back-button close for modals (Tier 1.6). When a modal opens we push a
   // history entry with ?modal=… so Back closes the modal instead of leaving
@@ -362,28 +325,6 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
     return () => { cancelled = true; };
   }, []);
 
-  const handleLogin = async () => {
-    if (loginLoading) return; // in-flight guard: prevents Enter + form-submit double-fire
-    setLoginLoading(true);
-    setLoginError('');
-    try {
-      const res = await adminLogin(password);
-      if (res.ok) {
-        setAuthed(true);
-        setPassword('');
-        // Bootstrap session may attach S3 creds (legacy keys or anonymous open-access).
-        await initFromSession().catch(() => {});
-      } else {
-        setLoginError(res.error || 'Login failed');
-        setPassword('');
-      }
-    } catch {
-      setLoginError('Network error');
-    } finally {
-      setLoginLoading(false);
-    }
-  };
-
   const navigateToGroup = useCallback(
     (groupId: number) => {
       setPendingGroupId(groupId);
@@ -396,356 +337,34 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
     [navigate]
   );
 
-  const handleExportFullBackup = useCallback(async () => {
-    try {
-      const { blob, filename } = await exportBackup();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      a.click();
-      URL.revokeObjectURL(url);
-      message.success('Full backup exported');
-    } catch (e) {
-      message.error(
-        'Export failed: ' + (normalizeUiError(e, 'unknown'))
-      );
-    }
-  }, []);
-
-  const runBackupImport = useCallback(async (file: File, mode: ImportBackupMode) => {
-    try {
-      const isZip =
-        file.name.toLowerCase().endsWith('.zip') ||
-        file.type === 'application/zip' ||
-        file.type === 'application/x-zip-compressed';
-      const result = isZip
-        ? await importBackup(file, mode)
-        : await importBackup(JSON.parse(await file.text()), 'iam-only');
-      const ext = result.external_identities_created ?? 0;
-      message.success(
-        `Imported: ${result.users_created} users, ${result.groups_created} groups, ${ext} OIDC identities (${result.users_skipped} skipped)`
-      );
-      window.location.reload();
-    } catch (e) {
-      if (e instanceof ImportBackupError) {
-        console.error('Full backup restore failed', {
-          file: { name: file.name, type: file.type, size: file.size },
-          status: e.status,
-          response: e.response,
-        });
-        message.error(e.message, 8);
-      } else {
-        console.error('Full backup restore failed before request', e);
-        message.error(
-          'Import failed: ' + (normalizeUiError(e, 'invalid file'))
-        );
-      }
-    } finally {
-      setRestoreFile(null);
-    }
-  }, []);
-
-  const handleImportFullBackup = useCallback(() => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    // Accept zip (new default) AND json (pre-v0.8.4 IAM-only backups
-    // still round-trip via the content-type-sniffing import handler).
-    input.accept = '.zip,.json,application/zip,application/json';
-    input.onchange = async () => {
-      const file = input.files?.[0];
-      if (!file) return;
-      const isZip =
-        file.name.toLowerCase().endsWith('.zip') ||
-        file.type === 'application/zip' ||
-        file.type === 'application/x-zip-compressed';
-      if (isZip) {
-        setRestoreFile(file);
-      } else {
-        runBackupImport(file, 'iam-only');
-      }
-    };
-    input.click();
-  }, [runBackupImport]);
-
-  /**
-   * Render the content pane for the current admin path.
-   *
-   * Wave 3's scope is the *sidebar* + *URL structure* — the content
-   * pane still delegates to the existing panels (UsersPanel,
-   * AuthenticationPanel, BackendsPanel, SettingsPage). Waves 4-7 will
-   * replace these one at a time with section-editor components that
-   * speak the section-level config API.
-   *
-   * Unknown paths fall through to the dashboard (diagnostics/
-   * dashboard) rather than erroring — a fresh install or a dropped
-   * URL segment should land somewhere sensible.
-   */
-  const renderContent = () => {
-    const meta = headerForPath(adminPath);
-    const header = meta ? (
-      <TabHeader icon={meta.icon} title={meta.title} description={meta.description} saveModel={meta.saveModel} />
-    ) : null;
-
-    // First-run wizard (Wave 8). Reachable explicitly via
-    // /_/admin/setup. Surface-wise it is its own full-page flow
-    // with its own hero — no TabHeader needed.
-    if (adminPath === 'setup') {
-      return (
-        <SetupWizard
-          onComplete={() => navigateAdmin('dashboard')}
-          onCancel={() => navigateAdmin('dashboard')}
-          search={search}
-        />
-      );
-    }
-
-    // Diagnostics
-    if (adminPath === 'dashboard') {
-      // Skip the outer section header — MetricsPage's toolbar
-      // already carries title + live indicator + tab switcher +
-      // refresh controls. Rendering both would duplicate the
-      // page-level identity and steal vertical real estate.
-      return <MetricsPage onBack={onBack} embedded search={search} proxyVersion={proxyVersion} />;
-    }
-    if (adminPath === 'diagnostics/trace') {
-      return (
-        <>
-          {header}
-          <TracePanel onSessionExpired={onSessionExpired} />
-        </>
-      );
-    }
-    if (adminPath === 'diagnostics/audit') {
-      return (
-        <>
-          {header}
-          <AuditLogPanel onSessionExpired={onSessionExpired} />
-        </>
-      );
-    }
-    if (adminPath === 'diagnostics/logs') {
-      return (
-        <>
-          {header}
-          <LogsPanel onSessionExpired={onSessionExpired} />
-        </>
-      );
-    }
-    if (adminPath === 'diagnostics/delta-efficiency') {
-      return (
-        <>
-          {header}
-          <DeltaEfficiencyPanel onSessionExpired={onSessionExpired} />
-        </>
-      );
-    }
-    if (adminPath === 'integrations/event-outbox') {
-      return (
-        <>
-          {header}
-          <EventOutboxPanel onSessionExpired={onSessionExpired} />
-        </>
-      );
-    }
-
-    // Configuration — Admission (Wave 4)
-    if (adminPath === 'access/admission') {
-      return (
-        <>
-          {header}
-          <AdmissionPanel
-            onSessionExpired={onSessionExpired}
-            onNavigateToBucket={(_bucket) =>
-              // Wave 6 will deep-link into a specific bucket editor;
-              // until then we land on the Buckets sub-tab.
-              navigateAdmin('storage/buckets')
-            }
-          />
-        </>
-      );
-    }
-
-    // Configuration — Access (Wave 5): dedicated Credentials & mode
-    // panel. The IAM mode radio is the central decision; bootstrap
-    // SigV4 credentials + admin password change are siblings. The
-    // legacy SettingsPage `security` tab conflated Access +
-    // rate-limit + session-TTL into one page; the latter two move
-    // to Advanced (Wave 7).
-    if (adminPath === 'access/credentials') {
-      return (
-        <>
-          {header}
-          <CredentialsModePanel onSessionExpired={onSessionExpired} />
-        </>
-      );
-    }
-    if (adminPath === 'access/users') {
-      return (
-        <>
-          {header}
-          <UsersPanel
-            onSessionExpired={onSessionExpired}
-            onNavigateToGroup={navigateToGroup}
-            search={search}
-          />
-        </>
-      );
-    }
-    if (adminPath === 'access/groups') {
-      return (
-        <>
-          {header}
-          <GroupsPanel
-            onSessionExpired={onSessionExpired}
-            initialGroupId={pendingGroupId}
-            onGroupSelected={() => setPendingGroupId(null)}
-            search={search}
-          />
-        </>
-      );
-    }
-    if (adminPath === 'access/external-auth') {
-      return (
-        <>
-          {header}
-          <AuthenticationPanel onSessionExpired={onSessionExpired} />
-        </>
-      );
-    }
-    if (adminPath === 'access/sessions') {
-      return (
-        <>
-          {header}
-          <SessionsPanel onSessionExpired={onSessionExpired} />
-        </>
-      );
-    }
-
-    // Configuration — Storage (Wave 6). Backends keeps the legacy
-  // Backends owns storage infrastructure. Buckets owns per-bucket
-  // policy. Object replication owns source → destination movement.
-  // Object lifecycle owns delete-only expiration rules.
-    if (adminPath === 'storage/backends') {
-      return (
-        <>
-          {header}
-          <BackendsPanel onSessionExpired={onSessionExpired} />
-        </>
-      );
-    }
-    if (adminPath === 'storage/buckets') {
-      return (
-        <>
-          {header}
-          <BucketsPanel onSessionExpired={onSessionExpired} />
-        </>
-      );
-    }
-    if (adminPath === 'jobs') {
-      return (
-        <>
-          {header}
-          <JobsPanel onSessionExpired={onSessionExpired} search={search} />
-        </>
-      );
-    }
-    if (adminPath === 'system') {
-      return (
-        <>
-          {header}
-          <SystemPanel
-            onSessionExpired={onSessionExpired}
-            onExportBackup={handleExportFullBackup}
-            onImportBackup={handleImportFullBackup}
-          />
-        </>
-      );
-    }
-    if (adminPath === 'integrations/event-delivery') {
-      return (
-        <>
-          {header}
-          <WebhookDeliveryPanel onSessionExpired={onSessionExpired} />
-        </>
-      );
-    }
-
-    // Unknown path — land on dashboard
-    return (
-      <>
-        <MetricsPage onBack={onBack} embedded search={search} proxyVersion={proxyVersion} />
-      </>
-    );
+  const routeCtx: AdminRouteContext = {
+    onSessionExpired,
+    onBack,
+    navigateAdmin,
+    navigateToGroup,
+    pendingGroupId,
+    clearPendingGroupId: () => setPendingGroupId(null),
+    onExportBackup: backup.exportFullBackup,
+    onImportBackup: backup.importFullBackup,
+    search,
+    proxyVersion,
   };
 
   // Access denied (IAM user without admin permissions)
   if (!authed && !checkingSession && accessDenied) {
-    return (
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1, background: colors.BG_BASE }}>
-        <div style={{ width: 380, padding: 40, textAlign: 'center' }}>
-          <LockOutlined style={{ fontSize: 32, color: colors.ACCENT_RED, marginBottom: 12 }} />
-          <div><Text strong style={{ fontSize: 18, fontFamily: 'var(--font-ui)' }}>Access Denied</Text></div>
-          <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 8, marginBottom: 24 }}>
-            Your account does not have admin permissions. Contact an administrator to grant you the &quot;admin&quot; action.
-          </Text>
-          <Button type="primary" onClick={onBack} style={{ borderRadius: 10 }}>Back to Browser</Button>
-        </div>
-      </div>
-    );
+    return <AdminAccessDenied onBack={onBack} />;
   }
 
   // Login gate (admin password + optional OAuth buttons)
   if (!authed && !checkingSession) {
     return (
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1, background: colors.BG_BASE }}>
-        <form onSubmit={e => { e.preventDefault(); handleLogin(); }} style={{ width: 380, padding: 40 }}>
-          <div style={{ textAlign: 'center', marginBottom: 24 }}>
-            <LockOutlined style={{ fontSize: 32, color: colors.ACCENT_BLUE, marginBottom: 12 }} />
-            <div><Text strong style={{ fontSize: 18, fontFamily: 'var(--font-ui)' }}>Admin Login</Text></div>
-            <Text type="secondary" style={{ fontSize: 13 }}>
-              {externalProviders.length > 0 ? 'Sign in to continue.' : 'Enter the admin password to continue.'}
-            </Text>
-          </div>
-          {s3BrowserSessionOnly && (
-            <Alert
-              type="info"
-              showIcon
-              message="File browser session active"
-              description="You are signed in for S3 browsing only. Use the admin password (or OAuth if configured) below to open a full administrator session."
-              style={{ marginBottom: 16, borderRadius: 8 }}
-            />
-          )}
-          {/* OAuth provider buttons */}
-          {externalProviders.length > 0 && (
-            <div style={{ marginBottom: 16 }}>
-              <OAuthProviderList providers={externalProviders} nextUrl="/_/admin" />
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12, margin: '16px 0' }}>
-                <div style={{ flex: 1, height: 1, background: colors.BORDER }} />
-                <Text type="secondary" style={{ fontSize: 12 }}>or</Text>
-                <div style={{ flex: 1, height: 1, background: colors.BORDER }} />
-              </div>
-            </div>
-          )}
-          {loginError && <Alert type="error" message={loginError} showIcon style={{ marginBottom: 16, borderRadius: 8 }} />}
-          <Input.Password
-            placeholder="Admin password"
-            value={password}
-            onChange={e => setPassword(e.target.value)}
-            onPressEnter={handleLogin}
-            size="large"
-            autoFocus={externalProviders.length === 0}
-            style={{ borderRadius: 10, marginBottom: 16 }}
-          />
-          <Space style={{ width: '100%' }} direction="vertical">
-            <Button type="primary" htmlType="submit" block size="large" loading={loginLoading} disabled={!password}
-              style={{ borderRadius: 10, height: 44, fontWeight: 600 }}>
-              Sign In
-            </Button>
-            <Button type="text" block onClick={onBack} style={{ color: colors.TEXT_MUTED }}>Cancel</Button>
-          </Space>
-        </form>
-      </div>
+      <AdminLoginGate
+        externalProviders={externalProviders}
+        s3BrowserSessionOnly={s3BrowserSessionOnly}
+        initialError={loginError}
+        onAuthed={() => setAuthed(true)}
+        onBack={onBack}
+      />
     );
   }
 
@@ -814,87 +433,11 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
           window.location.reload();
         }}
       />
-      <Modal
-        title="Restore Backup"
-        open={restoreFile !== null}
-        onCancel={() => setRestoreFile(null)}
-        footer={[
-          <Button key="cancel" onClick={() => setRestoreFile(null)}>
-            Cancel
-          </Button>,
-          <Button
-            key="config"
-            onClick={() => restoreFile && runBackupImport(restoreFile, 'config-only')}
-          >
-            Config Only
-          </Button>,
-          // The IAM-writing modes 403 in declarative mode (YAML owns IAM), so
-          // only Config Only is offered there.
-          ...(iamWritesOff ? [] : [
-            <Button
-              key="preserve-bootstrap"
-              type="primary"
-              onClick={() => restoreFile && runBackupImport(restoreFile, 'preserve-bootstrap')}
-            >
-              Everything Except Admin Password
-            </Button>,
-            <Button
-              key="full"
-              danger
-              onClick={() => restoreFile && runBackupImport(restoreFile, 'full')}
-            >
-              Full Restore
-            </Button>,
-            <Button
-              key="iam"
-              onClick={() => restoreFile && runBackupImport(restoreFile, 'iam-only')}
-            >
-              IAM Only
-            </Button>,
-          ]),
-        ]}
-      >
-        <Space direction="vertical" size={10}>
-          <Text>
-            Choose what to restore from <Text code>{restoreFile?.name}</Text>.
-          </Text>
-          {iamDeclarative && (
-            <Alert
-              type="warning"
-              showIcon
-              message="IAM is managed by YAML (declarative mode). Only Config Only is available — restore users, groups, and OIDC providers by editing access.iam_* in your YAML config and applying."
-            />
-          )}
-          {iamLoadError && (
-            <Alert
-              type="warning"
-              showIcon
-              message={`Could not load the IAM mode, so only Config Only is offered. Reload the page to see every restore option. ${iamLoadError}`}
-            />
-          )}
-          {!iamWritesOff && (
-            <Alert
-              type="info"
-              showIcon
-              message="Everything Except Admin Password restores config, backends, bucket policies, users, groups, OIDC providers, and secrets, while keeping this instance's local admin password."
-            />
-          )}
-          {!iamWritesOff && (
-            <Alert
-              type="info"
-              showIcon
-              message="IAM Only skips config and backend changes; use it only when you want users/groups/OIDC without restoring storage settings."
-            />
-          )}
-          {!iamWritesOff && (
-            <Alert
-              type="warning"
-              showIcon
-              message="Full Restore also tries to restore the backup's admin password and will fail if it doesn't match the admin password this instance was set up with."
-            />
-          )}
-        </Space>
-      </Modal>
+      <RestoreBackupModal
+        file={backup.restoreFile}
+        onCancel={backup.cancelRestore}
+        onRestore={backup.runBackupImport}
+      />
 
       {/* ⌘K command palette — fuzzy navigation over every admin page,
           plus a handful of shell-level quick actions (Export YAML,
@@ -972,7 +515,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
             overflow: 'auto',
           }}
         >
-          {renderContent()}
+          <AdminRouteContent path={adminPath} ctx={routeCtx} />
         </div>
       </div>
     </div>
