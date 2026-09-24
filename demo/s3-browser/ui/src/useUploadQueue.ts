@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { countBucketObjects, getBucket, headObject, uploadObject, type UploadTelemetry } from './s3client';
+import { getBucket, headObject, listDirectObjects, uploadObject, type UploadTelemetry } from './s3client';
 import { uploadSessionStats } from './uploadStats';
 import { uploadCreatedBaseline } from './savings';
 import {
   clampPercent,
+  folderEmptyFromListing,
+  startAfterProbe,
   mergeTotalBytes,
   uploadRetryAdvice,
   type UploadRetryAdvice,
@@ -157,19 +159,19 @@ export default function useUploadQueue(destination: string) {
     if (!folderWasEmptyRef.current.has(folderKey)) {
       folderWasEmptyRef.current.set(
         folderKey,
-        countBucketObjects(item.bucket, 1, folder ? `${folder}/` : '')
-          .then(({ count }) => count === 0)
+        listDirectObjects(item.bucket, folder ? `${folder}/` : '', 100)
+          .then(folderEmptyFromListing)
           .catch(() => undefined),
       );
     }
     const folderWasEmpty = folderWasEmptyRef.current.get(folderKey)!;
 
-    folderWasEmpty
-      .then(() => uploadObject(item.key, item.file, {
-        bucket: item.bucket,
-        signal: controller.signal,
-        onTelemetry: (telemetry) => applyTelemetry(item.id, telemetry),
-      }))
+    // Cancel during the probe must stop the upload before it starts.
+    startAfterProbe(folderWasEmpty, controller.signal, () => uploadObject(item.key, item.file, {
+      bucket: item.bucket,
+      signal: controller.signal,
+      onTelemetry: (telemetry) => applyTelemetry(item.id, telemetry),
+    }))
       .then(() => {
         setQueue((prev) =>
           prev.map((entry) =>

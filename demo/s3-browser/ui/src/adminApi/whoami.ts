@@ -16,6 +16,8 @@ export interface WhoamiResponse {
   /** UTC build timestamp of the running binary — same gate as `version`. */
   build_time?: string;
   user: { name: string; access_key_id: string; is_admin: boolean; permissions?: IamPermission[] } | null;
+  /** How the session signed in; absent without a session (or on servers before 1.19). */
+  auth_method?: 'bootstrap' | 'iam' | 'iam_browser' | 'open' | 'external';
   config_db_mismatch?: boolean;
   /** Typed lock signal from the server: 'locked' when the config DB is
    *  bootstrap-hash-mismatched. Prefer this over inferring from error text. */

@@ -426,9 +426,12 @@ export default function Sidebar({
                   if (b.name !== activeBucket) e.currentTarget.style.background = 'transparent';
                 }}
               >
+                {/* Status badges sit outside the wrapping part and never hide;
+                    the name then shrinks with an ellipsis. */}
+                <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
                 {/* One line tall and wrapping: a chip with no room left wraps
                     to a second line, which the fixed height hides. */}
-                <span style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 8, height: 20, minWidth: 0, overflow: 'hidden' }}>
+                <span style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 8, height: 20, minWidth: 0, flex: '1 1 auto', overflow: 'hidden' }}>
                   <span style={{
                     lineHeight: '20px',
                     fontFamily: "var(--font-mono)",
@@ -439,12 +442,18 @@ export default function Sidebar({
                     whiteSpace: 'nowrap',
                     display: 'block',
                     // The name keeps its full width; the backend chip beside it
-                    // gives way (and is clipped) first.
+                    // gives way (and is hidden) first.
                     flex: 'none',
                     maxWidth: '100%',
                   }}>
                     {b.name}
                   </span>
+                  {backendChips && (
+                    // Line breaking sees the 40 px stub, so the chip shrinks
+                    // (with an ellipsis) before it wraps out of view.
+                    <BucketBackendBadge origin={b.backend} style={{ flex: '1 1 40px', maxWidth: 'max-content' }} />
+                  )}
+                </span>
                   {isUnavailable && (
                     <span
                       title={b.unavailable}
@@ -457,11 +466,6 @@ export default function Sidebar({
                     >
                       Unavailable
                     </span>
-                  )}
-                  {backendChips && (
-                    // Line breaking sees the 40 px stub, so the chip shrinks
-                    // (with an ellipsis) before it wraps out of view.
-                    <BucketBackendBadge origin={b.backend} style={{ flex: '1 1 40px', maxWidth: 'max-content' }} />
                   )}
                 </span>
               </button>

@@ -357,6 +357,8 @@ export async function uploadObject(
     updatedAtMs: startedAtMs,
   };
 
+  // An abort before this point has no listener to fire: honour it now.
+  options.signal?.throwIfAborted();
   try {
     emitTelemetry(options.onTelemetry, lastTelemetry);
     // Managed upload uses multipart automatically for large payloads and
@@ -648,20 +650,36 @@ export async function createBucket(name: string, backendName?: string): Promise<
 }
 
 /**
- * How many objects the bucket (or the folder `prefix`) holds, counted up to
- * `cap` in one ListObjectsV2 page. `truncated` means "at least `cap`". Keep
- * `cap` small: callers ask "is it empty" or "how many, roughly".
+ * How many objects the bucket holds, counted up to `cap` in one
+ * ListObjectsV2 page. `truncated` means "at least `cap`". Keep `cap` small:
+ * the caller asks "is it empty" or "how many, roughly".
  */
 export async function countBucketObjects(
   name: string,
   cap: number,
-  prefix = '',
 ): Promise<{ count: number; truncated: boolean }> {
   const resp = await sendCommand<ListObjectsV2CommandOutput>(
-    new ListObjectsV2Command({ Bucket: name, MaxKeys: cap, ...(prefix ? { Prefix: prefix } : {}) }),
-    `Count objects in ${prefix ? `${name}/${prefix}` : `bucket ${name}`}`,
+    new ListObjectsV2Command({ Bucket: name, MaxKeys: cap }),
+    `Count objects in bucket ${name}`,
   );
   return { count: resp.KeyCount ?? resp.Contents?.length ?? 0, truncated: Boolean(resp.IsTruncated) };
+}
+
+/**
+ * Objects stored DIRECTLY in the folder `prefix` (one delimiter listing page
+ * of at most `cap` entries; subfolders are not counted). Subfolder entries
+ * share the page, so `truncated` with zero objects means "not known".
+ */
+export async function listDirectObjects(
+  bucket: string,
+  prefix: string,
+  cap: number,
+): Promise<{ objects: number; truncated: boolean }> {
+  const resp = await sendCommand<ListObjectsV2CommandOutput>(
+    new ListObjectsV2Command({ Bucket: bucket, MaxKeys: cap, Delimiter: '/', ...(prefix ? { Prefix: prefix } : {}) }),
+    `List ${bucket}/${prefix}`,
+  );
+  return { objects: resp.Contents?.length ?? 0, truncated: Boolean(resp.IsTruncated) };
 }
 
 export async function deleteBucket(name: string): Promise<void> {

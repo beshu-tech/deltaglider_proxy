@@ -76,6 +76,12 @@ pub struct WhoamiResponse {
     build_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<WhoamiUserInfo>,
+    /// How the caller signed in (see [`auth_method_label`]); omitted when
+    /// there is no session. `user.access_key_id` alone cannot say it: a
+    /// bootstrap session reports the synthetic key `bootstrap`, which a real
+    /// IAM user may also have.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_method: Option<&'static str>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     config_db_mismatch: bool,
     /// Typed lock signal for the frontend: `"locked"` when the config DB
@@ -616,6 +622,7 @@ pub async fn whoami(
     let session =
         extract_session_token(&headers).and_then(|t| state.sessions.auth_method(&t, client_ip));
     let session_valid = session.is_some();
+    let auth_method = session.as_ref().map(auth_method_label);
     let user = match session {
         Some(method) => session_user_info(&state, method).await,
         None => None,
@@ -650,6 +657,7 @@ pub async fn whoami(
         version: build_version_for(session_valid),
         build_time: build_time_for(session_valid),
         user,
+        auth_method,
         config_db_mismatch: state.config_db_mismatch,
         lock_state: lock_state_for(state.config_db_mismatch),
         external_providers,
@@ -704,10 +712,23 @@ pub async fn resolve_iam_identity(
             is_admin,
             permissions: user.permissions,
         }),
+        auth_method: Some("iam"),
         config_db_mismatch: state.config_db_mismatch,
         lock_state: lock_state_for(state.config_db_mismatch),
         external_providers: vec![],
     }))
+}
+
+/// The `auth_method` wire value of [`WhoamiResponse`] for a session.
+pub(crate) fn auth_method_label(method: &crate::session::AuthMethod) -> &'static str {
+    use crate::session::AuthMethod;
+    match method {
+        AuthMethod::Bootstrap => "bootstrap",
+        AuthMethod::IamLoginAs { .. } => "iam",
+        AuthMethod::IamBrowserLift { .. } => "iam_browser",
+        AuthMethod::OpenLift => "open",
+        AuthMethod::External { .. } => "external",
+    }
 }
 
 /// User info for a live session's auth method (`None` for an open-mode lift,
@@ -1542,5 +1563,35 @@ mod tests {
                 None => std::env::remove_var("DGP_SECURE_COOKIES"),
             }
         }
+    }
+
+    #[test]
+    fn auth_method_label_names_every_session_kind() {
+        use crate::session::AuthMethod;
+        assert_eq!(
+            super::auth_method_label(&AuthMethod::Bootstrap),
+            "bootstrap"
+        );
+        assert_eq!(
+            super::auth_method_label(&AuthMethod::IamLoginAs {
+                access_key_id: "bootstrap".into()
+            }),
+            "iam",
+            "an IAM user whose key is literally `bootstrap` is still an IAM session"
+        );
+        assert_eq!(
+            super::auth_method_label(&AuthMethod::IamBrowserLift {
+                access_key_id: "AK".into()
+            }),
+            "iam_browser"
+        );
+        assert_eq!(super::auth_method_label(&AuthMethod::OpenLift), "open");
+        assert_eq!(
+            super::auth_method_label(&AuthMethod::External {
+                provider_name: "google".into(),
+                user_id: 1
+            }),
+            "external"
+        );
     }
 }

@@ -42,10 +42,11 @@ assert.match(zipPreflightError(ZIP_MAX_KEYS + 1, 100), /10,001 files.*at most 10
 assert.match(zipPreflightError(900, ZIP_MAX_URL_LENGTH + 1), /too many files \(900\)/);
 
 // --- downloadZip, non-2xx: the picked file is deleted, the error explains ---
-function fakes(status, body = '') {
+function fakes(status, body = '', sizeBefore = 0) {
   const calls = { removed: 0, wrote: 0 };
   const handle = {
     createWritable: async () => { calls.wrote++; return new WritableStream(); },
+    getFile: async () => ({ size: sizeBefore }),
     remove: async () => { calls.removed++; },
   };
   const deps = {
@@ -85,6 +86,22 @@ function fakes(status, body = '') {
   deps.fetch = async () => { throw new TypeError('Failed to fetch'); };
   await assert.rejects(downloadZip('/zip', 'a.zip', deps), /Failed to fetch/);
   assert.equal(calls.removed, 1);
+}
+{
+  // An existing file the user picked to overwrite: a failure leaves it alone.
+  for (const status of [413, 404, 502]) {
+    const { calls, deps } = fakes(status, '{}', 4096);
+    await assert.rejects(downloadZip('/zip', 'old.zip', deps));
+    assert.equal(calls.removed, 0, `${status}: an existing file is never deleted`);
+    assert.equal(calls.wrote, 0, `${status}: nothing is written to it`);
+  }
+  // Size unknown (no getFile): do not delete either.
+  const { calls, deps } = fakes(413);
+  const h = await deps.picker();
+  delete h.getFile;
+  deps.picker = async () => h;
+  await assert.rejects(downloadZip('/zip', 'a.zip', deps));
+  assert.equal(calls.removed, 0, 'unknown size: keep the file');
 }
 {
   const { calls, deps } = fakes(200);

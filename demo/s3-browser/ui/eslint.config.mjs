@@ -36,6 +36,13 @@ const ANTD_DEPRECATED = [
   ["JSXMemberExpression[object.name='Button'][property.name='Group']", 'Button.Group: use Space.Compact.'],
   ["JSXMemberExpression[object.name='Input'][property.name='Group']", 'Input.Group: use Space.Compact.'],
   ["JSXAttribute[name.name=/^addon(After|Before)$/]", 'use suffix/prefix, or Space.Compact.'],
+  ["JSXOpeningElement[name.name='Card'] > JSXAttribute[name.name='bordered']", 'use variant.'],
+  ["JSXOpeningElement[name.name='Card'] > JSXAttribute[name.name='headStyle']", 'use styles.header.'],
+  ["JSXOpeningElement[name.name=/^(Card|Modal|Drawer)$/] > JSXAttribute[name.name='bodyStyle']", 'use styles.body.'],
+  ["JSXOpeningElement[name.name=/^(Modal|Drawer)$/] > JSXAttribute[name.name='maskStyle']", 'use styles.mask.'],
+  ["JSXOpeningElement[name.name=/^(Select|AutoComplete)$/] > JSXAttribute[name.name=/^(dropdownStyle|dropdownClassName|popupClassName|dropdownRender|onDropdownVisibleChange|dropdownMatchSelectWidth)$/]", 'use styles.popup / classNames.popup / popupRender / onOpenChange / popupMatchSelectWidth.'],
+  ["JSXOpeningElement[name.name='Tabs'] > JSXAttribute[name.name='destroyInactiveTabPane']", 'use destroyOnHidden.'],
+  ["JSXOpeningElement[name.name='Collapse'] > JSXAttribute[name.name='destroyInactivePanel']", 'use destroyOnHidden.'],
 ];
 
 const UI_RULES = {
