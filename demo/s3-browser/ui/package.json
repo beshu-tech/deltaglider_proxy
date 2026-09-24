@@ -75,6 +75,7 @@
     "test:log-level-radio": "node scripts/log-level-radio-regression-test.mjs",
     "test:status-tone": "node scripts/status-tone-regression-test.mjs",
     "test:code-tokens": "node scripts/code-tokens-regression-test.mjs",
+    "test:setup-detect": "node scripts/setup-detect-regression-test.mjs",
     "e2e": "playwright test",
     "typecheck": "tsc --noEmit",
     "knip": "knip"
