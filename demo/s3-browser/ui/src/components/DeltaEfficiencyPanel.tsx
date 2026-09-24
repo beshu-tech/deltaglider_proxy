@@ -30,6 +30,7 @@ import { useBucketNames } from '../queries/backends';
 import HoverHint from './HoverHint';
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
+import { useCopyToClipboard } from '../useCopyToClipboard';
 import { isSessionExpired } from '../errorHandling';
 
 /**
@@ -55,12 +56,6 @@ function efficiencyLabel(e: DeltaEfficiency): string {
     case 'fair': return 'Fair';
     case 'poor': return 'Poor';
     case 'no_reference': return 'No reference';
-  }
-}
-
-function copyToClipboard(text: string) {
-  if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(text);
   }
 }
 
@@ -101,6 +96,21 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
     if (buckets.length > 0 && bucket === undefined) setBucket(buckets[0]);
   }, [buckets, bucket]);
 
+  // A scan belongs to the (bucket, minDeltas) it started with. On change —
+  // and on unmount — supersede any in-flight poll (it captured the old
+  // bucket and would otherwise publish A's report under B, or keep polling
+  // after unmount up to SCAN_TIMEOUT_MS) and clear the stale report.
+  useEffect(() => {
+    const ids = scanIdRef;
+    return () => {
+      ids.current += 1;
+      setResponse(null);
+      setLoading(false);
+      setScanning(false);
+      setError(null);
+    };
+  }, [bucket, minDeltas]);
+
   /**
    * Server returns one of:
    *   - 200 OK with the report (cached or fresh)
@@ -132,6 +142,8 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
         // Server is working on it. Wait briefly, then re-fetch.
         setScanning(true);
         await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+        // Superseded (or unmounted) while sleeping — no further fetches.
+        if (scanIdRef.current !== scanId) return null;
         continue;
       }
       setScanning(false);
@@ -744,6 +756,7 @@ function RatioRow({
   onVerify: () => void;
 }) {
   const colors = useColors();
+  const { copy } = useCopyToClipboard();
   const ratio = r.ratio_median;
   const ratioLabel = ratio == null ? '—' : formatDeltaToReference(ratio);
   const barColor = ratioBarColor(r.efficiency, colors);
@@ -877,7 +890,7 @@ function RatioRow({
             size="small"
             type="text"
             icon={<CopyOutlined style={{ fontSize: 11 }} />}
-            onClick={() => copyToClipboard(`s3://${r.bucket}/${r.prefix}/`)}
+            onClick={() => void copy(`s3://${r.bucket}/${r.prefix}/`)}
             style={{ padding: 0, width: 20, height: 20, minWidth: 0 }}
           />
         </HoverHint>
