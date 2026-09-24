@@ -29,6 +29,7 @@ import {
 import type { ReactNode } from 'react';
 import { useColors } from '../ThemeContext';
 import { ADMIN_IA } from './adminNavigation';
+import { readStorage, writeStorage } from '../safeStorage';
 
 const { Text } = Typography;
 
@@ -115,9 +116,9 @@ const RECENTS_KEY = 'dgp.admin.palette.recents';
 const MAX_RECENTS = 5;
 
 function loadRecents(): string[] {
+  const raw = readStorage(RECENTS_KEY);
+  if (!raw) return [];
   try {
-    const raw = localStorage.getItem(RECENTS_KEY);
-    if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed)
       ? parsed.filter((x): x is string => typeof x === 'string').slice(0, MAX_RECENTS)
@@ -130,11 +131,7 @@ function loadRecents(): string[] {
 function pushRecent(id: string): string[] {
   const prev = loadRecents();
   const next = [id, ...prev.filter((x) => x !== id)].slice(0, MAX_RECENTS);
-  try {
-    localStorage.setItem(RECENTS_KEY, JSON.stringify(next));
-  } catch {
-    /* quota exceeded / private mode — best-effort, silently skip */
-  }
+  writeStorage(RECENTS_KEY, JSON.stringify(next));
   return next;
 }
 

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { darkColors, lightColors, ThemeContext } from './ThemeContext';
+import { readStorage, writeStorage } from './safeStorage';
 
 export default function ThemeProvider({ children }: { children: ReactNode }) {
   const [isDark, setIsDark] = useState(() => {
-    const saved = localStorage.getItem('dg-theme');
+    const saved = readStorage('dg-theme');
     return saved ? saved === 'dark' : true;
   });
 
@@ -14,7 +15,7 @@ export default function ThemeProvider({ children }: { children: ReactNode }) {
   const colors = isDark ? darkColors : lightColors;
 
   useEffect(() => {
-    localStorage.setItem('dg-theme', isDark ? 'dark' : 'light');
+    writeStorage('dg-theme', isDark ? 'dark' : 'light');
     document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
   }, [isDark]);
 

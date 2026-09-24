@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Alert, Button, Space } from 'antd';
 import { useColors } from '../ThemeContext';
 import { useNavigation } from '../NavigationContext';
+import { readStorage, writeStorage } from '../safeStorage';
 
 const STORAGE_KEY = 'dg-file-browser-session-tip-dismissed';
 
@@ -13,11 +14,11 @@ interface Props {
 export default function FileBrowserSessionTip({ visible }: Props) {
   const colors = useColors();
   const { navigate } = useNavigation();
-  const [dismissed, setDismissed] = useState(() => localStorage.getItem(STORAGE_KEY) === '1');
+  const [dismissed, setDismissed] = useState(() => readStorage(STORAGE_KEY) === '1');
 
   useEffect(() => {
     if (!visible) return;
-    setDismissed(localStorage.getItem(STORAGE_KEY) === '1');
+    setDismissed(readStorage(STORAGE_KEY) === '1');
   }, [visible]);
 
   if (!visible || dismissed) return null;
@@ -49,7 +50,7 @@ export default function FileBrowserSessionTip({ visible }: Props) {
         background: `${colors.ACCENT_BLUE}08`,
       }}
       onClose={() => {
-        localStorage.setItem(STORAGE_KEY, '1');
+        writeStorage(STORAGE_KEY, '1');
         setDismissed(true);
       }}
     />

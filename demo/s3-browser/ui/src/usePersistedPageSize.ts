@@ -1,5 +1,6 @@
 import { useCallback, useState } from 'react';
 import { coerceStoredPageSize } from './persistedPageSize';
+import { readStorage, writeStorage } from './safeStorage';
 
 /**
  * Page-size state with localStorage persistence and allow-list
@@ -38,20 +39,4 @@ export function usePersistedPageSize(
   );
 
   return [size, update];
-}
-
-function readStorage(key: string): string | null {
-  try {
-    return window.localStorage.getItem(key);
-  } catch {
-    return null; // SecurityError in some private modes
-  }
-}
-
-function writeStorage(key: string, value: string): void {
-  try {
-    window.localStorage.setItem(key, value);
-  } catch {
-    /* QuotaExceededError or private mode — ignore */
-  }
 }

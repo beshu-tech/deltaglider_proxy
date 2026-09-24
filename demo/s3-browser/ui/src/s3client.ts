@@ -38,10 +38,11 @@ import {
   storeSessionCredentials,
   clearSessionCredentials,
 } from './sessionApi';
+import { readStorage, removeStorage, writeStorage } from './safeStorage';
 
 // ── In-memory credential store (never persisted to localStorage) ──
 
-let activeBucket = localStorage.getItem('dg-bucket') || '';
+let activeBucket = readStorage('dg-bucket') || '';
 let activeRegion = 'us-east-1';
 let activeEndpoint = '';
 let activeAccessKeyId = '';
@@ -71,7 +72,7 @@ export function getBucket(): string {
 
 export function setBucket(name: string) {
   activeBucket = name;
-  localStorage.setItem('dg-bucket', name);
+  writeStorage('dg-bucket', name);
 }
 
 function getEndpoint(): string {
@@ -115,9 +116,9 @@ export function disconnect() {
   activeEndpoint = '';
   cachedClient = null;
   // Remove legacy localStorage keys (migration cleanup)
-  localStorage.removeItem('dg-access-key-id');
-  localStorage.removeItem('dg-secret-access-key');
-  localStorage.removeItem('dg-endpoint');
+  removeStorage('dg-access-key-id');
+  removeStorage('dg-secret-access-key');
+  removeStorage('dg-endpoint');
   clearSessionCredentials();
 }
 
