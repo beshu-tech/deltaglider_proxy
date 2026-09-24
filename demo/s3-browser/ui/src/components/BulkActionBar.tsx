@@ -16,12 +16,14 @@ interface Props {
   onCopy?: (destBucket: string, destPrefix: string) => Promise<{ succeeded: number; failed: number }>;
   onMove?: (destBucket: string, destPrefix: string) => Promise<{ succeeded: number; failed: number }>;
   onDownloadZip?: () => Promise<void>;
+  /** The folder being browsed: the copy/move destination starts there. */
+  currentPrefix?: string;
   deleting: boolean;
   /** Shown when bulk handlers are omitted (user signed in for files only). */
   hint?: string;
 }
 
-export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, onDelete, onCopy, onMove, onDownloadZip, deleting, hint }: Props) {
+export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, onDelete, onCopy, onMove, onDownloadZip, deleting, hint, currentPrefix }: Props) {
   const colors = useColors();
   const [modal, setModal] = useState<'copy' | 'move' | null>(null);
   const [operating, setOperating] = useState(false);
@@ -154,6 +156,7 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
         onConfirm={(bucket, prefix) => { if (modal) handleOperation(modal, bucket, prefix); }}
         onCancel={closeModal}
         loading={operating}
+        currentPrefix={currentPrefix}
       />
     </>
   );

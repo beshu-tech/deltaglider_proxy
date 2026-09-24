@@ -15,6 +15,8 @@ interface Props {
   onConfirm: (destBucket: string, destPrefix: string) => void;
   onCancel: () => void;
   loading: boolean;
+  /** The folder the user is browsing; the destination path starts there. */
+  currentPrefix?: string;
 }
 
 /** "Move 3 items" / "Copy 1 item" — shared by the modal title and OK button. */
@@ -31,7 +33,7 @@ function SectionLabel({ color, children }: { color: string; children: React.Reac
   );
 }
 
-export default function DestinationPickerModal({ open, mode, itemCount, onConfirm, onCancel, loading }: Props) {
+export default function DestinationPickerModal({ open, mode, itemCount, onConfirm, onCancel, loading, currentPrefix = '' }: Props) {
   const colors = useColors();
   const [buckets, setBuckets] = useState<string[]>([]);
   const [destBucket, setDestBucket] = useState(getBucket());
@@ -41,9 +43,11 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
     if (open) {
       listBuckets().then(bs => setBuckets(bs.filter(b => !b.unavailable).map(b => b.name))).catch(() => {});
       setDestBucket(getBucket());
-      setDestPrefix('');
+      // Start from the folder being browsed, not the bucket root: copies and
+      // moves usually go next to, or below, where the user already is.
+      setDestPrefix(normalizeDestPrefix(currentPrefix));
     }
-  }, [open]);
+  }, [open, currentPrefix]);
 
   const clean = normalizeDestPrefix(destPrefix);
   const preview = `${destBucket}/${clean ? clean + '/' : ''}`;
@@ -81,6 +85,7 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
           placeholder="/ (bucket root)"
           style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}
           autoFocus
+          onFocus={(e) => e.currentTarget.select()}
         />
       </div>
 

@@ -547,6 +547,7 @@ export default function App() {
             onMove={canMoveFromActiveBucket && hasAdminSession ? s3.bulkMove : undefined}
             onDownloadZip={canReadSelected && hasAdminSession ? s3.downloadZip : undefined}
             deleting={s3.deleting}
+            currentPrefix={s3.prefix}
             hint={
               hasAdminSession
                 ? undefined
