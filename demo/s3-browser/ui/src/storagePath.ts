@@ -5,11 +5,6 @@ export interface ResourcePatternParts {
   global: boolean;
 }
 
-export interface CommaSegment {
-  before: string;
-  segment: string;
-}
-
 function cleanPathSegments(value: string): string[] {
   return value
     .replace(/\\/g, '/')
@@ -41,24 +36,6 @@ export function normalizePrefixPreserveTrailingSlash(value: string | null | unde
   if (parts.length === 0) return '';
   const joined = parts.join('/');
   return hadTrailingSlash ? `${joined}/` : joined;
-}
-
-export function getTrailingCommaSegment(value: string | null | undefined): CommaSegment {
-  const raw = value || '';
-  const commaIndex = raw.lastIndexOf(',');
-  const beforeComma = commaIndex >= 0 ? raw.slice(0, commaIndex + 1) : '';
-  const afterComma = commaIndex >= 0 ? raw.slice(commaIndex + 1) : raw;
-  const leadingSpace = afterComma.match(/^\s*/)?.[0] || '';
-
-  return {
-    before: `${beforeComma}${leadingSpace}`,
-    segment: afterComma.slice(leadingSpace.length),
-  };
-}
-
-export function replaceTrailingCommaSegment(value: string | null | undefined, replacement: string): string {
-  const { before } = getTrailingCommaSegment(value);
-  return `${before}${replacement}`;
 }
 
 export function parseResourcePattern(value: string | null | undefined): ResourcePatternParts {

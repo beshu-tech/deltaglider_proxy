@@ -3,7 +3,7 @@ import { useColors } from '../ThemeContext';
 
 /**
  * Shared React primitives for the storage sub-panels (Lifecycle / Replication /
- * Buckets). Pure helpers (lineList / lines / fmtUnix / formRow) live in the
+ * Buckets). Pure helpers (lineList / lines / formRow) live in the
  * sibling `ruleEditorHelpers.ts`.
  *
  * The old bespoke `Field` labelled-wrapper was retired in favour of the

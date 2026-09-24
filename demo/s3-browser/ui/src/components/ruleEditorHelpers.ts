@@ -26,12 +26,6 @@ export function lines(value: string[]): string {
   return value.join('\n');
 }
 
-/** Render a unix-seconds timestamp as a locale string, or `never` when absent. */
-export function fmtUnix(ts: number | null | undefined): string {
-  if (!ts) return 'never';
-  return new Date(ts * 1000).toLocaleString();
-}
-
 /**
  * Build the repeated `{ display: 'flex', alignItems: 'center', gap }` row style.
  * Pass `extra` to override (e.g. `flexWrap`, `flexDirection`, margins).

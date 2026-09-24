@@ -18,7 +18,7 @@ const { outputText } = ts.transpileModule(source, {
   fileName: 'ruleEditorHelpers.ts',
 });
 
-const { lineList, lines, fmtUnix, formRow } = await import(dataUrl(outputText));
+const { lineList, lines, formRow } = await import(dataUrl(outputText));
 
 // --- lineList ----------------------------------------------------------------
 assert.deepEqual(lineList('a\nb\nc'), ['a', 'b', 'c']);
@@ -30,12 +30,6 @@ assert.deepEqual(lineList('\n  \n'), []); // whitespace-only -> empty
 assert.equal(lines(['a', 'b', 'c']), 'a\nb\nc');
 assert.equal(lines([]), '');
 assert.deepEqual(lineList(lines(['x/', 'y/'])), ['x/', 'y/']); // round-trip
-
-// --- fmtUnix -----------------------------------------------------------------
-assert.equal(fmtUnix(0), 'never');
-assert.equal(fmtUnix(null), 'never');
-assert.equal(fmtUnix(undefined), 'never');
-assert.equal(fmtUnix(1700000000), new Date(1700000000 * 1000).toLocaleString());
 
 // --- formRow -----------------------------------------------------------------
 assert.deepEqual(formRow(8), { display: 'flex', alignItems: 'center', gap: 8 });

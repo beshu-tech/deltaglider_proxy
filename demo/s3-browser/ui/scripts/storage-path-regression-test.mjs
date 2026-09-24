@@ -16,11 +16,9 @@ const transpiled = ts.transpileModule(source, {
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(transpiled).toString('base64')}`;
 const {
   formatResourcePattern,
-  getTrailingCommaSegment,
   normalizePrefix,
   normalizeResourcePattern,
   parseResourcePattern,
-  replaceTrailingCommaSegment,
 } = await import(moduleUrl);
 
 assert.equal(normalizePrefix(' /team//${iam:username}/builds '), 'team/${iam:username}/builds/');
@@ -47,19 +45,5 @@ assert.equal(formatResourcePattern('artifacts', 'team-a', false), 'artifacts/tea
 assert.equal(normalizeResourcePattern(' artifacts//team-a/* '), 'artifacts/team-a/*');
 assert.equal(normalizeResourcePattern('artifacts/team-a*'), 'artifacts/team-a*');
 assert.equal(normalizeResourcePattern('*'), '*');
-
-assert.deepEqual(getTrailingCommaSegment('alpha/*, beta/bu'), {
-  before: 'alpha/*, ',
-  segment: 'beta/bu',
-});
-assert.deepEqual(getTrailingCommaSegment('alpha/*,   beta/bu'), {
-  before: 'alpha/*,   ',
-  segment: 'beta/bu',
-});
-assert.deepEqual(getTrailingCommaSegment('beta/bu'), {
-  before: '',
-  segment: 'beta/bu',
-});
-assert.equal(replaceTrailingCommaSegment('alpha/*, beta/bu', 'beta/builds/*'), 'alpha/*, beta/builds/*');
 
 console.log('storage path regression checks passed');

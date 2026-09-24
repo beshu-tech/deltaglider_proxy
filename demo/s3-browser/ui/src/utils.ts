@@ -112,17 +112,6 @@ export function clamp(n: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, n));
 }
 
-/**
- * Tiny 6×6 dot pattern as a CSS background-image (inline SVG, no
- * external asset). Used to texturise "saved" bars so they read as
- * negative space without introducing another colour to the eye.
- */
-export function dotPattern(color: string): string {
-  const safe = encodeURIComponent(color);
-  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='6' height='6'><circle cx='1' cy='1' r='1' fill='${safe}' fill-opacity='0.5'/></svg>`;
-  return `url("data:image/svg+xml;utf8,${svg.replace(/"/g, "'")}")`;
-}
-
 /** Natural (numeric) string comparator — `v2` < `v10`, `file-1` < `file-20`.
  *  Uses `localeCompare` with `{ numeric: true }`. Shared across all sort sites
  *  so the object table, bucket list, and key list never disagree. */

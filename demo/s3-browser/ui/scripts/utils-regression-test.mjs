@@ -13,7 +13,7 @@ const { outputText } = ts.transpileModule(source, {
   fileName: 'utils.ts',
 });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
-const { clamp, dotPattern, formatDuration, relativeTime, formatBytes, getFileName, pluralize, parentPrefix } = await import(moduleUrl);
+const { clamp, formatDuration, relativeTime, formatBytes, getFileName, pluralize, parentPrefix } = await import(moduleUrl);
 
 // --- clamp -------------------------------------------------------------------
 assert.equal(clamp(50, 0, 100), 50);
@@ -29,16 +29,6 @@ assert.equal(clamp(-Infinity, -5, 5), -5);
 // arbitrary bounds (used by DeltaEfficiencyPanel's [0,100] axis mapping)
 assert.equal(clamp(3, 1, 2), 2);
 assert.equal(clamp(0.5, 1, 2), 1);
-
-// --- dotPattern --------------------------------------------------------------
-const pat = dotPattern('#abc123');
-assert.ok(pat.startsWith('url("data:image/svg+xml;utf8,'), 'is a data-URL background');
-assert.ok(pat.endsWith('")'), 'is a closed url() wrapper');
-assert.ok(pat.includes(encodeURIComponent('#abc123')), 'colour is URI-encoded');
-// SVG markup uses single quotes so the url() double-quote wrapper stays valid
-assert.ok(pat.includes("<svg xmlns='http://www.w3.org/2000/svg'"), 'svg attrs single-quoted');
-// deterministic — same input, same output
-assert.equal(dotPattern('#abc123'), pat);
 
 // --- formatDuration + relativeTime (the ONE relative-time vocabulary) --------
 // Units: s / m / h (+ m) / d / mo / y. Past: "<dur> ago". Future: "in <dur>"

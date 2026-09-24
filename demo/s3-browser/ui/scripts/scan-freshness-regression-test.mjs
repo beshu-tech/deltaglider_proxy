@@ -9,7 +9,7 @@ const { outputText } = ts.transpileModule(source, {
   fileName: 'scanFreshness.ts',
 });
 const mod = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
-const { scanAgeMs, isScanStale, scanAgeLabel, SCAN_STALE_MS } = mod;
+const { scanAgeMs, isScanStale, SCAN_STALE_MS } = mod;
 
 // fixed "now" for determinism
 const NOW = Date.parse('2026-05-31T12:00:00Z');
@@ -38,14 +38,5 @@ assert.equal(isScanStale(iso(500), 1000, NOW), false);
 // missing → never stale
 assert.equal(isScanStale(null, undefined, NOW), false);
 assert.equal(isScanStale('garbage', undefined, NOW), false);
-
-// --- scanAgeLabel ------------------------------------------------------------
-assert.equal(scanAgeLabel(null, NOW), '');
-assert.equal(scanAgeLabel(iso(10_000), NOW), 'just now'); // <45s
-assert.equal(scanAgeLabel(iso(5 * 60_000), NOW), '5m ago');
-assert.equal(scanAgeLabel(iso(59 * 60_000), NOW), '59m ago');
-assert.equal(scanAgeLabel(iso(3 * 3600_000), NOW), '3h ago');
-assert.equal(scanAgeLabel(iso(23 * 3600_000), NOW), '23h ago');
-assert.equal(scanAgeLabel(iso(2 * 24 * 3600_000), NOW), '2d ago');
 
 console.log('scan freshness regression checks passed');

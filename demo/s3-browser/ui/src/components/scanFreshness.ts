@@ -34,19 +34,3 @@ export function isScanStale(
   return age !== null && age > ttlMs;
 }
 
-/**
- * Short human age label: "just now", "5m ago", "3h ago", "2d ago".
- * Returns '' for a missing/unparseable timestamp.
- */
-export function scanAgeLabel(completedAt: string | null | undefined, now: number = Date.now()): string {
-  const age = scanAgeMs(completedAt, now);
-  if (age === null) return '';
-  const sec = Math.floor(age / 1000);
-  if (sec < 45) return 'just now';
-  const min = Math.floor(sec / 60);
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  const days = Math.floor(hr / 24);
-  return `${days}d ago`;
-}
