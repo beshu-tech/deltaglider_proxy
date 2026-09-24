@@ -664,7 +664,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
             />
             <div>
               <Text style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--font-ui)', color: colors.TEXT_PRIMARY }}>
-                Delta compression: <span style={{ color: globalCompressionOn ? colors.ACCENT_GREEN : colors.ACCENT_AMBER }}>{globalCompressionOn ? 'ON' : 'OFF'}</span>
+                Delta compression: <span style={{ color: globalCompressionOn ? colors.ACCENT_GREEN : colors.TEXT_SECONDARY }}>{globalCompressionOn ? 'ON' : 'OFF'}</span>
                 <span style={{ fontWeight: 400, color: colors.TEXT_MUTED, marginLeft: 8, fontSize: 12 }}>applies immediately</span>
               </Text>
               <Text type="secondary" style={{ fontSize: 12, fontFamily: 'var(--font-ui)', display: 'block', marginTop: 2, lineHeight: 1.6 }}>
