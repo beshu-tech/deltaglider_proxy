@@ -2206,3 +2206,99 @@ async fn test_sigv2_query_cannot_borrow_another_users_identity() {
         "a SigV2 query signed by mallory must not act as boss"
     );
 }
+
+/// An admin session stops working the moment its user is disabled or loses
+/// admin rights. The session KIND is fixed at login; the gate re-checks the
+/// principal against the live IAM index on every admin request.
+#[tokio::test]
+async fn test_admin_session_ends_when_user_is_disabled_or_demoted() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let users_url = format!("{}/_/api/admin/users", server.endpoint());
+
+    let login = |creds: UserCreds| {
+        let endpoint = server.endpoint();
+        async move {
+            let jar = std::sync::Arc::new(reqwest::cookie::Jar::default());
+            let client = reqwest::Client::builder()
+                .cookie_provider(jar)
+                .build()
+                .unwrap();
+            let resp = client
+                .post(format!("{endpoint}/_/api/admin/login-as"))
+                .json(&json!({
+                    "access_key_id": creds.access_key_id,
+                    "secret_access_key": creds.secret_access_key,
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "login-as");
+            client
+        }
+    };
+
+    let before = get_iam_version(&admin, &server.endpoint()).await;
+    let ops = create_user(
+        &admin,
+        &server,
+        "ops",
+        vec![json!({"actions": ["*"], "resources": ["*"]})],
+    )
+    .await;
+    let ops2 = create_user(
+        &admin,
+        &server,
+        "ops2",
+        vec![json!({"actions": ["*"], "resources": ["*"]})],
+    )
+    .await;
+    wait_for_iam_rebuild(&admin, &server.endpoint(), before).await;
+    let ops_session = login(ops.clone()).await;
+    let ops2_session = login(ops2.clone()).await;
+    assert_eq!(
+        ops_session.get(&users_url).send().await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    // Disable ops.
+    let before = get_iam_version(&admin, &server.endpoint()).await;
+    let resp = admin
+        .put(format!("{users_url}/{}", ops.id))
+        .json(&json!({"enabled": false}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "disable: {}", resp.status());
+    wait_for_iam_rebuild(&admin, &server.endpoint(), before).await;
+    let backdoor = ops_session
+        .post(&users_url)
+        .json(&json!({"name": "backdoor", "permissions": [{"actions": ["*"], "resources": ["*"]}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        backdoor.status(),
+        StatusCode::FORBIDDEN,
+        "a disabled admin must lose the admin API"
+    );
+
+    // Demote ops2 to read-only.
+    let before = get_iam_version(&admin, &server.endpoint()).await;
+    let resp = admin
+        .put(format!("{users_url}/{}", ops2.id))
+        .json(&json!({"permissions": [{"actions": ["read"], "resources": ["*"]}]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "demote: {}", resp.status());
+    wait_for_iam_rebuild(&admin, &server.endpoint(), before).await;
+    assert_eq!(
+        ops2_session.get(&users_url).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "a demoted admin must lose the admin API"
+    );
+}
