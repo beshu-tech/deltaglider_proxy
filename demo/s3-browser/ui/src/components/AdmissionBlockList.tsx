@@ -34,7 +34,7 @@ import {
   arrayMove,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { Button, Tag, Tooltip, Typography } from 'antd';
+import { Button, Tag, Typography } from 'antd';
 import {
   DragOutlined,
   EditOutlined,
@@ -150,22 +150,21 @@ function SortableRow({ block, onEdit, onDelete }: RowProps) {
   return (
     <div ref={setNodeRef} style={style} aria-label={`block ${block.name}`}>
       {/* Drag handle */}
-      <Tooltip title="Drag to reorder" placement="left">
-        <button
-          {...attributes}
-          {...listeners}
-          aria-label="drag to reorder"
-          style={{
-            cursor: 'grab',
-            background: 'transparent',
-            border: 'none',
-            padding: 4,
-            color: TEXT_MUTED,
-          }}
-        >
-          <DragOutlined />
-        </button>
-      </Tooltip>
+      <button
+        {...attributes}
+        {...listeners}
+        title="Drag to reorder"
+        aria-label="drag to reorder"
+        style={{
+          cursor: 'grab',
+          background: 'transparent',
+          border: 'none',
+          padding: 4,
+          color: TEXT_MUTED,
+        }}
+      >
+        <DragOutlined />
+      </button>
 
       {/* Name + match summary */}
       <div style={{ minWidth: 0 }}>
@@ -193,27 +192,25 @@ function SortableRow({ block, onEdit, onDelete }: RowProps) {
       <span />
 
       {/* Edit */}
-      <Tooltip title="Edit this block" placement="top">
-        <Button
-          size="small"
-          type="text"
-          icon={<EditOutlined />}
-          onClick={onEdit}
-          aria-label={`edit ${block.name}`}
-        />
-      </Tooltip>
+      <Button
+        size="small"
+        type="text"
+        icon={<EditOutlined />}
+        onClick={onEdit}
+        title="Edit this block"
+        aria-label={`edit ${block.name}`}
+      />
 
       {/* Delete */}
-      <Tooltip title="Remove this block" placement="top">
-        <Button
-          size="small"
-          type="text"
-          danger
-          icon={<DeleteOutlined />}
-          onClick={onDelete}
-          aria-label={`delete ${block.name}`}
-        />
-      </Tooltip>
+      <Button
+        size="small"
+        type="text"
+        danger
+        icon={<DeleteOutlined />}
+        onClick={onDelete}
+        title="Remove this block"
+        aria-label={`delete ${block.name}`}
+      />
     </div>
   );
 }

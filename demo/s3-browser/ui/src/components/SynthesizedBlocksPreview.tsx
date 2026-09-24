@@ -11,7 +11,7 @@
  * at a glance, but the rows are locked and link to the Storage tab
  * where the source-of-truth lives.
  */
-import { Tag, Typography, Tooltip } from 'antd';
+import { Tag, Typography } from 'antd';
 import { LockOutlined, RightOutlined } from '@ant-design/icons';
 import type { AdminConfig } from '../adminApi';
 import { useColors } from '../ThemeContext';
@@ -86,9 +86,9 @@ export default function SynthesizedBlocksPreview({
           }}
           aria-label={`synthesised block ${row.name}`}
         >
-          <Tooltip title="Read-only — edit via Storage → Buckets" placement="left">
+          <span title="Read-only — edit via Storage → Buckets" style={{ display: 'inline-flex' }}>
             <LockOutlined style={{ color: TEXT_MUTED, fontSize: 14 }} />
-          </Tooltip>
+          </span>
           <div style={{ minWidth: 0 }}>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
               <Text
@@ -118,24 +118,23 @@ export default function SynthesizedBlocksPreview({
             </Text>
           </div>
           <span />
-          <Tooltip title="Edit this bucket's public prefixes in Storage">
-            <button
-              onClick={() => onEditInStorage(row.bucket)}
-              style={{
-                background: 'transparent',
-                border: 'none',
-                color: TEXT_MUTED,
-                cursor: 'pointer',
-                padding: 4,
-                display: 'flex',
-                alignItems: 'center',
-                gap: 4,
-                fontSize: 11,
-              }}
-            >
-              Storage <RightOutlined />
-            </button>
-          </Tooltip>
+          <button
+            title="Edit this bucket's public prefixes in Storage"
+            onClick={() => onEditInStorage(row.bucket)}
+            style={{
+              background: 'transparent',
+              border: 'none',
+              color: TEXT_MUTED,
+              cursor: 'pointer',
+              padding: 4,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 4,
+              fontSize: 11,
+            }}
+          >
+            Storage <RightOutlined />
+          </button>
         </div>
       ))}
     </div>
