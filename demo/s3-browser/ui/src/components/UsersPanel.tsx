@@ -265,7 +265,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
                 background: user.enabled ? colors.ACCENT_GREEN : colors.TEXT_MUTED,
                 flexShrink: 0,
               }} />
-              <Text strong style={{ fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, fontFamily: 'var(--font-ui)' }}>
+              <Text strong title={user.name} style={{ fontSize: 14, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1, fontFamily: 'var(--font-ui)' }}>
                 {user.name}
               </Text>
               {isExternal && (

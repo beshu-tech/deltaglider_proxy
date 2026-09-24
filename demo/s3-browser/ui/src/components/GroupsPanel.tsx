@@ -253,7 +253,7 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
         <>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <FolderOutlined style={{ color: colors.TEXT_MUTED, flexShrink: 0 }} />
-            <Text strong style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
+            <Text strong title={group.name} style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
               {group.name}
             </Text>
             {!readOnly && (
