@@ -1,13 +1,16 @@
 import { useState, useEffect, useRef } from 'react';
-import { Layout, Button, Typography, Drawer, theme, message, Modal } from 'antd';
+import { Layout, Button, Typography, Drawer, Dropdown, theme, message, Modal } from 'antd';
+import type { MenuProps } from 'antd';
 import {
   PlusOutlined,
   DeleteOutlined,
+  EllipsisOutlined,
   UploadOutlined,
   ExclamationCircleOutlined,
 } from '@ant-design/icons';
 import {
   abortAllMultipartUploads,
+  countBucketObjects,
   countMultipartUploads,
   deleteBucket,
   getBucket,
@@ -18,6 +21,7 @@ import {
 import type { BucketInfo } from '../types';
 import { useColors } from '../ThemeContext';
 import BucketBackendBadge from './BucketBackendBadge';
+import { showBackendChips } from '../bucketBackend';
 import CreateBucketModal from './CreateBucketModal';
 
 const { Sider } = Layout;
@@ -33,6 +37,20 @@ function formatBuildTime(iso: string): string {
   } catch {
     return iso;
   }
+}
+
+type BucketObjectCount =
+  | { state: 'checking' }
+  | { state: 'known'; count: number; truncated: boolean }
+  | { state: 'error' };
+
+/** The row menu's Delete entry: its label, and whether it can be used. */
+function deleteMenuEntry(probe: BucketObjectCount | undefined): { label: string; disabled: boolean } {
+  if (!probe || probe.state === 'checking') return { label: 'Delete bucket (checking contents…)', disabled: true };
+  if (probe.state === 'error') return { label: 'Delete bucket…', disabled: false };
+  if (probe.count === 0) return { label: 'Delete bucket…', disabled: false };
+  const n = probe.truncated ? `${probe.count}+` : String(probe.count);
+  return { label: `Delete bucket (not empty: ${n} object${n === '1' ? '' : 's'})`, disabled: true };
 }
 
 /* Shared inline style constants for sidebar menu items */
@@ -89,6 +107,9 @@ export default function Sidebar({
   const [createBucketOpen, setCreateBucketOpen] = useState(false);
   const [deletingBucketName, setDeletingBucketName] = useState<string | null>(null);
   const deleteConfirmOpenRef = useRef(false);
+  // Object count per bucket, probed when its row menu opens: Delete is only
+  // offered for an empty bucket, because S3 refuses to delete any other.
+  const [objectCounts, setObjectCounts] = useState<Record<string, BucketObjectCount>>({});
   const { token } = theme.useToken();
   const [messageApi, contextHolder] = message.useMessage();
 
@@ -260,7 +281,7 @@ export default function Sidebar({
     Modal.confirm({
       title: `Delete bucket "${name}"?`,
       icon: <ExclamationCircleOutlined />,
-      content: 'Bucket must be empty. This removes the bucket itself.',
+      content: 'The bucket is empty. Deleting it cannot be undone.',
       okText: 'Delete',
       okButtonProps: { danger: true },
       cancelText: 'Cancel',
@@ -271,12 +292,45 @@ export default function Sidebar({
     });
   };
 
+  const probeBucketContents = (name: string) => {
+    setObjectCounts((prev) => ({ ...prev, [name]: { state: 'checking' } }));
+    countBucketObjects(name)
+      .then(({ count, truncated }) =>
+        setObjectCounts((prev) => ({ ...prev, [name]: { state: 'known', count, truncated } })))
+      // A failed probe must not block the operator: offer Delete, and the
+      // server's answer (BucketNotEmpty and so on) still shows in a message.
+      .catch(() => setObjectCounts((prev) => ({ ...prev, [name]: { state: 'error' } })));
+  };
+
+  const bucketMenu = (name: string): MenuProps => {
+    const entry = deleteMenuEntry(objectCounts[name]);
+    return {
+      items: [
+        {
+          key: 'delete',
+          danger: !entry.disabled,
+          disabled: entry.disabled,
+          icon: <DeleteOutlined />,
+          label: entry.label,
+          title: entry.disabled && objectCounts[name]?.state === 'known'
+            ? 'Only an empty bucket can be deleted. Delete or move its objects first.'
+            : undefined,
+        },
+      ],
+      onClick: ({ key, domEvent }) => {
+        domEvent.stopPropagation();
+        if (key === 'delete') confirmDeleteBucket(name);
+      },
+    };
+  };
+
   const handleSelectBucket = (name: string) => {
     setBucket(name);
     onBucketChange(name);
   };
 
   const activeBucket = getBucket();
+  const backendChips = canAdmin && showBackendChips(buckets.map((b) => b.backend));
   const menuItemStyle: React.CSSProperties = {
     gap: 10,
     padding: '8px 6px',
@@ -372,7 +426,7 @@ export default function Sidebar({
                   if (b.name !== activeBucket) e.currentTarget.style.background = 'transparent';
                 }}
               >
-                <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, overflow: 'hidden' }}>
                   <span style={{
                     fontFamily: "var(--font-mono)",
                     fontSize: 13,
@@ -381,8 +435,10 @@ export default function Sidebar({
                     textOverflow: 'ellipsis',
                     whiteSpace: 'nowrap',
                     display: 'block',
-                    minWidth: 0,
-                    flex: 1,
+                    // The name keeps its full width; the backend chip beside it
+                    // gives way (and is clipped) first.
+                    flex: 'none',
+                    maxWidth: '100%',
                   }}>
                     {b.name}
                   </span>
@@ -399,27 +455,28 @@ export default function Sidebar({
                       Unavailable
                     </span>
                   )}
-                  {canAdmin && <BucketBackendBadge origin={b.backend} />}
+                  {backendChips && <BucketBackendBadge origin={b.backend} />}
                 </span>
               </button>
               {!isUnavailable && canDeleteBucket(b.name) && (
-                <Button
-                  type="text"
-                  size="small"
-                  danger
-                  icon={<DeleteOutlined />}
-                  aria-label={`Delete bucket ${b.name}`}
-                  title={`Delete bucket ${b.name}`}
-                  loading={deletingBucketName === b.name}
-                  disabled={deletingBucketName !== null}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    confirmDeleteBucket(b.name);
-                  }}
-                  style={{ opacity: b.name === activeBucket ? 0.75 : 0.4, fontSize: 12, flexShrink: 0, transition: 'opacity 0.15s' }}
-                  onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = '1'; }}
-                  onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = b.name === activeBucket ? '0.75' : '0.4'; }}
-                />
+                <Dropdown
+                  menu={bucketMenu(b.name)}
+                  trigger={['click']}
+                  placement="bottomRight"
+                  onOpenChange={(isOpen) => { if (isOpen) probeBucketContents(b.name); }}
+                >
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<EllipsisOutlined />}
+                    aria-label={`Actions for bucket ${b.name}`}
+                    title="Bucket actions"
+                    loading={deletingBucketName === b.name}
+                    disabled={deletingBucketName !== null}
+                    onClick={(e) => e.stopPropagation()}
+                    style={{ color: TEXT_MUTED, flexShrink: 0 }}
+                  />
+                </Dropdown>
               )}
             </li>
             );
