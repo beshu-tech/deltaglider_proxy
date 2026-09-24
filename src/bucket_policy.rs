@@ -17,12 +17,15 @@ pub struct BucketPolicyConfig {
     /// Enable/disable delta compression for this bucket.
     /// When `false`, all files in this bucket are stored as passthrough
     /// regardless of file type or size.
-    #[serde(default)]
+    // Omitted when unset, like every other override: persisting and
+    // exporting used to write `compression: null` / `max_delta_ratio: null`
+    // into every bucket of the operator's YAML.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<bool>,
 
     /// Override the global `max_delta_ratio` for this bucket.
     /// Delta is kept only if `delta_size / original_size < ratio`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_delta_ratio: Option<f32>,
 
     /// Route this bucket to a specific named backend.
@@ -550,6 +553,18 @@ pub type SharedPublicPrefixSnapshot = std::sync::Arc<arc_swap::ArcSwap<PublicPre
 
 #[cfg(test)]
 mod tests {
+    /// Unset overrides stay out of the persisted YAML (they were written as
+    /// `compression: null` / `max_delta_ratio: null` for every bucket).
+    #[test]
+    fn unset_overrides_are_not_serialized() {
+        let yaml = serde_yaml::to_string(&BucketPolicyConfig {
+            backend: Some("local-disk".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(yaml.trim(), "backend: local-disk");
+    }
+
     use super::*;
 
     #[test]
