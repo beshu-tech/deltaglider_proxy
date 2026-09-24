@@ -45,7 +45,7 @@ export interface AdminRouteContext {
 interface AdminRoute {
   /** Render the page body. */
   render: (ctx: AdminRouteContext) => ReactNode;
-  /** False for pages that carry their own title (dashboard toolbar, wizard hero). */
+  /** False for pages that carry their own title (the setup wizard's hero). */
   header?: false;
 }
 
@@ -61,10 +61,9 @@ const ADMIN_ROUTES: Record<string, AdminRoute> = {
       />
     ),
   },
-  // MetricsPage's toolbar already carries title + live indicator + tab
-  // switcher + refresh controls; an outer header would duplicate it.
+  // The shared page header carries the title, like every other admin page;
+  // MetricsPage (embedded) drops its own title and keeps only its controls.
   'dashboard': {
-    header: false,
     render: (c) => <MetricsPage onBack={c.onBack} embedded search={c.search} proxyVersion={c.proxyVersion} />,
   },
   'diagnostics/trace': {

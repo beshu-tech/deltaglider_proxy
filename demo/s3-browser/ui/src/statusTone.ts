@@ -31,3 +31,16 @@ export function eventStatusTone(status: string, attempts: number): Tone {
       return attempts > 0 ? 'warning' : 'default';
   }
 }
+
+/**
+ * Severity of the dashboard error rate. Only server errors (5xx) count:
+ * S3 clients answer many requests with a 4xx as a normal step (a HEAD before
+ * a PUT answers 404), so client errors alone never turn the card amber or red.
+ */
+export function serverErrorSeverity(count5xx: number, total: number): 'good' | 'warn' | 'bad' {
+  if (total <= 0) return 'good';
+  const share = count5xx / total;
+  if (share > 0.05) return 'bad';
+  if (share > 0.01) return 'warn';
+  return 'good';
+}

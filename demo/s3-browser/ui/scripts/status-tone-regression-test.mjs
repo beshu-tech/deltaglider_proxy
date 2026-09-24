@@ -7,7 +7,7 @@ const { outputText } = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ES2020, target: ts.ScriptTarget.ES2020 },
   fileName: 'statusTone.ts',
 });
-const { countTone, eventStatusTone } = await import(
+const { countTone, eventStatusTone, serverErrorSeverity } = await import(
   `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`
 );
 
@@ -24,6 +24,13 @@ assert.equal(eventStatusTone('delivered', 1), 'success');
 assert.equal(eventStatusTone('in_progress', 0), 'processing');
 assert.equal(eventStatusTone('pending', 0), 'default');
 assert.equal(eventStatusTone('pending', 3), 'warning');
+
+// Dashboard error rate: 4xx alone (HEAD-before-PUT 404s) never alarms.
+assert.equal(serverErrorSeverity(0, 534), 'good');
+assert.equal(serverErrorSeverity(0, 0), 'good');
+assert.equal(serverErrorSeverity(3, 100), 'warn');
+assert.equal(serverErrorSeverity(6, 100), 'bad');
+assert.equal(serverErrorSeverity(1, 100), 'good');
 
 // Source guard: the event log counters go through countTone, so a zero
 // count can never render as an alarm again.
