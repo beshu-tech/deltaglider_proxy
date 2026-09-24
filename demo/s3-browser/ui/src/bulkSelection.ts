@@ -57,3 +57,18 @@ export async function expandSelection(
   }
   return Array.from(seen, ([source, relative]) => ({ source, relative }));
 }
+
+/**
+ * The bulk-delete confirmation text. Deleting used to fire on the first click
+ * with no confirmation at all — a selected folder took everything under it.
+ */
+export function bulkDeleteConfirmText(selectedCount: number, folderCount: number): string {
+  const items = `${selectedCount} selected ${selectedCount === 1 ? 'item' : 'items'}`;
+  const folders =
+    folderCount === 0
+      ? ''
+      : folderCount === selectedCount
+        ? ` ${folderCount === 1 ? 'It is a folder' : 'They are folders'}: everything inside is deleted too.`
+        : ` ${folderCount} of them ${folderCount === 1 ? 'is a folder' : 'are folders'}: everything inside is deleted too.`;
+  return `Delete ${items}?${folders} This cannot be undone.`;
+}

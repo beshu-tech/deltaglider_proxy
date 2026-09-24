@@ -1,14 +1,17 @@
 import { useState, useCallback } from 'react';
-import { Button, message } from 'antd';
+import { Button, Modal, message } from 'antd';
 import { DeleteOutlined, CopyOutlined, ScissorOutlined, DownloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { pluralize } from '../utils';
 import DestinationPickerModal from './DestinationPickerModal';
 import { normalizeUiError } from '../errorHandling';
 import { useBackClosesModal } from '../hooks/useOverlayClose';
+import { bulkDeleteConfirmText } from '../bulkSelection';
 
 interface Props {
   selectedCount: number;
+  /** How many of the selected entries are folders (named in the delete confirm). */
+  selectedFolderCount?: number;
   onDelete?: () => void;
   onCopy?: (destBucket: string, destPrefix: string) => Promise<{ succeeded: number; failed: number }>;
   onMove?: (destBucket: string, destPrefix: string) => Promise<{ succeeded: number; failed: number }>;
@@ -18,7 +21,7 @@ interface Props {
   hint?: string;
 }
 
-export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove, onDownloadZip, deleting, hint }: Props) {
+export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, onDelete, onCopy, onMove, onDownloadZip, deleting, hint }: Props) {
   const colors = useColors();
   const [modal, setModal] = useState<'copy' | 'move' | null>(null);
   const [operating, setOperating] = useState(false);
@@ -126,7 +129,15 @@ export default function BulkActionBar({ selectedCount, onDelete, onCopy, onMove,
             danger
             size="small"
             icon={<DeleteOutlined />}
-            onClick={onDelete}
+            onClick={() =>
+              Modal.confirm({
+                title: 'Delete permanently?',
+                content: bulkDeleteConfirmText(selectedCount, selectedFolderCount),
+                okText: 'Delete',
+                okButtonProps: { danger: true },
+                onOk: () => onDelete?.(),
+              })
+            }
             loading={deleting}
             disabled={busy}
             aria-label={`Delete ${selectedCount} selected items`}
