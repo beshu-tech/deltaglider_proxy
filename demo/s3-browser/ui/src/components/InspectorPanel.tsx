@@ -12,6 +12,7 @@ import { getPreviewMode } from './filePreviewMode';
 import { useAdminConfig } from '../queries/config';
 import { useOnClickOutside } from '../useDocumentEvent';
 import { useBackClosesModal } from '../hooks/useOverlayClose';
+import { useCopyToClipboard } from '../useCopyToClipboard';
 
 const SHARE_DURATIONS = [
   { label: '1 hour', seconds: 3600 },
@@ -242,6 +243,7 @@ export default function InspectorPanel({
   >(null);
   const blobRef = useRef<{ blob: Blob; name: string } | null>(null);
   const [shareDuration, setShareDuration] = useState<number | null>(null);
+  const { copy: copyToClipboard } = useCopyToClipboard();
   const objectKey = object?.key;
   const cachedHead = objectKey ? headCache?.[objectKey] : undefined;
 
@@ -437,10 +439,12 @@ export default function InspectorPanel({
     }
   };
 
-  const handleCopyUrl = async () => {
+  // Via the shared hook: on plain HTTP (no Clipboard API) or a denied write it
+  // shows an error instead of an unhandled rejection; the link stays visible
+  // in the modal for a manual copy.
+  const handleCopyUrl = () => {
     if (modalState?.mode === 'share' && modalState.url) {
-      await navigator.clipboard.writeText(modalState.url);
-      messageApi.success('Link copied');
+      void copyToClipboard(modalState.url, { successMessage: 'Link copied' });
     }
   };
 
