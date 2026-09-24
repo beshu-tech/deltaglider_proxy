@@ -12,6 +12,16 @@
   font-size: 13px;
 }
 
+/* A container query never restyles its own container, so the narrow-mode
+   `.dg-record-list { grid-template-columns: 1fr }` below never applied: the
+   list kept its wide tracks and the cards overflowed a phone screen. The
+   list's PARENT is therefore a same-named container too; the list's own rule
+   now matches against the parent's (equal) width. */
+:has(> .dg-record-list) {
+  container-type: inline-size;
+  container-name: recordlist;
+}
+
 /* Header + each row are real elements spanning all columns, inheriting the
    list's tracks via subgrid → cells align across rows on a wide container.
    The SEPARATOR lives on the row (one unbroken line), NOT on each cell — a
