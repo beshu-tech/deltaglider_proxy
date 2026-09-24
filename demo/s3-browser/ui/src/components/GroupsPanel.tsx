@@ -17,6 +17,8 @@ import { normalizeUiError } from '../errorHandling';
 import { useNavigation } from '../NavigationContext';
 import { buildViewUrl, parseAdminQuery } from '../urlState';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
+import { IAM_DIRTY_KEYS, confirmDiscardEdits, useDirtyFlag, useFormBaseline } from '../useDirtyFlag';
+import { useApplyHandler } from '../useDirtySection';
 
 const { Text, Title } = Typography;
 
@@ -111,12 +113,15 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   );
 
   const handleSelect = (group: IamGroup) => {
+    if (group.id === selectedId && !creating) return;
+    if (!confirmDiscardEdits(IAM_DIRTY_KEYS.groups)) return;
     setCreating(false);
     setSelectedId(group.id);
     writeSelectionUrl(group.id);
   };
 
   const handleCreate = () => {
+    if (!confirmDiscardEdits(IAM_DIRTY_KEYS.groups)) return;
     setSelectedId(null);
     setCreating(true);
     writeSelectionUrl(null);
@@ -149,6 +154,8 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   };
 
   const handleClone = async (group: IamGroup) => {
+    // The clone becomes the selection, which unmounts the open form.
+    if (!confirmDiscardEdits(IAM_DIRTY_KEYS.groups)) return;
     const copyMembers = group.member_ids.length > 0
       ? window.confirm(`Copy ${group.member_ids.length} member${group.member_ids.length !== 1 ? 's' : ''} into the duplicated group?`)
       : false;
@@ -171,7 +178,7 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
       group={null}
       users={users}
       onSaved={handleSaved}
-      onCancel={() => setCreating(false)}
+      onCancel={() => { if (confirmDiscardEdits(IAM_DIRTY_KEYS.groups)) setCreating(false); }}
       onSavingChange={onSavingChange}
     />
   ) : selectedGroup ? (
@@ -347,6 +354,12 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
   const setSaving = (v: boolean) => { setSavingState(v); onSavingChange?.(v); };
   const setDeleting = (v: boolean) => { setDeletingState(v); onSavingChange?.(v); };
 
+  // Unsaved-edit tracking on the wire shape (see UserForm).
+  const { isDirty, markClean } = useFormBaseline({
+    name, description, permissions: rowsToPermissions(permissions), memberIds: [...memberIds].sort((a, b) => a - b),
+  });
+  useDirtyFlag(IAM_DIRTY_KEYS.groups, isDirty && !readOnly);
+
   const handleSave = async () => {
     if (!name.trim()) { setError('Name is required'); return; }
     setSaving(true);
@@ -374,6 +387,7 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
             await removeMemberMutation.mutateAsync({ groupId: group.id, userId: uid });
           }
         }
+        markClean();
       } else {
         const created = await createGroupMutation.mutateAsync({
           name: name.trim(),
@@ -407,6 +421,8 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
       setDeleting(false);
     }
   };
+
+  useApplyHandler(IAM_DIRTY_KEYS.groups, () => { if (!saving) void handleSave(); }, isDirty && !readOnly);
 
   const toggleMember = (userId: number) => {
     setMemberIds(prev => {

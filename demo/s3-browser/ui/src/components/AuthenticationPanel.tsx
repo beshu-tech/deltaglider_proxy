@@ -19,6 +19,8 @@ import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
 import { normalizeUiError } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
+import { IAM_DIRTY_KEYS, confirmDiscardEdits, useDirtyFlag, useFormBaseline } from '../useDirtyFlag';
+import { useApplyHandler } from '../useDirtySection';
 
 const { Text } = Typography;
 
@@ -74,6 +76,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   const [pendingRules, setPendingRules] = useState<Record<number, Partial<typeof rules[number]>>>({});
   const [rulesSaving, setRulesSaving] = useState(false);
   const rulesDirty = Object.keys(pendingRules).length > 0;
+  useDirtyFlag(IAM_DIRTY_KEYS.mappingRules, rulesDirty && !readOnly);
   // The rule rows render the server snapshot with any pending local edits merged
   // on top (keyed by stable rule id — never array index).
   const mergedRules = rules.map(r => (pendingRules[r.id] ? { ...r, ...pendingRules[r.id] } : r));
@@ -152,6 +155,19 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
     setPendingRules({});
   };
 
+  const saveRules = async () => {
+    setRulesSaving(true);
+    try {
+      await flushPendingRules();
+      message.success('Mapping rules saved');
+    } catch (e) {
+      message.error(normalizeUiError(e, 'Save failed'));
+    } finally {
+      setRulesSaving(false);
+    }
+  };
+  useApplyHandler(IAM_DIRTY_KEYS.mappingRules, () => { if (!rulesSaving) void saveRules(); }, rulesDirty && !readOnly);
+
   const callbackUrl = `${window.location.origin}/_/api/admin/oauth/callback`;
 
   const label = useFormLabelStyle();
@@ -170,14 +186,21 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
         {/* Left: provider list — stacks above the detail when the row wraps. */}
         <div style={{ width: 220, flexShrink: 0, flexGrow: 1, maxWidth: '100%' }}>
           {!readOnly && (
-            <Button icon={<PlusOutlined />} block size="small" onClick={() => { setCreating(true); setSelectedProviderId(null); }} style={{ marginBottom: 8 }}>
+            <Button icon={<PlusOutlined />} block size="small" onClick={() => {
+              if (!confirmDiscardEdits(IAM_DIRTY_KEYS.providers)) return;
+              setCreating(true); setSelectedProviderId(null);
+            }} style={{ marginBottom: 8 }}>
               New Provider
             </Button>
           )}
           {providers.map(p => (
             <div
               key={p.id}
-              onClick={() => { setSelectedProviderId(p.id); setCreating(false); }}
+              onClick={() => {
+                if (p.id === selectedProviderId && !creating) return;
+                if (!confirmDiscardEdits(IAM_DIRTY_KEYS.providers)) return;
+                setSelectedProviderId(p.id); setCreating(false);
+              }}
               style={{
                 padding: '10px 12px', cursor: 'pointer', borderRadius: 8,
                 border: `1px solid ${selectedProviderId === p.id ? colors.ACCENT_BLUE : colors.BORDER}`,
@@ -313,17 +336,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
         <Button
           type="primary"
           loading={rulesSaving}
-          onClick={async () => {
-            setRulesSaving(true);
-            try {
-              await flushPendingRules();
-              message.success('Mapping rules saved');
-            } catch (e) {
-              message.error(normalizeUiError(e, 'Save failed'));
-            } finally {
-              setRulesSaving(false);
-            }
-          }}
+          onClick={saveRules}
           style={{ borderRadius: 8, fontWeight: 600, marginBottom: 16 }}
           block
         >
@@ -445,6 +458,12 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
   const [testResult, setTestResult] = useState<ProviderTestResult | null>(null);
   const [testing, setTesting] = useState(false);
 
+  const { isDirty, markClean } = useFormBaseline({
+    formName, formDisplayName, formIssuerUrl, formClientId, formClientSecret, formScopes, formEnabled,
+  });
+  useDirtyFlag(IAM_DIRTY_KEYS.providers, isDirty && !readOnly);
+  const canSave = Boolean(formName && formClientId && formIssuerUrl);
+
   const handleSave = async () => {
     setSaving(true);
     try {
@@ -473,6 +492,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
         await updateMutation.mutateAsync({ id: provider.id, patch });
         message.success('Provider updated');
       }
+      markClean();
       onSaved();
     } catch (e) {
       message.error(normalizeUiError(e, 'Save failed'));
@@ -480,6 +500,8 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
       setSaving(false);
     }
   };
+
+  useApplyHandler(IAM_DIRTY_KEYS.providers, () => { if (!saving && canSave) void handleSave(); }, isDirty && !readOnly);
 
   const handleDelete = async () => {
     if (!provider) return;
@@ -563,7 +585,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
             type="primary"
             onClick={handleSave}
             loading={saving}
-            disabled={!formName || !formClientId || !formIssuerUrl}
+            disabled={!canSave}
           >
             {isEdit ? 'Save' : 'Create'}
           </Button>

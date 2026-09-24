@@ -17,6 +17,7 @@ import { normalizeUiError } from '../errorHandling';
 import { useNavigation } from '../NavigationContext';
 import { buildViewUrl, parseAdminQuery } from '../urlState';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
+import { IAM_DIRTY_KEYS, confirmDiscardEdits } from '../useDirtyFlag';
 
 const { Text } = Typography;
 
@@ -95,6 +96,8 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   );
 
   const handleSelect = (user: IamUser) => {
+    if (user.id === selectedId && !creating) return;
+    if (!confirmDiscardEdits(IAM_DIRTY_KEYS.users)) return;
     setCreating(false);
     setSelectedId(user.id);
     setNewCreds(null);
@@ -102,6 +105,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   };
 
   const handleCreate = () => {
+    if (!confirmDiscardEdits(IAM_DIRTY_KEYS.users)) return;
     setSelectedId(null);
     setCreating(true);
     setNewCreds(null);
@@ -125,6 +129,8 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   };
 
   const handleClone = async (user: IamUser) => {
+    // The clone becomes the selection, which unmounts the open form.
+    if (!confirmDiscardEdits(IAM_DIRTY_KEYS.users)) return;
     onSavingChange?.(true);
     setNewCreds(null);
     try {
@@ -169,7 +175,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
           user={null}
           onSaved={handleSaved}
           onCreated={handleCreated}
-          onCancel={() => setCreating(false)}
+          onCancel={() => { if (confirmDiscardEdits(IAM_DIRTY_KEYS.users)) setCreating(false); }}
           onSavingChange={onSavingChange}
           onNavigateToGroup={onNavigateToGroup}
         />

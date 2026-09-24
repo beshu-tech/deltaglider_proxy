@@ -20,6 +20,8 @@ import {
 import CredentialsBanner from './CredentialsBanner';
 import { generateId, generateSecret } from '../credentialGeneration';
 import { normalizeUiError } from '../errorHandling';
+import { IAM_DIRTY_KEYS, useDirtyFlag, useFormBaseline } from '../useDirtyFlag';
+import { useApplyHandler } from '../useDirtySection';
 
 const { Text, Title } = Typography;
 
@@ -86,6 +88,12 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
   const setSaving = (v: boolean) => { setSavingState(v); onSavingChange?.(v); };
   const setDeleting = (v: boolean) => { setDeletingState(v); onSavingChange?.(v); };
 
+  // Unsaved-edit tracking: compare the wire shape (rowsToPermissions drops the
+  // per-row UI ids and blank rows) so only a real change lights the dot.
+  const { isDirty, markClean } = useFormBaseline({
+    name, accessKeyId, secretKey, enabled, permissions: rowsToPermissions(permissions),
+  });
+  useDirtyFlag(IAM_DIRTY_KEYS.users, isDirty && !readOnly);
 
   const handleSave = async () => {
     if (!name.trim()) { setError('Name is required'); return; }
@@ -116,6 +124,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
           }
           setSavedCredentials({ ak: rotated.access_key_id, sk: rotated.secret_access_key ?? '' });
         }
+        markClean();
         onSaved();
       } else {
         const req: CreateUserRequest = {
@@ -126,6 +135,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
           ...(secretKey.trim() ? { secret_access_key: secretKey.trim() } : {}),
         };
         const created = await createUserMutation.mutateAsync(req);
+        markClean();
         onSaved();
         onCreated?.(created.access_key_id, created.secret_access_key ?? '');
       }
@@ -153,6 +163,14 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
     (accessKeyId.trim() && accessKeyId.trim() !== user?.access_key_id) ||
     secretKey.trim().length > 0
   );
+
+  // One entry point for the Save button and ⌘S: key changes need a confirm
+  // because the new secret is shown only once.
+  const submit = async () => {
+    if (hasKeyChanges && !window.confirm('Update credentials? The new secret will be shown once — make sure to save it.')) return;
+    await handleSave();
+  };
+  useApplyHandler(IAM_DIRTY_KEYS.users, () => { if (!saving) void submit(); }, isDirty && !readOnly);
 
   return (
     <div style={{ padding: '24px 28px', maxWidth: 600, overflow: 'auto', height: '100%' }}>
@@ -317,14 +335,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
             )}
             {!isEdit && onCancel && <Button onClick={onCancel}>Cancel</Button>}
           </div>
-          {hasKeyChanges ? (
-            <Button data-testid="user-save" aria-label={isEdit ? 'Save user' : 'Create user'} type="primary" loading={saving} onClick={async () => {
-              if (!window.confirm('Update credentials? The new secret will be shown once — make sure to save it.')) return;
-              await handleSave();
-            }}>{isEdit ? 'Save' : 'Create User'}</Button>
-          ) : (
-            <Button data-testid="user-save" aria-label={isEdit ? 'Save user' : 'Create user'} type="primary" onClick={handleSave} loading={saving}>{isEdit ? 'Save' : 'Create User'}</Button>
-          )}
+          <Button data-testid="user-save" aria-label={isEdit ? 'Save user' : 'Create user'} type="primary" onClick={submit} loading={saving}>{isEdit ? 'Save' : 'Create User'}</Button>
         </div>
       )}
     </div>
