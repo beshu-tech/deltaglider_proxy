@@ -135,6 +135,30 @@ promptly.
   request.
 - User names that start with `$` are reserved for built-in principals. The
   admin API, backup import and OAuth provisioning now refuse or strip them.
+- On the filesystem backend, a key with a `.` segment or an empty segment (for
+  example `a/./secret.txt` or `a//secret.txt`) is now refused with HTTP 400.
+  The filesystem resolves such a key to the file of `a/secret.txt`, while the
+  policy check saw the literal key, so a Deny on `a/secret*` did not apply.
+  The S3 backend stores keys literally and is not affected.
+- The admin log stream and the bucket scan stream now end within about one
+  second when their session stops being an admin session. Before this fix, a
+  disabled or demoted admin, or a revoked session, kept receiving every server
+  log line until it disconnected.
+- User names are now unique. Before this fix, an OAuth or OIDC user could pick
+  an identity-provider name equal to another user's name and so share that
+  user's `${iam:username}` prefix. OAuth provisioning now adds a suffix to a
+  name that is in use (`dana-2`), and the admin API answers HTTP 409 to a
+  create, clone or rename that would duplicate a name. The database upgrade
+  renames the newer user of each existing same-name pair and logs a warning.
+
+### Fixed — Replication run-now and the event consumer use the shared lease
+
+With a coordination bucket configured, the replication scheduler took its
+per-rule lease in the bucket, but the event consumer and the admin run-now took
+a lease in the node-local database. So they did not exclude each other: a
+reconcile run could delete, as an orphan, a copy that the consumer made during
+the run. All three now take the same lease. A single instance keeps the
+node-local lease, as before.
 
 ### Changed — `${iam:username}` matches names that contain punctuation
 

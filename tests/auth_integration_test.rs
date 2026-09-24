@@ -2640,6 +2640,54 @@ async fn test_admin_log_stream_ends_when_admin_is_disabled() {
     );
 }
 
+/// User names are unique, because `${iam:username}` expands to the name: a
+/// create, clone or rename onto a name in use is refused with 409.
+#[tokio::test]
+async fn test_duplicate_user_names_are_refused() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let users_url = format!("{}/_/api/admin/users", server.endpoint());
+    let dana = create_user(&admin, &server, "dana", vec![]).await;
+    let other = create_user(&admin, &server, "other", vec![]).await;
+
+    let resp = admin
+        .post(&users_url)
+        .json(&json!({"name": "dana", "permissions": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "create");
+    let resp = admin
+        .put(format!("{users_url}/{}", other.id))
+        .json(&json!({"name": "dana"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "rename");
+    let resp = admin
+        .post(format!("{users_url}/{}/clone", other.id))
+        .json(&json!({"name": "dana"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT, "clone");
+    // Unchanged name on update is fine.
+    let resp = admin
+        .put(format!("{users_url}/{}", dana.id))
+        .json(&json!({"name": "dana", "enabled": true}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "same-name update: {}",
+        resp.status()
+    );
+}
+
 /// `$`-prefixed names are reserved: a rename to one is refused. A row that
 /// already carries such a name stays editable when the name is unchanged.
 #[tokio::test]

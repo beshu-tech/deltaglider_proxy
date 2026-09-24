@@ -117,7 +117,7 @@ The full-IAM export (`GET /_/api/admin/config/declarative-iam-export?include_sec
 - The export emits an `external_identities` list — user and provider referenced **by name**, plus the IdP `subject`, email, and claims. The import upserts each binding keyed on `(provider, subject)`, the exact pair the OAuth callback looks up, so a recovered database re-links the binding to the freshly created user row instead of letting the next login provision a duplicate user.
 - Bindings are never deleted by the reconciler. An `external_identities` list that is absent (hand-authored YAML, or a redacted export — `include_secrets=false` drops the bindings because `raw_claims` can carry IdP personal data) means "leave the database alone", never "delete the missing rows".
 - The main config file rejects `access.external_identities` outright — that file never manages OAuth bindings, and silently dropping them from a pasted full-IAM export would be a data-loss trap.
-- The export refuses (HTTP 409) when two users share a name. The reconciler keys users by name, and the database allows a same-name local/external pair (only `access_key_id` is unique). Such a pair cannot round-trip through YAML. For a database in that state, use the admin backup (`POST /_/api/admin/backup`), which handles external identities by database id, or rename one of the users.
+- User names are unique in the database, so every user maps to exactly one YAML entry. The reconciler keys users by name. As a safety check, the export refuses with HTTP 409 when it finds two users with one name, because such a pair cannot round-trip through YAML.
 
 ## Secrets in exports
 

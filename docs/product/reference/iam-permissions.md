@@ -77,6 +77,8 @@ Template facts:
 - Templates are stored raw in the DB/YAML and expanded when the in-memory IAM index is built, after group permissions are merged into each member user.
 - Identity values are inserted as they are, because the proxy compares policies against the decoded object key. The user `dana@corp.com` therefore matches the key `home/dana@corp.com/report.pdf`. A value that contains `/`, `*`, `?`, `$`, `{`, `}` or `%` cannot be inserted safely, because it would add a path level or a wildcard. When a user's name or access key contains one of these characters and one of the user's effective permissions uses the matching template, the proxy gives that user no permissions at all and logs a warning.
 - Unknown templates are rejected by user/group API validation and by declarative IAM apply.
+- User names are unique, so `${iam:username}` gives each user a prefix that no other user shares. The admin API refuses to create a user, clone a user, or rename a user to a name that another user already has, and answers with HTTP 409. When an OAuth or OIDC login creates a new user, the proxy takes the name from the identity provider. Many identity providers let their users change that name, so the proxy adds a suffix when the name is already in use: a second `dana` becomes `dana-2`. A backup import skips a user whose name is already in use.
+- When the proxy upgrades a database that already holds two users with the same name, it keeps the name of the older user and renames each newer user with the same suffix rule. It logs a warning for each rename. A renamed user's `${iam:username}` prefix changes with the name.
 
 Example — a per-user home prefix in `db-archive`, shared via the `Engineering` group:
 

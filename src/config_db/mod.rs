@@ -9,7 +9,7 @@
 use crate::iam::{IamUser, Permission};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Encrypted configuration database (SQLCipher).
 pub struct ConfigDb {
@@ -25,7 +25,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 24;
+const SCHEMA_VERSION: i32 = 25;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -806,6 +806,28 @@ impl ConfigDb {
             )?;
             info!(
                 "Migrated config DB schema from v{} to v24 (reconstructed run stat)",
+                version
+            );
+        }
+
+        if version < 25 {
+            // v25: unique user names. `${iam:username}` expands to the name, so
+            // two users with one name shared one prefix — and an OAuth user
+            // could pick another user's name at the identity provider. Rename
+            // the newer user of each same-name pair, then enforce uniqueness.
+            // One transaction: a crash leaves either nothing or both done.
+            let tx = conn.unchecked_transaction()?;
+            for (id, old, new) in users::dedupe_user_names(&tx)? {
+                warn!(
+                    "Config DB v25: user id={id} renamed from '{old}' to '{new}' — another \
+                     user already had that name, and user names are now unique. Its \
+                     ${{iam:username}} prefix changes with the name."
+                );
+            }
+            tx.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name ON users(name);")?;
+            tx.commit()?;
+            info!(
+                "Migrated config DB schema from v{} to v25 (unique user names)",
                 version
             );
         }
