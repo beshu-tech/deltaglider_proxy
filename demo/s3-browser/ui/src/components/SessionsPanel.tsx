@@ -92,11 +92,16 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
     {
       title: '',
       key: 'action',
-      render: (_: unknown, r: SessionSummary) => (
-        <Button danger size="small" icon={<LogoutOutlined />} loading={busy === r.id} onClick={() => void revokeOne(r.id)}>
-          Revoke
-        </Button>
-      ),
+      // The server refuses to revoke the caller's own session (use Sign out),
+      // so that row is labelled instead of offering a button that errors.
+      render: (_: unknown, r: SessionSummary) =>
+        r.current ? (
+          <Text type="secondary">This session</Text>
+        ) : (
+          <Button danger size="small" icon={<LogoutOutlined />} loading={busy === r.id} onClick={() => void revokeOne(r.id)}>
+            Revoke
+          </Button>
+        ),
     },
   ];
 

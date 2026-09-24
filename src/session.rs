@@ -135,6 +135,9 @@ pub struct SessionSummary {
     /// Revocation identity: access_key_id (IAM) or `provider:user_id`
     /// (external); None for bootstrap/open.
     pub identity: Option<String>,
+    /// True for the session making the list request. The UI labels it
+    /// instead of offering a force-logout the server refuses for it.
+    pub current: bool,
 }
 
 /// Thread-safe in-memory session store.
@@ -337,6 +340,7 @@ impl SessionStore {
                     // The same string revoke-by-identity matches on, so what the
                     // admin sees in the table is exactly what they can revoke.
                     identity: info.auth_method.revocation_identity(),
+                    current: false,
                 }
             })
             .collect()

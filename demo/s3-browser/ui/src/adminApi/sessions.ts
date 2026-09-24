@@ -8,6 +8,8 @@ export interface SessionSummary {
   admin_gui: boolean;
   auth: string;
   identity: string | null;
+  /** The session making this request (it cannot revoke itself). */
+  current: boolean;
 }
 
 export async function listSessions(): Promise<SessionSummary[]> {
