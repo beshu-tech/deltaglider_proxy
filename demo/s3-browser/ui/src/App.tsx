@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react';
-import { Alert, Layout, Spin, Empty, Grid, Button, Progress, Space } from 'antd';
+import { Alert, Layout, Spin, Empty, Grid, Button, Progress, Space, message } from 'antd';
 import useS3Browser from './useS3Browser';
 import TopBar from './components/TopBar';
 import BulkActionBar from './components/BulkActionBar';
@@ -341,6 +341,13 @@ export default function App() {
     navigate(buildViewUrl('browser'));
   };
 
+  // An admin request answered 401 (or "admin session required"): the session
+  // is gone on the server, so go back to the sign-in screen and say why.
+  const handleSessionExpired = () => {
+    message.warning('Your session expired. Sign in again to continue.');
+    void handleLogout();
+  };
+
   const handleBucketChange = useCallback((newBucket: string) => {
     // changeBucket() already navigates the URL to /browse/<bucket>/ (PUSH).
     changeS3Bucket(newBucket);
@@ -549,6 +556,7 @@ export default function App() {
             deleting={s3.deleting}
             currentPrefix={s3.prefix}
             selectionKeys={s3.selectedKeys}
+            onSessionExpired={handleSessionExpired}
             hint={
               hasAdminSession
                 ? undefined
