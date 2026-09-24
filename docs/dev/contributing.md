@@ -38,7 +38,7 @@ The S3 API and demo UI both start on `http://localhost:9000`. The UI is availabl
 cargo test --lib --locked
 
 # One integration binary (many need MinIO on localhost:9000 — see tests/common/mod.rs)
-cargo test --locked --test s3_integration_test
+cargo test --locked --test all -- s3_integration_test::
 
 # Full matrix (run before a release or after changing shared test harness / CI lists)
 cargo test --all --locked
@@ -58,7 +58,7 @@ cargo test --lib --locked
 cd demo/s3-browser/ui && npm ci && npm run build && npm run lint:strict && npm run typecheck && npm run knip \
   && npm run test:all
 # Optional local parity with CI integration batches (needs MinIO):
-cargo test --locked --test s3_integration_test
+cargo test --locked --test all -- s3_integration_test::
 ```
 
 Embedded UI smoke (Playwright — same as `e2e-smoke` CI job): from repo root, `cargo build --release --bin deltaglider_proxy` with UI already built, then `cd demo/s3-browser/ui && npx playwright install chromium && cd ../../../.. && ./scripts/e2e-smoke.sh`.
