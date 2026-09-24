@@ -18,6 +18,7 @@ import { virtualWritableChildren } from './permissions';
 import { expandSelection } from './bulkSelection';
 // Bulk actions → admin objects API; App gates them on `sessionCaps.adminGui`.
 import type { S3Object } from './types';
+import { readStorage, writeStorage } from './safeStorage';
 
 const MAX_HEAD_CACHE_SIZE = 5000;
 
@@ -57,10 +58,10 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   const [deleting, setDeleting] = useState(false);
   const [connected, setConnected] = useState(hasCredentials());
   const searchQuery = q;
-  const [showHidden, setShowHiddenState] = useState(() => localStorage.getItem('dg-show-hidden') === 'true');
+  const [showHidden, setShowHiddenState] = useState(() => readStorage('dg-show-hidden') === 'true');
   const setShowHidden = useCallback((v: boolean) => {
     setShowHiddenState(v);
-    localStorage.setItem('dg-show-hidden', String(v));
+    writeStorage('dg-show-hidden', String(v));
   }, []);
   const [headCache, setHeadCache] = useState<Record<string, { storageType?: string; storedSize?: number; error?: boolean }>>({});
   const [error, setError] = useState<string | null>(null);
