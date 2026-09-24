@@ -5,17 +5,79 @@
 ### Fixed — Listings reported the stored delta size instead of the object size
 
 A `ListObjects` request on an S3-backed bucket reported each delta object with
-the size and ETag of its stored delta, not of the object itself, as soon as the
-object's entry in the 10-minute metadata cache had expired. A 3 MB
-`firmware.tar` was listed as `46 B`, the object browser showed that size, and a
-sync tool that compares sizes copied the object again on every run. The proxy
-now reads the real size and ETag of every such entry, from the metadata cache
-when it can and with one metadata request per object otherwise, and caches the
-result. The browser's folder sizes had the same fault: the folder-size scan now
-reports the original size of the objects in the folder, the same as the size of
-a file. The scan also reports the stored size separately, and that figure now
-includes the delta baselines. The `stale_seconds` field of the scan result is
-now `0` while the result is fresh instead of a negative number.
+the size and ETag of its stored delta, not of the object itself. A LIST
+returns only what the backend stores, and the original size and ETag live in
+the object's metadata, which a LIST does not return. A 3 MB `firmware.tar` was
+listed as `46 B`, the object browser showed that size, and a sync tool that
+compares sizes copied the object again on every run.
+
+The proxy now remembers the original size and ETag of each stored object that
+it writes or reads (every upload, and every metadata or download request). It
+keys each entry by the stored object's own ETag and size, so an entry can
+never describe an older version of the object, even when another proxy
+instance replaced it. A listing uses these entries and sends no extra request
+to the backend, so a listing is never slower than before. An object that this
+proxy has not written or read since it started still lists with its stored
+size. `LastModified` in a listing is always the time that the backend reports,
+so it does not change between two listings of the same object. The cache holds
+about 200,000 objects by default; `DGP_LIST_SIZE_CACHE_MB` (default `32`) sets
+its size. The same applies to objects on a proxy-encrypted S3 backend, which
+listed with the size of the encrypted data. The new counter
+`deltaglider_backend_head_requests_total` counts the metadata requests that
+the proxy sends to S3 backends.
+
+### Fixed — Folder sizes in the object browser showed the stored size
+
+The folder-size scan added up the stored sizes, so a folder of deltas showed a
+few hundred bytes. The scan result (`GET /_/api/admin/usage`) now reports:
+
+- `total_size` and each child's `size`: the original size of the objects, the
+  same as the size of a file.
+- `stored_size`, on the total and on each child: the bytes stored on the
+  backend, including the delta baselines. The quota fallback uses this value.
+- `sizes_estimated`, on the total and on each child: `true` when the original
+  size of some objects is not known to this proxy (see the entry above). Those
+  objects count their smaller stored size, so the total is a lower bound. The
+  object browser then shows the size as `≥ 12 MB`, and it does the same for a
+  scan that stopped at its object limit (`truncated`).
+- `age_seconds`: the age of the result. `stale_seconds` is now `0` while the
+  result is fresh instead of a negative number.
+
+The scan makes one listing of the folder and no other requests. It reads the
+baseline sizes from that listing, so it no longer lists the whole bucket and
+reads each baseline separately.
+
+### Fixed — Filesystem listings missed keys when the prefix ended inside a name
+
+A listing without a delimiter on a filesystem backend returned no keys when the
+prefix ended inside a name (for example `nightly/pg`), while the S3 backend
+returned the matching keys. Both backends now return the same keys.
+
+### Fixed — A ZIP download hid the files it could not read
+
+The bulk ZIP download of the object browser skipped each file it could not
+read without saying so, and when it could read none of them it returned an
+empty archive. A partial archive now contains `_deltaglider-skipped-files.txt`,
+which lists each missing file and the reason. If a selected file already has
+that name, the list gets a free name such as `_deltaglider-skipped-files-2.txt`.
+When no selected file can be read, the request fails: with `404` when every
+file is missing, with `403` when the backend denied access to any file, and
+with `502` for other backend failures.
+
+### Changed — A new filesystem backend needs an absolute path
+
+`POST /_/api/admin/backends` rejects a filesystem backend without a path or
+with a relative path. A relative path resolves against the working directory
+of the proxy process, which is different under systemd, Docker and a shell, so
+the data could land in an unexpected place. The admin UI already required an
+absolute path.
+
+### Fixed — Copy events reported the stored delta size
+
+`ReplicationObjectCopied` and `LifecycleTransitioned` events reported the
+number of bytes that the copy transferred in `payload.content_length`. When
+the copy sends the stored delta, that is the delta size, for example `43` for a
+1 MB object. The field now holds the size of the object.
 
 ### Fixed — Successful admin logins were not audited
 
@@ -30,7 +92,9 @@ Every object write adds a row to the event outbox. While event delivery was off
 and replication was disabled, nothing ever deleted those rows, so the encrypted
 config database grew by one row per write. The dispatcher now deletes every row
 that no reader needs. While replication is enabled, a row is deleted only after
-replication has read it.
+replication has read it. A row that delivery already tried (a pending retry or
+a failed delivery) is kept while delivery is off, so that an operator who turns
+delivery off to repair an endpoint can still requeue those events afterwards.
 
 ### Changed — The apply dialog separates new warnings from existing ones
 
