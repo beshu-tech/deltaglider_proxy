@@ -9,7 +9,7 @@ const { outputText } = ts.transpileModule(source, {
   fileName: 'savings.ts',
 });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
-const { summarizeScopeSavings, summarizeObjectSavings } = await import(moduleUrl);
+const { summarizeScopeSavings, summarizeObjectSavings, GIB, gibFromBytes, bytesFromGib } = await import(moduleUrl);
 
 // --- summarizeScopeSavings ---------------------------------------------------
 assert.deepEqual(summarizeScopeSavings(0, 0), { pct: 0, pctOneDecimal: 0, savedBytes: 0, empty: true });
@@ -36,5 +36,19 @@ assert.equal(summarizeObjectSavings(1000, 104).pct, 89.6);
 assert.equal(summarizeObjectSavings(10000, 1034).pct, 89.6);
 // only a literally-empty stored object is an honest 100%
 assert.equal(summarizeObjectSavings(1000, 0).pct, 100);
+
+// --- GiB quota conversion (BucketCard quota input) ---------------------------
+assert.equal(GIB, 1024 ** 3);
+// 500 MiB must not read as 0 GB
+assert.equal(gibFromBytes(500 * 1024 ** 2), 0.488);
+assert.equal(gibFromBytes(2 * GIB), 2);
+assert.equal(gibFromBytes(1.5 * GIB), 1.5);
+// write path: always whole bytes (quota_bytes is a u64 server-side)
+assert.equal(bytesFromGib(0.5), 512 * 1024 ** 2);
+assert.equal(bytesFromGib(2), 2 * GIB);
+assert.ok(Number.isInteger(bytesFromGib(0.1)), '0.1 GiB → integer bytes');
+assert.equal(bytesFromGib(0.1), 107374182);
+// round-trip of a typed decimal stays stable
+assert.equal(gibFromBytes(bytesFromGib(0.3)), 0.3);
 
 console.log('savings regression checks passed');

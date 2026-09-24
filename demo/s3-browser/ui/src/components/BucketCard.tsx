@@ -36,6 +36,8 @@ import MigrateBucketModal from './MigrateBucketModal';
 import type { JobRow } from '../jobsView';
 import { progressLabel } from '../jobsView';
 import { runJobAction } from '../adminApi';
+import { formatBytes } from '../utils';
+import { bytesFromGib, gibFromBytes } from '../savings';
 
 const { Text } = Typography;
 
@@ -230,7 +232,7 @@ export default function BucketCard({
   if (eff.quota_bytes != null) {
     chips.push(
       <Chip key="quota" tone={colors.ACCENT_AMBER} title="Storage quota">
-        ≤ {Math.round(eff.quota_bytes / (1024 * 1024 * 1024))} GB
+        ≤ {formatBytes(eff.quota_bytes)}
       </Chip>
     );
   }
@@ -601,9 +603,10 @@ export default function BucketCard({
                         Quota
                       </Text>
                       <InputNumber
-                        value={eff.quota_bytes != null ? Math.round(eff.quota_bytes / (1024 * 1024 * 1024)) : undefined}
-                        onChange={(v) => onPatch({ quota_bytes: v != null ? v * 1024 * 1024 * 1024 : null })}
+                        value={eff.quota_bytes != null ? gibFromBytes(eff.quota_bytes) : undefined}
+                        onChange={(v) => onPatch({ quota_bytes: v != null ? bytesFromGib(v) : null })}
                         min={0}
+                        step={0.1}
                         placeholder="Unlimited"
                         style={{ width: 170, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 11 }}
                         size="small"

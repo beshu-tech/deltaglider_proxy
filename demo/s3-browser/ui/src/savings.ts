@@ -117,3 +117,18 @@ export function summarizeObjectSavings(
   const pct = storedSize !== 0 && floored > 99.9 ? 99.9 : floored;
   return { pct, savedBytes: saved, empty: false };
 }
+
+/** Bytes in one GiB. The UI labels it "GB", like `formatBytes`. */
+export const GIB = 1024 ** 3;
+
+/** Bytes → GiB for an editable quota field: 3 decimals, so 500 MiB reads
+ *  0.488 instead of rounding to 0. Display only — `bytesFromGib` is the
+ *  write path, and an untouched field never writes. */
+export function gibFromBytes(bytes: number): number {
+  return Number((bytes / GIB).toFixed(3));
+}
+
+/** GiB (possibly fractional) → whole bytes; `quota_bytes` is a u64. */
+export function bytesFromGib(gib: number): number {
+  return Math.round(gib * GIB);
+}
