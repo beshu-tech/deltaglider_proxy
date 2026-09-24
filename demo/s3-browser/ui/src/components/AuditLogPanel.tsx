@@ -22,7 +22,7 @@
  * For long-term audit, stdout remains authoritative: this panel
  * is a triage convenience, not a compliance substitute.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Typography, Input, Button, Tag, Alert, Space, Switch } from 'antd';
 import { useVisiblePolling } from '../useVisiblePolling';
 import {
@@ -78,14 +78,23 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
   // world every second.
   const [now, setNow] = useState(() => new Date());
 
+  // The 3s poll does not wait for the previous request: on a slow server the
+  // ticks (and a manual Refresh) overlap. `inFlight` skips a tick while one is
+  // pending; the generation guard drops any response a newer one superseded.
+  const fetchGen = useRef(0);
+  const inFlight = useRef(false);
   const refresh = async () => {
+    const gen = ++fetchGen.current;
+    inFlight.current = true;
     try {
       setLoading(true);
       const res = await fetchAudit(500);
+      if (gen !== fetchGen.current) return; // superseded by a newer refresh
       setEntries(res.entries);
       setNow(new Date());
       setError(null);
     } catch (e) {
+      if (gen !== fetchGen.current) return;
       if (isSessionExpired(e)) {
         onSessionExpired?.();
         return;
@@ -93,7 +102,10 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
       setError(
         `Failed to load audit entries: ${normalizeUiError(e, 'unknown')}`);
     } finally {
-      setLoading(false);
+      if (gen === fetchGen.current) {
+        inFlight.current = false;
+        setLoading(false);
+      }
     }
   };
 
@@ -105,7 +117,13 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
   // Auto-refresh. 3s — quick enough for incident-debugging ("does my click show
   // up?") without being abusive. Visibility-gated: a backgrounded tab stops
   // polling and catches up on return, instead of hammering the audit endpoint.
-  useVisiblePolling(() => void refresh(), 3000, autoRefresh);
+  useVisiblePolling(
+    () => {
+      if (!inFlight.current) void refresh();
+    },
+    3000,
+    autoRefresh,
+  );
 
   // Client-side filter — free-text substring match across action,
   // user, target, ip, bucket, and path. Deliberately lenient:
