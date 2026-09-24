@@ -1319,10 +1319,14 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
     ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
         let deltaspaces_dir = self.bucket_dir(bucket).join("deltaspaces");
-        let walk_root = if prefix.is_empty() {
+        // An S3 prefix is a string, not a directory: `nightly/pg` must match
+        // `nightly/pg-01.sql`. Walk the deepest directory the prefix names
+        // completely, then keep the keys that start with the whole prefix.
+        let dir_part = prefix.rfind('/').map_or("", |i| &prefix[..i]);
+        let walk_root = if dir_part.is_empty() {
             deltaspaces_dir.clone()
         } else {
-            deltaspaces_dir.join(prefix)
+            deltaspaces_dir.join(dir_part)
         };
 
         if !path_exists(&walk_root).await {
@@ -1331,6 +1335,7 @@ impl StorageBackend for FilesystemBackend {
 
         let mut results: Vec<(String, FileMetadata)> = Vec::new();
         Self::bulk_walk_recursive(&deltaspaces_dir, &walk_root, &mut results).await?;
+        results.retain(|(key, _)| key.starts_with(prefix));
 
         debug!(
             "Bulk listed {} objects in {}/{}",
@@ -1868,6 +1873,45 @@ mod tests {
             .join("deltaspaces")
             .join("only")
             .exists());
+    }
+
+    /// S3 prefixes are strings, not directories: a prefix that ends inside a
+    /// name (`n`, `nightly/pg`) must still match the keys below it.
+    #[tokio::test]
+    async fn test_bulk_list_matches_prefixes_that_end_inside_a_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        for (prefix, name) in [("nightly", "pg-01.sql"), ("", "notes.txt"), ("", "top.txt")] {
+            let meta =
+                FileMetadata::new_passthrough(name.into(), "0".repeat(64), "0".repeat(32), 3, None);
+            backend
+                .put_passthrough("bucket", prefix, name, b"abc", &meta)
+                .await
+                .expect("put");
+        }
+
+        let keys = |listed: Vec<(String, FileMetadata)>| {
+            let mut k: Vec<String> = listed.into_iter().map(|(k, _)| k).collect();
+            k.sort();
+            k
+        };
+        let list = |p: &'static str| {
+            let backend = &backend;
+            async move { backend.bulk_list_objects("bucket", p).await.expect("list") }
+        };
+        // Callers filter by prefix; the backend must not drop matching keys.
+        let n = keys(list("n").await);
+        assert!(n.contains(&"nightly/pg-01.sql".to_string()), "{n:?}");
+        assert!(n.contains(&"notes.txt".to_string()), "{n:?}");
+        let pg = keys(list("nightly/pg").await);
+        assert!(pg.contains(&"nightly/pg-01.sql".to_string()), "{pg:?}");
+        assert!(keys(list("nightly/x").await)
+            .iter()
+            .all(|k| !k.starts_with("nightly/x")));
+        assert!(keys(list("missing/").await).is_empty());
     }
 
     #[tokio::test]

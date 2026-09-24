@@ -81,10 +81,16 @@ pub struct BackendMutationResponse {
 fn build_backend_config(req: &CreateBackendRequest) -> Result<BackendConfig, String> {
     match req.backend_type.as_str() {
         "filesystem" => {
-            let path = req.path.as_deref().unwrap_or("./data").to_string();
-            Ok(BackendConfig::Filesystem {
-                path: std::path::PathBuf::from(path),
-            })
+            // A relative path resolves against the proxy's working directory,
+            // which differs between systemd, Docker and a shell.
+            let path = std::path::PathBuf::from(req.path.as_deref().unwrap_or("").trim());
+            if !path.is_absolute() {
+                return Err(
+                    "Filesystem backend requires an absolute path, e.g. /var/lib/deltaglider/data"
+                        .into(),
+                );
+            }
+            Ok(BackendConfig::Filesystem { path })
         }
         "s3" => {
             // Validate credentials upfront (S3Backend::new will reject them later,
@@ -645,4 +651,34 @@ pub async fn delete_backend(
             requires_restart: false,
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fs_request(path: Option<&str>) -> CreateBackendRequest {
+        CreateBackendRequest {
+            name: "local-disk".into(),
+            backend_type: "filesystem".into(),
+            path: path.map(str::to_string),
+            endpoint: None,
+            region: None,
+            force_path_style: None,
+            access_key_id: None,
+            secret_access_key: None,
+            set_default: None,
+        }
+    }
+
+    #[test]
+    fn filesystem_backend_requires_an_absolute_path() {
+        for bad in [None, Some(""), Some("./data"), Some("data/archive")] {
+            assert!(build_backend_config(&fs_request(bad)).is_err(), "{bad:?}");
+        }
+        let ok = build_backend_config(&fs_request(Some(" /srv/dg "))).unwrap();
+        assert!(
+            matches!(ok, BackendConfig::Filesystem { ref path } if path == std::path::Path::new("/srv/dg"))
+        );
+    }
 }
