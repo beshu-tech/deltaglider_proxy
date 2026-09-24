@@ -515,74 +515,16 @@ async fn export_zip(
     // ── secrets.json — harvest real plaintext values that YAML
     //    export would redact ────────────────────────────────────
     let secrets = {
-        let mut s = BackupSecrets {
-            bootstrap_password_hash: cfg.bootstrap_password_hash.clone(),
-            access: None,
-            storage: None,
-            storage_backends: Default::default(),
-            oauth_client_secrets: Default::default(),
-            event_delivery: None,
-        };
-        // Access-section bootstrap SigV4 pair.
-        if cfg.access_key_id.is_some() || cfg.secret_access_key.is_some() {
-            s.access = Some(SecretsAccess {
-                access_key_id: cfg.access_key_id.clone(),
-                secret_access_key: cfg.secret_access_key.clone(),
-            });
-        }
-        // Storage-section backend credentials (S3 only — filesystem
-        // backends have no secrets to round-trip).
-        if let crate::config::BackendConfig::S3 {
-            access_key_id,
-            secret_access_key,
-            ..
-        } = &cfg.backend
-        {
-            if access_key_id.is_some() || secret_access_key.is_some() {
-                s.storage = Some(SecretsStorage {
-                    access_key_id: access_key_id.clone(),
-                    secret_access_key: secret_access_key.clone(),
-                });
-            }
-        }
-        for named in &cfg.backends {
-            if let crate::config::BackendConfig::S3 {
-                access_key_id,
-                secret_access_key,
-                ..
-            } = &named.backend
-            {
-                if access_key_id.is_some() || secret_access_key.is_some() {
-                    s.storage_backends.insert(
-                        named.name.clone(),
-                        SecretsStorage {
-                            access_key_id: access_key_id.clone(),
-                            secret_access_key: secret_access_key.clone(),
-                        },
-                    );
-                }
-            }
-        }
+        let mut s = harvest_config_secrets(&cfg).map_err(|e| {
+            tracing::error!("Full-backup: config file view failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
         // OAuth client secrets (indexed by provider name, not id, so
         // restore is robust across id reshuffles).
         for p in &iam.auth_providers {
             if let Some(cs) = &p.client_secret {
                 s.oauth_client_secrets.insert(p.name.clone(), cs.clone());
             }
-        }
-        // Event-delivery secrets (Slack bot token + webhook header values) —
-        // masked in config.yaml, so captured here for cross-instance restore.
-        let ed = &cfg.event_delivery;
-        let has_token = ed
-            .slack_bot_token
-            .as_deref()
-            .map(|t| !t.trim().is_empty())
-            .unwrap_or(false);
-        if has_token || !ed.webhook_headers.is_empty() {
-            s.event_delivery = Some(SecretsEventDelivery {
-                slack_bot_token: ed.slack_bot_token.clone(),
-                webhook_headers: ed.webhook_headers.clone(),
-            });
         }
         s
     };
@@ -861,6 +803,111 @@ fn unzip_bounded(
     }
 
     Ok(files)
+}
+
+/// Harvest the config secrets for `secrets.json` from the FILE view of the
+/// config: a value that an environment variable supplies (for example
+/// `DGP_SECRET_ACCESS_KEY` or `DGP_BOOTSTRAP_PASSWORD_HASH`) stays out of the
+/// backup, so a restore never writes it into another instance's YAML file.
+/// The restored instance takes such values from its own environment.
+/// OAuth client secrets come from the IAM DB and are added by the caller.
+fn harvest_config_secrets(
+    runtime: &crate::config::Config,
+) -> Result<BackupSecrets, crate::config::ConfigError> {
+    let file = runtime.file_view()?;
+    let cfg = &file;
+    let mut s = BackupSecrets {
+        bootstrap_password_hash: cfg.bootstrap_password_hash.clone(),
+        access: None,
+        storage: None,
+        storage_backends: Default::default(),
+        oauth_client_secrets: Default::default(),
+        event_delivery: None,
+    };
+    // Access-section bootstrap SigV4 pair.
+    if cfg.access_key_id.is_some() || cfg.secret_access_key.is_some() {
+        s.access = Some(SecretsAccess {
+            access_key_id: cfg.access_key_id.clone(),
+            secret_access_key: cfg.secret_access_key.clone(),
+        });
+    }
+    // Storage-section backend credentials (S3 only — filesystem
+    // backends have no secrets to round-trip).
+    if let crate::config::BackendConfig::S3 {
+        access_key_id,
+        secret_access_key,
+        ..
+    } = &cfg.backend
+    {
+        if access_key_id.is_some() || secret_access_key.is_some() {
+            s.storage = Some(SecretsStorage {
+                access_key_id: access_key_id.clone(),
+                secret_access_key: secret_access_key.clone(),
+            });
+        }
+    }
+    for named in &cfg.backends {
+        if let crate::config::BackendConfig::S3 {
+            access_key_id,
+            secret_access_key,
+            ..
+        } = &named.backend
+        {
+            if access_key_id.is_some() || secret_access_key.is_some() {
+                s.storage_backends.insert(
+                    named.name.clone(),
+                    SecretsStorage {
+                        access_key_id: access_key_id.clone(),
+                        secret_access_key: secret_access_key.clone(),
+                    },
+                );
+            }
+        }
+    }
+    // Event-delivery secrets (Slack bot token + webhook header values) —
+    // masked in config.yaml, so captured here for cross-instance restore.
+    let ed = &cfg.event_delivery;
+    let has_token = ed
+        .slack_bot_token
+        .as_deref()
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false);
+    if has_token || !ed.webhook_headers.is_empty() {
+        s.event_delivery = Some(SecretsEventDelivery {
+            slack_bot_token: ed.slack_bot_token.clone(),
+            webhook_headers: ed.webhook_headers.clone(),
+        });
+    }
+    Ok(s)
+}
+
+/// Write the harvested secrets onto `cfg` (the restore half).
+fn hydrate_config_secrets(
+    cfg: &mut crate::config::Config,
+    secrets: &BackupSecrets,
+    restore_bootstrap_hash: bool,
+) {
+    if restore_bootstrap_hash {
+        if let Some(h) = &secrets.bootstrap_password_hash {
+            cfg.bootstrap_password_hash = Some(h.clone());
+        }
+    }
+    if let Some(a) = &secrets.access {
+        if let Some(ak) = &a.access_key_id {
+            cfg.access_key_id = Some(ak.clone());
+        }
+        if let Some(sk) = &a.secret_access_key {
+            cfg.secret_access_key = Some(sk.clone());
+        }
+    }
+    if let Some(s) = &secrets.storage {
+        hydrate_s3_backend_credentials(&mut cfg.backend, s);
+    }
+    for named in &mut cfg.backends {
+        if let Some(s) = secrets.storage_backends.get(&named.name) {
+            hydrate_s3_backend_credentials(&mut named.backend, s);
+        }
+    }
 }
 
 fn hydrate_s3_backend_credentials(backend: &mut BackendConfig, secrets: &SecretsStorage) {
@@ -1370,30 +1417,10 @@ async fn apply_secrets(
     // mutation Config for apply_config_transition after releasing.
     let new_cfg = {
         let mut cfg = state.config.write().await;
-        if restore_bootstrap_hash {
-            if let Some(h) = &secrets.bootstrap_password_hash {
-                cfg.bootstrap_password_hash = Some(h.clone());
-            }
-        }
-        if let Some(a) = &secrets.access {
-            if let Some(ak) = &a.access_key_id {
-                cfg.access_key_id = Some(ak.clone());
-            }
-            if let Some(sk) = &a.secret_access_key {
-                cfg.secret_access_key = Some(sk.clone());
-            }
-        }
-        if let Some(s) = &secrets.storage {
-            hydrate_s3_backend_credentials(&mut cfg.backend, s);
-        }
-        for named in &mut cfg.backends {
-            if let Some(s) = secrets.storage_backends.get(&named.name) {
-                hydrate_s3_backend_credentials(&mut named.backend, s);
-            }
-        }
+        hydrate_config_secrets(&mut cfg, secrets, restore_bootstrap_hash);
         // Env wins consistently: the restored secrets reach the file, but an
         // env-controlled field keeps its env value at runtime.
-        if let Err(e) = crate::api::admin::config::reapply_env(&old_cfg, &mut cfg) {
+        if let Err(e) = crate::api::admin::config::reapply_env(&old_cfg, &mut cfg, false) {
             tracing::error!("Full-backup import: env overrides could not be re-applied: {e}");
             *cfg = old_cfg.clone();
             return Err(BackupSecretApplyError::new(
@@ -1877,6 +1904,28 @@ pub struct ImportResult {
 
 #[cfg(test)]
 mod tests {
+
+    /// #92 M1: `secrets.json` never carries an env-supplied value, and a
+    /// restore of it writes none into the YAML file.
+    #[test]
+    fn backup_secrets_leave_env_values_out() {
+        use crate::api::admin::config::env_leak_probe::{assert_no_leak, running, sentinel_env};
+        let (env, check) = sentinel_env();
+        let run = running(&env);
+        let secrets = harvest_config_secrets(&run).unwrap();
+        let json = serde_json::to_string(&secrets).unwrap();
+        for (name, value) in &check {
+            assert!(
+                !json.contains(value.as_str()),
+                "{name} in secrets.json: {json}"
+            );
+        }
+        // The file's own secrets are still backed up.
+        assert!(json.contains("file-secret-0001"), "{json}");
+        let mut restored = run.clone();
+        hydrate_config_secrets(&mut restored, &secrets, true);
+        assert_no_leak("backup restore", &run, restored, &env, &check);
+    }
     use super::*;
 
     #[test]

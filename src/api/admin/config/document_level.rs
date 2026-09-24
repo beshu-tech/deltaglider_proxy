@@ -293,10 +293,41 @@ pub async fn validate_config_doc(
     Json(body): Json<ConfigDocumentRequest>,
 ) -> impl IntoResponse {
     match parse_and_validate_yaml(&body.yaml) {
-        Ok((cfg, warnings)) => {
+        Ok((mut cfg, _)) => {
             // Same changed-only gate as apply, so validate can't pass a doc
             // apply would reject (or vice versa for unchanged-invalid rules).
             let current = state.config.read().await.clone();
+            // Validate the SAME view apply runs: runtime secrets preserved,
+            // env overrides re-applied (a dry run must not differ from apply).
+            let mut side_warnings = preserve_runtime_secrets(&mut cfg, &current, &body.yaml);
+            match super::reapply_env(&current, &mut cfg, true) {
+                Ok(w) => side_warnings.extend(w),
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ConfigValidateResponse {
+                            existing_warnings: Vec::new(),
+                            ok: false,
+                            warnings: vec![],
+                            error: Some(e),
+                        }),
+                    );
+                }
+            }
+            let warnings = match cfg.clone().check_all() {
+                Ok(w) => w,
+                Err(fatal) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ConfigValidateResponse {
+                            existing_warnings: Vec::new(),
+                            ok: false,
+                            warnings: vec![],
+                            error: Some(format!("config refused: {}", fatal.join("; "))),
+                        }),
+                    );
+                }
+            };
             // Errors on UNCHANGED lifecycle content are standing, not new.
             let standing_lifecycle =
                 match crate::lifecycle::planner::lifecycle_gate(&current.lifecycle, &cfg.lifecycle)
@@ -330,7 +361,9 @@ pub async fn validate_config_doc(
             // Only this document's own warnings are "new"; standing ones
             // the running config already has are reported apart (#92).
             let before = current.clone().check_all().unwrap_or_default();
-            let (warnings, mut existing_warnings) = super::split_new_warnings(&before, warnings);
+            let (mut warnings, mut existing_warnings) =
+                super::split_new_warnings(&before, warnings);
+            warnings.extend(side_warnings);
             existing_warnings.extend(standing_lifecycle);
             (
                 StatusCode::OK,
@@ -371,7 +404,7 @@ pub async fn validate_config_doc(
 /// carry creds forward safely — backend renames, backend-type swaps, and
 /// asymmetric credential pairs. The caller surfaces these in the apply
 /// response so operators are never caught by a silent auth-loss.
-fn preserve_runtime_secrets(
+pub(super) fn preserve_runtime_secrets(
     incoming: &mut crate::config::Config,
     current: &crate::config::Config,
     raw_yaml: &str,
@@ -504,13 +537,6 @@ pub(crate) async fn apply_config_inner(
     //    cannot race our read-for-compare and our write-to-swap.
     let mut cfg = state.config.write().await;
 
-    // 2a. Split the document's check warnings: those the RUNNING config
-    //     already produces are standing ("existing"), only the rest are new.
-    let (parse_warnings, existing_warnings) = {
-        let before = cfg.clone().check_all().unwrap_or_default();
-        super::split_new_warnings(&before, parse_warnings)
-    };
-
     // 2b. Lifecycle gate (changed-only): fatal only when this doc actually EDITS
     //     an invalid lifecycle; an unchanged pre-existing bad rule downgrades to
     //     warnings so it can't block unrelated config edits.
@@ -606,7 +632,7 @@ pub(crate) async fn apply_config_inner(
     // 4b. Env wins consistently: re-apply the `DGP_*` overrides so the
     //     imported document cannot change an env-controlled field at runtime
     //     (the document's own value is what the file keeps).
-    let env_warnings = match super::reapply_env(&cfg, &mut incoming) {
+    let env_warnings = match super::reapply_env(&cfg, &mut incoming, true) {
         Ok(w) => w,
         Err(e) => {
             return (
@@ -622,6 +648,15 @@ pub(crate) async fn apply_config_inner(
                 },
             );
         }
+    };
+
+    // 4c. Split the check warnings of the env-applied document against the
+    //     running config (also env-applied): the running config's own
+    //     warnings are standing ("existing"), only the rest are new.
+    let (parse_warnings, existing_warnings) = {
+        let before = cfg.clone().check_all().unwrap_or_default();
+        let after = incoming.clone().check_all().unwrap_or(parse_warnings);
+        super::split_new_warnings(&before, after)
     };
 
     // 5. Run the transition side effects. The helper owns engine rebuild

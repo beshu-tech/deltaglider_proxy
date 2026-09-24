@@ -428,7 +428,7 @@ async fn apply_section(
     // Env wins consistently: re-apply the `DGP_*` overrides so an edit to an
     // env-controlled field does not take effect at runtime until the next
     // restart undoes it. The edit (if any) is kept for the file only.
-    let env_warnings = match super::reapply_env(&old_cfg, &mut new_cfg) {
+    let env_warnings = match super::reapply_env(&old_cfg, &mut new_cfg, false) {
         Ok(w) => w,
         Err(e) => return reject(StatusCode::INTERNAL_SERVER_ERROR, e.as_str()),
     };

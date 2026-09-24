@@ -713,7 +713,7 @@ pub async fn update_config(
     // Env wins consistently: re-apply the `DGP_*` overrides (see
     // `Config::reapply_env_overrides`); an edit to an env-controlled field
     // reaches the file only.
-    match super::reapply_env(&old_cfg, &mut cfg) {
+    match super::reapply_env(&old_cfg, &mut cfg, false) {
         Ok(env_warnings) => warnings.extend(env_warnings),
         Err(e) => {
             *cfg = old_cfg;
@@ -777,7 +777,7 @@ pub async fn update_config(
 /// backend type; the caller surfaces that as a warning. All other
 /// branches (type unchanged but fields updated, type changed to a known
 /// variant) return `Ok(())` and mutate in place.
-fn apply_backend_patch(
+pub(super) fn apply_backend_patch(
     backend: &mut crate::config::BackendConfig,
     body: &ConfigUpdateRequest,
     warnings: &mut Vec<String>,

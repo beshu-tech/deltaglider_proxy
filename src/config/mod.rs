@@ -1535,7 +1535,23 @@ impl Config {
     /// ([`Self::env_shadow`]), so persist and export write the file's value
     /// back instead of the env value.
     fn apply_env_overrides(&mut self) {
-        self.apply_env_overrides_tracked(&process_env);
+        self.apply_env_overrides_at_load(&process_env);
+    }
+
+    /// [`Self::apply_env_overrides_tracked`] for a config just loaded from
+    /// its file: also records which secret env values the file itself holds
+    /// (see [`env_shadow::EnvShadow`]), so the leak guard never refuses to
+    /// write back what the operator put in the file.
+    pub(crate) fn apply_env_overrides_at_load(&mut self, env: EnvLookup) {
+        let file_tree = serde_yaml::to_value(&*self).ok();
+        self.apply_env_overrides_tracked(env);
+        if let Some(tree) = file_tree {
+            self.env_shadow.1 = env_overrides::secret_env_values(self, env)
+                .into_iter()
+                .filter(|(_, v)| tree_has_string(&tree, v))
+                .map(|(_, v)| v)
+                .collect();
+        }
     }
 
     /// [`Self::apply_env_overrides`] over an injected lookup: applies the
@@ -1552,38 +1568,121 @@ impl Config {
                 // record every applied slot as absent: the file then omits
                 // them rather than leak an env secret.
                 tracing::error!("config did not serialize; env-controlled fields will be omitted from the persisted file");
-                env_shadow::EnvShadow(applied.into_iter().map(|s| (s, None)).collect())
+                env_shadow::EnvShadow(
+                    applied.into_iter().map(|s| (s, None)).collect(),
+                    Default::default(),
+                )
             }
         };
     }
 
     /// Re-apply the env overrides to an edited config that is about to
-    /// replace `running` (item: env wins consistently, not only at boot).
+    /// replace `running` (env wins consistently, not only at boot).
     ///
-    /// The edit is first turned into its file view: a slot whose value still
-    /// equals the running env value is an echo and takes the file's value
-    /// from `running`'s shadow; a slot the edit changed keeps the edit. Then
-    /// the env overrides are applied on top and the shadow is recaptured.
+    /// The edit is first turned into its file view, member by member (see
+    /// [`env_shadow::unapply_echoes`]): a value that still equals the running
+    /// env value is an echo and takes the file's value back; a value the edit
+    /// changed keeps the edit. Then the env overrides are applied on top and
+    /// the shadow is recaptured.
     ///
-    /// Returns the env-controlled fields the edit changed (dotted flat
-    /// paths): the edit reaches the file, but the env value stays in effect.
+    /// A secret env value that the edit copied to a field no env variable
+    /// controls (a mode flip promotes the env encryption key to `legacy_key`)
+    /// is recorded as an `${env:NAME}` reference, so the file names the
+    /// variable instead of holding the key.
     pub(crate) fn reapply_env_overrides(
         &mut self,
         running: &Config,
         env: EnvLookup,
-    ) -> Result<Vec<String>, ConfigError> {
-        let env_refs = std::mem::take(&mut self.env_refs);
-        let mut tree =
-            serde_yaml::to_value(&*self).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        let running_tree =
-            serde_yaml::to_value(running).map_err(|e| ConfigError::Parse(e.to_string()))?;
-        let edited = env_shadow::unapply_echoes(&mut tree, &running_tree, &running.env_shadow);
-        let mut file_view: Config =
-            serde_yaml::from_value(tree).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    ) -> Result<EnvReapply, ConfigError> {
+        let parse = |e: serde_yaml::Error| ConfigError::Parse(e.to_string());
+        let mut env_refs = std::mem::take(&mut self.env_refs);
+        let original = serde_yaml::to_value(&*self).map_err(parse)?;
+        let running_tree = serde_yaml::to_value(running).map_err(parse)?;
+        let mut tree = original.clone();
+        let found = env_shadow::unapply_echoes(&mut tree, &running_tree, &running.env_shadow);
+        let mut report = EnvReapply {
+            edited: found
+                .edited
+                .iter()
+                .map(|p| env_shadow::display(p))
+                .collect(),
+            echoed_over_file: found
+                .echoed_over_file
+                .iter()
+                .map(|p| env_shadow::display(p))
+                .collect(),
+            refs_added: Vec::new(),
+        };
+        let mut file_view: Config = match serde_yaml::from_value(tree) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                // The member-wise merge produced a shape that does not parse
+                // (an edit inside a block whose type the env sets). Fall back
+                // to the file's whole block: the edit is dropped, never the
+                // other way round.
+                tracing::warn!(
+                    "env re-apply: member-wise merge failed ({e}); keeping the file's blocks"
+                );
+                let mut tree = original;
+                env_shadow::restore(&mut tree, &running.env_shadow);
+                report.edited.clear();
+                serde_yaml::from_value(tree).map_err(parse)?
+            }
+        };
+
+        // Secret env values copied outside their own slots become refs.
+        let file_tree = serde_yaml::to_value(&file_view).map_err(parse)?;
+        let already_in_file = running.env_shadow.file_strings();
+        let mut secrets = env_overrides::secret_env_values(running, env);
+        secrets.extend(env_overrides::secret_env_values(&file_view, env));
+        for (name, value) in secrets {
+            if !already_in_file.contains(&value)
+                && tree_has_string(&file_tree, &value)
+                && env_refs.insert(name.clone(), value).is_none()
+            {
+                report.refs_added.push(name);
+            }
+        }
+        report.refs_added.sort();
+        report.refs_added.dedup();
+
         file_view.env_refs = env_refs;
         file_view.apply_env_overrides_tracked(env);
+        // What the ORIGINAL file held stays allowed; the edit cannot add to it.
+        file_view.env_shadow.1 = running.env_shadow.1.clone();
         *self = file_view;
-        Ok(edited.iter().map(|p| env_shadow::display(p)).collect())
+        Ok(report)
+    }
+
+    /// Names of the SECRET env variables whose value appears as a plain
+    /// scalar in `tree` (a serialized file or export), other than values the
+    /// config file itself already held. Persist and export refuse to write
+    /// such a tree: defence in depth behind [`Self::file_view`].
+    pub(crate) fn env_secret_leaks(&self, tree: &serde_yaml::Value, env: EnvLookup) -> Vec<String> {
+        let allowed = self.env_shadow.file_strings();
+        let mut leaks: Vec<String> = env_overrides::secret_env_values(self, env)
+            .into_iter()
+            .filter(|(_, v)| v.len() >= 4 && !allowed.contains(v) && tree_has_string(tree, v))
+            .map(|(name, _)| name)
+            .collect();
+        leaks.dedup();
+        leaks
+    }
+
+    fn refuse_env_secret_leaks(
+        &self,
+        tree: &serde_yaml::Value,
+        env: EnvLookup,
+    ) -> Result<(), ConfigError> {
+        let leaks = self.env_secret_leaks(tree, env);
+        if leaks.is_empty() {
+            return Ok(());
+        }
+        Err(ConfigError::Parse(format!(
+            "refusing to write the config: it would contain the value of the secret \
+             environment variable(s) {}. Set these values only in the environment.",
+            leaks.join(", ")
+        )))
     }
 
     /// The config as the FILE describes it: every env-overridden slot holds
@@ -2809,11 +2908,20 @@ impl Config {
     /// we only ever *emit* sectioned — legacy readers eventually disappear,
     /// the canonical artifact must be forward-shaped.
     pub fn to_canonical_yaml(&self) -> Result<String, ConfigError> {
+        self.to_canonical_yaml_with(&process_env)
+    }
+
+    pub(crate) fn to_canonical_yaml_with(&self, env: EnvLookup) -> Result<String, ConfigError> {
         let export = self
             .file_view()?
             .with_env_refs_reinserted()
             .redact_for_export();
         let sectioned = crate::config_sections::SectionedConfig::from_flat(&export);
+        let tree =
+            serde_yaml::to_value(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        self.refuse_env_secret_leaks(&tree, env)?;
+        // Serialize the typed value, not the tree: the tree widens f32 to
+        // f64 (`0.42` would print as `0.41999998688697815`).
         serde_yaml::to_string(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
@@ -2829,6 +2937,13 @@ impl Config {
     /// plaintext. The operator's in-memory state is correct but their
     /// on-disk source of truth disagrees.
     fn to_canonical_yaml_for_persist(&self) -> Result<String, ConfigError> {
+        self.to_canonical_yaml_for_persist_with(&process_env)
+    }
+
+    pub(crate) fn to_canonical_yaml_for_persist_with(
+        &self,
+        env: EnvLookup,
+    ) -> Result<String, ConfigError> {
         // The FILE view: env-overridden fields get the file's value back, so
         // an env value (a secret above all) never lands in the file.
         let export = self
@@ -2846,6 +2961,7 @@ impl Config {
         // exactly undoes this, so repeated persist/load is stable.
         let mut tree =
             serde_yaml::to_value(&sectioned).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        self.refuse_env_secret_leaks(&tree, env)?;
         escape_dollar_for_persist(&mut tree);
         serde_yaml::to_string(&tree).map_err(|e| ConfigError::Parse(e.to_string()))
     }
@@ -2873,6 +2989,30 @@ impl Config {
         }
         let content = self.to_canonical_yaml_for_persist()?;
         atomic_write(std::path::Path::new(path), content.as_bytes())
+    }
+}
+
+/// What [`Config::reapply_env_overrides`] found. Paths are dotted flat
+/// config paths.
+#[derive(Debug, Default, PartialEq)]
+pub struct EnvReapply {
+    /// Env-controlled fields the edit changed: saved to the file only.
+    pub edited: Vec<String>,
+    /// Fields the edit set to exactly the env value while the file holds
+    /// another value: treated as an echo, so the file keeps its value.
+    pub echoed_over_file: Vec<String>,
+    /// Secret variables now written to the file as `${env:NAME}` references.
+    pub refs_added: Vec<String>,
+}
+
+/// Does any string scalar in `tree` equal `needle`?
+fn tree_has_string(tree: &serde_yaml::Value, needle: &str) -> bool {
+    match tree {
+        serde_yaml::Value::String(s) => s == needle,
+        serde_yaml::Value::Sequence(seq) => seq.iter().any(|v| tree_has_string(v, needle)),
+        serde_yaml::Value::Mapping(m) => m.values().any(|v| tree_has_string(v, needle)),
+        serde_yaml::Value::Tagged(t) => tree_has_string(&t.value, needle),
+        _ => false,
     }
 }
 
@@ -5635,7 +5775,7 @@ advanced:
 
     fn loaded(env: &[(&str, &str)]) -> Config {
         let mut cfg = Config::from_yaml_str(FILE).unwrap();
-        cfg.apply_env_overrides_tracked(&lookup(env));
+        cfg.apply_env_overrides_at_load(&lookup(env));
         cfg
     }
 
@@ -5717,7 +5857,7 @@ advanced:
         edit.max_delta_ratio = 0.5;
         edit.cache_size_mb = 50;
         let edited = edit.reapply_env_overrides(&running, &lookup(ENV)).unwrap();
-        assert_eq!(edited, vec!["cache_size_mb".to_string()]);
+        assert_eq!(edited.edited, vec!["cache_size_mb".to_string()]);
 
         // Runtime: env still wins, the unrelated edit applies.
         assert_eq!(edit.cache_size_mb, 777);

@@ -428,6 +428,26 @@ pub fn env_overrides(cfg: &Config, env: EnvLookup) -> Vec<EnvOverride> {
     out
 }
 
+/// `(variable, value)` for every SECRET variable that is currently set and
+/// applies to `cfg` (plus the bootstrap password hash, which the GUI never
+/// shows). Persist and export refuse to write any of these values.
+pub fn secret_env_values(cfg: &Config, env: EnvLookup) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = env_overrides(cfg, env)
+        .into_iter()
+        .filter(|o| o.secret && o.set)
+        .filter_map(|o| env(&o.env).map(|v| (o.env, v)))
+        .collect();
+    for (name, _) in NOT_GUI_VISIBLE {
+        if let Some(v) = env(name) {
+            out.push((name.to_string(), v));
+        }
+    }
+    out.retain(|(_, v)| !v.is_empty());
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// [`env_overrides`] against the real process environment.
 pub fn process_env_overrides(cfg: &Config) -> Vec<EnvOverride> {
     env_overrides(cfg, &super::process_env)
@@ -734,6 +754,36 @@ storage:
             .chain([DATA_DIR, TLS_FLAG]);
         for n in names {
             assert!(registry.contains(&n), "{n} not in ENV_VAR_REGISTRY");
+        }
+    }
+
+    /// Source guard: the override code must read the environment ONLY
+    /// through its injected lookup, or the drift test and the leak probe
+    /// would not see the variable.
+    #[test]
+    fn override_code_reads_the_environment_only_through_the_lookup() {
+        let src = include_str!("mod.rs");
+        for (start, close) in [
+            ("pub(crate) fn apply_env_overrides_with(", "\n    }\n"),
+            ("pub(crate) fn apply_backend_encryption_env(", "\n}\n"),
+        ] {
+            let at = src
+                .find(start)
+                .unwrap_or_else(|| panic!("{start} not found"));
+            let body = &src[at..];
+            let end = body.find(close).expect("end of function");
+            let body = &body[..end];
+            for banned in [
+                "std::env::var",
+                "env_parse",
+                "env_bool(",
+                "env_parse_with_default",
+            ] {
+                assert!(
+                    !body.contains(banned),
+                    "{start} calls {banned}: read the environment through the injected lookup"
+                );
+            }
         }
     }
 }

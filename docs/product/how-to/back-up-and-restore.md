@@ -35,6 +35,8 @@ The zip contains four artefacts, each sha256-listed in the manifest:
 - `iam.json` — users, groups, OAuth providers, mapping rules, external identities
 - `secrets.json` — **plaintext** infra secrets: bootstrap hash, OAuth client_secrets, storage creds
 
+A secret that comes from an environment variable (for example `DGP_SECRET_ACCESS_KEY`, `DGP_BE_AWS_SECRET_ACCESS_KEY` or `DGP_BOOTSTRAP_PASSWORD_HASH`) is not part of the backup. The backup holds only what the config file holds, so a restore never writes an environment value into another instance's config file. The instance you restore onto must get these values from its own environment, so keep them in your secret manager.
+
 `secrets.json` makes the zip a keystore — treat it like one. Store it encrypted, off the host, somewhere the upgrade or incident you're protecting against can't reach. Take a fresh one after any password change: the zip carries both the bootstrap hash and the encrypted DB, so a fresh instance can be reconstituted from it alone.
 
 ## Restore a Full Backup
@@ -48,7 +50,7 @@ curl -b cookies -X POST \
 
 The import is atomic: all four parts are unpacked and sha256-verified before any state changes. `external_identities` are remapped through the imported user and provider IDs, so OAuth users keep working. A legacy JSON-only body is still accepted for IAM-only restores from pre-v0.8.4 scripts.
 
-If you're restoring onto a **fresh instance** and the import fails with a SQLCipher error, the new instance's bootstrap password doesn't match the DB. Inject the original `DGP_BOOTSTRAP_PASSWORD_HASH` (it's in the zip's `secrets.json`) before retrying.
+If you're restoring onto a **fresh instance** and the import fails with a SQLCipher error, the new instance's bootstrap password doesn't match the DB. Inject the original `DGP_BOOTSTRAP_PASSWORD_HASH` before retrying. The zip's `secrets.json` holds the hash only when the config file held it; a hash that came from the environment is not in the backup.
 
 ## Snapshot the DB file
 
