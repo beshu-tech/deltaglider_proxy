@@ -81,8 +81,9 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
       key: 'auth',
       render: (v: string, r: SessionSummary) => (
         <Space size={4}>
-          <Tag color={v === 'bootstrap' ? 'gold' : v === 'external' ? 'purple' : 'blue'}>{v}</Tag>
-          {r.admin_gui ? <Tag color="red">admin</Tag> : <Tag>browser</Tag>}
+          {/* Neutral chips: red and amber are kept for real problems. */}
+          <Tag>{v}</Tag>
+          {r.admin_gui ? <Tag color="blue">admin</Tag> : <Tag>browser</Tag>}
         </Space>
       ),
     },

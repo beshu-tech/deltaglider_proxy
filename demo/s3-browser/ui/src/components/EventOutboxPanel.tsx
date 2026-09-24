@@ -23,6 +23,7 @@ import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
 import { isSessionExpired } from '../errorHandling';
 import { relativeTime } from '../utils';
+import { countTone, eventStatusTone } from '../statusTone';
 
 const { Text } = Typography;
 const DEFAULT_PAGE_SIZE = 50;
@@ -53,11 +54,16 @@ function fmtRelative(ts: number | null | undefined): string {
   return relativeTime(ts ? ts * 1000 : null, { future: true });
 }
 
-function statusColour(status: string): string {
-  if (status === 'delivered') return 'success';
-  if (status === 'failed') return 'error';
-  if (status === 'in_progress') return 'processing';
-  return 'warning';
+/** Second line of the Timing cell: what happens next to this event. */
+function nextStep(row: EventOutboxRecord): string {
+  if (row.delivered_at) return `delivered ${fmtRelative(row.delivered_at)}`;
+  if (row.status === 'failed') return 'retries used up';
+  if (row.next_attempt_at) {
+    return row.next_attempt_at * 1000 <= Date.now()
+      ? 'next try due now'
+      : `next try ${fmtRelative(row.next_attempt_at)}`;
+  }
+  return `queued ${fmtRelative(row.created_at)}`;
 }
 
 export default function EventOutboxPanel({ onSessionExpired }: Props) {
@@ -100,7 +106,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
         onSessionExpired?.();
         return;
       }
-      setError(normalizeUiError(e, "Failed to load event outbox"));
+      setError(normalizeUiError(e, "Failed to load the event log"));
     } finally {
       if (gen === fetchGen.current) setLoading(false);
     }
@@ -151,7 +157,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       title: 'ID',
       dataIndex: 'id',
       key: 'id',
-      width: 86,
+      width: 72,
       sorter: true,
       sortOrder: sort === 'id' ? (order === 'asc' ? 'ascend' : 'descend') : null,
       render: (id: number) => <Text code>#{id}</Text>,
@@ -160,12 +166,12 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       title: 'Status',
       dataIndex: 'status',
       key: 'status',
-      width: 138,
+      width: 120,
       sorter: true,
       sortOrder: sort === 'status' ? (order === 'asc' ? 'ascend' : 'descend') : null,
       render: (value: EventOutboxStatus, row) => (
         <div title={`Attempts: ${row.attempts}${row.claimed_by ? ` · claimed by ${row.claimed_by}` : ''}`}>
-          <Tag color={statusColour(value)}>{value}</Tag>
+          <Tag color={eventStatusTone(value, row.attempts)}>{value}</Tag>
           <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 2 }}>
             {row.attempts} attempt{row.attempts === 1 ? '' : 's'}
           </Text>
@@ -176,7 +182,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       title: 'Kind',
       dataIndex: 'kind',
       key: 'kind',
-      width: 168,
+      width: 170,
       sorter: true,
       sortOrder: sort === 'kind' ? (order === 'asc' ? 'ascend' : 'descend') : null,
       render: (_: string, row) => (
@@ -190,15 +196,15 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       title: 'Object',
       dataIndex: 'key',
       key: 'key',
-      width: 360,
+      width: 250,
       sorter: true,
       sortOrder: sort === 'key' ? (order === 'asc' ? 'ascend' : 'descend') : null,
       render: (_: string, row) => (
         <div title={`${row.bucket}/${row.key}`} style={{ minWidth: 0 }}>
-          <Text code style={{ display: 'block', maxWidth: 330, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          <Text code style={{ display: 'block', maxWidth: 226, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {row.bucket}
           </Text>
-          <Text style={{ display: 'block', maxWidth: 330, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          <Text style={{ display: 'block', maxWidth: 226, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {row.key || '—'}
           </Text>
         </div>
@@ -208,43 +214,37 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       title: 'Timing',
       dataIndex: 'occurred_at',
       key: 'occurred_at',
-      width: 210,
+      width: 160,
       sorter: true,
       defaultSortOrder: 'descend',
       sortOrder: sort === 'occurred_at' ? (order === 'asc' ? 'ascend' : 'descend') : null,
       render: (value: number, row) => (
-        <div title={`Occurred ${fmtUnix(value)} · queued ${fmtUnix(row.created_at)}`}>
+        <div
+          title={[
+            `Occurred ${fmtUnix(value)}`,
+            `queued ${fmtUnix(row.created_at)}`,
+            row.delivered_at ? `delivered ${fmtUnix(row.delivered_at)}` : row.next_attempt_at ? `next try ${fmtUnix(row.next_attempt_at)}` : '',
+          ].filter(Boolean).join(' · ')}
+        >
           <Text style={{ display: 'block', fontSize: 12 }}>{fmtRelative(value)}</Text>
           <Text type="secondary" style={{ display: 'block', fontSize: 11 }}>
-            queued {fmtRelative(row.created_at)}
+            {nextStep(row)}
           </Text>
         </div>
       ),
     },
     {
-      title: 'Next Try',
-      dataIndex: 'next_attempt_at',
-      key: 'next_attempt_at',
-      width: 130,
-      sorter: true,
-      sortOrder: sort === 'next_attempt_at' ? (order === 'asc' ? 'ascend' : 'descend') : null,
-      render: (value: number | null, row) => (
-        <span title={row.delivered_at ? `Delivered ${fmtUnix(row.delivered_at)}` : fmtUnix(value)}>
-          {row.delivered_at ? 'delivered' : fmtRelative(value)}
-        </span>
-      ),
-    },
-    {
       title: 'Error / Payload',
       key: 'last_error',
-      width: 380,
+      // No fixed width: this column takes the space that is left, so the
+      // table fits the page at desktop widths.
       render: (_: unknown, row) => {
         const text = row.last_error || JSON.stringify(row.payload);
         return (
           <Text
             type={row.last_error ? 'danger' : 'secondary'}
             title={text}
-            style={{ display: 'block', maxWidth: 350, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+            style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
           >
             {text}
           </Text>
@@ -254,8 +254,10 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
     {
       title: 'Action',
       key: 'action',
-      width: 122,
-      fixed: 'right',
+      // Not `fixed: 'right'`: a sticky column covers the columns behind it
+      // while the table scrolls sideways, and their headers read as clipped
+      // fragments ("NI" for "Next try").
+      width: 116,
       render: (_: unknown, row) => (
         <Button
           size="small"
@@ -411,10 +413,10 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       </div>
 
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-        <CountPill label="Pending" value={counts.pending} colour="warning" active={status === 'pending'} onClick={() => { setStatus('pending'); setPage(1); }} />
-        <CountPill label="In progress" value={counts.in_progress} colour="processing" active={status === 'in_progress'} onClick={() => { setStatus('in_progress'); setPage(1); }} />
-        <CountPill label="Failed" value={counts.failed} colour="error" active={status === 'failed'} onClick={() => { setStatus('failed'); setPage(1); }} />
-        <CountPill label="Delivered" value={counts.delivered} colour="success" active={status === 'delivered'} onClick={() => { setStatus('delivered'); setPage(1); }} />
+        <CountPill label="Pending" value={counts.pending} colour="default" active={status === 'pending'} onClick={() => { setStatus('pending'); setPage(1); }} />
+        <CountPill label="In progress" value={counts.in_progress} colour={countTone(counts.in_progress, 'processing')} active={status === 'in_progress'} onClick={() => { setStatus('in_progress'); setPage(1); }} />
+        <CountPill label="Failed" value={counts.failed} colour={countTone(counts.failed, 'error')} active={status === 'failed'} onClick={() => { setStatus('failed'); setPage(1); }} />
+        <CountPill label="Delivered" value={counts.delivered} colour={countTone(counts.delivered, 'success')} active={status === 'delivered'} onClick={() => { setStatus('delivered'); setPage(1); }} />
         {status !== 'all' && (
           <Button size="small" onClick={() => { setStatus('all'); setPage(1); }}>
             Clear status filter
@@ -433,7 +435,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
           size="small"
           tableLayout="fixed"
           showSorterTooltip={false}
-          scroll={{ x: 'max-content' }}
+          scroll={{ x: 1040 }}
           onChange={onTableChange}
           locale={{
             // While loading the Table's own spinner overlay provides the motion;
@@ -442,7 +444,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
               ? ' '
               : status === 'all' && !filter
                 ? 'No object events have been recorded yet.'
-                : 'No outbox rows match this view.',
+                : 'No events match this view.',
           }}
           pagination={{
             current: page,
