@@ -63,10 +63,16 @@ import FormField from './FormField';
 import { normalizeUiError } from '../errorHandling';
 import { useNavigation } from '../NavigationContext';
 import { parseAdminQuery, buildViewUrl } from '../urlState';
-import { generateSetupYaml } from '../setupYaml';
+import {
+  generateSetupYaml,
+  setupEnvControl,
+  setupStepComplete,
+  type SetupEnvControl,
+} from '../setupYaml';
+import { useAdminConfig } from '../queries/config';
 import { useBackends, useBucketOrigins } from '../queries/backends';
 import { describeExistingSetup } from '../setupDetect';
-import { isAbsolutePath } from '../utils';
+import { ABSOLUTE_PATH_ERROR, isAbsolutePath } from '../utils';
 
 const { Text, Paragraph } = Typography;
 
@@ -139,6 +145,14 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
         )
       : null;
   const [overwriteConfirmed, setOverwriteConfirmed] = useState(false);
+  // Answers the environment already gives (DGP_* variables): shown
+  // read-only, counted as answered, and left out of the generated YAML.
+  const { data: adminConfig } = useAdminConfig();
+  const envControl = setupEnvControl(adminConfig?.env_overrides);
+  const envBackendKind = envControl.backendKind;
+  useEffect(() => {
+    if (envBackendKind) setState((s) => ({ ...s, backendKind: envBackendKind }));
+  }, [envBackendKind]);
   const seeded = useRef(false);
   useEffect(() => {
     if (!existing || seeded.current) return;
@@ -193,33 +207,17 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
     }
   };
 
-  const generatedYaml = generateSetupYaml(state);
+  const generatedYaml = generateSetupYaml(state, envControl);
 
-  // Validation per step.
-  const canAdvance = (() => {
-    switch (step) {
-      case 0:
-        return true;
-      case 1:
-        if (state.backendKind === 'filesystem') {
-          return isAbsolutePath(state.fsPath);
-        }
-        // S3: connection test must have succeeded.
-        return testResult?.success === true;
-      case 2:
-        return (
-          state.adminAccessKeyId.trim().length >= 4 &&
-          state.adminSecretKey.length >= 12 &&
-          state.adminSecretKey === state.adminSecretKeyConfirm
-        );
-      case 3:
-        return true; // optional
-      case 4:
-        return true;
-      default:
-        return false;
-    }
-  })();
+  // Validation per step (pure, see setupYaml.ts). An S3 backend needs a
+  // passed connection test unless the environment sets the backend.
+  const canAdvance = setupStepComplete(
+    step,
+    state,
+    envControl,
+    testResult?.success === true,
+    isAbsolutePath,
+  );
 
   const next = () => {
     const ns = Math.min(step + 1, MAX_STEP);
@@ -278,6 +276,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
       case 0:
         return (
           <PickBackendStep
+            envKind={envControl.backendKind}
             value={state.backendKind}
             onChange={(kind) => {
               update({ backendKind: kind });
@@ -291,6 +290,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
       case 1:
         return (
           <ConfigureBackendStep
+            env={envControl}
             state={state}
             update={update}
             testing={testing}
@@ -303,6 +303,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
       case 2:
         return (
           <CreateAdminStep
+            env={envControl}
             state={state}
             update={update}
             cardStyle={cardStyle}
@@ -469,9 +470,11 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
 // ───────────────────────────────────────────────────────────
 
 function PickBackendStep({
+  envKind,
   value,
   onChange,
 }: {
+  envKind: BackendKind | null;
   value: BackendKind;
   onChange: (kind: BackendKind) => void;
 }) {
@@ -489,8 +492,17 @@ function PickBackendStep({
         This proxy needs a backing store. Pick the one that matches your
         infrastructure. You can always change this later.
       </Text>
+      {envKind && (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 16, borderRadius: 8 }}
+          title={`Environment variables set this proxy's backend (${envKind === 's3' ? 'S3-compatible' : 'filesystem'}). To choose another one, change them and restart the proxy.`}
+        />
+      )}
       <Radio.Group
         value={value}
+        disabled={envKind !== null}
         onChange={(e) => onChange(e.target.value)}
         style={{ display: 'flex', flexDirection: 'column', gap: 14 }}
       >
@@ -529,6 +541,7 @@ function PickBackendStep({
 }
 
 function ConfigureBackendStep({
+  env,
   state,
   update,
   testing,
@@ -537,6 +550,7 @@ function ConfigureBackendStep({
   cardStyle,
   inputRadius,
 }: {
+  env: SetupEnvControl;
   state: WizardState;
   update: (patch: Partial<WizardState>) => void;
   testing: boolean;
@@ -552,9 +566,9 @@ function ConfigureBackendStep({
           Pick a data directory
         </h3>
         <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 4, marginBottom: 16 }}>
-          Objects live under this path. Use an absolute path: a relative one
-          would depend on the directory the proxy starts in. Make sure it is on
-          a disk with enough room.
+          {env.backendKind !== null
+            ? 'The environment sets this directory. Its value is shown below.'
+            : 'Objects live under this path. Use an absolute path: a relative one would depend on the directory the proxy starts in. Make sure it is on a disk with enough room.'}
         </Text>
         <FormField
           label="Data directory"
@@ -573,7 +587,7 @@ function ConfigureBackendStep({
           />
           {state.fsPath.trim() && !isAbsolutePath(state.fsPath) && (
             <Text type="danger" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
-              Use an absolute path that starts with /.
+              {ABSOLUTE_PATH_ERROR}
             </Text>
           )}
         </FormField>
@@ -588,14 +602,14 @@ function ConfigureBackendStep({
         Connect to your S3-compatible store
       </h3>
       <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 4, marginBottom: 16 }}>
-        Enter the endpoint + credentials. Test Connection proves the whole
-        loop works before you commit. You can't advance until the test
-        passes — catching a typo now beats debugging later.
+        {env.backendKind !== null
+          ? 'Environment variables connect this proxy to its S3 store. Their values are shown below.'
+          : "Enter the endpoint and credentials. Test the connection before you continue: you can't go on until the test passes, because a typo is easier to catch now than later."}
       </Text>
       <FormField
         label="Endpoint URL"
         yamlPath="storage.backend.endpoint"
-        helpText="Leave empty for AWS default. Include http(s):// scheme."
+        helpText={env.backendKind !== null ? undefined : 'Leave empty for AWS default. Include http(s):// scheme.'}
         examples={[
           'https://s3.us-east-1.amazonaws.com',
           'http://localhost:9000',
@@ -649,6 +663,12 @@ function ConfigureBackendStep({
           />
         </FormField>
       </div>
+      {env.backendKind !== null ? (
+        <Text type="secondary" style={{ fontSize: 13, display: 'block' }}>
+          Environment variables give these settings, so there is nothing to
+          enter or test here.
+        </Text>
+      ) : (
       <Button
         icon={<ApiOutlined />}
         onClick={onTest}
@@ -659,7 +679,8 @@ function ConfigureBackendStep({
       >
         Test connection
       </Button>
-      {testResult && (
+      )}
+      {testResult && env.backendKind === null && (
         <Alert
           type={testResult.success ? 'success' : 'error'}
           showIcon
@@ -681,11 +702,13 @@ function ConfigureBackendStep({
 }
 
 function CreateAdminStep({
+  env,
   state,
   update,
   cardStyle,
   inputRadius,
 }: {
+  env: SetupEnvControl;
   state: WizardState;
   update: (patch: Partial<WizardState>) => void;
   cardStyle: React.CSSProperties;
@@ -707,7 +730,8 @@ function CreateAdminStep({
       <FormField
         label="Access key ID"
         yamlPath="access.access_key_id"
-        helpText="4+ characters. Convention: uppercase, starts with AKIA."
+        // Input rules describe the input; an env-controlled field has none.
+        helpText={env.adminAccessKeyId ? undefined : '4+ characters. Convention: uppercase, starts with AKIA.'}
         examples={['AKIAADMINDEVELOPER01', 'AKIAMYDGPSITEADMIN']}
         onExampleClick={(v) => update({ adminAccessKeyId: String(v) })}
       >
@@ -721,7 +745,11 @@ function CreateAdminStep({
       <FormField
         label="Secret access key"
         yamlPath="access.secret_access_key"
-        helpText="At least 12 characters. Use a password manager; you won't see this again after Save."
+        helpText={
+          env.adminSecretKey
+            ? undefined
+            : "At least 12 characters. Use a password manager; you won't see this again after Save."
+        }
       >
         <Input.Password
           value={state.adminSecretKey}
@@ -730,6 +758,7 @@ function CreateAdminStep({
           style={{ ...inputRadius }}
         />
       </FormField>
+      {!env.adminSecretKey && (
       <FormField label="Confirm secret access key" helpText="Paste it again to catch typos.">
         <Input.Password
           value={state.adminSecretKeyConfirm}
@@ -744,6 +773,7 @@ function CreateAdminStep({
           </Text>
         )}
       </FormField>
+      )}
     </div>
   );
 }

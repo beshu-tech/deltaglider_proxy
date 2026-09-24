@@ -37,7 +37,7 @@ import type { CSSProperties, ReactNode } from 'react';
 import { Tag } from 'antd';
 import { useColors } from '../ThemeContext';
 import { useEnvOverride } from '../queries/config';
-import { envOverrideText } from '../envOverrides';
+import { envOverrideHelp, envOverrideSource, envOverrideText } from '../envOverrides';
 
 interface FormFieldProps {
   /**
@@ -102,7 +102,7 @@ export default function FormField({
   // editable-looking input (an edit would be overridden again at restart).
   const envOverride = useEnvOverride(yamlPath, envVar);
   const envBadge = envOverride
-    ? `from env ${envOverride.env}`
+    ? `from env ${envOverrideSource(envOverride)}`
     : envVar
       ? `set with env ${envVar}`
       : undefined;
@@ -207,8 +207,7 @@ export default function FormField({
           Example chips share this row. */}
       {envOverride && (
         <div style={{ marginTop: 6, fontSize: 12.5, color: TEXT_MUTED, lineHeight: 1.4 }}>
-          The <code>{envOverride.env}</code> environment variable sets this value. Change it
-          there and restart the proxy.
+          {envOverrideHelp(envOverride)}
         </div>
       )}
       {(helpText || (!envOverride && (defaultPlaceholder || (examples && examples.length > 0)))) && (

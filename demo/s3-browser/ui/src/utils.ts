@@ -125,6 +125,10 @@ export function numericCompare(a: string, b: string): number {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 }
 
+/** The error shown for a path that `isAbsolutePath` rejects. */
+export const ABSOLUTE_PATH_ERROR =
+  'Use an absolute path, such as /var/lib/deltaglider or C:\\deltaglider.';
+
 /**
  * True when `path` is an absolute filesystem path: POSIX (`/srv/data`) or a
  * Windows drive path (`C:\data`, `C:/data`). A relative path such as `./data`

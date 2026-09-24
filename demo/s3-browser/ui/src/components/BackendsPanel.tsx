@@ -21,7 +21,8 @@ import MaskedSecretInput from './MaskedSecretInput';
 import { normalizeUiError } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { isSessionExpired } from '../errorHandling';
-import { isAbsolutePath } from '../utils';
+import { ABSOLUTE_PATH_ERROR, isAbsolutePath } from '../utils';
+import { backendEncryptionEnvPath, envOverrideHelp, envOverrideSource, findEnvOverride } from '../envOverrides';
 
 const { Text } = Typography;
 
@@ -353,6 +354,18 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   };
 
   const globalCompressionOn = (config?.max_delta_ratio ?? 0.75) > 0;
+  // DGP_MAX_DELTA_RATIO controls the switch's field: show it read-only.
+  const ratioEnv = findEnvOverride(config?.env_overrides, 'advanced.max_delta_ratio');
+  // The singleton backend's type/path, when DGP_S3_* or DGP_DATA_DIR sets it.
+  const singletonEnv = findEnvOverride(config?.env_overrides, 'storage.backend.type');
+  /** The env override for a backend's encryption key or KMS key id, if any. */
+  const encryptionEnv = (b: { name: string; is_synthesized?: boolean }) => {
+    const name = b.is_synthesized ? null : b.name;
+    return (
+      findEnvOverride(config?.env_overrides, backendEncryptionEnvPath(name, 'key')) ??
+      findEnvOverride(config?.env_overrides, backendEncryptionEnvPath(name, 'kms_key_id'))
+    );
+  };
 
   if (loading) {
     return <div style={{ display: 'flex', justifyContent: 'center', padding: 64 }}><Spin /></div>;
@@ -432,6 +445,11 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                       ? `filesystem: ${b.path}`
                       : `s3: ${b.endpoint || 'AWS'} (${b.region})`}
                   </div>
+                  {b.is_synthesized && singletonEnv && (
+                    <div data-testid="backend-env-note" style={{ fontSize: 12, color: colors.TEXT_MUTED, marginTop: 2 }}>
+                      {envOverrideHelp(singletonEnv).replace('this value', 'this backend')}
+                    </div>
+                  )}
                   <div style={{ fontSize: 11, color: colors.TEXT_MUTED, marginTop: 2 }}>
                     {(() => {
                       const n = countByBackend[b.name] ?? 0;
@@ -541,6 +559,12 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                  mode, exposes a mode-change picker, and wraps the
                  proxy-AES key-generation flow. Apply sends a targeted
                  storage section PUT; siblings preserved by merge-patch. */}
+              {encryptionEnv(b) && (
+                <Text type="secondary" data-testid="backend-encryption-env-note" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
+                  {envOverrideHelp(encryptionEnv(b)!).replace('this value', "this backend's encryption key")}{' '}
+                  A key entered below is saved to the config file but does not take effect.
+                </Text>
+              )}
               <BackendEncryptionEditor
                 backendName={b.name}
                 current={b.encryption}
@@ -587,7 +611,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                   />
                   {formPath.trim() && pathInvalid && (
                     <Text type="danger" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
-                      Use an absolute path that starts with /.
+                      {ABSOLUTE_PATH_ERROR}
                     </Text>
                   )}
                 </FormField>
@@ -655,6 +679,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               data-testid="delta-compression-switch"
               aria-label="Delta compression default"
               checked={globalCompressionOn}
+              disabled={ratioEnv !== null}
               onChange={async (on) => {
                 try {
                   await updateAdminConfig({ max_delta_ratio: on ? 0.75 : 0 });
@@ -665,9 +690,12 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
             <div>
               <Text style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--font-ui)', color: colors.TEXT_PRIMARY }}>
                 Delta compression: <span style={{ color: globalCompressionOn ? colors.ACCENT_GREEN : colors.TEXT_SECONDARY }}>{globalCompressionOn ? 'ON' : 'OFF'}</span>
-                <span style={{ fontWeight: 400, color: colors.TEXT_MUTED, marginLeft: 8, fontSize: 12 }}>applies immediately</span>
+                <span style={{ fontWeight: 400, color: colors.TEXT_MUTED, marginLeft: 8, fontSize: 12 }}>
+                  {ratioEnv ? `from env ${envOverrideSource(ratioEnv)}` : 'applies immediately'}
+                </span>
               </Text>
               <Text type="secondary" style={{ fontSize: 12, fontFamily: 'var(--font-ui)', display: 'block', marginTop: 2, lineHeight: 1.6 }}>
+                {ratioEnv && `${envOverrideHelp(ratioEnv)} `}
                 {globalCompressionOn
                   ? 'Versioned binaries are stored as xdelta3 deltas (30-70% smaller); reads reconstruct transparently. Already-compressed formats (images, video) are skipped.'
                   : 'Files are stored as-is. Compression can still be enabled per bucket.'}

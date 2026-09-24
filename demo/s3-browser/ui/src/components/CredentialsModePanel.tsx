@@ -47,7 +47,8 @@ import type { IamMode } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import { useSectionEditor } from '../useSectionEditor';
-import { useAdminConfig } from '../queries/config';
+import { useAdminConfig, useEnvOverride } from '../queries/config';
+import { envOverrideHelp } from '../envOverrides';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
 import ApplyDialog from './ApplyDialog';
@@ -112,7 +113,10 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
   // Derive the auth-mode radio from the `authentication` string. The
   // server stores it as `Option<String>` — absent / `null` means
   // auto-detect; the literal `"none"` means open access.
-  const authMode: AuthMode = form.authentication === 'none' ? 'none' : 'auto';
+  // DGP_AUTHENTICATION controls this field: the radio then shows the env
+  // value read-only (an edit would be overridden by the environment).
+  const authEnv = useEnvOverride('access.authentication');
+  const authMode: AuthMode = (authEnv ? authEnv.value : form.authentication) === 'none' ? 'none' : 'auto';
 
   // ── Mutators ───────────────────────────────────────────
   // All write through `setForm((prev) => …)` so a burst of edits — or the
@@ -266,8 +270,14 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
           />
         )}
         <div>
+          {authEnv && (
+            <Text type="secondary" data-testid="auth-mode-env-note" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
+              {envOverrideHelp(authEnv)}
+            </Text>
+          )}
           <Radio.Group
             value={authMode}
+            disabled={authEnv !== null}
             onChange={(e) => setAuthMode(e.target.value as AuthMode)}
             style={{ display: 'flex', flexDirection: 'column', gap: 10 }}
           >
