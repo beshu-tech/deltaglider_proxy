@@ -117,6 +117,17 @@ pub(crate) fn check_quota(
     quota_decision(quota, used, incoming_bytes).map_err(S3Error::AccessDeniedReason)
 }
 
+fn human_bytes(b: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if b >= 1024 * MIB {
+        format!("{:.1} GB", b as f64 / (1024 * MIB) as f64)
+    } else if b >= MIB {
+        format!("{:.1} MB", b as f64 / MIB as f64)
+    } else {
+        format!("{} KB", b.div_ceil(1024))
+    }
+}
+
 /// Pure quota verdict. `Err` carries the operator-facing reason; the caller
 /// maps it to 403 AccessDenied (the documented status — it used to be a 500
 /// InternalError, which S3 SDKs retry as a server fault).
@@ -125,10 +136,13 @@ pub(crate) fn quota_decision(quota: u64, used: Option<u64>, incoming: u64) -> Re
         return Err("Bucket is frozen (quota = 0)".into());
     }
     match used {
+        // Say why THIS write fails: "24 MB used of 25 MB" alone reads as
+        // if there were still room.
         Some(used) if used.saturating_add(incoming) > quota => Err(format!(
-            "Bucket quota exceeded: {} MB used of {} MB limit",
-            used / (1024 * 1024),
-            quota / (1024 * 1024),
+            "Bucket quota exceeded: {} used + {} upload > {} limit",
+            human_bytes(used),
+            human_bytes(incoming),
+            human_bytes(quota),
         )),
         _ => Ok(()),
     }
@@ -157,6 +171,11 @@ mod quota_tests {
         );
         let e = quota_decision(100, Some(50), 51).unwrap_err();
         assert!(e.starts_with("Bucket quota exceeded"), "{e}");
+        let mib = 1024 * 1024;
+        assert_eq!(
+            quota_decision(25 * mib, Some(24 * mib), 3 * mib).unwrap_err(),
+            "Bucket quota exceeded: 24.0 MB used + 3.0 MB upload > 25.0 MB limit"
+        );
         assert!(
             quota_decision(100, Some(u64::MAX), 1).is_err(),
             "saturating, never wraps"
