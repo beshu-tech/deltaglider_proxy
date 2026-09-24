@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Drawer, Button, Modal, message, Tag, Skeleton, Input, Spin } from 'antd';
 import { DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutlined, CheckCircleFilled, CopyOutlined, LoadingOutlined, EyeOutlined } from '@ant-design/icons';
 import { deleteObject, downloadObject, getPresignedUrl, getObjectUrl, headObject, getBucket } from '../s3client';
@@ -11,8 +11,7 @@ import { useColors } from '../ThemeContext';
 import { getPreviewMode } from './filePreviewMode';
 import { useAdminConfig } from '../queries/config';
 import { useOnClickOutside } from '../useDocumentEvent';
-import { useOverlayClose } from '../hooks/useOverlayClose';
-import { useNavigation } from '../NavigationContext';
+import { useBackClosesModal } from '../hooks/useOverlayClose';
 
 const SHARE_DURATIONS = [
   { label: '1 hour', seconds: 3600 },
@@ -242,10 +241,6 @@ export default function InspectorPanel({
     | null
   >(null);
   const blobRef = useRef<{ blob: Blob; name: string } | null>(null);
-  // --- Back-button close for download/share modal ---
-  const { markPushed, closeOverlay } = useOverlayClose();
-  const { navigate } = useNavigation();
-  const pushedForModal = useRef(false);
   const [shareDuration, setShareDuration] = useState<number | null>(null);
   const objectKey = object?.key;
   const cachedHead = objectKey ? headCache?.[objectKey] : undefined;
@@ -322,38 +317,19 @@ export default function InspectorPanel({
     return () => { cancelled = true; };
   }, [cachedHead, objectKey]);
 
+  const closeModal = useCallback(() => {
+    setModalState(null);
+    blobRef.current = null;
+  }, []);
+
   // Clear any in-flight / completed download or share modal when the selected
   // object changes. Otherwise a "Download ready" / "Share ready" modal opened
   // for one object persists on top of a different object's drawer.
-  useEffect(() => {
-    setModalState(null);
-    blobRef.current = null;
-  }, [objectKey]);
+  useEffect(closeModal, [objectKey, closeModal]);
 
-  // Push a history entry when the modal opens so Back closes it before
-  // leaving the page.  The entry reuses the current URL (no visible change);
-  // popstate is the signal to close.
-  useEffect(() => {
-    if (modalState && !pushedForModal.current) {
-      window.history.pushState(null, '', window.location.href);
-      markPushed();
-      pushedForModal.current = true;
-    }
-    if (!modalState) {
-      pushedForModal.current = false;
-    }
-  }, [modalState, markPushed]);
-
-  // Close the modal on popstate (Back button or history.back()).
-  useEffect(() => {
-    if (!modalState) return;
-    const onPopState = () => {
-      setModalState(null);
-      blobRef.current = null;
-    };
-    window.addEventListener('popstate', onPopState);
-    return () => window.removeEventListener('popstate', onPopState);
-  }, [modalState !== null]);
+  // Back closes the download/share modal. Closing it any other way (button,
+  // object change above) pops the pushed entry, so the next Back still works.
+  useBackClosesModal(modalState !== null, closeModal);
 
   if (!object) return null;
 
@@ -434,8 +410,7 @@ export default function InspectorPanel({
   const triggerBlobDownload = () => {
     if (!blobRef.current) return;
     downloadBlobAsFile(blobRef.current.blob, blobRef.current.name);
-    closeOverlay(window.location.pathname + window.location.search, navigate);
-    setModalState(null);
+    closeModal();
   };
 
   const handleCopyLink = async (expiresInSeconds?: number) => {
@@ -763,7 +738,7 @@ export default function InspectorPanel({
       {/* Download / Share modal */}
       <Modal
         open={!!modalState}
-        onCancel={() => { closeOverlay(window.location.pathname + window.location.search, navigate); setModalState(null); blobRef.current = null; }}
+        onCancel={closeModal}
         footer={null}
         centered
         width={420}

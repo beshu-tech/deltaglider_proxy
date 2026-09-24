@@ -68,6 +68,7 @@
     "test:bulk-selection": "node scripts/bulk-selection-regression-test.mjs",
     "test:usage-poll": "node scripts/usage-poll-regression-test.mjs",
     "test:upload-stats": "node scripts/upload-stats-regression-test.mjs",
+    "test:modal-history": "node scripts/modal-history-regression-test.mjs",
     "e2e": "playwright test",
     "typecheck": "tsc --noEmit",
     "knip": "knip"

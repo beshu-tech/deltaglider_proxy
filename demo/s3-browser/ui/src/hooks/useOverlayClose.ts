@@ -1,4 +1,5 @@
 import { useRef, useCallback, useEffect } from 'react';
+import { pushModalEntry, popModalEntryIfTop } from './modalHistory';
 
 /**
  * Direct-load-safe close for overlays (drawers, modals, inspector).
@@ -49,4 +50,37 @@ export function useOverlayClose() {
   );
 
   return { markPushed, closeOverlay };
+}
+
+/**
+ * Back closes an in-page modal (download/share dialog, destination picker).
+ *
+ * While `open` is true, one history entry (same URL, tagged state) sits on top
+ * of the stack, so Back pops it and calls `onClose` instead of leaving the
+ * page. When the modal closes any other way (button, Esc, an object change),
+ * the hook pops its own entry — otherwise the next Back would land on the dead
+ * entry and appear to do nothing. It pops only when its entry is still the
+ * current one, so a navigation pushed on top of it is never undone.
+ */
+export function useBackClosesModal(open: boolean, onClose: () => void) {
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  });
+
+  useEffect(() => {
+    if (!open) return;
+    const id = `dg-modal-${Math.random().toString(36).slice(2)}`;
+    pushModalEntry(window.history, id, window.location.href);
+    let ours = true; // false once Back already popped the entry
+    const onPopState = () => {
+      ours = false;
+      onCloseRef.current();
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => {
+      window.removeEventListener('popstate', onPopState);
+      if (ours) popModalEntryIfTop(window.history, id);
+    };
+  }, [open]);
 }
