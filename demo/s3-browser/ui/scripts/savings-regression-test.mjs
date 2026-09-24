@@ -9,7 +9,7 @@ const { outputText } = ts.transpileModule(source, {
   fileName: 'savings.ts',
 });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
-const { summarizeScopeSavings, summarizeObjectSavings, GIB, gibFromBytes, bytesFromGib } = await import(moduleUrl);
+const { summarizeScopeSavings, summarizeObjectSavings, GIB, gibFromBytes, bytesFromGib, monthlyCost } = await import(moduleUrl);
 
 // --- summarizeScopeSavings ---------------------------------------------------
 assert.deepEqual(summarizeScopeSavings(0, 0), { pct: 0, pctOneDecimal: 0, savedBytes: 0, empty: true });
@@ -50,5 +50,11 @@ assert.ok(Number.isInteger(bytesFromGib(0.1)), '0.1 GiB → integer bytes');
 assert.equal(bytesFromGib(0.1), 107374182);
 // round-trip of a typed decimal stays stable
 assert.equal(gibFromBytes(bytesFromGib(0.3)), 0.3);
+
+// --- monthlyCost: bill = (bytes / GiB) × $/GB/mo ------------------------------
+assert.equal(monthlyCost(0, 0.023), 0);
+assert.equal(monthlyCost(GIB, 0.023), 0.023);
+assert.equal(monthlyCost(10 * GIB, 0.5), 5);
+assert.equal(monthlyCost(GIB / 2, 1), 0.5);
 
 console.log('savings regression checks passed');

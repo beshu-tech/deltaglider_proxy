@@ -5,6 +5,7 @@ import { deleteObject, downloadObject, getPresignedUrl, getObjectUrl, headObject
 import { GlobalOutlined } from '@ant-design/icons';
 import { formatBytes, getFileName, downloadBlobAsFile } from '../utils';
 import { summarizeObjectSavings } from '../savings';
+import { bucketPolicyFor } from '../bucketPolicyLookup';
 import type { S3Object } from '../types';
 import { useColors } from '../ThemeContext';
 import { getPreviewMode } from './filePreviewMode';
@@ -275,9 +276,7 @@ export default function InspectorPanel({
   const currentBucket = getBucket();
   const bucketPolicy: BucketPolicyInfo | null = (() => {
     if (!hasAdminSession || !currentBucket || !adminConfig) return null;
-    const bp =
-      adminConfig.bucket_policies?.[currentBucket] ||
-      adminConfig.bucket_policies?.[currentBucket.toLowerCase()];
+    const bp = bucketPolicyFor(adminConfig, currentBucket);
     // Match `BucketPolicyRegistry::compression_enabled`: per-bucket `compression`
     // only, then default `true`. Do not infer from `max_delta_ratio` — global
     // ratio 0 is a *threshold* / passthrough decision, not the same as

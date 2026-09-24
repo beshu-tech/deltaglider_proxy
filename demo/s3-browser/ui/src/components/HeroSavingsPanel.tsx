@@ -42,6 +42,7 @@ import { SettingOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { formatBytes, clamp } from '../utils';
 import { heroFontPx } from '../heroNumberSize';
+import { monthlyCost } from '../savings';
 import { useFixedOverlayPosition } from '../useFixedOverlayPosition';
 
 /** Cost rate presets. */
@@ -248,10 +249,8 @@ function HeroInner({
 
   // The two bills the dollar line tells: what you'd pay WITHOUT compression
   // (struck through) vs. what you actually pay WITH it (the green headline).
-  // Convention matches AnalyticsSection: bill = (bytes / 1024³) × $/GB/mo.
-  const GIB = 1024 ** 3;
-  const regularBill = (totalOriginal / GIB) * costRate; // crossed-out
-  const currentBill = (totalStored / GIB) * costRate; // the green number
+  const regularBill = monthlyCost(totalOriginal, costRate); // crossed-out
+  const currentBill = monthlyCost(totalStored, costRate); // the green number
   const fmtBill = (v: number) =>
     v > 0 && v < 0.01 ? '<$0.01' : `$${v.toFixed(2)}`;
 

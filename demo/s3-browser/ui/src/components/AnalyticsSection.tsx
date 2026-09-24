@@ -45,7 +45,8 @@ import {
   type BucketScanProgress,
 } from '../adminApi';
 import { formatBytes, ageLabel } from '../utils';
-import { summarizeScopeSavings } from '../savings';
+import { monthlyCost, summarizeScopeSavings } from '../savings';
+import { bucketPolicyFor } from '../bucketPolicyLookup';
 import DashboardGrid from './dashboard/DashboardGrid';
 import Panel from './dashboard/Panel';
 import HeroSavingsPanel from './HeroSavingsPanel';
@@ -350,7 +351,7 @@ export default function AnalyticsSection({ config }: Props) {
   const heroSavings = summarizeScopeSavings(totalOriginal, totalStored);
   const totalSavings = heroSavings.savedBytes;
   const savingsPercent = heroSavings.pctOneDecimal;
-  const monthlySavings = (totalSavings / (1024 * 1024 * 1024)) * costRate;
+  const monthlySavings = monthlyCost(totalSavings, costRate);
   const totalObjects = bucketRows.reduce((s, b) => s + b.objectCount, 0);
 
   // Cache-age summary: oldest + newest completed_at across cached rows.
@@ -370,8 +371,7 @@ export default function AnalyticsSection({ config }: Props) {
   const staleCount = cachedRows.filter(r => isScanStale(r.completedAt)).length;
 
   const opportunities = bucketRows.filter(b => {
-    const policy =
-      config?.bucket_policies?.[b.bucket] ?? config?.bucket_policies?.[b.bucket.toLowerCase()];
+    const policy = bucketPolicyFor(config, b.bucket);
     const bucketCompressionOn = policy?.compression ?? true;
     return !bucketCompressionOn && b.totalOriginal > 1024 * 1024;
   });
@@ -381,9 +381,7 @@ export default function AnalyticsSection({ config }: Props) {
    * back to the proxy's default_backend.
    */
   const backendOf = (bucket: string): string | null => {
-    const policy =
-      config?.bucket_policies?.[bucket] ??
-      config?.bucket_policies?.[bucket.toLowerCase()];
+    const policy = bucketPolicyFor(config, bucket);
     return policy?.backend ?? config?.default_backend ?? null;
   };
 
@@ -421,7 +419,7 @@ export default function AnalyticsSection({ config }: Props) {
   // bytes-weighted ratio would reclaim at the configured cost rate.
   const fleetRatio = savingsPercent / 100;
   const opportunityDollars = opportunities.reduce(
-    (s, b) => s + (b.totalOriginal * fleetRatio * costRate) / (1024 * 1024 * 1024),
+    (s, b) => s + monthlyCost(b.totalOriginal * fleetRatio, costRate),
     0,
   );
   const worstScanned = cachedRows
@@ -618,7 +616,7 @@ export default function AnalyticsSection({ config }: Props) {
                     <span>{b.bucket}</span>
                     <span style={{ color: colors.TEXT_MUTED }}>
                       {formatBytes(b.totalOriginal)} · est. +$
-                      {((b.totalOriginal * fleetRatio * costRate) / 1024 ** 3).toFixed(2)}/mo
+                      {monthlyCost(b.totalOriginal * fleetRatio, costRate).toFixed(2)}/mo
                     </span>
                   </div>
                 ))}

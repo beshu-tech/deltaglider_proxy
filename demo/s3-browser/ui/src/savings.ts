@@ -132,3 +132,9 @@ export function gibFromBytes(bytes: number): number {
 export function bytesFromGib(gib: number): number {
   return Math.round(gib * GIB);
 }
+
+/** Monthly storage bill for `bytes` at `ratePerGbMonth` ($/GB/mo, GB = GiB):
+ *  (bytes / GiB) × rate. The one cost formula for the analytics surfaces. */
+export function monthlyCost(bytes: number, ratePerGbMonth: number): number {
+  return (bytes / GIB) * ratePerGbMonth;
+}
