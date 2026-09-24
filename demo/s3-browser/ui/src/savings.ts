@@ -138,3 +138,13 @@ export function bytesFromGib(gib: number): number {
 export function monthlyCost(bytes: number, ratePerGbMonth: number): number {
   return (bytes / GIB) * ratePerGbMonth;
 }
+
+/** Default storage price in $/GB/mo when none is persisted. */
+export const DEFAULT_COST_RATE = 0.00524;
+
+/** Parse a persisted cost rate. Missing, non-numeric, non-finite or negative
+ *  → `DEFAULT_COST_RATE`, so a corrupt stored value never yields NaN costs. */
+export function parseCostRate(raw: string | null | undefined): number {
+  const n = raw ? Number(raw) : NaN;
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_COST_RATE;
+}

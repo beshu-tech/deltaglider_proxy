@@ -45,7 +45,7 @@ import {
   type BucketScanProgress,
 } from '../adminApi';
 import { formatBytes, relativeTime } from '../utils';
-import { monthlyCost, summarizeScopeSavings } from '../savings';
+import { monthlyCost, parseCostRate, summarizeScopeSavings } from '../savings';
 import { bucketPolicyFor } from '../bucketPolicyLookup';
 import DashboardGrid from './dashboard/DashboardGrid';
 import Panel from './dashboard/Panel';
@@ -77,6 +77,24 @@ interface Props {
 }
 
 // COST_PRESETS now lives in HeroSavingsPanel.tsx (sole consumer).
+
+// localStorage can be missing or throw (private mode, blocked site data);
+// these preferences are conveniences, so failures fall back silently.
+function readStored(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStored(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // Preference not persisted; the in-memory value still applies.
+  }
+}
 
 export default function AnalyticsSection({ config }: Props) {
   const colors = useColors();
@@ -110,18 +128,15 @@ export default function AnalyticsSection({ config }: Props) {
    * visit gets annoying.
    */
   const [topBucketsSort, setTopBucketsSort] = useState<TopBucketsSortKey>(() => {
-    const saved = typeof localStorage !== 'undefined' && localStorage.getItem('dgp-top-sort');
-    return (saved as TopBucketsSortKey) ?? 'original';
+    const saved = readStored('dgp-top-sort');
+    return saved && saved in SORT_LABELS ? (saved as TopBucketsSortKey) : 'original';
   });
   useEffect(() => {
-    if (typeof localStorage !== 'undefined') localStorage.setItem('dgp-top-sort', topBucketsSort);
+    writeStored('dgp-top-sort', topBucketsSort);
   }, [topBucketsSort]);
   const unsubRef = useRef<(() => void) | null>(null);
 
-  const [costRate, setCostRate] = useState(() => {
-    const saved = localStorage.getItem('dg-cost-per-gb');
-    return saved ? parseFloat(saved) : 0.00524;
-  });
+  const [costRate, setCostRate] = useState(() => parseCostRate(readStored('dg-cost-per-gb')));
   // The cost-rate cog popover (and the COST_PRESETS list, and the
   // localStorage setter) all live inside HeroSavingsPanel now —
   // AnalyticsSection just owns the rate value + the save callback so
@@ -129,7 +144,7 @@ export default function AnalyticsSection({ config }: Props) {
 
   const saveCostRate = (rate: number) => {
     setCostRate(rate);
-    localStorage.setItem('dg-cost-per-gb', String(rate));
+    writeStored('dg-cost-per-gb', String(rate));
   };
 
   /**

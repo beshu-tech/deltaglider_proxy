@@ -9,7 +9,7 @@ const { outputText } = ts.transpileModule(source, {
   fileName: 'savings.ts',
 });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
-const { summarizeScopeSavings, summarizeObjectSavings, GIB, gibFromBytes, bytesFromGib, monthlyCost } = await import(moduleUrl);
+const { summarizeScopeSavings, summarizeObjectSavings, GIB, gibFromBytes, bytesFromGib, monthlyCost, parseCostRate, DEFAULT_COST_RATE } = await import(moduleUrl);
 
 // --- summarizeScopeSavings ---------------------------------------------------
 assert.deepEqual(summarizeScopeSavings(0, 0), { pct: 0, pctOneDecimal: 0, savedBytes: 0, empty: true });
@@ -56,5 +56,14 @@ assert.equal(monthlyCost(0, 0.023), 0);
 assert.equal(monthlyCost(GIB, 0.023), 0.023);
 assert.equal(monthlyCost(10 * GIB, 0.5), 5);
 assert.equal(monthlyCost(GIB / 2, 1), 0.5);
+
+// --- parseCostRate: persisted $/GB/mo from localStorage ----------------------
+assert.equal(DEFAULT_COST_RATE, 0.00524);
+assert.equal(parseCostRate('0.023'), 0.023);
+assert.equal(parseCostRate('0'), 0, 'free storage is a valid rate');
+// missing / corrupt / nonsensical → default, never NaN costs
+for (const raw of [null, undefined, '', 'abc', 'NaN', 'Infinity', '-1']) {
+  assert.equal(parseCostRate(raw), DEFAULT_COST_RATE, `raw=${String(raw)}`);
+}
 
 console.log('savings regression checks passed');
