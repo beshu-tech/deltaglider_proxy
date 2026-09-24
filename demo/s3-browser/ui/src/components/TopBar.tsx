@@ -11,6 +11,11 @@ import type { DeltaSummary } from '../deltaSummary';
 import { useColors } from '../ThemeContext';
 import { useDocumentEvent } from '../useDocumentEvent';
 import { isTypingTarget, anyOverlayOpen } from '../keyboard';
+import { useIsNarrow } from '../useIsNarrow';
+
+/** Below this viewport width the savings chip no longer fits next to the
+ *  breadcrumb and the bucket-size pill (the 250px sidebar takes the rest). */
+const SAVINGS_CHIP_MIN_VIEWPORT = 1200;
 
 const { Header } = Layout;
 
@@ -94,6 +99,7 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
   // or Back): a filtered list with no visible search box looked like missing
   // files.
   const [searchOpen, setSearchOpen] = useState(() => !!searchQuery);
+  const hideSavingsChip = useIsNarrow(SAVINGS_CHIP_MIN_VIEWPORT);
   const inputRef = useRef<InputRef>(null);
   useEffect(() => {
     if (searchQuery) setSearchOpen(true);
@@ -135,10 +141,15 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
         borderBottom: `1px solid ${BORDER}`,
       }}
     >
-      {/* Left: hamburger on mobile, breadcrumb or search on desktop */}
-      <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 12 }}>
+      {/* Left: hamburger + one-line breadcrumb on mobile, breadcrumb or search
+          on desktop. overflow:hidden keeps anything here from ever covering
+          the action icons on the right. */}
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 12, overflow: 'hidden' }}>
         {isMobile && (
-          <Button type="text" icon={<MenuOutlined />} onClick={onMenuClick} size="small" aria-label="Open navigation menu" />
+          <>
+            <Button type="text" icon={<MenuOutlined />} onClick={onMenuClick} size="small" aria-label="Open navigation menu" />
+            {bucket && <Breadcrumb bucket={bucket} prefix={prefix} onNavigate={onNavigate} compact />}
+          </>
         )}
         {!isMobile && (
           searchOpen ? (
@@ -154,7 +165,7 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
             <>
               <Breadcrumb bucket={bucket} prefix={prefix} onNavigate={onNavigate} canAdmin={canAdmin} />
               {bucket && <BucketUsageChip bucket={bucket} canAdmin={canAdmin} inFolder={!!prefix} />}
-              <DeltaSavingsChip summary={deltaSummary} />
+              {!hideSavingsChip && <DeltaSavingsChip summary={deltaSummary} />}
             </>
           )
         )}

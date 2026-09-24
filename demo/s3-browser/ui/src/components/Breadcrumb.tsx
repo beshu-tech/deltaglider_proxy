@@ -17,6 +17,10 @@ interface Props {
   /** Show the backend-origin chip. Gated to admins — the origins API
    *  (/api/admin/buckets) is admin-only. */
   canAdmin?: boolean;
+  /** One-line mobile form: no Home icon and no backend chip; folders between
+   *  the bucket and the current folder collapse into one "…" link to the
+   *  parent folder. */
+  compact?: boolean;
 }
 
 const segmentBase: React.CSSProperties = {
@@ -33,15 +37,19 @@ const segmentBase: React.CSSProperties = {
   cursor: 'pointer',
 };
 
-export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = false }: Props) {
+export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = false, compact = false }: Props) {
   const { TEXT_PRIMARY, TEXT_SECONDARY, TEXT_FAINT, ACCENT_BLUE } = useColors();
   const separatorStyle: React.CSSProperties = { color: TEXT_FAINT, margin: '0 6px', fontSize: 12, flexShrink: 0, userSelect: 'none' };
-  const segments = prefixSegments(prefix);
+  const allSegments = prefixSegments(prefix);
+  // Compact: "bucket › … › current". The "…" opens the parent folder.
+  const segments: { label: string; prefix: string; collapsed?: boolean }[] = compact && allSegments.length > 1
+    ? [{ ...allSegments[allSegments.length - 2], label: '…', collapsed: true }, allSegments[allSegments.length - 1]]
+    : allSegments;
 
   // Backend-origin chip (admin-only — origins API is admin-gated). react-query
   // dedupes this with the Backends panel's useBucketOrigins(); `enabled` keeps
   // non-admins from firing the (403-ing) request.
-  const originsQuery = useBucketOrigins({ enabled: canAdmin && Boolean(bucket) });
+  const originsQuery = useBucketOrigins({ enabled: canAdmin && !compact && Boolean(bucket) });
   const activeOrigin: BucketBackendOrigin | undefined = (() => {
     const row = originsQuery.data?.buckets?.find((b) => b.name === bucket);
     if (!row) return undefined;
@@ -66,10 +74,10 @@ export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = fals
   };
 
   return (
-    <nav aria-label="Breadcrumb">
+    <nav aria-label="Breadcrumb" style={{ minWidth: 0 }}>
       <ol style={{ display: 'flex', alignItems: 'center', minWidth: 0, overflow: 'hidden', listStyle: 'none', margin: 0, padding: 0 }}>
         {/* Home */}
-        <li>
+        {!compact && <li>
           <a
             href={hrefFor('')}
             onClick={onCrumbClick('')}
@@ -78,12 +86,12 @@ export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = fals
           >
             <HomeFilled aria-hidden="true" />
           </a>
-        </li>
+        </li>}
 
-        <li aria-hidden="true" style={separatorStyle}>&rsaquo;</li>
+        {!compact && <li aria-hidden="true" style={separatorStyle}>&rsaquo;</li>}
 
         {/* Bucket name */}
-        <li>
+        <li style={{ display: 'flex', minWidth: 0, flexShrink: compact ? 1 : 0 }}>
           {prefix ? (
             <a
               href={hrefFor('')}
@@ -99,7 +107,7 @@ export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = fals
           )}
         </li>
 
-        {canAdmin && bucket && activeOrigin && (
+        {!compact && canAdmin && bucket && activeOrigin && (
           <li style={{ display: 'inline-flex', alignItems: 'center', marginLeft: 6 }}>
             <BucketBackendBadge origin={activeOrigin} />
           </li>
@@ -109,7 +117,7 @@ export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = fals
         {segments.map((seg, i) => {
           const isLast = i === segments.length - 1;
           return (
-            <li key={seg.prefix} style={{ display: 'flex', alignItems: 'center', minWidth: 0 }}>
+            <li key={seg.prefix} style={{ display: 'flex', alignItems: 'center', minWidth: 0, flexShrink: isLast ? 1 : 0 }}>
               <span aria-hidden="true" style={separatorStyle}>&rsaquo;</span>
               {isLast ? (
                 <span
@@ -122,6 +130,7 @@ export default function Breadcrumb({ bucket, prefix, onNavigate, canAdmin = fals
                 <a
                   href={hrefFor(seg.prefix)}
                   onClick={onCrumbClick(seg.prefix)}
+                  aria-label={seg.collapsed ? 'Parent folder' : undefined}
                   style={{ ...segmentBase, color: TEXT_SECONDARY, maxWidth: 140, transition: 'color 0.15s' }}
                 >
                   {seg.label}
