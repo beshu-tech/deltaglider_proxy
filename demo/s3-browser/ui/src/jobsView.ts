@@ -226,6 +226,18 @@ export function kindLabel(kind: JobKind): string {
   }
 }
 
+/** AntD tag color for a job kind chip: rules blue/purple, one-offs gold. */
+export function kindTone(kind: JobKind): string {
+  switch (kind) {
+    case 'replication':
+      return 'blue';
+    case 'lifecycle':
+      return 'purple';
+    default:
+      return 'gold';
+  }
+}
+
 export function triggerLabel(trigger: string): string {
   switch (trigger) {
     case 'continuous':
@@ -585,7 +597,7 @@ export interface MeterView {
 export function deriveMeter(p: OutcomeMeterInput): MeterView {
   const { scanned, copied, errors, skipped, status, percent } = p;
   const acted = copied + errors;
-  const running = status === 'running' || status === 'queued' || status === 'cancelling';
+  const running = isActiveJobStatus(status);
 
   const aria =
     `${scanned.toLocaleString()} scanned, ${copied.toLocaleString()} copied, ` +

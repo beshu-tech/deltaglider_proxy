@@ -33,9 +33,11 @@ import type { JobAction, JobDisplayRow, JobRow } from '../../jobsView';
 import {
   availableActions,
   editorAfterDiscard,
+  isActiveJobStatus,
   jobStatusLabel,
   jobStatusTone,
   kindLabel,
+  kindTone,
   mergeDraftRules,
   planRuleDeleteSync,
   runNowMessage,
@@ -402,10 +404,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       track: 'minmax(160px,1.3fr)',
       render: (d) => (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-          <Tag
-            color={d.row.kind === 'replication' ? 'blue' : d.row.kind === 'lifecycle' ? 'purple' : 'gold'}
-            style={{ margin: 0, flexShrink: 0 }}
-          >
+          <Tag color={kindTone(d.row.kind)} style={{ margin: 0, flexShrink: 0 }}>
             {kindLabel(d.row.kind)}
           </Tag>
           <Text
@@ -455,7 +454,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       label: 'Status',
       track: 'minmax(0,1.4fr)',
       render: (d) => {
-        const live = d.row.trigger === 'oneoff' && (d.row.status === 'running' || d.row.status === 'cancelling' || d.row.status === 'queued');
+        const live = d.row.trigger === 'oneoff' && isActiveJobStatus(d.row.status);
         return (
           <div style={{ minWidth: 0 }}>
             {live ? (

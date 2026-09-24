@@ -34,6 +34,7 @@ const {
   jobsPollInterval,
   ACTIVE_POLL_MS,
   IDLE_POLL_MS,
+  kindTone,
 } = await import(moduleUrl);
 
 const row = (over = {}) => ({
@@ -443,5 +444,12 @@ assert.equal(jobsPollInterval([row({ status: 'idle' }), row({ status: 'queued' }
 // scheduler started never showed on an open Jobs page.
 assert.equal(jobsPollInterval([row({ status: 'idle' })]), IDLE_POLL_MS);
 assert.equal(jobsPollInterval([]), IDLE_POLL_MS);
+
+// ── kindTone ────────────────────────────────────────────────────────────────
+assert.equal(kindTone('replication'), 'blue');
+assert.equal(kindTone('lifecycle'), 'purple');
+assert.equal(kindTone('reencrypt'), 'gold');
+assert.equal(kindTone('migrate'), 'gold');
+assert.equal(kindTone('backfill-metadata'), 'gold');
 
 console.log('jobs view regression checks passed');
