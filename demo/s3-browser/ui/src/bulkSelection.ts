@@ -12,8 +12,8 @@ export interface ExpandedItem {
   /** Absolute source key. */
   source: string;
   /**
-   * Destination suffix: the path under the selected folder, or the basename for
-   * a directly selected object. Empty for a folder's own marker key (`foo/`).
+   * Destination suffix: the selected folder's name plus the path under it
+   * (`v1/x.tar`), or the basename for a directly selected object.
    */
   relative: string;
 }
@@ -42,10 +42,14 @@ export async function expandSelection(
           `Folder ${pfx} has more than ${keys.length.toLocaleString('en-US')} objects; narrow the selection.`,
         );
       }
+      // Keep the folder's own name: "firmware/v1.0.1/x" relative to the
+      // folder's PARENT is "v1.0.1/x", so copying it into dest/ gives
+      // dest/v1.0.1/x rather than flattening every folder into dest/.
+      const parent = pfx.slice(0, pfx.slice(0, -1).lastIndexOf('/') + 1);
       for (const nk of keys) {
         if (seen.has(nk)) continue;
         // Defensive: a listing key outside `pfx` falls back to its basename.
-        seen.set(nk, nk.startsWith(pfx) ? nk.slice(pfx.length) : (nk.split('/').pop() || nk));
+        seen.set(nk, nk.startsWith(pfx) ? nk.slice(parent.length) : (nk.split('/').pop() || nk));
       }
     } else if (!seen.has(k)) {
       seen.set(k, k.split('/').pop() || k);

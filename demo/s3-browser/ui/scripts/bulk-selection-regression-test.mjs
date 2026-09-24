@@ -28,19 +28,26 @@ const lister = async (pfx) => {
   return { keys: tree[pfx] ?? [], truncated: pfx === 'big/' };
 };
 
-// --- folders expand; relative suffix is the path under the selected folder ---
+// --- folders expand and KEEP their own name: copying folder a/ into dest/
+//     yields dest/a/..., like any file manager (it used to flatten into dest/,
+//     so two selected folders' same-named files overwrote each other) ---------
 assert.deepEqual(await expandSelection(['folder:a/', 'top.bin', 'd/e/f.txt'], lister), [
-  { source: 'a/', relative: '' },
-  { source: 'a/x.txt', relative: 'x.txt' },
-  { source: 'a/sub/y.txt', relative: 'sub/y.txt' },
+  { source: 'a/', relative: 'a/' },
+  { source: 'a/x.txt', relative: 'a/x.txt' },
+  { source: 'a/sub/y.txt', relative: 'a/sub/y.txt' },
   { source: 'top.bin', relative: 'top.bin' },
   { source: 'd/e/f.txt', relative: 'f.txt' },
 ]);
 
 // --- overlapping selections dedupe; the FIRST relative suffix wins ------------
 assert.deepEqual(await expandSelection(['folder:a/', 'folder:a/sub/', 'a/x.txt'], lister), [
-  { source: 'a/', relative: '' },
-  { source: 'a/x.txt', relative: 'x.txt' },
+  { source: 'a/', relative: 'a/' },
+  { source: 'a/x.txt', relative: 'a/x.txt' },
+  { source: 'a/sub/y.txt', relative: 'a/sub/y.txt' },
+]);
+
+// --- a nested folder keeps only its own name, not its parents ----------------
+assert.deepEqual(await expandSelection(['folder:a/sub/'], lister), [
   { source: 'a/sub/y.txt', relative: 'sub/y.txt' },
 ]);
 
