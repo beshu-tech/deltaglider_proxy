@@ -657,6 +657,7 @@ pub async fn download_zip(
     let names = zip_entry_names(&parsed);
     let mut bytes_total: u64 = 0;
     let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(parsed.len());
+    let mut skipped: Vec<(String, String)> = Vec::new();
     for ((bucket, key), zip_name) in parsed.iter().zip(names) {
         match engine.retrieve(bucket, key).await {
             Ok((data, _meta)) => {
@@ -671,11 +672,14 @@ pub async fn download_zip(
             }
             Err(e) => {
                 debug!("zip: skipping {}/{}: {}", bucket, key, e);
-                // Skip individual failures to match the previous
-                // browser semantics (silent skip; the user gets a
-                // partial archive rather than an opaque error).
+                skipped.push((format!("{bucket}/{key}"), e.to_string()));
             }
         }
+    }
+    match zip_skip_report(parsed.len(), &skipped) {
+        Err(msg) => return Err((StatusCode::NOT_FOUND, msg)),
+        Ok(Some(report)) => entries.push((ZIP_SKIP_REPORT_NAME.to_string(), report.into_bytes())),
+        Ok(None) => {}
     }
 
     // Build an uncompressed zip via the existing `zip` crate. We emit
@@ -729,6 +733,36 @@ pub async fn download_zip(
     resp.headers_mut()
         .insert("Content-Disposition", cd.parse().unwrap());
     Ok(resp)
+}
+
+/// Archive entry that lists the files a partial ZIP could not include.
+const ZIP_SKIP_REPORT_NAME: &str = "_deltaglider-skipped-files.txt";
+
+/// Decide what a ZIP says about files it could not read. None read: an
+/// error, not an empty archive. Some read: a report entry inside the
+/// archive, so a partial download never looks complete.
+fn zip_skip_report(
+    requested: usize,
+    skipped: &[(String, String)],
+) -> Result<Option<String>, String> {
+    if skipped.is_empty() {
+        return Ok(None);
+    }
+    if skipped.len() >= requested {
+        let (key, reason) = &skipped[0];
+        return Err(format!(
+            "None of the {requested} selected files could be read (first: {key}: {reason})"
+        ));
+    }
+    let mut report = format!(
+        "{} of {} selected files could not be read and are not in this archive:\n\n",
+        skipped.len(),
+        requested
+    );
+    for (key, reason) in skipped {
+        report.push_str(&format!("{key}: {reason}\n"));
+    }
+    Ok(Some(report))
 }
 
 // ---------------------------------------------------------------------------
@@ -808,6 +842,19 @@ mod tests {
             .map(|(b, k)| (b.to_string(), k.to_string()))
             .collect();
         super::zip_entry_names(&owned)
+    }
+
+    #[test]
+    fn zip_skip_report_never_hides_missing_files() {
+        let skip = |k: &str| (k.to_string(), "not found".to_string());
+        assert_eq!(super::zip_skip_report(3, &[]), Ok(None));
+        // Nothing readable: an error, not an empty 22-byte archive.
+        let err = super::zip_skip_report(2, &[skip("b/x"), skip("b/y")]).unwrap_err();
+        assert!(err.contains("None of the 2"), "{err}");
+        // Partial: the archive carries the list of what is missing.
+        let report = super::zip_skip_report(3, &[skip("b/x")]).unwrap().unwrap();
+        assert!(report.starts_with("1 of 3 selected files"), "{report}");
+        assert!(report.contains("b/x: not found"), "{report}");
     }
 
     #[test]
