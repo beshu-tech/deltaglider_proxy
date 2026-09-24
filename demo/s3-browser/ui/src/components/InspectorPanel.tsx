@@ -4,7 +4,7 @@ import { DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutl
 import { deleteObject, downloadObject, getPresignedUrl, getObjectUrl, headObject, getBucket } from '../s3client';
 import { GlobalOutlined } from '@ant-design/icons';
 import { formatBytes, getFileName, downloadBlobAsFile } from '../utils';
-import { summarizeObjectSavings } from '../savings';
+import { isBaselineObject, summarizeObjectSavings } from '../savings';
 import { bucketPolicyFor } from '../bucketPolicyLookup';
 import type { S3Object } from '../types';
 import { useColors } from '../ThemeContext';
@@ -180,6 +180,9 @@ function ShareDurationButton({
             overflow: 'hidden',
           }}
         >
+          <div style={{ padding: '8px 14px 4px', fontSize: 11, color: textMuted, fontFamily: 'var(--font-ui)' }}>
+            Link expires after
+          </div>
           {durations.map((d) => (
             <div
               key={d.seconds}
@@ -203,9 +206,9 @@ function ShareDurationButton({
               onMouseLeave={(e) => { (e.currentTarget as HTMLDivElement).style.background = 'transparent'; }}
             >
               <span>{d.label}</span>
-              <span style={{ fontSize: 11, color: textMuted, fontFamily: 'var(--font-mono)' }}>
-                <LinkOutlined style={{ marginRight: 4 }} />Share
-              </span>
+              {d.seconds === durations[durations.length - 1].seconds && (
+                <span style={{ fontSize: 11, color: textMuted, fontFamily: 'var(--font-ui)' }}>default</span>
+              )}
             </div>
           ))}
         </div>
@@ -243,6 +246,7 @@ export default function InspectorPanel({
   >(null);
   const blobRef = useRef<{ blob: Blob; name: string } | null>(null);
   const [shareDuration, setShareDuration] = useState<number | null>(null);
+  const [showInternalMeta, setShowInternalMeta] = useState(false);
   const { copy: copyToClipboard } = useCopyToClipboard();
   const objectKey = object?.key;
   const cachedHead = objectKey ? headCache?.[objectKey] : undefined;
@@ -349,7 +353,11 @@ export default function InspectorPanel({
   // differed from useUploadQueue + DeltaSavingsChip in both cap (99.9 vs 99)
   // and zero-handling, so two surfaces could report different "saved %"
   // for the same data.
-  const objectSavings = summarizeObjectSavings(originalSize, storedSize);
+  // The file that became its folder's baseline cost a full copy (the
+  // reference) plus a near-empty delta; count both, or it reads ~99.9% saved.
+  const isBaseline = storageType === 'delta' && isBaselineObject(headers);
+  const effectiveStored = isBaseline && storedSize != null ? storedSize + originalSize : storedSize;
+  const objectSavings = summarizeObjectSavings(originalSize, effectiveStored);
   const savings = objectSavings.pct;
   const savedBytes = objectSavings.savedBytes;
 
@@ -629,14 +637,14 @@ export default function InspectorPanel({
                       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
                         <div style={{ fontSize: 11, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>Stored</div>
                         <div style={{ fontSize: 12, fontWeight: 600, color: TEXT_PRIMARY, fontFamily: "var(--font-mono)" }}>
-                          {storedSize != null ? formatBytes(storedSize) : formatBytes(originalSize)}
+                          {effectiveStored != null ? formatBytes(effectiveStored) : formatBytes(originalSize)}
                         </div>
                       </div>
                       <div style={{ height: 6, borderRadius: 3, background: `${TEXT_FAINT}33`, overflow: 'hidden' }}>
                         <div style={{
                           height: '100%',
                           borderRadius: 3,
-                          width: `${storedSize != null && originalSize > 0 ? Math.max(2, (storedSize / originalSize) * 100) : 100}%`,
+                          width: `${effectiveStored != null && originalSize > 0 ? Math.min(100, Math.max(2, (effectiveStored / originalSize) * 100)) : 100}%`,
                           background: ACCENT_GREEN,
                           transition: 'width 0.4s ease-out',
                         }} />
@@ -652,6 +660,13 @@ export default function InspectorPanel({
                     }}>
                       {storageTypeLabel.charAt(0).toUpperCase() + storageTypeLabel.slice(1)}
                     </Tag>
+                    {storageType === 'delta' && (
+                      <div style={{ fontSize: 11, color: TEXT_MUTED, marginTop: 10, lineHeight: 1.5, textAlign: 'left', fontFamily: 'var(--font-ui)' }}>
+                        {isBaseline
+                          ? 'This file is the baseline of its folder: it is stored in full once, and later versions in the folder are stored as deltas against it.'
+                          : 'This figure is for this file alone. It does not include the baseline that all versions in this folder share, so bucket and folder totals are lower.'}
+                      </div>
+                    )}
                   </div>
                 )}
               </InspectorSection>
@@ -678,7 +693,6 @@ export default function InspectorPanel({
                 label="Last modified"
                 value={object.lastModified ? new Date(object.lastModified).toLocaleString() : '--'}
               />
-              <InfoRow label="Accept-Ranges" value="Disabled" />
             </InspectorSection>
 
             {/* S3 METADATA */}
@@ -697,14 +711,31 @@ export default function InspectorPanel({
             <InspectorSection title="Custom Metadata">
               {headLoading ? (
                 <Skeleton active paragraph={{ rows: 2 }} />
-              ) : dgMeta.length === 0 && userMeta.length === 0 ? (
-                <div style={{ fontSize: 12, color: TEXT_FAINT, display: 'flex', alignItems: 'center', gap: 6, fontFamily: "var(--font-ui)" }}>
-                  No custom metadata
-                </div>
               ) : (
                 <>
-                  {dgMeta.map(([k, v]) => <InfoRow key={k} label={`dg-${k}`} value={v} />)}
-                  {userMeta.map(([k, v]) => <InfoRow key={k} label={k} value={v} />)}
+                  {userMeta.length === 0 ? (
+                    <div style={{ fontSize: 12, color: TEXT_FAINT, display: 'flex', alignItems: 'center', gap: 6, fontFamily: "var(--font-ui)" }}>
+                      No custom metadata
+                    </div>
+                  ) : (
+                    userMeta.map(([k, v]) => <InfoRow key={k} label={k} value={v} />)
+                  )}
+                  {/* The proxy's own dg-* bookkeeping is not the client's
+                      metadata; keep it behind a toggle for diagnostics. */}
+                  {dgMeta.length > 0 && (
+                    <>
+                      <Button
+                        type="link"
+                        size="small"
+                        aria-expanded={showInternalMeta}
+                        onClick={() => setShowInternalMeta((v) => !v)}
+                        style={{ paddingInline: 0, marginTop: 6, fontSize: 12 }}
+                      >
+                        {showInternalMeta ? 'Hide' : 'Show'} DeltaGlider internal metadata ({dgMeta.length})
+                      </Button>
+                      {showInternalMeta && dgMeta.map(([k, v]) => <InfoRow key={k} label={`dg-${k}`} value={v} />)}
+                    </>
+                  )}
                 </>
               )}
             </InspectorSection>
