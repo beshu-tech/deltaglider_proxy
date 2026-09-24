@@ -1,10 +1,10 @@
 import type { CSSProperties } from 'react';
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Table, Typography, Alert, Progress, Checkbox, theme, Button, Select } from 'antd';
 import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
-import { formatBytes, displayName, relativeTime, numericCompare } from '../utils';
-import type { ColumnsType } from 'antd/es/table';
+import { formatBytes, relativeTime } from '../utils';
+import type { ColumnsType, TableProps } from 'antd/es/table';
 import type { GetRef } from 'antd';
 import { useColors } from '../ThemeContext';
 import type { FolderSizeState } from '../useComputeSize';
@@ -13,6 +13,7 @@ import { canRequestPrefixUsageScan, isVirtualFolderPrefix } from '../permissions
 import { usePersistedPageSize } from '../usePersistedPageSize';
 import { clampPageToData, describeVisibleRange } from '../paginationLabels';
 import StorageTypeTag from './StorageTypeTag';
+import { buildRows, sortRows, type BrowserRow, type SortColumn, type SortState } from '../browserNav';
 
 const { Text } = Typography;
 
@@ -59,9 +60,13 @@ interface Props {
   cursorKey?: string | null;
   /** Sync the keyboard cursor when a row is clicked. */
   onCursorChange?: (key: string | null) => void;
+  /** Reports the displayed (sorted) row order, so keyboard navigation walks it. */
+  onRowOrderChange?: (keys: string[]) => void;
 }
 
-type RowData = { _isFolder: true; key: string; name: string } | (S3Object & { _isFolder: false; name: string });
+type RowData = BrowserRow;
+
+const SORT_COLUMNS: readonly string[] = ['name', 'size', 'modified'] satisfies SortColumn[];
 
 /**
  * Size cell for a folder row: renders the scan state machine
@@ -178,6 +183,7 @@ export default function ObjectTable({
   onPreview,
   cursorKey = null,
   onCursorChange,
+  onRowOrderChange,
 }: Props) {
   const { token } = theme.useToken();
   const { TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED, ACCENT_BLUE, ACCENT_AMBER, ACCENT_PURPLE, STORAGE_TYPE_COLORS, STORAGE_TYPE_DEFAULT } = useColors();
@@ -188,6 +194,21 @@ export default function ObjectTable({
     PAGE_SIZE_OPTIONS,
   );
   const [currentPage, setCurrentPage] = useState(1);
+  // Controlled sort: AntD only draws the header state (`sorter: true` never
+  // sorts); `sortedRows` below is the one displayed order.
+  const [sortState, setSortState] = useState<SortState | null>(null);
+
+  // THE displayed row order, shared by the Table, HEAD enrichment, the cursor
+  // page and (via onRowOrderChange) keyboard navigation. Memoised so a 10k-row
+  // listing is not rebuilt on every render.
+  const rows = useMemo(() => buildRows(folders, objects, prefix), [folders, objects, prefix]);
+  const sortedRows = useMemo(
+    () => sortRows(rows, sortState, (fp) => folderSizes[fp]?.progress?.totalSize ?? 0),
+    [rows, sortState, folderSizes],
+  );
+  useEffect(() => {
+    onRowOrderChange?.(sortedRows.map((r) => r.key));
+  }, [sortedRows, onRowOrderChange]);
 
   // Guard against rapid folder clicks (issue #4)
   const navigatingRef = useRef(false);
@@ -208,30 +229,38 @@ export default function ObjectTable({
   // computing an out-of-range slice against the shrunken list.
   useEffect(() => { setCurrentPage(1); }, [prefix, objects.length]);
 
-  // Compute visible file keys for the current page and request HEAD enrichment
+  // Compute visible file keys for the current page (in DISPLAYED order) and
+  // request HEAD enrichment.
   const enrichPage = useCallback((page: number, size: number) => {
-    const folderRows = folders.length;
-    const allRows = folderRows + objects.length;
     // Clamp to the page actually backed by data: when a search shrinks the
     // list, the page-reset effect and this enrich effect run in the same
     // render pass with `currentPage` still stale, so without clamping `start`
     // could land past the end and request keys that no longer exist.
-    const safePage = clampPageToData(page, allRows, size);
-    const start = (safePage - 1) * size;
-    const end = Math.min(safePage * size, allRows);
-    const fileKeys: string[] = [];
-    for (let i = start; i < end; i++) {
-      if (i >= folderRows) {
-        fileKeys.push(objects[i - folderRows].key);
-      }
-    }
+    const safePage = clampPageToData(page, sortedRows.length, size);
+    const fileKeys = sortedRows
+      .slice((safePage - 1) * size, safePage * size)
+      .flatMap((r) => (r._isFolder ? [] : [r.key]));
     if (fileKeys.length > 0) onEnrichKeys(fileKeys);
-  }, [folders.length, objects, onEnrichKeys]);
+  }, [sortedRows, onEnrichKeys]);
 
-  // Enrich when page or page-size changes or objects load
+  // Enrich when page, page-size, sort or objects change
   useEffect(() => {
     if (objects.length > 0) enrichPage(currentPage, pageSize);
-  }, [currentPage, pageSize, objects, enrichPage]);
+  }, [currentPage, pageSize, objects.length, enrichPage]);
+
+  const handleTableChange = useCallback<NonNullable<TableProps<RowData>['onChange']>>(
+    (_pagination, _filters, sorter, extra) => {
+      if (extra.action !== 'sort' || Array.isArray(sorter)) return;
+      const column = String(sorter.columnKey ?? '');
+      setSortState(
+        sorter.order && SORT_COLUMNS.includes(column)
+          ? { column: column as SortColumn, order: sorter.order }
+          : null,
+      );
+    },
+    [],
+  );
+  const sortOrderFor = (column: SortColumn) => (sortState?.column === column ? sortState.order : null);
 
   // Page-size change resets the operator to page 1 — otherwise
   // "page 5 of 25-per-page" becomes nonsense after switching to 250.
@@ -295,27 +324,15 @@ export default function ObjectTable({
     return TEXT_MUTED;
   }
 
-  const folderRows: RowData[] = folders.map((f) => ({
-    _isFolder: true as const,
-    key: `folder:${f}`,
-    name: displayName(f, prefix),
-  }));
-
-  const objectRows: RowData[] = objects.map((obj) => ({
-    ...obj,
-    _isFolder: false as const,
-    name: displayName(obj.key, prefix),
-  }));
-
-  const dataSource = [...folderRows, ...objectRows];
+  const dataSource = sortedRows;
   const totalItems = dataSource.length;
   const totalSelectable = totalItems;
   const allChecked = totalSelectable > 0 && selectedKeys.size === totalSelectable;
   const someChecked = selectedKeys.size > 0 && selectedKeys.size < totalSelectable;
 
   // Keyboard cursor: follow it across pages and scroll its row into view.
-  // `dataSource` is folders-then-objects, matching the cursor's row ordering in
-  // useBrowserKeyboardNav. Depend on the cursor's INDEX (a number), not the
+  // `dataSource` is the displayed (sorted) order, the same order
+  // useBrowserKeyboardNav walks (via onRowOrderChange). Depend on the cursor's INDEX (a number), not the
   // array identity, so the effect only runs when the cursor actually moves to a
   // different row — not on every re-render (which would re-fire the scroll).
   //
@@ -361,7 +378,8 @@ export default function ObjectTable({
       title: () => <span style={{ ...COL_HEADER_STYLE, color: TEXT_MUTED }}>Name</span>,
       dataIndex: 'name',
       key: 'name',
-      sorter: (a, b) => numericCompare(a.name, b.name),
+      sorter: true, // ordering lives in sortRows (browserNav.ts)
+      sortOrder: sortOrderFor('name'),
       ellipsis: true,
       render: (_: unknown, record: RowData) => {
         if (record._isFolder) {
@@ -398,18 +416,8 @@ export default function ObjectTable({
       title: () => <span style={{ ...COL_HEADER_STYLE, color: TEXT_MUTED }}>Size</span>,
       key: 'size',
       width: isMobile ? 80 : 100,
-      sorter: (a, b) => {
-        // Use the scanned folder size when available so sorting matches
-        // what the user sees rendered. Folders without a scanned size
-        // sort to 0 (after small files, before larger ones) — better
-        // than the old `-1` constant that made every folder tie.
-        const rowSize = (r: RowData): number => {
-          if (!r._isFolder) return r.size;
-          const folderPrefix = r.key.replace('folder:', '');
-          return folderSizes[folderPrefix]?.progress?.totalSize ?? 0;
-        };
-        return rowSize(a) - rowSize(b);
-      },
+      sorter: true,
+      sortOrder: sortOrderFor('size'),
       render: (_: unknown, record: RowData) => {
         if (record._isFolder) {
           const folderPrefix = record.key.replace('folder:', '');
@@ -432,11 +440,8 @@ export default function ObjectTable({
       key: 'modified',
       width: 200,
       responsive: ['lg'] as const,
-      sorter: (a, b) => {
-        const da = a._isFolder ? '' : a.lastModified || '';
-        const db = b._isFolder ? '' : b.lastModified || '';
-        return numericCompare(da, db);
-      },
+      sorter: true,
+      sortOrder: sortOrderFor('modified'),
       render: (_: unknown, record: RowData) => {
         if (record._isFolder) return null;
         if (!record.lastModified) return <span style={{ fontSize: 12, color: TEXT_MUTED }}>--</span>;
@@ -492,6 +497,7 @@ export default function ObjectTable({
           virtual
           columns={columns}
           dataSource={dataSource}
+          onChange={handleTableChange}
           rowKey="key"
           showSorterTooltip={false} /* Ant Design 6 rc-table renders sort tooltips inline in <th>, causing layout shift */
           pagination={{

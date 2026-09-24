@@ -1,8 +1,8 @@
 /**
  * Arrow-key navigation for the object browser.
  *
- * Maintains a keyboard "cursor" over the visible rows — folders first, then
- * objects, matching ObjectTable's render order — and translates key presses
+ * Maintains a keyboard "cursor" over the visible rows — in ObjectTable's
+ * displayed (sorted) order, which the table reports via `setRowOrder` — and translates key presses
  * into the browser's existing navigation primitives (`navigate(prefix)`,
  * `openInspector(key)`). No new product behaviour: every action is something a
  * click already does; the keyboard just reaches it.
@@ -14,7 +14,8 @@
  *   Esc              go up one folder
  *
  * Returns the cursor key and a setter so ObjectTable can highlight + scroll the
- * active row and keep the cursor in sync with mouse selection.
+ * active row and keep the cursor in sync with mouse selection, plus
+ * `setRowOrder` for ObjectTable to report its sorted row keys.
  *
  * Gated: does nothing while typing in a field, or while ANY overlay (modal /
  * drawer / open Select) owns the keyboard. The inspector drawer, FilePreview,
@@ -23,11 +24,11 @@
  * (applied before every key, Esc included) is what keeps "close the preview"
  * from also navigating the folder underneath it.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useDocumentEvent } from './useDocumentEvent';
 import { isTypingTarget, anyOverlayOpen } from './keyboard';
 import { parentPrefix } from './utils';
-import { rowKeysFor, nextCursor } from './browserNav';
+import { rowKeysFor, nextCursor, orderedRowKeys } from './browserNav';
 import type { S3Object } from './types';
 
 interface BrowserNavArgs {
@@ -48,6 +49,8 @@ interface BrowserNav {
   cursorKey: string | null;
   /** Sync the cursor (e.g. from a mouse click in ObjectTable). */
   setCursorKey: (key: string | null) => void;
+  /** ObjectTable reports its displayed (sorted) row keys here. */
+  setRowOrder: (keys: string[]) => void;
 }
 
 export function useBrowserKeyboardNav({
@@ -59,22 +62,28 @@ export function useBrowserKeyboardNav({
   enabled,
 }: BrowserNavArgs): BrowserNav {
   const [cursorKey, setCursorKey] = useState<string | null>(null);
+  const [rowOrder, setRowOrder] = useState<string[] | null>(null);
+
+  // The order ↑/↓ walk: the table's sorted order while it matches the current
+  // rows, else folders-then-objects.
+  const keys = useMemo(
+    () => orderedRowKeys(rowKeysFor(folders, objects), rowOrder),
+    [folders, objects, rowOrder],
+  );
 
   // Drop a stale cursor when the row set changes (folder navigation, search
   // filtering) so we never act on a key that no longer exists.
   useEffect(() => {
-    const keys = rowKeysFor(folders, objects);
     if (cursorKey !== null && !keys.includes(cursorKey)) {
       setCursorKey(null);
     }
-  }, [folders, objects, cursorKey]);
+  }, [keys, cursorKey]);
 
   const move = useCallback(
     (delta: number | 'first' | 'last') => {
-      const keys = rowKeysFor(folders, objects);
       setCursorKey((current) => nextCursor(keys, current, delta));
     },
-    [folders, objects],
+    [keys],
   );
 
   const openCursor = useCallback(() => {
@@ -140,5 +149,5 @@ export function useBrowserKeyboardNav({
     enabled,
   );
 
-  return { cursorKey, setCursorKey };
+  return { cursorKey, setCursorKey, setRowOrder };
 }

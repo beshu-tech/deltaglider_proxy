@@ -665,6 +665,7 @@ export default function App() {
               onPreview={openPreview}
               cursorKey={browserNav.cursorKey}
               onCursorChange={browserNav.setCursorKey}
+              onRowOrderChange={browserNav.setRowOrder}
             />
           )}
         </div>
