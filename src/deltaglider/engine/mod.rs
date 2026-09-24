@@ -1229,7 +1229,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         obj_key
             .validate_object()
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
-        self.refuse_aliased_key(&obj_key)?;
         let deltaspace_id = obj_key.deltaspace_id();
         Ok((obj_key, deltaspace_id))
     }
@@ -1237,7 +1236,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Like `validated_key` but stricter — the INGEST (PUT) gate. Rejects `//`
     /// so a malformed key can't be STORED; reads/deletes keep using
     /// `validated_key` so pre-existing `//` objects stay reachable for cleanup
-    /// (on a backend with literal keys).
+    /// on S3. (The filesystem backend refuses `.`/empty segments on every
+    /// path it builds: `filesystem::check_path_segments`.)
     fn validated_key_ingest(
         &self,
         bucket: &str,
@@ -1247,22 +1247,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         obj_key
             .validate_ingest()
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
-        self.refuse_aliased_key(&obj_key)?;
         let deltaspace_id = obj_key.deltaspace_id();
         Ok((obj_key, deltaspace_id))
-    }
-
-    /// On a backend that resolves key segments as a path (filesystem), refuse
-    /// `.` and empty segments: they would reach a DIFFERENT object than the
-    /// literal key IAM authorized. Every engine entry point goes through
-    /// `validated_key`/`validated_key_ingest`, so this is the one gate.
-    fn refuse_aliased_key(&self, obj_key: &ObjectKey) -> Result<(), EngineError> {
-        if self.storage.resolves_key_path_segments(&obj_key.bucket) {
-            obj_key
-                .validate_unaliased()
-                .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
-        }
-        Ok(())
     }
 
     /// Look up object metadata by checking both delta and passthrough storage,

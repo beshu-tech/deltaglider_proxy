@@ -1424,24 +1424,33 @@ mod tests {
     /// admin session: the gate runs once, and a stream can last for hours.
     #[test]
     fn every_admin_sse_stream_rechecks_its_session() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/admin");
+        // Every SSE endpoint in the crate is an admin endpoint; walk all of
+        // `src/`, so a stream added in a sub-module is covered too.
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        rs_files(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
         let needle = concat!("Sse", "::new(");
         let mut found = 0;
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_none_or(|e| e != "rs") {
-                continue;
-            }
+        for path in files {
             let src = std::fs::read_to_string(&path).unwrap();
             for (i, _) in src.match_indices(needle) {
                 found += 1;
-                let rest = &src[i + needle.len()..];
+                let rest = src[i + needle.len()..].trim_start();
                 assert!(
-                    rest.trim_start()
-                        .starts_with("end_when_admin_session_lapses(")
-                        || rest
-                            .trim_start()
-                            .starts_with("super::auth::end_when_admin_session_lapses("),
+                    rest.starts_with("end_when_admin_session_lapses(")
+                        || rest.starts_with("super::auth::end_when_admin_session_lapses("),
                     "{}: an admin SSE stream must be wrapped in end_when_admin_session_lapses",
                     path.display()
                 );

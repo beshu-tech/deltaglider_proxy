@@ -2545,6 +2545,17 @@ async fn test_dot_and_empty_key_segments_cannot_escape_deny_on_filesystem() {
         assert!(put.is_err(), "Deny bypassed on PUT by {alias}");
         let _ = client.delete_object().bucket(&b).key(alias).send().await;
     }
+    // Listing through an alias must not show the denied names either.
+    for prefix in ["a/./", "a//", "./a/"] {
+        let listed = client
+            .list_objects_v2()
+            .bucket(&b)
+            .prefix(prefix)
+            .delimiter("/")
+            .send()
+            .await;
+        assert!(listed.is_err(), "listing through {prefix} was served");
+    }
     // The object is intact: not overwritten and not deleted through an alias.
     let body = server
         .s3_client_with_creds(&reader.access_key_id, &reader.secret_access_key)

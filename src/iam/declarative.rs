@@ -907,6 +907,25 @@ pub fn diff_iam(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<IamDiff, Strin
         yaml.users.iter().map(|u| (u.name.as_str(), u)).collect();
     for yu in &yaml.users {
         match db.users.iter().find(|du| du.name == yu.name) {
+            // An OAuth login named this DB row from the identity provider's
+            // name claim, which the user can often edit. A YAML entry that
+            // omits `auth_source` and keeps the row's access key manages that
+            // row (for example a secret rotation). One that brings a DIFFERENT
+            // access key declares another person: binding it by name would
+            // hand those credentials and permissions to whoever holds the IdP
+            // account. Refuse; the operator renames one of the two. (An
+            // explicit `local` is refused by validation as a downgrade.)
+            Some(du)
+                if du.auth_source == "external"
+                    && yu.auth_source.is_none()
+                    && yu.access_key_id != du.access_key_id =>
+            {
+                return Err(format!(
+                    "user '{}' is declared as a local user, but an OAuth login already \
+                     created a user with that name; rename one of them",
+                    yu.name
+                ));
+            }
             Some(du) => {
                 let desired = desired_existing_user(du, yu);
                 if !user_equal(du, &desired, &db_group_id_to_name) {
@@ -1533,6 +1552,36 @@ mod tests {
             diff_iam(&yaml2, &current).is_ok(),
             "an existing user with a blanked secret must be allowed (preserved)"
         );
+    }
+
+    /// A hand-authored (local) YAML user must not bind by name to a row an
+    /// OAuth login created: that would hand the declared credentials to the
+    /// IdP account that picked the name.
+    #[test]
+    fn diff_refuses_local_yaml_user_over_an_oauth_row_of_the_same_name() {
+        let mut external = db_user(7, "carol", "AKEXT");
+        external.auth_source = "external".into();
+        let current = CurrentIam {
+            users: vec![external],
+            ..empty_db()
+        };
+        let yaml = DeclarativeIam {
+            users: vec![yu("carol", "AKCAROL")],
+            ..Default::default()
+        };
+        let err = diff_iam(&yaml, &current).unwrap_err();
+        assert!(err.contains("OAuth login"), "{err}");
+        // The round-trip shape (the export marks the row external) and an
+        // entry that keeps the row's access key still manage the row.
+        let mut round_trip = yu("carol", "AKEXT");
+        round_trip.auth_source = Some("external".into());
+        for user in [round_trip, yu("carol", "AKEXT")] {
+            let yaml = DeclarativeIam {
+                users: vec![user],
+                ..Default::default()
+            };
+            assert!(diff_iam(&yaml, &current).is_ok());
+        }
     }
 
     #[test]

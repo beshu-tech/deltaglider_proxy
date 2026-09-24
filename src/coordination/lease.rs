@@ -110,10 +110,14 @@ impl CoordinationLease for LocalLease {
     ) -> Result<bool, String> {
         let db = self.db.lock().await;
         match subsystem {
-            LeaseSubsystem::Replication => {
-                db.replication_try_acquire_lease(rule, owner, now, ttl_secs)
-            }
-            LeaseSubsystem::Lifecycle => db.lifecycle_try_acquire_lease(rule, owner, now, ttl_secs),
+            // The lease lives in the rule's state row: create it first, or
+            // the UPDATE matches nothing and a free rule reads as busy.
+            LeaseSubsystem::Replication => db
+                .replication_ensure_state(rule, now)
+                .and_then(|_| db.replication_try_acquire_lease(rule, owner, now, ttl_secs)),
+            LeaseSubsystem::Lifecycle => db
+                .lifecycle_ensure_state(rule, now)
+                .and_then(|_| db.lifecycle_try_acquire_lease(rule, owner, now, ttl_secs)),
         }
         .map_err(|e| e.to_string())
     }

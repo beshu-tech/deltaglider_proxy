@@ -57,7 +57,8 @@ use super::planner::{
 pub const REPLICATION_LISTENER: &str = "replication";
 
 /// The sentinel "rule name" the consumer's single-flight lease is keyed under,
-/// so only one instance drains+advances the shared cursor at a time.
+/// so only one consumer drains+advances this node's cursor at a time (the
+/// outbox, cursor and this lease are all in the node's own database).
 const CONSUMER_LEASE_KEY: &str = "__event_consumer__";
 
 /// Max events drained per tick.
@@ -306,8 +307,8 @@ pub fn spawn_event_consumer(
             //
             // The lease is acquired once per tick and NOT renewed mid-drain
             // (unlike the reconcile worker's heartbeat). A drain exceeding the
-            // TTL can therefore let a second instance steal the lease and
-            // overlap on the same cursor window. That is intentionally tolerated
+            // TTL can therefore let a second consumer (a fast restart) steal
+            // the lease and overlap on the same cursor window. That is intentionally tolerated
             // because every action is idempotent: a re-Copy is gated by a dest
             // HEAD + `should_replicate` (a no-op when current), and a re-Delete
             // re-confirms source-absence + HEADs an already-absent dest. The cursor
@@ -398,23 +399,60 @@ enum RuleClaim {
     Abort,
 }
 
+/// Is the rule still configured and not paused? Read on every key, not
+/// once per drain: an operator's pause or delete must stop the consumer at
+/// the next key, not up to a whole drain later.
+async fn live_rule_gate(
+    db: &Arc<Mutex<ConfigDb>>,
+    config: &crate::config::SharedConfig,
+    rule_name: &str,
+) -> RuleClaim {
+    // The rule snapshot is a tick stale; read the LIVE config.
+    let configured = config
+        .read()
+        .await
+        .replication
+        .rules
+        .iter()
+        .any(|r| r.name == rule_name);
+    if !configured {
+        return RuleClaim::Skip;
+    }
+    // A paused rule does nothing — copies or deletes. The events count as
+    // handled: holding them would pin the cursor and stall every other rule.
+    // Resume makes the rule due at once, so its reconcile run catches up. A
+    // state read that FAILS is not "paused": abort.
+    let state = db.lock().await.replication_load_state(rule_name);
+    match rule_gate(&state) {
+        RuleGate::Proceed => RuleClaim::Held { since: 0 },
+        RuleGate::SkipPaused => {
+            debug!("event consumer: rule '{rule_name}' is paused — skipping its events");
+            RuleClaim::Skip
+        }
+        RuleGate::AbortDrain => {
+            warn!(
+                "event consumer: cannot read state of rule '{rule_name}' ({:?})",
+                state.err()
+            );
+            RuleClaim::Abort
+        }
+    }
+}
+
 /// Take `rule`'s per-rule lease through the coordination lease, then gate on
-/// the LIVE config and the rule's state row. Every outcome other than `Held`
-/// leaves the lease released.
+/// the live config and state ([`live_rule_gate`]). Every outcome other than
+/// `Held` leaves the lease released.
 async fn claim_rule(
     lease: &dyn CoordinationLease,
     db: &Arc<Mutex<ConfigDb>>,
     config: &crate::config::SharedConfig,
     rule_name: &str,
     instance_id: &str,
-    now: i64,
     lease_ttl: i64,
 ) -> RuleClaim {
-    {
-        // The state row must exist before the SQLite lease can target it.
-        let dbg = db.lock().await;
-        let _ = dbg.replication_ensure_state(rule_name, now);
-    }
+    // The CURRENT time, not the drain's start: a rule first met late in a
+    // long drain must not get a lease that is already expired.
+    let now = current_unix_seconds();
     match lease
         .try_acquire(
             LeaseSubsystem::Replication,
@@ -428,48 +466,50 @@ async fn claim_rule(
         Ok(true) => {}
         Ok(false) => return RuleClaim::Busy,
         Err(e) => {
+            // A coordination-bucket error is about THIS rule's lease: hold
+            // its events for the next tick and go on with the other rules.
             warn!("event consumer: lease acquisition for rule '{rule_name}' failed: {e}");
-            return RuleClaim::Abort;
+            return RuleClaim::Busy;
         }
     }
-    // Post-acquire re-check against the LIVE config (the rule snapshot is a
-    // tick stale): delete_rule checks the lease before it removes the rule, so
-    // a vanished rule = lost race.
-    let configured = config
-        .read()
-        .await
-        .replication
-        .rules
-        .iter()
-        .any(|r| r.name == rule_name);
-    let claim = if !configured {
-        RuleClaim::Skip
-    } else {
-        // A paused rule does nothing — copies or deletes. Checked under the
-        // lease (the scheduler checks before taking it). The events count as
-        // handled: holding them would pin the cursor and stall every other
-        // rule. Resume makes the rule due at once, so its reconcile run
-        // catches up. A state read that FAILS is not "paused": abort.
-        let state = db.lock().await.replication_load_state(rule_name);
-        match rule_gate(&state) {
-            RuleGate::Proceed => return RuleClaim::Held { since: now },
-            RuleGate::SkipPaused => {
-                debug!("event consumer: rule '{rule_name}' is paused — skipping its events");
-                RuleClaim::Skip
-            }
-            RuleGate::AbortDrain => {
-                warn!(
-                    "event consumer: cannot read state of rule '{rule_name}' ({:?})",
-                    state.err()
-                );
-                RuleClaim::Abort
-            }
+    match live_rule_gate(db, config, rule_name).await {
+        RuleClaim::Held { .. } => RuleClaim::Held { since: now },
+        other => {
+            let _ = lease
+                .release(LeaseSubsystem::Replication, rule_name, instance_id)
+                .await;
+            other
         }
-    };
-    let _ = lease
-        .release(LeaseSubsystem::Replication, rule_name, instance_id)
-        .await;
-    claim
+    }
+}
+
+/// A key the destination (or the source) can never accept as written — for
+/// example a `.` or empty segment on a filesystem backend. Retrying it can
+/// never succeed, so the consumer records the failure and moves on instead
+/// of holding the cursor (which would stall every rule).
+#[derive(Debug)]
+struct PermanentKeyError(String);
+
+impl std::fmt::Display for PermanentKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "key cannot be stored as written: {}", self.0)
+    }
+}
+
+impl std::error::Error for PermanentKeyError {}
+
+/// Box an engine error, marking the ones a retry can never fix.
+fn classify_engine_error(
+    e: crate::deltaglider::EngineError,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    use crate::deltaglider::EngineError;
+    match e {
+        EngineError::InvalidArgument(msg)
+        | EngineError::Storage(crate::storage::StorageError::InvalidKey(msg)) => {
+            Box::new(PermanentKeyError(msg))
+        }
+        other => Box::new(other),
+    }
 }
 
 /// One drain pass: read new events, group + compact per key, route to rules,
@@ -589,11 +629,24 @@ async fn drain_rules(
             // instances take (the coordination lease chosen at startup), so
             // they and this consumer exclude each other.
             let claim = match claims.get(&rule.name) {
+                Some(RuleClaim::Held { since }) => {
+                    // Pause/delete since the claim: stop at this key.
+                    let since = *since;
+                    match live_rule_gate(db, config, &rule.name).await {
+                        RuleClaim::Held { .. } => RuleClaim::Held { since },
+                        other => {
+                            let _ = lease
+                                .release(LeaseSubsystem::Replication, &rule.name, instance_id)
+                                .await;
+                            claims.insert(rule.name.clone(), other);
+                            other
+                        }
+                    }
+                }
                 Some(claim) => *claim,
                 None => {
                     let claim =
-                        claim_rule(lease, db, config, &rule.name, instance_id, now, lease_ttl)
-                            .await;
+                        claim_rule(lease, db, config, &rule.name, instance_id, lease_ttl).await;
                     claims.insert(rule.name.clone(), claim);
                     claim
                 }
@@ -613,12 +666,27 @@ async fn drain_rules(
                                 lease_ttl,
                             )
                             .await;
-                        if renewed == Ok(true) {
-                            claims.insert(rule.name.clone(), RuleClaim::Held { since: t });
-                        } else {
-                            claims.insert(rule.name.clone(), RuleClaim::Busy);
-                            failed_ids.insert(max_id_for_key);
-                            continue;
+                        match renewed {
+                            Ok(true) => {
+                                claims.insert(rule.name.clone(), RuleClaim::Held { since: t });
+                            }
+                            lost_or_unknown => {
+                                // Ok(false): lost, nothing to release. Err: the
+                                // lease may still be ours — release it, so it
+                                // does not block the rule for a whole TTL.
+                                if lost_or_unknown.is_err() {
+                                    let _ = lease
+                                        .release(
+                                            LeaseSubsystem::Replication,
+                                            &rule.name,
+                                            instance_id,
+                                        )
+                                        .await;
+                                }
+                                claims.insert(rule.name.clone(), RuleClaim::Busy);
+                                failed_ids.insert(max_id_for_key);
+                                continue;
+                            }
                         }
                     }
                 }
@@ -665,7 +733,11 @@ async fn drain_rules(
                     },
                     replication.max_failures_retained,
                 );
-                failed_ids.insert(max_id_for_key);
+                // A permanent key error is recorded and counts as handled:
+                // holding it would stall every rule, forever.
+                if err.downcast_ref::<PermanentKeyError>().is_none() {
+                    failed_ids.insert(max_id_for_key);
+                }
             }
         }
     }
@@ -719,9 +791,21 @@ async fn apply_action(
                     // will handle removal. Treat as handled.
                     return Ok(());
                 }
-                Err(e) => return Err(Box::new(e)),
+                Err(e) => return Err(classify_engine_error(e)),
             };
-            let dest_meta = engine.head(&rule.destination.bucket, &dest_key).await.ok();
+            let dest_meta = match engine.head(&rule.destination.bucket, &dest_key).await {
+                Ok(meta) => Some(meta),
+                Err(crate::deltaglider::EngineError::NotFound(_)) => None,
+                // The destination can never hold this key (for example a `.`
+                // segment on a filesystem destination): do not try the copy.
+                Err(e @ crate::deltaglider::EngineError::InvalidArgument(_))
+                | Err(
+                    e @ crate::deltaglider::EngineError::Storage(
+                        crate::storage::StorageError::InvalidKey(_),
+                    ),
+                ) => return Err(classify_engine_error(e)),
+                Err(_) => None,
+            };
             let (include_globs, exclude_globs) = compile_rule_globs(rule)?;
             let decision = should_replicate(
                 key,
@@ -778,10 +862,10 @@ async fn apply_action(
                         Ok(_) => Ok(()),
                         // Dest already gone → nothing to delete.
                         Err(crate::deltaglider::EngineError::NotFound(_)) => Ok(()),
-                        Err(e) => Err(Box::new(e)),
+                        Err(e) => Err(classify_engine_error(e)),
                     }
                 }
-                Err(e) => Err(Box::new(e)),
+                Err(e) => Err(classify_engine_error(e)),
             }
         }
     }
@@ -1172,6 +1256,27 @@ mod tests {
 }
 
 #[cfg(test)]
+mod classify_tests {
+    use super::*;
+    use crate::deltaglider::EngineError;
+
+    /// Keys a destination can never accept are permanent (the cursor moves
+    /// on); everything else is retried.
+    #[test]
+    fn invalid_keys_are_permanent_other_errors_are_not() {
+        let permanent = |e: EngineError| classify_engine_error(e).is::<PermanentKeyError>();
+        assert!(permanent(EngineError::InvalidArgument("x".into())));
+        assert!(permanent(EngineError::Storage(
+            crate::storage::StorageError::InvalidKey("x".into())
+        )));
+        assert!(!permanent(EngineError::Storage(
+            crate::storage::StorageError::Other("x".into())
+        )));
+        assert!(!permanent(EngineError::NotFound("k".into())));
+    }
+}
+
+#[cfg(test)]
 mod claim_rule_tests {
     use super::*;
     use crate::config::Config;
@@ -1236,7 +1341,7 @@ mod claim_rule_tests {
         let lease = HeldElsewhere {
             released: StdMutex::new(Vec::new()),
         };
-        let claim = claim_rule(&lease, &db, &config, "r", "consumer", 100, 60).await;
+        let claim = claim_rule(&lease, &db, &config, "r", "consumer", 60).await;
         assert_eq!(claim, RuleClaim::Busy);
         assert!(
             lease.released.lock().unwrap().is_empty(),
@@ -1257,8 +1362,8 @@ mod claim_rule_tests {
             .unwrap();
         let lease = LocalLease::new(db.clone());
 
-        let claim = claim_rule(&lease, &db, &config, "live", "c", 100, 60).await;
-        assert_eq!(claim, RuleClaim::Held { since: 100 });
+        let claim = claim_rule(&lease, &db, &config, "live", "c", 60).await;
+        assert!(matches!(claim, RuleClaim::Held { .. }), "{claim:?}");
         // Held: a rival cannot take it.
         assert!(!lease
             .try_acquire(LeaseSubsystem::Replication, "live", "rival", 110, 60)
@@ -1266,7 +1371,7 @@ mod claim_rule_tests {
             .unwrap());
 
         for name in ["paused", "deleted"] {
-            let claim = claim_rule(&lease, &db, &config, name, "c", 100, 60).await;
+            let claim = claim_rule(&lease, &db, &config, name, "c", 60).await;
             assert_eq!(claim, RuleClaim::Skip, "{name}");
             // Released: a rival can take it at once.
             assert!(

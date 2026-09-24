@@ -23,14 +23,21 @@ pub(crate) fn first_free_user_name(base: &str, taken: impl Fn(&str) -> bool) -> 
         .expect("an unbounded range always yields a free name")
 }
 
-/// Rename every user whose name an OLDER user (lower id) already has, with
+/// Rename every user but one in each same-name group, with
 /// [`first_free_user_name`]. Returns `(id, old name, new name)` per rename.
 /// The v25 upgrade runs this before it creates the unique index.
+///
+/// Who keeps the name: a `local` user before an `external` (OAuth) one — the
+/// IdP name claim is the one a user could pick to squat another user's
+/// `${iam:username}` prefix — then the older row (lower id).
 pub(crate) fn dedupe_user_names(
     conn: &rusqlite::Connection,
 ) -> Result<Vec<(i64, String, String)>, rusqlite::Error> {
     let rows: Vec<(i64, String)> = conn
-        .prepare("SELECT id, name FROM users ORDER BY id")?
+        .prepare(
+            "SELECT id, name FROM users \
+             ORDER BY CASE WHEN auth_source = 'external' THEN 1 ELSE 0 END, id",
+        )?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<Result<_, _>>()?;
     let mut all: std::collections::HashSet<String> = rows.iter().map(|(_, n)| n.clone()).collect();
@@ -308,6 +315,34 @@ mod unique_name_tests {
         // An admin create or rename to a taken name is refused by the index.
         assert!(db.create_user("dana", "AKOTHER", "s", true, &[]).is_err());
         assert!(db.update_user(first.id, Some("dana"), None, None).is_err());
+    }
+
+    /// A local user keeps the name before an OAuth-created one, even when the
+    /// OAuth row is older: the IdP name is the one a user can pick to squat.
+    #[test]
+    fn v25_upgrade_prefers_the_local_user_over_an_older_oauth_user() {
+        let db = ConfigDb::in_memory("testpass").unwrap();
+        db.conn.execute_batch("DROP INDEX idx_users_name;").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO users (name, access_key_id, secret_access_key, auth_source) \
+                 VALUES ('dana', 'EXT', 's', 'external'), ('dana', 'LOCAL', 's', 'local')",
+                [],
+            )
+            .unwrap();
+        db.conn.pragma_update(None, "user_version", 24).unwrap();
+        ConfigDb::migrate(&db.conn).unwrap();
+        let name = |ak: &str| {
+            db.conn
+                .query_row(
+                    "SELECT name FROM users WHERE access_key_id = ?1",
+                    params![ak],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(name("LOCAL"), "dana");
+        assert_eq!(name("EXT"), "dana-2");
     }
 
     /// The v25 upgrade keeps the older user's name and renames the newer ones.

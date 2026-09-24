@@ -1346,6 +1346,7 @@ async fn import_zip_full_backup(
             Json(ImportResult {
                 users_created: 0,
                 users_skipped: 0,
+                users_renamed: Vec::new(),
                 groups_created: 0,
                 groups_skipped: 0,
                 memberships_created: 0,
@@ -1358,6 +1359,7 @@ async fn import_zip_full_backup(
         Json(ImportResult {
             users_created: 0,
             users_skipped: 0,
+            users_renamed: Vec::new(),
             groups_created: 0,
             groups_skipped: 0,
             memberships_created: 0,
@@ -1525,6 +1527,7 @@ async fn import_backup_iam(
     let mut result = ImportResult {
         users_created: 0,
         users_skipped: 0,
+        users_renamed: Vec::new(),
         groups_created: 0,
         groups_skipped: 0,
         memberships_created: 0,
@@ -1537,6 +1540,8 @@ async fn import_backup_iam(
     let existing_users = db.load_users().unwrap_or_default();
     let existing_group_names: std::collections::HashSet<String> =
         existing_groups.iter().map(|g| g.name.clone()).collect();
+    let mut taken_names: std::collections::HashSet<String> =
+        existing_users.iter().map(|u| u.name.clone()).collect();
     let existing_user_keys: std::collections::HashSet<String> = existing_users
         .iter()
         .map(|u| u.access_key_id.clone())
@@ -1637,8 +1642,18 @@ async fn import_backup_iam(
             continue;
         }
 
+        // User names are unique (`${iam:username}` isolation). A name in use
+        // gets the same `-N` suffix as the v25 upgrade, not a silent skip.
+        let name = crate::config_db::first_free_user_name(&bu.name, |c| taken_names.contains(c));
+        if name != bu.name {
+            tracing::warn!(
+                "Importing user '{}' as '{}': another user already has that name",
+                bu.name,
+                name
+            );
+        }
         match db.create_user(
-            &bu.name,
+            &name,
             &bu.access_key_id,
             &bu.secret_access_key,
             bu.enabled,
@@ -1663,6 +1678,12 @@ async fn import_backup_iam(
                     }
                 }
                 result.users_created += 1;
+                if name != bu.name {
+                    result
+                        .users_renamed
+                        .push(format!("{} -> {}", bu.name, name));
+                }
+                taken_names.insert(name);
             }
             Err(e) => {
                 tracing::warn!("Failed to import user '{}': {}", bu.name, e);
@@ -1892,6 +1913,9 @@ fn resolve_backup_user_id(bu: &BackupUser, idx: usize, backup: &IamBackup) -> i6
 pub struct ImportResult {
     pub users_created: u32,
     pub users_skipped: u32,
+    /// Users imported under a new name because another user had theirs
+    /// (user names are unique): `"old -> new"`.
+    pub users_renamed: Vec<String>,
     pub groups_created: u32,
     pub groups_skipped: u32,
     pub memberships_created: u32,

@@ -229,6 +229,7 @@ impl From<crate::storage::StorageError> for S3Error {
     fn from(err: crate::storage::StorageError) -> Self {
         match err {
             crate::storage::StorageError::NotFound(key) => S3Error::NoSuchKey(key),
+            crate::storage::StorageError::InvalidKey(msg) => S3Error::InvalidArgument(msg),
             crate::storage::StorageError::BucketNotFound(b) => S3Error::NoSuchBucket(b),
             crate::storage::StorageError::BucketNotEmpty(b) => S3Error::BucketNotEmpty(b),
             crate::storage::StorageError::AlreadyExists(b) => S3Error::BucketAlreadyExists(b),

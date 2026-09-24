@@ -204,7 +204,8 @@ pub async fn update_group(
         )
         .map_err(|e| {
             tracing::warn!("Failed to update group {}: {}", group_id, e);
-            StatusCode::NOT_FOUND
+            // A rename to a name another group has → 409.
+            super::db_write_status(&e, StatusCode::NOT_FOUND)
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
