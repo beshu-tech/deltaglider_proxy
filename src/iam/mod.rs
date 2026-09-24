@@ -156,6 +156,12 @@ impl IamIndex {
         self.users.get(access_key_id)
     }
 
+    /// Look up a user by database id. O(n); for per-request checks on the
+    /// low-traffic admin surface, not for the S3 hot path.
+    pub fn get_by_id(&self, id: i64) -> Option<&IamUser> {
+        self.users.values().find(|u| u.id == id)
+    }
+
     /// Number of users in the index.
     pub fn len(&self) -> usize {
         self.users.len()

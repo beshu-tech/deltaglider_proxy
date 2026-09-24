@@ -173,10 +173,10 @@ pub async fn require_metrics_access(
         guard.record_failure();
     }
     let client_ip = rate_limiter::extract_client_ip_with_peer(&headers, peer_ip);
-    // `allows_admin_gui` already requires a live entry (same `entry_valid`
+    // `admin_gui_session_ok` already requires a live entry (same `entry_valid`
     // check as `validate`), so one call is the whole test.
     let admin_session = extract_session_token(&headers)
-        .map(|t| state.sessions.allows_admin_gui(&t, client_ip))
+        .map(|t| admin_gui_session_ok(&state, &t, client_ip))
         .unwrap_or(false);
     if admin_session {
         return next.run(request).await.into_response();
@@ -554,7 +554,7 @@ pub async fn check_session(
     let admin_gui = token
         .as_ref()
         .filter(|_| valid)
-        .map(|t| state.sessions.allows_admin_gui(t, client_ip))
+        .map(|t| admin_gui_session_ok(&state, t, client_ip))
         .unwrap_or(false);
 
     Json(SessionResponse { valid, admin_gui })
@@ -1070,7 +1070,42 @@ pub async fn require_session(
     next.run(request).await.into_response()
 }
 
-/// Middleware: valid **AdminGui** session only (rejects S3BrowserLift cookies).
+/// Whether the principal behind a session is, right now, an enabled admin.
+/// `iam` is the live IAM state; its index holds EFFECTIVE (group-merged)
+/// permissions.
+///
+/// - `Bootstrap`: the holder of the bootstrap password — always admin.
+/// - `IamLoginAs` / `External`: the user must still exist, be enabled, and
+///   hold admin permissions. Anything else (IAM mode gone, user deleted) is no.
+/// - Browser-lift and open-mode sessions are never admin.
+pub(crate) fn session_principal_is_admin(method: &AuthMethod, iam: &IamState) -> bool {
+    let IamState::Iam(index) = iam else {
+        return matches!(method, AuthMethod::Bootstrap);
+    };
+    let user = match method {
+        AuthMethod::Bootstrap => return true,
+        AuthMethod::IamLoginAs { access_key_id } => index.get(access_key_id),
+        AuthMethod::External { user_id, .. } => index.get_by_id(*user_id),
+        AuthMethod::IamBrowserLift { .. } | AuthMethod::OpenLift => return false,
+    };
+    user.is_some_and(|u| u.enabled && u.is_admin())
+}
+
+/// THE admin-surface session test: a live `AdminGui` session whose principal
+/// is still an enabled admin. A session's KIND is fixed when it is minted; the
+/// principal's rights are not. So a disabled or demoted user (or one whose
+/// admin group was removed, locally or through config sync) loses the admin
+/// surface on the next request. Every admin-session check goes through here.
+fn admin_gui_session_ok(state: &AdminState, token: &str, client_ip: Option<IpAddr>) -> bool {
+    state.sessions.allows_admin_gui(token, client_ip)
+        && state
+            .sessions
+            .auth_method(token, client_ip)
+            .is_some_and(|method| session_principal_is_admin(&method, &state.iam_state.load()))
+}
+
+/// Middleware: valid **AdminGui** session only (rejects S3BrowserLift cookies),
+/// whose principal is still an enabled admin.
 pub async fn require_admin_gui_session(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
@@ -1098,7 +1133,7 @@ pub async fn require_admin_gui_session(
         )
             .into_response();
     }
-    if !state.sessions.allows_admin_gui(&token, client_ip) {
+    if !admin_gui_session_ok(&state, &token, client_ip) {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error": "admin_session_required"})),
@@ -1332,6 +1367,140 @@ mod tests {
             .iter()
             .any(|p| p.actions == vec!["write"]));
         assert_eq!(effective.iam_policies.len(), 2);
+    }
+
+    fn admin_test_user(
+        id: i64,
+        ak: &str,
+        enabled: bool,
+        direct_admin: bool,
+        groups: Vec<i64>,
+    ) -> IamUser {
+        let wildcard = Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["*".into()],
+            resources: vec!["*".into()],
+            conditions: None,
+        };
+        IamUser {
+            id,
+            name: ak.to_lowercase(),
+            access_key_id: ak.into(),
+            secret_access_key: "secret".into(),
+            enabled,
+            created_at: String::new(),
+            permissions: if direct_admin { vec![wildcard] } else { vec![] },
+            group_ids: groups,
+            auth_source: "local".into(),
+            iam_policies: vec![],
+        }
+    }
+
+    /// `SessionStore::allows_admin_gui` checks the session KIND only. Any
+    /// caller other than `admin_gui_session_ok` would skip the live-principal
+    /// check and let a disabled or demoted admin back in.
+    #[test]
+    fn allows_admin_gui_is_only_called_through_admin_gui_session_ok() {
+        fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, hits);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    // Built at runtime so this test's own source is no hit.
+                    let needle = [".allows_admin_gui", "("].concat();
+                    for (n, line) in text.lines().enumerate() {
+                        if line.contains(&needle) {
+                            hits.push(format!("{}:{}", path.display(), n + 1));
+                        }
+                    }
+                }
+            }
+        }
+        let mut hits = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut hits,
+        );
+        let outside: Vec<_> = hits.iter().filter(|h| !h.contains("session.rs")).collect();
+        assert_eq!(
+            outside.len(),
+            1,
+            "only admin_gui_session_ok may call allows_admin_gui: {outside:?}"
+        );
+        assert!(outside[0].contains("api/admin/auth.rs"));
+    }
+
+    /// Truth table: a session reaches the admin surface only while its
+    /// principal is an enabled admin in the LIVE index.
+    #[test]
+    fn session_principal_is_admin_tracks_the_live_index() {
+        let admins = Group {
+            id: 10,
+            name: "administrators".into(),
+            description: String::new(),
+            permissions: vec![Permission {
+                id: 0,
+                effect: "Allow".into(),
+                actions: vec!["*".into()],
+                resources: vec!["*".into()],
+                conditions: None,
+            }],
+            member_ids: vec![3],
+            created_at: String::new(),
+        };
+        let iam = IamState::Iam(IamIndex::from_users_and_groups(
+            vec![
+                admin_test_user(1, "AKADMIN", true, true, vec![]),
+                admin_test_user(2, "AKOFF", false, true, vec![]),
+                admin_test_user(3, "AKGROUP", true, false, vec![10]),
+                admin_test_user(4, "AKPLAIN", true, false, vec![]),
+            ],
+            vec![admins],
+        ));
+        let login_as = |ak: &str| AuthMethod::IamLoginAs {
+            access_key_id: ak.into(),
+        };
+        let external = |id: i64| AuthMethod::External {
+            provider_name: "google".into(),
+            user_id: id,
+        };
+
+        assert!(session_principal_is_admin(&AuthMethod::Bootstrap, &iam));
+        assert!(session_principal_is_admin(&login_as("AKADMIN"), &iam));
+        assert!(session_principal_is_admin(&external(1), &iam));
+        // Admin through a group only.
+        assert!(session_principal_is_admin(&external(3), &iam));
+        assert!(session_principal_is_admin(&login_as("AKGROUP"), &iam));
+        // Disabled admin, non-admin, deleted user.
+        assert!(!session_principal_is_admin(&login_as("AKOFF"), &iam));
+        assert!(!session_principal_is_admin(&external(2), &iam));
+        assert!(!session_principal_is_admin(&external(4), &iam));
+        assert!(!session_principal_is_admin(&login_as("AKGONE"), &iam));
+        assert!(!session_principal_is_admin(&external(99), &iam));
+        // Browser-lift kinds never reach the admin surface.
+        assert!(!session_principal_is_admin(
+            &AuthMethod::IamBrowserLift {
+                access_key_id: "AKADMIN".into()
+            },
+            &iam
+        ));
+        assert!(!session_principal_is_admin(&AuthMethod::OpenLift, &iam));
+        // IAM mode gone: only the bootstrap holder stays admin.
+        assert!(session_principal_is_admin(
+            &AuthMethod::Bootstrap,
+            &IamState::Disabled
+        ));
+        assert!(!session_principal_is_admin(
+            &login_as("AKADMIN"),
+            &IamState::Disabled
+        ));
+        assert!(!session_principal_is_admin(
+            &external(1),
+            &IamState::Disabled
+        ));
     }
 
     #[test]
