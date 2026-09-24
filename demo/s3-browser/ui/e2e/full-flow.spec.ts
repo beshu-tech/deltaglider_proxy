@@ -21,7 +21,9 @@ test('open auth: bucket, upload, list, admin login, sign out, reconnect, object 
   await page.getByRole('button', { name: 'Create bucket' }).click();
   await page.getByRole('textbox', { name: 'Bucket name' }).fill(bucketName);
   await page.getByRole('button', { name: 'Create', exact: true }).click();
-  const bucketRowBtn = page.getByRole('button', { name: `${bucketName} S3 backend` });
+  // The row's accessible name starts with the bucket name; a backend chip
+  // follows only when the proxy has more than one backend.
+  const bucketRowBtn = page.getByRole('button', { name: new RegExp(`^${bucketName}\\b`) });
   await expect(bucketRowBtn).toBeVisible({ timeout: 30_000 });
   await bucketRowBtn.click();
 
@@ -64,6 +66,6 @@ test('open auth: bucket, upload, list, admin login, sign out, reconnect, object 
   await page.getByRole('button', { name: 'Connect again' }).click();
 
   await expect(page.getByRole('button', { name: 'Create bucket' })).toBeVisible({ timeout: 60_000 });
-  await page.getByRole('button', { name: `${bucketName} S3 backend` }).click();
+  await page.getByRole('button', { name: new RegExp(`^${bucketName}\\b`) }).click();
   await expect(page.getByText(uploadName)).toBeVisible({ timeout: 30_000 });
 });
