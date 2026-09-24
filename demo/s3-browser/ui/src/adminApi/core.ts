@@ -306,6 +306,17 @@ export async function updateAdminConfig(updates: Record<string, unknown>): Promi
 }
 
 /**
+ * Dry-run a synthetic request through the live admission chain
+ * (`POST /api/admin/config/trace`). Throws ApiError on a non-2xx, so
+ * callers detect an expired session with `isSessionExpired`.
+ */
+export async function traceAdmission<T>(body: unknown): Promise<T> {
+  const res = await adminFetch('/api/admin/config/trace', 'POST', body);
+  if (!res.ok) await throwApiError(res, 'Trace');
+  return safeJson<T>(res);
+}
+
+/**
  * Fetch the current runtime config as canonical YAML (four-section
  * shape, secrets redacted). Backs the "Copy as YAML" / "Export"
  * button flows. Returns the raw YAML string — the UI renders it

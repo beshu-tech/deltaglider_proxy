@@ -14,10 +14,10 @@
  * Copy-buttons surface the exact values the operator must paste into Slack
  * (the scopes), so they don't have to transcribe them.
  */
-import { useState } from 'react';
-import { Button, Drawer, Typography, message } from 'antd';
+import { Button, Drawer, Typography } from 'antd';
 import { CheckOutlined, CopyOutlined, SlackOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
+import { useCopyToClipboard } from '../useCopyToClipboard';
 
 const { Text } = Typography;
 
@@ -129,19 +129,10 @@ function StepCard({
 }
 
 function CopyChip({ value, c }: { value: string; c: ReturnType<typeof useColors> }) {
-  const [done, setDone] = useState(false);
+  const { copy, copied } = useCopyToClipboard();
   return (
     <button
-      onClick={() => {
-        navigator.clipboard?.writeText(value).then(
-          () => {
-            setDone(true);
-            message.success(`Copied ${value}`);
-            setTimeout(() => setDone(false), 1500);
-          },
-          () => message.error('Copy failed'),
-        );
-      }}
+      onClick={() => void copy(value, { successMessage: `Copied ${value}`, resetMs: 1500 })}
       title={`Copy "${value}"`}
       style={{
         display: 'inline-flex',
@@ -160,7 +151,7 @@ function CopyChip({ value, c }: { value: string; c: ReturnType<typeof useColors>
       }}
     >
       {value}
-      {done ? <CheckOutlined style={{ fontSize: 10 }} /> : <CopyOutlined style={{ fontSize: 10 }} />}
+      {copied ? <CheckOutlined style={{ fontSize: 10 }} /> : <CopyOutlined style={{ fontSize: 10 }} />}
     </button>
   );
 }

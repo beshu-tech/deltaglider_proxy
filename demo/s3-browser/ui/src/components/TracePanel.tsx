@@ -31,15 +31,15 @@ import {
   Switch,
   Tag,
   Typography,
-  message,
 } from 'antd';
 import {
   ExperimentOutlined,
   CheckCircleOutlined,
   CloseCircleOutlined,
 } from '@ant-design/icons';
-import { adminFetch } from '../adminApi';
-import { throwApiError, normalizeUiError } from '../errorHandling';
+import { traceAdmission } from '../adminApi';
+import { isSessionExpired, normalizeUiError } from '../errorHandling';
+import { useCopyToClipboard } from '../useCopyToClipboard';
 import { buildTraceBody } from '../traceRequest';
 import { useColors } from '../ThemeContext';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
@@ -88,6 +88,7 @@ export default function TracePanel({ onSessionExpired }: Props) {
   const [running, setRunning] = useState(false);
   const [result, setResult] = useState<TraceResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const { copy } = useCopyToClipboard();
 
   const run = async () => {
     setRunning(true);
@@ -95,14 +96,9 @@ export default function TracePanel({ onSessionExpired }: Props) {
     setResult(null);
     const body = buildTraceBody({ method, path, query, sourceIp, authenticated });
     try {
-      const res = await adminFetch('/api/admin/config/trace', 'POST', body);
-      if (!res.ok) {
-        if (res.status === 401) onSessionExpired?.();
-        await throwApiError(res, 'Trace');
-      }
-      const data = (await res.json()) as TraceResponse;
-      setResult(data);
+      setResult(await traceAdmission<TraceResponse>(body));
     } catch (e) {
+      if (isSessionExpired(e)) onSessionExpired?.();
       setError(normalizeUiError(e, 'unknown error'));
     } finally {
       setRunning(false);
@@ -238,13 +234,9 @@ export default function TracePanel({ onSessionExpired }: Props) {
           <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
             <Button
               size="small"
-              onClick={() => {
-                const text = JSON.stringify(result, null, 2);
-                navigator.clipboard?.writeText?.(text).then(
-                  () => message.success('Result copied as JSON'),
-                  () => message.error('Copy failed')
-                );
-              }}
+              onClick={() =>
+                void copy(JSON.stringify(result, null, 2), { successMessage: 'Result copied as JSON' })
+              }
             >
               Copy as JSON
             </Button>
