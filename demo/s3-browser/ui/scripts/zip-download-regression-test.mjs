@@ -18,11 +18,16 @@ async function load(file, rewrite = {}) {
   return `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
 }
 
-const { zipPreflightError, ZIP_MAX_KEYS, ZIP_MAX_URL_LENGTH, ZIP_MAX_BYTES } = await import(
+const { zipPreflightError, ZIP_MAX_BYTES } = await import(
   await load('zipDownload.ts', { './errorHandling': await load('errorHandling.ts') }),
 );
 
 // The limits mirror the server constants in src/api/admin/objects.rs.
+const ZIP_MAX_KEYS = 10_000;
+const ZIP_MAX_URL_LENGTH = 60_000;
+const src = await readFile(new URL('../src/zipDownload.ts', import.meta.url), 'utf8');
+assert.match(src, /const ZIP_MAX_KEYS = 10_000;/);
+assert.match(src, /const ZIP_MAX_URL_LENGTH = 60_000;/);
 const rust = await readFile(new URL('../../../../src/api/admin/objects.rs', import.meta.url), 'utf8');
 assert.match(rust, new RegExp(`const MAX_BULK_OBJECTS: usize = ${ZIP_MAX_KEYS.toLocaleString('en-US').replaceAll(',', '_')};`));
 assert.equal(ZIP_MAX_BYTES, 500 * 1024 * 1024);

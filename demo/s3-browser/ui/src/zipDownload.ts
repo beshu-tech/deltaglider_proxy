@@ -22,11 +22,11 @@
 import { throwApiError } from './errorHandling';
 
 /** Mirrors `MAX_BULK_OBJECTS` in src/api/admin/objects.rs. */
-export const ZIP_MAX_KEYS = 10_000;
+const ZIP_MAX_KEYS = 10_000;
 /** Mirrors `MAX_ZIP_BYTES` in src/api/admin/objects.rs. */
 export const ZIP_MAX_BYTES = 500 * 1024 * 1024;
 /** The HTTP stack refuses request targets of 64 KiB and more; keep a margin. */
-export const ZIP_MAX_URL_LENGTH = 60_000;
+const ZIP_MAX_URL_LENGTH = 60_000;
 
 /** Why the ZIP cannot be requested at all, or null when it can. */
 export function zipPreflightError(keyCount: number, urlLength: number): string | null {
