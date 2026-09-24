@@ -104,7 +104,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             });
         }
 
-        let (obj_key, deltaspace_id) = Self::validated_key_ingest(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
 
         // Usage-counter accounting: capture the PRIOR object metadata (S3 PUT is
         // an upsert) so the counter nets an overwrite to +0 instead of double-
@@ -368,7 +368,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         use tokio::io::AsyncReadExt;
 
         self.metadata_cache.invalidate(bucket, key);
-        let (obj_key, deltaspace_id) = Self::validated_key_ingest(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
         // Size ceiling depends on the STRATEGY: a delta-eligible object is
         // bounded by max_object_size (it will be xdelta3-encoded in RAM); a
         // passthrough object streams from the spool and is bounded by the far
@@ -1044,7 +1044,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Invalidate stale metadata on overwrite
         self.metadata_cache.invalidate(bucket, key);
 
-        let (obj_key, deltaspace_id) = Self::validated_key_ingest(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
 
         // Compute SHA256 + MD5 incrementally across chunks
         let mut sha256_hasher = Sha256::new();
@@ -1143,7 +1143,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
         self.metadata_cache.invalidate(bucket, key);
-        let (obj_key, deltaspace_id) = Self::validated_key_ingest(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
 
         let mut sha256_hasher = Sha256::new();
         let mut md5_hasher = Md5::new();
@@ -1254,7 +1254,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
         self.metadata_cache.invalidate(bucket, key);
-        let (obj_key, deltaspace_id) = Self::validated_key_ingest(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
 
         let mut file = tokio::fs::File::open(source_path)
             .await
@@ -1336,7 +1336,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
         self.metadata_cache.invalidate(bucket, key);
-        let (obj_key, deltaspace_id) = Self::validated_key_ingest(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
         let guard = self.acquire_prefix_lock(&deltaspace_id).await;
 
         // The create call needs metadata headers (content-type, user
