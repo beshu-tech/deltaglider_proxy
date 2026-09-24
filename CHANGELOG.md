@@ -12,7 +12,10 @@ listed as `46 B`, the object browser showed that size, and a sync tool that
 compares sizes copied the object again on every run.
 
 The proxy now remembers the original size and ETag of each stored object that
-it writes or reads (every upload, and every metadata or download request). It
+it writes or reads: every upload that the proxy sends in one request (large
+uploads that the proxy spools to disk included), and every metadata or download
+request. An object uploaded to the backend in several parts is known after the
+first metadata or download request for it. It
 keys each entry by the stored object's own ETag and size, so an entry can
 never describe an older version of the object, even when another proxy
 instance replaced it. A listing uses these entries and sends no extra request
@@ -20,11 +23,12 @@ to the backend, so a listing is never slower than before. An object that this
 proxy has not written or read since it started still lists with its stored
 size. `LastModified` in a listing is always the time that the backend reports,
 so it does not change between two listings of the same object. The cache holds
-about 200,000 objects by default; `DGP_LIST_SIZE_CACHE_MB` (default `32`) sets
-its size. The same applies to objects on a proxy-encrypted S3 backend, which
+about 120,000 objects by default (for 60-byte keys);
+`DGP_LIST_SIZE_CACHE_MB` (default `32`) sets its size. The same applies to objects on a proxy-encrypted S3 backend, which
 listed with the size of the encrypted data. The new counter
-`deltaglider_backend_head_requests_total` counts the metadata requests that
-the proxy sends to S3 backends.
+`deltaglider_backend_head_requests_total` counts every object metadata (HEAD)
+request that the proxy sends to S3: to the storage backends and to the
+config-sync bucket.
 
 ### Fixed — Folder sizes in the object browser showed the stored size
 
@@ -37,9 +41,10 @@ few hundred bytes. The scan result (`GET /_/api/admin/usage`) now reports:
   backend, including the delta baselines. The quota fallback uses this value.
 - `sizes_estimated`, on the total and on each child: `true` when the original
   size of some objects is not known to this proxy (see the entry above). Those
-  objects count their smaller stored size, so the total is a lower bound. The
-  object browser then shows the size as `≥ 12 MB`, and it does the same for a
-  scan that stopped at its object limit (`truncated`).
+  objects count their stored size instead, which is smaller for a delta and
+  slightly larger for an encrypted object, so the total is approximate. The
+  object browser then shows the size as `≈ 12 MB`. For a scan that stopped at
+  its object limit (`truncated`), it shows `≥ 12 MB`.
 - `age_seconds`: the age of the result. `stale_seconds` is now `0` while the
   result is fresh instead of a negative number.
 
@@ -61,8 +66,9 @@ empty archive. A partial archive now contains `_deltaglider-skipped-files.txt`,
 which lists each missing file and the reason. If a selected file already has
 that name, the list gets a free name such as `_deltaglider-skipped-files-2.txt`.
 When no selected file can be read, the request fails: with `404` when every
-file is missing, with `403` when the backend denied access to any file, and
-with `502` for other backend failures.
+file is missing, with `403` when the backend denied access to any file, with
+`413` when a file is too large, with `503` when the proxy or the backend is
+overloaded, and with `502` for other backend failures.
 
 ### Changed — A new filesystem backend needs an absolute path
 

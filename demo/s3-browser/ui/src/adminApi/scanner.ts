@@ -8,7 +8,7 @@ interface ChildUsage {
   /** Bytes stored on the backend, delta baselines included. */
   stored_size: number;
   objects: number;
-  /** Some original sizes in this folder are not known; `size` is a lower bound. */
+  /** Some original sizes in this folder are not known; `size` is approximate. */
   sizes_estimated: boolean;
 }
 
@@ -27,7 +27,7 @@ interface UsageEntry {
   stale_seconds: number;
   truncated: boolean;
   /** Some original sizes are not known to the proxy (it never sends a request
-   *  per object to find out); total_size is a lower bound. */
+   *  per object to find out); total_size is approximate. */
   sizes_estimated: boolean;
 }
 

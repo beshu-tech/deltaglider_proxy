@@ -15,8 +15,8 @@ pub use encrypting::{EncryptingBackend, EncryptionConfig, EncryptionKey, WriteMo
 pub use filesystem::FilesystemBackend;
 pub use routing::RoutingBackend;
 pub use s3::{
-    NativeEncryptionConfig, S3Backend, BACKEND_HEAD_REQUESTS, DELEGATED_LIST_PROBE_REQUESTS,
-    DELEGATED_LIST_UPSTREAM_PAGES,
+    is_backend_access_denied, NativeEncryptionConfig, S3Backend, BACKEND_HEAD_REQUESTS,
+    DELEGATED_LIST_PROBE_REQUESTS, DELEGATED_LIST_UPSTREAM_PAGES,
 };
 pub use traits::{
     BucketListing, BulkListing, DelegatedListResult, MultipartUpload, StorageBackend, StorageError,

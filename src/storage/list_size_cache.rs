@@ -75,8 +75,10 @@ fn cache_key(id: &StoredObjectId<'_>) -> String {
     )
 }
 
-/// Default byte budget. An entry weighs about its key length plus 100 bytes,
-/// so 32 MiB holds about 200,000 objects with 60-byte keys.
+/// Default byte budget. An entry weighs its cache key (endpoint, bucket,
+/// stored key, stored ETag, size: about 145 bytes with a 60-byte object key)
+/// plus the original ETag (32) plus 100 bytes of overhead, so about 275
+/// bytes, and 32 MiB holds about 120,000 objects.
 const DEFAULT_BUDGET_MB: u64 = 32;
 
 static CACHE: LazyLock<Cache<String, LogicalFacts>> = LazyLock::new(|| {
@@ -96,10 +98,12 @@ pub fn differs(id: &StoredObjectId<'_>, facts: &LogicalFacts) -> bool {
 }
 
 /// Remember the logical facts of a stored object. A no-op when the stored
-/// facts already are the logical ones (a plain passthrough object) or when
-/// the stored ETag is unknown.
+/// facts already are the logical ones (a plain passthrough object), when the
+/// stored ETag is unknown, or when the logical ETag is unknown (a delta from
+/// a legacy toolchain without `dg-md5`): a LIST must never report an empty
+/// ETag.
 pub fn record(id: &StoredObjectId<'_>, facts: LogicalFacts) {
-    if bare_etag(id.etag).is_empty() || !differs(id, &facts) {
+    if bare_etag(id.etag).is_empty() || facts.etag.is_empty() || !differs(id, &facts) {
         return;
     }
     CACHE.insert(cache_key(id), facts);
@@ -191,6 +195,13 @@ mod tests {
         };
         record(&id("t2/noetag.delta", "", 5), facts);
         assert_eq!(lookup(&id("t2/noetag.delta", "", 5)), None);
+        // Legacy delta without `dg-md5`: no logical ETag, no entry.
+        let no_md5 = LogicalFacts {
+            size: 99,
+            etag: String::new(),
+        };
+        record(&id("t2/legacy.delta", "s", 5), no_md5);
+        assert_eq!(lookup(&id("t2/legacy.delta", "s", 5)), None);
     }
 
     #[test]

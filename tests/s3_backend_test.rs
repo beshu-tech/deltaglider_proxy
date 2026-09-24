@@ -307,18 +307,7 @@ async fn list_reports_original_delta_sizes_without_backend_heads() {
     }
     let key = format!("{prefix}/v1.zip");
 
-    // What a HEAD reports is the truth a LIST must match.
     let writer_client = writer.s3_client().await;
-    let head = writer_client
-        .head_object()
-        .bucket(writer.bucket())
-        .key(&key)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(head.content_length(), Some(variant.len() as i64));
-    let head_etag = head.e_tag().unwrap().to_string();
-
     let list_v1 = |client: aws_sdk_s3::Client, bucket: String| {
         let prefix = prefix.clone();
         let key = key.clone();
@@ -338,12 +327,27 @@ async fn list_reports_original_delta_sizes_without_backend_heads() {
         }
     };
 
-    // Warm (the writer): original size and ETag, no HEAD.
+    // Warm (the writer), BEFORE any HEAD of the object: only the PUT can have
+    // filled the cache, so this proves the PUT fill. Original size, no HEAD.
     let before = backend_heads(&writer.endpoint()).await;
     let warm = list_v1(writer_client.clone(), writer.bucket().to_string()).await;
-    assert_eq!(backend_heads(&writer.endpoint()).await, before);
+    assert_eq!(
+        backend_heads(&writer.endpoint()).await,
+        before,
+        "the writer sent no HEAD since the PUT, and the LIST sends none"
+    );
     assert_eq!(warm.size(), Some(variant.len() as i64));
-    assert_eq!(warm.e_tag(), Some(head_etag.as_str()));
+
+    // What a HEAD reports is the truth the LIST must match.
+    let head = writer_client
+        .head_object()
+        .bucket(writer.bucket())
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.content_length(), Some(variant.len() as i64));
+    assert_eq!(warm.e_tag(), head.e_tag());
 
     // Cold (a second proxy on the same bucket): stored size, no HEAD.
     let reader = TestServer::s3().await;

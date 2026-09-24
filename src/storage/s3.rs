@@ -62,14 +62,16 @@ pub static DELEGATED_LIST_UPSTREAM_PAGES: std::sync::LazyLock<prometheus::IntCou
         .expect("valid metric")
     });
 
-/// Object metadata (HEAD) requests sent to S3 backends. Lets an operator see
+/// Every object HEAD request the proxy sends to S3: object metadata reads,
+/// baseline existence checks, and the config-sync poll. Lets an operator see
 /// a HEAD burst (the Hetzner 503 SlowDown RCA) and lets tests prove that a
-/// path sends none.
+/// path sends none. Every `head_object()` call in the server must increment
+/// it (guarded by a source test).
 pub static BACKEND_HEAD_REQUESTS: std::sync::LazyLock<prometheus::IntCounter> =
     std::sync::LazyLock::new(|| {
         prometheus::IntCounter::new(
             "deltaglider_backend_head_requests_total",
-            "Object metadata (HEAD) requests sent to S3 backends",
+            "Object HEAD requests sent to S3 (storage backends and the config-sync bucket)",
         )
         .expect("valid metric")
     });
@@ -887,6 +889,8 @@ impl S3Backend {
             )));
         }
 
+        // The stored size for the listing-size cache: what this PUT sends.
+        let stored_size = tokio::fs::metadata(source_path).await.ok().map(|m| m.len());
         let backoff_ms = [100, 200, 400];
         for attempt in 0..=backoff_ms.len() {
             let body = ByteStream::from_path(source_path.to_path_buf())
@@ -907,7 +911,18 @@ impl S3Backend {
             request = apply_native_encryption(request, &self.native_encryption);
 
             match request.send().await {
-                Ok(_) => return Ok(()),
+                Ok(resp) => {
+                    if let Some(size) = stored_size {
+                        self.remember_listed_facts(
+                            bucket,
+                            key,
+                            resp.e_tag().unwrap_or_default(),
+                            size,
+                            metadata,
+                        );
+                    }
+                    return Ok(());
+                }
                 Err(e) => {
                     let is_retryable = if let SdkError::ServiceError(ref svc) = e {
                         let status = svc.raw().status().as_u16();
@@ -1672,6 +1687,7 @@ impl StorageBackend for S3Backend {
     #[instrument(skip(self))]
     async fn has_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
         let key = self.reference_key(prefix);
+        BACKEND_HEAD_REQUESTS.inc();
         match self
             .client
             .head_object()
@@ -2550,6 +2566,14 @@ impl StorageBackend for S3Backend {
         debug!("Created directory marker: {}/{}", bucket, key);
         Ok(())
     }
+}
+
+/// Did an S3 backend deny access to an object? An object-level 403 has no
+/// `StorageError` variant of its own: `S3Backend::classify_s3_error` keeps it
+/// as `S3("<op> failed (status=403): …")`. This helper lives next to that
+/// format so that callers never match on error text themselves.
+pub fn is_backend_access_denied(e: &StorageError) -> bool {
+    matches!(e, StorageError::S3(msg) if msg.contains("(status=403)"))
 }
 
 /// Early-exit decision for the delegated-listing fetch loop.

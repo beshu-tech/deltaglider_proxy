@@ -2,12 +2,12 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import { scanPrefixUsage, getPrefixUsage } from './adminApi';
 import { getBucket } from './s3client';
 import { normalizeUiError } from './errorHandling';
-import { folderSizeIsLowerBound } from './folderSize';
+import { folderSizeBound, type FolderSizeBound } from './folderSize';
 import { USAGE_POLL_INTERVAL_MS, usagePollStep } from './usagePoll';
 
 export interface FolderSizeState {
-  /** `lowerBound`: the size is at least `totalSize` (see folderSize.ts). */
-  progress: { totalSize: number; totalFiles: number; done: boolean; lowerBound?: boolean } | null;
+  /** `bound`: how exact `totalSize` is (see folderSize.ts). */
+  progress: { totalSize: number; totalFiles: number; done: boolean; bound?: FolderSizeBound } | null;
   loading: boolean;
   error: string | null;
 }
@@ -98,7 +98,7 @@ export default function useComputeSize() {
               totalSize: outcome.result.total_size,
               totalFiles: outcome.result.total_objects,
               done: true,
-              lowerBound: folderSizeIsLowerBound(outcome.result),
+              bound: folderSizeBound(outcome.result),
             },
             loading: false,
             error: null,
@@ -142,7 +142,7 @@ export default function useComputeSize() {
               totalSize: child.size,
               totalFiles: child.objects,
               done: true,
-              lowerBound: folderSizeIsLowerBound(result, child),
+              bound: folderSizeBound(result, child),
             },
             loading: false,
             error: null,
