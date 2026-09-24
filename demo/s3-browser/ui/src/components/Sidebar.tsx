@@ -141,8 +141,10 @@ export default function Sidebar({
   }, [createBucketFocusSignal]);
 
   // After CreateBucketModal reports success, refresh the Sidebar's local bucket
-  // list (it's plain useState, not react-query) and auto-select the new bucket
-  // if none is active yet.
+  // list (it's plain useState, not react-query) and open the new bucket — the
+  // next thing anyone does after creating a bucket is put files in it. (It
+  // used to switch only when no bucket was open, so the success toast left
+  // the user in the old bucket.)
   const handleBucketCreated = async (name: string) => {
     try {
       const updated = await listBuckets({ includeOrigins: includeBucketOrigins });
@@ -151,10 +153,8 @@ export default function Sidebar({
     } catch {
       /* refresh failure is non-fatal — the bucket was created */
     }
-    if (!getBucket()) {
-      setBucket(name);
-      onBucketChange(name);
-    }
+    setBucket(name);
+    onBucketChange(name);
   };
 
   const formatError = (e: unknown): string => {
