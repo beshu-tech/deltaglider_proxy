@@ -837,33 +837,91 @@ async fn delete_rule(
     name: &str,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, String)> {
-    // Cross-backend liveness gate (H29): the SQLite lease check below is blind to
-    // a scheduled run holding ONLY the coordination (S3) lease, so a rule could
-    // be purged mid-run. Check the active lease FIRST — before the config/db
-    // locks, since is_held may do S3 I/O we must not run under those locks.
-    if sub == JobSubsystem::Replication {
-        if let Some(lease) = state.coordination_lease.as_ref() {
-            let now = crate::replication::state_store::current_unix_seconds();
-            if lease
-                .is_held(crate::coordination::LeaseSubsystem::Replication, name, now)
-                .await
-                .unwrap_or(false)
-            {
-                return Err((
-                    StatusCode::CONFLICT,
-                    format!(
-                        "rule '{name}' has a run or verify in progress — stop it before deleting"
-                    ),
-                ));
+    // Replication (H29): TAKE the rule's lease — the same coordination lease
+    // the scheduler, run-now and the event consumer take (S3 when a
+    // coordination bucket is configured, else SQLite) — and hold it through the
+    // purge. A check-only `is_held` raced them: a run could take the lease
+    // between the check and the purge. Taken BEFORE the config/db locks,
+    // because the S3 lease does I/O we must not run under those locks.
+    let delete_lease = if sub == JobSubsystem::Replication {
+        match (state.coordination_lease.as_ref(), state.config_db.as_ref()) {
+            (Some(lease), Some(_)) => {
+                let owner = format!("delete:{}", uuid::Uuid::new_v4());
+                let now = crate::replication::state_store::current_unix_seconds();
+                let held = lease
+                    .try_acquire(
+                        crate::coordination::LeaseSubsystem::Replication,
+                        name,
+                        &owner,
+                        now,
+                        DELETE_LEASE_TTL_SECS,
+                    )
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("could not take the rule lease: {e}"),
+                        )
+                    })?;
+                if !held {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        format!(
+                            "rule '{name}' has a run or verify in progress — stop it before deleting"
+                        ),
+                    ));
+                }
+                Some((lease.clone(), owner))
             }
+            _ => None,
         }
+    } else {
+        None
+    };
+    let result = delete_rule_locked(state, sub, name, delete_lease.is_some()).await;
+    if let Some((lease, owner)) = delete_lease {
+        let _ = lease
+            .release(
+                crate::coordination::LeaseSubsystem::Replication,
+                name,
+                &owner,
+            )
+            .await;
     }
+    result?;
 
+    crate::audit::audit_log(
+        match sub {
+            JobSubsystem::Replication => "replication_delete",
+            _ => "lifecycle_delete",
+        },
+        "admin",
+        name,
+        headers,
+        "",
+        "",
+    );
+    Ok(())
+}
+
+/// How long `delete_rule` may hold the rule lease: the purge is a config
+/// persist plus a few DB deletes, so this only bounds a crash mid-delete.
+const DELETE_LEASE_TTL_SECS: i64 = 60;
+
+/// The locked part of [`delete_rule`]. `holds_rule_lease`: the caller holds
+/// the rule's coordination lease, so no run holds it (and the SQLite lease
+/// check would see the caller's own lease).
+async fn delete_rule_locked(
+    state: &Arc<AdminState>,
+    sub: JobSubsystem,
+    name: &str,
+    holds_rule_lease: bool,
+) -> Result<(), (StatusCode, String)> {
     // ONE critical section (config.write OUTER → db.lock INNER, the codebase
     // order): liveness check, config retain+persist, and the DB row purge all
-    // under the same guards. Holding the db lock across the purge closes the
-    // H2 race — run-now/scheduler acquire the lease under this same lock, and
-    // the LEASE (taken before the run row exists) is the liveness anchor.
+    // under the same guards. For replication the caller's rule lease is the
+    // liveness anchor (it exists before any run row); the run-row check below
+    // covers a run whose lease lapsed.
     {
         let mut cfg = state.config.write().await;
         let db_guard = match state.config_db.as_ref() {
@@ -880,8 +938,10 @@ async fn delete_rule(
             let blocked = match sub {
                 JobSubsystem::Replication => {
                     let run_status = db.replication_latest_run_status(name).ok().flatten();
-                    let lease_live = db.replication_lease_is_held(name, now).unwrap_or(false)
-                        || db.parity_lease_is_held(name, now).unwrap_or(false);
+                    let run_lease_live = !holds_rule_lease
+                        && db.replication_lease_is_held(name, now).unwrap_or(false);
+                    let lease_live =
+                        run_lease_live || db.parity_lease_is_held(name, now).unwrap_or(false);
                     delete_blocked_by_live_run(run_status.as_deref(), lease_live)
                 }
                 JobSubsystem::Lifecycle => db.lifecycle_lease_is_held(name, now).unwrap_or(false),
@@ -952,18 +1012,6 @@ async fn delete_rule(
             }
         }
     }
-
-    crate::audit::audit_log(
-        match sub {
-            JobSubsystem::Replication => "replication_delete",
-            _ => "lifecycle_delete",
-        },
-        "admin",
-        name,
-        headers,
-        "",
-        "",
-    );
     Ok(())
 }
 

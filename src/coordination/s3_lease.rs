@@ -30,6 +30,12 @@ pub struct Lease {
     pub node_id: String,
     pub epoch: u64,
     pub expires_at: i64,
+    /// Per-PROCESS id of the writer. Self-reclaim needs it: a lease that THIS
+    /// process wrote belongs to a live worker in it (scheduler, event
+    /// consumer, run-now) and must block the others. Absent (older writer) →
+    /// empty, which never equals a live process's id.
+    #[serde(default)]
+    pub boot_id: String,
 }
 
 /// Bounded retries for a renew PUT against a transient coordination-bucket blip,
@@ -52,16 +58,23 @@ pub enum AcquireAction {
 /// Pure acquire decision (mirrors `job_store::try_acquire_leader_lease`'s tiling).
 ///
 /// A lease is stealable when it is EXPIRED (`expires_at < now`, STRICT) OR when
-/// WE already own it (same `node_id`) — the self-reclaim path (E7) lets a
-/// rebooted node take back its own still-live lease immediately instead of
-/// waiting a full TTL. A live lease owned by a DIFFERENT node blocks.
-pub fn plan_acquire(current: Option<(&Lease, &str)>, now: i64, my_node_id: &str) -> AcquireAction {
+/// an EARLIER PROCESS of this node wrote it (same `node_id`, different
+/// `boot_id`) — the self-reclaim path (E7) lets a rebooted node take back its
+/// own still-live lease immediately instead of waiting a full TTL. A live lease
+/// written by this same process (another worker in it) or by a DIFFERENT node
+/// blocks.
+pub fn plan_acquire(
+    current: Option<(&Lease, &str)>,
+    now: i64,
+    my_node_id: &str,
+    my_boot_id: &str,
+) -> AcquireAction {
     match current {
         None => AcquireAction::Create,
         Some((lease, etag)) => {
             let expired = lease.expires_at < now;
-            let mine = lease.node_id == my_node_id;
-            if expired || mine {
+            let from_earlier_boot = lease.node_id == my_node_id && lease.boot_id != my_boot_id;
+            if expired || from_earlier_boot {
                 AcquireAction::Steal {
                     etag: etag.to_string(),
                     next_epoch: lease.epoch.saturating_add(1),
@@ -103,6 +116,9 @@ pub struct S3Lease {
     bucket: String,
     /// Durable node identity (survives restart) — for self-reclaim provenance.
     node_id: String,
+    /// This process's id: self-reclaim applies only to leases an earlier
+    /// process wrote.
+    boot_id: String,
 }
 
 impl S3Lease {
@@ -111,6 +127,7 @@ impl S3Lease {
             client,
             bucket,
             node_id,
+            boot_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -162,6 +179,7 @@ impl S3Lease {
             node_id: self.node_id.clone(),
             epoch,
             expires_at,
+            boot_id: self.boot_id.clone(),
         };
         ByteStream::from(serde_json::to_vec(&lease).unwrap_or_default())
     }
@@ -219,6 +237,7 @@ impl CoordinationLease for S3Lease {
             current.as_ref().map(|(l, e)| (l, e.as_str())),
             now,
             &self.node_id,
+            &self.boot_id,
         ) {
             AcquireAction::Blocked => Ok(false),
             AcquireAction::Create => {
@@ -350,19 +369,23 @@ mod tests {
             node_id: node.into(),
             epoch,
             expires_at: expires,
+            boot_id: "boot-old".into(),
         }
     }
 
     #[test]
     fn acquire_free_lease_creates() {
-        assert_eq!(plan_acquire(None, 100, "nodeA"), AcquireAction::Create);
+        assert_eq!(
+            plan_acquire(None, 100, "nodeA", "boot-now"),
+            AcquireAction::Create
+        );
     }
 
     #[test]
     fn acquire_expired_lease_steals_with_bumped_epoch() {
         let l = lease("old", "nodeB", 5, 90); // expired at now=100
         assert_eq!(
-            plan_acquire(Some((&l, "etag1")), 100, "nodeA"),
+            plan_acquire(Some((&l, "etag1")), 100, "nodeA", "boot-now"),
             AcquireAction::Steal {
                 etag: "etag1".into(),
                 next_epoch: 6
@@ -374,7 +397,7 @@ mod tests {
     fn acquire_live_foreign_lease_blocks() {
         let l = lease("held", "nodeB", 5, 160); // live at now=100
         assert_eq!(
-            plan_acquire(Some((&l, "etag1")), 100, "nodeA"),
+            plan_acquire(Some((&l, "etag1")), 100, "nodeA", "boot-now"),
             AcquireAction::Blocked
         );
     }
@@ -385,11 +408,23 @@ mod tests {
         // waiting for expiry — a rebooted node takes it straight back.
         let l = lease("old-task", "nodeA", 5, 160); // live, but ours
         assert_eq!(
-            plan_acquire(Some((&l, "etag1")), 100, "nodeA"),
+            plan_acquire(Some((&l, "etag1")), 100, "nodeA", "boot-now"),
             AcquireAction::Steal {
                 etag: "etag1".into(),
                 next_epoch: 6
             }
+        );
+    }
+
+    /// Another worker of THIS process (scheduler vs event consumer vs
+    /// run-now) holds the live lease: blocked, or they would take it from
+    /// each other.
+    #[test]
+    fn acquire_live_lease_of_this_process_blocks() {
+        let l = lease("scheduler", "nodeA", 5, 160);
+        assert_eq!(
+            plan_acquire(Some((&l, "etag1")), 100, "nodeA", "boot-old"),
+            AcquireAction::Blocked
         );
     }
 
@@ -399,7 +434,7 @@ mod tests {
         // still blocks (mirrors the job_store `< now` steal predicate).
         let l = lease("held", "nodeB", 5, 100);
         assert_eq!(
-            plan_acquire(Some((&l, "e")), 100, "nodeA"),
+            plan_acquire(Some((&l, "e")), 100, "nodeA", "boot-now"),
             AcquireAction::Blocked
         );
     }

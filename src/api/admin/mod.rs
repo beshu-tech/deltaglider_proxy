@@ -294,6 +294,23 @@ pub(crate) fn audit_log(
     crate::audit::audit_log(action, admin_user, target, headers, "", "");
 }
 
+/// Status for a failed config-DB write: 409 when a UNIQUE constraint
+/// refused it (a user or group name in use), else `otherwise`.
+pub(crate) fn db_write_status(
+    e: &crate::config_db::ConfigDbError,
+    otherwise: axum::http::StatusCode,
+) -> axum::http::StatusCode {
+    match e {
+        crate::config_db::ConfigDbError::Sqlite(se)
+            if crate::config_db::classify_sqlite_error(se)
+                == crate::config_db::SqliteErrorClass::Conflict =>
+        {
+            axum::http::StatusCode::CONFLICT
+        }
+        _ => otherwise,
+    }
+}
+
 pub(crate) fn next_copy_name(base: &str, existing: impl IntoIterator<Item = String>) -> String {
     let existing: std::collections::HashSet<String> = existing.into_iter().collect();
     for n in 1.. {

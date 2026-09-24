@@ -150,31 +150,13 @@ impl ObjectKey {
     /// cleanup. A single trailing `/` (folder marker) is unaffected.
     pub fn validate_ingest(&self) -> Result<(), KeyValidationError> {
         self.validate_object()?;
-        if self.prefix.trim_end_matches('/').contains("//") {
+        // `parse` strips leading `/` and puts no trailing `/` in the prefix, so
+        // any empty segment is an internal `//` (including one just before the
+        // filename: `a//x` has prefix `a/`).
+        if !self.prefix.is_empty() && self.prefix.split('/').any(str::is_empty) {
             return Err(KeyValidationError(
                 "Key must not contain empty path segments ('//')".to_string(),
             ));
-        }
-        Ok(())
-    }
-
-    /// Refuse keys that a path-resolving store would alias onto ANOTHER key:
-    /// a `.` segment or an empty (`//`) segment in the prefix. On the
-    /// filesystem backend `a/./b` and `a//b` open the file of `a/b`, while
-    /// IAM authorizes the literal text, so a Deny on `a/b*` would not apply.
-    /// (`validate_object` already refuses a `.`/`..` filename, and `parse`
-    /// strips leading `/`.)
-    pub fn validate_unaliased(&self) -> Result<(), KeyValidationError> {
-        if self.prefix.is_empty() {
-            return Ok(());
-        }
-        for segment in self.prefix.split('/') {
-            if segment.is_empty() || segment == "." {
-                return Err(KeyValidationError(
-                    "Key must not contain '.' or empty path segments on this storage backend"
-                        .to_string(),
-                ));
-            }
         }
         Ok(())
     }
@@ -770,34 +752,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_unaliased_refuses_dot_and_empty_segments() {
-        for key in [
-            "a/./secret.txt",
-            "./a/secret.txt",
-            "a//secret.txt",
-            "a/b//c",
-            "a/./",
-        ] {
-            assert!(
-                ObjectKey::parse("b", key).validate_unaliased().is_err(),
-                "{key} must be refused"
-            );
-        }
-        for key in [
-            "secret.txt",
-            "a/secret.txt",
-            "a/.hidden/x",
-            "a/b.c/d",
-            "a/..x/y",
-        ] {
-            assert!(
-                ObjectKey::parse("b", key).validate_unaliased().is_ok(),
-                "{key} must be accepted"
-            );
-        }
-    }
-
-    #[test]
     fn test_validate_prefix_allows_normal() {
         assert!(ObjectKey::validate_prefix("releases/v1.0/").is_ok());
     }
@@ -813,6 +767,11 @@ mod tests {
         assert!(ObjectKey::parse("b", "ror/builds//enterprise/x.zip")
             .validate_object()
             .is_ok());
+        // `//` just before the file name: prefix `a/`, still an empty segment.
+        assert!(ObjectKey::parse("b", "a//x.zip").validate_ingest().is_err());
+        assert!(ObjectKey::parse("b", "a///x.zip")
+            .validate_ingest()
+            .is_err());
         // A clean key + a single trailing slash (folder marker) stay valid on ingest.
         assert!(ObjectKey::parse("b", "ror/builds/enterprise/x.zip")
             .validate_ingest()

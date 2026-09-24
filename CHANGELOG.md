@@ -135,11 +135,15 @@ promptly.
   request.
 - User names that start with `$` are reserved for built-in principals. The
   admin API, backup import and OAuth provisioning now refuse or strip them.
-- On the filesystem backend, a key with a `.` segment or an empty segment (for
-  example `a/./secret.txt` or `a//secret.txt`) is now refused with HTTP 400.
-  The filesystem resolves such a key to the file of `a/secret.txt`, while the
-  policy check saw the literal key, so a Deny on `a/secret*` did not apply.
-  The S3 backend stores keys literally and is not affected.
+- On the filesystem backend, a key or a list prefix with a `.`, `..` or empty
+  segment (for example `a/./secret.txt`, `a//secret.txt` or `prefix=a/./`) is
+  now refused with HTTP 400. The filesystem resolves such a key to the file of
+  `a/secret.txt`, while the policy check saw the literal key, so a Deny on
+  `a/secret*` did not apply to reads, writes or listings. The check is in the
+  filesystem backend itself, so replication and lifecycle writes into a
+  filesystem bucket follow it too. The S3 backend stores keys literally and is
+  not affected. On S3, a new key with an empty segment just before the file
+  name (`a//x`) is now refused on upload, as other `//` keys already were.
 - The admin log stream and the bucket scan stream now end within about one
   second when their session stops being an admin session. Before this fix, a
   disabled or demoted admin, or a revoked session, kept receiving every server
@@ -148,8 +152,17 @@ promptly.
   an identity-provider name equal to another user's name and so share that
   user's `${iam:username}` prefix. OAuth provisioning now adds a suffix to a
   name that is in use (`dana-2`), and the admin API answers HTTP 409 to a
-  create, clone or rename that would duplicate a name. The database upgrade
-  renames the newer user of each existing same-name pair and logs a warning.
+  create, clone or rename that would duplicate a name (a group rename too). The
+  database upgrade renames all but one user of each existing same-name group
+  and logs a warning: a local user keeps the name before an OAuth user, and
+  otherwise the older user keeps it. A backup import renames a colliding user
+  in the same way instead of skipping it. In declarative mode, a YAML user
+  that has the name of an OAuth-created user but its own access key fails the
+  apply. A user name
+  of `.` or `..` no longer expands in `${iam:username}`.
+  **Downgrade note:** the upgrade adds the unique index `idx_users_name`, and an
+  older version keeps it. Drop the index before you downgrade, or an older
+  version fails OAuth logins whose name is in use.
 
 ### Fixed — Replication run-now and the event consumer use the shared lease
 
@@ -157,8 +170,20 @@ With a coordination bucket configured, the replication scheduler took its
 per-rule lease in the bucket, but the event consumer and the admin run-now took
 a lease in the node-local database. So they did not exclude each other: a
 reconcile run could delete, as an orphan, a copy that the consumer made during
-the run. All three now take the same lease. A single instance keeps the
-node-local lease, as before.
+the run. All three now take the same lease, and deleting a rule takes it too
+for the duration of the purge. A single instance keeps the node-local lease, as
+before.
+
+- With the S3 lease, a worker could take a live lease from another worker of
+  the same process, because a node could always reclaim its own lease. Now a
+  node reclaims only a lease that an earlier process wrote (after a restart).
+- The event consumer re-checks at every key whether the rule is paused or
+  deleted. A key that the destination can never accept (for example a `.`
+  segment on a filesystem destination) is recorded as a failure and no longer
+  holds the event cursor for every rule.
+- While another node runs a reconcile of a rule, the event consumer holds that
+  rule's events, and the cursor with them, until the run ends. This keeps the
+  consumer from copying objects that the run is about to delete.
 
 ### Changed — `${iam:username}` matches names that contain punctuation
 

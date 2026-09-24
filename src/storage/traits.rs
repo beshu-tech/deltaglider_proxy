@@ -70,6 +70,11 @@ pub enum StorageError {
     #[error("Backend throttled: {0}")]
     Throttled(String),
 
+    /// The key cannot be stored or read on this backend as written (for
+    /// example a `.` segment on the filesystem). Maps to 400 InvalidArgument.
+    #[error("Invalid key: {0}")]
+    InvalidKey(String),
+
     #[error("Storage error: {0}")]
     Other(String),
 }
@@ -505,17 +510,6 @@ pub trait StorageBackend: Send + Sync {
     /// filesystem default); S3 + actively-encrypting wrapper override `false`.
     fn lite_list_carries_logical_facts(&self, _bucket: &str) -> bool {
         true
-    }
-
-    /// Does the backend serving `bucket` resolve key segments as a PATH, so
-    /// that `a/./b` and `a//b` land on the object stored as `a/b`? True for
-    /// the filesystem backend (the OS path join resolves `.` and empty
-    /// segments); false for S3, where every key is a literal, distinct name.
-    /// The engine refuses such keys on a resolving backend, because IAM
-    /// authorizes the literal key text and a Deny on `a/b*` would not match
-    /// the alias.
-    fn resolves_key_path_segments(&self, _bucket: &str) -> bool {
-        false
     }
 
     // === Scanning operations ===
@@ -1032,9 +1026,6 @@ macro_rules! impl_storage_backend_for_box {
             }
             fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
                 (**self).lite_list_carries_logical_facts(bucket)
-            }
-            fn resolves_key_path_segments(&self, bucket: &str) -> bool {
-                (**self).resolves_key_path_segments(bucket)
             }
 
             async fn scan_deltaspace(

@@ -129,8 +129,9 @@ pub async fn run_now(
         // releases the lease normally, leaving `paused` untouched.
     }
 
-    // Post-acquire re-check: delete_rule holds the config lock while it checks
-    // our lease, so if the rule vanished here we lost that race — back out.
+    // Post-acquire re-check: delete_rule holds this same lease through its
+    // purge, so a rule that is gone here was deleted before we took it — back
+    // out.
     if !state
         .config
         .read()
@@ -164,8 +165,9 @@ pub async fn run_now(
     // Run in the BACKGROUND and return immediately. A replication run can copy
     // many GB (streaming multipart) and take minutes — blocking the HTTP request
     // until it finishes hangs the admin AJAX for the whole sync. We already hold
-    // the lease (acquired above under the DB lock, so a double run-now still
-    // 409s); the spawned task owns the run and releases the lease when done. The
+    // the rule lease (a second run-now, the scheduler or a consumer drain gets
+    // "busy", and a double run-now 409s); the spawned task owns the run and
+    // releases the lease when done. The
     // run appears in the jobs list as `running` with live progress via the
     // existing run-history polling — the client polls, it does not wait here.
     let engine = state.s3_state.engine.load().clone();

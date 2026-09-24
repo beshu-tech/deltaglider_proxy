@@ -32,6 +32,7 @@ mod declarative;
 mod groups;
 pub(crate) mod job_store;
 mod users;
+pub(crate) use users::first_free_user_name;
 
 /// Compute the path to the IAM config database file.
 ///

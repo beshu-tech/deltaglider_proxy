@@ -78,6 +78,14 @@ fn validate_condition_templates(value: &serde_json::Value) -> Result<(), String>
 /// stop denying. Such a value is an ERROR; the index then gives the user no
 /// permissions at all (fail closed).
 fn encode_template_value(value: &str) -> Result<&str, String> {
+    // A whole value of `.`/`..` (or nothing) is a path segment of its own:
+    // `home/${iam:username}/*` would become `home/./*` — every user's home on
+    // a path-resolving backend.
+    if matches!(value, "" | "." | "..") {
+        return Err(format!(
+            "identity value {value:?} is a path segment, which a policy template cannot hold"
+        ));
+    }
     match value
         .chars()
         .find(|c| matches!(c, '/' | '*' | '?' | '$' | '{' | '}' | '%'))
@@ -1987,6 +1995,9 @@ mod tests {
             "x{y}",
             "50%off",
             "x${iam:username}",
+            ".",
+            "..",
+            "",
         ] {
             assert!(
                 expand_permission_templates(&templated, name, "AK").is_err(),

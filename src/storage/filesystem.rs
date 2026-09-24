@@ -105,6 +105,24 @@ async fn atomic_copy_with_metadata(
     .map_err(super::join_error)?
 }
 
+/// Refuse a prefix or filename that the OS path join would resolve to a
+/// DIFFERENT key's file: a `.`, `..` or empty (`//`) segment. IAM authorizes
+/// the literal key text, so `a/./secret` must not open `a/secret` (and no
+/// such key can be stored distinctly on a filesystem anyway). S3 keeps keys
+/// literal, so only this backend needs the rule.
+fn check_path_segments(prefix: &str, filename: &str) -> Result<(), StorageError> {
+    let aliases = |segment: &str| segment.is_empty() || segment == "." || segment == "..";
+    let bad_prefix = !prefix.is_empty() && prefix.split('/').any(aliases);
+    let bad_filename = !filename.is_empty() && (aliases(filename) || filename.contains('/'));
+    if bad_prefix || bad_filename {
+        return Err(StorageError::InvalidKey(
+            "Key must not contain '.', '..' or empty path segments on the filesystem backend"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Filesystem storage backend
 ///
 /// Synthetic ETag for unmanaged files (no DG xattr).
@@ -179,29 +197,47 @@ impl FilesystemBackend {
         self.root.join(bucket)
     }
 
-    /// Get the full path for a deltaspace directory within a bucket
-    fn deltaspace_dir(&self, bucket: &str, prefix: &str) -> PathBuf {
-        if prefix.is_empty() {
+    /// Get the full path for a deltaspace directory within a bucket.
+    ///
+    /// THE gate for key aliasing: every object path is built here (or by a
+    /// listing join that calls [`check_path_segments`]), so no caller can
+    /// reach a file through a key that names another key.
+    fn deltaspace_dir(&self, bucket: &str, prefix: &str) -> Result<PathBuf, StorageError> {
+        check_path_segments(prefix, "")?;
+        Ok(if prefix.is_empty() {
             self.bucket_dir(bucket).join("deltaspaces")
         } else {
             self.bucket_dir(bucket).join("deltaspaces").join(prefix)
-        }
+        })
     }
 
     /// Get the path for the reference file
-    fn reference_path(&self, bucket: &str, prefix: &str) -> PathBuf {
-        self.deltaspace_dir(bucket, prefix).join("reference.bin")
+    fn reference_path(&self, bucket: &str, prefix: &str) -> Result<PathBuf, StorageError> {
+        Ok(self.deltaspace_dir(bucket, prefix)?.join("reference.bin"))
     }
 
     /// Get the path for a delta file
-    fn delta_path(&self, bucket: &str, prefix: &str, filename: &str) -> PathBuf {
-        self.deltaspace_dir(bucket, prefix)
-            .join(format!("{}.delta", filename))
+    fn delta_path(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<PathBuf, StorageError> {
+        check_path_segments("", filename)?;
+        Ok(self
+            .deltaspace_dir(bucket, prefix)?
+            .join(format!("{}.delta", filename)))
     }
 
     /// Get the path for a passthrough file (stored with original filename)
-    fn passthrough_path(&self, bucket: &str, prefix: &str, filename: &str) -> PathBuf {
-        self.deltaspace_dir(bucket, prefix).join(filename)
+    fn passthrough_path(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+    ) -> Result<PathBuf, StorageError> {
+        check_path_segments("", filename)?;
+        Ok(self.deltaspace_dir(bucket, prefix)?.join(filename))
     }
 
     /// Build a best-effort FileMetadata from filesystem stats alone (no xattr).
@@ -705,12 +741,6 @@ impl FilesystemBackend {
 impl StorageBackend for FilesystemBackend {
     // === Bucket operations ===
 
-    fn resolves_key_path_segments(&self, _bucket: &str) -> bool {
-        // `deltaspace_dir` joins the prefix onto an OS path: `a/./b` and
-        // `a//b` resolve to the file of `a/b`.
-        true
-    }
-
     #[instrument(skip(self))]
     async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError> {
         let bucket_dir = self.bucket_dir(bucket);
@@ -813,7 +843,7 @@ impl StorageBackend for FilesystemBackend {
     #[instrument(skip(self))]
     async fn get_reference(&self, bucket: &str, prefix: &str) -> Result<Vec<u8>, StorageError> {
         self.get_object_file(
-            &self.reference_path(bucket, prefix),
+            &self.reference_path(bucket, prefix)?,
             "reference",
             prefix,
             "reference.bin",
@@ -827,7 +857,7 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         dest: &Path,
     ) -> Result<u64, StorageError> {
-        let src = self.reference_path(bucket, prefix);
+        let src = self.reference_path(bucket, prefix)?;
         if !path_exists(&src).await {
             return Err(StorageError::NotFound(format!(
                 "reference: {}/reference.bin",
@@ -850,7 +880,7 @@ impl StorageBackend for FilesystemBackend {
         self.require_bucket_exists(bucket).await?;
         self.put_object_file(
             bucket,
-            &self.reference_path(bucket, prefix),
+            &self.reference_path(bucket, prefix)?,
             data,
             metadata,
             "reference",
@@ -869,7 +899,7 @@ impl StorageBackend for FilesystemBackend {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
-        let dest = self.reference_path(bucket, prefix);
+        let dest = self.reference_path(bucket, prefix)?;
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -884,7 +914,7 @@ impl StorageBackend for FilesystemBackend {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
-        xattr_meta::write_metadata(&self.reference_path(bucket, prefix), metadata).await
+        xattr_meta::write_metadata(&self.reference_path(bucket, prefix)?, metadata).await
     }
 
     async fn put_passthrough_metadata(
@@ -895,7 +925,7 @@ impl StorageBackend for FilesystemBackend {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
-        let path = self.passthrough_path(bucket, prefix, filename);
+        let path = self.passthrough_path(bucket, prefix, filename)?;
         if !path.exists() {
             return Err(StorageError::NotFound(format!(
                 "{bucket}/{prefix}/{filename}"
@@ -912,7 +942,7 @@ impl StorageBackend for FilesystemBackend {
         bucket: &str,
         prefix: &str,
     ) -> Result<FileMetadata, StorageError> {
-        let path = self.reference_path(bucket, prefix);
+        let path = self.reference_path(bucket, prefix)?;
         match xattr_meta::read_metadata(&path).await {
             Ok(meta) => Ok(meta),
             Err(StorageError::NotFound(_)) => {
@@ -926,14 +956,14 @@ impl StorageBackend for FilesystemBackend {
     async fn has_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
         // Local disk: a stat is either present or not; there is no transient
         // remote-throttle case to disambiguate.
-        Ok(path_exists(&self.reference_path(bucket, prefix)).await)
+        Ok(path_exists(&self.reference_path(bucket, prefix)?).await)
     }
 
     #[instrument(skip(self))]
     async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError> {
         self.delete_object_file(
-            &self.reference_path(bucket, prefix),
-            &self.deltaspace_dir(bucket, ""),
+            &self.reference_path(bucket, prefix)?,
+            &self.deltaspace_dir(bucket, "")?,
             "reference",
             prefix,
             "reference.bin",
@@ -951,7 +981,7 @@ impl StorageBackend for FilesystemBackend {
         filename: &str,
     ) -> Result<Vec<u8>, StorageError> {
         self.get_object_file(
-            &self.delta_path(bucket, prefix, filename),
+            &self.delta_path(bucket, prefix, filename)?,
             "delta",
             prefix,
             filename,
@@ -971,7 +1001,7 @@ impl StorageBackend for FilesystemBackend {
         self.require_bucket_exists(bucket).await?;
         self.put_object_file(
             bucket,
-            &self.delta_path(bucket, prefix, filename),
+            &self.delta_path(bucket, prefix, filename)?,
             data,
             metadata,
             "delta",
@@ -988,7 +1018,7 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        let path = self.delta_path(bucket, prefix, filename);
+        let path = self.delta_path(bucket, prefix, filename)?;
         match xattr_meta::read_metadata(&path).await {
             Ok(meta) => Ok(meta),
             Err(StorageError::NotFound(_)) => {
@@ -1007,8 +1037,8 @@ impl StorageBackend for FilesystemBackend {
         filename: &str,
     ) -> Result<(), StorageError> {
         self.delete_object_file(
-            &self.delta_path(bucket, prefix, filename),
-            &self.deltaspace_dir(bucket, ""),
+            &self.delta_path(bucket, prefix, filename)?,
+            &self.deltaspace_dir(bucket, "")?,
             "delta",
             prefix,
             filename,
@@ -1026,7 +1056,7 @@ impl StorageBackend for FilesystemBackend {
         filename: &str,
     ) -> Result<Vec<u8>, StorageError> {
         self.get_object_file(
-            &self.passthrough_path(bucket, prefix, filename),
+            &self.passthrough_path(bucket, prefix, filename)?,
             "passthrough",
             prefix,
             filename,
@@ -1046,7 +1076,7 @@ impl StorageBackend for FilesystemBackend {
         self.require_bucket_exists(bucket).await?;
         self.put_object_file(
             bucket,
-            &self.passthrough_path(bucket, prefix, filename),
+            &self.passthrough_path(bucket, prefix, filename)?,
             data,
             metadata,
             "passthrough",
@@ -1066,7 +1096,7 @@ impl StorageBackend for FilesystemBackend {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
-        let data_path = self.passthrough_path(bucket, prefix, filename);
+        let data_path = self.passthrough_path(bucket, prefix, filename)?;
         self.ensure_dir(bucket, &data_path).await?;
         atomic_copy_with_metadata(source_path, &data_path, metadata).await?;
         debug!(
@@ -1086,7 +1116,7 @@ impl StorageBackend for FilesystemBackend {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
-        let data_path = self.passthrough_path(bucket, prefix, filename);
+        let data_path = self.passthrough_path(bucket, prefix, filename)?;
         self.ensure_dir(bucket, &data_path).await?;
         let parent = data_path
             .parent()
@@ -1120,7 +1150,7 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         filename: &str,
     ) -> Result<FileMetadata, StorageError> {
-        let path = self.passthrough_path(bucket, prefix, filename);
+        let path = self.passthrough_path(bucket, prefix, filename)?;
         match xattr_meta::read_metadata(&path).await {
             Ok(meta) => Ok(meta),
             Err(StorageError::NotFound(_)) => {
@@ -1140,8 +1170,8 @@ impl StorageBackend for FilesystemBackend {
         filename: &str,
     ) -> Result<(), StorageError> {
         self.delete_object_file(
-            &self.passthrough_path(bucket, prefix, filename),
-            &self.deltaspace_dir(bucket, ""),
+            &self.passthrough_path(bucket, prefix, filename)?,
+            &self.deltaspace_dir(bucket, "")?,
             "passthrough",
             prefix,
             filename,
@@ -1161,7 +1191,7 @@ impl StorageBackend for FilesystemBackend {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
-        let data_path = self.passthrough_path(bucket, prefix, filename);
+        let data_path = self.passthrough_path(bucket, prefix, filename)?;
 
         self.ensure_dir(bucket, &data_path).await?;
 
@@ -1210,7 +1240,7 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
         use futures::StreamExt;
 
-        let data_path = self.passthrough_path(bucket, prefix, filename);
+        let data_path = self.passthrough_path(bucket, prefix, filename)?;
         if !path_exists(&data_path).await {
             return Err(StorageError::NotFound(format!(
                 "passthrough: {}/{}",
@@ -1240,7 +1270,7 @@ impl StorageBackend for FilesystemBackend {
         use futures::StreamExt;
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-        let data_path = self.passthrough_path(bucket, prefix, filename);
+        let data_path = self.passthrough_path(bucket, prefix, filename)?;
         if !path_exists(&data_path).await {
             return Err(StorageError::NotFound(format!(
                 "passthrough: {}/{}",
@@ -1269,7 +1299,7 @@ impl StorageBackend for FilesystemBackend {
         bucket: &str,
         prefix: &str,
     ) -> Result<Vec<FileMetadata>, StorageError> {
-        let dir = self.deltaspace_dir(bucket, prefix);
+        let dir = self.deltaspace_dir(bucket, prefix)?;
         if !path_exists(&dir).await {
             return Ok(Vec::new());
         }
@@ -1354,6 +1384,9 @@ impl StorageBackend for FilesystemBackend {
         // `nightly/pg-01.sql`. Walk the deepest directory the prefix names
         // completely, then keep the keys that start with the whole prefix.
         let dir_part = prefix.rfind('/').map_or("", |i| &prefix[..i]);
+        // A `.`/empty segment would walk another directory and report its
+        // keys under the alias.
+        check_path_segments(dir_part, "")?;
         let walk_root = if dir_part.is_empty() {
             deltaspaces_dir.clone()
         } else {
@@ -1421,6 +1454,9 @@ impl StorageBackend for FilesystemBackend {
             ("", prefix)
         };
 
+        // A `.`/empty segment would read another directory and list its keys
+        // under the alias text, past a policy on the real prefix.
+        check_path_segments(dir_part, "")?;
         let read_dir_path = if dir_part.is_empty() {
             deltaspaces_dir.clone()
         } else {
@@ -2033,6 +2069,82 @@ mod tests {
     /// Dot-DIRS with real content are legitimate user prefixes and must show up
     /// in delimiter listings (S3-backend + flat-listing parity). Only `.dg` is
     /// internal; dot-FILES remain hidden (atomic-write temp namespace).
+    /// The OS path join resolves `.`/`..`/empty segments, so every path this
+    /// backend builds — object reads and writes, raw delta/reference writes,
+    /// and listings — refuses them instead of reaching another key's file.
+    #[tokio::test]
+    async fn aliasing_key_segments_are_refused_on_every_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        backend
+            .put_passthrough(
+                "bucket",
+                "a",
+                "secret.txt",
+                b"s",
+                &dummy_metadata("secret.txt"),
+            )
+            .await
+            .expect("put");
+        fn invalid<T>(r: Result<T, StorageError>) -> bool {
+            matches!(r, Err(StorageError::InvalidKey(_)))
+        }
+        for prefix in ["a/.", "./a", "a/", "a/..", "x/../a"] {
+            assert!(
+                invalid(
+                    backend
+                        .get_passthrough_metadata("bucket", prefix, "secret.txt")
+                        .await
+                ),
+                "read through {prefix:?}"
+            );
+            assert!(
+                invalid(
+                    backend
+                        .put_delta("bucket", prefix, "x.zip", b"d", &dummy_metadata("x.zip"))
+                        .await
+                ),
+                "raw delta write through {prefix:?}"
+            );
+        }
+        for filename in [".", ".."] {
+            assert!(invalid(
+                backend
+                    .get_passthrough_metadata("bucket", "a", filename)
+                    .await
+            ));
+        }
+        for prefix in ["a/./", "a//", "./a/", "a/./s"] {
+            assert!(
+                invalid(
+                    backend
+                        .list_objects_delegated("bucket", prefix, Some("/"), 100, None)
+                        .await
+                ),
+                "delimited list of {prefix:?}"
+            );
+        }
+        for prefix in ["a/./", "./a/", "a//", "a/./s"] {
+            assert!(
+                invalid(backend.bulk_list_objects("bucket", prefix).await),
+                "bulk list of {prefix:?}"
+            );
+        }
+        // Plain and dot-leading names stay valid.
+        assert!(backend
+            .get_passthrough_metadata("bucket", "a", "secret.txt")
+            .await
+            .is_ok());
+        assert!(backend
+            .list_objects_delegated("bucket", "a/.hid", Some("/"), 100, None)
+            .await
+            .is_ok());
+        assert!(backend.bulk_list_objects("bucket", "a/").await.is_ok());
+    }
+
     #[tokio::test]
     async fn test_delegated_list_shows_dot_dirs_hides_dg_and_dot_files() {
         let tmp = tempfile::tempdir().expect("tempdir");

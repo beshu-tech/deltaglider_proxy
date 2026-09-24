@@ -225,9 +225,11 @@ single-instance planes below are addressed.
   default 300s) and a peer steals it = automatic failover, no double-run. The seam
   is `CoordinationLease` (trait) with `LocalLease` (SQLite, single-instance default)
   and `S3Lease` (shared) impls, selected once at startup; `durable_node_id` lets a
-  rebooted node reclaim its own live lease. **Still node-local:** LIFECYCLE (hourly,
-  pure-plan-idempotent), MAINTENANCE (operator one-offs), PARITY, and admin
-  RUN-NOW — those still double-run under round-robin. **Cross-node kill/pause,
+  rebooted node reclaim its own live lease (only a lease an EARLIER process wrote:
+  the lease body carries a per-process `boot_id`, so workers in one live process
+  block each other). Rule delete takes the same lease through its purge.
+  **Still node-local:** LIFECYCLE (hourly, pure-plan-idempotent), MAINTENANCE
+  (operator one-offs) and PARITY — those still double-run under round-robin. **Cross-node kill/pause,
   resume-from-cursor on takeover, and post-failover run-history are NOT delivered**
   (cursor / `cancelling`+`paused` rows / run_history stay node-local) — a cross-node
   takeover RESTARTS the run (safe: idempotent copy / generation-pin / provenance-

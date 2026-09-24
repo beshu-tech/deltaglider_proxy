@@ -475,7 +475,8 @@ pub async fn oauth_callback(
                 .as_deref()
                 .or(identity.email.as_deref())
                 .map(crate::iam::types::strip_reserved_principal_prefix)
-                .filter(|n| !n.is_empty())
+                // `.`/`..` would be a path segment in `${iam:username}`.
+                .filter(|n| !matches!(*n, "" | "." | ".."))
                 .unwrap_or("external-user");
 
             let ak = keygen::generate_access_key_id();

@@ -1518,10 +1518,6 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         self.inner.lite_list_carries_logical_facts(bucket)
     }
 
-    fn resolves_key_path_segments(&self, bucket: &str) -> bool {
-        self.inner.resolves_key_path_segments(bucket)
-    }
-
     async fn get_passthrough_stream_range(
         &self,
         bucket: &str,
