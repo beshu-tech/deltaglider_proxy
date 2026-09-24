@@ -2773,22 +2773,38 @@ pub fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), ConfigEr
     // Write + fsync the tempfile. Scope the File so it's closed before
     // rename — some platforms (notably Windows) won't rename over an open
     // file, and on POSIX closing-before-rename is cleaner regardless.
+    //
+    // The persisted config carries secrets (SigV4 and backend credentials,
+    // AES keys), so the file is never world-readable: 0600 for a new file;
+    // a rewrite keeps the owner/group bits of the file it replaces and drops
+    // every "other" bit. The tempfile is created with that mode, so the
+    // secrets are never readable by others, not even before the rename.
     {
-        let mut f = std::fs::File::create(&tmp_path)
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mode = std::fs::metadata(path)
+                .map(|m| m.permissions().mode() & 0o660)
+                .unwrap_or(0o600);
+            options.mode(mode);
+            mode
+        };
+        let mut f = options
+            .open(&tmp_path)
             .map_err(|e| ConfigError::Io(format!("create {}: {}", tmp_path.display(), e)))?;
+        // The create-time mode is filtered by the umask; set it exactly.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(mode))
+                .map_err(|e| ConfigError::Io(format!("chmod {}: {}", tmp_path.display(), e)))?;
+        }
         f.write_all(bytes)
             .map_err(|e| ConfigError::Io(format!("write {}: {}", tmp_path.display(), e)))?;
         f.sync_all()
             .map_err(|e| ConfigError::Io(format!("fsync {}: {}", tmp_path.display(), e)))?;
-    }
-
-    // Match the permission posture of fs::write for non-sensitive config
-    // files (0644 on Unix). For hash-bearing files, callers already use the
-    // dedicated `write_bootstrap_hash_file` helper that sets 0600 separately.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o644));
     }
 
     std::fs::rename(&tmp_path, path).map_err(|e| {
@@ -4196,6 +4212,40 @@ storage:
             leftovers.is_empty(),
             "atomic_write leaked tempfiles: {leftovers:?}"
         );
+    }
+
+    /// The persisted config carries secrets (SigV4 and backend credentials,
+    /// AES keys), so it is never world-readable: a new file is 0600, and a
+    /// rewrite keeps the owner/group bits of the file it replaces but drops
+    /// every "other" bit.
+    #[cfg(unix)]
+    #[test]
+    fn test_atomic_write_is_never_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+
+        let fresh = dir.path().join("fresh.yaml");
+        atomic_write(&fresh, b"secret: x\n").unwrap();
+        assert_eq!(mode(&fresh), 0o600);
+
+        let private = dir.path().join("private.yaml");
+        std::fs::write(&private, b"old\n").unwrap();
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+        atomic_write(&private, b"secret: x\n").unwrap();
+        assert_eq!(mode(&private), 0o600);
+
+        let shared = dir.path().join("shared.yaml");
+        std::fs::write(&shared, b"old\n").unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write(&shared, b"secret: x\n").unwrap();
+        assert_eq!(mode(&shared), 0o640, "a 0644 file loses its world-read bit");
+
+        let group = dir.path().join("group.yaml");
+        std::fs::write(&group, b"old\n").unwrap();
+        std::fs::set_permissions(&group, std::fs::Permissions::from_mode(0o660)).unwrap();
+        atomic_write(&group, b"secret: x\n").unwrap();
+        assert_eq!(mode(&group), 0o660, "an operator's group access is kept");
     }
 
     #[test]
