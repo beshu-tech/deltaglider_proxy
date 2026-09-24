@@ -12,7 +12,7 @@
 //! Uses `.bin` passthrough objects so no delta seeding (xdelta3) is
 //! involved — sha256 parity is the dominant verifier here.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{admin_http_client, minio_endpoint_url, wait_for_run, TestServer, MINIO_BUCKET};

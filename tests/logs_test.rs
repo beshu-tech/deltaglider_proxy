@@ -6,7 +6,7 @@
 //! target / q filters narrow server-side. The pure filter logic itself is
 //! unit-tested in `src/logs.rs`; this covers the HTTP + capture-layer seam.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, TestServer};
 

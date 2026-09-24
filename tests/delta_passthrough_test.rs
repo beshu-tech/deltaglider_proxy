@@ -16,7 +16,7 @@
 //! `/dev/stdin` quirk on some dev machines makes v2 store as passthrough,
 //! in which case the fast-path assertions are skipped with a clear note.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{admin_http_client, generate_binary, mutate_binary, TestServer};

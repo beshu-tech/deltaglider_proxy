@@ -7,7 +7,7 @@
 //! @aws-sdk/client-s3 in the browser. Each test exercises the public
 //! HTTP contract — the same shape the React client will call.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, TestServer};
 use serde_json::{json, Value};

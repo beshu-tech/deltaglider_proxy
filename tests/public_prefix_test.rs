@@ -2,7 +2,7 @@
 
 //! Integration tests for public prefix (unauthenticated read-only) access.
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 

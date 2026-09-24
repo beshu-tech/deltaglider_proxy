@@ -7,7 +7,7 @@
 //! The actual OAuth redirect flow (browser → IdP → callback) cannot be tested
 //! without a real OIDC provider, but everything around it is covered.
 
-mod common;
+use crate::common;
 
 use common::{
     admin_http_client, get_ext_auth_version, get_iam_version, wait_for_ext_auth_rebuild,

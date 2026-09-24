@@ -6,7 +6,7 @@
 //! delta/reference files have missing or corrupt DG metadata — a condition that
 //! occurs when files are copied without preserving S3 user metadata.
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 use std::path::Path;

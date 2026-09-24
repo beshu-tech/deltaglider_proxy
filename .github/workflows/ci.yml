@@ -16,6 +16,16 @@ permissions:
   packages: read
 
 env:
+  # Measured on the homelab runners (5 GB RAM, full nightly job): with one test
+  # binary, -j16 is the fastest setting and peaks at ~4.7-4.8 GB. Line tables keep
+  # file:line backtraces; unpacked split debuginfo trims ~0.3 GB off the peak
+  # (sccache still caches it). The peak is two ~2 GB rustc (lib unit tests +
+  # tests/all) overlapping, so lowering -j does not reduce it further.
+  CARGO_BUILD_JOBS: "16"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
+  CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: unpacked
   BUILDER_IMAGE: ghcr.io/${{ github.repository }}/builder:latest
   # ── sccache: local MinIO compilation cache (NOT the CI test MinIO) ──
   RUSTC_WRAPPER: sccache
@@ -374,87 +384,85 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
         run: |
-          cargo test --locked \
-            --test bootstrap_password_hash_invariant_test \
-            --test auth_integration_test \
-            --test concurrency_test \
-            --test error_test \
-            --test iam_authorization_test \
-            --test iam_persona_test \
-            --test iam_test \
-            --test list_truncation_test \
-            --test metadata_validation_test \
-            --test s3_api_test \
-            --test s3_backend_test \
-            --test s3_compat_test \
-            --test s3_integration_test \
-            --test storage_resilience_test \
-            --test unmanaged_objects_test \
-            -- --nocapture
+          cargo test --locked --test all -- --nocapture \
+            bootstrap_password_hash_invariant_test:: \
+            auth_integration_test:: \
+            concurrency_test:: \
+            error_test:: \
+            iam_authorization_test:: \
+            iam_persona_test:: \
+            iam_test:: \
+            list_truncation_test:: \
+            metadata_validation_test:: \
+            s3_api_test:: \
+            s3_backend_test:: \
+            s3_compat_test:: \
+            s3_integration_test:: \
+            storage_resilience_test:: \
+            unmanaged_objects_test::
       - name: Interop tests (spawns proxy subprocesses)
         env:
           RUST_BACKTRACE: "1"
         run: |
-          cargo test --locked --test interop_test -- --include-ignored --nocapture
+          cargo test --locked --test all -- --include-ignored --nocapture interop_test::
       - name: Integration tests (admin, IAM, replication, lifecycle, …)
         env:
           RUST_BACKTRACE: "1"
         run: |
-          cargo test --locked \
-            --test admin_bulk_objects_test \
-            --test browser_session_connect_test \
-            --test admin_config_test \
-            --test admin_login_as_test \
-            --test admin_section_test \
-            --test bucket_existence_test \
-            --test cli_admin_test \
-            --test cli_s3_bucket_acl_test \
-            --test cli_s3_cp_test \
-            --test cli_s3_ls_test \
-            --test cli_s3_migrate_test \
-            --test cli_s3_purge_test \
-            --test cli_s3_rm_test \
-            --test cli_s3_stats_test \
-            --test cli_s3_sync_test \
-            --test cli_s3_verify_test \
-            --test backend_capability_gate_test \
-            --test backend_health_test \
-            --test config_sync_ha_test \
-            --test config_sync_test \
-            --test coordination_lease_test \
-            --test reference_lock_race_test \
-            --test encryption_test \
-            --test external_auth_test \
-            --test iam_declarative_reconcile_test \
-            --test iam_identity_test \
-            --test iam_mode_test \
-            --test iam_variables_clone_test \
-            --test lifecycle_test \
-            --test maintenance_backfill_test \
-            --test maintenance_reencrypt_test \
-            --test migrate_job_test \
-            --test mismatch_boot_test \
-            --test quota_test \
-            --test replication_target_only_test \
-            --test replication_test \
-            --test delta_passthrough_test \
-            --test streaming_copy_test \
-            --test generation_pin_test \
-            --test large_object_e2e_test \
-            --test parity_test \
-            --test savings_test \
-            --test bucket_usage_test \
-            --test logs_test \
-            --test admission_test \
-            --test aws_chunked_upload_test \
-            --test iam_list_scope_test \
-            --test multipart_etag_test \
-            --test multipart_complete_resilience_test \
-            --test public_prefix_list_test \
-            --test public_prefix_test \
-            --test recursive_delete_test \
-            --test s3_correctness_test \
-            -- --nocapture
+          cargo test --locked --test all -- --nocapture \
+            admin_bulk_objects_test:: \
+            browser_session_connect_test:: \
+            admin_config_test:: \
+            admin_login_as_test:: \
+            admin_section_test:: \
+            bucket_existence_test:: \
+            cli_admin_test:: \
+            cli_s3_bucket_acl_test:: \
+            cli_s3_cp_test:: \
+            cli_s3_ls_test:: \
+            cli_s3_migrate_test:: \
+            cli_s3_purge_test:: \
+            cli_s3_rm_test:: \
+            cli_s3_stats_test:: \
+            cli_s3_sync_test:: \
+            cli_s3_verify_test:: \
+            backend_capability_gate_test:: \
+            backend_health_test:: \
+            config_sync_ha_test:: \
+            config_sync_test:: \
+            coordination_lease_test:: \
+            reference_lock_race_test:: \
+            encryption_test:: \
+            external_auth_test:: \
+            iam_declarative_reconcile_test:: \
+            iam_identity_test:: \
+            iam_mode_test:: \
+            iam_variables_clone_test:: \
+            lifecycle_test:: \
+            maintenance_backfill_test:: \
+            maintenance_reencrypt_test:: \
+            migrate_job_test:: \
+            mismatch_boot_test:: \
+            quota_test:: \
+            replication_target_only_test:: \
+            replication_test:: \
+            delta_passthrough_test:: \
+            streaming_copy_test:: \
+            generation_pin_test:: \
+            large_object_e2e_test:: \
+            parity_test:: \
+            savings_test:: \
+            bucket_usage_test:: \
+            logs_test:: \
+            admission_test:: \
+            aws_chunked_upload_test:: \
+            iam_list_scope_test:: \
+            multipart_etag_test:: \
+            multipart_complete_resilience_test:: \
+            public_prefix_list_test:: \
+            public_prefix_test:: \
+            recursive_delete_test:: \
+            s3_correctness_test::
       - name: Clean up MinIO test data
         if: always()
         run: |
@@ -497,11 +505,10 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
         run: |
-          cargo test --locked \
-            --test delta_test \
-            --test optimization_test \
-            --test memory_test \
-            -- --nocapture
+          cargo test --locked --test all -- --nocapture \
+            delta_test:: \
+            optimization_test:: \
+            memory_test::
 
   e2e-smoke:
     name: E2E smoke (embedded UI)

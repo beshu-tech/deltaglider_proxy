@@ -10,7 +10,7 @@
 //! true), and a later boot with the CORRECT hash promotes the backup back into
 //! place so recovery actually terminates.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, TestServer};
 use serde_json::json;

@@ -25,7 +25,7 @@
 //! `.deltaglider/` (UUID-based) so parallel integration-test binaries
 //! do not clobber the same object in `deltaglider-test`.
 
-mod common;
+use crate::common;
 
 use common::{
     admin_http_client, admin_http_client_with_password, minio_endpoint_url, TestServer,

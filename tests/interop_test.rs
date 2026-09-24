@@ -13,7 +13,7 @@
 //! Usage:
 //!   docker compose up -d                    # Start MinIO
 //!   pip install deltaglider                 # Install CLI
-//!   cargo test --test interop_test -- --ignored --nocapture
+//!   cargo test --test all -- --ignored --nocapture interop_test::
 //!   docker compose down
 //!
 //! Requirements:
@@ -40,7 +40,7 @@ static INTEROP_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16
 /// Test prefix counter for isolation
 static TEST_PREFIX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-mod common;
+use crate::common;
 
 const MINIO_BUCKET: &str = "deltaglider-test";
 

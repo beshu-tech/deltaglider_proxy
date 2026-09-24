@@ -8,7 +8,7 @@
 //! and real ListBuckets creation dates. Uses reqwest for raw HTTP
 //! to verify XML responses and header values.
 
-mod common;
+use crate::common;
 
 use base64::Engine;
 use common::{

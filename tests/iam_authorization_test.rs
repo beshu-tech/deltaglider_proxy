@@ -6,7 +6,7 @@
 //! checks authorization against the correct resource. This catches the entire
 //! class of "operation X accesses resource Y but auth only checks resource Z" bugs.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{admin_http_client, TestServer};

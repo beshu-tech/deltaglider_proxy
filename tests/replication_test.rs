@@ -7,7 +7,7 @@
 //! together. Skeleton: seed a rule in YAML, seed source objects, trigger
 //! run-now, verify destination + status + history + counters.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{admin_http_client, latest_run_id, wait_for_run_after, TestServer};

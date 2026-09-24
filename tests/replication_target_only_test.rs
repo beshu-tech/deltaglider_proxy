@@ -6,7 +6,7 @@
 //! reads stay open. This is the enforced single-writer property that makes a
 //! non-CAS backend (e.g. Backblaze B2) safe as a replication destination.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;

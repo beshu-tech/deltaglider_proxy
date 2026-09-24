@@ -2,7 +2,7 @@
 
 //! Integration tests: S3 browser-lift session + open-mode browser session.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, TestServer};
 use reqwest::StatusCode;

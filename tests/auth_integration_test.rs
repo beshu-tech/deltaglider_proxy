@@ -7,7 +7,7 @@
 //! presigned URLs, clock skew, replay detection, rate limiting, and admin API
 //! user lifecycle — verifying the auth *layer* as a black box.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;

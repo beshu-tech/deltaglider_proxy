@@ -10,7 +10,7 @@
 //! rule name (UUID) so parallel crates sharing the bucket never collide on a
 //! lease object under `_dgp/leases/`.
 
-mod common;
+use crate::common;
 
 use common::{minio_available, minio_client, MINIO_BUCKET};
 use deltaglider_proxy::coordination::{CoordinationLease, LeaseSubsystem, S3Lease};

@@ -4,7 +4,7 @@
 //! HA replicas share one SQLCipher key (see `TEST_BOOTSTRAP_PASSWORD_HASH`
 //! in `common/mod.rs`).
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 

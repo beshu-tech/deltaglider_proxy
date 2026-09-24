@@ -4,7 +4,7 @@
 //! (H2 / M1 / M2 / M3 / M4 / L1). Each finding has its own
 //! `test_*` function; see the CHANGELOG for the full context.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::TestServer;

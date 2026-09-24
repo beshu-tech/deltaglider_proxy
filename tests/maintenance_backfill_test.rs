@@ -11,7 +11,7 @@
 //! S3 backend's server-side self-copy path against MinIO (skipped without
 //! it), including multipart-ETag stability across the copy.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, put_object, TestServer};
 use sha2::{Digest, Sha256};

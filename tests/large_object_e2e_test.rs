@@ -14,7 +14,7 @@
 //! dest now correctly routes to the bounded spooled path — see the streaming
 //! destination-matrix fix), so the per-part gauges are exercised only there.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{

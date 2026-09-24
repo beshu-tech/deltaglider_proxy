@@ -5,7 +5,7 @@
 //! Verifies delta compression through the S3 API using TestServer::filesystem().
 //! Checks the `x-amz-storage-type` response header to verify storage decisions.
 
-mod common;
+use crate::common;
 
 use common::{
     generate_binary, get_bytes, head_headers, list_objects_raw, mutate_binary,

@@ -13,7 +13,7 @@
 //! whose S3 key had a .delta suffix. 222 tests missed it because they all
 //! follow the clean path (PUT through proxy → GET through proxy).
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 use sha2::{Digest, Sha256};

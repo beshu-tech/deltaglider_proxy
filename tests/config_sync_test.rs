@@ -4,7 +4,7 @@
 //! config sync. Tests the full IAM state export/import flow across two server instances.
 //! Requires MinIO for S3 backend tests.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, TestServer};
 use serde_json::json;

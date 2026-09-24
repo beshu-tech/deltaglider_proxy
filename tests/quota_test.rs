@@ -2,7 +2,7 @@
 
 //! Integration tests for per-bucket storage quotas.
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 

@@ -10,7 +10,7 @@
 //! 2. `get-bucket-acl` returns a non-empty grants list (MinIO always
 //!    emits the owner's full-control grant).
 
-mod common;
+use crate::common;
 
 use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
 use deltaglider_proxy::cli::bucket_acl::{get_run, put_run, GetArgs, PutArgs};
