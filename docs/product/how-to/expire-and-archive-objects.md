@@ -100,7 +100,7 @@ And structurally: a transition copy failure never deletes the source; deletes ar
    ```
 
 3. Excluded keys (`nightly/golden/**`) are still there.
-4. If you have event delivery configured, `LifecycleExpired` / `LifecycleTransitioned` events appear in the outbox ([how to send them somewhere](send-event-notifications.md)).
+4. If you have event delivery configured, `LifecycleExpired` / `LifecycleTransitioned` events appear in the event log at **Settings → Integrations → Event log** ([how to send them somewhere](send-event-notifications.md)).
 
 ## Related
 

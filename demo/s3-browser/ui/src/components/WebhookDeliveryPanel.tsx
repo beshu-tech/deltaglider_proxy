@@ -296,7 +296,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
                 style={{ padding: 0 }}
                 onClick={() => nav.navigate('admin/integrations/event-outbox')}
               >
-                View event outbox →
+                View event log →
               </Button>
             </Space>
           }
