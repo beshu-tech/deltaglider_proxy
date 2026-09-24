@@ -15,7 +15,8 @@
  * have no dirty state, just live progress + cancel.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Dropdown, Space, Spin, Tag, Typography, message } from 'antd';
+import { Alert, Button, Space, Spin, Tag, Typography, message } from 'antd';
+import Dropdown from '../KeyboardDropdown';
 import {
   CaretRightOutlined,
   DeleteOutlined,

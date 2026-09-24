@@ -22,7 +22,8 @@
  */
 import { useState } from 'react';
 import { CAPABILITY_DOC_URL, docsUrlToInAppHref } from '../linkifyDocUrl';
-import { Button, Collapse, Dropdown, Input, InputNumber, Modal, Progress, Radio, Select, Typography } from 'antd';
+import { Button, Collapse, Input, InputNumber, Modal, Progress, Radio, Select, Typography } from 'antd';
+import Dropdown from './KeyboardDropdown';
 import { DownOutlined, EllipsisOutlined, RightOutlined, SyncOutlined } from '@ant-design/icons';
 import type { BackendInfo } from '../adminApi';
 import { resolveBackendFor, describeEncryption } from '../encryptionUi';

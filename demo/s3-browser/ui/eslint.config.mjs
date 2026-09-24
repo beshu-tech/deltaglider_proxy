@@ -48,6 +48,11 @@ const UI_RULES = {
           importNames: ['Tooltip', 'Popover'],
           message: 'theme.css hides every AntD tooltip/popover — use a native title or <HoverHint>.',
         },
+        {
+          name: 'antd',
+          importNames: ['Dropdown'],
+          message: 'Use components/KeyboardDropdown: it focuses the menu on open so the arrow keys work.',
+        },
       ],
     },
   ],

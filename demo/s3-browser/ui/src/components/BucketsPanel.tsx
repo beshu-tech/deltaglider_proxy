@@ -24,7 +24,8 @@
  * beforeunload, and Cmd/Ctrl+S behave like the rest of Configuration.
  */
 import { useCallback, useRef, useState } from 'react';
-import { Alert, Button, Dropdown, Space, Typography, message } from 'antd';
+import { Alert, Button, Space, Typography, message } from 'antd';
+import Dropdown from './KeyboardDropdown';
 import { DownOutlined, PlusOutlined } from '@ant-design/icons';
 import { LoadingState } from './StatePlaceholders';
 import type { AdminConfig } from '../adminApi';
