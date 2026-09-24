@@ -1,3 +1,5 @@
 
 # TypeScript incremental build cache
 *.tsbuildinfo
+# ESLint cache (npx eslint --cache)
+.eslintcache
