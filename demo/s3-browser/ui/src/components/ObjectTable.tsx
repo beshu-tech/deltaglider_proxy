@@ -294,11 +294,13 @@ export default function ObjectTable({
   // status bar). Content changes can't move that number, only real window /
   // pane geometry changes can.
   const [bodyHeight, setBodyHeight] = useState(400);
+  // The pager row renders only when there is more than one page.
+  const multiPage = folders.length + objects.length > pageSize;
   useEffect(() => {
     const el = scrollContainerRef.current;
     if (!el) return;
-    // 39 thead + 48 pagination + 44 status bar + 9 breathing room.
-    const CHROME_BELOW = 140;
+    // 39 thead + 48 pagination (when shown) + 44 status bar + 9 breathing room.
+    const CHROME_BELOW = multiPage ? 140 : 92;
     const measure = () => {
       // Clamp a negative top (window resized while the page is scrolled) so
       // the height stays viewport-bounded instead of growing by the scroll.
@@ -315,7 +317,7 @@ export default function ObjectTable({
       window.removeEventListener('resize', measure);
       ro.disconnect();
     };
-  }, []);
+  }, [multiPage]);
 
   function fileIconColor(name: string): string {
     const ext = name.split('.').pop()?.toLowerCase() || '';
@@ -521,13 +523,11 @@ export default function ObjectTable({
             // in the status bar below.
             showSizeChanger: false,
             size: 'small',
-            // Keep pagination bar visible even when one page fits all
-            // (so operators see "X items" with no pager) — the size
-            // changer is rendered separately, so this only affects
-            // the prev/next buttons + page numbers.
-            hideOnSinglePage: false,
-            showTotal: (totalCount, range) =>
-              `${range[0].toLocaleString()}–${range[1].toLocaleString()} of ${totalCount.toLocaleString()}`,
+            // The status bar below owns the range text ("Showing 101–200
+            // of 1,500 items · Page 2 of 15"); the pager shows only page
+            // buttons, and only when there is a second page. It used to
+            // repeat the range at the top AND the bottom.
+            hideOnSinglePage: true,
           }}
           size="small"
           /* `virtual` needs a fixed body height and pins the header itself,
@@ -570,12 +570,10 @@ export default function ObjectTable({
         />
       )}
 
-      {/* Status bar — single source of truth for the visible-range
-          summary, mirrored to assistive tech via `aria-live`. AntD's
-          pagination `showTotal` puts the same range next to the page
-          buttons; the status bar repeats it so screen readers
-          announce page/size changes even when the user's focus is on
-          the page-size dropdown. */}
+      {/* Status bar — the single source of truth for the visible-range
+          summary, mirrored to assistive tech via `aria-live`, so screen
+          readers announce page/size changes even when focus is on the
+          page-size dropdown. */}
       {/*
         Footer row: aria-live range readout on the left, page-size
         Select on the right.
