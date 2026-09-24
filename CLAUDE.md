@@ -219,7 +219,8 @@ single-instance planes below are addressed.
   NODE-LOCAL (B3 dropped coordination tables from the sync set). **Exception —
   REPLICATION now has an OPTIONAL cross-instance lease** (`src/coordination/`):
   when a CAS-capable coordination bucket is configured (`config_sync_bucket`), the
-  replication scheduler elects a single leader via an S3-CAS lease OBJECT
+  replication scheduler, event consumer and admin run-now share ONE per-rule
+  lease: a single leader is elected via an S3-CAS lease OBJECT
   (`_dgp/leases/replication/<rule>.json`) → a dead leader's lease lapses (≤TTL,
   default 300s) and a peer steals it = automatic failover, no double-run. The seam
   is `CoordinationLease` (trait) with `LocalLease` (SQLite, single-instance default)
