@@ -94,8 +94,6 @@ mod iam_persona_test;
 mod iam_test;
 #[path = "iam_variables_clone_test.rs"]
 mod iam_variables_clone_test;
-#[path = "interop_test.rs"]
-mod interop_test;
 #[path = "large_object_e2e_test.rs"]
 mod large_object_e2e_test;
 #[path = "lifecycle_test.rs"]

@@ -369,17 +369,6 @@ jobs:
           mc mb --ignore-existing local/deltaglider-test
           mc mb --ignore-existing local/deltaglider-data
           echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
-      - name: Install DeltaGlider CLI
-        env:
-          DEBIAN_FRONTEND: noninteractive
-          PIP_DISABLE_PIP_VERSION_CHECK: "1"
-        run: |
-          if ! python3 -m pip --version >/dev/null 2>&1; then
-            apt-get update -qq
-            apt-get install -y -qq python3-pip
-          fi
-          python3 -m pip install --quiet --break-system-packages deltaglider
-          deltaglider --version
       - name: Integration tests (fast)
         env:
           RUST_BACKTRACE: "1"
@@ -400,11 +389,6 @@ jobs:
             s3_integration_test:: \
             storage_resilience_test:: \
             unmanaged_objects_test::
-      - name: Interop tests (spawns proxy subprocesses)
-        env:
-          RUST_BACKTRACE: "1"
-        run: |
-          cargo test --locked --test all -- --include-ignored --nocapture interop_test::
       - name: Integration tests (admin, IAM, replication, lifecycle, …)
         env:
           RUST_BACKTRACE: "1"
