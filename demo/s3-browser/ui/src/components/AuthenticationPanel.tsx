@@ -176,6 +176,35 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   if (loading) return <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div>;
   if (error) return <Alert type="error" message={error} style={{ margin: 16 }} />;
 
+  // Nothing configured yet: ONE empty state with ONE next step. The rule
+  // editor, the preview, and "Sync Groups" all need a provider first, so
+  // showing them here only added controls that could not do anything.
+  const nothingConfigured =
+    providers.length === 0 && !creating && rules.length === 0 && identities.length === 0;
+  if (nothingConfigured) {
+    return (
+      <div style={contentColumn(CONTENT_FORM)}>
+        <IamSourceBanner iamMode={iamMode} loadError={iamLoadError} resource="OAuth providers + mapping rules" />
+        <div style={{ textAlign: 'center', padding: '48px 24px', color: colors.TEXT_MUTED }}>
+          <SafetyOutlined style={{ fontSize: 36, marginBottom: 12 }} />
+          <div style={{ fontSize: 15, fontWeight: 600, color: colors.TEXT_PRIMARY }}>
+            No identity providers yet
+          </div>
+          <div style={{ fontSize: 13, maxWidth: 440, margin: '8px auto 20px', lineHeight: 1.5 }}>
+            {readOnly
+              ? 'Your YAML config declares no providers. Add them under access.auth_providers and apply.'
+              : 'Add an OAuth or OIDC provider, for example Google, so people can sign in with it. Then choose who may sign in and which group each person gets.'}
+          </div>
+          {!readOnly && (
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreating(true)}>
+              Add provider
+            </Button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div style={contentColumn(CONTENT_FORM)}>
       {/* IAM source-of-truth banner — OAuth providers + mapping rules
@@ -191,7 +220,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
               if (!confirmDiscardEdits(IAM_DIRTY_KEYS.providers)) return;
               setCreating(true); setSelectedProviderId(null);
             }} style={{ marginBottom: 8 }}>
-              New Provider
+              Add provider
             </Button>
           )}
           {providers.map(p => (
