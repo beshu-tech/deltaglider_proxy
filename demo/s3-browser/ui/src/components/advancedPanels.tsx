@@ -475,12 +475,8 @@ export function LimitsPanel({ onSessionExpired }: PanelProps) {
   const { cardStyle, inputRadius } = useCardStyles();
   const { TEXT_MUTED } = useColors();
   // Read-only env-var view of the running config (cached react-query read).
-  const { data: config, error: queryError, isError } = useAdminConfig();
-
-  // getAdminConfig resolves to `null` on a 401; treat as session-expiry.
-  useEffect(() => {
-    if (config === null) onSessionExpired?.();
-  }, [config, onSessionExpired]);
+  // A 401 surfaces as `queryError`; useAdminConfig routes it to onSessionExpired.
+  const { data: config, error: queryError, isError } = useAdminConfig({ onSessionExpired });
 
   if (isError) {
     const msg = normalizeUiError(queryError, 'Failed to load');

@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo, useCallback } from 'react';
 import { Button, Typography, Alert, Input, Divider, Checkbox, message } from 'antd';
 import { PlusOutlined, FolderOutlined, DeleteOutlined, CopyOutlined } from '@ant-design/icons';
 import type { IamGroup, IamUser } from '../adminApi';
-import { useAdminConfig } from '../queries/config';
+import { useIamMode } from '../queries/config';
 import { useGroups, useCreateGroup, useUpdateGroup, useDeleteGroup, useCloneGroup, useAddGroupMember, useRemoveGroupMember } from '../queries/groups';
 import { useUsers } from '../queries/users';
 import { useCardStyles } from './shared-styles';
@@ -44,11 +44,10 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   const [filterText, setFilterText] = useState('');
 
   // IAM mode for the source-of-truth banner (cached react-query read).
-  const { data: cfg } = useAdminConfig();
-  const iamMode = cfg?.iam_mode;
+  const { iamMode, readOnly, loadError: iamLoadError } = useIamMode(onSessionExpired);
   // Declarative IAM: YAML owns group state; admin-API mutations 403. Render
   // read-only (no New / clone / delete / save) — same as UsersPanel.
-  const readOnly = iamMode === 'declarative';
+  // An unknown mode (config still loading, or failed) is read-only too.
 
   // Groups + users are read from the shared query cache; the form's mutations
   // (create/update/delete/clone + membership add/remove) invalidate these keys
@@ -216,7 +215,7 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   return (
     <MasterDetailPanel<IamGroup>
       // IAM source-of-truth banner — same explainer as UsersPanel.
-      banner={<IamSourceBanner iamMode={iamMode} resource="groups" />}
+      banner={<IamSourceBanner iamMode={iamMode} loadError={iamLoadError} resource="groups" />}
       title="Groups"
       searchPlaceholder="Search groups..."
       items={filtered}

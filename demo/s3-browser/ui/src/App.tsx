@@ -217,15 +217,27 @@ export default function App() {
     void refreshSessionGate();
   }, [refreshSessionGate]);
 
+  // THE session poller (AdminPage no longer runs its own). checkSession
+  // throws on a 5xx / network blip, so the catch keeps the last-known
+  // snapshot instead of ejecting the operator and losing unsaved edits. A
+  // real valid→invalid answer while in Settings returns to the browser, as
+  // the old AdminPage poller did.
+  const viewRef = useRef(view);
+  viewRef.current = view;
+  const sessionValidRef = useRef(sessionValid);
+  sessionValidRef.current = sessionValid;
   const pollSession = useCallback(async () => {
+    let session: { valid: boolean; admin_gui: boolean };
     try {
-      const session = await checkSession();
-      setSessionValid(session.valid);
-      setSessionCaps(deriveSessionCapabilities(session));
+      session = await checkSession();
     } catch {
-      /* keep last-known session snapshot on transient errors */
+      return; /* keep last-known session snapshot on transient errors */
     }
-  }, []);
+    const expired = sessionValidRef.current && !session.valid;
+    setSessionValid(session.valid);
+    setSessionCaps(deriveSessionCapabilities(session));
+    if (expired && viewRef.current === 'admin') navigateToBrowse();
+  }, [navigateToBrowse]);
 
   // Restore credentials from server-side session on mount; same path after ConnectPage.
   useEffect(() => {

@@ -23,7 +23,7 @@
  * Uses the section-level storage Apply flow so dirty-state indicators,
  * beforeunload, and Cmd/Ctrl+S behave like the rest of Configuration.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { Alert, Button, Space, Typography, message } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
 import { LoadingState } from './StatePlaceholders';
@@ -102,7 +102,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
   });
 
   // Config (backends + default backend + global compression) from the cache.
-  const { data: cfg } = useAdminConfig();
+  const { data: cfg } = useAdminConfig({ onSessionExpired });
   const queryClient = useQueryClient();
   // Backends + real bucket names from the SHARED query cache — not a per-mount
   // Promise.all. `useBucketNames` derives names from the cached origins map, so
@@ -117,10 +117,6 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
   // Active jobs drive the busy chip + progress bar; the query self-polls
   // every 2s while any job is active and goes quiet otherwise.
   const maintenanceJobs = useJobs().data?.jobs ?? [];
-
-  useEffect(() => {
-    if (cfg === null) onSessionExpired?.();
-  }, [cfg, onSessionExpired]);
 
   // Prefer the /api/admin/config `backends` array — it synthesises a
   // "default" entry on the singleton path so encryption badges resolve

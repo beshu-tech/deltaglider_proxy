@@ -1,5 +1,5 @@
 // Admin API client core: shared fetch glue + cross-cutting types.
-import { throwApiError } from '../errorHandling';
+import { ApiError, isSessionExpired, normalizeUiError, throwApiError } from '../errorHandling';
 import { BASE as APP_BASE } from '../urlState';
 
 /** API path prefix: the SPA base without its trailing slash (`/_`). One
@@ -295,24 +295,31 @@ export type BackendHealthEntry = {
   | { status: 'erroring'; detail: string }
 );
 
-export async function getAdminConfig(): Promise<AdminConfig | null> {
-  const res = await adminFetch('/api/admin/config');
-  if (!res.ok) return null;
-  return safeJson(res);
+/** Throws `ApiError` on failure. Callers detect expiry with
+ *  `useSessionExpiredOn(error, …)`; a failed load is NOT a config (never
+ *  read a missing `iam_mode` as GUI mode). */
+export async function getAdminConfig(): Promise<AdminConfig> {
+  return adminJson('/api/admin/config', { context: 'Config load' });
 }
 
+/**
+ * Ask the server whether the session cookie is still valid. Answers
+ * `valid: false` only when the server says so, or when the request itself
+ * reports an expired session (401 / `admin_session_required`). Any other
+ * failure (5xx, a gateway blip, no network) is NOT an answer: it throws an
+ * `ApiError`, so a poller keeps its last-known state instead of ejecting the
+ * operator and losing unsaved edits.
+ */
 export async function checkSession(): Promise<{ valid: boolean; admin_gui: boolean }> {
+  let data: { valid?: boolean; admin_gui?: boolean };
   try {
-    const res = await adminFetch('/api/admin/session');
-    if (!res.ok) return { valid: false, admin_gui: false };
-    const data = await safeJson<{ valid?: boolean; admin_gui?: boolean }>(res);
-    return {
-      valid: data.valid === true,
-      admin_gui: data.admin_gui === true,
-    };
-  } catch {
-    return { valid: false, admin_gui: false };
+    data = await adminJson('/api/admin/session', { context: 'Session check' });
+  } catch (e) {
+    if (isSessionExpired(e)) return { valid: false, admin_gui: false };
+    if (e instanceof ApiError) throw e;
+    throw new ApiError(`Session check failed: ${normalizeUiError(e, 'network error')}`, 0);
   }
+  return { valid: data.valid === true, admin_gui: data.admin_gui === true };
 }
 
 interface ConfigUpdateResponse {

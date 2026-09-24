@@ -10,16 +10,22 @@ import type { IamMode } from '../adminApi';
 
 interface Props {
   iamMode: IamMode | undefined;
+  /** Set when the config (and so the mode) failed to load: editing stays off. */
+  loadError?: string;
   /** "users", "groups", "OAuth providers", or "mapping rules" — used in the copy. */
   resource: string;
 }
 
-export default function IamSourceBanner({ iamMode, resource }: Props) {
+export default function IamSourceBanner({ iamMode, loadError, resource }: Props) {
   const colors = useColors();
+  // Mode unknown and still loading: say nothing rather than guess.
+  if (!iamMode && !loadError) return null;
   const isDeclarative = iamMode === 'declarative';
-  const accent = isDeclarative ? colors.ACCENT_AMBER : colors.ACCENT_BLUE;
+  const accent = loadError ? colors.ACCENT_RED : isDeclarative ? colors.ACCENT_AMBER : colors.ACCENT_BLUE;
 
-  const text = isDeclarative
+  const text = loadError
+    ? `Read-only — could not load the IAM mode, so editing ${resource} is off until it loads. ${loadError}`
+    : isDeclarative
     ? `Read-only — your YAML config owns ${resource}. Edit it and apply to make changes.`
     : `${capitalise(resource)} live in the encrypted database, not YAML — use Full Backup to export everything.`;
 
@@ -46,12 +52,14 @@ export default function IamSourceBanner({ iamMode, resource }: Props) {
       </span>
       <span>
         {text}{' '}
-        <code
-          title="YAML key controlling where IAM state lives"
-          style={{ fontFamily: 'var(--font-mono)', fontSize: 11, opacity: 0.6, color: colors.TEXT_MUTED }}
-        >
-          access.iam_mode: {isDeclarative ? 'declarative' : 'gui'}
-        </code>
+        {!loadError && (
+          <code
+            title="YAML key controlling where IAM state lives"
+            style={{ fontFamily: 'var(--font-mono)', fontSize: 11, opacity: 0.6, color: colors.TEXT_MUTED }}
+          >
+            access.iam_mode: {isDeclarative ? 'declarative' : 'gui'}
+          </code>
+        )}
       </span>
     </div>
   );

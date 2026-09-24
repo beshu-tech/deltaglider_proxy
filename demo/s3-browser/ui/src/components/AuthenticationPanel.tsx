@@ -5,7 +5,7 @@ import {
   testAuthProvider, previewMapping, syncMemberships,
   type AuthProvider, type ProviderTestResult,
 } from '../adminApi';
-import { useAdminConfig } from '../queries/config';
+import { useIamMode } from '../queries/config';
 import { useAuthProviders, useCreateAuthProvider, useUpdateAuthProvider, useDeleteAuthProvider } from '../queries/authProviders';
 import { useGroupMappingRules, useCreateMappingRule, useUpdateMappingRule, useDeleteMappingRule } from '../queries/mappingRules';
 import { useExternalIdentities } from '../queries/externalIdentities';
@@ -60,14 +60,13 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   const qc = useQueryClient();
 
   // IAM mode for the source-of-truth banner (cached react-query read).
-  const { data: cfg } = useAdminConfig();
-  const iamMode = cfg?.iam_mode;
+  const { iamMode, readOnly, loadError: iamLoadError } = useIamMode(onSessionExpired);
   // Declarative IAM: providers + mapping rules are declared in YAML and the
   // admin API 403s every mutation. Render the config surfaces read-only (no
   // New Provider / Add Rule / Save Rules / provider Save+Delete). Non-mutating
   // diagnostics stay live: Test Connection, mapping Preview, and Sync Groups
   // (re-derives memberships from the declared rules — it doesn't edit them).
-  const readOnly = iamMode === 'declarative';
+  // An unknown mode (config still loading, or failed) is read-only too.
 
   // Provider master-detail selection (form state lives in ProviderForm, keyed).
   const [selectedProviderId, setSelectedProviderId] = useState<number | null>(null);
@@ -181,7 +180,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
     <div style={contentColumn(CONTENT_FORM)}>
       {/* IAM source-of-truth banner — OAuth providers + mapping rules
           live in the encrypted IAM DB, not YAML, in GUI mode. */}
-      <IamSourceBanner iamMode={iamMode} resource="OAuth providers + mapping rules" />
+      <IamSourceBanner iamMode={iamMode} loadError={iamLoadError} resource="OAuth providers + mapping rules" />
       {/* Identity Providers */}
       <SectionHeader icon={<SafetyOutlined />} title="Identity Providers" />
       <div style={{ display: 'flex', gap: 16, marginBottom: 24, flexWrap: 'wrap' }}>

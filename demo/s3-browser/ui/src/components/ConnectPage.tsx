@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { Button, Input, Typography, Space, Alert, Spin, message } from 'antd';
 import { WarningOutlined, CheckCircleOutlined, CopyOutlined, SunOutlined, MoonOutlined } from '@ant-design/icons';
 import { testConnection, setEndpoint, setCredentials, setBucket, initFromSession, getBucket } from '../s3client';
-import { adminLogin, loginAs, whoami, isConfigDbLocked, recoverDb, browserSessionConnect, openBrowserConnect } from '../adminApi';
+import { adminLogin, loginAs, isNotAdminDenial, whoami, isConfigDbLocked, recoverDb, browserSessionConnect, openBrowserConnect } from '../adminApi';
 import type { ExternalProviderInfo } from '../adminApi';
 import OAuthProviderList from './OAuthProviderList';
 import { detectDefaultEndpoint } from '../utils';
@@ -259,13 +259,19 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       const trimmedSk = secretKey.trim();
 
       // Admin session must exist before PUT /session/s3-credentials (cookie-gated).
-      // login-as succeeds only for IAM admins → admin GUI; otherwise we fall back
-      // to a browse-only lift session. The outcome is KNOWN here, so pass it on
-      // rather than have the caller re-derive it.
+      // login-as succeeds only for IAM admins → admin GUI; a 403 (not an admin)
+      // falls back to a browse-only lift session. A 429 or 5xx is not an answer
+      // about the user: show it rather than silently downgrade to files-only.
+      // The outcome is KNOWN here, so pass it on rather than have the caller
+      // re-derive it.
       let iamOutcome: ConnectOutcome = { kind: 'admin' };
       const loginAsRes = await loginAs(trimmedAk, trimmedSk);
       if (loginAsRes.ok) {
         setCredentials(trimmedAk, trimmedSk);
+      } else if (!isNotAdminDenial(loginAsRes)) {
+        setError(loginAsRes.error);
+        setLoading(false);
+        return;
       } else {
         iamOutcome = { kind: 'filesOnly' };
         const bc = await browserSessionConnect({

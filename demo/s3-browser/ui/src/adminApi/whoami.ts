@@ -1,5 +1,6 @@
 // === Whoami / Login-as ===
-import { adminFetch, safeJson } from './core';
+import { ApiError } from '../errorHandling';
+import { adminFetch, adminRequest, safeJson } from './core';
 import type { IamPermission } from './users';
 
 export interface ExternalProviderInfo {
@@ -53,13 +54,38 @@ export async function resolveIamIdentity(accessKeyId: string, secretAccessKey: s
   }
 }
 
-export async function loginAs(accessKeyId: string, secretAccessKey: string): Promise<{ ok: boolean; error?: string }> {
-  const res = await adminFetch('/api/admin/login-as', 'POST', {
-    access_key_id: accessKeyId,
-    secret_access_key: secretAccessKey,
-  });
-  if (res.ok) return { ok: true };
-  return { ok: false, error: 'Admin access denied — invalid credentials or insufficient permissions' };
+export type LoginAsResult = { ok: true } | { ok: false; status: number; error: string };
+
+/**
+ * IAM admin sign-in with S3 keys. On failure, `status` tells the caller WHY:
+ * 403 is the server's single answer for "unknown key, wrong secret, or not an
+ * admin"; 429 (rate limit) and 5xx are not an answer about the user at all.
+ */
+export async function loginAs(accessKeyId: string, secretAccessKey: string): Promise<LoginAsResult> {
+  try {
+    await adminRequest('/api/admin/login-as', {
+      method: 'POST',
+      body: { access_key_id: accessKeyId, secret_access_key: secretAccessKey },
+      context: 'Admin sign-in',
+    });
+    return { ok: true };
+  } catch (e) {
+    if (!(e instanceof ApiError)) throw e; // network failure: the caller shows it
+    if (e.status === 403) {
+      return {
+        ok: false,
+        status: 403,
+        error: 'Admin access denied — invalid credentials or insufficient permissions',
+      };
+    }
+    return { ok: false, status: e.status, error: e.message };
+  }
+}
+
+/** THE rule for "fall back to a files-only session": login-as said 403. A rate
+ *  limit or a server error must be shown, never silently downgraded. */
+export function isNotAdminDenial(result: LoginAsResult): boolean {
+  return !result.ok && result.status === 403;
 }
 
 /** IAM non-admin: cookie + server-stored S3 creds (survives hard refresh). */

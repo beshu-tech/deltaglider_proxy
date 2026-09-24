@@ -1,6 +1,6 @@
 import { cloneElement, isValidElement, useState, useEffect, useCallback, useMemo } from 'react';
 import { Typography, Button, Input, Alert, Space, Spin, Drawer, message, Modal } from 'antd';
-import { checkSession, adminLogin, whoami, loginAs, exportBackup, importBackup, ImportBackupError, type ExternalProviderInfo, type ImportBackupMode } from '../adminApi';
+import { checkSession, adminLogin, whoami, loginAs, isNotAdminDenial, exportBackup, importBackup, ImportBackupError, type ExternalProviderInfo, type ImportBackupMode, type LoginAsResult } from '../adminApi';
 import { getCredentials, initFromSession } from '../s3client';
 import { LockOutlined, MenuOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
@@ -35,7 +35,7 @@ import CommandPalette, {
 import JobsPanel from './jobs/JobsPanel';
 import SystemPanel from './SystemPanel';
 import WebhookDeliveryPanel from './WebhookDeliveryPanel';
-import { useAdminConfig } from '../queries/config';
+import { useIamMode } from '../queries/config';
 import { useNavigation } from '../NavigationContext';
 import { resolveAdminPath as remapAdminPath } from '../adminPathRemap';
 import { buildViewUrl, parseAdminQuery } from '../urlState';
@@ -87,9 +87,11 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
   const { navigate } = useNavigation();
   // Declarative IAM: the IAM-writing backup-restore modes (full / iam-only /
   // preserve-bootstrap) would 403 server-side, so the restore modal offers only
-  // Config Only. Read the mode from the shared config query (cached).
-  const { data: adminCfg } = useAdminConfig();
-  const iamDeclarative = adminCfg?.iam_mode === 'declarative';
+  // Config Only. An unknown mode (config not loaded) gets the same treatment.
+  // Read from the shared config query (cached). No expiry callback here: this
+  // also runs behind the login gate, where a 401 is expected.
+  const { iamMode, readOnly: iamWritesOff, loadError: iamLoadError } = useIamMode();
+  const iamDeclarative = iamMode === 'declarative';
   // Hook up the `● ` tab-title prefix + beforeunload guard for any
   // section with unsaved edits. Mounting at AdminPage is the single
   // sensible home; moving higher would fire the guard on non-admin
@@ -309,7 +311,9 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
       if (cancelled) return;
       setExternalProviders(info.external_providers || []);
 
-      const session = await checkSession();
+      // A failed probe (5xx, network) is not "no session": fall through to the
+      // login gate, which still works, rather than hang on the spinner.
+      const session = await checkSession().catch(() => ({ valid: false, admin_gui: false }));
       if (cancelled) return;
       if (session.valid) {
         if (session.admin_gui) {
@@ -335,12 +339,18 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
         const ak = creds.accessKeyId;
         const sk = creds.secretAccessKey;
         if (ak && sk) {
-          const result = await loginAs(ak, sk);
+          const result = await loginAs(ak, sk).catch(
+            (e): LoginAsResult => ({ ok: false, status: 0, error: normalizeUiError(e, 'Network error') }),
+          );
           if (cancelled) return;
           if (result.ok) {
             setAuthed(true);
-          } else {
+          } else if (isNotAdminDenial(result)) {
             setAccessDenied(true);
+          } else {
+            // Rate limit / server error: not an answer about the user. Show it
+            // on the login gate instead of claiming "not an admin".
+            setLoginError(result.error);
           }
         }
       }
@@ -373,18 +383,6 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
       setLoginLoading(false);
     }
   };
-
-  // Periodic session check every 5 minutes while page is active
-  useEffect(() => {
-    if (!authed) return;
-    const id = setInterval(async () => {
-      const session = await checkSession();
-      if (!session.valid) {
-        onSessionExpired?.();
-      }
-    }, 5 * 60 * 1000);
-    return () => clearInterval(id);
-  }, [authed, onSessionExpired]);
 
   const navigateToGroup = useCallback(
     (groupId: number) => {
@@ -832,7 +830,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
           </Button>,
           // The IAM-writing modes 403 in declarative mode (YAML owns IAM), so
           // only Config Only is offered there.
-          ...(iamDeclarative ? [] : [
+          ...(iamWritesOff ? [] : [
             <Button
               key="preserve-bootstrap"
               type="primary"
@@ -867,21 +865,28 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
               message="IAM is managed by YAML (declarative mode). Only Config Only is available — restore users, groups, and OIDC providers by editing access.iam_* in your YAML config and applying."
             />
           )}
-          {!iamDeclarative && (
+          {iamLoadError && (
+            <Alert
+              type="warning"
+              showIcon
+              message={`Could not load the IAM mode, so only Config Only is offered. Reload the page to see every restore option. ${iamLoadError}`}
+            />
+          )}
+          {!iamWritesOff && (
             <Alert
               type="info"
               showIcon
               message="Everything Except Admin Password restores config, backends, bucket policies, users, groups, OIDC providers, and secrets, while keeping this instance's local admin password."
             />
           )}
-          {!iamDeclarative && (
+          {!iamWritesOff && (
             <Alert
               type="info"
               showIcon
               message="IAM Only skips config and backend changes; use it only when you want users/groups/OIDC without restoring storage settings."
             />
           )}
-          {!iamDeclarative && (
+          {!iamWritesOff && (
             <Alert
               type="warning"
               showIcon

@@ -6,7 +6,7 @@ import { getUsers } from '../adminApi';
 import type { IamUser } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useUsers, useDeleteUser, useCloneUser } from '../queries/users';
-import { useAdminConfig } from '../queries/config';
+import { useIamMode } from '../queries/config';
 import { qk } from '../queries/keys';
 import { userPermissionSummary, filterItems } from '../masterDetailFilter';
 import MasterDetailPanel from './MasterDetailPanel';
@@ -46,12 +46,11 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   // IAM mode banner: tells the operator where user state lives (DB in
   // `gui` mode vs YAML in `declarative`). Snapshot once via TanStack
   // Query — refetch is automatic if the mode flips elsewhere in the app.
-  const { data: cfg } = useAdminConfig();
-  const iamMode = cfg?.iam_mode;
+  const { iamMode, readOnly, loadError: iamLoadError } = useIamMode(onSessionExpired);
   // Declarative IAM: YAML is the source of truth and every admin-API IAM
   // mutation returns 403. Render the whole panel read-only so operators browse
   // the reconciled state instead of filling out forms that 403 on save.
-  const readOnly = iamMode === 'declarative';
+  // An unknown mode (config still loading, or failed) is read-only too.
 
   // Users list. Query handles loading/error/refetch automatically;
   // mutations on this resource invalidate this key (see queries/users.ts)
@@ -219,7 +218,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
       // mode, YAML-authoritative in Declarative mode. Shows on every IAM panel
       // so operators never wonder why Copy YAML on Access shows `access: {}`
       // after adding a user.
-      banner={<IamSourceBanner iamMode={iamMode} resource="users" />}
+      banner={<IamSourceBanner iamMode={iamMode} loadError={iamLoadError} resource="users" />}
       title="Users"
       searchPlaceholder="Search users..."
       items={filtered}

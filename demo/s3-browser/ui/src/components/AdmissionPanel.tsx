@@ -62,7 +62,7 @@ export default function AdmissionPanel({
 
   // Bucket-policies for the synthesised-blocks preview come from the
   // cached config query (shared, invalidated by config mutations).
-  const { data: config } = useAdminConfig();
+  const { data: config } = useAdminConfig({ onSessionExpired });
 
   // The shared editor handles the admission section (blocks[]).
   // Local state is `AdmissionBlock[]`; wire shape is

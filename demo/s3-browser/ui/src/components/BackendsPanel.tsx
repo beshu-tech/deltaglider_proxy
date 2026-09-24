@@ -84,7 +84,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   const backendsQuery = useBackends();
   const backends = backendsQuery.data?.backends ?? [];
   const defaultBackend = backendsQuery.data?.default_backend ?? null;
-  const { data: config } = useAdminConfig();
+  const { data: config } = useAdminConfig({ onSessionExpired });
 
   // Bucket counts per backend, from the authoritative virtual→backend origin
   // map (works for filesystem AND s3; testS3Connection is s3-only + transient).
