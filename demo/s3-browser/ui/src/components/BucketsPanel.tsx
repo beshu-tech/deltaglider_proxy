@@ -24,7 +24,8 @@
  * beforeunload, and Cmd/Ctrl+S behave like the rest of Configuration.
  */
 import { useCallback, useRef, useState } from 'react';
-import { Alert, Dropdown, Typography, message } from 'antd';
+import { Alert, Button, Space, Typography, message } from 'antd';
+import Dropdown from './KeyboardDropdown';
 import { DownOutlined, PlusOutlined } from '@ant-design/icons';
 import { LoadingState } from './StatePlaceholders';
 import type { AdminConfig } from '../adminApi';
@@ -221,7 +222,7 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
   const overrideCount = rows.filter((r) => r.name && realBuckets.includes(r.name)).length;
 
   if (error) {
-    return <Alert type="error" showIcon message="Failed to load" description={error} />;
+    return <Alert type="error" showIcon title="Failed to load" description={error} />;
   }
 
   return (
@@ -299,20 +300,26 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
               that does not exist yet) is its secondary option, not a second
               competing button. */}
           <div style={{ marginTop: 4 }}>
-            <Dropdown.Button
-              data-testid="buckets-create"
-              aria-label="Create bucket"
-              onClick={() => setCreateOpen(true)}
-              icon={<DownOutlined />}
-              menu={{
-                items: [
-                  { key: 'draft', label: 'Add settings for a bucket that does not exist yet' },
-                ],
-                onClick: () => addDraft(),
-              }}
-            >
-              <PlusOutlined /> Create bucket
-            </Dropdown.Button>
+            <Space.Compact>
+              <Button
+                data-testid="buckets-create"
+                aria-label="Create bucket"
+                onClick={() => setCreateOpen(true)}
+                icon={<PlusOutlined />}
+              >
+                Create bucket
+              </Button>
+              <Dropdown
+                menu={{
+                  items: [
+                    { key: 'draft', label: 'Add settings for a bucket that does not exist yet' },
+                  ],
+                  onClick: () => addDraft(),
+                }}
+              >
+                <Button icon={<DownOutlined />} aria-label="More ways to add a bucket" />
+              </Dropdown>
+            </Space.Compact>
           </div>
         </div>
       </div>

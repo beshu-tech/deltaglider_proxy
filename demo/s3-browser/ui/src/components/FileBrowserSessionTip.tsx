@@ -27,10 +27,15 @@ export default function FileBrowserSessionTip({ visible }: Props) {
     <Alert
       type="info"
       showIcon
-      closable
-      message="Signed in for files only"
+      closable={{
+        onClose: () => {
+          writeStorage(STORAGE_KEY, '1');
+          setDismissed(true);
+        },
+      }}
+      title="Signed in for files only"
       description={
-        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+        <Space orientation="vertical" size="small" style={{ width: '100%' }}>
           <span>
             You connected with an access key, so you can browse buckets and objects. For bulk actions, folder sizes,
             metrics, and full bucket details in the inspector, open Settings and sign in as an administrator (bootstrap
@@ -48,10 +53,6 @@ export default function FileBrowserSessionTip({ visible }: Props) {
         borderRadius: 10,
         border: `1px solid ${colors.BORDER}`,
         background: `${colors.ACCENT_BLUE}08`,
-      }}
-      onClose={() => {
-        writeStorage(STORAGE_KEY, '1');
-        setDismissed(true);
       }}
     />
   );

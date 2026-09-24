@@ -15,7 +15,8 @@
  * have no dirty state, just live progress + cancel.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Button, Dropdown, Space, Spin, Tag, Typography, message } from 'antd';
+import { Alert, Button, Space, Spin, Tag, Typography, message } from 'antd';
+import Dropdown from '../KeyboardDropdown';
 import {
   CaretRightOutlined,
   DeleteOutlined,
@@ -639,7 +640,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
             type="error"
             showIcon
             style={{ marginTop: 16, borderRadius: 8 }}
-            message={normalizeUiError(jobsQuery.error, 'Failed to load jobs')}
+            title={normalizeUiError(jobsQuery.error, 'Failed to load jobs')}
           />
         ) : (
           <div style={{ marginTop: 16 }}>

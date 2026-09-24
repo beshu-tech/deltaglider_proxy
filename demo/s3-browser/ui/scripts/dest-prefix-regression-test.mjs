@@ -69,3 +69,25 @@ for (let i = 0; i < 5000; i++) {
 }
 
 console.log('dest prefix regression checks passed');
+
+// --- destinationIsSource: the default destination (current folder) ---------
+const { destinationIsSource } = await import(url);
+// Files in the browsed folder, destination = that folder -> self-copy.
+assert.equal(destinationIsSource('b', ['fw/a.bin', 'fw/b.bin'], 'b', 'fw'), true);
+assert.equal(destinationIsSource('b', ['fw/a.bin'], 'b', '/fw/'), true);        // raw input normalized
+// A selected folder keeps its name: fw/v1/ copied into fw/ lands on fw/v1/.
+assert.equal(destinationIsSource('b', ['folder:fw/v1/'], 'b', 'fw'), true);
+assert.equal(destinationIsSource('b', ['folder:fw/v1/', 'fw/x'], 'b', 'fw/'), true);
+// Bucket root.
+assert.equal(destinationIsSource('b', ['a.txt', 'folder:dir/'], 'b', ''), true);
+// Different bucket or prefix -> real copy.
+assert.equal(destinationIsSource('b', ['fw/a.bin'], 'c', 'fw'), false);
+assert.equal(destinationIsSource('b', ['fw/a.bin'], 'b', 'fw/sub'), false);
+assert.equal(destinationIsSource('b', ['folder:fw/v1/'], 'b', 'fw/v1'), false); // into itself: new keys fw/v1/v1/...
+assert.equal(destinationIsSource('b', ['fw/a.bin'], 'b', ''), false);
+// Mixed parents: only some items would self-map -> not blocked.
+assert.equal(destinationIsSource('b', ['fw/a.bin', 'other/b.bin'], 'b', 'fw'), false);
+// Empty selection -> nothing to block.
+assert.equal(destinationIsSource('b', [], 'b', ''), false);
+
+console.log('destination-is-source checks passed');

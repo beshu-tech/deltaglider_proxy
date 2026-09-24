@@ -147,7 +147,7 @@ export default function MasterDetailPanel<T>({
           <div style={{ flex: 1, overflow: 'auto', padding: '4px 0' }}>
             {loading && items.length === 0 && <LoadingState />}
             {error && (
-              <Alert type="error" message={error} showIcon style={{ margin: 8, borderRadius: 8 }} />
+              <Alert type="error" title={error} showIcon style={{ margin: 8, borderRadius: 8 }} />
             )}
             {!loading && items.length === 0 && !error && listEmptyState}
             {items.map(item => {

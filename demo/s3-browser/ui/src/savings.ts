@@ -131,6 +131,23 @@ export function isBaselineObject(headers: Record<string, string>): boolean {
   return Boolean(file) && file === ref;
 }
 
+/**
+ * True when THIS upload created its folder's baseline. The proxy's PUT
+ * response does not say so (no storage-type header, verified against 1.19),
+ * and `isBaselineObject` is also true for a later re-upload of the baseline
+ * bytes, under the same or another name. So an upload counts as the creator
+ * only when it matches the baseline AND its folder held no objects before the
+ * session's first upload into it. `folderWasEmpty` undefined = not known.
+ * Known gap: a folder that held only passthrough files (images, archives)
+ * before counts as not new, so that baseline is left out.
+ */
+export function uploadCreatedBaseline(
+  headers: Record<string, string>,
+  folderWasEmpty: boolean | undefined,
+): boolean {
+  return folderWasEmpty === true && isBaselineObject(headers);
+}
+
 /** Bytes in one GiB. The UI labels it "GB", like `formatBytes`. */
 export const GIB = 1024 ** 3;
 

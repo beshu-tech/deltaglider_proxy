@@ -498,7 +498,7 @@ export default function ObjectTable({
           percent={100}
           status="active"
           showInfo={false}
-          strokeWidth={2}
+          size={{ height: 2 }}
           style={{ lineHeight: 0, marginBottom: 0 }}
         />
       )}
@@ -566,7 +566,7 @@ export default function ObjectTable({
           type="warning"
           showIcon
           banner
-          message="Showing first 10,000 objects. Navigate into a folder to see more."
+          title="Showing first 10,000 objects. Navigate into a folder to see more."
           style={{ borderRadius: 0 }}
         />
       )}

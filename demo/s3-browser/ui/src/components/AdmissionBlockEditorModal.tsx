@@ -424,7 +424,7 @@ export default function AdmissionBlockEditorModal({
             type="warning"
             showIcon
             style={{ marginTop: 12 }}
-            message={
+            title={
               kind === 'deny'
                 ? 'Every matching request gets a 403 Access Denied response.'
                 : 'Every matching request gets the status code below.'

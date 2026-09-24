@@ -483,8 +483,7 @@ export default function BucketCard({
                   value={eff.backend}
                   onChange={handleBackendChange}
                   size="small"
-                  showSearch
-                  optionFilterProp="label"
+                  showSearch={{ optionFilterProp: 'label' }}
                   style={{ width: 260 }}
                   options={[
                     {
@@ -608,7 +607,7 @@ export default function BucketCard({
                         placeholder="Unlimited"
                         style={{ width: 170, ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 11 }}
                         size="small"
-                        addonAfter="GB"
+                        suffix="GB"
                       />
                     </div>
                   </div>

@@ -93,7 +93,7 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
         type="warning"
         showIcon
         style={{ marginBottom: 12, borderRadius: 8 }}
-        message="While the migration runs"
+        title="While the migration runs"
         description={
           <span style={{ fontSize: 12 }}>
             Reads keep working; <strong>uploads and deletes get a temporary 503</strong> until

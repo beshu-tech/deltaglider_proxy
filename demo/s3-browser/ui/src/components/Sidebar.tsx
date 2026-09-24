@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import { Layout, Button, Typography, Drawer, Dropdown, theme, message, Modal } from 'antd';
+import { Layout, Button, Typography, Drawer, theme, message, Modal } from 'antd';
+import Dropdown from './KeyboardDropdown';
 import type { MenuProps } from 'antd';
 import {
   PlusOutlined,
@@ -22,6 +23,7 @@ import type { BucketInfo } from '../types';
 import { useColors } from '../ThemeContext';
 import BucketBackendBadge from './BucketBackendBadge';
 import { showBackendChips } from '../bucketBackend';
+import { BUCKET_PROBE_CAP, BUCKET_PROBE_TIMEOUT_MS, deleteConfirmText, deleteMenuEntry, type BucketObjectCount } from '../bucketDelete';
 import CreateBucketModal from './CreateBucketModal';
 
 const { Sider } = Layout;
@@ -37,20 +39,6 @@ function formatBuildTime(iso: string): string {
   } catch {
     return iso;
   }
-}
-
-type BucketObjectCount =
-  | { state: 'checking' }
-  | { state: 'known'; count: number; truncated: boolean }
-  | { state: 'error' };
-
-/** The row menu's Delete entry: its label, and whether it can be used. */
-function deleteMenuEntry(probe: BucketObjectCount | undefined): { label: string; disabled: boolean } {
-  if (!probe || probe.state === 'checking') return { label: 'Delete bucket (checking contents…)', disabled: true };
-  if (probe.state === 'error') return { label: 'Delete bucket…', disabled: false };
-  if (probe.count === 0) return { label: 'Delete bucket…', disabled: false };
-  const n = probe.truncated ? `${probe.count}+` : String(probe.count);
-  return { label: `Delete bucket (not empty: ${n} object${n === '1' ? '' : 's'})`, disabled: true };
 }
 
 /* Shared inline style constants for sidebar menu items */
@@ -107,6 +95,7 @@ export default function Sidebar({
   const [createBucketOpen, setCreateBucketOpen] = useState(false);
   const [deletingBucketName, setDeletingBucketName] = useState<string | null>(null);
   const deleteConfirmOpenRef = useRef(false);
+  const probeSeqRef = useRef<Record<string, number>>({});
   // Object count per bucket, probed when its row menu opens: Delete is only
   // offered for an empty bucket, because S3 refuses to delete any other.
   const [objectCounts, setObjectCounts] = useState<Record<string, BucketObjectCount>>({});
@@ -281,7 +270,7 @@ export default function Sidebar({
     Modal.confirm({
       title: `Delete bucket "${name}"?`,
       icon: <ExclamationCircleOutlined />,
-      content: 'The bucket is empty. Deleting it cannot be undone.',
+      content: deleteConfirmText(objectCounts[name]),
       okText: 'Delete',
       okButtonProps: { danger: true },
       cancelText: 'Cancel',
@@ -293,13 +282,24 @@ export default function Sidebar({
   };
 
   const probeBucketContents = (name: string) => {
-    setObjectCounts((prev) => ({ ...prev, [name]: { state: 'checking' } }));
-    countBucketObjects(name)
-      .then(({ count, truncated }) =>
-        setObjectCounts((prev) => ({ ...prev, [name]: { state: 'known', count, truncated } })))
-      // A failed probe must not block the operator: offer Delete, and the
-      // server's answer (BucketNotEmpty and so on) still shows in a message.
-      .catch(() => setObjectCounts((prev) => ({ ...prev, [name]: { state: 'error' } })));
+    // Only the newest probe per bucket may write: an older, slower answer
+    // must not overwrite a newer one.
+    const seq = (probeSeqRef.current[name] ?? 0) + 1;
+    probeSeqRef.current[name] = seq;
+    const settle = (value: BucketObjectCount) => {
+      if (probeSeqRef.current[name] === seq) setObjectCounts((prev) => ({ ...prev, [name]: value }));
+    };
+    settle({ state: 'checking' });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('timeout')), BUCKET_PROBE_TIMEOUT_MS);
+    });
+    Promise.race([countBucketObjects(name, BUCKET_PROBE_CAP), timeout])
+      .then(({ count, truncated }) => settle({ state: 'known', count, truncated }))
+      // A failed or hung probe must not block the operator: offer Delete, and
+      // the server's answer (BucketNotEmpty and so on) still shows in a message.
+      .catch(() => settle({ state: 'error' }))
+      .finally(() => clearTimeout(timer));
   };
 
   const bucketMenu = (name: string): MenuProps => {
@@ -426,8 +426,11 @@ export default function Sidebar({
                   if (b.name !== activeBucket) e.currentTarget.style.background = 'transparent';
                 }}
               >
-                <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, overflow: 'hidden' }}>
+                {/* One line tall and wrapping: a chip with no room left wraps
+                    to a second line, which the fixed height hides. */}
+                <span style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 8, height: 20, minWidth: 0, overflow: 'hidden' }}>
                   <span style={{
+                    lineHeight: '20px',
                     fontFamily: "var(--font-mono)",
                     fontSize: 13,
                     fontWeight: b.name === activeBucket ? 600 : 400,
@@ -455,7 +458,11 @@ export default function Sidebar({
                       Unavailable
                     </span>
                   )}
-                  {backendChips && <BucketBackendBadge origin={b.backend} />}
+                  {backendChips && (
+                    // Line breaking sees the 40 px stub, so the chip shrinks
+                    // (with an ellipsis) before it wraps out of view.
+                    <BucketBackendBadge origin={b.backend} style={{ flex: '1 1 40px', maxWidth: 'max-content' }} />
+                  )}
                 </span>
               </button>
               {!isUnavailable && canDeleteBucket(b.name) && (

@@ -9,7 +9,7 @@ const { outputText } = ts.transpileModule(source, {
   fileName: 'savings.ts',
 });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
-const { summarizeScopeSavings, summarizeObjectSavings, GIB, gibFromBytes, bytesFromGib, monthlyCost, parseCostRate, DEFAULT_COST_RATE } = await import(moduleUrl);
+const { summarizeScopeSavings, summarizeObjectSavings, GIB, gibFromBytes, bytesFromGib, monthlyCost, parseCostRate, DEFAULT_COST_RATE, uploadCreatedBaseline } = await import(moduleUrl);
 
 // --- summarizeScopeSavings ---------------------------------------------------
 assert.deepEqual(summarizeScopeSavings(0, 0), { pct: 0, pctOneDecimal: 0, savedBytes: 0, empty: true });
@@ -67,3 +67,15 @@ for (const raw of [null, undefined, '', 'abc', 'NaN', 'Infinity', '-1']) {
 }
 
 console.log('savings regression checks passed');
+
+// An upload created its folder's baseline only when it matches the baseline
+// AND the folder was empty before: re-uploading v1 later, or the same bytes
+// under a new name, also has file-sha256 == ref-sha256.
+const sameAsRef = { 'x-amz-meta-dg-file-sha256': 'aaa', 'x-amz-meta-dg-ref-sha256': 'aaa' };
+const delta = { 'x-amz-meta-dg-file-sha256': 'bbb', 'x-amz-meta-dg-ref-sha256': 'aaa' };
+assert.equal(uploadCreatedBaseline(sameAsRef, true), true, 'first file into a new folder');
+assert.equal(uploadCreatedBaseline(sameAsRef, false), false, 're-upload of the baseline bytes into an existing folder');
+assert.equal(uploadCreatedBaseline(sameAsRef, undefined), false, 'unknown folder state: do not guess');
+assert.equal(uploadCreatedBaseline(delta, true), false);
+assert.equal(uploadCreatedBaseline({}, true), false, 'passthrough object');
+console.log('upload-created-baseline checks passed');

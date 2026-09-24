@@ -78,7 +78,7 @@ export function AdminLoginGate({ externalProviders, s3BrowserSessionOnly, initia
           <Alert
             type="info"
             showIcon
-            message="File browser session active"
+            title="File browser session active"
             description="You are signed in for S3 browsing only. Use the admin password (or OAuth if configured) below to open a full administrator session."
             style={{ marginBottom: 16, borderRadius: 8 }}
           />
@@ -94,7 +94,7 @@ export function AdminLoginGate({ externalProviders, s3BrowserSessionOnly, initia
             </div>
           </div>
         )}
-        {loginError && <Alert type="error" message={loginError} showIcon style={{ marginBottom: 16, borderRadius: 8 }} />}
+        {loginError && <Alert type="error" title={loginError} showIcon style={{ marginBottom: 16, borderRadius: 8 }} />}
         <Input.Password
           placeholder="Admin password"
           value={password}
@@ -104,7 +104,7 @@ export function AdminLoginGate({ externalProviders, s3BrowserSessionOnly, initia
           autoFocus={externalProviders.length === 0}
           style={{ borderRadius: 10, marginBottom: 16 }}
         />
-        <Space style={{ width: '100%' }} direction="vertical">
+        <Space style={{ width: '100%' }} orientation="vertical">
           <Button type="primary" htmlType="submit" block size="large" loading={loginLoading} disabled={!password}
             style={{ borderRadius: 10, height: 44, fontWeight: 600 }}>
             Sign In

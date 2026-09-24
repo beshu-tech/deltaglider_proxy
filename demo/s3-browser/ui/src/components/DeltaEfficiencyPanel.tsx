@@ -260,7 +260,7 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
       {error && (
         <Alert
           type="error"
-          message="Error"
+          title="Error"
           description={error}
           style={{ marginBottom: 16 }}
           showIcon
@@ -272,7 +272,7 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
           {response.reports.length === 0 ? (
             <Alert
               type="success"
-              message="No compression scopes met the reporting threshold"
+              title="No compression scopes met the reporting threshold"
               description={`No prefix in '${response.bucket}' has at least ${response.min_deltas} deltas. Try lowering 'min deltas' or pick another bucket.`}
               showIcon
             />
@@ -650,7 +650,7 @@ function RankedRatioRows({
       <Alert
         type="info"
         showIcon
-        message="No prefixes match the current filter."
+        title="No prefixes match the current filter."
       />
     );
   }

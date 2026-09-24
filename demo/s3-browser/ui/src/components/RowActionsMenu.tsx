@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react';
-import { Button, Dropdown, Modal } from 'antd';
+import { Button, Modal } from 'antd';
+import Dropdown from './KeyboardDropdown';
 import { EllipsisOutlined } from '@ant-design/icons';
 
 /** What a destructive item asks before it runs. */
@@ -63,8 +64,6 @@ export default function RowActionsMenu({ actions, label, loading, disabled }: Pr
   return (
     <span style={{ display: 'inline-flex' }} onClick={(e) => e.stopPropagation()}>
       <Dropdown
-        trigger={['click']}
-        autoFocus
         disabled={disabled}
         menu={{
           items: actions.map((a) => ({

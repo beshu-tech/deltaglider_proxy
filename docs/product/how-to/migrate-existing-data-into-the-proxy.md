@@ -94,7 +94,7 @@ Do not keep writing to the backend bucket directly (e.g. with the Python DeltaGl
 
 2. Upload a new version and confirm it stored as a delta — check the `x-amz-storage-type` response header on a GET/HEAD (`delta` for compressed, `passthrough` otherwise).
 
-3. Watch overall savings grow at **`/_/metrics`** or on the Metrics page.
+3. Watch the overall savings grow on the dashboard at **Settings → Observability → Dashboard** (`/_/admin/dashboard`). Its storage analytics tab shows the savings for each bucket. The same counters are also available to Prometheus at `/_/metrics`.
 
 ## Related
 

@@ -20,6 +20,7 @@
  * fetch that waits for the status costs nothing extra.
  */
 import { throwApiError } from './errorHandling';
+import { formatBytes } from './utils';
 
 /** Mirrors `MAX_BULK_OBJECTS` in src/api/admin/objects.rs. */
 const ZIP_MAX_KEYS = 10_000;
@@ -43,7 +44,24 @@ export function zipPreflightError(keyCount: number, urlLength: number): string |
 type SaveFilePicker = (opts: {
   suggestedName?: string;
   types?: { description: string; accept: Record<string, string[]> }[];
-}) => Promise<{ createWritable: () => Promise<WritableStream<Uint8Array>> }>;
+}) => Promise<{
+  createWritable: () => Promise<WritableStream<Uint8Array>>;
+  /** Deletes the file (Chrome 110+). */
+  remove?: () => Promise<void>;
+}>;
+
+/** Injected in tests; the browser globals otherwise. */
+export interface ZipDownloadDeps {
+  fetch: typeof fetch;
+  picker?: SaveFilePicker;
+}
+
+function browserDeps(): ZipDownloadDeps {
+  return {
+    fetch: (...args) => fetch(...args),
+    picker: (window as unknown as { showSaveFilePicker?: SaveFilePicker }).showSaveFilePicker,
+  };
+}
 
 export type ZipOutcome = 'saved' | 'cancelled' | 'started';
 
@@ -61,10 +79,15 @@ function startAnchorDownload(url: string, filename: string): ZipOutcome {
  * Download the ZIP at `url`. Resolves 'saved' (streamed into the file the
  * user picked), 'cancelled' (the user closed the save dialog) or 'started'
  * (handed to the browser's own download manager). Throws with the server's
- * message when the request fails.
+ * message when the request fails (an `ApiError`, so a 401 reads as an
+ * expired session through `isSessionExpired`).
  */
-export async function downloadZip(url: string, filename: string): Promise<ZipOutcome> {
-  const picker = (window as unknown as { showSaveFilePicker?: SaveFilePicker }).showSaveFilePicker;
+export async function downloadZip(
+  url: string,
+  filename: string,
+  deps: ZipDownloadDeps = browserDeps(),
+): Promise<ZipOutcome> {
+  const { picker } = deps;
   if (typeof picker !== 'function') return startAnchorDownload(url, filename);
 
   let handle: Awaited<ReturnType<SaveFilePicker>>;
@@ -80,12 +103,36 @@ export async function downloadZip(url: string, filename: string): Promise<ZipOut
     return startAnchorDownload(url, filename);
   }
 
-  const res = await fetch(url, { credentials: 'same-origin' });
-  if (res.status === 413) {
-    throw new Error('The selected files add up to more than 500 MB, the limit for one ZIP. Select fewer files.');
+  // The picker already created the file (or picked one to overwrite). When
+  // no archive arrives, delete it: an empty file must not look like a ZIP.
+  const discard = async () => {
+    try {
+      await handle.remove?.();
+    } catch {
+      /* the file stays; the error below still explains why */
+    }
+  };
+  let res: Response;
+  try {
+    res = await deps.fetch(url, { credentials: 'same-origin' });
+  } catch (e) {
+    await discard();
+    throw e;
   }
-  if (!res.ok) await throwApiError(res, 'ZIP download');
-  if (!res.body) throw new Error('ZIP download failed: the server sent no data.');
+  if (res.status === 413) {
+    await discard();
+    throw new Error(
+      `The selected files add up to more than ${formatBytes(ZIP_MAX_BYTES)}, the limit for one ZIP. Select fewer files.`,
+    );
+  }
+  if (!res.ok) {
+    await discard();
+    await throwApiError(res, 'ZIP download');
+  }
+  if (!res.body) {
+    await discard();
+    throw new Error('ZIP download failed: the server sent no data.');
+  }
   const writable = await handle.createWritable();
   // pipeTo closes the file on success and aborts it (discarding the partial
   // file) when the connection breaks.

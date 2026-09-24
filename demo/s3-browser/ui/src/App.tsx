@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from 'react';
-import { Alert, Layout, Spin, Empty, Grid, Button, Progress, Space } from 'antd';
+import { Alert, Layout, Spin, Empty, Grid, Button, Progress, Space, message } from 'antd';
 import useS3Browser from './useS3Browser';
 import TopBar from './components/TopBar';
 import BulkActionBar from './components/BulkActionBar';
@@ -60,7 +60,7 @@ export default function App() {
 
   const { view, subPath, browser, navigate, search } = useUrlRouter();
   // Stable "go back to browser" callback. Previously inlined into
-  // AdminPage / MetricsPage props as `() => navigate('browse')`, which
+  // AdminPage props as `() => navigate('browse')`, which
   // allocated a fresh arrow every App render and propagated as
   // `onBack` / `onSessionExpired` to ~10 admin panels. Each panel's
   // `loadData` `useCallback` lists `onSessionExpired` in its deps,
@@ -341,12 +341,21 @@ export default function App() {
     navigate(buildViewUrl('browser'));
   };
 
+  // An admin request answered 401 (or "admin session required"): the session
+  // is gone on the server, so go back to the sign-in screen and say why.
+  const handleSessionExpired = () => {
+    message.warning('Your session expired. Sign in again to continue.');
+    void handleLogout();
+  };
+
   const handleBucketChange = useCallback((newBucket: string) => {
     // changeBucket() already navigates the URL to /browse/<bucket>/ (PUSH).
     changeS3Bucket(newBucket);
   }, [changeS3Bucket]);
 
   const isEmpty = s3.objects.length === 0 && s3.folders.length === 0;
+  // Empty only because "Show system files" is off (the folder holds .dg/ etc.).
+  const onlyHiddenEntries = isEmpty && !s3.searchQuery && !s3.showHidden && s3.allFolders.length > 0;
   const hasBuckets = (bucketCount ?? 0) > 0;
   const hasNoBuckets = bucketCount === 0;
   const isRootBucketEmpty = hasBuckets && s3.prefix === '' && !s3.searchQuery && isEmpty && !s3.loading;
@@ -379,13 +388,15 @@ export default function App() {
   const canReadActiveBucket = !activeBucket || canUse(identity, 'read', activeBucket, s3.prefix) || canUse(identity, 'list', activeBucket, s3.prefix);
   const who = identitySummary(identity, currentAccessKey);
   const openSettings = () => navigate(buildViewUrl('admin'));
-  const accountMenu = (includeBrowserToggles = false) => (
+  // Settings has ONE entry point per screen: the labelled TopBar button when
+  // it is there (visible, one click), else the account-menu entry.
+  const accountMenu = (includeBrowserToggles = false, topBarHasSettings = false) => (
     <AccountMenu
       identityLabel={who.name}
       identityDetail={who.detail}
       canAdmin={canAdmin}
       onBrowserClick={view === 'browser' ? undefined : () => navigate(buildViewUrl('browser'))}
-      onSettingsClick={view === 'admin' ? undefined : openSettings}
+      onSettingsClick={view === 'admin' || topBarHasSettings ? undefined : openSettings}
       onDocsClick={view === 'docs' ? undefined : () => navigate(buildViewUrl('docs'))}
       onLogout={handleLogout}
       showHidden={includeBrowserToggles ? s3.showHidden : undefined}
@@ -548,6 +559,8 @@ export default function App() {
             onDownloadZip={canReadSelected && hasAdminSession ? s3.downloadZip : undefined}
             deleting={s3.deleting}
             currentPrefix={s3.prefix}
+            selectionKeys={s3.selectedKeys}
+            onSessionExpired={handleSessionExpired}
             hint={
               hasAdminSession
                 ? undefined
@@ -567,7 +580,7 @@ export default function App() {
               type="warning"
               showIcon
               banner
-              message="Showing a stale listing — the last refresh failed"
+              title="Showing a stale listing — the last refresh failed"
               description={s3.error}
               style={{ borderRadius: 0 }}
             />
@@ -581,7 +594,7 @@ export default function App() {
               <Alert
                 type="error"
                 showIcon
-                message={
+                title={
                   /NoSuchBucket/i.test(s3.error)
                     ? `Bucket '${activeBucket}' was not found on its storage backend`
                     : /ServiceUnavailable|unavailable|503/i.test(s3.error)
@@ -589,7 +602,7 @@ export default function App() {
                       : 'Failed to load objects'
                 }
                 description={
-                  <Space direction="vertical" size={8}>
+                  <Space orientation="vertical" size={8}>
                     <span>{s3.error}</span>
                     {/NoSuchBucket/i.test(s3.error) && (
                       <span>
@@ -613,7 +626,9 @@ export default function App() {
                   ? `No results for "${s3.searchQuery}"`
                   : hasNoBuckets
                     ? 'Create a bucket before uploading objects or generating demo data.'
-                    : s3.prefix
+                    : onlyHiddenEntries
+                      ? 'This folder holds only hidden system files. Turn on "Show system files" in the account menu to see them.'
+                      : s3.prefix
                       // The proxy stores no folder markers: a folder exists
                       // only while it holds files, so an empty listing here
                       // is as likely a typo in the path as an empty folder.
@@ -640,7 +655,7 @@ export default function App() {
                 </Button>
               )}
               {isRootBucketEmpty && canUploadToActiveBucket && (
-                <Space direction="vertical" size={4} align="center">
+                <Space orientation="vertical" size={4} align="center">
                   <DemoDataGenerator
                     onDone={s3.mutate}
                     variant="empty-state"
@@ -728,7 +743,7 @@ export default function App() {
               refreshing={s3.refreshing}
               canAdmin={canAdmin}
               onShowShortcuts={showShortcuts}
-              accountMenu={accountMenu(true)}
+              accountMenu={accountMenu(true, canAdmin)}
               onOpenSettings={canAdmin ? openSettings : undefined}
               deltaSummary={view === 'browser' ? s3.deltaSummary : null}
             />

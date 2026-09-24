@@ -85,8 +85,8 @@ async function readResponseBodyMessage(res: Response): Promise<{ code?: string; 
 }
 
 /**
- * An HTTP failure from the proxy. The message keeps its operator-facing shape;
- * `status` and `detail` carry the facts that code decides on, so no caller
+ * An HTTP failure from the proxy — admin API or S3 (see `normalizeS3Error`).
+ * The message keeps its operator-facing shape; `status`, `code` and `detail` carry the facts that code decides on, so no caller
  * has to parse the message text.
  */
 export class ApiError extends Error {
@@ -151,29 +151,18 @@ type S3LikeError = {
 };
 
 /**
- * A failed S3 request. The message is the operator-facing text; `status`
- * and `code` carry the facts that code decides on (for example whether a
- * failed upload is worth retrying), so no caller parses the message.
+ * A failed S3 request as an `ApiError`: the message is the operator-facing
+ * text; `status` (0 = no HTTP answer, as in XHR) and `code` carry the facts
+ * code decides on, so no caller parses the message.
  */
-export class S3RequestError extends Error {
-  readonly status?: number;
-  readonly code?: string;
-
-  constructor(message: string, status?: number, code?: string) {
-    super(message);
-    this.name = 'S3RequestError';
-    this.status = status;
-    this.code = code;
-  }
-}
-
-export function normalizeS3Error(err: unknown, context: string): S3RequestError {
+export function normalizeS3Error(err: unknown, context: string): ApiError {
   const e = err as S3LikeError;
-  const prior = err instanceof S3RequestError ? err : undefined;
-  return new S3RequestError(
+  const prior = err instanceof ApiError ? err : undefined;
+  return new ApiError(
     describeS3Error(err, context).message,
-    prior?.status ?? e?.$metadata?.httpStatusCode,
+    prior?.status ?? e?.$metadata?.httpStatusCode ?? 0,
     prior?.code ?? (e?.Code || e?.code || e?.name),
+    prior?.detail ?? e?.message,
   );
 }
 

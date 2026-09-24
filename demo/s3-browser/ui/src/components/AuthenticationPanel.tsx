@@ -174,7 +174,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   const label = useFormLabelStyle();
 
   if (loading) return <div style={{ display: 'flex', justifyContent: 'center', padding: 40 }}><Spin /></div>;
-  if (error) return <Alert type="error" message={error} style={{ margin: 16 }} />;
+  if (error) return <Alert type="error" title={error} style={{ margin: 16 }} />;
 
   // Nothing configured yet: ONE empty state with ONE next step. The rule
   // editor, the preview, and "Sync Groups" all need a provider first, so
@@ -609,7 +609,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
       {testResult && (
         <Alert
           type={testResult.success ? 'success' : 'error'}
-          message={testResult.success
+          title={testResult.success
             ? `Connected. Issuer: ${testResult.issuer}`
             : `Failed: ${testResult.error}`}
           showIcon

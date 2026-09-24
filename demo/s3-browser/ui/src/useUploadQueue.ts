@@ -1,13 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { headObject, uploadObject, type UploadTelemetry } from './s3client';
+import { countBucketObjects, getBucket, headObject, uploadObject, type UploadTelemetry } from './s3client';
 import { uploadSessionStats } from './uploadStats';
-import { isBaselineObject } from './savings';
-import { clampPercent, isRetryableUploadFailure, mergeTotalBytes, type UploadStatus } from './uploadTelemetry';
-import { S3RequestError, normalizeUiError } from './errorHandling';
+import { uploadCreatedBaseline } from './savings';
+import {
+  clampPercent,
+  mergeTotalBytes,
+  uploadRetryAdvice,
+  type UploadRetryAdvice,
+  type UploadStatus,
+} from './uploadTelemetry';
+import { ApiError, normalizeUiError } from './errorHandling';
 
 export interface UploadQueueItem {
   id: string;
   file: File;
+  /** Bucket captured when the file was queued: switching buckets later must not redirect it. */
+  bucket: string;
   destination: string;
   key: string;
   status: UploadStatus;
@@ -30,8 +38,8 @@ export interface UploadQueueItem {
   /** Set when this upload became its folder's baseline (see uploadStats.ts). */
   baselineKey?: string;
   error?: string;
-  /** False when the failure repeats on every attempt (403, 413, …): no Retry. */
-  retryable?: boolean;
+  /** What to offer after a failure (see `uploadRetryAdvice`). */
+  retry?: UploadRetryAdvice;
 }
 
 export default function useUploadQueue(destination: string) {
@@ -51,6 +59,9 @@ export default function useUploadQueue(destination: string) {
   // the timer; per-file 4-part queue still governs throughput.
   const maxConcurrentFiles = 1;
   const [tick, setTick] = useState(0);
+  // `${bucket}|${folder}` -> "held no objects before this session's first
+  // upload into it". Probed once, before that first upload starts.
+  const folderWasEmptyRef = useRef(new Map<string, Promise<boolean | undefined>>());
 
   const toKey = useCallback((dest: string, file: File): string => {
     const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
@@ -63,6 +74,7 @@ export default function useUploadQueue(destination: string) {
     const items: UploadQueueItem[] = Array.from(files).map((file) => ({
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       file,
+      bucket: getBucket(),
       destination: cleanDest,
       key: toKey(cleanDest, file),
       status: 'queued',
@@ -140,10 +152,24 @@ export default function useUploadQueue(destination: string) {
       ),
     );
 
-    uploadObject(item.key, item.file, {
-      signal: controller.signal,
-      onTelemetry: (telemetry) => applyTelemetry(item.id, telemetry),
-    })
+    const folder = item.key.includes('/') ? item.key.slice(0, item.key.lastIndexOf('/')) : '';
+    const folderKey = `${item.bucket}|${folder}`;
+    if (!folderWasEmptyRef.current.has(folderKey)) {
+      folderWasEmptyRef.current.set(
+        folderKey,
+        countBucketObjects(item.bucket, 1, folder ? `${folder}/` : '')
+          .then(({ count }) => count === 0)
+          .catch(() => undefined),
+      );
+    }
+    const folderWasEmpty = folderWasEmptyRef.current.get(folderKey)!;
+
+    folderWasEmpty
+      .then(() => uploadObject(item.key, item.file, {
+        bucket: item.bucket,
+        signal: controller.signal,
+        onTelemetry: (telemetry) => applyTelemetry(item.id, telemetry),
+      }))
       .then(() => {
         setQueue((prev) =>
           prev.map((entry) =>
@@ -165,11 +191,10 @@ export default function useUploadQueue(destination: string) {
         // passthrough. HEAD the object for the stored size the inspector shows
         // (`dg-delta-size` for a delta, else the full object). A failed HEAD
         // leaves it unknown, and the page shows "—" instead of a guess.
-        headObject(item.key)
-          .then(({ headers, storedSize }) => {
-            const folder = item.key.includes('/') ? item.key.slice(0, item.key.lastIndexOf('/')) : '';
-            const baselineKey = isBaselineObject(headers)
-              ? `${folder}|${headers['x-amz-meta-dg-ref-sha256']}`
+        Promise.all([headObject(item.key, item.bucket), folderWasEmpty])
+          .then(([{ headers, storedSize }, wasEmpty]) => {
+            const baselineKey = uploadCreatedBaseline(headers, wasEmpty)
+              ? `${folderKey}|${headers['x-amz-meta-dg-ref-sha256']}`
               : undefined;
             setQueue((prev) =>
               prev.map((entry) =>
@@ -206,9 +231,9 @@ export default function useUploadQueue(destination: string) {
                   ...entry,
                   status: 'error',
                   error: normalizeUiError(err, 'Upload failed'),
-                  retryable: err instanceof S3RequestError
-                    ? isRetryableUploadFailure(err.status, err.code)
-                    : true,
+                  retry: err instanceof ApiError
+                    ? uploadRetryAdvice(err.status, err.code, err.detail)
+                    : 'retry',
                   inFlightParts: 0,
                   activeConnections: 0,
                   speedBytesPerSec: 0,
@@ -268,7 +293,7 @@ export default function useUploadQueue(destination: string) {
               activeConnections: 0,
               currentPart: null,
               error: undefined,
-              retryable: undefined,
+              retry: undefined,
               startedAtMs: null,
               completingSinceMs: null,
               updatedAtMs: null,

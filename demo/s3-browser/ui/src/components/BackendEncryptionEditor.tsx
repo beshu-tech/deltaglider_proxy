@@ -241,7 +241,7 @@ export default function BackendEncryptionEditor({ backendName, current, onApply 
           type="info"
           showIcon
           style={{ marginTop: 8, borderRadius: 6, fontSize: 12 }}
-          message="Decrypt-only shim active"
+          title="Decrypt-only shim active"
           description={
             <span>
               A legacy key is configured on this backend. Historical objects
@@ -263,7 +263,7 @@ export default function BackendEncryptionEditor({ backendName, current, onApply 
               type="info"
               showIcon
               style={{ borderRadius: 6, fontSize: 12, marginBottom: 8 }}
-              message="Applies to newly written objects only"
+              title="Applies to newly written objects only"
               description={
                 <span>
                   Objects already stored on <code>{backendName}</code> are NOT
@@ -280,7 +280,7 @@ export default function BackendEncryptionEditor({ backendName, current, onApply 
               showIcon
               icon={<WarningOutlined />}
               style={{ borderRadius: 6, fontSize: 12 }}
-              message="Disabling encryption"
+              title="Disabling encryption"
               description={
                 <span>
                   New writes to backend <code>{backendName}</code> will go to disk as plaintext.
@@ -299,7 +299,7 @@ export default function BackendEncryptionEditor({ backendName, current, onApply 
                 showIcon
                 icon={<WarningOutlined />}
                 style={{ borderRadius: 6, fontSize: 12, marginBottom: 8 }}
-                message="If you lose this key, encrypted objects on this backend are unrecoverable."
+                title="If you lose this key, encrypted objects on this backend are unrecoverable."
                 description="DeltaGlider does not back up your encryption key. Copy it to a password manager / secrets vault BEFORE clicking Apply."
               />
               <span style={{ fontSize: 11, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
@@ -353,7 +353,7 @@ export default function BackendEncryptionEditor({ backendName, current, onApply 
                   showIcon
                   icon={<CheckCircleOutlined />}
                   style={{ marginTop: 8, borderRadius: 6, fontSize: 12 }}
-                  message="Ready to apply."
+                  title="Ready to apply."
                 />
               )}
             </>

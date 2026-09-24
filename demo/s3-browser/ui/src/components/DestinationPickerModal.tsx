@@ -4,7 +4,7 @@ import { WarningOutlined } from '@ant-design/icons';
 import { listBuckets, getBucket } from '../s3client';
 import { useColors } from '../ThemeContext';
 import { pluralize } from '../utils';
-import { normalizeDestPrefix } from './destPrefix';
+import { normalizeDestPrefix, destinationIsSource } from './destPrefix';
 
 const { Text } = Typography;
 
@@ -17,6 +17,8 @@ interface Props {
   loading: boolean;
   /** The folder the user is browsing; the destination path starts there. */
   currentPrefix?: string;
+  /** Selection keys (`folder:<prefix>` for folders) — used to refuse a copy onto itself. */
+  selectionKeys?: Iterable<string>;
 }
 
 /** "Move 3 items" / "Copy 1 item" — shared by the modal title and OK button. */
@@ -33,15 +35,17 @@ function SectionLabel({ color, children }: { color: string; children: React.Reac
   );
 }
 
-export default function DestinationPickerModal({ open, mode, itemCount, onConfirm, onCancel, loading, currentPrefix = '' }: Props) {
+export default function DestinationPickerModal({ open, mode, itemCount, onConfirm, onCancel, loading, currentPrefix = '', selectionKeys = [] }: Props) {
   const colors = useColors();
   const [buckets, setBuckets] = useState<string[]>([]);
+  const [sourceBucket, setSourceBucket] = useState(getBucket());
   const [destBucket, setDestBucket] = useState(getBucket());
   const [destPrefix, setDestPrefix] = useState('');
 
   useEffect(() => {
     if (open) {
       listBuckets().then(bs => setBuckets(bs.filter(b => !b.unavailable).map(b => b.name))).catch(() => {});
+      setSourceBucket(getBucket());
       setDestBucket(getBucket());
       // Start from the folder being browsed, not the bucket root: copies and
       // moves usually go next to, or below, where the user already is.
@@ -51,6 +55,9 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
 
   const clean = normalizeDestPrefix(destPrefix);
   const preview = `${destBucket}/${clean ? clean + '/' : ''}`;
+  // The path starts at the browsed folder, which IS where the selection lives:
+  // a move there does nothing and a copy rewrites every object in place.
+  const sameLocation = destinationIsSource(sourceBucket, selectionKeys, destBucket, destPrefix);
 
   return (
     <Modal
@@ -59,10 +66,10 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
       onCancel={onCancel}
       onOk={() => onConfirm(destBucket, clean ? clean + '/' : '')}
       okText={getModalTitle(mode, itemCount)}
-      okButtonProps={{ loading, disabled: !destBucket }}
+      okButtonProps={{ loading, disabled: !destBucket || sameLocation }}
       cancelButtonProps={{ disabled: loading }}
-      destroyOnClose
-      maskClosable={!loading}
+      destroyOnHidden
+      mask={{ closable: !loading }}
     >
       <div style={{ marginBottom: 16 }}>
         <SectionLabel color={colors.TEXT_MUTED}>Destination Bucket</SectionLabel>
@@ -72,8 +79,7 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
           options={buckets.map(b => ({ value: b, label: b }))}
           placeholder="Select bucket"
           style={{ width: '100%' }}
-          showSearch
-          optionFilterProp="label"
+          showSearch={{ optionFilterProp: 'label' }}
         />
       </div>
 
@@ -92,17 +98,26 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
       <div style={{
         padding: '8px 12px', borderRadius: 6,
         background: colors.BG_BASE, border: `1px solid ${colors.BORDER}`,
-        marginBottom: mode === 'move' ? 12 : 0,
+        marginBottom: mode === 'move' || sameLocation ? 12 : 0,
       }}>
         <Text style={{ fontSize: 12, color: colors.TEXT_MUTED }}>Preview: </Text>
         <Text style={{ fontSize: 12, fontFamily: 'var(--font-mono)', color: colors.ACCENT_BLUE }}>{preview}</Text>
       </div>
 
+      {sameLocation && (
+        <Alert
+          type="info"
+          showIcon
+          title={`The selected items are already in this folder. Choose another folder or bucket to ${mode} them.`}
+          style={{ borderRadius: 8, marginBottom: mode === 'move' ? 12 : 0 }}
+        />
+      )}
+
       {mode === 'move' && (
         <Alert
           type="warning"
           icon={<WarningOutlined />}
-          message="Source files will be deleted after successful copy."
+          title="Source files will be deleted after successful copy."
           showIcon
           style={{ borderRadius: 8 }}
         />

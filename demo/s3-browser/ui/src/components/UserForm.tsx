@@ -230,7 +230,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
         </div>
       )}
 
-      {error && <Alert type="error" message={error} showIcon closable onClose={() => setError('')} style={{ marginBottom: 16, borderRadius: 8 }} />}
+      {error && <Alert type="error" title={error} showIcon closable={{ onClose: () => setError('') }} style={{ marginBottom: 16, borderRadius: 8 }} />}
 
       <div style={{ marginBottom: 16 }}>
         <FormLabel text="Name" />

@@ -15,7 +15,7 @@ export default function RecoveryPanel({ onExportBackup, onImportBackup }: Recove
   return (
     <div style={{ ...contentColumn(CONTENT_FORM), paddingTop: 0 }}>
     <Card style={{ borderRadius: 12 }}>
-      <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <Space orientation="vertical" size={16} style={{ width: '100%' }}>
         <Text type="secondary">
           Download a full backup bundle (config + IAM/control-plane data), or restore from a previous export.
         </Text>
@@ -35,7 +35,7 @@ export default function RecoveryPanel({ onExportBackup, onImportBackup }: Recove
         <Alert
           type="warning"
           showIcon
-          message="Restores can replace IAM users/groups/providers and configuration state for this instance."
+          title="Restores can replace IAM users/groups/providers and configuration state for this instance."
         />
       </Space>
     </Card>

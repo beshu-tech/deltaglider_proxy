@@ -45,7 +45,7 @@ export function SlackSetupGuideDrawer({
     <Drawer
       open={open}
       onClose={onClose}
-      width={Math.min(640, typeof window !== 'undefined' ? window.innerWidth - 32 : 640)}
+      size={Math.min(640, typeof window !== 'undefined' ? window.innerWidth - 32 : 640)}
       title={
         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 10, fontSize: 16 }}>
           <SlackOutlined style={{ color: '#611f69', fontSize: 20 }} />

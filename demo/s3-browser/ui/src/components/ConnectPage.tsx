@@ -388,7 +388,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', padding: 24 }}>
         <div className="dg-login-card animate-fade-in" style={{ borderRadius: 14, padding: 'clamp(28px, 4vw, 40px)', width: '100%', maxWidth: 520 }}>
-          <Space direction="vertical" size="large" style={{ width: '100%' }}>
+          <Space orientation="vertical" size="large" style={{ width: '100%' }}>
             {recoveredHash ? (
               <>
                 <div>
@@ -421,7 +421,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     </div>
                   </div>
                 </div>
-                <Alert type="info" showIcon message={
+                <Alert type="info" showIcon title={
                   <span style={{ fontFamily: "var(--font-ui)", fontSize: 12 }}>
                     Set <code style={{ fontFamily: "var(--font-mono)" }}>DGP_BOOTSTRAP_PASSWORD_HASH</code> in your environment
                     or <code style={{ fontFamily: "var(--font-mono)" }}>advanced.bootstrap_password_hash</code> in your YAML config, then restart.
@@ -456,7 +456,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     <code style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: TEXT_SECONDARY }}>.db.bak</code> in case the hash turns up.
                   </div>
                 </div>
-                {recoveryError && <Alert type="error" message={recoveryError} showIcon />}
+                {recoveryError && <Alert type="error" title={recoveryError} showIcon />}
                 <div>
                   <label style={{ fontSize: 13, fontWeight: 600, color: TEXT_SECONDARY, fontFamily: "var(--font-ui)", marginBottom: 6, display: 'block' }}>
                     Original Admin Password Hash
@@ -508,7 +508,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           className="dg-login-theme-toggle"
         />
 
-        <Space direction="vertical" size={22} style={{ width: '100%' }}>
+        <Space orientation="vertical" size={22} style={{ width: '100%' }}>
           <div className="dg-login-brand-block">
             <div className="dg-login-brand">DeltaGlider</div>
             <div className="dg-login-product">Proxy</div>
@@ -516,11 +516,11 @@ export default function ConnectPage({ onConnect, showError }: Props) {
 
           {isOpenSignedOutReconnect ? (
             <>
-              {error && <Alert type="error" message={error} showIcon />}
+              {error && <Alert type="error" title={error} showIcon />}
               <Alert
                 type="info"
                 showIcon
-                message="You signed out"
+                title="You signed out"
                 description="This server uses open access. Connect again to return to the file browser, or open Settings from the menu after connecting if you need administrator tools."
               />
               <Button
@@ -537,9 +537,9 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           ) : (
             <>
           {showError && !error && (
-            <Alert type="warning" message="Stored credentials are invalid or the endpoint is unreachable." showIcon />
+            <Alert type="warning" title="Stored credentials are invalid or the endpoint is unreachable." showIcon />
           )}
-          {error && <Alert type="error" message={error} showIcon />}
+          {error && <Alert type="error" title={error} showIcon />}
 
           {/* OAuth provider buttons — shown prominently when available */}
           {externalProviders.length > 0 && (

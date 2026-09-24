@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import {
   BookOutlined,
   CopyOutlined,
@@ -44,6 +44,11 @@ interface Props extends AccountMenuConfigProps {
   avatarOnly?: boolean;
 }
 
+/** The focusable entries of the open menu, in order. */
+function menuItems(root: HTMLElement | null): HTMLElement[] {
+  return root ? Array.from(root.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])')) : [];
+}
+
 export default function AccountMenu({
   identityLabel,
   identityDetail,
@@ -66,7 +71,12 @@ export default function AccountMenu({
   const { isDark, toggleTheme } = useTheme();
   const [open, setOpen] = useState(false);
   const [sectionYamlOpen, setSectionYamlOpen] = useState(false);
+  const idBase = useId();
   const menuRef = useRef<HTMLDivElement>(null);
+  const itemsRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  // Which item gets focus when the menu opens (ArrowUp on the trigger opens at the last).
+  const focusOnOpenRef = useRef<'first' | 'last'>('first');
   const label = identityLabel.trim() || 'user';
   const avatarLetter = (() => {
     const ch = label.charAt(0);
@@ -83,7 +93,10 @@ export default function AccountMenu({
       setOpen(false);
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setOpen(false);
+      if (event.key === 'Escape') {
+        setOpen(false);
+        triggerRef.current?.focus();
+      }
     };
 
     document.addEventListener('pointerdown', onPointerDown);
@@ -93,6 +106,35 @@ export default function AccountMenu({
       document.removeEventListener('keydown', onKeyDown);
     };
   }, [open]);
+
+  // Opening the menu moves focus to its first item, so the arrow keys work.
+  useEffect(() => {
+    if (!open) return;
+    const items = menuItems(itemsRef.current);
+    (focusOnOpenRef.current === 'last' ? items[items.length - 1] : items[0])?.focus();
+    focusOnOpenRef.current = 'first';
+  }, [open]);
+
+  const onMenuKeyDown = (event: React.KeyboardEvent) => {
+    const items = menuItems(itemsRef.current);
+    const i = items.indexOf(document.activeElement as HTMLElement);
+    const next = { ArrowDown: i + 1, ArrowUp: i - 1, Home: 0, End: items.length - 1 }[event.key];
+    if (next === undefined || items.length === 0) return;
+    event.preventDefault();
+    items[(next + items.length) % items.length].focus();
+  };
+
+  const onTriggerKeyDown = (event: React.KeyboardEvent) => {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    event.preventDefault();
+    focusOnOpenRef.current = event.key === 'ArrowUp' ? 'last' : 'first';
+    if (open) {
+      const items = menuItems(itemsRef.current);
+      (event.key === 'ArrowUp' ? items[items.length - 1] : items[0])?.focus();
+    } else {
+      setOpen(true);
+    }
+  };
 
   useEffect(() => {
     if (!configSection) setSectionYamlOpen(false);
@@ -130,10 +172,9 @@ export default function AccountMenu({
       ].filter(Boolean).join(' ')}
     >
       {open && (
-        <div className="account-menu-panel" role="menu">
-          {/* Who is signed in, and how. */}
+        <div className="account-menu-panel">
+          {/* Who is signed in, and how. Outside the menu: it is text, not an item. */}
           <div
-            aria-label="Signed in as"
             style={{ padding: '2px 4px 10px', marginBottom: 8, borderBottom: '1px solid color-mix(in srgb, currentColor 14%, transparent)' }}
           >
             <div style={{ fontWeight: 700, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={label}>
@@ -145,8 +186,9 @@ export default function AccountMenu({
               </div>
             )}
           </div>
+          <div ref={itemsRef} role="menu" aria-label="Account" onKeyDown={onMenuKeyDown}>
           <div className="account-menu-section account-menu-section--first" role="group" aria-label="Navigation">
-            <div className="account-menu-section-label">Navigation</div>
+            <div className="account-menu-section-label" aria-hidden>Navigation</div>
             {/* Each view passes no handler for itself, so the menu never
                 offers the page you are already on. */}
             {onBrowserClick && (
@@ -193,9 +235,9 @@ export default function AccountMenu({
             )}
           </div>
           {hasConfigActions && (
-            <div className="account-menu-section" role="group" aria-label="Settings" title={settingsHelp}>
-              <div className="account-menu-section-label">Settings</div>
-              <div className="account-menu-section-help">{settingsHelp}</div>
+            <div className="account-menu-section" role="group" aria-label="Settings" aria-describedby={`${idBase}-settings-help`} title={settingsHelp}>
+              <div className="account-menu-section-label" aria-hidden>Settings</div>
+              <div className="account-menu-section-help" id={`${idBase}-settings-help`} aria-hidden>{settingsHelp}</div>
               {configSection && (
                 <button
                   type="button"
@@ -242,7 +284,7 @@ export default function AccountMenu({
                 </button>
               )}
               {(onExportFullIam || onImportFullIam) && (
-                <div className="account-menu-section-help" title={iamHelp}>{iamHelp}</div>
+                <div className="account-menu-section-help" title={iamHelp} aria-hidden>{iamHelp}</div>
               )}
               {onExportFullIam && (
                 <button
@@ -277,7 +319,7 @@ export default function AccountMenu({
             </div>
           )}
           <div className="account-menu-section" role="group" aria-label="Quick actions">
-            <div className="account-menu-section-label">Quick actions</div>
+            <div className="account-menu-section-label" aria-hidden>Quick actions</div>
             <button
               type="button"
               className="account-menu-item"
@@ -324,15 +366,18 @@ export default function AccountMenu({
               </button>
             </div>
           )}
+          </div>
         </div>
       )}
       <button
+        ref={triggerRef}
         type="button"
         className="account-menu-trigger"
         aria-haspopup="menu"
         aria-expanded={open}
         aria-label={`Account menu: ${label}`}
         onClick={() => setOpen((v) => !v)}
+        onKeyDown={onTriggerKeyDown}
       >
         <span className="account-menu-avatar" aria-hidden>
           {avatarLetter}

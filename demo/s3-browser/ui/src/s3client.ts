@@ -269,9 +269,10 @@ function formatHeadObjectResponse(resp: HeadObjectCommandOutput): HeadObjectShap
 }
 
 /** Fetch HEAD metadata for a single object (called lazily by InspectorPanel). */
-export async function headObject(key: string): Promise<HeadObjectShape> {
+/** `bucket` defaults to the active one; pass it when the caller captured it earlier. */
+export async function headObject(key: string, bucket = activeBucket): Promise<HeadObjectShape> {
   const headResp = await sendCommand<HeadObjectCommandOutput>(
-    new HeadObjectCommand({ Bucket: activeBucket, Key: key }),
+    new HeadObjectCommand({ Bucket: bucket, Key: key }),
     `Read object metadata for ${key}`,
   );
   return formatHeadObjectResponse(headResp);
@@ -302,6 +303,8 @@ interface UploadProgressEvent {
 }
 
 interface UploadObjectOptions {
+  /** Target bucket; defaults to the active one. The upload queue captures it at enqueue time. */
+  bucket?: string;
   onTelemetry?: (telemetry: UploadTelemetry) => void;
   signal?: AbortSignal;
   partSize?: number;
@@ -362,7 +365,7 @@ export async function uploadObject(
     const upload = new Upload({
       client: getClient(),
       params: {
-        Bucket: activeBucket,
+        Bucket: options.bucket ?? activeBucket,
         Key: key,
         Body: body,
         ContentType: contentType,
@@ -645,17 +648,18 @@ export async function createBucket(name: string, backendName?: string): Promise<
 }
 
 /**
- * How many objects the bucket holds, counted up to `cap` (one ListObjectsV2
- * page). `truncated` means "at least `cap`". Used to decide whether Delete
- * bucket can succeed before offering it.
+ * How many objects the bucket (or the folder `prefix`) holds, counted up to
+ * `cap` in one ListObjectsV2 page. `truncated` means "at least `cap`". Keep
+ * `cap` small: callers ask "is it empty" or "how many, roughly".
  */
 export async function countBucketObjects(
   name: string,
-  cap = 1000,
+  cap: number,
+  prefix = '',
 ): Promise<{ count: number; truncated: boolean }> {
   const resp = await sendCommand<ListObjectsV2CommandOutput>(
-    new ListObjectsV2Command({ Bucket: name, MaxKeys: cap }),
-    `Count objects in bucket ${name}`,
+    new ListObjectsV2Command({ Bucket: name, MaxKeys: cap, ...(prefix ? { Prefix: prefix } : {}) }),
+    `Count objects in ${prefix ? `${name}/${prefix}` : `bucket ${name}`}`,
   );
   return { count: resp.KeyCount ?? resp.Contents?.length ?? 0, truncated: Boolean(resp.IsTruncated) };
 }

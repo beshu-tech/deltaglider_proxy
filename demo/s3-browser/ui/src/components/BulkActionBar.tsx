@@ -4,7 +4,7 @@ import { DeleteOutlined, CopyOutlined, ScissorOutlined, DownloadOutlined } from 
 import { useColors } from '../ThemeContext';
 import { pluralize } from '../utils';
 import DestinationPickerModal from './DestinationPickerModal';
-import { normalizeUiError } from '../errorHandling';
+import { isSessionExpired, normalizeUiError } from '../errorHandling';
 import { useBackClosesModal } from '../hooks/useOverlayClose';
 import { bulkDeleteConfirmText } from '../bulkSelection';
 
@@ -18,12 +18,16 @@ interface Props {
   onDownloadZip?: () => Promise<void>;
   /** The folder being browsed: the copy/move destination starts there. */
   currentPrefix?: string;
+  /** The raw selection keys: the destination picker refuses to copy them onto themselves. */
+  selectionKeys?: Iterable<string>;
   deleting: boolean;
   /** Shown when bulk handlers are omitted (user signed in for files only). */
   hint?: string;
+  /** Called instead of an error toast when the admin session expired. */
+  onSessionExpired?: () => void;
 }
 
-export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, onDelete, onCopy, onMove, onDownloadZip, deleting, hint, currentPrefix }: Props) {
+export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, onDelete, onCopy, onMove, onDownloadZip, deleting, hint, currentPrefix, selectionKeys, onSessionExpired }: Props) {
   const colors = useColors();
   const [modal, setModal] = useState<'copy' | 'move' | null>(null);
   const [operating, setOperating] = useState(false);
@@ -45,7 +49,8 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
         message.success(`${pluralize(result.succeeded, 'item')} ${op === 'copy' ? 'copied' : 'moved'}`);
       }
     } catch (e) {
-      message.error(normalizeUiError(e, `${op} failed`));
+      if (isSessionExpired(e) && onSessionExpired) onSessionExpired();
+      else message.error(normalizeUiError(e, `${op} failed`));
     } finally {
       setOperating(false);
       closeModal();
@@ -58,7 +63,8 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
       if (!onDownloadZip) return;
       await onDownloadZip();
     } catch (e) {
-      message.error(normalizeUiError(e, "Download failed"));
+      if (isSessionExpired(e) && onSessionExpired) onSessionExpired();
+      else message.error(normalizeUiError(e, 'Download failed'));
     } finally {
       setDownloading(false);
     }
@@ -158,6 +164,7 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
         onCancel={closeModal}
         loading={operating}
         currentPrefix={currentPrefix}
+        selectionKeys={selectionKeys}
       />
     </>
   );

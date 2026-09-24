@@ -153,12 +153,12 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
       open={open}
       onCancel={onClose}
       width={820}
-      maskClosable={false}
+      mask={{ closable: false }}
       footer={null}
-      destroyOnClose
+      destroyOnHidden
     >
       {mode === 'export' && (
-        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+        <Space orientation="vertical" size="small" style={{ width: '100%' }}>
           <Paragraph type="secondary" style={{ marginBottom: 8 }}>
             This is the canonical four-section YAML of the current
             runtime config. Secrets (SigV4 credentials, bootstrap
@@ -168,7 +168,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
             point the server at it with{' '}
             <Text code>--config</Text>, and restart.
           </Paragraph>
-          {error && <Alert type="error" message={error} showIcon />}
+          {error && <Alert type="error" title={error} showIcon />}
           <Input.TextArea
             value={yaml}
             readOnly
@@ -197,7 +197,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
       )}
 
       {mode === 'import' && (
-        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+        <Space orientation="vertical" size="small" style={{ width: '100%' }}>
           <Paragraph type="secondary" style={{ marginBottom: 8 }}>
             Paste a full YAML config document. Validate runs server-
             side (same logic as{' '}
@@ -231,7 +231,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
           {error && (
             <Alert
               type="error"
-              message="Validation error"
+              title="Validation error"
               description={<LinkifiedText text={error} />}
               showIcon
             />
@@ -239,7 +239,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
           {warnings.length > 0 && (
             <Alert
               type="warning"
-              message={`${warnings.length} warning${warnings.length === 1 ? '' : 's'}`}
+              title={`${warnings.length} warning${warnings.length === 1 ? '' : 's'}`}
               description={
                 <ul style={{ margin: '4px 0', paddingLeft: 18 }}>
                   {warnings.map((w, i) => (
@@ -255,7 +255,7 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
           {validated && !applyResult && (
             <Alert
               type="success"
-              message="YAML is valid"
+              title="YAML is valid"
               description="Click Apply to swap the running config."
               showIcon
             />
@@ -263,9 +263,9 @@ export function YamlImportExportModal({ open, mode, onClose, onApplied }: YamlMo
           {applyResult && applyResult.applied && (
             <Alert
               type="success"
-              message="Config applied"
+              title="Config applied"
               description={
-                <Space direction="vertical" size={2}>
+                <Space orientation="vertical" size={2}>
                   <div>
                     <Tag color={applyResult.persisted ? 'green' : 'orange'}>
                       {applyResult.persisted ? 'persisted to disk' : 'in-memory only'}

@@ -9,6 +9,9 @@ export interface IdentitySummary {
   detail: string;
 }
 
+/** The access key the proxy reports for a bootstrap-password session (see `session_user_info`). */
+const BOOTSTRAP_SESSION_KEY = 'bootstrap';
+
 export function identitySummary(
   identity: WhoamiResponse | null,
   accessKeyId: string | undefined,
@@ -22,6 +25,14 @@ export function identitySummary(
     return {
       name: user?.name || 'Administrator',
       detail: 'Bootstrap mode: one shared administrator credential, no IAM users yet.',
+    };
+  }
+  // A bootstrap-password session in IAM mode: whoami reports the synthetic
+  // user { name: 'admin', access_key_id: 'bootstrap' }, which is no IAM key.
+  if (user?.access_key_id === BOOTSTRAP_SESSION_KEY) {
+    return {
+      name: 'Administrator',
+      detail: 'Signed in with the bootstrap password, not as an IAM user.',
     };
   }
   const key = user?.access_key_id || accessKeyId;

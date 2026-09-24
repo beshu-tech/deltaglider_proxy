@@ -15,9 +15,8 @@ export default function CredentialsBanner({ accessKey, secretKey, message, onClo
     <Alert
       type="success"
       showIcon
-      closable
-      onClose={onClose}
-      message={message}
+      closable={{ onClose }}
+      title={message}
       description={
         <div style={{ marginTop: 8 }}>
           <Text type="secondary" style={{ fontSize: 10, textTransform: 'uppercase' }}>Access Key</Text>

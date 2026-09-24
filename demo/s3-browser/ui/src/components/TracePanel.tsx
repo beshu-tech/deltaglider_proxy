@@ -204,7 +204,7 @@ export default function TracePanel({ onSessionExpired }: Props) {
 
       {/* Error */}
       {error && (
-        <Alert type="error" showIcon message="Test failed" description={error} />
+        <Alert type="error" showIcon title="Test failed" description={error} />
       )}
 
       {/* Result */}
@@ -251,7 +251,7 @@ export default function TracePanel({ onSessionExpired }: Props) {
         <Alert
           type="info"
           showIcon
-          message="How to read the output"
+          title="How to read the output"
           description={
             <Paragraph type="secondary" style={{ fontSize: 13, marginBottom: 0 }}>
               The test uses the same request rules as real traffic,
