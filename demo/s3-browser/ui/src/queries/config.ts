@@ -6,7 +6,7 @@
  * panels adopt them. Keeping unused exports here would just earn knip warnings.
  */
 import { useQuery } from '@tanstack/react-query';
-import { getAdminConfig, type AdminConfig, type IamMode } from '../adminApi';
+import { getAdminConfig, getSection, type AdminConfig, type IamMode } from '../adminApi';
 import { normalizeUiError } from '../errorHandling';
 import { findEnvOverride, type EnvOverride } from '../envOverrides';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
@@ -56,4 +56,20 @@ export function useIamMode(onSessionExpired?: () => void): {
 export function useEnvOverride(yamlPath?: string, envVar?: string): EnvOverride | null {
   const { data } = useAdminConfig({ enabled: yamlPath !== undefined || envVar !== undefined });
   return findEnvOverride(data?.env_overrides, yamlPath, envVar);
+}
+
+/**
+ * All four configuration sections as the file would hold them (defaults left
+ * out). Keyed under `qk.config()`, so every config invalidation refreshes it.
+ */
+export function useConfigSections() {
+  return useQuery({
+    queryKey: [...qk.config(), 'sections'] as const,
+    queryFn: async () => {
+      const [admission, access, storage, advanced] = await Promise.all(
+        (['admission', 'access', 'storage', 'advanced'] as const).map((n) => getSection(n)),
+      );
+      return { admission, access, storage, advanced };
+    },
+  });
 }

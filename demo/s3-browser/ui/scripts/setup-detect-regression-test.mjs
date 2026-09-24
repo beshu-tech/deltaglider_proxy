@@ -7,60 +7,86 @@ const { outputText } = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ES2020, target: ts.ScriptTarget.ES2020 },
   fileName: 'setupDetect.ts',
 });
-const { describeExistingSetup } = await import(
+const { describeExistingSetup, settingsAtRisk } = await import(
   `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`
 );
 
 const fs = (name, path, extra = {}) => ({ name, backend_type: 'filesystem', path, endpoint: null, region: null, force_path_style: null, ...extra });
 const s3 = (name, endpoint, region, extra = {}) => ({ name, backend_type: 's3', path: null, endpoint, region, force_path_style: true, ...extra });
 
-const none0 = { bucketSettings: 0, requestRules: 0 };
+// ── settingsAtRisk: what applying the wizard (a WHOLE document) would lose ──
+const fresh = { admission: {}, access: {}, storage: {}, advanced: {} };
+assert.deepEqual(settingsAtRisk(fresh, []), [], 'a fresh install has nothing at risk');
+// An env-set listen address is not in the file: it survives, so no warning.
+assert.deepEqual(settingsAtRisk({ ...fresh, advanced: { listen_addr: '0.0.0.0:9000' } }, ['advanced.listen_addr']), []);
+// …but a listen address written in the file would be dropped.
+assert.deepEqual(settingsAtRisk({ ...fresh, advanced: { listen_addr: '0.0.0.0:9000' } }, []), ['the listen address']);
 
-// Fresh install: only the synthesized singleton, nothing configured.
-const fresh = describeExistingSetup([fs('default', './data', { is_synthesized: true })], none0, null);
-assert.equal(fresh.configured, false);
-assert.equal(fresh.kind, 'filesystem');
-assert.equal(fresh.backendCount, 0, 'the synthesized singleton is not a named backend');
-
-// Issue #92 review: a fresh proxy on a MinIO that already HAS buckets is not
-// "configured" — the buckets live on the storage, the wizard does not touch
-// them. Only the proxy's own configuration counts; the signature no longer
-// takes a bucket count at all.
-const freshS3 = describeExistingSetup(
-  [s3('default', 'http://minio:9000', 'us-east-1', { is_synthesized: true })],
-  none0,
-  null,
+// Issue #92 round-2 review: a single legacy backend (no named backends, no
+// bucket settings, no request rules) got no warning, and Apply dropped the
+// rest of the file.
+assert.deepEqual(
+  settingsAtRisk({ ...fresh, storage: { s3: { endpoint: 'http://minio:9000', region: 'us-east-1' } } }, []),
+  ['the storage backend settings'],
 );
-assert.equal(freshS3.configured, false);
-assert.equal(freshS3.kind, 's3');
+assert.deepEqual(settingsAtRisk({ ...fresh, storage: { filesystem: '/srv/dgp' } }, []), ['the storage backend settings']);
+// …unless the environment sets that backend.
+assert.deepEqual(settingsAtRisk({ ...fresh, storage: { backend: { type: 's3' } } }, ['storage.backend']), []);
+assert.deepEqual(settingsAtRisk({ ...fresh, access: { iam_mode: 'declarative' } }, []), ['the declarative IAM mode']);
+assert.deepEqual(settingsAtRisk({ ...fresh, access: { access_key_id: 'ak' } }, []), ['access settings']);
+assert.deepEqual(settingsAtRisk({ ...fresh, advanced: { config_sync_bucket: 'dgp-sync' } }, []), ['the configuration sync bucket']);
 
-// Singleton with bucket settings, or with request rules: configured.
-assert.equal(describeExistingSetup([fs('default', '/srv', { is_synthesized: true })], { bucketSettings: 2, requestRules: 0 }, null).configured, true);
-assert.equal(describeExistingSetup([fs('default', '/srv', { is_synthesized: true })], { bucketSettings: 0, requestRules: 1 }, null).configured, true);
+// The hunt proxy: everything named, in a stable order, deduplicated.
+const hunt = {
+  admission: { blocks: [{ name: 'block-bad-actor', match: {}, action: 'deny' }] },
+  access: {},
+  storage: {
+    backends: [{ name: 'hetzner-fsn1', type: 's3' }],
+    default_backend: 'hetzner-fsn1',
+    buckets: { releases: { backend: 'hetzner-fsn1' }, downloads: { public_prefixes: ['public/'] } },
+    replication: { enabled: true, rules: [{ name: 'r' }] },
+    lifecycle: { rules: [{ name: 'l' }] },
+  },
+  advanced: { listen_addr: '1.2.3.4:19080', log_level: 'warn', event_delivery: { enabled: true } },
+};
+assert.deepEqual(settingsAtRisk(hunt, []), [
+  'request rules',
+  'bucket settings',
+  'replication rules',
+  'lifecycle rules',
+  'storage backends',
+  'event delivery',
+  'the listen address',
+  'advanced settings',
+]);
+// Empty lists and nulls are defaults, not settings.
+assert.deepEqual(settingsAtRisk({ ...fresh, admission: { blocks: [] }, storage: { default_backend: null } }, []), []);
+
+// ── describeExistingSetup: configured = anything at risk; seeding ──
+assert.equal(describeExistingSetup([fs('default', './data', { is_synthesized: true })], [], null).configured, false);
+assert.equal(describeExistingSetup([fs('default', './data', { is_synthesized: true })], ['access settings'], null).configured, true);
 
 // Named backends, S3 default (issue #92 item 20: the wizard preselected
 // Filesystem on an S3-backed proxy).
-const hunt = describeExistingSetup(
+const h = describeExistingSetup(
   [s3('hetzner-fsn1', 'http://127.0.0.1:29000', 'fsn1'), fs('local-disk', '/data/local')],
-  { bucketSettings: 5, requestRules: 1 },
+  ['storage backends'],
   'hetzner-fsn1',
 );
-assert.equal(hunt.configured, true);
-assert.equal(hunt.kind, 's3');
-assert.equal(hunt.s3Endpoint, 'http://127.0.0.1:29000');
-assert.equal(hunt.s3Region, 'fsn1');
-assert.equal(hunt.fsPath, '');
-assert.equal(hunt.backendCount, 2);
-assert.equal(hunt.bucketSettingsCount, 5);
-assert.equal(hunt.requestRuleCount, 1);
+assert.equal(h.configured, true);
+assert.equal(h.kind, 's3');
+assert.equal(h.s3Endpoint, 'http://127.0.0.1:29000');
+assert.equal(h.s3Region, 'fsn1');
+assert.equal(h.fsPath, '');
+assert.deepEqual(h.atRisk, ['storage backends']);
 
 // Default names a filesystem backend: its path carries over.
-const local = describeExistingSetup([s3('a', 'http://x', 'r'), fs('b', '/srv/b')], none0, 'b');
+const local = describeExistingSetup([s3('a', 'http://x', 'r'), fs('b', '/srv/b')], [], 'b');
 assert.equal(local.kind, 'filesystem');
 assert.equal(local.fsPath, '/srv/b');
 
 // No backends at all.
-const none = describeExistingSetup([], none0, null);
+const none = describeExistingSetup([], [], null);
 assert.equal(none.configured, false);
 assert.equal(none.kind, null);
 
