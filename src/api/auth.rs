@@ -487,7 +487,7 @@ impl SigV4Params {
 /// Check whether the query string contains presigned URL parameters.
 /// Uses proper key-level parsing instead of substring matching.
 fn has_presigned_query_params(query: &str) -> bool {
-    RequestTarget::parse("/", Some(query)).is_ok_and(|t| t.has_query("X-Amz-Algorithm"))
+    RequestTarget::parse("/", Some(query)).is_ok_and(|t| t.is_presigned_v4())
 }
 
 /// Bucket-level HTML form upload candidates (`POST /bucket` with multipart form-data)
@@ -991,6 +991,14 @@ mod tests {
         assert!(resolved_identity_is_verified(Some(&alice), Some("AKALICE")));
         // Duplicate Authorization headers: s3s verified nothing.
         assert!(!resolved_identity_is_verified(Some(&alice), None));
+        // A stored user NAMED `$anonymous` is not the anonymous principal.
+        let named_anon = AuthenticatedUser {
+            name: crate::iam::types::ANONYMOUS_USER_NAME.into(),
+            access_key_id: "AKREAL".into(),
+            permissions: vec![],
+            iam_policies: vec![],
+        };
+        assert!(!resolved_identity_is_verified(Some(&named_anon), None));
         // SigV2 query signed by another key.
         assert!(!resolved_identity_is_verified(
             Some(&alice),
@@ -1081,12 +1089,12 @@ mod tests {
     #[test]
     fn test_has_presigned_query_params() {
         assert!(has_presigned_query_params(
-            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=foo"
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=foo&X-Amz-Signature=ab"
         ));
         assert!(!has_presigned_query_params("list-type=2&prefix=test"));
         assert!(!has_presigned_query_params(""));
-        // Should not match substring (e.g. a value containing "X-Amz-Algorithm=")
-        assert!(!has_presigned_query_params("foo=X-Amz-Algorithm%3Dbar"));
+        // Should not match substring (e.g. a value containing "X-Amz-Signature=")
+        assert!(!has_presigned_query_params("foo=X-Amz-Signature%3Dbar"));
     }
     #[test]
     fn replay_cache_pruning_enforces_hard_cap() {

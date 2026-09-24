@@ -1568,7 +1568,7 @@ async fn import_backup_iam(
 
     for (idx, bu) in backup.users.iter().enumerate() {
         // Block reserved names
-        if bu.name.starts_with('$') {
+        if crate::iam::types::is_reserved_principal_name(&bu.name) {
             tracing::warn!("Skipping user '{}': reserved name", bu.name);
             result.users_skipped += 1;
             continue;

@@ -144,9 +144,8 @@ pub async fn admission_middleware(mut request: Request<Body>, next: Next) -> Res
 /// synthetic inputs (via its own adapter — trace takes a JSON payload,
 /// not a live request).
 ///
-/// Bucket and key parsing mirrors the logic the old inline SigV4 bypass
-/// used (`trim_start_matches('/')` + `split_once('/')`), so the admission
-/// chain sees exactly what that code did.
+/// Bucket, key and list prefix come from `RequestTarget`, decoded as s3s
+/// decodes them, so a block matches the resource s3s will serve.
 ///
 /// Source IP comes from the same extractor the rate limiter uses
 /// (`rate_limiter::extract_client_ip`) — honors `DGP_TRUST_PROXY_HEADERS`
@@ -202,10 +201,9 @@ impl OwnedRequestInfo {
     /// Build an `OwnedRequestInfo` from already-extracted raw inputs.
     ///
     /// - `method` — uppercased via `to_ascii_uppercase`.
-    /// - `path` — leading `/` trimmed; `bucket/key` split on the
-    ///   first remaining `/`; bucket lowercased; key percent-decoded.
-    /// - `query` — accepts both `?prefix=…` and bare `prefix=…`;
-    ///   `prefix` value is percent-decoded.
+    /// - `path` / `query` — decoded through `RequestTarget` exactly as s3s
+    ///   decodes them (`%2F` is a separator, query names decoded, `+` is a
+    ///   space); bucket lowercased. The query may carry a leading `?`.
     /// - `authenticated` — caller's responsibility to determine
     ///   (Authorization header or presigned query param for the
     ///   HTTP path; explicit body field for trace).
@@ -270,32 +268,23 @@ use crate::api::request_target::RequestTarget;
 /// Detects whether the URL query carries a SigV4 presigned-URL
 /// `X-Amz-Credential` parameter (name decoded, case ignored).
 fn has_presigned_query_params(query: &str) -> bool {
-    RequestTarget::parse("/", Some(query))
-        .is_ok_and(|t| t.has_query_ignore_case("X-Amz-Credential"))
+    RequestTarget::parse("/", Some(query)).is_ok_and(|t| t.is_presigned_v4())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Same test as the SigV4 middleware and s3s: the `X-Amz-Signature`
+    /// parameter (see `RequestTarget::is_presigned_v4`).
     #[test]
-    fn has_presigned_detects_case_insensitive() {
+    fn has_presigned_matches_s3s() {
         assert!(has_presigned_query_params(
-            "X-Amz-Credential=AKIA%2F...&X-Amz-Date=..."
-        ));
-        assert!(has_presigned_query_params(
-            "x-amz-credential=AKIA&x-amz-date=..."
+            "X-Amz-Credential=AKIA%2F...&X-Amz-Date=...&X-Amz-Signature=ab"
         ));
         assert!(!has_presigned_query_params("prefix=releases/&marker=x"));
         assert!(!has_presigned_query_params(""));
-    }
-
-    #[test]
-    fn has_presigned_ignores_values_that_look_like_credentials() {
-        // The key must be X-Amz-Credential, not the value.
-        assert!(!has_presigned_query_params("foo=X-Amz-Credential"));
-        // An encoded parameter NAME is still the parameter.
-        assert!(has_presigned_query_params("%58-Amz-Credential=AKIA"));
+        assert!(!has_presigned_query_params("foo=X-Amz-Signature"));
     }
 
     /// Admission matches the bucket and key s3s will serve, not the raw

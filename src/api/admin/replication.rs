@@ -652,8 +652,9 @@ pub async fn resume(
         })?
         .lock()
         .await;
-    let _ = db.replication_ensure_state(&name, replication::current_unix_seconds());
-    db.replication_set_paused(&name, false)
+    let now = replication::current_unix_seconds();
+    let _ = db.replication_ensure_state(&name, now);
+    db.replication_resume(&name, now)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
     crate::audit::audit_log("replication_resume", "admin", &name, headers, "", "");
     Ok(StatusCode::NO_CONTENT)

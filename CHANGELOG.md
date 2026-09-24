@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+### Security — Authentication and authorization fixes
+
+This release closes several authentication and authorization defects. Upgrade
+promptly.
+
+- A request is now honoured only when the S3 signature layer verified the same
+  access key that the proxy resolved the caller to. Before this fix, a request
+  that carried two `Authorization` headers, or a SigV2 query string next to a
+  SigV4 header, could act as any user whose access key ID the caller knew.
+- Authorization, admission blocks and the maintenance write gate now check the
+  bucket, key and query exactly as the S3 layer decodes them. Before this fix,
+  one percent-encoded character (for example `%2F`, `%74`, or `%70refix=`), or
+  an extra `/` in front of the key, made the policy check a different resource
+  from the one that the proxy served.
+- An OAuth or OIDC login now receives an admin session only when the user is an
+  admin, through direct or group permissions. Other users receive the
+  browser-only session, which is the same session that an IAM non-admin
+  receives from browser-connect.
+- Every admin request now checks that the session's user is still an enabled
+  admin. A user who is disabled or demoted loses the admin API on the next
+  request.
+- User names that start with `$` are reserved for built-in principals. The
+  admin API, backup import and OAuth provisioning now refuse or strip them.
+
+### Changed — `${iam:username}` matches names that contain punctuation
+
+Because authorization now compares policies against the decoded key, the
+`${iam:username}` and `${iam:access_key_id}` templates insert the name as it
+is. A policy on `home/${iam:username}/*` now matches the key
+`home/dana@corp.com/report.pdf` for the user `dana@corp.com`. Only the
+characters that change the meaning of a pattern (`/`, `*`, `?`, `$`, `{`, `}`
+and `%`) are escaped.
+
+### Changed — A paused replication rule also pauses event-driven replication
+
+Before this release, pausing a rule stopped only the scheduled reconcile run.
+The event consumer still copied new objects and propagated deletes. Now a
+paused rule does nothing, and the events for it during the pause are not
+queued. Resuming the rule makes it due at once, so the next scheduler tick
+starts a reconcile run that brings the destination in sync. With
+`replicate_deletes: true`, that run applies the source's deletes too; to keep
+deleted objects on the destination, turn `replicate_deletes` off.
+
+### Changed — The persisted config file is no longer world-readable
+
+The config file holds credentials and encryption keys. When the proxy writes
+it, a new file now gets mode `0600`, and a rewrite keeps the owner and group
+permissions of the old file but removes all permissions for other users. An
+existing `0644` file therefore becomes `0640` on its next write.
+
 ### Changed — The build version is no longer advertised to anonymous callers
 
 `GET /_/api/whoami` returns `version` only when the request carries a live

@@ -46,11 +46,18 @@ impl RequestTarget {
         Self::parse(uri.path(), uri.query())
     }
 
-    /// Path-style `(bucket, key)`: the first segment after the leading `/`,
-    /// and everything after the next `/` (empty for bucket-level requests).
+    /// Path-style `(bucket, key)`, as the engine resolves them.
+    ///
+    /// The bucket is the segment after the ONE leading `/` (s3s strips one;
+    /// `//b/k` has an empty bucket, which s3s refuses). The key is everything
+    /// after the next `/`, with its leading slashes removed: s3s passes
+    /// `/b//k` on as key `/k`, and `ObjectKey::parse` serves it as `k`. So the
+    /// policy must check `k` too, or `GET /b//secret` escapes a Deny on
+    /// `b/secret*`.
     pub fn bucket_and_key(&self) -> (&str, &str) {
-        let trimmed = self.path.trim_start_matches('/');
-        trimmed.split_once('/').unwrap_or((trimmed, ""))
+        let path = self.path.strip_prefix('/').unwrap_or(&self.path);
+        let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
+        (bucket, key.trim_start_matches('/'))
     }
 
     /// The bucket segment, or `None` for the service root (`/`).
@@ -59,8 +66,11 @@ impl RequestTarget {
         (!bucket.is_empty()).then_some(bucket)
     }
 
-    /// First value of query parameter `name`. s3s rejects a duplicated
-    /// parameter, so the first value is the only one a handler can see.
+    /// First value of query parameter `name`. s3s refuses a duplicated
+    /// parameter when it parses it as a handler argument (`prefix`,
+    /// `delimiter`, `max-keys`, …), so for those the first value is the only
+    /// one a handler can see. s3s ROUTING instead treats a duplicate as absent
+    /// (`get_unique`); do not use this for a routing parameter.
     pub fn query_value(&self, name: &str) -> Option<&str> {
         self.query
             .iter()
@@ -72,9 +82,11 @@ impl RequestTarget {
         self.query.iter().any(|(k, _)| k == name)
     }
 
-    /// `has_query`, ignoring ASCII case of the parameter name.
-    pub fn has_query_ignore_case(&self, name: &str) -> bool {
-        self.query.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+    /// Whether s3s treats this request as SigV4-presigned: it selects the
+    /// presigned path on the `X-Amz-Signature` parameter (name decoded,
+    /// case-sensitive). THE one presigned test for every pre-s3s decision.
+    pub fn is_presigned_v4(&self) -> bool {
+        self.has_query("X-Amz-Signature")
     }
 }
 
@@ -101,6 +113,17 @@ mod tests {
     }
 
     #[test]
+    fn leading_slashes_of_the_key_are_dropped_like_the_engine() {
+        let t = RequestTarget::parse("/b//secret.txt", None).unwrap();
+        assert_eq!(t.bucket_and_key(), ("b", "secret.txt"));
+        let t = RequestTarget::parse("/b/%2F%2Fsecret.txt", None).unwrap();
+        assert_eq!(t.bucket_and_key(), ("b", "secret.txt"));
+        // s3s strips ONE leading slash: `//b/k` has an empty bucket.
+        let t = RequestTarget::parse("//b/k", None).unwrap();
+        assert_eq!(t.bucket_and_key(), ("", "b/k"));
+    }
+
+    #[test]
     fn bucket_level_and_root() {
         let t = RequestTarget::parse("/bucket", None).unwrap();
         assert_eq!(t.bucket_and_key(), ("bucket", ""));
@@ -122,10 +145,22 @@ mod tests {
     }
 
     #[test]
-    fn presigned_parameter_name_may_be_encoded() {
-        let t = RequestTarget::parse("/b/k", Some("%58-Amz-Credential=AK%2F20260101")).unwrap();
-        assert!(t.has_query("X-Amz-Credential"));
-        assert!(t.has_query_ignore_case("x-amz-credential"));
+    fn presigned_is_keyed_on_the_signature_parameter_like_s3s() {
+        let t =
+            RequestTarget::parse("/b/k", Some("X-Amz-Credential=AK&%58-Amz-Signature=ab")).unwrap();
+        assert!(
+            t.is_presigned_v4(),
+            "an encoded parameter NAME is still the parameter"
+        );
+        let t = RequestTarget::parse("/b/k", Some("X-Amz-Algorithm=AWS4-HMAC-SHA256")).unwrap();
+        assert!(!t.is_presigned_v4());
+        let t = RequestTarget::parse("/b/k", Some("x-amz-signature=ab")).unwrap();
+        assert!(
+            !t.is_presigned_v4(),
+            "s3s matches the name case-sensitively"
+        );
+        let t = RequestTarget::parse("/b/k", Some("foo=X-Amz-Signature")).unwrap();
+        assert!(!t.is_presigned_v4());
     }
 
     #[test]
@@ -140,19 +175,24 @@ mod tests {
     fn pre_s3s_decision_points_do_not_decode_by_hand() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         // Built at runtime so this test's own source is no hit.
-        let needles = [
-            ["urlencoding::", "decode("].concat(),
-            [".split('", "&')"].concat(),
-        ];
-        for file in [
-            "api/auth.rs",
-            "iam/middleware.rs",
-            "admission/middleware.rs",
-            "maintenance/gate.rs",
-            "coordination/health.rs",
+        let decode = ["urlencoding::", "decode("].concat();
+        let query_split = [".split('", "&')"].concat();
+        // Splitting a path into bucket/key by hand (the raw-path bug class).
+        let path_split = ["split_once('", "/')"].concat();
+        let path_trim = ["trim_start_matches('", "/')"].concat();
+        let all = [decode.clone(), query_split.clone(), path_split, path_trim];
+        // `api/auth.rs` also splits SigV4 credential scopes on `/`, which is
+        // not a request path, so it gets only the decode/query needles.
+        let auth_only = [decode, query_split];
+        for (file, needles) in [
+            ("api/auth.rs", &auth_only[..]),
+            ("iam/middleware.rs", &all[..]),
+            ("admission/middleware.rs", &all[..]),
+            ("maintenance/gate.rs", &all[..]),
+            ("coordination/health.rs", &all[..]),
         ] {
             let text = std::fs::read_to_string(root.join(file)).unwrap();
-            for needle in &needles {
+            for needle in needles {
                 assert!(
                     !text.contains(needle.as_str()),
                     "{file} decodes the request target by hand ({needle}); use RequestTarget"
@@ -162,9 +202,11 @@ mod tests {
     }
 
     #[test]
-    fn multibyte_after_percent_does_not_panic() {
-        // S20: the old hand-rolled decoder sliced mid-character here.
-        let t = RequestTarget::parse("/b/%a\u{e9}", Some("k=%a\u{e9}"));
-        assert!(t.is_ok() || t == Err(InvalidUri));
+    fn multibyte_after_percent_is_kept_literally() {
+        // The old hand-rolled decoder sliced mid-character here and panicked.
+        // An incomplete escape stays literal text, as s3s keeps it.
+        let t = RequestTarget::parse("/b/%a\u{e9}", Some("k=%a\u{e9}")).unwrap();
+        assert_eq!(t.bucket_and_key(), ("b", "%a\u{e9}"));
+        assert_eq!(t.query_value("k"), Some("%a\u{e9}"));
     }
 }

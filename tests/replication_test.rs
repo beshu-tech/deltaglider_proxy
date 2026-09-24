@@ -1485,9 +1485,11 @@ async fn test_event_driven_replication_copies_and_deletes() {
     );
 }
 
-/// Pausing a rule must stop the event consumer too, not only the scheduler.
-/// An operator pauses a mirror to protect the replica during a mass delete on
-/// the source; the delete events must not reach the destination.
+/// Pausing a rule must stop the event consumer too, not only the scheduler:
+/// while the rule is paused, a delete on the source must not reach the
+/// replica. (Pause DELAYS: resume makes the rule due, and its reconcile run
+/// then applies whatever the source says, deletes included under
+/// `replicate_deletes`. To keep deleted objects, turn `replicate_deletes` off.)
 #[tokio::test]
 async fn test_paused_rule_event_consumer_does_not_propagate_deletes() {
     let server = TestServer::builder()

@@ -806,7 +806,12 @@ pub async fn login_as(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    if !user.is_admin() {
+    // The same rule that mints the OAuth session kind and gates every admin
+    // request afterwards.
+    let auth_method = AuthMethod::IamLoginAs {
+        access_key_id: body.access_key_id.clone(),
+    };
+    if !session_principal_is_admin(&auth_method, &iam_state) {
         return Err(StatusCode::FORBIDDEN);
     }
 
@@ -819,9 +824,7 @@ pub async fn login_as(
         &state,
         &req_headers,
         connect_info.as_ref(),
-        AuthMethod::IamLoginAs {
-            access_key_id: body.access_key_id.clone(),
-        },
+        auth_method,
         SessionKind::AdminGui,
     );
 
@@ -1097,11 +1100,10 @@ pub(crate) fn session_principal_is_admin(method: &AuthMethod, iam: &IamState) ->
 /// admin group was removed, locally or through config sync) loses the admin
 /// surface on the next request. Every admin-session check goes through here.
 fn admin_gui_session_ok(state: &AdminState, token: &str, client_ip: Option<IpAddr>) -> bool {
-    state.sessions.allows_admin_gui(token, client_ip)
-        && state
-            .sessions
-            .auth_method(token, client_ip)
-            .is_some_and(|method| session_principal_is_admin(&method, &state.iam_state.load()))
+    state
+        .sessions
+        .admin_gui_auth_method(token, client_ip)
+        .is_some_and(|method| session_principal_is_admin(&method, &state.iam_state.load()))
 }
 
 /// Middleware: valid **AdminGui** session only (rejects S3BrowserLift cookies),
@@ -1395,42 +1397,6 @@ mod tests {
             auth_source: "local".into(),
             iam_policies: vec![],
         }
-    }
-
-    /// `SessionStore::allows_admin_gui` checks the session KIND only. Any
-    /// caller other than `admin_gui_session_ok` would skip the live-principal
-    /// check and let a disabled or demoted admin back in.
-    #[test]
-    fn allows_admin_gui_is_only_called_through_admin_gui_session_ok() {
-        fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    walk(&path, hits);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    let text = std::fs::read_to_string(&path).unwrap();
-                    // Built at runtime so this test's own source is no hit.
-                    let needle = [".allows_admin_gui", "("].concat();
-                    for (n, line) in text.lines().enumerate() {
-                        if line.contains(&needle) {
-                            hits.push(format!("{}:{}", path.display(), n + 1));
-                        }
-                    }
-                }
-            }
-        }
-        let mut hits = Vec::new();
-        walk(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut hits,
-        );
-        let outside: Vec<_> = hits.iter().filter(|h| !h.contains("session.rs")).collect();
-        assert_eq!(
-            outside.len(),
-            1,
-            "only admin_gui_session_ok may call allows_admin_gui: {outside:?}"
-        );
-        assert!(outside[0].contains("api/admin/auth.rs"));
     }
 
     /// Truth table: a session reaches the admin surface only while its

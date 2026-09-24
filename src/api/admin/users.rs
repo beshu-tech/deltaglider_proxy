@@ -237,7 +237,7 @@ pub async fn create_user(
     }
 
     // Block reserved names
-    if body.name.starts_with('$') {
+    if crate::iam::types::is_reserved_principal_name(&body.name) {
         tracing::warn!("User name cannot start with '$': {:?}", body.name);
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -300,7 +300,7 @@ pub async fn clone_user(
             next_copy_name(&source.name, names)
         });
 
-    if name.starts_with('$') {
+    if crate::iam::types::is_reserved_principal_name(&name) {
         tracing::warn!("User name cannot start with '$': {:?}", name);
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -347,6 +347,14 @@ pub async fn update_user(
     headers: HeaderMap,
     Json(body): Json<UpdateUserRequest>,
 ) -> Result<Json<IamUser>, StatusCode> {
+    if body
+        .name
+        .as_deref()
+        .is_some_and(crate::iam::types::is_reserved_principal_name)
+    {
+        tracing::warn!("User name cannot start with '$': {:?}", body.name);
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
 

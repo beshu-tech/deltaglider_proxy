@@ -291,7 +291,21 @@ impl SessionStore {
             .unwrap_or(false)
     }
 
-    /// Full admin GUI (config, IAM, operator APIs). `S3BrowserLift` sessions return false.
+    /// The auth method of a live `AdminGui` session, read under ONE lock (so
+    /// the kind and the principal come from the same entry). `None` for an
+    /// unknown, expired, revoked or browser-lift session. The admin gate
+    /// (`admin_gui_session_ok`) must still check the principal against the
+    /// live IAM index: the kind alone is fixed at mint time.
+    pub fn admin_gui_auth_method(&self, token: &str, ip: Option<IpAddr>) -> Option<AuthMethod> {
+        let sessions = self.sessions.read();
+        let info = sessions.get(token)?;
+        (self.entry_valid(info, ip) && info.kind == SessionKind::AdminGui)
+            .then(|| info.auth_method.clone())
+    }
+
+    /// Kind-only check. Test-only: production code goes through
+    /// `admin_gui_auth_method` + the live-principal check.
+    #[cfg(test)]
     pub fn allows_admin_gui(&self, token: &str, ip: Option<IpAddr>) -> bool {
         let sessions = self.sessions.read();
         let Some(info) = sessions.get(token) else {

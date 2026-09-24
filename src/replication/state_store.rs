@@ -324,6 +324,19 @@ impl ConfigDb {
         Ok(n > 0)
     }
 
+    /// Resume a paused rule and make it due no later than `now`. The event
+    /// consumer drops a paused rule's events, so the reconcile run that the
+    /// next scheduler tick starts is what catches the destination up.
+    /// Returns `true` if the row existed.
+    pub fn replication_resume(&self, rule_name: &str, now: i64) -> Result<bool, ConfigDbError> {
+        let n = self.conn.execute(
+            "UPDATE replication_state SET paused = 0, next_due_at = MIN(next_due_at, ?) \
+             WHERE rule_name = ?",
+            params![now, rule_name],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Try to acquire the per-rule run lease.
     ///
     /// This is the single-flight guard shared by the periodic scheduler
@@ -1313,6 +1326,36 @@ mod tests {
         assert!(db.replication_load_state("r").unwrap().unwrap().paused);
         assert!(db.replication_set_paused("r", false).unwrap());
         assert!(!db.replication_load_state("r").unwrap().unwrap().paused);
+    }
+
+    #[test]
+    fn resume_unpauses_and_makes_the_rule_due_now() {
+        let db = db();
+        db.replication_ensure_state("r", 100).unwrap();
+        db.replication_set_paused("r", true).unwrap();
+        db.conn
+            .execute(
+                "UPDATE replication_state SET next_due_at = 99999 WHERE rule_name = 'r'",
+                [],
+            )
+            .unwrap();
+        assert!(db.replication_resume("r", 500).unwrap());
+        let st = db.replication_load_state("r").unwrap().unwrap();
+        assert!(!st.paused);
+        assert_eq!(st.next_due_at, 500);
+        // An earlier due time is kept.
+        db.conn
+            .execute(
+                "UPDATE replication_state SET next_due_at = 10 WHERE rule_name = 'r'",
+                [],
+            )
+            .unwrap();
+        db.replication_resume("r", 500).unwrap();
+        assert_eq!(
+            db.replication_load_state("r").unwrap().unwrap().next_due_at,
+            10
+        );
+        assert!(!db.replication_resume("ghost", 500).unwrap());
     }
 
     #[test]

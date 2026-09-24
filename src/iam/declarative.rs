@@ -700,7 +700,7 @@ fn validate(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<(), String> {
     // Reserved-name blocks ($-prefixed are reserved for synthetic
     // principals like $anonymous and $bootstrap).
     for u in &yaml.users {
-        if u.name.starts_with('$') {
+        if crate::iam::types::is_reserved_principal_name(&u.name) {
             return Err(format!(
                 "user '{}': names starting with `$` are reserved",
                 u.name
