@@ -164,15 +164,6 @@ impl TestServer {
         extra_env: Vec<(String, String)>,
     ) -> Self {
         let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        // DIAG(pr93): all integration tests now share one process; report a
-        // port that something else already holds when we are about to use it.
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
-            eprintln!(
-                "[port-diag] port {} already in use before spawn (test thread {:?})",
-                port,
-                std::thread::current().name()
-            );
-        }
 
         // Build full config with listen_addr prepended (flat YAML shape).
         let full_config = format!("listen_addr: \"127.0.0.1:{}\"\n{}", port, config_body);
