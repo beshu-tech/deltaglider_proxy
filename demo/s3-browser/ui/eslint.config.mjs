@@ -112,6 +112,12 @@ export default tseslint.config(
       ],
     },
   },
+  // Dev-only page entry (like main.tsx): it mounts itself and exports
+  // nothing, so Fast Refresh boundaries don't apply.
+  {
+    files: ['src/storyboard.tsx'],
+    rules: { 'react-refresh/only-export-components': 'off' },
+  },
   // The two sanctioned wrappers are the only places allowed to touch the raw APIs.
   {
     files: ['src/safeStorage.ts'],
