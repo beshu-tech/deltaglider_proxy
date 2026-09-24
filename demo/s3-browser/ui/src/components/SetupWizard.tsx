@@ -70,21 +70,15 @@ import {
   setupStepComplete,
   type SetupEnvControl,
 } from '../setupYaml';
-import { useAdminConfig } from '../queries/config';
-import { describeExistingSetup, type ExistingSetup } from '../setupDetect';
+import { useAdminConfig, useConfigSections } from '../queries/config';
+import { describeExistingSetup, settingsAtRisk } from '../setupDetect';
 import { ABSOLUTE_PATH_ERROR, isAbsolutePath } from '../utils';
 
 const { Text, Paragraph } = Typography;
 
-/** "2 named backends, 5 bucket settings and 1 request rule" (non-zero parts only). */
-function describeCounts(e: ExistingSetup): string {
-  const n = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
-  const parts = [
-    e.backendCount > 0 ? n(e.backendCount, 'named backend', 'named backends') : '',
-    e.bucketSettingsCount > 0 ? n(e.bucketSettingsCount, 'bucket setting', 'bucket settings') : '',
-    e.requestRuleCount > 0 ? n(e.requestRuleCount, 'request rule', 'request rules') : '',
-  ].filter(Boolean);
-  return parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0] ?? '';
+/** "a, b and c". */
+function joinList(items: string[]): string {
+  return items.length > 1 ? `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}` : items[0] ?? '';
 }
 
 type BackendKind = 'filesystem' | 's3';
@@ -145,22 +139,24 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
   // The wizard applies a WHOLE configuration document. On a proxy that is
   // already configured, say so first, and start from the running backend's
   // type instead of a Filesystem default that contradicts it.
-  // Only the proxy's own configuration counts (named backends, bucket
-  // settings, request rules), not buckets that exist on the storage.
-  // Until the check settles the steps stay hidden; if it fails, the
-  // warning shows (fail closed).
+  // Fail safe: every setting the running file holds is at risk, because
+  // Apply replaces the whole document (settingsAtRisk). Until the check
+  // settles the steps stay hidden; if it fails, the warning shows.
   const configQuery = useAdminConfig();
-  const existing = configQuery.data
-    ? describeExistingSetup(
-        configQuery.data.backends,
-        {
-          bucketSettings: Object.keys(configQuery.data.bucket_policies ?? {}).length,
-          requestRules: configQuery.data.admission_blocks?.length ?? 0,
-        },
-        configQuery.data.default_backend,
-      )
-    : null;
-  const checkFailed = configQuery.isError && !configQuery.data;
+  const sectionsQuery = useConfigSections();
+  const existing =
+    configQuery.data && sectionsQuery.data
+      ? describeExistingSetup(
+          configQuery.data.backends,
+          settingsAtRisk(
+            sectionsQuery.data,
+            (configQuery.data.env_overrides ?? []).flatMap((o) => (o.yaml_path ? [o.yaml_path] : [])),
+          ),
+          configQuery.data.default_backend,
+        )
+      : null;
+  const checkFailed = !existing && (configQuery.isError || sectionsQuery.isError);
+  const checkError = configQuery.error ?? sectionsQuery.error;
   const [overwriteConfirmed, setOverwriteConfirmed] = useState(false);
   // Answers the environment already gives (DGP_* variables): shown
   // read-only, counted as answered, and left out of the generated YAML.
@@ -394,7 +390,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
         </Paragraph>
       </header>
 
-      {configQuery.isPending ? (
+      {!existing && !checkFailed ? (
         <div style={{ display: 'flex', justifyContent: 'center', padding: 48 }}>
           <Spin description="Checking the current configuration…"><div style={{ padding: 24 }} /></Spin>
         </div>
@@ -406,15 +402,19 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
           description={
             <div>
               <Paragraph style={{ marginBottom: 12 }}>
+                This wizard writes a complete new configuration, which replaces the current one.{' '}
                 {existing ? (
-                  <>It has {describeCounts(existing)}. </>
+                  <>
+                    These settings would be lost or replaced: {joinList(existing.atRisk)}.{' '}
+                  </>
                 ) : (
-                  <>{normalizeUiError(configQuery.error, 'The configuration did not load').replace(/\.$/, '')}. The proxy may already be configured. </>
+                  <>
+                    {normalizeUiError(checkError, 'The configuration did not load').replace(/\.$/, '')}, so
+                    the wizard cannot tell what would be lost.{' '}
+                  </>
                 )}
-                This wizard writes a complete new configuration, which replaces the current one:
-                backends, bucket settings and request rules that the wizard does not ask about are
-                removed. The objects in your buckets are not touched. To change one thing, use its
-                settings page instead.
+                Settings from environment variables and the objects in your buckets are not touched.
+                To change one thing, use its settings page instead.
               </Paragraph>
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <Button type="primary" onClick={onCancel}>

@@ -42,7 +42,8 @@ function sourceIpEntryError(entry: string): string | null {
   }
   if (prefix !== undefined) {
     const max = v4 ? 32 : 128;
-    if (!/^\d{1,3}$/.test(prefix) || Number(prefix) > max) {
+    // No leading zeros: the server rejects /008.
+    if (!/^(0|[1-9]\d{0,2})$/.test(prefix) || Number(prefix) > max) {
       return `has a network size that is not between /0 and /${max}`;
     }
   }

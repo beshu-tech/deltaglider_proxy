@@ -3,7 +3,7 @@ import { LinkifiedText } from './LinkifiedText';
 import { CAPABILITY_DOC_URL } from '../linkifyDocUrl';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
-import { Button, Input, Modal, Radio, Switch, Typography, Space, Alert, Spin, message } from 'antd';
+import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin, message } from 'antd';
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
 import type { BackendHealthEntry, BackendInfo, CreateBackendRequest } from '../adminApi';
 import { createBackend, deleteBackend, probeBackend, testS3Connection, updateAdminConfig, putSection } from '../adminApi';
@@ -22,7 +22,7 @@ import { normalizeUiError } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { isSessionExpired } from '../errorHandling';
 import { ABSOLUTE_PATH_ERROR, isAbsolutePath } from '../utils';
-import RowActionsMenu from './RowActionsMenu';
+import RowActionsMenu, { type RowActionConfirm } from './RowActionsMenu';
 import { backendEncryptionEnvPath, envOverrideHelp, envOverrideSource, findEnvOverride } from '../envOverrides';
 
 const { Text } = Typography;
@@ -224,12 +224,12 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
     }
   };
 
-  const handleDelete = (name: string) => {
+  // The row's "⋯" menu shows this confirmation, then runs removeBackend.
+  const removeConfirm = (name: string): RowActionConfirm => {
     const routedHere = countByBackend[name] ?? 0;
-    Modal.confirm({
+    return {
       title: `Remove backend "${name}"?`,
       okText: 'Remove backend',
-      okButtonProps: { danger: true },
       content: (
         <Text type="secondary" style={{ fontSize: 13 }}>
           {routedHere > 0 ? (
@@ -244,20 +244,20 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           The stored data itself is not deleted.
         </Text>
       ),
-      onOk: async () => {
-        try {
-          const result = await deleteBackend(name);
-          if (result.success) {
-            message.success(`Backend "${name}" removed`);
-            await refresh();
-          } else {
-            setSaveResult({ ok: false, message: result.error || 'Failed to delete' });
-          }
-        } catch (e) {
-          setSaveResult({ ok: false, message: normalizeUiError(e, "Network error") });
-        }
-      },
-    });
+    };
+  };
+  const removeBackend = async (name: string) => {
+    try {
+      const result = await deleteBackend(name);
+      if (result.success) {
+        message.success(`Backend "${name}" removed`);
+        await refresh();
+      } else {
+        setSaveResult({ ok: false, message: result.error || 'Failed to delete' });
+      }
+    } catch (e) {
+      setSaveResult({ ok: false, message: normalizeUiError(e, "Network error") });
+    }
   };
 
   // Server-side probe: exercises the SERVER's credentials + endpoint +
@@ -488,9 +488,8 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                         label: 'Remove backend…',
                         icon: <DeleteOutlined />,
                         danger: true,
-                        // handleDelete opens its own dialog: it names the buckets routed here.
-                        confirm: 'caller',
-                        onSelect: () => handleDelete(b.name),
+                        confirm: removeConfirm(b.name),
+                        onSelect: () => removeBackend(b.name),
                       },
                     ]}
                   />

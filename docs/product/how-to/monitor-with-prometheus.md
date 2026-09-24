@@ -224,7 +224,7 @@ groups:
 
 ![Built-in analytics dashboard](/_/screenshots/analytics.jpg)
 
-The admin UI ships a live monitoring page at `/_/admin/dashboard` — same metrics, auto-refreshed every 5s, with a storage-analytics tab that surfaces per-bucket savings and estimated cost. The Monitoring view leads with 9 headline KPIs; deeper codec/latency telemetry sits behind a default-closed "Detailed telemetry" toggle. It's not a substitute for Grafana in production (no historical retention, no alerting), but it answers "is the proxy healthy right now?" without leaving the UI.
+The admin UI ships a live monitoring page at `/_/admin/dashboard` — same metrics, auto-refreshed every 5s, with an **Analytics** view that shows the savings and the estimated cost for each bucket. The Monitoring view leads with 9 headline KPIs; deeper codec/latency telemetry sits behind a default-closed "Detailed telemetry" toggle. It's not a substitute for Grafana in production (no historical retention, no alerting), but it answers "is the proxy healthy right now?" without leaving the UI.
 
 ## Verify
 

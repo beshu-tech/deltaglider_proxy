@@ -201,7 +201,7 @@ function SortableRow({ block, onEdit, onDelete }: RowProps) {
         aria-label={`edit ${block.name}`}
       />
 
-      {/* Remove: behind "⋯"; AdmissionPanel's handler confirms. */}
+      {/* Remove: behind "⋯", confirmed by the menu. */}
       <RowActionsMenu
         label={`More actions for rule ${block.name}`}
         actions={[
@@ -210,7 +210,11 @@ function SortableRow({ block, onEdit, onDelete }: RowProps) {
             label: 'Remove rule…',
             icon: <DeleteOutlined />,
             danger: true,
-            confirm: 'caller',
+            confirm: {
+              title: `Remove rule "${block.name}"?`,
+              content: 'The rule is removed from this page only. Nothing changes until you review and apply.',
+              okText: 'Remove',
+            },
             onSelect: onDelete,
           },
         ]}
