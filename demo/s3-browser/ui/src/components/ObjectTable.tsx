@@ -366,9 +366,19 @@ export default function ObjectTable({
       ),
       key: 'select',
       width: 40,
+      // The whole cell is the hit target, and a click here never reaches the
+      // row handler (which opens the inspector).
+      onCell: (record: RowData) => ({
+        onClick: (e: React.MouseEvent) => {
+          e.stopPropagation();
+          onToggleKey(record.key);
+        },
+        style: { cursor: 'pointer' },
+      }),
       render: (_: unknown, record: RowData) => (
         <Checkbox
           checked={selectedKeys.has(record.key)}
+          onClick={(e) => e.stopPropagation()}
           onChange={() => onToggleKey(record.key)}
           aria-label={`Select ${record.name}`}
         />
