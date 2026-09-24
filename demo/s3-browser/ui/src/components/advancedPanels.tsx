@@ -106,10 +106,11 @@ interface AdvancedSectionBody {
   };
 }
 
-/** Small amber chip next to a label indicating that the field
- *  requires a server restart to take effect. */
+/** Small neutral chip next to a label indicating that the field
+ *  requires a server restart to take effect. It is a permanent property of
+ *  the field, not a problem, so it is not amber (see statusTone.ts). */
 function RestartChip({ reason }: { reason: string }) {
-  const { ACCENT_AMBER } = useColors();
+  const { TEXT_MUTED, BORDER } = useColors();
   return (
     <span
       title={reason}
@@ -121,8 +122,8 @@ function RestartChip({ reason }: { reason: string }) {
         textTransform: 'uppercase',
         padding: '1px 6px',
         borderRadius: 10,
-        background: `${ACCENT_AMBER}20`,
-        color: ACCENT_AMBER,
+        border: `1px solid ${BORDER}`,
+        color: TEXT_MUTED,
         marginLeft: 8,
         cursor: 'help',
         verticalAlign: 'middle',

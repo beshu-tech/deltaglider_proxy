@@ -47,6 +47,51 @@ const CELL_TRUNCATE_STYLE = {
   whiteSpace: 'nowrap',
 } as const;
 
+/** The column tracks of the audit table, defined once on the outer grid.
+ *  The action column sizes to its widest tag, so a long action such as
+ *  `apply_config_section:admission` never runs into the user column. */
+const AUDIT_COLUMNS =
+  '110px minmax(120px, max-content) minmax(100px, 180px) minmax(90px, 140px) minmax(80px, 140px) minmax(160px, 1fr)';
+
+/** A header or data row: a subgrid that spans every column of the table. */
+const AUDIT_ROW = {
+  display: 'grid',
+  gridTemplateColumns: 'subgrid',
+  gridColumn: '1 / -1',
+  columnGap: 16,
+} as const;
+
+/** What the audit trail records, shown when the ring is empty. */
+const AUDITED_EVENTS = [
+  'Admin sign-ins and failed sign-in attempts.',
+  'Changes to users, groups, external identity providers and group mapping rules.',
+  'Configuration changes that you apply from these settings pages.',
+  'Job actions: pause, resume, run now, cancel, and one-off maintenance jobs.',
+  'Password changes, key rotations and session revocations.',
+  'Requests that the proxy refused because the caller did not have permission.',
+];
+
+function AuditEmptyState() {
+  const colors = useColors();
+  return (
+    <div style={{ padding: '28px 24px', color: colors.TEXT_SECONDARY, fontSize: 13, lineHeight: 1.6 }}>
+      <div style={{ color: colors.TEXT_PRIMARY, fontWeight: 600, marginBottom: 6 }}>
+        No audit entries yet.
+      </div>
+      <div>The audit log records these events:</div>
+      <ul style={{ margin: '6px 0 10px', paddingLeft: 20 }}>
+        {AUDITED_EVENTS.map((line) => (
+          <li key={line}>{line}</li>
+        ))}
+      </ul>
+      <div style={{ color: colors.TEXT_MUTED }}>
+        The entries are kept in memory, so a restart of the proxy clears this list.
+        The same entries also go to the proxy log, which stays the long-term record.
+      </div>
+    </div>
+  );
+}
+
 interface Props {
   onSessionExpired?: () => void;
 }
@@ -57,9 +102,11 @@ interface Props {
  * to neutral — we don't try to be exhaustive here.
  */
 function actionColour(action: string): string {
-  if (action.startsWith('login_fail')) return 'red';
+  // Red is kept for real problems (refused sign-ins and requests). A delete
+  // is a normal admin action, so it stays neutral.
+  if (action.startsWith('login_fail') || action.endsWith('_denied')) return 'red';
   if (action.startsWith('login') || action === 'whoami') return 'green';
-  if (action.startsWith('delete') || action.startsWith('remove')) return 'volcano';
+  if (action.startsWith('delete') || action.startsWith('remove')) return 'default';
   if (action.startsWith('create') || action.startsWith('add')) return 'blue';
   if (action.startsWith('update') || action.startsWith('put')) return 'geekblue';
   if (action.startsWith('public_read')) return 'cyan';
@@ -219,8 +266,9 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
       </Space>
 
       {/* Table — hand-rolled so we can tightly control the monospace
-          IP / action columns. AntD's Table would work too but is
-          heavier than this view needs. */}
+          IP / action columns. ONE grid owns the column tracks; the header
+          and every row are subgrids of it, so all rows share the same
+          column widths and the header spans the full table width. */}
       <div
         style={{
           border: `1px solid ${colors.BORDER}`,
@@ -237,110 +285,111 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
         <div
           style={{
             display: 'grid',
-            gridTemplateColumns: '170px 150px 140px 120px 100px minmax(120px, 1fr)',
-            width: 'max-content',
-            gap: 0,
-            padding: '10px 14px',
-            borderBottom: `1px solid ${colors.BORDER}`,
-            fontSize: 11,
-            fontWeight: 700,
-            letterSpacing: 0.5,
-            textTransform: 'uppercase',
-            color: colors.TEXT_MUTED,
-            fontFamily: 'var(--font-ui)',
-            background: colors.BG_ELEVATED,
+            gridTemplateColumns: AUDIT_COLUMNS,
+            // Fill the card; below the sum of the column minimums the card
+            // scrolls sideways instead of squeezing the columns.
+            width: '100%',
+            minWidth: 820,
           }}
         >
-          <div>Time</div>
-          <div>Action</div>
-          <div>User</div>
-          <div>IP</div>
-          <div>Bucket</div>
-          <div>Target / Path</div>
-        </div>
-        {filtered.length === 0 ? (
-          loading ? (
-            <LoadingState label="Loading audit entries…" />
+          <div
+            style={{
+              ...AUDIT_ROW,
+              padding: '10px 14px',
+              borderBottom: `1px solid ${colors.BORDER}`,
+              fontSize: 11,
+              fontWeight: 700,
+              letterSpacing: 0.5,
+              textTransform: 'uppercase',
+              color: colors.TEXT_MUTED,
+              fontFamily: 'var(--font-ui)',
+              background: colors.BG_ELEVATED,
+            }}
+          >
+            <div>Time</div>
+            <div>Action</div>
+            <div>User</div>
+            <div>IP</div>
+            <div>Bucket</div>
+            <div>Target / Path</div>
+          </div>
+          {filtered.length === 0 ? (
+            <div style={{ gridColumn: '1 / -1' }}>
+              {loading ? (
+                <LoadingState label="Loading audit entries…" />
+              ) : entries.length > 0 ? (
+                <div style={{ padding: 40, textAlign: 'center', color: colors.TEXT_MUTED, fontSize: 13 }}>
+                  No entries match this filter.
+                </div>
+              ) : (
+                <AuditEmptyState />
+              )}
+            </div>
           ) : (
-            <div
-              style={{
-                padding: 40,
-                textAlign: 'center',
-                color: colors.TEXT_MUTED,
-                fontSize: 13,
-              }}
-            >
-              No entries match this filter.
-            </div>
-          )
-        ) : (
-          filtered.map((e, i) => (
-            <div
-              key={`${e.timestamp}-${i}`}
-              style={{
-                display: 'grid',
-                gridTemplateColumns: '170px 150px 140px 120px 100px minmax(120px, 1fr)',
-                width: 'max-content',
-                minWidth: '100%',
-                gap: 0,
-                padding: '8px 14px',
-                borderBottom:
-                  i < filtered.length - 1
-                    ? `1px solid ${colors.BORDER}`
-                    : 'none',
-                fontSize: 12,
-                fontFamily: 'var(--font-mono)',
-                alignItems: 'center',
-              }}
-            >
+            filtered.map((e, i) => (
               <div
-                title={new Date(e.timestamp).toLocaleString()}
-                style={{ color: colors.TEXT_SECONDARY, fontSize: 11 }}
-              >
-                {relativeTime(e.timestamp, { now })}
-              </div>
-              <div>
-                <Tag
-                  color={actionColour(e.action)}
-                  style={{
-                    margin: 0,
-                    fontFamily: 'var(--font-mono)',
-                    fontSize: 11,
-                  }}
-                >
-                  {e.action || '—'}
-                </Tag>
-              </div>
-              <div
+                key={`${e.timestamp}-${i}`}
                 style={{
-                  ...CELL_TRUNCATE_STYLE,
-                  color: e.user ? colors.TEXT_PRIMARY : colors.TEXT_MUTED,
+                  ...AUDIT_ROW,
+                  padding: '8px 14px',
+                  borderBottom:
+                    i < filtered.length - 1
+                      ? `1px solid ${colors.BORDER}`
+                      : 'none',
+                  fontSize: 12,
+                  fontFamily: 'var(--font-mono)',
+                  alignItems: 'center',
                 }}
-                title={e.user}
               >
-                {e.user || '—'}
+                <div
+                  title={new Date(e.timestamp).toLocaleString()}
+                  style={{ color: colors.TEXT_SECONDARY, fontSize: 11 }}
+                >
+                  {relativeTime(e.timestamp, { now })}
+                </div>
+                <div>
+                  <Tag
+                    color={actionColour(e.action)}
+                    style={{
+                      margin: 0,
+                      fontFamily: 'var(--font-mono)',
+                      fontSize: 11,
+                    }}
+                  >
+                    {e.action || '—'}
+                  </Tag>
+                </div>
+                <div
+                  style={{
+                    ...CELL_TRUNCATE_STYLE,
+                    color: e.user ? colors.TEXT_PRIMARY : colors.TEXT_MUTED,
+                  }}
+                  title={e.user}
+                >
+                  {e.user || '—'}
+                </div>
+                <div
+                  style={{ ...CELL_TRUNCATE_STYLE, color: colors.TEXT_SECONDARY }}
+                  title={e.ua ? `${e.ip} · ${e.ua}` : e.ip}
+                >
+                  {e.ip || '—'}
+                </div>
+                <div
+                  style={{ ...CELL_TRUNCATE_STYLE, color: colors.TEXT_SECONDARY }}
+                  title={e.bucket}
+                >
+                  {e.bucket || '—'}
+                </div>
+                <div
+                  style={{ ...CELL_TRUNCATE_STYLE, color: colors.TEXT_SECONDARY }}
+                  title={e.path ? `${e.target} · ${e.path}` : e.target}
+                >
+                  {e.path || e.target || '—'}
+                </div>
               </div>
-              <div
-                style={{ ...CELL_TRUNCATE_STYLE, color: colors.TEXT_SECONDARY }}
-                title={e.ua ? `${e.ip} · ${e.ua}` : e.ip}
-              >
-                {e.ip || '—'}
-              </div>
-              <div
-                style={{ ...CELL_TRUNCATE_STYLE, color: colors.TEXT_SECONDARY }}
-                title={e.bucket}
-              >
-                {e.bucket || '—'}
-              </div>
-              <div
-                style={{ ...CELL_TRUNCATE_STYLE, color: colors.TEXT_SECONDARY }}
-                title={e.path ? `${e.target} · ${e.path}` : e.target}
-              >
-                {e.path || e.target || '—'}
-              </div>
-            </div>
-          ))
-        )}
+            ))
+          )}
+        </div>
       </div>
     </div>
   );

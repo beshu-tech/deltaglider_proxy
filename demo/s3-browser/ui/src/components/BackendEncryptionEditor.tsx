@@ -162,39 +162,35 @@ export default function BackendEncryptionEditor({ backendName, current, onApply 
   };
 
   // Header row: current status + top-level action.
-  const statusLine = (() => {
-    if (current.mode === 'none') {
-      // Same vocabulary as the mode select beside it ("None (plaintext)") —
-      // one fact, one wording.
-      return (
-        <Text style={{ fontSize: 13, color: colors.TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
-          Encryption: <strong style={{ color: colors.TEXT_MUTED }}>None (plaintext)</strong>
-        </Text>
-      );
-    }
-    const modeLabel =
-      current.mode === 'aes256-gcm-proxy'
-        ? 'AES-256-GCM (proxy)'
-        : current.mode === 'sse-kms'
-          ? 'SSE-KMS'
-          : 'SSE-S3';
-    const detail =
-      current.mode === 'aes256-gcm-proxy' && current.key_id
-        ? `key id ${current.key_id}`
-        : current.mode === 'sse-kms' && current.kms_key_id
-          ? current.kms_key_id
-          : null;
-    return (
-      <Text style={{ fontSize: 13, fontFamily: 'var(--font-ui)' }}>
-        Encryption: <strong style={{ color: tone }}>{modeLabel}</strong>
-        {detail && (
-          <span style={{ color: colors.TEXT_MUTED, marginLeft: 6, fontFamily: 'var(--font-mono)', fontSize: 12 }}>
-            ({detail})
-          </span>
-        )}
-      </Text>
-    );
-  })();
+  const modeLabel =
+    current.mode === 'aes256-gcm-proxy'
+      ? 'AES-256-GCM (proxy)'
+      : current.mode === 'sse-kms'
+        ? 'SSE-KMS'
+        : current.mode === 'sse-s3'
+          ? 'SSE-S3'
+          : 'None (plaintext)';
+  const detail =
+    current.mode === 'aes256-gcm-proxy' && current.key_id
+      ? `key id ${current.key_id}`
+      : current.mode === 'sse-kms' && current.kms_key_id
+        ? current.kms_key_id
+        : null;
+  // While the mode Select is shown it already names the current mode, so the
+  // label says only "Encryption" (one fact, one place). While an edit is open
+  // the Select is hidden, and the label names the current mode instead.
+  const statusLine = (
+    <Text style={{ fontSize: 13, fontFamily: 'var(--font-ui)', color: colors.TEXT_MUTED }}>
+      Encryption{pending && (
+        <>: <strong style={{ color: tone }}>{modeLabel}</strong></>
+      )}
+      {detail && (
+        <span style={{ marginLeft: 6, fontFamily: 'var(--font-mono)', fontSize: 12, overflowWrap: 'anywhere' }}>
+          ({detail})
+        </span>
+      )}
+    </Text>
+  );
 
   return (
     <div
@@ -205,13 +201,15 @@ export default function BackendEncryptionEditor({ backendName, current, onApply 
         background: colors.BG_ELEVATED,
       }}
     >
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+      {/* Wraps on narrow screens: the Select drops below the label instead
+          of squeezing the label to one letter per line. */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
           <LockOutlined style={{ fontSize: 14, color: tone }} />
           {statusLine}
         </div>
         {!pending && (
-          <Space>
+          <Space wrap>
             {current.mode === 'aes256-gcm-proxy' && (
               <Button
                 size="small"
@@ -228,7 +226,7 @@ export default function BackendEncryptionEditor({ backendName, current, onApply 
                 onChange={(v) => startEdit(v as BackendEncryptionMode)}
                 options={modeOptions}
                 size="small"
-                style={{ width: 220 }}
+                style={{ width: 220, maxWidth: '100%' }}
               />
             </span>
           </Space>

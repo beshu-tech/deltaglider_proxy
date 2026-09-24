@@ -20,6 +20,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Typography, Spin, Progress } from 'antd';
 import { useColors } from '../ThemeContext';
 import { formatBytes } from '../utils';
+import { serverErrorSeverity } from '../statusTone';
 import { useVisiblePolling } from '../useVisiblePolling';
 import AnalyticsSection from './AnalyticsSection';
 import BucketScanCard from './BucketScanCard';
@@ -270,6 +271,8 @@ export default function MetricsPage({ onBack, embedded, search, proxyVersion }: 
   const totalHttp = httpChartData.reduce((a, d) => a + d.value, 0);
   const errorCount = (httpByStatus['4xx'] ?? 0) + (httpByStatus['5xx'] ?? 0);
   const errorRate = totalHttp > 0 ? ((httpByStatus['4xx'] ?? 0) + (httpByStatus['5xx'] ?? 0)) / totalHttp : 0;
+  // Colour follows server errors only (see serverErrorSeverity).
+  const errorSeverity = serverErrorSeverity(httpByStatus['5xx'] ?? 0, totalHttp);
 
   const latencyStats = histStats(m, 'deltaglider_http_request_duration_seconds');
   const reqSizeStats = histStats(m, 'deltaglider_http_request_size_bytes');
@@ -310,7 +313,8 @@ export default function MetricsPage({ onBack, embedded, search, proxyVersion }: 
   return (
     <div className="animate-fade-in" style={{ width: '100%', padding: 'clamp(14px, 1.8vw, 24px) clamp(12px, 1.6vw, 20px)' }}>
       <DashboardToolbar
-        title="Proxy Dashboard"
+        // Inside admin settings the shared page header carries the title.
+        title={embedded ? undefined : 'Proxy Dashboard'}
         meta={<>v{buildVersion} · {backendType === 'mixed' ? 'mixed backends' : `${backendType} backend`} · up {uptimeStr}</>}
         view={activeView}
         onView={(v) => {
@@ -326,8 +330,6 @@ export default function MetricsPage({ onBack, embedded, search, proxyVersion }: 
             { replace: true },
           );
         }}
-        range="5m"
-        onRange={() => {}}
         cadence={cadence}
         onCadence={setCadence}
         onManualRefresh={fetchMetrics}
@@ -387,8 +389,8 @@ export default function MetricsPage({ onBack, embedded, search, proxyVersion }: 
           <Panel title="Total requests" colSpan={3}>
             <StatValue
               value={fmtNum(totalHttp)}
-              hint={`Avg latency ${fmtDuration(latencyStats.avg)}${errorRate > 0.05 ? ` · ${fmtPct(errorRate)} errors` : ''}`}
-              tone={errorRate > 0.05 ? 'bad' : 'neutral'}
+              hint={`Avg latency ${fmtDuration(latencyStats.avg)}${errorSeverity === 'bad' ? ` · ${fmtPct(errorRate)} errors` : ''}`}
+              tone={errorSeverity === 'bad' ? 'bad' : 'neutral'}
             />
           </Panel>
           <Panel title="Peak memory" colSpan={3}>
@@ -409,7 +411,7 @@ export default function MetricsPage({ onBack, embedded, search, proxyVersion }: 
             {history.length >= 2 && (
               <div style={{ flex: 1, minHeight: 0 }}>
                 <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={history} margin={{ top: 8, right: 8, bottom: 0, left: -20 }}>
+                  <AreaChart data={history} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
                     <XAxis dataKey="t" tick={axisTickStyle(colors, true)} axisLine={false} tickLine={false} minTickGap={40} />
                     <YAxis yAxisId="left" tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} />
                     <YAxis yAxisId="right" orientation="right" tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} />
@@ -426,11 +428,11 @@ export default function MetricsPage({ onBack, embedded, search, proxyVersion }: 
             subtitle="Share of 4xx + 5xx responses"
             colSpan={4}
             rowSpan={2}
-            accent={errorRate > 0.05 ? 'red' : errorRate > 0.01 ? 'amber' : 'green'}
+            accent={errorSeverity === 'bad' ? 'red' : errorSeverity === 'warn' ? 'amber' : 'green'}
           >
             <StatValue
               value={totalHttp > 0 ? fmtPct(errorRate) : '—'}
-              tone={errorRate > 0.05 ? 'bad' : errorRate > 0.01 ? 'warn' : 'good'}
+              tone={errorSeverity}
               hint={`${fmtNum(errorCount)} ${errorCount === 1 ? 'error' : 'errors'} of ${fmtNum(totalHttp)} requests`}
             />
             {totalHttp > 0 && Object.keys(httpByStatus).length > 0 && (
@@ -510,7 +512,7 @@ export default function MetricsPage({ onBack, embedded, search, proxyVersion }: 
             {history.length >= 2 && (
               <div style={{ flex: 1, minHeight: 0 }}>
                 <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={history} margin={{ top: 8, right: 8, bottom: 0, left: -20 }}>
+                  <AreaChart data={history} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
                     <XAxis dataKey="t" tick={axisTickStyle(colors, true)} axisLine={false} tickLine={false} minTickGap={60} />
                     <YAxis tick={axisTickStyle(colors)} axisLine={false} tickLine={false} width={40} allowDecimals={false} />
                     <RTooltip {...tt} />

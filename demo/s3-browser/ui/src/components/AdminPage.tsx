@@ -397,7 +397,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
         title="Admin Settings"
         onBack={onBack}
         onShowShortcuts={onShowShortcuts}
-        extra={
+        leading={
           isNarrow ? (
             <Button
               size="small"

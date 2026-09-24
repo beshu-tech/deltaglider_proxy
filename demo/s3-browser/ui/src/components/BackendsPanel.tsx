@@ -3,8 +3,8 @@ import { LinkifiedText } from './LinkifiedText';
 import { CAPABILITY_DOC_URL } from '../linkifyDocUrl';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
-import { Button, Input, Modal, Radio, Switch, Typography, Space, Alert, Spin } from 'antd';
-import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
+import { Button, Dropdown, Input, Modal, Radio, Switch, Typography, Space, Alert, Spin, message } from 'antd';
+import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined, MoreOutlined } from '@ant-design/icons';
 import type { BackendHealthEntry, BackendInfo, CreateBackendRequest } from '../adminApi';
 import { createBackend, deleteBackend, probeBackend, testS3Connection, updateAdminConfig, putSection } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
@@ -21,6 +21,7 @@ import MaskedSecretInput from './MaskedSecretInput';
 import { normalizeUiError } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { isSessionExpired } from '../errorHandling';
+import { isAbsolutePath } from '../utils';
 
 const { Text } = Typography;
 
@@ -125,7 +126,9 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   const [showForm, setShowForm] = useState(false);
   const [formName, setFormName] = useState('');
   const [formType, setFormType] = useState<'filesystem' | 's3'>('filesystem');
-  const [formPath, setFormPath] = useState('./data');
+  // No prefill: a relative path such as ./data resolves against the proxy's
+  // working directory, which differs between systemd, Docker and a shell.
+  const [formPath, setFormPath] = useState('');
   const [formEndpoint, setFormEndpoint] = useState('');
   const [formRegion, setFormRegion] = useState('us-east-1');
   const [formForcePathStyle, setFormForcePathStyle] = useState(true);
@@ -134,6 +137,10 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   const [formSetDefault, setFormSetDefault] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveResult, setSaveResult] = useState<{ ok: boolean; message: string } | null>(null);
+  // Create errors render inside the form, next to the button that caused them;
+  // the page-top Alert is out of view when the form is open.
+  const [formError, setFormError] = useState<string | null>(null);
+  const pathInvalid = formType === 'filesystem' && !isAbsolutePath(formPath);
 
   const [testingBackend, setTestingBackend] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<{ name: string; ok: boolean; message: string } | null>(null);
@@ -152,13 +159,14 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   const handleCreate = async () => {
     setSaving(true);
     setSaveResult(null);
+    setFormError(null);
     const req: CreateBackendRequest = {
       name: formName.trim(),
       type: formType,
       set_default: formSetDefault || backends.length === 0,
     };
     if (formType === 'filesystem') {
-      req.path = formPath;
+      req.path = formPath.trim();
     } else {
       req.endpoint = formEndpoint || undefined;
       req.region = formRegion;
@@ -172,10 +180,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       // failing uploads) is the worse failure mode.
       if (formType === 's3') {
         if (!formAccessKey || !formSecretKey) {
-          setSaveResult({
-            ok: false,
-            message: 'S3 backends need both an Access Key ID and a Secret Access Key.',
-          });
+          setFormError('S3 backends need both an Access Key ID and a Secret Access Key.');
           return;
         }
         const probe = await testS3Connection({
@@ -186,27 +191,32 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           secret_access_key: req.secret_access_key,
         });
         if (!probe.success) {
-          setSaveResult({
-            ok: false,
-            message: `Connection test failed — backend not created: ${probe.error || 'unknown error'}`,
-          });
+          setFormError(`Connection test failed, so the backend was not created: ${probe.error || 'unknown error'}`);
           return;
         }
       }
       const result = await createBackend(req);
       if (result.success) {
-        setSaveResult({
-          ok: true,
-          message: `Backend '${formName.trim()}' created${formType === 's3' ? ' (connection verified)' : ''} — use "Create bucket here" on its card to start using it`,
-        });
+        const name = formName.trim();
+        // A toast is visible wherever the page is scrolled; then bring the
+        // new card into view so the operator sees what was created.
+        message.success(
+          `Backend "${name}" created${formType === 's3' ? ' (connection verified)' : ''}. Use "Create bucket here" on its card to start using it.`,
+          6,
+        );
         setShowForm(false);
         resetForm();
         await refresh();
+        requestAnimationFrame(() => {
+          document
+            .querySelector(`[data-backend-card="${CSS.escape(name)}"]`)
+            ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
       } else {
-        setSaveResult({ ok: false, message: result.error || 'Failed to create backend' });
+        setFormError(result.error || 'Failed to create backend');
       }
     } catch (e) {
-      setSaveResult({ ok: false, message: normalizeUiError(e, "Network error") });
+      setFormError(normalizeUiError(e, "Network error"));
     } finally {
       setSaving(false);
     }
@@ -236,7 +246,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
         try {
           const result = await deleteBackend(name);
           if (result.success) {
-            setSaveResult({ ok: true, message: `Backend '${name}' removed` });
+            message.success(`Backend "${name}" removed`);
             await refresh();
           } else {
             setSaveResult({ ok: false, message: result.error || 'Failed to delete' });
@@ -271,7 +281,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   };
 
   const resetForm = () => {
-    setFormName(''); setFormType('filesystem'); setFormPath('./data');
+    setFormName(''); setFormType('filesystem'); setFormPath(''); setFormError(null);
     setFormEndpoint(''); setFormRegion('us-east-1'); setFormForcePathStyle(true);
     setFormAccessKey(''); setFormSecretKey(''); setFormSetDefault(false);
   };
@@ -393,7 +403,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           />
 
           {backends.map((b) => (
-            <div key={b.name} style={{
+            <div key={b.name} data-backend-card={b.name} style={{
               marginTop: 12, padding: '12px 14px',
               border: `1px solid ${b.name === defaultBackend ? colors.ACCENT_BLUE + '66' : colors.BORDER}`,
               borderRadius: 8,
@@ -448,8 +458,22 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 >
                   Test connection
                 </Button>
+                {/* Remove sits in a "⋯" menu, not as a red icon on every card:
+                    a destructive action should take a deliberate second step. */}
                 {!b.is_synthesized && (
-                  <Button size="small" icon={<DeleteOutlined />} danger onClick={() => handleDelete(b.name)} title="Remove backend" />
+                  <Dropdown
+                    trigger={['click']}
+                    menu={{
+                      items: [
+                        { key: 'remove', label: 'Remove backend…', icon: <DeleteOutlined />, danger: true },
+                      ],
+                      onClick: ({ key }) => {
+                        if (key === 'remove') handleDelete(b.name);
+                      },
+                    }}
+                  >
+                    <Button size="small" icon={<MoreOutlined />} aria-label={`More actions for backend ${b.name}`} title="More actions" />
+                  </Dropdown>
                 )}
               </div>
               {testResult?.name === b.name && (
@@ -547,8 +571,25 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 </Radio.Group>
               </FormField>
               {formType === 'filesystem' && (
-                <FormField label="Data Directory" yamlPath="storage.backends[].path">
-                  <Input value={formPath} onChange={(e) => setFormPath(e.target.value)} placeholder="./data" style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }} />
+                <FormField
+                  label="Data Directory"
+                  yamlPath="storage.backends[].path"
+                  helpText="An absolute path on the proxy host, for example /var/lib/deltaglider/data. A relative path would depend on the directory the proxy starts in."
+                >
+                  <Input
+                    data-testid="backend-path"
+                    aria-label="Data directory"
+                    value={formPath}
+                    onChange={(e) => setFormPath(e.target.value)}
+                    placeholder="/var/lib/deltaglider/data"
+                    status={formPath.trim() && pathInvalid ? 'error' : undefined}
+                    style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
+                  />
+                  {formPath.trim() && pathInvalid && (
+                    <Text type="danger" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
+                      Use an absolute path that starts with /.
+                    </Text>
+                  )}
                 </FormField>
               )}
               {formType === 's3' && (
@@ -588,8 +629,11 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               <Switch checked={formSetDefault} onChange={setFormSetDefault} size="small" />
               <Text style={{ fontSize: 13, fontFamily: 'var(--font-ui)' }}>Set as default backend</Text>
             </div>
+            {formError && (
+              <Alert type="error" showIcon message={formError} style={{ marginTop: 16, borderRadius: 8 }} />
+            )}
             <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
-              <Button data-testid="backend-create" aria-label="Create backend" type="primary" icon={<CheckCircleOutlined />} onClick={handleCreate} loading={saving} disabled={!formName.trim()} style={{ flex: 1, borderRadius: 8, fontWeight: 600 }}>
+              <Button data-testid="backend-create" aria-label="Create backend" type="primary" icon={<CheckCircleOutlined />} onClick={handleCreate} loading={saving} disabled={!formName.trim() || pathInvalid} style={{ flex: 1, borderRadius: 8, fontWeight: 600 }}>
                 Create Backend
               </Button>
               <Button onClick={() => { setShowForm(false); resetForm(); }} style={{ borderRadius: 8 }}>Cancel</Button>
@@ -620,7 +664,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
             />
             <div>
               <Text style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--font-ui)', color: colors.TEXT_PRIMARY }}>
-                Delta compression: <span style={{ color: globalCompressionOn ? colors.ACCENT_GREEN : colors.ACCENT_AMBER }}>{globalCompressionOn ? 'ON' : 'OFF'}</span>
+                Delta compression: <span style={{ color: globalCompressionOn ? colors.ACCENT_GREEN : colors.TEXT_SECONDARY }}>{globalCompressionOn ? 'ON' : 'OFF'}</span>
                 <span style={{ fontWeight: 400, color: colors.TEXT_MUTED, marginLeft: 8, fontSize: 12 }}>applies immediately</span>
               </Text>
               <Text type="secondary" style={{ fontSize: 12, fontFamily: 'var(--font-ui)', display: 'block', marginTop: 2, lineHeight: 1.6 }}>

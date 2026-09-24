@@ -124,3 +124,14 @@ export function clamp(n: number, lo: number, hi: number): number {
 export function numericCompare(a: string, b: string): number {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 }
+
+/**
+ * True when `path` is an absolute filesystem path: POSIX (`/srv/data`) or a
+ * Windows drive path (`C:\data`, `C:/data`). A relative path such as `./data`
+ * resolves against the proxy's working directory, which differs between
+ * systemd, Docker and a shell — so a backend directory must be absolute.
+ */
+export function isAbsolutePath(path: string): boolean {
+  const p = path.trim();
+  return p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p);
+}

@@ -64,6 +64,9 @@ import { normalizeUiError } from '../errorHandling';
 import { useNavigation } from '../NavigationContext';
 import { parseAdminQuery, buildViewUrl } from '../urlState';
 import { generateSetupYaml } from '../setupYaml';
+import { useBackends, useBucketOrigins } from '../queries/backends';
+import { describeExistingSetup } from '../setupDetect';
+import { isAbsolutePath } from '../utils';
 
 const { Text, Paragraph } = Typography;
 
@@ -90,7 +93,9 @@ interface WizardState {
 
 const INITIAL: WizardState = {
   backendKind: 'filesystem',
-  fsPath: './data',
+  // No prefill: a relative path such as ./data depends on the directory the
+  // proxy starts in (systemd, Docker and a shell differ). Must be absolute.
+  fsPath: '',
   s3Endpoint: '',
   s3Region: 'us-east-1',
   s3ForcePathStyle: true,
@@ -119,6 +124,35 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
   const { navigate } = useNavigation();
 
   const [state, setState] = useState<WizardState>(INITIAL);
+
+  // The wizard applies a WHOLE configuration document. On a proxy that is
+  // already configured, say so first, and start from the running backend's
+  // type instead of a Filesystem default that contradicts it.
+  const backendsQuery = useBackends();
+  const originsQuery = useBucketOrigins();
+  const existing =
+    backendsQuery.data && originsQuery.data
+      ? describeExistingSetup(
+          backendsQuery.data.backends,
+          originsQuery.data.buckets.length,
+          backendsQuery.data.default_backend,
+        )
+      : null;
+  const [overwriteConfirmed, setOverwriteConfirmed] = useState(false);
+  const seeded = useRef(false);
+  useEffect(() => {
+    if (!existing || seeded.current) return;
+    seeded.current = true;
+    if (!existing.kind) return;
+    setState((s) => ({
+      ...s,
+      backendKind: existing.kind ?? s.backendKind,
+      fsPath: existing.fsPath && isAbsolutePath(existing.fsPath) ? existing.fsPath : s.fsPath,
+      s3Endpoint: existing.s3Endpoint,
+      s3Region: existing.s3Region,
+      s3ForcePathStyle: existing.s3ForcePathStyle,
+    }));
+  }, [existing]);
   // The wizard step is deep-linked via ?step=N so browser Back traverses
   // steps in-session. But we DON'T restore from URL on initial load — a
   // refresh resets form state to INITIAL while the URL still says ?step=4,
@@ -168,7 +202,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
         return true;
       case 1:
         if (state.backendKind === 'filesystem') {
-          return state.fsPath.trim().length > 0;
+          return isAbsolutePath(state.fsPath);
         }
         // S3: connection test must have succeeded.
         return testResult?.success === true;
@@ -343,6 +377,33 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
         </Paragraph>
       </header>
 
+      {existing?.configured && !overwriteConfirmed ? (
+        <Alert
+          type="warning"
+          showIcon
+          message="This proxy is already configured"
+          description={
+            <div>
+              <Paragraph style={{ marginBottom: 12 }}>
+                It has {existing.backendCount} backend{existing.backendCount === 1 ? '' : 's'} and{' '}
+                {existing.bucketCount} bucket{existing.bucketCount === 1 ? '' : 's'}. This wizard
+                writes a complete new configuration, which replaces the current one: backends,
+                bucket settings and request rules that the wizard does not ask about are removed.
+                To change one thing, use its settings page instead.
+              </Paragraph>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <Button type="primary" onClick={onCancel}>
+                  Back to the dashboard
+                </Button>
+                <Button onClick={() => setOverwriteConfirmed(true)}>
+                  Start over anyway
+                </Button>
+              </div>
+            </div>
+          }
+        />
+      ) : (
+      <>
       <Steps
         current={step}
         size="small"
@@ -397,6 +458,8 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
           </Button>
         )}
       </div>
+      </>
+      )}
     </div>
   );
 }
@@ -489,21 +552,30 @@ function ConfigureBackendStep({
           Pick a data directory
         </h3>
         <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 4, marginBottom: 16 }}>
-          Objects live under this path. Relative paths resolve from the proxy's
-          working directory. Make sure it's on a disk with enough room.
+          Objects live under this path. Use an absolute path: a relative one
+          would depend on the directory the proxy starts in. Make sure it is on
+          a disk with enough room.
         </Text>
         <FormField
           label="Data directory"
           yamlPath="storage.backend.path"
           helpText="Must be writable by the proxy user."
-          examples={['./data', '/var/lib/deltaglider', '/mnt/fast-nvme/dgp']}
+          examples={['/var/lib/deltaglider', '/mnt/fast-nvme/dgp']}
           onExampleClick={(v) => update({ fsPath: String(v) })}
         >
           <Input
+            aria-label="Data directory"
             value={state.fsPath}
             onChange={(e) => update({ fsPath: e.target.value })}
+            placeholder="/var/lib/deltaglider"
+            status={state.fsPath.trim() && !isAbsolutePath(state.fsPath) ? 'error' : undefined}
             style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
           />
+          {state.fsPath.trim() && !isAbsolutePath(state.fsPath) && (
+            <Text type="danger" style={{ fontSize: 12, display: 'block', marginTop: 4 }}>
+              Use an absolute path that starts with /.
+            </Text>
+          )}
         </FormField>
       </div>
     );

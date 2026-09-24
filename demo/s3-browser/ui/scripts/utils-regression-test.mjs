@@ -13,7 +13,19 @@ const { outputText } = ts.transpileModule(source, {
   fileName: 'utils.ts',
 });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
-const { clamp, formatDuration, relativeTime, formatBytes, getFileName, pluralize, noun, parentPrefix } = await import(moduleUrl);
+const { clamp, formatDuration, relativeTime, formatBytes, getFileName, pluralize, noun, parentPrefix, isAbsolutePath } = await import(moduleUrl);
+
+// --- isAbsolutePath (backend data directory, issue #92 comment item 3) --------
+assert.equal(isAbsolutePath('/var/lib/deltaglider'), true);
+assert.equal(isAbsolutePath('  /srv/data  '), true);
+assert.equal(isAbsolutePath('C:\\data'), true);
+assert.equal(isAbsolutePath('d:/data'), true);
+assert.equal(isAbsolutePath('./data'), false);
+assert.equal(isAbsolutePath('data'), false);
+assert.equal(isAbsolutePath('../data'), false);
+assert.equal(isAbsolutePath('~/data'), false);
+assert.equal(isAbsolutePath(''), false);
+assert.equal(isAbsolutePath('C:data'), false);
 
 // --- clamp -------------------------------------------------------------------
 assert.equal(clamp(50, 0, 100), 50);

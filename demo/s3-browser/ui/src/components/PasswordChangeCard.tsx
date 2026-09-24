@@ -4,6 +4,7 @@ import { LockOutlined, WarningOutlined } from '@ant-design/icons';
 import { changeAdminPassword } from '../adminApi';
 import { useCardStyles } from './shared-styles';
 import SectionHeader from './SectionHeader';
+import { CodeTokenText } from './CodeTokenText';
 import { useColors } from '../ThemeContext';
 
 const { Text } = Typography;
@@ -50,7 +51,9 @@ export default function PasswordChangeCard() {
           icon={<WarningOutlined />}
           showIcon
           message="Changing this password re-encrypts the IAM database"
-          description="All active admin sessions will be invalidated. IAM users and their credentials are preserved. If you forget this password, use the CLI flag --set-bootstrap-password to reset it (warning: this wipes the IAM database)."
+          description={
+            <CodeTokenText text="All active admin sessions will be invalidated. IAM users and their credentials are preserved. If you forget this password, use the CLI flag --set-bootstrap-password to reset it (warning: this wipes the IAM database)." />
+          }
           style={{ borderRadius: 8 }}
         />
 
@@ -73,7 +76,7 @@ export default function PasswordChangeCard() {
         {result && (
           <Alert
             type={result.ok ? 'success' : 'error'}
-            message={result.ok ? 'Admin password changed. All sessions invalidated.' : (result.error || 'Failed')}
+            message={result.ok ? 'Admin password changed. All sessions invalidated.' : <CodeTokenText text={result.error || 'Failed'} />}
             showIcon
             style={{ borderRadius: 8 }}
           />

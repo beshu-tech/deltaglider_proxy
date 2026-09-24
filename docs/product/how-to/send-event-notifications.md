@@ -77,7 +77,7 @@ The bot token is masked on export and in the GUI; an unchanged round-trip preser
    ```
 
 2. Within one `tick_interval` (10s default) the dispatcher claims the row and POSTs it. Check your endpoint logs or the Slack channel.
-3. Check the row's status in the outbox at **Settings → Integrations → Event log**, or:
+3. Check the row's status in the event log at **Settings → Integrations → Event log**, or:
 
    ```bash
    curl -b cookies "https://s3.acme.example/_/api/admin/event-outbox?limit=10"
@@ -99,7 +99,7 @@ Requeue doesn't create a new event — it flips `failed` back to `pending`, keep
 
 Note Slack's Web API returns HTTP 200 even on failure; the dispatcher checks the JSON `ok` field and retries on `{"ok": false}` (e.g. `channel_not_found`), so Slack misconfigurations show up as retries, not silent drops.
 
-## 6. Monitor outbox depth
+## 6. Monitor the event log
 
 The outbox list response carries per-status counts (`pending`, `in_progress`, `delivered`, `failed`). A growing `pending` count means the dispatcher can't keep up or the endpoint is down; a non-zero `failed` count means rows are waiting on you. Watch the counts on the Event log page, poll the endpoint above from your monitoring, and see the [metrics reference](../reference/metrics.md) for the Prometheus side. Delivered rows are pruned automatically; pending and failed rows are not.
 

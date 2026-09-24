@@ -5,6 +5,9 @@ import { useColors } from '../ThemeContext';
 interface Props {
   title: string;
   onBack: () => void;
+  /** Optional left-edge control before the back button: the mobile menu
+   *  button, which sits on the left in the object browser too. */
+  leading?: React.ReactNode;
   /** Optional right-side content (e.g. backup buttons) */
   extra?: React.ReactNode;
   /** Open the keyboard-shortcuts help modal (renders a help icon when set). */
@@ -13,7 +16,7 @@ interface Props {
 }
 
 /** Shared header bar for full-screen views (Admin, Docs) */
-export default function FullScreenHeader({ title, onBack, extra, onShowShortcuts, accountMenu }: Props) {
+export default function FullScreenHeader({ title, onBack, leading, extra, onShowShortcuts, accountMenu }: Props) {
   const colors = useColors();
   return (
     <div style={{
@@ -26,7 +29,9 @@ export default function FullScreenHeader({ title, onBack, extra, onShowShortcuts
       background: colors.BG_CARD,
       flexShrink: 0,
     }}>
-      {/* Left: back button */}
+      {/* Left: optional menu button + back button */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+      {leading}
       <Button
         type="text"
         icon={<ArrowLeftOutlined />}
@@ -39,6 +44,7 @@ export default function FullScreenHeader({ title, onBack, extra, onShowShortcuts
       >
         Browser
       </Button>
+      </div>
 
       {/* Center: branding + section title */}
       <div style={{
