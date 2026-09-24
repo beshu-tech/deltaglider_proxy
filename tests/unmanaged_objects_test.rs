@@ -6,7 +6,7 @@
 //! Regression tests for issues #3 and #4: the proxy previously returned 404
 //! for such objects because it required DG metadata to be present.
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 use std::path::Path;

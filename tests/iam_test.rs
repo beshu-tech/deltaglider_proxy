@@ -9,7 +9,7 @@
 //! - Legacy single-credential mode still works
 //! - Open access mode (no auth) still works
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 

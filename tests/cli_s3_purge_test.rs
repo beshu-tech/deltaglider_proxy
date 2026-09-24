@@ -6,7 +6,7 @@
 //! `dg-expires-at`, one with a future one — and asserts that only the
 //! past one is removed.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};

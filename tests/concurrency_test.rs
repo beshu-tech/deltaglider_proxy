@@ -5,7 +5,7 @@
 //! Verifies that concurrent operations don't cause corruption or panics.
 //! Uses TestServer::filesystem() with multiple tokio tasks.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{generate_binary, TestServer};

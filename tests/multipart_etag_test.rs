@@ -10,7 +10,7 @@
 //! use it as an If-Match precondition would hit 412 Precondition
 //! Failed on a later write.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::TestServer;

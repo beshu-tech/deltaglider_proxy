@@ -12,7 +12,7 @@
 //! Each test spawns its own TestServer (filesystem backend, bootstrap
 //! auth for the admin cookie).
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, get_iam_version, wait_for_iam_rebuild, TestServer};
 use reqwest::StatusCode;

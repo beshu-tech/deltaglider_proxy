@@ -24,8 +24,8 @@ npm run dev                    # dev server on :5173, proxies /api to :9001
 # regression scripts, E2E smoke — not a single `cargo test --all`.
 cargo test --lib --locked
 ./scripts/check-integration-tests-in-ci.sh   # every tests/*.rs appears in ci.yml
-cargo test --test delta_test                 # single integration binary
-cargo test --test delta_test test_name       # single test
+cargo test --test all -- delta_test::        # one integration-test file (all live in tests/all.rs)
+cargo test --test all -- delta_test::test_name  # single test
 cargo test -- --nocapture                    # show println output
 
 # Before a release or when touching integration tests, run the full matrix locally

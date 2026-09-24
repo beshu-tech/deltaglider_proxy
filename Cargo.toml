@@ -1,4 +1,6 @@
 [package]
+# All integration tests build into ONE binary (tests/all.rs): one link instead of ~70.
+autotests = false
 name = "deltaglider_proxy"
 version = "1.19.0"
 description = "S3-compatible proxy with transparent delta compression"
@@ -9,6 +11,16 @@ edition = "2021"
 # md-5's import name is `md5`, which cargo-machete can't match to the crate.
 [package.metadata.cargo-machete]
 ignored = ["md-5"]
+
+[[test]]
+name = "all"
+path = "tests/all.rs"
+
+# Third-party crates carry no debug info: they dominated link memory and CI OOMs.
+# Workspace crates keep the profile default (CI trims them to line tables via env,
+# which still gives file:line backtraces).
+[profile.dev.package."*"]
+debug = false
 
 # `tokio_unstable` is passed via RUSTFLAGS (nightly workflow + opt-in builds)
 # to unlock tokio's RuntimeMetrics API — the #87 runtime sampler. Declared

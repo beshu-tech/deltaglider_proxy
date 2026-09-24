@@ -14,7 +14,7 @@
 //! - Cross-user permission isolation
 //! - Deny rules from groups overriding user allows
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
 use common::{admin_http_client, TestServer};

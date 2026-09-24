@@ -7,7 +7,7 @@
 //! presigned URLs, clock skew, replay detection, rate limiting, and admin API
 //! user lifecycle — verifying the auth *layer* as a black box.
 
-mod common;
+use crate::common;
 
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
@@ -1237,13 +1237,14 @@ async fn test_user_lifecycle_crud() {
 /// Multiple rapid auth failures should trigger rate limiting (progressive delay or lockout).
 #[tokio::test]
 async fn test_brute_force_rate_limiting() {
-    // Override rate limiter to small values for fast testing
-    std::env::set_var("DGP_RATE_LIMIT_MAX_ATTEMPTS", "5");
-    std::env::set_var("DGP_RATE_LIMIT_WINDOW_SECS", "60");
-    std::env::set_var("DGP_RATE_LIMIT_LOCKOUT_SECS", "60");
-
+    // Override rate limiter to small values for fast testing. Passed to the
+    // proxy child only: all integration tests share one process (tests/all.rs),
+    // so std::env::set_var would leak into every proxy other tests start.
     let server = TestServer::builder()
         .auth("testkey", "testsecret")
+        .env("DGP_RATE_LIMIT_MAX_ATTEMPTS", "5")
+        .env("DGP_RATE_LIMIT_WINDOW_SECS", "60")
+        .env("DGP_RATE_LIMIT_LOCKOUT_SECS", "60")
         .build()
         .await;
 

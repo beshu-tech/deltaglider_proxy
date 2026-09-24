@@ -8,7 +8,7 @@
 //! Purpose is to cover the wire-level behaviour: env-var discipline,
 //! cookie-based session flow, error mapping → exit codes.
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 use std::process::Command;

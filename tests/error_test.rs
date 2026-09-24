@@ -5,7 +5,7 @@
 //! Uses reqwest (not aws-sdk-s3) to inspect raw HTTP responses.
 //! Verifies error codes, status codes, and Content-Type headers.
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 

@@ -2,7 +2,7 @@
 
 //! Integration tests for admin login-as (IAM user impersonation).
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, TestServer};
 use reqwest::StatusCode;

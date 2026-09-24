@@ -2,7 +2,7 @@
 
 //! Integration tests for `deltaglider_proxy migrate`.
 
-mod common;
+use crate::common;
 
 use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
 use deltaglider_proxy::cli::cp::{run as cp_run, CpArgs};

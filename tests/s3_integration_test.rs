@@ -16,7 +16,7 @@
 //! call `skip_unless_minio!()` and exit gracefully when MinIO is
 //! unreachable.
 
-mod common;
+use crate::common;
 
 use bytes::Bytes;
 use common::{

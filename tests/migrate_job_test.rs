@@ -8,7 +8,7 @@
 //!
 //! Two filesystem backends — no MinIO needed.
 
-mod common;
+use crate::common;
 
 use common::{admin_http_client, get_bytes, put_object, TestServer};
 

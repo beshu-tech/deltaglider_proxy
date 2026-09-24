@@ -28,7 +28,7 @@
 //! extension as a literal string where the variant demands it; AWS SDKs
 //! do the same.
 
-mod common;
+use crate::common;
 
 use common::TestServer;
 
