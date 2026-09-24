@@ -27,6 +27,17 @@ import { isSessionExpired } from '../errorHandling';
 
 const { Text } = Typography;
 const RING_CAP = 2000; // client-side trim ceiling for the live tail
+const FILTER_DEBOUNCE_MS = 300;
+
+/** `value`, updated only after it stops changing for `ms`. */
+function useDebounced<T>(value: T, ms: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const id = window.setTimeout(() => setDebounced(value), ms);
+    return () => window.clearTimeout(id);
+  }, [value, ms]);
+  return debounced;
+}
 
 interface Props {
   onSessionExpired?: () => void;
@@ -57,20 +68,31 @@ export default function LogsPanel({ onSessionExpired }: Props) {
   const [q, setQ] = useState('');
   const [follow, setFollow] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [streamError, setStreamError] = useState<string | null>(null);
   const [now, setNow] = useState(new Date());
   const unsubRef = useRef<(() => void) | null>(null);
 
+  // Typing in target/q must not fire a backlog fetch + SSE reconnect per
+  // keystroke: the text filters feed `filters` only after a pause.
+  const debouncedTarget = useDebounced(target, FILTER_DEBOUNCE_MS);
+  const debouncedQ = useDebounced(q, FILTER_DEBOUNCE_MS);
   const filters: LogFilters = useMemo(
-    () => ({ level, target: target || undefined, q: q || undefined }),
-    [level, target, q],
+    () => ({ level, target: debouncedTarget || undefined, q: debouncedQ || undefined }),
+    [level, debouncedTarget, debouncedQ],
   );
 
+  // Generation guard: a slow response for an older filter set must not
+  // overwrite the entries of a newer one.
+  const fetchGen = useRef(0);
   const loadBacklog = useCallback(async () => {
+    const gen = ++fetchGen.current;
     try {
       const resp = await fetchLogs(filters, RING_CAP);
+      if (gen !== fetchGen.current) return; // superseded by a newer load
       setEntries(resp.entries);
       setError(null);
     } catch (e) {
+      if (gen !== fetchGen.current) return;
       const msg = normalizeUiError(e, 'fetch failed');
       if (isSessionExpired(e)) onSessionExpired?.();
       setError(msg);
@@ -86,17 +108,20 @@ export default function LogsPanel({ onSessionExpired }: Props) {
   useEffect(() => {
     unsubRef.current?.();
     unsubRef.current = null;
+    setStreamError(null);
     if (!follow) return;
     unsubRef.current = streamLogs(
       filters,
       (entry) => {
+        // An entry arrived: the stream is healthy again.
+        setStreamError(null);
         setEntries((prev) => {
           const next = [entry, ...prev];
           return next.length > RING_CAP ? next.slice(0, RING_CAP) : next;
         });
       },
       undefined,
-      () => setError('log stream interrupted — retrying…'),
+      () => setStreamError('log stream interrupted — retrying…'),
     );
     return () => {
       unsubRef.current?.();
@@ -160,6 +185,7 @@ export default function LogsPanel({ onSessionExpired }: Props) {
       </Space>
 
       {error && <Text type="danger">{error}</Text>}
+      {streamError && <Text type="danger">{streamError}</Text>}
 
       <div
         ref={parentRef}
