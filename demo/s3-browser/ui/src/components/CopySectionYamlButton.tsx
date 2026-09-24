@@ -130,7 +130,7 @@ export function SectionYamlModal({ section, open, onClose }: SectionYamlModalPro
             message="This preview is intentionally minimal"
             description={
               <>
-                SigV4 keys are redacted from API YAML. IAM users and groups in GUI mode live in the encrypted
+                SigV4 keys are redacted from exported YAML. IAM users and groups in GUI mode live in the encrypted
                 database, not in <code style={{ fontSize: 11 }}>access:</code>. The comment block in the text area
                 below is included when you copy — use Backup → Download backup for a full IAM bundle.
               </>

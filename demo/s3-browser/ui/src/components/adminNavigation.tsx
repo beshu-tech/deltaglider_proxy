@@ -20,8 +20,6 @@ import type { ReactNode } from 'react';
 import type { SectionName } from '../adminApi';
 import { findEntry } from '../adminNavTree';
 
-export type SaveModel = 'immediate' | 'review';
-
 export interface SidebarEntry {
   /** Path sub-segment: `dashboard`, `access/users`, `jobs`, `system`. */
   path: string;
@@ -49,8 +47,6 @@ export interface SidebarEntry {
    * key; absent = ⌘S falls through to the browser.
    */
   applyKey?: string;
-  /** Save-model badge: 'immediate' = every click is live; 'review' = Apply flow. */
-  saveModel?: SaveModel;
   /** Child entries rendered below as a sub-nav. */
   children?: SidebarEntry[];
 }
@@ -74,10 +70,10 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
       },
       {
         path: 'diagnostics/trace',
-        label: 'Rule tester',
+        label: 'Request rule tester',
         icon: <ExperimentOutlined />,
         description:
-          'Replay a synthetic request against the admission chain and see which rule fires.',
+          'Send a sample request through the request rules and see which rule decides it.',
       },
       {
         path: 'diagnostics/delta-efficiency',
@@ -109,7 +105,6 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         section: 'access',
         dirtyKeys: ['access/credentials'],
         applyKey: 'access/credentials',
-        saveModel: 'review',
         description: 'IAM mode, authentication mode, bootstrap credentials, admin password.',
       },
       {
@@ -118,7 +113,6 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         icon: <UserOutlined />,
         section: 'access',
         dirtyKeys: ['access/users'],
-        saveModel: 'immediate',
         description: 'IAM users and their S3 permissions.',
       },
       {
@@ -127,7 +121,6 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         icon: <TeamOutlined />,
         section: 'access',
         dirtyKeys: ['access/groups'],
-        saveModel: 'immediate',
         description: 'Shared permission policies for sets of users.',
       },
       {
@@ -136,7 +129,6 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         icon: <ApiOutlined />,
         section: 'access',
         dirtyKeys: ['access/external-auth/providers', 'access/external-auth/mapping-rules'],
-        saveModel: 'immediate',
         description: 'OAuth/OIDC providers and group mapping for SSO.',
       },
       {
@@ -146,15 +138,13 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         section: 'admission',
         dirtyKeys: ['admission'],
         applyKey: 'admission',
-        saveModel: 'review',
-        description: 'Pre-auth request gating. First matching rule wins.',
+        description: 'Allow, deny, or reject requests before authentication. The first matching rule wins.',
       },
       {
         path: 'access/sessions',
         label: 'Sessions',
         icon: <LockOutlined />,
         section: 'access',
-        saveModel: 'immediate',
         description: 'Live admin sessions. Force-logout a stolen cookie or all sessions of a key.',
       },
     ],
@@ -167,7 +157,6 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         label: 'Backends',
         icon: <DatabaseOutlined />,
         section: 'storage',
-        saveModel: 'immediate',
         description: 'Storage backends, connection tests, encryption at rest.',
       },
       {
@@ -177,7 +166,6 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         section: 'storage',
         dirtyKeys: ['storage/buckets'],
         applyKey: 'storage/buckets',
-        saveModel: 'review',
         description: 'Per-bucket settings: routing, public access, quotas, compression.',
       },
       {
@@ -187,7 +175,6 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         section: 'storage',
         dirtyKeys: ['jobs/replication', 'jobs/lifecycle'],
         applyKey: 'jobs',
-        saveModel: 'review',
         description:
           'Everything that runs in the background: replication, lifecycle, re-encryption, migrations.',
       },
@@ -203,7 +190,6 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         section: 'advanced',
         dirtyKeys: ['integrations/event-delivery'],
         applyKey: 'integrations/event-delivery',
-        saveModel: 'review',
         description: 'Send object events to webhooks and Slack.',
       },
       {
@@ -223,7 +209,6 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         icon: <SettingOutlined />,
         section: 'advanced',
         dirtyKeys: ['system/listener', 'system/caches', 'system/logging', 'system/sync'],
-        saveModel: 'review',
         description: 'Listener & TLS, caches and limits, logging, config DB sync, backup.',
       },
     ],
@@ -233,11 +218,11 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
 /**
  * Header metadata for an admin page, derived from the matching ADMIN_IA
  * entry. Single source of truth — the sidebar label doubles as the page
- * title, and the save-model badge rides along. Returns undefined for
+ * title. Returns undefined for
  * paths with no entry (the setup wizard).
  */
 export function headerForPath(path: string):
-  | { icon: ReactNode; title: string; description: string; saveModel?: SaveModel }
+  | { icon: ReactNode; title: string; description: string }
   | undefined {
   const entry = findEntry(ADMIN_IA, path);
   if (!entry || entry.description === undefined) return undefined;
@@ -245,6 +230,5 @@ export function headerForPath(path: string):
     icon: entry.icon,
     title: entry.label,
     description: entry.description,
-    saveModel: entry.saveModel,
   };
 }

@@ -63,7 +63,7 @@ export default function SynthesizedBlocksPreview({
   if (rows.length === 0) {
     return (
       <Text type="secondary" style={{ fontStyle: 'italic' }}>
-        No buckets expose public prefixes — no synthesised blocks.
+        No bucket has public access, so there are no public-access rules.
       </Text>
     );
   }
@@ -84,7 +84,7 @@ export default function SynthesizedBlocksPreview({
             alignItems: 'center',
             opacity: 0.75,
           }}
-          aria-label={`synthesised block ${row.name}`}
+          aria-label={`public-access rule ${row.name}`}
         >
           <span title="Read-only — edit via Storage → Buckets" style={{ display: 'inline-flex' }}>
             <LockOutlined style={{ color: TEXT_MUTED, fontSize: 14 }} />

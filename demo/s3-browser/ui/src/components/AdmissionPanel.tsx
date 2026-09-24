@@ -85,7 +85,7 @@ export default function AdmissionPanel({
     onSessionExpired,
     pick: (body) => body?.blocks ?? [],
     toPayload: (v) => ({ blocks: v }),
-    noun: 'admission blocks',
+    noun: 'request rules',
   });
 
   // Modal state. The list passes us array indices, but indices go
@@ -144,10 +144,10 @@ export default function AdmissionPanel({
     deleteInFlightRef.current = true;
     const name = block.name;
     Modal.confirm({
-      title: `Remove block "${name}"?`,
+      title: `Remove rule "${name}"?`,
       icon: <ExclamationCircleOutlined />,
       content:
-        'The block is removed from the local form state only — nothing persists until you click Apply.',
+        'The rule is removed from this page only. Nothing changes until you review and apply.',
       okText: 'Remove',
       okButtonProps: { danger: true },
       cancelText: 'Cancel',
@@ -187,15 +187,15 @@ export default function AdmissionPanel({
         >
           <div>
             <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)' }}>
-              Operator-authored blocks
+              Your rules
             </h3>
             <Text type="secondary" style={{ fontSize: 12 }}>
-              Drag to reorder. First match wins. Operator blocks fire{' '}
-              <b>before</b> synthesised public-prefix blocks below.
+              Drag to reorder. The first matching rule wins. Your rules are
+              checked <b>before</b> the public-access rules below.
             </Text>
           </div>
           <Button icon={<PlusOutlined />} onClick={openAdd} disabled={loading}>
-            Add block
+            Add rule
           </Button>
         </header>
         <AdmissionBlockList
@@ -220,14 +220,15 @@ export default function AdmissionPanel({
         >
           <div>
             <h3 style={{ margin: 0, fontFamily: 'var(--font-ui)' }}>
-              Synthesised blocks (read-only)
+              Public-access rules
             </h3>
             <Text type="secondary" style={{ fontSize: 12 }}>
-              Derived from Storage → Buckets' public_prefixes. Edit there.
+              Created from the public access setting of each bucket. Change
+              them on the Buckets page.
             </Text>
           </div>
           <Text type="secondary" style={{ fontSize: 11, color: TEXT_MUTED }}>
-            <InfoCircleOutlined /> evaluated after operator blocks
+            <InfoCircleOutlined /> checked after your rules
           </Text>
         </header>
         {config && (

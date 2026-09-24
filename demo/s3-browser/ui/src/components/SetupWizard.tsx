@@ -711,7 +711,7 @@ function OptionalPublicBucketStep({
         <Radio value="yes">
           <span style={{ fontWeight: 600 }}>Yes, set up one public bucket now</span>
           <Text type="secondary" style={{ fontSize: 12, display: 'block' }}>
-            Anyone can GET objects from this bucket without SigV4 signing.
+            Anyone can download objects from this bucket without credentials.
           </Text>
         </Radio>
       </Radio.Group>
@@ -719,7 +719,7 @@ function OptionalPublicBucketStep({
         <FormField
           label="Bucket name"
           yamlPath="storage.buckets.<name>"
-          helpText="Lowercase, alphanumerics + dots + hyphens only. The wizard will set `public: true` on this bucket."
+          helpText="Lowercase letters, digits, dots, and hyphens only. The wizard makes this bucket publicly readable."
           examples={['docs', 'releases', 'public-assets']}
           onExampleClick={(v) => update({ publicBucketName: String(v) })}
         >

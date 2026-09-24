@@ -80,8 +80,7 @@ export default function AdmissionBlockList({
   if (blocks.length === 0) {
     return (
       <Text type="secondary" style={{ fontStyle: 'italic' }}>
-        No operator-authored blocks yet. Click <b>Add block</b> to create the
-        first one.
+        No rules yet. Click <b>Add rule</b> to create the first one.
       </Text>
     );
   }
@@ -148,7 +147,7 @@ function SortableRow({ block, onEdit, onDelete }: RowProps) {
   };
 
   return (
-    <div ref={setNodeRef} style={style} aria-label={`block ${block.name}`}>
+    <div ref={setNodeRef} style={style} aria-label={`rule ${block.name}`}>
       {/* Drag handle */}
       <button
         {...attributes}
@@ -197,7 +196,7 @@ function SortableRow({ block, onEdit, onDelete }: RowProps) {
         type="text"
         icon={<EditOutlined />}
         onClick={onEdit}
-        title="Edit this block"
+        title="Edit this rule"
         aria-label={`edit ${block.name}`}
       />
 
@@ -208,7 +207,7 @@ function SortableRow({ block, onEdit, onDelete }: RowProps) {
         danger
         icon={<DeleteOutlined />}
         onClick={onDelete}
-        title="Remove this block"
+        title="Remove this rule"
         aria-label={`delete ${block.name}`}
       />
     </div>

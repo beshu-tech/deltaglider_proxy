@@ -39,7 +39,7 @@ interface ActionChipDef {
 const ACTION_CHIPS: ActionChipDef[] = [
   { value: 'list', label: 'List', hint: 'Browse / list this prefix (ListObjects)', icon: <EyeOutlined />, tone: 'list' },
   { value: 'read', label: 'Read', hint: 'Download objects (GET / HEAD)', icon: <DownloadOutlined />, tone: 'read' },
-  { value: 'write', label: 'Write', hint: 'Upload / overwrite objects (PUT)', icon: <UploadOutlined />, tone: 'write' },
+  { value: 'write', label: 'Write', hint: 'Upload and overwrite objects', icon: <UploadOutlined />, tone: 'write' },
   { value: 'delete', label: 'Delete', hint: 'Delete objects (DELETE)', icon: <DeleteOutlined />, tone: 'delete' },
   { value: 'admin', label: 'Admin', hint: 'Bucket-level ops (Create / Delete bucket). Only meaningful at bucket scope.', icon: <CrownOutlined />, tone: 'admin' },
 ];

@@ -152,7 +152,7 @@ export function AdminRouteContent({ path, ctx }: { path: string; ctx: AdminRoute
   return (
     <>
       {meta && (
-        <TabHeader icon={meta.icon} title={meta.title} description={meta.description} saveModel={meta.saveModel} />
+        <TabHeader icon={meta.icon} title={meta.title} description={meta.description} />
       )}
       {route.render(ctx)}
     </>

@@ -117,7 +117,7 @@ export default function TracePanel({ onSessionExpired }: Props) {
       {/* Request form — TabHeader already titles the page "Trace". */}
       <div style={cardStyle}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          <FormField label="Method" helpText="HTTP verb to trace. No real traffic hits the backends — this is a dry-run against the live chain.">
+          <FormField label="Method" helpText="The HTTP method of the sample request.">
             <Radio.Group
               value={method}
               onChange={(e) => setMethod(e.target.value)}
@@ -134,8 +134,7 @@ export default function TracePanel({ onSessionExpired }: Props) {
 
           <FormField
             label="Path"
-            yamlPath="(e.g. /my-bucket/path/to/object)"
-            helpText="Full request path. Leading / required. Bucket is the first segment; the remainder is the object key (or empty for bucket-level ops)."
+            helpText="The full request path, starting with /. The first segment is the bucket and the rest is the object key. Leave the key empty for a bucket-level request."
             examples={['/releases/builds/v1.zip', '/docs/readme.md', '/api/']}
             onExampleClick={(v) => setPath(String(v))}
           >
@@ -149,7 +148,7 @@ export default function TracePanel({ onSessionExpired }: Props) {
 
           <FormField
             label="Query string"
-            helpText="Optional. LIST operations pass `prefix=` here."
+            helpText="Optional. For a list request, add the folder to list, for example prefix=builds/."
             examples={['prefix=builds/', 'list-type=2']}
             onExampleClick={(v) => setQuery(String(v))}
           >
@@ -163,7 +162,7 @@ export default function TracePanel({ onSessionExpired }: Props) {
 
           <FormField
             label="Source IP"
-            helpText="Leave empty to simulate a request with no source-IP info (source_ip predicates fail closed)."
+            helpText="Leave empty to send the request without a source address. Rules that match on a source IP then do not match."
             examples={['203.0.113.5', '198.51.100.42', '2001:db8::1']}
             onExampleClick={(v) => setSourceIp(String(v))}
           >
@@ -177,7 +176,7 @@ export default function TracePanel({ onSessionExpired }: Props) {
 
           <FormField
             label="Authenticated"
-            helpText="Whether the synthetic request carries SigV4 credentials."
+            helpText="Whether the sample request is signed with credentials."
           >
             <Space>
               <Switch checked={authenticated} onChange={setAuthenticated} />
@@ -198,14 +197,14 @@ export default function TracePanel({ onSessionExpired }: Props) {
             block
             size="large"
           >
-            Run trace
+            Test request
           </Button>
         </div>
       </div>
 
       {/* Error */}
       {error && (
-        <Alert type="error" showIcon message="Trace failed" description={error} />
+        <Alert type="error" showIcon message="Test failed" description={error} />
       )}
 
       {/* Result */}
@@ -220,7 +219,7 @@ export default function TracePanel({ onSessionExpired }: Props) {
               )
             }
             title="Decision"
-            description="How the admission chain evaluated your request."
+            description="How the request rules decided your request."
           />
           <DecisionSummary result={result} />
           <div style={{ marginTop: 16, borderTop: `1px solid ${colors.BORDER}`, paddingTop: 14 }}>
@@ -255,13 +254,13 @@ export default function TracePanel({ onSessionExpired }: Props) {
           message="How to read the output"
           description={
             <Paragraph type="secondary" style={{ fontSize: 13, marginBottom: 0 }}>
-              The trace evaluates the SAME admission chain live
-              traffic hits. The Decision is the terminal action for
-              this request. <b>Reason path</b> walks the evaluator
-              — which block matched, which predicate, what action
-              fired. <b>Resolved request</b> shows how the parser
-              decomposed your path into bucket + key (helpful for
-              debugging path-glob patterns).
+              The test uses the same request rules as real traffic,
+              but sends nothing to the backends. <b>Decision</b> is
+              what happens to the request. <b>Reason path</b> shows
+              which rule matched and which condition decided it.{' '}
+              <b>Resolved request</b> shows how the path splits into
+              bucket and object key, which helps when you debug a
+              path pattern.
             </Paragraph>
           }
         />
@@ -327,7 +326,7 @@ function DecisionSummary({ result }: { result: TraceResponse }) {
       {admission.matched ? (
         <>
           <Text type="secondary" style={{ fontSize: 13 }}>
-            by block
+            by rule
           </Text>
           <Text code style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}>
             {admission.matched}
@@ -335,7 +334,7 @@ function DecisionSummary({ result }: { result: TraceResponse }) {
         </>
       ) : (
         <Text type="secondary" style={{ fontSize: 13 }}>
-          no block matched — chain fell through to the default
+          No rule matched, so the request continues to authentication.
         </Text>
       )}
       {admission.decision === 'reject' && admission.message && (
@@ -366,9 +365,9 @@ function ReasonPath({ result }: { result: TraceResponse }) {
   );
   // Line 2: which block (if any) matched.
   if (admission.matched) {
-    lines.push(`  → admission: ${admission.matched} matched`);
+    lines.push(`  → request rules: ${admission.matched} matched`);
   } else {
-    lines.push(`  → admission: no operator block matched`);
+    lines.push(`  → request rules: no rule matched`);
   }
   // Line 3: terminal action.
   const actionLine =
@@ -403,7 +402,7 @@ function ReasonPath({ result }: { result: TraceResponse }) {
       <span style={{ color: colors.TEXT_MUTED, fontStyle: 'italic' }}>
         {/* footer — short hint for `continue` */}
         {admission.decision === 'continue'
-          ? `\n(auth=${authLabel}) continue means the request is handed off to SigV4 middleware; whether it's allowed depends on IAM policies attached to the caller.`
+          ? `\n(auth=${authLabel}) The request goes on to the signature and permission checks. Whether it is allowed depends on the permissions of the caller.`
           : ''}
       </span>
     </pre>
