@@ -28,7 +28,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useDocumentEvent } from './useDocumentEvent';
 import { isTypingTarget, anyOverlayOpen } from './keyboard';
 import { parentPrefix } from './utils';
-import { rowKeysFor, nextCursor, orderedRowKeys } from './browserNav';
+import { rowKeysFor, nextCursor, orderedRowKeys, sameKeyOrder } from './browserNav';
 import type { S3Object } from './types';
 
 interface BrowserNavArgs {
@@ -62,7 +62,11 @@ export function useBrowserKeyboardNav({
   enabled,
 }: BrowserNavArgs): BrowserNav {
   const [cursorKey, setCursorKey] = useState<string | null>(null);
-  const [rowOrder, setRowOrder] = useState<string[] | null>(null);
+  const [rowOrder, setRowOrderState] = useState<string[] | null>(null);
+  // Keep the stored array when the report is unchanged (see sameKeyOrder).
+  const setRowOrder = useCallback((next: string[]) => {
+    setRowOrderState((prev) => (sameKeyOrder(prev, next) ? prev : next));
+  }, []);
 
   // The order ↑/↓ walk: the table's sorted order while it matches the current
   // rows, else folders-then-objects.

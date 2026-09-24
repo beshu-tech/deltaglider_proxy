@@ -20,7 +20,7 @@ async function load(file, rewrite = {}) {
   return `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
 }
 const utilsUrl = await load('utils.ts');
-const { rowKeysFor, nextCursor, buildRows, sortRows, orderedRowKeys } = await import(
+const { rowKeysFor, nextCursor, buildRows, sortRows, orderedRowKeys, sameKeyOrder } = await import(
   await load('browserNav.ts', { './utils': utilsUrl }),
 );
 
@@ -120,6 +120,12 @@ assert.deepEqual(
 // Keyboard ↓ walks the SORTED order.
 const sortedKeys = keysOf(sortRows(rows, { column: 'size', order: 'descend' }, noSize));
 assert.equal(nextCursor(sortedKeys, 'p/a.txt', 1), 'p/c.txt', '↓ follows the sorted order');
+
+// --- sameKeyOrder: an equal report must not replace the stored order --------
+assert.equal(sameKeyOrder(null, []), false, 'first report is always stored');
+assert.equal(sameKeyOrder(['a', 'b'], ['a', 'b']), true);
+assert.equal(sameKeyOrder(['a', 'b'], ['b', 'a']), false);
+assert.equal(sameKeyOrder(['a'], ['a', 'b']), false);
 
 // --- orderedRowKeys: reported table order, or the unsorted fallback ----------
 const base = keysOf(rows);

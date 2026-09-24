@@ -66,4 +66,5 @@ fi
 
 export PLAYWRIGHT_BASE_URL="http://127.0.0.1:${PORT}"
 cd "$ROOT/demo/s3-browser/ui"
-exec npx playwright test e2e/
+# Not `exec`: that would drop the EXIT trap and leave the proxy running.
+npx playwright test e2e/

@@ -100,6 +100,15 @@ export function nextCursor(
  * listing change and ObjectTable's next report, so a stale order never makes
  * the cursor land on a row that no longer exists.
  */
+/**
+ * True when two reported row orders are identical. The table reports a fresh
+ * array on every render; storing an equal copy would re-render the browser,
+ * rebuild the rows and report again — an update loop (React error #185).
+ */
+export function sameKeyOrder(a: readonly string[] | null, b: readonly string[]): boolean {
+  return a !== null && a.length === b.length && a.every((k, i) => k === b[i]);
+}
+
 export function orderedRowKeys(baseKeys: string[], reported: string[] | null): string[] {
   if (!reported || reported.length !== baseKeys.length) return baseKeys;
   const current = new Set(baseKeys);
