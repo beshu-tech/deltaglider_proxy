@@ -14,7 +14,7 @@
  * One-off jobs are DB-born (created via the modals), not config: they
  * have no dirty state, just live progress + cancel.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Button, Dropdown, Space, Spin, Tag, Typography, message } from 'antd';
 import {
   CaretRightOutlined,
@@ -32,10 +32,12 @@ import { runJobAction } from '../../adminApi';
 import type { JobAction, JobDisplayRow, JobRow } from '../../jobsView';
 import {
   availableActions,
+  editorAfterDiscard,
   jobStatusLabel,
   jobStatusTone,
   kindLabel,
   mergeDraftRules,
+  planRuleDeleteSync,
   triggerLabel,
 } from '../../jobsView';
 import { qk } from '../../queries/keys';
@@ -148,6 +150,46 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     },
   });
 
+  // True after a rule was deleted on the server while that editor was dirty:
+  // the rule was filtered out of the value, but the baseline still holds it,
+  // so Discard must re-fetch instead of reverting to the baseline.
+  const replBaselineStale = useRef(false);
+  const lcBaselineStale = useRef(false);
+
+  const syncEditorAfterDelete = (row: JobRow) => {
+    if (row.kind === 'replication') {
+      const plan = planRuleDeleteSync(repl.isDirty, repl.value.rules, row.name);
+      if (plan.action === 'refresh') {
+        void repl.refresh();
+      } else {
+        repl.setValue((cur) => ({ ...cur, rules: cur.rules.filter((r) => r.name !== row.name) }));
+        replBaselineStale.current = true;
+      }
+    } else if (row.kind === 'lifecycle') {
+      const plan = planRuleDeleteSync(lc.isDirty, lc.value.rules, row.name);
+      if (plan.action === 'refresh') {
+        void lc.refresh();
+      } else {
+        lc.setValue((cur) => ({ ...cur, rules: cur.rules.filter((r) => r.name !== row.name) }));
+        lcBaselineStale.current = true;
+      }
+    }
+  };
+
+  const discardEditors = () => {
+    for (const [ed, stale] of [
+      [repl, replBaselineStale],
+      [lc, lcBaselineStale],
+    ] as const) {
+      if (editorAfterDiscard(stale.current) === 'refresh') {
+        stale.current = false;
+        void ed.refresh();
+      } else {
+        ed.discard();
+      }
+    }
+  };
+
   // ── Sequential apply queue: replication dialog → lifecycle dialog. ──
   // 'lifecycle-pending' means: after replication confirms, open lifecycle.
   const [queueLifecycleNext, setQueueLifecycleNext] = useState(false);
@@ -188,6 +230,8 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       setQueueLifecycleNext(false);
       return;
     }
+    // A successful apply re-fetches the section: the baseline is fresh.
+    replBaselineStale.current = false;
     if (queueLifecycleNext) {
       setQueueLifecycleNext(false);
       // Open the lifecycle dialog as the next step of the queue.
@@ -202,7 +246,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
   }, [repl]);
 
   const confirmLcApply = useCallback(async () => {
-    await lc.confirmApply();
+    if (await lc.confirmApply()) lcBaselineStale.current = false;
     qc.invalidateQueries({ queryKey: qk.jobs.list() });
   }, [lc, qc]);
 
@@ -312,6 +356,9 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       }
       // A deleted rule no longer exists — close its drawer.
       if (action === 'delete' && drawerJobId === row.id) handleDrawerClose();
+      // …and drop it from its editor, or it comes back as a draft that the
+      // next Apply re-creates.
+      if (action === 'delete') syncEditorAfterDelete(row);
       // Refresh the list AND this job's runs/failures tables — a resume/run-now
       // starts a new run that the open drawer's Runs/Failures tabs must show.
       qc.invalidateQueries({ queryKey: qk.jobs.list() });
@@ -577,10 +624,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       <StickyDirtyBar
         visible={anyDirty}
         applying={repl.applying || lc.applying}
-        onDiscard={() => {
-          repl.discard();
-          lc.discard();
-        }}
+        onDiscard={discardEditors}
         onApply={() => void startApplyQueue()}
         floating
       />

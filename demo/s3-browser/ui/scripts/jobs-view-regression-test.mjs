@@ -27,6 +27,8 @@ const {
   deriveVerifyProgress,
   jobWalkProgress,
   jobStrategyMix,
+  planRuleDeleteSync,
+  editorAfterDiscard,
 } = await import(moduleUrl);
 
 const row = (over = {}) => ({
@@ -368,5 +370,30 @@ assert.equal(jobStrategyMix({ objects_processed: 0 }), null, 'nothing copied →
   );
   assert.equal(mix.segments[0].count, 9, 'verbatim kept as reported');
 }
+
+// ── planRuleDeleteSync (deleted rule must not resurrect as a draft) ──────────
+{
+  const rules = [{ name: 'keep' }, { name: 'gone' }];
+  // Clean editor → re-fetch server truth (value AND baseline lose the rule).
+  assert.deepEqual(planRuleDeleteSync(false, rules, 'gone'), { action: 'refresh' });
+  // Dirty editor → filter the rule out of the value; the other edits stay.
+  const plan = planRuleDeleteSync(true, rules, 'gone');
+  assert.equal(plan.action, 'filter');
+  assert.deepEqual(plan.rules, [{ name: 'keep' }]);
+  // Regression: after the delete, the server list no longer has the rule.
+  // Without the sync the editor still carries it and mergeDraftRules shows it
+  // as a DRAFT, which the next Apply re-creates.
+  const server = [row({ id: 'replication:keep', name: 'keep' })];
+  const stale = mergeDraftRules(server, rules, []);
+  assert.ok(stale.some((d) => d.draft && d.row.name === 'gone'), 'stale editor resurrects the rule');
+  const synced = mergeDraftRules(server, plan.rules, []);
+  assert.equal(synced.some((d) => d.row.name === 'gone'), false, 'synced editor drops the rule');
+  // Deleting a rule the editor does not have is a no-op filter.
+  assert.deepEqual(planRuleDeleteSync(true, rules, 'other').rules, rules);
+}
+// Discard after a dirty delete: the baseline still holds the deleted rule, so
+// a plain discard would bring it back — refresh from the server instead.
+assert.equal(editorAfterDiscard(false), 'discard');
+assert.equal(editorAfterDiscard(true), 'refresh');
 
 console.log('jobs view regression checks passed');

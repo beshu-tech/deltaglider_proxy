@@ -478,6 +478,33 @@ export function mergeDraftRules(
   return out;
 }
 
+/**
+ * How to bring a rule editor in line after the server deleted one of its
+ * rules. Without this the editor still carries the rule, mergeDraftRules
+ * shows it as a DRAFT, and the next Apply re-creates it.
+ * - clean editor → re-fetch (value AND baseline lose the rule);
+ * - dirty editor → drop the rule from the value only, keeping the other
+ *   edits. The baseline still holds it, so a later discard must refresh
+ *   (see `editorAfterDiscard`).
+ */
+export function planRuleDeleteSync<T extends NamedRule>(
+  dirty: boolean,
+  rules: T[],
+  name: string,
+): { action: 'refresh' } | { action: 'filter'; rules: T[] } {
+  if (!dirty) return { action: 'refresh' };
+  return { action: 'filter', rules: rules.filter((r) => r.name !== name) };
+}
+
+/**
+ * Discard for a rule editor. `baselineStale` = a rule was deleted on the
+ * server while the editor was dirty: its baseline still holds that rule, so a
+ * plain discard would resurrect it — re-fetch server truth instead.
+ */
+export function editorAfterDiscard(baselineStale: boolean): 'discard' | 'refresh' {
+  return baselineStale ? 'refresh' : 'discard';
+}
+
 // ── Outcome meter (the calm-by-default run-result visual) ─────────────────
 export type MeterState = 'in-sync' | 'copied' | 'errors' | 'mixed' | 'running' | 'idle';
 
