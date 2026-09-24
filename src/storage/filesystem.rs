@@ -705,6 +705,12 @@ impl FilesystemBackend {
 impl StorageBackend for FilesystemBackend {
     // === Bucket operations ===
 
+    fn resolves_key_path_segments(&self, _bucket: &str) -> bool {
+        // `deltaspace_dir` joins the prefix onto an OS path: `a/./b` and
+        // `a//b` resolve to the file of `a/b`.
+        true
+    }
+
     #[instrument(skip(self))]
     async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError> {
         let bucket_dir = self.bucket_dir(bucket);

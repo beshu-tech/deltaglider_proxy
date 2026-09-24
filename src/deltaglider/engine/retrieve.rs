@@ -42,7 +42,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         key: &str,
     ) -> Result<RetrieveResponse, EngineError> {
-        let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
 
         // Check metadata cache first (avoids resolve_metadata_with_migration I/O)
         let (metadata, from_cache) = if let Some(cached) = self.metadata_cache.get(bucket, key) {
@@ -445,7 +445,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         )>,
         EngineError,
     > {
-        let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
 
         // Check metadata cache first. Track cache provenance so a stale
         // strategy (e.g. passthrough cached before a concurrent rewrite to

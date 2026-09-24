@@ -157,6 +157,27 @@ impl ObjectKey {
         }
         Ok(())
     }
+
+    /// Refuse keys that a path-resolving store would alias onto ANOTHER key:
+    /// a `.` segment or an empty (`//`) segment in the prefix. On the
+    /// filesystem backend `a/./b` and `a//b` open the file of `a/b`, while
+    /// IAM authorizes the literal text, so a Deny on `a/b*` would not apply.
+    /// (`validate_object` already refuses a `.`/`..` filename, and `parse`
+    /// strips leading `/`.)
+    pub fn validate_unaliased(&self) -> Result<(), KeyValidationError> {
+        if self.prefix.is_empty() {
+            return Ok(());
+        }
+        for segment in self.prefix.split('/') {
+            if segment.is_empty() || segment == "." {
+                return Err(KeyValidationError(
+                    "Key must not contain '.' or empty path segments on this storage backend"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for ObjectKey {
@@ -746,6 +767,34 @@ mod tests {
     #[test]
     fn test_validate_prefix_rejects_traversal() {
         assert!(ObjectKey::validate_prefix("../bad").is_err());
+    }
+
+    #[test]
+    fn test_validate_unaliased_refuses_dot_and_empty_segments() {
+        for key in [
+            "a/./secret.txt",
+            "./a/secret.txt",
+            "a//secret.txt",
+            "a/b//c",
+            "a/./",
+        ] {
+            assert!(
+                ObjectKey::parse("b", key).validate_unaliased().is_err(),
+                "{key} must be refused"
+            );
+        }
+        for key in [
+            "secret.txt",
+            "a/secret.txt",
+            "a/.hidden/x",
+            "a/b.c/d",
+            "a/..x/y",
+        ] {
+            assert!(
+                ObjectKey::parse("b", key).validate_unaliased().is_ok(),
+                "{key} must be accepted"
+            );
+        }
     }
 
     #[test]

@@ -1089,6 +1089,16 @@ impl StorageBackend for RoutingBackend {
             .lite_list_carries_logical_facts(bucket)
     }
 
+    fn resolves_key_path_segments(&self, bucket: &str) -> bool {
+        if let Some(route) = self.routes.get(bucket) {
+            return self.backends[&route.backend_name]
+                .as_ref()
+                .as_ref()
+                .resolves_key_path_segments(bucket);
+        }
+        self.default_backend().resolves_key_path_segments(bucket)
+    }
+
     // === Scanning operations ===
 
     async fn scan_deltaspace(

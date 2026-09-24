@@ -2473,6 +2473,96 @@ async fn test_percent_encoded_path_cannot_escape_authorization() {
     }
 }
 
+/// On the filesystem backend the OS path join resolves `.` and empty
+/// segments, so `a/./secret.txt` and `a//secret.txt` would open the file of
+/// `a/secret.txt` while IAM authorizes the literal text. The engine refuses
+/// such keys on that backend, so a Deny on `a/secret*` cannot be escaped.
+#[tokio::test]
+async fn test_dot_and_empty_key_segments_cannot_escape_deny_on_filesystem() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let b = server.bucket().to_string();
+    // Seed while still in bootstrap mode; IAM users replace the bootstrap key.
+    server
+        .s3_client()
+        .await
+        .put_object()
+        .bucket(&b)
+        .key("a/secret.txt")
+        .body(ByteStream::from_static(b"top secret"))
+        .send()
+        .await
+        .expect("put");
+    let before = get_iam_version(&admin, &server.endpoint()).await;
+    let denied = create_user(
+        &admin,
+        &server,
+        "denied",
+        vec![
+            json!({"actions": ["*"], "resources": ["*"]}),
+            json!({"effect": "Deny", "actions": ["read", "write", "delete"],
+                   "resources": [format!("{b}/a/secret*")]}),
+        ],
+    )
+    .await;
+    let reader = create_user(
+        &admin,
+        &server,
+        "reader",
+        vec![json!({"actions": ["*"], "resources": ["*"]})],
+    )
+    .await;
+    wait_for_iam_rebuild(&admin, &server.endpoint(), before).await;
+    let client = server
+        .s3_client_with_creds(&denied.access_key_id, &denied.secret_access_key)
+        .await;
+
+    assert!(
+        client
+            .get_object()
+            .bucket(&b)
+            .key("a/secret.txt")
+            .send()
+            .await
+            .is_err(),
+        "control: the plain key is denied"
+    );
+    for alias in ["a/./secret.txt", "./a/secret.txt", "a//secret.txt"] {
+        let got = client.get_object().bucket(&b).key(alias).send().await;
+        assert!(got.is_err(), "Deny bypassed on GET by {alias}");
+        let head = client.head_object().bucket(&b).key(alias).send().await;
+        assert!(head.is_err(), "Deny bypassed on HEAD by {alias}");
+        let put = client
+            .put_object()
+            .bucket(&b)
+            .key(alias)
+            .body(ByteStream::from_static(b"overwritten"))
+            .send()
+            .await;
+        assert!(put.is_err(), "Deny bypassed on PUT by {alias}");
+        let _ = client.delete_object().bucket(&b).key(alias).send().await;
+    }
+    // The object is intact: not overwritten and not deleted through an alias.
+    let body = server
+        .s3_client_with_creds(&reader.access_key_id, &reader.secret_access_key)
+        .await
+        .get_object()
+        .bucket(&b)
+        .key("a/secret.txt")
+        .send()
+        .await
+        .expect("reader GET")
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    assert_eq!(&body[..], b"top secret");
+}
+
 /// `$`-prefixed names are reserved: a rename to one is refused. A row that
 /// already carries such a name stays editable when the name is unchanged.
 #[tokio::test]

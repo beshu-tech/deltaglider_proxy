@@ -810,7 +810,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// only when a counter is attached. `None` on miss / no counter.
     async fn prior_for_counter(&self, bucket: &str, key: &str) -> Option<FileMetadata> {
         self.bucket_usage.as_ref()?;
-        let (obj_key, deltaspace_id) = Self::validated_key(bucket, key).ok()?;
+        let (obj_key, deltaspace_id) = self.validated_key(bucket, key).ok()?;
         self.resolve_metadata(bucket, &deltaspace_id, &obj_key)
             .await
             .ok()
@@ -1224,25 +1224,45 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Parse and validate an S3 key, returning the parsed key and deltaspace ID.
-    fn validated_key(bucket: &str, key: &str) -> Result<(ObjectKey, String), EngineError> {
+    fn validated_key(&self, bucket: &str, key: &str) -> Result<(ObjectKey, String), EngineError> {
         let obj_key = ObjectKey::parse(bucket, key);
         obj_key
             .validate_object()
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
+        self.refuse_aliased_key(&obj_key)?;
         let deltaspace_id = obj_key.deltaspace_id();
         Ok((obj_key, deltaspace_id))
     }
 
     /// Like `validated_key` but stricter — the INGEST (PUT) gate. Rejects `//`
     /// so a malformed key can't be STORED; reads/deletes keep using
-    /// `validated_key` so pre-existing `//` objects stay reachable for cleanup.
-    fn validated_key_ingest(bucket: &str, key: &str) -> Result<(ObjectKey, String), EngineError> {
+    /// `validated_key` so pre-existing `//` objects stay reachable for cleanup
+    /// (on a backend with literal keys).
+    fn validated_key_ingest(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(ObjectKey, String), EngineError> {
         let obj_key = ObjectKey::parse(bucket, key);
         obj_key
             .validate_ingest()
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
+        self.refuse_aliased_key(&obj_key)?;
         let deltaspace_id = obj_key.deltaspace_id();
         Ok((obj_key, deltaspace_id))
+    }
+
+    /// On a backend that resolves key segments as a path (filesystem), refuse
+    /// `.` and empty segments: they would reach a DIFFERENT object than the
+    /// literal key IAM authorized. Every engine entry point goes through
+    /// `validated_key`/`validated_key_ingest`, so this is the one gate.
+    fn refuse_aliased_key(&self, obj_key: &ObjectKey) -> Result<(), EngineError> {
+        if self.storage.resolves_key_path_segments(&obj_key.bucket) {
+            obj_key
+                .validate_unaliased()
+                .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Look up object metadata by checking both delta and passthrough storage,
@@ -1385,7 +1405,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // the object exists on storage to handle out-of-band deletions correctly.
         // The cost is one storage call per HEAD, but HEAD is already a storage call.
 
-        let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
 
         let meta = match self
             .resolve_metadata_with_migration(bucket, &deltaspace_id, &obj_key)
@@ -1824,7 +1844,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         key: &str,
         reclaim_reference: bool,
     ) -> Result<FileMetadata, EngineError> {
-        let (obj_key, deltaspace_id) = Self::validated_key(bucket, key)?;
+        let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
 
         info!("Deleting {}/{}", bucket, key);
 
