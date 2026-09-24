@@ -63,7 +63,17 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   const [isTruncated, setIsTruncated] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [connected, setConnected] = useState(hasCredentials());
-  const searchQuery = q;
+  // The search box shows a local draft; the URL's ?q= follows 200ms later
+  // (debounced replace, see setSearchQuery). Binding the box to ?q= directly
+  // made each keystroke edit the value from BEFORE the previous one, so at
+  // normal typing speed characters vanished ("09-03" → "3"). An external ?q=
+  // change (Back, a link) resets the draft unless the user is mid-typing.
+  const qDebounce = useRef<number | null>(null);
+  const [draftQ, setDraftQ] = useState(q);
+  useEffect(() => {
+    if (qDebounce.current === null) setDraftQ(q);
+  }, [q]);
+  const searchQuery = draftQ;
   const [showHidden, setShowHiddenState] = useState(() => readStorage('dg-show-hidden') === 'true');
   const setShowHidden = useCallback((v: boolean) => {
     setShowHiddenState(v);
@@ -316,8 +326,8 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   // typing doesn't spam the history stack (each keystroke swaps the current
   // entry rather than pushing). REPLACE also means Back from a filtered view
   // leaves the folder rather than undoing keystrokes.
-  const qDebounce = useRef<number | null>(null);
   const setSearchQuery = useCallback((next: string) => {
+    setDraftQ(next);
     if (qDebounce.current !== null) window.clearTimeout(qDebounce.current);
     qDebounce.current = window.setTimeout(() => {
       qDebounce.current = null;
