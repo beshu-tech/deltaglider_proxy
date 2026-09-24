@@ -22,8 +22,8 @@
  */
 import { useState } from 'react';
 import { CAPABILITY_DOC_URL, docsUrlToInAppHref } from '../linkifyDocUrl';
-import { Button, Collapse, Dropdown, Input, InputNumber, Modal, Progress, Radio, Select, Typography } from 'antd';
-import { DownOutlined, EllipsisOutlined, RightOutlined, SyncOutlined } from '@ant-design/icons';
+import { Button, Collapse, Input, InputNumber, Modal, Progress, Radio, Select, Typography } from 'antd';
+import { DownOutlined, RightOutlined, SyncOutlined } from '@ant-design/icons';
 import type { BackendInfo } from '../adminApi';
 import { resolveBackendFor, describeEncryption } from '../encryptionUi';
 import { useColors } from '../ThemeContext';
@@ -38,6 +38,8 @@ import { progressLabel } from '../jobsView';
 import { runJobAction } from '../adminApi';
 import { formatBytes } from '../utils';
 import { bytesFromGib, gibFromBytes } from '../savings';
+import { activateOnKey } from '../keyboard';
+import RowActionsMenu from './RowActionsMenu';
 
 const { Text } = Typography;
 
@@ -286,12 +288,7 @@ export default function BucketCard({
         aria-expanded={expanded}
         aria-label={`${name || 'new bucket policy'} — click to ${expanded ? 'collapse' : 'edit'}`}
         onClick={onToggle}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            onToggle();
-          }
-        }}
+        onKeyDown={activateOnKey(onToggle)}
         style={{
           display: 'flex',
           alignItems: 'center',
@@ -637,50 +634,40 @@ export default function BucketCard({
               )}
               {/* Destructive actions sit behind a "⋯" menu, never as red
                   buttons on the row, and each one is confirmed. */}
-              {(hasOverrides || onRemoveDraft) && (
-                <Dropdown
-                  trigger={['click']}
-                  menu={{
-                    items: [
-                      ...(hasOverrides
-                        ? [{ key: 'reset', danger: true, label: 'Reset to defaults…' }]
-                        : []),
-                      ...(onRemoveDraft
-                        ? [{ key: 'remove', danger: true, label: 'Remove these settings…' }]
-                        : []),
-                    ],
-                    onClick: ({ key }) => {
-                      if (key === 'reset') {
-                        Modal.confirm({
-                          title: `Reset ${name || 'this bucket'} to defaults?`,
-                          content:
-                            'Public access, routing, quota, and compression go back to the defaults. Nothing changes until you review and apply.',
-                          okText: 'Reset',
-                          okButtonProps: { danger: true },
-                          onOk: () => onPatch({ ...DEFAULT_ROW_FIELDS }),
-                        });
-                      } else if (key === 'remove' && onRemoveDraft) {
-                        Modal.confirm({
-                          title: 'Remove these settings?',
-                          content: 'The settings for this bucket name are removed when you review and apply.',
-                          okText: 'Remove',
-                          okButtonProps: { danger: true },
-                          onOk: onRemoveDraft,
-                        });
-                      }
-                    },
-                  }}
-                >
-                  <Button
-                    size="small"
-                    type="text"
-                    icon={<EllipsisOutlined />}
-                    aria-label="More bucket actions"
-                    title="More actions"
-                    style={{ marginLeft: 'auto' }}
-                  />
-                </Dropdown>
-              )}
+              <span style={{ marginLeft: 'auto' }}>
+                <RowActionsMenu
+                  label={`More actions for bucket ${name || '(new)'}`}
+                  actions={[
+                    ...(hasOverrides
+                      ? [{
+                          key: 'reset',
+                          danger: true as const,
+                          label: 'Reset to defaults…',
+                          confirm: {
+                            title: `Reset ${name || 'this bucket'} to defaults?`,
+                            content:
+                              'Public access, routing, quota, and compression go back to the defaults. Nothing changes until you review and apply.',
+                            okText: 'Reset',
+                          },
+                          onSelect: () => onPatch({ ...DEFAULT_ROW_FIELDS }),
+                        }]
+                      : []),
+                    ...(onRemoveDraft
+                      ? [{
+                          key: 'remove',
+                          danger: true as const,
+                          label: 'Remove these settings…',
+                          confirm: {
+                            title: 'Remove these settings?',
+                            content: 'The settings for this bucket name are removed when you review and apply.',
+                            okText: 'Remove',
+                          },
+                          onSelect: onRemoveDraft,
+                        }]
+                      : []),
+                  ]}
+                />
+              </span>
             </div>
           )}
         </div>

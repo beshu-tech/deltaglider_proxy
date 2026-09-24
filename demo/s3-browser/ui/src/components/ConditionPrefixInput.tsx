@@ -260,6 +260,7 @@ export default function ConditionPrefixInput({ value, onChange, bucket = '', sty
               />
             </div>
             {rows.length > 1 && (
+              // eslint-disable-next-line no-restricted-syntax -- removes an unsaved form input, not a stored record
               <Button
                 type="text"
                 danger

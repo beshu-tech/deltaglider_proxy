@@ -14,6 +14,7 @@ import { useFolderSuggestions } from '../useFolderSuggestions';
 import useUploadQueue from '../useUploadQueue';
 import { useColors } from '../ThemeContext';
 import UploadProgressList from './UploadProgressList';
+import { activateOnKey } from '../keyboard';
 
 const { Text, Title } = Typography;
 
@@ -372,12 +373,7 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
         tabIndex={0}
         role="button"
         aria-label="Drop files here to upload, or press Enter to select files"
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            fileInputRef.current?.click();
-          }
-        }}
+        onKeyDown={activateOnKey(() => fileInputRef.current?.click())}
         style={{
           border: `2px dashed ${dragging ? ACCENT_BLUE : BORDER}`,
           borderRadius: 14,

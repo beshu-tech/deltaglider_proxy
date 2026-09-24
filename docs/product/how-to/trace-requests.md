@@ -1,6 +1,6 @@
 # How to trace and audit requests
 
-This guide shows you how to find out why the proxy allowed or denied a request — by dry-running a synthetic request through the admission chain, reading the audit log, and turning on debug headers.
+This guide shows you how to find out why the proxy allowed or denied a request — by testing a sample request against the request rules, reading the audit log, and turning on debug headers.
 
 ## 1. Check the audit log first
 
@@ -12,7 +12,7 @@ When a client reports a denial, start at **Settings → Observability → Audit 
 curl -b cookies "https://s3.acme.example/_/api/admin/audit?limit=500"
 ```
 
-If the audit log shows nothing for the failing request, the denial happened **before** IAM — in SigV4 verification or the admission chain. That's what tracing is for.
+If the audit log shows nothing for the failing request, the denial happened **before** IAM — in SigV4 verification or in the request rules. That's what tracing is for.
 
 Know what the ring is: an **in-memory** buffer (default 500 entries, `DGP_AUDIT_RING_SIZE` to raise it) that resets to empty on every restart. The persistent audit source is stdout — every `audit_log()` call also emits a `tracing::info!` line; ship those into your log pipeline for retention.
 
@@ -22,7 +22,7 @@ Know what the ring is: an **in-memory** buffer (default 500 entries, `DGP_AUDIT_
 
 Three equivalent front doors to the same evaluator — none of them touches real data:
 
-**Admin UI:** **Settings → Observability → Rule tester** (`/_/admin/diagnostics/trace`). Enter method, path, and whether the request is authenticated; the panel renders the reason path and offers Copy-as-JSON.
+**Admin UI:** **Settings → Observability → Request rule tester** (`/_/admin/diagnostics/trace`). Enter method, path, and whether the request is authenticated; the panel renders the reason path and offers Copy-as-JSON.
 
 **CLI:**
 
@@ -42,7 +42,7 @@ curl -b cookies "https://s3.acme.example/_/api/admin/config/trace?method=PUT&pat
 
 ## 3. Read the reason path
 
-The trace output is a decision plus the chain that produced it: the decision tag (allow / allow-anonymous / deny / reject), the **matched block** by name, and the resolved request as the evaluator saw it. Admission is first-match-wins, so the named block is the complete answer — nothing after it was consulted.
+The trace output is a decision plus the path that produced it: the decision tag (allow / allow-anonymous / deny / reject), the **matched rule** by name, and the resolved request as the evaluator saw it. The first matching rule decides, so the named rule is the complete answer — nothing after it was consulted.
 
 Worked example — `downloads` has a public prefix:
 
@@ -54,10 +54,10 @@ storage:
         - public/
 ```
 
-- Trace `GET /downloads/public/tool.zip`, unauthenticated → **allow-anonymous**, matched block `public-prefix:downloads/public/` — the block synthesized from the bucket policy, granting read+list only.
-- Trace `PUT /downloads/public/tool.zip`, unauthenticated → **denied**. The public-prefix block matches only read methods, so the PUT falls through to authentication, which an anonymous request fails.
+- Trace `GET /downloads/public/tool.zip`, unauthenticated → **allow-anonymous**, matched rule `public-prefix:downloads/public/` — the public-access rule that the proxy creates from the bucket setting. It allows reading and listing only.
+- Trace `PUT /downloads/public/tool.zip`, unauthenticated → **denied**. The public-access rule matches only read methods, so the PUT falls through to authentication, which an anonymous request fails.
 
-Same prefix, opposite outcomes — and the trace names the exact block responsible for each.
+Same prefix, opposite outcomes — and the trace names the exact rule responsible for each.
 
 ## 4. Turn on debug headers
 

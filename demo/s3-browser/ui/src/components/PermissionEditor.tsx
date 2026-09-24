@@ -214,6 +214,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                 >
                   Conditions
                 </Button>
+                {/* eslint-disable-next-line no-restricted-syntax -- removes an unsaved form row, not a stored record */}
                 <Button type="text" danger size="small" icon={<DeleteOutlined />} onClick={() => removeRow(id)}>
                   Remove
                 </Button>

@@ -393,6 +393,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
         >
           Requeue failed shown ({visibleFailedIds.length})
         </Button>
+        {/* eslint-disable-next-line no-restricted-syntax -- toolbar bulk action (confirmed), not a row action */}
         <Button
           danger
           icon={<DeleteOutlined />}

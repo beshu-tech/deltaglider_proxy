@@ -21,7 +21,7 @@ Or in the UI: **Settings → Storage → Buckets** → expand the `downloads` ro
 
 The tri-state maps directly to the YAML: **None** (no anonymous access), **Specific prefixes** (`public_prefixes: [...]`), **Entire bucket** (`public: true`).
 
-Apply the change — it hot-reloads; the proxy synthesizes a read-only `public-prefix:downloads` admission block from it.
+Apply the change — it hot-reloads; the proxy creates a read-only request rule named `public-prefix:downloads` from it.
 
 ## 2. Know what anonymous callers get
 
@@ -83,5 +83,5 @@ Publishing a prefix doesn't change who can write to it — review that separatel
 
 - [Authentication reference](../reference/authentication.md#public-prefixes) — exact anonymous semantics and prefix validation rules.
 - [About authentication and access control](../explanation/security-model.md) — why public prefixes are carve-outs, not a credential type.
-- [How to gate requests before authentication](gate-requests-with-admission-rules.md) — the synthesized `public-prefix:*` blocks, and taking a prefix offline with one deny.
+- [How to gate requests before authentication](gate-requests-with-admission-rules.md) — the `public-prefix:*` public-access rules, and how one deny rule takes a public folder offline.
 - [How to create IAM users and groups](create-iam-users.md) — credentials for everyone who isn't anonymous.

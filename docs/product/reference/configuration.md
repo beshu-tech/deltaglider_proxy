@@ -463,7 +463,7 @@ The initial `gui → declarative` flip is guarded: if YAML contains no users or 
 
 ## Admission chain
 
-Operator-authored pre-auth request gating. Blocks are evaluated top-to-bottom; first match wins. Operator blocks fire *before* synthesized public-prefix blocks derived from `storage.buckets[*].public_prefixes`.
+Request rules: gating of requests before authentication. Each entry of `blocks` is one rule. Rules are checked from top to bottom, and the first rule that matches decides. Your rules are checked *before* the public-access rules that the proxy creates from `storage.buckets[*].public_prefixes`.
 
 ```yaml
 admission:
@@ -494,7 +494,7 @@ admission:
 
 | Field | Type | Notes |
 |-------|------|-------|
-| `name` | string (required) | 1-128 chars, `[A-Za-z0-9_:.-]`. Must be unique across the chain. `public-prefix:*` is reserved for synthesized blocks. |
+| `name` | string (required) | 1-128 chars, `[A-Za-z0-9_:.-]`. Must be unique across the chain. `public-prefix:*` is reserved for the public-access rules. |
 | `match` | object (default `{}`) | AND-combined predicates. Empty `{}` fires on every request. |
 | `match.method` | `[string]` | HTTP methods: `GET` `HEAD` `PUT` `POST` `DELETE` `PATCH` `OPTIONS`. Case-insensitive on parse. |
 | `match.source_ip` | IP | Exact match. Mutually exclusive with `source_ip_list`. |
@@ -509,9 +509,9 @@ admission:
 
 ### Round-trip
 
-Operator-authored `source_ip_list` entries round-trip verbatim (bare IPs stay bare, CIDRs stay CIDRs) so GitOps diffs don't flip on every apply.
+`source_ip_list` entries round-trip verbatim (bare IPs stay bare, CIDRs stay CIDRs) so GitOps diffs don't flip on every apply.
 
-The admin GUI's Admission page (`/_/admin/access/admission`) is the authoring surface. Synthesized `public-prefix:*` blocks appear read-only below the operator list; edit them via Storage → Buckets instead.
+The admin UI page **Request rules** (`/_/admin/access/admission`) edits these rules. The `public-prefix:*` public-access rules show read-only below your rules; change them in **Storage → Buckets** instead.
 
 ---
 
@@ -712,7 +712,7 @@ storage:
 
 ### Public prefixes
 
-When `public_prefixes` (or `public: true`) is set, anonymous users can GET, HEAD, and LIST objects under the prefix. Writes always require authentication. Use trailing `/` for directory-aligned matching (`"public/"` matches `public/installer.zip` but not `publicity/`). The empty string `""` makes the entire bucket public (logged as a warning). Prefixes containing `..`, null bytes, or `//` are rejected. The proxy synthesizes `public-prefix:<bucket>` admission blocks from this config.
+When `public_prefixes` (or `public: true`) is set, anonymous users can GET, HEAD, and LIST objects under the prefix. Writes always require authentication. Use trailing `/` for directory-aligned matching (`"public/"` matches `public/installer.zip` but not `publicity/`). The empty string `""` makes the entire bucket public (logged as a warning). Prefixes containing `..`, null bytes, or `//` are rejected. The proxy creates `public-prefix:<bucket>` request rules from this setting.
 
 ---
 
@@ -888,7 +888,7 @@ A kitchen-sink YAML covering every top-level section. Fields omitted here inheri
 ```yaml
 # deltaglider_proxy.yaml
 
-# Operator-authored admission chain (pre-auth gating)
+# Request rules (checked before authentication)
 admission:
   blocks:
     - name: deny-known-bad-ips

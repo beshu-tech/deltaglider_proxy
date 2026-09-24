@@ -5,6 +5,7 @@ import { PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { LoadingState } from './StatePlaceholders';
 import './MasterDetailPanel.css';
+import { activateOnKey } from '../keyboard';
 
 const { Text } = Typography;
 
@@ -154,7 +155,11 @@ export default function MasterDetailPanel<T>({
               return (
                 <div
                   key={getId(item)}
+                  role="button"
+                  tabIndex={0}
+                  aria-current={selected || undefined}
                   onClick={() => onSelect(item)}
+                  onKeyDown={activateOnKey(() => onSelect(item))}
                   className={rowClassName}
                   style={{
                     padding: rowPadding,

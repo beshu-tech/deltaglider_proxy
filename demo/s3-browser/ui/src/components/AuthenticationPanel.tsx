@@ -350,10 +350,7 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
                 }));
               }}
               onDelete={async () => {
-                // The rule decides who may sign in and which group they get.
-                const groupName = groups.find((g) => g.id === rule.group_id)?.name ?? `group #${rule.group_id}`;
-                const what = rule.match_value ? `"${rule.match_value}" → ${groupName}` : `→ ${groupName}`;
-                if (!window.confirm(`Delete mapping rule ${what}? Users who match only this rule can no longer sign in or get this group.`)) return;
+                // MappingRuleRow's menu confirms before this runs.
                 try {
                   await deleteRuleMutation.mutateAsync(rule.id);
                   setPendingRules((prev) => {

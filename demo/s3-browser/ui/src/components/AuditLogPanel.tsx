@@ -218,13 +218,12 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
       >
         <FileTextOutlined style={{ color: colors.ACCENT_BLUE, flexShrink: 0 }} aria-hidden />
         <span>
-          Newest {entries.length || 500} entries kept in memory for quick inspection.{' '}
-          <code
-            title="Environment variable controlling the ring size (default 500)"
-            style={{ fontFamily: 'var(--font-mono)', fontSize: 11, opacity: 0.6, color: colors.TEXT_MUTED }}
-          >
+          This proxy keeps the most recent entries in memory (500 by default; set the number
+          with{' '}
+          <code style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: colors.TEXT_MUTED }}>
             DGP_AUDIT_RING_SIZE
           </code>
+          ). A restart clears them. Showing {entries.length} {entries.length === 1 ? 'entry' : 'entries'}.
         </span>
       </div>
 

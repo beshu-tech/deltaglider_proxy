@@ -14,6 +14,7 @@ import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
 import { isSessionExpired } from '../errorHandling';
 import { formatDuration } from '../utils';
+import RowActionsMenu from './RowActionsMenu';
 
 const { Text } = Typography;
 
@@ -38,7 +39,6 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
   useEffect(() => { void refresh(); }, [refresh]);
 
   const revokeOne = async (id: string) => {
-    if (!window.confirm(`Force-logout session ${id}? That session is signed out immediately.`)) return;
     try {
       setBusy(id);
       await revokeSession(id);
@@ -93,15 +93,31 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
     {
       title: '',
       key: 'action',
+      align: 'right' as const,
       // The server refuses to revoke the caller's own session (use Sign out),
       // so that row is labelled instead of offering a button that errors.
       render: (_: unknown, r: SessionSummary) =>
         r.current ? (
           <Text type="secondary">This session</Text>
         ) : (
-          <Button danger size="small" icon={<LogoutOutlined />} loading={busy === r.id} onClick={() => void revokeOne(r.id)}>
-            Revoke
-          </Button>
+          <RowActionsMenu
+            label={`More actions for session ${r.id}`}
+            loading={busy === r.id}
+            actions={[
+              {
+                key: 'revoke',
+                label: 'Sign out this session…',
+                icon: <LogoutOutlined />,
+                danger: true,
+                confirm: {
+                  title: 'Sign out this session?',
+                  content: `Session ${r.id}${r.identity ? ` (${r.identity})` : ''} is signed out immediately.`,
+                  okText: 'Sign out',
+                },
+                onSelect: () => revokeOne(r.id),
+              },
+            ]}
+          />
         ),
     },
   ];

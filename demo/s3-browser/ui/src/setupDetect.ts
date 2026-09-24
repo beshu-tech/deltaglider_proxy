@@ -17,11 +17,25 @@ export interface BackendSummary {
   is_synthesized?: boolean;
 }
 
+/** What the proxy's own configuration holds (from `GET /config`). */
+export interface ConfigCounts {
+  /** Bucket settings entries (`storage.buckets`). */
+  bucketSettings: number;
+  /** Request rules (`admission.blocks`). */
+  requestRules: number;
+}
+
 export interface ExistingSetup {
-  /** True when the proxy has named backends or at least one bucket. */
+  /**
+   * True when the proxy's configuration holds an operator's work: named
+   * backends, bucket settings, or request rules. Buckets that merely exist
+   * on the storage do not count: the wizard does not touch them.
+   */
   configured: boolean;
+  /** Named backends (the synthesized singleton is not counted). */
   backendCount: number;
-  bucketCount: number;
+  bucketSettingsCount: number;
+  requestRuleCount: number;
   /** Type of the default backend (or the only one), if known. */
   kind: 'filesystem' | 's3' | null;
   fsPath: string;
@@ -32,7 +46,7 @@ export interface ExistingSetup {
 
 export function describeExistingSetup(
   backends: BackendSummary[],
-  bucketCount: number,
+  counts: ConfigCounts,
   defaultBackend: string | null,
 ): ExistingSetup {
   const named = backends.filter((b) => !b.is_synthesized);
@@ -40,12 +54,13 @@ export function describeExistingSetup(
     backends.find((b) => b.name === defaultBackend) ?? (backends.length > 0 ? backends[0] : undefined);
   const type = current?.backend_type;
   return {
-    // A fresh install shows only the synthesized singleton backend and no
-    // buckets. Anything more is an operator's work that the wizard would
-    // overwrite.
-    configured: named.length > 0 || bucketCount > 0,
-    backendCount: backends.length,
-    bucketCount,
+    // A fresh install shows only the synthesized singleton backend, with no
+    // bucket settings and no request rules. Anything more is an operator's
+    // work that the wizard would overwrite.
+    configured: named.length > 0 || counts.bucketSettings > 0 || counts.requestRules > 0,
+    backendCount: named.length,
+    bucketSettingsCount: counts.bucketSettings,
+    requestRuleCount: counts.requestRules,
     kind: type === 's3' ? 's3' : type === 'filesystem' ? 'filesystem' : null,
     fsPath: type === 'filesystem' ? current?.path ?? '' : '',
     s3Endpoint: type === 's3' ? current?.endpoint ?? '' : '',

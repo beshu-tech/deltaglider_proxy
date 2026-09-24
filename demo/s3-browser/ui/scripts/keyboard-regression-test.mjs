@@ -25,7 +25,7 @@ class FakeHTMLElement {
 globalThis.HTMLElement = FakeHTMLElement;
 
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
-const { isTypingTarget, anyOverlayOpen, isCommandCombo } = await import(moduleUrl);
+const { isTypingTarget, anyOverlayOpen, isCommandCombo, activateOnKey } = await import(moduleUrl);
 
 // --- isTypingTarget ----------------------------------------------------------
 assert.equal(isTypingTarget(null), false, 'null target is not typing');
@@ -65,5 +65,27 @@ assert.equal(anyOverlayOpen(fakeDoc([MODAL, DRAWER, DROPDOWN])), true, 'all open
 // Escape that closes a menu (bucket row "⋯", account menu) went up a folder too.
 assert.equal(anyOverlayOpen(fakeDoc(['.ant-dropdown:not(.ant-dropdown-hidden)'])), true, 'row menu open');
 assert.equal(anyOverlayOpen(fakeDoc(['.account-menu-panel'])), true, 'account menu open');
+
+// --- activateOnKey -----------------------------------------------------------
+// Issue #92 review: Enter on a row's "⋯" button opened the job drawer, because
+// the row handled Enter for every descendant.
+{
+  let runs = 0;
+  let prevented = 0;
+  const row = {};
+  const child = {};
+  const ev = (key, target) => ({ key, target, currentTarget: row, preventDefault: () => { prevented++; } });
+  const handler = activateOnKey(() => { runs++; });
+  handler(ev('Enter', row));
+  handler(ev(' ', row));
+  assert.equal(runs, 2, 'Enter and Space on the row itself activate it');
+  assert.equal(prevented, 2, 'the row suppresses page scroll on Space');
+  handler(ev('Enter', child));
+  handler(ev(' ', child));
+  assert.equal(runs, 2, 'keys from a descendant never activate the row');
+  assert.equal(prevented, 2, 'a descendant keeps its default key behaviour');
+  handler(ev('a', row));
+  assert.equal(runs, 2, 'other keys do nothing');
+}
 
 console.log('keyboard regression checks passed');

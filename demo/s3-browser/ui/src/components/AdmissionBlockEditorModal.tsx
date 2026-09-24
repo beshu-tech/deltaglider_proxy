@@ -50,7 +50,7 @@ import {
 } from '../schemas/admissionSchema';
 import { useColors } from '../ThemeContext';
 import FormField from './FormField';
-import { sourceIpMatch, sourceIpText } from '../sourceIpField';
+import { sourceIpMatch, sourceIpProblem, sourceIpText } from '../sourceIpField';
 
 /** Tighter field rhythm than FormField's page default: keeps the modal short. */
 const FIELD_GAP: React.CSSProperties = { marginBottom: 16 };
@@ -142,9 +142,14 @@ export default function AdmissionBlockEditorModal({
   useEffect(() => {
     if (open) setIpText(sourceIpText(originalIps));
   }, [open, originalIps]);
+  // Checked here, not only by the schema: a bad entry inside the list is an
+  // array-element error with no message of its own, which blocked Save
+  // without saying why.
+  const ipProblem = sourceIpProblem(ipText);
   const configFlag = watch('match.config_flag');
 
   const onSubmit = (data: AdmissionBlockForm) => {
+    if (ipProblem) return;
     // Duplicate-name check (case-insensitive, excluding the block
     // we're currently editing). Surface as an RHF field error so
     // the operator sees it inline under the Name input rather than
@@ -270,7 +275,7 @@ export default function AdmissionBlockEditorModal({
         <FormField
           label="Source IPs"
           yamlPath="match.source_ip_list"
-          helpText="One IP address or network (CIDR) per line. Up to 4096 entries."
+          helpText="One IP address or network (CIDR) per line. A pasted list separated by commas or spaces also works. Up to 4096 entries."
           style={FIELD_GAP}
         >
           <Input.TextArea
@@ -286,11 +291,18 @@ export default function AdmissionBlockEditorModal({
             }}
             style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}
           />
-          {(errors.match?.source_ip_list || errors.match?.source_ip) && (
-            <Text type="danger" style={{ fontSize: 12 }}>
-              {errors.match?.source_ip_list?.message ?? errors.match?.source_ip?.message}
-            </Text>
-          )}
+          {(() => {
+            const msg =
+              ipProblem ??
+              errors.match?.source_ip_list?.message ??
+              errors.match?.source_ip?.message ??
+              (errors.match?.source_ip_list ? 'Check the source IPs: one entry is not valid.' : null);
+            return msg ? (
+              <Text type="danger" role="alert" style={{ fontSize: 12 }}>
+                {msg}
+              </Text>
+            ) : null;
+          })()}
         </FormField>
 
         <div style={TWO_COLUMNS}>

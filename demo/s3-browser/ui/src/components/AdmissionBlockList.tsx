@@ -1,7 +1,7 @@
 /**
  * AdmissionBlockList — drag-reorderable list of operator-authored
  * blocks. Each row renders a summary of the match predicates + the
- * action badge, with Edit / Delete buttons.
+ * action badge, an Edit button, and a "⋯" menu that holds Remove.
  *
  * Wave 4 of the admin UI revamp plan, §7.1. Built on @dnd-kit
  * (see §4.4 of the plan). First-match-wins semantics make row order
@@ -43,6 +43,7 @@ import {
 import type { AdmissionBlock } from '../adminApi';
 import { actionKind } from '../schemas/admissionSchema';
 import { useColors } from '../ThemeContext';
+import RowActionsMenu from './RowActionsMenu';
 
 const { Text } = Typography;
 
@@ -200,15 +201,19 @@ function SortableRow({ block, onEdit, onDelete }: RowProps) {
         aria-label={`edit ${block.name}`}
       />
 
-      {/* Delete */}
-      <Button
-        size="small"
-        type="text"
-        danger
-        icon={<DeleteOutlined />}
-        onClick={onDelete}
-        title="Remove this rule"
-        aria-label={`delete ${block.name}`}
+      {/* Remove: behind "⋯"; AdmissionPanel's handler confirms. */}
+      <RowActionsMenu
+        label={`More actions for rule ${block.name}`}
+        actions={[
+          {
+            key: 'remove',
+            label: 'Remove rule…',
+            icon: <DeleteOutlined />,
+            danger: true,
+            confirm: 'caller',
+            onSelect: onDelete,
+          },
+        ]}
       />
     </div>
   );

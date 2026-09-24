@@ -63,3 +63,20 @@ export function isCommandCombo(
 ): boolean {
   return (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey;
 }
+
+/**
+ * `onKeyDown` for a clickable non-button element (a list row, a card header,
+ * a drop zone): Enter or Space runs `action`. Keys from a DESCENDANT (a "⋯"
+ * menu button, a Pause button, an input inside the row) are ignored, so they
+ * keep their own behaviour instead of also activating the row. Always use
+ * this instead of an inline `e.key === 'Enter' || e.key === ' '` check
+ * (ESLint forbids the inline form).
+ */
+export function activateOnKey(action: () => void) {
+  return (e: Pick<KeyboardEvent, 'key' | 'target' | 'currentTarget' | 'preventDefault'>): void => {
+    if (e.target !== e.currentTarget) return;
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    e.preventDefault();
+    action();
+  };
+}

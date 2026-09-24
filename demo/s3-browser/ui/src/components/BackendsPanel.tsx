@@ -3,8 +3,8 @@ import { LinkifiedText } from './LinkifiedText';
 import { CAPABILITY_DOC_URL } from '../linkifyDocUrl';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
-import { Button, Dropdown, Input, Modal, Radio, Switch, Typography, Space, Alert, Spin, message } from 'antd';
-import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined, MoreOutlined } from '@ant-design/icons';
+import { Button, Input, Modal, Radio, Switch, Typography, Space, Alert, Spin, message } from 'antd';
+import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
 import type { BackendHealthEntry, BackendInfo, CreateBackendRequest } from '../adminApi';
 import { createBackend, deleteBackend, probeBackend, testS3Connection, updateAdminConfig, putSection } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
@@ -22,6 +22,7 @@ import { normalizeUiError } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { isSessionExpired } from '../errorHandling';
 import { isAbsolutePath } from '../utils';
+import RowActionsMenu from './RowActionsMenu';
 
 const { Text } = Typography;
 
@@ -461,19 +462,20 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 {/* Remove sits in a "⋯" menu, not as a red icon on every card:
                     a destructive action should take a deliberate second step. */}
                 {!b.is_synthesized && (
-                  <Dropdown
-                    trigger={['click']}
-                    menu={{
-                      items: [
-                        { key: 'remove', label: 'Remove backend…', icon: <DeleteOutlined />, danger: true },
-                      ],
-                      onClick: ({ key }) => {
-                        if (key === 'remove') handleDelete(b.name);
+                  <RowActionsMenu
+                    label={`More actions for backend ${b.name}`}
+                    actions={[
+                      {
+                        key: 'remove',
+                        label: 'Remove backend…',
+                        icon: <DeleteOutlined />,
+                        danger: true,
+                        // handleDelete opens its own dialog: it names the buckets routed here.
+                        confirm: 'caller',
+                        onSelect: () => handleDelete(b.name),
                       },
-                    }}
-                  >
-                    <Button size="small" icon={<MoreOutlined />} aria-label={`More actions for backend ${b.name}`} title="More actions" />
-                  </Dropdown>
+                    ]}
+                  />
                 )}
               </div>
               {testResult?.name === b.name && (

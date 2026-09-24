@@ -1,7 +1,8 @@
-import { Button, Typography, Input, Select } from 'antd';
+import { Typography, Input, Select } from 'antd';
 import { DeleteOutlined } from '@ant-design/icons';
 import type { AuthProvider, MappingRule, IamGroup } from '../adminApi';
 import { useColors } from '../ThemeContext';
+import RowActionsMenu from './RowActionsMenu';
 
 const { Text } = Typography;
 
@@ -11,7 +12,7 @@ interface MappingRuleRowProps {
   groups: IamGroup[];
   colors: ReturnType<typeof useColors>;
   onUpdate: (req: Record<string, unknown>) => void;
-  /** Confirms and handles its own errors; the row only fires it. */
+  /** Runs after the row's menu confirms; handles its own errors. */
   onDelete: () => void | Promise<void>;
   /** Locks all inputs while a Save Rules round-trip is in flight, so a
    *  concurrent edit can't be lost when loadData() resyncs afterwards. */
@@ -27,6 +28,8 @@ const MATCH_TYPES = [
 ];
 
 export default function MappingRuleRow({ rule, providers, groups, colors, onUpdate, onDelete, disabled }: MappingRuleRowProps) {
+  const groupName = groups.find((g) => g.id === rule.group_id)?.name ?? `group #${rule.group_id}`;
+  const what = rule.match_value ? `"${rule.match_value}" → ${groupName}` : `→ ${groupName}`;
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
@@ -92,7 +95,25 @@ export default function MappingRuleRow({ rule, providers, groups, colors, onUpda
         ]}
         style={{ width: 130 }}
       />
-      <Button size="small" danger disabled={disabled} icon={<DeleteOutlined />} onClick={() => { void onDelete(); }} title="Delete rule" aria-label="Delete rule" />
+      <RowActionsMenu
+        label={`More actions for mapping rule ${what}`}
+        disabled={disabled}
+        actions={[
+          {
+            key: 'delete',
+            label: 'Delete rule…',
+            icon: <DeleteOutlined />,
+            danger: true,
+            // The rule decides who may sign in and which group they get.
+            confirm: {
+              title: `Delete mapping rule ${what}?`,
+              content: 'Users who match only this rule can no longer sign in or get this group.',
+              okText: 'Delete rule',
+            },
+            onSelect: onDelete,
+          },
+        ]}
+      />
     </div>
   );
 }

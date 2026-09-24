@@ -267,6 +267,7 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
               />
             </div>
             {rows.length > 1 && (
+              // eslint-disable-next-line no-restricted-syntax -- removes an unsaved form input, not a stored record
               <Button
                 type="text"
                 danger
