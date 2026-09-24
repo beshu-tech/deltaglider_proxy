@@ -31,9 +31,11 @@ promptly.
 Because authorization now compares policies against the decoded key, the
 `${iam:username}` and `${iam:access_key_id}` templates insert the name as it
 is. A policy on `home/${iam:username}/*` now matches the key
-`home/dana@corp.com/report.pdf` for the user `dana@corp.com`. Only the
-characters that change the meaning of a pattern (`/`, `*`, `?`, `$`, `{`, `}`
-and `%`) are escaped.
+`home/dana@corp.com/report.pdf` for the user `dana@corp.com`. A name or access
+key that contains a character that changes the meaning of a pattern (`/`, `*`,
+`?`, `$`, `{`, `}` or `%`) cannot be inserted safely. If one of a user's
+effective permissions uses the template, that user now gets no permissions at
+all, and the proxy logs a warning. Rename such users to keep their access.
 
 ### Changed — A paused replication rule also pauses event-driven replication
 
@@ -41,7 +43,8 @@ Before this release, pausing a rule stopped only the scheduled reconcile run.
 The event consumer still copied new objects and propagated deletes. Now a
 paused rule does nothing, and the events for it during the pause are not
 queued. Resuming the rule makes it due at once, so the next scheduler tick
-starts a reconcile run that brings the destination in sync. With
+starts a full reconcile run (from the start, not from a saved position) that
+brings the destination in sync. With
 `replicate_deletes: true`, that run applies the source's deletes too; to keep
 deleted objects on the destination, turn `replicate_deletes` off.
 

@@ -12,9 +12,15 @@ use tracing::debug;
 use super::types::{AuthenticatedUser, ListScope, S3Action};
 use crate::metrics::{record_http_request_total, Metrics};
 
-/// Map an HTTP method + path to an S3 action.
+/// Map an HTTP method + DECODED path to an S3 action. Bucket-level vs
+/// object-level comes from `RequestTarget::bucket_and_key`, the same split
+/// the resource check uses, so the two can never disagree about a path.
 fn classify_action(method: &axum::http::Method, path: &str) -> S3Action {
-    let is_bucket_level = path.trim_matches('/').split('/').count() <= 1;
+    let target = crate::api::request_target::RequestTarget {
+        path: path.to_string(),
+        query: Vec::new(),
+    };
+    let is_bucket_level = target.bucket_and_key().1.is_empty();
 
     match *method {
         axum::http::Method::GET | axum::http::Method::HEAD => {
@@ -100,8 +106,10 @@ pub async fn authorization_middleware(
     let (bucket, key) = target.bucket_and_key();
 
     // ListBuckets (GET /) is filtered at the handler level, not denied outright.
-    // This lets IAM users see only the buckets they have permissions on.
-    if bucket.is_empty() && action == S3Action::List {
+    // This lets IAM users see only the buckets they have permissions on. Only
+    // the real service root: `//x` has an empty bucket too, but it is not
+    // ListBuckets and must not skip IAM.
+    if path == "/" && action == S3Action::List {
         return Ok(next.run(request).await);
     }
 
@@ -325,6 +333,16 @@ mod tests {
         assert_eq!(
             classify_action(&axum::http::Method::POST, "/bucket/key"),
             S3Action::Write
+        );
+        // Same split as the resource check: `//x` is an object in bucket "",
+        // `/b//k` is object `k`.
+        assert_eq!(
+            classify_action(&axum::http::Method::GET, "//x"),
+            S3Action::Read
+        );
+        assert_eq!(
+            classify_action(&axum::http::Method::GET, "/b//k"),
+            S3Action::Read
         );
     }
 }

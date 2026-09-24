@@ -1583,7 +1583,10 @@ fn copy_source_bucket_key(source: &s3s::dto::CopySource) -> s3s::S3Result<(Strin
                     "copy source versionId is not supported"
                 ));
             }
-            Ok((bucket.to_string(), key.to_string()))
+            // s3s keeps `b//k` as key `/k`; the engine (`ObjectKey::parse`)
+            // serves it as `k`. Authorize the key the engine will read, or a
+            // Deny on `b/k*` is escaped through `x-amz-copy-source: b//k`.
+            Ok((bucket.to_string(), key.trim_start_matches('/').to_string()))
         }
         s3s::dto::CopySource::AccessPoint { .. } | s3s::dto::CopySource::Outpost { .. } => {
             Err(s3s::s3_error!(

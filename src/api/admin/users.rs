@@ -347,16 +347,23 @@ pub async fn update_user(
     headers: HeaderMap,
     Json(body): Json<UpdateUserRequest>,
 ) -> Result<Json<IamUser>, StatusCode> {
-    if body
-        .name
-        .as_deref()
-        .is_some_and(crate::iam::types::is_reserved_principal_name)
-    {
-        tracing::warn!("User name cannot start with '$': {:?}", body.name);
-        return Err(StatusCode::BAD_REQUEST);
-    }
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
+
+    // Refuse a RENAME to a reserved name. A row that already carries one (an
+    // OAuth user provisioned before names were checked) stays editable: the
+    // GUI always sends the current name back.
+    if let Some(name) = body.name.as_deref() {
+        if crate::iam::types::is_reserved_principal_name(name) {
+            let current = db
+                .get_user_by_id(user_id)
+                .map_err(|_| StatusCode::NOT_FOUND)?;
+            if current.name != name {
+                tracing::warn!("User name cannot start with '$': {:?}", name);
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
 
     let normalized_perms = body.permissions.as_ref().map(|p| {
         let mut perms = p.clone();

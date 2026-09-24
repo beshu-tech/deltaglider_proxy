@@ -75,7 +75,7 @@ Template facts:
 
 - The `iam:` prefix is mandatory; a bare `${username}` is **not** substituted. The prefix distinguishes request-time identity substitution from the `${env:NAME}` load-time config expansion. A stale bare `${username}` leaves a literal, unmatchable resource pattern — so the rule matches nothing and the user is **silently denied**. The save-time config advisories flag this; see [Config advisories](configuration.md#config-advisories).
 - Templates are stored raw in the DB/YAML and expanded when the in-memory IAM index is built, after group permissions are merged into each member user.
-- Identity values are percent-encoded before substitution: a username `dana/team*` becomes `dana%2Fteam%2A`, so it cannot inject path separators or wildcards.
+- Identity values are inserted as they are, because the proxy compares policies against the decoded object key. The user `dana@corp.com` therefore matches the key `home/dana@corp.com/report.pdf`. A value that contains `/`, `*`, `?`, `$`, `{`, `}` or `%` cannot be inserted safely, because it would add a path level or a wildcard. When a user's name or access key contains one of these characters and one of the user's effective permissions uses the matching template, the proxy gives that user no permissions at all and logs a warning.
 - Unknown templates are rejected by user/group API validation and by declarative IAM apply.
 
 Example — a per-user home prefix in `db-archive`, shared via the `Engineering` group:
@@ -114,7 +114,7 @@ Conditions within a single rule are ANDed — all must match for the rule to app
 
 With `DGP_TRUST_PROXY_HEADERS=true` on a proxy exposed directly to the internet, clients can spoof `aws:SourceIp` via a forged `X-Forwarded-For` header.
 
-`s3:prefix` string values accept the identity templates above, with the same storage, expansion, and percent-encoding rules as resource patterns.
+`s3:prefix` string values accept the identity templates above, with the same storage, expansion, and character rules as resource patterns.
 
 ### JSON format
 

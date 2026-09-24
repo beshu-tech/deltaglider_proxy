@@ -151,9 +151,20 @@ pub struct AuthenticatedUser {
 
 /// `$`-prefixed user names are reserved for synthetic principals
 /// (`$anonymous`, `$bootstrap`). Every path that names a stored user refuses
-/// them.
+/// them, or (OAuth auto-provisioning, where the IdP picks the name) strips
+/// them with [`strip_reserved_principal_prefix`].
 pub fn is_reserved_principal_name(name: &str) -> bool {
     name.starts_with('$')
+}
+
+/// `name` with every reserved prefix removed, so that
+/// `is_reserved_principal_name` is false for the result.
+pub fn strip_reserved_principal_prefix(name: &str) -> &str {
+    let mut name = name;
+    while is_reserved_principal_name(name) {
+        name = &name[1..];
+    }
+    name
 }
 
 /// Principal name of the bootstrap (single-credential, legacy-mode) user.
@@ -321,6 +332,9 @@ mod principal_tests {
         assert!(is_reserved_principal_name("$anonymous"));
         assert!(is_reserved_principal_name("$x"));
         assert!(!is_reserved_principal_name("dana$"));
+        assert_eq!(strip_reserved_principal_prefix("$$anonymous"), "anonymous");
+        assert_eq!(strip_reserved_principal_prefix("dana"), "dana");
+        assert_eq!(strip_reserved_principal_prefix("$"), "");
     }
 
     /// The bootstrap principal is full access. SigV4 and form-POST both build

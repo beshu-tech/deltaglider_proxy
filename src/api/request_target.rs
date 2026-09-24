@@ -180,7 +180,16 @@ mod tests {
         // Splitting a path into bucket/key by hand (the raw-path bug class).
         let path_split = ["split_once('", "/')"].concat();
         let path_trim = ["trim_start_matches('", "/')"].concat();
-        let all = [decode.clone(), query_split.clone(), path_split, path_trim];
+        let path_split_all = [".split('", "/')"].concat();
+        let path_trim_both = ["trim_matches('", "/')"].concat();
+        let all = [
+            decode.clone(),
+            query_split.clone(),
+            path_split,
+            path_trim,
+            path_split_all,
+            path_trim_both,
+        ];
         // `api/auth.rs` also splits SigV4 credential scopes on `/`, which is
         // not a request path, so it gets only the decode/query needles.
         let auth_only = [decode, query_split];
