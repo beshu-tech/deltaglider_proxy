@@ -126,6 +126,7 @@ export default function App() {
   );
   const s3 = useS3Browser({
     writablePrefixes,
+    adminSession: hasAdminSession,
     bucket: browser.bucket,
     prefix: browser.prefix,
     q: browser.q,

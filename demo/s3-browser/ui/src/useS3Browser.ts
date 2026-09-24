@@ -26,6 +26,9 @@ const MAX_HEAD_CACHE_SIZE = 5000;
 
 interface UseS3BrowserOptions {
   writablePrefixes?: string[];
+  /** The savings chip reads an admin-only endpoint: without an admin session
+   *  every folder visit logged a 403, so skip the request instead. */
+  adminSession?: boolean;
   /**
    * The browser location, derived from the URL by `useUrlRouter().browser`.
    * The URL is the single source of truth for where-am-I: bucket / current
@@ -44,6 +47,7 @@ interface UseS3BrowserOptions {
 export default function useS3Browser(options: UseS3BrowserOptions) {
   const {
     writablePrefixes = [],
+    adminSession = false,
     bucket,
     prefix,
     q,
@@ -481,6 +485,10 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     // state here raced the setBucket() sync effect: switching bucket A→B without
     // changing prefix would fetch A's savings and commit them under B's view.
     if (!bucket) return;
+    if (!adminSession) {
+      setDeltaSummary(null);
+      return;
+    }
     let cancelled = false;
     setDeltaSummary((prev) => (prev ? { ...prev, loading: true } : null));
     getPrefixSavings(bucket, prefix)
@@ -501,7 +509,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     return () => {
       cancelled = true;
     };
-  }, [connected, bucket, prefix, refreshTrigger]);
+  }, [connected, bucket, prefix, refreshTrigger, adminSession]);
 
   return {
     // Data
