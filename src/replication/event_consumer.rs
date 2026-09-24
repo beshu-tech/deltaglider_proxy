@@ -345,6 +345,21 @@ async fn seed_cursor_if_absent(db: &Arc<Mutex<ConfigDb>>) {
     }
 }
 
+/// Whether `rule` is paused. A state read that fails counts as paused: the
+/// consumer must never copy or delete on a rule it cannot prove is live, and
+/// the reconcile run covers anything skipped.
+fn rule_is_paused(db: &ConfigDb, rule: &str) -> bool {
+    match db.replication_load_state(rule) {
+        Ok(state) => state.is_some_and(|st| st.paused),
+        Err(e) => {
+            warn!(
+                "event consumer: cannot read state of rule '{rule}' ({e}); treating it as paused"
+            );
+            true
+        }
+    }
+}
+
 /// One drain pass: read new events, group + compact per key, route to rules,
 /// act (copy/delete) under the per-rule lease, and advance the cursor to the
 /// highest CONTIGUOUS fully-handled id.
@@ -453,6 +468,26 @@ async fn drain_once(
                     {
                         let dbg = db.lock().await;
                         let _ = dbg.replication_release_lease(&rule.name, instance_id);
+                        continue;
+                    }
+                    // A paused rule does nothing — copies or deletes. Checked
+                    // under the lease, like the scheduler. The events count as
+                    // handled: holding them would pin the shared cursor and
+                    // stall every other rule, and the reconcile run after
+                    // resume brings the destination back in sync.
+                    let paused = {
+                        let dbg = db.lock().await;
+                        let paused = rule_is_paused(&dbg, &rule.name);
+                        if paused {
+                            let _ = dbg.replication_release_lease(&rule.name, instance_id);
+                        }
+                        paused
+                    };
+                    if paused {
+                        debug!(
+                            "event consumer: rule '{}' is paused — skipping {}/{}",
+                            rule.name, bucket, key
+                        );
                         continue;
                     }
                 }
