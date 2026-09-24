@@ -103,10 +103,19 @@ export default function Sidebar({
         setLoadError(null);
         setBuckets(list);
         onBucketsChanged?.(list.length);
-        if (list.length > 0 && !list.some((b) => b.name === getBucket())) {
+        const requested = getBucket();
+        if (list.length > 0 && !list.some((b) => b.name === requested)) {
           // Never auto-select an unavailable placeholder — it would drive the
           // object pane at a dead backend.
           const firstLive = list.find((b) => !b.unavailable) ?? list[0];
+          // A deep link (or a bucket deleted elsewhere) used to swap silently
+          // to another bucket; say why the page is not what was linked.
+          if (requested) {
+            messageApi.warning(
+              `Bucket "${requested}" does not exist or you have no access to it — showing "${firstLive.name}".`,
+              6,
+            );
+          }
           setBucket(firstLive.name);
           onBucketChange(firstLive.name);
         }
@@ -124,7 +133,7 @@ export default function Sidebar({
     return () => {
       cancelled = true;
     };
-  }, [onBucketChange, onBucketsChanged, includeBucketOrigins, reloadSignal]);
+  }, [onBucketChange, onBucketsChanged, includeBucketOrigins, reloadSignal, messageApi]);
 
   useEffect(() => {
     if (createBucketFocusSignal <= 0) return;
