@@ -18,6 +18,8 @@ import { useOverlayClose } from './hooks/useOverlayClose';
 import useSelection from './useSelection';
 import { virtualWritableChildren } from './permissions';
 import { expandSelection } from './bulkSelection';
+import { ZIP_MAX_BYTES, downloadZip as saveZip, zipPreflightError } from './zipDownload';
+import { formatBytes } from './utils';
 // Bulk actions → admin objects API; App gates them on `sessionCaps.adminGui`.
 import type { S3Object } from './types';
 import { readStorage, writeStorage } from './safeStorage';
@@ -465,20 +467,22 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   }, [clearSelection, refresh, resolveSelectionWithRelativeKeys]);
 
   const downloadZip = useCallback(async () => {
-    // Phase B: archive assembly moves to the proxy. The browser just
-    // resolves the selection and triggers a same-origin download. No
-    // SDK GETs in JS, no in-memory zip buffer, no 500 MB cap on JS
-    // heap.
+    // The proxy builds the archive; the browser resolves the selection and
+    // saves the response. See zipDownload.ts for how failures stay visible.
     const bucket = getBucket();
     const keys = await resolveSelectedKeys(bucket);
-    if (keys.length === 0) return;
     const url = bulkZipDownloadUrl(keys.map((k) => `${bucket}/${k}`));
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `deltaglider-${new Date().toISOString().slice(0, 10)}.zip`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    const blocked = zipPreflightError(keys.length, url.length);
+    if (blocked) throw new Error(blocked);
+    const filename = `deltaglider-${new Date().toISOString().slice(0, 10)}.zip`;
+    const outcome = await saveZip(url, filename);
+    if (outcome === 'saved') message.success(`Saved ${filename}`);
+    if (outcome === 'started') {
+      message.info(
+        `The ZIP download started. If it fails, your browser's download list shows it. One ZIP can hold at most ${formatBytes(ZIP_MAX_BYTES)}.`,
+        8,
+      );
+    }
   }, [resolveSelectedKeys]);
 
   // Per-prefix delta savings, fetched from the server-side endpoint that
