@@ -33,15 +33,16 @@ pub use deltaglider_proxy::config_db::config_db_path;
 /// Initialize tracing with reload support.
 /// Priority: RUST_LOG > DGP_LOG_LEVEL > --verbose > default.
 pub fn init_tracing(cli: &Cli) -> reload::Handle<EnvFilter, tracing_subscriber::Registry> {
-    let initial_filter = EnvFilter::try_from_default_env()
-        .or_else(|_| std::env::var("DGP_LOG_LEVEL").map(EnvFilter::new))
+    let spec = std::env::var("RUST_LOG")
+        .or_else(|_| std::env::var("DGP_LOG_LEVEL"))
         .unwrap_or_else(|_| {
             if cli.verbose {
-                EnvFilter::new("deltaglider_proxy=trace,tower_http=trace")
+                "deltaglider_proxy=trace,tower_http=trace".to_string()
             } else {
-                EnvFilter::new("deltaglider_proxy=debug,tower_http=debug")
+                "deltaglider_proxy=debug,tower_http=debug".to_string()
             }
         });
+    let initial_filter = EnvFilter::new(deltaglider_proxy::audit::with_audit_directive(&spec));
 
     let (filter_layer, reload_handle) = reload::Layer::new(initial_filter);
 

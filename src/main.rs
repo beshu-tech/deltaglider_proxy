@@ -461,7 +461,9 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // env-driven deployments keep their semantics) and the config
     // value differs from what init_tracing chose.
     if std::env::var("RUST_LOG").is_err() && std::env::var("DGP_LOG_LEVEL").is_err() {
-        match config.log_level.parse::<tracing_subscriber::EnvFilter>() {
+        match deltaglider_proxy::audit::with_audit_directive(&config.log_level)
+            .parse::<tracing_subscriber::EnvFilter>()
+        {
             Ok(filter) => {
                 if let Err(e) = log_reload_handle.reload(filter) {
                     eprintln!(
