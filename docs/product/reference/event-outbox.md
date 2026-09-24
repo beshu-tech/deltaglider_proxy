@@ -5,7 +5,10 @@ Durable object events are written to the encrypted config DB after successful S3
 ## Semantics
 
 - Rows are stored in `event_outbox` with status `pending`, `in_progress`, `delivered`, or `failed`.
-- Delivery is disabled by default. With no delivery config, the outbox is an operator-visible journal only.
+- Delivery is disabled by default. While delivery is off, the outbox does not keep events for later. The dispatcher still runs, and on every tick it deletes the rows that no reader needs any more:
+  - When replication is enabled, event-driven replication also reads the outbox. The dispatcher deletes a row only after replication has read it, so replication never misses an event.
+  - When replication is disabled, nothing reads the outbox, so the dispatcher deletes every row. A replication consumer that starts later begins at the newest event and never reads older rows.
+  - As a result, turning delivery on sends only the events that occur after that moment, and the Event log stays short or empty while delivery is off.
 - When HTTP delivery is enabled, a background dispatcher claims due rows in small batches, POSTs each row to every configured webhook endpoint, and marks it delivered only after all endpoints return 2xx.
 - Delivery is at-least-once. Webhook receivers must be idempotent, typically by deduplicating on `event.id`.
 - Multiple webhooks are fan-out, not independent subscriptions. If one endpoint fails, the row is retried and endpoints that already accepted the event may see it again.

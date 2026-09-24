@@ -394,11 +394,10 @@ pub fn spawn_dispatcher_with_client(
             let cfg = { config.read().await.event_delivery.clone() };
             tokio::time::sleep(dispatcher_tick(&cfg)).await;
             if !cfg.is_active() {
-                // Delivery disabled — but STILL prune the outbox below the
-                // active-listener floor, or pending rows consumed by
-                // replication (but never delivered) grow without bound
-                // (X-ray H14). No dispatch, just the floor prune.
-                prune_below_floor(&db, &cfg, current_unix_seconds()).await;
+                // Delivery off: no dispatch, but still bound the outbox (X-ray
+                // H14, issue #92). See `prune_while_inactive`.
+                let replication_enabled = { config.read().await.replication.enabled };
+                prune_while_inactive(&db, &cfg, replication_enabled, current_unix_seconds()).await;
                 continue;
             }
             dispatch_once(
@@ -413,18 +412,60 @@ pub fn spawn_dispatcher_with_client(
     })
 }
 
-/// Prune outbox rows at or below the active-listener floor, regardless of
-/// whether delivery is active. Bounds the append-only outbox when delivery is
-/// disabled (pending rows consumed by replication but never delivered).
-pub async fn prune_below_floor(db: &Arc<Mutex<ConfigDb>>, config: &EventDeliveryConfig, now: i64) {
+/// Upper bound on prune batches per tick while delivery is off, so one tick
+/// never holds the config-DB lock for long.
+const INACTIVE_PRUNE_MAX_BATCHES: u32 = 50;
+
+/// The highest outbox id nobody still needs while delivery is off, or `None`
+/// to delete nothing. Pure; unit-tested.
+///
+/// While delivery is off the only other reader is event-driven replication.
+/// * Replication enabled: rows at or below its ACTIVE cursor are consumed. With
+///   no active cursor (an idle consumer ages out after an hour) keep
+///   everything: the next event must not be pruned before replication reads it.
+/// * Replication disabled: rows at or below a still-active cursor are kept for
+///   a quick re-enable to replay; with no active cursor, NO reader exists, so
+///   every row goes. Without this the outbox of a default install (no delivery,
+///   no replication) grew by one row per write, forever. A replication consumer
+///   enabled later seeds its cursor at the newest id and never reads older rows.
+pub(crate) fn inactive_prune_floor(
+    replication_enabled: bool,
+    active_cursor: Option<i64>,
+    max_id: Option<i64>,
+) -> Option<i64> {
+    if replication_enabled {
+        active_cursor
+    } else {
+        active_cursor.or(max_id)
+    }
+}
+
+/// Prune the outbox while delivery is off (see [`inactive_prune_floor`]).
+/// Events are therefore not kept for a later enable of delivery: the UI says so.
+pub async fn prune_while_inactive(
+    db: &Arc<Mutex<ConfigDb>>,
+    config: &EventDeliveryConfig,
+    replication_enabled: bool,
+    now: i64,
+) {
     let batch = config.prune_batch.max(1);
-    let db = db.lock().await;
-    let min_keep_id = db
-        .event_outbox_min_active_listener_cursor(now, LISTENER_CURSOR_STALE_SECS)
-        .unwrap_or(None)
-        .unwrap_or(i64::MAX);
-    if let Err(err) = db.event_outbox_prune_below_floor(min_keep_id, batch) {
-        warn!("Event outbox floor prune failed: {}", err);
+    for _ in 0..INACTIVE_PRUNE_MAX_BATCHES {
+        let db = db.lock().await;
+        let active = db
+            .event_outbox_min_active_listener_cursor(now, LISTENER_CURSOR_STALE_SECS)
+            .unwrap_or(None);
+        let max_id = db.event_outbox_max_id().unwrap_or(None);
+        let Some(floor) = inactive_prune_floor(replication_enabled, active, max_id) else {
+            return;
+        };
+        match db.event_outbox_prune_below_floor(floor, batch) {
+            Ok(deleted) if (deleted as u32) < batch => return,
+            Ok(_) => {}
+            Err(err) => {
+                warn!("Event outbox floor prune failed: {}", err);
+                return;
+            }
+        }
     }
 }
 
@@ -529,7 +570,7 @@ pub async fn dispatch_once(
             warn!("Event outbox delivered count-prune failed: {}", err);
         }
     }
-    // NOTE: no any-status `prune_below_floor` here. When delivery is ACTIVE every
+    // NOTE: no any-status floor prune here. When delivery is ACTIVE every
     // claimed row ends `delivered` or `failed` (a filtered-out event is marked
     // delivered — see `deliver_slack`'s "consume without posting"), so nothing
     // stays consumed-but-pending on this path; the delivered/failed prunes above
@@ -538,8 +579,7 @@ pub async fn dispatch_once(
     // delivery resolves them — breaking the at-least-once contract. The
     // consumed-but-never-delivered accumulation the floor prune guards against
     // only arises when delivery is DISABLED, and the disabled branch of
-    // `run_event_delivery_dispatcher` handles that via the standalone
-    // `prune_below_floor`.
+    // `spawn_dispatcher_with_client` handles that via `prune_while_inactive`.
 }
 
 pub(crate) fn dispatcher_tick(config: &EventDeliveryConfig) -> Duration {
@@ -698,6 +738,52 @@ mod tests {
             100,
             json!({ "size": 1 }),
         )
+    }
+
+    #[test]
+    fn inactive_prune_floor_truth_table() {
+        // Replication on: only what its active cursor consumed; idle → keep all.
+        assert_eq!(inactive_prune_floor(true, Some(5), Some(9)), Some(5));
+        assert_eq!(inactive_prune_floor(true, None, Some(9)), None);
+        // Replication off: keep rows a still-active cursor would replay …
+        assert_eq!(inactive_prune_floor(false, Some(5), Some(9)), Some(5));
+        // … and with no reader at all, everything goes.
+        assert_eq!(inactive_prune_floor(false, None, Some(9)), Some(9));
+        assert_eq!(inactive_prune_floor(false, None, None), None);
+    }
+
+    /// Issue #92: with delivery AND replication off, the outbox kept every
+    /// write forever. It must now drain; with replication on (idle consumer,
+    /// no active cursor) nothing may be pruned.
+    #[tokio::test]
+    async fn prune_while_inactive_drains_outbox_without_readers() {
+        let mut off = cfg();
+        off.enabled = false;
+        off.prune_batch = 2; // forces several batches in one tick
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        {
+            let db = db.lock().await;
+            for i in 0..5 {
+                db.event_outbox_insert(&event(&format!("k{i}"))).unwrap();
+            }
+        }
+        let now = current_unix_seconds();
+        prune_while_inactive(&db, &off, true, now).await;
+        assert_eq!(db.lock().await.event_outbox_count(None).unwrap(), 5);
+
+        prune_while_inactive(&db, &off, false, now).await;
+        assert_eq!(db.lock().await.event_outbox_count(None).unwrap(), 0);
+
+        // A live replication cursor still protects the rows after it.
+        {
+            let db = db.lock().await;
+            let first = db.event_outbox_insert(&event("a")).unwrap();
+            db.event_outbox_insert(&event("b")).unwrap();
+            db.listener_cursor_advance("replication", first, now)
+                .unwrap();
+        }
+        prune_while_inactive(&db, &off, true, now).await;
+        assert_eq!(db.lock().await.event_outbox_count(None).unwrap(), 1);
     }
 
     /// M2: error strings persisted to the outbox must not leak a Slack

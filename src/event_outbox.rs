@@ -363,6 +363,15 @@ impl ConfigDb {
             .query_row("SELECT count(*) FROM event_outbox", [], |row| row.get(0))?)
     }
 
+    /// Highest row id in the outbox, or `None` when it is empty.
+    pub fn event_outbox_max_id(&self) -> Result<Option<i64>, ConfigDbError> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(id) FROM event_outbox", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })?)
+    }
+
     pub fn event_outbox_status_counts(&self) -> Result<EventOutboxStatusCounts, ConfigDbError> {
         let mut counts = EventOutboxStatusCounts {
             pending: 0,
