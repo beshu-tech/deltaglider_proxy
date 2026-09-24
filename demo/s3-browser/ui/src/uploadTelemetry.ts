@@ -130,3 +130,29 @@ export function movingAverageSpeedBps(samples: ThroughputSample[]): number {
   if (elapsedMs <= 0 || bytes <= 0) return 0;
   return (bytes / elapsedMs) * 1000;
 }
+
+/**
+ * Run `start` after `probe` settles, unless `signal` aborts first (before or
+ * during the probe): an abort then rejects with the signal's AbortError and
+ * `start` never runs. A failed probe does not block the upload.
+ */
+export async function startAfterProbe<T>(
+  probe: Promise<unknown>,
+  signal: AbortSignal,
+  start: () => Promise<T>,
+): Promise<T> {
+  signal.throwIfAborted();
+  await probe.catch(() => undefined);
+  signal.throwIfAborted();
+  return start();
+}
+
+/**
+ * Whether the folder held no objects directly in it (a folder's baseline is
+ * per directory: objects in subfolders have their own). `undefined` when the
+ * one listing page could not tell (truncated by subfolder entries, or failed).
+ */
+export function folderEmptyFromListing(listing: { objects: number; truncated: boolean }): boolean | undefined {
+  if (listing.objects > 0) return false;
+  return listing.truncated ? undefined : true;
+}

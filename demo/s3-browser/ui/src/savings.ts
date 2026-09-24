@@ -136,10 +136,12 @@ export function isBaselineObject(headers: Record<string, string>): boolean {
  * response does not say so (no storage-type header, verified against 1.19),
  * and `isBaselineObject` is also true for a later re-upload of the baseline
  * bytes, under the same or another name. So an upload counts as the creator
- * only when it matches the baseline AND its folder held no objects before the
+ * only when it matches the baseline AND its folder held no objects directly
+ * in it (subfolders do not count: a baseline is per directory) before the
  * session's first upload into it. `folderWasEmpty` undefined = not known.
- * Known gap: a folder that held only passthrough files (images, archives)
- * before counts as not new, so that baseline is left out.
+ * Known gaps: a folder that held only passthrough files (images, archives)
+ * counts as not new, so that baseline is left out; a folder whose first
+ * listing page is all subfolders counts as not known, also left out.
  */
 export function uploadCreatedBaseline(
   headers: Record<string, string>,

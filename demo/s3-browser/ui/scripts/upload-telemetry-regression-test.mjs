@@ -36,6 +36,8 @@ const {
   movingAverageSpeedBps,
   uploadDisplayPath,
   uploadRetryAdvice,
+  startAfterProbe,
+  folderEmptyFromListing,
 } = await import(moduleUrl);
 
 // Issue #92 comment item 4: "Retry" after a failure that repeats cannot
@@ -65,6 +67,37 @@ assert.equal(A(502, undefined), 'retry');
 assert.equal(A(503, 'SlowDown'), 'retry');
 assert.equal(A(429, undefined), 'retry');
 assert.equal(A(408, 'RequestTimeout'), 'retry');
+
+// Cancel while the folder probe runs: the upload never starts.
+{
+  const ac = new AbortController();
+  let started = 0;
+  let release;
+  const probe = new Promise((r) => { release = r; });
+  const run = startAfterProbe(probe, ac.signal, async () => { started++; return 'done'; });
+  ac.abort();
+  release(true);
+  await assert.rejects(run, (e) => e.name === 'AbortError');
+  assert.equal(started, 0, 'aborted during the probe: no upload');
+}
+{
+  const ac = new AbortController();
+  ac.abort();
+  let started = 0;
+  await assert.rejects(startAfterProbe(Promise.resolve(true), ac.signal, async () => { started++; }), (e) => e.name === 'AbortError');
+  assert.equal(started, 0, 'aborted before: no upload');
+}
+{
+  const ac = new AbortController();
+  assert.equal(await startAfterProbe(Promise.reject(new Error('list failed')), ac.signal, async () => 'done'), 'done',
+    'a failed probe does not block the upload');
+}
+
+// A baseline is per directory: only objects directly in the folder count.
+assert.equal(folderEmptyFromListing({ objects: 0, truncated: false }), true, 'only subfolders, all listed');
+assert.equal(folderEmptyFromListing({ objects: 2, truncated: false }), false);
+assert.equal(folderEmptyFromListing({ objects: 1, truncated: true }), false);
+assert.equal(folderEmptyFromListing({ objects: 0, truncated: true }), undefined, 'page full of subfolders: not known');
 
 // Folder uploads show the path under the destination, not just the file name.
 assert.equal(uploadDisplayPath('dest/rel/sub1/README.md', 'dest'), 'rel/sub1/README.md');
