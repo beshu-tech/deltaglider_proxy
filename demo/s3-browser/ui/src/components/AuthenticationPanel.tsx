@@ -22,6 +22,7 @@ import { normalizeUiError } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { IAM_DIRTY_KEYS, confirmDiscardEdits, useDirtyFlag, useFormBaseline } from '../useDirtyFlag';
 import { useApplyHandler } from '../useDirtySection';
+import { useCopyToClipboard } from '../useCopyToClipboard';
 
 const { Text } = Typography;
 
@@ -466,6 +467,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
   const [saving, setSaving] = useState(false);
   const [testResult, setTestResult] = useState<ProviderTestResult | null>(null);
   const [testing, setTesting] = useState(false);
+  const { copy } = useCopyToClipboard();
 
   const { isDirty, markClean } = useFormBaseline({
     formName, formDisplayName, formIssuerUrl, formClientId, formClientSecret, formScopes, formEnabled,
@@ -565,7 +567,9 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
         </code>
         <Button
           size="small" icon={<CopyOutlined />}
-          onClick={() => { navigator.clipboard.writeText(callbackUrl); message.success('Copied'); }}
+          title="Copy callback URL"
+          aria-label="Copy callback URL"
+          onClick={() => { void copy(callbackUrl, { successMessage: 'Callback URL copied' }); }}
         />
       </div>
 

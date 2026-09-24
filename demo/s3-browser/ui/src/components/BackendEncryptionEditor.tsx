@@ -16,7 +16,7 @@
  * sibling config.
  */
 import { useState } from 'react';
-import { Alert, Button, Checkbox, Input, Select, Space, Typography, message } from 'antd';
+import { Alert, Button, Checkbox, Input, Select, Space, Typography } from 'antd';
 import {
   LockOutlined,
   SafetyOutlined,
@@ -28,6 +28,7 @@ import type { BackendEncryptionSummary, BackendEncryptionMode } from '../adminAp
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
 import { generateAesKeyHex } from '../aesKeyGen';
+import { useCopyToClipboard } from '../useCopyToClipboard';
 
 const { Text } = Typography;
 
@@ -126,14 +127,10 @@ export default function BackendEncryptionEditor({ backendName, current, onApply 
     setStoredSafelyChecked(false);
   };
 
+  const { copy } = useCopyToClipboard();
   const copyKey = async () => {
     if (!pendingKey) return;
-    try {
-      await navigator.clipboard.writeText(pendingKey);
-      message.success('Key copied to clipboard');
-    } catch {
-      message.error('Copy failed — select and copy manually');
-    }
+    await copy(pendingKey, { successMessage: 'Key copied to clipboard' });
   };
 
   const canApply = (): boolean => {
