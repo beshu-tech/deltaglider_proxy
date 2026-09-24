@@ -13,6 +13,7 @@ import { useAdminConfig } from '../queries/config';
 import { useOnClickOutside } from '../useDocumentEvent';
 import { useBackClosesModal } from '../hooks/useOverlayClose';
 import { useCopyToClipboard } from '../useCopyToClipboard';
+import { activateOnKey } from '../keyboard';
 
 const SHARE_DURATIONS = [
   { label: '1 hour', seconds: 3600 },
@@ -190,7 +191,7 @@ function ShareDurationButton({
               tabIndex={0}
               aria-selected={false}
               onClick={() => { onSelect(d.seconds); setOpen(false); }}
-              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect(d.seconds); setOpen(false); } }}
+              onKeyDown={activateOnKey(() => { onSelect(d.seconds); setOpen(false); })}
               style={{
                 padding: '10px 14px',
                 cursor: 'pointer',

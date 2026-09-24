@@ -45,6 +45,7 @@ import { heroFontPx } from '../heroNumberSize';
 import { monthlyCost } from '../savings';
 import { useFixedOverlayPosition } from '../useFixedOverlayPosition';
 import { readStorage, writeStorage } from '../safeStorage';
+import { activateOnKey } from '../keyboard';
 
 /** Cost rate presets. */
 const COST_PRESETS = [
@@ -694,13 +695,10 @@ function HeroInner({
                     onChangeCostRate(p.rate);
                     setShowCostConfig(false);
                   }}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      onChangeCostRate(p.rate);
-                      setShowCostConfig(false);
-                    }
-                  }}
+                  onKeyDown={activateOnKey(() => {
+                    onChangeCostRate(p.rate);
+                    setShowCostConfig(false);
+                  })}
                   style={{
                     padding: '6px 8px',
                     cursor: 'pointer',

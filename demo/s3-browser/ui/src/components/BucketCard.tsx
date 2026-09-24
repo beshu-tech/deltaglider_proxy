@@ -38,6 +38,7 @@ import { progressLabel } from '../jobsView';
 import { runJobAction } from '../adminApi';
 import { formatBytes } from '../utils';
 import { bytesFromGib, gibFromBytes } from '../savings';
+import { activateOnKey } from '../keyboard';
 
 const { Text } = Typography;
 
@@ -286,12 +287,7 @@ export default function BucketCard({
         aria-expanded={expanded}
         aria-label={`${name || 'new bucket policy'} — click to ${expanded ? 'collapse' : 'edit'}`}
         onClick={onToggle}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            onToggle();
-          }
-        }}
+        onKeyDown={activateOnKey(onToggle)}
         style={{
           display: 'flex',
           alignItems: 'center',

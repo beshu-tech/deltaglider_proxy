@@ -1,6 +1,7 @@
 import { type ReactNode } from 'react';
 import { useColors } from '../../ThemeContext';
 import './RecordList.css';
+import { activateOnKey } from '../../keyboard';
 
 /** One column of a RecordList. `track` is the wide-mode grid track size
  *  (e.g. 'max-content' | 'minmax(0,1fr)'); on narrow the list collapses to
@@ -75,16 +76,7 @@ export default function RecordList<T>({
             data-clickable={clickable || undefined}
             tabIndex={clickable ? 0 : undefined}
             onClick={clickable ? () => onRowClick(row) : undefined}
-            onKeyDown={
-              clickable
-                ? (e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      onRowClick(row);
-                    }
-                  }
-                : undefined
-            }
+            onKeyDown={clickable ? activateOnKey(() => onRowClick(row)) : undefined}
           >
             {columns.map((col) => (
               <div
