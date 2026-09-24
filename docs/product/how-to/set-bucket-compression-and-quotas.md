@@ -64,7 +64,9 @@ storage:
       quota_bytes: 536870912000   # 500 GB
 ```
 
-**What happens at the quota:** PUT requests that would exceed it are rejected with `403`. The quota is **soft** — it reads from the usage scanner's 5-minute cache, so a burst of concurrent writes can overshoot by up to 5 minutes of throughput. If you need a strict hard cap, enforce it at the reverse proxy or the storage provider.
+**What the quota measures:** the quota counts the bytes that the bucket really occupies on its storage backend. This total includes the shared delta baselines (`reference.bin`), not only the small per-object deltas, so a bucket that holds one build per folder is measured at its true size.
+
+**What happens at the quota:** the proxy rejects a PUT request that would push the bucket past its quota with `403 AccessDenied` and the message `Bucket quota exceeded`. The proxy reads the bucket's running usage counter, which it updates on every write and delete, so enforcement is nearly immediate. The quota is still **soft**: requests that run at the same moment each check the counter before any of them has stored its bytes, so a burst of concurrent writes can overshoot the limit slightly. If you need a strict hard cap, enforce it at the reverse proxy or the storage provider.
 
 ## 5. Freeze a bucket
 
