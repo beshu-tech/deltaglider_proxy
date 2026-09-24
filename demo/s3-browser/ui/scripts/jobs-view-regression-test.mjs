@@ -16,6 +16,7 @@ const {
   kindLabel,
   triggerLabel,
   availableActions,
+  draftBlocksAction,
   progressLabel,
   busyJobForBucket,
   mergeDraftRules,
@@ -74,6 +75,16 @@ assert.equal(jobStatusLabel(row({ enabled: false })), 'disabled');
 assert.equal(kindLabel('reencrypt'), 'Re-encrypt');
 assert.equal(kindLabel('migrate'), 'Migrate');
 assert.equal(triggerLabel('oneoff'), 'one-off');
+
+// ── draftBlocksAction: preview/run-now never run a stale definition ─────────
+{
+  const clean = { replication: false, lifecycle: false };
+  assert.equal(draftBlocksAction('preview', 'lifecycle', clean), null);
+  assert.match(draftBlocksAction('preview', 'lifecycle', { ...clean, lifecycle: true }), /saved rule/);
+  assert.match(draftBlocksAction('run-now', 'replication', { ...clean, replication: true }), /saved rule/);
+  assert.equal(draftBlocksAction('run-now', 'replication', { ...clean, lifecycle: true }), null, 'only its own kind');
+  assert.equal(draftBlocksAction('pause', 'lifecycle', { replication: true, lifecycle: true }), null);
+}
 
 // ── availableActions matrix ─────────────────────────────────────────────────
 // A disabled rule that is ALSO paused still offers resume (clears the flag).

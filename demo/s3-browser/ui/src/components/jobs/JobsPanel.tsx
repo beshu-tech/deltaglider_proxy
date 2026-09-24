@@ -39,6 +39,7 @@ import {
   kindLabel,
   kindTone,
   mergeDraftRules,
+  draftBlocksAction,
   planRuleDeleteSync,
   runNowMessage,
   triggerLabel,
@@ -512,6 +513,10 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
               const oneOff =
                 a === 'run-now' && (d.row.enabled === false || d.row.paused === true);
               const label = oneOff ? 'Run once' : ACTION_META[a].label;
+              const blocked = draftBlocksAction(a, d.row.kind, {
+                replication: repl.isDirty,
+                lifecycle: lc.isDirty,
+              });
               const title = oneOff
                 ? 'Run this rule once now — does not enable or resume it'
                 : label;
@@ -523,7 +528,8 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
                   danger={ACTION_META[a].danger}
                   icon={ACTION_META[a].icon}
                   loading={actionBusy === `${d.row.id}:${a}`}
-                  title={title}
+                  disabled={blocked !== null}
+                  title={blocked ?? title}
                   aria-label={title}
                   onClick={() => void runAction(d.row, a)}
                 >
