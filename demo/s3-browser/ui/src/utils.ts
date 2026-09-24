@@ -60,31 +60,45 @@ export function parentPrefix(prefix: string): string {
   return idx === -1 ? '' : trimmed.slice(0, idx + 1);
 }
 
-/** Compact relative time from an ISO string against an explicit `now` (so a
- *  caller ticking `now` re-renders live). e.g. "5s ago", "3m ago", "2h ago". */
-export function relativeTime(iso: string, now: Date): string {
-  const d = Math.floor((now.getTime() - new Date(iso).getTime()) / 1000);
-  if (d < 0) return 'just now';
-  if (d < 60) return `${d}s ago`;
-  if (d < 3600) return `${Math.floor(d / 60)}m ago`;
-  if (d < 86400) return `${Math.floor(d / 3600)}h ago`;
-  return `${Math.floor(d / 86400)}d ago`;
+/**
+ * Compact duration — THE unit vocabulary for every age / relative-time label:
+ * "47s", "5m", "3h 21m", "3d", "2mo", "1y". Hours carry their minutes; every
+ * other unit stands alone. Negative input clamps to "0s".
+ */
+export function formatDuration(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
+  const d = Math.floor(h / 24);
+  if (d < 30) return `${d}d`;
+  if (d < 365) return `${Math.floor(d / 30)}mo`;
+  return `${Math.floor(d / 365)}y`;
 }
 
-/** Format a date as relative time, e.g. "6 hours ago" */
-export function timeAgo(date: Date): string {
-  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-  if (seconds < 60) return 'just now';
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes} min ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 30) return `${days}d ago`;
-  const months = Math.floor(days / 30);
-  if (months < 12) return `${months}mo ago`;
-  const years = Math.floor(days / 365);
-  return `${years}y ago`;
+/**
+ * Relative time in the `formatDuration` vocabulary: "just now", "5s ago",
+ * "2h 21m ago". `when` is a Date, an ISO string, or epoch MILLISECONDS; null or
+ * unparseable → "—". Pass `now` when a ticking caller re-renders live.
+ *
+ * A future instant is clock skew by default and reads "just now". Pass
+ * `future: true` for genuinely scheduled times (e.g. a next retry): it then
+ * reads "in 5m".
+ */
+export function relativeTime(
+  when: Date | string | number | null | undefined,
+  opts: { now?: Date | number; future?: boolean } = {},
+): string {
+  if (when == null) return '—';
+  const t = new Date(when).getTime();
+  if (Number.isNaN(t)) return '—';
+  const now = opts.now == null ? Date.now() : new Date(opts.now).getTime();
+  const secs = Math.floor((now - t) / 1000);
+  if (secs < 0) return opts.future ? `in ${formatDuration(-secs)}` : 'just now';
+  if (secs < 1) return 'just now';
+  return `${formatDuration(secs)} ago`;
 }
 
 /** Detect the S3 endpoint from the current browser URL (same origin in single-port mode) */
@@ -114,22 +128,4 @@ export function dotPattern(color: string): string {
  *  so the object table, bucket list, and key list never disagree. */
 export function numericCompare(a: string, b: string): number {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
-}
-
-/** "3h 21m ago" / "47s ago" / "never" — coarse age label for cache timestamps. */
-export function ageLabel(iso: string | null): string {
-  if (!iso) return 'never';
-  const ms = Date.now() - new Date(iso).getTime();
-  if (ms < 0) return 'just now';
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) {
-    const mm = m % 60;
-    return mm ? `${h}h ${mm}m ago` : `${h}h ago`;
-  }
-  const d = Math.floor(h / 24);
-  return `${d}d ago`;
 }

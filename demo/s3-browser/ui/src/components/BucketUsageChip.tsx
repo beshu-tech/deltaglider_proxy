@@ -5,7 +5,7 @@ import { useBucketOrigins } from '../queries/backends';
 import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
 import { formatBytes } from '../utils';
-import { timeAgo } from '../utils';
+import { relativeTime } from '../utils';
 
 /**
  * O(1) bucket-size pill in the TopBar — the Ceph-style running counter
@@ -75,7 +75,7 @@ export default function BucketUsageChip({
 
   const scannedTitle =
     data.last_scan_at != null
-      ? `Last full scan ${timeAgo(new Date(data.last_scan_at * 1000))}`
+      ? `Last full scan ${relativeTime(data.last_scan_at * 1000)}`
       : 'Never scanned — running total maintained on every write/delete; ⟳ to reconcile';
 
   return (

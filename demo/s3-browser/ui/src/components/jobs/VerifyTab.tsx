@@ -41,7 +41,7 @@ import {
 } from '../../queries/jobs';
 import { useColors } from '../../ThemeContext';
 import { useTweenedCount } from '../../hooks/useTweenedCount';
-import { timeAgo } from '../../utils';
+import { relativeTime } from '../../utils';
 import { normalizeUiError } from '../../errorHandling';
 
 const { Text } = Typography;
@@ -686,7 +686,7 @@ export function ParityResult({
           style={{ fontSize: 12, color: c.TEXT_MUTED, marginTop: 18 }}
           title={`Scanned at ${scannedAbsolute}`}
         >
-          Checked {timeAgo(scannedDate)} ·{' '}
+          Checked {relativeTime(scannedDate)} ·{' '}
           {pure
             ? 'compared sizes + checksums from the object listing — no downloads'
             : 'compared recorded checksums + sizes — no downloads'}
@@ -885,7 +885,7 @@ function ReverifyBanner({
               ? `${Math.round(animatedScanned).toLocaleString()} of ${total!.toLocaleString()} · ${rate} · `
               : `${Math.round(animatedScanned).toLocaleString()} objects scanned · ${rate} · `
             : ''}
-          recomputing — the result below is from {timeAgo(since)} and is being refreshed.
+          recomputing — the result below is from {relativeTime(since)} and is being refreshed.
         </Text>
       </div>
       {onCancel && (

@@ -226,7 +226,7 @@ export default function LogsPanel({ onSessionExpired }: Props) {
                   title={new Date(e.ts).toLocaleString()}
                   style={{ color: c.TEXT_MUTED, width: 40, flexShrink: 0 }}
                 >
-                  {relativeTime(e.ts, now)}
+                  {relativeTime(e.ts, { now })}
                 </span>
                 <span style={{ color: c.TEXT_SECONDARY, flexShrink: 0 }}>
                   {e.target.replace(/^deltaglider_proxy::/, '')}

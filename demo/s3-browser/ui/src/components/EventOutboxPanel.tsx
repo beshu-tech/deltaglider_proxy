@@ -22,6 +22,7 @@ import {
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
 import { isSessionExpired } from '../errorHandling';
+import { relativeTime } from '../utils';
 
 const { Text } = Typography;
 const DEFAULT_PAGE_SIZE = 50;
@@ -46,16 +47,10 @@ function fmtUnix(ts: number | null | undefined): string {
   });
 }
 
+/** Unix SECONDS → relative label. `future: true` because a row's
+ *  `next_attempt_at` is scheduled ahead ("in 5m"). */
 function fmtRelative(ts: number | null | undefined): string {
-  if (!ts) return '—';
-  const seconds = Math.round((ts * 1000 - Date.now()) / 1000);
-  const abs = Math.abs(seconds);
-  const unit =
-    abs < 60 ? ['s', abs] :
-      abs < 3600 ? ['m', Math.round(abs / 60)] :
-        abs < 86400 ? ['h', Math.round(abs / 3600)] :
-          ['d', Math.round(abs / 86400)];
-  return seconds >= 0 ? `in ${unit[1]}${unit[0]}` : `${unit[1]}${unit[0]} ago`;
+  return relativeTime(ts ? ts * 1000 : null, { future: true });
 }
 
 function statusColour(status: string): string {

@@ -297,7 +297,7 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
                 title={new Date(e.timestamp).toLocaleString()}
                 style={{ color: colors.TEXT_SECONDARY, fontSize: 11 }}
               >
-                {relativeTime(e.timestamp, now)}
+                {relativeTime(e.timestamp, { now })}
               </div>
               <div>
                 <Tag

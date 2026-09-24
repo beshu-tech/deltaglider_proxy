@@ -44,7 +44,7 @@ import {
   type BucketScanResult,
   type BucketScanProgress,
 } from '../adminApi';
-import { formatBytes, ageLabel } from '../utils';
+import { formatBytes, relativeTime } from '../utils';
 import { monthlyCost, summarizeScopeSavings } from '../savings';
 import { bucketPolicyFor } from '../bucketPolicyLookup';
 import DashboardGrid from './dashboard/DashboardGrid';
@@ -434,9 +434,9 @@ export default function AnalyticsSection({ config }: Props) {
   // Buckets-panel header subline: coverage + freshness in one quiet line.
   const coverageSubtitle = [
     `${cachedRows.length} of ${bucketRows.length} scanned`,
-    newestCompletedAt ? `newest ${ageLabel(newestCompletedAt)}` : null,
+    newestCompletedAt ? `newest ${relativeTime(newestCompletedAt)}` : null,
     oldestCompletedAt && oldestCompletedAt !== newestCompletedAt
-      ? `oldest ${ageLabel(oldestCompletedAt)}`
+      ? `oldest ${relativeTime(oldestCompletedAt)}`
       : null,
     staleCount > 0 ? `${staleCount} stale` : null,
   ]
@@ -739,9 +739,9 @@ function CoverageStrip({
       <div style={{ fontSize: 11, color: colors.TEXT_MUTED, lineHeight: 1.5 }}>
         {newestCompletedAt ? (
           <>
-            Newest scan {ageLabel(newestCompletedAt)}
+            Newest scan {relativeTime(newestCompletedAt)}
             {oldestCompletedAt && oldestCompletedAt !== newestCompletedAt && (
-              <> · oldest {ageLabel(oldestCompletedAt)}</>
+              <> · oldest {relativeTime(oldestCompletedAt)}</>
             )}
           </>
         ) : (

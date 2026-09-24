@@ -17,7 +17,7 @@ import { useState } from 'react';
 import { PlayCircleOutlined, StopOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import type { AdminConfig } from '../adminApi';
-import { formatBytes, ageLabel } from '../utils';
+import { formatBytes, relativeTime } from '../utils';
 import { fmtNum } from './dashboard/chartDefaults';
 import type { BucketRow } from './AnalyticsSection';
 
@@ -213,7 +213,7 @@ function FleetRow({
                 <>
                   {' '}·{' '}
                   <span title={new Date(b.completedAt).toLocaleString()}>
-                    {ageLabel(b.completedAt)}
+                    {relativeTime(b.completedAt)}
                   </span>
                 </>
               )}
@@ -366,7 +366,7 @@ function FleetRow({
           onClick={() => onScanOne(b.bucket)}
           title={
             b.completedAt
-              ? `Re-scan ${b.bucket} (currently ${ageLabel(b.completedAt)})`
+              ? `Re-scan ${b.bucket} (currently ${relativeTime(b.completedAt)})`
               : `Scan ${b.bucket}`
           }
           disabled={!scansLoaded}

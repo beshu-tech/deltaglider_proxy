@@ -13,14 +13,9 @@ import { listSessions, revokeSession, revokeUserSessions, type SessionSummary } 
 import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
 import { isSessionExpired } from '../errorHandling';
+import { formatDuration } from '../utils';
 
 const { Text } = Typography;
-
-function ageLabel(secs: number): string {
-  if (secs < 60) return `${secs}s`;
-  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
-  return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
-}
 
 export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?: () => void }) {
   const [rows, setRows] = useState<SessionSummary[]>([]);
@@ -93,7 +88,7 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
     },
     { title: 'Identity', dataIndex: 'identity', key: 'identity', render: (v: string | null) => v ?? <Text type="secondary">—</Text> },
     { title: 'IP', dataIndex: 'ip', key: 'ip', render: (v: string | null) => v ?? <Text type="secondary">—</Text> },
-    { title: 'Age', dataIndex: 'age_secs', key: 'age', render: (v: number) => ageLabel(v) },
+    { title: 'Age', dataIndex: 'age_secs', key: 'age', render: (v: number) => formatDuration(v) },
     {
       title: '',
       key: 'action',

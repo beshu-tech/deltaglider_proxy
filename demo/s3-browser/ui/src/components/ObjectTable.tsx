@@ -3,7 +3,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { Table, Typography, Alert, Progress, Checkbox, theme, Button, Select } from 'antd';
 import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
-import { formatBytes, displayName, timeAgo, numericCompare } from '../utils';
+import { formatBytes, displayName, relativeTime, numericCompare } from '../utils';
 import type { ColumnsType } from 'antd/es/table';
 import type { GetRef } from 'antd';
 import { useColors } from '../ThemeContext';
@@ -443,7 +443,7 @@ export default function ObjectTable({
         const date = new Date(record.lastModified);
         return (
           <span title={date.toLocaleString()} style={{ fontSize: 12, color: TEXT_SECONDARY, cursor: 'default' }}>
-            {timeAgo(date)}
+            {relativeTime(date)}
           </span>
         );
       },

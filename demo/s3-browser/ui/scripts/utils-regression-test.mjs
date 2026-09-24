@@ -13,7 +13,7 @@ const { outputText } = ts.transpileModule(source, {
   fileName: 'utils.ts',
 });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`;
-const { clamp, dotPattern, ageLabel, formatBytes, getFileName, pluralize, parentPrefix } = await import(moduleUrl);
+const { clamp, dotPattern, formatDuration, relativeTime, formatBytes, getFileName, pluralize, parentPrefix } = await import(moduleUrl);
 
 // --- clamp -------------------------------------------------------------------
 assert.equal(clamp(50, 0, 100), 50);
@@ -40,16 +40,41 @@ assert.ok(pat.includes("<svg xmlns='http://www.w3.org/2000/svg'"), 'svg attrs si
 // deterministic — same input, same output
 assert.equal(dotPattern('#abc123'), pat);
 
-// --- ageLabel ----------------------------------------------------------------
-assert.equal(ageLabel(null), 'never');
-const now = Date.now();
-assert.equal(ageLabel(new Date(now - 5_000).toISOString()), '5s ago');
-assert.equal(ageLabel(new Date(now - 90_000).toISOString()), '1m ago');
-assert.equal(ageLabel(new Date(now - 2 * 3600_000).toISOString()), '2h ago');
-assert.equal(ageLabel(new Date(now - (2 * 3600_000 + 21 * 60_000)).toISOString()), '2h 21m ago');
-assert.equal(ageLabel(new Date(now - 3 * 86400_000).toISOString()), '3d ago');
-// future timestamp clamps to "just now"
-assert.equal(ageLabel(new Date(now + 10_000).toISOString()), 'just now');
+// --- formatDuration + relativeTime (the ONE relative-time vocabulary) --------
+// Units: s / m / h (+ m) / d / mo / y. Past: "<dur> ago". Future: "in <dur>"
+// only when asked (scheduled times); otherwise a future instant is clock skew
+// and reads "just now".
+assert.equal(formatDuration(0), '0s');
+assert.equal(formatDuration(47), '47s');
+assert.equal(formatDuration(90), '1m');
+assert.equal(formatDuration(59 * 60 + 59), '59m');
+assert.equal(formatDuration(2 * 3600), '2h');
+assert.equal(formatDuration(3 * 3600 + 21 * 60), '3h 21m');
+assert.equal(formatDuration(3 * 86400 + 5 * 3600), '3d');
+assert.equal(formatDuration(45 * 86400), '1mo');
+assert.equal(formatDuration(800 * 86400), '2y');
+assert.equal(formatDuration(-5), '0s', 'negative clamps to 0');
+
+const NOW = Date.UTC(2026, 0, 15, 12, 0, 0);
+const ago = (ms) => new Date(NOW - ms).toISOString();
+assert.equal(relativeTime(ago(0), { now: NOW }), 'just now');
+assert.equal(relativeTime(ago(5_000), { now: NOW }), '5s ago');
+assert.equal(relativeTime(ago(90_000), { now: NOW }), '1m ago');
+assert.equal(relativeTime(ago(2 * 3600_000), { now: NOW }), '2h ago');
+assert.equal(relativeTime(ago(2 * 3600_000 + 21 * 60_000), { now: NOW }), '2h 21m ago');
+assert.equal(relativeTime(ago(3 * 86400_000), { now: NOW }), '3d ago');
+assert.equal(relativeTime(ago(400 * 86400_000), { now: NOW }), '1y ago');
+// accepts Date, ISO string, epoch ms; `now` as Date or ms
+assert.equal(relativeTime(new Date(NOW - 5_000), { now: new Date(NOW) }), '5s ago');
+assert.equal(relativeTime(NOW - 5_000, { now: NOW }), '5s ago');
+// future: clock skew → "just now" by default, "in 5m" when scheduled
+assert.equal(relativeTime(NOW + 300_000, { now: NOW }), 'just now');
+assert.equal(relativeTime(NOW + 300_000, { now: NOW, future: true }), 'in 5m');
+assert.equal(relativeTime(NOW - 300_000, { now: NOW, future: true }), '5m ago');
+// missing / unparseable
+assert.equal(relativeTime(null), '—');
+assert.equal(relativeTime(undefined), '—');
+assert.equal(relativeTime('not a date'), '—');
 
 // --- formatBytes (regression guard for the shared analytics formatter) -------
 assert.equal(formatBytes(0), '0 B');

@@ -38,7 +38,7 @@ import {
 } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { useVisiblePolling } from '../useVisiblePolling';
-import { formatBytes } from '../utils';
+import { formatBytes, relativeTime } from '../utils';
 import { summarizeScopeSavings } from '../savings';
 import { fmtNum } from './dashboard/chartDefaults';
 import {
@@ -71,23 +71,6 @@ interface Props {
    * buckets.
    */
   scopeBucket?: string | null;
-}
-
-/** Format a duration like "3h 21m ago" or "47s ago". */
-function ageLabel(iso: string): string {
-  const ms = Date.now() - new Date(iso).getTime();
-  if (ms < 0) return 'just now';
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) {
-    const mm = m % 60;
-    return mm ? `${h}h ${mm}m ago` : `${h}h ago`;
-  }
-  const d = Math.floor(h / 24);
-  return `${d}d ago`;
 }
 
 /** Aggregate a map of per-bucket results into one synthetic total. */
@@ -443,11 +426,11 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
         >
           <ClockCircleOutlined style={{ fontSize: 10 }} />
           {scopeBucket ? (
-            <span>Scanned {ageLabel(totals.newestCompletedAt!)}</span>
+            <span>Scanned {relativeTime(totals.newestCompletedAt!)}</span>
           ) : (
             <span>
-              Newest: {ageLabel(totals.newestCompletedAt!)} ·{' '}
-              Oldest: {ageLabel(totals.oldestCompletedAt!)}
+              Newest: {relativeTime(totals.newestCompletedAt!)} ·{' '}
+              Oldest: {relativeTime(totals.oldestCompletedAt!)}
             </span>
           )}
         </div>

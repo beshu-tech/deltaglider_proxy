@@ -1,7 +1,7 @@
 import { Button } from 'antd';
 import { ClockCircleOutlined, PlayCircleOutlined, StopOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
-import { formatBytes, ageLabel } from '../utils';
+import { formatBytes, relativeTime } from '../utils';
 import { fmtNum } from './dashboard/chartDefaults';
 import type { BucketScanProgress } from '../adminApi';
 
@@ -92,11 +92,11 @@ export default function ScanStatusBanner({
           <>
             <strong>{cachedCount}</strong> of{' '}
             <strong>{bucketCount}</strong> buckets scanned · Newest:{' '}
-            <span style={{ color: colors.TEXT_PRIMARY }}>{ageLabel(newestCompletedAt)}</span>
+            <span style={{ color: colors.TEXT_PRIMARY }}>{relativeTime(newestCompletedAt)}</span>
             {oldestCompletedAt && oldestCompletedAt !== newestCompletedAt && (
               <>
                 {' '}· Oldest:{' '}
-                <span style={{ color: colors.TEXT_PRIMARY }}>{ageLabel(oldestCompletedAt)}</span>
+                <span style={{ color: colors.TEXT_PRIMARY }}>{relativeTime(oldestCompletedAt)}</span>
               </>
             )}
             {unscannedCount > 0 && (
