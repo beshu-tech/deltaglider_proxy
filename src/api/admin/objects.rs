@@ -761,6 +761,8 @@ fn zip_skip_report_name(taken: &[&str]) -> String {
 enum ZipFailure {
     NotFound,
     AccessDenied,
+    TooLarge,
+    Overloaded,
     Other,
 }
 
@@ -776,25 +778,33 @@ fn zip_failure_kind(e: &crate::deltaglider::EngineError) -> ZipFailure {
         {
             ZipFailure::AccessDenied
         }
-        // An object-level 403 from an S3 backend has no variant of its own:
-        // `classify_s3_error` keeps it as `S3("… (status=403) …")`.
-        EngineError::Storage(StorageError::S3(msg))
-            if msg.contains("status=403") || msg.contains("AccessDenied") =>
-        {
+        EngineError::Storage(se) if crate::storage::is_backend_access_denied(se) => {
             ZipFailure::AccessDenied
+        }
+        EngineError::TooLarge { .. } | EngineError::Storage(StorageError::TooLarge { .. }) => {
+            ZipFailure::TooLarge
+        }
+        EngineError::Overloaded(_) | EngineError::Storage(StorageError::Throttled(_)) => {
+            ZipFailure::Overloaded
         }
         _ => ZipFailure::Other,
     }
 }
 
-/// Status of a ZIP request where no selected file could be read: 404 only
-/// when every file is missing, 403 when access was denied to any, and 502
-/// (the backend failed) otherwise. It used to be 404 for every cause.
+/// Status of a ZIP request where no selected file could be read. It used to
+/// be 404 for every cause. Now: 404 only when every file is missing; else,
+/// by precedence, 403 when access was denied to any file, 413 when a file is
+/// too large, 503 when the proxy or the backend shed load, and 502 for any
+/// other backend failure.
 fn zip_all_failed_status(failures: &[ZipFailure]) -> StatusCode {
     if !failures.is_empty() && failures.iter().all(|f| *f == ZipFailure::NotFound) {
         StatusCode::NOT_FOUND
     } else if failures.contains(&ZipFailure::AccessDenied) {
         StatusCode::FORBIDDEN
+    } else if failures.contains(&ZipFailure::TooLarge) {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else if failures.contains(&ZipFailure::Overloaded) {
+        StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::BAD_GATEWAY
     }
@@ -942,6 +952,9 @@ mod tests {
         assert_eq!(st(&[NotFound, NotFound]), StatusCode::NOT_FOUND);
         assert_eq!(st(&[NotFound, AccessDenied]), StatusCode::FORBIDDEN);
         assert_eq!(st(&[NotFound, Other]), StatusCode::BAD_GATEWAY);
+        assert_eq!(st(&[TooLarge, Other]), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(st(&[Overloaded, NotFound]), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(st(&[AccessDenied, TooLarge]), StatusCode::FORBIDDEN);
         assert_eq!(st(&[Other]), StatusCode::BAD_GATEWAY);
         assert_eq!(st(&[]), StatusCode::BAD_GATEWAY);
 
@@ -971,6 +984,12 @@ mod tests {
             ))),
             Other
         );
+        assert_eq!(kind(&EngineError::TooLarge { size: 2, max: 1 }), TooLarge);
+        assert_eq!(
+            kind(&EngineError::Storage(StorageError::Throttled("x".into()))),
+            Overloaded
+        );
+        assert_eq!(kind(&EngineError::Overloaded("x".into())), Overloaded);
     }
 
     #[test]
