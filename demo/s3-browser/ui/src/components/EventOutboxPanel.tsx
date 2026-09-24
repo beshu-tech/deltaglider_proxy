@@ -434,7 +434,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
           columns={columns}
           dataSource={filtered}
           rowKey="id"
-          loading={loading}
+          loading={loading && !autoRefresh}
           size="small"
           tableLayout="fixed"
           showSorterTooltip={false}
