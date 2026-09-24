@@ -409,7 +409,9 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
           </Tag>
           <Text
             strong
-            ellipsis={{ tooltip: d.row.name }}
+            // AntD tooltips are hidden globally (theme.css): native title.
+            ellipsis
+            title={d.row.name}
             style={{ fontFamily: 'var(--font-mono)', fontSize: 13, minWidth: 0 }}
           >
             {d.row.name}
