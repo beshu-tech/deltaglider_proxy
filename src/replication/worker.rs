@@ -1310,7 +1310,7 @@ async fn copy_one_object(
                     "source_key": src_key,
                     "destination_bucket": dst_bucket,
                     "destination_key": dest_key,
-                    "content_length": bytes_copied,
+                    "content_length": outcome.content_length(),
                     "strategy": outcome.strategy.as_str(),
                     "source_storage_type": outcome.source_storage_label,
                 }),

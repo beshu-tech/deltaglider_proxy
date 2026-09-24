@@ -798,7 +798,7 @@ async fn execute_action(
                 meta,
                 destination_bucket,
                 destination_key,
-                copied.bytes_copied,
+                copied.content_length(),
                 *delete_source_after_success,
             )
             .await;
@@ -1012,7 +1012,7 @@ async fn append_lifecycle_transition_event(
     meta: &crate::types::FileMetadata,
     destination_bucket: &str,
     destination_key: &str,
-    bytes_copied: usize,
+    content_length: u64,
     delete_source_after_success: bool,
 ) {
     let Some(db) = db else {
@@ -1033,7 +1033,7 @@ async fn append_lifecycle_transition_event(
             "destination_key": destination_key,
             "expire_after": &rule.expire_after,
             "created_at": meta.created_at.to_rfc3339(),
-            "content_length": bytes_copied,
+            "content_length": content_length,
             "delete_source_after_success": delete_source_after_success,
         }),
     );

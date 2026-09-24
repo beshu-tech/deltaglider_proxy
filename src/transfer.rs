@@ -127,11 +127,21 @@ pub(crate) struct ObjectTransferOutcome {
     pub strategy: CopyStrategy,
     /// At-rest storage label of the SOURCE object ("delta" / "passthrough").
     pub source_storage_label: &'static str,
-    /// Logical (hydrated) source size — only meaningful on the fast path.
+    /// Logical (hydrated) source size: what a client downloads. Every copy
+    /// path sets it.
     pub source_file_size: u64,
     /// Egress bytes the fast path saved vs reconstruct (`file_size - delta`);
     /// 0 on every non-`DeltaPassthrough` path. Single source for metric + column.
     pub bytes_egress_saved: u64,
+}
+
+impl ObjectTransferOutcome {
+    /// The `content_length` an object event reports: the object's logical
+    /// size. NOT `bytes_copied`, which counts transferred bytes and is the
+    /// stored delta size on the delta fast path (43 B for a 1 MB object).
+    pub fn content_length(&self) -> u64 {
+        self.source_file_size
+    }
 }
 
 pub(crate) async fn copy_object_with_retries(
@@ -1258,6 +1268,20 @@ async fn spooled_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round-2 review: `ReplicationObjectCopied` reported the stored delta
+    /// size (43 B for a 1 MB object) as `content_length`.
+    #[test]
+    fn event_content_length_is_the_logical_size_not_the_transfer() {
+        let fast = ObjectTransferOutcome {
+            bytes_copied: 43,
+            strategy: CopyStrategy::DeltaPassthrough,
+            source_storage_label: "delta",
+            source_file_size: 1_048_576,
+            bytes_egress_saved: 1_048_533,
+        };
+        assert_eq!(fast.content_length(), 1_048_576);
+    }
 
     #[test]
     fn verify_size_verdict_truth_table() {

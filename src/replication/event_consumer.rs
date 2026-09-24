@@ -591,7 +591,8 @@ async fn apply_action(
                     let outcome = copy_object_with_retries(engine, transfer).await?;
                     // Emit ReplicationObjectCopied so the chain is observable
                     // (mirrors the reconcile worker).
-                    emit_replication_copied(db, rule, key, &dest_key, outcome.bytes_copied).await;
+                    emit_replication_copied(db, rule, key, &dest_key, outcome.content_length())
+                        .await;
                     Ok(())
                 }
                 Decision::Skip { .. } => Ok(()),
@@ -631,7 +632,7 @@ async fn emit_replication_copied(
     rule: &ReplicationRule,
     source_key: &str,
     dest_key: &str,
-    bytes_copied: usize,
+    content_length: u64,
 ) {
     let dbg = db.lock().await;
     let _ = dbg.event_outbox_insert(&NewEvent::new(
@@ -646,7 +647,7 @@ async fn emit_replication_copied(
             "source_key": source_key,
             "destination_bucket": &rule.destination.bucket,
             "destination_key": dest_key,
-            "content_length": bytes_copied,
+            "content_length": content_length,
             "trigger": "event",
         }),
     ));
