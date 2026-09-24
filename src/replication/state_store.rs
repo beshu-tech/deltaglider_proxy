@@ -326,12 +326,18 @@ impl ConfigDb {
 
     /// Resume a paused rule and make it due no later than `now`. The event
     /// consumer drops a paused rule's events, so the reconcile run that the
-    /// next scheduler tick starts is what catches the destination up.
+    /// next scheduler tick starts is what catches the destination up. That
+    /// run must be a FULL walk: a cursor kept from a run stopped mid-walk
+    /// would skip keys written during the pause below it, so it is cleared.
+    /// Resuming a rule that is NOT paused changes nothing (no forced run).
     /// Returns `true` if the row existed.
     pub fn replication_resume(&self, rule_name: &str, now: i64) -> Result<bool, ConfigDbError> {
         let n = self.conn.execute(
-            "UPDATE replication_state SET paused = 0, next_due_at = MIN(next_due_at, ?) \
-             WHERE rule_name = ?",
+            "UPDATE replication_state \
+             SET next_due_at = CASE WHEN paused = 1 THEN MIN(next_due_at, ?1) ELSE next_due_at END, \
+                 continuation_token = CASE WHEN paused = 1 THEN NULL ELSE continuation_token END, \
+                 paused = 0 \
+             WHERE rule_name = ?2",
             params![now, rule_name],
         )?;
         Ok(n > 0)
@@ -1339,10 +1345,16 @@ mod tests {
                 [],
             )
             .unwrap();
+        db.replication_set_continuation_token("r", Some("releases/m"))
+            .unwrap();
         assert!(db.replication_resume("r", 500).unwrap());
         let st = db.replication_load_state("r").unwrap().unwrap();
         assert!(!st.paused);
         assert_eq!(st.next_due_at, 500);
+        assert_eq!(
+            st.continuation_token, None,
+            "the catch-up run is a full walk"
+        );
         // An earlier due time is kept.
         db.conn
             .execute(
@@ -1356,6 +1368,19 @@ mod tests {
             10
         );
         assert!(!db.replication_resume("ghost", 500).unwrap());
+        // Resuming a LIVE rule does not force a run or drop its cursor.
+        db.conn
+            .execute(
+                "UPDATE replication_state SET next_due_at = 99999 WHERE rule_name = 'r'",
+                [],
+            )
+            .unwrap();
+        db.replication_set_continuation_token("r", Some("keep"))
+            .unwrap();
+        db.replication_resume("r", 500).unwrap();
+        let st = db.replication_load_state("r").unwrap().unwrap();
+        assert_eq!(st.next_due_at, 99999);
+        assert_eq!(st.continuation_token.as_deref(), Some("keep"));
     }
 
     #[test]

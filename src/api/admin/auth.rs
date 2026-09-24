@@ -697,7 +697,7 @@ async fn session_user_info(
         crate::session::AuthMethod::IamLoginAs { access_key_id }
         | crate::session::AuthMethod::IamBrowserLift { access_key_id } => {
             let user = resolve_effective_iam_user(state, &access_key_id).await?;
-            let is_admin = crate::iam::permissions::is_admin(&user.permissions);
+            let is_admin = user.enabled && crate::iam::permissions::is_admin(&user.permissions);
             Some(WhoamiUserInfo {
                 name: user.name,
                 access_key_id: user.access_key_id,
@@ -719,7 +719,8 @@ async fn session_user_info(
             let effective = resolve_effective_iam_user(state, &user.access_key_id)
                 .await
                 .unwrap_or(user);
-            let is_admin = crate::iam::permissions::is_admin(&effective.permissions);
+            let is_admin =
+                effective.enabled && crate::iam::permissions::is_admin(&effective.permissions);
             Some(WhoamiUserInfo {
                 name: display_name,
                 access_key_id: effective.access_key_id,

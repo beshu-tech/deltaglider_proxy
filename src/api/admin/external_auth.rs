@@ -469,13 +469,12 @@ pub async fn oauth_callback(
         }
         Ok(None) => {
             // First login — auto-provision local IAM user
-            // The IdP controls this string. `$`-prefixed names are reserved
-            // for synthetic principals, so strip the prefix.
+            // The IdP controls this string: strip a reserved prefix.
             let display_name = identity
                 .name
                 .as_deref()
                 .or(identity.email.as_deref())
-                .map(|n| n.trim_start_matches('$'))
+                .map(crate::iam::types::strip_reserved_principal_prefix)
                 .filter(|n| !n.is_empty())
                 .unwrap_or("external-user");
 

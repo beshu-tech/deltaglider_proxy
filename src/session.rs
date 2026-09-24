@@ -303,20 +303,6 @@ impl SessionStore {
             .then(|| info.auth_method.clone())
     }
 
-    /// Kind-only check. Test-only: production code goes through
-    /// `admin_gui_auth_method` + the live-principal check.
-    #[cfg(test)]
-    pub fn allows_admin_gui(&self, token: &str, ip: Option<IpAddr>) -> bool {
-        let sessions = self.sessions.read();
-        let Some(info) = sessions.get(token) else {
-            return false;
-        };
-        if !self.entry_valid(info, ip) {
-            return false;
-        }
-        info.kind == SessionKind::AdminGui
-    }
-
     /// Remove a session (logout).
     pub fn remove(&self, token: &str) {
         self.sessions.write().remove(token);
@@ -662,7 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn test_allows_admin_gui_rejects_browser_lift() {
+    fn test_admin_gui_auth_method_rejects_browser_lift() {
         let store = SessionStore::new();
         let admin_t = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
         let lift_t = store.create_session(
@@ -672,8 +658,12 @@ mod tests {
             },
             SessionKind::S3BrowserLift,
         );
-        assert!(store.allows_admin_gui(&admin_t, None));
-        assert!(!store.allows_admin_gui(&lift_t, None));
+        assert!(matches!(
+            store.admin_gui_auth_method(&admin_t, None),
+            Some(AuthMethod::Bootstrap)
+        ));
+        assert!(store.admin_gui_auth_method(&lift_t, None).is_none());
+        assert!(store.admin_gui_auth_method("no-such-token", None).is_none());
     }
 
     #[test]

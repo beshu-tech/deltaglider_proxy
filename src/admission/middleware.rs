@@ -265,8 +265,9 @@ impl OwnedRequestInfo {
 
 use crate::api::request_target::RequestTarget;
 
-/// Detects whether the URL query carries a SigV4 presigned-URL
-/// `X-Amz-Credential` parameter (name decoded, case ignored).
+/// Whether s3s treats the query as SigV4-presigned
+/// (`RequestTarget::is_presigned_v4`: `X-Amz-Signature`, name decoded,
+/// case-sensitive).
 fn has_presigned_query_params(query: &str) -> bool {
     RequestTarget::parse("/", Some(query)).is_ok_and(|t| t.is_presigned_v4())
 }

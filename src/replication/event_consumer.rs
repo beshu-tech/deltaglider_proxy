@@ -345,6 +345,26 @@ async fn seed_cursor_if_absent(db: &Arc<Mutex<ConfigDb>>) {
     }
 }
 
+/// What the consumer does with a rule's events, from the rule's state row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleGate {
+    /// Live rule (or no row yet): act on the events.
+    Proceed,
+    /// Paused: do nothing; the events count as handled.
+    SkipPaused,
+    /// The state read failed: never guess. Stop the drain and hold the
+    /// cursor, so the events replay on the next tick.
+    AbortDrain,
+}
+
+fn rule_gate<E>(state: &Result<Option<super::state_store::ReplicationState>, E>) -> RuleGate {
+    match state {
+        Ok(Some(st)) if st.paused => RuleGate::SkipPaused,
+        Ok(_) => RuleGate::Proceed,
+        Err(_) => RuleGate::AbortDrain,
+    }
+}
+
 /// One drain pass: read new events, group + compact per key, route to rules,
 /// act (copy/delete) under the per-rule lease, and advance the cursor to the
 /// highest CONTIGUOUS fully-handled id.
@@ -462,28 +482,30 @@ async fn drain_once(
                     // the rule due at once, so its reconcile run catches up.
                     // A state read that FAILS is not "paused": like the lease
                     // DB error below, abort the drain and hold the cursor.
-                    let state = {
+                    let (gate, state) = {
                         let dbg = db.lock().await;
                         let state = dbg.replication_load_state(&rule.name);
-                        if matches!(state, Ok(Some(ref st)) if st.paused) || state.is_err() {
+                        let gate = rule_gate(&state);
+                        if gate != RuleGate::Proceed {
                             let _ = dbg.replication_release_lease(&rule.name, instance_id);
                         }
-                        state
+                        (gate, state)
                     };
-                    match state {
-                        Ok(Some(st)) if st.paused => {
+                    match gate {
+                        RuleGate::Proceed => {}
+                        RuleGate::SkipPaused => {
                             debug!(
                                 "event consumer: rule '{}' is paused — skipping {}/{}",
                                 rule.name, bucket, key
                             );
                             continue;
                         }
-                        Ok(_) => {}
-                        Err(e) => {
+                        RuleGate::AbortDrain => {
                             warn!(
-                                "event consumer: cannot read state of rule '{}' ({e}); \
+                                "event consumer: cannot read state of rule '{}' ({:?}); \
                                  aborting drain, cursor held at {cursor}",
-                                rule.name
+                                rule.name,
+                                state.err()
                             );
                             return;
                         }
@@ -683,6 +705,38 @@ async fn emit_replication_copied(
             "trigger": "event",
         }),
     ));
+}
+
+#[cfg(test)]
+mod rule_gate_tests {
+    use super::*;
+    use crate::replication::state_store::ReplicationState;
+
+    fn state(paused: bool) -> ReplicationState {
+        ReplicationState {
+            rule_name: "r".into(),
+            last_run_at: None,
+            next_due_at: 0,
+            last_status: String::new(),
+            objects_copied_lifetime: 0,
+            bytes_copied_lifetime: 0,
+            paused,
+            continuation_token: None,
+            leader_instance_id: None,
+            leader_expires_at: None,
+        }
+    }
+
+    #[test]
+    fn rule_gate_truth_table() {
+        assert_eq!(rule_gate::<()>(&Ok(Some(state(false)))), RuleGate::Proceed);
+        assert_eq!(rule_gate::<()>(&Ok(None)), RuleGate::Proceed);
+        assert_eq!(
+            rule_gate::<()>(&Ok(Some(state(true)))),
+            RuleGate::SkipPaused
+        );
+        assert_eq!(rule_gate::<&str>(&Err("db locked")), RuleGate::AbortDrain);
+    }
 }
 
 #[cfg(test)]

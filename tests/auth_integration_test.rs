@@ -2447,6 +2447,63 @@ async fn test_percent_encoded_path_cannot_escape_authorization() {
         .unwrap();
         assert_ne!(resp.status(), StatusCode::OK, "Deny bypassed by {wire}");
     }
+
+    // The same through CopyObject: s3s keeps `b//secret.txt` as key
+    // `/secret.txt`, the engine reads `secret.txt`.
+    for source in [format!("{b}//secret.txt"), format!("{b}/%2Fsecret.txt")] {
+        let resp = signed_encoded(
+            reqwest::Method::PUT,
+            &server.endpoint(),
+            &format!("/{b}/stolen.txt"),
+            &format!("/{b}/stolen.txt"),
+            "",
+            "",
+            &denied.access_key_id,
+            &denied.secret_access_key,
+        )
+        .header("x-amz-copy-source", &source)
+        .send()
+        .await
+        .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "Deny bypassed through x-amz-copy-source: {source}"
+        );
+    }
+}
+
+/// `$`-prefixed names are reserved: a rename to one is refused. A row that
+/// already carries such a name stays editable when the name is unchanged.
+#[tokio::test]
+async fn test_rename_to_reserved_principal_name_is_refused() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let alice = create_user(&admin, &server, "alice", vec![]).await;
+    let url = format!("{}/_/api/admin/users/{}", server.endpoint(), alice.id);
+    for name in ["$anonymous", "$bootstrap", "$x"] {
+        let resp = admin
+            .put(&url)
+            .json(&json!({"name": name}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "rename to {name}");
+    }
+    let resp = admin
+        .put(&url)
+        .json(&json!({"name": "alice", "enabled": false}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "plain update: {}",
+        resp.status()
+    );
 }
 
 /// A Deny on LIST with an `s3:prefix` condition must also match when the
