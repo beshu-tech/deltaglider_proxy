@@ -7,7 +7,7 @@ const { outputText } = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ES2020, target: ts.ScriptTarget.ES2020 },
   fileName: 'sourceIpField.ts',
 });
-const { sourceIpMatch, sourceIpText, parseSourceIpLines } = await import(
+const { sourceIpMatch, sourceIpText, parseSourceIpLines, sourceIpProblem } = await import(
   `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`
 );
 
@@ -43,5 +43,40 @@ assert.deepEqual(sourceIpMatch('203.0.113.5', { source_ip_list: ['203.0.113.5'] 
 assert.deepEqual(sourceIpMatch('203.0.113.5', { source_ip: '203.0.113.5' }), { source_ip: '203.0.113.5' });
 // A changed value follows the normal rule.
 assert.deepEqual(sourceIpMatch('203.0.113.6', { source_ip_list: ['203.0.113.5'] }), { source_ip: '203.0.113.6' });
+
+// A pasted list: commas and spaces separate entries too.
+assert.deepEqual(parseSourceIpLines('203.0.113.5, 10.0.0.0/8 2001:db8::1'), ['203.0.113.5', '10.0.0.0/8', '2001:db8::1']);
+assert.deepEqual(sourceIpMatch('203.0.113.5,198.51.100.0/24'), { source_ip_list: ['203.0.113.5', '198.51.100.0/24'] });
+
+// Client-side validation, with the line number (issue #92 review).
+for (const ok of [
+  '',
+  '203.0.113.5',
+  '0.0.0.0/0',
+  '10.0.0.0/8\n192.168.1.1/32',
+  '2001:db8::1',
+  '::',
+  '::1/128',
+  '2001:db8::/32',
+  '::ffff:192.0.2.1',
+  'fe80::1, 10.1.2.3',
+]) {
+  assert.equal(sourceIpProblem(ok), null, `valid: ${JSON.stringify(ok)}`);
+}
+assert.equal(sourceIpProblem('10.0.0.1\nfoo'), 'Line 2: "foo" is not an IP address or a network such as 10.0.0.0/8.');
+assert.match(sourceIpProblem('256.1.1.1'), /^Line 1: .*not an IP address/);
+assert.match(sourceIpProblem('1.2.3'), /not an IP address/);
+assert.match(sourceIpProblem('01.2.3.4'), /not an IP address/, 'leading zeros are ambiguous (octal)');
+assert.match(sourceIpProblem('10.0.0.0/33'), /between \/0 and \/32/);
+assert.match(sourceIpProblem('2001:db8::/129'), /between \/0 and \/128/);
+assert.match(sourceIpProblem('10.0.0.0/x'), /between \/0 and \/32/);
+assert.match(sourceIpProblem('10.0.0.0/8/8'), /not an IP address/);
+assert.match(sourceIpProblem('2001:db8:::1'), /not an IP address/);
+assert.match(sourceIpProblem('fe80::1%eth0'), /not an IP address/, 'no zone ids');
+// An over-long entry (the schema's max(64)) gets a message with its line.
+assert.match(sourceIpProblem('1.2.3.4\n\n' + 'a'.repeat(70)), /^Line 3: "a{40}…" is longer than 64 characters\.$/);
+// Entry count cap.
+const many = Array.from({ length: 4097 }, (_, i) => `10.${(i >> 8) & 255}.${i & 255}.1`).join('\n');
+assert.match(sourceIpProblem(many), /at most 4096/);
 
 console.log('source-ip field regression checks passed');

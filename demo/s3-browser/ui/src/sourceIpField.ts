@@ -9,12 +9,65 @@ export interface SourceIpMatch {
   source_ip_list?: string[];
 }
 
-/** One entry per line, blank lines and surrounding space dropped. */
+/** Entries separated by new lines, commas or spaces (a pasted list). */
 export function parseSourceIpLines(text: string): string[] {
-  return text
-    .split('\n')
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
+  return text.split(/[\s,]+/).filter((l) => l.length > 0);
+}
+
+const V4_OCTET = '(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)';
+const V4 = new RegExp(`^${V4_OCTET}(\\.${V4_OCTET}){3}$`);
+
+function isIpv4(s: string): boolean {
+  return V4.test(s);
+}
+
+function isIpv6(s: string): boolean {
+  if (!s.includes(':') || !/^[0-9a-fA-F:.]+$/.test(s)) return false;
+  // The URL parser implements the full IPv6 grammar (::, embedded IPv4).
+  try {
+    new URL(`http://[${s}]/`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Why one entry is not an IP address or a network (CIDR), or null. */
+function sourceIpEntryError(entry: string): string | null {
+  if (entry.length > 64) return 'is longer than 64 characters';
+  const [addr, prefix, extra] = entry.split('/');
+  const v4 = isIpv4(addr);
+  if (extra !== undefined || (!v4 && !isIpv6(addr))) {
+    return 'is not an IP address or a network such as 10.0.0.0/8';
+  }
+  if (prefix !== undefined) {
+    const max = v4 ? 32 : 128;
+    if (!/^\d{1,3}$/.test(prefix) || Number(prefix) > max) {
+      return `has a network size that is not between /0 and /${max}`;
+    }
+  }
+  return null;
+}
+
+/** Most entries the server accepts in `match.source_ip_list`. */
+const MAX_SOURCE_IPS = 4096;
+
+/**
+ * The first problem in the field's text, with its line number, or null.
+ * The textarea shows it; the rule cannot be saved while it is set.
+ */
+export function sourceIpProblem(text: string): string | null {
+  const lines = text.split('\n');
+  let count = 0;
+  for (let i = 0; i < lines.length; i++) {
+    for (const entry of parseSourceIpLines(lines[i])) {
+      count++;
+      const why = sourceIpEntryError(entry);
+      if (why) return `Line ${i + 1}: "${entry.length > 40 ? `${entry.slice(0, 40)}…` : entry}" ${why}.`;
+    }
+  }
+  if (count > MAX_SOURCE_IPS) return `Enter at most ${MAX_SOURCE_IPS} source IPs (there are ${count}).`;
+  return null;
 }
 
 /** The text shown in the field for a rule's match. */
