@@ -1,6 +1,7 @@
 import { useColors } from '../ThemeContext';
 import type { DocsBundle, DocGroup } from '../docsBundle';
 import Lightbox from './Lightbox';
+import { useIsNarrow } from '../useIsNarrow';
 
 interface Props {
   bundle: DocsBundle;
@@ -22,6 +23,10 @@ interface Props {
  */
 export default function DocsLanding({ bundle, onSelectDoc }: Props) {
   const colors = useColors();
+  // Same breakpoint as the docs sidebar's `hide-mobile` (768px). With the
+  // sidebar on screen, a card lists only where each group starts — the full
+  // list would repeat the sidebar. Without it, the cards are the navigation.
+  const sidebarHidden = useIsNarrow(769);
   const { docs: DOCS, groups: DOC_GROUPS, taglines: GROUP_TAGLINE } = bundle;
 
   const card = {
@@ -119,7 +124,8 @@ export default function DocsLanding({ bundle, onSelectDoc }: Props) {
             }}>
               {GROUP_TAGLINE[group as DocGroup]}
             </div>
-            {docs.map((d) => (
+            {/* The landing page is itself the README; never offer it as a start. */}
+            {(sidebarHidden ? docs : docs.filter((d) => d.id !== 'readme').slice(0, 1)).map((d) => (
               <div
                 key={d.id}
                 onClick={() => onSelectDoc(d.id)}
@@ -134,7 +140,7 @@ export default function DocsLanding({ bundle, onSelectDoc }: Props) {
                 onMouseEnter={(e) => (e.currentTarget.style.color = colors.ACCENT_BLUE)}
                 onMouseLeave={(e) => (e.currentTarget.style.color = colors.TEXT_SECONDARY)}
               >
-                {d.title}
+                {sidebarHidden ? d.title : `Start with: ${d.title} →`}
               </div>
             ))}
           </div>

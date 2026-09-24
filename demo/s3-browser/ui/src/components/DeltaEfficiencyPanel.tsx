@@ -206,9 +206,12 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
   return (
     <div style={contentColumn(CONTENT_WIDE)}>
       <Paragraph style={{ marginBottom: 12, color: colors.TEXT_SECONDARY }}>
-        Find folders whose reference file compresses its neighbors poorly.
-        Re-uploading such a folder lets the proxy pick a better seed and recover
-        most of the stored bytes. Read-only — you decide what to re-upload.
+        {/* The page header already says what this page finds; this line adds
+            only what to do about it. */}
+        When a folder&apos;s reference file compresses its neighbors poorly,
+        re-uploading the folder lets the proxy pick a better reference and
+        recover most of the stored bytes. The scan only reads; you decide what
+        to re-upload.
       </Paragraph>
 
       <Space wrap style={{ marginBottom: 16 }}>
@@ -233,26 +236,19 @@ export default function DeltaEfficiencyPanel({ onSessionExpired }: Props) {
             />
           </span>
         </HoverHint>
+        {/* One button. The first scan may answer from the server's 5-minute
+            cache; once a result is on screen, the button forces a fresh scan
+            (a cached re-read would only show the same result again). */}
         <Button
           type="primary"
-          icon={<ThunderboltOutlined />}
-          onClick={() => runScan(false)}
+          icon={response ? <ReloadOutlined /> : <ThunderboltOutlined />}
+          onClick={() => runScan(response !== null)}
           loading={loading && !scanning}
           disabled={!bucket}
+          title={response ? 'Scan this bucket again now, ignoring the 5-minute cache' : undefined}
         >
-          {response ? 'Refresh' : 'Scan'}
+          {response ? 'Re-scan' : 'Scan'}
         </Button>
-        {response && (
-          <HoverHint hint="Force a fresh scan, ignoring the 5-min cache.">
-            <Button
-              icon={<ReloadOutlined />}
-              onClick={() => runScan(true)}
-              loading={loading}
-            >
-              Re-scan
-            </Button>
-          </HoverHint>
-        )}
         {scanning && (
           <Space>
             <Spin size="small" />
