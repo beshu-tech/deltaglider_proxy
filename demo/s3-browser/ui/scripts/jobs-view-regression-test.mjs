@@ -76,6 +76,8 @@ assert.equal(kindLabel('migrate'), 'Migrate');
 assert.equal(triggerLabel('oneoff'), 'one-off');
 
 // ── availableActions matrix ─────────────────────────────────────────────────
+// A disabled rule that is ALSO paused still offers resume (clears the flag).
+assert.deepEqual(availableActions(row({ enabled: false, paused: true })), ['resume', 'run-now', 'delete']);
 assert.deepEqual(availableActions(row()), ['pause', 'run-now', 'delete']);
 // run-now is a one-off: available even when paused or disabled (backend runs it
 // once without flipping the flag). Only a RUNNING rule has nothing to trigger.
@@ -91,8 +93,8 @@ assert.deepEqual(
 );
 assert.deepEqual(
   availableActions(row({ enabled: false })),
-  ['pause', 'run-now', 'delete'],
-  'disabled still allows a one-off run'
+  ['run-now', 'delete'],
+  'disabled still allows a one-off run; pausing a rule that never runs is noise'
 );
 assert.deepEqual(
   availableActions(row({ kind: 'lifecycle' })),
@@ -112,7 +114,7 @@ assert.deepEqual(
 );
 assert.deepEqual(
   availableActions(row({ kind: 'lifecycle', enabled: false })),
-  ['pause', 'preview', 'delete'],
+  ['preview', 'delete'],
   'disabled lifecycle: no run-now (backend 409s it)'
 );
 // Replication one-off is unchanged: paused/disabled still runnable.

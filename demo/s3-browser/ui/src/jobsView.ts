@@ -260,7 +260,10 @@ export function triggerLabel(trigger: string): string {
 export function availableActions(row: JobRow): JobAction[] {
   const out: JobAction[] = [];
   if (row.kind === 'replication' || row.kind === 'lifecycle') {
-    out.push(row.paused ? 'resume' : 'pause');
+    // Pause is meaningless on a disabled rule (the scheduler never runs it);
+    // resume stays so a paused-and-disabled rule can still clear its flag.
+    if (row.paused) out.push('resume');
+    else if (row.enabled !== false) out.push('pause');
     if (row.kind === 'lifecycle') out.push('preview');
     // run-now availability differs by kind (matches the backend contract):
     //  - replication: a deliberate ONE-OFF that runs even a disabled/paused
