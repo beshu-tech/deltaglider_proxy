@@ -2,6 +2,7 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import { scanPrefixUsage, getPrefixUsage } from './adminApi';
 import { getBucket } from './s3client';
 import { normalizeUiError } from './errorHandling';
+import { USAGE_POLL_INTERVAL_MS, usagePollStep } from './usagePoll';
 
 export interface FolderSizeState {
   progress: { totalSize: number; totalFiles: number; done: boolean } | null;
@@ -17,14 +18,16 @@ export interface FolderSizeState {
 export default function useComputeSize() {
   const [sizes, setSizes] = useState<Record<string, FolderSizeState>>({});
   const abortControllers = useRef<Record<string, AbortController>>({});
-  const pollTimers = useRef<Record<string, ReturnType<typeof setInterval>>>({});
+  const pollTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
-  // Cleanup poll timers on unmount
+  // Cleanup on unmount: stop every poll (abort also detaches any
+  // waiting-for-visible listener).
   useEffect(() => {
+    const controllers = abortControllers.current;
+    const timers = pollTimers.current;
     return () => {
-      for (const timer of Object.values(pollTimers.current)) {
-        clearInterval(timer);
-      }
+      for (const c of Object.values(controllers)) c.abort();
+      for (const timer of Object.values(timers)) clearTimeout(timer);
     };
   }, []);
 
@@ -34,7 +37,7 @@ export default function useComputeSize() {
       abortControllers.current[prefix].abort();
     }
     if (pollTimers.current[prefix]) {
-      clearInterval(pollTimers.current[prefix]);
+      clearTimeout(pollTimers.current[prefix]);
     }
 
     const controller = new AbortController();
@@ -46,55 +49,75 @@ export default function useComputeSize() {
     }));
 
     const bucket = getBucket();
+    const settle = (state: FolderSizeState) => {
+      delete pollTimers.current[prefix];
+      if (abortControllers.current[prefix] === controller) delete abortControllers.current[prefix];
+      setSizes((prev) => ({ ...prev, [prefix]: state }));
+    };
+
+    // Poll for the result as a setTimeout chain: the next poll is scheduled
+    // only after the previous one settles (no overlapping requests), the
+    // attempt budget is bounded, non-retryable errors stop it (usagePollStep),
+    // and a hidden tab pauses it until the tab is visible again.
+    const schedule = (attempt: number) => {
+      const run = async () => {
+        if (controller.signal.aborted) return;
+        if (document.hidden) {
+          const onVisible = () => {
+            if (document.hidden) return;
+            document.removeEventListener('visibilitychange', onVisible);
+            void run();
+          };
+          document.addEventListener('visibilitychange', onVisible);
+          controller.signal.addEventListener(
+            'abort',
+            () => document.removeEventListener('visibilitychange', onVisible),
+            { once: true },
+          );
+          return;
+        }
+        let outcome: { result: Awaited<ReturnType<typeof getPrefixUsage>> } | { error: unknown };
+        try {
+          outcome = { result: await getPrefixUsage(bucket, prefix) };
+        } catch (error) {
+          outcome = { error };
+        }
+        if (controller.signal.aborted) return;
+        // The bucket changed under us: never show A's size under B.
+        if (getBucket() !== bucket) return;
+        const step = usagePollStep(attempt, outcome);
+        if (step.kind === 'retry') {
+          schedule(attempt + 1);
+        } else if (step.kind === 'fail') {
+          settle({ progress: null, loading: false, error: step.error });
+        } else if ('result' in outcome && outcome.result) {
+          settle({
+            progress: {
+              totalSize: outcome.result.total_size,
+              totalFiles: outcome.result.total_objects,
+              done: true,
+            },
+            loading: false,
+            error: null,
+          });
+        }
+      };
+      pollTimers.current[prefix] = setTimeout(() => void run(), USAGE_POLL_INTERVAL_MS);
+    };
 
     // Trigger the scan
     scanPrefixUsage(bucket, prefix)
       .then(() => {
         if (controller.signal.aborted) return;
-
-        // Poll for results every 2 seconds
-        const timer = setInterval(async () => {
-          if (controller.signal.aborted) {
-            clearInterval(timer);
-            return;
-          }
-          try {
-            const result = await getPrefixUsage(bucket, prefix);
-            if (controller.signal.aborted) return;
-            // The bucket changed under us: never show A's size under B.
-            if (getBucket() !== bucket) return;
-            if (result) {
-              clearInterval(timer);
-              delete pollTimers.current[prefix];
-              setSizes((prev) => ({
-                ...prev,
-                [prefix]: {
-                  progress: {
-                    totalSize: result.total_size,
-                    totalFiles: result.total_objects,
-                    done: true,
-                  },
-                  loading: false,
-                  error: null,
-                },
-              }));
-            }
-          } catch {
-            // Keep polling on transient errors
-          }
-        }, 2000);
-        pollTimers.current[prefix] = timer;
+        schedule(1);
       })
       .catch((err) => {
         if (controller.signal.aborted) return;
-        setSizes((prev) => ({
-          ...prev,
-          [prefix]: {
-            progress: null,
-            loading: false,
-            error: normalizeUiError(err, "Compute size failed"),
-          },
-        }));
+        settle({
+          progress: null,
+          loading: false,
+          error: normalizeUiError(err, "Compute size failed"),
+        });
       });
   }, []);
 
@@ -132,7 +155,7 @@ export default function useComputeSize() {
       delete abortControllers.current[prefix];
     }
     if (pollTimers.current[prefix]) {
-      clearInterval(pollTimers.current[prefix]);
+      clearTimeout(pollTimers.current[prefix]);
       delete pollTimers.current[prefix];
     }
     setSizes((prev) => {
@@ -148,7 +171,7 @@ export default function useComputeSize() {
     }
     abortControllers.current = {};
     for (const timer of Object.values(pollTimers.current)) {
-      clearInterval(timer);
+      clearTimeout(timer);
     }
     pollTimers.current = {};
     setSizes({});

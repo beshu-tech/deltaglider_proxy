@@ -66,6 +66,7 @@
     "test:safe-storage": "node scripts/safe-storage-regression-test.mjs",
     "test:setup-yaml": "node scripts/setup-yaml-regression-test.mjs",
     "test:bulk-selection": "node scripts/bulk-selection-regression-test.mjs",
+    "test:usage-poll": "node scripts/usage-poll-regression-test.mjs",
     "e2e": "playwright test",
     "typecheck": "tsc --noEmit",
     "knip": "knip"
