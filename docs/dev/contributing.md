@@ -55,8 +55,8 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --lib --locked
 ./scripts/check-integration-tests-in-ci.sh
-cd demo/s3-browser/ui && npm ci && npm run build && npm run lint && npm run typecheck && npm run knip \
-  && npm run test:permissions && npm run test:storage-path
+cd demo/s3-browser/ui && npm ci && npm run build && npm run lint:strict && npm run typecheck && npm run knip \
+  && npm run test:all
 # Optional local parity with CI integration batches (needs MinIO):
 cargo test --locked --test s3_integration_test
 ```
