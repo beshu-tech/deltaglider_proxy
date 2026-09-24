@@ -25,6 +25,30 @@ use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 
+tokio::task_local! {
+    /// TCP peer of the request being served, set by [`scope_request_peer`].
+    /// `audit_log` falls back to it when no trusted forwarding header names
+    /// the client, so audit entries carry a real IP without a reverse proxy.
+    static REQUEST_PEER: Option<std::net::IpAddr>;
+}
+
+/// Outermost middleware: makes the connection's peer IP visible to every
+/// `audit_log` call made while this request is served.
+pub async fn scope_request_peer(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0.ip());
+    REQUEST_PEER.scope(peer, next.run(req)).await
+}
+
+fn current_request_peer() -> Option<std::net::IpAddr> {
+    REQUEST_PEER.try_with(|p| *p).ok().flatten()
+}
+
 /// Sanitize a value for structured audit log output.
 /// Prevents newline injection and pipe-delimiter confusion.
 pub fn sanitize(s: &str) -> String {
@@ -52,7 +76,7 @@ fn extract_ua(headers: &HeaderMap) -> String {
 /// "unknown" here while the rate limiter keys on the peer IP, producing
 /// inconsistent log lines for the same request.
 pub fn extract_client_info(headers: &HeaderMap) -> (String, String) {
-    let ip = crate::rate_limiter::extract_client_ip(headers)
+    let ip = crate::rate_limiter::extract_client_ip_with_peer(headers, current_request_peer())
         .map(|ip| ip.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     (ip, extract_ua(headers))
@@ -230,5 +254,25 @@ mod audit_filter_tests {
                 .parse()
                 .unwrap();
         assert!(f.to_string().contains("deltaglider_proxy::audit=info"));
+    }
+}
+
+#[cfg(test)]
+mod request_peer_tests {
+    use super::*;
+
+    /// Issue #92 hunt: every audit entry showed ip "unknown" without a
+    /// reverse proxy, because audit_log read only forwarding headers. Inside
+    /// a request scope the TCP peer must be the fallback.
+    #[tokio::test]
+    async fn audit_ip_falls_back_to_the_request_peer() {
+        let peer: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let headers = HeaderMap::new();
+        let ip = REQUEST_PEER
+            .scope(Some(peer), async { extract_client_info(&headers).0 })
+            .await;
+        assert_eq!(ip, "203.0.113.7");
+        // Outside a request scope nothing is known.
+        assert_eq!(extract_client_info(&headers).0, "unknown");
     }
 }

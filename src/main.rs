@@ -997,7 +997,12 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let rustls_config = init_tls(&config).await?;
 
     // --- Merge UI + security headers ---
-    let app = demo::ui_router(admin_state).merge(app);
+    let app = demo::ui_router(admin_state)
+        .merge(app)
+        // Outermost: audit entries fall back to the connection's peer IP.
+        .layer(middleware::from_fn(
+            deltaglider_proxy::audit::scope_request_peer,
+        ));
     info!("  Dashboard: http://{}/_/", config.listen_addr);
 
     let tls_enabled = config.tls_enabled();
