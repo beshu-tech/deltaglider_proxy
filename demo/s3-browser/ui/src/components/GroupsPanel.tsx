@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
 import { Button, Typography, Alert, Input, Divider, Checkbox, message } from 'antd';
-import { PlusOutlined, FolderOutlined, DeleteOutlined, CopyOutlined } from '@ant-design/icons';
+import { FolderOutlined, CopyOutlined } from '@ant-design/icons';
 import type { IamGroup, IamUser } from '../adminApi';
 import { useIamMode } from '../queries/config';
 import { useGroups, useCreateGroup, useUpdateGroup, useDeleteGroup, useCloneGroup, useAddGroupMember, useRemoveGroupMember } from '../queries/groups';
@@ -94,7 +94,6 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
   // Mutations used directly by the panel (the form gets its own). Each
   // invalidates qk.groups.list() (+ users) so the list refreshes automatically.
   const cloneMutation = useCloneGroup();
-  const deleteMutation = useDeleteGroup();
 
   const selectedGroup = groups.find(g => g.id === selectedId) ?? null;
   const filtered = filterItems(groups, filterText, g => [g.name]);
@@ -196,11 +195,11 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
         {groups.length === 0 ? (
           <>
             <FolderOutlined style={{ fontSize: 40, marginBottom: 12, color: colors.TEXT_MUTED }} />
-            <div><Text type="secondary" style={{ fontSize: 15, fontWeight: 500 }}>Permission Groups</Text></div>
+            <div><Text type="secondary" style={{ fontSize: 15, fontWeight: 500 }}>{readOnly ? 'No groups declared' : 'Create the first group'}</Text></div>
             <Text type="secondary" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
               {readOnly
-                ? 'No groups in your YAML config. Add them under access.iam_groups and apply.'
-                : 'Create groups to share permissions across multiple users. Users inherit all permissions from their groups.'}
+                ? 'Your YAML config has no groups. Add them under access.iam_groups and apply.'
+                : 'Click New to create the first group. Users inherit every permission of their groups.'}
             </Text>
           </>
         ) : (
@@ -231,21 +230,7 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
       error={error}
       listEmptyState={(
         <div style={{ padding: 20, textAlign: 'center' }}>
-          <Text type="secondary" style={{ fontSize: 13, display: 'block', marginBottom: 8 }}>No groups yet</Text>
-          {readOnly ? (
-            <Text type="secondary" style={{ fontSize: 11, display: 'block' }}>
-              Add groups under access.iam_groups in your YAML config and apply.
-            </Text>
-          ) : (
-            <>
-              <Text type="secondary" style={{ fontSize: 11, display: 'block', marginBottom: 12 }}>
-                Create groups to share permissions across multiple users.
-              </Text>
-              <Button type="primary" size="small" icon={<PlusOutlined />} onClick={handleCreate}>
-                Create Group
-              </Button>
-            </>
-          )}
+          <Text type="secondary" style={{ fontSize: 13 }}>No groups yet</Text>
         </div>
       )}
       renderRowBody={group => (
@@ -265,23 +250,6 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
                   onClick={(e) => {
                     e.stopPropagation();
                     void handleClone(group);
-                  }}
-                  style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0 }}
-                  onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
-                  onMouseLeave={e => { e.currentTarget.style.opacity = '0.5'; }}
-                />
-                <Button
-                  type="text"
-                  danger
-                  size="small"
-                  icon={<DeleteOutlined />}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (!window.confirm(`Delete group "${group.name}"? This cannot be undone.`)) return;
-                    deleteMutation.mutate(group.id, {
-                      onSuccess: handleDeleted,
-                      onError: (err) => console.error('Delete group failed:', err),
-                    });
                   }}
                   style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0 }}
                   onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
