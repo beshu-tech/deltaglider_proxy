@@ -570,65 +570,19 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install dependencies
         run: cd demo/s3-browser/ui && npm ci
-      # ── Blocking: ESLint with react-hooks/rules-of-hooks at error.
-      #    A regression of error #310 (hooks after early returns) is
-      #    caught here, before it ever ships. Warnings are still
-      #    visible in logs but don't fail CI — warn budget is being
-      #    managed down separately (see lint:strict). ──
-      - name: ESLint (rules-of-hooks, no-unused-vars, ...)
-        run: cd demo/s3-browser/ui && npm run lint
+      # ── Blocking: ESLint, zero warnings (hooks rules, UI rules, unused
+      #    code — see eslint.config.mjs). ──
+      - name: ESLint (hooks, UI rules, no-unused-vars, ...)
+        run: cd demo/s3-browser/ui && npm run lint:strict
       # ── Blocking: TypeScript. `recharts` types no longer break this. ──
       - name: TypeScript type check
         run: cd demo/s3-browser/ui && npm run typecheck
       # ── Blocking: Knip detects unused files, deps, and exports. ──
       - name: Knip (dead code / unused deps)
         run: cd demo/s3-browser/ui && npm run knip
-      - name: Node regression scripts (permissions + storage paths + page size)
-        run: |
-          cd demo/s3-browser/ui
-          npm run test:permissions
-          npm run test:docs-bundle
-          npm run test:storage-path
-          npm run test:page-size
-          npm run test:condition-prefix-rows
-          npm run test:advanced-merge-patch
-          npm run test:permission-conditions
-          npm run test:permission-warnings
-          npm run test:action-chips
-          npm run test:resource-pattern-rows
-          npm run test:permission-rows
-          npm run test:rule-editor-helpers
-          npm run test:credential-generation
-          npm run test:overlay-styles
-          npm run test:admin-nav-tree
-          npm run test:yaml-utils
-          npm run test:linkify
-          npm run test:utils
-          npm run test:request-id-suffix
-          npm run test:session-expiry
-          npm run test:storage-section-payload
-          npm run test:backend-encryption-payload
-          npm run test:master-detail-filter
-          npm run test:trace-request
-          npm run test:bulk-clear-selection
-          npm run test:dest-prefix
-          npm run test:url-state
-          npm run test:scan-freshness
-          npm run test:rule-names
-          npm run test:upload-telemetry
-          npm run test:webhook-delivery-payload
-          npm run test:keyboard
-          npm run test:browser-nav
-          npm run test:dropped-files
-          npm run test:maintenance-status
-          npm run test:jobs-view
-          npm run test:outcome-meter
-          npm run test:admin-path-remap
-          npm run test:destination-suggest
-          npm run test:hero-number-size
-          npm run test:file-preview-mode
-          npm run test:make-zip
-          npm run test:safe-storage
+      # Every `test:*` script in package.json — no hand-kept list to drift.
+      - name: Node regression scripts
+        run: cd demo/s3-browser/ui && npm run test:all
       - name: npm audit
         run: cd demo/s3-browser/ui && npm audit --audit-level=high || true  # warn-only
 

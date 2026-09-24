@@ -16,6 +16,7 @@
     "preview": "vite preview",
     "lint": "eslint 'src/**/*.{ts,tsx}'",
     "lint:strict": "eslint 'src/**/*.{ts,tsx}' --max-warnings 0",
+    "test:all": "node scripts/run-regression-tests.mjs",
     "test:permissions": "node scripts/permissions-regression-test.mjs",
   "test:docs-bundle": "node scripts/docs-bundle-regression-test.mjs",
     "test:writable-prefixes": "node scripts/writable-prefixes-regression-test.mjs",
