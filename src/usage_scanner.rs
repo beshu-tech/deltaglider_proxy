@@ -12,6 +12,7 @@ use serde::Serialize;
 use tracing::{debug, warn};
 
 use crate::api::handlers::AppState;
+use crate::storage::list_size_cache::ListedSize;
 use crate::storage::StorageBackend as _;
 
 /// Monotonic counter bumped after every completed usage-scan cache insert.
@@ -79,21 +80,25 @@ pub struct UsageEntry {
     /// `MAX_SCAN_OBJECTS` objects. The totals represent a lower bound.
     #[serde(default)]
     pub truncated: bool,
-    /// True when the backend refused some metadata lookups (throttling), so
-    /// some delta objects count their stored size instead of the original
-    /// one. `total_size` is then a lower bound.
+    /// True when the original size of some objects is not known to this
+    /// proxy (a delta, or an encrypted object, that no request through this
+    /// proxy has read or written since it started), so those objects count
+    /// their stored size, which is smaller. `total_size` is then a lower
+    /// bound. The scan never sends a metadata request per object to find out.
     #[serde(default)]
     pub sizes_estimated: bool,
 }
 
 /// Size and object count for an immediate child prefix.
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Default, Debug, PartialEq, Serialize)]
 pub struct ChildUsage {
     /// Logical (original) bytes.
     pub size: u64,
     /// Bytes stored on the backend, delta baselines included.
     pub stored_size: u64,
     pub objects: u64,
+    /// Same meaning as [`UsageEntry::sizes_estimated`], for this child.
+    pub sizes_estimated: bool,
 }
 
 /// Totals of one scan, before they become a cache entry. Pure output of
@@ -104,8 +109,7 @@ pub(crate) struct UsageTotals {
     pub stored_size: u64,
     pub total_objects: u64,
     pub sizes_estimated: bool,
-    /// child prefix -> (logical, stored, objects)
-    pub children: HashMap<String, (u64, u64, u64)>,
+    pub children: HashMap<String, ChildUsage>,
 }
 
 /// The immediate child folder of `prefix` that `key` lives in, or `None`
@@ -116,63 +120,55 @@ fn child_prefix_of(prefix: &str, key: &str) -> Option<String> {
     Some(format!("{}{}/", prefix, &relative[..slash]))
 }
 
-/// Fold listed objects and reference baselines into logical + stored totals,
+/// Fold listed objects and delta baselines into logical + stored totals,
 /// grouped by immediate child prefix. Pure; unit-tested.
 ///
-/// * Objects count their logical `file_size` and their stored size. An
-///   unresolved delta stub only knows its stored size, so it counts that for
-///   both and sets `sizes_estimated`.
-/// * A baseline (`reference.bin`) is not a user object: it adds stored bytes
-///   to its folder and to the total, but no logical bytes and no object.
-///   `references` carry their deltaspace prefix without a trailing slash.
+/// * `sizes[i]` says whether the logical size of `objects[i]` is known. An
+///   object whose size is not known counts its stored size for both totals
+///   and sets `sizes_estimated` (on the total and on its child).
+/// * A baseline (`(stored key, stored size)`, e.g. `fw/v1/reference.bin`) is
+///   not a user object: it adds stored bytes, but no logical bytes and no
+///   object. Objects and baselines follow the SAME prefix rule (plain string
+///   prefix, like the listing that produced both).
 /// * Additions saturate: a corrupt size near `u64::MAX` must not wrap a total
 ///   to a tiny value (the quota fallback compares against it).
 pub(crate) fn aggregate_usage(
     prefix: &str,
     objects: &[(String, crate::types::FileMetadata)],
-    references: &[(String, crate::types::FileMetadata)],
+    sizes: &[ListedSize],
+    baselines: &[(String, u64)],
 ) -> UsageTotals {
     let mut t = UsageTotals::default();
-    for (key, meta) in objects {
+    for (i, (key, meta)) in objects.iter().enumerate() {
         if !key.starts_with(prefix) {
             continue;
         }
         let stored = meta.stored_size();
-        let logical = if meta.is_unresolved_delta_stub() {
-            t.sizes_estimated = true;
-            stored
-        } else {
-            meta.file_size
-        };
+        // A missing entry (callers pass one per object) is treated as unknown.
+        let known = sizes.get(i).is_some_and(|s| s.is_known());
+        let logical = if known { meta.file_size } else { stored };
         t.total_size = t.total_size.saturating_add(logical);
         t.stored_size = t.stored_size.saturating_add(stored);
         t.total_objects = t.total_objects.saturating_add(1);
+        t.sizes_estimated |= !known;
         if let Some(child) = child_prefix_of(prefix, key) {
             let c = t.children.entry(child).or_default();
-            c.0 = c.0.saturating_add(logical);
-            c.1 = c.1.saturating_add(stored);
-            c.2 = c.2.saturating_add(1);
+            c.size = c.size.saturating_add(logical);
+            c.stored_size = c.stored_size.saturating_add(stored);
+            c.objects = c.objects.saturating_add(1);
+            c.sizes_estimated |= !known;
         }
     }
-    for (deltaspace, meta) in references {
-        // A key-shaped path inside the deltaspace, so the same child rule
-        // applies: `a/b` holds `a/b/.dg/reference.bin`.
-        let inner = if deltaspace.is_empty() {
-            ".dg/reference.bin".to_string()
-        } else {
-            format!("{deltaspace}/.dg/reference.bin")
-        };
-        if !inner.starts_with(prefix) {
+    for (key, size) in baselines {
+        if !key.starts_with(prefix) {
             continue;
         }
-        t.stored_size = t.stored_size.saturating_add(meta.file_size);
-        if let Some(child) = child_prefix_of(prefix, &inner) {
-            // `.dg/` itself is never a child folder: the baseline belongs to
-            // the scanned prefix, which the total already counts.
-            if !child.ends_with("/.dg/") && child != ".dg/" {
-                let c = t.children.entry(child).or_default();
-                c.1 = c.1.saturating_add(meta.file_size);
-            }
+        t.stored_size = t.stored_size.saturating_add(*size);
+        // `fw/reference.bin` under `fw/` belongs to the scanned folder itself,
+        // which the total already counts; it forms no child.
+        if let Some(child) = child_prefix_of(prefix, key) {
+            let c = t.children.entry(child).or_default();
+            c.stored_size = c.stored_size.saturating_add(*size);
         }
     }
     t
@@ -377,20 +373,23 @@ impl UsageScanner {
     /// immediate child prefix. Limits processing to `MAX_SCAN_OBJECTS` to
     /// prevent OOM on very large prefixes.
     ///
-    /// One lite listing, then `resolve_listed_sizes` for the delta entries the
-    /// listing could not size (S3 backend: metadata cache first, one HEAD per
-    /// miss), then one metadata lookup per deltaspace for the baselines.
+    /// One lite listing of the prefix and nothing else: no request per
+    /// object, no request per folder. The listing carries the baselines too.
+    /// Logical sizes come from the listing (filesystem: exact, from the
+    /// xattrs it reads anyway) or from the listing-size cache (S3); an object
+    /// neither knows counts its stored size and marks the result estimated.
     async fn do_scan(
         s3_state: &AppState,
         bucket: &str,
         prefix: &str,
     ) -> Result<UsageEntry, String> {
         let engine = s3_state.engine.load();
-        let mut objects = engine
+        let listing = engine
             .storage()
-            .bulk_list_objects(bucket, prefix)
+            .bulk_list_objects_with_baselines(bucket, prefix)
             .await
             .map_err(|e| format!("bulk_list_objects failed: {e}"))?;
+        let mut objects = listing.objects;
 
         let truncated = objects.len() > MAX_SCAN_OBJECTS;
         if truncated {
@@ -403,37 +402,19 @@ impl UsageScanner {
             );
             objects.truncate(MAX_SCAN_OBJECTS);
         }
-        let objects = engine
-            .resolve_listed_sizes(bucket, objects)
-            .await
-            .map_err(|e| format!("resolving object sizes failed: {e}"))?;
-        let references = engine
-            .list_deltaspace_references(bucket, prefix, None)
-            .await
-            .map_err(|e| format!("listing delta baselines failed: {e}"))?
-            .references;
+        let sizes = engine
+            .storage()
+            .resolve_listed_sizes(bucket, &mut objects)
+            .await;
 
-        let totals = aggregate_usage(prefix, &objects, &references);
+        let totals = aggregate_usage(prefix, &objects, &sizes, &listing.baselines);
         Ok(UsageEntry {
             prefix: prefix.to_string(),
             bucket: bucket.to_string(),
             total_size: totals.total_size,
             stored_size: totals.stored_size,
             total_objects: totals.total_objects,
-            children: totals
-                .children
-                .into_iter()
-                .map(|(k, (size, stored_size, objects))| {
-                    (
-                        k,
-                        ChildUsage {
-                            size,
-                            stored_size,
-                            objects,
-                        },
-                    )
-                })
-                .collect(),
+            children: totals.children,
             computed_at: Utc::now(),
             age_seconds: 0,
             stale_seconds: 0,
@@ -538,18 +519,26 @@ mod tests {
         (key.to_string(), m)
     }
 
-    fn reference(deltaspace: &str, size: u64) -> (String, FileMetadata) {
-        let m = FileMetadata::fallback(
-            "reference.bin".into(),
+    fn known(objects: &[(String, FileMetadata)]) -> Vec<ListedSize> {
+        objects
+            .iter()
+            .map(|(_, m)| {
+                if m.is_unresolved_delta_stub() {
+                    ListedSize::StoredOnly
+                } else {
+                    ListedSize::Listed
+                }
+            })
+            .collect()
+    }
+
+    fn child(size: u64, stored_size: u64, objects: u64, sizes_estimated: bool) -> ChildUsage {
+        ChildUsage {
             size,
-            "etag".into(),
-            Utc::now(),
-            None,
-            StorageInfo::Reference {
-                source_name: String::new(),
-            },
-        );
-        (deltaspace.to_string(), m)
+            stored_size,
+            objects,
+            sizes_estimated,
+        }
     }
 
     #[test]
@@ -562,53 +551,91 @@ mod tests {
             plain("firmware/README.md", 36),
             plain("top.txt", 10),
         ];
-        let refs = vec![reference("firmware/v1", 3_000_000)];
-        let t = aggregate_usage("", &objects, &refs);
+        let sizes = known(&objects);
+        let refs = vec![("firmware/v1/reference.bin".to_string(), 3_000_000)];
+        let t = aggregate_usage("", &objects, &sizes, &refs);
         assert_eq!(t.total_size, 3_000_000 + 3_100_000 + 36 + 10);
         assert_eq!(t.stored_size, 46 + 28_000 + 36 + 10 + 3_000_000);
         assert_eq!(t.total_objects, 4);
         assert!(!t.sizes_estimated);
         assert_eq!(
             t.children.get("firmware/"),
-            Some(&(3_000_000 + 3_100_000 + 36, 46 + 28_000 + 36 + 3_000_000, 3))
+            Some(&child(
+                3_000_000 + 3_100_000 + 36,
+                46 + 28_000 + 36 + 3_000_000,
+                3,
+                false
+            ))
         );
         assert_eq!(t.children.len(), 1, "top-level file forms no child");
 
-        let t = aggregate_usage("firmware/", &objects, &refs);
+        let t = aggregate_usage("firmware/", &objects, &sizes, &refs);
         assert_eq!(t.total_size, 3_000_000 + 3_100_000 + 36);
         assert_eq!(t.total_objects, 3);
         assert_eq!(
             t.children.get("firmware/v1/"),
-            Some(&(3_000_000, 46 + 3_000_000, 1))
+            Some(&child(3_000_000, 46 + 3_000_000, 1, false))
         );
         assert_eq!(
             t.children.get("firmware/v2/"),
-            Some(&(3_100_000, 28_000, 1))
+            Some(&child(3_100_000, 28_000, 1, false))
         );
     }
 
     #[test]
     fn baseline_of_the_scanned_folder_is_not_a_child() {
         let objects = vec![delta("fw/a.tar", 100, 5)];
-        let refs = vec![reference("fw", 100)];
-        let t = aggregate_usage("fw/", &objects, &refs);
+        let refs = vec![("fw/reference.bin".to_string(), 100)];
+        let t = aggregate_usage("fw/", &objects, &known(&objects), &refs);
         assert_eq!(t.stored_size, 105);
-        assert!(t.children.is_empty(), "no `.dg/` child: {:?}", t.children);
-        let t = aggregate_usage("", &[delta("a.tar", 100, 5)], &[reference("", 100)]);
+        assert!(t.children.is_empty(), "{:?}", t.children);
+        let objects = vec![delta("a.tar", 100, 5)];
+        let refs = vec![("reference.bin".to_string(), 100)];
+        let t = aggregate_usage("", &objects, &known(&objects), &refs);
         assert_eq!(t.stored_size, 105);
         assert!(t.children.is_empty());
     }
 
+    /// Review finding (round 2): baselines used a folder rule while objects
+    /// used a string-prefix rule. One rule now: the prefix `fw` (no slash)
+    /// covers `fw/…` and `fw2/…` for objects AND baselines alike.
     #[test]
-    fn unresolved_stub_counts_stored_size_and_flags_estimate() {
-        let t = aggregate_usage("", &[stub("d/a.tar", 46)], &[]);
-        assert_eq!(t.total_size, 46);
+    fn objects_and_baselines_follow_the_same_prefix_rule() {
+        let objects = vec![delta("fw/a.tar", 100, 5), delta("fw2/b.tar", 200, 7)];
+        let refs = vec![
+            ("fw/reference.bin".to_string(), 100),
+            ("fw2/reference.bin".to_string(), 200),
+            ("other/reference.bin".to_string(), 999),
+        ];
+        let t = aggregate_usage("fw", &objects, &known(&objects), &refs);
+        assert_eq!(t.total_size, 300);
+        assert_eq!(t.stored_size, 5 + 7 + 100 + 200);
+    }
+
+    #[test]
+    fn unknown_sizes_count_stored_bytes_and_flag_the_estimate() {
+        let objects = vec![stub("d/a.tar", 46), delta("e/b.tar", 1000, 9)];
+        let t = aggregate_usage("", &objects, &known(&objects), &[]);
+        assert_eq!(t.total_size, 46 + 1000);
         assert!(t.sizes_estimated);
+        assert!(t.children["d/"].sizes_estimated);
+        assert!(
+            !t.children["e/"].sizes_estimated,
+            "only the folder with the unknown size"
+        );
+        // An object the cache resolved counts its logical size.
+        let mut resolved = stub("d/a.tar", 46);
+        resolved.1.file_size = 3_000;
+        let t = aggregate_usage("", &[resolved], &[ListedSize::Cached], &[]);
+        assert_eq!(t.total_size, 3_000);
+        assert_eq!(t.stored_size, 46);
+        assert!(!t.sizes_estimated);
     }
 
     #[test]
     fn sizes_saturate_instead_of_wrapping() {
-        let t = aggregate_usage("", &[plain("a", u64::MAX), plain("b", 5)], &[]);
+        let objects = vec![plain("a", u64::MAX), plain("b", 5)];
+        let t = aggregate_usage("", &objects, &known(&objects), &[]);
         assert_eq!(t.total_size, u64::MAX);
         assert_eq!(t.stored_size, u64::MAX);
     }

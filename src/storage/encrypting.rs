@@ -50,9 +50,10 @@
 //! Objects without the marker → returned as-is (backward compatible).
 
 use super::io_to_storage_error;
+use super::list_size_cache::ListedSize;
 use super::traits::{
-    DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend, StorageError,
-    UploadedPart,
+    BulkListing, DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend,
+    StorageError, UploadedPart,
 };
 use crate::types::FileMetadata;
 use aes_gcm::aead::{Aead, Payload};
@@ -1747,6 +1748,26 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
         self.inner.enrich_list_metadata(b, o).await
     }
+    async fn bulk_list_objects_with_baselines(
+        &self,
+        b: &str,
+        p: &str,
+    ) -> Result<BulkListing, StorageError> {
+        self.inner.bulk_list_objects_with_baselines(b, p).await
+    }
+    async fn resolve_listed_sizes(
+        &self,
+        b: &str,
+        objects: &mut [(String, FileMetadata)],
+    ) -> Vec<ListedSize> {
+        let mut sizes = self.inner.resolve_listed_sizes(b, objects).await;
+        // An inner listing of ciphertext (S3) reports the ciphertext size of a
+        // passthrough object: without a cache hit, only that is known.
+        if self.actively_encrypts() && !self.inner.lite_list_carries_logical_facts(b) {
+            downgrade_ciphertext_listings(objects, &mut sizes);
+        }
+        sizes
+    }
     async fn list_objects_delegated(
         &self,
         b: &str,
@@ -1759,9 +1780,47 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     }
 }
 
+/// On a backend whose listing reports ciphertext, a passthrough entry the
+/// listing-size cache did not resolve carries the ciphertext size: mark it
+/// `StoredOnly`. Directory markers stay `Listed`. Pure; unit-tested.
+fn downgrade_ciphertext_listings(objects: &[(String, FileMetadata)], sizes: &mut [ListedSize]) {
+    for ((key, _), size) in objects.iter().zip(sizes.iter_mut()) {
+        if *size == ListedSize::Listed && !key.ends_with('/') {
+            *size = ListedSize::StoredOnly;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ciphertext_listings_without_a_cache_hit_are_stored_only() {
+        let m = FileMetadata::fallback(
+            "x".into(),
+            1,
+            "e".into(),
+            chrono::Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        let objects = vec![
+            ("a.bin".to_string(), m.clone()),
+            ("b.bin".to_string(), m.clone()),
+            ("dir/".to_string(), m),
+        ];
+        let mut sizes = vec![ListedSize::Listed, ListedSize::Cached, ListedSize::Listed];
+        downgrade_ciphertext_listings(&objects, &mut sizes);
+        assert_eq!(
+            sizes,
+            [
+                ListedSize::StoredOnly,
+                ListedSize::Cached,
+                ListedSize::Listed
+            ]
+        );
+    }
 
     fn test_key() -> EncryptionKey {
         EncryptionKey::from_hex("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")

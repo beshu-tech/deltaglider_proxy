@@ -2,6 +2,7 @@
 
 //! Storage backend trait definitions
 
+use crate::storage::list_size_cache::ListedSize;
 use crate::types::FileMetadata;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -575,6 +576,49 @@ pub trait StorageBackend: Send + Sync {
         prefix: &str,
     ) -> Result<Vec<(String, FileMetadata)>, StorageError>;
 
+    /// [`Self::bulk_list_objects`] plus the delta baselines the same listing
+    /// saw, as `(stored key, stored size)` (for example `fw/v1/reference.bin`).
+    /// Callers that report stored bytes (the folder-size scan) get the
+    /// baselines at no extra request, from the same prefix listing, so objects
+    /// and baselines always follow the same prefix rule. The default lists no
+    /// baselines; every production backend overrides it.
+    async fn bulk_list_objects_with_baselines(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<BulkListing, StorageError> {
+        Ok(BulkListing {
+            objects: self.bulk_list_objects(bucket, prefix).await?,
+            baselines: Vec::new(),
+        })
+    }
+
+    /// Replace each listed entry's STORED size and ETag with the logical ones
+    /// when this process knows them for exactly that stored object (see
+    /// [`crate::storage::list_size_cache`]). Sends no request, never fails.
+    /// Returns, per entry, how much of its size is known. `created_at` (the
+    /// listed LastModified) is never changed.
+    ///
+    /// The default suits a backend whose listing already carries logical
+    /// sizes (filesystem: the xattrs are read during the listing): only a
+    /// delta stub is `StoredOnly`.
+    async fn resolve_listed_sizes(
+        &self,
+        _bucket: &str,
+        objects: &mut [(String, FileMetadata)],
+    ) -> Vec<ListedSize> {
+        objects
+            .iter()
+            .map(|(_, m)| {
+                if m.is_unresolved_delta_stub() {
+                    ListedSize::StoredOnly
+                } else {
+                    ListedSize::Listed
+                }
+            })
+            .collect()
+    }
+
     /// Enrich listed objects with full metadata from HEAD calls.
     /// Used by the `metadata=true` MinIO ListObjectsV2 extension.
     ///
@@ -642,6 +686,14 @@ pub struct DelegatedListResult {
     pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
+}
+
+/// Result of [`StorageBackend::bulk_list_objects_with_baselines`].
+#[derive(Debug, Default)]
+pub struct BulkListing {
+    pub objects: Vec<(String, FileMetadata)>,
+    /// `(stored key, stored size)` of every `reference.bin` in the listing.
+    pub baselines: Vec<(String, u64)>,
 }
 
 /// Result from [`StorageBackend::scan_deltaspace_lite`].
@@ -987,6 +1039,22 @@ macro_rules! impl_storage_backend_for_box {
             }
             async fn list_deltaspaces(&self, bucket: &str) -> Result<Vec<String>, StorageError> {
                 (**self).list_deltaspaces(bucket).await
+            }
+            async fn bulk_list_objects_with_baselines(
+                &self,
+                bucket: &str,
+                prefix: &str,
+            ) -> Result<BulkListing, StorageError> {
+                (**self)
+                    .bulk_list_objects_with_baselines(bucket, prefix)
+                    .await
+            }
+            async fn resolve_listed_sizes(
+                &self,
+                bucket: &str,
+                objects: &mut [(String, FileMetadata)],
+            ) -> Vec<ListedSize> {
+                (**self).resolve_listed_sizes(bucket, objects).await
             }
             async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {
                 (**self).total_size(bucket).await

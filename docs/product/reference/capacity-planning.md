@@ -24,6 +24,7 @@ Memory is the variable most people underestimate, because it scales with *object
 - **Delta reads (reconstruction):** xdelta3 needs the reference baseline and the output object in RAM at once. Peak working memory for a single delta GET is on the order of the reconstructed object size plus the reference — bounded per object by **`DGP_MAX_OBJECT_SIZE`** (default 100 MB). With the default cap and N concurrent delta GETs of large objects, plan for roughly `N × (object + reference)` of transient RAM on top of the baseline footprint.
 - **Reference cache (`DGP_CACHE_MB`, default 100 MB):** an LRU that keeps hot baselines in memory so only the first cold read of a deltaspace pays a backend round-trip. Raising it trades RAM for fewer backend fetches on read-heavy workloads; it does not change the per-request buffering cost.
 - **Metadata cache (`DGP_METADATA_CACHE_MB`, default 50 MB):** caches per-object `FileMetadata` for HEAD/GET/LIST. Small and bounded.
+- **Listing-size cache (`DGP_LIST_SIZE_CACHE_MB`, default 32 MB):** remembers the original size and ETag of each stored delta that this proxy wrote or read, so that a listing can report them without a metadata request per object. An entry takes about 100 bytes plus the key length, so the default holds about 200,000 objects.
 
 **Worked example.** Suppose your delta-eligible objects average 40 MB and you expect up to 16 concurrent delta reads at peak. Transient reconstruction memory is roughly `16 × (40 MB + reference)` ≈ 1.3 GB on top of the caches and base process. Lowering `DGP_MAX_OBJECT_SIZE` (objects above the cap go passthrough and stream) or lowering codec concurrency both cap that number directly.
 
@@ -51,6 +52,7 @@ Before production, decide each of these from your workload, not the defaults:
 | Max delta-eligible object size | `DGP_MAX_OBJECT_SIZE` | 100 MB | Largest object you want compressed (bigger → passthrough) |
 | Reference cache | `DGP_CACHE_MB` | 100 MB | Number/size of hot baselines, read-heaviness |
 | Metadata cache | `DGP_METADATA_CACHE_MB` | 50 MB | LIST/HEAD volume |
+| Listing-size cache | `DGP_LIST_SIZE_CACHE_MB` | 32 MB | Number of delta objects that listings report |
 | HTTP concurrency ceiling | `DGP_MAX_CONCURRENT_REQUESTS` | 1024 | Peak in-flight requests |
 
 **A reasonable starting point** for a moderate-throughput single instance: 4–8 cores, 4 GB RAM, `DGP_CODEC_CONCURRENCY` left at default, caps left at default — then watch the [Prometheus metrics](metrics.md) (codec timings, queue depth, cache hit rate) under real load and adjust. Scale out with multiple instances behind a load balancer (each stateless on the data path; share IAM via [config sync](../how-to/run-multiple-instances.md)) rather than scaling a single box indefinitely.

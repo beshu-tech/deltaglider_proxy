@@ -26,9 +26,10 @@
 //!   - storage/s3/listing.rs        — S3ListedObject + pagination
 //!   - storage/s3/metadata_io.rs    — header/metadata serialisation
 
+use super::list_size_cache::{self, ListedSize, LogicalFacts, StoredObjectId};
 use super::traits::{
-    DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend, StorageError,
-    UploadedPart,
+    BulkListing, DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend,
+    StorageError, UploadedPart,
 };
 use crate::config::BackendConfig;
 use crate::types::{FileMetadata, StorageInfo};
@@ -57,6 +58,18 @@ pub static DELEGATED_LIST_UPSTREAM_PAGES: std::sync::LazyLock<prometheus::IntCou
         prometheus::IntCounter::new(
             "deltaglider_delegated_list_upstream_pages_total",
             "Upstream ListObjectsV2 pages fetched by delegated listings",
+        )
+        .expect("valid metric")
+    });
+
+/// Object metadata (HEAD) requests sent to S3 backends. Lets an operator see
+/// a HEAD burst (the Hetzner 503 SlowDown RCA) and lets tests prove that a
+/// path sends none.
+pub static BACKEND_HEAD_REQUESTS: std::sync::LazyLock<prometheus::IntCounter> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounter::new(
+            "deltaglider_backend_head_requests_total",
+            "Object metadata (HEAD) requests sent to S3 backends",
         )
         .expect("valid metric")
     });
@@ -188,6 +201,14 @@ impl S3ListedObject {
     }
 }
 
+/// Output of `S3Backend::classify_listed_objects`.
+struct ClassifiedListing {
+    classified: Vec<ClassifiedObject>,
+    dir_markers: Vec<(String, FileMetadata)>,
+    /// `(stored key, stored size)` of each `reference.bin`.
+    baselines: Vec<(String, u64)>,
+}
+
 /// An S3 listed object classified into a user-visible key, with enough info
 /// to decide whether a HEAD call is needed for full metadata.
 struct ClassifiedObject {
@@ -247,6 +268,9 @@ pub struct S3Backend {
     /// Per-backend native S3 server-side encryption mode. Applied to
     /// every `put_object`/`put_directory_marker` call.
     native_encryption: NativeEncryptionConfig,
+    /// Scope of this backend's entries in the listing-size cache: the
+    /// endpoint that holds the buckets (see `list_size_cache`).
+    list_cache_scope: String,
 }
 
 impl S3Backend {
@@ -393,9 +417,18 @@ impl S3Backend {
             "S3Backend initialized (multi-bucket mode, native encryption: {:?})",
             native_encryption
         );
+        let list_cache_scope = match config {
+            BackendConfig::S3 {
+                endpoint: Some(endpoint),
+                ..
+            } => endpoint.trim_end_matches('/').to_string(),
+            BackendConfig::S3 { region, .. } => format!("aws:{region}"),
+            _ => String::new(),
+        };
         Ok(Self {
             client,
             native_encryption,
+            list_cache_scope,
         })
     }
 
@@ -769,7 +802,14 @@ impl S3Backend {
             request = apply_native_encryption(request, &self.native_encryption);
 
             match request.send().await {
-                Ok(_) => {
+                Ok(resp) => {
+                    self.remember_listed_facts(
+                        bucket,
+                        key,
+                        resp.e_tag().unwrap_or_default(),
+                        data.len() as u64,
+                        metadata,
+                    );
                     if attempt > 0 {
                         debug!(
                             "S3 PUT {}/{} succeeded on attempt {} ({} bytes)",
@@ -955,6 +995,7 @@ impl S3Backend {
         bucket: &str,
         key: &str,
     ) -> Result<FileMetadata, StorageError> {
+        BACKEND_HEAD_REQUESTS.inc();
         let response = self
             .client
             .head_object()
@@ -1011,7 +1052,16 @@ impl S3Backend {
         // from the HEAD response itself.
         if !headers.is_empty() {
             match self.headers_to_metadata(&headers, s3_last_modified) {
-                Ok(meta) => return Ok(meta),
+                Ok(meta) => {
+                    self.remember_listed_facts(
+                        bucket,
+                        key,
+                        response.e_tag().unwrap_or_default(),
+                        response.content_length().unwrap_or(0).max(0) as u64,
+                        &meta,
+                    );
+                    return Ok(meta);
+                }
                 Err(e) if delta_critical => {
                     warn!(
                         "PATHOLOGICAL | {} file {}/{} has missing/corrupt DG metadata — \
@@ -1087,6 +1137,71 @@ impl S3Backend {
     // the has_reference transient-error corruption bug. has_reference now
     // classifies the error directly — NotFound → absent, else propagate.)
 
+    /// Record, in the listing-size cache, what a client must see for the
+    /// stored object `key` (see `list_size_cache`). Called wherever the
+    /// backend learns the logical metadata anyway (the PUT it sends, the HEAD
+    /// it sends), so it costs no request. Baselines are never listed to
+    /// clients, so they get no entry.
+    fn remember_listed_facts(
+        &self,
+        bucket: &str,
+        key: &str,
+        stored_etag: &str,
+        stored_size: u64,
+        meta: &FileMetadata,
+    ) {
+        if key.rsplit('/').next() == Some("reference.bin") {
+            return;
+        }
+        list_size_cache::record(
+            &StoredObjectId {
+                scope: &self.list_cache_scope,
+                bucket,
+                key,
+                etag: stored_etag,
+                size: stored_size,
+            },
+            LogicalFacts::of(meta),
+        );
+    }
+
+    /// The listing-size-cache resolution of one listed entry. Pure apart from
+    /// the cache lookup; see `StorageBackend::resolve_listed_sizes`.
+    fn resolve_one_listed(
+        scope: &str,
+        bucket: &str,
+        user_key: &str,
+        meta: &mut FileMetadata,
+    ) -> ListedSize {
+        if user_key.ends_with('/') {
+            return ListedSize::Listed; // directory marker
+        }
+        let stub = meta.is_unresolved_delta_stub();
+        if meta.is_delta() && !stub {
+            return ListedSize::Listed; // already full metadata
+        }
+        let stored_key = if stub {
+            format!("{user_key}.delta")
+        } else {
+            user_key.to_string()
+        };
+        let id = StoredObjectId {
+            scope,
+            bucket,
+            key: &stored_key,
+            etag: &meta.md5,
+            size: meta.stored_size(),
+        };
+        match list_size_cache::lookup(&id) {
+            Some(facts) => {
+                list_size_cache::apply(meta, &facts);
+                ListedSize::Cached
+            }
+            None if stub => ListedSize::StoredOnly,
+            None => ListedSize::Listed,
+        }
+    }
+
     // === Listing classification helpers ===
     //
     // Both `bulk_list_objects` and `list_objects_delegated` need to:
@@ -1097,13 +1212,15 @@ impl S3Backend {
     //
     // These helpers centralise that logic so changes only need to happen once.
 
-    /// Classify a batch of S3 listed objects into user-visible entries and
-    /// directory markers. Internal files (reference.bin) are filtered out.
-    fn classify_listed_objects(
-        objects: Vec<S3ListedObject>,
-    ) -> (Vec<ClassifiedObject>, Vec<(String, FileMetadata)>) {
+    /// Classify a batch of S3 listed objects into user-visible entries,
+    /// directory markers, and delta baselines. A baseline (`reference.bin`)
+    /// is never user-visible: it comes back separately as
+    /// `(stored key, stored size)` so a caller that reports stored bytes can
+    /// count it without another request.
+    fn classify_listed_objects(objects: Vec<S3ListedObject>) -> ClassifiedListing {
         let mut classified = Vec::new();
         let mut dir_markers = Vec::new();
+        let mut baselines = Vec::new();
 
         for obj in objects {
             let filename = obj.key.rsplit('/').next().unwrap_or(&obj.key);
@@ -1114,8 +1231,9 @@ impl S3Backend {
                 continue;
             }
 
-            // Skip internal deltaspace files: reference.bin and anything inside .dg/
+            // Internal deltaspace file: never a user-visible object.
             if filename == "reference.bin" {
+                baselines.push((obj.key.clone(), obj.size));
                 continue;
             }
 
@@ -1145,7 +1263,11 @@ impl S3Backend {
             });
         }
 
-        (classified, dir_markers)
+        ClassifiedListing {
+            classified,
+            dir_markers,
+            baselines,
+        }
     }
 
     /// Fire bounded parallel HEAD calls for a set of S3 keys, returning metadata
@@ -2151,28 +2273,50 @@ impl StorageBackend for S3Backend {
         bucket: &str,
         prefix: &str,
     ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
-        let listed = self.list_objects_full(bucket, prefix).await?;
-        let (classified, dir_markers) = Self::classify_listed_objects(listed);
+        Ok(self
+            .bulk_list_objects_with_baselines(bucket, prefix)
+            .await?
+            .objects)
+    }
 
-        // Build FileMetadata from LIST data only — no HEAD calls.
-        // DG metadata (storage type, delta size, SHA) is fetched lazily via
-        // HEAD when clients actually need it (GUI enrichKeys, inspector panel).
-        //
-        // NOTE: For delta files, file_size = delta size (not original size).
-        // This is a known trade-off: accurate original sizes require HEAD per
-        // delta file. The GUI handles this via lazy HEAD enrichment for visible
-        // files. Third-party clients see the stored (delta) size, which is
-        // technically correct from an S3 perspective.
-        let results: Vec<(String, FileMetadata)> =
-            Self::resolve_classified_lite(classified, dir_markers);
+    async fn bulk_list_objects_with_baselines(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<BulkListing, StorageError> {
+        let listed = self.list_objects_full(bucket, prefix).await?;
+        let listing = Self::classify_listed_objects(listed);
+
+        // Build FileMetadata from LIST data only — no HEAD calls. A delta
+        // entry is a stub carrying its STORED size and ETag;
+        // `resolve_listed_sizes` swaps in the logical ones when the
+        // listing-size cache knows this exact stored object. Full metadata
+        // (storage type, SHA) is fetched by HEAD only where a caller asks for
+        // it (metadata=true listings, the inspector).
+        let objects = Self::resolve_classified_lite(listing.classified, listing.dir_markers);
 
         debug!(
-            "Bulk listed {} objects (lite, no HEAD) in {}/{}",
-            results.len(),
+            "Bulk listed {} objects + {} baselines (lite, no HEAD) in {}/{}",
+            objects.len(),
+            listing.baselines.len(),
             bucket,
             prefix
         );
-        Ok(results)
+        Ok(BulkListing {
+            objects,
+            baselines: listing.baselines,
+        })
+    }
+
+    async fn resolve_listed_sizes(
+        &self,
+        bucket: &str,
+        objects: &mut [(String, FileMetadata)],
+    ) -> Vec<ListedSize> {
+        objects
+            .iter_mut()
+            .map(|(key, meta)| Self::resolve_one_listed(&self.list_cache_scope, bucket, key, meta))
+            .collect()
     }
 
     /// Optimised listing that delegates delimiter collapsing to upstream S3.
@@ -2345,9 +2489,9 @@ impl StorageBackend for S3Backend {
         }
 
         // Classify and build lite metadata (no HEAD calls — same as bulk_list_objects).
-        let (classified, dir_markers) = Self::classify_listed_objects(raw_objects);
+        let listing = Self::classify_listed_objects(raw_objects);
         let objects: Vec<(String, FileMetadata)> =
-            Self::resolve_classified_lite(classified, dir_markers);
+            Self::resolve_classified_lite(listing.classified, listing.dir_markers);
 
         // Apply max_keys across both objects and common_prefixes (interleaved)
         let common_prefixes: Vec<String> = all_common_prefixes.into_iter().collect();
@@ -2634,6 +2778,92 @@ fn apply_native_encryption_mpu(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client LIST resolves a delta stub from the listing-size cache only
+    /// when the cache holds exactly the listed stored object; a miss keeps
+    /// the stored size and says so. No request is involved.
+    #[test]
+    fn listed_delta_resolves_only_for_the_same_stored_object() {
+        use crate::storage::list_size_cache::{record, LogicalFacts, StoredObjectId};
+        let scope = "http://resolve-one-listed-test";
+        record(
+            &StoredObjectId {
+                scope,
+                bucket: "b",
+                key: "fw/a.tar.delta",
+                etag: "d1",
+                size: 46,
+            },
+            LogicalFacts {
+                size: 3_000_000,
+                etag: "orig".into(),
+            },
+        );
+        let listed = |etag: &str| {
+            FileMetadata::fallback(
+                "a.tar".into(),
+                46,
+                etag.into(),
+                Utc::now(),
+                None,
+                StorageInfo::delta_stub(46),
+            )
+        };
+        let mut hit = listed("d1");
+        assert_eq!(
+            S3Backend::resolve_one_listed(scope, "b", "fw/a.tar", &mut hit),
+            ListedSize::Cached
+        );
+        assert_eq!((hit.file_size, hit.etag()), (3_000_000, "\"orig\"".into()));
+        // Overwritten elsewhere: same size, new ETag → no hit, stored size.
+        let mut miss = listed("d2");
+        assert_eq!(
+            S3Backend::resolve_one_listed(scope, "b", "fw/a.tar", &mut miss),
+            ListedSize::StoredOnly
+        );
+        assert_eq!(miss.file_size, 46);
+        let mut plain = FileMetadata::fallback(
+            "r.txt".into(),
+            5,
+            "p".into(),
+            Utc::now(),
+            None,
+            StorageInfo::Passthrough,
+        );
+        assert_eq!(
+            S3Backend::resolve_one_listed(scope, "b", "fw/r.txt", &mut plain),
+            ListedSize::Listed
+        );
+    }
+
+    /// Round-2 review: baselines come out of the same listing as the objects
+    /// (zero extra requests) instead of being dropped.
+    #[test]
+    fn classify_reports_baselines_separately() {
+        let obj = |key: &str, size: u64| S3ListedObject {
+            key: key.to_string(),
+            size,
+            last_modified: None,
+            etag: Some("e".into()),
+        };
+        let listing = S3Backend::classify_listed_objects(vec![
+            obj("fw/v1/reference.bin", 3_000),
+            obj("fw/v1/a.tar.delta", 46),
+            obj("fw/b.txt", 5),
+            obj("fw/dir/", 0),
+        ]);
+        assert_eq!(
+            listing.baselines,
+            [("fw/v1/reference.bin".to_string(), 3_000)]
+        );
+        let keys: Vec<&str> = listing
+            .classified
+            .iter()
+            .map(|c| c.user_key.as_str())
+            .collect();
+        assert_eq!(keys, ["fw/v1/a.tar", "fw/b.txt"]);
+        assert_eq!(listing.dir_markers.len(), 1);
+    }
     use aws_sdk_s3::operation::get_object::GetObjectError;
     use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
     use aws_smithy_runtime_api::http::StatusCode;

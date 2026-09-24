@@ -3,11 +3,12 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { Table, Typography, Alert, Progress, Checkbox, theme, Button, Select } from 'antd';
 import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, CloseCircleOutlined, WarningOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
-import { formatBytes, relativeTime, noun } from '../utils';
+import { formatBytes, relativeTime } from '../utils';
 import type { ColumnsType, TableProps } from 'antd/es/table';
 import type { GetRef } from 'antd';
 import { useColors } from '../ThemeContext';
 import type { FolderSizeState } from '../useComputeSize';
+import { folderSizeText, folderSizeTitle } from '../folderSize';
 import { getPreviewMode } from './filePreviewMode';
 import { canRequestPrefixUsageScan, isVirtualFolderPrefix } from '../permissions';
 import { usePersistedPageSize } from '../usePersistedPageSize';
@@ -110,7 +111,7 @@ function FolderSizeCell({
   if (sizeState?.loading) {
     return (
       <Button
-        title={sizeState.progress ? formatBytes(sizeState.progress.totalSize) + ' stored across ' + sizeState.progress.totalFiles.toLocaleString() + ' files so far...' : 'Starting...'}
+        title={sizeState.progress ? formatBytes(sizeState.progress.totalSize) + ' across ' + sizeState.progress.totalFiles.toLocaleString() + ' files so far...' : 'Starting...'}
         type="text"
         size="small"
         icon={<CloseCircleOutlined />}
@@ -125,10 +126,10 @@ function FolderSizeCell({
   if (sizeState?.progress?.done) {
     return (
       <span
-        title={`${sizeState.progress.totalFiles.toLocaleString()} ${noun(sizeState.progress.totalFiles, 'file')} — stored (compressed) size`}
+        title={folderSizeTitle(sizeState.progress.totalFiles, Boolean(sizeState.progress.lowerBound))}
         style={{ ...MONO_CELL_STYLE, color: TEXT_SECONDARY, cursor: 'default' }}
       >
-        {formatBytes(sizeState.progress.totalSize)}
+        {folderSizeText(formatBytes(sizeState.progress.totalSize), Boolean(sizeState.progress.lowerBound))}
       </span>
     );
   }

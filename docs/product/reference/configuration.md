@@ -1019,6 +1019,7 @@ Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_
 | `DGP_MAX_OBJECT_SIZE` | 104857600 | Max bytes eligible for delta (xdelta3 mem cap) |
 | `DGP_CACHE_MB` | 100 | Reference cache size in MB |
 | `DGP_METADATA_CACHE_MB` | 50 | `FileMetadata` cache size in MB (0 to disable) |
+| `DGP_LIST_SIZE_CACHE_MB` | 32 | Listing-size cache in MB: the original size and ETag of stored deltas, for listings |
 | `DGP_CODEC_CONCURRENCY` | `num_cpus * 4` (min 16) | Max concurrent xdelta3 subprocesses |
 | `DGP_CODEC_TIMEOUT_SECS` | 60 | Per-subprocess timeout |
 

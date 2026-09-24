@@ -268,3 +268,115 @@ async fn delegated_list_pages(endpoint: &str) -> u64 {
 async fn delegated_list_probes(endpoint: &str) -> u64 {
     scrape_counter(endpoint, "deltaglider_delegated_list_probe_requests_total").await
 }
+
+async fn backend_heads(endpoint: &str) -> u64 {
+    scrape_counter(endpoint, "deltaglider_backend_head_requests_total").await
+}
+
+/// Issue #92 round 2: a client LIST reports the ORIGINAL size and ETag of a
+/// delta from the listing-size cache, and sends ZERO backend HEADs doing it.
+///
+/// * A proxy that wrote the object (warm) lists the original size and the
+///   same ETag a HEAD returns. Fails before round 1 (the metadata-cache
+///   override replaced the size but kept the stored delta's ETag).
+/// * A second proxy on the same bucket (cold caches: a restart, another
+///   node) lists the stored size without any HEAD. Fails on round 1, which
+///   sent one HEAD per listed delta (up to 1000 per page) to resolve it.
+/// * After that proxy reads the object once (a HEAD), its LIST reports the
+///   original size and ETag, and LastModified does not change between the
+///   cold and the warm LIST.
+#[tokio::test]
+async fn list_reports_original_delta_sizes_without_backend_heads() {
+    skip_unless_minio!();
+    let writer = TestServer::s3().await;
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+
+    let base = generate_binary(100_000, 7);
+    let variant = mutate_binary(&base, 0.01);
+    for (name, body) in [("base.zip", &base), ("v1.zip", &variant)] {
+        let url = format!("{}/{}/{prefix}/{name}", writer.endpoint(), writer.bucket());
+        let resp = http
+            .put(&url)
+            .header("content-type", "application/zip")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+    let key = format!("{prefix}/v1.zip");
+
+    // What a HEAD reports is the truth a LIST must match.
+    let writer_client = writer.s3_client().await;
+    let head = writer_client
+        .head_object()
+        .bucket(writer.bucket())
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(head.content_length(), Some(variant.len() as i64));
+    let head_etag = head.e_tag().unwrap().to_string();
+
+    let list_v1 = |client: aws_sdk_s3::Client, bucket: String| {
+        let prefix = prefix.clone();
+        let key = key.clone();
+        async move {
+            let out = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(format!("{prefix}/"))
+                .send()
+                .await
+                .unwrap();
+            out.contents()
+                .iter()
+                .find(|o| o.key() == Some(key.as_str()))
+                .cloned()
+                .expect("v1.zip listed")
+        }
+    };
+
+    // Warm (the writer): original size and ETag, no HEAD.
+    let before = backend_heads(&writer.endpoint()).await;
+    let warm = list_v1(writer_client.clone(), writer.bucket().to_string()).await;
+    assert_eq!(backend_heads(&writer.endpoint()).await, before);
+    assert_eq!(warm.size(), Some(variant.len() as i64));
+    assert_eq!(warm.e_tag(), Some(head_etag.as_str()));
+
+    // Cold (a second proxy on the same bucket): stored size, no HEAD.
+    let reader = TestServer::s3().await;
+    let reader_client = reader.s3_client().await;
+    let before = backend_heads(&reader.endpoint()).await;
+    let cold = list_v1(reader_client.clone(), reader.bucket().to_string()).await;
+    assert_eq!(
+        backend_heads(&reader.endpoint()).await,
+        before,
+        "a client LIST must not send HEADs"
+    );
+    let stored = cold.size().unwrap();
+    assert!(
+        stored < variant.len() as i64,
+        "cold LIST keeps the stored delta size ({stored} B), as before round 1"
+    );
+
+    // One read through the reader fills its cache; the LIST then matches HEAD.
+    let reader_head = reader_client
+        .head_object()
+        .bucket(reader.bucket())
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    let before = backend_heads(&reader.endpoint()).await;
+    let resolved = list_v1(reader_client, reader.bucket().to_string()).await;
+    assert_eq!(backend_heads(&reader.endpoint()).await, before);
+    assert_eq!(resolved.size(), Some(variant.len() as i64));
+    assert_eq!(resolved.e_tag(), reader_head.e_tag());
+    assert_eq!(
+        resolved.last_modified(),
+        cold.last_modified(),
+        "LastModified must not flip between LISTs"
+    );
+}

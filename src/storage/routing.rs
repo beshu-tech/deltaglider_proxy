@@ -16,11 +16,12 @@ use bytes::Bytes;
 use futures::stream::BoxStream;
 use tracing::warn;
 
+use super::list_size_cache::ListedSize;
 use crate::types::FileMetadata;
 
 use super::traits::{
-    BucketListing, DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend,
-    StorageError, UploadedPart,
+    BucketListing, BulkListing, DelegatedListResult, LiteScanResult, MultipartUpload,
+    StorageBackend, StorageError, UploadedPart,
 };
 
 /// Route entry: maps a virtual bucket to a backend and optional real bucket name.
@@ -1159,6 +1160,23 @@ impl StorageBackend for RoutingBackend {
     ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
         let (backend, real_bucket) = self.resolve_existing(bucket).await;
         backend.enrich_list_metadata(&real_bucket, objects).await
+    }
+
+    async fn bulk_list_objects_with_baselines(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<BulkListing, StorageError> {
+        route_existing!(self, bucket, bulk_list_objects_with_baselines, prefix)
+    }
+
+    async fn resolve_listed_sizes(
+        &self,
+        bucket: &str,
+        objects: &mut [(String, FileMetadata)],
+    ) -> Vec<ListedSize> {
+        let (backend, real_bucket) = self.resolve_existing(bucket).await;
+        backend.resolve_listed_sizes(&real_bucket, objects).await
     }
 
     async fn list_objects_delegated(

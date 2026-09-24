@@ -301,15 +301,6 @@ impl s3s::S3 for DeltaGliderS3Service {
             page.common_prefixes
                 .retain(|prefix| user_can_see_common_prefix(&user, &input.bucket, prefix));
         }
-        // Transparency: report every object's ORIGINAL size and ETag, never the
-        // stored delta's (see `resolve_listed_sizes`).
-        page.objects = self
-            .state
-            .engine
-            .load()
-            .resolve_listed_sizes(&input.bucket, std::mem::take(&mut page.objects))
-            .await
-            .map_err(engine_error_to_s3s)?;
         let next_marker = page.next_continuation_token.clone();
         let is_truncated = page.next_continuation_token.is_some();
         let contents: Vec<s3s::dto::Object> = page
@@ -377,15 +368,6 @@ impl s3s::S3 for DeltaGliderS3Service {
             page.common_prefixes
                 .retain(|prefix| user_can_see_common_prefix(&user, &input.bucket, prefix));
         }
-        // Transparency: report every object's ORIGINAL size and ETag, never the
-        // stored delta's (see `resolve_listed_sizes`).
-        page.objects = self
-            .state
-            .engine
-            .load()
-            .resolve_listed_sizes(&input.bucket, std::mem::take(&mut page.objects))
-            .await
-            .map_err(engine_error_to_s3s)?;
         let metadata_ext = include_metadata.then(|| {
             ListMetadataXmlExtensions(
                 page.objects

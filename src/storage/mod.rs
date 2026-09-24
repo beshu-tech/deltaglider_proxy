@@ -4,6 +4,7 @@
 
 pub mod encrypting;
 mod filesystem;
+pub mod list_size_cache;
 pub(crate) mod routing;
 mod s3;
 mod traits;
@@ -14,10 +15,12 @@ pub use encrypting::{EncryptingBackend, EncryptionConfig, EncryptionKey, WriteMo
 pub use filesystem::FilesystemBackend;
 pub use routing::RoutingBackend;
 pub use s3::{
-    NativeEncryptionConfig, S3Backend, DELEGATED_LIST_PROBE_REQUESTS, DELEGATED_LIST_UPSTREAM_PAGES,
+    NativeEncryptionConfig, S3Backend, BACKEND_HEAD_REQUESTS, DELEGATED_LIST_PROBE_REQUESTS,
+    DELEGATED_LIST_UPSTREAM_PAGES,
 };
 pub use traits::{
-    BucketListing, DelegatedListResult, MultipartUpload, StorageBackend, StorageError, UploadedPart,
+    BucketListing, BulkListing, DelegatedListResult, MultipartUpload, StorageBackend, StorageError,
+    UploadedPart,
 };
 
 /// ENOSPC raw error code on Linux and macOS.

@@ -2,7 +2,7 @@
 
 //! Filesystem-based storage backend with xattr-based metadata
 
-use super::traits::{DelegatedListResult, StorageBackend, StorageError};
+use super::traits::{BulkListing, DelegatedListResult, StorageBackend, StorageError};
 use super::xattr_meta;
 use crate::types::FileMetadata;
 use async_trait::async_trait;
@@ -505,6 +505,7 @@ impl FilesystemBackend {
         deltaspaces_dir: &'a Path,
         current_dir: &'a Path,
         results: &'a mut Vec<(String, FileMetadata)>,
+        baselines: &'a mut Vec<(String, u64)>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), StorageError>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -513,7 +514,7 @@ impl FilesystemBackend {
                 let path = entry.path();
                 let ft = entry.file_type().await?;
                 if ft.is_dir() {
-                    Self::bulk_walk_recursive(deltaspaces_dir, &path, results).await?;
+                    Self::bulk_walk_recursive(deltaspaces_dir, &path, results, baselines).await?;
                     continue;
                 }
 
@@ -522,8 +523,21 @@ impl FilesystemBackend {
                     None => continue,
                 };
 
-                // Skip hidden files and internal reference files
-                if name.starts_with('.') || name == "reference.bin" {
+                // A baseline is never a user object; report its stored size
+                // (one local stat, the walk already reads each file's xattrs).
+                if name == "reference.bin" {
+                    if let Ok(md) = entry.metadata().await {
+                        let rel = path
+                            .strip_prefix(deltaspaces_dir)
+                            .unwrap_or(Path::new(&name))
+                            .to_string_lossy()
+                            .into_owned();
+                        baselines.push((rel, md.len()));
+                    }
+                    continue;
+                }
+                // Skip hidden files
+                if name.starts_with('.') {
                     continue;
                 }
 
@@ -1318,6 +1332,17 @@ impl StorageBackend for FilesystemBackend {
         bucket: &str,
         prefix: &str,
     ) -> Result<Vec<(String, FileMetadata)>, StorageError> {
+        Ok(self
+            .bulk_list_objects_with_baselines(bucket, prefix)
+            .await?
+            .objects)
+    }
+
+    async fn bulk_list_objects_with_baselines(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<BulkListing, StorageError> {
         let deltaspaces_dir = self.bucket_dir(bucket).join("deltaspaces");
         // An S3 prefix is a string, not a directory: `nightly/pg` must match
         // `nightly/pg-01.sql`. Walk the deepest directory the prefix names
@@ -1330,20 +1355,28 @@ impl StorageBackend for FilesystemBackend {
         };
 
         if !path_exists(&walk_root).await {
-            return Ok(Vec::new());
+            return Ok(BulkListing::default());
         }
 
         let mut results: Vec<(String, FileMetadata)> = Vec::new();
-        Self::bulk_walk_recursive(&deltaspaces_dir, &walk_root, &mut results).await?;
+        let mut baselines: Vec<(String, u64)> = Vec::new();
+        Self::bulk_walk_recursive(&deltaspaces_dir, &walk_root, &mut results, &mut baselines)
+            .await?;
+        // One prefix rule for objects and baselines alike.
         results.retain(|(key, _)| key.starts_with(prefix));
+        baselines.retain(|(key, _)| key.starts_with(prefix));
 
         debug!(
-            "Bulk listed {} objects in {}/{}",
+            "Bulk listed {} objects + {} baselines in {}/{}",
             results.len(),
+            baselines.len(),
             bucket,
             prefix
         );
-        Ok(results)
+        Ok(BulkListing {
+            objects: results,
+            baselines,
+        })
     }
 
     /// Optimised single-level listing for `delimiter = "/"`.
@@ -1912,6 +1945,45 @@ mod tests {
             .iter()
             .all(|k| !k.starts_with("nightly/x")));
         assert!(keys(list("missing/").await).is_empty());
+    }
+
+    /// The folder-size scan reads baselines from the same walk as the
+    /// objects (no per-folder lookup), with the same prefix rule.
+    #[tokio::test]
+    async fn bulk_listing_reports_baselines_with_the_object_prefix_rule() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        let meta = FileMetadata::new_reference(
+            "reference.bin".into(),
+            "source.bin".into(),
+            "0".repeat(64),
+            "0".repeat(32),
+            3,
+            None,
+        );
+        for ds in ["fw/v1", "fw2", "other"] {
+            backend
+                .put_reference("bucket", ds, b"ref", &meta)
+                .await
+                .expect("put reference");
+        }
+        let listing = backend
+            .bulk_list_objects_with_baselines("bucket", "fw")
+            .await
+            .expect("list");
+        let mut keys: Vec<(String, u64)> = listing.baselines;
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                ("fw/v1/reference.bin".to_string(), 3),
+                ("fw2/reference.bin".to_string(), 3)
+            ]
+        );
+        assert!(listing.objects.is_empty(), "a baseline is never an object");
     }
 
     #[tokio::test]

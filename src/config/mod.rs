@@ -208,6 +208,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         example: "50",
         category: "Delta Engine",
     },
+    EnvVarEntry {
+        name: "DGP_LIST_SIZE_CACHE_MB",
+        description: "Listing-size cache size in MB (original sizes of stored deltas for LIST, no TTL; default: 32)",
+        example: "32",
+        category: "Delta Engine",
+    },
     // ── Filesystem backend ──────────────────────────────────
     EnvVarEntry {
         name: "DGP_DATA_DIR",
@@ -3033,6 +3039,7 @@ mod tests {
             "DGP_MAX_TOTAL_MULTIPART_BYTES",         // multipart::max_total_multipart_bytes()
             "DGP_MULTIPART_IDLE_TTL_HOURS",          // multipart::idle_ttl_hours()
             "DGP_AUDIT_RING_SIZE",                   // audit::ring capacity
+            "DGP_LIST_SIZE_CACHE_MB",                // storage::list_size_cache budget
             "DGP_CLOCK_SKEW_SECONDS",                // api::auth + startup replay cache
             "DGP_MAX_CONCURRENT_REQUESTS",           // startup::build_s3_router()
             "DGP_CORS_PERMISSIVE",                   // demo::ui_router()
