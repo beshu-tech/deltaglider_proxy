@@ -61,6 +61,8 @@ export default function useComputeSize() {
           try {
             const result = await getPrefixUsage(bucket, prefix);
             if (controller.signal.aborted) return;
+            // The bucket changed under us: never show A's size under B.
+            if (getBucket() !== bucket) return;
             if (result) {
               clearInterval(timer);
               delete pollTimers.current[prefix];
@@ -101,7 +103,9 @@ export default function useComputeSize() {
     const bucket = getBucket();
     try {
       const result = await getPrefixUsage(bucket, currentPrefix);
-      if (!result) return;
+      // Drop a result for a bucket the user already left (sizes are keyed by
+      // folder prefix only, so it would land under the new bucket's folders).
+      if (!result || getBucket() !== bucket) return;
       // Populate sizes for folders that have cached data in the children map
       const updates: Record<string, FolderSizeState> = {};
       for (const fp of folderPrefixes) {

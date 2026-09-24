@@ -67,6 +67,10 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   const headCacheRef = useRef(headCache);
   headCacheRef.current = headCache;
   const headInflight = useRef(new Set<string>());
+  // Bumped by resetBrowseState (bucket/prefix change). HEADs started under an
+  // older generation drop their results instead of writing the previous
+  // bucket's metadata into the freshly reset cache (same pattern as loadSeq).
+  const headGen = useRef(0);
   const prefixRef = useRef(prefix);
   prefixRef.current = prefix;
   // bucket/object tracked in refs too so the debounced search write reads the
@@ -109,6 +113,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     setHeadCache({});
     setError(null);
     headInflight.current.clear();
+    headGen.current += 1;
     isInitialLoad.current = true;
     clearSelection();
   }, [clearSelection]);
@@ -142,7 +147,12 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     // with an empty bucket before the Sidebar mounts, producing a false "No objects"
     // state that flashes before the real content appears.
     // DO NOT REMOVE: this prevents a race between reconnect() and Sidebar mount.
-    if (!getBucket()) {
+    // The URL bucket is a real input (and a dep): a bucket switch reloads by
+    // design. listObjects() reads the s3client's module bucket, so sync it here
+    // rather than rely on the setBucket effect having run first.
+    const listBucket = bucket || getBucket();
+    if (listBucket && listBucket !== getBucket()) setBucket(listBucket);
+    if (!listBucket) {
       setLoading(false);
       setRefreshing(false);
       setConnected(true);
@@ -184,7 +194,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
         setLoading(false);
         setRefreshing(false);
       });
-  }, [prefix, reconcile, writablePrefixes]);
+  }, [bucket, prefix, reconcile, writablePrefixes]);
 
   useEffect(load, [load, refreshTrigger]);
 
@@ -196,12 +206,12 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     return () => clearInterval(id);
   }, [refresh]);
 
-  // Track the latest enrich generation. If keys is replaced (prefix/bucket change)
-  // before in-flight HEADs settle, we still want to safely write per-key results
-  // — but cache writes themselves are idempotent and keyed, so we only need to
-  // preserve the per-result error flag. The previous bug hardcoded error:false
-  // on every result, masking HEAD failures so ObjectTable never showed warnings.
+  // HEAD enrichment. Results keep the per-key error flag (a hardcoded
+  // error:false once masked HEAD failures). Results from an older generation
+  // (a bucket/prefix change reset the cache while they were in flight) are
+  // dropped: they belong to the previous listing.
   const enrichKeys = useCallback((keys: string[]) => {
+    const gen = headGen.current;
     const cache = headCacheRef.current;
     const toFetch = keys.filter((k) => !(k in cache) && !headInflight.current.has(k));
     if (toFetch.length === 0) return;
@@ -213,6 +223,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
           .catch(() => ({ key, storageType: undefined, storedSize: undefined, error: true as const }))
       )
     ).then((results) => {
+      if (gen !== headGen.current) return; // reset since — inflight set already cleared
       setHeadCache((prev) => {
         const next = { ...prev };
         for (const r of results) {

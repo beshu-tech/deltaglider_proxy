@@ -274,11 +274,13 @@ export default function App() {
   const isMobile = !screens.md;
   const mainRef = useRef<HTMLElement>(null);
 
-  // Clear folder size computations and preview when prefix or bucket changes
+  // Clear folder size computations and preview when prefix or bucket changes.
+  // The bucket must be a dep: sizes are keyed by folder prefix, so a
+  // root-to-root bucket switch would otherwise keep bucket A's sizes under B.
   useEffect(() => {
     cancelFolderSizes();
     setPreviewObject(null);
-  }, [cancelFolderSizes, s3.prefix]);
+  }, [cancelFolderSizes, s3.prefix, browser.bucket]);
 
   // Dynamic page title on view change
   useEffect(() => {
