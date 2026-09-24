@@ -211,22 +211,12 @@ export default function JobDrawer({
         </div>
       );
     }
+    // A rule-kind jobId that resolves to NEITHER a live editor rule NOR a server
+    // row is a stale draft reference (the draft was discarded or renamed while
+    // the drawer pointed at it). Don't auto-close: show "this job no longer
+    // exists" on a shared/deep-linked URL instead of a silent close.
     return <Empty description="This job no longer exists — it may have been removed or already applied. Close this panel." />;
   })();
-
-  // A rule-kind jobId that resolves to NEITHER a live editor rule NOR a server
-  // row is a stale draft reference (the draft was discarded or renamed while the
-  // drawer pointed at it). Don't auto-close — instead the definition section
-  // renders an Empty state so the user sees "this job no longer exists" on
-  // a shared/deep-linked URL instead of a silent close.
-  // Guard on configs having loaded at least once — on initial render both
-  // sections are still `{rules: []}`, so findIndex returns -1 prematurely.
-  const hasLoadedConfigs = useRef(false);
-  useEffect(() => {
-    if (!hasLoadedConfigs.current && (replication.rules.length > 0 || lifecycle.rules.length > 0)) {
-      hasLoadedConfigs.current = true;
-    }
-  }, [replication, lifecycle]);
 
   const runsTable = (
     <RecordList
@@ -417,7 +407,7 @@ export default function JobDrawer({
                 {f.key}
               </Typography.Text>
               <Typography.Text type="secondary" style={{ whiteSpace: 'nowrap' }}>
-                {formatBytes(f.size)} · <TimeAgo ts={f.started_unix * 1000} />
+                {formatBytes(f.size)} · <TimeAgo ts={f.started_unix} />
               </Typography.Text>
             </div>
           ))}
