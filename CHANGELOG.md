@@ -2,6 +2,46 @@
 
 ## Unreleased
 
+### Fixed — Listings reported the stored delta size instead of the object size
+
+A `ListObjects` request on an S3-backed bucket reported each delta object with
+the size and ETag of its stored delta, not of the object itself, as soon as the
+object's entry in the 10-minute metadata cache had expired. A 3 MB
+`firmware.tar` was listed as `46 B`, the object browser showed that size, and a
+sync tool that compares sizes copied the object again on every run. The proxy
+now reads the real size and ETag of every such entry, from the metadata cache
+when it can and with one metadata request per object otherwise, and caches the
+result. The browser's folder sizes had the same fault: the folder-size scan now
+reports the original size of the objects in the folder, the same as the size of
+a file. The scan also reports the stored size separately, and that figure now
+includes the delta baselines. The `stale_seconds` field of the scan result is
+now `0` while the result is fresh instead of a negative number.
+
+### Fixed — Successful admin logins were not audited
+
+Only failed logins wrote an audit entry. Every successful login now writes one:
+`login` for the bootstrap password, `login_as` for an IAM administrator, and
+the existing `external_login`, `browser_session_connect` and
+`open_browser_connect` entries for the other login paths.
+
+### Fixed — The event outbox grew forever while delivery and replication were off
+
+Every object write adds a row to the event outbox. While event delivery was off
+and replication was disabled, nothing ever deleted those rows, so the encrypted
+config database grew by one row per write. The dispatcher now deletes every row
+that no reader needs. While replication is enabled, a row is deleted only after
+replication has read it.
+
+### Changed — The apply dialog separates new warnings from existing ones
+
+The "Review & apply" dialog showed every warning of the resulting
+configuration, so a standing warning (for example the rate-limit warning about
+`DGP_TRUST_PROXY_HEADERS`) appeared on every unrelated change. The section
+validate and apply responses now return the warnings that the change introduces
+in `warnings` and the warnings that the current configuration already produces
+in `existing_warnings`. The dialog shows the new warnings prominently and folds
+the existing ones away.
+
 ### Changed — The build version is no longer advertised to anonymous callers
 
 `GET /_/api/whoami` returns `version` only when the request carries a live

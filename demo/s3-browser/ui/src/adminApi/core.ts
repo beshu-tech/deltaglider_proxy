@@ -484,7 +484,10 @@ export type SectionName = 'admission' | 'access' | 'storage' | 'advanced';
  */
 export interface SectionApplyResponse {
   ok: boolean;
+  /** Warnings this change introduces. */
   warnings?: string[];
+  /** Warnings the current config already produces, unchanged by this apply. */
+  existing_warnings?: string[];
   requires_restart?: boolean;
   persisted_path?: string;
   error?: string;

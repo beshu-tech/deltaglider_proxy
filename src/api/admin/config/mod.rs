@@ -578,6 +578,36 @@ async fn declarative_iam_precommit_gate(
         .map_err(|e| format!("declarative IAM reconcile failed (no state changed): {e}"))
 }
 
+/// Split the advisory warnings of the RESULTING config into those this change
+/// introduces and those the CURRENT config already produces. Pure; unit-tested.
+///
+/// Returns `(new, existing)`. Matching is by exact text and counts duplicates
+/// (a warning that appears twice after and once before is one new, one
+/// existing), so a change that adds a second copy of a problem still shows it.
+/// Order follows `after`. The apply dialog shows `new` prominently and folds
+/// `existing` away, so unrelated standing warnings stop drowning the review.
+pub(crate) fn split_new_warnings(
+    before: &[String],
+    after: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut remaining: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for w in before {
+        *remaining.entry(w.as_str()).or_default() += 1;
+    }
+    let mut new = Vec::new();
+    let mut existing = Vec::new();
+    for w in after {
+        match remaining.get_mut(w.as_str()) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                existing.push(w);
+            }
+            _ => new.push(w),
+        }
+    }
+    (new, existing)
+}
+
 /// Return one warning per restart-required field that changed between
 /// `old` and `new`. Empty vec = no restart required.
 ///
@@ -1141,6 +1171,46 @@ pub async fn sync_now(
             tracing::warn!("sync-now failed: {e}");
             Err(axum::http::StatusCode::BAD_GATEWAY)
         }
+    }
+}
+
+#[cfg(test)]
+mod split_warnings_tests {
+    use super::split_new_warnings;
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn standing_warnings_are_existing_and_only_the_change_is_new() {
+        // Issue #92: the rate-limit warning showed up on every unrelated apply.
+        let before = v(&["rate-limit shares one bucket", "event URL is http"]);
+        let after = v(&[
+            "rate-limit shares one bucket",
+            "bucket quota is 0",
+            "event URL is http",
+        ]);
+        let (new, existing) = split_new_warnings(&before, after);
+        assert_eq!(new, v(&["bucket quota is 0"]));
+        assert_eq!(
+            existing,
+            v(&["rate-limit shares one bucket", "event URL is http"])
+        );
+    }
+
+    #[test]
+    fn duplicates_are_counted_and_fixed_warnings_vanish() {
+        let (new, existing) = split_new_warnings(&v(&["a", "gone"]), v(&["a", "a"]));
+        assert_eq!(new, v(&["a"]));
+        assert_eq!(existing, v(&["a"]));
+    }
+
+    #[test]
+    fn no_baseline_means_everything_is_new() {
+        let (new, existing) = split_new_warnings(&[], v(&["x"]));
+        assert_eq!(new, v(&["x"]));
+        assert!(existing.is_empty());
     }
 }
 

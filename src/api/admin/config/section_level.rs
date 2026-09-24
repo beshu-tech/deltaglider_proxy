@@ -70,8 +70,16 @@ pub struct SectionApplyResponse {
     /// the HTTP status stays 200 and warnings narrate any partial / best-
     /// effort outcomes (invalid log_level, IAM-mode-gated legacy creds,
     /// etc.). Rendered in the Apply dialog above the confirm button.
+    ///
+    /// Only the warnings THIS change introduces; the ones the current config
+    /// already produces are in `existing_warnings`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Advisory warnings the current config already produces, unchanged by
+    /// this apply. The Apply dialog folds them away so they do not drown the
+    /// warnings that matter for this change (issue #92).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub existing_warnings: Vec<String>,
     /// `true` when at least one field in the transition is in the restart-
     /// required set (see [`apply_config_transition`]). The UI surfaces this
     /// as a banner in the Apply dialog so operators don't ship a
@@ -111,6 +119,7 @@ fn reject(status: StatusCode, error: impl Into<String>) -> Response {
         status,
         Json(SectionApplyResponse {
             ok: false,
+            existing_warnings: Vec::new(),
             warnings: vec![],
             requires_restart: false,
             persisted_path: None,
@@ -435,6 +444,7 @@ async fn apply_section(
             StatusCode::BAD_REQUEST,
             Json(SectionApplyResponse {
                 ok: false,
+                existing_warnings: Vec::new(),
                 warnings: removed_warnings,
                 requires_restart: false,
                 persisted_path: None,
@@ -448,13 +458,14 @@ async fn apply_section(
     // Validate semantically via `Config::check_all` (the same fatal gate
     // and warnings pipeline the document-level apply runs), so a dry-run
     // cannot pass a section the real apply refuses.
-    let mut warnings_from_check = match new_cfg.check_all() {
+    let warnings_from_check = match new_cfg.check_all() {
         Ok(w) => w,
         Err(fatal) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(SectionApplyResponse {
                     ok: false,
+                    existing_warnings: Vec::new(),
                     warnings: removed_warnings,
                     requires_restart: false,
                     persisted_path: None,
@@ -465,6 +476,13 @@ async fn apply_section(
                 .into_response();
         }
     };
+
+    // Split the check warnings: the current config's own warnings are
+    // "existing", only the rest are this change's (issue #92). A current
+    // config that fails its own fatal gate has no baseline → all new.
+    let before_warnings = old_cfg.clone().check_all().unwrap_or_default();
+    let (warnings_from_check, mut existing_warnings) =
+        super::split_new_warnings(&before_warnings, warnings_from_check);
 
     // Lifecycle gate — the SAME changed-only gate the document-level apply runs.
     // The GUI's Jobs/Storage editor saves through THIS section path, so without
@@ -479,7 +497,8 @@ async fn apply_section(
                     "section apply: pre-existing invalid lifecycle config left unchanged: {}",
                     lifecycle_warnings.join("; ")
                 );
-                warnings_from_check.extend(lifecycle_warnings);
+                // Errors on UNCHANGED lifecycle content — standing, not new.
+                existing_warnings.extend(lifecycle_warnings);
             }
         }
         Err(lifecycle_errors) => {
@@ -487,6 +506,7 @@ async fn apply_section(
                 StatusCode::BAD_REQUEST,
                 Json(SectionApplyResponse {
                     ok: false,
+                    existing_warnings: Vec::new(),
                     warnings: removed_warnings,
                     requires_restart: false,
                     persisted_path: None,
@@ -507,6 +527,7 @@ async fn apply_section(
             StatusCode::BAD_REQUEST,
             Json(SectionApplyResponse {
                 ok: false,
+                existing_warnings: Vec::new(),
                 warnings: removed_warnings,
                 requires_restart: false,
                 persisted_path: None,
@@ -608,6 +629,7 @@ async fn apply_section(
             StatusCode::OK,
             Json(SectionApplyResponse {
                 ok: true,
+                existing_warnings,
                 warnings: removed_warnings
                     .clone()
                     .into_iter()
@@ -634,6 +656,7 @@ async fn apply_section(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(SectionApplyResponse {
                         ok: false,
+                        existing_warnings: Vec::new(),
                         warnings: removed_warnings
                             .into_iter()
                             .chain(warnings_from_check)
@@ -707,6 +730,7 @@ async fn apply_section(
         status,
         Json(SectionApplyResponse {
             ok: true,
+            existing_warnings,
             warnings,
             requires_restart,
             persisted_path,

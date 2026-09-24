@@ -38,7 +38,7 @@ All three scopes route through the same `apply_config_transition` path, so hot-r
 |---|---|---|---|
 | `GET` | `/_/api/admin/config/section/:name[?format=yaml]` | — | Section slice as JSON or YAML |
 | `PUT` | `/_/api/admin/config/section/:name` | RFC 7396 JSON Merge Patch | Partial section update |
-| `POST` | `/_/api/admin/config/section/:name/validate` | same as PUT | Dry-run: `{ok, warnings[], diff, requires_restart}` |
+| `POST` | `/_/api/admin/config/section/:name/validate` | same as PUT | Dry-run: `{ok, warnings[], existing_warnings[], diff, requires_restart}`. `warnings` holds only the warnings this change introduces; `existing_warnings` holds the warnings the current config already produces. The section PUT response splits them the same way. |
 
 `:name` ∈ `admission` / `access` / `storage` / `advanced`. Unknown names → 404.
 

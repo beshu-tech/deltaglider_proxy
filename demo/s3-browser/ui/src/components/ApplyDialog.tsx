@@ -53,7 +53,7 @@ export default function ApplyDialog({
 
   if (!response) return null;
 
-  const { ok, warnings = [], requires_restart, error, diff } = response;
+  const { ok, warnings = [], existing_warnings: existingWarnings = [], requires_restart, error, diff } = response;
   const sectionDiff = (diff && diff[section]) || {};
   const diffRows = Object.entries(sectionDiff);
 
@@ -100,24 +100,34 @@ export default function ApplyDialog({
         />
       )}
 
-      {/* Warnings (semi-blocking — operator must read, but Apply still
-          available). Same contract as the field-level PATCH. */}
+      {/* Warnings this change introduces (semi-blocking — operator must
+          read, but Apply still available). Same contract as the field-level
+          PATCH. */}
       {warnings.length > 0 && (
         <Alert
           type="warning"
           showIcon
-          message={warnings.length === 1 ? '1 warning' : `${warnings.length} warnings`}
-          description={
-            <ul style={{ marginBottom: 0, paddingLeft: 20 }}>
-              {warnings.map((w, i) => (
-                <li key={i}>
-                  <LinkifiedText text={w} />
-                </li>
-              ))}
-            </ul>
+          message={
+            warnings.length === 1 ? '1 warning from this change' : `${warnings.length} warnings from this change`
           }
+          description={<WarningList items={warnings} />}
           style={{ marginBottom: 12 }}
         />
+      )}
+
+      {/* Warnings the current config already had. Folded away so that they
+          do not hide the warnings that matter for this change. */}
+      {existingWarnings.length > 0 && (
+        <details data-testid="apply-dialog-existing-warnings" style={{ marginBottom: 12, color: TEXT_MUTED }}>
+          <summary style={{ cursor: 'pointer', fontSize: 13 }}>
+            {existingWarnings.length === 1
+              ? '1 warning that already existed before this change'
+              : `${existingWarnings.length} warnings that already existed before this change`}
+          </summary>
+          <div style={{ marginTop: 6 }}>
+            <WarningList items={existingWarnings} />
+          </div>
+        </details>
       )}
 
       {summary && (
@@ -181,6 +191,18 @@ export default function ApplyDialog({
         />
       )}
     </Modal>
+  );
+}
+
+function WarningList({ items }: { items: string[] }) {
+  return (
+    <ul style={{ marginBottom: 0, paddingLeft: 20 }}>
+      {items.map((w, i) => (
+        <li key={i}>
+          <LinkifiedText text={w} />
+        </li>
+      ))}
+    </ul>
   );
 }
 
