@@ -37,6 +37,7 @@ import {
   Button,
   Input,
   Radio,
+  Spin,
   Steps,
   Typography,
   message,
@@ -64,11 +65,22 @@ import { normalizeUiError } from '../errorHandling';
 import { useNavigation } from '../NavigationContext';
 import { parseAdminQuery, buildViewUrl } from '../urlState';
 import { generateSetupYaml } from '../setupYaml';
-import { useBackends, useBucketOrigins } from '../queries/backends';
-import { describeExistingSetup } from '../setupDetect';
+import { useAdminConfig } from '../queries/config';
+import { describeExistingSetup, type ExistingSetup } from '../setupDetect';
 import { isAbsolutePath } from '../utils';
 
 const { Text, Paragraph } = Typography;
+
+/** "2 named backends, 5 bucket settings and 1 request rule" (non-zero parts only). */
+function describeCounts(e: ExistingSetup): string {
+  const n = (count: number, one: string, many: string) => `${count} ${count === 1 ? one : many}`;
+  const parts = [
+    e.backendCount > 0 ? n(e.backendCount, 'named backend', 'named backends') : '',
+    e.bucketSettingsCount > 0 ? n(e.bucketSettingsCount, 'bucket setting', 'bucket settings') : '',
+    e.requestRuleCount > 0 ? n(e.requestRuleCount, 'request rule', 'request rules') : '',
+  ].filter(Boolean);
+  return parts.length > 1 ? `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}` : parts[0] ?? '';
+}
 
 type BackendKind = 'filesystem' | 's3';
 
@@ -128,16 +140,22 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
   // The wizard applies a WHOLE configuration document. On a proxy that is
   // already configured, say so first, and start from the running backend's
   // type instead of a Filesystem default that contradicts it.
-  const backendsQuery = useBackends();
-  const originsQuery = useBucketOrigins();
-  const existing =
-    backendsQuery.data && originsQuery.data
-      ? describeExistingSetup(
-          backendsQuery.data.backends,
-          originsQuery.data.buckets.length,
-          backendsQuery.data.default_backend,
-        )
-      : null;
+  // Only the proxy's own configuration counts (named backends, bucket
+  // settings, request rules), not buckets that exist on the storage.
+  // Until the check settles the steps stay hidden; if it fails, the
+  // warning shows (fail closed).
+  const configQuery = useAdminConfig();
+  const existing = configQuery.data
+    ? describeExistingSetup(
+        configQuery.data.backends,
+        {
+          bucketSettings: Object.keys(configQuery.data.bucket_policies ?? {}).length,
+          requestRules: configQuery.data.admission_blocks?.length ?? 0,
+        },
+        configQuery.data.default_backend,
+      )
+    : null;
+  const checkFailed = configQuery.isError && !configQuery.data;
   const [overwriteConfirmed, setOverwriteConfirmed] = useState(false);
   const seeded = useRef(false);
   useEffect(() => {
@@ -377,19 +395,27 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
         </Paragraph>
       </header>
 
-      {existing?.configured && !overwriteConfirmed ? (
+      {configQuery.isPending ? (
+        <div style={{ display: 'flex', justifyContent: 'center', padding: 48 }}>
+          <Spin description="Checking the current configuration…"><div style={{ padding: 24 }} /></Spin>
+        </div>
+      ) : (existing?.configured || checkFailed) && !overwriteConfirmed ? (
         <Alert
           type="warning"
           showIcon
-          message="This proxy is already configured"
+          message={checkFailed ? 'Could not check the current configuration' : 'This proxy is already configured'}
           description={
             <div>
               <Paragraph style={{ marginBottom: 12 }}>
-                It has {existing.backendCount} backend{existing.backendCount === 1 ? '' : 's'} and{' '}
-                {existing.bucketCount} bucket{existing.bucketCount === 1 ? '' : 's'}. This wizard
-                writes a complete new configuration, which replaces the current one: backends,
-                bucket settings and request rules that the wizard does not ask about are removed.
-                To change one thing, use its settings page instead.
+                {existing ? (
+                  <>It has {describeCounts(existing)}. </>
+                ) : (
+                  <>{normalizeUiError(configQuery.error, 'The configuration did not load').replace(/\.$/, '')}. The proxy may already be configured. </>
+                )}
+                This wizard writes a complete new configuration, which replaces the current one:
+                backends, bucket settings and request rules that the wizard does not ask about are
+                removed. The objects in your buckets are not touched. To change one thing, use its
+                settings page instead.
               </Paragraph>
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <Button type="primary" onClick={onCancel}>
