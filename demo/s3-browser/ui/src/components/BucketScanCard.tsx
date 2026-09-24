@@ -29,7 +29,7 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Button, Progress, Tooltip } from 'antd';
+import { Button, Progress } from 'antd';
 import {
   PlayCircleOutlined,
   StopOutlined,
@@ -436,17 +436,15 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
         </div>
 
         {unscanned > 0 && (
-          <Tooltip title="Click Re-scan all to include them in the totals.">
-            <div
-              style={{
-                marginTop: 4,
-                fontSize: 11,
-                color: colors.ACCENT_AMBER,
-              }}
-            >
-              {unscanned} of {totalBuckets} buckets not measured yet — press "Scan all" to include them
-            </div>
-          </Tooltip>
+          <div
+            style={{
+              marginTop: 4,
+              fontSize: 11,
+              color: colors.ACCENT_AMBER,
+            }}
+          >
+            {unscanned} of {totalBuckets} buckets not measured yet — press "Re-scan all" to include them
+          </div>
         )}
 
         {scansLoaded && (
