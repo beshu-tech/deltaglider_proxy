@@ -30,6 +30,7 @@ const {
   planRuleDeleteSync,
   editorAfterDiscard,
   stepPendingReverify,
+  runNowMessage,
 } = await import(moduleUrl);
 
 const row = (over = {}) => ({
@@ -416,6 +417,18 @@ assert.equal(editorAfterDiscard(true), 'refresh');
     stepPendingReverify({ baselineLastRunAt: null, sawActive: false }, { status: 'failed', last_run_at: 5 }),
     { next: null, start: true },
   );
+}
+
+// ── runNowMessage (replication run-now is async → no fake count) ────────────
+{
+  // Replication returns 202 {status:'running', objects_copied:0}: the count is meaningless.
+  const m = runNowMessage('replication', { status: 'running', objects_copied: 0 });
+  assert.equal(m, 'Run started — progress shows in the row and the Runs tab');
+  assert.equal(/0 objects/.test(m), false);
+  // Lifecycle runs synchronously → keep the count.
+  assert.equal(runNowMessage('lifecycle', { status: 'succeeded', objects_affected: 3 }), 'Run succeeded: 3 objects processed');
+  assert.equal(runNowMessage('lifecycle', { objects_affected: 1 }), 'Run finished: 1 object processed');
+  assert.equal(runNowMessage('lifecycle', null), 'Run finished');
 }
 
 console.log('jobs view regression checks passed');

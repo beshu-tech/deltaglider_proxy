@@ -256,6 +256,20 @@ export function availableActions(row: JobRow): JobAction[] {
   return out;
 }
 
+/**
+ * Toast after a successful run-now. Replication answers 202 and runs in the
+ * background (its body's `objects_copied` is always 0), so it gets no count;
+ * lifecycle runs synchronously and reports what it processed.
+ */
+export function runNowMessage(kind: JobKind, result: unknown): string {
+  if (kind === 'replication') return 'Run started — progress shows in the row and the Runs tab';
+  const r = result as { objects_copied?: number; objects_affected?: number; status?: string } | null;
+  const n = r?.objects_copied ?? r?.objects_affected;
+  return n != null
+    ? `Run ${r?.status ?? 'finished'}: ${n} object${n === 1 ? '' : 's'} processed`
+    : 'Run finished';
+}
+
 /** Compact progress label for the table row. */
 export function progressLabel(row: JobRow): string {
   if (row.trigger === 'oneoff') {

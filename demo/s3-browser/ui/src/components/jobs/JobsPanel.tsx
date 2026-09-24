@@ -38,6 +38,7 @@ import {
   kindLabel,
   mergeDraftRules,
   planRuleDeleteSync,
+  runNowMessage,
   triggerLabel,
 } from '../../jobsView';
 import { qk } from '../../queries/keys';
@@ -339,13 +340,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     try {
       const result = await runJobAction(row.id, action);
       if (action === 'run-now') {
-        const r = result as { objects_copied?: number; objects_affected?: number; status?: string };
-        const n = r?.objects_copied ?? r?.objects_affected;
-        messageApi.success(
-          n != null
-            ? `Run ${r?.status ?? 'finished'}: ${n} object${n === 1 ? '' : 's'} processed`
-            : 'Run finished'
-        );
+        messageApi.success(runNowMessage(row.kind, result));
       } else if (action === 'preview') {
         const r = result as { objects_affected?: number; objects_scanned?: number };
         messageApi.info(
