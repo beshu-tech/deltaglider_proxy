@@ -186,8 +186,15 @@ async fn test_quota_delete_frees_space() {
         .await;
 
     // Fill bucket well over quota
-    put_sized(&server, "fill1.bin", 8000).await.ok();
-    put_sized(&server, "fill2.bin", 8000).await.ok();
+    // DIAG(pr93): these results used to be swallowed with .ok().
+    let f1 = put_sized(&server, "fill1.bin", 8000).await;
+    let f2 = put_sized(&server, "fill2.bin", 8000).await;
+    eprintln!(
+        "[quota-diag] endpoint={} fill1={:?} fill2={:?}",
+        server.endpoint(),
+        f1,
+        f2
+    );
 
     // Signal-driven poll for the scanner to catch up and enforce quota.
     let http = reqwest::Client::new();
@@ -208,6 +215,43 @@ async fn test_quota_delete_frees_space() {
             break;
         }
         delete(&server, "probe_over.bin").await;
+    }
+    if !blocked {
+        // DIAG(pr93): what does the server we are talking to actually hold?
+        let client = server.s3_client().await;
+        let listed = client
+            .list_objects_v2()
+            .bucket(server.bucket())
+            .send()
+            .await;
+        let keys: Vec<String> = match &listed {
+            Ok(out) => out
+                .contents()
+                .iter()
+                .map(|o| format!("{}={}", o.key().unwrap_or("?"), o.size().unwrap_or(-1)))
+                .collect(),
+            Err(e) => vec![format!("list error: {e}")],
+        };
+        let admin = common::admin_http_client(&endpoint).await;
+        let usage = match admin
+            .get(format!(
+                "{}/_/api/admin/usage/bucket/{}",
+                endpoint,
+                server.bucket()
+            ))
+            .send()
+            .await
+        {
+            Ok(r) => format!("{} {}", r.status(), r.text().await.unwrap_or_default()),
+            Err(e) => format!("usage error: {e}"),
+        };
+        eprintln!(
+            "[quota-diag] NEVER BLOCKED endpoint={} scan_version={} objects={:?} usage={}",
+            endpoint,
+            common::get_usage_scan_version(&http, &endpoint).await,
+            keys,
+            usage
+        );
     }
     assert!(blocked, "Should be over quota after filling");
 
