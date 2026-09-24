@@ -321,12 +321,20 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
                 }));
               }}
               onDelete={async () => {
-                await deleteRuleMutation.mutateAsync(rule.id);
-                setPendingRules((prev) => {
-                  const next = { ...prev };
-                  delete next[rule.id];
-                  return next;
-                });
+                // The rule decides who may sign in and which group they get.
+                const groupName = groups.find((g) => g.id === rule.group_id)?.name ?? `group #${rule.group_id}`;
+                const what = rule.match_value ? `"${rule.match_value}" → ${groupName}` : `→ ${groupName}`;
+                if (!window.confirm(`Delete mapping rule ${what}? Users who match only this rule can no longer sign in or get this group.`)) return;
+                try {
+                  await deleteRuleMutation.mutateAsync(rule.id);
+                  setPendingRules((prev) => {
+                    const next = { ...prev };
+                    delete next[rule.id];
+                    return next;
+                  });
+                } catch (e) {
+                  message.error(normalizeUiError(e, 'Delete failed'));
+                }
               }}
             />
           ))}

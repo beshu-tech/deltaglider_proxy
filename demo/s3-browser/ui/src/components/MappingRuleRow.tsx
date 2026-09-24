@@ -11,7 +11,8 @@ interface MappingRuleRowProps {
   groups: IamGroup[];
   colors: ReturnType<typeof useColors>;
   onUpdate: (req: Record<string, unknown>) => void;
-  onDelete: () => void;
+  /** Confirms and handles its own errors; the row only fires it. */
+  onDelete: () => void | Promise<void>;
   /** Locks all inputs while a Save Rules round-trip is in flight, so a
    *  concurrent edit can't be lost when loadData() resyncs afterwards. */
   disabled?: boolean;
@@ -91,7 +92,7 @@ export default function MappingRuleRow({ rule, providers, groups, colors, onUpda
         ]}
         style={{ width: 130 }}
       />
-      <Button size="small" danger disabled={disabled} icon={<DeleteOutlined />} onClick={onDelete} />
+      <Button size="small" danger disabled={disabled} icon={<DeleteOutlined />} onClick={() => { void onDelete(); }} title="Delete rule" aria-label="Delete rule" />
     </div>
   );
 }
