@@ -394,11 +394,21 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
           description: description.trim(),
           permissions: rowsToPermissions(permissions),
         });
-        // Add members to newly created group
-        for (const uid of memberIds) {
-          await addMemberMutation.mutateAsync({ groupId: created.id, userId: uid });
-        }
+        // The group exists now: leave Create mode at once, so a retry after a
+        // member-add failure edits this group instead of re-creating it (which
+        // hits the UNIQUE name constraint).
         onSaved(created.id);
+        const failed: string[] = [];
+        for (const uid of memberIds) {
+          try {
+            await addMemberMutation.mutateAsync({ groupId: created.id, userId: uid });
+          } catch {
+            failed.push(users.find(u => u.id === uid)?.name ?? `user #${uid}`);
+          }
+        }
+        if (failed.length > 0) {
+          message.warning(`Group created, but adding these members failed: ${failed.join(', ')}. Add them again in the group's edit view.`);
+        }
         return;
       }
       onSaved();
