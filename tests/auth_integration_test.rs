@@ -2078,3 +2078,131 @@ async fn test_forged_presigned_signature_rejected() {
         resp.status()
     );
 }
+
+/// Two `Authorization` headers carrying a known access key and garbage
+/// signatures. s3s reads the header with `get_unique`, sees no unique
+/// value, and treats the request as anonymous — so it verifies nothing.
+/// The identity our middleware resolved from the FIRST header must not be
+/// honoured without an s3s-verified signature for the same key.
+#[tokio::test]
+async fn test_duplicate_authorization_headers_do_not_bypass_signature() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let client = server.s3_client_with_creds("testkey", "testsecret").await;
+    client
+        .put_object()
+        .bucket(server.bucket())
+        .key("secret.txt")
+        .body(ByteStream::from_static(b"top secret"))
+        .send()
+        .await
+        .expect("put");
+
+    let forged = |sig: &str| {
+        format!(
+            "AWS4-HMAC-SHA256 Credential=testkey/20260101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host, Signature={sig}"
+        )
+    };
+    let url = format!("{}/{}/secret.txt", server.endpoint(), server.bucket());
+
+    let get = reqwest::Client::new()
+        .get(&url)
+        .header("authorization", forged("00"))
+        .header("authorization", forged("11"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get.status(),
+        StatusCode::FORBIDDEN,
+        "duplicate Authorization headers must not read the object"
+    );
+
+    let del = reqwest::Client::new()
+        .delete(&url)
+        .header("authorization", forged("22"))
+        .header("authorization", forged("33"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), StatusCode::FORBIDDEN);
+    client
+        .get_object()
+        .bucket(server.bucket())
+        .key("secret.txt")
+        .send()
+        .await
+        .expect("object must survive the forged DELETE");
+}
+
+/// A low-privilege user signs a SigV2 presigned query with their OWN secret
+/// and adds a v4 `Authorization` header that names another user's key. s3s
+/// verifies the SigV2 query (the attacker); our middleware resolved the
+/// header (the victim). The two identities must match or the request fails.
+#[tokio::test]
+async fn test_sigv2_query_cannot_borrow_another_users_identity() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let before = get_iam_version(&admin, &server.endpoint()).await;
+    let boss = create_user(
+        &admin,
+        &server,
+        "boss",
+        vec![json!({"actions": ["*"], "resources": ["*"]})],
+    )
+    .await;
+    let mallory = create_user(&admin, &server, "mallory", vec![]).await;
+    wait_for_iam_rebuild(&admin, &server.endpoint(), before).await;
+
+    server
+        .s3_client_with_creds(&boss.access_key_id, &boss.secret_access_key)
+        .await
+        .put_object()
+        .bucket(server.bucket())
+        .key("secret.txt")
+        .body(ByteStream::from_static(b"top secret"))
+        .send()
+        .await
+        .expect("put");
+
+    let path = format!("/{}/secret.txt", server.bucket());
+    let expires = (chrono::Utc::now().timestamp() + 600).to_string();
+    let string_to_sign = format!("GET\n\n\n{expires}\n{path}");
+    let sig = {
+        use base64::Engine as _;
+        let key = ring::hmac::Key::new(
+            ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
+            mallory.secret_access_key.as_bytes(),
+        );
+        base64::engine::general_purpose::STANDARD
+            .encode(ring::hmac::sign(&key, string_to_sign.as_bytes()))
+    };
+    let url = format!(
+        "{}{path}?AWSAccessKeyId={}&Expires={expires}&Signature={}",
+        server.endpoint(),
+        mallory.access_key_id,
+        urlencoding::encode(&sig)
+    );
+    let boss_header = format!(
+        "AWS4-HMAC-SHA256 Credential={}/20260101/us-east-1/s3/aws4_request, \
+         SignedHeaders=host, Signature=00",
+        boss.access_key_id
+    );
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("authorization", boss_header)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a SigV2 query signed by mallory must not act as boss"
+    );
+}
