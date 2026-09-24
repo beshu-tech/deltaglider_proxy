@@ -38,6 +38,12 @@ async fn delete(server: &TestServer, key: &str) {
 // Basic quota enforcement
 // ═══════════════════════════════════════════════════
 
+/// Upper bound for waiting on the usage scanner. Integration tests share one
+/// process (tests/all.rs) and CI runners share a power-capped host, so scanner
+/// refreshes can take far longer than on an idle box. Loops exit as soon as
+/// the condition holds; the budget only matters when things are slow.
+const SCANNER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[tokio::test]
 async fn test_quota_put_under_limit() {
     // Quota = 1 MB, upload a 100-byte file → should succeed
@@ -139,7 +145,8 @@ async fn test_quota_second_put_enforced() {
     let http = reqwest::Client::new();
     let endpoint = server.endpoint();
     let mut blocked = false;
-    for _ in 0..20 {
+    let deadline = std::time::Instant::now() + SCANNER_WAIT;
+    while std::time::Instant::now() < deadline {
         // Wait for the next scan to settle (signal-driven, bounded to 500ms so
         // the first iteration — no scan triggered yet — falls through like the
         // old sleep did). Fresh baseline per iteration: no cross-iter mutation.
@@ -186,7 +193,8 @@ async fn test_quota_delete_frees_space() {
     let http = reqwest::Client::new();
     let endpoint = server.endpoint();
     let mut blocked = false;
-    for _ in 0..20 {
+    let deadline = std::time::Instant::now() + SCANNER_WAIT;
+    while std::time::Instant::now() < deadline {
         let baseline = common::get_usage_scan_version(&http, &endpoint).await;
         let _ = common::wait_usage_scan_refresh_bounded(
             &http,
@@ -210,7 +218,8 @@ async fn test_quota_delete_frees_space() {
     // Signal-driven poll until scanner refreshes and allows writes again.
     // Scanner cache TTL is 5 minutes, but get_or_scan re-triggers scan when stale.
     let mut freed = false;
-    for _ in 0..30 {
+    let deadline = std::time::Instant::now() + SCANNER_WAIT;
+    while std::time::Instant::now() < deadline {
         let baseline = common::get_usage_scan_version(&http, &endpoint).await;
         let _ = common::wait_usage_scan_refresh_bounded(
             &http,
