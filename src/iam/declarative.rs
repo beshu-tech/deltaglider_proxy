@@ -401,11 +401,11 @@ pub fn export_as_declarative(db: &ConfigDb) -> Result<DeclarativeIam, String> {
 
 /// The first user name that appears twice in a snapshot, if any.
 ///
-/// The reconciler keys users by NAME, so a database that holds a same-name
-/// pair (a `local` and an `external` row for the same person — allowed, since
-/// only `access_key_id` is UNIQUE) cannot be represented in the full-IAM
-/// YAML: the import rejects duplicate names. The export refuses such a
-/// snapshot rather than emit a file that cannot be re-imported (#71 review).
+/// The reconciler keys users by NAME, so a same-name pair cannot be
+/// represented in the full-IAM YAML: the import rejects duplicate names. User
+/// names are unique since schema v25, so a database cannot hold such a pair;
+/// the export still refuses one rather than emit a file that cannot be
+/// re-imported (#71 review).
 pub fn duplicate_user_name(snapshot: &DeclarativeIam) -> Option<&str> {
     let mut seen = HashSet::new();
     for u in &snapshot.users {

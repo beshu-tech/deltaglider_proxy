@@ -386,7 +386,16 @@ pub async fn update_user(
         )
         .map_err(|e| {
             tracing::warn!("Failed to update user {}: {}", user_id, e);
-            StatusCode::NOT_FOUND
+            match &e {
+                // A rename to a name another user has (names are unique).
+                crate::config_db::ConfigDbError::Sqlite(se)
+                    if crate::config_db::classify_sqlite_error(se)
+                        == crate::config_db::SqliteErrorClass::Conflict =>
+                {
+                    StatusCode::CONFLICT
+                }
+                _ => StatusCode::NOT_FOUND,
+            }
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;

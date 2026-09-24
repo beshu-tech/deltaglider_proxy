@@ -497,7 +497,7 @@ pub async fn oauth_callback(
                     }
                     tracing::info!(
                         "Auto-provisioned external user '{}' (id={}) via '{}'",
-                        display_name,
+                        user.name,
                         user.id,
                         pending.provider_name
                     );
