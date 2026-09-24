@@ -22,7 +22,7 @@
  * through the `requires_restart` flag on the section PUT response —
  * ApplyDialog renders it as a blue banner.
  */
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Alert, Input, InputNumber, Radio, Switch, Typography } from 'antd';
 import {
   CloudServerOutlined,
@@ -31,7 +31,6 @@ import {
   ControlOutlined,
   SyncOutlined,
 } from '@ant-design/icons';
-import type { SectionApplyResponse } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
 import { useColors } from '../ThemeContext';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
@@ -43,6 +42,7 @@ import FormField from './FormField';
 import ApplyDialog from './ApplyDialog';
 import StickyDirtyBar from './StickyDirtyBar';
 import { LoadingState } from './StatePlaceholders';
+import { CUSTOM_LOG_LEVEL, LOG_LEVEL_PRESETS, logLevelRadio } from './admin/logLevelPresets';
 import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
@@ -176,38 +176,32 @@ function useAdvancedSubset<T extends Partial<AdvancedSectionBody>>(
   });
 }
 
-/** Render the dirty-state banner + ApplyDialog pair. Every Advanced
- *  sub-panel uses this same tail. */
 // Shared dirty UX for the Advanced sub-panels. Rendered at the TOP of each
 // PanelShell, so it owns the ApplyDialog (a modal — placement-independent) and
 // the floating StickyDirtyBar. The bar uses fixed-to-viewport positioning so it
 // pins to the bottom regardless of where in the flow this rail sits.
-function AdvancedApplyRail(props: {
-  isDirty: boolean;
-  applying: boolean;
-  onDiscard: () => void;
-  onApply: () => void;
-  applyOpen: boolean;
-  applyResponse: SectionApplyResponse | null;
-  cancelApply: () => void;
-  confirmApply: () => void;
-}) {
+type ApplyRailEditor = Pick<
+  UseSectionEditorResult<unknown, AdvancedSectionBody>,
+  'isDirty' | 'applying' | 'discard' | 'runApply' | 'applyOpen' | 'applyResponse' | 'cancelApply' | 'confirmApply'
+>;
+
+function AdvancedApplyRail({ editor }: { editor: ApplyRailEditor }) {
   return (
     <>
       <StickyDirtyBar
-        visible={props.isDirty}
-        applying={props.applying}
-        onDiscard={props.onDiscard}
-        onApply={props.onApply}
+        visible={editor.isDirty}
+        applying={editor.applying}
+        onDiscard={editor.discard}
+        onApply={editor.runApply}
         inline
       />
       <ApplyDialog
-        open={props.applyOpen}
+        open={editor.applyOpen}
         section="advanced"
-        response={props.applyResponse}
-        onApply={props.confirmApply}
-        onCancel={props.cancelApply}
-        loading={props.applying}
+        response={editor.applyResponse}
+        onApply={editor.confirmApply}
+        onCancel={editor.cancelApply}
+        loading={editor.applying}
       />
     </>
   );
@@ -228,6 +222,14 @@ function PanelShell(props: { children: React.ReactNode }) {
   );
 }
 
+/** The shared "failed to load" / "loading" early return of every Advanced
+ *  sub-panel; null once the data is there. */
+function loadGate({ loading, error }: { loading: boolean; error: string | null }): React.ReactNode | null {
+  if (error) return <Alert type="error" showIcon message="Failed to load" description={error} />;
+  if (loading) return <PanelShell><LoadingState /></PanelShell>;
+  return null;
+}
+
 // ───────────────────────────────────────────────────────────
 // ListenerTlsPanel  (advanced.listen_addr + advanced.tls.*)
 // ───────────────────────────────────────────────────────────
@@ -235,10 +237,10 @@ function PanelShell(props: { children: React.ReactNode }) {
 export function ListenerTlsPanel({ onSessionExpired }: PanelProps) {
   const { cardStyle, inputRadius } = useCardStyles();
   const subset = useAdvancedSubset(LISTENER_INITIAL, onSessionExpired, 'system/listener');
-  const { value, setValue, isDirty, discard, loading, error } = subset;
+  const { value, setValue } = subset;
 
-  if (error) return <Alert type="error" showIcon message="Failed to load" description={error} />;
-  if (loading) return <PanelShell><LoadingState /></PanelShell>;
+  const gate = loadGate(subset);
+  if (gate) return gate;
 
   const tls = value.tls ?? {};
   const tlsEnabled = tls.enabled === true;
@@ -250,16 +252,7 @@ export function ListenerTlsPanel({ onSessionExpired }: PanelProps) {
 
   return (
     <PanelShell>
-      <AdvancedApplyRail
-        isDirty={isDirty}
-        applying={subset.applying}
-        onDiscard={discard}
-        onApply={subset.runApply}
-        applyOpen={subset.applyOpen}
-        applyResponse={subset.applyResponse}
-        cancelApply={subset.cancelApply}
-        confirmApply={subset.confirmApply}
-      />
+      <AdvancedApplyRail editor={subset} />
 
       <div style={cardStyle}>
         <SectionHeader
@@ -358,22 +351,13 @@ export function ListenerTlsPanel({ onSessionExpired }: PanelProps) {
 export function CachesPanel({ onSessionExpired }: PanelProps) {
   const { cardStyle, inputRadius } = useCardStyles();
   const subset = useAdvancedSubset(CACHES_INITIAL, onSessionExpired, 'system/caches');
-  const { value, setValue, isDirty, discard, loading, error } = subset;
-  if (error) return <Alert type="error" showIcon message="Failed to load" description={error} />;
-  if (loading) return <PanelShell><LoadingState /></PanelShell>;
+  const { value, setValue } = subset;
+  const gate = loadGate(subset);
+  if (gate) return gate;
 
   return (
     <PanelShell>
-      <AdvancedApplyRail
-        isDirty={isDirty}
-        applying={subset.applying}
-        onDiscard={discard}
-        onApply={subset.runApply}
-        applyOpen={subset.applyOpen}
-        applyResponse={subset.applyResponse}
-        cancelApply={subset.cancelApply}
-        confirmApply={subset.confirmApply}
-      />
+      <AdvancedApplyRail editor={subset} />
       <div style={cardStyle}>
         <SectionHeader
           icon={<DatabaseOutlined />}
@@ -478,11 +462,11 @@ export function LimitsPanel({ onSessionExpired }: PanelProps) {
   // A 401 surfaces as `queryError`; useAdminConfig routes it to onSessionExpired.
   const { data: config, error: queryError, isError } = useAdminConfig({ onSessionExpired });
 
-  if (isError) {
-    const msg = normalizeUiError(queryError, 'Failed to load');
-    return <Alert type="error" showIcon message="Failed to load" description={msg} />;
-  }
-  if (!config) return <PanelShell><LoadingState /></PanelShell>;
+  const gate = loadGate({
+    loading: !config,
+    error: isError ? normalizeUiError(queryError, 'Failed to load') : null,
+  });
+  if (gate || !config) return gate;
 
   // label + read-only value + one help line; the env var name rides in the help
   // as a mono chip. The card header states restart-required once for all fields.
@@ -542,62 +526,30 @@ export function LimitsPanel({ onSessionExpired }: PanelProps) {
 // LoggingPanel  (hot-reloadable log_level)
 // ───────────────────────────────────────────────────────────
 
-const LOG_LEVEL_PRESETS = [
-  { label: 'Error', value: 'deltaglider_proxy=error,tower_http=error' },
-  { label: 'Warn', value: 'deltaglider_proxy=warn,tower_http=warn' },
-  { label: 'Info', value: 'deltaglider_proxy=info,tower_http=info' },
-  { label: 'Debug', value: 'deltaglider_proxy=debug,tower_http=debug' },
-  { label: 'Trace', value: 'deltaglider_proxy=trace,tower_http=trace' },
-] as const;
-
-function normaliseFilter(filter: string): string {
-  return filter
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .sort()
-    .join(',');
-}
-
-function findMatchingPreset(logLevel: string): string | null {
-  const canon = normaliseFilter(logLevel);
-  for (const p of LOG_LEVEL_PRESETS) {
-    if (normaliseFilter(p.value) === canon) return p.value;
-  }
-  return null;
-}
-
 export function LoggingPanel({ onSessionExpired }: PanelProps) {
   const { cardStyle, inputRadius } = useCardStyles();
   const subset = useAdvancedSubset(LOG_INITIAL, onSessionExpired, 'system/logging');
-  const { value, setValue, isDirty, discard, loading, error } = subset;
-  const [custom, setCustom] = useState(false);
+  const { value, setValue } = subset;
+  // The operator clicked "Custom" on a preset value. Everything else about
+  // the radio derives from the value (logLevelRadio), so a Discard that
+  // restores a preset shows that preset again.
+  const [customPicked, setCustomPicked] = useState(false);
+  const editor = {
+    ...subset,
+    discard: () => {
+      setCustomPicked(false);
+      subset.discard();
+    },
+  };
 
-  // Sync custom flag from server-loaded value
-  useEffect(() => {
-    if (value.log_level && findMatchingPreset(value.log_level) == null) {
-      setCustom(true);
-    }
-  }, [value.log_level]);
+  const gate = loadGate(subset);
+  if (gate) return gate;
 
-  if (error) return <Alert type="error" showIcon message="Failed to load" description={error} />;
-  if (loading) return <PanelShell><LoadingState /></PanelShell>;
-
-  const currentPreset = value.log_level ? findMatchingPreset(value.log_level) : null;
-  const radioValue = custom ? '__custom__' : currentPreset;
+  const radio = logLevelRadio(value.log_level, customPicked);
 
   return (
     <PanelShell>
-      <AdvancedApplyRail
-        isDirty={isDirty}
-        applying={subset.applying}
-        onDiscard={discard}
-        onApply={subset.runApply}
-        applyOpen={subset.applyOpen}
-        applyResponse={subset.applyResponse}
-        cancelApply={subset.cancelApply}
-        confirmApply={subset.confirmApply}
-      />
+      <AdvancedApplyRail editor={editor} />
       <div style={cardStyle}>
         <SectionHeader
           icon={<ControlOutlined />}
@@ -606,13 +558,13 @@ export function LoggingPanel({ onSessionExpired }: PanelProps) {
         />
         <div>
           <Radio.Group
-            value={radioValue}
+            value={radio.value}
             onChange={(e) => {
               const v = e.target.value;
-              if (v === '__custom__') {
-                setCustom(true);
+              if (v === CUSTOM_LOG_LEVEL) {
+                setCustomPicked(true);
               } else {
-                setCustom(false);
+                setCustomPicked(false);
                 setValue({ ...value, log_level: v });
               }
             }}
@@ -623,11 +575,11 @@ export function LoggingPanel({ onSessionExpired }: PanelProps) {
                 {p.label}
               </Radio.Button>
             ))}
-            <Radio.Button value="__custom__" style={{ fontSize: 13 }}>
+            <Radio.Button value={CUSTOM_LOG_LEVEL} style={{ fontSize: 13 }}>
               Custom
             </Radio.Button>
           </Radio.Group>
-          {custom && (
+          {radio.custom && (
             <FormField
               label="Custom EnvFilter"
               yamlPath="advanced.log_level"
@@ -660,24 +612,15 @@ export function LoggingPanel({ onSessionExpired }: PanelProps) {
 export function ConfigDbSyncPanel({ onSessionExpired }: PanelProps) {
   const { cardStyle, inputRadius } = useCardStyles();
   const subset = useAdvancedSubset(SYNC_INITIAL, onSessionExpired, 'system/sync');
-  const { value, setValue, isDirty, discard, loading, error } = subset;
-  if (error) return <Alert type="error" showIcon message="Failed to load" description={error} />;
-  if (loading) return <PanelShell><LoadingState /></PanelShell>;
+  const { value, setValue } = subset;
+  const gate = loadGate(subset);
+  if (gate) return gate;
 
   const enabled = !!(value.config_sync_bucket && value.config_sync_bucket.length > 0);
 
   return (
     <PanelShell>
-      <AdvancedApplyRail
-        isDirty={isDirty}
-        applying={subset.applying}
-        onDiscard={discard}
-        onApply={subset.runApply}
-        applyOpen={subset.applyOpen}
-        applyResponse={subset.applyResponse}
-        cancelApply={subset.cancelApply}
-        confirmApply={subset.confirmApply}
-      />
+      <AdvancedApplyRail editor={subset} />
       <div style={cardStyle}>
         {/* Header + status pill on the same baseline. The pill
             (Disabled / Active / Pending restart) replaces the old
@@ -702,7 +645,7 @@ export function ConfigDbSyncPanel({ onSessionExpired }: PanelProps) {
           />
           <SyncStatusPill
             enabled={enabled}
-            dirty={isDirty}
+            dirty={subset.isDirty}
             bucket={value.config_sync_bucket}
           />
         </div>
