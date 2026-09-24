@@ -38,6 +38,7 @@ import type { S3Object } from './types';
 import { writeStorage } from './safeStorage';
 import { pageTitle } from './pageTitle';
 import { headerForPath } from './components/adminNavigation';
+import { identitySummary } from './identitySummary';
 
 const { Content } = Layout;
 const { useBreakpoint } = Grid;
@@ -375,13 +376,16 @@ export default function App() {
   const canCopyFromActiveBucket = canReadSelected && canWriteActivePrefix;
   const canMoveFromActiveBucket = canCopyFromActiveBucket && canDeleteSelected;
   const canReadActiveBucket = !activeBucket || canUse(identity, 'read', activeBucket, s3.prefix) || canUse(identity, 'list', activeBucket, s3.prefix);
+  const who = identitySummary(identity, currentAccessKey);
+  const openSettings = () => navigate(buildViewUrl('admin'));
   const accountMenu = (includeBrowserToggles = false) => (
     <AccountMenu
-      identityLabel={identity?.user?.name || currentAccessKey || 'user'}
+      identityLabel={who.name}
+      identityDetail={who.detail}
       canAdmin={canAdmin}
-      onBrowserClick={() => navigate(buildViewUrl('browser'))}
-      onSettingsClick={() => navigate(buildViewUrl('admin'))}
-      onDocsClick={() => navigate(buildViewUrl('docs'))}
+      onBrowserClick={view === 'browser' ? undefined : () => navigate(buildViewUrl('browser'))}
+      onSettingsClick={view === 'admin' ? undefined : openSettings}
+      onDocsClick={view === 'docs' ? undefined : () => navigate(buildViewUrl('docs'))}
       onLogout={handleLogout}
       showHidden={includeBrowserToggles ? s3.showHidden : undefined}
       onToggleHidden={includeBrowserToggles ? () => s3.setShowHidden(!s3.showHidden) : undefined}
@@ -708,6 +712,7 @@ export default function App() {
               canAdmin={canAdmin}
               onShowShortcuts={showShortcuts}
               accountMenu={accountMenu(true)}
+              onOpenSettings={canAdmin ? openSettings : undefined}
               deltaSummary={view === 'browser' ? s3.deltaSummary : null}
             />
           )}

@@ -2,7 +2,7 @@ import { useRef, useState, useEffect } from 'react';
 import { flushSync } from 'react-dom';
 import { Layout, Space, Button, Input, theme } from 'antd';
 import type { InputRef } from 'antd';
-import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, QuestionCircleOutlined } from '@ant-design/icons';
+import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, QuestionCircleOutlined, SettingOutlined } from '@ant-design/icons';
 import { metaKeyLabel } from '../platform';
 import Breadcrumb from './Breadcrumb';
 import DeltaSavingsChip from './DeltaSavingsChip';
@@ -37,6 +37,8 @@ interface Props {
   /** Open the keyboard-shortcuts help modal (header help icon). */
   onShowShortcuts?: () => void;
   accountMenu?: React.ReactNode;
+  /** Labelled Settings entry point (administrators only). */
+  onOpenSettings?: () => void;
   /** Aggregated delta savings for the current prefix view. Auto-hides when no deltas present. */
   deltaSummary?: DeltaSummary | null;
 }
@@ -92,7 +94,7 @@ function SearchInput({
   );
 }
 
-export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, canAdmin = false, onShowShortcuts, accountMenu, deltaSummary = null }: Props) {
+export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, canAdmin = false, onShowShortcuts, accountMenu, onOpenSettings, deltaSummary = null }: Props) {
   const { token } = theme.useToken();
   const { ACCENT_BLUE, TEXT_MUTED, BORDER } = useColors();
   // Open when the URL already carries a filter (?q= from a deep link, reload
@@ -215,6 +217,19 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
             onClick={onShowShortcuts}
             style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
           />
+        )}
+        {onOpenSettings && (
+          <Button
+            type="text"
+            icon={<SettingOutlined />}
+            size="small"
+            title={`Settings (${metaKeyLabel()}+,)`}
+            aria-label="Settings"
+            onClick={onOpenSettings}
+            style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
+          >
+            {isMobile ? null : 'Settings'}
+          </Button>
         )}
         {accountMenu}
       </Space>
