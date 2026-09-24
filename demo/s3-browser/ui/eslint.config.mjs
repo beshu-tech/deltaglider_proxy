@@ -40,6 +40,27 @@ const UI_RULES = {
       selector: "JSXAttribute[name.name='ellipsis'] Property[key.name='tooltip']",
       message: 'ellipsis.tooltip renders an AntD tooltip, which theme.css hides — pass a native title instead.',
     },
+    {
+      // Safari < 16.4 cannot parse a lookbehind: one in the bundle breaks the whole app.
+      selector: 'Literal[regex.pattern=/\\(\\?<[=!]/]',
+      message: 'No regex lookbehind ((?<= / (?<!): Safari < 16.4 fails to parse the bundle. Capture the prefix instead, e.g. (^|[^\\w-]).',
+    },
+    {
+      selector: "NewExpression[callee.name='RegExp'] > Literal[value=/\\(\\?<[=!]/]",
+      message: 'No regex lookbehind ((?<= / (?<!): Safari < 16.4 fails to parse the bundle.',
+    },
+    {
+      // A row/card that handles Enter/Space itself swallowed the keys of its
+      // own buttons (Enter on the Jobs "⋯" opened the drawer).
+      selector: "BinaryExpression[operator=/^[!=]==?$/][left.property.name='key'][right.value=' ']",
+      message: 'Use activateOnKey() from src/keyboard.ts: it ignores keys aimed at buttons inside the row.',
+    },
+    {
+      // Destructive row actions go in <RowActionsMenu> (⋯ + confirm), not a red trash per row.
+      selector:
+        "JSXOpeningElement[name.name='Button']:has(JSXAttribute[name.name='danger']):has(JSXAttribute[name.name='icon'] JSXIdentifier[name='DeleteOutlined'])",
+      message: 'Put destructive row actions in <RowActionsMenu> (⋯ with a confirmation), not a red trash button.',
+    },
   ],
   'no-restricted-globals': [
     'error',
@@ -122,6 +143,11 @@ export default tseslint.config(
   {
     files: ['src/safeStorage.ts'],
     rules: { 'no-restricted-properties': 'off', 'no-restricted-globals': 'off' },
+  },
+  // The one sanctioned Enter/Space activation handler.
+  {
+    files: ['src/keyboard.ts'],
+    rules: { 'no-restricted-syntax': 'off' },
   },
   {
     files: ['src/useCopyToClipboard.ts'],

@@ -127,6 +127,7 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
           </Button>
         )}
         {onDelete && (
+          // eslint-disable-next-line no-restricted-syntax -- toolbar action on the selection (confirmed), not a row action
           <Button
             danger
             size="small"

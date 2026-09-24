@@ -19,7 +19,6 @@ import { Alert, Button, Dropdown, Space, Spin, Tag, Typography, message } from '
 import {
   CaretRightOutlined,
   DeleteOutlined,
-  EllipsisOutlined,
   EyeOutlined,
   PauseOutlined,
   PlayCircleOutlined,
@@ -52,6 +51,7 @@ import { buildViewUrl, parseAdminQuery } from '../../urlState';
 import { useOverlayClose } from '../../hooks/useOverlayClose';
 import TimeAgo from '../TimeAgo';
 import RecordList, { type RecordColumn } from './RecordList';
+import RowActionsMenu, { type RowActionConfirm } from '../RowActionsMenu';
 import OutcomeMeter from './OutcomeMeter';
 import { useSectionEditor } from '../../useSectionEditor';
 import { useApplyHandler } from '../../useDirtySection';
@@ -117,7 +117,22 @@ const ACTION_META: Record<
 };
 
 /** Destructive row actions: shown in the row's "⋯" menu, not as buttons. */
-const MENU_ACTIONS: readonly JobAction[] = ['kill', 'delete'];
+type MenuAction = 'kill' | 'delete';
+const MENU_ACTIONS: readonly JobAction[] = ['kill', 'delete'] satisfies MenuAction[];
+/** The confirmation each menu action asks before it runs. */
+const MENU_CONFIRM: Record<MenuAction, (name: string) => RowActionConfirm> = {
+  delete: (name) => ({
+    title: `Delete rule "${name}"?`,
+    content: 'This removes the rule from the configuration and clears its run history.',
+    okText: 'Delete rule',
+  }),
+  // Kill aborts in-flight work mid-object.
+  kill: (name) => ({
+    title: `Kill the running "${name}" run?`,
+    content: 'Transfers in progress stop immediately.',
+    okText: 'Kill run',
+  }),
+};
 
 export default function JobsPanel({ onSessionExpired, search }: Props) {
   const { cardStyle, inputRadius } = useCardStyles();
@@ -336,13 +351,6 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
   );
 
   const runAction = async (row: JobRow, action: JobAction) => {
-    if (action === 'delete' && !window.confirm(`Delete rule "${row.name}"? This removes it from config and clears its run history.`)) {
-      return;
-    }
-    // Kill aborts in-flight work mid-object — confirm like delete.
-    if (action === 'kill' && !window.confirm(`Kill the running "${row.name}" run? In-flight transfers are aborted immediately.`)) {
-      return;
-    }
     setActionBusy(`${row.id}:${action}`);
     try {
       const result = await runJobAction(row.id, action);
@@ -547,35 +555,21 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
                 );
               })}
             {/* Destructive actions (delete, kill) live behind "⋯", not as a
-                red icon on every row; runAction still confirms each one. */}
-            {availableActions(d.row).some((a) => MENU_ACTIONS.includes(a)) && (
-              <Dropdown
-                trigger={['click']}
-                menu={{
-                  items: availableActions(d.row)
-                    .filter((a) => MENU_ACTIONS.includes(a))
-                    .map((a) => ({
-                      key: a,
-                      danger: true,
-                      icon: ACTION_META[a].icon,
-                      label: `${ACTION_META[a].label}…`,
-                    })),
-                  onClick: ({ key, domEvent }) => {
-                    domEvent.stopPropagation();
-                    void runAction(d.row, key as JobAction);
-                  },
-                }}
-              >
-                <Button
-                  size="small"
-                  type="text"
-                  icon={<EllipsisOutlined />}
-                  loading={MENU_ACTIONS.some((a) => actionBusy === `${d.row.id}:${a}`)}
-                  title="More actions"
-                  aria-label={`More actions for ${d.row.name}`}
-                />
-              </Dropdown>
-            )}
+                red icon on every row; the menu confirms each one. */}
+            <RowActionsMenu
+              label={`More actions for ${d.row.name}`}
+              loading={MENU_ACTIONS.some((a) => actionBusy === `${d.row.id}:${a}`)}
+              actions={availableActions(d.row)
+                .filter((a) => MENU_ACTIONS.includes(a))
+                .map((a) => ({
+                  key: a,
+                  danger: true as const,
+                  icon: ACTION_META[a].icon,
+                  label: `${ACTION_META[a].label}…`,
+                  confirm: MENU_CONFIRM[a as MenuAction](d.row.name),
+                  onSelect: () => runAction(d.row, a),
+                }))}
+            />
           </Space>
         ),
     },
