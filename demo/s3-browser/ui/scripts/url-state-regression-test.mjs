@@ -9,7 +9,7 @@ const { outputText } = ts.transpileModule(source, {
   fileName: 'urlState.ts',
 });
 const mod = await import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`);
-const { parseViewLocation, parseBrowserLocation, buildBrowserUrl, buildViewUrl, parseAdminQuery, BASE } = mod;
+const { parseViewLocation, parseBrowserLocation, buildBrowserUrl, buildViewUrl, parseAdminQuery, BASE, isAdminPageLeave } = mod;
 
 // --- parseViewLocation --------------------------------------------------------
 assert.deepEqual(parseViewLocation('/_/'), { view: 'browser', subPath: '' });
@@ -88,6 +88,22 @@ assert.deepEqual(parseBrowserLocation('/_/browse/beshu/ok%20dir/50%off/', ''), {
 assert.deepEqual(parseBrowserLocation('/_/browse/beshu/%E0%A4%A/', ''), {
   bucket: 'beshu', prefix: '%E0%A4%A/', q: '', object: '', preview: '',
 });
+
+// --- isAdminPageLeave: when unsaved admin edits need a confirm --------------
+// Only mounted panels hold dirty state, so leaving the admin PAGE (another
+// leaf, or out of Settings) unmounts them and drops the edits. A query-only
+// change on the same page (?user=, ?group=, ?modal=) keeps the panel mounted.
+assert.equal(isAdminPageLeave('/_/admin/access/users', '/_/admin/access/groups'), true);
+assert.equal(isAdminPageLeave('/_/admin/storage/buckets', '/_/browse/'), true);
+assert.equal(isAdminPageLeave('/_/admin/jobs', '/_/docs/configuration'), true);
+assert.equal(isAdminPageLeave('/_/admin/access/users', '/_/admin/access/users?user=4'), false);
+assert.equal(isAdminPageLeave('/_/admin/access/users?user=4', '/_/admin/access/users?user=7'), false);
+assert.equal(isAdminPageLeave('/_/admin/access/groups?group=2', '/_/admin/access/groups'), false);
+assert.equal(isAdminPageLeave('/_/admin/system', '/_/admin/system?modal=yaml'), false);
+assert.equal(isAdminPageLeave('/_/admin/system/', '/_/admin/system'), false);
+// Not on an admin page: nothing to lose.
+assert.equal(isAdminPageLeave('/_/browse/b/', '/_/admin/system'), false);
+assert.equal(isAdminPageLeave('/_/docs/x', '/_/browse/'), false);
 
 // --- ROUND TRIP: parse(build(x)) === x (the core invariant) -------------------
 const cases = [

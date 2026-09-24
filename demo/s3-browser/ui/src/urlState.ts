@@ -187,3 +187,18 @@ export function parseAdminQuery(search: string): Record<string, string> {
   }
   return result;
 }
+
+/**
+ * Does moving from `fromUrl` to `toUrl` leave the current admin PAGE? Only
+ * mounted admin panels hold unsaved (dirty) edits, so a move to another leaf
+ * or out of Settings unmounts them and drops the edits — that move needs a
+ * confirm when anything is dirty. A query-only change on the same page
+ * (`?user=`, `?group=`, `?modal=`) keeps the panel mounted and is never
+ * guarded. Both URLs are BASE-prefixed paths with an optional query string.
+ */
+export function isAdminPageLeave(fromUrl: string, toUrl: string): boolean {
+  const from = parseViewLocation(fromUrl.split(/[?#]/)[0]);
+  if (from.view !== 'admin') return false;
+  const to = parseViewLocation(toUrl.split(/[?#]/)[0]);
+  return to.view !== 'admin' || to.subPath !== from.subPath;
+}
