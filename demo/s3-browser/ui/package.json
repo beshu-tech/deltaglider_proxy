@@ -84,7 +84,8 @@
     "knip": "knip",
     "test:env-overrides": "node scripts/env-overrides-regression-test.mjs",
     "test:source-ip-field": "node scripts/source-ip-field-regression-test.mjs",
-    "test:ui-copy": "node scripts/ui-copy-regression-test.mjs"
+    "test:ui-copy": "node scripts/ui-copy-regression-test.mjs",
+    "test:bucket-delete": "node scripts/bucket-delete-regression-test.mjs"
   },
   "dependencies": {
     "@ant-design/icons": "^6.1.0",
