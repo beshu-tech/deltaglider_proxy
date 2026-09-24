@@ -17,25 +17,48 @@ export interface ThroughputSample {
   loadedBytes: number;
 }
 
-// Failures that come back the same on every attempt: permission and quota
-// rejections (403), a malformed request, a missing bucket, an object above the
-// size limit. Offering "Retry" for these only invites a second failure.
-const PERMANENT_UPLOAD_STATUSES = new Set([400, 403, 404, 405, 411, 413]);
+/**
+ * What the queue offers after a failed upload:
+ * - `retry`: a transient failure; Retry is the next step.
+ * - `after-fix`: fails again until someone acts (a full quota); Retry stays
+ *   available as a secondary action next to the reason.
+ * - `never`: the same request fails every time (permission, bad name, size).
+ */
+export type UploadRetryAdvice = 'retry' | 'after-fix' | 'never';
+
+// Decided on the S3 error CODE first: S3 sends several transient codes with
+// status 400, so the status alone misclassifies them.
+const RETRYABLE_UPLOAD_CODES = new Set([
+  // Multipart state lives in one proxy node's memory; a retry starts a new upload.
+  'NoSuchUpload',
+  'RequestTimeout',
+  'IncompleteBody',
+  'BadDigest',
+  'SlowDown',
+  'InternalError',
+  'ServiceUnavailable',
+]);
 const PERMANENT_UPLOAD_CODES = new Set([
   'AccessDenied',
   'EntityTooLarge',
   'InvalidArgument',
   'InvalidBucketName',
   'NoSuchBucket',
-  'QuotaExceeded',
 ]);
+// Fallback when there is no known code.
+const PERMANENT_UPLOAD_STATUSES = new Set([400, 403, 404, 405, 411, 413]);
 
-/** True when retrying a failed upload can succeed: network errors, timeouts,
- *  throttling and server errors. `status` undefined = no HTTP answer. */
-export function isRetryableUploadFailure(status?: number, code?: string): boolean {
-  if (code && PERMANENT_UPLOAD_CODES.has(code)) return false;
-  if (status !== undefined && PERMANENT_UPLOAD_STATUSES.has(status)) return false;
-  return true;
+/**
+ * `status` 0 or undefined = no HTTP answer (network error). `detail` is the
+ * server's message: the proxy rejects a full quota as 403 AccessDenied with a
+ * message that names the quota.
+ */
+export function uploadRetryAdvice(status?: number, code?: string, detail?: string): UploadRetryAdvice {
+  if (code === 'QuotaExceeded' || (status === 403 && /quota/i.test(detail ?? ''))) return 'after-fix';
+  if (code && RETRYABLE_UPLOAD_CODES.has(code)) return 'retry';
+  if (code && PERMANENT_UPLOAD_CODES.has(code)) return 'never';
+  if (status && PERMANENT_UPLOAD_STATUSES.has(status)) return 'never';
+  return 'retry';
 }
 
 /** The queue label: the path under the destination folder, so two README.md

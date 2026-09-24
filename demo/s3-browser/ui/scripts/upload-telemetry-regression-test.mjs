@@ -32,26 +32,39 @@ const {
   estimateCompletedParts,
   estimateInFlightParts,
   estimateTotalParts,
-  isRetryableUploadFailure,
   mergeTotalBytes,
   movingAverageSpeedBps,
   uploadDisplayPath,
+  uploadRetryAdvice,
 } = await import(moduleUrl);
 
-// Issue #92 comment item 4: "Retry" after a 403 quota rejection cannot
-// succeed; only transient failures offer it.
-assert.equal(isRetryableUploadFailure(403, 'AccessDenied'), false, 'quota / permission rejection');
-assert.equal(isRetryableUploadFailure(403, undefined), false);
-assert.equal(isRetryableUploadFailure(413, 'EntityTooLarge'), false);
-assert.equal(isRetryableUploadFailure(404, 'NoSuchBucket'), false);
-assert.equal(isRetryableUploadFailure(400, 'InvalidArgument'), false);
-assert.equal(isRetryableUploadFailure(undefined, 'NoSuchBucket'), false);
-assert.equal(isRetryableUploadFailure(undefined, undefined), true, 'network error: no HTTP answer');
-assert.equal(isRetryableUploadFailure(500, 'InternalError'), true);
-assert.equal(isRetryableUploadFailure(502, undefined), true);
-assert.equal(isRetryableUploadFailure(503, 'SlowDown'), true);
-assert.equal(isRetryableUploadFailure(429, undefined), true);
-assert.equal(isRetryableUploadFailure(408, 'RequestTimeout'), true);
+// Issue #92 comment item 4: "Retry" after a failure that repeats cannot
+// succeed; transient failures offer it. The code decides before the status.
+const A = uploadRetryAdvice;
+assert.equal(A(403, 'AccessDenied', 'Access Denied'), 'never', 'permission rejection');
+assert.equal(A(403, undefined), 'never');
+assert.equal(A(413, 'EntityTooLarge'), 'never');
+assert.equal(A(404, 'NoSuchBucket'), 'never');
+assert.equal(A(400, 'InvalidArgument'), 'never');
+assert.equal(A(undefined, 'NoSuchBucket'), 'never');
+assert.equal(A(400, undefined), 'never', 'status fallback');
+// Transient S3 codes sent with status 400 / 404.
+assert.equal(A(400, 'RequestTimeout'), 'retry');
+assert.equal(A(400, 'IncompleteBody'), 'retry');
+assert.equal(A(400, 'BadDigest'), 'retry');
+assert.equal(A(404, 'NoSuchUpload'), 'retry', 'multipart state is per node; a retry starts a new upload');
+// Quota: retry once space is freed, with the reason visible.
+assert.equal(A(403, 'AccessDenied', 'Bucket quota exceeded: 24 MB used + 3 MB upload > 25 MB limit'), 'after-fix');
+assert.equal(A(403, 'AccessDenied', 'Bucket is frozen (quota = 0)'), 'after-fix');
+assert.equal(A(403, 'QuotaExceeded'), 'after-fix');
+// No HTTP answer, throttling, server errors.
+assert.equal(A(undefined, undefined), 'retry', 'network error: no HTTP answer');
+assert.equal(A(0, undefined), 'retry', 'network error: status 0');
+assert.equal(A(500, 'InternalError'), 'retry');
+assert.equal(A(502, undefined), 'retry');
+assert.equal(A(503, 'SlowDown'), 'retry');
+assert.equal(A(429, undefined), 'retry');
+assert.equal(A(408, 'RequestTimeout'), 'retry');
 
 // Folder uploads show the path under the destination, not just the file name.
 assert.equal(uploadDisplayPath('dest/rel/sub1/README.md', 'dest'), 'rel/sub1/README.md');

@@ -128,7 +128,7 @@ export default function UploadProgressList({
         const isCompleting = item.status === 'completing';
         const transferDone = isCompleting || item.status === 'success';
         const showActionCancel = item.status === 'queued' || item.status === 'uploading';
-        const showActionRetry = item.status === 'cancelled' || (item.status === 'error' && item.retryable !== false);
+        const showActionRetry = item.status === 'cancelled' || (item.status === 'error' && item.retry !== 'never');
         const displayPath = uploadDisplayPath(item.key, item.destination);
         const completingStartMs = item.completingSinceMs;
         const hasCompletingStart = typeof completingStartMs === 'number' && Number.isFinite(completingStartMs);
@@ -265,9 +265,14 @@ export default function UploadProgressList({
             {item.error && (
               <Text role="alert" style={{ fontSize: 11, color: accentRed }}>
                 {item.error}
-                {item.retryable === false && (
+                {item.retry === 'never' && (
                   <span style={{ display: 'block', marginTop: 2 }}>
                     Retrying will not help. Fix the cause first, then upload the file again.
+                  </span>
+                )}
+                {item.retry === 'after-fix' && (
+                  <span style={{ display: 'block', marginTop: 2 }}>
+                    The upload fails again until the bucket has room. Free space or raise the quota, then retry.
                   </span>
                 )}
               </Text>
