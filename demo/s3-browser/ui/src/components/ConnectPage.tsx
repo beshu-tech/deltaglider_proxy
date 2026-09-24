@@ -8,6 +8,8 @@ import OAuthProviderList from './OAuthProviderList';
 import { detectDefaultEndpoint } from '../utils';
 import { useColors, useTheme } from '../ThemeContext';
 import { normalizeUiError } from '../errorHandling';
+import { readStorage, removeStorage, writeStorage } from '../safeStorage';
+import { useCopyToClipboard } from '../useCopyToClipboard';
 
 const { Text } = Typography;
 
@@ -15,11 +17,7 @@ const { Text } = Typography;
 const SESSION_USER_SIGNED_OUT = 'dg-session-user-signed-out';
 
 function clearSignedOutFlag() {
-  try {
-    sessionStorage.removeItem(SESSION_USER_SIGNED_OUT);
-  } catch {
-    /* private mode */
-  }
+  removeStorage(SESSION_USER_SIGNED_OUT, 'session');
 }
 
 /** What kind of session the connect flow established, decided at the point it's
@@ -107,12 +105,12 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   // config), so the user keeps seeing the hash they need to copy. We must not clear it
   // when re-entering the wizard or that recovered hash would be lost.
   const [recoveredHash, setRecoveredHash] = useState<{ hash: string; base64: string } | null>(() => {
+    const saved = readStorage('dg-recovered-hash', 'session');
     try {
-      const saved = sessionStorage.getItem('dg-recovered-hash');
       return saved ? JSON.parse(saved) : null;
     } catch { return null; }
   });
-  const [messageApi, contextHolder] = message.useMessage();
+  const { copy } = useCopyToClipboard();
 
   const runOpenModeConnect = useCallback(async (): Promise<{ ok: true } | { ok: false; error: string }> => {
     const endpoint = detectDefaultEndpoint().replace(/\/+$/, '');
@@ -166,13 +164,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
         }
         // In open access mode, auto-connect with the proxy's own endpoint (no credentials needed)
         if (info.mode === 'open') {
-          let signedOut = false;
-          try {
-            signedOut = sessionStorage.getItem(SESSION_USER_SIGNED_OUT) === '1';
-          } catch {
-            /* private mode */
-          }
-          if (signedOut) {
+          if (readStorage(SESSION_USER_SIGNED_OUT, 'session') === '1') {
             setOpenSignedOut(true);
             setDetecting(false);
             return;
@@ -339,7 +331,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
           base64: result.correct_hash_base64 || '',
         };
         setRecoveredHash(recovered);
-        try { sessionStorage.setItem('dg-recovered-hash', JSON.stringify(recovered)); } catch { /* Safari private mode — fine to skip */ }
+        writeStorage('dg-recovered-hash', JSON.stringify(recovered), 'session');
       } else {
         setRecoveryError(result.error || 'Password does not match');
       }
@@ -351,9 +343,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   };
 
   const copyToClipboard = (text: string, label: string) => {
-    navigator.clipboard.writeText(text).then(() => {
-      messageApi.success(`${label} copied to clipboard`);
-    });
+    void copy(text, { successMessage: `${label} copied to clipboard` });
   };
 
   const isBootstrap = authMode === 'bootstrap';
@@ -397,7 +387,6 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   if (showRecovery) {
     return (
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', padding: 24 }}>
-        {contextHolder}
         <div className="dg-login-card animate-fade-in" style={{ borderRadius: 14, padding: 'clamp(28px, 4vw, 40px)', width: '100%', maxWidth: 520 }}>
           <Space direction="vertical" size="large" style={{ width: '100%' }}>
             {recoveredHash ? (

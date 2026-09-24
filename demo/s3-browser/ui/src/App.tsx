@@ -36,6 +36,7 @@ import { useUrlRouter } from './useUrlRouter';
 import { buildViewUrl, buildBrowserUrl, type View } from './urlState';
 import { useOverlayClose } from './hooks/useOverlayClose';
 import type { S3Object } from './types';
+import { writeStorage } from './safeStorage';
 
 const { Content } = Layout;
 const { useBreakpoint } = Grid;
@@ -331,11 +332,7 @@ export default function App() {
       /* still leave the app shell */
     }
     disconnect();
-    try {
-      sessionStorage.setItem('dg-session-user-signed-out', '1');
-    } catch {
-      /* private mode */
-    }
+    writeStorage('dg-session-user-signed-out', '1', 'session');
     setFirstLoadDone(false);
     setNeedsConnect(true);
     setIdentity(null);
