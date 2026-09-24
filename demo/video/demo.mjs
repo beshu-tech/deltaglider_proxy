@@ -167,6 +167,8 @@ await beat(1200);
 
 await clickSlow(tid('backends-add'));
 await typeSlow(tid('backend-name'), 'hetzner-fsn1');
+// The form requires an absolute data directory (no ./data prefill).
+await typeSlow(tid('backend-path'), `${DEMO_DIR}/data`);
 await beat(400);
 await clickSlow(tid('backend-create'));
 await beat(1500);
