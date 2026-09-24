@@ -668,7 +668,8 @@ impl ConfigDb {
         Ok(deleted)
     }
 
-    /// Prune every row (any status) AT OR BELOW the active-listener floor: those
+    /// Prune the rows AT OR BELOW the active-listener floor that delivery never
+    /// tried (plus delivered ones): those
     /// events have been consumed by every live listener (replication, delivery),
     /// so no one needs them. Unlike the delivered/failed prunes this does NOT
     /// require delivery to be active — it bounds the append-only outbox even
@@ -691,11 +692,16 @@ impl ConfigDb {
         if limit == 0 || min_keep_id <= 0 || min_keep_id == i64::MAX {
             return Ok(0);
         }
+        // Never delete a row that delivery already tried (attempts > 0): it
+        // is a pending retry or a failure an operator may requeue after
+        // turning delivery back on.
         let deleted = self.conn.execute(
             "DELETE FROM event_outbox
               WHERE id IN (
                     SELECT id FROM event_outbox
                      WHERE id <= ?
+                       AND (status = 'delivered'
+                            OR (status = 'pending' AND attempts = 0))
                      ORDER BY id ASC
                      LIMIT ?
               )",
@@ -1357,5 +1363,21 @@ mod tests {
         assert!(db.event_outbox_load(c).unwrap().is_some());
         // Floor 0 (no active listener has consumed anything) prunes nothing.
         assert_eq!(db.event_outbox_prune_below_floor(0, 100).unwrap(), 0);
+    }
+
+    /// Issue #92 review: turning delivery off must not discard the rows
+    /// delivery already tried. A failed or retrying row stays for a requeue.
+    #[test]
+    fn prune_below_floor_keeps_rows_delivery_already_tried() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let tried = db.event_outbox_insert(&event_at(10, "tried")).unwrap();
+        let fresh = db.event_outbox_insert(&event_at(20, "fresh")).unwrap();
+        let claimed = db.event_outbox_claim_due("c", 100, 60, 1).unwrap();
+        assert_eq!(claimed[0].id, tried);
+        db.event_outbox_mark_failed(tried, "endpoint down", Some(200))
+            .unwrap();
+        assert_eq!(db.event_outbox_prune_below_floor(fresh, 100).unwrap(), 1);
+        assert!(db.event_outbox_load(tried).unwrap().is_some());
+        assert!(db.event_outbox_load(fresh).unwrap().is_none());
     }
 }

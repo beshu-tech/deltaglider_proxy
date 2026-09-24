@@ -391,8 +391,11 @@ pub fn spawn_dispatcher_with_client(
     tokio::spawn(async move {
         info!("Event outbox dispatcher started: claimant={}", claimant);
         loop {
+            let tick = dispatcher_tick(&config.read().await.event_delivery);
+            tokio::time::sleep(tick).await;
+            // Read the config AFTER the sleep: a snapshot from before it could
+            // prune events written after delivery was turned on.
             let cfg = { config.read().await.event_delivery.clone() };
-            tokio::time::sleep(dispatcher_tick(&cfg)).await;
             if !cfg.is_active() {
                 // Delivery off: no dispatch, but still bound the outbox (X-ray
                 // H14, issue #92). See `prune_while_inactive`.
