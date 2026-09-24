@@ -55,6 +55,17 @@ assert.equal(ageLabel(new Date(now + 10_000).toISOString()), 'just now');
 assert.equal(formatBytes(0), '0 B');
 assert.equal(formatBytes(512), '512 B');
 assert.equal(formatBytes(1536), '1.5 KB');
+// sign-aware: a negative delta (stored > original) must not render "NaN undefined"
+assert.equal(formatBytes(-5), '-5 B');
+assert.equal(formatBytes(-1536), '-1.5 KB');
+// fractional sub-byte input clamps to the B unit instead of units[-1]
+assert.equal(formatBytes(0.5), '1 B');
+// PB exists, and the unit index clamps at the largest unit
+assert.equal(formatBytes(2 * 1024 ** 5), '2.0 PB');
+assert.equal(formatBytes(2048 * 1024 ** 5), '2048.0 PB');
+// non-finite input never reaches the log math
+assert.equal(formatBytes(NaN), '—');
+assert.equal(formatBytes(Infinity), '—');
 
 // --- getFileName (shared filename extraction for Inspector + Preview) ---------
 assert.equal(getFileName('a/b/c.txt'), 'c.txt');

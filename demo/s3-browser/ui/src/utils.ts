@@ -1,8 +1,14 @@
+/** Binary-unit byte label ("1.5 KB"). Sign-aware (a negative delta reads
+ *  "-1.5 KB"); sub-byte input stays in B; the unit clamps at PB; non-finite
+ *  input renders "—". */
 export function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
+  if (!Number.isFinite(bytes)) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  const sign = bytes < 0 ? '-' : '';
+  const abs = Math.abs(bytes);
+  const i = abs < 1 ? 0 : Math.min(units.length - 1, Math.floor(Math.log(abs) / Math.log(1024)));
+  if (i === 0) return `${sign}${Math.round(abs)} B`;
+  return `${sign}${(abs / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
 }
 
 /** Extract the display name from a full S3 key given the current prefix */

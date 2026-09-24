@@ -426,7 +426,7 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
           <span style={{ color: totals.savings > 10 ? colors.ACCENT_GREEN : colors.TEXT_SECONDARY, fontWeight: 600 }}>
             {totals.savings.toFixed(1)}% saved
           </span>{' '}
-          ({formatBytes(totals.originalBytes - totals.storedBytes)})
+          ({formatBytes(summarizeScopeSavings(totals.originalBytes, totals.storedBytes).savedBytes)})
         </div>
 
         {/* Scan-age line — the user MUST see this so they don't trust
