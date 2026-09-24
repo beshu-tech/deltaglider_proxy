@@ -422,16 +422,34 @@ pub fn build_s3_router(
     }
 
     #[derive(Clone)]
-    struct AllowAllS3sAccess;
+    struct VerifiedIdentityS3sAccess;
 
     #[async_trait::async_trait]
-    impl S3Access for AllowAllS3sAccess {
-        async fn check(&self, _cx: &mut S3AccessContext<'_>) -> s3s::S3Result<()> {
-            // IAM/admission authorization is still enforced by the outer Axum
-            // middleware chain. This access hook only prevents s3s' default
-            // "auth provider implies anonymous deny" behavior from rejecting
-            // already-admitted public/open-mode requests.
-            Ok(())
+    impl S3Access for VerifiedIdentityS3sAccess {
+        async fn check(&self, cx: &mut S3AccessContext<'_>) -> s3s::S3Result<()> {
+            // IAM/admission authorization is enforced by the outer Axum
+            // middleware chain, against the identity the SigV4 middleware
+            // resolved. This hook binds that identity to the key s3s verified
+            // (see `resolved_identity_is_verified`). It also replaces s3s'
+            // default "auth provider implies anonymous deny", which would
+            // reject already-admitted public/open-mode requests.
+            let verified = cx.credentials().map(|c| c.access_key.clone());
+            let resolved = cx
+                .extensions_mut()
+                .get::<deltaglider_proxy::iam::AuthenticatedUser>();
+            if deltaglider_proxy::api::auth::resolved_identity_is_verified(
+                resolved,
+                verified.as_deref(),
+            ) {
+                Ok(())
+            } else {
+                tracing::warn!(
+                    "SECURITY | event=identity_mismatch | resolved={} | verified={}",
+                    resolved.map(|u| u.access_key_id.as_str()).unwrap_or(""),
+                    verified.as_deref().unwrap_or("<none>")
+                );
+                Err(s3s::s3_error!(AccessDenied))
+            }
         }
     }
 
@@ -570,7 +588,7 @@ pub fn build_s3_router(
     builder.set_auth(DeltaGliderS3sAuth {
         iam_state: iam_state.clone(),
     });
-    builder.set_access(AllowAllS3sAccess);
+    builder.set_access(VerifiedIdentityS3sAccess);
     let s3_service = HandleError::new(builder.build(), handle_s3s_http_error);
 
     // Form-POST upload interceptor (`POST /<bucket>` with

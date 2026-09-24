@@ -164,6 +164,9 @@ proptest = "1"
 # are slow + machine-dependent, treated like coverage). Run with
 # `cargo bench --bench codec`.
 criterion = "0.5"
+# HMAC-SHA1 for crafting SigV2 requests in auth regression tests. Already in
+# the lockfile through rustls; hmac 0.12 cannot pair with the sha1 0.11 in tree.
+ring = "0.17"
 
 [[bench]]
 name = "codec"

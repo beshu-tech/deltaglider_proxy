@@ -1174,6 +1174,7 @@ dependencies = [
  "rcgen",
  "regex-lite",
  "reqwest",
+ "ring",
  "rusqlite",
  "rust-embed",
  "s3s",
