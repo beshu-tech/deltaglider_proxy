@@ -2,17 +2,19 @@
 
 *Reject unwanted traffic — bad IPs, anonymous writes, everything during maintenance — before the proxy spends a single HMAC on it.*
 
-Admission blocks run before signature verification, so they can do what IAM can't: refuse requests without knowing who sent them, including traffic that carries no credentials at all. Why the chain sits first is covered in [About authentication and access control](../explanation/security-model.md).
+Request rules run before the proxy verifies the request signature. Because of that, they can do something that IAM cannot do: they can refuse a request without knowing who sent it, including a request that carries no credentials at all. The page [About authentication and access control](../explanation/security-model.md) explains why the rules run first.
 
-## 1. Author a block
+In the configuration file, request rules live in the list under the `admission.blocks` key. Each entry in that list is one rule. The rest of this page says "rule", as the admin UI does.
+
+## 1. Add a rule
 
 Acme's `downloads` bucket serves a public prefix, which attracts anonymous upload attempts. Deny anonymous mutations on the whole bucket outright.
 
-In the UI: **Settings → Access → Request rules** → add a block, set the match fields, pick the action, and drag to position. Each block has a form view and a YAML view.
+In the admin UI, open **Settings → Access → Request rules** and click **Add rule**. Set the conditions that a request must match, choose the action, and save the rule. Then drag the rule to its position in the list. The rule editor has a form view and a YAML view.
 
 ![Request rules editor](/_/screenshots/admission-rules.jpg)
 
-The same block in YAML:
+This is the same rule in YAML:
 
 ```yaml
 # validate
@@ -26,21 +28,21 @@ admission:
       action: deny
 ```
 
-Match predicates are AND-combined; an empty `match: {}` fires on every request. Available predicates (`method`, `source_ip` / `source_ip_list` with CIDRs, `bucket`, `path_glob`, `authenticated`) and the action shapes (`deny`, `allow-anonymous`, `continue`, `reject` with a custom status and message) are in the [configuration reference](../reference/configuration.md#admission-chain).
+A request matches a rule only when it matches every condition of the rule. A rule with an empty `match: {}` matches every request. The [configuration reference](../reference/configuration.md#admission-chain) lists all conditions (`method`, `source_ip` or `source_ip_list` with CIDR networks, `bucket`, `path_glob`, `authenticated`) and all actions (`deny`, `allow-anonymous`, `continue`, and `reject` with a custom status and message).
 
-## 2. Order the chain
+## 2. Put the rules in order
 
-Evaluation is top-to-bottom, **first match wins** — a request that matches block 1 never reaches block 2. Put narrow exceptions above broad rules: an `allow-anonymous` for one path must sit above a `deny` that would otherwise swallow it.
+The proxy checks the rules from the top of the list to the bottom, and the **first rule that matches decides**. A request that matches rule 1 never reaches rule 2. For this reason, put narrow exceptions above broad rules. For example, an `allow-anonymous` rule for one path must be above a `deny` rule that would otherwise match the same requests.
 
-Operator-authored blocks always fire before the synthesized ones (next section), so an admission `deny` can take a published public prefix offline with one rule, no bucket-config change.
+Your rules are always checked before the public-access rules (see the next section). Because of this order, one `deny` rule can take a published public folder offline, and you do not have to change the bucket settings.
 
-## The synthesized public-prefix blocks
+## The public-access rules
 
-Below your blocks, the Admission page shows read-only `public-prefix:*` entries. The proxy generates these from each bucket's `public_prefixes` config — they grant anonymous **read-only** access and are edited via **Settings → Storage → Buckets**, not here. The `public-prefix:` name prefix is reserved; you can't author blocks with it.
+Below your rules, the Request rules page shows read-only rules whose names start with `public-prefix:`. The proxy creates these rules from the public access setting of each bucket (`public_prefixes`). They give anonymous users **read-only** access. To change them, use **Settings → Storage → Buckets**, not this page. The `public-prefix:` name prefix is reserved, so your own rules cannot use it.
 
 ## 3. Dry-run with trace
 
-Never ship a chain you haven't traced. The trace evaluates a synthetic request against the **running** server's chain and shows which block decided, without sending real traffic.
+Test the rules before you rely on them. The trace checks a sample request against the rules of the **running** proxy and shows which rule decided. It does not send real traffic.
 
 From the CLI:
 
@@ -50,17 +52,17 @@ deltaglider_proxy admission trace --method PUT --path /downloads/public/installe
   --server https://s3.acme.example | jq .
 ```
 
-Expect a `deny` decision naming `deny-anonymous-writes-downloads`. Re-run with `--authenticated`: the block no longer matches (its `authenticated: false` predicate fails), and the request falls through to SigV4 authentication.
+The result is a `deny` decision that names the rule `deny-anonymous-writes-downloads`. Run the command again with `--authenticated`. This time the rule does not match, because its `authenticated: false` condition is not true, and the request continues to SigV4 authentication.
 
-The same tool lives in the UI at **Settings → Observability → Request rule tester** — it renders the decision path, the matched block, and ready-made example requests, with a Copy-as-JSON button:
+The same tool is in the admin UI at **Settings → Observability → Request rule tester**. It shows the decision, the rule that matched, and ready-made example requests, and it has a Copy-as-JSON button:
 
 ![Request trace diagnostics](/_/screenshots/request-trace.jpg)
 
-If you want explicit trace output for requests nothing matches, end the chain with a `continue` block — it's a terminal that falls through to authentication and exists exactly for diagnostic visibility.
+If you want the trace to name a rule also for requests that match no other rule, add a `continue` rule at the end of the list. A `continue` rule sends the request on to authentication, so it changes nothing; it exists only to make the trace output explicit.
 
 ## 4. Roll out
 
-Apply via the UI's dirty-bar, or commit the `admission:` section to your config file and push it with `deltaglider_proxy config apply`. The chain hot-reloads — no restart. Then watch **Settings → Observability → Audit** for a few minutes: denials show up with source IP and path, so a too-broad block surfaces immediately.
+Apply the change with the bar at the bottom of the admin UI page. Alternatively, commit the `admission:` section to your configuration file and apply it with `deltaglider_proxy config apply`. The proxy loads the new rules without a restart. Then watch **Settings → Observability → Audit log** for a few minutes. Each denied request shows there with its source IP and path, so a rule that matches too much becomes visible quickly.
 
 ## Verify
 
@@ -69,16 +71,16 @@ Apply via the UI's dirty-bar, or commit the `admission:` section to your config 
 curl -sw "%{http_code}\n" -o /dev/null -X PUT \
   https://s3.acme.example/downloads/public/installer.zip --data-binary @installer.zip
 
-# Anonymous GET under the public prefix — still works (the block only matches mutations)
+# Anonymous GET under the public prefix — still works (the rule matches only writes and deletes)
 curl -sw "%{http_code}\n" -o /dev/null \
   https://s3.acme.example/downloads/public/installer-1.2.0.zip
 ```
 
-Re-run the trace from step 3 after any chain edit — it reads the live chain, so it doubles as a deployment check.
+Run the trace from step 3 again after each change to the rules. The trace reads the rules of the running proxy, so it also confirms that the change is live.
 
 ## Related
 
-- [Configuration reference](../reference/configuration.md#admission-chain) — every match predicate and action field.
-- [How to publish a folder publicly](publish-a-public-folder.md) — where the synthesized blocks come from.
+- [Configuration reference](../reference/configuration.md#admission-chain) — every condition and action field.
+- [How to publish a folder publicly](publish-a-public-folder.md) — where the public-access rules come from.
 - [How to restrict access by IP and prefix](restrict-access-with-conditions.md) — per-user IP rules *after* authentication.
 - [About authentication and access control](../explanation/security-model.md) — admission's place in the four-layer model.

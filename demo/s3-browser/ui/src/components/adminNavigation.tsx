@@ -85,7 +85,7 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         path: 'diagnostics/audit',
         label: 'Audit log',
         icon: <FileTextOutlined />,
-        description: 'Recent authentication and mutation events from this process.',
+        description: 'Recent sign-ins and changes made through this proxy instance.',
       },
       {
         path: 'diagnostics/logs',

@@ -48,4 +48,25 @@ for (const f of await files(ROOT)) {
   });
 }
 assert.deepEqual(violations, [], `UI copy violations:\n${violations.join('\n')}`);
+
+// The product docs use the UI's vocabulary for request rules too. The YAML
+// key `admission.blocks` stays; prose says "rule". The changelog is history.
+const DOCS = new URL('../../../../docs/product/', import.meta.url).pathname;
+async function mdFiles(dir) {
+  const out = [];
+  for (const e of await readdir(dir, { withFileTypes: true })) {
+    const p = join(dir, e.name);
+    if (e.isDirectory()) out.push(...(await mdFiles(p)));
+    else if (e.name.endsWith('.md') && e.name !== 'changelog.md') out.push(p);
+  }
+  return out;
+}
+const DOC_VOCAB = /operator-authored|\badmission blocks?\b|\bsynthesi[sz]ed (public-prefix |admission )?blocks?\b|\bmatched block\b|(?<!request )\brule tester\b/i;
+const docViolations = [];
+for (const f of await mdFiles(DOCS)) {
+  (await readFile(f, 'utf8')).split('\n').forEach((line, i) => {
+    if (DOC_VOCAB.test(line)) docViolations.push(`${f.replace(DOCS, 'docs/product/')}:${i + 1}: ${line.trim().slice(0, 120)}`);
+  });
+}
+assert.deepEqual(docViolations, [], `Docs vocabulary violations:\n${docViolations.join('\n')}`);
 console.log('ui-copy regression checks passed');

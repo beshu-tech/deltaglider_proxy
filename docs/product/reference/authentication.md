@@ -123,11 +123,11 @@ Semantics for requests without credentials:
 
 - **Allowed**: GET and HEAD on objects under a public prefix; LIST with a `prefix` parameter inside the public prefix. LIST results are scoped to the public prefix — never the whole bucket.
 - **Denied**: PUT, DELETE, COPY, and multipart uploads, always.
-- **Identity**: anonymous requests run as a synthesized `$anonymous` user with scoped read+list permissions (including `s3:prefix` conditions for LIST). All anonymous access is audit-logged as `user=$anonymous`.
+- **Identity**: anonymous requests run as a built-in `$anonymous` user with scoped read+list permissions (including `s3:prefix` conditions for LIST). All anonymous access is audit-logged as `user=$anonymous`.
 - **Credentials win**: a request carrying valid SigV4 credentials gets full IAM evaluation regardless of public-prefix configuration.
 - **Matching**: a trailing `/` is significant — `public/` matches `public/...` but not `publicity/`. The empty prefix `""` makes the entire bucket public (logged as a startup warning). Prefixes containing `..`, null bytes, or `//` are rejected.
 
-Public prefixes are synthesized into admission blocks named `public-prefix:*`, evaluated after any operator-authored `admission.blocks[]` (see [Configuration](configuration.md#admission-chain)).
+The proxy creates a request rule named `public-prefix:*` for each public prefix and checks these rules after your own `admission.blocks[]` rules (see [Configuration](configuration.md#admission-chain)).
 
 ## Error responses
 
