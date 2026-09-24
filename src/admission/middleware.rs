@@ -221,26 +221,19 @@ impl OwnedRequestInfo {
         authenticated: bool,
         source_ip: Option<std::net::IpAddr>,
     ) -> Self {
-        let trimmed_path = path.trim_start_matches('/');
-        let (bucket_raw, key_raw) = match trimmed_path.split_once('/') {
-            Some((b, k)) => (b.to_string(), percent_decode(k)),
-            None => (trimmed_path.to_string(), String::new()),
-        };
-
         // Tolerate a leading `?` on the query, matching the trace
         // endpoint's operator-convenience behavior.
         let query_trimmed = query.strip_prefix('?').unwrap_or(query);
-        let list_prefix = query_trimmed
-            .split('&')
-            .find_map(|pair| {
-                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-                if k == "prefix" {
-                    Some(percent_decode(v))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
+        // Decode bucket, key and query exactly as s3s will, so a block that
+        // names `prod` also matches `/pro%64/...`. A target that does not
+        // decode matches no bucket: s3s refuses it with `InvalidURI`.
+        let target = RequestTarget::parse(path, Some(query_trimmed)).unwrap_or(RequestTarget {
+            path: String::new(),
+            query: Vec::new(),
+        });
+        let (bucket_raw, key_raw) = target.bucket_and_key();
+        let (bucket_raw, key_raw) = (bucket_raw.to_string(), key_raw.to_string());
+        let list_prefix = target.query_value("prefix").unwrap_or_default().to_string();
 
         OwnedRequestInfo {
             method: method.to_ascii_uppercase(),
@@ -272,23 +265,13 @@ impl OwnedRequestInfo {
     }
 }
 
-/// Percent-decoder shared with the SigV4 middleware — see
-/// [`crate::api::auth::percent_decode`]. Aliased here so the admission
-/// module doesn't leak `api` paths into its call sites, but behaviorally
-/// identical to the SigV4 path's decoder (critical for the refactor: the
-/// old inline public-prefix handling in SigV4 used that exact decoder).
-use crate::api::auth::percent_decode;
+use crate::api::request_target::RequestTarget;
 
 /// Detects whether the URL query carries a SigV4 presigned-URL
-/// `X-Amz-Credential` parameter. Mirrors `has_presigned_query_params` in
-/// `api/auth.rs` — kept inline here so admission doesn't import SigV4's
-/// private parser (tight coupling to query-string layout), and because
-/// this check is trivially a two-liner.
+/// `X-Amz-Credential` parameter (name decoded, case ignored).
 fn has_presigned_query_params(query: &str) -> bool {
-    query.split('&').any(|pair| {
-        let key = pair.split_once('=').map(|(k, _)| k).unwrap_or(pair);
-        key.eq_ignore_ascii_case("X-Amz-Credential")
-    })
+    RequestTarget::parse("/", Some(query))
+        .is_ok_and(|t| t.has_query_ignore_case("X-Amz-Credential"))
 }
 
 #[cfg(test)]
@@ -311,6 +294,23 @@ mod tests {
     fn has_presigned_ignores_values_that_look_like_credentials() {
         // The key must be X-Amz-Credential, not the value.
         assert!(!has_presigned_query_params("foo=X-Amz-Credential"));
+        // An encoded parameter NAME is still the parameter.
+        assert!(has_presigned_query_params("%58-Amz-Credential=AKIA"));
+    }
+
+    /// Admission matches the bucket and key s3s will serve, not the raw
+    /// text: a block naming `prod` must also see `/pro%64/...`.
+    #[test]
+    fn from_raw_decodes_bucket_key_and_prefix_like_s3s() {
+        let info = OwnedRequestInfo::from_raw("get", "/pro%64/secre%74.txt", "", false, None);
+        assert_eq!(
+            (info.bucket.as_str(), info.key.as_str()),
+            ("prod", "secret.txt")
+        );
+        let info = OwnedRequestInfo::from_raw("GET", "/prod%2Fk", "", false, None);
+        assert_eq!((info.bucket.as_str(), info.key.as_str()), ("prod", "k"));
+        let info = OwnedRequestInfo::from_raw("GET", "/prod", "?%70refix=a+b", false, None);
+        assert_eq!(info.list_prefix, "a b");
     }
 
     #[test]

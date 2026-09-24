@@ -2302,3 +2302,192 @@ async fn test_admin_session_ends_when_user_is_disabled_or_demoted() {
         "a demoted admin must lose the admin API"
     );
 }
+
+/// Sign a request whose WIRE path/query differ from the canonical ones s3s
+/// verifies (s3s canonicalises the decoded form, so an encoded wire target
+/// still carries a valid signature).
+#[allow(clippy::too_many_arguments)]
+fn signed_encoded(
+    method: reqwest::Method,
+    endpoint: &str,
+    wire_path: &str,
+    canonical_path: &str,
+    wire_query: &str,
+    canonical_query: &str,
+    access_key: &str,
+    secret_key: &str,
+) -> reqwest::RequestBuilder {
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let date = &now[..8];
+    let host = endpoint.strip_prefix("http://").unwrap().to_string();
+    let scope = format!("{date}/us-east-1/s3/aws4_request");
+    let payload_hash = "UNSIGNED-PAYLOAD";
+    let headers = format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{now}\n");
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let canonical_request = format!(
+        "{}\n{canonical_path}\n{canonical_query}\n{headers}\n{signed_headers}\n{payload_hash}",
+        method.as_str()
+    );
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{now}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let key = derive_signing_key(secret_key, date, "us-east-1", "s3");
+    let signature = hex::encode(hmac_sha256(&key, string_to_sign.as_bytes()));
+    let url = if wire_query.is_empty() {
+        format!("{endpoint}{wire_path}")
+    } else {
+        format!("{endpoint}{wire_path}?{wire_query}")
+    };
+    reqwest::Client::new()
+        .request(method, url)
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, \
+                 SignedHeaders={signed_headers}, Signature={signature}"
+            ),
+        )
+        .header("x-amz-date", now)
+        .header("x-amz-content-sha256", payload_hash)
+}
+
+/// Authorization must check the resource s3s serves. s3s decodes the whole
+/// path, so `/bucket%2Fkey` is an object GET and `secre%74.txt` is
+/// `secret.txt`.
+#[tokio::test]
+async fn test_percent_encoded_path_cannot_escape_authorization() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let b = server.bucket().to_string();
+    // Seed while still in bootstrap mode; IAM users replace the bootstrap key.
+    server
+        .s3_client()
+        .await
+        .put_object()
+        .bucket(&b)
+        .key("secret.txt")
+        .body(ByteStream::from_static(b"top secret"))
+        .send()
+        .await
+        .expect("put");
+    let before = get_iam_version(&admin, &server.endpoint()).await;
+    let lister = create_user(
+        &admin,
+        &server,
+        "lister",
+        vec![json!({"actions": ["list"], "resources": ["*"]})],
+    )
+    .await;
+    let denied = create_user(
+        &admin,
+        &server,
+        "denied",
+        vec![
+            json!({"actions": ["*"], "resources": ["*"]}),
+            json!({"effect": "Deny", "actions": ["read"], "resources": [format!("{b}/secret*")]}),
+        ],
+    )
+    .await;
+    wait_for_iam_rebuild(&admin, &server.endpoint(), before).await;
+
+    let get = |wire: String, user: &UserCreds| {
+        signed_encoded(
+            reqwest::Method::GET,
+            &server.endpoint(),
+            &wire,
+            &format!("/{b}/secret.txt"),
+            "",
+            "",
+            &user.access_key_id,
+            &user.secret_access_key,
+        )
+        .send()
+    };
+
+    // Control: the plain paths are refused.
+    assert_eq!(
+        get(format!("/{b}/secret.txt"), &lister)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        get(format!("/{b}/secret.txt"), &denied)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    // An encoded separator must not turn a list grant into a read.
+    let resp = get(format!("/{b}%2Fsecret.txt"), &lister).await.unwrap();
+    assert_ne!(resp.status(), StatusCode::OK, "list grant read the object");
+    // An encoded key character must not escape a key-scoped Deny.
+    let resp = get(format!("/{b}/secre%74.txt"), &denied).await.unwrap();
+    assert_ne!(resp.status(), StatusCode::OK, "Deny bypassed by encoding");
+}
+
+/// A Deny on LIST with an `s3:prefix` condition must also match when the
+/// query parameter NAME is percent-encoded (s3s decodes query keys).
+#[tokio::test]
+async fn test_percent_encoded_query_key_cannot_escape_prefix_deny() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let b = server.bucket().to_string();
+    // Seed while still in bootstrap mode; IAM users replace the bootstrap key.
+    server
+        .s3_client()
+        .await
+        .put_object()
+        .bucket(&b)
+        .key("secret/a.txt")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .expect("put");
+    let before = get_iam_version(&admin, &server.endpoint()).await;
+    let user = create_user(
+        &admin,
+        &server,
+        "u",
+        vec![
+            json!({"actions": ["list"], "resources": [format!("{b}/*")]}),
+            json!({"effect": "Deny", "actions": ["list"], "resources": [b.clone()],
+                   "conditions": {"StringLike": {"s3:prefix": ["secret*"]}}}),
+        ],
+    )
+    .await;
+    wait_for_iam_rebuild(&admin, &server.endpoint(), before).await;
+
+    let list = |wire_query: &str| {
+        signed_encoded(
+            reqwest::Method::GET,
+            &server.endpoint(),
+            &format!("/{b}"),
+            &format!("/{b}"),
+            wire_query,
+            "list-type=2&prefix=secret",
+            &user.access_key_id,
+            &user.secret_access_key,
+        )
+        .send()
+    };
+    assert_eq!(
+        list("list-type=2&prefix=secret").await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    let resp = list("list-type=2&%70refix=secret").await.unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert!(
+        !(status == StatusCode::OK && body.contains("secret/a.txt")),
+        "prefix Deny bypassed by an encoded parameter name: {status} {body}"
+    );
+}

@@ -15,6 +15,7 @@
 //! redundancy (and the source of a hand-rolled/s3s divergence hazard), so the
 //! canonical-request + HMAC machinery was removed.
 
+use super::request_target::RequestTarget;
 use super::S3Error;
 use crate::iam::{AuthenticatedUser, IamState, Permission, SharedIamState};
 use crate::metrics::Metrics;
@@ -381,21 +382,15 @@ impl SigV4Params {
     /// Extract SigV4 parameters from presigned URL query params.
     #[allow(clippy::result_large_err)]
     fn from_query(request: &Request<Body>) -> Result<Self, Response> {
-        let query_string = request.uri().query().unwrap_or("");
+        let target = RequestTarget::from_uri(request.uri()).map_err(|_| {
+            S3Error::InvalidArgument("Invalid URI encoding".to_string()).into_response()
+        })?;
+        let param = |name: &str| target.query_value(name).unwrap_or_default().to_string();
 
-        let params: std::collections::HashMap<String, String> = query_string
-            .split('&')
-            .filter(|s| !s.is_empty())
-            .filter_map(|pair| {
-                let (k, v) = pair.split_once('=')?;
-                Some((percent_decode(k), percent_decode(v)))
-            })
-            .collect();
-
-        let credential = params.get("X-Amz-Credential").cloned().unwrap_or_default();
-        let signature = params.get("X-Amz-Signature").cloned().unwrap_or_default();
-        let amz_date = params.get("X-Amz-Date").cloned().unwrap_or_default();
-        let expires = params.get("X-Amz-Expires").cloned().unwrap_or_default();
+        let credential = param("X-Amz-Credential");
+        let signature = param("X-Amz-Signature");
+        let amz_date = param("X-Amz-Date");
+        let expires = param("X-Amz-Expires");
 
         if credential.is_empty() || signature.is_empty() {
             debug!("SigV4 presigned: missing credential or signature");
@@ -492,10 +487,7 @@ impl SigV4Params {
 /// Check whether the query string contains presigned URL parameters.
 /// Uses proper key-level parsing instead of substring matching.
 fn has_presigned_query_params(query: &str) -> bool {
-    query.split('&').filter(|s| !s.is_empty()).any(|pair| {
-        let key = pair.split_once('=').map(|(k, _)| k).unwrap_or(pair);
-        percent_decode(key) == "X-Amz-Algorithm"
-    })
+    RequestTarget::parse("/", Some(query)).is_ok_and(|t| t.has_query("X-Amz-Algorithm"))
 }
 
 /// Bucket-level HTML form upload candidates (`POST /bucket` with multipart form-data)
@@ -977,30 +969,6 @@ fn parse_auth_header(header: &str) -> Option<ParsedAuthHeader> {
         access_key: access_key.to_string(),
         signature,
     })
-}
-
-/// Percent-decode a URI component (e.g. `%2F` → `/`).
-///
-/// Lossy on invalid UTF-8 sequences (substitutes `U+FFFD`). This function
-/// is the canonical decoder used across the request path — SigV4 query
-/// parsing, admission middleware, and the admin trace endpoint all call
-/// it so their decoding semantics are identical by construction.
-pub fn percent_decode(input: &str) -> String {
-    let mut result = Vec::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
-                result.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        result.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&result).into_owned()
 }
 
 #[cfg(test)]
