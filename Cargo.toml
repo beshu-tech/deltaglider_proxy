@@ -157,3 +157,11 @@ criterion = "0.5"
 name = "codec"
 harness = false
 
+
+# Dev builds keep line tables only: backtraces still name file and line, and
+# links and target directories shrink a lot. Dependencies carry no debug info.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
