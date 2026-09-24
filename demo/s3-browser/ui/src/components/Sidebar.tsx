@@ -425,8 +425,11 @@ export default function Sidebar({
                   if (b.name !== activeBucket) e.currentTarget.style.background = 'transparent';
                 }}
               >
-                <span style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, overflow: 'hidden' }}>
+                {/* One line tall and wrapping: a chip with no room left wraps
+                    to a second line, which the fixed height hides. */}
+                <span style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', columnGap: 8, height: 20, minWidth: 0, overflow: 'hidden' }}>
                   <span style={{
+                    lineHeight: '20px',
                     fontFamily: "var(--font-mono)",
                     fontSize: 13,
                     fontWeight: b.name === activeBucket ? 600 : 400,
@@ -454,7 +457,11 @@ export default function Sidebar({
                       Unavailable
                     </span>
                   )}
-                  {backendChips && <BucketBackendBadge origin={b.backend} />}
+                  {backendChips && (
+                    // Line breaking sees the 40 px stub, so the chip shrinks
+                    // (with an ellipsis) before it wraps out of view.
+                    <BucketBackendBadge origin={b.backend} style={{ flex: '1 1 40px', maxWidth: 'max-content' }} />
+                  )}
                 </span>
               </button>
               {!isUnavailable && canDeleteBucket(b.name) && (
