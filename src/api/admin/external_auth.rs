@@ -575,6 +575,7 @@ pub async fn oauth_callback(
             user_id: user.id,
         },
         crate::session::SessionKind::AdminGui,
+        &user.name,
     );
 
     // Auto-populate S3 credentials
@@ -585,13 +586,6 @@ pub async fn oauth_callback(
         user.secret_access_key.clone(),
     )
     .await;
-
-    audit_log(
-        "external_login",
-        &user.name,
-        &pending.provider_name,
-        &req_headers,
-    );
 
     let cookie =
         super::auth::session_cookie_with_headers(&token, state.sessions.ttl(), Some(&req_headers));

@@ -298,17 +298,52 @@ pub(super) fn drop_prior_session(state: &AdminState, headers: &HeaderMap) {
 /// prior cookie BEFORE creating the new one (XSS-rotation defense) — so a new
 /// mint path physically cannot forget it. All session-minting routes go through
 /// here; setting S3 creds stays at the call site (it varies per path).
+///
+/// It also writes the audit entry for the successful login, so no login path
+/// can mint a session without leaving a trace (issue #92: bootstrap and
+/// login-as logins were not audited, only `login_failed`). `user_name` is the
+/// display name of the identity that logged in (`""` when there is none).
 pub(super) fn mint_session(
     state: &AdminState,
     headers: &HeaderMap,
     connect_info: Option<&ConnectInfo<SocketAddr>>,
     auth_method: AuthMethod,
     kind: SessionKind,
+    user_name: &str,
 ) -> String {
     drop_prior_session(state, headers);
-    state
-        .sessions
-        .create_session(request_client_ip(headers, connect_info), auth_method, kind)
+    let (action, user, target) = login_audit_fields(&auth_method, user_name);
+    let token =
+        state
+            .sessions
+            .create_session(request_client_ip(headers, connect_info), auth_method, kind);
+    audit_log(action, &user, &target, headers);
+    token
+}
+
+/// Audit `(action, user, target)` for a successful login. Pure; unit-tested.
+/// Action names that existed before this helper (`external_login`,
+/// `browser_session_connect`, `open_browser_connect`) are kept so log
+/// pipelines that match on them keep working.
+pub(super) fn login_audit_fields(
+    method: &AuthMethod,
+    user_name: &str,
+) -> (&'static str, String, String) {
+    match method {
+        AuthMethod::Bootstrap => ("login", "bootstrap".into(), "bootstrap".into()),
+        AuthMethod::IamLoginAs { access_key_id } => {
+            ("login_as", user_name.into(), access_key_id.clone())
+        }
+        AuthMethod::IamBrowserLift { access_key_id } => (
+            "browser_session_connect",
+            user_name.into(),
+            access_key_id.clone(),
+        ),
+        AuthMethod::OpenLift => ("open_browser_connect", "open".into(), "anonymous".into()),
+        AuthMethod::External { provider_name, .. } => {
+            ("external_login", user_name.into(), provider_name.clone())
+        }
+    }
 }
 
 /// Test-only shim: equivalent to [`session_cookie_with_headers`] with
@@ -483,6 +518,7 @@ pub async fn login(
         connect_info.as_ref(),
         AuthMethod::Bootstrap,
         SessionKind::AdminGui,
+        "",
     );
 
     // Auto-populate S3 credentials from config so "login IS connect".
@@ -823,6 +859,7 @@ pub async fn login_as(
             access_key_id: body.access_key_id.clone(),
         },
         SessionKind::AdminGui,
+        &user.name,
     );
 
     // Auto-populate S3 credentials from the IAM login so "login IS connect"
@@ -935,6 +972,7 @@ pub async fn browser_session_connect(
             access_key_id: ak.clone(),
         },
         SessionKind::S3BrowserLift,
+        &user.name,
     );
 
     state.sessions.set_s3_creds(
@@ -952,13 +990,6 @@ pub async fn browser_session_connect(
         "S3 browser-lift session created for access key '{}' from {}",
         ak_for_log,
         guard.ip()
-    );
-
-    audit_log(
-        "browser_session_connect",
-        &user.name,
-        &ak_for_log,
-        &req_headers,
     );
 
     Ok((
@@ -1023,14 +1054,13 @@ pub async fn open_browser_connect(
         connect_info.as_ref(),
         AuthMethod::OpenLift,
         SessionKind::S3BrowserLift,
+        "",
     );
 
     state.sessions.set_s3_creds(
         &token,
         S3SessionCredentials::anonymous(body.endpoint, region, body.bucket),
     );
-
-    audit_log("open_browser_connect", "open", "anonymous", &req_headers);
 
     Ok((
         StatusCode::OK,
@@ -1230,6 +1260,60 @@ mod tests {
     use super::*;
     use crate::iam::{AuthConfig, Permission, SharedIamState};
     use arc_swap::ArcSwap;
+
+    /// Issue #92: every successful login writes an audit entry, and the
+    /// action names that existed before (OAuth, browser lift, open lift) stay.
+    #[test]
+    fn login_audit_fields_cover_every_auth_method() {
+        let f = |m: AuthMethod, n: &str| {
+            let (a, u, t) = login_audit_fields(&m, n);
+            (a.to_string(), u, t)
+        };
+        assert_eq!(
+            f(AuthMethod::Bootstrap, ""),
+            ("login".into(), "bootstrap".into(), "bootstrap".into())
+        );
+        assert_eq!(
+            f(
+                AuthMethod::IamLoginAs {
+                    access_key_id: "AK".into()
+                },
+                "dana"
+            ),
+            ("login_as".into(), "dana".into(), "AK".into())
+        );
+        assert_eq!(
+            f(
+                AuthMethod::IamBrowserLift {
+                    access_key_id: "AK".into()
+                },
+                "ci"
+            ),
+            ("browser_session_connect".into(), "ci".into(), "AK".into())
+        );
+        assert_eq!(
+            f(AuthMethod::OpenLift, ""),
+            (
+                "open_browser_connect".into(),
+                "open".into(),
+                "anonymous".into()
+            )
+        );
+        assert_eq!(
+            f(
+                AuthMethod::External {
+                    provider_name: "google".into(),
+                    user_id: 7
+                },
+                "dana"
+            ),
+            ("external_login".into(), "dana".into(), "google".into())
+        );
+        // The admin audit panel colours `login*` actions green.
+        assert!(login_audit_fields(&AuthMethod::Bootstrap, "")
+            .0
+            .starts_with("login"));
+    }
 
     /// Regression: SharedAuthConfig must reflect credential updates immediately.
     /// This guards against reverting to a static Extension<Option<Arc<AuthConfig>>>.
