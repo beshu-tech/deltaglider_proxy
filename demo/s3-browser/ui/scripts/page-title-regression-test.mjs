@@ -15,7 +15,7 @@ assert.equal(pageTitle('browser', 'releases'), 'releases — DeltaGlider Proxy')
 assert.equal(pageTitle('upload', 'releases'), 'Upload to releases — DeltaGlider Proxy');
 assert.equal(pageTitle('admin', '', 'Users'), 'Users · Settings — DeltaGlider Proxy');
 assert.equal(pageTitle('admin', 'releases'), 'Settings — DeltaGlider Proxy');
-for (const v of ['browser', 'upload', 'metrics', 'docs', 'admin']) {
+for (const v of ['browser', 'upload', 'docs', 'admin']) {
   assert.ok(!pageTitle(v, '').startsWith('—'), `${v}: title must not start with a dash`);
 }
 console.log('page-title regression checks passed');

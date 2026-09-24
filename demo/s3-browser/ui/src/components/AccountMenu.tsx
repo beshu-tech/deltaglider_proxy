@@ -30,6 +30,8 @@ export interface AccountMenuConfigProps {
 
 interface Props extends AccountMenuConfigProps {
   identityLabel: string;
+  /** Second header line: role and auth mode (see identitySummary.ts). */
+  identityDetail?: string;
   canAdmin?: boolean;
   onBrowserClick?: () => void;
   onSettingsClick?: () => void;
@@ -44,6 +46,7 @@ interface Props extends AccountMenuConfigProps {
 
 export default function AccountMenu({
   identityLabel,
+  identityDetail,
   canAdmin,
   onBrowserClick,
   onSettingsClick,
@@ -128,20 +131,38 @@ export default function AccountMenu({
     >
       {open && (
         <div className="account-menu-panel" role="menu">
+          {/* Who is signed in, and how. */}
+          <div
+            aria-label="Signed in as"
+            style={{ padding: '2px 4px 10px', marginBottom: 8, borderBottom: '1px solid color-mix(in srgb, currentColor 14%, transparent)' }}
+          >
+            <div style={{ fontWeight: 700, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={label}>
+              {label}
+            </div>
+            {identityDetail && (
+              <div style={{ fontSize: 11, opacity: 0.7, marginTop: 2, lineHeight: 1.4, wordBreak: 'break-word' }}>
+                {identityDetail}
+              </div>
+            )}
+          </div>
           <div className="account-menu-section account-menu-section--first" role="group" aria-label="Navigation">
             <div className="account-menu-section-label">Navigation</div>
-            <button
-              type="button"
-              className="account-menu-item"
-              role="menuitem"
-              onClick={() => {
-                close();
-                onBrowserClick?.();
-              }}
-            >
-              <HomeOutlined aria-hidden style={iconStyle} />
-              <span>Browser</span>
-            </button>
+            {/* Each view passes no handler for itself, so the menu never
+                offers the page you are already on. */}
+            {onBrowserClick && (
+              <button
+                type="button"
+                className="account-menu-item"
+                role="menuitem"
+                onClick={() => {
+                  close();
+                  onBrowserClick();
+                }}
+              >
+                <HomeOutlined aria-hidden style={iconStyle} />
+                <span>Browser</span>
+              </button>
+            )}
             {onSettingsClick && (
               <button
                 type="button"
@@ -156,18 +177,20 @@ export default function AccountMenu({
                 <span>Settings</span>
               </button>
             )}
-            <button
-              type="button"
-              className="account-menu-item"
-              role="menuitem"
-              onClick={() => {
-                close();
-                onDocsClick?.();
-              }}
-            >
-              <BookOutlined aria-hidden style={iconStyle} />
-              <span>Documentation</span>
-            </button>
+            {onDocsClick && (
+              <button
+                type="button"
+                className="account-menu-item"
+                role="menuitem"
+                onClick={() => {
+                  close();
+                  onDocsClick();
+                }}
+              >
+                <BookOutlined aria-hidden style={iconStyle} />
+                <span>Documentation</span>
+              </button>
+            )}
           </div>
           {hasConfigActions && (
             <div className="account-menu-section" role="group" aria-label="Settings" title={settingsHelp}>

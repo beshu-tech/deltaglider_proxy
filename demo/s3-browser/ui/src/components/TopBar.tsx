@@ -2,7 +2,7 @@ import { useRef, useState, useEffect } from 'react';
 import { flushSync } from 'react-dom';
 import { Layout, Space, Button, Input, theme } from 'antd';
 import type { InputRef } from 'antd';
-import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, QuestionCircleOutlined } from '@ant-design/icons';
+import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, QuestionCircleOutlined, SettingOutlined } from '@ant-design/icons';
 import { metaKeyLabel } from '../platform';
 import Breadcrumb from './Breadcrumb';
 import DeltaSavingsChip from './DeltaSavingsChip';
@@ -11,6 +11,11 @@ import type { DeltaSummary } from '../deltaSummary';
 import { useColors } from '../ThemeContext';
 import { useDocumentEvent } from '../useDocumentEvent';
 import { isTypingTarget, anyOverlayOpen } from '../keyboard';
+import { useIsNarrow } from '../useIsNarrow';
+
+/** Below this viewport width the savings chip no longer fits next to the
+ *  breadcrumb and the bucket-size pill (the 250px sidebar takes the rest). */
+const SAVINGS_CHIP_MIN_VIEWPORT = 1200;
 
 const { Header } = Layout;
 
@@ -32,6 +37,8 @@ interface Props {
   /** Open the keyboard-shortcuts help modal (header help icon). */
   onShowShortcuts?: () => void;
   accountMenu?: React.ReactNode;
+  /** Labelled Settings entry point (administrators only). */
+  onOpenSettings?: () => void;
   /** Aggregated delta savings for the current prefix view. Auto-hides when no deltas present. */
   deltaSummary?: DeltaSummary | null;
 }
@@ -87,13 +94,14 @@ function SearchInput({
   );
 }
 
-export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, canAdmin = false, onShowShortcuts, accountMenu, deltaSummary = null }: Props) {
+export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, canAdmin = false, onShowShortcuts, accountMenu, onOpenSettings, deltaSummary = null }: Props) {
   const { token } = theme.useToken();
   const { ACCENT_BLUE, TEXT_MUTED, BORDER } = useColors();
   // Open when the URL already carries a filter (?q= from a deep link, reload
   // or Back): a filtered list with no visible search box looked like missing
   // files.
   const [searchOpen, setSearchOpen] = useState(() => !!searchQuery);
+  const hideSavingsChip = useIsNarrow(SAVINGS_CHIP_MIN_VIEWPORT);
   const inputRef = useRef<InputRef>(null);
   useEffect(() => {
     if (searchQuery) setSearchOpen(true);
@@ -135,10 +143,15 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
         borderBottom: `1px solid ${BORDER}`,
       }}
     >
-      {/* Left: hamburger on mobile, breadcrumb or search on desktop */}
-      <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 12 }}>
+      {/* Left: hamburger + one-line breadcrumb on mobile, breadcrumb or search
+          on desktop. overflow:hidden keeps anything here from ever covering
+          the action icons on the right. */}
+      <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', gap: 12, overflow: 'hidden' }}>
         {isMobile && (
-          <Button type="text" icon={<MenuOutlined />} onClick={onMenuClick} size="small" aria-label="Open navigation menu" />
+          <>
+            <Button type="text" icon={<MenuOutlined />} onClick={onMenuClick} size="small" aria-label="Open navigation menu" />
+            {bucket && <Breadcrumb bucket={bucket} prefix={prefix} onNavigate={onNavigate} compact />}
+          </>
         )}
         {!isMobile && (
           searchOpen ? (
@@ -154,7 +167,7 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
             <>
               <Breadcrumb bucket={bucket} prefix={prefix} onNavigate={onNavigate} canAdmin={canAdmin} />
               {bucket && <BucketUsageChip bucket={bucket} canAdmin={canAdmin} inFolder={!!prefix} />}
-              <DeltaSavingsChip summary={deltaSummary} />
+              {!hideSavingsChip && <DeltaSavingsChip summary={deltaSummary} />}
             </>
           )
         )}
@@ -204,6 +217,19 @@ export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuCli
             onClick={onShowShortcuts}
             style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
           />
+        )}
+        {onOpenSettings && (
+          <Button
+            type="text"
+            icon={<SettingOutlined />}
+            size="small"
+            title={`Settings (${metaKeyLabel()}+,)`}
+            aria-label="Settings"
+            onClick={onOpenSettings}
+            style={{ color: TEXT_MUTED, transition: 'color 0.15s' }}
+          >
+            {isMobile ? null : 'Settings'}
+          </Button>
         )}
         {accountMenu}
       </Space>

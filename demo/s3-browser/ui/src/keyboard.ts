@@ -45,6 +45,9 @@ export function anyOverlayOpen(doc: Document = document): boolean {
   if (doc.querySelector('.ant-select-dropdown:not(.ant-select-dropdown-hidden)') !== null) {
     return true;
   }
+  // Menus: Escape closes them, and must not also go up a folder.
+  if (doc.querySelector('.ant-dropdown:not(.ant-dropdown-hidden)') !== null) return true;
+  if (doc.querySelector('.account-menu-panel') !== null) return true;
   return false;
 }
 

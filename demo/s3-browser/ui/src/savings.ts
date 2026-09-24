@@ -118,6 +118,19 @@ export function summarizeObjectSavings(
   return { pct, savedBytes: saved, empty: false };
 }
 
+/**
+ * True when this object IS its folder's shared baseline: the proxy stored the
+ * full file once as the folder's reference, plus a near-empty delta against
+ * itself. The HEAD metadata says so when the file's SHA-256 equals the
+ * reference's. Per-object savings (stored = delta bytes) leave the baseline
+ * out, so they read ~99.9% for exactly the file that cost a full copy.
+ */
+export function isBaselineObject(headers: Record<string, string>): boolean {
+  const file = headers['x-amz-meta-dg-file-sha256'];
+  const ref = headers['x-amz-meta-dg-ref-sha256'];
+  return Boolean(file) && file === ref;
+}
+
 /** Bytes in one GiB. The UI labels it "GB", like `formatBytes`. */
 export const GIB = 1024 ** 3;
 

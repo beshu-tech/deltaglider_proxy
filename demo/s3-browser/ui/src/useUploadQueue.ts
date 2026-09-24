@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { headObject, uploadObject, type UploadTelemetry } from './s3client';
 import { uploadSessionStats } from './uploadStats';
-import { clampPercent, mergeTotalBytes, type UploadStatus } from './uploadTelemetry';
-import { normalizeUiError } from './errorHandling';
+import { isBaselineObject } from './savings';
+import { clampPercent, isRetryableUploadFailure, mergeTotalBytes, type UploadStatus } from './uploadTelemetry';
+import { S3RequestError, normalizeUiError } from './errorHandling';
 
 export interface UploadQueueItem {
   id: string;
@@ -26,7 +27,11 @@ export interface UploadQueueItem {
   durationMs: number | null;
   /** Bytes the proxy stored (HEAD after success); undefined = pending/unknown. */
   storedSize?: number;
+  /** Set when this upload became its folder's baseline (see uploadStats.ts). */
+  baselineKey?: string;
   error?: string;
+  /** False when the failure repeats on every attempt (403, 413, …): no Retry. */
+  retryable?: boolean;
 }
 
 export default function useUploadQueue(destination: string) {
@@ -161,11 +166,15 @@ export default function useUploadQueue(destination: string) {
         // (`dg-delta-size` for a delta, else the full object). A failed HEAD
         // leaves it unknown, and the page shows "—" instead of a guess.
         headObject(item.key)
-          .then(({ storedSize }) => {
+          .then(({ headers, storedSize }) => {
+            const folder = item.key.includes('/') ? item.key.slice(0, item.key.lastIndexOf('/')) : '';
+            const baselineKey = isBaselineObject(headers)
+              ? `${folder}|${headers['x-amz-meta-dg-ref-sha256']}`
+              : undefined;
             setQueue((prev) =>
               prev.map((entry) =>
                 entry.id === item.id && entry.status === 'success'
-                  ? { ...entry, storedSize: storedSize ?? entry.originalSize }
+                  ? { ...entry, storedSize: storedSize ?? entry.originalSize, baselineKey }
                   : entry,
               ),
             );
@@ -197,6 +206,9 @@ export default function useUploadQueue(destination: string) {
                   ...entry,
                   status: 'error',
                   error: normalizeUiError(err, 'Upload failed'),
+                  retryable: err instanceof S3RequestError
+                    ? isRetryableUploadFailure(err.status, err.code)
+                    : true,
                   inFlightParts: 0,
                   activeConnections: 0,
                   speedBytesPerSec: 0,
@@ -256,11 +268,13 @@ export default function useUploadQueue(destination: string) {
               activeConnections: 0,
               currentPart: null,
               error: undefined,
+              retryable: undefined,
               startedAtMs: null,
               completingSinceMs: null,
               updatedAtMs: null,
               durationMs: null,
               storedSize: undefined,
+              baselineKey: undefined,
             }
           : item,
       ),

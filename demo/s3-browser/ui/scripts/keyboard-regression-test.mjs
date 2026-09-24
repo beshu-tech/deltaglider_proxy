@@ -62,5 +62,8 @@ assert.equal(anyOverlayOpen(fakeDoc([MODAL])), true, 'modal open');
 assert.equal(anyOverlayOpen(fakeDoc([DRAWER])), true, 'drawer open');
 assert.equal(anyOverlayOpen(fakeDoc([DROPDOWN])), true, 'visible select dropdown open');
 assert.equal(anyOverlayOpen(fakeDoc([MODAL, DRAWER, DROPDOWN])), true, 'all open');
+// Escape that closes a menu (bucket row "⋯", account menu) went up a folder too.
+assert.equal(anyOverlayOpen(fakeDoc(['.ant-dropdown:not(.ant-dropdown-hidden)'])), true, 'row menu open');
+assert.equal(anyOverlayOpen(fakeDoc(['.account-menu-panel'])), true, 'account menu open');
 
 console.log('keyboard regression checks passed');

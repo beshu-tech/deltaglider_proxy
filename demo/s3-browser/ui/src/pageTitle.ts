@@ -14,8 +14,6 @@ export function pageTitle(view: View, bucket: string, adminPageLabel?: string): 
       return bucket ? `${bucket} — ${APP}` : `Browse — ${APP}`;
     case 'upload':
       return bucket ? `Upload to ${bucket} — ${APP}` : `Upload — ${APP}`;
-    case 'metrics':
-      return `Metrics — ${APP}`;
     case 'docs':
       return `Docs — ${APP}`;
     case 'admin':

@@ -18,7 +18,8 @@ assert.deepEqual(parseViewLocation('/_/admin/configuration/access/credentials'),
   view: 'admin', subPath: 'configuration/access/credentials',
 });
 assert.deepEqual(parseViewLocation('/_/docs/configuration'), { view: 'docs', subPath: 'configuration' });
-assert.deepEqual(parseViewLocation('/_/metrics'), { view: 'metrics', subPath: '' });
+// /_/metrics belongs to the Prometheus endpoint; the SPA has no view there.
+assert.deepEqual(parseViewLocation('/_/metrics'), { view: 'browser', subPath: '' });
 assert.deepEqual(parseViewLocation('/_/unknownthing'), { view: 'browser', subPath: '' });
 
 // --- parseBrowserLocation -----------------------------------------------------

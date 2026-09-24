@@ -32,9 +32,32 @@ const {
   estimateCompletedParts,
   estimateInFlightParts,
   estimateTotalParts,
+  isRetryableUploadFailure,
   mergeTotalBytes,
   movingAverageSpeedBps,
+  uploadDisplayPath,
 } = await import(moduleUrl);
+
+// Issue #92 comment item 4: "Retry" after a 403 quota rejection cannot
+// succeed; only transient failures offer it.
+assert.equal(isRetryableUploadFailure(403, 'AccessDenied'), false, 'quota / permission rejection');
+assert.equal(isRetryableUploadFailure(403, undefined), false);
+assert.equal(isRetryableUploadFailure(413, 'EntityTooLarge'), false);
+assert.equal(isRetryableUploadFailure(404, 'NoSuchBucket'), false);
+assert.equal(isRetryableUploadFailure(400, 'InvalidArgument'), false);
+assert.equal(isRetryableUploadFailure(undefined, 'NoSuchBucket'), false);
+assert.equal(isRetryableUploadFailure(undefined, undefined), true, 'network error: no HTTP answer');
+assert.equal(isRetryableUploadFailure(500, 'InternalError'), true);
+assert.equal(isRetryableUploadFailure(502, undefined), true);
+assert.equal(isRetryableUploadFailure(503, 'SlowDown'), true);
+assert.equal(isRetryableUploadFailure(429, undefined), true);
+assert.equal(isRetryableUploadFailure(408, 'RequestTimeout'), true);
+
+// Folder uploads show the path under the destination, not just the file name.
+assert.equal(uploadDisplayPath('dest/rel/sub1/README.md', 'dest'), 'rel/sub1/README.md');
+assert.equal(uploadDisplayPath('rel/sub2/README.md', ''), 'rel/sub2/README.md');
+assert.equal(uploadDisplayPath('a/b/app.tar', 'a/b'), 'app.tar');
+assert.equal(uploadDisplayPath('destination-other/x', 'dest'), 'destination-other/x');
 
 assert.equal(clampPercent(-10), 0);
 assert.equal(clampPercent(140), 100);

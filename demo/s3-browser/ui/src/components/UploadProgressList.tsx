@@ -12,6 +12,7 @@ import {
 } from '@ant-design/icons';
 import { formatBytes } from '../utils';
 import type { UploadQueueItem } from '../useUploadQueue';
+import { uploadDisplayPath } from '../uploadTelemetry';
 
 const { Text } = Typography;
 
@@ -127,7 +128,8 @@ export default function UploadProgressList({
         const isCompleting = item.status === 'completing';
         const transferDone = isCompleting || item.status === 'success';
         const showActionCancel = item.status === 'queued' || item.status === 'uploading';
-        const showActionRetry = item.status === 'error' || item.status === 'cancelled';
+        const showActionRetry = item.status === 'cancelled' || (item.status === 'error' && item.retryable !== false);
+        const displayPath = uploadDisplayPath(item.key, item.destination);
         const completingStartMs = item.completingSinceMs;
         const hasCompletingStart = typeof completingStartMs === 'number' && Number.isFinite(completingStartMs);
         const finalizingElapsedMs = isCompleting && hasCompletingStart
@@ -141,7 +143,7 @@ export default function UploadProgressList({
           <div
             key={item.id}
             role="listitem"
-            aria-label={`${item.file.name} — ${item.status}`}
+            aria-label={`${displayPath} — ${item.status}`}
             style={{
               padding: '12px 16px',
               borderBottom: `1px solid ${borderColor}`,
@@ -159,8 +161,9 @@ export default function UploadProgressList({
                   color: item.status === 'error' ? accentRed : textPrimary,
                 }}
                 ellipsis
+                title={item.key}
               >
-                {item.file.name}
+                {displayPath}
               </Text>
               <span
                 style={{
@@ -262,6 +265,11 @@ export default function UploadProgressList({
             {item.error && (
               <Text role="alert" style={{ fontSize: 11, color: accentRed }}>
                 {item.error}
+                {item.retryable === false && (
+                  <span style={{ display: 'block', marginTop: 2 }}>
+                    Retrying will not help. Fix the cause first, then upload the file again.
+                  </span>
+                )}
               </Text>
             )}
           </div>

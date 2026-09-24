@@ -156,14 +156,12 @@ interface Snapshot {
 const MAX_HISTORY = 60;
 
 interface Props {
-  onBack: () => void;
-  embedded?: boolean;
   search?: string;
   /** Running proxy version from the session-authenticated whoami (App owns it, as for Sidebar). */
   proxyVersion?: string;
 }
 
-export default function MetricsPage({ onBack, embedded, search, proxyVersion }: Props) {
+export default function MetricsPage({ search, proxyVersion }: Props) {
   const colors = useColors();
   const { navigate } = useNavigation();
   const [metricsMap, setMetricsMap] = useState<Map<string, ParsedMetric>>(new Map());
@@ -313,22 +311,12 @@ export default function MetricsPage({ onBack, embedded, search, proxyVersion }: 
   return (
     <div className="animate-fade-in" style={{ width: '100%', padding: 'clamp(14px, 1.8vw, 24px) clamp(12px, 1.6vw, 20px)' }}>
       <DashboardToolbar
-        // Inside admin settings the shared page header carries the title.
-        title={embedded ? undefined : 'Proxy Dashboard'}
         meta={<>v{buildVersion} · {backendType === 'mixed' ? 'mixed backends' : `${backendType} backend`} · up {uptimeStr}</>}
         view={activeView}
         onView={(v) => {
           setActiveView(v);
-          // Replace (not push) so toggling doesn't spam history. The base
-          // URL is context-dependent: embedded lives at /_/admin/dashboard,
-          // the standalone page at /_/metrics — so the same ?view= param
-          // deep-links correctly from either surface.
-          navigate(
-            embedded
-              ? buildViewUrl('admin', 'dashboard', { view: v })
-              : buildViewUrl('metrics', '', { view: v }),
-            { replace: true },
-          );
+          // Replace (not push) so toggling doesn't spam history.
+          navigate(buildViewUrl('admin', 'dashboard', { view: v }), { replace: true });
         }}
         cadence={cadence}
         onCadence={setCadence}
@@ -339,22 +327,6 @@ export default function MetricsPage({ onBack, embedded, search, proxyVersion }: 
       {error && (
         <div style={{ padding: '10px 14px', marginBottom: 12, background: colors.BG_CARD, border: `1px solid ${colors.ACCENT_RED}`, borderRadius: 8 }}>
           <Text style={{ color: colors.ACCENT_RED, fontSize: 13 }}>Failed to load metrics: {error}</Text>
-        </div>
-      )}
-
-      {/* Back button on non-embedded mount lives at the top, minimal. */}
-      {!embedded && (
-        <div style={{ marginBottom: 8 }}>
-          <button
-            onClick={onBack}
-            style={{
-              background: 'transparent', border: 'none', cursor: 'pointer',
-              color: colors.TEXT_SECONDARY, fontSize: 12, padding: '4px 0',
-              fontFamily: 'var(--font-ui)',
-            }}
-          >
-            ← Back
-          </button>
         </div>
       )}
 

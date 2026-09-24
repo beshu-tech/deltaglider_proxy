@@ -62,9 +62,9 @@ const ADMIN_ROUTES: Record<string, AdminRoute> = {
     ),
   },
   // The shared page header carries the title, like every other admin page;
-  // MetricsPage (embedded) drops its own title and keeps only its controls.
+  // MetricsPage shows only its controls.
   'dashboard': {
-    render: (c) => <MetricsPage onBack={c.onBack} embedded search={c.search} proxyVersion={c.proxyVersion} />,
+    render: (c) => <MetricsPage search={c.search} proxyVersion={c.proxyVersion} />,
   },
   'diagnostics/trace': {
     render: (c) => <TracePanel onSessionExpired={c.onSessionExpired} />,

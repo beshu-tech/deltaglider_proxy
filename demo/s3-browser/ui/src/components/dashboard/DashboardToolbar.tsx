@@ -2,8 +2,8 @@
  * DashboardToolbar — the top strip of the dashboard.
  *
  * One horizontal row:
- *   - Left: optional title (the standalone page only; inside admin settings
- *     the shared page header carries it) + meta (version · backend · uptime).
+ *   - Left: meta (version · backend · uptime). The admin page header
+ *     carries the title.
  *   - Right: labelled control groups — "View" (Monitoring / Analytics) and,
  *     on Monitoring, "Auto-refresh" (off / 5s / 30s) + manual Refresh.
  *
@@ -18,8 +18,6 @@ import { useColors } from '../../ThemeContext';
 export type RefreshCadence = 'off' | '5s' | '30s';
 
 interface Props {
-  /** Omitted inside admin settings, where the page header shows the title. */
-  title?: string;
   meta?: ReactNode;
   view: 'monitoring' | 'analytics';
   onView: (v: 'monitoring' | 'analytics') => void;
@@ -30,7 +28,6 @@ interface Props {
 }
 
 export default function DashboardToolbar({
-  title,
   meta,
   view,
   onView,
@@ -52,23 +49,7 @@ export default function DashboardToolbar({
         flexWrap: 'wrap',
       }}
     >
-      {/* Title (standalone only) + meta */}
       <div style={{ minWidth: 0, flex: '1 1 auto' }}>
-        {title && (
-          <div
-            style={{
-              fontSize: 18,
-              fontWeight: 700,
-              color: colors.TEXT_PRIMARY,
-              fontFamily: 'var(--font-ui)',
-              letterSpacing: '-0.01em',
-              lineHeight: 1.2,
-              marginBottom: 2,
-            }}
-          >
-            {title}
-          </div>
-        )}
         {meta && (
           <div
             style={{

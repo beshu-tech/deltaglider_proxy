@@ -644,6 +644,22 @@ export async function createBucket(name: string, backendName?: string): Promise<
   invalidateListBucketsCache();
 }
 
+/**
+ * How many objects the bucket holds, counted up to `cap` (one ListObjectsV2
+ * page). `truncated` means "at least `cap`". Used to decide whether Delete
+ * bucket can succeed before offering it.
+ */
+export async function countBucketObjects(
+  name: string,
+  cap = 1000,
+): Promise<{ count: number; truncated: boolean }> {
+  const resp = await sendCommand<ListObjectsV2CommandOutput>(
+    new ListObjectsV2Command({ Bucket: name, MaxKeys: cap }),
+    `Count objects in bucket ${name}`,
+  );
+  return { count: resp.KeyCount ?? resp.Contents?.length ?? 0, truncated: Boolean(resp.IsTruncated) };
+}
+
 export async function deleteBucket(name: string): Promise<void> {
   await sendCommand(
     new DeleteBucketCommand({ Bucket: name }),

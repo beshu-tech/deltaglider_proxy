@@ -12,10 +12,9 @@ import FilePreview from './components/FilePreview';
 import DropZone from './components/DropZone';
 import UploadPage from './components/UploadPage';
 import ConnectPage, { type ConnectOutcome } from './components/ConnectPage';
-// Heavy admin/docs/metrics pages are lazy-loaded so the file-browser
+// Heavy admin/docs pages are lazy-loaded so the file-browser
 // shell doesn't pay for Monaco / mermaid / recharts on first paint.
 const AdminPage = lazy(() => import('./components/AdminPage'));
-const MetricsPage = lazy(() => import('./components/MetricsPage'));
 const DocsPage = lazy(() => import('./components/DocsPage'));
 import FileBrowserSessionTip from './components/FileBrowserSessionTip';
 import AccountMenu from './components/AccountMenu';
@@ -36,9 +35,11 @@ import { useUrlRouter } from './useUrlRouter';
 import { buildViewUrl, buildBrowserUrl, type View } from './urlState';
 import { useOverlayClose } from './hooks/useOverlayClose';
 import type { S3Object } from './types';
+import { parentPrefix } from './utils';
 import { writeStorage } from './safeStorage';
 import { pageTitle } from './pageTitle';
 import { headerForPath } from './components/adminNavigation';
+import { identitySummary } from './identitySummary';
 
 const { Content } = Layout;
 const { useBreakpoint } = Grid;
@@ -46,7 +47,7 @@ const { useBreakpoint } = Grid;
 /** Full-screen views hide the main sidebar and TopBar */
 const FULLSCREEN_VIEWS: Set<View> = new Set(['admin', 'docs']);
 
-// Shared Suspense fallback for lazy admin / metrics / docs page chunks.
+// Shared Suspense fallback for lazy admin / docs page chunks.
 // Module-scope so we don't reallocate it on every render.
 const LAZY_FALLBACK = (
   <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 48 }}>
@@ -376,13 +377,16 @@ export default function App() {
   const canCopyFromActiveBucket = canReadSelected && canWriteActivePrefix;
   const canMoveFromActiveBucket = canCopyFromActiveBucket && canDeleteSelected;
   const canReadActiveBucket = !activeBucket || canUse(identity, 'read', activeBucket, s3.prefix) || canUse(identity, 'list', activeBucket, s3.prefix);
+  const who = identitySummary(identity, currentAccessKey);
+  const openSettings = () => navigate(buildViewUrl('admin'));
   const accountMenu = (includeBrowserToggles = false) => (
     <AccountMenu
-      identityLabel={identity?.user?.name || currentAccessKey || 'user'}
+      identityLabel={who.name}
+      identityDetail={who.detail}
       canAdmin={canAdmin}
-      onBrowserClick={() => navigate(buildViewUrl('browser'))}
-      onSettingsClick={() => navigate(buildViewUrl('admin'))}
-      onDocsClick={() => navigate(buildViewUrl('docs'))}
+      onBrowserClick={view === 'browser' ? undefined : () => navigate(buildViewUrl('browser'))}
+      onSettingsClick={view === 'admin' ? undefined : openSettings}
+      onDocsClick={view === 'docs' ? undefined : () => navigate(buildViewUrl('docs'))}
       onLogout={handleLogout}
       showHidden={includeBrowserToggles ? s3.showHidden : undefined}
       onToggleHidden={includeBrowserToggles ? () => s3.setShowHidden(!s3.showHidden) : undefined}
@@ -467,25 +471,6 @@ export default function App() {
       );
     }
 
-    if (view === 'metrics') {
-      if (!hasAdminSession) {
-        return (
-          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 48 }}>
-            <Empty
-              description="Sign in through Settings to view metrics and analytics. You are currently signed in for browsing files only (for example after using an access key on the sign-in screen)."
-            >
-              <Button type="primary" onClick={navigateToBrowse}>Back to Browser</Button>
-            </Empty>
-          </div>
-        );
-      }
-      return (
-        <Suspense fallback={LAZY_FALLBACK}>
-          <MetricsPage onBack={navigateToBrowse} search={search} proxyVersion={identity?.version} />
-        </Suspense>
-      );
-    }
-
     if (view === 'docs') {
       return (
         <Suspense fallback={LAZY_FALLBACK}>
@@ -562,6 +547,7 @@ export default function App() {
             onMove={canMoveFromActiveBucket && hasAdminSession ? s3.bulkMove : undefined}
             onDownloadZip={canReadSelected && hasAdminSession ? s3.downloadZip : undefined}
             deleting={s3.deleting}
+            currentPrefix={s3.prefix}
             hint={
               hasAdminSession
                 ? undefined
@@ -622,17 +608,32 @@ export default function App() {
             </div>
           ) : isEmpty ? (
             <Empty
-              description={
+              description={<span style={{ display: 'inline-block', maxWidth: 520 }}>{
                 s3.searchQuery
                   ? `No results for "${s3.searchQuery}"`
                   : hasNoBuckets
                     ? 'Create a bucket before uploading objects or generating demo data.'
                     : s3.prefix
-                      ? 'This folder is empty.'
+                      // The proxy stores no folder markers: a folder exists
+                      // only while it holds files, so an empty listing here
+                      // is as likely a typo in the path as an empty folder.
+                      ? `Nothing is stored under ${activeBucket}/${s3.prefix}. A folder exists only while it holds files, so check the path for a typo${canUploadToActiveBucket ? ', or upload files to create it' : ''}.`
                       : 'No objects yet. Upload files or generate demo data.'
-              }
+              }</span>}
               style={{ padding: '64px 0' }}
             >
+              {s3.prefix && !s3.searchQuery && (
+                <Space size={16} wrap style={{ justifyContent: 'center' }}>
+                  {canUploadToActiveBucket && (
+                    <Button type="primary" onClick={openUpload}>
+                      Upload files here
+                    </Button>
+                  )}
+                  <Button onClick={() => s3.navigate(parentPrefix(s3.prefix))}>
+                    {parentPrefix(s3.prefix) ? 'Go to the parent folder' : `Go to ${activeBucket}`}
+                  </Button>
+                </Space>
+              )}
               {hasNoBuckets && canCreateBucket && (
                 <Button type="link" onClick={requestCreateBucket} style={{ paddingInline: 0 }}>
                   Create a bucket
@@ -728,6 +729,7 @@ export default function App() {
               canAdmin={canAdmin}
               onShowShortcuts={showShortcuts}
               accountMenu={accountMenu(true)}
+              onOpenSettings={canAdmin ? openSettings : undefined}
               deltaSummary={view === 'browser' ? s3.deltaSummary : null}
             />
           )}
