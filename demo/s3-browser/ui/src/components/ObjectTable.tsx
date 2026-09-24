@@ -380,12 +380,15 @@ export default function ObjectTable({
       key: 'name',
       sorter: true, // ordering lives in sortRows (browserNav.ts)
       sortOrder: sortOrderFor('name'),
+      // `ellipsis` sets no title for a rendered (non-string) cell, and AntD
+      // tooltips are hidden globally: the cells carry a native `title` instead.
       ellipsis: true,
       render: (_: unknown, record: RowData) => {
         if (record._isFolder) {
           return (
             <button
               className="btn-reset"
+              title={record.name}
               onClick={() => guardedNavigate(record.key.replace('folder:', ''))}
               style={{ fontWeight: 500, color: TEXT_PRIMARY, gap: 8, fontFamily: "var(--font-ui)" }}
             >
@@ -403,7 +406,7 @@ export default function ObjectTable({
           );
         }
         return (
-          <span data-testid={`object-row-${record.name}`} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span data-testid={`object-row-${record.name}`} title={record.name} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <FileOutlined aria-hidden="true" style={{ color: fileIconColor(record.name), fontSize: 14 }} />
             <span style={{ fontFamily: "var(--font-mono)", fontSize: 13, color: TEXT_PRIMARY, cursor: 'pointer', flex: 1 }}>
               {record.name}
