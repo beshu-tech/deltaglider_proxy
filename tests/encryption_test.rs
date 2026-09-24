@@ -44,6 +44,18 @@ fn encrypted_builder() -> common::TestServerBuilder {
         .encryption_key(TEST_KEY)
 }
 
+/// The key lives in the YAML file, not in `DGP_ENCRYPTION_KEY`. Tests that
+/// rotate the key through the admin API need this: an env-provided key keeps
+/// winning at runtime, so a GUI rotation would never take effect.
+fn yaml_keyed_builder() -> common::TestServerBuilder {
+    TestServer::builder()
+        .bucket(BUCKET)
+        .auth("ENCKEY", "ENCSECRET")
+        .extra_yaml_root(&format!(
+            "backend_encryption:\n  mode: aes256-gcm-proxy\n  key: \"{TEST_KEY}\"\n"
+        ))
+}
+
 // ═══════════════════════════════════════════════════
 // Basic encrypted PUT/GET
 // ═══════════════════════════════════════════════════
@@ -889,7 +901,7 @@ async fn test_section_put_absent_field_preserves_per_backend_encryption_key() {
 /// admin UI can show a clear rejection before the config lands.
 #[tokio::test]
 async fn test_invalid_per_backend_encryption_key_rejected() {
-    let server = encrypted_builder().build().await;
+    let server = yaml_keyed_builder().build().await;
     let http = common::admin_http_client(&server.endpoint()).await;
 
     // Try to rotate the singleton backend to a key that isn't
@@ -986,7 +998,7 @@ async fn test_get_config_exposes_per_backend_encryption_summary() {
 /// diff must NOT leak the underlying key material.
 #[tokio::test]
 async fn test_section_put_key_rotation_surfaces_fingerprint_diff() {
-    let server = encrypted_builder().build().await;
+    let server = yaml_keyed_builder().build().await;
     let http = common::admin_http_client(&server.endpoint()).await;
 
     // Rotate to a new key. /validate returns the diff without

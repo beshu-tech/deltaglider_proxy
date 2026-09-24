@@ -2,43 +2,43 @@
 
 //! Which admin-GUI fields an environment variable currently controls.
 //!
-//! `Config::apply_env_overrides` makes `DGP_*` variables win over the YAML
-//! file. The admin GUI must show that: a field whose value comes from the
-//! environment is read-only in practice (an edit is persisted to YAML and then
-//! overridden again at the next start). [`env_overrides`] reports, for each
-//! GUI-visible field, whether its variable is set and applied, and the
-//! effective value — never the value of a secret.
+//! `Config::apply_env_overrides_with` makes `DGP_*` variables win over the
+//! YAML file (at boot and again on every admin apply). The admin GUI must
+//! show that: a field whose value comes from the environment is read-only.
+//! [`env_overrides`] reports every such field with its effective value —
+//! never the value of a secret.
 //!
-//! Pure: the environment lookup is injected, so the truth table is unit-tested
-//! without touching the process environment.
+//! Some variables control a whole block, not one field: an S3 activator
+//! (`DGP_S3_ENDPOINT` / `DGP_S3_REGION`) replaces the whole
+//! `storage.backend` block, and `DGP_TLS_ENABLED=true` replaces the whole
+//! `advanced.tls` block. Members whose own variable is unset are reported
+//! too (`set: false`, `activated_by` names the activator), with the default
+//! the override puts there.
+//!
+//! Pure: the environment lookup and the config are injected. A drift test
+//! (below) runs the real `apply_env_overrides_with` with a recording lookup
+//! and fails when it reads a variable this module does not report.
 
+use super::{backend_encryption_env_names, BackendEncryptionConfig, Config, EnvLookup};
 use serde::Serialize;
 
-/// How `apply_env_overrides` parses the variable. A value that does not parse
-/// is ignored there (with a warning), so it is not an override here either.
+/// How `apply_env_overrides_with` parses the variable. A value that does not
+/// parse is ignored there (with a warning), so it is not an override here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvValueKind {
     Text,
+    /// Applies only when not blank (`DGP_CONFIG_SYNC_KEY`).
+    NonBlankText,
     Unsigned,
     Float,
     SocketAddr,
-    /// Only a truthy value applies (`DGP_TLS_ENABLED=false` changes nothing).
-    TruthyFlag,
+    /// A boolean; an unrecognised value falls back to the default.
+    Bool {
+        default: bool,
+    },
 }
 
-/// Extra condition from `apply_env_overrides` for the variable to apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EnvGuard {
-    Always,
-    /// Applies only when the named flag variable is truthy.
-    FlagSet(&'static str),
-    /// Applies only when at least one of these variables is set.
-    AnySet(&'static [&'static str]),
-    /// Applies only when none of these variables is set.
-    NoneSet(&'static [&'static str]),
-}
-
-/// One GUI field that a `DGP_*` variable can control.
+/// One GUI field that a `DGP_*` variable controls on its own.
 #[derive(Debug, Clone, Copy)]
 pub struct EnvFieldBinding {
     pub env: &'static str,
@@ -47,10 +47,21 @@ pub struct EnvFieldBinding {
     pub yaml_path: Option<&'static str>,
     pub kind: EnvValueKind,
     pub secret: bool,
-    pub guard: EnvGuard,
 }
 
-const S3_ACTIVATORS: &[&str] = &["DGP_S3_ENDPOINT", "DGP_S3_REGION"];
+/// One member of a block that an activator variable replaces as a whole.
+#[derive(Debug, Clone, Copy)]
+pub struct EnvBlockMember {
+    pub env: &'static str,
+    pub yaml_path: &'static str,
+    pub kind: EnvValueKind,
+    pub secret: bool,
+    /// What the override puts in the field when `env` is unset.
+    pub unset_value: Option<&'static str>,
+}
+
+pub const S3_ACTIVATORS: &[&str] = &["DGP_S3_ENDPOINT", "DGP_S3_REGION"];
+pub const TLS_FLAG: &str = "DGP_TLS_ENABLED";
 
 const fn bind(env: &'static str, yaml_path: &'static str, kind: EnvValueKind) -> EnvFieldBinding {
     EnvFieldBinding {
@@ -58,7 +69,6 @@ const fn bind(env: &'static str, yaml_path: &'static str, kind: EnvValueKind) ->
         yaml_path: Some(yaml_path),
         kind,
         secret: false,
-        guard: EnvGuard::Always,
     }
 }
 
@@ -68,12 +78,26 @@ const fn env_only(env: &'static str) -> EnvFieldBinding {
         yaml_path: None,
         kind: EnvValueKind::Unsigned,
         secret: false,
-        guard: EnvGuard::Always,
     }
 }
 
-/// Mirrors `Config::apply_env_overrides` for every field the GUI edits, plus
-/// the env-only request limits the System page shows.
+const fn member(
+    env: &'static str,
+    yaml_path: &'static str,
+    kind: EnvValueKind,
+    secret: bool,
+    unset_value: Option<&'static str>,
+) -> EnvBlockMember {
+    EnvBlockMember {
+        env,
+        yaml_path,
+        kind,
+        secret,
+        unset_value,
+    }
+}
+
+/// Variables that control exactly one field.
 pub const ENV_FIELD_BINDINGS: &[EnvFieldBinding] = &[
     bind(
         "DGP_LISTEN_ADDR",
@@ -88,6 +112,11 @@ pub const ENV_FIELD_BINDINGS: &[EnvFieldBinding] = &[
     bind(
         "DGP_MAX_OBJECT_SIZE",
         "advanced.max_object_size",
+        EnvValueKind::Unsigned,
+    ),
+    bind(
+        "DGP_MAX_PASSTHROUGH_OBJECT_SIZE",
+        "advanced.max_passthrough_object_size",
         EnvValueKind::Unsigned,
     ),
     bind(
@@ -117,18 +146,10 @@ pub const ENV_FIELD_BINDINGS: &[EnvFieldBinding] = &[
         EnvValueKind::Text,
     ),
     bind(
-        "DGP_TLS_ENABLED",
-        "advanced.tls.enabled",
-        EnvValueKind::TruthyFlag,
+        "DGP_CONFIG_SYNC_KEY",
+        "advanced.config_sync_object_key",
+        EnvValueKind::NonBlankText,
     ),
-    EnvFieldBinding {
-        guard: EnvGuard::FlagSet("DGP_TLS_ENABLED"),
-        ..bind("DGP_TLS_CERT", "advanced.tls.cert_path", EnvValueKind::Text)
-    },
-    EnvFieldBinding {
-        guard: EnvGuard::FlagSet("DGP_TLS_ENABLED"),
-        ..bind("DGP_TLS_KEY", "advanced.tls.key_path", EnvValueKind::Text)
-    },
     bind(
         "DGP_AUTHENTICATION",
         "access.authentication",
@@ -147,54 +168,118 @@ pub const ENV_FIELD_BINDINGS: &[EnvFieldBinding] = &[
             EnvValueKind::Text,
         )
     },
-    // Legacy single-backend shape (`storage.backend`).
-    bind(
-        "DGP_S3_ENDPOINT",
-        "storage.backend.endpoint",
-        EnvValueKind::Text,
-    ),
-    bind(
-        "DGP_S3_REGION",
-        "storage.backend.region",
-        EnvValueKind::Text,
-    ),
-    EnvFieldBinding {
-        guard: EnvGuard::AnySet(S3_ACTIVATORS),
-        ..bind(
-            "DGP_BE_AWS_ACCESS_KEY_ID",
-            "storage.backend.access_key_id",
-            EnvValueKind::Text,
-        )
-    },
-    EnvFieldBinding {
-        guard: EnvGuard::AnySet(S3_ACTIVATORS),
-        secret: true,
-        ..bind(
-            "DGP_BE_AWS_SECRET_ACCESS_KEY",
-            "storage.backend.secret_access_key",
-            EnvValueKind::Text,
-        )
-    },
-    EnvFieldBinding {
-        guard: EnvGuard::NoneSet(S3_ACTIVATORS),
-        ..bind("DGP_DATA_DIR", "storage.backend.path", EnvValueKind::Text)
-    },
     env_only("DGP_REQUEST_TIMEOUT_SECS"),
     env_only("DGP_MAX_CONCURRENT_REQUESTS"),
     env_only("DGP_MAX_MULTIPART_UPLOADS"),
 ];
 
+/// The legacy singleton backend when an S3 activator is set: the WHOLE
+/// `storage.backend` block comes from the environment.
+pub const S3_BLOCK: &[EnvBlockMember] = &[
+    member(
+        "DGP_S3_ENDPOINT",
+        "storage.backend.endpoint",
+        EnvValueKind::Text,
+        false,
+        None,
+    ),
+    member(
+        "DGP_S3_REGION",
+        "storage.backend.region",
+        EnvValueKind::Text,
+        false,
+        Some("us-east-1"),
+    ),
+    member(
+        "DGP_S3_PATH_STYLE",
+        "storage.backend.force_path_style",
+        EnvValueKind::Bool { default: true },
+        false,
+        Some("true"),
+    ),
+    member(
+        "DGP_BE_AWS_ACCESS_KEY_ID",
+        "storage.backend.access_key_id",
+        EnvValueKind::Text,
+        false,
+        None,
+    ),
+    member(
+        "DGP_BE_AWS_SECRET_ACCESS_KEY",
+        "storage.backend.secret_access_key",
+        EnvValueKind::Text,
+        true,
+        None,
+    ),
+    member(
+        "DGP_BACKEND_ALLOW_LOCAL",
+        "storage.backend.allow_local",
+        EnvValueKind::Bool { default: false },
+        false,
+        Some("false"),
+    ),
+];
+
+/// `DGP_TLS_ENABLED=true` replaces the WHOLE `advanced.tls` block.
+pub const TLS_BLOCK: &[EnvBlockMember] = &[
+    member(
+        "DGP_TLS_CERT",
+        "advanced.tls.cert_path",
+        EnvValueKind::Text,
+        false,
+        None,
+    ),
+    member(
+        "DGP_TLS_KEY",
+        "advanced.tls.key_path",
+        EnvValueKind::Text,
+        false,
+        None,
+    ),
+];
+
+pub const BACKEND_TYPE_PATH: &str = "storage.backend.type";
+pub const BACKEND_PATH_PATH: &str = "storage.backend.path";
+pub const DATA_DIR: &str = "DGP_DATA_DIR";
+
+/// Variables `apply_env_overrides_with` reads that the GUI never shows,
+/// with the reason. The drift test accepts these and nothing else unbound.
+pub const NOT_GUI_VISIBLE: &[(&str, &str)] = &[
+    (
+        "DGP_BOOTSTRAP_PASSWORD_HASH",
+        "infra secret; never persisted, rotated with PUT /api/admin/password",
+    ),
+    (
+        "DGP_ADMIN_PASSWORD_HASH",
+        "legacy alias of DGP_BOOTSTRAP_PASSWORD_HASH",
+    ),
+];
+
+/// YAML path of a backend's encryption field. The singleton backend
+/// ("default" with no named list) lives under `storage.backend_encryption`.
+pub fn backend_encryption_path(backend_name: Option<&str>, field: &str) -> String {
+    match backend_name {
+        None => format!("storage.backend_encryption.{field}"),
+        Some(name) => format!("storage.backends[{name}].encryption.{field}"),
+    }
+}
+
 /// One field whose value currently comes from the environment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EnvOverride {
-    pub env: &'static str,
+    pub env: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub yaml_path: Option<&'static str>,
+    pub yaml_path: Option<String>,
     pub secret: bool,
-    /// The effective value. `None` for secrets: the GUI shows only that the
-    /// value is set from the environment.
+    /// The effective value. `None` for secrets (the GUI shows only that the
+    /// value comes from the environment) and for block members left unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// `false` when `env` itself is unset and the field is env-controlled
+    /// only because `activated_by` replaced its whole block.
+    pub set: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activated_by: Option<String>,
 }
 
 /// Same truth table as `env_bool`.
@@ -206,67 +291,194 @@ fn parse_bool(raw: &str) -> Option<bool> {
     }
 }
 
-/// The value `apply_env_overrides` would apply, or `None` when it would
-/// ignore the variable.
+/// The value the override applies, or `None` when it ignores the variable.
 fn applied_value(kind: EnvValueKind, raw: &str) -> Option<String> {
     match kind {
         EnvValueKind::Text => Some(raw.to_string()),
+        EnvValueKind::NonBlankText => (!raw.trim().is_empty()).then(|| raw.to_string()),
         EnvValueKind::Unsigned => raw.parse::<u64>().ok().map(|v| v.to_string()),
         EnvValueKind::Float => raw.parse::<f32>().ok().map(|v| v.to_string()),
         EnvValueKind::SocketAddr => raw
             .parse::<std::net::SocketAddr>()
             .ok()
             .map(|v| v.to_string()),
-        EnvValueKind::TruthyFlag => (parse_bool(raw) == Some(true)).then(|| "true".to_string()),
+        EnvValueKind::Bool { default } => Some(parse_bool(raw).unwrap_or(default).to_string()),
     }
 }
 
-fn guard_holds(guard: EnvGuard, lookup: &dyn Fn(&str) -> Option<String>) -> bool {
-    match guard {
-        EnvGuard::Always => true,
-        EnvGuard::FlagSet(flag) => lookup(flag).and_then(|v| parse_bool(&v)) == Some(true),
-        EnvGuard::AnySet(vars) => vars.iter().any(|v| lookup(v).is_some()),
-        EnvGuard::NoneSet(vars) => vars.iter().all(|v| lookup(v).is_none()),
+fn shown(secret: bool, value: String) -> Option<String> {
+    (!secret).then_some(value)
+}
+
+fn block(out: &mut Vec<EnvOverride>, members: &[EnvBlockMember], activator: &str, env: EnvLookup) {
+    for m in members {
+        let entry = match env(m.env) {
+            Some(raw) => EnvOverride {
+                env: m.env.to_string(),
+                yaml_path: Some(m.yaml_path.to_string()),
+                secret: m.secret,
+                value: applied_value(m.kind, &raw).and_then(|v| shown(m.secret, v)),
+                set: true,
+                activated_by: (m.env != activator).then(|| activator.to_string()),
+            },
+            None => EnvOverride {
+                env: m.env.to_string(),
+                yaml_path: Some(m.yaml_path.to_string()),
+                secret: m.secret,
+                value: m.unset_value.map(str::to_string),
+                set: false,
+                activated_by: Some(activator.to_string()),
+            },
+        };
+        out.push(entry);
     }
 }
 
-/// Every GUI field whose value the environment currently controls.
-pub fn env_overrides(lookup: &dyn Fn(&str) -> Option<String>) -> Vec<EnvOverride> {
-    ENV_FIELD_BINDINGS
-        .iter()
-        .filter(|b| guard_holds(b.guard, lookup))
-        .filter_map(|b| {
-            let value = applied_value(b.kind, &lookup(b.env)?)?;
-            Some(EnvOverride {
-                env: b.env,
-                yaml_path: b.yaml_path,
+/// Every GUI field whose value the environment currently controls, for the
+/// running config `cfg` (its backend names and encryption modes decide which
+/// per-backend encryption variables apply).
+pub fn env_overrides(cfg: &Config, env: EnvLookup) -> Vec<EnvOverride> {
+    let mut out = Vec::new();
+    for b in ENV_FIELD_BINDINGS {
+        if let Some(value) = env(b.env).and_then(|raw| applied_value(b.kind, &raw)) {
+            out.push(EnvOverride {
+                env: b.env.to_string(),
+                yaml_path: b.yaml_path.map(str::to_string),
                 secret: b.secret,
-                value: (!b.secret).then_some(value),
-            })
-        })
-        .collect()
+                value: shown(b.secret, value),
+                set: true,
+                activated_by: None,
+            });
+        }
+    }
+
+    // Legacy singleton backend block.
+    if let Some(activator) = S3_ACTIVATORS.iter().find(|v| env(v).is_some()) {
+        block(&mut out, S3_BLOCK, activator, env);
+        out.push(EnvOverride {
+            env: activator.to_string(),
+            yaml_path: Some(BACKEND_TYPE_PATH.to_string()),
+            secret: false,
+            value: Some("s3".into()),
+            set: true,
+            activated_by: None,
+        });
+        // The filesystem path is not used: the block is an S3 backend now.
+        out.push(EnvOverride {
+            env: DATA_DIR.to_string(),
+            yaml_path: Some(BACKEND_PATH_PATH.to_string()),
+            secret: false,
+            value: None,
+            set: false,
+            activated_by: Some(activator.to_string()),
+        });
+    } else if let Some(dir) = env(DATA_DIR) {
+        for (path, value) in [
+            (BACKEND_TYPE_PATH, "filesystem"),
+            (BACKEND_PATH_PATH, dir.as_str()),
+        ] {
+            out.push(EnvOverride {
+                env: DATA_DIR.to_string(),
+                yaml_path: Some(path.to_string()),
+                secret: false,
+                value: Some(value.to_string()),
+                set: true,
+                activated_by: None,
+            });
+        }
+    }
+
+    // TLS block.
+    if env(TLS_FLAG).and_then(|v| parse_bool(&v)) == Some(true) {
+        out.push(EnvOverride {
+            env: TLS_FLAG.to_string(),
+            yaml_path: Some("advanced.tls.enabled".into()),
+            secret: false,
+            value: Some("true".into()),
+            set: true,
+            activated_by: None,
+        });
+        block(&mut out, TLS_BLOCK, TLS_FLAG, env);
+    }
+
+    // Per-backend encryption: the variable applies only in the matching mode.
+    let singleton = std::iter::once((None, "default", &cfg.backend_encryption));
+    let named = cfg
+        .backends
+        .iter()
+        .map(|b| (Some(b.name.as_str()), b.name.as_str(), &b.encryption));
+    for (path_name, env_name, enc) in singleton.chain(named) {
+        let (key_env, kms_env) = backend_encryption_env_names(env_name);
+        let (var, field, secret) = match enc {
+            BackendEncryptionConfig::Aes256GcmProxy { .. } => (key_env, "key", true),
+            BackendEncryptionConfig::SseKms { .. } => (kms_env, "kms_key_id", false),
+            _ => continue,
+        };
+        if let Some(raw) = env(&var).filter(|v| !v.is_empty()) {
+            out.push(EnvOverride {
+                env: var,
+                yaml_path: Some(backend_encryption_path(path_name, field)),
+                secret,
+                value: shown(secret, raw),
+                set: true,
+                activated_by: None,
+            });
+        }
+    }
+    out
 }
 
 /// [`env_overrides`] against the real process environment.
-pub fn process_env_overrides() -> Vec<EnvOverride> {
-    env_overrides(&|name| std::env::var(name).ok())
+pub fn process_env_overrides(cfg: &Config) -> Vec<EnvOverride> {
+    env_overrides(cfg, &super::process_env)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::cell::RefCell;
+    use std::collections::{BTreeSet, HashMap};
 
-    fn run(vars: &[(&str, &str)]) -> Vec<EnvOverride> {
+    fn lookup(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = vars
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        env_overrides(&move |name| map.get(name).cloned())
+        move |name: &str| map.get(name).cloned()
     }
 
-    fn find<'a>(out: &'a [EnvOverride], env: &str) -> Option<&'a EnvOverride> {
+    fn run(vars: &[(&str, &str)]) -> Vec<EnvOverride> {
+        env_overrides(&Config::default(), &lookup(vars))
+    }
+
+    fn at<'a>(out: &'a [EnvOverride], path: &str) -> Option<&'a EnvOverride> {
+        out.iter().find(|o| o.yaml_path.as_deref() == Some(path))
+    }
+
+    fn by_env<'a>(out: &'a [EnvOverride], env: &str) -> Option<&'a EnvOverride> {
         out.iter().find(|o| o.env == env)
+    }
+
+    /// A config with every encryption mode the per-backend variables act on.
+    fn encrypted_config() -> Config {
+        let yaml = r#"
+storage:
+  backend_encryption:
+    mode: aes256-gcm-proxy
+  backends:
+    - name: eu-archive
+      type: filesystem
+      path: /tmp/a
+      encryption:
+        mode: aes256-gcm-proxy
+    - name: kms-one
+      type: filesystem
+      path: /tmp/b
+      encryption:
+        mode: sse-kms
+        kms_key_id: arn:file
+"#;
+        Config::from_yaml_str(yaml).unwrap()
     }
 
     #[test]
@@ -280,101 +492,248 @@ mod tests {
         assert_eq!(
             out,
             vec![EnvOverride {
-                env: "DGP_CACHE_MB",
-                yaml_path: Some("advanced.cache_size_mb"),
+                env: "DGP_CACHE_MB".into(),
+                yaml_path: Some("advanced.cache_size_mb".into()),
                 secret: false,
                 value: Some("2048".into()),
+                set: true,
+                activated_by: None,
             }]
         );
     }
 
     #[test]
     fn secrets_never_carry_their_value() {
-        let out = run(&[
-            ("DGP_ACCESS_KEY_ID", "AKIAENV"),
-            ("DGP_SECRET_ACCESS_KEY", "super-secret"),
-        ]);
+        let out = env_overrides(
+            &encrypted_config(),
+            &lookup(&[
+                ("DGP_ACCESS_KEY_ID", "AKIAENV"),
+                ("DGP_SECRET_ACCESS_KEY", "super-secret"),
+                ("DGP_S3_ENDPOINT", "http://s3"),
+                ("DGP_BE_AWS_SECRET_ACCESS_KEY", "be-secret"),
+                ("DGP_ENCRYPTION_KEY", "enc-secret"),
+                ("DGP_BACKEND_EU_ARCHIVE_ENCRYPTION_KEY", "enc2-secret"),
+            ]),
+        );
         assert_eq!(
-            find(&out, "DGP_ACCESS_KEY_ID").unwrap().value.as_deref(),
+            by_env(&out, "DGP_ACCESS_KEY_ID").unwrap().value.as_deref(),
             Some("AKIAENV")
         );
-        let secret = find(&out, "DGP_SECRET_ACCESS_KEY").unwrap();
-        assert!(secret.secret);
-        assert_eq!(secret.value, None);
+        for o in out.iter().filter(|o| o.secret) {
+            assert_eq!(o.value, None, "{o:?}");
+        }
         let json = serde_json::to_string(&out).unwrap();
-        assert!(!json.contains("super-secret"), "secret leaked: {json}");
+        for leak in ["super-secret", "be-secret", "enc-secret", "enc2-secret"] {
+            assert!(!json.contains(leak), "{leak} leaked: {json}");
+        }
     }
 
     #[test]
     fn unparseable_values_are_not_overrides() {
-        // apply_env_overrides ignores these, so the YAML value still wins.
         let out = run(&[
             ("DGP_CACHE_MB", "lots"),
             ("DGP_LISTEN_ADDR", "not-an-addr"),
             ("DGP_MAX_DELTA_RATIO", "x"),
+            ("DGP_CONFIG_SYNC_KEY", "  "),
         ]);
         assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]
-    fn tls_flag_applies_only_when_truthy_and_gates_paths() {
-        let off = run(&[("DGP_TLS_ENABLED", "false"), ("DGP_TLS_CERT", "/c.pem")]);
-        assert!(off.is_empty(), "{off:?}");
-        let on = run(&[("DGP_TLS_ENABLED", "yes"), ("DGP_TLS_CERT", "/c.pem")]);
+    fn s3_activator_puts_the_whole_backend_block_under_env_control() {
+        let out = run(&[("DGP_S3_ENDPOINT", "http://minio:9000")]);
+        let region = at(&out, "storage.backend.region").unwrap();
+        assert_eq!(region.value.as_deref(), Some("us-east-1"));
+        assert!(!region.set);
+        assert_eq!(region.activated_by.as_deref(), Some("DGP_S3_ENDPOINT"));
+        let secret = at(&out, "storage.backend.secret_access_key").unwrap();
+        assert!(secret.secret && !secret.set && secret.value.is_none());
         assert_eq!(
-            find(&on, "DGP_TLS_ENABLED").unwrap().value.as_deref(),
+            at(&out, "storage.backend.force_path_style")
+                .unwrap()
+                .value
+                .as_deref(),
             Some("true")
         );
         assert_eq!(
-            find(&on, "DGP_TLS_CERT").unwrap().yaml_path,
-            Some("advanced.tls.cert_path")
+            at(&out, "storage.backend.allow_local")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("false")
         );
+        assert_eq!(
+            at(&out, BACKEND_TYPE_PATH).unwrap().value.as_deref(),
+            Some("s3")
+        );
+        assert!(at(&out, BACKEND_PATH_PATH).is_some());
+        let endpoint = at(&out, "storage.backend.endpoint").unwrap();
+        assert!(endpoint.set && endpoint.activated_by.is_none());
     }
 
     #[test]
-    fn backend_vars_follow_the_s3_versus_filesystem_switch() {
-        // Backend credentials apply only when an S3 activator is set.
-        let no_s3 = run(&[("DGP_BE_AWS_ACCESS_KEY_ID", "k")]);
-        assert!(no_s3.is_empty());
-        // DGP_DATA_DIR loses to the S3 activators.
+    fn data_dir_loses_to_the_s3_activators() {
         let both = run(&[("DGP_S3_REGION", "eu"), ("DGP_DATA_DIR", "/d")]);
-        assert!(find(&both, "DGP_DATA_DIR").is_none());
-        assert!(find(&both, "DGP_S3_REGION").is_some());
+        assert_eq!(
+            at(&both, BACKEND_TYPE_PATH).unwrap().value.as_deref(),
+            Some("s3")
+        );
+        assert!(!at(&both, BACKEND_PATH_PATH).unwrap().set);
         let fs = run(&[("DGP_DATA_DIR", "/d")]);
         assert_eq!(
-            find(&fs, "DGP_DATA_DIR").unwrap().yaml_path,
-            Some("storage.backend.path")
+            at(&fs, BACKEND_PATH_PATH).unwrap().value.as_deref(),
+            Some("/d")
         );
+        assert_eq!(
+            at(&fs, BACKEND_TYPE_PATH).unwrap().value.as_deref(),
+            Some("filesystem")
+        );
+        // Backend credentials alone change nothing.
+        assert!(run(&[("DGP_BE_AWS_ACCESS_KEY_ID", "k")]).is_empty());
+    }
+
+    #[test]
+    fn tls_flag_controls_the_whole_block() {
+        assert!(run(&[("DGP_TLS_ENABLED", "false"), ("DGP_TLS_CERT", "/c.pem")]).is_empty());
+        let on = run(&[("DGP_TLS_ENABLED", "yes")]);
+        assert_eq!(
+            at(&on, "advanced.tls.enabled").unwrap().value.as_deref(),
+            Some("true")
+        );
+        let cert = at(&on, "advanced.tls.cert_path").unwrap();
+        assert!(!cert.set && cert.value.is_none());
+        assert_eq!(cert.activated_by.as_deref(), Some("DGP_TLS_ENABLED"));
+    }
+
+    #[test]
+    fn per_backend_encryption_follows_the_mode() {
+        let cfg = encrypted_config();
+        let out = env_overrides(
+            &cfg,
+            &lookup(&[
+                ("DGP_ENCRYPTION_KEY", "k0"),
+                ("DGP_BACKEND_EU_ARCHIVE_ENCRYPTION_KEY", "k1"),
+                ("DGP_BACKEND_KMS_ONE_SSE_KMS_KEY_ID", "arn:env"),
+                // Wrong mode for this backend: ignored.
+                ("DGP_BACKEND_KMS_ONE_ENCRYPTION_KEY", "k2"),
+            ]),
+        );
+        assert!(at(&out, "storage.backend_encryption.key").unwrap().secret);
+        assert!(at(&out, "storage.backends[eu-archive].encryption.key").is_some());
+        assert_eq!(
+            at(&out, "storage.backends[kms-one].encryption.kms_key_id")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("arn:env")
+        );
+        assert!(by_env(&out, "DGP_BACKEND_KMS_ONE_ENCRYPTION_KEY").is_none());
     }
 
     #[test]
     fn env_only_limits_have_no_yaml_path() {
         let out = run(&[("DGP_REQUEST_TIMEOUT_SECS", "60")]);
-        let o = find(&out, "DGP_REQUEST_TIMEOUT_SECS").unwrap();
+        let o = by_env(&out, "DGP_REQUEST_TIMEOUT_SECS").unwrap();
         assert_eq!(o.yaml_path, None);
         assert_eq!(o.value.as_deref(), Some("60"));
     }
 
+    /// A value every override accepts.
+    fn plausible(name: &str) -> String {
+        match name {
+            "DGP_LISTEN_ADDR" => "127.0.0.1:1".into(),
+            "DGP_TLS_ENABLED" => "true".into(),
+            _ => "1".into(),
+        }
+    }
+
+    /// Every variable the real override code reads, in both backend branches.
+    fn variables_read_by_apply() -> BTreeSet<String> {
+        let read = RefCell::new(BTreeSet::new());
+        for with_s3 in [true, false] {
+            let env = |name: &str| {
+                read.borrow_mut().insert(name.to_string());
+                if !with_s3 && S3_ACTIVATORS.contains(&name) {
+                    return None;
+                }
+                Some(plausible(name))
+            };
+            encrypted_config().apply_env_overrides_with(&env);
+        }
+        read.into_inner()
+    }
+
+    /// Every variable `env_overrides` can report, in both backend branches.
+    fn variables_reported() -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        for with_s3 in [true, false] {
+            let env = |name: &str| {
+                if !with_s3 && S3_ACTIVATORS.contains(&name) {
+                    return None;
+                }
+                Some(plausible(name))
+            };
+            for o in env_overrides(&encrypted_config(), &env) {
+                names.insert(o.env);
+            }
+        }
+        names
+    }
+
+    /// Drift guard: a variable the overrides read must be shown to the GUI or
+    /// be listed in NOT_GUI_VISIBLE with a reason.
     #[test]
-    fn every_binding_is_a_registered_env_var() {
-        let registry: Vec<&str> = super::super::ENV_VAR_REGISTRY
-            .iter()
-            .map(|e| e.name)
-            .collect();
-        for b in ENV_FIELD_BINDINGS {
+    fn every_variable_the_overrides_read_is_reported_or_exempt() {
+        let reported = variables_reported();
+        let exempt: BTreeSet<&str> = NOT_GUI_VISIBLE.iter().map(|(n, _)| *n).collect();
+        for name in variables_read_by_apply() {
             assert!(
-                registry.contains(&b.env),
-                "{} not in ENV_VAR_REGISTRY",
-                b.env
+                reported.contains(&name) || exempt.contains(name.as_str()),
+                "{name} is read by apply_env_overrides_with but neither reported by \
+                 env_overrides nor listed in NOT_GUI_VISIBLE"
             );
         }
     }
 
+    /// Deny-list: a variable whose name says it holds a secret must be marked
+    /// secret, so its value never reaches the GUI. Names ending in `_KEY_ID`
+    /// are identifiers; the two listed below name a file path and an object key.
     #[test]
-    fn every_secret_binding_is_a_secret_named_var() {
-        for b in ENV_FIELD_BINDINGS {
-            let looks_secret = b.env.contains("SECRET");
-            assert_eq!(b.secret, looks_secret, "{}", b.env);
+    fn secret_looking_names_are_marked_secret() {
+        const IDENTIFIERS: &[&str] = &["DGP_TLS_KEY", "DGP_CONFIG_SYNC_KEY"];
+        let env = |name: &str| Some(plausible(name));
+        let mut all = env_overrides(&encrypted_config(), &env);
+        all.extend(env_overrides(&encrypted_config(), &|n: &str| {
+            (!S3_ACTIVATORS.contains(&n)).then(|| plausible(n))
+        }));
+        assert!(!all.is_empty());
+        for o in &all {
+            let n = o.env.as_str();
+            let looks_secret = ["HASH", "TOKEN", "PASSWORD", "SECRET", "KEY"]
+                .iter()
+                .any(|w| n.contains(w))
+                && !n.ends_with("_KEY_ID")
+                && !IDENTIFIERS.contains(&n);
+            if looks_secret {
+                assert!(o.secret, "{n} looks secret but is not marked secret");
+            }
+        }
+    }
+
+    #[test]
+    fn every_static_binding_is_a_registered_env_var() {
+        let registry: Vec<&str> = super::super::ENV_VAR_REGISTRY
+            .iter()
+            .map(|e| e.name)
+            .collect();
+        let names = ENV_FIELD_BINDINGS
+            .iter()
+            .map(|b| b.env)
+            .chain(S3_BLOCK.iter().map(|m| m.env))
+            .chain(TLS_BLOCK.iter().map(|m| m.env))
+            .chain([DATA_DIR, TLS_FLAG]);
+        for n in names {
+            assert!(registry.contains(&n), "{n} not in ENV_VAR_REGISTRY");
         }
     }
 }

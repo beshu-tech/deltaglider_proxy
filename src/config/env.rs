@@ -11,7 +11,24 @@ pub fn env_parse<T: std::str::FromStr>(var: &str) -> Option<T>
 where
     T::Err: std::fmt::Display,
 {
-    std::env::var(var).ok().and_then(|raw| {
+    lookup_parse(&process_env, var)
+}
+
+/// An environment lookup. Injected so env-reading logic is testable without
+/// touching the process environment.
+pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// The real process environment, as an [`EnvLookup`].
+pub fn process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// [`env_parse`] over an injected lookup.
+pub fn lookup_parse<T: std::str::FromStr>(env: EnvLookup, var: &str) -> Option<T>
+where
+    T::Err: std::fmt::Display,
+{
+    env(var).and_then(|raw| {
         raw.parse()
             .map_err(|e| eprintln!("Warning: ignoring invalid {var}=\"{raw}\": {e}"))
             .ok()
@@ -34,7 +51,12 @@ where
 /// Unrecognised values log a warning and fall back to `default` so
 /// operator typos don't silently flip behaviour in either direction.
 pub fn env_bool(var: &str, default: bool) -> bool {
-    let Ok(raw) = std::env::var(var) else {
+    lookup_bool(&process_env, var, default)
+}
+
+/// [`env_bool`] over an injected lookup.
+pub fn lookup_bool(env: EnvLookup, var: &str, default: bool) -> bool {
+    let Some(raw) = env(var) else {
         return default;
     };
     let trimmed = raw.trim();

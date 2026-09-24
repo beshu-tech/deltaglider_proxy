@@ -60,7 +60,9 @@ All three scopes route through the same `apply_config_transition` path, so hot-r
 | `GET` | `/_/api/admin/config/trace?method=&path=&...` | — | Query-param variant (bookmarkable trace URLs) |
 | `POST` | `/_/api/admin/config/sync-now` | — | Force an immediate config-DB pull from the sync bucket |
 
-Full-document apply returns `{applied, persisted, requires_restart, warnings, persisted_path}`. **Persist failure returns HTTP 500**, not 200+warning — GitOps pipelines can't mistake a half-applied state for a clean success.
+Full-document apply returns `{applied, persisted, requires_restart, warnings, existing_warnings, persisted_path}`. Full-document validate returns `{ok, warnings, existing_warnings}`. As on the section endpoints, `warnings` holds only the warnings the document introduces, and `existing_warnings` holds the warnings the running config already produces. The field-level `PUT /_/api/admin/config` returns only warnings about its own change. **Persist failure returns HTTP 500**, not 200+warning — GitOps pipelines can't mistake a half-applied state for a clean success.
+
+**Environment variables win.** A `DGP_*` environment variable overrides its field at startup and again after every apply. `GET /_/api/admin/config` lists these fields in `env_overrides` (`{env, yaml_path, secret, value, set, activated_by}`; a secret never carries its value). Some variables control a whole block: `DGP_S3_ENDPOINT` or `DGP_S3_REGION` controls all of `storage.backend`, and `DGP_TLS_ENABLED=true` controls all of `advanced.tls`. A block member whose own variable is unset has `set: false`, and `activated_by` names the variable that controls the block. The config file and every export hold the value the file had, never the environment value. When an apply changes an env-controlled field, the new value is saved to the file, the environment value stays in effect, and the response carries a warning that says so.
 
 CLI wrapper:
 

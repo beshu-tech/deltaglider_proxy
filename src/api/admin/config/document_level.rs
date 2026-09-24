@@ -51,6 +51,10 @@ pub struct ConfigValidateResponse {
     pub ok: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Warnings the RUNNING config already produces (standing problems this
+    /// document did not introduce). `warnings` carries only the new ones.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub existing_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -70,6 +74,10 @@ pub struct ConfigApplyResponse {
     pub requires_restart: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Warnings the RUNNING config already produces (standing problems this
+    /// document did not introduce). `warnings` carries only the new ones.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub existing_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Path the config was written to. `None` when persist failed.
@@ -285,38 +293,49 @@ pub async fn validate_config_doc(
     Json(body): Json<ConfigDocumentRequest>,
 ) -> impl IntoResponse {
     match parse_and_validate_yaml(&body.yaml) {
-        Ok((cfg, mut warnings)) => {
+        Ok((cfg, warnings)) => {
             // Same changed-only gate as apply, so validate can't pass a doc
             // apply would reject (or vice versa for unchanged-invalid rules).
             let current = state.config.read().await.clone();
-            match crate::lifecycle::planner::lifecycle_gate(&current.lifecycle, &cfg.lifecycle) {
-                Ok(lifecycle_warnings) => warnings.extend(lifecycle_warnings),
-                Err(errs) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ConfigValidateResponse {
-                            ok: false,
-                            warnings: vec![],
-                            error: Some(errs.join("; ")),
-                        }),
-                    );
-                }
-            }
+            // Errors on UNCHANGED lifecycle content are standing, not new.
+            let standing_lifecycle =
+                match crate::lifecycle::planner::lifecycle_gate(&current.lifecycle, &cfg.lifecycle)
+                {
+                    Ok(lifecycle_warnings) => lifecycle_warnings,
+                    Err(errs) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(ConfigValidateResponse {
+                                existing_warnings: Vec::new(),
+                                ok: false,
+                                warnings: vec![],
+                                error: Some(errs.join("; ")),
+                            }),
+                        );
+                    }
+                };
             if let Err(errs) =
                 crate::config_sections::replication_gate(&current.replication, &cfg.replication)
             {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(ConfigValidateResponse {
+                        existing_warnings: Vec::new(),
                         ok: false,
                         warnings: vec![],
                         error: Some(errs.join("; ")),
                     }),
                 );
             }
+            // Only this document's own warnings are "new"; standing ones
+            // the running config already has are reported apart (#92).
+            let before = current.clone().check_all().unwrap_or_default();
+            let (warnings, mut existing_warnings) = super::split_new_warnings(&before, warnings);
+            existing_warnings.extend(standing_lifecycle);
             (
                 StatusCode::OK,
                 Json(ConfigValidateResponse {
+                    existing_warnings,
                     ok: true,
                     warnings,
                     error: None,
@@ -326,6 +345,7 @@ pub async fn validate_config_doc(
         Err(err) => (
             StatusCode::BAD_REQUEST,
             Json(ConfigValidateResponse {
+                existing_warnings: Vec::new(),
                 ok: false,
                 warnings: vec![],
                 error: Some(err),
@@ -467,6 +487,7 @@ pub(crate) async fn apply_config_inner(
             return (
                 StatusCode::BAD_REQUEST,
                 ConfigApplyResponse {
+                    existing_warnings: Vec::new(),
                     applied: false,
                     persisted: false,
                     requires_restart: false,
@@ -482,6 +503,13 @@ pub(crate) async fn apply_config_inner(
     //    Serializes admin mutations so a concurrent PATCH via `update_config`
     //    cannot race our read-for-compare and our write-to-swap.
     let mut cfg = state.config.write().await;
+
+    // 2a. Split the document's check warnings: those the RUNNING config
+    //     already produces are standing ("existing"), only the rest are new.
+    let (parse_warnings, existing_warnings) = {
+        let before = cfg.clone().check_all().unwrap_or_default();
+        super::split_new_warnings(&before, parse_warnings)
+    };
 
     // 2b. Lifecycle gate (changed-only): fatal only when this doc actually EDITS
     //     an invalid lifecycle; an unchanged pre-existing bad rule downgrades to
@@ -501,6 +529,7 @@ pub(crate) async fn apply_config_inner(
                 return (
                     StatusCode::BAD_REQUEST,
                     ConfigApplyResponse {
+                        existing_warnings: Vec::new(),
                         applied: false,
                         persisted: false,
                         requires_restart: false,
@@ -519,6 +548,7 @@ pub(crate) async fn apply_config_inner(
         return (
             StatusCode::BAD_REQUEST,
             ConfigApplyResponse {
+                existing_warnings: Vec::new(),
                 applied: false,
                 persisted: false,
                 requires_restart: false,
@@ -560,6 +590,7 @@ pub(crate) async fn apply_config_inner(
         return (
             StatusCode::FORBIDDEN,
             ConfigApplyResponse {
+                existing_warnings: Vec::new(),
                 applied: false,
                 persisted: false,
                 requires_restart: false,
@@ -571,6 +602,27 @@ pub(crate) async fn apply_config_inner(
             },
         );
     }
+
+    // 4b. Env wins consistently: re-apply the `DGP_*` overrides so the
+    //     imported document cannot change an env-controlled field at runtime
+    //     (the document's own value is what the file keeps).
+    let env_warnings = match super::reapply_env(&cfg, &mut incoming) {
+        Ok(w) => w,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ConfigApplyResponse {
+                    existing_warnings: Vec::new(),
+                    applied: false,
+                    persisted: false,
+                    requires_restart: false,
+                    warnings: vec![],
+                    error: Some(e),
+                    persisted_path: None,
+                },
+            );
+        }
+    };
 
     // 5. Run the transition side effects. The helper owns engine rebuild
     //    (with bail-before-swap on failure), log reload, IAM state swap,
@@ -586,6 +638,7 @@ pub(crate) async fn apply_config_inner(
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     ConfigApplyResponse {
+                        existing_warnings: Vec::new(),
                         applied: false,
                         persisted: false,
                         requires_restart: false,
@@ -630,10 +683,15 @@ pub(crate) async fn apply_config_inner(
 
     audit_log("apply_config", "admin", &persist_path, headers);
 
-    let warnings: Vec<String> = parse_warnings
+    // Errors on UNCHANGED lifecycle content are standing, not new.
+    let existing_warnings: Vec<String> = existing_warnings
         .into_iter()
         .chain(lifecycle_warnings)
+        .collect();
+    let warnings: Vec<String> = parse_warnings
+        .into_iter()
         .chain(preserve_warnings)
+        .chain(env_warnings)
         .chain(transition_warnings)
         .chain(persist_warning)
         .collect();
@@ -641,6 +699,7 @@ pub(crate) async fn apply_config_inner(
     (
         status,
         ConfigApplyResponse {
+            existing_warnings,
             applied: true,
             persisted,
             requires_restart,
