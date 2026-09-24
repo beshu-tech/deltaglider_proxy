@@ -68,13 +68,17 @@ const UI_RULES = {
       message: 'No regex lookbehind ((?<= / (?<!): Safari < 16.4 fails to parse the bundle. Capture the prefix instead, e.g. (^|[^\\w-]).',
     },
     {
-      selector: "NewExpression[callee.name='RegExp'] > Literal[value=/\\(\\?<[=!]/]",
+      // Any string or template text that spells a lookbehind: RegExp('…'),
+      // new RegExp(`…`), String.raw, a pattern kept in a constant.
+      selector: ":matches(Literal[value=/\\(\\?<[=!]/], TemplateElement[value.raw=/\\(\\?<[=!]/])",
       message: 'No regex lookbehind ((?<= / (?<!): Safari < 16.4 fails to parse the bundle.',
     },
     {
       // A row/card that handles Enter/Space itself swallowed the keys of its
       // own buttons (Enter on the Jobs "⋯" opened the drawer).
-      selector: "BinaryExpression[operator=/^[!=]==?$/][left.property.name='key'][right.value=' ']",
+      // Covers e.key === ' ', ' ' === e.key, [..., ' '].includes(e.key) and case ' ':.
+      selector:
+        ":matches(BinaryExpression[operator=/^[!=]==?$/][left.property.name='key'][right.value=' '], BinaryExpression[operator=/^[!=]==?$/][right.property.name='key'][left.value=' '], CallExpression[callee.property.name='includes'][arguments.0.property.name='key'][callee.object.type='ArrayExpression']:has(Literal[value=' ']), SwitchCase[test.value=' '])",
       message: 'Use activateOnKey() from src/keyboard.ts: it ignores keys aimed at buttons inside the row.',
     },
     {
