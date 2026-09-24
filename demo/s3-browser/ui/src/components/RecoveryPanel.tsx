@@ -1,6 +1,8 @@
 import { Alert, Button, Card, Space, Typography } from 'antd';
 import { DownloadOutlined, UploadOutlined } from '@ant-design/icons';
 
+import { contentColumn, CONTENT_FORM } from './shared-styles';
+
 const { Text } = Typography;
 
 interface RecoveryPanelProps {
@@ -9,8 +11,10 @@ interface RecoveryPanelProps {
 }
 
 export default function RecoveryPanel({ onExportBackup, onImportBackup }: RecoveryPanelProps) {
+  // Same content column as the other System cards (was full-width).
   return (
-    <Card style={{ margin: 16, borderRadius: 12 }}>
+    <div style={{ ...contentColumn(CONTENT_FORM), paddingTop: 0 }}>
+    <Card style={{ borderRadius: 12 }}>
       <Space direction="vertical" size={16} style={{ width: '100%' }}>
         <Text type="secondary">
           Download a full backup bundle (config + IAM/control-plane data), or restore from a previous export.
@@ -35,5 +39,6 @@ export default function RecoveryPanel({ onExportBackup, onImportBackup }: Recove
         />
       </Space>
     </Card>
+    </div>
   );
 }
