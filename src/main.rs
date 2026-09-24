@@ -836,6 +836,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 shared_config.clone(),
                 db.clone(),
                 state.clone(),
+                coordination_lease.clone(),
             );
             deltaglider_proxy::event_delivery::spawn_dispatcher(shared_config.clone(), db.clone());
         }

@@ -39,6 +39,7 @@ use crate::api::handlers::AppState;
 use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
 use crate::config_sections::ReplicationRule;
+use crate::coordination::{CoordinationLease, LeaseSubsystem, LocalLease};
 use crate::event_outbox::{
     current_unix_seconds, EventKind, EventOutboxRecord, EventSource, NewEvent,
 };
@@ -267,8 +268,14 @@ pub fn spawn_event_consumer(
     config: SharedConfig,
     db: Arc<Mutex<ConfigDb>>,
     state: Arc<AppState>,
+    lease: Option<Arc<dyn CoordinationLease>>,
 ) -> tokio::task::JoinHandle<()> {
     let instance_id = format!("event-consumer:{}", uuid::Uuid::new_v4());
+    // Per-rule leases go through the SAME lease the scheduler uses (S3 when a
+    // coordination bucket is configured), so the consumer and a reconcile run
+    // exclude each other across instances too. Node-local when none is given.
+    let lease: Arc<dyn CoordinationLease> =
+        lease.unwrap_or_else(|| Arc::new(LocalLease::new(db.clone())));
     tokio::spawn(async move {
         info!(
             "Replication event consumer started: instance_id={}",
@@ -293,7 +300,9 @@ pub fn spawn_event_consumer(
             // outbox grow without bound while replication never advances it.
             seed_cursor_if_absent(&db).await;
             // Single-flight: only the consumer-lease holder drains+advances the
-            // shared cursor, so two instances can't both move it / double-copy.
+            // cursor. The outbox and its cursor are node-local, so this lease
+            // is node-local too (SQLite): it stops two consumers in one node's
+            // database (for example across a fast restart) from overlapping.
             //
             // The lease is acquired once per tick and NOT renewed mid-drain
             // (unlike the reconcile worker's heartbeat). A drain exceeding the
@@ -303,8 +312,8 @@ pub fn spawn_event_consumer(
             // HEAD + `should_replicate` (a no-op when current), and a re-Delete
             // re-confirms source-absence + HEADs an already-absent dest. The cursor
             // advance is monotonic (`MAX`), so overlap costs duplicate WORK, not
-            // correctness. Per-rule leases below add a second mutual-exclusion
-            // layer for the common case.
+            // correctness. The per-rule leases in `drain_once` are what exclude
+            // the scheduler, run-now and other instances.
             let lease_ttl = super::scheduler::lease_ttl_secs(&replication);
             let now = current_unix_seconds();
             let acquired = {
@@ -318,7 +327,16 @@ pub fn spawn_event_consumer(
                 continue;
             }
 
-            drain_once(&config, &db, &state, &replication, &instance_id, now).await;
+            drain_once(
+                &config,
+                &db,
+                &state,
+                &replication,
+                lease.as_ref(),
+                &instance_id,
+                now,
+            )
+            .await;
 
             let dbg = db.lock().await;
             let _ = dbg.replication_release_lease(CONSUMER_LEASE_KEY, &instance_id);
@@ -365,14 +383,137 @@ fn rule_gate<E>(state: &Result<Option<super::state_store::ReplicationState>, E>)
     }
 }
 
+/// What the consumer may do with one rule's events during one drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleClaim {
+    /// We hold the rule's lease (taken at `since`, unix seconds): act.
+    Held { since: i64 },
+    /// Another worker (scheduler, run-now, another instance) holds it: hold
+    /// the rule's events for the next tick.
+    Busy,
+    /// Paused or deleted: do nothing; the events count as handled.
+    Skip,
+    /// The lease or state read failed: never guess. Stop the drain and hold
+    /// the cursor.
+    Abort,
+}
+
+/// Take `rule`'s per-rule lease through the coordination lease, then gate on
+/// the LIVE config and the rule's state row. Every outcome other than `Held`
+/// leaves the lease released.
+async fn claim_rule(
+    lease: &dyn CoordinationLease,
+    db: &Arc<Mutex<ConfigDb>>,
+    config: &crate::config::SharedConfig,
+    rule_name: &str,
+    instance_id: &str,
+    now: i64,
+    lease_ttl: i64,
+) -> RuleClaim {
+    {
+        // The state row must exist before the SQLite lease can target it.
+        let dbg = db.lock().await;
+        let _ = dbg.replication_ensure_state(rule_name, now);
+    }
+    match lease
+        .try_acquire(
+            LeaseSubsystem::Replication,
+            rule_name,
+            instance_id,
+            now,
+            lease_ttl,
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return RuleClaim::Busy,
+        Err(e) => {
+            warn!("event consumer: lease acquisition for rule '{rule_name}' failed: {e}");
+            return RuleClaim::Abort;
+        }
+    }
+    // Post-acquire re-check against the LIVE config (the rule snapshot is a
+    // tick stale): delete_rule checks the lease before it removes the rule, so
+    // a vanished rule = lost race.
+    let configured = config
+        .read()
+        .await
+        .replication
+        .rules
+        .iter()
+        .any(|r| r.name == rule_name);
+    let claim = if !configured {
+        RuleClaim::Skip
+    } else {
+        // A paused rule does nothing — copies or deletes. Checked under the
+        // lease (the scheduler checks before taking it). The events count as
+        // handled: holding them would pin the cursor and stall every other
+        // rule. Resume makes the rule due at once, so its reconcile run
+        // catches up. A state read that FAILS is not "paused": abort.
+        let state = db.lock().await.replication_load_state(rule_name);
+        match rule_gate(&state) {
+            RuleGate::Proceed => return RuleClaim::Held { since: now },
+            RuleGate::SkipPaused => {
+                debug!("event consumer: rule '{rule_name}' is paused — skipping its events");
+                RuleClaim::Skip
+            }
+            RuleGate::AbortDrain => {
+                warn!(
+                    "event consumer: cannot read state of rule '{rule_name}' ({:?})",
+                    state.err()
+                );
+                RuleClaim::Abort
+            }
+        }
+    };
+    let _ = lease
+        .release(LeaseSubsystem::Replication, rule_name, instance_id)
+        .await;
+    claim
+}
+
 /// One drain pass: read new events, group + compact per key, route to rules,
 /// act (copy/delete) under the per-rule lease, and advance the cursor to the
-/// highest CONTIGUOUS fully-handled id.
+/// highest CONTIGUOUS fully-handled id. Each rule's lease is taken once per
+/// drain (one S3 round-trip per rule, not per key) and released at the end.
 async fn drain_once(
     config: &crate::config::SharedConfig,
     db: &Arc<Mutex<ConfigDb>>,
     state: &Arc<AppState>,
     replication: &crate::config_sections::ReplicationConfig,
+    lease: &dyn CoordinationLease,
+    instance_id: &str,
+    now: i64,
+) {
+    let mut claims: std::collections::HashMap<String, RuleClaim> = std::collections::HashMap::new();
+    drain_rules(
+        config,
+        db,
+        state,
+        replication,
+        lease,
+        &mut claims,
+        instance_id,
+        now,
+    )
+    .await;
+    for (rule, claim) in &claims {
+        if matches!(claim, RuleClaim::Held { .. }) {
+            let _ = lease
+                .release(LeaseSubsystem::Replication, rule, instance_id)
+                .await;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drain_rules(
+    config: &crate::config::SharedConfig,
+    db: &Arc<Mutex<ConfigDb>>,
+    state: &Arc<AppState>,
+    replication: &crate::config_sections::ReplicationConfig,
+    lease: &dyn CoordinationLease,
+    claims: &mut std::collections::HashMap<String, RuleClaim>,
     instance_id: &str,
     now: i64,
 ) {
@@ -444,85 +585,52 @@ async fn drain_once(
                 failed_ids.insert(max_id_for_key);
                 continue;
             }
-            // Respect the SAME per-rule lease the scheduler/reconcile uses, so
-            // fast-path + reconcile + multi-instance are mutually exclusive.
-            //
-            // Three outcomes, NOT two (Finding 2): `Ok(true)` = we hold the
-            // lease, proceed; `Ok(false)` = another worker holds it, stall this
-            // key for next tick; `Err(_)` = the DB itself failed. A DB error is
-            // NOT "lease busy" — collapsing it into a stall would silently pin
-            // the cursor on a transient fault. Abort the whole drain (advance
-            // nothing) and let the next tick retry the same window.
-            let got = {
-                let dbg = db.lock().await;
-                let _ = dbg.replication_ensure_state(&rule.name, now);
-                dbg.replication_try_acquire_lease(&rule.name, instance_id, now, lease_ttl)
+            // The per-rule lease is the one the scheduler, run-now and other
+            // instances take (the coordination lease chosen at startup), so
+            // they and this consumer exclude each other.
+            let claim = match claims.get(&rule.name) {
+                Some(claim) => *claim,
+                None => {
+                    let claim =
+                        claim_rule(lease, db, config, &rule.name, instance_id, now, lease_ttl)
+                            .await;
+                    claims.insert(rule.name.clone(), claim);
+                    claim
+                }
             };
-            match got {
-                Ok(true) => {
-                    // Post-acquire re-check against the LIVE config (the rule
-                    // snapshot is a tick stale): delete_rule verifies our lease
-                    // under the config lock, so a vanished rule = lost race.
-                    if !config
-                        .read()
-                        .await
-                        .replication
-                        .rules
-                        .iter()
-                        .any(|r| r.name == rule.name)
-                    {
-                        let dbg = db.lock().await;
-                        let _ = dbg.replication_release_lease(&rule.name, instance_id);
-                        continue;
-                    }
-                    // A paused rule does nothing — copies or deletes. Checked
-                    // under the lease (the scheduler checks before taking it).
-                    // The events count as handled: holding them would pin the
-                    // shared cursor and stall every other rule. Resume makes
-                    // the rule due at once, so its reconcile run catches up.
-                    // A state read that FAILS is not "paused": like the lease
-                    // DB error below, abort the drain and hold the cursor.
-                    let (gate, state) = {
-                        let dbg = db.lock().await;
-                        let state = dbg.replication_load_state(&rule.name);
-                        let gate = rule_gate(&state);
-                        if gate != RuleGate::Proceed {
-                            let _ = dbg.replication_release_lease(&rule.name, instance_id);
-                        }
-                        (gate, state)
-                    };
-                    match gate {
-                        RuleGate::Proceed => {}
-                        RuleGate::SkipPaused => {
-                            debug!(
-                                "event consumer: rule '{}' is paused — skipping {}/{}",
-                                rule.name, bucket, key
-                            );
+            match claim {
+                RuleClaim::Held { since } => {
+                    // A long drain must not outlive the lease: renew at half
+                    // the TTL, and stop acting for the rule if it was lost.
+                    let t = current_unix_seconds();
+                    if t - since >= lease_ttl / 2 {
+                        let renewed = lease
+                            .renew(
+                                LeaseSubsystem::Replication,
+                                &rule.name,
+                                instance_id,
+                                t,
+                                lease_ttl,
+                            )
+                            .await;
+                        if renewed == Ok(true) {
+                            claims.insert(rule.name.clone(), RuleClaim::Held { since: t });
+                        } else {
+                            claims.insert(rule.name.clone(), RuleClaim::Busy);
+                            failed_ids.insert(max_id_for_key);
                             continue;
-                        }
-                        RuleGate::AbortDrain => {
-                            warn!(
-                                "event consumer: cannot read state of rule '{}' ({:?}); \
-                                 aborting drain, cursor held at {cursor}",
-                                rule.name,
-                                state.err()
-                            );
-                            return;
                         }
                     }
                 }
-                Ok(false) => {
-                    // Busy on another worker — leave for next tick (don't advance
-                    // past this key's events).
+                RuleClaim::Busy => {
+                    // Busy on another worker — leave for next tick (don't
+                    // advance past this key's events).
                     failed_ids.insert(max_id_for_key);
                     continue;
                 }
-                Err(e) => {
-                    warn!(
-                        "event consumer: lease acquisition for rule '{}' failed (DB error): {e}; \
-                         aborting drain, cursor held at {cursor}",
-                        rule.name
-                    );
+                RuleClaim::Skip => continue,
+                RuleClaim::Abort => {
+                    warn!("event consumer: aborting drain, cursor held at {cursor}");
                     return;
                 }
             }
@@ -531,7 +639,6 @@ async fn drain_once(
 
             {
                 let dbg = db.lock().await;
-                let _ = dbg.replication_release_lease(&rule.name, instance_id);
                 // Mid-drain heartbeat: a long drain (up to 500 engine copies)
                 // must keep pinning the background pruner's staleness floor.
                 let _ = dbg.listener_cursor_advance(
@@ -1061,5 +1168,114 @@ mod tests {
         let rows: Vec<EventOutboxRecord> = vec![];
         let failed = std::collections::BTreeSet::new();
         assert_eq!(contiguous_watermark(&rows, &failed, 7), 7);
+    }
+}
+
+#[cfg(test)]
+mod claim_rule_tests {
+    use super::*;
+    use crate::config::Config;
+    use async_trait::async_trait;
+    use std::sync::Mutex as StdMutex;
+
+    /// A lease another worker already holds for rule "r"; records releases.
+    struct HeldElsewhere {
+        released: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl CoordinationLease for HeldElsewhere {
+        async fn try_acquire(
+            &self,
+            _: LeaseSubsystem,
+            rule: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<bool, String> {
+            Ok(rule != "r")
+        }
+        async fn renew(
+            &self,
+            _: LeaseSubsystem,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<bool, String> {
+            Ok(false)
+        }
+        async fn release(&self, _: LeaseSubsystem, rule: &str, _: &str) -> Result<(), String> {
+            self.released.lock().unwrap().push(rule.to_string());
+            Ok(())
+        }
+        async fn is_held(&self, _: LeaseSubsystem, rule: &str, _: i64) -> Result<bool, String> {
+            Ok(rule == "r")
+        }
+    }
+
+    fn setup(rules: &[&str]) -> (Arc<Mutex<ConfigDb>>, crate::config::SharedConfig) {
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("testpass").unwrap()));
+        let mut cfg = Config::default();
+        cfg.replication.rules = rules.iter().map(|n| tests_rule(n)).collect();
+        (db, Arc::new(tokio::sync::RwLock::new(cfg)))
+    }
+
+    fn tests_rule(name: &str) -> ReplicationRule {
+        serde_yaml::from_str(&format!(
+            "name: {name}\nsource: {{bucket: src}}\ndestination: {{bucket: dest}}\n"
+        ))
+        .unwrap()
+    }
+
+    /// The consumer defers (holds the rule's events) when the coordination
+    /// lease — the one the scheduler takes — is held by another worker.
+    #[tokio::test]
+    async fn consumer_defers_to_the_coordination_lease_holder() {
+        let (db, config) = setup(&["r"]);
+        let lease = HeldElsewhere {
+            released: StdMutex::new(Vec::new()),
+        };
+        let claim = claim_rule(&lease, &db, &config, "r", "consumer", 100, 60).await;
+        assert_eq!(claim, RuleClaim::Busy);
+        assert!(
+            lease.released.lock().unwrap().is_empty(),
+            "released a lease it never held"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_is_held_for_a_live_rule_and_released_for_paused_or_deleted() {
+        let (db, config) = setup(&["live", "paused"]);
+        db.lock()
+            .await
+            .replication_ensure_state("paused", 0)
+            .unwrap();
+        db.lock()
+            .await
+            .replication_set_paused("paused", true)
+            .unwrap();
+        let lease = LocalLease::new(db.clone());
+
+        let claim = claim_rule(&lease, &db, &config, "live", "c", 100, 60).await;
+        assert_eq!(claim, RuleClaim::Held { since: 100 });
+        // Held: a rival cannot take it.
+        assert!(!lease
+            .try_acquire(LeaseSubsystem::Replication, "live", "rival", 110, 60)
+            .await
+            .unwrap());
+
+        for name in ["paused", "deleted"] {
+            let claim = claim_rule(&lease, &db, &config, name, "c", 100, 60).await;
+            assert_eq!(claim, RuleClaim::Skip, "{name}");
+            // Released: a rival can take it at once.
+            assert!(
+                lease
+                    .try_acquire(LeaseSubsystem::Replication, name, "rival", 101, 60)
+                    .await
+                    .unwrap(),
+                "{name}: lease left held"
+            );
+        }
     }
 }

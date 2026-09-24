@@ -92,49 +92,31 @@ pub async fn run_now(
 
     let lease_owner = format!("run-now:{}", uuid::Uuid::new_v4());
 
-    // Cross-backend liveness gate (H14): when a coordination (S3) lease is
-    // active, a scheduled run holds ONLY that lease — the node-local SQLite
-    // acquire below would succeed (SQLite lease free) and DOUBLE-RUN. Check the
-    // active lease first; a held lease → 409. (No-op when only LocalLease is
-    // wired, which the SQLite acquire already covers.)
-    if let Some(lease) = state.coordination_lease.as_ref() {
-        let now = replication::current_unix_seconds();
-        if lease
-            .is_held(
-                crate::coordination::LeaseSubsystem::Replication,
-                &rule.name,
-                now,
-            )
-            .await
-            .unwrap_or(false)
-        {
-            return Err((
-                StatusCode::CONFLICT,
-                "rule is already running; wait for the current run to finish".to_string(),
-            ));
-        }
-    }
-
-    // Short lock for the precheck + lease acquisition only — run_rule
-    // acquires the lock itself at each sync boundary (see its doc comment).
+    // The run takes the SAME per-rule lease as the scheduler and the event
+    // consumer: the coordination lease chosen at startup (S3 when a
+    // coordination bucket is configured, else node-local SQLite). So a run-now
+    // never overlaps a scheduled run or a consumer drain on any instance.
+    let lease: Arc<dyn crate::coordination::CoordinationLease> = state
+        .coordination_lease
+        .clone()
+        .unwrap_or_else(|| Arc::new(crate::coordination::LocalLease::new(db_arc.clone())));
     {
-        let db = db_arc.lock().await;
         let now = replication::current_unix_seconds();
-        let _ = db.replication_ensure_state(&rule.name, now);
-        // Acquire the lease FIRST, then re-check `paused` while still holding
-        // the same DB lock. The lease is the true serialization anchor: making
-        // it the first mutation closes the check-then-act window where a
-        // concurrent pause/resume could toggle the flag between a standalone
-        // paused check and lease acquisition. Both the read and the lease grant
-        // happen under one uninterrupted lock hold, so the decision is atomic.
-        let acquired = db
-            .replication_try_acquire_lease(
+        // The state row must exist before the SQLite lease can target it.
+        let _ = db_arc
+            .lock()
+            .await
+            .replication_ensure_state(&rule.name, now);
+        let acquired = lease
+            .try_acquire(
+                crate::coordination::LeaseSubsystem::Replication,
                 &rule.name,
                 &lease_owner,
                 now,
                 replication::scheduler::lease_ttl_secs(&repl),
             )
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
         if !acquired {
             return Err((
                 StatusCode::CONFLICT,
@@ -158,8 +140,13 @@ pub async fn run_now(
         .iter()
         .any(|r| r.name == rule.name)
     {
-        let db = db_arc.lock().await;
-        let _ = db.replication_release_lease(&rule.name, &lease_owner);
+        let _ = lease
+            .release(
+                crate::coordination::LeaseSubsystem::Replication,
+                &rule.name,
+                &lease_owner,
+            )
+            .await;
         return Err((StatusCode::NOT_FOUND, "rule was deleted".to_string()));
     }
 
@@ -210,15 +197,16 @@ pub async fn run_now(
             }),
             concurrency,
             Some(maintenance_gate),
-            // Admin run-now uses the node-local SQLite lease (it is an explicit,
-            // sticky-routed operator action) — not the cross-instance trait lease.
-            None,
+            Some(lease.clone()),
         )
         .await;
-        {
-            let db = db_arc.lock().await;
-            let _ = db.replication_release_lease(&rule_owned.name, &lease_owner);
-        }
+        let _ = lease
+            .release(
+                crate::coordination::LeaseSubsystem::Replication,
+                &rule_owned.name,
+                &lease_owner,
+            )
+            .await;
         if let Err(e) = result {
             warn!(
                 "Replication run-now background task failed: rule='{}': {}",
