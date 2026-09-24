@@ -56,7 +56,6 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
   const {
     queue,
     stats,
-    savings,
     pendingCount,
     activeCount,
     addFiles,
@@ -321,12 +320,23 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
           {[
             { label: 'Files uploaded', value: String(stats.uploaded), color: ACCENT_BLUE },
             { label: 'Original size', value: formatBytes(stats.originalSize), color: ACCENT_PURPLE },
-            { label: 'Stored', value: formatBytes(stats.storedSize), color: ACCENT_GREEN },
-            { label: 'Space saved', value: `${savings.toFixed(1)}%`, color: savings > 0 ? ACCENT_GREEN : TEXT_MUTED },
+            {
+              label: 'Stored',
+              value: stats.storedSize === null ? '—' : formatBytes(stats.storedSize),
+              color: ACCENT_GREEN,
+              hint: stats.storedSize === null ? 'Reading the stored size of each uploaded file' : undefined,
+            },
+            {
+              label: 'Space saved',
+              value: stats.savingsPct === null ? '—' : `${stats.savingsPct.toFixed(1)}%`,
+              color: stats.savingsPct !== null && stats.savingsPct > 0 ? ACCENT_GREEN : TEXT_MUTED,
+              hint: stats.savingsPct === null ? 'Reading the stored size of each uploaded file' : undefined,
+            },
             { label: 'Active uploads', value: String(activeCount), color: activeCount > 0 ? ACCENT_BLUE : TEXT_MUTED },
           ].map((stat) => (
             <div
               key={stat.label}
+              title={'hint' in stat ? stat.hint : undefined}
               className="glass-card"
               style={{
                 borderRadius: 10,

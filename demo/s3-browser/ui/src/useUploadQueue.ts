@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { uploadObject, type UploadTelemetry } from './s3client';
-import { summarizeObjectSavings } from './savings';
+import { headObject, uploadObject, type UploadTelemetry } from './s3client';
+import { uploadSessionStats } from './uploadStats';
 import { clampPercent, mergeTotalBytes, type UploadStatus } from './uploadTelemetry';
 import { normalizeUiError } from './errorHandling';
 
@@ -24,13 +24,9 @@ export interface UploadQueueItem {
   completingSinceMs: number | null;
   updatedAtMs: number | null;
   durationMs: number | null;
+  /** Bytes the proxy stored (HEAD after success); undefined = pending/unknown. */
+  storedSize?: number;
   error?: string;
-}
-
-interface UploadStats {
-  uploaded: number;
-  originalSize: number;
-  storedSize: number;
 }
 
 export default function useUploadQueue(destination: string) {
@@ -160,6 +156,21 @@ export default function useUploadQueue(destination: string) {
                 },
           ),
         );
+        // The browser only knows logical bytes; the proxy decides delta vs
+        // passthrough. HEAD the object for the stored size the inspector shows
+        // (`dg-delta-size` for a delta, else the full object). A failed HEAD
+        // leaves it unknown, and the page shows "—" instead of a guess.
+        headObject(item.key)
+          .then(({ storedSize }) => {
+            setQueue((prev) =>
+              prev.map((entry) =>
+                entry.id === item.id && entry.status === 'success'
+                  ? { ...entry, storedSize: storedSize ?? entry.originalSize }
+                  : entry,
+              ),
+            );
+          })
+          .catch(() => {});
       })
       .catch((err) => {
         if (controller.signal.aborted) {
@@ -249,6 +260,7 @@ export default function useUploadQueue(destination: string) {
               completingSinceMs: null,
               updatedAtMs: null,
               durationMs: null,
+              storedSize: undefined,
             }
           : item,
       ),
@@ -261,28 +273,14 @@ export default function useUploadQueue(destination: string) {
   ).length;
   const activeCount = queue.filter((i) => i.status === 'uploading' || i.status === 'completing').length;
 
-  const stats = useMemo<UploadStats>(() => {
-    const completed = queue.filter((item) => item.status === 'success');
-    const originalSize = completed.reduce((sum, item) => sum + item.originalSize, 0);
-    return {
-      uploaded: completed.length,
-      originalSize,
-      // The browser only knows logical object bytes; stored size is computed server-side later.
-      storedSize: originalSize,
-    };
-  }, [queue]);
-
-  // All "savings %" math goes through `src/savings.ts` — see that
-  // file's header for why we don't roll our own here. The upload
-  // batch is conceptually an aggregate over completed objects so it
-  // uses the OBJECT view (decimal cap at 99.9), not the scope view
-  // (integer cap at 99) that the breadcrumb chip uses.
-  const savings = summarizeObjectSavings(stats.originalSize, stats.storedSize).pct;
+  // Stored size and savings come from the per-upload HEADs; both stay null
+  // (shown as "—") until every completed upload has one. Savings % goes
+  // through `src/savings.ts` (object view, decimal cap at 99.9).
+  const stats = useMemo(() => uploadSessionStats(queue), [queue]);
 
   return {
     queue,
     stats,
-    savings,
     pendingCount,
     activeCount,
     addFiles,
