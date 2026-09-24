@@ -324,7 +324,11 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
               label: 'Stored',
               value: stats.storedSize === null ? '—' : formatBytes(stats.storedSize),
               color: ACCENT_GREEN,
-              hint: stats.storedSize === null ? 'Reading the stored size of each uploaded file' : undefined,
+              hint: stats.storedSize === null
+                ? 'Reading the stored size of each uploaded file'
+                : stats.baselineCount > 0
+                  ? 'Includes the full copy stored as the baseline of each new folder'
+                  : undefined,
             },
             {
               label: 'Space saved',
@@ -348,6 +352,15 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
             </div>
           ))}
         </div>
+        {stats.baselineCount > 0 && stats.storedSize !== null && (
+          <Text style={{ display: 'block', marginTop: 10, fontSize: 12, color: TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
+            {stats.baselineCount === 1 ? 'One upload was' : `${stats.baselineCount} uploads were`} the first
+            file in {stats.baselineCount === 1 ? 'its folder' : 'their folders'}. The first file is stored in
+            full as the folder&apos;s baseline, and later versions are stored as small deltas against it. The
+            figures above include {stats.baselineCount === 1 ? 'that baseline' : 'those baselines'}, so the
+            savings grow as you upload more versions.
+          </Text>
+        )}
       </div>
       )}
 
