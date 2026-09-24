@@ -356,7 +356,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
         </Text>
       </div>
 
-      {error && <Alert type="error" showIcon message="Fetch failed" description={error} />}
+      {error && <Alert type="error" showIcon title="Fetch failed" description={error} />}
 
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
         <Input

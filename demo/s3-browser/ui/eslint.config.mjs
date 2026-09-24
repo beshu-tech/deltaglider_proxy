@@ -21,6 +21,23 @@ import globals from 'globals';
  *   - any-related TS rules are set to warn because the existing code
  *     uses them liberally and cleaning them up is a separate task.
  */
+/** [selector, replacement] for AntD 6 props that log a deprecation warning in dev. */
+const ANTD_DEPRECATED = [
+  ["JSXOpeningElement[name.name='Alert'] > JSXAttribute[name.name='message']", 'use title instead of message.'],
+  ["JSXOpeningElement[name.name='Alert'] > JSXAttribute[name.name='onClose']", 'use closable={{ onClose }}.'],
+  ["JSXOpeningElement[name.name=/^(Space|Steps)$/] > JSXAttribute[name.name='direction']", 'use orientation instead of direction.'],
+  ["JSXOpeningElement[name.object.name='Space'][name.property.name='Compact'] > JSXAttribute[name.name='direction']", 'use orientation.'],
+  ["JSXOpeningElement[name.name='Progress'] > JSXAttribute[name.name='strokeWidth']", 'use size (for example size={{ height: 2 }}).'],
+  ["JSXAttribute[name.name='destroyOnClose']", 'use destroyOnHidden.'],
+  ["JSXAttribute[name.name='maskClosable']", 'use mask={{ closable }}.'],
+  ["JSXOpeningElement[name.name='Drawer'] > JSXAttribute[name.name=/^(width|height)$/]", 'use size.'],
+  ["JSXOpeningElement[name.name='Select'] > JSXAttribute[name.name='optionFilterProp']", 'use showSearch={{ optionFilterProp }}.'],
+  ["JSXMemberExpression[object.name='Dropdown'][property.name='Button']", 'Dropdown.Button: use Space.Compact + Button + Dropdown.'],
+  ["JSXMemberExpression[object.name='Button'][property.name='Group']", 'Button.Group: use Space.Compact.'],
+  ["JSXMemberExpression[object.name='Input'][property.name='Group']", 'Input.Group: use Space.Compact.'],
+  ["JSXAttribute[name.name=/^addon(After|Before)$/]", 'use suffix/prefix, or Space.Compact.'],
+];
+
 const UI_RULES = {
   'no-restricted-imports': [
     'error',
@@ -40,6 +57,8 @@ const UI_RULES = {
       selector: "JSXAttribute[name.name='ellipsis'] Property[key.name='tooltip']",
       message: 'ellipsis.tooltip renders an AntD tooltip, which theme.css hides — pass a native title instead.',
     },
+    // AntD 6 deprecated props: each one floods the dev console with a warning.
+    ...ANTD_DEPRECATED.map(([selector, message]) => ({ selector, message: `AntD 6 deprecation: ${message}` })),
   ],
   'no-restricted-globals': [
     'error',

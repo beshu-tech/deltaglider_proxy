@@ -379,13 +379,13 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
           qc.invalidateQueries({ queryKey: qk.backends.list() });
         }}
       />
-      <Space direction="vertical" size={0} style={{ width: '100%' }}>
+      <Space orientation="vertical" size={0} style={{ width: '100%' }}>
 
         {saveResult && (
-          <Alert type={saveResult.ok ? 'success' : 'error'} message={saveResult.message} showIcon closable onClose={() => setSaveResult(null)} style={{ borderRadius: 8, marginBottom: 12 }} />
+          <Alert type={saveResult.ok ? 'success' : 'error'} title={saveResult.message} showIcon closable={{ onClose: () => setSaveResult(null) }} style={{ borderRadius: 8, marginBottom: 12 }} />
         )}
         {error && (
-          <Alert type="error" message={error} showIcon style={{ borderRadius: 8, marginBottom: 12 }} />
+          <Alert type="error" title={error} showIcon style={{ borderRadius: 8, marginBottom: 12 }} />
         )}
 
         {/* Storage Backends — the page's subject, first. */}
@@ -477,7 +477,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 )}
               </div>
               {testResult?.name === b.name && (
-                <Alert type={testResult.ok ? 'success' : 'error'} message={testResult.message} showIcon style={{ marginTop: 8, borderRadius: 6 }} />
+                <Alert type={testResult.ok ? 'success' : 'error'} title={testResult.message} showIcon style={{ marginTop: 8, borderRadius: 6 }} />
               )}
               {/* Loud connection-health fault. Only DEFINITIVE faults
                  (credentials rejected / unreachable) gate requests with 503;
@@ -487,7 +487,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 <Alert
                   type={b.health.status === 'erroring' ? 'warning' : 'error'}
                   showIcon
-                  message={b.health.status === 'erroring' ? 'Backend degraded' : 'Backend unavailable'}
+                  title={b.health.status === 'erroring' ? 'Backend degraded' : 'Backend unavailable'}
                   description={
                     b.health.status === 'erroring'
                       ? `${healthLabel(b.health)}. Requests are NOT blocked — the backend is reachable but fails some requests. Re-probed every 30s.`
@@ -503,7 +503,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 <Alert
                   type="success"
                   showIcon
-                  message="Conditional writes: verified by live probe — safe for multi-instance client writes"
+                  title="Conditional writes: verified by live probe — safe for multi-instance client writes"
                   style={{ marginTop: 8, borderRadius: 6 }}
                 />
               )}
@@ -511,7 +511,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 <Alert
                   type="warning"
                   showIcon
-                  message="Conditional writes NOT supported"
+                  title="Conditional writes NOT supported"
                   description={
                     <LinkifiedText
                       text={
@@ -528,7 +528,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 <Alert
                   type="info"
                   showIcon
-                  message="Conditional-write support could not be verified"
+                  title="Conditional-write support could not be verified"
                   description={
                     <LinkifiedText
                       text={`${b.capability.reason} — multi-instance write safety is unproven on this backend. See ${CAPABILITY_DOC_URL}`}
@@ -630,7 +630,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
               <Text style={{ fontSize: 13, fontFamily: 'var(--font-ui)' }}>Set as default backend</Text>
             </div>
             {formError && (
-              <Alert type="error" showIcon message={formError} style={{ marginTop: 16, borderRadius: 8 }} />
+              <Alert type="error" showIcon title={formError} style={{ marginTop: 16, borderRadius: 8 }} />
             )}
             <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
               <Button data-testid="backend-create" aria-label="Create backend" type="primary" icon={<CheckCircleOutlined />} onClick={handleCreate} loading={saving} disabled={!formName.trim() || pathInvalid} style={{ flex: 1, borderRadius: 8, fontWeight: 600 }}>

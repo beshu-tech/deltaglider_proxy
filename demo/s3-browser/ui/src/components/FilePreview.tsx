@@ -111,14 +111,14 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
       )}
 
       {error && (
-        <Alert type="error" message={error} showIcon style={{ borderRadius: 8 }} />
+        <Alert type="error" title={error} showIcon style={{ borderRadius: 8 }} />
       )}
 
       {!loading && !error && tooLarge && (
         <Alert
           type="info"
           showIcon
-          message={`File too large for preview (${formatBytes(object.size)})`}
+          title={`File too large for preview (${formatBytes(object.size)})`}
           description="Text preview is limited to 512 KB. Use the Download button to view the full file."
           style={{ borderRadius: 8 }}
         />
@@ -128,7 +128,7 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
         <Alert
           type="info"
           showIcon
-          message="Preview not available for this file type"
+          title="Preview not available for this file type"
           description="Use the Download button to save the file locally."
           style={{ borderRadius: 8 }}
         />

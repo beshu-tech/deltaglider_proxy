@@ -104,7 +104,7 @@ export function SectionYamlModal({ section, open, onClose }: SectionYamlModalPro
       open={open}
       onCancel={handleClose}
       width={820}
-      destroyOnClose
+      destroyOnHidden
       footer={
         <Space style={{ justifyContent: 'flex-end', width: '100%' }}>
           <Button onClick={handleClose}>Close</Button>
@@ -121,13 +121,13 @@ export function SectionYamlModal({ section, open, onClose }: SectionYamlModalPro
         </Space>
       }
     >
-      <Space direction="vertical" size="small" style={{ width: '100%' }}>
-        {error && <Alert type="error" message="Section YAML fetch failed" description={error} showIcon />}
+      <Space orientation="vertical" size="small" style={{ width: '100%' }}>
+        {error && <Alert type="error" title="Section YAML fetch failed" description={error} showIcon />}
         {accessEmptyExplainer && !error && (
           <Alert
             type="info"
             showIcon
-            message="This preview is intentionally minimal"
+            title="This preview is intentionally minimal"
             description={
               <>
                 SigV4 keys are redacted from exported YAML. IAM users and groups in GUI mode live in the encrypted

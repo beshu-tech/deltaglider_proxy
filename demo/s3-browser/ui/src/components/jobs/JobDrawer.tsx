@@ -189,7 +189,7 @@ export default function JobDrawer({
       return (
         <div>
           {serverRow.last_error && (
-            <Alert type="error" showIcon message={serverRow.last_error} style={{ marginBottom: 12, borderRadius: 8 }} />
+            <Alert type="error" showIcon title={serverRow.last_error} style={{ marginBottom: 12, borderRadius: 8 }} />
           )}
           {entries.map(([k, v]) => (
             <div key={k} style={{ display: 'flex', gap: 12, padding: '6px 0' }}>
@@ -325,7 +325,7 @@ export default function JobDrawer({
     <Drawer
       open={!!jobId}
       onClose={onClose}
-      width="min(640px, 100vw)"
+      size="min(640px, 100vw)"
       title={
         serverRow ? (
           <span>

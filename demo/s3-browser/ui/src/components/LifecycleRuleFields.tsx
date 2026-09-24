@@ -58,7 +58,7 @@ export default function RuleEditor({
       <Alert
         type="warning"
         showIcon
-        message="Lifecycle actions"
+        title="Lifecycle actions"
         description="Delete removes expired candidates. Archive/move copies through the same DeltaGlider engine path as replication, then optionally deletes the source after the copy verifies."
         style={{ marginTop: 14 }}
       />
@@ -154,7 +154,7 @@ export default function RuleEditor({
           <Alert
             type="info"
             showIcon
-            message="Keep the newest N — count-based retention"
+            title="Keep the newest N — count-based retention"
             description="Ranks objects newest-first and keeps the latest N qualifying ones; the rest are deleted. The qualify filters below are an eligibility gate, not a delete guard: a file that fails them is ignored entirely — never counted toward N, never deleted — so an accidental empty or half-written file can't push a real backup out of the keep set."
             style={{ marginTop: 14 }}
           />
@@ -186,7 +186,7 @@ export default function RuleEditor({
                 min={0}
                 step={1048576}
                 style={{ width: '100%', ...inputRadius }}
-                addonAfter="bytes"
+                suffix="bytes"
               />
             </FormField>
             <FormField

@@ -154,8 +154,7 @@ export default function CreateBucketModal({
                   )}
                 </div>
               )}
-              showSearch
-              optionFilterProp="label"
+              showSearch={{ optionFilterProp: 'label' }}
               placeholder="Choose backend"
               style={{ width: '100%' }}
               size="middle"

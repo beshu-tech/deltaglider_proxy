@@ -83,7 +83,7 @@ function SummaryTags({ s }: { s: IamImportSummary }) {
     );
   };
   return (
-    <Space direction="vertical" size={4} style={{ width: '100%' }}>
+    <Space orientation="vertical" size={4} style={{ width: '100%' }}>
       {row('Users', s.users_created, s.users_updated, s.users_deleted)}
       {row('Groups', s.groups_created, s.groups_updated, s.groups_deleted)}
       {row('Providers', s.providers_created, s.providers_updated, s.providers_deleted)}
@@ -198,14 +198,14 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
     );
 
   return (
-    <Modal title={title} open={open} onCancel={onClose} width={820} maskClosable={false} footer={null} destroyOnClose>
+    <Modal title={title} open={open} onCancel={onClose} width={820} mask={{ closable: false }} footer={null} destroyOnHidden>
       {mode === 'export' && (
-        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+        <Space orientation="vertical" size="small" style={{ width: '100%' }}>
           <Alert
             type="warning"
             showIcon
             icon={<WarningOutlined />}
-            message="This file contains live credentials"
+            title="This file contains live credentials"
             description={
               <Paragraph style={{ marginBottom: 0 }}>
                 The export includes real <Text code>secret_access_key</Text> and{' '}
@@ -221,7 +221,7 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
             group-mapping rules — as declarative <Text code>access:</Text> YAML.
             Re-import it on another instance via <Text strong>Import full IAM</Text>.
           </Paragraph>
-          {error && <Alert type="error" message={error} showIcon />}
+          {error && <Alert type="error" title={error} showIcon />}
           <Input.TextArea
             value={yaml}
             readOnly
@@ -249,7 +249,7 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
       )}
 
       {mode === 'import' && (
-        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+        <Space orientation="vertical" size="small" style={{ width: '100%' }}>
           <Paragraph type="secondary" style={{ marginBottom: 8 }}>
             Paste a full IAM YAML document (the output of <Text strong>Export
             full IAM</Text>). Validate previews exactly what would change without
@@ -272,13 +272,13 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
             disabled={loading}
           />
 
-          {error && <Alert type="error" message="Import error" description={error} showIcon />}
+          {error && <Alert type="error" title="Import error" description={error} showIcon />}
 
           {preview && !applied && (
             <Alert
               type={preview.no_changes ? 'info' : 'warning'}
               showIcon
-              message={
+              title={
                 preview.no_changes
                   ? 'No changes — the YAML matches the live IAM state'
                   : `Dry run: ${totalChanges(preview)} change${totalChanges(preview) === 1 ? '' : 's'} to apply`
@@ -291,7 +291,7 @@ export function FullIamYamlModal({ open, mode, onClose, onApplied }: Props) {
             <Alert
               type="success"
               showIcon
-              message={applied.no_changes ? 'Applied — nothing changed' : 'IAM import applied'}
+              title={applied.no_changes ? 'Applied — nothing changed' : 'IAM import applied'}
               description={applied.no_changes ? undefined : <SummaryTags s={applied} />}
             />
           )}

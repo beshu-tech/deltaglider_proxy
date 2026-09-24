@@ -645,7 +645,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
             type="error"
             showIcon
             style={{ marginTop: 16, borderRadius: 8 }}
-            message={normalizeUiError(jobsQuery.error, 'Failed to load jobs')}
+            title={normalizeUiError(jobsQuery.error, 'Failed to load jobs')}
           />
         ) : (
           <div style={{ marginTop: 16 }}>

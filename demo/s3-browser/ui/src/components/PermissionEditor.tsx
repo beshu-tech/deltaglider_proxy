@@ -250,7 +250,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                   type="warning"
                   showIcon
                   style={{ marginTop: 6 }}
-                  message={
+                  title={
                     <span style={{ fontSize: 12 }}>
                       {bucketWarnings.map((w) => (
                         <div key={w.resource}>
@@ -272,7 +272,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                   type="error"
                   showIcon
                   style={{ marginTop: 6 }}
-                  message={
+                  title={
                     <span style={{ fontSize: 12 }}>
                       {patternErrors.map((msg, idx) => (
                         <div key={idx}>{msg}</div>
@@ -328,7 +328,7 @@ export default function PermissionEditor({ permissions, onChange }: PermissionEd
                       type="warning"
                       showIcon
                       style={{ marginTop: 8 }}
-                      message={
+                      title={
                         <span style={{ fontSize: 12 }}>
                           <strong>Administrative access.</strong> This grants full control
                           {isPrefixScoped(row.resources) ? ' of the targeted prefix' : ' of the bucket'},

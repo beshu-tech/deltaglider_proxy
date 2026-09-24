@@ -228,7 +228,7 @@ export default function AuditLogPanel({ onSessionExpired }: Props) {
         </span>
       </div>
 
-      {error && <Alert type="error" showIcon message="Fetch failed" description={error} />}
+      {error && <Alert type="error" showIcon title="Fetch failed" description={error} />}
 
       {/* Toolbar */}
       <Space size="middle" style={{ flexWrap: 'wrap' }}>

@@ -127,7 +127,7 @@ export default function ReplicationRuleFields({
             <Alert
               type="warning"
               showIcon
-              message="Deletes are destructive"
+              title="Deletes are destructive"
               description="When enabled, the destination is a faithful mirror of the source: ANY destination object absent at source is deleted — including objects written by other tools. The destination bucket must be dedicated to this rule."
               style={{ marginTop: 8 }}
             />

@@ -281,7 +281,7 @@ export default function SlackConnectorCard({
           yamlPath="advanced.event_delivery.slack_notify_kinds"
           helpText="Only these event kinds are posted to Slack. ObjectCreated is the default."
         >
-          <Space direction="vertical" size={6} style={{ width: '100%' }}>
+          <Space orientation="vertical" size={6} style={{ width: '100%' }}>
             {SLACK_NOTIFY_KINDS.map((kind) => (
               <Checkbox
                 key={kind}
@@ -444,7 +444,7 @@ function WebhookModeFields({
         yamlPath="advanced.event_delivery.webhook_urls"
         helpText="The hooks.slack.com/services/… URL Slack generated. Each URL posts to its own bound channel."
       >
-        <Space direction="vertical" style={{ width: '100%' }}>
+        <Space orientation="vertical" style={{ width: '100%' }}>
           {form.urlRows.length === 0 && (
             <Text type="secondary" style={{ fontSize: 13 }}>
               No webhook URL yet. Add the one Slack gave you.
@@ -568,7 +568,7 @@ function GlobRowsField({
 }) {
   return (
     <FormField label={label} yamlPath={yamlPath} helpText={helpText}>
-      <Space direction="vertical" style={{ width: '100%' }}>
+      <Space orientation="vertical" style={{ width: '100%' }}>
         {rows.length === 0 && (
           <Text type="secondary" style={{ fontSize: 13 }}>
             None.
@@ -628,7 +628,7 @@ function ChannelRoutingEditor({
         unmatched events.
       </Text>
 
-      <Space direction="vertical" size={14} style={{ width: '100%' }}>
+      <Space orientation="vertical" size={14} style={{ width: '100%' }}>
         {form.slackRoutes.length === 0 && (
           <Text type="secondary" style={{ fontSize: 13 }}>
             No routes — every event posts to the single channel above.

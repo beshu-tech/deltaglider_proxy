@@ -173,7 +173,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
   const setSecretKey = (v: string) => setForm((prev) => ({ ...prev, secret_access_key: v || undefined }));
 
   if (error) {
-    return <Alert type="error" showIcon message="Failed to load" description={error} />;
+    return <Alert type="error" showIcon title="Failed to load" description={error} />;
   }
   if (loading) {
     return (
@@ -234,7 +234,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
               showIcon
               icon={<LockOutlined />}
               style={{ marginTop: 12, borderRadius: 8 }}
-              message="Declarative mode is active after Apply"
+              title="Declarative mode is active after Apply"
               description={
                 <span style={{ fontSize: 12 }}>
                   The Users / Groups / External authentication panels

@@ -79,7 +79,7 @@ export default function RestoreBackupModal({ file, onCancel, onRestore }: Props)
         </Button>,
       ]}
     >
-      <Space direction="vertical" size={12} style={{ width: '100%' }}>
+      <Space orientation="vertical" size={12} style={{ width: '100%' }}>
         <Text>
           Choose what to restore from <Text code>{file?.name}</Text>.
         </Text>
@@ -87,14 +87,14 @@ export default function RestoreBackupModal({ file, onCancel, onRestore }: Props)
           <Alert
             type="warning"
             showIcon
-            message="IAM is managed by YAML (declarative mode), so only Config only is available. Restore users, groups and OIDC providers by editing access.iam_* in your YAML config and applying it."
+            title="IAM is managed by YAML (declarative mode), so only Config only is available. Restore users, groups and OIDC providers by editing access.iam_* in your YAML config and applying it."
           />
         )}
         {iamLoadError && (
           <Alert
             type="warning"
             showIcon
-            message={`Could not load the IAM mode, so only Config only is offered. Reload the page to see every restore option. ${iamLoadError}`}
+            title={`Could not load the IAM mode, so only Config only is offered. Reload the page to see every restore option. ${iamLoadError}`}
           />
         )}
         <Radio.Group
@@ -102,7 +102,7 @@ export default function RestoreBackupModal({ file, onCancel, onRestore }: Props)
           onChange={(e) => setPick({ file, mode: e.target.value })}
           style={{ width: '100%' }}
         >
-          <Space direction="vertical" size={10} style={{ width: '100%' }}>
+          <Space orientation="vertical" size={10} style={{ width: '100%' }}>
             {modes.map((m) => (
               <Radio key={m.mode} value={m.mode}>
                 <Text strong>{m.label}</Text>

@@ -198,7 +198,7 @@ export default function VerifyTab({ ruleName }: Props) {
         <Alert
           type="error"
           showIcon
-          message={normalizeUiError(runNow.error, 'Run now failed')}
+          title={normalizeUiError(runNow.error, 'Run now failed')}
           style={{ borderRadius: 8, marginBottom: 12 }}
         />
       )}
@@ -206,7 +206,7 @@ export default function VerifyTab({ ruleName }: Props) {
         <Alert
           type="error"
           showIcon
-          message={normalizeUiError(start.error, 'Could not start verification')}
+          title={normalizeUiError(start.error, 'Could not start verification')}
           style={{ borderRadius: 8, marginBottom: 12 }}
         />
       )}
@@ -214,7 +214,7 @@ export default function VerifyTab({ ruleName }: Props) {
         <Alert
           type="info"
           showIcon
-          message="Run started — verification re-runs when it finishes."
+          title="Run started — verification re-runs when it finishes."
           style={{ borderRadius: 8, marginBottom: 12 }}
         />
       )}
@@ -259,7 +259,7 @@ export default function VerifyTab({ ruleName }: Props) {
           <Alert
             type="info"
             showIcon
-            message="Verification cancelled"
+            title="Verification cancelled"
             description="The parity audit was cancelled before it finished."
             style={{ borderRadius: 8, marginBottom: 16 }}
           />
@@ -282,7 +282,7 @@ export default function VerifyTab({ ruleName }: Props) {
           <Alert
             type="error"
             showIcon
-            message="Verification failed"
+            title="Verification failed"
             description={s.error || 'The parity audit could not complete.'}
             style={{ borderRadius: 8, marginBottom: 16 }}
           />
@@ -731,7 +731,7 @@ export function ParityResult({
             type="warning"
             showIcon
             style={{ borderRadius: 8, marginTop: 14 }}
-            message={
+            title={
               outcome.cap_hit
                 ? 'Only part of the mirror was checked'
                 : (outcome.unresolved ?? 0) > 0
@@ -780,7 +780,7 @@ export function ParityResult({
               type="info"
               showIcon
               style={{ borderRadius: 8, marginTop: 14 }}
-              message={`${outcome.unverifiable.toLocaleString()} ${noun(outcome.unverifiable, 'object matches', 'objects match')} on size, not checksum`}
+              title={`${outcome.unverifiable.toLocaleString()} ${noun(outcome.unverifiable, 'object matches', 'objects match')} on size, not checksum`}
               description="Their sizes match on both sides, but there was no comparable checksum to prove the bytes are identical — usually because they were written to the backend directly (not through the proxy), or the two sides store them differently. This is not a mismatch; re-write them through the proxy if you want full checksum parity."
             />
           )}

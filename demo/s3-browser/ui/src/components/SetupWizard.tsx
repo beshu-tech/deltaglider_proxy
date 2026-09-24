@@ -381,7 +381,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
         <Alert
           type="warning"
           showIcon
-          message="This proxy is already configured"
+          title="This proxy is already configured"
           description={
             <div>
               <Paragraph style={{ marginBottom: 12 }}>
@@ -664,7 +664,7 @@ function ConfigureBackendStep({
           type={testResult.success ? 'success' : 'error'}
           showIcon
           style={{ marginTop: 12, borderRadius: 8 }}
-          message={
+          title={
             testResult.success
               ? `Connected — ${testResult.buckets?.length ?? 0} bucket(s) visible`
               : 'Connection failed'
@@ -860,7 +860,7 @@ function ReviewStep({ yaml, cardStyle }: { yaml: string; cardStyle: React.CSSPro
         type="info"
         showIcon
         style={{ marginTop: 12, borderRadius: 8 }}
-        message="What happens next"
+        title="What happens next"
         description={
           <ul style={{ margin: 0, paddingLeft: 20, fontSize: 13, lineHeight: 1.6 }}>
             <li>The YAML is applied in-memory and persisted to disk.</li>

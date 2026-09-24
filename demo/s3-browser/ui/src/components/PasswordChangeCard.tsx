@@ -32,7 +32,7 @@ export default function PasswordChangeCard() {
 
   return (
     <form onSubmit={(e) => { e.preventDefault(); handleSubmit(); }} style={cardStyle}>
-      <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+      <Space orientation="vertical" size="middle" style={{ width: '100%' }}>
         <SectionHeader icon={<LockOutlined />} title="Change Admin Password" />
 
         <div style={{ fontSize: 13, color: TEXT_MUTED, lineHeight: 1.6 }}>
@@ -50,7 +50,7 @@ export default function PasswordChangeCard() {
           type="warning"
           icon={<WarningOutlined />}
           showIcon
-          message="Changing this password re-encrypts the IAM database"
+          title="Changing this password re-encrypts the IAM database"
           description={
             <CodeTokenText text="All active admin sessions will be invalidated. IAM users and their credentials are preserved. If you forget this password, use the CLI flag --set-bootstrap-password to reset it (warning: this wipes the IAM database)." />
           }
@@ -76,7 +76,7 @@ export default function PasswordChangeCard() {
         {result && (
           <Alert
             type={result.ok ? 'success' : 'error'}
-            message={result.ok ? 'Admin password changed. All sessions invalidated.' : <CodeTokenText text={result.error || 'Failed'} />}
+            title={result.ok ? 'Admin password changed. All sessions invalidated.' : <CodeTokenText text={result.error || 'Failed'} />}
             showIcon
             style={{ borderRadius: 8 }}
           />

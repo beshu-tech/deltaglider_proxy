@@ -94,7 +94,7 @@ export default function ApplyDialog({
           type="error"
           showIcon
           icon={<WarningOutlined />}
-          message="Validation failed"
+          title="Validation failed"
           description={<LinkifiedText text={error} />}
           style={{ marginBottom: 12 }}
         />
@@ -107,7 +107,7 @@ export default function ApplyDialog({
         <Alert
           type="warning"
           showIcon
-          message={
+          title={
             warnings.length === 1 ? '1 warning from this change' : `${warnings.length} warnings from this change`
           }
           description={<WarningList items={warnings} />}
@@ -185,7 +185,7 @@ export default function ApplyDialog({
           type="info"
           showIcon
           icon={<SyncOutlined />}
-          message="Restart required"
+          title="Restart required"
           description="One or more changed fields (listen_addr, cache_size_mb) require a server restart to take effect. The apply will persist to disk — restart the proxy when the window is safe."
           style={{ marginBottom: 0 }}
         />

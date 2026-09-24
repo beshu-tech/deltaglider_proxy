@@ -567,7 +567,7 @@ export default function App() {
               type="warning"
               showIcon
               banner
-              message="Showing a stale listing — the last refresh failed"
+              title="Showing a stale listing — the last refresh failed"
               description={s3.error}
               style={{ borderRadius: 0 }}
             />
@@ -581,7 +581,7 @@ export default function App() {
               <Alert
                 type="error"
                 showIcon
-                message={
+                title={
                   /NoSuchBucket/i.test(s3.error)
                     ? `Bucket '${activeBucket}' was not found on its storage backend`
                     : /ServiceUnavailable|unavailable|503/i.test(s3.error)
@@ -589,7 +589,7 @@ export default function App() {
                       : 'Failed to load objects'
                 }
                 description={
-                  <Space direction="vertical" size={8}>
+                  <Space orientation="vertical" size={8}>
                     <span>{s3.error}</span>
                     {/NoSuchBucket/i.test(s3.error) && (
                       <span>
@@ -640,7 +640,7 @@ export default function App() {
                 </Button>
               )}
               {isRootBucketEmpty && canUploadToActiveBucket && (
-                <Space direction="vertical" size={4} align="center">
+                <Space orientation="vertical" size={4} align="center">
                   <DemoDataGenerator
                     onDone={s3.mutate}
                     variant="empty-state"

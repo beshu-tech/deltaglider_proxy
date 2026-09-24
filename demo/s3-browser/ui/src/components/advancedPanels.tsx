@@ -225,7 +225,7 @@ function PanelShell(props: { children: React.ReactNode }) {
 /** The shared "failed to load" / "loading" early return of every Advanced
  *  sub-panel; null once the data is there. */
 function loadGate({ loading, error }: { loading: boolean; error: string | null }): React.ReactNode | null {
-  if (error) return <Alert type="error" showIcon message="Failed to load" description={error} />;
+  if (error) return <Alert type="error" showIcon title="Failed to load" description={error} />;
   if (loading) return <PanelShell><LoadingState /></PanelShell>;
   return null;
 }
@@ -384,7 +384,7 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
               min={16}
               placeholder="100"
               style={{ width: 180, ...inputRadius }}
-              addonAfter="MB"
+              suffix="MB"
             />
           </FormField>
 
@@ -402,7 +402,7 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
               min={1}
               placeholder="50"
               style={{ width: 180, ...inputRadius }}
-              addonAfter="MB"
+              suffix="MB"
             />
           </FormField>
 

@@ -133,7 +133,7 @@ export default function ReencryptProposalModal({
         type="warning"
         showIcon
         style={{ marginBottom: 12, borderRadius: 8 }}
-        message="While a bucket is being processed"
+        title="While a bucket is being processed"
         description={
           <span style={{ fontSize: 12 }}>
             Reads keep working; <strong>uploads and deletes get a temporary 503</strong> (S3

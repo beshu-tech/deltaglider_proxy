@@ -71,8 +71,7 @@ export default function MappingRuleRow({ rule, providers, groups, colors, onUpda
       <Text style={{ fontSize: 12, color: colors.TEXT_MUTED, whiteSpace: 'nowrap' }}>assign to</Text>
       <Select
         size="small"
-        showSearch
-        optionFilterProp="label"
+        showSearch={{ optionFilterProp: 'label' }}
         disabled={disabled}
         value={String(rule.group_id)}
         onChange={v => onUpdate({ group_id: Number(v) })}
@@ -81,8 +80,7 @@ export default function MappingRuleRow({ rule, providers, groups, colors, onUpda
       />
       <Select
         size="small"
-        showSearch
-        optionFilterProp="label"
+        showSearch={{ optionFilterProp: 'label' }}
         disabled={disabled}
         value={String(rule.provider_id ?? 0)}
         onChange={v => onUpdate({ provider_id: Number(v) === 0 ? null : Number(v) })}

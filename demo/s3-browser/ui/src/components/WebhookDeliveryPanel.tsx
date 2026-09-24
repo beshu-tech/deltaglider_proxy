@@ -249,7 +249,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
     editorRunApply();
   };
 
-  if (error) return <Alert type="error" showIcon message="Failed to load" description={error} />;
+  if (error) return <Alert type="error" showIcon title="Failed to load" description={error} />;
   if (loading)
     return (
       <PanelShell>
@@ -267,7 +267,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
           type="error"
           showIcon
           banner
-          message={
+          title={
             <span style={{ fontSize: 13 }}>
               {liveErrors.join(' · ')}
             </span>
@@ -280,7 +280,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
         <Alert
           type={outbox.active ? 'success' : 'info'}
           showIcon
-          message={
+          title={
             <Space size="middle" wrap>
               <span>
                 Delivery:{' '}

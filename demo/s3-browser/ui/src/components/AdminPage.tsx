@@ -472,7 +472,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
             open={mobileNavOpen}
             onClose={() => setMobileNavOpen(false)}
             closable={false}
-            width={260}
+            size={260}
             styles={{
               body: { padding: 0, background: colors.BG_CARD },
               header: { display: 'none' },
