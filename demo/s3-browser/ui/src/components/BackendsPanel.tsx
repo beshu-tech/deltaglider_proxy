@@ -563,14 +563,14 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                  storage section PUT; siblings preserved by merge-patch. */}
               {encryptionEnv(b) && (
                 <Text type="secondary" data-testid="backend-encryption-env-note" style={{ fontSize: 12, display: 'block', marginTop: 8 }}>
-                  {envOverrideHelp(encryptionEnv(b)!).replace('this value', "this backend's encryption key")}{' '}
-                  A key entered below is saved to the config file but does not take effect.
+                  {envOverrideHelp(encryptionEnv(b)!).replace('this value', "this backend's encryption key")}
                 </Text>
               )}
               <BackendEncryptionEditor
                 backendName={b.name}
                 current={b.encryption}
                 onApply={(patch) => handleEncryptionApply(b.name, patch)}
+                readOnly={!!encryptionEnv(b)}
               />
             </div>
           ))}

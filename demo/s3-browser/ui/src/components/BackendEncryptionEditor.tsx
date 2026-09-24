@@ -66,9 +66,11 @@ interface Props {
    * resolution to clear its pending-change state.
    */
   onApply: (patch: BackendEncryptionPatch) => Promise<void>;
+  /** An env variable sets this backend's key: show the mode, offer no edits. */
+  readOnly?: boolean;
 }
 
-export default function BackendEncryptionEditor({ backendName, current, onApply }: Props) {
+export default function BackendEncryptionEditor({ backendName, current, onApply, readOnly }: Props) {
   const colors = useColors();
   const { cardStyle, inputRadius } = useCardStyles();
 
@@ -208,7 +210,7 @@ export default function BackendEncryptionEditor({ backendName, current, onApply 
           <LockOutlined style={{ fontSize: 14, color: tone }} />
           {statusLine}
         </div>
-        {!pending && (
+        {!pending && !readOnly && (
           <Space wrap>
             {current.mode === 'aes256-gcm-proxy' && (
               <Button
