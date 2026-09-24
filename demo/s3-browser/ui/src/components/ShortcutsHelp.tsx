@@ -54,6 +54,7 @@ function buildGroups(): ShortcutGroup[] {
         { keys: ['Backspace'], description: 'Go up one folder' },
         { keys: ['Home', 'End'], description: 'Jump to first / last row' },
         { keys: ['Esc'], description: 'Close inspector, or go up one folder' },
+        { keys: ['/'], description: 'Search this folder' },
       ],
     },
     {

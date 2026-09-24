@@ -1,4 +1,5 @@
 import { useRef, useState, useEffect } from 'react';
+import { flushSync } from 'react-dom';
 import { Layout, Space, Button, Input, theme } from 'antd';
 import type { InputRef } from 'antd';
 import { MenuOutlined, SearchOutlined, CloseOutlined, ReloadOutlined, QuestionCircleOutlined } from '@ant-design/icons';
@@ -8,6 +9,8 @@ import DeltaSavingsChip from './DeltaSavingsChip';
 import BucketUsageChip from './BucketUsageChip';
 import type { DeltaSummary } from '../deltaSummary';
 import { useColors } from '../ThemeContext';
+import { useDocumentEvent } from '../useDocumentEvent';
+import { isTypingTarget, anyOverlayOpen } from '../keyboard';
 
 const { Header } = Layout;
 
@@ -87,8 +90,26 @@ function SearchInput({
 export default function TopBar({ bucket, prefix, onNavigate, isMobile, onMenuClick, onRefresh, searchQuery, onSearchChange, refreshing, canRefresh = true, canAdmin = false, onShowShortcuts, accountMenu, deltaSummary = null }: Props) {
   const { token } = theme.useToken();
   const { ACCENT_BLUE, TEXT_MUTED, BORDER } = useColors();
-  const [searchOpen, setSearchOpen] = useState(false);
+  // Open when the URL already carries a filter (?q= from a deep link, reload
+  // or Back): a filtered list with no visible search box looked like missing
+  // files.
+  const [searchOpen, setSearchOpen] = useState(() => !!searchQuery);
   const inputRef = useRef<InputRef>(null);
+  useEffect(() => {
+    if (searchQuery) setSearchOpen(true);
+  }, [searchQuery]);
+
+  // "/" opens search — the usual web convention, and the box is otherwise
+  // reachable only through the magnifier icon.
+  useDocumentEvent('keydown', (e) => {
+    if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (isTypingTarget(e.target) || anyOverlayOpen()) return;
+    e.preventDefault();
+    // Mount the box and focus it in this same tick, or the first characters
+    // typed right after "/" are lost.
+    flushSync(() => setSearchOpen(true));
+    inputRef.current?.focus();
+  });
 
   useEffect(() => {
     if (searchOpen) {
