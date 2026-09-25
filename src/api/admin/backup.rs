@@ -1583,16 +1583,9 @@ async fn import_backup_iam(
     // Import users — track old→new user IDs so external_identities
     // references below can be remapped (not just group memberships).
     //
-    // Resolving `old_id` for the mapping:
-    //   1. Prefer `bu.id` from the backup (new export format).
-    //   2. Fall back to `bg.member_ids` in groups — the original DB's
-    //      user IDs leak through here (v2 format, pre-Wave-11).
-    //   3. Last resort: assume SQLite autoincrement order matches the
-    //      `users` array index + 1.
-    //
-    // This lets us restore external_identities from backups generated
-    // BEFORE the Wave 11 fix added `BackupUser.id`, without breaking
-    // existing v1/v2 payloads.
+    // `old_id` comes from `resolve_backup_user_id`: `bu.id`, or a proof
+    // from group membership for pre-Wave-11 backups. No proof → no mapping,
+    // so that user's external_identities are skipped, never misattached.
     let mut user_id_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
     // Pre-populate with any existing-user overlaps so imports on a
     // non-empty instance still remap correctly for external_identities.
@@ -1603,8 +1596,9 @@ async fn import_backup_iam(
             .enumerate()
             .find(|(_, bu)| bu.access_key_id == existing.access_key_id)
         {
-            let old_id = resolve_backup_user_id(bu, idx, &backup);
-            user_id_map.insert(old_id, existing.id);
+            if let Some(old_id) = resolve_backup_user_id(bu, idx, &backup) {
+                user_id_map.insert(old_id, existing.id);
+            }
         }
     }
 
@@ -1661,8 +1655,9 @@ async fn import_backup_iam(
         ) {
             Ok(created) => {
                 // Track old→new id mapping for external_identities below.
-                let old_id = resolve_backup_user_id(bu, idx, &backup);
-                user_id_map.insert(old_id, created.id);
+                if let Some(old_id) = resolve_backup_user_id(bu, idx, &backup) {
+                    user_id_map.insert(old_id, created.id);
+                }
                 // Restore group memberships
                 for old_gid in &bu.group_ids {
                     if let Some(&new_gid) = group_id_map.get(old_gid) {
@@ -1852,61 +1847,46 @@ async fn import_backup_iam(
     Ok(Json(result))
 }
 
-/// Best-effort resolver for a backup user's original database id.
+/// Resolve a backup user's original database id, or `None` when the
+/// backup does not PROVE it.
 ///
 /// Old backups (before the Wave-11 fix) never carried `BackupUser.id`.
-/// To restore external_identities from those, we walk a short fallback
-/// chain:
+/// The id is only used to re-attach `external_identities`, so a wrong
+/// guess binds one user's OAuth identity to another user (S16: Bob logs in
+/// as Alice). A missing id only drops the binding, and the next OAuth login
+/// re-provisions it. So only provable answers count:
 ///
 ///   1. `bu.id` — authoritative when present (new exports).
-///   2. `backup.groups[].member_ids` — the sibling field lists original
-///      user IDs and is present in v2 backups. Match by position: the
-///      `idx`-th user was written from `load_users()`, which returns
-///      rows in id order, so the `idx`-th member across all groups
-///      that refers back to this user yields the original id.
-///      Simpler: scan every member_ids list, pick the one whose
-///      position in the flattened user list equals `idx`.
-///   3. `idx + 1` — SQLite autoincrement starts at 1 and the export
-///      writes users in id order. This is a last-resort heuristic.
-///      It fails only when the original DB had deleted ids (id gaps).
+///   2. Every user is a member of some group: then the distinct
+///      `groups[].member_ids` set IS the set of user ids, and the export
+///      writes users in id order, so the `idx`-th smallest is this user's.
 ///
-/// None of these are perfect, but (3) covers the overwhelming majority
-/// of restores and the damage of a wrong guess is limited to a single
-/// dropped external_identity — the operator's next OAuth login will
-/// re-provision the binding.
-fn resolve_backup_user_id(bu: &BackupUser, idx: usize, backup: &IamBackup) -> i64 {
+/// The old `idx`-th-member guess (without the every-user check) and the
+/// `idx + 1` autoincrement guess are gone: both pick a different user's id
+/// when a user is in no group, or when the source DB had id gaps.
+fn resolve_backup_user_id(bu: &BackupUser, idx: usize, backup: &IamBackup) -> Option<i64> {
     if let Some(id) = bu.id {
-        return id;
+        return Some(id);
     }
-    // Fallback (2): scan groups.member_ids for a candidate.
-    // Build a sorted set of member IDs from groups, then pick the
-    // idx-th smallest. Since `load_users()` returns users in id order
-    // and the user is a member of at least one group, this yields
-    // the original id for any user that had a group membership.
-    let mut member_ids: Vec<i64> = backup
+    let member_ids: Vec<i64> = backup
         .groups
         .iter()
         .flat_map(|g| g.member_ids.iter().copied())
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect();
-    member_ids.sort();
-    if let Some(&cand) = member_ids.get(idx) {
-        return cand;
+    let every_user_is_a_member = member_ids.len() == backup.users.len()
+        && backup.users.iter().all(|u| !u.group_ids.is_empty());
+    if every_user_is_a_member {
+        return member_ids.get(idx).copied();
     }
-    // Fallback (3): SQLite autoincrement assumption. This is a pure guess
-    // and collides silently if the original DB had id gaps (deleted users),
-    // which would drop or misattach an external_identity. Surface it.
-    let guessed = (idx as i64) + 1;
     tracing::warn!(
-        "Backup user '{}' (access_key_id {}) has no explicit id and no group-membership hint; \
-         falling back to autoincrement heuristic id {}. external_identities for this user may be \
-         dropped or misattached if the original DB had id gaps.",
+        "Backup user '{}' (access_key_id {}) has no id, and the backup does not prove it; \
+         its external_identities are not restored (the next OAuth login re-creates them).",
         bu.name,
         bu.access_key_id,
-        guessed
     );
-    guessed
+    None
 }
 
 #[derive(Serialize)]
@@ -1928,6 +1908,43 @@ pub struct ImportResult {
 
 #[cfg(test)]
 mod tests {
+
+    /// S16: a legacy backup (no `users[].id`) where Alice is in no group and
+    /// Bob and Carol are. The old fallback took the idx-th group member id,
+    /// so Alice resolved to Bob's id and Bob's OAuth identity was bound to
+    /// Alice. An id that cannot be proven must not be guessed.
+    #[test]
+    fn legacy_backup_never_guesses_another_users_id() {
+        let backup: IamBackup = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "users": [
+                {"name":"alice","access_key_id":"A","secret_access_key":"a","enabled":true,"permissions":[],"group_ids":[]},
+                {"name":"bob","access_key_id":"B","secret_access_key":"b","enabled":true,"permissions":[],"group_ids":[1]},
+                {"name":"carol","access_key_id":"C","secret_access_key":"c","enabled":true,"permissions":[],"group_ids":[1]}
+            ],
+            "groups": [{"id":1,"name":"eng","permissions":[],"member_ids":[2,3]}]
+        }))
+        .unwrap();
+        let ids: Vec<Option<i64>> = backup
+            .users
+            .iter()
+            .enumerate()
+            .map(|(i, u)| resolve_backup_user_id(u, i, &backup))
+            .collect();
+        assert_eq!(ids, [None, None, None], "unprovable ids must not resolve");
+
+        // Every user in a group: the member-id set IS the id list.
+        let mut all = backup;
+        all.groups[0].member_ids = vec![1, 5, 9];
+        all.users[0].group_ids = vec![1];
+        let ids: Vec<Option<i64>> = all
+            .users
+            .iter()
+            .enumerate()
+            .map(|(i, u)| resolve_backup_user_id(u, i, &all))
+            .collect();
+        assert_eq!(ids, [Some(1), Some(5), Some(9)]);
+    }
 
     /// #92 M1: `secrets.json` never carries an env-supplied value, and a
     /// restore of it writes none into the YAML file.
