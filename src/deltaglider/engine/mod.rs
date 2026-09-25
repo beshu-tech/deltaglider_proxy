@@ -1936,15 +1936,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Get reference with caching. Returns `Bytes` for zero-copy sharing.
     /// Returns `(reference_data, cache_hit)`.
+    /// `expected_sha256` is the reference sha the caller is about to rely on
+    /// (the stored reference metadata on PUT, the delta's `ref_sha256` on
+    /// GET; empty = cannot verify). A cached copy with another sha is stale:
+    /// a peer node reseeded the deltaspace. Encoding against it wrote deltas
+    /// that no other node could decode.
     async fn get_reference_cached(
         &self,
         bucket: &str,
         deltaspace_id: &str,
+        expected_sha256: &str,
     ) -> Result<(bytes::Bytes, bool), EngineError> {
         let cache_key = Self::cache_key(bucket, deltaspace_id);
 
         // Check cache first (Bytes clone is a cheap refcount increment)
-        if let Some(data) = self.cache.get(&cache_key) {
+        if let Some(data) = self.cache.get_matching(&cache_key, expected_sha256) {
             self.with_metrics(|m| m.cache_hits_total.inc());
             return Ok((data, true));
         }
@@ -1970,9 +1976,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // A missing metadata read or empty checksum (out-of-band / CLI-uploaded
         // references) is treated as "cannot verify" — we proceed and let the
         // downstream per-object checksum in retrieve.rs catch any corruption.
+        let actual = hex::encode(Sha256::digest(&data));
         if let Ok(expected) = meta_result {
             if !expected.file_sha256.is_empty() {
-                let actual = hex::encode(Sha256::digest(&data));
                 if let Err(expected_sha256) = reference_integrity_ok(&actual, &expected.file_sha256)
                 {
                     // Do NOT cache corrupt bytes — fail fast so a single bad
@@ -1996,7 +2002,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // The old code did data.clone() (full 80MB memcpy) + Bytes::from — this
         // saves one memcpy per cache miss.
         let bytes = Bytes::from(data);
-        self.cache.put(&cache_key, bytes.clone());
+        self.cache.put(&cache_key, bytes.clone(), &actual);
 
         Ok((bytes, false))
     }

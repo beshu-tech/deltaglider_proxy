@@ -592,11 +592,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 self.storage.get_reference(bucket, deltaspace_id).await?,
                 None,
             ),
-            StorageInfo::Delta { .. } => {
+            StorageInfo::Delta { ref_sha256, .. } => {
                 // Fetch reference and delta in parallel — saves one S3 round-trip.
                 // The reference is sibling to the delta: same parent directory + "reference.bin".
                 let (ref_result, delta_result) = tokio::join!(
-                    self.get_reference_cached(bucket, deltaspace_id),
+                    self.get_reference_cached(bucket, deltaspace_id, ref_sha256),
                     self.storage
                         .get_delta(bucket, deltaspace_id, &obj_key.filename)
                 );
@@ -623,9 +623,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                                     "Reference passthrough fallback succeeded ({} bytes)",
                                     data.len()
                                 );
+                                let sha = hex::encode(Sha256::digest(&data));
                                 let bytes = bytes::Bytes::from(data);
                                 let cache_key = Self::cache_key(bucket, deltaspace_id);
-                                self.cache.put(&cache_key, bytes.clone());
+                                self.cache.put(&cache_key, bytes.clone(), &sha);
                                 (bytes, false)
                             }
                             Err(_) => {

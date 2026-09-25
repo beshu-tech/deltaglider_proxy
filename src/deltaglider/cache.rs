@@ -34,8 +34,16 @@ use tracing::debug;
 /// `Bytes::copy_from_slice()` (one unavoidable copy).
 /// Do NOT change put() to accept `Vec<u8>` — it defeats the zero-copy path.
 pub struct ReferenceCache {
-    cache: Cache<String, Bytes>,
+    cache: Cache<String, CachedReference>,
     max_capacity_bytes: u64,
+}
+
+/// Cached reference bytes plus their SHA-256, so a reader can tell that the
+/// stored reference changed under the cache (a peer node reseeded it).
+#[derive(Clone)]
+struct CachedReference {
+    data: Bytes,
+    sha256: std::sync::Arc<str>,
 }
 
 impl ReferenceCache {
@@ -46,13 +54,13 @@ impl ReferenceCache {
         let cache = Cache::builder()
             // moka uses max_capacity as the total weight budget (in bytes here).
             .max_capacity(max_size_bytes)
-            .weigher(|_key: &String, value: &Bytes| -> u32 {
+            .weigher(|_key: &String, value: &CachedReference| -> u32 {
                 // Each entry's weight = its actual byte length.
                 // moka weigher returns u32; clamp to u32::MAX for entries that
                 // (in theory) exceed 4 GiB. This is a moka API constraint, not
                 // a bug — entries >4GiB would be rejected by the engine's
                 // max_object_size limit long before reaching the cache.
-                value.len().try_into().unwrap_or(u32::MAX)
+                value.data.len().try_into().unwrap_or(u32::MAX)
             })
             .build();
 
@@ -69,7 +77,7 @@ impl ReferenceCache {
 
     /// Get a reference from cache. Returns a `Bytes` handle (cheap refcount clone).
     pub fn get(&self, prefix: &str) -> Option<Bytes> {
-        let result = self.cache.get(&prefix.to_string());
+        let result = self.cache.get(&prefix.to_string()).map(|c| c.data);
         if result.is_some() {
             debug!("Cache hit for prefix: {}", prefix);
         } else {
@@ -78,15 +86,38 @@ impl ReferenceCache {
         result
     }
 
+    /// Like `get`, but only when the cached bytes have `expected_sha256`
+    /// (empty = cannot verify, any entry matches). A mismatch means the
+    /// stored reference changed under the cache: drop the entry and miss.
+    pub fn get_matching(&self, prefix: &str, expected_sha256: &str) -> Option<Bytes> {
+        let entry = self.cache.get(&prefix.to_string())?;
+        if expected_sha256.is_empty() || *entry.sha256 == *expected_sha256 {
+            debug!("Cache hit for prefix: {}", prefix);
+            return Some(entry.data);
+        }
+        debug!(
+            "Cached reference for {} has sha {}, stored one has {} — reloading",
+            prefix, entry.sha256, expected_sha256
+        );
+        self.invalidate(prefix);
+        None
+    }
+
     /// Put a reference into cache.
     ///
     /// PERF: Takes `Bytes` (not `Vec<u8>`) to enable zero-copy insertion when the
     /// caller already owns a Vec (via `Bytes::from(vec)` — ownership transfer, no
     /// memcpy). See struct-level doc comment for details.
-    pub fn put(&self, prefix: &str, data: Bytes) {
+    pub fn put(&self, prefix: &str, data: Bytes, sha256: &str) {
         let data_len = data.len();
         debug!("Cached reference for {}: {} bytes", prefix, data_len);
-        self.cache.insert(prefix.to_string(), data);
+        self.cache.insert(
+            prefix.to_string(),
+            CachedReference {
+                data,
+                sha256: sha256.into(),
+            },
+        );
     }
 
     /// Return the number of entries in the cache (O(1) atomic read).
@@ -117,11 +148,30 @@ impl ReferenceCache {
 mod tests {
     use super::*;
 
+    impl ReferenceCache {
+        fn put_test(&self, prefix: &str, data: Bytes) {
+            self.put(prefix, data, "");
+        }
+    }
+
+    #[test]
+    fn get_matching_drops_an_entry_with_another_sha() {
+        let cache = ReferenceCache::new(10);
+        cache.put("k", Bytes::from_static(b"old"), "aaa");
+        assert!(cache.get_matching("k", "aaa").is_some());
+        assert!(
+            cache.get_matching("k", "").is_some(),
+            "empty = cannot verify"
+        );
+        assert!(cache.get_matching("k", "bbb").is_none());
+        assert!(cache.get("k").is_none(), "mismatch must evict");
+    }
+
     #[test]
     fn test_byte_budget_eviction() {
         let cache = ReferenceCache::new(1);
         for i in 0..100u8 {
-            cache.put(&format!("key_{}", i), Bytes::from(vec![i; 20 * 1024]));
+            cache.put_test(&format!("key_{}", i), Bytes::from(vec![i; 20 * 1024]));
         }
         cache.run_pending_tasks();
         let count = (0..100u8)
@@ -134,13 +184,13 @@ mod tests {
     #[test]
     fn test_large_entry_eviction() {
         let cache = ReferenceCache::new(1); // 1 MB budget
-        cache.put("big", Bytes::from(vec![0xAA; 500 * 1024])); // 500 KB
-                                                               // Fill the remaining ~500 KB, then keep inserting to force eviction.
-                                                               // Inserting 2 MB total of 100 KB entries (20 entries) ensures the
-                                                               // cache must evict aggressively — "big" is the highest-value eviction
-                                                               // target since it frees the most space in one shot.
+        cache.put_test("big", Bytes::from(vec![0xAA; 500 * 1024])); // 500 KB
+                                                                    // Fill the remaining ~500 KB, then keep inserting to force eviction.
+                                                                    // Inserting 2 MB total of 100 KB entries (20 entries) ensures the
+                                                                    // cache must evict aggressively — "big" is the highest-value eviction
+                                                                    // target since it frees the most space in one shot.
         for i in 0..20 {
-            cache.put(&format!("fill_{}", i), Bytes::from(vec![0xBB; 100 * 1024]));
+            cache.put_test(&format!("fill_{}", i), Bytes::from(vec![0xBB; 100 * 1024]));
         }
         // Drain moka's async eviction queue
         for _ in 0..20 {
@@ -179,7 +229,7 @@ mod tests {
                     for j in 0..1000usize {
                         let key = format!("key_{}", j % 50);
                         match j % 3 {
-                            0 => cache.put(
+                            0 => cache.put_test(
                                 &key,
                                 Bytes::from(vec![t.wrapping_mul(17).wrapping_add(j as u8); 100]),
                             ),
@@ -199,9 +249,9 @@ mod tests {
     fn test_bytes_from_vec_and_copy_from_slice_equivalent() {
         let cache = ReferenceCache::new(10);
         let data = vec![1u8, 2, 3, 4, 5];
-        cache.put("vec_path", Bytes::from(data.clone()));
+        cache.put_test("vec_path", Bytes::from(data.clone()));
         let from_vec = cache.get("vec_path").unwrap();
-        cache.put("slice_path", Bytes::copy_from_slice(&data));
+        cache.put_test("slice_path", Bytes::copy_from_slice(&data));
         let from_slice = cache.get("slice_path").unwrap();
         assert_eq!(from_vec, from_slice);
         assert_eq!(&from_vec[..], &data[..]);
@@ -210,7 +260,7 @@ mod tests {
     #[test]
     fn test_invalidation_is_immediate() {
         let cache = ReferenceCache::new(10);
-        cache.put("key", Bytes::from_static(b"hello"));
+        cache.put_test("key", Bytes::from_static(b"hello"));
         assert!(cache.get("key").is_some());
         cache.invalidate("key");
         assert!(
@@ -222,7 +272,7 @@ mod tests {
     #[test]
     fn test_zero_byte_entry() {
         let cache = ReferenceCache::new(10);
-        cache.put("empty", Bytes::new());
+        cache.put_test("empty", Bytes::new());
         let result = cache.get("empty");
         assert!(result.is_some(), "empty entry should be retrievable");
         assert!(
@@ -237,7 +287,7 @@ mod tests {
         let sizes = [0, 1, 100, 10_000, 100_000];
         for (i, &size) in sizes.iter().enumerate() {
             let key = format!("entry_{}", i);
-            cache.put(&key, Bytes::from(vec![0xCC; size]));
+            cache.put_test(&key, Bytes::from(vec![0xCC; size]));
         }
         for (i, &size) in sizes.iter().enumerate() {
             let key = format!("entry_{}", i);

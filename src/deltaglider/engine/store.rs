@@ -274,7 +274,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         has_existing_reference: bool,
     ) -> Result<StoreResult, EngineError> {
         let (reference, _cache_hit) = self
-            .get_reference_cached(ctx.bucket, ctx.deltaspace_id)
+            .get_reference_cached(ctx.bucket, ctx.deltaspace_id, &ref_meta.file_sha256)
             .await?;
         // PERF: try_acquire instead of acquire — fail fast with 503 when all codec
         // slots are busy rather than queuing unbounded requests in memory (each
@@ -830,7 +830,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         });
 
         let cache_key = Self::cache_key(ctx.bucket, ctx.deltaspace_id);
-        self.cache.put(&cache_key, Bytes::copy_from_slice(ctx.data));
+        self.cache
+            .put(&cache_key, Bytes::copy_from_slice(ctx.data), &ctx.sha256);
 
         Ok(metadata)
     }
@@ -1564,7 +1565,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Ok(false);
         }
 
-        let (reference, _cache_hit) = self.get_reference_cached(bucket, deltaspace_id).await?;
+        let (reference, _cache_hit) = self
+            .get_reference_cached(bucket, deltaspace_id, &ref_meta.file_sha256)
+            .await?;
         let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
             EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
         })?;
@@ -1843,5 +1846,74 @@ mod counter_tests {
             assert_eq!(count, 1, "{sink}: overwrite must not add an object");
             assert_eq!(logical, v2.len() as u64, "{sink}: logical bytes of v2 only");
         }
+    }
+}
+
+/// D8: the buffered encode must not trust a cached reference that no longer
+/// matches the stored one (a peer node reseeded the deltaspace).
+#[cfg(test)]
+mod stale_reference_cache_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::storage::FilesystemBackend;
+
+    fn noise(seed: u64, n: usize) -> Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn buffered_store_reloads_a_reseeded_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            FilesystemBackend::new(tmp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        backend.create_bucket("b").await.unwrap();
+        let engine = DeltaGliderEngine::new_with_backend(backend.clone(), &Config::default(), None);
+
+        // v1 seeds the reference and the cache.
+        let v1 = noise(1, 200_000);
+        engine
+            .store("b", "rel/a.zip", &v1, None, HashMap::new())
+            .await
+            .unwrap();
+
+        // A peer node reseeds reference.bin with different bytes + metadata.
+        let r2 = noise(2, 200_000);
+        let r2_meta = FileMetadata::new_reference(
+            DeltaGliderEngine::<FilesystemBackend>::INTERNAL_REFERENCE_NAME.to_string(),
+            "rel/other.zip".into(),
+            hex::encode(Sha256::digest(&r2)),
+            hex::encode(Md5::digest(&r2)),
+            r2.len() as u64,
+            None,
+        );
+        backend
+            .put_reference("b", "rel", &r2, &r2_meta)
+            .await
+            .unwrap();
+
+        // v2 is close to v1: against the STALE cached v1 it deltas well and
+        // gets committed as a delta, stamped with r2's sha.
+        let mut v2 = v1.clone();
+        v2[1000..1100].fill(0xAB);
+        engine
+            .store("b", "rel/b.zip", &v2, None, HashMap::new())
+            .await
+            .unwrap();
+        // Another node (or this one after a restart) has no cached copy and
+        // decodes against the stored reference.
+        let fresh = DeltaGliderEngine::new_with_backend(backend, &Config::default(), None);
+        let (back, _) = fresh.retrieve("b", "rel/b.zip").await.expect("readable");
+        assert_eq!(back, v2);
     }
 }
