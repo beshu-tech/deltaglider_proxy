@@ -313,12 +313,13 @@ impl RateLimiter {
         }
     }
 
-    /// Whether a lock on `subject` applies to `ip`. It does not for loopback
-    /// (break-glass through an SSH tunnel or port-forward) or for an IP that
-    /// logged in to this subject within `KNOWN_GOOD_TTL`. The per-IP bucket
-    /// still applies to both.
-    pub fn account_lock_applies(&self, subject: &str, ip: &IpAddr) -> bool {
-        if ip.is_loopback() {
+    /// Whether a lock on `subject` applies to a caller resolved to `ip`. It
+    /// does not for a direct local request (see [`is_direct_local_request`]:
+    /// break-glass on the box, through an SSH tunnel or port-forward) or for
+    /// an IP that logged in to this subject within `KNOWN_GOOD_TTL`. The
+    /// per-IP bucket still applies to both.
+    pub fn account_lock_applies(&self, subject: &str, ip: &IpAddr, direct_local: bool) -> bool {
+        if direct_local {
             return false;
         }
         !self
@@ -341,6 +342,19 @@ impl RateLimiter {
         self.account_known_good
             .retain(|_, seen| now.duration_since(*seen) < KNOWN_GOOD_TTL);
     }
+}
+
+/// A request from the box itself: the TCP peer is loopback AND no
+/// forwarding header is present. A same-host reverse proxy that is not in
+/// the trusted list also connects from loopback, but it always adds
+/// `X-Forwarded-For` (or `Forwarded` / `X-Real-IP`), so internet traffic
+/// through it never qualifies. The resolved client IP is NOT used here:
+/// without a trusted proxy it is the loopback peer for every client.
+pub fn is_direct_local_request(headers: &axum::http::HeaderMap, peer_ip: Option<IpAddr>) -> bool {
+    peer_ip.is_some_and(|p| normalize_ip(p).is_loopback())
+        && !["x-forwarded-for", "forwarded", "x-real-ip"]
+            .iter()
+            .any(|h| headers.contains_key(*h))
 }
 
 /// How long a successful login keeps an IP exempt from its account's lock.
@@ -644,7 +658,7 @@ impl<'a> RateLimitGuard<'a> {
         }
         if !subject.is_empty()
             && rl.is_limited_account(subject)
-            && rl.account_lock_applies(subject, &ip)
+            && rl.account_lock_applies(subject, &ip, is_direct_local_request(headers, peer_ip))
         {
             tracing::warn!(
                 "SECURITY | event={}_brute_force_blocked | scope=account | subject={} | ip={}",
@@ -774,13 +788,13 @@ mod tests {
     async fn account_lockout_spares_known_good_and_loopback_ips() {
         let rl = RateLimiter::new(100, Duration::from_secs(60), Duration::from_secs(60))
             .with_account_policy(3, Duration::from_secs(60), Duration::from_secs(60));
-        let from = |ip: &str| hdrs(&[("x-forwarded-for", ip)]);
-        let enter = |ip: &'static str| {
+        // Direct TCP peer `ip`, optionally with forwarding headers.
+        let enter_with = |ip: &'static str, headers: axum::http::HeaderMap| {
             let rl = &rl;
             async move {
                 RateLimitGuard::enter_with_account(
                     rl,
-                    &from(ip),
+                    &headers,
                     Some(ip.parse().unwrap()),
                     "bootstrap",
                     "t",
@@ -788,6 +802,7 @@ mod tests {
                 .await
             }
         };
+        let enter = |ip: &'static str| enter_with(ip, axum::http::HeaderMap::new());
         // The operator logs in once from their usual IP.
         enter("203.0.113.10").await.unwrap().record_success();
         // A botnet burns the account budget from fresh IPs.
@@ -805,8 +820,25 @@ mod tests {
         );
         assert!(
             enter("127.0.0.1").await.is_ok(),
-            "loopback break-glass is spared"
+            "direct local request (loopback peer, no forwarding header) is spared"
         );
+        assert!(enter("::1").await.is_ok(), "IPv6 loopback, direct");
+        // A same-host reverse proxy that is not trusted: the peer is
+        // loopback, but the request carries forwarding headers, so it is
+        // internet traffic and the lock applies.
+        for name in ["x-forwarded-for", "forwarded", "x-real-ip"] {
+            let value = if name == "forwarded" {
+                "for=198.51.100.9"
+            } else {
+                "198.51.100.9"
+            };
+            assert!(
+                enter_with("127.0.0.1", hdrs(&[(name, value)]))
+                    .await
+                    .is_err(),
+                "loopback peer + {name} stays locked"
+            );
+        }
         // The operator's login while locked keeps the lock for everyone else.
         enter("203.0.113.10").await.unwrap().record_success();
         assert!(enter("198.51.100.201").await.is_err(), "lock not reset");
