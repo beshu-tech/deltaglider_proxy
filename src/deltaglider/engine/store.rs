@@ -2078,6 +2078,39 @@ mod prefix_lock_scope_tests {
     }
 }
 
+/// A rebuilt engine (config reload) serves while the old one drains its
+/// in-flight PUTs. Each built its own prefix-lock map, so the two engines'
+/// writers to one deltaspace did not exclude each other.
+#[cfg(test)]
+mod prefix_lock_rebuild_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::storage::FilesystemBackend;
+
+    #[tokio::test]
+    async fn rebuilt_engines_share_prefix_locks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            FilesystemBackend::new(tmp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let old = DeltaGliderEngine::new_with_backend(backend.clone(), &Config::default(), None);
+        let new = DeltaGliderEngine::new_with_backend(backend, &Config::default(), None);
+        let bucket = format!("rebuild-{}", uuid::Uuid::new_v4());
+        let _held = old.acquire_prefix_lock(&bucket, "releases").await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                new.acquire_prefix_lock(&bucket, "releases"),
+            )
+            .await
+            .is_err(),
+            "the new engine must wait for the old engine's writer"
+        );
+    }
+}
+
 /// A rebuilt engine (config reload) must share the spool budget with the
 /// engine it replaces: each built its own, so a reload doubled the budget.
 #[cfg(test)]

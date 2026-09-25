@@ -270,6 +270,10 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     storage: Arc<S>,
     codec: Arc<DeltaCodec>,
     file_router: FileRouter,
+    /// Per engine on purpose (unlike `prefix_locks`): every hit is checked
+    /// against the stored reference sha, so an overlap with the old engine
+    /// cannot serve stale bytes, and a rebuild may re-route a bucket to
+    /// another backend, whose references a shared cache would mask.
     cache: ReferenceCache,
     max_object_size: u64,
     /// Streaming-passthrough size ceiling (Phase B). Separate from
@@ -279,7 +283,9 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     codec_semaphore: Arc<Semaphore>,
     /// Per-deltaspace locks preventing concurrent reference overwrites.
     /// Uses DashMap for lock-free shard-level lookups (different prefixes never contend).
-    prefix_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Process-wide ([`shared_prefix_locks`]): a rebuilt engine and the one
+    /// it replaces must exclude each other while the old one drains.
+    prefix_locks: Arc<PrefixLocks>,
     /// Optional CROSS-INSTANCE per-deltaspace lock (multi-instance only; `None`
     /// single-instance → zero S3 round-trips). Held INSIDE `prefix_locks` around
     /// the reference read-modify-write so two nodes cannot both create a
@@ -539,6 +545,16 @@ impl Drop for ReferenceLockGuard {
             // No runtime available (dropped during shutdown) → rely on the TTL.
         }
     }
+}
+
+type PrefixLocks = DashMap<String, Arc<tokio::sync::Mutex<()>>>;
+
+/// THE process-wide prefix-lock map, shared by every engine (like the spool).
+/// Per-engine maps let a config reload's new engine write a deltaspace while
+/// the old engine's in-flight PUT still held its own lock for it.
+fn shared_prefix_locks() -> Arc<PrefixLocks> {
+    static SHARED: std::sync::OnceLock<Arc<PrefixLocks>> = std::sync::OnceLock::new();
+    SHARED.get_or_init(|| Arc::new(DashMap::new())).clone()
 }
 
 tokio::task_local! {
@@ -989,7 +1005,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             max_object_size: config.max_object_size,
             max_passthrough_object_size: config.max_passthrough_object_size,
             codec_semaphore: Arc::new(Semaphore::new(codec_concurrency)),
-            prefix_locks: DashMap::new(),
+            prefix_locks: shared_prefix_locks(),
             reference_lock: None,
             metrics,
             metadata_cache: MetadataCache::new((config.metadata_cache_mb as u64) * 1024 * 1024),
