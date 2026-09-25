@@ -1045,12 +1045,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Acquire a per-deltaspace async lock. Different prefixes do not contend.
-    async fn acquire_prefix_lock(&self, prefix: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    pub(super) async fn acquire_prefix_lock(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
         // Periodic cleanup on every lock acquisition (cheap — just checks len())
         self.cleanup_prefix_locks();
+        // A deltaspace is (bucket, prefix): keyed by the prefix alone, the
+        // same prefix in two buckets shared one mutex. Same key shape as the
+        // reference cache.
         let mutex = self
             .prefix_locks
-            .entry(prefix.to_string())
+            .entry(Self::cache_key(bucket, prefix))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         mutex.lock_owned().await
@@ -1241,12 +1248,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Run `f` while holding the per-deltaspace prefix lock, serialising
     /// the reference seed against concurrent live PUTs to that deltaspace.
-    pub async fn with_dest_prefix_lock<F, Fut, R>(&self, prefix: &str, f: F) -> R
+    pub async fn with_dest_prefix_lock<F, Fut, R>(&self, bucket: &str, prefix: &str, f: F) -> R
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = R>,
     {
-        let _guard = self.acquire_prefix_lock(prefix).await;
+        let _guard = self.acquire_prefix_lock(bucket, prefix).await;
         f().await
     }
 
@@ -1826,7 +1833,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         deltaspace_id: &str,
     ) -> Result<(), EngineError> {
-        let _guard = self.acquire_prefix_lock(deltaspace_id).await;
+        let _guard = self.acquire_prefix_lock(bucket, deltaspace_id).await;
         let remaining = self.storage.scan_deltaspace(bucket, deltaspace_id).await?;
         let has_objects = remaining
             .iter()
@@ -1863,7 +1870,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // Acquire per-deltaspace lock to prevent races with concurrent store/delete
         // operations that may create or clean up the reference.
-        let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
+        let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
         // Use resolve_metadata (no migration) — we already hold the prefix lock, and
         // tokio::sync::Mutex is not reentrant, so calling resolve_metadata_with_migration

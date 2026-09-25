@@ -137,7 +137,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     .with_label_values(&["passthrough"])
                     .inc()
             });
-            let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
+            let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
             let ctx = StoreContext {
                 bucket,
                 obj_key: &obj_key,
@@ -171,7 +171,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // must be atomic per-prefix to avoid two writers both creating a reference.
         // The in-process mutex serializes same-node threads; the cross-instance
         // lock (multi-instance only, inert otherwise) serializes across nodes.
-        let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
+        let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
         let _xnode_guard = self.acquire_reference_lock(bucket, &deltaspace_id).await?;
 
         let ctx = StoreContext {
@@ -429,7 +429,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // cross-instance lock (multi-instance only, inert single-instance)
         // serializes across NODES, so two instances can no longer both create a
         // baseline and corrupt reference.bin (see CLAUDE.md HA contract).
-        let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
+        let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
         let _xnode_guard = self.acquire_reference_lock(bucket, &deltaspace_id).await?;
         // Write path: a backend error must abort, not read as "no reference".
         let has_existing_reference = self.storage.has_reference(bucket, &deltaspace_id).await?;
@@ -1072,7 +1072,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             &sha256[..8]
         );
 
-        let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
+        let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
         let mut metadata = FileMetadata::new_passthrough(
             obj_key.filename.clone(),
@@ -1178,7 +1178,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
         let sha256 = hex::encode(sha256_hasher.finalize());
         let md5 = hex::encode(md5_hasher.finalize());
-        let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
+        let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
         let mut metadata = FileMetadata::new_passthrough(
             obj_key.filename.clone(),
@@ -1287,7 +1287,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
         let sha256 = hex::encode(sha256_hasher.finalize());
         let md5 = hex::encode(md5_hasher.finalize());
-        let _guard = self.acquire_prefix_lock(&deltaspace_id).await;
+        let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
         let mut metadata = FileMetadata::new_passthrough(
             obj_key.filename.clone(),
@@ -1344,7 +1344,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
-        let guard = self.acquire_prefix_lock(&deltaspace_id).await;
+        let guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
         // The create call needs metadata headers (content-type, user
         // metadata) so the backend stamps them at create time.
@@ -1645,7 +1645,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
             // This is a legacy reference — migrate it
             let filename = ref_meta.original_name.clone();
-            let _guard = self.acquire_prefix_lock(ds).await;
+            let _guard = self.acquire_prefix_lock(bucket, ds).await;
             match self
                 .migrate_legacy_reference_object_if_needed(bucket, ds, &filename)
                 .await
@@ -2005,5 +2005,40 @@ mod metadata_cache_ttl_tests {
                 "{key}: cache hits re-inserted the entry"
             );
         }
+    }
+}
+
+/// Tier 3: the per-deltaspace lock is per BUCKET too. Keyed by the prefix
+/// alone, `a/releases` and `b/releases` shared one mutex.
+#[cfg(test)]
+mod prefix_lock_scope_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::storage::FilesystemBackend;
+
+    #[tokio::test]
+    async fn same_prefix_in_two_buckets_does_not_contend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
+        let _held = engine.acquire_prefix_lock("bucket-a", "releases").await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            engine.acquire_prefix_lock("bucket-b", "releases"),
+        )
+        .await
+        .expect("another bucket's deltaspace must not wait");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                engine.acquire_prefix_lock("bucket-a", "releases"),
+            )
+            .await
+            .is_err(),
+            "the same deltaspace must still serialise"
+        );
     }
 }

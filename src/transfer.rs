@@ -1024,7 +1024,7 @@ async fn delta_passthrough_copy(
     // `Some(ref_bytes)` = shipped (ref_bytes = bytes of a reference we SEEDED on
     // this copy, 0 if the dest already had one); `None` = fell back.
     let shipped: Result<Option<u64>, Box<dyn std::error::Error + Send + Sync>> = engine
-        .with_dest_prefix_lock(&dest_prefix, || async move {
+        .with_dest_prefix_lock(&counter_dest_bucket, &dest_prefix, || async move {
             // Re-read the dest reference UNDER the lock and re-run the SAME pure
             // gate — identical sha + enc precedence to the first read.
             let dest_ref = engine2
@@ -1151,7 +1151,7 @@ async fn heal_stripped_dest_delta(
     // Re-assert the stripped signature INSIDE the lock: if the object changed since
     // the pre-check, another writer already re-stamped it — nothing to heal.
     engine
-        .with_dest_prefix_lock(&dest_key.prefix, || async {
+        .with_dest_prefix_lock(bucket, &dest_key.prefix, || async {
             match engine.head(bucket, key).await {
                 Ok(m) if m.file_size != expected_delta_size => return, // healed/changed under us
                 Ok(_) => {}
