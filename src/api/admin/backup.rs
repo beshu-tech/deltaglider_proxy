@@ -376,6 +376,63 @@ struct BackupSecrets {
     /// would silently lose them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     event_delivery: Option<SecretsEventDelivery>,
+    /// Proxy AES keys of the singleton backend (`storage.backend_encryption`)
+    /// — D13. config.yaml has them redacted, so without these a DR restore
+    /// leaves encrypted objects unreadable. Optional: old backups lack it,
+    /// and old servers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backend_encryption: Option<SecretsEncryption>,
+    /// Same, per named backend, keyed by backend name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    backend_encryption_named: BTreeMap<String, SecretsEncryption>,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, PartialEq, Debug)]
+struct SecretsEncryption {
+    /// `aes256-gcm-proxy` key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    /// Decrypt-only key of any mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_key: Option<String>,
+}
+
+impl SecretsEncryption {
+    fn harvest(e: &crate::config::BackendEncryptionConfig) -> Option<Self> {
+        use crate::config::BackendEncryptionConfig as E;
+        let (key, legacy_key) = match e {
+            E::Aes256GcmProxy {
+                key, legacy_key, ..
+            } => (key.clone(), legacy_key.clone()),
+            E::None { legacy_key, .. }
+            | E::SseKms { legacy_key, .. }
+            | E::SseS3 { legacy_key, .. } => (None, legacy_key.clone()),
+        };
+        let s = Self { key, legacy_key };
+        (s != Self::default()).then_some(s)
+    }
+
+    /// Fill only the slots the restored config leaves empty (redacted), and
+    /// only where its mode has such a slot.
+    fn hydrate(&self, e: &mut crate::config::BackendEncryptionConfig) {
+        use crate::config::BackendEncryptionConfig as E;
+        let legacy = match e {
+            E::Aes256GcmProxy {
+                key, legacy_key, ..
+            } => {
+                if key.is_none() {
+                    key.clone_from(&self.key);
+                }
+                legacy_key
+            }
+            E::None { legacy_key, .. }
+            | E::SseKms { legacy_key, .. }
+            | E::SseS3 { legacy_key, .. } => legacy_key,
+        };
+        if legacy.is_none() {
+            legacy.clone_from(&self.legacy_key);
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -823,6 +880,12 @@ fn harvest_config_secrets(
         storage_backends: Default::default(),
         oauth_client_secrets: Default::default(),
         event_delivery: None,
+        backend_encryption: SecretsEncryption::harvest(&cfg.backend_encryption),
+        backend_encryption_named: cfg
+            .backends
+            .iter()
+            .filter_map(|b| Some((b.name.clone(), SecretsEncryption::harvest(&b.encryption)?)))
+            .collect(),
     };
     // Access-section bootstrap SigV4 pair.
     if cfg.access_key_id.is_some() || cfg.secret_access_key.is_some() {
@@ -964,6 +1027,15 @@ fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets)
         }
     }
 
+    if let Some(e) = &secrets.backend_encryption {
+        e.hydrate(&mut cfg.backend_encryption);
+    }
+    for named in &mut cfg.backends {
+        if let Some(e) = secrets.backend_encryption_named.get(&named.name) {
+            e.hydrate(&mut named.encryption);
+        }
+    }
+
     // Event-delivery secrets: restore the real Slack bot token + webhook header
     // values over the masked placeholders in config.yaml. Without this, a
     // cross-instance / DR restore (where the running instance has no token to
@@ -989,7 +1061,10 @@ fn config_yaml_hydrated_for_restore(
     if let Some(secrets) = secrets {
         hydrate_config_with_backup_secrets(&mut cfg, secrets);
     }
-    cfg.to_canonical_yaml()
+    // The persist serializer, not the export one: export strips the AES keys
+    // just hydrated (D13). It also escapes `$`, so apply's env pass returns
+    // the hydrated values unchanged.
+    cfg.to_canonical_yaml_for_persist_with(&crate::config::process_env)
         .map_err(|e| format!("config.yaml could not be re-serialized after secret hydration: {e}"))
 }
 
@@ -1908,6 +1983,36 @@ pub struct ImportResult {
 
 #[cfg(test)]
 mod tests {
+
+    /// D13: a full backup must carry the YAML-configured AES keys (singleton
+    /// and named), and a restore must put them back into the applied config.
+    /// Before, config.yaml had them redacted and secrets.json lacked them, so
+    /// a DR restore left encrypted objects unreadable.
+    #[test]
+    fn full_backup_round_trips_encryption_keys() {
+        const K1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const K2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+        const K3: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+        let yaml = format!(
+            "storage:\n  filesystem: /tmp/d13\n  backend_encryption:\n    mode: aes256-gcm-proxy\n    key: \"{K1}\"\n  backends:\n    - name: hetzner-fsn1\n      type: filesystem\n      path: /tmp/d13b\n      encryption:\n        mode: none\n        legacy_key: \"{K2}\"\n    - name: local-disk\n      type: filesystem\n      path: /tmp/d13c\n      encryption:\n        mode: aes256-gcm-proxy\n        key: \"{K3}\"\n"
+        );
+        let cfg = crate::config::Config::from_yaml_str(&yaml).unwrap();
+        let secrets = harvest_config_secrets(&cfg).unwrap();
+        let json = serde_json::to_string(&secrets).unwrap();
+        for k in [K1, K2, K3] {
+            assert!(json.contains(k), "secrets.json lacks a key: {json}");
+        }
+        // The backup's config.yaml is the redacted export.
+        let exported = cfg.redact_all_secrets().to_canonical_yaml().unwrap();
+        assert!(!exported.contains(K1));
+        let restored = config_yaml_hydrated_for_restore(&exported, Some(&secrets)).unwrap();
+        for k in [K1, K2, K3] {
+            assert!(restored.contains(k), "restore lost a key:\n{restored}");
+        }
+        // Old secrets.json (no key fields) still parses.
+        let old: BackupSecrets = serde_json::from_str("{}").unwrap();
+        assert!(config_yaml_hydrated_for_restore(&exported, Some(&old)).is_ok());
+    }
 
     /// S16: a legacy backup (no `users[].id`) where Alice is in no group and
     /// Bob and Carol are. The old fallback took the idx-th group member id,

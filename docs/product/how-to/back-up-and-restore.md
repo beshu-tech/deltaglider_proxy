@@ -33,7 +33,7 @@ The zip contains four artefacts, each sha256-listed in the manifest:
 - `manifest.json` — version, timestamp, checksums
 - `config.yaml` — canonical YAML, secrets redacted
 - `iam.json` — users, groups, OAuth providers, mapping rules, external identities
-- `secrets.json` — **plaintext** infra secrets: bootstrap hash, OAuth client_secrets, storage creds
+- `secrets.json` — **plaintext** infra secrets: bootstrap hash, OAuth client_secrets, storage creds, and the encryption keys (`key` and `legacy_key`) of every backend whose keys are in the config file. A restore puts these keys back, so that objects encrypted before the backup stay readable and new writes stay encrypted. A key that comes from an environment variable, such as `DGP_ENCRYPTION_KEY`, is not in the backup, so set that variable on the new instance before you restore
 
 A secret that comes from an environment variable (for example `DGP_SECRET_ACCESS_KEY`, `DGP_BE_AWS_SECRET_ACCESS_KEY` or `DGP_BOOTSTRAP_PASSWORD_HASH`) is not part of the backup. The backup holds only what the config file holds, so a restore never writes an environment value into another instance's config file. The instance you restore onto must get these values from its own environment, so keep them in your secret manager.
 
