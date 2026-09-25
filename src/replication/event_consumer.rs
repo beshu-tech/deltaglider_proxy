@@ -346,21 +346,18 @@ pub fn spawn_event_consumer(
 }
 
 /// Seed the replication cursor to `MAX(event_outbox.id)` if it has no cursor yet
-/// (don't replay history on first feature boot).
+/// (don't replay history on first feature boot). "No cursor" is "no row", not
+/// "0": the row is written even at 0 (an empty outbox). Otherwise the next tick
+/// saw a 0 cursor again, took the first LIVE event for history and seeded past
+/// it — that event was never replicated.
 async fn seed_cursor_if_absent(db: &Arc<Mutex<ConfigDb>>) {
     let dbg = db.lock().await;
-    if dbg.listener_cursor_load(REPLICATION_LISTENER).unwrap_or(0) == 0 {
-        // Read the newest event id; advance the cursor to it so only events
-        // after this moment are treated as live.
-        let max_id = dbg
-            .event_outbox_recent(1)
-            .ok()
-            .and_then(|rows| rows.first().map(|r| r.id))
-            .unwrap_or(0);
-        if max_id > 0 {
-            let _ =
-                dbg.listener_cursor_advance(REPLICATION_LISTENER, max_id, current_unix_seconds());
-        }
+    if matches!(
+        dbg.listener_cursor_load_full(REPLICATION_LISTENER),
+        Ok(None)
+    ) {
+        let max_id = dbg.event_outbox_max_id().ok().flatten().unwrap_or(0);
+        let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, max_id, current_unix_seconds());
     }
 }
 
@@ -1382,5 +1379,56 @@ mod claim_rule_tests {
                 "{name}: lease left held"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+
+    fn put_event(db: &ConfigDb, key: &str) -> i64 {
+        db.event_outbox_insert(&NewEvent::new(
+            EventKind::ObjectCreated,
+            "b",
+            key,
+            EventSource::S3Api,
+            1,
+            serde_json::json!({}),
+        ))
+        .unwrap()
+    }
+
+    /// The seed runs on every enabled tick. With an empty outbox it wrote no
+    /// cursor row, so the next tick took the first live event for history,
+    /// seeded past it, and that event was never replicated.
+    #[tokio::test]
+    async fn seed_does_not_swallow_the_first_live_event() {
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("pw").unwrap()));
+        seed_cursor_if_absent(&db).await; // first enabled tick, empty outbox
+        let first = put_event(&*db.lock().await, "k1");
+        seed_cursor_if_absent(&db).await; // next tick, before any drain
+        let cursor = db
+            .lock()
+            .await
+            .listener_cursor_load(REPLICATION_LISTENER)
+            .unwrap();
+        assert!(
+            cursor < first,
+            "event {first} was seeded past (cursor {cursor})"
+        );
+    }
+
+    /// History from before the enable is still skipped once.
+    #[tokio::test]
+    async fn seed_skips_history_once() {
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("pw").unwrap()));
+        let old = put_event(&*db.lock().await, "old");
+        seed_cursor_if_absent(&db).await;
+        let cursor = db
+            .lock()
+            .await
+            .listener_cursor_load(REPLICATION_LISTENER)
+            .unwrap();
+        assert_eq!(cursor, old);
     }
 }
