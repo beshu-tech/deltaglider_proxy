@@ -11,6 +11,7 @@ use crate::cli::aws_creds;
 use crate::cli::config as cli_exit;
 use crate::cli::engine_factory::{build_cli_engine, CliEngineOpts};
 use crate::cli::filter::Filter;
+use crate::cli::keys::{dir_prefix, rel_under};
 use crate::cli::ls::should_allow_local;
 use crate::cli::s3_url::{is_s3_url, parse_s3_url};
 use crate::deltaglider::DynEngine;
@@ -155,13 +156,16 @@ async fn rm_recursive(engine: &DynEngine, args: &RmArgs, bucket: &str, prefix: &
         }
     };
 
+    // Directory semantics: `releases` means `releases/`, never
+    // `releases-old/`.
+    let dir = dir_prefix(prefix);
     let mut continuation: Option<String> = None;
     let mut succeeded: u64 = 0;
     let mut failed: u64 = 0;
 
     loop {
         let page = match engine
-            .list_objects(bucket, prefix, None, 1000, continuation.as_deref(), false)
+            .list_objects(bucket, &dir, None, 1000, continuation.as_deref(), false)
             .await
         {
             Ok(p) => p,
@@ -171,10 +175,8 @@ async fn rm_recursive(engine: &DynEngine, args: &RmArgs, bucket: &str, prefix: &
             }
         };
 
-        for (key, _meta) in &page.objects {
-            if !filter.matches(key) {
-                continue;
-            }
+        let keys: Vec<&str> = page.objects.iter().map(|(k, _)| k.as_str()).collect();
+        for key in rm_targets(&keys, &dir, &filter) {
             if !args.quiet {
                 println!("delete: s3://{bucket}/{key}");
             }
@@ -209,8 +211,44 @@ async fn rm_recursive(engine: &DynEngine, args: &RmArgs, bucket: &str, prefix: &
     }
 }
 
+/// Pure: the keys of one listing page that `rm -r` deletes. `prefix`
+/// is normalised with [`dir_prefix`] here too, so a caller cannot
+/// forget it.
+pub(crate) fn rm_targets<'a>(keys: &[&'a str], prefix: &str, filter: &Filter) -> Vec<&'a str> {
+    let dir = dir_prefix(prefix);
+    keys.iter()
+        .copied()
+        .filter(|k| rel_under(k, &dir).is_some() && filter.matches(k))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn filter(inc: &[&str], exc: &[&str]) -> Filter {
+        let inc: Vec<String> = inc.iter().map(|s| s.to_string()).collect();
+        let exc: Vec<String> = exc.iter().map(|s| s.to_string()).collect();
+        Filter::build(&inc, &exc).unwrap()
+    }
+
+    const KEYS: &[&str] = &[
+        "releases",
+        "releases/v1.zip",
+        "releases/tmp/scratch.zip",
+        "releases-old/v0.zip",
+    ];
+
+    /// `rm -r s3://b/releases` means the `releases/` directory, never
+    /// the sibling `releases-old/`.
+    #[test]
+    fn prefix_without_slash_is_a_directory() {
+        assert_eq!(
+            rm_targets(KEYS, "releases", &filter(&[], &[])),
+            vec!["releases/v1.zip", "releases/tmp/scratch.zip"]
+        );
+    }
+
     /// Single-key rm without `--recursive` requires a non-empty key —
     /// "s3://bucket" alone is a programming error (would be a bucket
     /// delete, which we leave to a future explicit subcommand). This

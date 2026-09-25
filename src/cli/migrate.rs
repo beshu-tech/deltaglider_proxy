@@ -22,6 +22,7 @@ use crate::cli::aws_creds;
 use crate::cli::config as cli_exit;
 use crate::cli::engine_factory::{build_cli_engine, render_store_error, CliEngineOpts};
 use crate::cli::filter::Filter;
+use crate::cli::keys::{dir_prefix, rel_under};
 use crate::cli::ls::should_allow_local;
 use crate::cli::s3_url::{is_s3_url, parse_s3_url, S3Loc};
 use crate::deltaglider::DynEngine;
@@ -174,10 +175,18 @@ pub async fn run(args: MigrateArgs) -> i32 {
     };
 
     let preserve_prefix = !args.no_preserve_prefix;
-    let dest_prefix_eff = effective_dest_prefix(&src_loc.key, &dst_loc.key, preserve_prefix);
+    // Directory semantics on both sides: `releases` means `releases/`,
+    // so siblings (`releases-old/`) are neither read nor counted as
+    // already migrated, and destination keys never get a `//`.
+    let src_dir = dir_prefix(&src_loc.key);
+    let dest_prefix_eff = dir_prefix(&effective_dest_prefix(
+        &src_loc.key,
+        &dst_loc.key,
+        preserve_prefix,
+    ));
 
     // List source.
-    let src_keys = match list_prefix(&src_engine, &src_loc.bucket, &src_loc.key).await {
+    let src_keys = match list_prefix(&src_engine, &src_loc.bucket, &src_dir).await {
         Ok(k) => k,
         Err(code) => return code,
     };
@@ -188,12 +197,12 @@ pub async fn run(args: MigrateArgs) -> i32 {
         Err(code) => return code,
     };
     let dst_index: HashSet<String> = dst_keys
-        .into_iter()
-        .map(|k| strip_prefix(&k, &dest_prefix_eff))
+        .iter()
+        .filter_map(|k| rel_under(k, &dest_prefix_eff).map(str::to_string))
         .collect();
 
     // Compute the migration plan.
-    let plan = build_plan(&src_keys, &src_loc.key, &dst_index, &filter);
+    let plan = build_plan(&src_keys, &src_dir, &dst_index, &filter);
 
     if plan.is_empty() {
         if !args.quiet {
@@ -240,13 +249,7 @@ pub async fn run(args: MigrateArgs) -> i32 {
     let mut succeeded = 0u64;
     let mut failed = 0u64;
     for (rel_key, src_full) in &plan {
-        let dst_full = if dest_prefix_eff.is_empty() {
-            rel_key.clone()
-        } else if dest_prefix_eff.ends_with('/') {
-            format!("{dest_prefix_eff}{rel_key}")
-        } else {
-            format!("{dest_prefix_eff}/{rel_key}")
-        };
+        let dst_full = format!("{dest_prefix_eff}{rel_key}");
         if !args.quiet {
             println!(
                 "copy: s3://{}/{} to s3://{}/{}",
@@ -289,27 +292,21 @@ pub(crate) fn build_plan(
     dst_index: &HashSet<String>,
     filter: &Filter,
 ) -> Vec<(String, String)> {
+    let dir = dir_prefix(src_prefix);
     let mut out = Vec::new();
     for k in src_keys {
-        let rel = strip_prefix(k, src_prefix);
-        if !filter.matches(&rel) {
+        let Some(rel) = rel_under(k, &dir) else {
+            continue;
+        };
+        if !filter.matches(rel) {
             continue;
         }
-        if dst_index.contains(&rel) {
+        if dst_index.contains(rel) {
             continue;
         }
-        out.push((rel, k.clone()));
+        out.push((rel.to_string(), k.clone()));
     }
     out
-}
-
-fn strip_prefix(key: &str, prefix: &str) -> String {
-    if prefix.is_empty() {
-        return key.to_string();
-    }
-    key.strip_prefix(prefix)
-        .map(str::to_string)
-        .unwrap_or_else(|| key.to_string())
 }
 
 async fn list_prefix(engine: &DynEngine, bucket: &str, prefix: &str) -> Result<Vec<String>, i32> {
@@ -528,13 +525,19 @@ mod tests {
         assert_eq!(rel_keys, vec!["v1.zip", "v2.zip"]);
     }
 
+    /// A source prefix without a trailing `/` is a directory: siblings
+    /// are not migrated and relative keys carry no leading `/`.
     #[test]
-    fn strip_prefix_handles_empty_prefix() {
-        assert_eq!(strip_prefix("releases/v1.zip", ""), "releases/v1.zip");
-        assert_eq!(strip_prefix("releases/v1.zip", "releases/"), "v1.zip");
-        // Prefix doesn't match → return original (we use this for paths
-        // that fell outside the listed prefix, which shouldn't happen in
-        // practice but we don't want to panic).
-        assert_eq!(strip_prefix("other/v1.zip", "releases/"), "other/v1.zip");
+    fn plan_treats_prefix_as_directory() {
+        let src_keys = vec![
+            "releases/v1.zip".to_string(),
+            "releases-old/v0.zip".to_string(),
+        ];
+        let filter = Filter::build(&[], &[]).unwrap();
+        let plan = build_plan(&src_keys, "releases", &HashSet::new(), &filter);
+        assert_eq!(
+            plan,
+            vec![("v1.zip".to_string(), "releases/v1.zip".to_string())]
+        );
     }
 }

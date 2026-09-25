@@ -17,7 +17,7 @@ use crate::cli::aws_creds;
 use crate::cli::config as cli_exit;
 use crate::cli::engine_factory::{build_cli_engine, render_store_error, CliEngineOpts};
 use crate::cli::filter::Filter;
-use crate::cli::keys::{local_path_for_key, LocalPathError};
+use crate::cli::keys::{dir_prefix, local_path_for_key, rel_under, LocalPathError};
 use crate::cli::ls::should_allow_local;
 use crate::cli::s3_url::{is_s3_url, parse_s3_url, S3Loc};
 use crate::deltaglider::DynEngine;
@@ -391,6 +391,8 @@ async fn download(engine: &DynEngine, args: &CpArgs, filter: &Filter, src: &S3Lo
             eprintln!("error: mkdir {} failed: {e}", dst_root.display());
             return cli_exit::EXIT_IO;
         }
+        // Directory semantics: `releases` means `releases/`.
+        let src_dir = dir_prefix(&src.key);
         let mut continuation: Option<String> = None;
         let mut succeeded: u64 = 0;
         let mut failed: u64 = 0;
@@ -398,7 +400,7 @@ async fn download(engine: &DynEngine, args: &CpArgs, filter: &Filter, src: &S3Lo
             let page = match engine
                 .list_objects(
                     &src.bucket,
-                    &src.key,
+                    &src_dir,
                     None,
                     1000,
                     continuation.as_deref(),
@@ -413,7 +415,9 @@ async fn download(engine: &DynEngine, args: &CpArgs, filter: &Filter, src: &S3Lo
                 }
             };
             for (k, _meta) in &page.objects {
-                let rel = k.strip_prefix(&src.key).unwrap_or(k);
+                let Some(rel) = rel_under(k, &src_dir) else {
+                    continue;
+                };
                 if !filter.matches(rel) {
                     continue;
                 }
@@ -511,6 +515,8 @@ async fn s3_to_s3(
         )
         .await
     } else {
+        // Directory semantics: `releases` means `releases/`.
+        let src_dir = dir_prefix(&src.key);
         let mut continuation: Option<String> = None;
         let mut succeeded: u64 = 0;
         let mut failed: u64 = 0;
@@ -518,7 +524,7 @@ async fn s3_to_s3(
             let page = match engine
                 .list_objects(
                     &src.bucket,
-                    &src.key,
+                    &src_dir,
                     None,
                     1000,
                     continuation.as_deref(),
@@ -533,7 +539,9 @@ async fn s3_to_s3(
                 }
             };
             for (k, _meta) in &page.objects {
-                let rel = k.strip_prefix(&src.key).unwrap_or(k);
+                let Some(rel) = rel_under(k, &src_dir) else {
+                    continue;
+                };
                 if !filter.matches(rel) {
                     continue;
                 }

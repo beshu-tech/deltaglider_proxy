@@ -160,6 +160,23 @@ mod tests {
         assert_eq!(rel_under("releases/", &d), None);
         assert_eq!(rel_under("a/b", ""), Some("a/b"));
     }
+
+    /// Guard for the class: recursive verbs derive relative keys only
+    /// through `rel_under`, never a raw `strip_prefix` on a key.
+    #[test]
+    fn recursive_verbs_do_not_strip_key_prefixes_by_hand() {
+        for (name, src) in [
+            ("cp.rs", include_str!("cp.rs")),
+            ("rm.rs", include_str!("rm.rs")),
+            ("sync.rs", include_str!("sync.rs")),
+            ("migrate.rs", include_str!("migrate.rs")),
+        ] {
+            let code = src.split("#[cfg(test)]").next().unwrap();
+            for bad in ["k.strip_prefix(", "key.strip_prefix("] {
+                assert!(!code.contains(bad), "{name} strips a key prefix by hand");
+            }
+        }
+    }
 }
 
 #[cfg(test)]

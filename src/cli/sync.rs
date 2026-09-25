@@ -24,7 +24,7 @@ use crate::cli::aws_creds;
 use crate::cli::config as cli_exit;
 use crate::cli::engine_factory::{build_cli_engine, render_store_error, CliEngineOpts};
 use crate::cli::filter::Filter;
-use crate::cli::keys::{local_path_for_key, LocalPathError};
+use crate::cli::keys::{dir_prefix, local_path_for_key, rel_under, LocalPathError};
 use crate::cli::ls::should_allow_local;
 use crate::cli::s3_url::{is_s3_url, parse_s3_url};
 use crate::deltaglider::DynEngine;
@@ -512,11 +512,13 @@ async fn collect_s3_entries(
     prefix: &str,
     filter: &Filter,
 ) -> Result<HashMap<String, Entry>, i32> {
+    // Directory semantics: `releases` means `releases/`.
+    let dir = dir_prefix(prefix);
     let mut out = HashMap::new();
     let mut continuation: Option<String> = None;
     loop {
         let page = engine
-            .list_objects(bucket, prefix, None, 1000, continuation.as_deref(), true)
+            .list_objects(bucket, &dir, None, 1000, continuation.as_deref(), true)
             .await
             .map_err(|e| {
                 eprintln!("error: list_objects on s3://{bucket}/{prefix} failed: {e}");
@@ -529,10 +531,9 @@ async fn collect_s3_entries(
             if key.starts_with(".deltaglider/") || key.ends_with("reference.bin") {
                 continue;
             }
-            let rel = strip_prefix(&key, prefix);
-            if rel.is_empty() {
+            let Some(rel) = rel_under(&key, &dir).map(str::to_string) else {
                 continue;
-            }
+            };
             if !filter.matches(&rel) {
                 continue;
             }
@@ -637,30 +638,7 @@ async fn copy_one(
 
 /// Pure: join a prefix and a relative key, handling trailing slashes.
 fn join_prefix(prefix: &str, rel: &str) -> String {
-    if prefix.is_empty() {
-        return rel.to_string();
-    }
-    if prefix.ends_with('/') {
-        format!("{prefix}{rel}")
-    } else {
-        format!("{prefix}/{rel}")
-    }
-}
-
-/// Pure: strip the prefix from a full key, returning the relative tail.
-fn strip_prefix(key: &str, prefix: &str) -> String {
-    if prefix.is_empty() {
-        return key.to_string();
-    }
-    let normalized = if prefix.ends_with('/') {
-        prefix.to_string()
-    } else {
-        format!("{prefix}/")
-    };
-    key.strip_prefix(&normalized)
-        .or_else(|| key.strip_prefix(prefix))
-        .map(str::to_string)
-        .unwrap_or_else(String::new)
+    format!("{}{rel}", dir_prefix(prefix))
 }
 
 fn summarize(args: &SyncArgs, succeeded: u64, failed: u64, deleted: u64) -> i32 {
@@ -833,14 +811,5 @@ mod tests {
         assert_eq!(join_prefix("p", "a/b"), "p/a/b");
         assert_eq!(join_prefix("p/", "a/b"), "p/a/b");
         assert_eq!(join_prefix("", "a/b"), "a/b");
-    }
-
-    #[test]
-    fn strip_prefix_removes_normalized_slash() {
-        assert_eq!(strip_prefix("p/a/b", "p"), "a/b");
-        assert_eq!(strip_prefix("p/a/b", "p/"), "a/b");
-        assert_eq!(strip_prefix("a/b", ""), "a/b");
-        // Prefix doesn't appear at the start → empty (caller filters out).
-        assert_eq!(strip_prefix("other/a", "p"), "");
     }
 }

@@ -116,3 +116,39 @@ async fn rm_recursive_with_include_only_touches_matching_keys() {
     }
     s3.delete_bucket().bucket(&bucket).send().await.ok();
 }
+
+/// `rm -r s3://b/releases` (no trailing `/`) is a directory delete:
+/// the sibling `releases-old/` must survive.
+#[tokio::test]
+async fn rm_recursive_prefix_without_slash_spares_siblings() {
+    skip_unless_minio!();
+    let bucket = unique_bucket("siblings");
+    let s3 = minio_client().await;
+    s3.create_bucket().bucket(&bucket).send().await.unwrap();
+    for key in ["releases/v1.zip", "releases-old/v0.zip"] {
+        s3.put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"x"))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let mut args = make_args(format!("s3://{bucket}/releases"));
+    args.recursive = true;
+    assert_eq!(run(args).await, deltaglider_proxy::cli::config::EXIT_OK);
+
+    let listing = s3.list_objects_v2().bucket(&bucket).send().await.unwrap();
+    let remaining: Vec<String> = listing
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(String::from))
+        .collect();
+    assert_eq!(remaining, vec!["releases-old/v0.zip".to_string()]);
+
+    for k in remaining {
+        s3.delete_object().bucket(&bucket).key(&k).send().await.ok();
+    }
+    s3.delete_bucket().bucket(&bucket).send().await.ok();
+}
