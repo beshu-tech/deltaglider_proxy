@@ -1995,13 +1995,30 @@ fn add_get_object_security_headers(resp: &mut s3s::S3Response<s3s::dto::GetObjec
 
 /// Pure: may a browser treat this content type as an active document?
 /// Unknown types count as active: only inert media and PDF are exempt.
+/// A value with a `,` is a list: browsers use the LAST valid type in it
+/// (Fetch "extract a MIME type"), so it is never inert. The essence must
+/// be one well-formed `type/subtype` token, else it counts as active.
 fn content_type_needs_sandbox(content_type: &str) -> bool {
+    if content_type.contains(',') {
+        return true;
+    }
     let essence = content_type
         .split(';')
         .next()
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
+    let well_formed = essence.split_once('/').is_some_and(|(t, sub)| {
+        let token = |s: &str| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b))
+        };
+        token(t) && token(sub)
+    });
+    if !well_formed {
+        return true;
+    }
     let inert = (essence.starts_with("image/") && !essence.contains("svg"))
         || essence.starts_with("video/")
         || essence.starts_with("audio/")
@@ -2730,7 +2747,13 @@ mod tests {
         ] {
             assert!(content_type_needs_sandbox(active), "{active:?}");
         }
-        for inert in ["image/png", "video/mp4", "audio/mpeg", "application/pdf"] {
+        for inert in [
+            "image/png",
+            "image/png; q=1",
+            "video/mp4",
+            "audio/mpeg",
+            "application/pdf",
+        ] {
             assert!(!content_type_needs_sandbox(inert), "{inert:?}");
         }
     }
@@ -3161,7 +3184,6 @@ mod review2_tests {
     /// renders as HTML, but the essence here is taken before the first `;`,
     /// so it counts as an inert image and gets no sandbox.
     #[test]
-    #[ignore = "review2: pending fix"]
     fn review2_sandbox_is_not_bypassed_by_a_content_type_list() {
         for ct in [
             "image/png, text/html",
