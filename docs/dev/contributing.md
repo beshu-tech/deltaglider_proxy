@@ -117,7 +117,6 @@ src/
 ├── event_delivery.rs    # Background dispatcher → webhook JSON or Slack message
 ├── slack_format.rs      # Pure Slack Block Kit formatter + notification filter
 ├── security.rs          # Pure security primitives (validate_bucket_name, bucket_name_is_ip_like, outbound-URL SSRF policy)
-├── secret.rs            # Secret trait (opaque material + non-secret id) — future KMS/Vault home
 ├── tls.rs               # TLS setup (user PEM or self-signed via rcgen)
 ├── background.rs        # Shared background-runner helpers (parse_duration_or)
 ├── init.rs              # Interactive --init config wizard

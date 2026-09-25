@@ -134,7 +134,6 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                             failure-ring prune (id DESC), zombie-run scan — all three subsystems delegate here
   → transfer.rs             Shared engine-routed copy primitive (retrieve→store, preserve multipart ETags, stamp provenance, retry transient) — used by replication + lifecycle
   → usage_scanner.rs        Background prefix size scanner (cached results, LRU, scan cap)
-  → secret.rs               Secret trait (opaque material + non-secret stable id) — formalises the AES-key shape; future KMS/Vault impls plug in here
   → tls.rs                  TLS setup: user-provided PEM or ephemeral self-signed (rcgen)
   → background.rs           Shared background-runner helpers (parse_duration_or for replication/lifecycle/event_delivery)
   → init.rs                 Interactive `--init` config wizard

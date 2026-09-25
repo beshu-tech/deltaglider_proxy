@@ -33,7 +33,6 @@ pub mod multipart;
 pub mod rate_limiter;
 pub mod replication;
 pub mod s3_adapter_s3s;
-pub mod secret;
 pub mod security;
 pub mod session;
 pub mod slack_format;
