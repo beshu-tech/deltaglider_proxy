@@ -31,7 +31,8 @@ pub struct EnvVarEntry {
 
 /// Single source of truth for every `DGP_*` environment variable.
 ///
-/// A unit test enforces that this list matches `from_env()` exactly.
+/// `every_dgp_literal_in_src_is_registered` scans `src/` and fails when a
+/// `DGP_*` literal is missing here, or an entry here is read nowhere.
 pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     // ── Server ──────────────────────────────────────────────
     EnvVarEntry {
@@ -521,6 +522,90 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         description: "Require HTTPS for admin session cookies (default: true)",
         example: "true",
         category: "Security",
+    },
+    EnvVarEntry {
+        name: "DGP_ADMIN_PASSWORD_HASH",
+        description: "Legacy alias of DGP_BOOTSTRAP_PASSWORD_HASH (used when that is unset)",
+        example: "$2b$12$...",
+        category: "Authentication",
+    },
+    EnvVarEntry {
+        name: "DGP_BOOTSTRAP_PASSWORD",
+        description: "Plaintext bootstrap password for the admin CLI (`config apply`, `admin ...`) only; never read by the server",
+        example: "change-me",
+        category: "Authentication",
+    },
+    EnvVarEntry {
+        name: "DGP_RATE_LIMIT_ACCOUNT_MAX_ATTEMPTS",
+        description: "Failed logins per account (any IP) before that account locks (default: 10)",
+        example: "10",
+        category: "Security",
+    },
+    EnvVarEntry {
+        name: "DGP_RATE_LIMIT_ACCOUNT_WINDOW_SECS",
+        description: "Rolling window for the per-account login-failure count (default: 3600)",
+        example: "3600",
+        category: "Security",
+    },
+    EnvVarEntry {
+        name: "DGP_RATE_LIMIT_ACCOUNT_LOCKOUT_SECS",
+        description: "Per-account lockout duration after the limit (default: 3600)",
+        example: "3600",
+        category: "Security",
+    },
+    EnvVarEntry {
+        name: "DGP_ENCRYPTION_KEY",
+        description: "Singleton-backend AES-256 key (64 hex chars). Named backends use DGP_BACKEND_<NAME>_ENCRYPTION_KEY",
+        example: "<64 hex chars>",
+        category: "Storage",
+    },
+    EnvVarEntry {
+        name: "DGP_SSE_KMS_KEY_ID",
+        description: "Singleton-backend SSE-KMS key ARN or alias. Named backends use DGP_BACKEND_<NAME>_SSE_KMS_KEY_ID",
+        example: "alias/dgp",
+        category: "Storage",
+    },
+    EnvVarEntry {
+        name: "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
+        description: "Largest delta-stored source that UploadPartCopy reconstructs in memory (default: 64 MiB)",
+        example: "67108864",
+        category: "Delta Engine",
+    },
+    EnvVarEntry {
+        name: "DGP_REFERENCE_LOCK_TTL_SECS",
+        description: "Cross-instance reference.bin lock lifetime when config sync is on (default: 120)",
+        example: "120",
+        category: "Config Sync",
+    },
+    EnvVarEntry {
+        name: "DGP_REFERENCE_LOCK_ACQUIRE_TIMEOUT_SECS",
+        description: "How long a PUT waits for the cross-instance reference lock before it fails (default: 30)",
+        example: "30",
+        category: "Config Sync",
+    },
+    EnvVarEntry {
+        name: "DGP_NODE_ID",
+        description: "Stable node label for coordination leases (default: derived and saved next to the config DB)",
+        example: "dgp-0",
+        category: "Config Sync",
+    },
+    EnvVarEntry {
+        name: "DGP_REFERENCE_SCAN_LIMIT",
+        description: "Max reference baselines the savings panel reads per request (default: built-in cap)",
+        example: "10000",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_USAGE_CACHE_TTL_SECS",
+        description: "Lifetime of a cached prefix-usage scan result (default: 300)",
+        example: "300",
+        category: "Server",
+    },
+    EnvVarEntry {
+        name: "DGP_RELAY_FOREIGN_MIN_AGE_SECS",
+        description: "Min age before startup removes another process's multipart relay dir (default: 3600)",
+        example: "3600",
+        category: "Server",
     },
 ];
 
@@ -3333,115 +3418,70 @@ mod tests {
         );
     }
 
-    /// Ensure every env var read in `from_env()` is present in the registry.
+    /// Source guard: every `DGP_*` name that appears as a string literal in
+    /// `src/` is in ENV_VAR_REGISTRY (so `--show-env` and the docs list it),
+    /// apart from test hooks and example names. The hand-kept lists below
+    /// drifted by ~15 variables; this scan cannot.
     #[test]
-    fn test_registry_completeness() {
-        // All env var names referenced in from_env() — extracted manually and
-        // kept in sync by this test.
-        let used_in_from_env: &[&str] = &[
-            "DGP_LISTEN_ADDR",
-            "DGP_S3_ENDPOINT",
-            "DGP_S3_REGION",
-            "DGP_S3_PATH_STYLE",
-            "DGP_BACKEND_ALLOW_LOCAL",
-            "DGP_BE_AWS_ACCESS_KEY_ID",
-            "DGP_BE_AWS_SECRET_ACCESS_KEY",
-            "DGP_DATA_DIR",
-            "DGP_MAX_DELTA_RATIO",
-            "DGP_MAX_OBJECT_SIZE",
-            "DGP_MAX_PASSTHROUGH_OBJECT_SIZE",
-            "DGP_CACHE_MB",
-            "DGP_METADATA_CACHE_MB",
-            "DGP_CODEC_CONCURRENCY",
-            "DGP_BLOCKING_THREADS",
-            "DGP_AUTHENTICATION",
-            "DGP_ACCESS_KEY_ID",
-            "DGP_SECRET_ACCESS_KEY",
-            "DGP_BOOTSTRAP_PASSWORD_HASH",
-            "DGP_LOG_LEVEL",
-            "DGP_CONFIG_SYNC_BUCKET",
-            "DGP_CONFIG_SYNC_KEY",
-            "DGP_TLS_ENABLED",
-            "DGP_TLS_CERT",
-            "DGP_TLS_KEY",
-        ];
-
-        let registry_names: Vec<&str> = super::ENV_VAR_REGISTRY.iter().map(|e| e.name).collect();
-
-        // Every var used in from_env must be in the registry
-        for var in used_in_from_env {
-            assert!(
-                registry_names.contains(var),
-                "Env var {var} is used in from_env() but missing from ENV_VAR_REGISTRY"
-            );
-        }
-
-        // Every registry entry must be referenced somewhere in the codebase.
-        // Vars not in from_env() are read at other call sites (startup, session, etc.).
-        let used_outside_from_env: &[&str] = &[
-            "DGP_CONFIG",                            // config::load()
-            "DGP_DEBUG_HEADERS",                     // api::handlers::debug_headers_enabled()
-            "DGP_TRUST_PROXY_HEADERS",               // rate_limiter::trust_proxy_headers()
-            "DGP_LOG_FORMAT",                        // startup::init_tracing() (text|json)
-            "DGP_LOG_RING_SIZE",                     // logs::ring_capacity()
-            "DGP_LOG_RING_LEVEL",                    // logs::ring_min_level()
-            "DGP_SESSION_TTL_HOURS",                 // session::default_session_ttl()
-            "DGP_MAX_MULTIPART_UPLOADS",             // multipart::default_max_uploads()
-            "DGP_MULTIPART_SWEEP_INTERVAL_SECS",     // main multipart sweeper cadence
-            "DGP_BUCKET_USAGE_FLUSH_SECS",           // main bucket-usage flush cadence (#85)
-            "DGP_MULTIPART_SWEEP_MAX_AGE_SECS",      // main multipart sweeper max-age cutoff
-            "DGP_MULTIPART_COMPLETING_TIMEOUT_SECS", // main multipart Completing timeout
-            "DGP_MAX_TOTAL_MULTIPART_BYTES",         // multipart::max_total_multipart_bytes()
-            "DGP_MULTIPART_IDLE_TTL_HOURS",          // multipart::idle_ttl_hours()
-            "DGP_AUDIT_RING_SIZE",                   // audit::ring capacity
-            "DGP_LIST_SIZE_CACHE_MB",                // storage::list_size_cache budget
-            "DGP_CLOCK_SKEW_SECONDS",                // api::auth + startup replay cache
-            "DGP_MAX_CONCURRENT_REQUESTS",           // startup::build_s3_router()
-            "DGP_CORS_PERMISSIVE",                   // demo::ui_router()
-            "DGP_METRICS_EXPOSE_VERSION",            // startup::init_metrics()
-            "DGP_METRICS_BEARER_TOKEN",              // api::admin::auth::metrics_bearer_token()
-            "DGP_REQUEST_TIMEOUT_SECS",              // startup::build_s3_router()
-            "DGP_RECURSIVE_DELETE_PAGE_SIZE", // s3_adapter_s3s::recursive_delete_prefix_s3s()
-            "DGP_READY_TIMEOUT_SECS",         // api::handlers::status::readiness_check()
-            "DGP_READY_RETRIES",              // api::handlers::status::readiness_check()
-            "DGP_READY_CACHE_TTL_SECS",       // api::handlers::status::readiness_check()
-            "DGP_CODEC_TIMEOUT_SECS",         // deltaglider::codec::codec_timeout()
-            "DGP_CODEC_STALL_SECS",           // deltaglider::codec::codec_stall_timeout()
-            "DGP_CODEC_ABSOLUTE_SECS",        // deltaglider::codec::codec_absolute_ceiling()
-            "DGP_SPOOL_DIR",                  // deltaglider::spool::SpoolDir::from_env()
-            "DGP_SPOOL_MAX_BYTES",            // deltaglider::spool::SpoolDir::from_env()
-            "DGP_SPOOL_THRESHOLD_BYTES",      // engine::retrieve::spool_threshold()
-            "DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", // engine::retrieve::reconstruct_delta_to_spool()
-            "DGP_RATE_LIMIT_MAX_ATTEMPTS",    // rate_limiter::default_auth()
-            "DGP_RATE_LIMIT_WINDOW_SECS",     // rate_limiter::default_auth()
-            "DGP_RATE_LIMIT_LOCKOUT_SECS",    // rate_limiter::default_auth()
-            "DGP_REPLAY_WINDOW_SECS",         // api::auth replay detection
-            "DGP_SECURE_COOKIES",             // api::admin::auth::secure_cookies()
-            "DGP_STREAM_COPY_THRESHOLD",      // transfer_plan::stream_copy_threshold()
-            "DGP_MULTIPART_PART_SIZE",        // transfer_plan::multipart_part_size()
-            "DGP_UPLOAD_CONCURRENCY",         // transfer_plan::upload_concurrency()
-            "DGP_REPLICATION_TRANSFERS",      // transfer_plan::transfers()
-            "DGP_S3_READ_TIMEOUT_SECS",       // storage::s3::build_client()
-            "DGP_S3_CONNECT_TIMEOUT_SECS",    // storage::s3::build_client()
-            "DGP_S3_OPERATION_ATTEMPT_TIMEOUT_SECS", // storage::s3::build_client()
-            "DGP_S3_STALL_GRACE_SECS",        // storage::s3::build_client()
-            "DGP_PARITY_HEAD_CONCURRENCY",    // replication::parity::head_burst()
-            "DGP_PARITY_MAX_OBJECTS",         // replication::parity::max_parity_objects()
-            "DGP_BOOT_BACKEND_PROBE",         // coordination::health::boot_probe_mode()
-            "DGP_BACKEND_LIST_COOLDOWN_SECS", // storage::routing::RoutingBackend::new()
-            "DGP_BACKEND_LIST_TIMEOUT_SECS",  // storage::routing::RoutingBackend::new()
-            "DGP_BACKEND_LIST_FRESH_SECS",    // storage::routing::RoutingBackend::new()
-            "DGP_TRUSTED_PROXY_CIDRS",        // rate_limiter::trusted_proxy_cidrs()
-        ];
-        for name in &registry_names {
-            if used_outside_from_env.contains(name) {
-                continue;
+    fn every_dgp_literal_in_src_is_registered() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
             }
-            assert!(
-                used_in_from_env.contains(name),
-                "Env var {name} is in ENV_VAR_REGISTRY but not used in from_env() or listed in used_outside_from_env"
-            );
         }
+        // Not operator settings: test hooks, a build-time stamp, the
+        // per-backend name prefix, and example backend names in tests.
+        let exempt = |n: &str| {
+            n.starts_with("DGP_TEST_")
+                || n == "DGP_BUILD_TIME"
+                || n == "DGP_BACKEND_"
+                || (n.starts_with("DGP_BACKEND_")
+                    && (n.ends_with("_ENCRYPTION_KEY") || n.ends_with("_SSE_KMS_KEY_ID")))
+        };
+        let registry: Vec<&str> = super::ENV_VAR_REGISTRY.iter().map(|e| e.name).collect();
+        let mut files = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut missing = std::collections::BTreeSet::new();
+        let mut seen: std::collections::HashMap<String, usize> = Default::default();
+        for f in files {
+            let src = std::fs::read_to_string(&f).unwrap();
+            for part in src.split("\"DGP_").skip(1) {
+                let name: String = part
+                    .chars()
+                    .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                    .collect();
+                if !part[name.len()..].starts_with('"') {
+                    continue;
+                }
+                if name.is_empty() {
+                    continue;
+                }
+                let full = format!("DGP_{name}");
+                *seen.entry(full.clone()).or_default() += 1;
+                if !exempt(&full) && !registry.contains(&full.as_str()) {
+                    missing.insert(full);
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "DGP_* variables read in src/ but missing from ENV_VAR_REGISTRY: {missing:?}"
+        );
+        // And the reverse: a registry entry that nothing else names is dead.
+        let dead: Vec<&str> = registry
+            .iter()
+            .copied()
+            .filter(|n| seen.get(*n).copied().unwrap_or(0) < 2)
+            .collect();
+        assert!(dead.is_empty(), "registry entries no code reads: {dead:?}");
     }
 
     #[test]

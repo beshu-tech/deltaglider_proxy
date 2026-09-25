@@ -986,7 +986,7 @@ DGP_TLS_KEY=/etc/ssl/private/proxy-key.pem
 
 ## Environment variable registry
 
-Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_registry_completeness` in `src/config/mod.rs` enforces that this list and `ENV_VAR_REGISTRY` stay in sync.
+The list of `DGP_*` variables that the server reads. The unit test `every_dgp_literal_in_src_is_registered` in `src/config/mod.rs` scans the source code and fails when the code reads a variable that `ENV_VAR_REGISTRY` does not list. `deltaglider_proxy --show-env` prints that registry.
 
 ### Server / Advanced
 
@@ -1010,6 +1010,9 @@ Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_
 | `DGP_CORS_PERMISSIVE` | false | Enable permissive CORS (dev only) |
 | `DGP_METRICS_EXPOSE_VERSION` | false | Put the exact build version in the `version` label of `deltaglider_build_info` on the unauthenticated `/_/metrics` endpoint. Off by default so that anonymous callers cannot fingerprint the deployment; the version stays available through the authenticated admin API |
 | `DGP_METRICS_BEARER_TOKEN` | unset | When set, `/_/metrics` answers only to `Authorization: Bearer <token>` (the Prometheus `authorization:` scrape setting) or to an admin session. Unset keeps the scrape endpoint public. See [Monitor with Prometheus](../how-to/monitor-with-prometheus.md) |
+| `DGP_USAGE_CACHE_TTL_SECS` | 300 | Lifetime of a cached prefix-usage scan result, in seconds |
+| `DGP_REFERENCE_SCAN_LIMIT` | built-in cap | Maximum number of reference baselines that the savings panel reads for one request |
+| `DGP_RELAY_FOREIGN_MIN_AGE_SECS` | 3600 | Minimum age, in seconds, before startup removes a multipart relay directory that another process left behind |
 
 ### Delta engine
 
@@ -1022,6 +1025,7 @@ Exhaustive list of every `DGP_*` variable the server reads. The unit test `test_
 | `DGP_LIST_SIZE_CACHE_MB` | 32 | Listing-size cache in MB: the original size and ETag of stored deltas, for listings |
 | `DGP_CODEC_CONCURRENCY` | `num_cpus * 4` (min 16) | Max concurrent xdelta3 subprocesses |
 | `DGP_CODEC_TIMEOUT_SECS` | 60 | Per-subprocess timeout |
+| `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES` | 64 MiB | Largest delta-stored source object that `UploadPartCopy` reconstructs in memory |
 
 ### Storage
 
@@ -1078,6 +1082,9 @@ Tuning knobs for the large-object streaming multipart copy path (replication + l
 | `DGP_RATE_LIMIT_MAX_ATTEMPTS` | 100 | Max auth failures before lockout |
 | `DGP_RATE_LIMIT_WINDOW_SECS` | 300 | Rate-limit rolling window |
 | `DGP_RATE_LIMIT_LOCKOUT_SECS` | 600 | Lockout duration |
+| `DGP_RATE_LIMIT_ACCOUNT_MAX_ATTEMPTS` | 10 | Failed logins for one account, from any IP address, before that account locks |
+| `DGP_RATE_LIMIT_ACCOUNT_WINDOW_SECS` | 3600 | Rolling window for the per-account count of failed logins |
+| `DGP_RATE_LIMIT_ACCOUNT_LOCKOUT_SECS` | 3600 | Per-account lockout duration |
 
 ### TLS / Config sync / Encryption at rest / Misc
 
@@ -1087,6 +1094,9 @@ Tuning knobs for the large-object streaming multipart copy path (replication + l
 | `DGP_TLS_CERT` | auto self-signed | PEM cert path |
 | `DGP_TLS_KEY` | auto self-signed | PEM key path |
 | `DGP_CONFIG_SYNC_BUCKET` | — | S3 bucket for encrypted-DB multi-instance sync |
+| `DGP_REFERENCE_LOCK_TTL_SECS` | 120 | Lifetime of the cross-instance `reference.bin` lock, when config sync is on |
+| `DGP_REFERENCE_LOCK_ACQUIRE_TIMEOUT_SECS` | 30 | How long a PUT waits for the cross-instance reference lock before it fails |
+| `DGP_NODE_ID` | derived | Stable node label for coordination leases. By default the proxy derives one and saves it next to the config database |
 | `DGP_ENCRYPTION_KEY` | — | Singleton-backend AES-256 key (64-char hex). Named backends use `DGP_BACKEND_<NAME>_ENCRYPTION_KEY`. |
 | `DGP_SSE_KMS_KEY_ID` | — | Singleton-backend SSE-KMS ARN/alias. Named backends use `DGP_BACKEND_<NAME>_SSE_KMS_KEY_ID`. |
 
