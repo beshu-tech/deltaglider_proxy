@@ -212,71 +212,119 @@ pub async fn get_savings(
     }
 }
 
-/// The pure-ish compute path: pages through user-visible objects,
-/// then folds in `reference.bin` bytes via the engine helper. The
-/// math itself lives in `SavingsTotals` so other call sites stay in
-/// lockstep with this one.
+/// How a [`scan_totals`] walk ended early.
+pub(crate) enum TotalsScanError {
+    Cancelled,
+    Failed(String),
+}
+
+/// Options for [`scan_totals`].
+pub(crate) struct TotalsScanOpts<'a> {
+    pub prefix: &'a str,
+    /// Stop after this many user-visible objects (`truncated` = true).
+    pub object_cap: Option<usize>,
+    /// Cap on the reference walk (see `list_deltaspace_references`).
+    pub ref_limit: Option<usize>,
+    pub cancel: Option<&'a tokio_util::sync::CancellationToken>,
+}
+
+/// THE savings scan: page every user-visible object through
+/// `SavingsTotals`, then fold in each `reference.bin` (hidden from LIST
+/// but real stored bytes). `on_page(totals, pages_done, has_more)` runs
+/// after each page. Shared by the savings chip, the dashboard scan and the
+/// usage Refresh, which each carried a copy of this loop. The engine is
+/// re-loaded per page, so a config reload mid-scan uses the new engine.
+pub(crate) async fn scan_totals(
+    s3_state: &Arc<AppState>,
+    bucket: &str,
+    opts: TotalsScanOpts<'_>,
+    mut on_page: impl FnMut(&SavingsTotals, u32, bool),
+) -> Result<(SavingsTotals, bool), TotalsScanError> {
+    let cancelled = || opts.cancel.is_some_and(|c| c.is_cancelled());
+    let mut totals = SavingsTotals::default();
+    let mut continuation: Option<String> = None;
+    let mut walked: usize = 0;
+    let mut truncated = false;
+    let mut pages_done: u32 = 0;
+    loop {
+        if cancelled() {
+            return Err(TotalsScanError::Cancelled);
+        }
+        let engine = s3_state.engine.load();
+        let list = engine.list_objects(
+            bucket,
+            opts.prefix,
+            None,
+            PAGE_SIZE,
+            continuation.as_deref(),
+            true, // metadata=true so deltas carry delta_size (stored bytes)
+        );
+        let page = match opts.cancel {
+            Some(cancel) => tokio::select! {
+                _ = cancel.cancelled() => return Err(TotalsScanError::Cancelled),
+                r = list => r,
+            },
+            None => list.await,
+        }
+        .map_err(|e| TotalsScanError::Failed(e.to_string()))?;
+        for (_key, meta) in &page.objects {
+            totals.accumulate(meta);
+            walked += 1;
+            if opts.object_cap.is_some_and(|cap| walked >= cap) {
+                truncated = true;
+                break;
+            }
+        }
+        pages_done += 1;
+        let has_more = !truncated && page.is_truncated && page.next_continuation_token.is_some();
+        on_page(&totals, pages_done, has_more);
+        if !has_more {
+            break;
+        }
+        continuation = page.next_continuation_token;
+    }
+    if cancelled() {
+        return Err(TotalsScanError::Cancelled);
+    }
+    let refs = s3_state
+        .engine
+        .load()
+        .list_deltaspace_references(bucket, opts.prefix, opts.ref_limit)
+        .await
+        .map_err(|e| TotalsScanError::Failed(e.to_string()))?;
+    for (_, meta) in &refs.references {
+        totals.accumulate(meta);
+    }
+    Ok((totals, truncated || refs.truncated))
+}
+
+/// The savings chip: a capped [`scan_totals`]. The reference walk is
+/// capped too — a bucket with 50k deltaspaces would otherwise fire 50k
+/// HEADs against S3 on every cache miss; the dashboard scan is the
+/// exhaustive path. Tests can lower the cap via `DGP_REFERENCE_SCAN_LIMIT`.
 async fn compute_savings(
     s3_state: &Arc<AppState>,
     bucket: &str,
     prefix: &str,
 ) -> Result<SavingsResponse, String> {
-    let engine = s3_state.engine.load();
-    let mut totals = SavingsTotals::default();
-    let mut continuation: Option<String> = None;
-    let mut walked: usize = 0;
-    let mut truncated = false;
-
-    loop {
-        let page = engine
-            .list_objects(
-                bucket,
-                prefix,
-                None,
-                PAGE_SIZE,
-                continuation.as_deref(),
-                true,
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-
-        for (_key, meta) in &page.objects {
-            totals.accumulate(meta);
-            walked += 1;
-            if walked >= MAX_LISTING_OBJECTS {
-                truncated = true;
-                break;
-            }
-        }
-
-        if truncated || !page.is_truncated {
-            break;
-        }
-        continuation = page.next_continuation_token;
-        if continuation.is_none() {
-            break;
-        }
-    }
-
-    // Fold in references for this scope so `totals.stored_bytes`
-    // matches what's actually on disk. The latency-sensitive cap is
-    // applied here — a bucket with 50k deltaspaces would otherwise
-    // fire 50k HEADs against S3 on every cache miss. Operators who
-    // need exhaustive numbers hit the dashboard scan (limit=None)
-    // instead.
-    // Reference-walk cap. Default is the centralised constant; tests
-    // can override via `DGP_REFERENCE_SCAN_LIMIT` to exercise the
-    // truncated path without uploading thousands of deltaspaces.
     let ref_limit =
         crate::config::env_parse_with_default("DGP_REFERENCE_SCAN_LIMIT", REFERENCE_SCAN_LIMIT);
-    let ref_scan = engine
-        .list_deltaspace_references(bucket, prefix, Some(ref_limit))
-        .await
-        .map_err(|e| e.to_string())?;
-    for (_, meta) in &ref_scan.references {
-        totals.accumulate(meta);
-    }
-    truncated = truncated || ref_scan.truncated;
+    let (totals, truncated) = scan_totals(
+        s3_state,
+        bucket,
+        TotalsScanOpts {
+            prefix,
+            object_cap: Some(MAX_LISTING_OBJECTS),
+            ref_limit: Some(ref_limit),
+            cancel: None,
+        },
+        |_, _, _| {},
+    )
+    .await
+    .map_err(|e| match e {
+        TotalsScanError::Failed(msg) => msg,
+        TotalsScanError::Cancelled => "scan cancelled".to_string(),
+    })?;
 
     let savings_percentage = totals.savings_percentage();
     Ok(SavingsResponse {

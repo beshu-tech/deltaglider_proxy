@@ -207,32 +207,16 @@ async fn scan_bucket_totals(
     s3_state: &Arc<crate::api::handlers::AppState>,
     bucket: &str,
 ) -> Result<SavingsTotals, String> {
-    let engine = s3_state.engine.load();
-    let mut totals = SavingsTotals::default();
-    let mut continuation: Option<String> = None;
-    loop {
-        let page = engine
-            .list_objects(bucket, "", None, 1000, continuation.as_deref(), true)
-            .await
-            .map_err(|e| e.to_string())?;
-        for (_key, meta) in &page.objects {
-            totals.accumulate(meta);
-        }
-        if !page.is_truncated {
-            break;
-        }
-        continuation = page.next_continuation_token;
-        if continuation.is_none() {
-            break;
-        }
+    use super::savings::{scan_totals, TotalsScanError, TotalsScanOpts};
+    let opts = TotalsScanOpts {
+        prefix: "",
+        object_cap: None,
+        ref_limit: None,
+        cancel: None,
+    };
+    match scan_totals(s3_state, bucket, opts, |_, _, _| {}).await {
+        Ok((totals, _)) => Ok(totals),
+        Err(TotalsScanError::Failed(e)) => Err(e),
+        Err(TotalsScanError::Cancelled) => Err("scan cancelled".into()),
     }
-    // Fold in every reference baseline (no cap) so stored_bytes is exact.
-    let ref_scan = engine
-        .list_deltaspace_references(bucket, "", None)
-        .await
-        .map_err(|e| e.to_string())?;
-    for (_, meta) in &ref_scan.references {
-        totals.accumulate(meta);
-    }
-    Ok(totals)
 }

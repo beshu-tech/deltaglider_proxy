@@ -70,11 +70,6 @@ use tracing::{debug, warn};
 use super::AdminState;
 use crate::api::handlers::AppState;
 
-/// Per-page batch size for the underlying `list_objects` walk. 1000 is
-/// the S3 protocol cap; the filesystem backend accepts anything but
-/// matches the same convention for predictable progress increments.
-const PAGE_SIZE: u32 = 1000;
-
 /// On-disk + in-memory record of a completed scan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanResult {
@@ -453,95 +448,40 @@ async fn run_scan(
     cancel: CancellationToken,
 ) -> Result<ScanResult, ScanFailure> {
     let started_instant = std::time::Instant::now();
-    // The pure savings accumulator (`src/deltaglider/savings.rs`) owns
-    // the math. Page through every user-visible object; once that's
-    // done, walk the deltaspace references separately and feed them in
-    // — references are hidden from `list_objects` but their bytes are
-    // real and MUST count toward `total_stored_bytes`, otherwise the
-    // dashboard reports up to "100% saved" on prefixes whose true
-    // savings is ~80%.
-    let mut totals = crate::deltaglider::SavingsTotals::default();
-    let mut pages_done: u32 = 0;
-    let mut continuation_token: Option<String> = None;
-
-    loop {
-        if cancel.is_cancelled() {
-            return Err(ScanFailure::Cancelled);
-        }
-
-        // Hold the engine guard in a local so the future returned by
-        // `list_objects` doesn't borrow a temporary that gets dropped
-        // mid-await in the tokio::select! arm.
-        let engine = s3_state.engine.load();
-        let list_fut = engine.list_objects(
-            bucket,
-            "",
-            None,
-            PAGE_SIZE,
-            continuation_token.as_deref(),
-            true, // metadata=true so we get delta_size for stored bytes
-        );
-        let page = tokio::select! {
-            _ = cancel.cancelled() => return Err(ScanFailure::Cancelled),
-            result = list_fut => result.map_err(|e| ScanFailure::Error(e.to_string()))?,
-        };
-
-        for (_key, meta) in &page.objects {
-            totals.accumulate(meta);
-        }
-        pages_done += 1;
-
-        let has_more = page.is_truncated && page.next_continuation_token.is_some();
-        // Emit on EVERY page. The watch channel coalesces — if the
-        // SSE forwarder hasn't read the previous value, the new send
-        // overwrites it, so even a 100k-object filesystem walk can't
-        // flood the consumer. Earlier we throttled to every-5-pages
-        // which made small buckets (<5k objects) look broken: the
-        // dashboard showed "Scanning… 0 objects" right up to "done".
-        let snapshot = ScanProgress {
-            bucket: bucket.to_string(),
-            objects: totals.user_visible_count(),
-            original_bytes: totals.original_bytes,
-            stored_bytes: totals.stored_bytes,
-            pages_done,
-            has_more,
-            finished: !has_more,
-            error: None,
-            started_at,
-        };
-        // send() only fails if all receivers have been dropped; that's
-        // fine — the scan keeps running for the background result +
-        // disk cache, even with no live observers.
-        let _ = tx.send(snapshot);
-
-        if !has_more {
-            break;
-        }
-        continuation_token = page.next_continuation_token;
-    }
-
-    // Second pass: fold in every `reference.bin` across the bucket so
-    // `total_stored_bytes` matches what's actually on disk. Failures
-    // for individual deltaspaces are logged inside the engine helper
-    // and skipped — a missing reference is a per-deltaspace data
-    // problem, not a reason to abort the whole scan.
-    if cancel.is_cancelled() {
-        return Err(ScanFailure::Cancelled);
-    }
-    let engine = s3_state.engine.load();
-    // limit=None: the dashboard scan is the "real number" path; the
-    // operator triggered it explicitly. Cost is the operator's
-    // problem here — they're already waiting on a paginated walk of
-    // every user-visible object. The lightweight chip endpoint passes
-    // Some(REFERENCE_SCAN_LIMIT) instead. Truncation isn't surfaced
-    // on this path because it never happens.
-    let refs = engine
-        .list_deltaspace_references(bucket, "", None)
+    // limit=None on the reference walk: the dashboard scan is the "real
+    // number" path the operator triggered explicitly (the chip endpoint
+    // caps it instead). Progress goes out on EVERY page: the watch channel
+    // coalesces, so even a 100k-object walk cannot flood the SSE consumer,
+    // and a throttle made small buckets look stuck at "0 objects".
+    let opts = super::savings::TotalsScanOpts {
+        prefix: "",
+        object_cap: None,
+        ref_limit: None,
+        cancel: Some(&cancel),
+    };
+    let mut pages_done = 0u32;
+    let (totals, _) =
+        super::savings::scan_totals(&s3_state, bucket, opts, |totals, pages, has_more| {
+            pages_done = pages;
+            // send() fails only when every receiver is gone; the scan keeps
+            // running for the background result + disk cache.
+            let _ = tx.send(ScanProgress {
+                bucket: bucket.to_string(),
+                objects: totals.user_visible_count(),
+                original_bytes: totals.original_bytes,
+                stored_bytes: totals.stored_bytes,
+                pages_done: pages,
+                has_more,
+                finished: !has_more,
+                error: None,
+                started_at,
+            });
+        })
         .await
-        .map_err(|e| ScanFailure::Error(e.to_string()))?;
-    for (_, meta) in &refs.references {
-        totals.accumulate(meta);
-    }
+        .map_err(|e| match e {
+            super::savings::TotalsScanError::Cancelled => ScanFailure::Cancelled,
+            super::savings::TotalsScanError::Failed(msg) => ScanFailure::Error(msg),
+        })?;
 
     let completed_at = Utc::now();
     let duration_ms = started_instant.elapsed().as_millis() as u64;
