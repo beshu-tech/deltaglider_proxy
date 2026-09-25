@@ -451,7 +451,7 @@ pub async fn run_rule(
     //
     // The pure WalkMachine (`replication::walk`) owns every decision: per-dir
     // src/dest merge, policy/regime-driven HEAD resolution (PureMirror ⇒ zero
-    // HEADs), per-dir provenance-gated deletes, the resume watermark, the page
+    // HEADs), per-dir deletes of source-absent keys, the resume watermark, the page
     // budget, and the flat-sweep degrade. This driver only executes commands
     // against the engine and feeds results back — copies start with the first
     // directory, no discovery pre-pass.
@@ -1089,7 +1089,7 @@ pub async fn run_rule(
             .map(|c| c.to_json())
     };
 
-    // Deletes are fused into the walk: each directory's provenance-gated
+    // Deletes are fused into the walk: each directory's source-absent
     // candidates flush when THAT directory completes cleanly (per-dir gate,
     // strictly narrower blast radius than the old whole-run clean-pass gate).
 
