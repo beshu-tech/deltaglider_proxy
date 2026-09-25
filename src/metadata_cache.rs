@@ -23,6 +23,9 @@ use tracing::debug;
 #[derive(Clone)]
 pub struct MetadataCache {
     cache: Cache<String, FileMetadata>,
+    /// Test probe: number of `insert` calls (moka resets the TTL on each).
+    #[cfg(test)]
+    inserts: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MetadataCache {
@@ -49,7 +52,16 @@ impl MetadataCache {
             })
             .time_to_live(Duration::from_secs(600)) // 10 min TTL
             .build();
-        Self { cache }
+        Self {
+            cache,
+            #[cfg(test)]
+            inserts: Arc::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_count(&self) -> u64 {
+        self.inserts.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Build the cache key from bucket and object key.
@@ -72,8 +84,14 @@ impl MetadataCache {
         result
     }
 
-    /// Insert or update metadata for an object.
+    /// Insert or update metadata for an object. Every insert restarts the
+    /// entry's TTL, so call it only with metadata freshly read from storage
+    /// (or just written), never with a value that came from this cache: a
+    /// re-insert on each hit kept a hot key's stale entry alive forever.
     pub fn insert(&self, bucket: &str, key: &str, metadata: FileMetadata) {
+        #[cfg(test)]
+        self.inserts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let ck = Self::cache_key(bucket, key);
         debug!("Metadata cache insert: {}", ck);
         self.cache.insert(ck, metadata);

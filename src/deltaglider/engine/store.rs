@@ -1971,3 +1971,39 @@ mod spool_budget_tests {
         assert_eq!(back, v2);
     }
 }
+
+/// Tier 4: a GET served from the metadata cache must not re-insert the entry
+/// (each insert restarts moka's TTL, so a hot key never expired).
+#[cfg(test)]
+mod metadata_cache_ttl_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::storage::FilesystemBackend;
+
+    #[tokio::test]
+    async fn cache_hits_do_not_restart_the_ttl() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        backend.create_bucket("b").await.unwrap();
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
+        for key in ["rel/a.zip", "img/a.jpg"] {
+            engine
+                .store("b", key, b"payload bytes", None, HashMap::new())
+                .await
+                .unwrap();
+            let after_put = engine.metadata_cache().insert_count();
+            for _ in 0..3 {
+                engine.retrieve("b", key).await.unwrap();
+                let _ = engine.retrieve_stream_range("b", key, 0, 3, None).await;
+            }
+            assert_eq!(
+                engine.metadata_cache().insert_count(),
+                after_put,
+                "{key}: cache hits re-inserted the entry"
+            );
+        }
+    }
+}

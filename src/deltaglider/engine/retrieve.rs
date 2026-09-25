@@ -56,8 +56,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         let metadata = match metadata {
             Some(m) => {
-                // Populate metadata cache on resolve
-                self.metadata_cache.insert(bucket, key, m.clone());
+                // Populate on a fresh resolve only: re-inserting a cache hit
+                // restarts its TTL, so a hot key never expired.
+                if !from_cache {
+                    self.metadata_cache.insert(bucket, key, m.clone());
+                }
                 m
             }
             None => {
@@ -481,7 +484,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         let metadata = match metadata {
             Some(m) => {
-                self.metadata_cache.insert(bucket, key, m.clone());
+                if !from_cache {
+                    self.metadata_cache.insert(bucket, key, m.clone());
+                }
                 m
             }
             None => {
