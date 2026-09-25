@@ -368,3 +368,65 @@ async fn test_migrate_cancel_preflip_restores_source() {
     )
     .await;
 }
+
+/// D9: a bucket whose policy has an `alias` lives under the ALIAS name on
+/// its backend. The migrate must copy from, flip to and clean up under the
+/// real name — not the virtual one. Before the fix the flip routed the bucket
+/// to an empty target bucket, and cleanup deleted an unrelated bucket that
+/// happened to carry the virtual name on the source backend.
+#[tokio::test]
+async fn test_migrate_honours_bucket_alias() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migalias";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .bucket_policy(bucket, "backend: src\nalias: real-store")
+        // An unrelated bucket whose REAL name equals the virtual name above.
+        .bucket_policy("decoy", "backend: src\nalias: migalias")
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let http = reqwest::Client::new();
+    let endpoint = server.endpoint();
+    for b in [bucket, "decoy"] {
+        http.put(format!("{endpoint}/{b}")).send().await.unwrap();
+    }
+    seed(&http, &endpoint, bucket, 5).await;
+    put_object(
+        &http,
+        &endpoint,
+        "decoy",
+        "keep-me.json",
+        b"decoy data".to_vec(),
+        "application/json",
+    )
+    .await;
+    assert!(
+        dir_a.path().join("real-store").exists(),
+        "alias fixture: {:?}\n{}",
+        walkdir_files(dir_a.path()),
+        std::fs::read_to_string(server.config_path()).unwrap()
+    );
+
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", true).await;
+    assert_eq!(resp.status(), 202);
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "succeeded", "job: {job}");
+
+    // The migrated bucket serves its data from the target.
+    for i in 0..5 {
+        let bytes = get_bytes(&http, &endpoint, bucket, &format!("obj-{i:03}.json")).await;
+        assert!(bytes.starts_with(MARKER), "obj-{i:03} lost after the flip");
+    }
+    // The unrelated bucket is untouched.
+    assert_eq!(
+        get_bytes(&http, &endpoint, "decoy", "keep-me.json").await,
+        b"decoy data"
+    );
+    // The source real-name bucket is emptied (delete_source).
+    let leftover = walkdir_files(&dir_a.path().join("real-store"));
+    assert!(leftover.is_empty(), "source objects left: {leftover:?}");
+}

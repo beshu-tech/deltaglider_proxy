@@ -132,20 +132,38 @@ pub fn orphaned_transients<'a>(
         .collect()
 }
 
-/// Ensure the transient (or cleanup) route exists in the live config —
-/// idempotent; re-run per page because a config apply can wipe it.
+/// Pure: the bucket's name ON its backend, with the routing table's rule:
+/// an `alias` applies only to a policy with an explicit `backend`. The migrate
+/// keeps this real name on the target (the flip pins the alias to it), so the
+/// flip finds the copies and the cleanup deletes the real source — never an
+/// unrelated bucket that happens to carry the virtual name.
+pub fn real_bucket_name<'a>(
+    buckets: &'a std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
+    bucket: &'a str,
+) -> &'a str {
+    match buckets.get(bucket) {
+        Some(p) if p.backend.is_some() => p.alias.as_deref().unwrap_or(bucket),
+        _ => bucket,
+    }
+}
+
+/// Ensure the transient (or cleanup) route to `bucket`'s real name on
+/// `backend` exists in the live config — idempotent; re-run per page
+/// because a config apply can wipe it.
 async fn ensure_route(
     mutator: &ConfigMutator,
     route_key: &str,
     backend: &str,
-    alias_bucket: &str,
+    bucket: &str,
     context: &str,
 ) -> Result<(), String> {
-    let present = {
+    let (present, alias_bucket) = {
         let cfg = mutator.read().await;
-        cfg.buckets
-            .get(route_key)
-            .is_some_and(|p| p.backend.as_deref() == Some(backend))
+        let real = real_bucket_name(&cfg.buckets, bucket).to_string();
+        let present = cfg.buckets.get(route_key).is_some_and(|p| {
+            p.backend.as_deref() == Some(backend) && p.alias.as_deref() == Some(real.as_str())
+        });
+        (present, real)
     };
     if present {
         return Ok(());
@@ -460,7 +478,11 @@ async fn run_phases(
             .mutate_and_apply_strict(
                 &format!("Bucket '{bucket_key}' migrated to backend '{target}'"),
                 move |cfg| {
+                    // Pin the alias to the name the copies used (the real name
+                    // BEFORE the flip): setting `backend` activates `alias`.
+                    let real = real_bucket_name(&cfg.buckets, &bucket_key).to_string();
                     let mut policy = cfg.buckets.get(&bucket_key).cloned().unwrap_or_default();
+                    policy.alias = (real != bucket_key).then_some(real);
                     policy.backend = Some(target);
                     cfg.buckets.insert(bucket_key, policy);
                     cfg.buckets.remove(&transient);
@@ -611,6 +633,31 @@ async fn run_phases(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn real_bucket_name_follows_the_routing_rule() {
+        use crate::bucket_policy::BucketPolicyConfig;
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            "routed".to_string(),
+            BucketPolicyConfig {
+                backend: Some("src".into()),
+                alias: Some("real".into()),
+                ..Default::default()
+            },
+        );
+        // Alias without a backend is inert in the routing table.
+        m.insert(
+            "inert".to_string(),
+            BucketPolicyConfig {
+                alias: Some("ignored".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(real_bucket_name(&m, "routed"), "real");
+        assert_eq!(real_bucket_name(&m, "inert"), "inert");
+        assert_eq!(real_bucket_name(&m, "absent"), "absent");
+    }
 
     #[test]
     fn params_round_trip() {
