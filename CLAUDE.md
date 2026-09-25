@@ -288,7 +288,7 @@ single-instance planes below are addressed.
 | Role | CAS needed | Enforcement |
 |---|---|---|
 | Coordination bucket (`config_sync_bucket`) | always | boot probe → exit(1) |
-| Client-writable delta storage, multi-instance | yes | startup probe of every named S3 backend hosting such buckets + hot-apply pre-commit gate (`apply_config_transition` step 0) → exit(1)/reject |
+| Client-writable delta storage, multi-instance | yes | startup probe of every S3 backend (default included, via `Config::effective_backend_for_bucket`) hosting such buckets; `POST /buckets` runs the same gate + hot-apply pre-commit gate (`apply_config_transition` step 0) → exit(1)/reject |
 | Client-writable delta storage, single-instance | no | in-process prefix lock (no probes, zero cost) |
 | `replication_target_only` bucket (any backend incl. B2) | no | client writes → 403 (`check_client_write_allowed`, ten s3s/form-POST/admin-bulk call sites) → replication is the single writer |
 
