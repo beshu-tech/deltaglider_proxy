@@ -794,7 +794,7 @@ fn same_generation(a: chrono::DateTime<Utc>, b: chrono::DateTime<Utc>) -> bool {
         let n = t.nanosecond() % 1_000_000_000;
         [1_000_000_000u32, 1_000_000, 1_000]
             .into_iter()
-            .find(|u| n % u == 0)
+            .find(|u| n.is_multiple_of(*u))
             .unwrap_or(1)
     };
     let u = unit(a).max(unit(b));
