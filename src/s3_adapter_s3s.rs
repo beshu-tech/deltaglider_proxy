@@ -2197,13 +2197,23 @@ static OBJECT_WRITE_LOCKS: std::sync::LazyLock<
     dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 > = std::sync::LazyLock::new(dashmap::DashMap::new);
 
+/// Pure: the write-lock key of an object. The engine trims leading `/`
+/// (`//a` and `a` are one object), so the lock must too, or two
+/// create-only PUTs through the two spellings both pass the check.
+fn object_write_lock_key(bucket: &str, key: &str) -> String {
+    format!(
+        "{bucket}/{}",
+        crate::types::ObjectKey::parse(bucket, key).full_key()
+    )
+}
+
 async fn acquire_object_write_lock(bucket: &str, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
     const CLEANUP_THRESHOLD: usize = 1024;
     if OBJECT_WRITE_LOCKS.len() > CLEANUP_THRESHOLD {
         OBJECT_WRITE_LOCKS.retain(|_, m| Arc::strong_count(m) > 1);
     }
     let mutex = OBJECT_WRITE_LOCKS
-        .entry(format!("{bucket}/{key}"))
+        .entry(object_write_lock_key(bucket, key))
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone();
     mutex.lock_owned().await
@@ -2761,6 +2771,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn object_write_lock_key_matches_the_engine_key() {
+        assert_eq!(
+            object_write_lock_key("b", "//a"),
+            object_write_lock_key("b", "a")
+        );
+        assert_eq!(
+            object_write_lock_key("b", "/x/y"),
+            object_write_lock_key("b", "x/y")
+        );
+        assert_ne!(
+            object_write_lock_key("b", "x/y"),
+            object_write_lock_key("b", "xy")
+        );
     }
 
     #[test]
