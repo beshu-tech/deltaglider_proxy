@@ -470,7 +470,12 @@ pub fn resolve_client_ip(
         return peer_ip.map(normalize_ip);
     }
 
-    let peer_trusted = |ip: IpAddr| trusted_cidrs.iter().any(|n| n.contains(&ip));
+    // Normalize first: a dual-stack listener reports an IPv4 proxy as
+    // `::ffff:a.b.c.d`, which no V4 CIDR contains.
+    let peer_trusted = |ip: IpAddr| {
+        let ip = normalize_ip(ip);
+        trusted_cidrs.iter().any(|n| n.contains(&ip))
+    };
 
     if trusted_cidrs.is_empty() {
         // Legacy spoofable path: first XFF element, then X-Real-IP, then peer.
@@ -1156,6 +1161,27 @@ mod tests {
         );
         let got = resolve_client_ip(&h, Some(ip("10.0.0.5")), true, &[cidr("10.0.0.0/8")]);
         assert_ne!(got, Some(ip("6.6.6.6")), "the forged left hop won");
+    }
+
+    /// Review-2: a dual-stack listener reports an IPv4 proxy as
+    /// `::ffff:a.b.c.d`. The CIDR check must see the V4 form, for the peer
+    /// and for every hop, or a trusted proxy counts as untrusted (and a
+    /// trusted hop as the client).
+    #[test]
+    fn review2_v4_mapped_peer_and_hops_match_v4_trusted_cidrs() {
+        let trusted = [cidr("10.0.0.0/8")];
+        let h = hdrs(&[("x-forwarded-for", "203.0.113.9")]);
+        assert_eq!(
+            resolve_client_ip(&h, Some(ip("::ffff:10.0.0.5")), true, &trusted),
+            Some(ip("203.0.113.9")),
+            "a v4-mapped trusted peer must be trusted"
+        );
+        let h = hdrs(&[("x-forwarded-for", "203.0.113.9, ::ffff:10.0.0.7")]);
+        assert_eq!(
+            resolve_client_ip(&h, Some(ip("10.0.0.5")), true, &trusted),
+            Some(ip("203.0.113.9")),
+            "a v4-mapped trusted hop must be skipped as trusted"
+        );
     }
 
     /// Review-2: the known-good account-lock exemption (S22) keys on the
