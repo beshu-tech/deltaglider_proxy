@@ -488,10 +488,14 @@ pub fn resolve_client_ip(
             // X-Real-IP, then the peer.
             if let Some(xff) = xff_chain(headers) {
                 for hop in xff.rsplit(',') {
-                    if let Ok(ip) = hop.trim().parse::<IpAddr>() {
-                        if !peer_trusted(ip) {
-                            return Some(normalize_ip(ip));
-                        }
+                    let Ok(ip) = hop.trim().parse::<IpAddr>() else {
+                        // A hop we cannot read (`ip:port`, `unknown`) ends the
+                        // walk: everything to its left is client-written, so
+                        // skipping it would hand a forged hop the verdict.
+                        return Some(normalize_ip(p));
+                    };
+                    if !peer_trusted(ip) {
+                        return Some(normalize_ip(ip));
                     }
                 }
             }
@@ -1144,7 +1148,6 @@ mod tests {
     /// writes it) must stop the right-to-left walk. Skipping it hands the
     /// forged hop to its left to aws:SourceIp, the limiter and admission.
     #[test]
-    #[ignore = "review2: pending fix"]
     fn review2_unparseable_trusted_hop_does_not_expose_forged_left_hop() {
         let mut h = axum::http::HeaderMap::new();
         h.insert(
