@@ -54,3 +54,18 @@ export function destinationIsSource(
   }
   return any;
 }
+
+/**
+ * Why `path` (an object key or folder prefix) cannot be used, or null when it
+ * can. Mirrors `check_object_path` in src/api/admin/path_guard.rs: the proxy
+ * refuses a `.` or `..` segment and a NUL. Check before any request: the
+ * browser's URL parser resolves `..`, so an S3 request is signed for one path
+ * and sent to another, and the user sees only SignatureDoesNotMatch.
+ */
+export function keyPathError(path: string): string | null {
+  if (path.includes('\0')) return 'The path contains a NUL character.';
+  if (path.split('/').some((seg) => seg === '.' || seg === '..')) {
+    return `The path "${path}" contains a "." or ".." folder. Folder names cannot be "." or "..".`;
+  }
+  return null;
+}

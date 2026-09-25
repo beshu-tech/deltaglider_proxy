@@ -4,7 +4,7 @@ import { WarningOutlined } from '@ant-design/icons';
 import { listBuckets, getBucket } from '../s3client';
 import { useColors } from '../ThemeContext';
 import { pluralize } from '../utils';
-import { normalizeDestPrefix, destinationIsSource } from './destPrefix';
+import { normalizeDestPrefix, destinationIsSource, keyPathError } from './destPrefix';
 
 const { Text } = Typography;
 
@@ -58,6 +58,7 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
   // The path starts at the browsed folder, which IS where the selection lives:
   // a move there does nothing and a copy rewrites every object in place.
   const sameLocation = destinationIsSource(sourceBucket, selectionKeys, destBucket, destPrefix);
+  const pathError = keyPathError(clean);
 
   return (
     <Modal
@@ -66,7 +67,7 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
       onCancel={onCancel}
       onOk={() => onConfirm(destBucket, clean ? clean + '/' : '')}
       okText={getModalTitle(mode, itemCount)}
-      okButtonProps={{ loading, disabled: !destBucket || sameLocation }}
+      okButtonProps={{ loading, disabled: !destBucket || sameLocation || pathError !== null }}
       cancelButtonProps={{ disabled: loading }}
       destroyOnHidden
       mask={{ closable: !loading }}
@@ -92,7 +93,14 @@ export default function DestinationPickerModal({ open, mode, itemCount, onConfir
           style={{ fontFamily: 'var(--font-mono)', fontSize: 13 }}
           autoFocus
           onFocus={(e) => e.currentTarget.select()}
+          status={pathError ? 'error' : undefined}
+          aria-invalid={pathError !== null}
         />
+        {pathError && (
+          <Text role="alert" style={{ display: 'block', marginTop: 6, fontSize: 12, color: colors.ACCENT_RED }}>
+            {pathError}
+          </Text>
+        )}
       </div>
 
       <div style={{

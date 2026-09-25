@@ -10,6 +10,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { listCommonPrefixes } from './s3client';
 import { splitDestinationInput, filterFolderOptions } from './destinationSuggest';
+import { keyPathError } from './components/destPrefix';
 
 const DEBOUNCE_MS = 200;
 
@@ -22,7 +23,8 @@ export function useFolderSuggestions(bucket: string, input: string): string[] {
   const { parent, tail } = splitDestinationInput(input);
 
   useEffect(() => {
-    if (!bucket) {
+    // A '.'/'..' parent is not a real folder, and the proxy refuses to list it.
+    if (!bucket || keyPathError(parent) !== null) {
       setSuggestions([]);
       return;
     }

@@ -15,6 +15,7 @@ import useUploadQueue from '../useUploadQueue';
 import { useColors } from '../ThemeContext';
 import UploadProgressList from './UploadProgressList';
 import { activateOnKey } from '../keyboard';
+import { keyPathError } from './destPrefix';
 
 const { Text, Title } = Typography;
 
@@ -76,13 +77,23 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
     }
   }, [initialFiles, onConsumeInitialFiles]);
 
+  const normalizedDest = normalizeDestination(destination);
+  const destError = keyPathError(normalizedDest);
+  const folderNameError = keyPathError(folderName.replace(/^\/+|\/+$/g, ''));
+
+  // A bad destination blocks the upload here, at the one place files enter
+  // the queue; the message is shown under the destination input.
+  const addFilesIfValid = (files: FileList | File[]) => {
+    if (destError) return;
+    addFiles(files);
+  };
+
   const commitPending = () => {
-    if (pendingFiles.length === 0) return;
+    if (pendingFiles.length === 0 || destError) return;
     addFiles(pendingFiles);
     setPendingFiles([]);
   };
 
-  const normalizedDest = normalizeDestination(destination);
   const destLabel = normalizedDest ? `${normalizedDest}/` : '/ (bucket root)';
 
   // Existing-folder suggestions for the destination autocomplete (debounced,
@@ -167,6 +178,7 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
 
   const handleFolderConfirm = () => {
     const trimmed = folderName.replace(/^\/+|\/+$/g, '');
+    if (folderNameError) return;
     if (trimmed) {
       setDestination((prev) => {
         const base = prev ? prev.replace(/\/+$/, '') : '';
@@ -231,6 +243,7 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
             }))}
             placeholder="/ (bucket root)"
             aria-label="Destination path prefix — type to autocomplete existing folders"
+            status={destError ? 'error' : undefined}
             style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: 13 }}
           />
           <Button
@@ -241,6 +254,11 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
             New folder
           </Button>
         </div>
+        {destError && (
+          <Text role="alert" style={{ display: 'block', marginTop: 8, fontSize: 12, color: ACCENT_RED, fontFamily: 'var(--font-ui)' }}>
+            {destError}
+          </Text>
+        )}
         <Text style={{ display: 'block', marginTop: 8, fontSize: 12, color: TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
           Edit the path above to change the destination folder. It is created if it doesn&rsquo;t exist.
         </Text>
@@ -270,6 +288,7 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
               size="large"
               icon={<CloudUploadOutlined />}
               onClick={commitPending}
+              disabled={destError !== null}
               style={{ borderRadius: 8, fontWeight: 600 }}
             >
               Upload {pendingFiles.length} file{pendingFiles.length !== 1 ? 's' : ''} to {destLabel}
@@ -295,6 +314,7 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
           setFolderName('');
         }}
         okText="Create"
+        okButtonProps={{ disabled: folderNameError !== null }}
       >
         <label htmlFor="new-folder-name" style={{ display: 'block', marginBottom: 8, fontSize: 13, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
           Folder name
@@ -307,7 +327,13 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
           placeholder="my-folder"
           autoFocus
           style={{ fontFamily: "var(--font-mono)" }}
+          status={folderNameError ? 'error' : undefined}
         />
+        {folderNameError && (
+          <Text role="alert" style={{ display: 'block', marginTop: 6, fontSize: 12, color: ACCENT_RED }}>
+            {folderNameError}
+          </Text>
+        )}
       </Modal>
 
       {/* Session statistics — only once an upload has actually started; a wall
@@ -399,6 +425,7 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
             type="primary"
             icon={<CloudUploadOutlined />}
             onClick={() => fileInputRef.current?.click()}
+            disabled={destError !== null}
             style={{ borderRadius: 8 }}
           >
             Select files
@@ -406,6 +433,7 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
           <Button
             icon={<FolderAddOutlined />}
             onClick={() => folderInputRef.current?.click()}
+            disabled={destError !== null}
             style={{ background: BG_ELEVATED, borderColor: BORDER, color: TEXT_SECONDARY, borderRadius: 8 }}
           >
             Select folder
@@ -422,7 +450,7 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
         style={{ display: 'none' }}
         aria-hidden="true"
         onChange={(e) => {
-          if (e.target.files?.length) addFiles(e.target.files);
+          if (e.target.files?.length) addFilesIfValid(e.target.files);
           e.target.value = '';
         }}
       />
@@ -434,7 +462,7 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
         style={{ display: 'none' }}
         aria-hidden="true"
         onChange={(e) => {
-          if (e.target.files?.length) addFiles(e.target.files);
+          if (e.target.files?.length) addFilesIfValid(e.target.files);
           e.target.value = '';
         }}
       />

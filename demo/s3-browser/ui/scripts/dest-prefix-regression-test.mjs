@@ -91,3 +91,17 @@ assert.equal(destinationIsSource('b', ['fw/a.bin', 'other/b.bin'], 'b', 'fw'), f
 assert.equal(destinationIsSource('b', [], 'b', ''), false);
 
 console.log('destination-is-source checks passed');
+
+// --- keyPathError: '.' / '..' segments never reach a request ----------------
+// The browser's URL parser resolves `..` in a request path, so an upload to
+// `../x/` was signed for one path and sent to another (403
+// SignatureDoesNotMatch), and the proxy refuses such keys anyway
+// (`check_object_path` in src/api/admin/path_guard.rs).
+const { keyPathError } = await import(url);
+for (const bad of ['..', '.', '../x', 'a/../b', 'a/./b', 'a/..', '../', 'x/../', 'a\0b']) {
+  assert.equal(typeof keyPathError(bad), 'string', `refused: ${JSON.stringify(bad)}`);
+}
+for (const ok of ['', 'a', 'a/b/', 'releases/v1.2.3/', '..a/', 'a../b', '.hidden/', 'a/.../b', 'a//b']) {
+  assert.equal(keyPathError(ok), null, `allowed: ${JSON.stringify(ok)}`);
+}
+console.log('key path checks passed');
