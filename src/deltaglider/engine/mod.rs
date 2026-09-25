@@ -335,6 +335,13 @@ struct HoldState {
     lost: std::sync::atomic::AtomicBool,
     /// Monotonic instant of the last confirmed acquire/renew.
     confirmed_at: parking_lot::Mutex<std::time::Instant>,
+    /// One renew at a time. The heartbeat and a commit's confirm renew the
+    /// same lock as the same owner: both If-Match one etag, and the loser's
+    /// 412 read as "lost" although the lock is still ours.
+    renewing: tokio::sync::Mutex<()>,
+    /// Stops the heartbeat between renews (never mid-renew), so the release
+    /// on drop never races a renew in flight.
+    stop: tokio::sync::Notify,
 }
 
 /// What a commit must do with a hold, given how old its last confirmation
@@ -368,6 +375,8 @@ impl ReferenceLockGuard {
         let state = Arc::new(HoldState {
             lost: std::sync::atomic::AtomicBool::new(false),
             confirmed_at: parking_lot::Mutex::new(std::time::Instant::now()),
+            renewing: tokio::sync::Mutex::new(()),
+            stop: tokio::sync::Notify::new(),
         });
         let heartbeat = tokio::spawn(Self::heartbeat(
             lock.clone(),
@@ -399,7 +408,11 @@ impl ReferenceLockGuard {
         let every = lock.renew_interval().max(Duration::from_millis(10));
         let give_up = Duration::from_secs((lock.ttl_secs().max(1) as u64).div_ceil(2));
         loop {
-            tokio::time::sleep(every).await;
+            tokio::select! {
+                _ = tokio::time::sleep(every) => {}
+                _ = state.stop.notified() => return,
+            }
+            let _one = state.renewing.lock().await;
             let started = std::time::Instant::now();
             match lock
                 .renew(&key, &owner, crate::event_outbox::current_unix_seconds())
@@ -429,18 +442,27 @@ impl ReferenceLockGuard {
         let Some(h) = &self.hold else {
             return Ok(());
         };
-        let age = h.state.confirmed_at.lock().elapsed();
         let lost_err = || {
             EngineError::Storage(StorageError::Other(format!(
-                "reference lock {} lapsed before the write; refusing to write reference.bin                  or its delta (another instance may own the deltaspace now)",
+                "reference lock {} lapsed before the write; refusing to write reference.bin \
+                 or its delta (another instance may own the deltaspace now)",
                 h.key
             )))
         };
-        match hold_check(
-            h.state.lost.load(Ordering::SeqCst),
-            age,
-            h.lock.renew_interval(),
-        ) {
+        let check = || {
+            hold_check(
+                h.state.lost.load(Ordering::SeqCst),
+                h.state.confirmed_at.lock().elapsed(),
+                h.lock.renew_interval(),
+            )
+        };
+        if check() == HoldCheck::Trust {
+            return Ok(());
+        }
+        // Wait out a heartbeat renew in flight, then decide again: it may
+        // have just confirmed the lock, or seen it lost.
+        let _one = h.state.renewing.lock().await;
+        match check() {
             HoldCheck::Trust => Ok(()),
             HoldCheck::Lost => Err(lost_err()),
             HoldCheck::Confirm => {
@@ -533,16 +555,23 @@ impl ReferenceLockGuard {
 impl Drop for ReferenceLockGuard {
     fn drop(&mut self) {
         if let Some(h) = self.hold.take() {
-            h.heartbeat.abort();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let (lock, key, owner) = (h.lock, h.key, h.owner);
+                // Stop the heartbeat and let a renew in flight finish BEFORE
+                // the release: a renew PUT that lands between the release's
+                // read and its If-Match DELETE made the DELETE fail, and the
+                // lock blocked the deltaspace for a whole TTL.
+                h.state.stop.notify_one();
+                let (lock, key, owner, heartbeat) = (h.lock, h.key, h.owner, h.heartbeat);
                 handle.spawn(async move {
+                    let _ = heartbeat.await;
                     if let Err(e) = lock.release(&key, &owner).await {
                         tracing::warn!("reference lock release failed for {key}: {e}");
                     }
                 });
+            } else {
+                // No runtime available (dropped during shutdown) → rely on the TTL.
+                h.heartbeat.abort();
             }
-            // No runtime available (dropped during shutdown) → rely on the TTL.
         }
     }
 }
@@ -3563,7 +3592,6 @@ mod reference_lock_hold_tests {
     /// the loser's 412 reads as "lost", so the commit is refused and the
     /// hold is marked lost although the lock is still ours.
     #[tokio::test]
-    #[ignore = "review2: pending fix"]
     async fn review2_commit_racing_the_heartbeat_renew_keeps_the_lock() {
         let lock = Arc::new(CasLock {
             state: parking_lot::Mutex::new((0, None)),
@@ -3587,6 +3615,92 @@ mod reference_lock_hold_tests {
         assert!(lock.state.lock().1.is_some(), "the lock is still ours");
         assert!(commit.is_ok(), "commit refused: {}", commit.unwrap_err());
         assert!(next.is_ok(), "hold marked lost: {}", next.unwrap_err());
+    }
+
+    /// A lock that models the S3 wire: a renew's If-Match PUT, once sent,
+    /// lands even when the caller's future is dropped; release reads the
+    /// etag, then one round trip later DELETEs with If-Match.
+    struct WireLock {
+        state: Arc<parking_lot::Mutex<(u64, Option<String>)>>, // (etag, owner)
+        rtt: Duration,
+        interval: Duration,
+    }
+
+    #[async_trait]
+    impl crate::coordination::ReferenceLock for WireLock {
+        async fn try_acquire(&self, _: &str, owner: &str, _: i64) -> Result<bool, String> {
+            let mut s = self.state.lock();
+            if s.1.is_some() {
+                return Ok(false);
+            }
+            *s = (s.0 + 1, Some(owner.to_string()));
+            Ok(true)
+        }
+        async fn release(&self, _: &str, owner: &str) -> Result<(), String> {
+            let seen = self.state.lock().clone();
+            tokio::time::sleep(self.rtt).await;
+            let mut s = self.state.lock();
+            if s.0 == seen.0 && s.1.as_deref() == Some(owner) {
+                *s = (s.0 + 1, None);
+            }
+            Ok(())
+        }
+        async fn renew(&self, _: &str, owner: &str, _: i64) -> Result<bool, String> {
+            let seen = self.state.lock().clone();
+            if seen.1.as_deref() != Some(owner) {
+                return Ok(false);
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let (state, rtt) = (self.state.clone(), self.rtt);
+            tokio::spawn(async move {
+                tokio::time::sleep(rtt).await; // the PUT is on the wire
+                let mut s = state.lock();
+                let ok = s.0 == seen.0;
+                if ok {
+                    s.0 += 1;
+                }
+                let _ = tx.send(ok);
+            });
+            Ok(rx.await.unwrap_or(false))
+        }
+        fn ttl_secs(&self) -> i64 {
+            120
+        }
+        fn renew_interval(&self) -> Duration {
+            self.interval
+        }
+        fn acquire_timeout(&self) -> Duration {
+            Duration::from_millis(50)
+        }
+    }
+
+    /// The guard dropped while a heartbeat renew is on the wire: the renew
+    /// lands between the release's read and its If-Match DELETE, the DELETE
+    /// fails, and the lock stays until its TTL (every PUT to the deltaspace
+    /// waits, then fails). The release must wait out the renew.
+    #[tokio::test]
+    async fn release_does_not_race_a_heartbeat_renew() {
+        let state = Arc::new(parking_lot::Mutex::new((0, None)));
+        let lock = Arc::new(WireLock {
+            state: state.clone(),
+            rtt: Duration::from_millis(30),
+            interval: Duration::from_millis(20),
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
+                .with_reference_lock(Some(lock));
+        let guard = engine
+            .acquire_reference_lock("release-race", "v1")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(28)).await; // renew on the wire
+        drop(guard);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(state.lock().1.is_none(), "the lock was never released");
     }
 
     /// Review-2 (b22f6ff8 incomplete): only the reclaim CHECK became
