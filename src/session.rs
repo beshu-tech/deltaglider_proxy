@@ -11,8 +11,12 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
-/// Maximum number of concurrent sessions. Oldest sessions are evicted on overflow.
-const MAX_SESSIONS: usize = 10;
+/// Maximum live sessions of ONE principal; its own oldest is evicted first.
+const MAX_SESSIONS_PER_PRINCIPAL: usize = 10;
+
+/// Global memory bound. Only reached by many distinct principals; the
+/// eviction then prefers browser-lift sessions over admin sessions.
+const MAX_SESSIONS: usize = 1024;
 
 /// Default session TTL: 4 hours.
 /// Overridable at startup via `DGP_SESSION_TTL_HOURS` env var.
@@ -105,6 +109,16 @@ struct SessionInfo {
 }
 
 impl AuthMethod {
+    /// Who owns the session, for the per-principal cap. Open-mode sessions
+    /// carry no identity, so each client IP counts as one principal.
+    fn principal(&self, ip: Option<IpAddr>) -> String {
+        match self {
+            AuthMethod::Bootstrap => "bootstrap".to_string(),
+            AuthMethod::OpenLift => format!("open:{ip:?}"),
+            other => other.revocation_identity().unwrap_or_default(),
+        }
+    }
+
     /// The identity a cross-instance revocation targets: the IAM access_key_id,
     /// or `provider:user_id` for external logins. Bootstrap/open have no
     /// revocable identity (None) — those are cleared by restart / password reset.
@@ -250,21 +264,27 @@ impl SessionStore {
 
         let mut sessions = self.sessions.write();
 
-        // Evict oldest session if at capacity
-        while sessions.len() >= MAX_SESSIONS {
-            if let Some(oldest_token) = sessions
-                .iter()
-                .min_by_key(|(_, info)| info.created_at)
-                .map(|(token, _)| token.clone())
-            {
-                tracing::warn!(
-                    "Evicting oldest admin session to make room (max {})",
-                    MAX_SESSIONS
-                );
-                sessions.remove(&oldest_token);
-            } else {
+        // A principal at its cap loses its OWN oldest session. One global
+        // cap with oldest-first eviction let any IAM user log every admin
+        // out by minting sessions (S22).
+        let principal = auth_method.principal(ip);
+        let owned = |info: &SessionInfo| info.auth_method.principal(info.ip) == principal;
+        while sessions.values().filter(|info| owned(info)).count() >= MAX_SESSIONS_PER_PRINCIPAL {
+            let Some(token) = oldest_evictable(&sessions, owned) else {
                 break;
-            }
+            };
+            sessions.remove(&token);
+        }
+        // Global bound: browser-lift sessions go before admin sessions.
+        while sessions.len() >= MAX_SESSIONS {
+            let Some(token) =
+                oldest_evictable(&sessions, |info| info.kind == SessionKind::S3BrowserLift)
+                    .or_else(|| oldest_evictable(&sessions, |_| true))
+            else {
+                break;
+            };
+            tracing::warn!("Evicting oldest session to make room (max {MAX_SESSIONS})");
+            sessions.remove(&token);
         }
 
         sessions.insert(
@@ -354,7 +374,7 @@ impl SessionStore {
 
     /// Revoke a session by its non-secret id (force-logout). Returns true if a
     /// session matched. The id is a token prefix; matching by prefix is safe
-    /// because a 12-hex-char (48-bit) collision among ≤10 live sessions is
+    /// because a 12-hex-char (48-bit) collision among ≤1024 live sessions is
     /// negligible, and we only ever revoke server-held tokens.
     pub fn revoke_by_id(&self, id: &str) -> bool {
         let mut sessions = self.sessions.write();
@@ -436,6 +456,18 @@ impl SessionStore {
             .write()
             .retain(|_, info| self.entry_live(info));
     }
+}
+
+/// Token of the oldest session matching `filter`, if any.
+fn oldest_evictable(
+    sessions: &HashMap<String, SessionInfo>,
+    filter: impl Fn(&SessionInfo) -> bool,
+) -> Option<String> {
+    sessions
+        .iter()
+        .filter(|(_, info)| filter(info))
+        .min_by_key(|(_, info)| info.created_at)
+        .map(|(token, _)| token.clone())
 }
 
 /// Pure IP-binding check: a session bound to an IP is only valid for a caller
@@ -559,7 +591,7 @@ mod tests {
     fn test_max_sessions_eviction() {
         let store = SessionStore::new();
         let mut tokens = Vec::new();
-        for _ in 0..MAX_SESSIONS {
+        for _ in 0..MAX_SESSIONS_PER_PRINCIPAL {
             tokens.push(store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui));
         }
 
@@ -572,6 +604,41 @@ mod tests {
         let new_token = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
         assert!(store.validate(&new_token, None));
         assert!(!store.validate(&tokens[0], None)); // oldest evicted
+        assert_eq!(store.sessions.read().len(), MAX_SESSIONS_PER_PRINCIPAL);
+    }
+
+    /// One principal minting sessions evicts only its OWN oldest sessions,
+    /// never another principal's (S22: any IAM user could log the admin out).
+    #[test]
+    fn one_principal_cannot_evict_another() {
+        let store = SessionStore::new();
+        let admin = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
+        let bob = || AuthMethod::IamBrowserLift {
+            access_key_id: "AKBOB".into(),
+        };
+        let mut bobs = Vec::new();
+        for _ in 0..50 {
+            bobs.push(store.create_session(None, bob(), SessionKind::S3BrowserLift));
+        }
+        assert!(store.validate(&admin, None), "admin session evicted by bob");
+        let live_bob = bobs.iter().filter(|t| store.validate(t, None)).count();
+        assert_eq!(live_bob, MAX_SESSIONS_PER_PRINCIPAL);
+        assert!(store.validate(bobs.last().unwrap(), None), "newest kept");
+    }
+
+    /// At the global bound, browser-lift sessions are evicted before any
+    /// admin session.
+    #[test]
+    fn global_cap_evicts_browser_lift_before_admin() {
+        let store = SessionStore::new();
+        let admin = store.create_session(None, AuthMethod::Bootstrap, SessionKind::AdminGui);
+        for i in 0..MAX_SESSIONS + 20 {
+            let who = AuthMethod::IamBrowserLift {
+                access_key_id: format!("AK{i}"),
+            };
+            store.create_session(None, who, SessionKind::S3BrowserLift);
+        }
+        assert!(store.validate(&admin, None));
         assert_eq!(store.sessions.read().len(), MAX_SESSIONS);
     }
 
