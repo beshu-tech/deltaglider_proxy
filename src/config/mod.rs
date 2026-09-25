@@ -3603,11 +3603,13 @@ mod tests {
             }
         }
         // Not operator settings: test hooks, a build-time stamp, the
-        // per-backend name prefix, and example backend names in tests.
+        // per-backend and bootstrap name prefixes, and example backend
+        // names in tests.
         let exempt = |n: &str| {
             n.starts_with("DGP_TEST_")
                 || n == "DGP_BUILD_TIME"
                 || n == "DGP_BACKEND_"
+                || n == "DGP_BOOTSTRAP_"
                 || (n.starts_with("DGP_BACKEND_")
                     && (n.ends_with("_ENCRYPTION_KEY") || n.ends_with("_SSE_KMS_KEY_ID")))
         };
