@@ -1503,3 +1503,31 @@ async fn document_validate_and_apply_report_standing_warnings_apart() {
         );
     }
 }
+
+/// D15: with DGP_BOOTSTRAP_PASSWORD_HASH set, the env hash wins at every
+/// boot. A GUI password change re-keyed the IAM DB with a new hash that the
+/// next boot never uses, so the DB became unreadable (IAM lockout). The
+/// change must be refused while the env var controls the hash.
+#[tokio::test]
+async fn password_change_refused_when_hash_comes_from_env() {
+    let server = common::TestServer::builder()
+        .env(
+            "DGP_BOOTSTRAP_PASSWORD_HASH",
+            common::TEST_BOOTSTRAP_PASSWORD_HASH,
+        )
+        .build()
+        .await;
+    let admin = common::admin_http_client(&server.endpoint()).await;
+    let r = admin
+        .put(format!("{}/_/api/admin/password", server.endpoint()))
+        .json(&serde_json::json!({
+            "current_password": common::TEST_BOOTSTRAP_PASSWORD,
+            "new_password": "a-new-Password-123!"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 409);
+    let body = r.text().await.unwrap();
+    assert!(body.contains("DGP_BOOTSTRAP_PASSWORD_HASH"), "{body}");
+}

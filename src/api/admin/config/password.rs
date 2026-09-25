@@ -44,6 +44,15 @@ fn password_err(status: StatusCode, msg: impl Into<String>) -> axum::response::R
         .into_response()
 }
 
+/// D15: the env var that pins the bootstrap hash, if one is set. That hash
+/// wins at every boot, so a GUI change would re-key the IAM DB with a hash
+/// the next boot never uses: the DB becomes unreadable (IAM lockout).
+fn env_pinned_hash_var(env: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+    ["DGP_BOOTSTRAP_PASSWORD_HASH", "DGP_ADMIN_PASSWORD_HASH"]
+        .into_iter()
+        .find(|n| env(n).is_some_and(|v| !v.trim().is_empty()))
+}
+
 /// PUT /api/admin/password — change bootstrap password.
 ///
 /// Ordering invariants (do NOT reorder without understanding recovery):
@@ -62,6 +71,18 @@ pub async fn change_password(
     headers: HeaderMap,
     Json(body): Json<PasswordChangeRequest>,
 ) -> impl IntoResponse {
+    if let Some(var) = env_pinned_hash_var(|n| std::env::var(n).ok()) {
+        return password_err(
+            StatusCode::CONFLICT,
+            format!(
+                "{var} is set, and it sets the bootstrap password hash at every start. \
+                 A change here would re-encrypt the IAM database with a hash that the \
+                 next start does not use, so the database would become unreadable. \
+                 To change the password, run `deltaglider_proxy --set-bootstrap-password` \
+                 and put the printed hash into {var}, on every instance."
+            ),
+        );
+    }
     let current_hash = state.password_hash.read().clone();
     let valid = match bcrypt::verify(&body.current_password, &current_hash) {
         Ok(v) => v,
@@ -384,5 +405,22 @@ pub async fn recover_db(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn env_pinned_hash_blocks_password_change() {
+        use super::env_pinned_hash_var as f;
+        assert_eq!(f(|_| None), None);
+        assert_eq!(
+            f(|n| (n == "DGP_BOOTSTRAP_PASSWORD_HASH").then(|| " ".into())),
+            None
+        );
+        assert_eq!(
+            f(|n| (n == "DGP_ADMIN_PASSWORD_HASH").then(|| "$2b$x".into())),
+            Some("DGP_ADMIN_PASSWORD_HASH")
+        );
     }
 }
