@@ -227,3 +227,35 @@ async fn test_create_bucket_on_noncas_backend_is_refused_multi_instance() {
         "route must roll back: {export}"
     );
 }
+
+/// Buckets WITHOUT a policy land on the default backend, and clients can
+/// write them. A non-CAS default under multi-instance must fail boot even
+/// when no bucket policy routes there.
+#[test]
+fn test_noncas_default_backend_without_policies_fails_boot() {
+    let dir = tempfile::tempdir().expect("data dir");
+    let config = format!(
+        "listen_addr: \"127.0.0.1:0\"\n\
+         access_key_id: \"k\"\n\
+         secret_access_key: \"s\"\n\
+         config_sync_bucket: \"dgp-sync\"\n\
+         backend:\n  type: filesystem\n  path: \"{}\"\n\
+         backends:\n  - name: b2sim\n    type: s3\n    endpoint: \"http://127.0.0.1:1\"\n    \
+         region: \"us-east-1\"\n    force_path_style: true\n    access_key_id: \"x\"\n    \
+         secret_access_key: \"y\"\n  - name: local-disk\n    type: filesystem\n    \
+         path: \"{}\"\n",
+        dir.path().display(),
+        dir.path().join("local").display()
+    );
+    let (status, output) = spawn_expect_exit(&config);
+    assert!(
+        !status.success(),
+        "boot must FAIL with a non-CAS default backend, output:\n{output}"
+    );
+    assert!(
+        output.contains("FATAL")
+            && output.contains("does not support conditional writes")
+            && output.contains("b2sim"),
+        "FATAL line must name the backend, output:\n{output}"
+    );
+}

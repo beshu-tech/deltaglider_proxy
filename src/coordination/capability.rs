@@ -141,6 +141,73 @@ pub fn client_writable_s3_backends(
     groups
 }
 
+/// Pure: which bucket to probe the DEFAULT backend on, given the real
+/// buckets it lists. Buckets with a policy are skipped: they are covered by
+/// [`client_writable_s3_backends`] or exempt. `None` = no unrouted bucket.
+pub fn pick_default_probe_bucket(
+    config: &crate::config::Config,
+    listed: &[String],
+) -> Option<String> {
+    listed
+        .iter()
+        .find(|b| !config.buckets.contains_key(&b.to_ascii_lowercase()))
+        .cloned()
+}
+
+/// The DEFAULT backend as a probe group when it is S3 and hosts buckets
+/// with no policy (clients write those, and config cannot name them), and
+/// no policy bucket already put it in [`client_writable_s3_backends`].
+/// Lists the backend's buckets to find one to probe on (bounded by
+/// [`PROBE_TIMEOUT`]). The forced-non-CAS seam skips the listing.
+pub async fn default_backend_group(
+    config: &crate::config::Config,
+    groups: &std::collections::BTreeMap<String, ClientWritableGroup>,
+    forced_noncas: &std::collections::BTreeSet<String>,
+) -> Option<(String, ClientWritableGroup)> {
+    let name = config.default_backend_name();
+    if groups.contains_key(&name) {
+        return None;
+    }
+    let def = config.backend_by_name(&name)?;
+    if !matches!(def, crate::config::BackendConfig::S3 { .. }) {
+        return None;
+    }
+    let group = |probe_bucket: String| ClientWritableGroup {
+        backend: def.clone(),
+        buckets: vec![format!("(buckets without a policy on '{name}')")],
+        probe_bucket,
+    };
+    if forced_noncas.contains(&name) {
+        return Some((name.clone(), group(String::new())));
+    }
+    let client = crate::config_db_sync::ConfigDbSync::build_client(def)
+        .await
+        .ok()?;
+    let listed = tokio::time::timeout(PROBE_TIMEOUT, client.list_buckets().send())
+        .await
+        .ok()?
+        .ok()?;
+    let names: Vec<String> = listed
+        .buckets()
+        .iter()
+        .filter_map(|b| b.name().map(str::to_string))
+        .collect();
+    let bucket = pick_default_probe_bucket(config, &names)?;
+    Some((name.clone(), group(bucket)))
+}
+
+/// [`client_writable_s3_backends`] plus the default backend's group.
+pub async fn client_writable_groups_with_default(
+    config: &crate::config::Config,
+    forced_noncas: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeMap<String, ClientWritableGroup> {
+    let mut groups = client_writable_s3_backends(config);
+    if let Some((name, g)) = default_backend_group(config, &groups, forced_noncas).await {
+        groups.insert(name, g);
+    }
+    groups
+}
+
 /// Test seam: backends listed in `DGP_TEST_FORCE_NONCAS_BACKEND` (comma-
 /// separated) get a forced NonCas verdict without probing — the only way to
 /// exercise the fail-fast path against a MinIO-only test harness.
@@ -251,7 +318,20 @@ pub async fn hot_apply_capability_gate(
         return Ok(());
     }
     let forced = forced_noncas_backends();
-    for (name, group) in client_writable_s3_backends(new_config) {
+    let mut groups = client_writable_s3_backends(new_config);
+    // The default backend's group needs a bucket listing: only when its
+    // current definition has no real verdict yet.
+    let default_name = new_config.default_backend_name();
+    let default_known = new_config
+        .backend_by_name(&default_name)
+        .and_then(|def| cache.get(&default_name, def))
+        .is_some_and(|v| !matches!(v, CapabilityVerdict::Unknown { .. }));
+    if !default_known {
+        if let Some((name, g)) = default_backend_group(new_config, &groups, &forced).await {
+            groups.insert(name, g);
+        }
+    }
+    for (name, group) in groups {
         let verdict = match cache.get(&name, &group.backend) {
             // A cached Unknown is NOT a verdict — the blocker (missing bucket,
             // network) may since be fixed; re-probe instead of staying sticky.
@@ -463,6 +543,18 @@ storage:
         let groups = client_writable_s3_backends(&cfg);
         assert_eq!(groups["remote"].buckets, vec!["on-default"]);
         assert_eq!(groups["remote"].probe_bucket, "on-default");
+    }
+
+    #[test]
+    fn default_probe_bucket_skips_policy_buckets() {
+        let cfg = crate::config::Config::from_yaml_str("storage:\n  buckets:\n    releases: {}\n")
+            .unwrap();
+        let listed = vec!["releases".to_string(), "downloads".to_string()];
+        assert_eq!(
+            pick_default_probe_bucket(&cfg, &listed).as_deref(),
+            Some("downloads")
+        );
+        assert_eq!(pick_default_probe_bucket(&cfg, &listed[..1]), None);
     }
 
     #[test]

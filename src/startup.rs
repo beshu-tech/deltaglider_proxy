@@ -1510,7 +1510,7 @@ pub async fn validate_backend_write_capability(
     cache: &deltaglider_proxy::coordination::BackendCapabilityCache,
 ) {
     use deltaglider_proxy::coordination::capability::{
-        client_writable_s3_backends, establish_backend_verdict, forced_noncas_backends,
+        client_writable_groups_with_default, establish_backend_verdict, forced_noncas_backends,
         CapabilityVerdict, CAPABILITY_DOC_URL,
     };
 
@@ -1525,7 +1525,8 @@ pub async fn validate_backend_write_capability(
         );
         return;
     }
-    let groups = client_writable_s3_backends(config);
+    let forced = forced_noncas_backends();
+    let groups = client_writable_groups_with_default(config, &forced).await;
     if groups.is_empty() {
         info!(
             "Backend capability gate: no client-writable buckets on S3 backends — \
@@ -1533,7 +1534,6 @@ pub async fn validate_backend_write_capability(
         );
         return;
     }
-    let forced = forced_noncas_backends();
     for (name, group) in groups {
         let verdict = establish_backend_verdict(&name, &group, &forced).await;
         cache.set(&name, &group.backend, verdict.clone());
