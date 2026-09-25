@@ -546,9 +546,21 @@ pub fn build_s3_router(
             return response;
         }
 
+        // A metadata=true page of 1000 long keys with their metadata is
+        // several MiB. Above the cap the body is gone (to_bytes consumed
+        // it): answer 500, never an empty 200 that reads as a broken list.
+        const REWRITE_BODY_CAP: usize = 64 * 1024 * 1024;
         let (mut parts, body) = response.into_parts();
-        let Ok(bytes) = axum::body::to_bytes(body, 1024 * 1024).await else {
-            return axum::http::Response::from_parts(parts, axum::body::Body::empty());
+        let Ok(bytes) = axum::body::to_bytes(body, REWRITE_BODY_CAP).await else {
+            tracing::error!("S3 response body over {REWRITE_BODY_CAP} bytes; cannot rewrite it");
+            let text = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>InternalError</Code>\
+                 <Message>The response is too large to return.</Message>\
+                 <RequestId>{request_id}</RequestId></Error>"
+            );
+            parts.status = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            return axum::http::Response::from_parts(parts, axum::body::Body::from(text));
         };
         let mut text = String::from_utf8_lossy(&bytes).into_owned();
         if is_error && text.contains("<Error>") && !text.contains("<RequestId>") {
