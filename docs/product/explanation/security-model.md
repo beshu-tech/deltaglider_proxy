@@ -26,7 +26,7 @@ The proxy refuses to start without credentials unless you explicitly opt into op
 
 Why auto-activation instead of a mode switch? Because a switch implies a flag day: flip it and every client breaks until reconfigured. Auto-activation means the system is always in the most capable mode its state supports, and old credentials keep working through the transition. You migrate by adding users, not by scheduling downtime.
 
-One opinionated design sits underneath all of this: the **bootstrap password** is a single secret with three jobs — it encrypts the SQLCipher config DB, signs admin session cookies, and gates the GUI in bootstrap mode. The trade is deliberate: one infrastructure secret to manage and back up, in exchange for a real blast radius if you reset it (a reset invalidates the encrypted IAM database; the safe rotation path re-encrypts atomically). Treat it like a master key, because it is one.
+Two infrastructure secrets sit underneath all of this, and they are deliberately separate. The **bootstrap password** signs admin session cookies and gates the GUI in bootstrap mode. The **config DB key** (`DGP_CONFIG_DB_KEY`, or a key file that the proxy generates on the first start) encrypts the SQLCipher config DB. Earlier releases used the bootstrap password hash as the DB key. That coupling had two costs: anyone who could read the config file could decrypt the IAM database, and a password reset made the database unreadable. With a separate key, a password reset is harmless, and the key never has to appear in a config file. The cost is one more secret to back up: treat the config DB key like a master key for your IAM data, because it is one.
 
 ## Verify, then re-sign
 

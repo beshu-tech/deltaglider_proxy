@@ -53,14 +53,19 @@ Filesystems that don't: tmpfs, FAT32, exFAT, NFS-without-acl-over-xattr mount, s
 
 Fix: mount `DGP_DATA_DIR` on a supporting filesystem, or switch to the S3 backend.
 
-## Startup fails: `SQLCipher could not open config DB`
+## The config DB is locked: `The config DB key ... does not open the config DB`
 
-The encryption key doesn't match the DB file. Usually:
+No key that the proxy has opens `deltaglider_config.db`. The proxy moves the database aside as `deltaglider_config.db.bak`, starts with an empty database, and answers every S3 request with `503` until the right key is back. Usually one of these happened:
 
-1. You restored a Full Backup zip on a fresh instance but didn't feed the corresponding `bootstrap_password_hash` back in. The zip's `secrets.json` carries it — re-import the zip, or inject `DGP_BOOTSTRAP_PASSWORD_HASH` before the restore. See [How to back up and restore](back-up-and-restore.md).
-2. You rotated the bootstrap password outside the admin UI (edited env, restarted). The admin UI's `PUT /_/api/admin/password` is the only safe path — it re-encrypts the DB atomically.
+1. `DGP_CONFIG_DB_KEY` changed, or an instance got a different value than its peers. Set the value that encrypted the database and restart.
+2. The key file `deltaglider_config.db.key` was lost, for example because a volume was recreated without it. Restore the file from a backup and restart. On the next start, the proxy moves the preserved database back into place.
+3. You copied a database snapshot to another instance without its key. Start that instance with the same `DGP_CONFIG_DB_KEY`, or copy the key file along with the database.
 
-Recovery path: `POST /_/api/admin/recover-db` with the correct password. The endpoint is public but rate-limited.
+The admin GUI shows a recovery wizard while the database is locked. It sends the candidate to `POST /_/api/admin/recover-db`, which tests it against the preserved database without changing anything and says whether it is a config DB key or a legacy bootstrap hash. The endpoint is public but rate-limited.
+
+## Startup fails: `config_sync_bucket is set, but DGP_CONFIG_DB_KEY is not`
+
+All instances that share a sync bucket share one encrypted database, so they need one key. Set `DGP_CONFIG_DB_KEY` to the same value on every instance (at least 32 characters, for example from `openssl rand -hex 32`) and restart. See [How to run multiple instances](run-multiple-instances.md).
 
 ## 502 Bad Gateway / 504 Gateway Timeout on large uploads
 

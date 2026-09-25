@@ -182,12 +182,13 @@ Orthogonal to bootstrap/IAM mode, the **`access.iam_mode` YAML selector** (Phase
 - `gui` (default) — encrypted SQLCipher DB is the source of truth. Admin GUI + admin API mutate the DB directly.
 - `declarative` — YAML is authoritative. Admin API IAM mutation routes (`POST/PUT/PATCH/DELETE` on `/users`, `/groups`, `/ext-auth/*`, `/migrate`, backup import) return `403 { "error": "iam_declarative" }`. Read endpoints stay accessible for diagnostics. **Phase 3c.3 reconciler (shipped)**: every `/config/apply` or section-PUT on `access` runs `diff_iam` (validates YAML — unique names, valid group refs, valid permissions, no access-key collisions; zero DB writes on validation failure) followed by `apply_iam_reconcile` (all creates/updates/deletes in one SQLite transaction). Diff-by-name means a renamed access_key_id is an UPDATE that preserves the DB row id, so external_identities stay valid through rotations. The initial `gui→declarative` flip is gated: if the incoming YAML has no `iam_users`/`iam_groups`, apply fails loudly rather than wiping the DB. Mode transitions are audit-logged (warn-level); individual reconcile mutations emit `iam_reconcile_user_create` / `_update` / `_delete` / `_group_*` / `_provider_*` audit entries.
 
-The **bootstrap password** is a single infrastructure secret that:
-1. Encrypts the SQLCipher config DB
-2. Signs admin GUI session cookies
-3. Gates admin GUI access in bootstrap mode (before IAM users exist)
+The **bootstrap password** is an infrastructure secret that:
+1. Signs admin GUI session cookies
+2. Gates admin GUI access in bootstrap mode (before IAM users exist)
 
-Auto-generated on first run (printed to stderr when stderr is a TTY; hidden in containers/CI — and so is the bcrypt hash, which is also the SQLCipher key; the operator reads `.deltaglider_bootstrap_hash` or runs `--set-bootstrap-password`). Reset via `--set-bootstrap-password` CLI flag (warning: invalidates encrypted IAM database).
+It does NOT encrypt the config DB (S8). The SQLCipher key is `DGP_CONFIG_DB_KEY` (required + identical on every node when `config_sync_bucket` is set — boot refuses otherwise) else the key file `<db>.key` (0600, generated on first boot, never regenerated when present-but-empty) — `src/config_db/key.rs`. `ConfigDb::open_with_keys` tries the primary key, then FALLBACKS (a key file that the env key replaces; the bootstrap hash = the pre-S8 key) and re-encrypts a fallback-opened DB to the primary via `rekey_file` (rekey a COPY → verify → atomic rename; the original is never at risk). The sync download path uses the same keyring (a legacy-hash peer upload is accepted and re-keyed; another key → `Err` naming `DGP_CONFIG_DB_KEY`). No key opens the DB → `.db.bak` park + mismatch lock + recovery wizard (`recover-db` accepts a DB key or a legacy hash, read-only probe); a later boot with the right key promotes the bak (Err branch, or Ok branch when the live DB is empty).
+
+Auto-generated on first run (printed to stderr when stderr is a TTY; hidden in containers/CI; the operator reads `.deltaglider_bootstrap_hash` or runs `--set-bootstrap-password`). `--set-bootstrap-password` and `PUT /api/admin/password` never touch the DB (the CLI first migrates a still-hash-keyed DB to the DB key).
 
 IAM users have ABAC permissions: `{ actions: ["read", "write", "delete", "list", "admin"], resources: ["bucket/*"] }`. Admin = wildcard actions AND wildcard resources. The IAM DB is independent of the YAML config file — `access: {}` in YAML with no legacy creds is correct when users/groups/OAuth providers live in the DB. Multi-instance sync via S3 (`DGP_CONFIG_SYNC_BUCKET` / `config_sync_bucket`) uploads the encrypted DB after every mutation; readers poll S3 every 5 minutes and download on ETag change.
 
@@ -289,9 +290,11 @@ single-instance planes below are addressed.
   `DGP_REFERENCE_LOCK_TTL_SECS` (120), `DGP_REFERENCE_LOCK_ACQUIRE_TIMEOUT_SECS` (30).
 
 **Hard prerequisites for any multi-instance deployment:**
-- **All instances MUST share the same `DGP_BOOTSTRAP_PASSWORD_HASH`** — it
-  encrypts the synced SQLCipher DB; a mismatch makes the synced DB unreadable on
-  the other node (`config_db_mismatch` then locks the S3 API + blocks sync).
+- **All instances MUST share the same `DGP_CONFIG_DB_KEY`** — it encrypts the
+  synced SQLCipher DB; boot refuses a sync bucket without it, and a node with a
+  different key refuses the synced DB (error names `DGP_CONFIG_DB_KEY`, never
+  overwrites the remote). Share `DGP_BOOTSTRAP_PASSWORD_HASH` too for one admin
+  password (it no longer encrypts anything).
 - The **filesystem** storage backend is per-node local disk — NOT shareable across
   instances. Multi-instance needs a shared backend (S3/MinIO) or per-node buckets.
 - Config-apply on one instance does NOT propagate to others except via the IAM/DB

@@ -65,6 +65,47 @@ the IAM tables and a `rule_uid` column to the mapping rules. The first sync afte
 bucket wins, as before. Upgrade every instance before you expect merges: an
 instance refuses a peer database with a different schema version.
 
+### Changed — The IAM database has its own encryption key (upgrade step for multi-instance)
+
+The encrypted config database (`deltaglider_config.db`) used the bootstrap
+password hash as its SQLCipher key. So anyone who could read the config file
+could decrypt the IAM database, and `--set-bootstrap-password` made the
+database unreadable. The database now has its own key: `DGP_CONFIG_DB_KEY`,
+or, when that variable is unset, a random key in the file
+`deltaglider_config.db.key` next to the database (mode 0600), which the proxy
+generates on the first start. The bootstrap password only signs admin
+sessions and gates the admin GUI. `--set-bootstrap-password` and
+`PUT /_/api/admin/password` no longer touch the database.
+
+The first start after the upgrade opens the database with the bootstrap
+password hash and re-encrypts it with the new key. The re-encryption works on
+a copy, and the copy replaces the original only after it opens with the new
+key, so a failure leaves the original unchanged. Back up the key together
+with the database from now on: a database without its key cannot be read.
+
+Upgrade steps:
+
+- **One instance:** nothing to do. Back up `deltaglider_config.db.key` with
+  the database.
+- **Several instances with `config_sync_bucket`:** generate one key
+  (`openssl rand -hex 32`) and set it as `DGP_CONFIG_DB_KEY` on every
+  instance before you start this release. An instance with a sync bucket and
+  without the variable refuses to start. Upgrade all instances together and
+  make no IAM changes during the rollout: instances on the old release cannot
+  read uploads under the new key. This release still accepts a synced
+  database that an old instance wrote under the hash. An instance whose key
+  differs refuses the synced database with an error that names
+  `DGP_CONFIG_DB_KEY`, and never overwrites the synced copy.
+- **Kubernetes operator:** with `bootstrapPassword.autoGenerate`, the operator
+  adds a `dbKey` to the `<name>-bootstrap` Secret and injects it as
+  `DGP_CONFIG_DB_KEY`. Without it, add `DGP_CONFIG_DB_KEY` to the env Secret;
+  the operator does not scale beyond one pod without it.
+- **Helm:** set `auth.configDbKey` (or `DGP_CONFIG_DB_KEY` in
+  `auth.existingSecret`) before you raise `replicaCount` with config sync.
+
+The recovery wizard of a locked database now accepts a config DB key, or,
+for a database from an older release, the bootstrap password hash.
+
 ### Changed — `DELETE photos/` deletes only the folder marker, as on S3
 
 A `DeleteObject` request for a key that ends in `/` deleted every key under

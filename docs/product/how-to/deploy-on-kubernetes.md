@@ -152,14 +152,15 @@ started it. For a multi-pod deployment, use the official operator instead — it
 the consistent-hashing router that this requires: [How to scale out with the Kubernetes
 operator](scale-out-with-the-kubernetes-operator.md).
 
-With config sync set up, replication rules elect one leader per rule through an S3-CAS lease in the sync bucket (default `lease_ttl: "300s"`, `heartbeat_interval: "60s"`); a dead leader's lease lapses and a peer takes over automatically. Lifecycle and maintenance jobs still use node-local database leases, so they may run on more than one pod (idempotent — wasteful, not corrupting). Do not scale above one replica if each pod has its own independent `/data/deltaglider_config.db` — in that shape, each pod is an independent control plane. To run more than one instance, set up config sync first: [How to run multiple instances (HA)](run-multiple-instances.md).
+With config sync set up, replication rules elect one leader per rule through an S3-CAS lease in the sync bucket (default `lease_ttl: "300s"`, `heartbeat_interval: "60s"`); a dead leader's lease lapses and a peer takes over automatically. Lifecycle and maintenance jobs still use node-local database leases, so they may run on more than one pod (idempotent — wasteful, not corrupting). Do not scale above one replica if each pod has its own independent `/data/deltaglider_config.db` — in that shape, each pod is an independent control plane. To run more than one instance, set up config sync and a shared `DGP_CONFIG_DB_KEY` first: [How to run multiple instances (HA)](run-multiple-instances.md).
 
 ## Useful values
 
 | Value | Purpose |
 |---|---|
 | `image.repository` / `image.tag` | Container image. Defaults to chart `appVersion`. |
-| `auth.existingSecret` | Secret created outside Helm. Minimum keys: `DGP_ACCESS_KEY_ID`, `DGP_SECRET_ACCESS_KEY`, `DGP_BOOTSTRAP_PASSWORD_HASH`; add `DGP_BE_AWS_*` for S3 backends. Keeps credentials out of Helm values and release history. |
+| `auth.existingSecret` | Secret created outside Helm. Minimum keys: `DGP_ACCESS_KEY_ID`, `DGP_SECRET_ACCESS_KEY`, `DGP_BOOTSTRAP_PASSWORD_HASH`; add `DGP_BE_AWS_*` for S3 backends, and `DGP_CONFIG_DB_KEY` when config sync is set. Keeps credentials out of Helm values and release history. |
+| `auth.configDbKey` | `DGP_CONFIG_DB_KEY` when the chart creates the Secret. Leave it empty for one replica: the proxy then keeps a generated key file next to the IAM database on the PVC. Required, and the same on every replica, with config sync. |
 | `config.inline` | Canonical DeltaGlider YAML rendered into `/data/deltaglider_proxy.yaml`. |
 | `persistence.*` | PVC settings for `/data`. |
 | `ingress.*` | Optional host/TLS routing. |

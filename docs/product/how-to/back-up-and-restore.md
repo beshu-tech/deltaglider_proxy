@@ -50,11 +50,11 @@ curl -b cookies -X POST \
 
 The import is atomic: all four parts are unpacked and sha256-verified before any state changes. `external_identities` are remapped through the imported user and provider IDs, so OAuth users keep working. A legacy JSON-only body is still accepted for IAM-only restores from pre-v0.8.4 scripts.
 
-If you're restoring onto a **fresh instance** and the import fails with a SQLCipher error, the new instance's bootstrap password doesn't match the DB. Inject the original `DGP_BOOTSTRAP_PASSWORD_HASH` before retrying. The zip's `secrets.json` holds the hash only when the config file held it; a hash that came from the environment is not in the backup.
+The zip carries the IAM state as plain JSON (`iam.json`), so a restore onto a **fresh instance** does not need the old instance's config DB key: the fresh instance writes the imported users into its own database, under its own key. The zip's `secrets.json` holds the bootstrap password hash only when the config file held it; a hash that came from the environment is not in the backup.
 
 ## Snapshot the DB file
 
-`deltaglider_config.db` is safe to copy at the file level — it's encrypted at rest. The snapshot is only useful if the **bootstrap password is preserved with it**: the password derives the DB encryption key. Snapshot the file, store the password (or hash) in your secret manager, and the pair restores onto any instance.
+`deltaglider_config.db` is safe to copy at the file level — it's encrypted at rest. The snapshot is only useful if the **config DB key is preserved with it**: without the key, nobody can open the file. The key is the value of `DGP_CONFIG_DB_KEY` or, when that variable is unset, the content of the key file `deltaglider_config.db.key` next to the DB. Store the key in your secret manager, and the snapshot restores onto any instance that starts with the same key. A snapshot from a release before the config DB key is encrypted with the bootstrap password hash instead; an instance that starts with that hash re-encrypts it with its config DB key on the first start.
 
 ## The xattr warning (filesystem backend)
 

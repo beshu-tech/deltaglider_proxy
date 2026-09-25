@@ -140,7 +140,7 @@ To manage IAM users and groups from the YAML instead of the admin GUI, set `acce
 
 ## Persistence and backups
 
-The `dgp-config` volume holds the **encrypted config DB** (`deltaglider_config.db`) — your IAM users, groups, and OAuth providers. Back it up (see [How to back up and restore](back-up-and-restore.md)). The `dgp-data` volume is scratch (caches + delta-reconstruction buffers); object data itself lives in your S3 backend, not in these volumes.
+The `dgp-config` volume holds the **encrypted config DB** (`deltaglider_config.db`) — your IAM users, groups, and OAuth providers — and, next to it, the key file `deltaglider_config.db.key` that the proxy generates on the first start. The database is useless without that key. Back up both (see [How to back up and restore](back-up-and-restore.md)). The `dgp-data` volume is scratch (caches + delta-reconstruction buffers); object data itself lives in your S3 backend, not in these volumes.
 
 ## Verify
 

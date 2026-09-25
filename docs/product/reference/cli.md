@@ -48,7 +48,7 @@ Interactive wizard, in the style of `npm init`. Prompts for output path (default
 
 ## `--set-bootstrap-password`
 
-Reads one line from stdin, validates password quality, and writes the bcrypt hash to `.deltaglider_bootstrap_hash` in the working directory. Also prints the base64-encoded hash for `DGP_BOOTSTRAP_PASSWORD_HASH` (avoids `$` escaping in Docker/env files). If an encrypted IAM database exists, it becomes unreadable on the next restart — it was encrypted with the old password — and the proxy returns to bootstrap mode. Exit: `0`, or `1` on empty/weak password.
+Reads one line from stdin, validates password quality, and writes the bcrypt hash to `.deltaglider_bootstrap_hash` in the working directory. Also prints the base64-encoded hash for `DGP_BOOTSTRAP_PASSWORD_HASH` (avoids `$` escaping in Docker/env files). The IAM database is not affected, because its key is `DGP_CONFIG_DB_KEY` or the key file next to the database. If the database is still encrypted with the old hash (a database from a release before the config DB key), the flag first re-encrypts it with the config DB key. Exit: `0`, or `1` on empty/weak password, or when the database opens with neither the config DB key nor the current hash (the hash is then not changed).
 
 ## `s3` — client command family
 

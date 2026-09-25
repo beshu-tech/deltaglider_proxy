@@ -422,13 +422,23 @@ access:
 
 ### `bootstrap_password_hash`
 
-Bcrypt hash of the bootstrap password (encrypts the IAM config DB, signs session cookies, gates admin GUI access in bootstrap mode). Auto-generated on first run. Accepts base64-encoded hashes to avoid `$` escaping in Docker/env vars.
+Bcrypt hash of the bootstrap password (signs session cookies, gates admin GUI access in bootstrap mode). Auto-generated on first run. Accepts base64-encoded hashes to avoid `$` escaping in Docker/env vars. It does not encrypt the IAM config DB: that is the job of [`DGP_CONFIG_DB_KEY`](#config-db-key).
 
 | | |
 |---|---|
 | **Env var** | `DGP_BOOTSTRAP_PASSWORD_HASH` (legacy alias: `DGP_ADMIN_PASSWORD_HASH`) |
 | **YAML** | `advanced.bootstrap_password_hash` (treated as an **infra secret** — stripped by canonical exports) |
 | **Default** | Auto-generated on first run |
+
+### Config DB key
+
+The SQLCipher key of the IAM config DB (`deltaglider_config.db`). When the variable is unset, the proxy uses the key file `deltaglider_config.db.key` next to the DB, and it generates that file (mode 0600) on the first start. When `config_sync_bucket` is set, the variable is required and must be identical on every instance, because all instances share one encrypted DB. The value needs at least 32 characters. See [Config database key](authentication.md#config-database-key) for the upgrade from the hash-keyed DB of earlier releases.
+
+| | |
+|---|---|
+| **Env var** | `DGP_CONFIG_DB_KEY` |
+| **YAML** | none (env only, so that the key never lands in a config file or an export) |
+| **Default** | Key file next to the DB, generated on first start |
 
 ### `DGP_BOOTSTRAP_PASSWORD`
 
@@ -642,6 +652,8 @@ Multi-instance coordination via S3. When enabled, the shared bucket does three t
 advanced:
   config_sync_bucket: dgp-iam-sync
 ```
+
+Every instance that shares the bucket must set `DGP_CONFIG_DB_KEY` to the same value: the synced DB is encrypted with that key, and the proxy refuses to start with a sync bucket but without the variable. An instance whose key does not open the synced DB refuses to merge it and logs an error that names `DGP_CONFIG_DB_KEY`.
 
 Sync uses the same S3 credentials as the storage backend (`DGP_BE_AWS_*`) and only works when the storage backend is S3 (not filesystem). On every IAM mutation, the DB is uploaded to `s3://<bucket>/.deltaglider/config.db`; readers poll the S3 ETag every 5 minutes and download on change.
 
@@ -1073,6 +1085,7 @@ Tuning knobs for the large-object streaming multipart copy path (replication + l
 | `DGP_ACCESS_KEY_ID` | — | Proxy SigV4 access key |
 | `DGP_SECRET_ACCESS_KEY` | — | Proxy SigV4 secret key |
 | `DGP_BOOTSTRAP_PASSWORD_HASH` | auto | Bcrypt hash (legacy alias: `DGP_ADMIN_PASSWORD_HASH`) |
+| `DGP_CONFIG_DB_KEY` | key file | Encryption key of the IAM config DB, at least 32 characters; required and identical on every instance when `config_sync_bucket` is set |
 | `DGP_BOOTSTRAP_PASSWORD` | — | Plaintext password for admin CLI only |
 
 ### Security

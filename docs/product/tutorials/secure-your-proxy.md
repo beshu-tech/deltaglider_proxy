@@ -17,25 +17,17 @@ printf '%s\n' 'acme-rocks-mauve-42' | docker run --rm -i -v dgp-data:/data \
   beshultd/deltaglider_proxy --set-bootstrap-password
 ```
 
-You should see a confirmation, plus a warning we're about to take care of:
+You should see a confirmation:
 
 ```
-⚠ WARNING: If an encrypted IAM database exists, it will become
-  unreadable on next restart (encrypted with the old password).
-  All IAM users will be lost. The proxy will return to bootstrap mode.
-
 Bootstrap password hash written to .deltaglider_bootstrap_hash
+The IAM database is not affected (its key is DGP_CONFIG_DB_KEY or the key file).
 
 For Docker/env vars (base64, no escaping needed):
   DGP_BOOTSTRAP_PASSWORD_HASH=JDJiJDEyJ...
 ```
 
-That warning is real: the first run created an empty IAM database encrypted with the *old* password. We have no users in it yet, so we simply clear it before it can confuse the next start:
-
-```bash
-docker run --rm -v dgp-data:/data --entrypoint /bin/sh \
-  beshultd/deltaglider_proxy -c 'rm -f /data/deltaglider_config.db*'
-```
+The IAM database that the first run created is still usable: its encryption key is in the key file `deltaglider_config.db.key` on the same volume, and that key does not depend on the password.
 
 Start the proxy again — same command as before, still in open mode for a few more minutes:
 

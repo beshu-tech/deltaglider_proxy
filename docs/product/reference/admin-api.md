@@ -22,8 +22,8 @@ Endpoints documented here are **admin** only. The S3-compatible API lives under 
 | `POST` | `/_/api/admin/session/open-browser-connect` | Browser-lift session when `authentication: none` |
 | `GET` | `/_/api/whoami` | `{mode, user, external_providers, version, build_time}` — `version` and `build_time` are present for authenticated callers only (a live session, or verified IAM credentials on `POST /_/api/iam/identity`); anonymous callers get `mode` and the provider list but nothing that identifies the build |
 | `GET` | `/_/api/docs` | Session-gated: every product doc plus `docs/product/manifest.json` as one JSON payload (`{manifest, docs: [{path, content}]}`). The embedded docs viewer fetches it at runtime; the markdown is not part of the public JS bundle |
-| `POST` | `/_/api/admin/recover-db` | Reset the config DB when the bootstrap hash doesn't match (public, rate-limited) |
-| `PUT` | `/_/api/admin/password` | Change the bootstrap password — re-encrypts the SQLCipher DB atomically |
+| `POST` | `/_/api/admin/recover-db` | Only while the config DB is locked (no key opens it): test a candidate config DB key, or a legacy bootstrap hash, against the preserved `.db.bak`. Read-only; the response names the kind of key (`key_kind`) so that the operator can set it and restart (public, rate-limited) |
+| `PUT` | `/_/api/admin/password` | Change the bootstrap password. The config DB is not re-encrypted: its key does not depend on the password |
 
 ## Configuration — three scopes
 

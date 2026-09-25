@@ -50,7 +50,9 @@ kubectl apply -f operator/deploy/operator.yaml
 ## 2. Create the credentials Secret
 
 Every pod receives the same Secret. This also guarantees that all pods share the same
-bootstrap password hash, which multi-pod IAM synchronisation requires:
+config DB key, which multi-pod IAM synchronisation requires (the synced IAM database is
+encrypted with it), and the same bootstrap password hash, so that the admin password is
+the same on every pod:
 
 ```bash
 kubectl create namespace dgp
@@ -58,6 +60,7 @@ kubectl -n dgp create secret generic dgp-env \
   --from-literal=DGP_ACCESS_KEY_ID=admin \
   --from-literal=DGP_SECRET_ACCESS_KEY=replace-me \
   --from-literal=DGP_BOOTSTRAP_PASSWORD_HASH="JDJiJDEyJ..." \
+  --from-literal=DGP_CONFIG_DB_KEY="$(openssl rand -hex 32)" \
   --from-literal=DGP_BE_AWS_ACCESS_KEY_ID="..." \
   --from-literal=DGP_BE_AWS_SECRET_ACCESS_KEY="..."
 ```
@@ -68,12 +71,17 @@ Generate the hash with the proxy binary:
 printf '%s\n' 'your-admin-password' | deltaglider_proxy --set-bootstrap-password
 ```
 
-If you would rather skip this step, leave `DGP_BOOTSTRAP_PASSWORD_HASH` out of the
-Secret and set `bootstrapPassword: { autoGenerate: true }` in the resource below. The
-operator then generates a random password once, stores it together with its hash in a
-Secret named `<name>-bootstrap`, and injects the hash into every pod. Read the
-password later with
+If you would rather skip this step, leave `DGP_BOOTSTRAP_PASSWORD_HASH` and
+`DGP_CONFIG_DB_KEY` out of the Secret and set `bootstrapPassword: { autoGenerate: true }`
+in the resource below. The operator then generates a random password and a random
+config DB key once, stores them with the password hash in a Secret named
+`<name>-bootstrap`, and injects the hash and the key into every pod. Read the password
+later with
 `kubectl -n dgp get secret dgp-bootstrap -o jsonpath='{.data.password}' | base64 -d`.
+Back up that Secret: its `dbKey` is the only key that opens the IAM databases on the
+pod volumes. A `<name>-bootstrap` Secret from an older operator release gets its `dbKey`
+added on the next reconcile, and the pods re-encrypt their databases on their next
+restart.
 
 ## 3. Declare the proxy
 
@@ -126,7 +134,7 @@ the Service's ClusterIP instead of its DNS name.
 
 The operator checks the multi-replica requirements before it scales: if the spec has
 no config sync bucket, uses a filesystem backend, or has no shared bootstrap password
-hash, the operator refuses to scale up — a fresh deployment comes up with one pod, an
+hash or config DB key, the operator refuses to scale up — a fresh deployment comes up with one pod, an
 already-running fleet keeps its current size — and it sets the phase to `Degraded`
 with the exact problems listed in `status.message` (`kubectl -n dgp describe dgp dgp`
 shows them). Fix the spec and it scales up on its own.

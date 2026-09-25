@@ -28,20 +28,39 @@ OAuth providers appear as buttons on the `/_/` login page:
 
 ## Bootstrap password
 
-One infrastructure secret with three roles:
+One infrastructure secret with two roles:
 
 | Role | Mechanism |
 |------|-----------|
-| Encrypts the config database | IAM users, OAuth providers, and group mapping rules are stored in SQLCipher, keyed by this password |
 | Signs admin session cookies | HMAC-based session authentication for the admin GUI |
 | Gates admin GUI access | Required to open settings in bootstrap mode (before IAM users exist) |
 
+The bootstrap password does **not** encrypt the config database. The database has its own key, which the next section describes. So a change of the bootstrap password never makes the IAM database unreadable.
+
 Generation and reset facts:
 
-- **Auto-generated** on first run when not set. The plaintext is printed to stderr only when stderr is a TTY. In containers and CI, the proxy prints neither the password nor the bcrypt hash, because the hash is also the encryption key of the IAM database and captured logs are kept. The hash is saved to `.deltaglider_bootstrap_hash` (mode 0600). To get a password that you know, run `--set-bootstrap-password` before any IAM user exists, or set `DGP_BOOTSTRAP_PASSWORD_HASH` before the first start.
+- **Auto-generated** on first run when not set. The plaintext is printed to stderr only when stderr is a TTY. In containers and CI, the proxy does not print the password, because captured logs are kept. The hash is saved to `.deltaglider_bootstrap_hash` (mode 0600). To get a password that you know, run `--set-bootstrap-password`, or set `DGP_BOOTSTRAP_PASSWORD_HASH` before the first start.
 - **Set explicitly** via `DGP_BOOTSTRAP_PASSWORD_HASH` (bcrypt, or base64-encoded bcrypt to avoid `$` escaping in Docker). YAML: `advanced.bootstrap_password_hash`. Legacy alias: `DGP_ADMIN_PASSWORD_HASH`.
-- **Reset** via the `--set-bootstrap-password` CLI flag (reads the new plaintext from stdin). Resetting invalidates the encrypted IAM database — all IAM users, OAuth providers, and group mappings are lost.
-- **Rotation without data loss**: `PUT /_/api/admin/password` verifies the current password and re-encrypts the DB atomically. When `DGP_BOOTSTRAP_PASSWORD_HASH` is set, this request fails with `409`. The reason is that the variable sets the hash again at every start, so the next start would not be able to open a database that was re-encrypted with a new hash. To change the password in that case, first write the current value of the variable into `.deltaglider_bootstrap_hash`. Then unset the variable and restart, so that the proxy reads the same hash from the file. Change the password through this request, which re-encrypts the database with the new hash. Finally, set the variable to the new hash from `.deltaglider_bootstrap_hash` on every instance. Do not only change the variable, and do not use `--set-bootstrap-password`: both leave the database encrypted with a hash that the proxy no longer uses, so the database becomes unreadable.
+- **Reset** via the `--set-bootstrap-password` CLI flag, which reads the new plaintext from stdin. The IAM database keeps all of its users, OAuth providers, and group mappings. If the database is still encrypted with the old hash (a database from a release before the config DB key), the flag first re-encrypts it with the config DB key, and only then writes the new hash.
+- **Change at runtime**: `PUT /_/api/admin/password` verifies the current password and writes the new hash to `.deltaglider_bootstrap_hash`. When `DGP_BOOTSTRAP_PASSWORD_HASH` is set, this request fails with `409`, because the variable sets the hash again at every start and the change would be lost at the next start. In that case, run `--set-bootstrap-password` to get the new hash, set the variable to it on every instance, and restart.
+
+## Config database key
+
+The encrypted config database (`deltaglider_config.db`, SQLCipher) holds IAM users, groups, OAuth providers, and group mapping rules. The proxy takes its key from the first of these sources:
+
+| Source | When to use it |
+|--------|----------------|
+| `DGP_CONFIG_DB_KEY` | Required when `config_sync_bucket` is set, and it must have the same value on every instance. Use at least 32 characters, for example the output of `openssl rand -hex 32`. |
+| Key file `deltaglider_config.db.key` | The default for a single instance. The proxy generates a random key into this file (mode 0600) on the first start, next to the database. |
+
+Facts about the key:
+
+- **Back up the key with the database.** A copy of `deltaglider_config.db` is useless without its key. If you lose the key, the IAM data cannot be recovered.
+- **An empty or unreadable key file stops the start.** The proxy never replaces an existing key file, because a new key would make the database unreadable.
+- **Upgrade from a release before the config DB key**: those releases encrypted the database with the bootstrap password hash. On the first start, the proxy opens the database with that hash and re-encrypts it with the new key. The re-encryption works on a copy, and the copy replaces the original only after it opens with the new key. If a step fails, the original database stays unchanged and the next start tries again.
+- **Move from the key file to `DGP_CONFIG_DB_KEY`**: set the variable and restart. The proxy opens the database with the key file and re-encrypts it with the variable's value.
+- **A key that opens nothing**: when no key opens the database, the proxy keeps the database as `deltaglider_config.db.bak`, starts with an empty database, and locks the S3 API (`503`) until you restore the right key and restart. The admin GUI has a recovery wizard that tells you whether a candidate key opens the preserved database.
+- **The key is never printed** and never leaves the node: the synced copy in `config_sync_bucket` is encrypted with it.
 
 ## SigV4 verification
 

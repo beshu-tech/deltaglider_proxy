@@ -17,9 +17,22 @@ advanced:
 DGP_CONFIG_SYNC_BUCKET=dgp-iam-sync
 ```
 
-After every IAM mutation, the mutating instance uploads the encrypted DB to the bucket. The other instances poll every 5 minutes and download when the ETag changes. All instances must share the same bootstrap password — it's the DB encryption key.
+After every IAM mutation, the mutating instance uploads the encrypted DB to the bucket. The other instances poll every 5 minutes and download when the ETag changes.
 
-## 2. Decide where operators edit IAM
+## 2. Give every instance the same config DB key
+
+The synced DB is encrypted with the config DB key, so every instance needs the same one. Generate a key once and set it on every instance:
+
+```bash
+openssl rand -hex 32          # run once; store the output in your secret manager
+DGP_CONFIG_DB_KEY=<that value> # on every instance
+```
+
+An instance with a sync bucket but without `DGP_CONFIG_DB_KEY` refuses to start, because a per-node key file cannot open the other nodes' uploads. An instance whose key differs refuses to merge the synced DB and logs an error that names `DGP_CONFIG_DB_KEY`; it never overwrites the synced copy. Also share the bootstrap password hash (`DGP_BOOTSTRAP_PASSWORD_HASH`) if you want the same admin password on every instance; it no longer encrypts anything.
+
+**Upgrading a fleet from a release before the config DB key.** Those releases encrypted the DB with the bootstrap password hash. Set the same new `DGP_CONFIG_DB_KEY` on every instance and restart all of them. On the first start, each instance re-encrypts its local DB with the new key, and it still accepts a synced DB under the old hash. Until the last instance runs the new release, the old instances cannot read the uploads of the new ones, so avoid IAM changes during the rollout.
+
+## 3. Decide where operators edit IAM
 
 Any instance can accept IAM changes. Each instance keeps a copy of the database that it last shared with the bucket, and it uses that copy as a merge base. When an instance downloads a newer database, it compares both its own database and the downloaded one with the merge base, row by row, and it matches the rows by name. A group mapping rule has no name, so each rule carries a generated id that stays the same when you edit the rule. A change that only one side made is kept. A user, group, or provider that one side deleted is deleted on both sides. Two instances can therefore add, change, or delete different users at the same time, and every change survives.
 
@@ -29,7 +42,7 @@ The first sync after an upgrade has no merge base yet. In that sync, the copy in
 
 If you want no writer at all, switch to `iam_mode: declarative` and manage IAM via YAML + GitOps — see [How to manage IAM as code](manage-iam-as-code.md).
 
-## 3. Force a sync when you can't wait
+## 4. Force a sync when you can't wait
 
 After a known-good mutation on the writer, make a reader pull immediately instead of waiting out the poll interval:
 
@@ -39,13 +52,13 @@ curl -b cookies -X POST https://dgp-reader-1:9000/_/api/admin/config/sync-now
 
 Use this during rollouts and incident response — e.g. you just disabled a leaked key on the writer and want every reader to enforce it now.
 
-## 4. If you scale with Helm
+## 5. If you scale with Helm
 
 `replicaCount` defaults to `1` — do not raise it until the sync bucket is configured. With the sync bucket set, **replication** rules elect a single leader per rule through an S3 lease object in that bucket (conditional-write CAS): if the leader dies, its lease lapses (default `lease_ttl: "300s"`) and a peer takes over automatically — no double-run, no shared DB required. **Lifecycle and maintenance** jobs still use node-local database leases (`heartbeat_interval: "60s"` renewals), so under multiple replicas those can run on more than one pod; their operations are idempotent, so this wastes work rather than corrupting data. The sync bucket must pass the boot-time conditional-write validation — see [How to use non-CAS backends safely](backend-capability-validation.md).
 
 See [How to deploy on Kubernetes with Helm](deploy-on-kubernetes.md) for the chart specifics.
 
-## 5. Route multipart uploads to one instance
+## 6. Route multipart uploads to one instance
 
 The state of a multipart upload — the upload id and the parts received so far — lives
 only in the memory and on the local disk of the instance that answered the
@@ -92,7 +105,7 @@ Be aware of the limit of this approach: when you add or remove an instance, part
 the hash ring moves, so a multipart upload that is in flight on a moved prefix fails
 and the client has to restart it from the beginning.
 
-## 6. Know what stays per-instance
+## 7. Know what stays per-instance
 
 Two more pieces of state live inside each instance and are not shared. Neither breaks
 correctness, but both change behaviour compared to a single instance:
@@ -109,7 +122,7 @@ correctness, but both change behaviour compared to a single instance:
   accordingly, and remember that the admin GUI's source-IP stickiness concentrates
   everyone behind one NAT gateway onto a single instance's budget.
 
-## 7. Mind upgrades across the fleet
+## 8. Mind upgrades across the fleet
 
 During a rolling upgrade, a newer binary may migrate the DB schema forward; older instances still running will download a DB they can't fully read. Upgrade all instances before making IAM mutations, or accept that mid-rollout mutations are lost on older readers. Details: [How to upgrade the proxy](upgrade.md).
 
