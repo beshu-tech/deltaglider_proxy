@@ -461,11 +461,17 @@ pub async fn verify(
                 tick.tick().await;
                 let now = crate::replication::current_unix_seconds();
                 let db = db_for_task.lock().await;
-                if !db
-                    .parity_renew_lease(&rule_clone.name, &owner, now, PARITY_LEASE_TTL_SECS)
-                    .unwrap_or(false)
-                {
-                    break; // lost the lease — stop renewing
+                let renewed =
+                    db.parity_renew_lease(&rule_clone.name, &owner, now, PARITY_LEASE_TTL_SECS);
+                use crate::config_db::job_store::{keeper_step, KeeperStep};
+                match keeper_step(&renewed) {
+                    KeeperStep::Held => {}
+                    KeeperStep::Lost => break, // lost the lease — stop renewing
+                    KeeperStep::Retry => tracing::warn!(
+                        "parity audit: lease renewal for '{}' failed ({:?}); retrying",
+                        rule_clone.name,
+                        renewed.err()
+                    ),
                 }
             }
         };

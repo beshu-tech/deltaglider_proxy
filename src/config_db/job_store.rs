@@ -80,6 +80,29 @@ pub(crate) fn try_acquire_leader_lease(
 /// Renew a lease this owner still holds. Fails (false) when the owner
 /// doesn't match OR the lease already lapsed (`leader_expires_at < now`)
 /// — a lapsed worker must stop, never resurrect.
+/// What a background lease keeper does with one renewal's result.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum KeeperStep {
+    /// Renewed: keep going.
+    Held,
+    /// Refused (lapsed, or another holder): stop renewing.
+    Lost,
+    /// The DB errored: not a refusal. Try again next tick; the lease still
+    /// lapses at its TTL if the errors go on.
+    Retry,
+}
+
+/// Pure: THE renewal verdict for timer-driven lease keepers. A keeper that
+/// read a transient DB error as "lost" stopped for good, and the lease
+/// lapsed mid-job although the next renewal would have worked.
+pub(crate) fn keeper_step<E>(renewal: &Result<bool, E>) -> KeeperStep {
+    match renewal {
+        Ok(true) => KeeperStep::Held,
+        Ok(false) => KeeperStep::Lost,
+        Err(_) => KeeperStep::Retry,
+    }
+}
+
 pub(crate) fn renew_leader_lease(
     conn: &Connection,
     table: &str,

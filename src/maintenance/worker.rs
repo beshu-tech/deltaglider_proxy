@@ -574,7 +574,8 @@ pub(crate) async fn persist(
 /// The per-page `heartbeat` is not enough on its own: one page of copy work
 /// can outlast the TTL, and a lapsed lease lets the requeue scan hand the job
 /// back and the write gate open mid-job. The keeper stops at the first
-/// refused renewal; the next per-page `heartbeat` then reports LEASE_LOST.
+/// refused renewal (a DB error is retried); the next per-page `heartbeat`
+/// then reports LEASE_LOST.
 pub(crate) struct LeaseKeeper(tokio::task::JoinHandle<()>);
 
 impl LeaseKeeper {
@@ -591,11 +592,20 @@ impl LeaseKeeper {
                 let renewed = {
                     let db = db.lock().await;
                     db.maintenance_heartbeat(job_id, &instance_id, current_unix_seconds(), ttl_secs)
-                        .unwrap_or(false)
                 };
-                if !renewed {
-                    warn!("maintenance: job #{job_id} lease renewal refused; keeper stops");
-                    return;
+                use crate::config_db::job_store::{keeper_step, KeeperStep};
+                match keeper_step(&renewed) {
+                    KeeperStep::Held => {}
+                    KeeperStep::Lost => {
+                        warn!("maintenance: job #{job_id} lease renewal refused; keeper stops");
+                        return;
+                    }
+                    // If the DB stays unreadable past the TTL, the per-page
+                    // heartbeat then stops the phase.
+                    KeeperStep::Retry => warn!(
+                        "maintenance: job #{job_id} lease renewal failed ({:?}); retrying",
+                        renewed.err()
+                    ),
                 }
             }
         }))
@@ -686,6 +696,35 @@ mod tests {
             db.lock().await.maintenance_requeue_abandoned().unwrap(),
             0,
             "the lease lapsed while the keeper ran"
+        );
+    }
+
+    /// A renewal that ERRORS (a busy or briefly unreadable DB) is not a
+    /// refusal: the keeper must try again, not stop for good and let the
+    /// lease lapse mid-job.
+    #[tokio::test]
+    async fn lease_keeper_survives_a_transient_db_error() {
+        let ttl = 2;
+        let (db, id) = claimed_job(ttl);
+        let _keeper = LeaseKeeper::spawn(
+            db.clone(),
+            id,
+            "inst".to_string(),
+            ttl,
+            std::time::Duration::from_millis(300),
+        );
+        let sql = |q: &'static str| {
+            let db = db.clone();
+            async move { db.lock().await.conn.execute_batch(q).unwrap() }
+        };
+        sql("ALTER TABLE maintenance_jobs RENAME TO maintenance_jobs_away").await;
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        sql("ALTER TABLE maintenance_jobs_away RENAME TO maintenance_jobs").await;
+        tokio::time::sleep(std::time::Duration::from_millis(2800)).await;
+        assert_eq!(
+            db.lock().await.maintenance_requeue_abandoned().unwrap(),
+            0,
+            "the keeper stopped at a DB error and the lease lapsed"
         );
     }
 
