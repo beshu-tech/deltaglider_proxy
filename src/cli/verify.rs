@@ -118,21 +118,57 @@ pub async fn run(args: VerifyArgs) -> i32 {
     };
 
     let observed = hex_sha256(&data);
-    if observed.eq_ignore_ascii_case(&metadata.file_sha256) {
-        println!(
-            "OK: {} (sha256={observed}, size={size})",
-            args.url,
-            size = data.len()
-        );
-        cli_exit::EXIT_OK
-    } else {
-        eprintln!(
+    match verdict(&metadata.file_sha256, &observed) {
+        Verdict::Ok => {
+            println!(
+                "OK: {} (sha256={observed}, size={size})",
+                args.url,
+                size = data.len()
+            );
+            cli_exit::EXIT_OK
+        }
+        // Not an integrity failure: the read succeeded, there is just
+        // no stored checksum. Exit 0 so a sweep over a mixed bucket
+        // does not flag objects written by other tools.
+        Verdict::Unverifiable => {
+            println!(
+                "UNVERIFIABLE: {} has no DeltaGlider checksum (not written through DeltaGlider) \
+                 (sha256={observed}, size={size})",
+                args.url,
+                size = data.len()
+            );
+            cli_exit::EXIT_OK
+        }
+        Verdict::Mismatch => {
+            eprintln!(
             "MISMATCH: {url}\n  expected sha256: {expected}\n  observed sha256: {observed}\n  size: {size}",
             url = args.url,
             expected = metadata.file_sha256,
             size = data.len()
         );
-        cli_exit::EXIT_INTEGRITY
+            cli_exit::EXIT_INTEGRITY
+        }
+    }
+}
+
+/// Outcome of comparing the recomputed hash with the stored one.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    Ok,
+    Mismatch,
+    /// The object carries no DeltaGlider checksum (it was not written
+    /// through DeltaGlider), so there is nothing to compare against.
+    Unverifiable,
+}
+
+/// Pure: compare the stored `dg-file-sha256` with the observed hash.
+pub(crate) fn verdict(expected: &str, observed: &str) -> Verdict {
+    if expected.is_empty() {
+        Verdict::Unverifiable
+    } else if observed.eq_ignore_ascii_case(expected) {
+        Verdict::Ok
+    } else {
+        Verdict::Mismatch
     }
 }
 
@@ -154,6 +190,16 @@ mod tests {
             hex_sha256(b""),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn verdict_table() {
+        let h = hex_sha256(b"abc");
+        assert_eq!(verdict(&h, &h), Verdict::Ok);
+        assert_eq!(verdict(&h.to_uppercase(), &h), Verdict::Ok);
+        assert_eq!(verdict(&hex_sha256(b"abd"), &h), Verdict::Mismatch);
+        // Foreign object: no stored checksum is not a mismatch.
+        assert_eq!(verdict("", &h), Verdict::Unverifiable);
     }
 
     #[test]

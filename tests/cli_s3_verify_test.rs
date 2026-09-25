@@ -130,13 +130,21 @@ async fn verify_detects_passthrough_byte_corruption() {
         deltaglider_proxy::cli::config::EXIT_OK
     );
 
-    // Overwrite the stored bytes (passthrough → direct overwrite is
-    // enough). The xattrs / user-metadata that carry `file_sha256`
-    // stay tied to the ORIGINAL content, so subsequent verify will
-    // mismatch.
+    // Overwrite the stored bytes but carry the DeltaGlider user
+    // metadata over: an S3 PUT replaces metadata, and without
+    // `dg-file-sha256` the object would be foreign (unverifiable), not
+    // corrupt. With it, the stored hash describes the ORIGINAL bytes.
+    let head = s3
+        .head_object()
+        .bucket(&bucket)
+        .key("doc.txt")
+        .send()
+        .await
+        .unwrap();
     s3.put_object()
         .bucket(&bucket)
         .key("doc.txt")
+        .set_metadata(head.metadata().cloned())
         .body(ByteStream::from(b"poisoned-content".to_vec()))
         .send()
         .await
@@ -155,6 +163,34 @@ async fn verify_detects_passthrough_byte_corruption() {
     s3.delete_object()
         .bucket(&bucket)
         .key("doc.txt")
+        .send()
+        .await
+        .ok();
+    s3.delete_bucket().bucket(&bucket).send().await.ok();
+}
+
+/// An object written by another tool has no `dg-file-sha256`. That is
+/// not corruption: `verify` reports it as unverifiable and exits 0.
+#[tokio::test]
+async fn verify_reports_foreign_object_as_unverifiable_not_mismatch() {
+    skip_unless_minio!();
+    let bucket = unique_bucket("foreign");
+    let s3 = common::minio_client().await;
+    s3.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3.put_object()
+        .bucket(&bucket)
+        .key("foreign.txt")
+        .body(ByteStream::from_static(b"written by another tool"))
+        .send()
+        .await
+        .unwrap();
+
+    let code = verify_run(verify_args(format!("s3://{bucket}/foreign.txt"))).await;
+    assert_eq!(code, deltaglider_proxy::cli::config::EXIT_OK);
+
+    s3.delete_object()
+        .bucket(&bucket)
+        .key("foreign.txt")
         .send()
         .await
         .ok();
