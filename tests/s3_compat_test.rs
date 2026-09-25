@@ -2419,6 +2419,65 @@ async fn test_form_post_rejects_field_not_covered_by_policy() {
     );
 }
 
+/// A form POST authenticates BEFORE the bucket-existence check: an
+/// unauthenticated caller must get 403 for a missing bucket and an existing
+/// one alike, never a 404 that reveals which buckets exist.
+#[tokio::test]
+async fn test_form_post_wrong_signature_does_not_reveal_bucket_existence() {
+    let server = TestServer::builder()
+        .auth("POSTACCESSKEY", "POSTSECRETKEY123")
+        .build()
+        .await;
+    let client = reqwest::Client::new();
+    let endpoint = server.endpoint();
+    let amz_date = "20260507T120000Z";
+    let credential = "POSTACCESSKEY/20260507/us-east-1/s3/aws4_request";
+    for bucket in [
+        server.bucket().to_string(),
+        "no-such-bucket-xyz".to_string(),
+    ] {
+        let policy = serde_json::json!({
+            "expiration": "2099-01-01T00:00:00.000Z",
+            "conditions": [
+                { "bucket": bucket },
+                ["starts-with", "$key", "post/"],
+                { "x-amz-algorithm": "AWS4-HMAC-SHA256" },
+                { "x-amz-credential": credential },
+                { "x-amz-date": amz_date }
+            ]
+        });
+        let policy_b64 = base64::engine::general_purpose::STANDARD.encode(policy.to_string());
+        let signing_key = derive_post_signing_key("WRONG-SECRET", "20260507", "us-east-1");
+        let signature = hex::encode(hmac_sha256(&signing_key, policy_b64.as_bytes()));
+        let form = reqwest::multipart::Form::new()
+            .text("key", "post/x.txt")
+            .text("policy", policy_b64)
+            .text("x-amz-algorithm", "AWS4-HMAC-SHA256")
+            .text("x-amz-credential", credential)
+            .text("x-amz-date", amz_date)
+            .text("x-amz-signature", signature)
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(b"x".to_vec())
+                    .file_name("x.txt")
+                    .mime_str("text/plain")
+                    .unwrap(),
+            );
+        let resp = client
+            .post(format!("{endpoint}/{bucket}"))
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            403,
+            "a wrong-signature form POST to '{bucket}' must fail auth first, got {}",
+            resp.status()
+        );
+    }
+}
+
 /// `key` is NOT exempt from the covered-fields rule: a policy signed with no
 /// key condition must 403 (AWS: "Extra input fields: key"), else a leaked
 /// minimal-policy signature could write to ANY key in the signer's scope.

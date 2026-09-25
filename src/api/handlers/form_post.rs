@@ -15,7 +15,7 @@
 //! file part; `authenticate_form_post` rebuilds the SigV4 signing key,
 //! verifies the form signature in constant time, decodes and validates
 //! the policy document, and authorises the user against IAM;
-//! `handle_form_post_upload` runs the bucket-existence + quota gates,
+//! `handle_form_post_upload` runs auth first, then the bucket-existence + quota gates,
 //! hands the file body to `engine.store`, and emits the object-created
 //! event + audit log.
 //!
@@ -701,7 +701,7 @@ fn authenticate_form_post(
 ///
 /// Called from `object::delete_objects` when the dispatcher detects a
 /// `multipart/form-data` body via [`is_multipart_form_upload`]. Performs
-/// bucket-existence + parse + auth + quota checks, hands the file body
+/// parse + auth + gate + bucket-existence + quota checks, in that order, hands the file body
 /// to `engine.store`, emits the object-created event, and returns a
 /// 204 No Content with the persisted object's ETag.
 pub async fn handle_form_post_upload(
@@ -726,7 +726,9 @@ pub async fn handle_form_post_upload(
     // Refuse a replication_target_only bucket before any backend I/O or body
     // parse (403-before-404 parity with the PUT path, commit b1b2249).
     check_client_write_allowed(state, bucket)?;
-    ensure_bucket_exists(state, bucket).await?;
+    // Authenticate BEFORE the existence check: a 404 to an unauthenticated
+    // caller reveals which buckets exist, and the backend round-trip would
+    // delay the health gate's fast 503 behind a backend timeout.
     let parsed = parse_form_post_upload(headers, body).await?;
     let auth_user = match authenticate_form_post(iam_state, bucket, &parsed, client_ip) {
         Ok(u) => u,
@@ -751,6 +753,7 @@ pub async fn handle_form_post_upload(
         &axum::http::Method::POST,
         &format!("/{bucket}"),
     )?;
+    ensure_bucket_exists(state, bucket).await?;
     check_quota(state, bucket, parsed.file_data.len() as u64)?;
     let engine = state.engine.load();
     let size = parsed.file_data.len() as u64;
