@@ -891,7 +891,9 @@ pub async fn reopen_and_rebuild_iam(
     let groups = db.load_groups().unwrap_or_default();
     let count = users.len();
     let group_count = groups.len();
-    let state = IamIndex::build_iam_state(users, groups);
+    // An empty synced DB falls back to THIS node's bootstrap credential,
+    // never to open access (see `build_iam_state`).
+    let state = IamIndex::build_iam_state(users, groups, &iam_state.load());
     if matches!(&state, IamState::Iam(_)) {
         info!(
             "IAM index rebuilt from S3-synced DB ({} users, {} groups) [{}]",

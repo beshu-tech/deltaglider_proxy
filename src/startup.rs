@@ -1207,7 +1207,11 @@ fn init_config_db_attempt(
                             db_file.display()
                         );
                     }
-                    let state = deltaglider_proxy::iam::IamIndex::build_iam_state(users, groups);
+                    let state = deltaglider_proxy::iam::IamIndex::build_iam_state(
+                        users,
+                        groups,
+                        &iam_state.load(),
+                    );
                     iam_state.store(Arc::new(state));
                 }
                 // If no users exist, keep current IamState (Legacy or Disabled)

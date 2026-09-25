@@ -86,6 +86,17 @@ pub enum IamState {
     Iam(IamIndex),
 }
 
+impl IamState {
+    /// The bootstrap credential to fall back to when the IAM DB has no users.
+    pub fn bootstrap_fallback(&self) -> Option<&AuthConfig> {
+        match self {
+            IamState::Disabled => None,
+            IamState::Legacy(auth) => Some(auth),
+            IamState::Iam(index) => index.bootstrap_fallback.as_ref(),
+        }
+    }
+}
+
 /// Thread-safe, hot-swappable IAM state.
 pub type SharedIamState = Arc<ArcSwap<IamState>>;
 
@@ -93,6 +104,9 @@ pub type SharedIamState = Arc<ArcSwap<IamState>>;
 pub struct IamIndex {
     users: HashMap<String, IamUser>,
     groups: Vec<Group>,
+    /// The YAML/env bootstrap credential this process runs with, carried
+    /// through IAM mode so an empty DB falls back to it, not to open access.
+    bootstrap_fallback: Option<AuthConfig>,
 }
 
 impl IamIndex {
@@ -148,7 +162,11 @@ impl IamIndex {
             }
             map.insert(user.access_key_id.clone(), user);
         }
-        Self { users: map, groups }
+        Self {
+            users: map,
+            groups,
+            bootstrap_fallback: None,
+        }
     }
 
     /// Look up a user by access_key_id. O(1).
@@ -176,13 +194,29 @@ impl IamIndex {
         &self.groups
     }
 
-    /// Build IAM state from users and groups.
-    /// Returns `Iam(index)` if users exist, `Disabled` otherwise.
-    pub fn build_iam_state(users: Vec<IamUser>, groups: Vec<Group>) -> IamState {
+    /// Build IAM state from users and groups, replacing `current`.
+    ///
+    /// Returns `Iam(index)` if users exist. An EMPTY user set (last user
+    /// deleted, or a peer synced an empty DB) falls back to the bootstrap
+    /// credential `current` carries — `Legacy` — and only to `Disabled`
+    /// when the process has no bootstrap credential at all (explicit
+    /// `authentication: none`). Returning `Disabled` unconditionally
+    /// turned "delete the last user" into open access.
+    pub fn build_iam_state(
+        users: Vec<IamUser>,
+        groups: Vec<Group>,
+        current: &IamState,
+    ) -> IamState {
+        let fallback = current.bootstrap_fallback().cloned();
         if users.is_empty() {
-            return IamState::Disabled;
+            return match fallback {
+                Some(auth) => IamState::Legacy(auth),
+                None => IamState::Disabled,
+            };
         }
-        IamState::Iam(Self::from_users_and_groups(users, groups))
+        let mut index = Self::from_users_and_groups(users, groups);
+        index.bootstrap_fallback = fallback;
+        IamState::Iam(index)
     }
 }
 
@@ -516,15 +550,15 @@ mod tests {
         assert_eq!(bob.permissions[0].resources, vec!["prod/home/bob/*"]);
     }
 
-    #[test]
-    fn test_build_iam_state_empty_users() {
-        let state = IamIndex::build_iam_state(vec![], vec![]);
-        assert!(matches!(state, IamState::Disabled));
+    fn boot() -> AuthConfig {
+        AuthConfig {
+            access_key_id: "AKBOOT".into(),
+            secret_access_key: "s".into(),
+        }
     }
 
-    #[test]
-    fn test_build_iam_state_with_users() {
-        let users = vec![IamUser {
+    fn one_user() -> Vec<IamUser> {
+        vec![IamUser {
             id: 1,
             name: "test".into(),
             access_key_id: "AK1".into(),
@@ -535,8 +569,32 @@ mod tests {
             group_ids: vec![],
             auth_source: "local".into(),
             iam_policies: vec![],
-        }];
-        let state = IamIndex::build_iam_state(users, vec![]);
+        }]
+    }
+
+    /// Empty user set: open access ONLY without a bootstrap credential.
+    #[test]
+    fn test_build_iam_state_empty_users() {
+        let state = IamIndex::build_iam_state(vec![], vec![], &IamState::Disabled);
+        assert!(matches!(state, IamState::Disabled));
+        let state = IamIndex::build_iam_state(vec![], vec![], &IamState::Legacy(boot()));
+        assert!(matches!(state, IamState::Legacy(a) if a.access_key_id == "AKBOOT"));
+    }
+
+    /// The bootstrap credential survives IAM mode: Legacy -> Iam -> empty
+    /// (last user deleted, or an empty DB synced from a peer) -> Legacy.
+    #[test]
+    fn test_build_iam_state_carries_bootstrap_through_iam() {
+        let iam = IamIndex::build_iam_state(one_user(), vec![], &IamState::Legacy(boot()));
+        assert!(matches!(iam, IamState::Iam(_)));
+        let again = IamIndex::build_iam_state(one_user(), vec![], &iam);
+        let empty = IamIndex::build_iam_state(vec![], vec![], &again);
+        assert!(matches!(empty, IamState::Legacy(a) if a.access_key_id == "AKBOOT"));
+    }
+
+    #[test]
+    fn test_build_iam_state_with_users() {
+        let state = IamIndex::build_iam_state(one_user(), vec![], &IamState::Disabled);
         assert!(matches!(state, IamState::Iam(_)));
     }
 }

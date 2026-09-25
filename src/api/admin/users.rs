@@ -62,7 +62,8 @@ fn mask_user(user: &IamUser) -> IamUser {
 }
 
 /// Rebuild the in-memory IamIndex from the database and store it.
-/// If no users exist, restores Disabled mode to avoid locking out all access.
+/// If no users exist, falls back to the bootstrap credential (Legacy), or to
+/// open access only when the process has none (see `build_iam_state`).
 /// On first IAM user creation (Legacy -> IAM transition), auto-migrates the
 /// legacy config-file credentials as a "legacy-admin" user with full access so
 /// existing S3 clients don't break.
@@ -96,8 +97,13 @@ fn rebuild_iam_index_inner(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     if users.is_empty() {
-        tracing::info!("No IAM users in database — disabling auth (open access)");
-        iam_state.store(Arc::new(IamState::Disabled));
+        let state = IamIndex::build_iam_state(users, Vec::new(), &iam_state.load());
+        if matches!(state, IamState::Disabled) {
+            tracing::info!("No IAM users in database and no bootstrap credential — open access");
+        } else {
+            tracing::info!("No IAM users in database — falling back to the bootstrap credential");
+        }
+        iam_state.store(Arc::new(state));
         iam::bump_iam_version();
         return Ok(());
     }
@@ -152,7 +158,7 @@ fn rebuild_iam_index_inner(
 
     let count = users.len();
     let group_count = groups.len();
-    let state = IamIndex::build_iam_state(users, groups);
+    let state = IamIndex::build_iam_state(users, groups, &iam_state.load());
     iam_state.store(Arc::new(state));
     // Bump AFTER the store so observers see the new state when they
     // see a new version — lets integration tests poll `iam/version`
@@ -536,4 +542,55 @@ pub async fn rotate_user_keys(
     audit_log("rotate_keys", "admin", &user.name, &headers);
     // Return full user including new secret (shown only once)
     Ok(Json(user))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arc_swap::ArcSwap;
+
+    fn legacy_state() -> SharedIamState {
+        Arc::new(ArcSwap::from_pointee(IamState::Legacy(iam::AuthConfig {
+            access_key_id: "AKBOOT".into(),
+            secret_access_key: "boot-secret".into(),
+        })))
+    }
+
+    /// Deleting the last IAM user must fall back to the YAML bootstrap
+    /// credential, never to open access (S10).
+    #[test]
+    fn last_user_delete_falls_back_to_bootstrap_not_open() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let state = legacy_state();
+        db.create_user("alice", "AKALICE", "alice-secret", true, &[])
+            .unwrap();
+        rebuild_iam_index(&db, &state).unwrap();
+        assert!(matches!(&**state.load(), IamState::Iam(_)));
+
+        for u in db.load_users().unwrap() {
+            db.delete_user(u.id).unwrap();
+        }
+        rebuild_iam_index(&db, &state).unwrap();
+        match &**state.load() {
+            IamState::Legacy(auth) => assert_eq!(auth.access_key_id, "AKBOOT"),
+            IamState::Disabled => panic!("empty IAM DB opened access"),
+            IamState::Iam(_) => panic!("expected bootstrap fallback"),
+        }
+    }
+
+    /// Without bootstrap credentials (explicit `authentication: none`), an
+    /// empty DB keeps meaning open access.
+    #[test]
+    fn last_user_delete_without_bootstrap_stays_open() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let state: SharedIamState = Arc::new(ArcSwap::from_pointee(IamState::Disabled));
+        db.create_user("alice", "AKALICE", "alice-secret", true, &[])
+            .unwrap();
+        rebuild_iam_index(&db, &state).unwrap();
+        for u in db.load_users().unwrap() {
+            db.delete_user(u.id).unwrap();
+        }
+        rebuild_iam_index(&db, &state).unwrap();
+        assert!(matches!(&**state.load(), IamState::Disabled));
+    }
 }
