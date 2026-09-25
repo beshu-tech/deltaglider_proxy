@@ -837,11 +837,15 @@ where
             match st {
                 State::Initial(mut inner) => {
                     let mut head = bytes::BytesMut::new();
+                    let mut ended = false;
                     while head.len() < CHUNK_MAGIC.len() {
                         match inner.next().await {
                             Some(Ok(chunk)) => head.extend_from_slice(&chunk),
                             Some(Err(e)) => return Some((Err(e), State::Done)),
-                            None => break,
+                            None => {
+                                ended = true;
+                                break;
+                            }
                         }
                     }
                     if head.is_empty() {
@@ -850,7 +854,14 @@ where
                     if head.starts_with(&CHUNK_MAGIC) {
                         return Some((Err(stripped_marker_error()), State::Done));
                     }
-                    Some((Ok(head.freeze()), State::Passthrough(inner)))
+                    // Never poll an ended stream again: the S3 body stream
+                    // (an `unfold`) panics when polled after `None`.
+                    let next = if ended {
+                        State::Done
+                    } else {
+                        State::Passthrough(inner)
+                    };
+                    Some((Ok(head.freeze()), next))
                 }
                 State::Passthrough(mut inner) => inner
                     .next()
@@ -2949,6 +2960,23 @@ mod tests {
             msg.contains("xattrs") || msg.contains("dg-encrypted"),
             "error must explain the xattr-strip scenario, got: {msg}"
         );
+    }
+
+    /// Production bodies are `unfold` streams (s3_body_to_stream), which
+    /// panic when polled after they end. An object shorter than the magic
+    /// ends inside the sniff; the sniff must not poll it again.
+    #[tokio::test]
+    async fn dge1_sniff_never_polls_an_ended_stream() {
+        use futures::TryStreamExt;
+        let body = |data: &'static [u8]| {
+            Box::pin(futures::stream::unfold(Some(data), |d| async move {
+                d.map(|d| (Ok::<_, StorageError>(Bytes::from_static(d)), None))
+            }))
+        };
+        for data in [&b"v0"[..], b"abc", b"abcd", b"abcdefg"] {
+            let out: Vec<Bytes> = sniff_dge1_magic(body(data)).try_collect().await.unwrap();
+            assert_eq!(out.concat(), data.to_vec());
+        }
     }
 
     /// The sniff must see the magic even when the backend emits it split
