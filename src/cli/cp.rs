@@ -17,6 +17,7 @@ use crate::cli::aws_creds;
 use crate::cli::config as cli_exit;
 use crate::cli::engine_factory::{build_cli_engine, render_store_error, CliEngineOpts};
 use crate::cli::filter::Filter;
+use crate::cli::keys::{local_path_for_key, LocalPathError};
 use crate::cli::ls::should_allow_local;
 use crate::cli::s3_url::{is_s3_url, parse_s3_url, S3Loc};
 use crate::deltaglider::DynEngine;
@@ -366,7 +367,16 @@ async fn download(engine: &DynEngine, args: &CpArgs, filter: &Filter, src: &S3Lo
             eprintln!("error: source must be an object (not a prefix); use `-r` to copy a prefix");
             return cli_exit::EXIT_USAGE;
         }
-        let dst_path = resolve_local_dst(&args.dst, &src.key);
+        let dst_path = match resolve_local_dst(&args.dst, &src.key) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "error: refusing to download s3://{}/{}: {e}",
+                    src.bucket, src.key
+                );
+                return cli_exit::EXIT_USAGE;
+            }
+        };
         download_one(engine, args, &src.bucket, &src.key, &dst_path).await
     } else {
         let dst_root = PathBuf::from(&args.dst);
@@ -407,7 +417,15 @@ async fn download(engine: &DynEngine, args: &CpArgs, filter: &Filter, src: &S3Lo
                 if !filter.matches(rel) {
                     continue;
                 }
-                let dst_path = dst_root.join(rel);
+                let dst_path = match local_path_for_key(&dst_root, rel) {
+                    Ok(p) => p,
+                    Err(LocalPathError::DirectoryMarker) => continue,
+                    Err(e) => {
+                        eprintln!("warning: skipping s3://{}/{k}: {e}", src.bucket);
+                        failed += 1;
+                        continue;
+                    }
+                };
                 if let Some(parent) = dst_path.parent() {
                     if let Err(e) = tokio::fs::create_dir_all(parent).await {
                         eprintln!("error: mkdir {} failed: {e}", parent.display());
@@ -587,16 +605,16 @@ async fn copy_one(
     }
 }
 
-/// Pure: pick a local destination path from `dst` flag + the source key.
+/// Pick a local destination path from `dst` flag + the source key.
 /// `dst` may be a file path (used verbatim) or a directory path (key's
-/// basename is appended).
-fn resolve_local_dst(dst: &str, src_key: &str) -> PathBuf {
+/// basename is appended, through the same safety gate as `-r`).
+fn resolve_local_dst(dst: &str, src_key: &str) -> Result<PathBuf, LocalPathError> {
     let dst_path = PathBuf::from(dst);
     if dst_path.is_dir() || dst.ends_with('/') {
         let basename = src_key.rsplit('/').next().unwrap_or(src_key);
-        dst_path.join(basename)
+        local_path_for_key(&dst_path, basename)
     } else {
-        dst_path
+        Ok(dst_path)
     }
 }
 
@@ -652,13 +670,13 @@ mod tests {
     fn resolve_local_dst_with_directory_appends_basename() {
         // Build a directory under tempdir so .is_dir() is true.
         let dir = tempfile::tempdir().unwrap();
-        let dst = resolve_local_dst(dir.path().to_str().unwrap(), "releases/v1.zip");
+        let dst = resolve_local_dst(dir.path().to_str().unwrap(), "releases/v1.zip").unwrap();
         assert_eq!(dst.file_name().and_then(|s| s.to_str()), Some("v1.zip"));
     }
 
     #[test]
     fn resolve_local_dst_with_explicit_file_path_keeps_it() {
-        let dst = resolve_local_dst("./output.bin", "releases/v1.zip");
+        let dst = resolve_local_dst("./output.bin", "releases/v1.zip").unwrap();
         assert_eq!(dst.to_str(), Some("./output.bin"));
     }
 
@@ -747,11 +765,32 @@ mod tests {
     fn resolve_local_dst_with_root_key_keeps_dst_within_dir() {
         let dir = tempfile::tempdir().unwrap();
         // src_key = "single.bin" (no slashes) → file goes directly in dir.
-        let dst = resolve_local_dst(dir.path().to_str().unwrap(), "single.bin");
+        let dst = resolve_local_dst(dir.path().to_str().unwrap(), "single.bin").unwrap();
         assert_eq!(
             dst.parent().map(|p| p.to_path_buf()),
             Some(dir.path().to_path_buf())
         );
         assert_eq!(dst.file_name().and_then(|s| s.to_str()), Some("single.bin"));
+    }
+
+    #[test]
+    fn resolve_local_dst_refuses_a_dot_dot_basename() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_local_dst(dir.path().to_str().unwrap(), "a/..").is_err());
+    }
+
+    /// Guard for the class: every download path must build local paths
+    /// through `keys::local_path_for_key`, never `Path::join` on a key.
+    #[test]
+    fn download_paths_never_join_a_raw_key() {
+        for (name, src) in [
+            ("cp.rs", include_str!("cp.rs")),
+            ("sync.rs", include_str!("sync.rs")),
+        ] {
+            let code = src.split("#[cfg(test)]").next().unwrap();
+            for bad in ["dst_root.join(", "dst_dir.join(", "dst_path.join("] {
+                assert!(!code.contains(bad), "{name} joins a raw key: `{bad}`");
+            }
+        }
     }
 }

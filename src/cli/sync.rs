@@ -24,6 +24,7 @@ use crate::cli::aws_creds;
 use crate::cli::config as cli_exit;
 use crate::cli::engine_factory::{build_cli_engine, render_store_error, CliEngineOpts};
 use crate::cli::filter::Filter;
+use crate::cli::keys::{local_path_for_key, LocalPathError};
 use crate::cli::ls::should_allow_local;
 use crate::cli::s3_url::{is_s3_url, parse_s3_url};
 use crate::deltaglider::DynEngine;
@@ -324,7 +325,15 @@ async fn sync_s3_to_local(args: &SyncArgs, filter: &Filter, opts: SyncDecisionOp
             continue;
         }
         let s3_key = join_prefix(&src_loc.key, rel);
-        let local_path = dst_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let local_path = match local_path_for_key(&dst_dir, rel) {
+            Ok(p) => p,
+            Err(LocalPathError::DirectoryMarker) => continue,
+            Err(e) => {
+                eprintln!("warning: skipping s3://{}/{s3_key}: {e}", src_loc.bucket);
+                failed += 1;
+                continue;
+            }
+        };
         if !args.quiet {
             println!(
                 "download: s3://{}/{} to {}",
@@ -344,11 +353,12 @@ async fn sync_s3_to_local(args: &SyncArgs, filter: &Filter, opts: SyncDecisionOp
     }
 
     if args.delete {
-        for rel in local_entries.keys() {
+        for (rel, local) in &local_entries {
             if s3_entries.contains_key(rel) {
                 continue;
             }
-            let local_path = dst_dir.join(rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+            // The walk recorded the real on-disk path; never rebuild it.
+            let local_path = PathBuf::from(&local.rel);
             if !args.quiet {
                 println!("delete: {}", local_path.display());
             }
