@@ -19,9 +19,7 @@
 
 use crate::cli::aws_creds;
 use crate::cli::config as cli_exit;
-use crate::cli::ls::should_allow_local;
-use crate::config::BackendConfig;
-use crate::storage::S3Backend;
+use crate::cli::engine_factory::build_raw_s3_client;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -319,22 +317,12 @@ async fn build_client(args: &PurgeArgs) -> Result<aws_sdk_s3::Client, i32> {
         cli_exit::EXIT_AUTH
     })?;
 
-    // `allow_local` flows through the typed `BackendConfig::S3` field
-    // instead of via `DGP_BACKEND_ALLOW_LOCAL` env mutation.
-    let allow_local = should_allow_local(args.endpoint_url.as_deref());
-
-    let backend = BackendConfig::S3 {
-        endpoint: args.endpoint_url.clone(),
-        region: creds.region.unwrap_or_else(|| "us-east-1".into()),
-        force_path_style: args.force_path_style,
-        access_key_id: Some(creds.access_key_id),
-        secret_access_key: Some(creds.secret_access_key),
-        allow_local,
-    };
-    S3Backend::build_client(&backend).await.map_err(|e| {
-        eprintln!("error: failed to initialise S3 client: {e}");
-        cli_exit::EXIT_HTTP
-    })
+    build_raw_s3_client(&creds, args.endpoint_url.clone(), args.force_path_style)
+        .await
+        .map_err(|e| {
+            eprintln!("error: failed to initialise S3 client: {e}");
+            cli_exit::EXIT_HTTP
+        })
 }
 
 fn flatten_err<E: std::error::Error>(e: &E) -> String {

@@ -679,6 +679,7 @@ async fn build_engine_from_args(args: &SyncArgs) -> Result<DynEngine, i32> {
         force_path_style: args.force_path_style,
         access_key_id: creds.access_key_id,
         secret_access_key: creds.secret_access_key,
+        session_token: creds.session_token,
         max_delta_ratio: None,
         max_object_size: args.max_object_size_mb.map(|mb| mb * 1024 * 1024),
         allow_local: should_allow_local(args.endpoint_url.as_deref()),
