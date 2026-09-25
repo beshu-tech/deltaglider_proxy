@@ -764,16 +764,34 @@ enum DeleteCheck {
 
 /// Pure: compare the snapshot generation with a fresh HEAD. `created_at`
 /// is the generation marker: every overwrite stamps a new one, and it is
-/// the same field the listing and HEAD both resolve.
+/// the same field the listing and HEAD both resolve. Compared at the
+/// coarser precision of the two ([`same_generation`]).
 fn classify_delete_check(
     snapshot_created_at: chrono::DateTime<Utc>,
     head: Result<&crate::types::FileMetadata, &crate::deltaglider::EngineError>,
 ) -> DeleteCheck {
     match head {
-        Ok(current) if current.created_at == snapshot_created_at => DeleteCheck::Proceed,
+        Ok(current) if same_generation(snapshot_created_at, current.created_at) => {
+            DeleteCheck::Proceed
+        }
         Ok(_) => DeleteCheck::Changed,
         Err(crate::deltaglider::EngineError::NotFound(_)) => DeleteCheck::Gone,
         Err(e) => DeleteCheck::HeadFailed(format!("re-check before delete failed: {e}")),
+    }
+}
+
+/// Pure: do two `created_at` values name one generation? For an object
+/// without DG metadata on S3, the listing gives milliseconds and HEAD's
+/// Last-Modified header whole seconds: an exact compare called every such
+/// object overwritten, and lifecycle never deleted it. When either side has
+/// no sub-second part, compare whole seconds; else compare exactly (an
+/// overwrite within the same second must still count as a change).
+fn same_generation(a: chrono::DateTime<Utc>, b: chrono::DateTime<Utc>) -> bool {
+    use chrono::Timelike;
+    if a.nanosecond() == 0 || b.nanosecond() == 0 {
+        a.timestamp() == b.timestamp()
+    } else {
+        a == b
     }
 }
 
@@ -1242,6 +1260,8 @@ mod tests {
         assert_eq!(classify_delete_check(t, Ok(&meta)), DeleteCheck::Proceed);
         meta.created_at = t + chrono::Duration::milliseconds(1);
         assert_eq!(classify_delete_check(t, Ok(&meta)), DeleteCheck::Changed);
+        meta.created_at = t + chrono::Duration::seconds(1);
+        assert_eq!(classify_delete_check(t, Ok(&meta)), DeleteCheck::Changed);
         assert_eq!(
             classify_delete_check(t, Err(&EngineError::NotFound("k".into()))),
             DeleteCheck::Gone
@@ -1250,6 +1270,28 @@ mod tests {
             classify_delete_check(t, Err(&EngineError::InvalidArgument("boom".into()))),
             DeleteCheck::HeadFailed(_)
         ));
+    }
+
+    /// S3 LIST reports LastModified in milliseconds; HEAD's Last-Modified
+    /// header has whole seconds. A passthrough object without DG metadata
+    /// therefore always looked overwritten, and lifecycle never deleted it.
+    #[test]
+    fn delete_check_compares_at_whole_seconds() {
+        use super::{classify_delete_check, DeleteCheck};
+        use chrono::TimeZone;
+        let listed = chrono::Utc.timestamp_millis_opt(1_700_000_000_123).unwrap();
+        let headed = crate::types::FileMetadata::fallback(
+            "k".into(),
+            1,
+            "e".into(),
+            chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        assert_eq!(
+            classify_delete_check(listed, Ok(&headed)),
+            DeleteCheck::Proceed
+        );
     }
 
     /// A copy-mode transition (source kept) acts on the same expired objects
