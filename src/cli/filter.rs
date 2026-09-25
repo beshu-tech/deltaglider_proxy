@@ -7,9 +7,10 @@
 //!   (no include patterns specified OR any include pattern matches)
 //!   AND no exclude pattern matches.
 //!
-//! Patterns without `/` are tested against the key's basename
-//! (`releases/v1.zip` → `v1.zip`); patterns with `/` are tested
-//! against the full key. This is simpler than AWS-CLI's strict-
+//! Callers pass the key RELATIVE to the listed prefix (every recursive
+//! verb does). Patterns without `/` are tested against its basename
+//! (`releases/v1.zip` → `v1.zip`); patterns with `/` against the whole
+//! relative key. This is simpler than AWS-CLI's strict-
 //! order-of-application semantics — good enough for `cp -r` /
 //! `rm -r`; revisit when `sync` lands and needs precise parity.
 

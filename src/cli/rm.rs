@@ -27,8 +27,8 @@ pub struct RmArgs {
     #[arg(short, long)]
     pub recursive: bool,
 
-    /// Include patterns (basename glob OR full-key glob with `/`).
-    /// Repeatable.
+    /// Include patterns (basename glob, OR a glob with `/` matched
+    /// against the key relative to the prefix, like `cp`). Repeatable.
     #[arg(long, value_name = "GLOB")]
     pub include: Vec<String>,
 
@@ -211,14 +211,15 @@ async fn rm_recursive(engine: &DynEngine, args: &RmArgs, bucket: &str, prefix: &
     }
 }
 
-/// Pure: the keys of one listing page that `rm -r` deletes. `prefix`
+/// Pure: the keys of one listing page that `rm -r` deletes. Globs see
+/// the key relative to the prefix, the same as `cp -r`. `prefix`
 /// is normalised with [`dir_prefix`] here too, so a caller cannot
 /// forget it.
 pub(crate) fn rm_targets<'a>(keys: &[&'a str], prefix: &str, filter: &Filter) -> Vec<&'a str> {
     let dir = dir_prefix(prefix);
     keys.iter()
         .copied()
-        .filter(|k| rel_under(k, &dir).is_some() && filter.matches(k))
+        .filter(|k| rel_under(k, &dir).is_some_and(|rel| filter.matches(rel)))
         .collect()
 }
 
@@ -246,6 +247,20 @@ mod tests {
         assert_eq!(
             rm_targets(KEYS, "releases", &filter(&[], &[])),
             vec!["releases/v1.zip", "releases/tmp/scratch.zip"]
+        );
+    }
+
+    /// Globs match the key relative to the prefix, as in `cp`, `sync`
+    /// and `aws s3 rm`.
+    #[test]
+    fn globs_match_relative_to_the_prefix() {
+        assert_eq!(
+            rm_targets(KEYS, "releases/", &filter(&[], &["tmp/*"])),
+            vec!["releases/v1.zip"]
+        );
+        assert_eq!(
+            rm_targets(KEYS, "releases/", &filter(&["tmp/*"], &[])),
+            vec!["releases/tmp/scratch.zip"]
         );
     }
 
