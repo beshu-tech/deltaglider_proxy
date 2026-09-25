@@ -43,7 +43,7 @@ use super::ConfigError;
 /// values with YAML indicators (leading `@`, `*`, `:` `, ` etc.) parse as
 /// intended only when the field is quoted in the template (`key: "${env:X}"`).
 pub fn expand_env_vars(input: &str) -> Result<String, ConfigError> {
-    expand_env_with(input, |name| std::env::var(name).ok())
+    expand_env_doc_with(input, |name| std::env::var(name).ok())
 }
 
 /// True if `s` is exactly one `${env:NAME}` / `${env:NAME:-default}`
@@ -154,7 +154,7 @@ pub(crate) fn expand_env_with_recording(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<(String, std::collections::BTreeMap<String, String>), ConfigError> {
     let mut used = std::collections::BTreeMap::new();
-    let expanded = expand_env_with(input, |name| {
+    let expanded = expand_env_doc_with(input, |name| {
         let v = lookup(name);
         if let Some(val) = &v {
             if !val.is_empty() {
@@ -170,7 +170,83 @@ pub(crate) fn expand_env_with_recording(
 /// value (`None` = unset).
 pub(crate) fn expand_env_with(
     input: &str,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<String, ConfigError> {
+    expand_core(input, lookup, false)
+}
+
+/// [`expand_env_with`] for a whole YAML DOCUMENT: a ref that is an entire
+/// plain scalar becomes `!envref "value"`, a string that YAML cannot
+/// re-type; an entire quoted scalar (`"…"`, `'…'`) becomes an escaped
+/// double-quoted string. Spliced as plain text, an all-digit AES key read as
+/// a number, a secret `true` as a bool, and the config failed to load. The
+/// typed load (`lenient::from_value`) gives the value the type of its field.
+pub(crate) fn expand_env_doc_with(
+    input: &str,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<String, ConfigError> {
+    expand_core(input, lookup, true)
+}
+
+/// Pure: where a ref starting at byte `start` (its `$`) and ending at byte
+/// `end` (its `}`) sits in `input`. `Some(quote)` when the ref is a whole
+/// scalar (`quote` = the enclosing quote char, or `None` for plain), else
+/// `None` (mid-string, a key, a block scalar line).
+fn whole_scalar_quote(input: &str, start: usize, end: usize) -> Option<Option<char>> {
+    let line_start = input[..start].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = input[end + 1..]
+        .find('\n')
+        .map_or(input.len(), |i| end + 1 + i);
+    let mut before = &input[line_start..start];
+    let mut after = &input[end + 1..line_end];
+    let quote = match (before.chars().next_back(), after.chars().next()) {
+        (Some(q @ ('"' | '\'')), Some(c)) if c == q => {
+            before = &before[..before.len() - 1];
+            after = &after[1..];
+            Some(q)
+        }
+        _ => None,
+    };
+    // What precedes must end a mapping key (`key: `), a sequence dash
+    // (`- `) or a flow opener/separator, after whitespace.
+    let head = before.trim_end();
+    if head.len() == before.len() && !before.ends_with(['[', '{', ',']) {
+        return None; // `key:${env:X}` or text glued to the ref
+    }
+    let opens_scalar = head.ends_with(':')
+        || head.ends_with(['[', '{', ','])
+        || (!head.is_empty() && head.split_whitespace().all(|t| t == "-"));
+    if !opens_scalar || head.contains('#') {
+        return None;
+    }
+    // What follows: end of line, a comment, or a flow separator/closer.
+    let tail = after.trim_start();
+    let closes = tail.is_empty()
+        || (tail.starts_with('#') && tail.len() < after.len())
+        || tail.starts_with([',', ']', '}']);
+    closes.then_some(quote)
+}
+
+/// `value` as a YAML double-quoted scalar.
+fn yaml_double_quoted(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn expand_core(
+    input: &str,
     mut lookup: impl FnMut(&str) -> Option<String>,
+    doc: bool,
 ) -> Result<String, ConfigError> {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
@@ -246,7 +322,25 @@ pub(crate) fn expand_env_with(
                         if has_unsafe_control_char(&resolved) {
                             return Err(ConfigError::UnsafeEnvValue(name.to_string()));
                         }
-                        out.push_str(&resolved);
+                        match doc.then(|| whole_scalar_quote(input, i, end)).flatten() {
+                            Some(quote) => {
+                                if quote.is_some() {
+                                    // A quoted ref is a string: re-quote it
+                                    // escaped (a `"` or `\\` in the value broke
+                                    // the old splice). A plain ref is typed by
+                                    // its field (`lenient::from_value`).
+                                    out.pop(); // the opening quote, already copied
+                                } else {
+                                    out.push_str(super::lenient::ENV_REF_TAG);
+                                    out.push(' ');
+                                }
+                                out.push_str(&yaml_double_quoted(&resolved));
+                                i = end + 1 + usize::from(quote.is_some());
+                                cursor = i;
+                                continue;
+                            }
+                            None => out.push_str(&resolved),
+                        }
                     }
                 }
                 i = end + 1;
@@ -519,6 +613,33 @@ mod tests {
         assert!(
             msg.contains("unset or empty"),
             "message should cover the empty case, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn doc_expansion_types_only_whole_scalars() {
+        let v = |_: &str| Some("0123".to_string());
+        let d = |t: &str| expand_env_doc_with(t, v).unwrap();
+        assert_eq!(d("k: ${env:X}\n"), "k: !envref \"0123\"\n");
+        assert_eq!(d("k: ${env:X}  # c\n"), "k: !envref \"0123\"  # c\n");
+        assert_eq!(d("- ${env:X}"), "- !envref \"0123\"");
+        assert_eq!(
+            d("k: [${env:X}, ${env:X}]"),
+            "k: [!envref \"0123\", !envref \"0123\"]"
+        );
+        assert_eq!(d("k: \"${env:X}\"\n"), "k: \"0123\"\n");
+        assert_eq!(d("k: '${env:X}'"), "k: \"0123\"");
+        // Not a whole scalar: spliced as before.
+        assert_eq!(d("k: a${env:X}"), "k: a0123");
+        assert_eq!(d("k: ${env:X}b"), "k: 0123b");
+        assert_eq!(d("k: \"a${env:X}\""), "k: \"a0123\"");
+        assert_eq!(d("k: |\n  ${env:X}\n"), "k: |\n  0123\n");
+        assert_eq!(d("${env:X}: v"), "0123: v");
+        // Escaping of a quoted value.
+        let q = |_: &str| Some(r#"a"b\c"#.to_string());
+        assert_eq!(
+            expand_env_doc_with("k: ${env:X}", q).unwrap(),
+            r#"k: !envref "a\"b\\c""#
         );
     }
 
