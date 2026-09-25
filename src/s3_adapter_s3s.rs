@@ -355,7 +355,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             input.delimiter.as_deref(),
             max_keys,
             list_cursor(
-                input.continuation_token.as_deref(),
+                decode_v2_token(input.continuation_token.as_deref()).as_deref(),
                 input.start_after.as_deref(),
             ),
             include_metadata,
@@ -1543,6 +1543,39 @@ async fn collect_blob_limited(
     Ok(body)
 }
 
+/// Marks an opaque ListObjectsV2 continuation token (`.` is not in base64url).
+const V2_TOKEN_PREFIX: &str = "dg1.";
+
+/// Pure: the opaque V2 continuation token for the engine cursor `key`. A raw
+/// key in <NextContinuationToken> broke the XML for a key with a control
+/// character (encoding-type=url encodes <Key> but not the token).
+fn encode_v2_token(key: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "{V2_TOKEN_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key)
+    )
+}
+
+/// Pure: the engine cursor for a V2 continuation token. A token without the
+/// prefix (or that does not decode) is the old raw-key form, accepted for
+/// one release so a listing that spans the upgrade goes on.
+fn decode_v2_token(token: Option<&str>) -> Option<String> {
+    use base64::Engine as _;
+    let token = token?;
+    Some(
+        token
+            .strip_prefix(V2_TOKEN_PREFIX)
+            .and_then(|b| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(b)
+                    .ok()
+            })
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_else(|| token.to_string()),
+    )
+}
+
 /// Engine pages one filtered LIST may scan before it gives up. A prefix-scoped
 /// user can ask for a prefix where every key is hidden; the scan must end.
 const FILTERED_LIST_MAX_ENGINE_PAGES: usize = 10_000;
@@ -2571,7 +2604,7 @@ fn list_objects_v2_output_from_page(
         key_count: Some(i32::try_from(key_count).unwrap_or(i32::MAX)),
         continuation_token: input.continuation_token.clone(),
         is_truncated: Some(page.is_truncated),
-        next_continuation_token: page.next_continuation_token,
+        next_continuation_token: page.next_continuation_token.as_deref().map(encode_v2_token),
         contents: Some(contents),
         common_prefixes: Some(common_prefixes),
         encoding_type: input.encoding_type.clone(),
@@ -2728,6 +2761,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn v2_tokens_are_opaque_and_accept_the_raw_form() {
+        for key in ["p/a.txt", "ctl/a\u{1}b.txt", "", "é/<x>&"] {
+            let t = encode_v2_token(key);
+            assert!(t.bytes().all(|b| b.is_ascii_graphic()), "{t}");
+            assert_eq!(decode_v2_token(Some(&t)).as_deref(), Some(key));
+        }
+        assert_eq!(decode_v2_token(Some("p/a.txt")).as_deref(), Some("p/a.txt"));
+        assert_eq!(decode_v2_token(Some("dg1.!!")).as_deref(), Some("dg1.!!"));
+        assert_eq!(decode_v2_token(None), None);
     }
 
     #[test]
@@ -2977,7 +3022,10 @@ mod tests {
         assert_eq!(out.name.as_deref(), Some("bucket"));
         assert_eq!(out.key_count, Some(2));
         assert_eq!(out.is_truncated, Some(true));
-        assert_eq!(out.next_continuation_token.as_deref(), Some("p/a.txt"));
+        assert_eq!(
+            out.next_continuation_token.as_deref(),
+            Some(encode_v2_token("p/a.txt").as_str())
+        );
         assert_eq!(out.contents.as_ref().map(Vec::len), Some(1));
         assert_eq!(out.common_prefixes.as_ref().map(Vec::len), Some(1));
     }
