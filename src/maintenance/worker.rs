@@ -383,14 +383,14 @@ async fn execute_phases(
             resolve_desired(&cfg, bucket).map_err(|e| format!("config changed mid-run: {e}"))?
         };
         let engine = state.engine.load().clone();
-        let storage: &dyn crate::storage::StorageBackend = engine.storage().as_ref();
-        let deltaspaces = storage
+        let deltaspaces = engine
+            .storage()
             .list_deltaspaces(bucket)
             .await
             .map_err(|e| format!("list deltaspaces failed: {e}"))?;
         for prefix in deltaspaces {
             check_cancel(db, job.id).await?;
-            match rewrite_reference_if_needed(storage, bucket, &prefix, &desired).await {
+            match rewrite_reference_if_needed(&engine, bucket, &prefix, &desired).await {
                 Ok(()) => {}
                 Err(e) => {
                     failed += 1;
@@ -477,38 +477,35 @@ pub(crate) async fn counting_phase(
 /// Re-store a deltaspace's reference blob through the (encrypting)
 /// storage wrapper when its at-rest state doesn't match. The reference's
 /// PLAINTEXT bytes are unchanged, so the engine's in-memory
-/// ReferenceCache (keyed by content) stays valid.
+/// ReferenceCache (keyed by content) stays valid. The check and the
+/// rewrite run under the deltaspace's prefix lock AND the cross-instance
+/// reference lock (`with_dest_prefix_lock`), like every reference write.
 async fn rewrite_reference_if_needed(
-    storage: &dyn crate::storage::StorageBackend,
+    engine: &crate::deltaglider::DynEngine,
     bucket: &str,
     prefix: &str,
     desired: &DesiredEncryption,
 ) -> Result<(), String> {
-    if !storage
-        .has_reference(bucket, prefix)
-        .await
-        .map_err(|e| format!("has_reference failed for {bucket}/{prefix}: {e}"))?
-    {
-        return Ok(());
-    }
-    let meta = storage
-        .get_reference_metadata(bucket, prefix)
-        .await
-        .map_err(|e| format!("reference metadata failed: {e}"))?;
-    if !needs_rewrite(&meta.user_metadata, desired) {
-        return Ok(());
-    }
-    let data = storage
-        .get_reference(bucket, prefix)
-        .await
-        .map_err(|e| format!("reference read failed: {e}"))?;
-    let mut new_meta = meta;
-    strip_encryption_markers(&mut new_meta.user_metadata);
-    storage
-        .put_reference(bucket, prefix, &data, &new_meta)
-        .await
-        .map_err(|e| format!("reference rewrite failed: {e}"))?;
-    Ok(())
+    let res: Result<(), crate::deltaglider::EngineError> = engine
+        .with_dest_prefix_lock(bucket, prefix, || async {
+            let storage = engine.storage();
+            if !storage.has_reference(bucket, prefix).await? {
+                return Ok(());
+            }
+            let meta = storage.get_reference_metadata(bucket, prefix).await?;
+            if !needs_rewrite(&meta.user_metadata, desired) {
+                return Ok(());
+            }
+            let data = engine.get_reference_raw(bucket, prefix).await?;
+            let mut new_meta = meta;
+            strip_encryption_markers(&mut new_meta.user_metadata);
+            engine
+                .put_reference_raw(bucket, prefix, &data, &new_meta)
+                .await?;
+            Ok(())
+        })
+        .await;
+    res.map_err(|e| format!("reference rewrite failed for {bucket}/{prefix}: {e}"))
 }
 
 /// Wait for the gated bucket's in-flight S3 writes to reach zero. The

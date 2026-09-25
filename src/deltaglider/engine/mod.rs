@@ -3435,10 +3435,7 @@ mod reference_lock_hold_tests {
         .iter()
         .map(|m| format!("storage.{m}("))
         .collect();
-        // src/maintenance/worker.rs::rewrite_reference_if_needed carries a raw
-        // rewrite owned by another change; drop it here once it goes through
-        // `with_dest_prefix_lock` + `put_reference_raw`.
-        let allowed = ["src/maintenance/worker.rs"];
+        let allowed: [&str; 0] = [];
         let mut offenders = Vec::new();
         let mut stack = vec![root.join("src")];
         while let Some(dir) = stack.pop() {
