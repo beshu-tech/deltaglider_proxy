@@ -378,9 +378,12 @@ async fn run_or_preview(
                     if execute {
                         match execute_action(db.as_ref(), engine, rule, &key, &meta, &action).await
                         {
-                            Ok(bytes_actioned) => {
+                            Ok(ActionOutcome::Acted(bytes_actioned)) => {
                                 out.objects_affected += 1;
                                 out.bytes_affected += bytes_actioned as i64;
+                            }
+                            Ok(ActionOutcome::Skipped) => {
+                                out.objects_skipped += 1;
                             }
                             Err(err) => {
                                 out.errors += 1;
@@ -659,33 +662,24 @@ async fn run_or_preview_retain_newest(
     }
 
     for c in &plan.delete {
-        // TOCTOU guard: the ranking used a snapshot taken during collect. If the
-        // object was OVERWRITTEN between collect and now (same key, newer
-        // created_at), the snapshot is stale — re-ranked, the fresh object might
-        // be in the KEEP set. Re-HEAD and skip the delete on a created_at change
-        // so a concurrent backup upload can never be deleted out from under the
-        // client. (A delete by another writer surfaces as NotFound → already gone.)
-        match engine.head(&rule.bucket, &c.key).await {
-            Ok(current) if current.created_at != c.created_at => {
+        // TOCTOU guard: the ranking used a snapshot taken during collect. An
+        // overwrite since then is a new object that might rank in the KEEP set.
+        match recheck_before_delete(engine, &rule.bucket, &c.key, c.created_at).await {
+            DeleteCheck::Proceed => {}
+            DeleteCheck::Changed | DeleteCheck::Gone => {
                 out.objects_skipped += 1;
                 debug!(
-                    "lifecycle rule '{}': retain-newest skipping {:?} — changed since collect \
-                     (ranked {} → current {})",
-                    rule.name,
-                    c.key,
-                    c.created_at.to_rfc3339(),
-                    current.created_at.to_rfc3339()
+                    "lifecycle rule '{}': retain-newest skipping {:?} — changed or gone since collect",
+                    rule.name, c.key
                 );
                 continue;
             }
-            // Already gone (deleted by another writer) — nothing to do.
-            Err(crate::deltaglider::EngineError::NotFound(_)) => {
-                out.objects_skipped += 1;
+            DeleteCheck::HeadFailed(msg) => {
+                out.errors += 1;
+                push_failure(&mut out.failures, response_cap, c.key.clone(), msg.clone());
+                record_failure(&db, rule, ctx.as_ref(), &c.key, &msg).await?;
                 continue;
             }
-            // Unchanged, or HEAD failed for another reason: fall through to the
-            // delete, which re-resolves metadata and reports its own errors.
-            _ => {}
         }
 
         let meta = metas.get(&c.key);
@@ -755,6 +749,56 @@ fn preview_action_fields(
     }
 }
 
+/// Result of re-checking an object right before a delete.
+#[derive(Debug, PartialEq, Eq)]
+enum DeleteCheck {
+    /// Same generation as the snapshot: delete.
+    Proceed,
+    /// Overwritten since the snapshot: a new object the rule never judged.
+    Changed,
+    /// Already deleted by another writer.
+    Gone,
+    /// HEAD failed: fail closed (never delete what we cannot see).
+    HeadFailed(String),
+}
+
+/// Pure: compare the snapshot generation with a fresh HEAD. `created_at`
+/// is the generation marker: every overwrite stamps a new one, and it is
+/// the same field the listing and HEAD both resolve.
+fn classify_delete_check(
+    snapshot_created_at: chrono::DateTime<Utc>,
+    head: Result<&crate::types::FileMetadata, &crate::deltaglider::EngineError>,
+) -> DeleteCheck {
+    match head {
+        Ok(current) if current.created_at == snapshot_created_at => DeleteCheck::Proceed,
+        Ok(_) => DeleteCheck::Changed,
+        Err(crate::deltaglider::EngineError::NotFound(_)) => DeleteCheck::Gone,
+        Err(e) => DeleteCheck::HeadFailed(format!("re-check before delete failed: {e}")),
+    }
+}
+
+/// Every lifecycle delete goes through this re-HEAD: the plan was made on a
+/// listing snapshot, and a delete by key would remove a newer overwrite.
+/// (A small window between this HEAD and the delete remains: the engine has
+/// no conditional delete.)
+async fn recheck_before_delete(
+    engine: &DynEngine,
+    bucket: &str,
+    key: &str,
+    snapshot_created_at: chrono::DateTime<Utc>,
+) -> DeleteCheck {
+    classify_delete_check(snapshot_created_at, engine.head(bucket, key).await.as_ref())
+}
+
+/// What `execute_action` did with one planned object.
+#[derive(Debug, PartialEq, Eq)]
+enum ActionOutcome {
+    /// Deleted and/or copied this many bytes.
+    Acted(u64),
+    /// The object changed or vanished since the listing: nothing done.
+    Skipped,
+}
+
 async fn execute_action(
     db: Option<&Arc<Mutex<ConfigDb>>>,
     engine: &Arc<DynEngine>,
@@ -762,12 +806,17 @@ async fn execute_action(
     key: &str,
     meta: &crate::types::FileMetadata,
     action: &PlannedLifecycleAction,
-) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<ActionOutcome, Box<dyn std::error::Error + Send + Sync>> {
     match action {
         PlannedLifecycleAction::Delete => {
+            match recheck_before_delete(engine, &rule.bucket, key, meta.created_at).await {
+                DeleteCheck::Proceed => {}
+                DeleteCheck::Changed | DeleteCheck::Gone => return Ok(ActionOutcome::Skipped),
+                DeleteCheck::HeadFailed(msg) => return Err(msg.into()),
+            }
             engine.delete(&rule.bucket, key).await?;
             append_lifecycle_delete_event(db, rule, key, meta, "delete").await;
-            Ok(meta.file_size)
+            Ok(ActionOutcome::Acted(meta.file_size))
         }
         PlannedLifecycleAction::Transition {
             destination_bucket,
@@ -804,12 +853,26 @@ async fn execute_action(
             .await;
 
             if *delete_source_after_success {
-                engine.delete(&rule.bucket, key).await?;
-                append_lifecycle_delete_event(db, rule, key, meta, "transition-source-delete")
-                    .await;
+                match recheck_before_delete(engine, &rule.bucket, key, meta.created_at).await {
+                    DeleteCheck::Proceed => {
+                        engine.delete(&rule.bucket, key).await?;
+                        append_lifecycle_delete_event(
+                            db,
+                            rule,
+                            key,
+                            meta,
+                            "transition-source-delete",
+                        )
+                        .await;
+                    }
+                    // Overwritten since the listing: the copy is done, but the
+                    // new source is not ours to delete.
+                    DeleteCheck::Changed | DeleteCheck::Gone => {}
+                    DeleteCheck::HeadFailed(msg) => return Err(msg.into()),
+                }
             }
 
-            Ok(copied.bytes_copied as u64)
+            Ok(ActionOutcome::Acted(copied.bytes_copied as u64))
         }
     }
 }
@@ -1055,6 +1118,151 @@ fn push_failure(failures: &mut Vec<LifecycleFailure>, cap: usize, key: String, e
 #[cfg(test)]
 mod tests {
     use super::retain_newest_may_delete;
+    use super::{execute_action, PlannedLifecycleAction};
+    use crate::config::Config;
+    use crate::config_sections::LifecycleRule;
+    use crate::deltaglider::{DeltaGliderEngine, DynEngine};
+    use crate::storage::{FilesystemBackend, StorageBackend};
+    use std::sync::Arc;
+
+    async fn fs_engine(dir: &std::path::Path) -> Arc<DynEngine> {
+        let backend: Box<dyn StorageBackend> =
+            Box::new(FilesystemBackend::new(dir.to_path_buf()).await.unwrap());
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
+        engine.create_bucket("b").await.ok();
+        engine.create_bucket("dst").await.ok();
+        Arc::new(engine)
+    }
+
+    fn rule() -> LifecycleRule {
+        LifecycleRule {
+            name: "r".to_string(),
+            enabled: true,
+            bucket: "b".to_string(),
+            prefix: String::new(),
+            action: Default::default(),
+            expire_after: Some("1d".to_string()),
+            include_globs: vec![],
+            exclude_globs: vec![],
+            batch_size: 100,
+        }
+    }
+
+    /// Store `key`, snapshot its metadata (what the listing saw), then overwrite
+    /// it: the snapshot is now stale.
+    async fn stale_snapshot(engine: &DynEngine, key: &str) -> crate::types::FileMetadata {
+        engine
+            .store("b", key, b"old generation", None, Default::default())
+            .await
+            .unwrap();
+        let snapshot = engine.head("b", key).await.unwrap();
+        // created_at must differ between the two generations.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        engine
+            .store("b", key, b"new generation!", None, Default::default())
+            .await
+            .unwrap();
+        snapshot
+    }
+
+    /// D6: an age delete acts on a listing snapshot. An overwrite after the
+    /// listing is a NEW object that the rule never judged; it must survive.
+    #[tokio::test]
+    async fn age_delete_spares_an_object_overwritten_after_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        let snapshot = stale_snapshot(&engine, "k.bin").await;
+        let _ = execute_action(
+            None,
+            &engine,
+            &rule(),
+            "k.bin",
+            &snapshot,
+            &PlannedLifecycleAction::Delete,
+        )
+        .await
+        .unwrap();
+        assert!(
+            engine.head("b", "k.bin").await.is_ok(),
+            "the newer overwrite was deleted"
+        );
+    }
+
+    /// D6: the transition source delete must also spare a newer overwrite.
+    #[tokio::test]
+    async fn transition_source_delete_spares_an_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        let snapshot = stale_snapshot(&engine, "t.bin").await;
+        let _ = execute_action(
+            None,
+            &engine,
+            &rule(),
+            "t.bin",
+            &snapshot,
+            &PlannedLifecycleAction::Transition {
+                destination_bucket: "dst".to_string(),
+                destination_key: "t.bin".to_string(),
+                delete_source_after_success: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            engine.head("b", "t.bin").await.is_ok(),
+            "the newer overwrite was deleted after the transition copy"
+        );
+    }
+
+    #[test]
+    fn delete_check_truth_table() {
+        use super::{classify_delete_check, DeleteCheck};
+        use crate::deltaglider::EngineError;
+        let mut meta = crate::types::FileMetadata::fallback(
+            "k".into(),
+            1,
+            "e".into(),
+            chrono::Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        let t = meta.created_at;
+        assert_eq!(classify_delete_check(t, Ok(&meta)), DeleteCheck::Proceed);
+        meta.created_at = t + chrono::Duration::milliseconds(1);
+        assert_eq!(classify_delete_check(t, Ok(&meta)), DeleteCheck::Changed);
+        assert_eq!(
+            classify_delete_check(t, Err(&EngineError::NotFound("k".into()))),
+            DeleteCheck::Gone
+        );
+        assert!(matches!(
+            classify_delete_check(t, Err(&EngineError::InvalidArgument("boom".into()))),
+            DeleteCheck::HeadFailed(_)
+        ));
+    }
+
+    /// An unchanged object is still deleted (the guard must not block the rule).
+    #[tokio::test]
+    async fn age_delete_removes_an_unchanged_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        engine
+            .store("b", "u.bin", b"x", None, Default::default())
+            .await
+            .unwrap();
+        let snapshot = engine.head("b", "u.bin").await.unwrap();
+        let _ = execute_action(
+            None,
+            &engine,
+            &rule(),
+            "u.bin",
+            &snapshot,
+            &PlannedLifecycleAction::Delete,
+        )
+        .await
+        .unwrap();
+        assert!(engine.head("b", "u.bin").await.is_err());
+    }
 
     /// retain-newest may rank+delete ONLY over a complete, non-truncated
     /// collect — a partial set (early defer/lease break OR budget overrun)
