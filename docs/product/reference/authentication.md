@@ -38,7 +38,7 @@ One infrastructure secret with three roles:
 
 Generation and reset facts:
 
-- **Auto-generated** on first run when not set. The plaintext is printed to stderr only when stderr is a TTY; in containers/CI only the bcrypt hash is logged. The hash is saved to `.deltaglider_bootstrap_hash`.
+- **Auto-generated** on first run when not set. The plaintext is printed to stderr only when stderr is a TTY. In containers and CI, the proxy prints neither the password nor the bcrypt hash, because the hash is also the encryption key of the IAM database and captured logs are kept. The hash is saved to `.deltaglider_bootstrap_hash` (mode 0600). To get a password that you know, run `--set-bootstrap-password` before any IAM user exists, or set `DGP_BOOTSTRAP_PASSWORD_HASH` before the first start.
 - **Set explicitly** via `DGP_BOOTSTRAP_PASSWORD_HASH` (bcrypt, or base64-encoded bcrypt to avoid `$` escaping in Docker). YAML: `advanced.bootstrap_password_hash`. Legacy alias: `DGP_ADMIN_PASSWORD_HASH`.
 - **Reset** via the `--set-bootstrap-password` CLI flag (reads the new plaintext from stdin). Resetting invalidates the encrypted IAM database — all IAM users, OAuth providers, and group mappings are lost.
 - **Rotation without data loss**: `PUT /_/api/admin/password` verifies the current password and re-encrypts the DB atomically.

@@ -2502,23 +2502,9 @@ impl Config {
         // plaintext would leak into captured logs, so we print only the bcrypt
         // hash and tell the operator to set the env var.
         use std::io::IsTerminal;
-        eprintln!();
-        if std::io::stderr().is_terminal() {
-            eprintln!("╔══════════════════════════════════════════════════════════════╗");
-            eprintln!("║  BOOTSTRAP PASSWORD (first run — save this!)                ║");
-            eprintln!("║                                                              ║");
-            eprintln!("║  Password: {:<49}║", password);
-            eprintln!("║                                                              ║");
-            eprintln!("║  This password appears ONCE. Store it securely.              ║");
-            eprintln!("║  Set DGP_BOOTSTRAP_PASSWORD_HASH to skip auto-generation.   ║");
-            eprintln!("╚══════════════════════════════════════════════════════════════╝");
-        } else {
-            eprintln!("BOOTSTRAP PASSWORD auto-generated (not a TTY — plaintext hidden).");
-            eprintln!("  Hash: {}", hash);
-            eprintln!("  Set DGP_BOOTSTRAP_PASSWORD_HASH={}", hash);
-            eprintln!("  Or run interactively to see the plaintext password.");
+        for line in first_run_banner(&password, &hash, std::io::stderr().is_terminal()) {
+            eprintln!("{line}");
         }
-        eprintln!();
 
         self.bootstrap_password_hash = Some(hash.clone());
         hash
@@ -3156,6 +3142,37 @@ pub enum ConfigError {
     UnsafeEnvValue(String),
 }
 
+/// Lines printed on the first run that generates a bootstrap password.
+/// With a TTY: the plaintext, once. Without (containers, CI): neither the
+/// plaintext nor the hash, because captured logs outlive the process and
+/// the hash is also the SQLCipher key of the IAM database (S8).
+fn first_run_banner(password: &str, hash: &str, is_tty: bool) -> Vec<String> {
+    let mut out = vec![String::new()];
+    if is_tty {
+        out.push("╔══════════════════════════════════════════════════════════════╗".into());
+        out.push("║  BOOTSTRAP PASSWORD (first run — save this!)                ║".into());
+        out.push("║                                                              ║".into());
+        out.push(format!("║  Password: {:<49}║", password));
+        out.push("║                                                              ║".into());
+        out.push("║  This password appears ONCE. Store it securely.              ║".into());
+        out.push("║  Set DGP_BOOTSTRAP_PASSWORD_HASH to skip auto-generation.   ║".into());
+        out.push("╚══════════════════════════════════════════════════════════════╝".into());
+    } else {
+        let _ = hash; // deliberately not printed
+        out.push(
+            "BOOTSTRAP PASSWORD auto-generated (not a TTY — password and hash hidden).".into(),
+        );
+        out.push("  The hash is in .deltaglider_bootstrap_hash (mode 0600).".into());
+        out.push(
+            "  To choose a password, run `deltaglider_proxy --set-bootstrap-password <pw>`".into(),
+        );
+        out.push("  (safe on a first run: no IAM data exists yet), or set".into());
+        out.push("  DGP_BOOTSTRAP_PASSWORD_HASH before the first start.".into());
+    }
+    out.push(String::new());
+    out
+}
+
 /// Write the bootstrap hash file with restrictive permissions (0600).
 /// This file doubles as the SQLCipher encryption key, so it must not be
 /// world-readable — not even transiently. Create it 0600 in one syscall
@@ -3187,6 +3204,18 @@ pub fn write_bootstrap_hash_file(path: &std::path::Path, hash: &str) -> std::io:
 
 #[cfg(test)]
 mod tests {
+
+    /// S8: the non-TTY first-run banner must not print the bcrypt hash —
+    /// it is also the SQLCipher key, and container logs are retained.
+    #[test]
+    fn first_run_banner_hides_hash_without_tty() {
+        let hash = "$2b$12$abcdefghijklmnopqrstuuFAKEFAKEFAKEFAKEFAKEFAKEFAKE";
+        let lines = first_run_banner("pw123", hash, false).join("\n");
+        assert!(!lines.contains(hash), "{lines}");
+        assert!(!lines.contains("pw123"), "{lines}");
+        let tty = first_run_banner("pw123", hash, true).join("\n");
+        assert!(tty.contains("pw123") && !tty.contains(hash), "{tty}");
+    }
     use super::*;
 
     #[test]

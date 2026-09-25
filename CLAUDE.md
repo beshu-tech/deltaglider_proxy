@@ -187,7 +187,7 @@ The **bootstrap password** is a single infrastructure secret that:
 2. Signs admin GUI session cookies
 3. Gates admin GUI access in bootstrap mode (before IAM users exist)
 
-Auto-generated on first run (printed to stderr when stderr is a TTY; hidden in containers/CI — only the bcrypt hash is logged). Reset via `--set-bootstrap-password` CLI flag (warning: invalidates encrypted IAM database).
+Auto-generated on first run (printed to stderr when stderr is a TTY; hidden in containers/CI — and so is the bcrypt hash, which is also the SQLCipher key; the operator reads `.deltaglider_bootstrap_hash` or runs `--set-bootstrap-password`). Reset via `--set-bootstrap-password` CLI flag (warning: invalidates encrypted IAM database).
 
 IAM users have ABAC permissions: `{ actions: ["read", "write", "delete", "list", "admin"], resources: ["bucket/*"] }`. Admin = wildcard actions AND wildcard resources. The IAM DB is independent of the YAML config file — `access: {}` in YAML with no legacy creds is correct when users/groups/OAuth providers live in the DB. Multi-instance sync via S3 (`DGP_CONFIG_SYNC_BUCKET` / `config_sync_bucket`) uploads the encrypted DB after every mutation; readers poll S3 every 5 minutes and download on ETag change.
 
