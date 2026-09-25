@@ -14,6 +14,7 @@ pub(crate) mod xattr_meta;
 pub use encrypting::{EncryptingBackend, EncryptionConfig, EncryptionKey, WriteMode};
 pub use filesystem::FilesystemBackend;
 pub use routing::RoutingBackend;
+pub(crate) use s3::guard_s3_endpoint;
 pub use s3::{
     is_backend_access_denied, NativeEncryptionConfig, S3Backend, BACKEND_HEAD_REQUESTS,
     DELEGATED_LIST_PROBE_REQUESTS, DELEGATED_LIST_UPSTREAM_PAGES,

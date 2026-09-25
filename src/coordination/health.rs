@@ -760,7 +760,6 @@ mod review2_tests {
     /// check or the SSRF resolver. The engine refuses the endpoint; the
     /// probe still sends a signed request to it.
     #[tokio::test]
-    #[ignore = "review2: pending fix"]
     async fn review2_probe_never_contacts_an_endpoint_the_backend_validator_refuses() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();

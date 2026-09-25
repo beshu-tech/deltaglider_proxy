@@ -229,6 +229,55 @@ fn resolve_created_at(meta_value: Option<String>, fallback: DateTime<Utc>) -> Da
 /// The SDK's default HTTPS client (hyper 1 + rustls/aws-lc, env proxy
 /// config, SDK connector settings), with an SSRF-guarded DNS resolver.
 /// Mirrors `aws_smithy_runtime::client::http::default_https_client`.
+/// Point `builder` at the operator-supplied endpoint `ep`, SSRF-guarded:
+/// THE one place an S3 client gets a custom endpoint (engine backends,
+/// config sync, S3 leases, the reference lock, health and capability
+/// probes). A source test refuses a direct `endpoint_url` call elsewhere.
+///
+/// Rejects endpoints that point at cloud instance-metadata services,
+/// RFC1918 / loopback / link-local ranges, or other internal hosts.
+/// Without this the S3 client becomes an SSRF pivot: a compromised admin
+/// can swap the endpoint to http://169.254.169.254 and the proxy will
+/// faithfully relay signed requests against IMDS.
+///
+/// `BackendDev` keeps the door open for local MinIO so dev/CI deployments
+/// still work — opted into via either the typed `BackendConfig::S3.allow_local`
+/// field (the preferred path) or the legacy `DGP_BACKEND_ALLOW_LOCAL=true`
+/// env var. A hardened production env must keep both off.
+pub(crate) fn guard_s3_endpoint(
+    builder: aws_sdk_s3::config::Builder,
+    ep: &str,
+    allow_local: bool,
+) -> Result<aws_sdk_s3::config::Builder, String> {
+    let env_allow = crate::config::env_bool("DGP_BACKEND_ALLOW_LOCAL", false);
+    let kind = if allow_local || env_allow {
+        crate::security::UrlKind::BackendDev
+    } else {
+        crate::security::UrlKind::Backend
+    };
+    crate::security::validate_outbound_url(ep, kind).map_err(|e| {
+        format!(
+            "Refusing to use S3 endpoint {ep:?}: {e}. \
+             Set `allow_local: true` in the backend config (or \
+             DGP_BACKEND_ALLOW_LOCAL=true env) to permit http:// + \
+             private IPs for dev/CI."
+        )
+    })?;
+    let mut builder = builder.endpoint_url(ep);
+    // The text check above cannot see DNS: a name whose record points at
+    // IMDS (or rebinds there) passed. Private answers stay allowed: on-prem
+    // storage behind internal DNS is normal.
+    if let Some(host) = reqwest::Url::parse(ep)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+    {
+        builder = builder.http_client(ssrf_guarded_http_client(
+            crate::security::SdkSsrfGuardedResolver::new(kind, host.trim_matches(['[', ']'])),
+        ));
+    }
+    Ok(builder)
+}
+
 fn ssrf_guarded_http_client(
     resolver: crate::security::SdkSsrfGuardedResolver,
 ) -> aws_smithy_runtime_api::client::http::SharedHttpClient {
@@ -502,50 +551,8 @@ impl S3Backend {
             );
 
         if let Some(ref ep) = endpoint {
-            // Reject operator-supplied endpoints that point at cloud
-            // instance-metadata services, RFC1918 / loopback / link-
-            // local ranges, or other internal hosts. Without this the
-            // S3 backend becomes an SSRF pivot: a compromised admin
-            // can swap the endpoint to http://169.254.169.254 and the
-            // proxy will faithfully relay PUT/GET against IMDS,
-            // turning admin-GUI access into cloud-account takeover.
-            //
-            // `BackendDev` keeps the door open for local MinIO so
-            // dev/CI deployments still work — opted into via either
-            // the typed `BackendConfig::S3.allow_local` field (the
-            // preferred path) or the legacy `DGP_BACKEND_ALLOW_LOCAL=true`
-            // env var (kept for backward-compat with existing
-            // deployments and the proxy's env-driven config layer).
-            // A hardened production env must keep both off.
-            let env_allow = crate::config::env_bool("DGP_BACKEND_ALLOW_LOCAL", false);
-            let kind = if allow_local || env_allow {
-                crate::security::UrlKind::BackendDev
-            } else {
-                crate::security::UrlKind::Backend
-            };
-            crate::security::validate_outbound_url(ep, kind).map_err(|e| {
-                StorageError::Other(format!(
-                    "Refusing to use S3 endpoint {ep:?}: {e}. \
-                     Set `allow_local: true` in the backend config (or \
-                     DGP_BACKEND_ALLOW_LOCAL=true env) to permit http:// + \
-                     private IPs for dev/CI."
-                ))
-            })?;
-            s3_config_builder = s3_config_builder.endpoint_url(ep);
-            // The text check above cannot see DNS: a name whose record
-            // points at IMDS (or rebinds there) passed. Private answers stay
-            // allowed: on-prem storage behind internal DNS is normal.
-            if let Some(host) = reqwest::Url::parse(ep)
-                .ok()
-                .and_then(|u| u.host_str().map(str::to_string))
-            {
-                s3_config_builder = s3_config_builder.http_client(ssrf_guarded_http_client(
-                    crate::security::SdkSsrfGuardedResolver::new(
-                        kind,
-                        host.trim_matches(['[', ']']),
-                    ),
-                ));
-            }
+            s3_config_builder = guard_s3_endpoint(s3_config_builder, ep, allow_local)
+                .map_err(StorageError::Other)?;
         }
 
         Ok(Client::from_conf(s3_config_builder.build()))
@@ -2971,6 +2978,30 @@ fn apply_native_encryption_mpu(
 // in-tree via existing transitive dependencies, and constructing a
 // ServiceError for a classifier test is ~3 lines, not a mock server.
 // ────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod endpoint_guard_source_test {
+    /// Every S3 client that gets a custom endpoint goes through
+    /// `guard_s3_endpoint`. The config-sync/lease/probe client once set it
+    /// directly and skipped the SSRF check (review-2 #6).
+    #[test]
+    fn only_guard_s3_endpoint_sets_an_endpoint_url() {
+        let mut offenders = Vec::new();
+        for entry in walkdir::WalkDir::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")) {
+            let entry = entry.unwrap();
+            if entry.path().extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(entry.path()).unwrap();
+            let prod = text.split("\n#[cfg(test)]\nmod ").next().unwrap_or("");
+            let allowed = usize::from(entry.path().ends_with("storage/s3.rs"));
+            if prod.matches(".endpoint_url(").count() > allowed {
+                offenders.push(entry.path().display().to_string());
+            }
+        }
+        assert!(offenders.is_empty(), "use guard_s3_endpoint: {offenders:?}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

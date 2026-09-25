@@ -168,27 +168,30 @@ impl ConfigDbSync {
     /// `pub` so the coordination-lease builder (in the binary crate's startup)
     /// shares the exact same client construction as the config sync.
     pub async fn build_client(config: &BackendConfig) -> Result<Client, String> {
-        let (endpoint, region, force_path_style, access_key_id, secret_access_key) = match config {
-            BackendConfig::S3 {
-                endpoint,
-                region,
-                force_path_style,
-                access_key_id,
-                secret_access_key,
-                ..
-            } => (
-                endpoint.clone(),
-                region.clone(),
-                *force_path_style,
-                access_key_id.clone(),
-                secret_access_key.clone(),
-            ),
-            BackendConfig::Filesystem { .. } => {
-                return Err("Config DB S3 sync requires an S3 backend. \
+        let (endpoint, region, force_path_style, access_key_id, secret_access_key, allow_local) =
+            match config {
+                BackendConfig::S3 {
+                    endpoint,
+                    region,
+                    force_path_style,
+                    access_key_id,
+                    secret_access_key,
+                    allow_local,
+                    ..
+                } => (
+                    endpoint.clone(),
+                    region.clone(),
+                    *force_path_style,
+                    access_key_id.clone(),
+                    secret_access_key.clone(),
+                    *allow_local,
+                ),
+                BackendConfig::Filesystem { .. } => {
+                    return Err("Config DB S3 sync requires an S3 backend. \
                      Set DGP_CONFIG_SYNC_BUCKET only when using the S3 backend."
-                    .to_string());
-            }
-        };
+                        .to_string());
+                }
+            };
 
         let credentials = match (access_key_id, secret_access_key) {
             (Some(ref key_id), Some(ref secret)) => {
@@ -214,7 +217,9 @@ impl ConfigDbSync {
             );
 
         if let Some(ref ep) = endpoint {
-            builder = builder.endpoint_url(ep);
+            // The same SSRF guard as the engine's backends: this client
+            // sends signed requests to the endpoint too.
+            builder = crate::storage::guard_s3_endpoint(builder, ep, allow_local)?;
         }
 
         Ok(Client::from_conf(builder.build()))
