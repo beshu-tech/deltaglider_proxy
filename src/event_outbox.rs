@@ -756,6 +756,32 @@ impl ConfigDb {
         Ok(rows)
     }
 
+    /// Names of every listener cursor row that starts with `prefix`.
+    pub fn listener_cursor_names_with_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<String>, ConfigDbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT listener_name FROM listener_cursors WHERE substr(listener_name, 1, ?) = ?",
+        )?;
+        let names = stmt
+            .query_map(params![prefix.len() as i64, prefix], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(names)
+    }
+
+    /// Delete one listener cursor row (a listener that no longer exists must
+    /// not pin the prune floor).
+    pub fn listener_cursor_delete(&self, listener: &str) -> Result<(), ConfigDbError> {
+        self.conn.execute(
+            "DELETE FROM listener_cursors WHERE listener_name = ?",
+            params![listener],
+        )?;
+        Ok(())
+    }
+
     /// The listener's current high-water `last_event_id` (0 if it has never
     /// recorded a cursor).
     pub fn listener_cursor_load(&self, listener: &str) -> Result<i64, ConfigDbError> {

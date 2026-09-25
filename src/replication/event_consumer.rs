@@ -328,10 +328,12 @@ pub fn spawn_event_consumer(
                 continue;
             }
 
+            let engine = state.engine.load_full();
             drain_once(
                 &config,
                 &db,
-                &state,
+                &engine,
+                &state.maintenance_gate,
                 &replication,
                 lease.as_ref(),
                 &instance_id,
@@ -510,13 +512,15 @@ fn classify_engine_error(
 }
 
 /// One drain pass: read new events, group + compact per key, route to rules,
-/// act (copy/delete) under the per-rule lease, and advance the cursor to the
-/// highest CONTIGUOUS fully-handled id. Each rule's lease is taken once per
-/// drain (one S3 round-trip per rule, not per key) and released at the end.
+/// act (copy/delete) under the per-rule lease, and advance each rule's cursor
+/// to its highest CONTIGUOUS fully-handled id. Each rule's lease is taken once
+/// per drain (one S3 round-trip per rule, not per key) and released at the end.
+#[allow(clippy::too_many_arguments)]
 async fn drain_once(
     config: &crate::config::SharedConfig,
     db: &Arc<Mutex<ConfigDb>>,
-    state: &Arc<AppState>,
+    engine: &Arc<crate::deltaglider::DynEngine>,
+    gate: &crate::maintenance::gate::MaintenanceGate,
     replication: &crate::config_sections::ReplicationConfig,
     lease: &dyn CoordinationLease,
     instance_id: &str,
@@ -526,7 +530,8 @@ async fn drain_once(
     drain_rules(
         config,
         db,
-        state,
+        engine,
+        gate,
         replication,
         lease,
         &mut claims,
@@ -543,20 +548,97 @@ async fn drain_once(
     }
 }
 
+/// A failing key holds its rule's cursor for this many drains, then the
+/// consumer gives up on it (failure row + warning) so the rule moves on. The
+/// reconcile run still retries the object (poison-skip ledger).
+pub(crate) const MAX_EVENT_KEY_ATTEMPTS: u32 = 5;
+
+/// The listener-cursor row of one rule. Each rule has its own cursor, so one
+/// rule that holds its events (busy lease, maintenance, a failing key) never
+/// holds another rule's.
+pub(crate) fn rule_listener(rule: &str) -> String {
+    format!("{REPLICATION_LISTENER}:{rule}")
+}
+
+/// Pure: a rule's new cursor. Only rows past its own cursor count; the
+/// first failed id stops the advance (at-least-once).
+fn rule_watermark(
+    rows: &[EventOutboxRecord],
+    failed_ids: Option<&std::collections::BTreeSet<i64>>,
+    cursor: i64,
+) -> i64 {
+    let empty = std::collections::BTreeSet::new();
+    let start = rows.partition_point(|r| r.id <= cursor);
+    contiguous_watermark(&rows[start..], failed_ids.unwrap_or(&empty), cursor)
+}
+
+/// Pure: the global `replication` cursor = the slowest rule's cursor (it is
+/// the read floor and the lag the jobs API shows). No enabled rule: every
+/// row is handled.
+fn global_watermark(rule_cursors: &BTreeMap<String, i64>, global: i64, rows_max: i64) -> i64 {
+    rule_cursors
+        .values()
+        .copied()
+        .min()
+        .unwrap_or(rows_max)
+        .max(global)
+}
+
+/// Load each enabled rule's cursor. A rule without a row starts at the global
+/// cursor: on upgrade that is exactly where the single cursor stood, so no
+/// event is skipped. Rows of rules no longer enabled are dropped (they would
+/// pin the prune floor).
+fn load_rule_cursors(
+    dbg: &ConfigDb,
+    rule_names: &[&str],
+    global: i64,
+    now: i64,
+) -> Result<BTreeMap<String, i64>, crate::config_db::ConfigDbError> {
+    let mut cursors = BTreeMap::new();
+    for name in rule_names {
+        let listener = rule_listener(name);
+        let cursor = match dbg.listener_cursor_load_full(&listener)? {
+            Some(row) => row.last_event_id,
+            None => {
+                dbg.listener_cursor_advance(&listener, global, now)?;
+                global
+            }
+        };
+        cursors.insert(name.to_string(), cursor);
+    }
+    let wanted: std::collections::HashSet<String> =
+        rule_names.iter().map(|n| rule_listener(n)).collect();
+    for name in dbg.listener_cursor_names_with_prefix(&format!("{REPLICATION_LISTENER}:"))? {
+        if !wanted.contains(&name) {
+            dbg.listener_cursor_delete(&name)?;
+        }
+    }
+    Ok(cursors)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drain_rules(
     config: &crate::config::SharedConfig,
     db: &Arc<Mutex<ConfigDb>>,
-    state: &Arc<AppState>,
+    engine: &Arc<crate::deltaglider::DynEngine>,
+    gate: &crate::maintenance::gate::MaintenanceGate,
     replication: &crate::config_sections::ReplicationConfig,
     lease: &dyn CoordinationLease,
     claims: &mut std::collections::HashMap<String, RuleClaim>,
     instance_id: &str,
     now: i64,
 ) {
-    let cursor = {
+    let mut rule_names: Vec<&str> = replication
+        .rules
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.name.as_str())
+        .collect();
+    rule_names.sort_unstable();
+    rule_names.dedup();
+    let (global, mut cursors) = {
         let dbg = db.lock().await;
-        match dbg.listener_cursor_load_full(REPLICATION_LISTENER) {
+        let global = match dbg.listener_cursor_load_full(REPLICATION_LISTENER) {
             Ok(Some(row)) => {
                 // Re-assert the cursor (MAX-upsert keeps last_event_id). NOTE:
                 // updated_at only moves on a REAL advance (H65) — a zero-advance
@@ -569,11 +651,19 @@ async fn drain_rules(
                 row.last_event_id
             }
             _ => 0,
+        };
+        match load_rule_cursors(&dbg, &rule_names, global, now) {
+            Ok(c) => (global, c),
+            Err(e) => {
+                warn!("event consumer: failed to load rule cursors: {e}");
+                return;
+            }
         }
     };
+    let read_from = cursors.values().copied().min().unwrap_or(global);
     let rows = {
         let dbg = db.lock().await;
-        match dbg.event_outbox_since(cursor, DRAIN_BATCH) {
+        match dbg.event_outbox_since(read_from, DRAIN_BATCH) {
             Ok(r) => r,
             Err(e) => {
                 warn!("event consumer: failed to read outbox: {e}");
@@ -586,40 +676,43 @@ async fn drain_rules(
     }
 
     let lease_ttl = super::scheduler::lease_ttl_secs(replication);
-    let engine = state.engine.load();
 
-    // Compile globsets once per drain, keyed by rule name.
     let groups = group_events_by_key(&rows);
 
-    // Track the highest contiguous id fully handled. We process keys in id
-    // order of their LAST event; but the safe contiguous watermark is computed
-    // over the raw rows: walk rows ascending and stop advancing at the first id
-    // whose key-action failed.
-    let mut failed_ids: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    // Per rule: the ids whose key-action failed (the rule's cursor stops there).
+    let mut failed_ids: BTreeMap<String, std::collections::BTreeSet<i64>> = BTreeMap::new();
 
     for ((bucket, key), recs) in &groups {
-        let kinds: Vec<&str> = recs.iter().map(|r| r.kind.as_str()).collect();
-        let action = compact_key_events(&kinds);
-        if action == KeyAction::Noop {
-            continue;
-        }
-        let max_id_for_key = recs.iter().map(|r| r.id).max().unwrap_or(0);
-
         let matched = match_rules(&replication.rules, bucket, key);
-        if matched.is_empty() {
-            continue; // no rule cares about this key; it's still "handled"
-        }
-
         for rule in matched {
+            // Only the events past THIS rule's cursor.
+            let rule_cursor = cursors.get(&rule.name).copied().unwrap_or(global);
+            let sub: Vec<&EventOutboxRecord> = recs
+                .iter()
+                .copied()
+                .filter(|r| r.id > rule_cursor)
+                .collect();
+            let kinds: Vec<&str> = sub.iter().map(|r| r.kind.as_str()).collect();
+            let action = compact_key_events(&kinds);
+            if action == KeyAction::Noop {
+                continue;
+            }
+            let max_id_for_key = sub.iter().map(|r| r.id).max().unwrap_or(0);
+            let mut hold = || {
+                failed_ids
+                    .entry(rule.name.clone())
+                    .or_default()
+                    .insert(max_id_for_key);
+            };
             // Maintenance gate: the destination bucket is being rewritten in
             // place (re-encryption). Stall this key's events — the cursor
             // does not advance past them, so they replay after the job ends.
-            if state.maintenance_gate.is_busy(&rule.destination.bucket) {
+            if gate.is_busy(&rule.destination.bucket) {
                 debug!(
                     "event consumer: rule '{}' deferred — destination '{}' under maintenance",
                     rule.name, rule.destination.bucket
                 );
-                failed_ids.insert(max_id_for_key);
+                hold();
                 continue;
             }
             // The per-rule lease is the one the scheduler, run-now and other
@@ -681,87 +774,123 @@ async fn drain_rules(
                                         .await;
                                 }
                                 claims.insert(rule.name.clone(), RuleClaim::Busy);
-                                failed_ids.insert(max_id_for_key);
+                                hold();
                                 continue;
                             }
                         }
                     }
                 }
                 RuleClaim::Busy => {
-                    // Busy on another worker — leave for next tick (don't
-                    // advance past this key's events).
-                    failed_ids.insert(max_id_for_key);
+                    // Busy on another worker — leave for next tick (holds only
+                    // this rule's cursor).
+                    hold();
                     continue;
                 }
                 RuleClaim::Skip => continue,
                 RuleClaim::Abort => {
-                    warn!("event consumer: aborting drain, cursor held at {cursor}");
+                    warn!("event consumer: aborting drain, cursors held");
                     return;
                 }
             }
 
-            let outcome = apply_action(&engine, db, rule, bucket, key, action).await;
+            let outcome = apply_action(engine, db, rule, bucket, key, action).await;
 
-            {
-                let dbg = db.lock().await;
-                // Mid-drain heartbeat: a long drain (up to 500 engine copies)
-                // must keep pinning the background pruner's staleness floor.
-                let _ = dbg.listener_cursor_advance(
-                    REPLICATION_LISTENER,
-                    cursor,
-                    current_unix_seconds(),
-                );
-            }
+            let dbg = db.lock().await;
+            // Mid-drain heartbeat: a long drain (up to 500 engine copies)
+            // must keep pinning the background pruner's staleness floor.
+            let _ =
+                dbg.listener_cursor_advance(REPLICATION_LISTENER, global, current_unix_seconds());
 
-            if let Err(err) = outcome {
-                warn!(
-                    "event consumer: rule '{}' {:?} {}/{} failed: {}",
-                    rule.name, action, bucket, key, err
-                );
-                let dbg = db.lock().await;
-                let _ = dbg.replication_record_failure(
-                    &rule.name,
-                    crate::replication::state_store::FailureInsert {
-                        run_id: None,
-                        occurred_at: now,
-                        source_key: key,
-                        dest_key: key,
-                        error_message: &err.to_string(),
-                    },
-                    replication.max_failures_retained,
-                );
-                // A permanent key error is recorded and counts as handled:
-                // holding it would stall every rule, forever.
-                if err.downcast_ref::<PermanentKeyError>().is_none() {
-                    failed_ids.insert(max_id_for_key);
+            match outcome {
+                Ok(()) => {
+                    let _ = dbg.replication_clear_object_failure(&rule.name, key);
+                }
+                Err(err) => {
+                    warn!(
+                        "event consumer: rule '{}' {:?} {}/{} failed: {}",
+                        rule.name, action, bucket, key, err
+                    );
+                    // The failure ring has a foreign key to the state row; a
+                    // rule the scheduler never ran has none yet.
+                    let _ = dbg.replication_ensure_state(&rule.name, now);
+                    let record = |msg: &str| {
+                        let _ = dbg.replication_record_failure(
+                            &rule.name,
+                            crate::replication::state_store::FailureInsert {
+                                run_id: None,
+                                occurred_at: now,
+                                source_key: key,
+                                dest_key: key,
+                                error_message: msg,
+                            },
+                            replication.max_failures_retained,
+                        );
+                    };
+                    record(&err.to_string());
+                    // A permanent key error is recorded and counts as handled:
+                    // holding it would stall the rule, forever.
+                    if err.downcast_ref::<PermanentKeyError>().is_some() {
+                        continue;
+                    }
+                    let attempts = dbg
+                        .replication_record_object_failure(&rule.name, key, &err.to_string(), now)
+                        .unwrap_or(0);
+                    if key_attempts_exhausted(attempts) {
+                        warn!(
+                            "event consumer: rule '{}' gives up on {}/{} after {} failed \
+                             attempts; the reconcile run retries it",
+                            rule.name, bucket, key, attempts
+                        );
+                        record(&format!(
+                            "event-driven replication gave up after {attempts} attempts; \
+                             the next reconcile run retries the object"
+                        ));
+                    } else {
+                        hold();
+                    }
                 }
             }
         }
     }
 
-    // Advance the cursor to the highest CONTIGUOUS id with no failure (anything
-    // at or past the first failed id is left for next tick → at-least-once).
-    let watermark = contiguous_watermark(&rows, &failed_ids, cursor);
-    if watermark > cursor {
-        {
-            let dbg = db.lock().await;
-            let _ = dbg.listener_cursor_advance(
-                REPLICATION_LISTENER,
-                watermark,
-                current_unix_seconds(),
-            );
+    // Advance each rule's cursor to its highest CONTIGUOUS handled id
+    // (anything at or past its first failed id is left for next tick).
+    let rows_max = rows.last().map(|r| r.id).unwrap_or(global);
+    let mut advanced = false;
+    {
+        let dbg = db.lock().await;
+        let t = current_unix_seconds();
+        for (name, cursor) in cursors.iter_mut() {
+            let next = rule_watermark(&rows, failed_ids.get(name), *cursor);
+            if next > *cursor {
+                let _ = dbg.listener_cursor_advance(&rule_listener(name), next, t);
+                *cursor = next;
+                advanced = true;
+            }
         }
-        // Settle barrier: a drain that advanced the cursor handled real events.
-        // Bump after the advance so a test polling the event-version can wait on
-        // a drain instead of polling S3 / sleeping (event-driven writes no run).
-        super::state_store::bump_replication_event_version();
+        let next_global = global_watermark(&cursors, global, rows_max);
+        if next_global > global {
+            let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, next_global, t);
+            advanced = true;
+        }
         debug!(
-            "event consumer: cursor {} -> {} ({} events drained)",
-            cursor,
-            watermark,
+            "event consumer: global cursor {} -> {} ({} events read)",
+            global,
+            next_global,
             rows.len()
         );
     }
+    if advanced {
+        // Settle barrier: a drain that advanced a cursor handled real events.
+        // Bump after the advance so a test polling the event-version can wait on
+        // a drain instead of polling S3 / sleeping (event-driven writes no run).
+        super::state_store::bump_replication_event_version();
+    }
+}
+
+/// Pure: has a key used up its attempts?
+fn key_attempts_exhausted(consecutive_failures: u32) -> bool {
+    consecutive_failures >= MAX_EVENT_KEY_ATTEMPTS
 }
 
 /// Apply one compacted action for one (rule, key): the planner + dest HEAD
@@ -1430,5 +1559,227 @@ mod seed_tests {
             .listener_cursor_load(REPLICATION_LISTENER)
             .unwrap();
         assert_eq!(cursor, old);
+    }
+}
+
+#[cfg(test)]
+mod per_rule_cursor_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::deltaglider::{DeltaGliderEngine, DynEngine};
+    use crate::storage::{FilesystemBackend, StorageBackend};
+
+    /// Lease that another worker holds for one rule; free for the rest.
+    struct BusyFor(&'static str);
+
+    #[async_trait::async_trait]
+    impl CoordinationLease for BusyFor {
+        async fn try_acquire(
+            &self,
+            _: LeaseSubsystem,
+            rule: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<bool, String> {
+            Ok(rule != self.0)
+        }
+        async fn renew(
+            &self,
+            _: LeaseSubsystem,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<bool, String> {
+            Ok(true)
+        }
+        async fn release(&self, _: LeaseSubsystem, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn is_held(&self, _: LeaseSubsystem, rule: &str, _: i64) -> Result<bool, String> {
+            Ok(rule == self.0)
+        }
+    }
+
+    fn rule(name: &str, dst: &str) -> ReplicationRule {
+        serde_yaml::from_str(&format!(
+            "name: {name}\nenabled: true\nsource: {{bucket: src}}\ndestination: {{bucket: {dst}}}\n"
+        ))
+        .unwrap()
+    }
+
+    async fn fixture(
+        rules: Vec<ReplicationRule>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<Mutex<ConfigDb>>,
+        crate::config::SharedConfig,
+        Arc<DynEngine>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<dyn StorageBackend> = Box::new(
+            FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine: Arc<DynEngine> = Arc::new(DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &Config::default(),
+            None,
+        ));
+        for b in ["src", "dst-a", "dst-b"] {
+            engine.create_bucket(b).await.unwrap();
+        }
+        let mut cfg = Config::default();
+        cfg.replication.enabled = true;
+        cfg.replication.rules = rules;
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("pw").unwrap()));
+        (dir, db, Arc::new(tokio::sync::RwLock::new(cfg)), engine)
+    }
+
+    async fn put(db: &Arc<Mutex<ConfigDb>>, engine: &DynEngine, key: &str) -> i64 {
+        engine
+            .store("src", key, b"data", None, Default::default())
+            .await
+            .unwrap();
+        db.lock()
+            .await
+            .event_outbox_insert(&NewEvent::new(
+                EventKind::ObjectCreated,
+                "src",
+                key,
+                EventSource::S3Api,
+                1,
+                serde_json::json!({}),
+            ))
+            .unwrap()
+    }
+
+    async fn drain(
+        config: &crate::config::SharedConfig,
+        db: &Arc<Mutex<ConfigDb>>,
+        engine: &Arc<DynEngine>,
+        lease: &dyn CoordinationLease,
+    ) {
+        let replication = config.read().await.replication.clone();
+        let gate = crate::maintenance::gate::MaintenanceGate::default();
+        drain_once(config, db, engine, &gate, &replication, lease, "c", 100).await;
+    }
+
+    async fn cursor(db: &Arc<Mutex<ConfigDb>>, listener: &str) -> i64 {
+        db.lock().await.listener_cursor_load(listener).unwrap()
+    }
+
+    /// Rule "a" is busy on another worker. Before: one global cursor, so rule
+    /// "b" re-read (and waited on) every event "a" held. Now "b" moves on and
+    /// only "a" holds; the global cursor is the slowest rule.
+    #[tokio::test]
+    async fn a_busy_rule_does_not_hold_another_rules_cursor() {
+        let (_d, db, config, engine) = fixture(vec![rule("a", "dst-a"), rule("b", "dst-b")]).await;
+        let id = put(&db, &engine, "k.bin").await;
+        drain(&config, &db, &engine, &BusyFor("a")).await;
+        assert!(engine.head("dst-b", "k.bin").await.is_ok(), "b copied");
+        assert!(engine.head("dst-a", "k.bin").await.is_err(), "a was busy");
+        assert_eq!(cursor(&db, &rule_listener("b")).await, id);
+        assert_eq!(cursor(&db, &rule_listener("a")).await, 0);
+        assert_eq!(cursor(&db, REPLICATION_LISTENER).await, 0);
+
+        // "a" frees up: it catches up from its own cursor.
+        drain(&config, &db, &engine, &BusyFor("none")).await;
+        assert!(engine.head("dst-a", "k.bin").await.is_ok());
+        // (>=: b's copy appended a ReplicationObjectCopied event, which no
+        // rule matches, so it counts as handled.)
+        assert!(cursor(&db, &rule_listener("a")).await >= id);
+        assert!(cursor(&db, REPLICATION_LISTENER).await >= id);
+    }
+
+    /// Upgrade: a rule without a cursor row starts at the global cursor, so
+    /// no event is skipped or replayed from zero; a removed rule's row goes.
+    #[tokio::test]
+    async fn rule_cursors_seed_from_the_global_cursor() {
+        let db = ConfigDb::in_memory("pw").unwrap();
+        db.listener_cursor_advance(&rule_listener("gone"), 3, 1)
+            .unwrap();
+        let cursors = load_rule_cursors(&db, &["r"], 42, 1).unwrap();
+        assert_eq!(cursors.get("r"), Some(&42));
+        assert_eq!(db.listener_cursor_load(&rule_listener("r")).unwrap(), 42);
+        assert!(db
+            .listener_cursor_load_full(&rule_listener("gone"))
+            .unwrap()
+            .is_none());
+    }
+
+    /// A key that keeps failing holds its rule's cursor for
+    /// MAX_EVENT_KEY_ATTEMPTS drains, then the rule gives up on it (with a
+    /// failure row) and moves on.
+    #[tokio::test]
+    async fn a_failing_key_stops_holding_the_cursor_after_n_attempts() {
+        let (_d, db, config, engine) = fixture(vec![rule("a", "no-such-bucket")]).await;
+        let id = put(&db, &engine, "k.bin").await;
+        let lease = BusyFor("none");
+        for attempt in 1..MAX_EVENT_KEY_ATTEMPTS {
+            drain(&config, &db, &engine, &lease).await;
+            assert_eq!(
+                cursor(&db, &rule_listener("a")).await,
+                0,
+                "attempt {attempt}: the cursor must hold while retries remain"
+            );
+        }
+        drain(&config, &db, &engine, &lease).await;
+        assert_eq!(
+            cursor(&db, &rule_listener("a")).await,
+            id,
+            "gave up, moved on"
+        );
+        let failures = db
+            .lock()
+            .await
+            .replication_recent_failures("a", 50)
+            .unwrap();
+        assert!(
+            failures.iter().any(|f| f.error_message.contains("gave up")),
+            "{failures:?}"
+        );
+    }
+
+    #[test]
+    fn rule_watermark_ignores_rows_at_or_below_the_cursor() {
+        let rows: Vec<EventOutboxRecord> = [1, 2, 3, 4]
+            .iter()
+            .map(|id| EventOutboxRecord {
+                id: *id,
+                ..rows_template()
+            })
+            .collect();
+        let failed = std::collections::BTreeSet::from([4]);
+        assert_eq!(rule_watermark(&rows, Some(&failed), 2), 3);
+        assert_eq!(rule_watermark(&rows, None, 4), 4);
+        assert_eq!(
+            rule_watermark(&rows, Some(&std::collections::BTreeSet::from([2])), 2),
+            4
+        );
+    }
+
+    fn rows_template() -> EventOutboxRecord {
+        let db = ConfigDb::in_memory("pw").unwrap();
+        db.event_outbox_insert(&NewEvent::new(
+            EventKind::ObjectCreated,
+            "b",
+            "k",
+            EventSource::S3Api,
+            1,
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        db.event_outbox_since(0, 1).unwrap().remove(0)
+    }
+
+    #[test]
+    fn global_watermark_is_the_slowest_rule() {
+        let c = BTreeMap::from([("a".to_string(), 5), ("b".to_string(), 9)]);
+        assert_eq!(global_watermark(&c, 3, 12), 5);
+        assert_eq!(global_watermark(&BTreeMap::new(), 3, 12), 12);
+        assert_eq!(global_watermark(&c, 7, 12), 7, "never moves back");
     }
 }
