@@ -78,7 +78,7 @@ pub async fn require_same_origin(req: Request, next: Next) -> Response {
         StatusCode::FORBIDDEN,
         axum::Json(serde_json::json!({
             "error": "cross_origin_request",
-            "message": "state-changing admin requests must come from the proxy's own origin"
+            "message": "state-changing admin requests must come from the proxy's own origin. Behind a reverse proxy, forward the original Host header (or set DGP_TRUST_PROXY_HEADERS=true so X-Forwarded-Host counts)"
         })),
     )
         .into_response()
