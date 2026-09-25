@@ -769,7 +769,6 @@ async fn test_lifecycle_preview_delete_without_expire_after_is_400_not_500() {
 /// MinIO only (self-skips locally); the filesystem backend reads one xattr
 /// for both and cannot show it.
 #[tokio::test]
-#[ignore = "review2: pending fix"]
 async fn review2_lifecycle_s3_deletes_passthrough_object_with_cold_cache() {
     crate::skip_unless_minio!();
     let prefix = format!(
