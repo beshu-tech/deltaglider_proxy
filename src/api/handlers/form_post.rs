@@ -711,8 +711,10 @@ pub async fn handle_form_post_upload(
     headers: &HeaderMap,
     extensions: &axum::http::Extensions,
     body: Bytes,
-    client_ip: Option<std::net::IpAddr>,
+    peer_ip: Option<std::net::IpAddr>,
 ) -> Result<Response, S3Error> {
+    // aws:SourceIp for the policy check: never a client-written XFF.
+    let client_ip = crate::rate_limiter::extract_trusted_client_ip(headers, peer_ip);
     // Validate the bucket name FIRST. The s3s adapter gets AWS name validation
     // for free; this interceptor bypasses s3s, so an unvalidated segment like
     // `..` would otherwise reach `bucket_dir = root.join("..")` and escape the

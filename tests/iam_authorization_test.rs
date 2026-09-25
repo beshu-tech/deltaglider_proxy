@@ -812,3 +812,59 @@ async fn test_reader_cannot_delete_bucket() {
         "Reader should not be able to delete buckets"
     );
 }
+
+/// `aws:SourceIp` must not come from a client-written `X-Forwarded-For`.
+/// The harness sets DGP_TRUST_PROXY_HEADERS=true with no
+/// DGP_TRUSTED_PROXY_CIDRS, so the first XFF element is forged: the policy
+/// must see the TCP peer (127.0.0.1), outside 10.0.0.0/8. Covers the IAM
+/// middleware and the CopyObject source-read check (RequestClientIp).
+#[tokio::test]
+async fn test_forged_xff_does_not_satisfy_source_ip_condition() {
+    let h = IamTestHarness::setup().await;
+    let admin_client = admin_http_client(&h.server.endpoint()).await;
+    let ip_user = create_iam_user(
+        &admin_client,
+        &h.server,
+        "xff_user",
+        vec![
+            json!({"effect": "Allow", "actions": ["*"], "resources": ["bucket-a/*"]}),
+            json!({
+                "effect": "Deny",
+                "actions": ["read"],
+                "resources": ["bucket-a/ipguard/*"],
+                "conditions": {"NotIpAddress": {"aws:SourceIp": ["10.0.0.0/8"]}}
+            }),
+        ],
+    )
+    .await;
+    seed_object(&h, "bucket-a", "ipguard/secret.txt").await;
+    let client = h.client_for(&ip_user).await;
+
+    let got = client
+        .get_object()
+        .bucket("bucket-a")
+        .key("ipguard/secret.txt")
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-forwarded-for", "10.1.2.3");
+        })
+        .send()
+        .await;
+    assert!(got.is_err(), "a forged XFF satisfied aws:SourceIp on GET");
+
+    let copied = client
+        .copy_object()
+        .bucket("bucket-a")
+        .key("open/copied.txt")
+        .copy_source("bucket-a/ipguard/secret.txt")
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut().insert("x-forwarded-for", "10.1.2.3");
+        })
+        .send()
+        .await;
+    assert!(
+        copied.is_err(),
+        "a forged XFF satisfied aws:SourceIp on the CopyObject source read"
+    );
+}

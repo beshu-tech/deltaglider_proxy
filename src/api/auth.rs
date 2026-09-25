@@ -253,8 +253,8 @@ pub fn replay_slot_kept(status: axum::http::StatusCode) -> bool {
 #[derive(Debug, Clone)]
 pub struct SignedPayloadHash(pub String);
 
-/// The resolved client IP for this request (peer-aware, honoring trusted-proxy
-/// XFF), injected into request extensions so handlers that run a SECOND
+/// The policy client IP for this request (`extract_trusted_client_ip`: the
+/// peer, or the XFF client behind a `DGP_TRUSTED_PROXY_CIDRS` proxy), injected into request extensions so handlers that run a SECOND
 /// authorization the middleware never saw — e.g. CopyObject's source-read
 /// check — can build a policy context with `aws:SourceIp` and honor IP-scoped
 /// conditions. Without it those checks silently ignore IP conditions.
@@ -986,11 +986,13 @@ pub async fn sigv4_auth_middleware(
         request.extensions_mut().insert(PresignedRequest);
     }
 
-    // Stash the resolved client IP so handlers running a SECONDARY authz the
+    // Stash the policy IP so handlers running a SECONDARY authz the
     // authorization middleware never sees (CopyObject source-read) can build a
-    // policy context with aws:SourceIp and honor IP-scoped conditions.
-    if let Some(ip) = client_ip {
-        request.extensions_mut().insert(RequestClientIp(ip));
+    // policy context with aws:SourceIp and honor IP-scoped conditions. It is
+    // the TRUSTED IP, not the limiter's `client_ip`: without a CIDR list the
+    // XFF header is client-written and must not satisfy a condition.
+    if let Some(policy_ip) = rate_limiter::extract_trusted_client_ip(request.headers(), peer_ip) {
+        request.extensions_mut().insert(RequestClientIp(policy_ip));
     }
 
     // H1 SigV4 fix: stash the verified `x-amz-content-sha256` so the

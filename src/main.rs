@@ -660,7 +660,13 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let trust_proxy_explicit = std::env::var("DGP_TRUST_PROXY_HEADERS").ok();
     let trust_proxy = deltaglider_proxy::rate_limiter::trust_proxy_headers();
     if trust_proxy {
-        info!("  Proxy headers: trusted (DGP_TRUST_PROXY_HEADERS=true) — X-Forwarded-For/X-Real-IP used for rate limiting and aws:SourceIp");
+        info!("  Proxy headers: trusted (DGP_TRUST_PROXY_HEADERS=true) — X-Forwarded-For/X-Real-IP used for rate limiting; for admission source_ip and aws:SourceIp only from DGP_TRUSTED_PROXY_CIDRS peers");
+        if let Some(msg) = deltaglider_proxy::rate_limiter::xff_trust_warning(
+            trust_proxy,
+            !deltaglider_proxy::rate_limiter::trusted_proxy_cidrs().is_empty(),
+        ) {
+            tracing::warn!("{msg}");
+        }
     } else if trust_proxy_explicit.is_none() {
         info!("  Proxy headers: untrusted (default) — set DGP_TRUST_PROXY_HEADERS=true if behind a reverse proxy (nginx, Caddy, ALB) to enable IP-based rate limiting and aws:SourceIp IAM conditions");
     } else {

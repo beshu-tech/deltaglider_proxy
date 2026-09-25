@@ -118,7 +118,7 @@ env:
     value: "true"
 ```
 
-Set `DGP_TRUST_PROXY_HEADERS=true` only when the proxy is actually behind a trusted ingress controller — it affects rate limiting and IAM `aws:SourceIp` conditions. If the pod is reachable without the ingress, leave it `false`. If your ingress controller has a request read-timeout (most do), raise it for large uploads — see [How to serve TLS](serve-tls.md).
+Set `DGP_TRUST_PROXY_HEADERS=true` only when the proxy is actually behind a trusted ingress controller — it affects the per-IP rate limit. Admission `source_ip` rules and IAM `aws:SourceIp` conditions read `X-Forwarded-For` only from a connection that `DGP_TRUSTED_PROXY_CIDRS` lists, so also set that variable to the pod network of the ingress controller. If the pod is reachable without the ingress, leave `DGP_TRUST_PROXY_HEADERS` set to `false`. If your ingress controller has a request read-timeout (most do), raise it for large uploads — see [How to serve TLS](serve-tls.md).
 
 ## 5. Validate before deploy
 

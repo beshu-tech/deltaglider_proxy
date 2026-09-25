@@ -521,7 +521,9 @@ The admin UI page **Request rules** (`/_/admin/access/admission`) edits these ru
 
 ### `trust_proxy_headers`
 
-Trust `X-Forwarded-For` / `X-Real-IP` for rate limiting and `aws:SourceIp` IAM conditions. **Disable** if the proxy is internet-facing without a reverse proxy.
+Trust `X-Forwarded-For` / `X-Real-IP` for the per-IP rate-limit bucket. **Disable** if the proxy is internet-facing without a reverse proxy.
+
+This setting alone does not change admission `source_ip` rules, IAM `aws:SourceIp` conditions, or the known-good exemption from the login lockout. Those three decisions use the address of the TCP connection, because a client can write any `X-Forwarded-For` value. They read `X-Forwarded-For` only when the connection comes from a network that `DGP_TRUSTED_PROXY_CIDRS` lists. When this setting is `true` and `DGP_TRUSTED_PROXY_CIDRS` is unset, the proxy logs a warning at startup. Behind a reverse proxy, an `aws:SourceIp` condition then sees the reverse proxy's address, so set `DGP_TRUSTED_PROXY_CIDRS` to the networks of your reverse proxies.
 
 | | |
 |---|---|
@@ -1077,7 +1079,8 @@ Tuning knobs for the large-object streaming multipart copy path (replication + l
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DGP_TRUST_PROXY_HEADERS` | false | Trust `X-Forwarded-For` / `X-Real-IP` |
+| `DGP_TRUST_PROXY_HEADERS` | false | Trust `X-Forwarded-For` / `X-Real-IP` for the per-IP rate-limit bucket |
+| `DGP_TRUSTED_PROXY_CIDRS` | unset | Comma-separated networks of trusted reverse proxies. Only a connection from these networks can name the client in `X-Forwarded-For` for admission `source_ip`, `aws:SourceIp`, and the login-lockout exemption |
 | `DGP_SESSION_TTL_HOURS` | 4 | Admin session lifetime |
 | `DGP_CLOCK_SKEW_SECONDS` | 900 | SigV4 clock skew tolerance |
 | `DGP_REPLAY_WINDOW_SECS` | 2 | SigV4 replay detection window |

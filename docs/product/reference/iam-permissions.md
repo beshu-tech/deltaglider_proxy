@@ -114,10 +114,10 @@ Conditions within a single rule are ANDed — all must match for the rule to app
 
 | Key | Type | Available on | Value |
 |-----|------|--------------|-------|
-| `aws:SourceIp` | IP address (CIDR) | All requests | Client IP — from the direct connection, or from `X-Forwarded-For` / `X-Real-IP` when `DGP_TRUST_PROXY_HEADERS=true` |
+| `aws:SourceIp` | IP address (CIDR) | All requests | Client IP — the address of the TCP connection, or the client that `X-Forwarded-For` names when the connection comes from a network in `DGP_TRUSTED_PROXY_CIDRS` |
 | `s3:prefix` | String | LIST requests | The `prefix` query parameter |
 
-With `DGP_TRUST_PROXY_HEADERS=true` on a proxy exposed directly to the internet, clients can spoof `aws:SourceIp` via a forged `X-Forwarded-For` header.
+A client can write any `X-Forwarded-For` value, so the proxy reads that header for `aws:SourceIp` only when the connection comes from a reverse proxy that `DGP_TRUSTED_PROXY_CIDRS` lists. `DGP_TRUST_PROXY_HEADERS=true` alone is not enough. Without the list, behind a reverse proxy, every request has the reverse proxy's address as `aws:SourceIp`, so a condition that allows only client networks denies every request. Set `DGP_TRUSTED_PROXY_CIDRS` to the networks of your reverse proxies to fix this.
 
 `s3:prefix` string values accept the identity templates above, with the same storage, expansion, and character rules as resource patterns.
 

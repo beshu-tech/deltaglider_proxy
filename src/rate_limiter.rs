@@ -478,6 +478,21 @@ pub fn resolve_trusted_client_ip(
     resolve_client_ip(headers, peer_ip, trust, trusted_cidrs)
 }
 
+/// The boot warning for `DGP_TRUST_PROXY_HEADERS=true` without
+/// `DGP_TRUSTED_PROXY_CIDRS`: the proxy cannot tell a reverse proxy's
+/// X-Forwarded-For from a forged one, so only the per-IP limiter bucket
+/// reads it. `None` when there is nothing to warn about.
+pub fn xff_trust_warning(trust: bool, trusted_cidrs_set: bool) -> Option<&'static str> {
+    (trust && !trusted_cidrs_set).then_some(
+        "DGP_TRUST_PROXY_HEADERS=true but DGP_TRUSTED_PROXY_CIDRS is unset: \
+         admission source_ip rules, IAM aws:SourceIp conditions and the \
+         known-good login-lockout exemption IGNORE X-Forwarded-For and use the \
+         TCP peer; only the per-IP rate-limit bucket uses X-Forwarded-For. Set \
+         DGP_TRUSTED_PROXY_CIDRS to your reverse proxies' networks so the \
+         others see the real client IP",
+    )
+}
+
 /// Pure client-IP resolver — the anti-spoofing decision, injectable for tests.
 ///
 /// - `trust == false`: proxy headers are ignored entirely; the TCP `peer_ip` is
@@ -1246,6 +1261,83 @@ mod tests {
             resolve_trusted_client_ip(&h, peer, true, &[cidr("10.0.0.0/8")]),
             peer
         );
+    }
+
+    #[test]
+    fn xff_trust_warning_only_for_trust_without_cidrs() {
+        assert!(xff_trust_warning(true, false).is_some());
+        assert!(xff_trust_warning(true, true).is_none());
+        assert!(xff_trust_warning(false, false).is_none());
+        assert!(xff_trust_warning(false, true).is_none());
+    }
+
+    /// Source guard: `aws:SourceIp` (and any policy condition) must come from
+    /// `extract_trusted_client_ip`. The legacy resolver takes the first XFF
+    /// element when no CIDR list is set, which the client writes. It may be
+    /// called only from the files below, none of which builds a policy
+    /// context except `api/auth.rs`, whose `RequestClientIp` is checked.
+    #[test]
+    fn policy_contexts_never_use_the_legacy_client_ip_resolver() {
+        const LEGACY: [&str; 2] = ["extract_client_ip_with_peer(", "resolve_client_ip("];
+        // Callers that key the per-IP limiter bucket, sessions or audit.
+        const ALLOWED: [&str; 6] = [
+            "rate_limiter.rs",
+            "api/auth.rs",
+            "startup.rs",
+            "audit.rs",
+            "api/admin/auth.rs",
+            "api/admin/external_auth.rs",
+        ];
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        assert!(files.len() > 50, "scan found the sources");
+        for f in files {
+            let rel = f
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&f).unwrap();
+            let calls_legacy = LEGACY.iter().any(|p| text.contains(p));
+            let builds_policy =
+                text.contains("insert_source_ip(") || text.contains("insert(RequestClientIp(");
+            if calls_legacy {
+                assert!(
+                    ALLOWED.contains(&rel.as_str()),
+                    "{rel} calls the legacy client-IP resolver; use extract_trusted_client_ip for policy decisions, or add it to ALLOWED with a reason"
+                );
+            }
+            if calls_legacy && builds_policy && rel != "rate_limiter.rs" {
+                // Only api/auth.rs may do both: its RequestClientIp must be fed
+                // by the trusted resolver.
+                assert_eq!(
+                    rel, "api/auth.rs",
+                    "{rel} builds a policy context next to the legacy resolver"
+                );
+                let lines: Vec<&str> = text.lines().collect();
+                for (i, l) in lines.iter().enumerate() {
+                    if l.contains("insert(RequestClientIp(") {
+                        let before = lines[i.saturating_sub(2)..i].join("\n");
+                        assert!(
+                            before.contains("extract_trusted_client_ip("),
+                            "api/auth.rs:{} RequestClientIp must come from extract_trusted_client_ip",
+                            i + 1
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Review-2: the known-good account-lock exemption (S22) keys on the
