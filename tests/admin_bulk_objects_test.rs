@@ -312,7 +312,7 @@ async fn test_admin_inputs_refuse_path_escapes() {
     for body in [
         copy("../escape", "a"),
         copy("/etc", "passwd"),
-        copy(&bucket, "../../x"),
+        copy(bucket, "../../x"),
     ] {
         let r = admin
             .post(format!("{ep}/_/api/admin/objects/copy"))
