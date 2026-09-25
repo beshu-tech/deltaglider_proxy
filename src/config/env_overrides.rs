@@ -339,6 +339,18 @@ fn block(out: &mut Vec<EnvOverride>, members: &[EnvBlockMember], activator: &str
 /// per-backend encryption variables apply).
 pub fn env_overrides(cfg: &Config, env: EnvLookup) -> Vec<EnvOverride> {
     let mut out = Vec::new();
+    // First, so a lookup by YAML path finds it before DGP_LOG_LEVEL, which
+    // it beats (see apply_env_overrides_with).
+    if let Some(value) = env(super::RUST_LOG) {
+        out.push(EnvOverride {
+            env: super::RUST_LOG.to_string(),
+            yaml_path: Some("advanced.log_level".to_string()),
+            secret: false,
+            value: Some(value),
+            set: true,
+            activated_by: None,
+        });
+    }
     for b in ENV_FIELD_BINDINGS {
         if let Some(value) = env(b.env).and_then(|raw| applied_value(b.kind, &raw)) {
             out.push(EnvOverride {
@@ -504,6 +516,18 @@ storage:
     #[test]
     fn empty_environment_reports_nothing() {
         assert!(run(&[]).is_empty());
+    }
+
+    /// The GUI must show `RUST_LOG` as the source of the log level (read-only),
+    /// ahead of `DGP_LOG_LEVEL`, which `RUST_LOG` beats.
+    #[test]
+    fn rust_log_controls_the_log_level_field() {
+        let out = run(&[("RUST_LOG", "info"), ("DGP_LOG_LEVEL", "warn")]);
+        let o = at(&out, "advanced.log_level").expect("log level reported");
+        assert_eq!(o.env, "RUST_LOG");
+        assert_eq!(o.value.as_deref(), Some("info"));
+        let out = run(&[("DGP_LOG_LEVEL", "warn")]);
+        assert_eq!(at(&out, "advanced.log_level").unwrap().env, "DGP_LOG_LEVEL");
     }
 
     #[test]

@@ -603,6 +603,16 @@ async function importYaml(yaml: string) {
 test('6. config: export YAML, edit + Review & apply, persisted; env refs in YAML import', async () => {
   await ensureSignedIn();
   await openAdmin('system', 'System');
+  // The Logging card shows the level the process runs at. When RUST_LOG
+  // sets it (it beats the file), the field is read-only with the variable
+  // named; it used to show the file's default ("Debug") instead.
+  const cfg = await (await page.request.get('/_/api/admin/config')).json();
+  const rustLog = (cfg.env_overrides ?? []).find((o: { env: string }) => o.env === 'RUST_LOG');
+  const logField = page.locator('.dg-field').filter({ hasText: 'advanced.log_level' });
+  if (rustLog) {
+    await expect(logField).toContainText('RUST_LOG');
+    await expect(logField).toContainText(rustLog.value);
+  }
   const exported = await exportYaml();
   expect(exported).toContain(PUBLIC_BUCKET);
   expect(exported).not.toContain(SECRET_KEY);
@@ -638,7 +648,9 @@ test('6. config: export YAML, edit + Review & apply, persisted; env refs in YAML
   await dlg.getByRole('button', { name: 'Close', exact: true }).last().click();
 
   // With a `:-default` the same ref resolves to the default and applies.
-  dlg = await importYaml(withLevel('${env:QA_UNSET_LEVEL:-deltaglider_proxy=info}'));
+  // (Not the RUST_LOG value of the local run: a value equal to the env value
+  // is an echo and never reaches the file.)
+  dlg = await importYaml(withLevel('${env:QA_UNSET_LEVEL:-deltaglider_proxy=warn}'));
   await expect(dlg.getByRole('alert').filter({ hasText: 'YAML is valid' })).toBeVisible({ timeout: 30_000 });
   // A successful apply reloads the admin page so every panel re-fetches.
   await Promise.all([
@@ -647,7 +659,7 @@ test('6. config: export YAML, edit + Review & apply, persisted; env refs in YAML
   ]);
   await expect(page.getByRole('heading', { level: 2, name: /^System/ })).toBeVisible({ timeout: 30_000 });
   const after = await exportYaml();
-  expect(after).toContain('deltaglider_proxy=info');
+  expect(after).toContain('deltaglider_proxy=warn');
   // The imported document carried the section edit from above.
   expect(after).toContain(`metadata_cache_mb: ${newValue}`);
 });
@@ -747,5 +759,5 @@ test('9. sign out, sign back in, data and settings persist', async () => {
   await openBucket(BUCKET);
   await expect(row('bundle.zip')).toBeVisible();
   await openAdmin('system', 'System');
-  expect(await exportYaml()).toContain('deltaglider_proxy=info');
+  expect(await exportYaml()).toContain('deltaglider_proxy=warn');
 });

@@ -29,6 +29,10 @@ pub struct EnvVarEntry {
     pub category: &'static str,
 }
 
+/// The standard `tracing` filter variable. It is not a `DGP_*` setting, so it
+/// is not in [`ENV_VAR_REGISTRY`], but it overrides `advanced.log_level`.
+pub const RUST_LOG: &str = "RUST_LOG";
+
 /// Single source of truth for every `DGP_*` environment variable.
 ///
 /// `every_dgp_literal_in_src_is_registered` scans `src/` and fails when a
@@ -1891,8 +1895,13 @@ impl Config {
             applied.push(slot(&["bootstrap_password_hash"]));
         }
 
-        // Log level (runtime operational)
-        text!("DGP_LOG_LEVEL", log_level, |v| v);
+        // Log level (runtime operational). RUST_LOG sets the startup filter
+        // above DGP_LOG_LEVEL (startup.rs::init_tracing), so it is the
+        // effective level: the GUI shows it and an apply cannot replace it.
+        if let Some(v) = env(RUST_LOG).or_else(|| env("DGP_LOG_LEVEL")) {
+            self.log_level = v;
+            applied.push(slot(&["log_level"]));
+        }
 
         // Config DB S3 sync
         text!("DGP_CONFIG_SYNC_BUCKET", config_sync_bucket, Some);
@@ -6152,6 +6161,38 @@ advanced:
         let cfg = loaded(&[]);
         assert!(cfg.env_shadow.is_empty());
         assert_eq!(cfg.file_view().unwrap(), cfg);
+    }
+}
+
+#[cfg(test)]
+mod log_level_env_tests {
+    use super::*;
+
+    /// `RUST_LOG` sets the running filter at startup, above `DGP_LOG_LEVEL`
+    /// and the file. The config must say so: the GUI showed the file's
+    /// level (default debug) while the process ran at `RUST_LOG=info`, and
+    /// a GUI apply then replaced the `RUST_LOG` filter.
+    #[test]
+    fn rust_log_is_the_effective_log_level() {
+        let only = |pairs: &'static [(&'static str, &'static str)]| {
+            move |n: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == n)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let mut cfg = Config::default();
+        cfg.apply_env_overrides_with(&only(&[("RUST_LOG", "deltaglider_proxy=info")]));
+        assert_eq!(cfg.log_level, "deltaglider_proxy=info");
+
+        let mut cfg = Config::default();
+        cfg.apply_env_overrides_with(&only(&[("RUST_LOG", "info"), ("DGP_LOG_LEVEL", "warn")]));
+        assert_eq!(cfg.log_level, "info", "RUST_LOG beats DGP_LOG_LEVEL");
+
+        let mut cfg = Config::default();
+        cfg.apply_env_overrides_with(&only(&[("DGP_LOG_LEVEL", "warn")]));
+        assert_eq!(cfg.log_level, "warn");
     }
 }
 
