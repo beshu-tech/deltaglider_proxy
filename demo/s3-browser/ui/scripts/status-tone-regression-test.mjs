@@ -7,7 +7,7 @@ const { outputText } = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ES2020, target: ts.ScriptTarget.ES2020 },
   fileName: 'statusTone.ts',
 });
-const { countTone, eventStatusTone, serverErrorSeverity, cacheMissSeverity } = await import(
+const { countTone, eventStatusTone, serverErrorSeverity, cacheMissSeverity, endpointDeliverySummary } = await import(
   `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`
 );
 
@@ -24,6 +24,18 @@ assert.equal(eventStatusTone('delivered', 1), 'success');
 assert.equal(eventStatusTone('in_progress', 0), 'processing');
 assert.equal(eventStatusTone('pending', 0), 'default');
 assert.equal(eventStatusTone('pending', 3), 'warning');
+
+// Per-endpoint delivery: a summary chip only when an endpoint was attempted.
+assert.equal(endpointDeliverySummary([]), null);
+assert.deepEqual(endpointDeliverySummary([{ status: 'delivered' }, { status: 'delivered' }]), {
+  text: '2/2 endpoints',
+  tone: 'success',
+});
+assert.deepEqual(endpointDeliverySummary([{ status: 'delivered' }, { status: 'failed' }]), {
+  text: '1/2 endpoints',
+  tone: 'warning',
+});
+assert.deepEqual(endpointDeliverySummary([{ status: 'failed' }]), { text: '0/1 endpoint', tone: 'error' });
 
 // Dashboard error rate: 4xx alone (HEAD-before-PUT 404s) never alarms.
 assert.equal(serverErrorSeverity(0, 534), 'good');

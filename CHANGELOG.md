@@ -14,6 +14,14 @@ does this for you: the Runs tab refreshes while a run is in progress. A client
 that read the counters from the run-now response must read them from the run
 history instead.
 
+### Added — per-endpoint delivery state in the event log
+
+Each row of `GET /_/api/admin/event-outbox` now carries `deliveries`: for
+each webhook URL or Slack channel, whether it accepted the event, the number
+of attempts, and the last error. URLs are redacted. On the Event log page,
+the status cell shows how many endpoints accepted the event, and you can
+expand a row to see each endpoint.
+
 ### Fixed — a Slack retry posts only to the channels and URLs that failed
 
 With several Slack Incoming Webhook URLs, a retry posted the message again to

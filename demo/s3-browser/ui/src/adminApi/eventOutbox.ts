@@ -21,6 +21,18 @@ export interface EventOutboxRecord {
   delivered_at: number | null;
   last_error: string | null;
   created_at: number;
+  /** Per-endpoint delivery state (empty until an endpoint is attempted). */
+  deliveries: EndpointDelivery[];
+}
+
+export interface EndpointDelivery {
+  endpoint_id: string;
+  /** Redacted URL or Slack channel; null when the endpoint left the config. */
+  label: string | null;
+  status: 'delivered' | 'failed';
+  attempts: number;
+  last_error: string | null;
+  updated_at: number;
 }
 
 interface EventOutboxCounts {

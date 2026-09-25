@@ -16,6 +16,7 @@ import {
   requeueEventOutbox,
   requeueEventOutboxMany,
   purgeFailedEventOutbox,
+  type EndpointDelivery,
   type EventOutboxRecord,
   type EventOutboxStatus,
 } from '../adminApi';
@@ -23,7 +24,7 @@ import { contentColumn, CONTENT_WIDE } from './shared-styles';
 import { normalizeUiError } from '../errorHandling';
 import { isSessionExpired } from '../errorHandling';
 import { relativeTime } from '../utils';
-import { countTone, eventStatusTone } from '../statusTone';
+import { countTone, endpointDeliverySummary, eventStatusTone } from '../statusTone';
 
 const { Text } = Typography;
 const DEFAULT_PAGE_SIZE = 50;
@@ -169,14 +170,25 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       width: 120,
       sorter: true,
       sortOrder: sort === 'status' ? (order === 'asc' ? 'ascend' : 'descend') : null,
-      render: (value: EventOutboxStatus, row) => (
-        <div title={`Attempts: ${row.attempts}${row.claimed_by ? ` · claimed by ${row.claimed_by}` : ''}`}>
-          <Tag color={eventStatusTone(value, row.attempts)}>{value}</Tag>
-          <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 2 }}>
-            {row.attempts} attempt{row.attempts === 1 ? '' : 's'}
-          </Text>
-        </div>
-      ),
+      render: (value: EventOutboxStatus, row) => {
+        const summary = endpointDeliverySummary(row.deliveries ?? []);
+        return (
+          <div title={`Attempts: ${row.attempts}${row.claimed_by ? ` · claimed by ${row.claimed_by}` : ''}`}>
+            <Tag color={eventStatusTone(value, row.attempts)}>{value}</Tag>
+            <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: 2 }}>
+              {row.attempts} attempt{row.attempts === 1 ? '' : 's'}
+              {summary && (
+                <>
+                  {' · '}
+                  <Text type={summary.tone === 'success' ? 'secondary' : 'warning'} style={{ fontSize: 11 }}>
+                    {summary.text}
+                  </Text>
+                </>
+              )}
+            </Text>
+          </div>
+        );
+      },
     },
     {
       title: 'Kind',
@@ -438,6 +450,12 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
           showSorterTooltip={false}
           scroll={{ x: 1040 }}
           onChange={onTableChange}
+          expandable={{
+            // Per-endpoint delivery state: which webhook URL or Slack channel
+            // accepted the event, and why the others failed.
+            rowExpandable: (row) => (row.deliveries?.length ?? 0) > 0,
+            expandedRowRender: (row) => <EndpointDeliveries deliveries={row.deliveries} />,
+          }}
           locale={{
             // While loading the Table's own spinner overlay provides the motion;
             // a static "Loading..." underneath it just reads as a dead label.
@@ -493,5 +511,33 @@ function CountPill({
       <Text type="secondary" style={{ fontSize: 11, textTransform: 'uppercase', letterSpacing: 0.4 }}>{label}</Text>
       <Tag color={colour} style={{ marginInlineEnd: 0 }}>{value}</Tag>
     </button>
+  );
+}
+
+/** Read-only list of one event's per-endpoint delivery state. */
+function EndpointDeliveries({ deliveries }: { deliveries: EndpointDelivery[] }) {
+  return (
+    <div style={{ display: 'grid', gap: 4, padding: '4px 8px' }}>
+      {deliveries.map((d) => (
+        <div key={d.endpoint_id} style={{ display: 'flex', gap: 8, alignItems: 'baseline', minWidth: 0 }}>
+          <Tag color={d.status === 'delivered' ? 'success' : 'error'}>{d.status}</Tag>
+          <Text style={{ fontSize: 12, flexShrink: 0 }} title={`endpoint id ${d.endpoint_id}`}>
+            {d.label ?? 'endpoint no longer configured'}
+          </Text>
+          <Text type="secondary" style={{ fontSize: 11, flexShrink: 0 }}>
+            {d.attempts} attempt{d.attempts === 1 ? '' : 's'} · {fmtRelative(d.updated_at)}
+          </Text>
+          {d.last_error && (
+            <Text
+              type="danger"
+              title={d.last_error}
+              style={{ fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+            >
+              {d.last_error}
+            </Text>
+          )}
+        </div>
+      ))}
+    </div>
   );
 }

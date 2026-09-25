@@ -513,6 +513,42 @@ impl ConfigDb {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Per-endpoint delivery state for several outbox rows in one query,
+    /// grouped by outbox id (rows without state are absent).
+    pub fn event_deliveries_for_many(
+        &self,
+        outbox_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<EventEndpointDelivery>>, ConfigDbError> {
+        let mut out: std::collections::HashMap<i64, Vec<EventEndpointDelivery>> =
+            std::collections::HashMap::new();
+        if outbox_ids.is_empty() {
+            return Ok(out);
+        }
+        let marks = vec!["?"; outbox_ids.len()].join(",");
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT outbox_id, endpoint_id, status, attempts, last_error, updated_at
+               FROM event_deliveries WHERE outbox_id IN ({marks})
+              ORDER BY outbox_id, endpoint_id"
+        ))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(outbox_ids), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                EventEndpointDelivery {
+                    endpoint_id: r.get(1)?,
+                    status: r.get(2)?,
+                    attempts: r.get(3)?,
+                    last_error: r.get(4)?,
+                    updated_at: r.get(5)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (id, d) = row?;
+            out.entry(id).or_default().push(d);
+        }
+        Ok(out)
+    }
+
     /// Every endpoint's delivery state for one outbox row.
     pub fn event_deliveries_for(
         &self,

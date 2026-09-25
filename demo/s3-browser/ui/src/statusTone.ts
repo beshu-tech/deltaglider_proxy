@@ -33,6 +33,21 @@ export function eventStatusTone(status: string, attempts: number): Tone {
 }
 
 /**
+ * Summary chip for an event's per-endpoint delivery state: how many endpoints
+ * accepted it. `null` until an endpoint is attempted. All accepted is green,
+ * a partial result (the row retries the rest) amber, none accepted red.
+ */
+export function endpointDeliverySummary(
+  deliveries: { status: string }[],
+): { text: string; tone: Tone } | null {
+  if (deliveries.length === 0) return null;
+  const ok = deliveries.filter((d) => d.status === 'delivered').length;
+  const n = deliveries.length;
+  const tone: Tone = ok === n ? 'success' : ok === 0 ? 'error' : 'warning';
+  return { text: `${ok}/${n} endpoint${n === 1 ? '' : 's'}`, tone };
+}
+
+/**
  * Severity of the dashboard error rate. Only server errors (5xx) count:
  * S3 clients answer many requests with a 4xx as a normal step (a HEAD before
  * a PUT answers 404), so client errors alone never turn the card amber or red.

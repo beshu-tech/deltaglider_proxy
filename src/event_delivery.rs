@@ -155,6 +155,35 @@ pub fn delivery_targets(
     }
 }
 
+/// Pure: a readable, non-secret label for every target the current config can
+/// deliver to, keyed by its `event_deliveries.endpoint_id`. URLs are redacted
+/// (a path can carry a token); the position tells two URLs on one host apart.
+/// An id missing from the map is an endpoint removed from the config.
+pub fn endpoint_labels(config: &EventDeliveryConfig) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for (i, url) in config.webhook_endpoints().into_iter().enumerate() {
+        let target = DeliveryTarget::Webhook(url.to_string());
+        out.insert(
+            target.id(),
+            format!("webhook {}: {}", i + 1, redact_url_for_error(url)),
+        );
+    }
+    let channels = config
+        .slack_channel
+        .iter()
+        .map(String::as_str)
+        .chain(config.slack_routes.iter().map(|r| r.channel.as_str()))
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    for c in channels {
+        out.insert(
+            DeliveryTarget::SlackChannel(c.to_string()).id(),
+            format!("slack channel {c}"),
+        );
+    }
+    out
+}
+
 /// Stable, non-secret id of a webhook endpoint URL: the URL can carry a token
 /// (Slack-style paths), so only a hash of it is stored.
 pub fn endpoint_id(endpoint: &str) -> String {
@@ -1231,6 +1260,43 @@ mod tests {
         let (first, retry) = fan_out_twice(config, "C2").await;
         assert_eq!(first, vec!["C1", "C2"]);
         assert_eq!(retry, vec!["C2"], "C1 must not get the message twice");
+    }
+
+    #[test]
+    fn endpoint_labels_name_every_target_without_secrets() {
+        let config = EventDeliveryConfig {
+            webhook_url: Some("https://hooks.slack.test/services/T/B/SECRET".into()),
+            webhook_urls: vec!["https://hooks.slack.test/services/T/B/OTHER".into()],
+            slack_channel: Some("#ops".into()),
+            ..cfg()
+        };
+        let labels = endpoint_labels(&config);
+        let a = &labels[&endpoint_id("https://hooks.slack.test/services/T/B/SECRET")];
+        let b = &labels[&endpoint_id("https://hooks.slack.test/services/T/B/OTHER")];
+        assert_eq!(a, "webhook 1: https://hooks.slack.test/<redacted>");
+        assert_eq!(b, "webhook 2: https://hooks.slack.test/<redacted>");
+        assert_eq!(
+            labels[&DeliveryTarget::SlackChannel("#ops".into()).id()],
+            "slack channel #ops"
+        );
+        assert!(labels.values().all(|l| !l.contains("SECRET")));
+    }
+
+    #[tokio::test]
+    async fn deliveries_for_many_groups_rows_by_outbox_id() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let a = db.event_outbox_insert(&event("a")).unwrap();
+        let b = db.event_outbox_insert(&event("b")).unwrap();
+        db.event_delivery_record(a, "e1", None, 10).unwrap();
+        db.event_delivery_record(a, "e2", Some("HTTP 503"), 10)
+            .unwrap();
+        db.event_delivery_record(b, "e1", None, 10).unwrap();
+        let map = db.event_deliveries_for_many(&[a, b, 999]).unwrap();
+        assert_eq!(map[&a].len(), 2);
+        assert_eq!(map[&a][1].last_error.as_deref(), Some("HTTP 503"));
+        assert_eq!(map[&b].len(), 1);
+        assert!(!map.contains_key(&999));
+        assert!(db.event_deliveries_for_many(&[]).unwrap().is_empty());
     }
 
     #[test]

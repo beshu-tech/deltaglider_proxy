@@ -160,7 +160,7 @@ Legacy JSON-only import path is still supported for pre-v0.8.4 scripts.
 | `GET` | `/_/api/admin/audit[?limit=N]` | Snapshot of the in-memory audit ring, newest first. Bounded (default 500, override `DGP_AUDIT_RING_SIZE`). Stdout `tracing::info!` is still the long-term audit source. |
 | `GET` | `/_/api/admin/logs[?level=&target=&q=&limit=N]` | Filtered backlog of the in-memory operational-log ring (INFO+ floor), newest first. Bounded (`DGP_LOG_RING_SIZE`, default 2000). |
 | `GET` | `/_/api/admin/logs/stream[?level=&target=&q=]` | Live tail of operational logs via server-sent events, same filters as the backlog. |
-| `GET` | `/_/api/admin/event-outbox[?status=failed&limit=N&offset=N&sort=occurred_at&order=desc]` | Paged durable object-event outbox rows plus status counts. Delivery is background-only; delivered rows default to 24h/10,000-row retention; see [event-outbox.md](event-outbox.md). |
+| `GET` | `/_/api/admin/event-outbox[?status=failed&limit=N&offset=N&sort=occurred_at&order=desc]` | Paged durable object-event outbox rows plus status counts. Each row carries `deliveries`, its per-endpoint delivery state. Delivery is background-only; delivered rows default to 24h/10,000-row retention; see [event-outbox.md](event-outbox.md). |
 | `POST` | `/_/api/admin/event-outbox/:id/requeue` | Requeue a single failed outbox row for re-delivery |
 | `POST` | `/_/api/admin/event-outbox/requeue` | Bulk-requeue failed outbox rows |
 | `GET` / `PUT` / `DELETE` | `/_/api/admin/session/s3-credentials` | Per-session S3 credential store for the browse panel |

@@ -24,9 +24,30 @@ pub struct EventOutboxQuery {
     pub order: Option<String>,
 }
 
+/// One endpoint's delivery state, with a readable label for the panel.
+#[derive(Debug, Serialize)]
+pub struct EndpointDeliveryView {
+    pub endpoint_id: String,
+    /// Redacted URL or channel; `None` when the endpoint left the config.
+    pub label: Option<String>,
+    pub status: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub updated_at: i64,
+}
+
+/// An outbox row plus its per-endpoint delivery state (empty until a target
+/// is attempted; Slack rows filtered out by the notify rules stay empty).
+#[derive(Debug, Serialize)]
+pub struct EventOutboxRowView {
+    #[serde(flatten)]
+    pub record: EventOutboxRecord,
+    pub deliveries: Vec<EndpointDeliveryView>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct EventOutboxResponse {
-    pub rows: Vec<EventOutboxRecord>,
+    pub rows: Vec<EventOutboxRowView>,
     pub counts: EventOutboxStatusCounts,
     pub total: i64,
     pub limit: u32,
@@ -114,8 +135,34 @@ pub async fn list(
         })
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    let ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
+    let mut deliveries = db
+        .event_deliveries_for_many(&ids)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let labels = crate::event_delivery::endpoint_labels(&delivery);
+    let rows = page
+        .rows
+        .into_iter()
+        .map(|record| {
+            let deliveries = deliveries
+                .remove(&record.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|d| EndpointDeliveryView {
+                    label: labels.get(&d.endpoint_id).cloned(),
+                    endpoint_id: d.endpoint_id,
+                    status: d.status,
+                    attempts: d.attempts,
+                    last_error: d.last_error,
+                    updated_at: d.updated_at,
+                })
+                .collect();
+            EventOutboxRowView { record, deliveries }
+        })
+        .collect();
+
     Ok(Json(EventOutboxResponse {
-        rows: page.rows,
+        rows,
         counts,
         total: page.total,
         limit,

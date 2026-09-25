@@ -511,6 +511,12 @@ async fn test_bulk_ops_honour_quota_and_record_events_and_audit() {
     };
     assert!(has("ObjectCopied"), "no ObjectCopied: {outbox}");
     assert!(has("ObjectDeleted"), "no ObjectDeleted: {outbox}");
+    // Each row carries its per-endpoint delivery state (none: delivery is off).
+    assert!(
+        rows.iter()
+            .all(|e| e["deliveries"].as_array().is_some_and(Vec::is_empty)),
+        "rows must carry an empty deliveries list: {outbox}"
+    );
     let audit: Value = admin
         .get(format!("{ep}/_/api/admin/audit?limit=100"))
         .send()
