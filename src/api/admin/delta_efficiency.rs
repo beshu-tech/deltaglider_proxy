@@ -499,7 +499,7 @@ fn build_report_for_prefix(
     min_deltas: usize,
     originals_estimated: bool,
 ) -> Option<DeltaspaceReport> {
-    let partition = partition_deltaspace_scan(scan, originals_estimated);
+    let partition = partition_deltaspace_scan(scan);
     let efficiency = classify_deltaspace(
         partition.reference_bytes,
         &partition.delta_sizes,
@@ -565,39 +565,22 @@ struct DeltaspacePartition {
     reference_bytes: Option<u64>,
     delta_sizes: Vec<u64>,
     passthrough_count: usize,
-    /// Sum of `file_size` across non-reference entries. Under
-    /// `originals_estimated` the delta `file_size` is the on-disk delta
-    /// size (not the original), so it's excluded — otherwise we'd
-    /// double-count delta storage as "original" and make
-    /// `savings_bytes` look negative on healthy prefixes.
-    total_original: u64,
 }
 
-fn partition_deltaspace_scan(
-    scan: &[FileMetadata],
-    originals_estimated: bool,
-) -> DeltaspacePartition {
+/// Byte totals are NOT summed here: `SavingsTotals` owns that math.
+fn partition_deltaspace_scan(scan: &[FileMetadata]) -> DeltaspacePartition {
     let mut p = DeltaspacePartition {
         reference_bytes: None,
         delta_sizes: Vec::new(),
         passthrough_count: 0,
-        total_original: 0,
     };
     for m in scan {
         match &m.storage_info {
             StorageInfo::Reference { .. } => {
                 p.reference_bytes = Some(m.file_size);
             }
-            StorageInfo::Delta { delta_size, .. } => {
-                p.delta_sizes.push(*delta_size);
-                if !originals_estimated {
-                    p.total_original = p.total_original.saturating_add(m.file_size);
-                }
-            }
-            StorageInfo::Passthrough => {
-                p.passthrough_count += 1;
-                p.total_original = p.total_original.saturating_add(m.file_size);
-            }
+            StorageInfo::Delta { delta_size, .. } => p.delta_sizes.push(*delta_size),
+            StorageInfo::Passthrough => p.passthrough_count += 1,
         }
     }
     p
