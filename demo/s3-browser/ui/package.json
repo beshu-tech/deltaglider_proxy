@@ -81,6 +81,7 @@
     "test:code-tokens": "node scripts/code-tokens-regression-test.mjs",
     "test:setup-detect": "node scripts/setup-detect-regression-test.mjs",
     "e2e": "playwright test",
+    "e2e:qa": "QA_REGRESSION=1 playwright test e2e/qa-regression.spec.ts",
     "typecheck": "tsc --noEmit",
     "knip": "knip",
     "test:env-overrides": "node scripts/env-overrides-regression-test.mjs",
