@@ -102,6 +102,17 @@ pub struct RunTotals {
     pub reconstructed: i64,
 }
 
+/// Rule-keyed tables besides `replication_state` that a rule delete purges.
+/// Must list every `replication_*` table with a `rule_name` column (test
+/// `reconcile_rules_purges_every_rule_keyed_table` checks the schema).
+const RULE_KEYED_CHILD_TABLES: &[&str] = &[
+    "replication_parity_objects",
+    "replication_parity",
+    "replication_run_history",
+    "replication_failures",
+    "replication_object_failures",
+];
+
 pub fn current_unix_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -176,29 +187,25 @@ impl ConfigDb {
         let tx = self.conn.unchecked_transaction()?;
         for existing in rows {
             if !known.contains(existing.as_str()) {
-                let n = tx.execute(
+                removed += tx.execute(
                     "DELETE FROM replication_state WHERE rule_name = ?",
                     params![existing],
                 )?;
-                // Drop the rule's parity object-cache AND result row, run history,
-                // and failure ring too — all keyed by rule_name, else orphaned.
+            }
+        }
+        // Every OTHER rule-keyed table, by its own rule names (a row can exist
+        // without a state row). The schema test pins this list.
+        for table in RULE_KEYED_CHILD_TABLES {
+            let mut stmt = tx.prepare(&format!("SELECT DISTINCT rule_name FROM {table}"))?;
+            let names: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            for name in names.iter().filter(|n| !known.contains(n.as_str())) {
                 tx.execute(
-                    "DELETE FROM replication_parity_objects WHERE rule_name = ?",
-                    params![existing],
+                    &format!("DELETE FROM {table} WHERE rule_name = ?"),
+                    params![name],
                 )?;
-                tx.execute(
-                    "DELETE FROM replication_parity WHERE rule_name = ?",
-                    params![existing],
-                )?;
-                tx.execute(
-                    "DELETE FROM replication_run_history WHERE rule_name = ?",
-                    params![existing],
-                )?;
-                tx.execute(
-                    "DELETE FROM replication_failures WHERE rule_name = ?",
-                    params![existing],
-                )?;
-                removed += n;
             }
         }
         tx.commit()?;
@@ -1311,6 +1318,69 @@ mod tests {
 
     fn db() -> ConfigDb {
         ConfigDb::in_memory("testpass").expect("open in-memory db")
+    }
+
+    /// Every `replication_*` table with a `rule_name` column, from the schema.
+    fn rule_keyed_tables_in_schema(db: &ConfigDb) -> Vec<String> {
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'replication_%'",
+            )
+            .unwrap();
+        let tables: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut out: Vec<String> = tables
+            .into_iter()
+            .filter(|t| {
+                let mut s = db.conn.prepare(&format!("PRAGMA table_info({t})")).unwrap();
+                let cols: Vec<String> = s
+                    .query_map([], |r| r.get::<_, String>(1))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                cols.iter().any(|c| c == "rule_name")
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A deleted rule's rows go from EVERY rule-keyed table. The object
+    /// failure ledger was missed: its rows outlived the rule and came back
+    /// to poison-skip objects when a rule with the same name was created.
+    #[test]
+    fn reconcile_rules_purges_every_rule_keyed_table() {
+        let db = db();
+        db.replication_ensure_state("gone", 100).unwrap();
+        db.replication_record_object_failure("gone", "k", "boom", 100)
+            .unwrap();
+        db.replication_reconcile_rules(&[]).unwrap();
+        let mut listed: Vec<String> = RULE_KEYED_CHILD_TABLES
+            .iter()
+            .map(|t| t.to_string())
+            .chain(["replication_state".to_string()])
+            .collect();
+        listed.sort();
+        assert_eq!(
+            rule_keyed_tables_in_schema(&db),
+            listed,
+            "a new rule-keyed table must join RULE_KEYED_CHILD_TABLES"
+        );
+        for table in rule_keyed_tables_in_schema(&db) {
+            let n: i64 = db
+                .conn
+                .query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE rule_name = 'gone'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "{table} kept rows of a deleted rule");
+        }
     }
 
     #[test]
