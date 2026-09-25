@@ -25,11 +25,12 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 25;
+const SCHEMA_VERSION: i32 = 26;
 
 pub(crate) mod auth_providers;
 mod declarative;
 mod groups;
+pub(crate) mod iam_merge;
 pub(crate) mod job_store;
 mod users;
 pub(crate) use users::first_free_user_name;
@@ -849,6 +850,19 @@ impl ConfigDb {
             );
         }
 
+        if version < 26 {
+            // v26: per-row modification time for the three-way IAM sync merge
+            // (last-writer-wins on a true conflict). Triggers keep it current,
+            // so every write path (admin API, OAuth login, declarative
+            // reconcile, backup import) stamps it without code at the call
+            // site. A permission row change counts as a change of its owner.
+            iam_merge::install_mtime_schema(conn)?;
+            info!(
+                "Migrated config DB schema from v{} to v26 (IAM sync_mtime)",
+                version
+            );
+        }
+
         Ok(())
     }
 
@@ -982,120 +996,6 @@ impl ConfigDb {
         self.conn = conn;
         info!("Config database re-opened after S3 sync");
         Ok(())
-    }
-
-    /// The IAM-truth tables that the S3 sync owns. ORDER MATTERS: parents
-    /// before children (for INSERT). The reverse order is used for DELETE.
-    /// Everything NOT in this list (replication_*, lifecycle_*, maintenance_*,
-    /// event_outbox, listener_cursors, replication_parity*) is per-node
-    /// COORDINATION state that the sync must never touch — see `merge_iam_from`.
-    const IAM_SYNC_TABLES: &'static [&'static str] = &[
-        "users",
-        "groups",
-        "auth_providers",
-        "group_mapping_rules",
-        "permissions",         // FK → users
-        "group_members",       // FK → groups, users
-        "group_permissions",   // FK → groups
-        "external_identities", // FK → users
-    ];
-
-    /// Replace ONLY the IAM-truth tables from a downloaded peer DB, leaving this
-    /// node's coordination tables (jobs/leases/outbox/cursors/parity) intact.
-    ///
-    /// This is the B3 fix for the audit's CRITICAL finding: the old sync path
-    /// `fs::rename`d the whole SQLCipher file, wholesale-clobbering coordination
-    /// state that is correct per-node and lease-shared — silently desyncing
-    /// `event_outbox` cursors and replication/maintenance leases across instances.
-    /// We now ATTACH the peer file and copy across only the 8 IAM tables in one
-    /// transaction, so the synced plane (IAM) converges while the coordination
-    /// plane stays node-local. No `reopen` is needed — the live connection keeps
-    /// its coordination rows.
-    pub fn merge_iam_from(
-        &self,
-        downloaded_path: &Path,
-        passphrase: &str,
-    ) -> Result<(), ConfigDbError> {
-        let attach_path = downloaded_path.to_string_lossy().replace('\'', "''");
-        // ATTACH + KEY the encrypted peer DB. (SQLCipher: key the attached DB via
-        // the `KEY` clause on ATTACH.)
-        self.conn.execute_batch(&format!(
-            "ATTACH DATABASE '{attach_path}' AS remote KEY '{}';",
-            passphrase.replace('\'', "''")
-        ))?;
-
-        // Guard: if anything below fails, always DETACH so the connection isn't
-        // left with a dangling attachment.
-        let result = (|| -> Result<(), ConfigDbError> {
-            // Sanity: the attached DB must be readable (correct key) — a bad key
-            // surfaces here rather than mid-merge.
-            self.conn
-                .query_row("SELECT count(*) FROM remote.sqlite_master", [], |r| {
-                    r.get::<_, i32>(0)
-                })?;
-
-            // Schema-version gate (review fix): `INSERT ... SELECT *` is positional,
-            // so a peer on a DIFFERENT schema version (rolling upgrade: a node with
-            // an extra/renamed IAM column) would corrupt or abort the copy. Refuse
-            // unless the peer's user_version matches ours; the operator finishes the
-            // rolling upgrade and the next sync converges cleanly.
-            let remote_version: i32 =
-                self.conn
-                    .query_row("PRAGMA remote.user_version", [], |r| r.get(0))?;
-            if remote_version != SCHEMA_VERSION {
-                return Err(ConfigDbError::Other(format!(
-                    "peer config DB schema v{remote_version} != local v{SCHEMA_VERSION}; \
-                     skipping IAM merge until the rolling upgrade completes"
-                )));
-            }
-
-            // NOTE: foreign_keys cannot be toggled inside a transaction (SQLite
-            // silently ignores the pragma mid-txn), so the DELETE/INSERT order
-            // below is what keeps us FK-correct, NOT a pragma. Verified against
-            // the IAM FK graph: DELETE children-first, INSERT parents-first.
-            // (All IAM FKs are ON DELETE CASCADE, so delete order is also safe on
-            // its own; insert order must put users/groups/auth_providers before
-            // their referrers — IAM_SYNC_TABLES is ordered for exactly this.)
-            self.conn.execute_batch("BEGIN IMMEDIATE;")?;
-            let tx = (|| -> Result<(), ConfigDbError> {
-                for table in Self::IAM_SYNC_TABLES.iter().rev() {
-                    self.conn
-                        .execute(&format!("DELETE FROM main.{table}"), [])?;
-                }
-                for table in Self::IAM_SYNC_TABLES {
-                    self.conn.execute(
-                        &format!("INSERT INTO main.{table} SELECT * FROM remote.{table}"),
-                        [],
-                    )?;
-                }
-                // session_revocations is NOT a replace-merge (that would let one
-                // node's sync wipe another's revocations). It's a monotonic
-                // MAX-upsert union: a revocation only ever moves `revoked_since`
-                // forward, so merging keeps the latest from either side.
-                self.conn.execute(
-                    "INSERT INTO main.session_revocations (identity, revoked_since)
-                       SELECT identity, revoked_since FROM remote.session_revocations
-                     WHERE true
-                     ON CONFLICT(identity) DO UPDATE SET
-                       revoked_since = MAX(revoked_since, excluded.revoked_since)",
-                    [],
-                )?;
-                Ok(())
-            })();
-            match tx {
-                Ok(()) => {
-                    self.conn.execute_batch("COMMIT;")?;
-                    Ok(())
-                }
-                Err(e) => {
-                    let _ = self.conn.execute_batch("ROLLBACK;");
-                    Err(e)
-                }
-            }
-        })();
-
-        let _ = self.conn.execute_batch("DETACH DATABASE remote;");
-        result
     }
 
     /// Revoke every session of `identity` (access_key_id or `provider:user_id`)
@@ -1709,7 +1609,7 @@ mod tests {
         }
 
         // Merge peer's IAM into local.
-        local.merge_iam_from(&peer_path, pass).unwrap();
+        local.merge_iam_from(&peer_path, None, pass).unwrap();
 
         // IAM replaced: local-only gone, peer-user present.
         let names: Vec<String> = local
@@ -1747,7 +1647,9 @@ mod tests {
         }
         // Merging a peer encrypted with a different key must fail and leave the
         // local IAM untouched (no half-applied wipe).
-        assert!(local.merge_iam_from(&peer_path, "local-pass").is_err());
+        assert!(local
+            .merge_iam_from(&peer_path, None, "local-pass")
+            .is_err());
         assert_eq!(
             local.load_users().unwrap().len(),
             1,
@@ -1773,7 +1675,7 @@ mod tests {
                 .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
                 .unwrap();
         }
-        let err = local.merge_iam_from(&peer_path, pass).unwrap_err();
+        let err = local.merge_iam_from(&peer_path, None, pass).unwrap_err();
         assert!(
             err.to_string().contains("schema"),
             "expected a schema-version rejection, got: {err}"

@@ -654,3 +654,146 @@ async fn ha_concurrent_same_node_creates_do_not_self_clobber() {
         );
     }
 }
+
+async fn user_names(admin: &reqwest::Client, endpoint: &str) -> Vec<String> {
+    let users: Vec<serde_json::Value> = admin
+        .get(format!("{endpoint}/_/api/admin/users"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    users
+        .iter()
+        .filter_map(|u| u["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+async fn create_user(admin: &reqwest::Client, endpoint: &str, name: &str) {
+    let resp = admin
+        .post(format!("{endpoint}/_/api/admin/users"))
+        .json(&json!({
+            "name": name,
+            "permissions": [{"actions": ["read"], "resources": ["*"]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201, "create {name} must 201");
+}
+
+/// D16: two nodes create different users while each holds a stale copy. The
+/// second upload hits a CAS conflict; the old table-replace reconcile dropped
+/// that node's own new user. The three-way merge keeps both, on both nodes.
+#[tokio::test]
+async fn ha_concurrent_creates_on_two_nodes_both_survive() {
+    skip_unless_minio!();
+
+    let sync_key = unique_config_sync_object_key();
+    let build = |key: &'static str, secret: &'static str| {
+        TestServer::builder()
+            .auth(key, secret)
+            .s3_endpoint(&minio_endpoint_url())
+            .bucket(MINIO_BUCKET)
+            .config_sync_bucket(MINIO_BUCKET)
+            .config_sync_object_key(&sync_key)
+            .build()
+    };
+    let server_a = build("HAKEY-3W-A", "HASECRET-3W-A-1234567890").await;
+    let server_b = build("HAKEY-3W-B", "HASECRET-3W-B-1234567890").await;
+    let (ep_a, ep_b) = (server_a.endpoint(), server_b.endpoint());
+    let admin_a = admin_http_client(&ep_a).await;
+    let admin_b = admin_http_client(&ep_b).await;
+    let sync_now = |admin: reqwest::Client, ep: String| async move {
+        let resp = admin
+            .post(format!("{ep}/_/api/admin/config/sync-now"))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "sync-now: {}", resp.status());
+    };
+
+    // A seeds the bucket; B pulls it, so both share one merge base.
+    let seed = unique_user_name("3w-seed");
+    create_user(&admin_a, &ep_a, &seed).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !user_names(&admin_b, &ep_b).await.contains(&seed) {
+        assert!(std::time::Instant::now() < deadline, "B never saw the seed");
+        sync_now(admin_b.clone(), ep_b.clone()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // B uploads first; A's upload then conflicts and reconciles.
+    let on_b = unique_user_name("3w-b");
+    create_user(&admin_b, &ep_b, &on_b).await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let on_a = unique_user_name("3w-a");
+    create_user(&admin_a, &ep_a, &on_a).await;
+
+    // A's reconcile brings B's user in and keeps its own.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let names = user_names(&admin_a, &ep_a).await;
+        assert!(
+            names.contains(&on_a),
+            "A lost its own new user in the reconcile: {names:?}"
+        );
+        if names.contains(&on_b) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "A never merged B's user: {names:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // B pulls the reconciled copy: everything, on both nodes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        sync_now(admin_b.clone(), ep_b.clone()).await;
+        let names = user_names(&admin_b, &ep_b).await;
+        if [&seed, &on_a, &on_b].iter().all(|n| names.contains(n)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "B is missing a user: {names:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // A delete on B reaches A (base present, so it is a delete, not a gap).
+    let users: Vec<serde_json::Value> = admin_b
+        .get(format!("{ep_b}/_/api/admin/users"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let seed_id = users.iter().find(|u| u["name"] == seed).unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let resp = admin_b
+        .delete(format!("{ep_b}/_/api/admin/users/{seed_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "delete: {}", resp.status());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        sync_now(admin_a.clone(), ep_a.clone()).await;
+        let names = user_names(&admin_a, &ep_a).await;
+        if !names.contains(&seed) {
+            assert!(names.contains(&on_a) && names.contains(&on_b), "{names:?}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the delete never reached A"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}

@@ -206,13 +206,23 @@ single-instance planes below are addressed.
   eventually consistent, ≤5min lag; mutations push immediately with
   reconcile-then-retry on CAS conflict). The sync IS atomic at the S3-OBJECT
   level (`config_db_sync.rs` PUT uses `If-Match`/`If-None-Match` → 412 →
-  reconcile-retry, a real compare-and-swap) — but the IAM merge is
-  DELETE-all+INSERT-all table-replace, i.e. **row-level LAST-WRITER-WINS**: a
-  concurrent IAM edit on peer B can silently revert node A's row (only
-  `session_revocations` merges monotonically via `MAX`). So: linearizable blob,
-  LWW rows, coordination tables excluded entirely. This shape is fine for
-  human-paced identity and structurally WRONG for leases/locks — which is
-  exactly why B3 dropped the coordination tables (below) rather than sync them.
+  reconcile-retry, a real compare-and-swap) — and the IAM merge is a
+  **THREE-WAY merge by NAME** (D16, `config_db/iam_merge.rs`): the last synced
+  DB is kept as the base (`<db>.sync-base`, written after every successful
+  upload and every merge; download/merge/upload serialise on `upload_lock`
+  via `pull_and_merge`). A row changed on one side takes that side; a delete
+  (in base, absent on one side) propagates; only a row changed on BOTH sides
+  conflicts → newer `sync_mtime` wins (trigger-maintained, v26; a permission
+  change stamps its owner), delete beats edit, each conflict is an
+  `iam_sync_conflict` audit entry. Ids: remote id if the remote has the row,
+  else local if free, else fresh; FKs resolve through names (external
+  identities follow), and local user ids that change owner end their live
+  external sessions. No base (upgrade/first sync/unreadable) → remote wins
+  (the old table-replace). `session_revocations` stays a monotonic `MAX`
+  merge. So: linearizable blob, row-level merge, coordination tables excluded
+  entirely. This shape is fine for human-paced identity and structurally
+  WRONG for leases/locks — which is exactly why B3 dropped the coordination
+  tables (below) rather than sync them.
 
 **Instance-LOCAL (NOT shared — break or degrade under non-sticky round-robin):**
 - **Background-job leadership** — the SQLite leases (`config_db/job_store.rs`) are

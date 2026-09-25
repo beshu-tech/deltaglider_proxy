@@ -389,6 +389,21 @@ impl SessionStore {
         !targets.is_empty()
     }
 
+    /// End every external-login session bound to one of `user_ids`. A sync
+    /// merge moves or deletes a user id; a live session that still carries the
+    /// old id would otherwise resolve to whoever holds that id now.
+    pub fn revoke_external_user_ids(&self, user_ids: &[i64]) -> usize {
+        if user_ids.is_empty() {
+            return 0;
+        }
+        let mut sessions = self.sessions.write();
+        let before = sessions.len();
+        sessions.retain(|_, info| {
+            !matches!(&info.auth_method, AuthMethod::External { user_id, .. } if user_ids.contains(user_id))
+        });
+        before - sessions.len()
+    }
+
     /// Force-logout EVERY session matching a revocation identity (IAM
     /// access_key_id or `provider:user_id` for external logins). Used when a
     /// key is compromised — rotating the key alone does NOT invalidate

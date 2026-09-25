@@ -19,9 +19,13 @@ DGP_CONFIG_SYNC_BUCKET=dgp-iam-sync
 
 After every IAM mutation, the mutating instance uploads the encrypted DB to the bucket. The other instances poll every 5 minutes and download when the ETag changes. All instances must share the same bootstrap password — it's the DB encryption key.
 
-## 2. Designate one writer
+## 2. Decide where operators edit IAM
 
-Sync is **not multi-master**. Run exactly one instance as the IAM administration surface (where operators use the admin GUI / admin API); treat the others as readers. If two instances both mutate, the "loudest" writer wins and the other's mutations are lost — you'll see continuous `[config-sync] ETag mismatch on DB download — retrying` in the logs. An occasional mismatch is normal (two events inside one 5-minute poll window resolve on the next cycle); a continuous one means you have two writers.
+Any instance can accept IAM changes. Each instance keeps a copy of the database that it last shared with the bucket, and it uses that copy as a merge base. When an instance downloads a newer database, it compares both its own database and the downloaded one with the merge base, row by row, and it matches the rows by name. A change that only one side made is kept. A user, group, or provider that one side deleted is deleted on both sides. Two instances can therefore add, change, or delete different users at the same time, and every change survives.
+
+A conflict happens only when two instances change the same row before they sync. In that case, the more recent change wins, and a delete wins over an edit, because a deleted identity must not come back. Each conflict writes an `iam_sync_conflict` entry to the audit log that names the row and the side that was kept. If you want predictable results, you can still make one instance the place where operators edit IAM.
+
+The first sync after an upgrade has no merge base yet. In that sync, the copy in the bucket wins, which is the same as the behaviour of earlier versions. The merge base is stored next to the database as `deltaglider_config.db.sync-base`.
 
 If you want no writer at all, switch to `iam_mode: declarative` and manage IAM via YAML + GitOps — see [How to manage IAM as code](manage-iam-as-code.md).
 
@@ -122,7 +126,7 @@ curl -b cookies https://dgp-reader-1:9000/_/api/admin/users | jq '.[] | .name'
 aws s3 ls --endpoint-url https://dgp-reader-1:9000
 ```
 
-Watch the reader's logs for `[config-sync]` lines — a download on ETag change is the success signal; continuous ETag-mismatch retries mean two writers.
+Watch the reader's logs for `[config-sync]` lines — a download on ETag change is the success signal. An `iam_sync_conflict` audit entry means that two instances changed the same row.
 
 ## Related
 

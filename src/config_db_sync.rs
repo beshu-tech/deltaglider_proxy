@@ -775,6 +775,29 @@ struct PendingUpload {
     base_etag: Option<String>,
 }
 
+/// The DB this node last agreed with the sync bucket: the base of the
+/// three-way IAM merge (`ConfigDb::merge_iam_from`).
+pub fn sync_base_path(local_path: &std::path::Path) -> PathBuf {
+    local_path.with_extension("db.sync-base")
+}
+
+/// Record `data` (the DB bytes the bucket now holds) as the merge base.
+/// Written to a temp file and renamed, so a crash never leaves half a base.
+async fn write_sync_base(local_path: &std::path::Path, data: &[u8]) {
+    let base = sync_base_path(local_path);
+    let tmp = base.with_extension("sync-base.tmp");
+    let res = async {
+        tokio::fs::write(&tmp, data).await?;
+        tokio::fs::rename(&tmp, &base).await
+    }
+    .await;
+    if let Err(e) = res {
+        // A missing base only costs precision: the next merge lets the remote win.
+        let _ = tokio::fs::remove_file(&base).await;
+        warn!("Config DB S3 sync: could not record the merge base: {e}");
+    }
+}
+
 fn pending_marker_path(local_path: &std::path::Path) -> PathBuf {
     local_path.with_extension("db.sync-pending")
 }
@@ -819,41 +842,29 @@ pub async fn upload_with_reconcile(
                 break;
             }
         };
-        match sync.upload(data).await {
-            Ok(()) => return Ok(()),
+        match sync.upload(data.clone()).await {
+            Ok(()) => {
+                write_sync_base(&sync.local_path, &data).await;
+                return Ok(());
+            }
             Err(UploadError::Conflict) => {
                 last_err = UploadError::Conflict;
-                // Pull + merge the peer's version so the retried upload sits
-                // on top of the reconciled DB instead of clobbering it.
-                // KNOWN LIMIT: IAM tables are replace-merged (last-writer-wins,
-                // the pre-existing sync model) — a concurrent peer mutation can
-                // revert THIS node's row-level change; only session_revocations
-                // merge monotonically. Callers with security-critical intent
-                // must re-assert it after this returns (revoke does).
-                warn!(
-                    "Config DB sync ({context}): CAS conflict — merging peer state before retry; \
-                     concurrent IAM row changes resolve last-writer-wins"
-                );
-                match sync.download_if_newer().await {
-                    Ok(Some(dl)) => {
-                        let applied = reopen_and_rebuild_iam(
-                            config_db,
-                            admin_password_hash,
-                            iam_state,
-                            external_auth,
-                            sessions,
-                            &dl.temp_path,
-                            context,
-                        )
-                        .await;
-                        if applied {
-                            sync.commit_downloaded_etag(dl.etag).await;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        warn!("Config DB sync ({context}): reconcile download failed: {e}");
-                    }
+                // Pull + three-way merge the peer's version so the retried
+                // upload carries both sides' changes. Only a row changed on
+                // BOTH sides resolves last-writer-wins (audited).
+                warn!("Config DB sync ({context}): CAS conflict — merging peer state before retry");
+                if let Err(e) = pull_locked(
+                    sync,
+                    config_db,
+                    admin_password_hash,
+                    iam_state,
+                    external_auth,
+                    sessions,
+                    context,
+                )
+                .await
+                {
+                    warn!("Config DB sync ({context}): reconcile download failed: {e}");
                 }
             }
             Err(UploadError::Other(e)) => {
@@ -869,6 +880,63 @@ pub async fn upload_with_reconcile(
     sync.mark_needs_upload().await;
     warn!("Config DB sync ({context}): upload retries exhausted — queued for next poll tick");
     Err(last_err)
+}
+
+/// Download the remote DB when it changed and merge its IAM into the live DB.
+/// Returns `Ok(None)` when the local copy is current, `Ok(Some(applied))`
+/// after a download. Holds the upload lock: a merge and an upload never
+/// interleave, so the merge base always matches what the bucket held.
+#[allow(clippy::too_many_arguments)]
+pub async fn pull_and_merge(
+    sync: &ConfigDbSync,
+    config_db: &Option<Arc<Mutex<ConfigDb>>>,
+    admin_password_hash: &str,
+    iam_state: &SharedIamState,
+    external_auth: &Option<Arc<ExternalAuthManager>>,
+    sessions: Option<&Arc<crate::session::SessionStore>>,
+    context: &str,
+) -> Result<Option<bool>, String> {
+    let _guard = sync.upload_lock.lock().await;
+    pull_locked(
+        sync,
+        config_db,
+        admin_password_hash,
+        iam_state,
+        external_auth,
+        sessions,
+        context,
+    )
+    .await
+}
+
+/// `pull_and_merge` for a caller that already holds the upload lock.
+async fn pull_locked(
+    sync: &ConfigDbSync,
+    config_db: &Option<Arc<Mutex<ConfigDb>>>,
+    admin_password_hash: &str,
+    iam_state: &SharedIamState,
+    external_auth: &Option<Arc<ExternalAuthManager>>,
+    sessions: Option<&Arc<crate::session::SessionStore>>,
+    context: &str,
+) -> Result<Option<bool>, String> {
+    let Some(dl) = sync.download_if_newer().await? else {
+        return Ok(None);
+    };
+    let applied = reopen_and_rebuild_iam(
+        config_db,
+        admin_password_hash,
+        iam_state,
+        external_auth,
+        sessions,
+        &dl.temp_path,
+        context,
+    )
+    .await;
+    // Commit the ETag only on a successful merge so a failure retries.
+    if applied {
+        sync.commit_downloaded_etag(dl.etag).await;
+    }
+    Ok(Some(applied))
 }
 
 /// Reopen the config DB file after an S3-sync download has replaced it
@@ -909,15 +977,56 @@ pub async fn reopen_and_rebuild_iam(
     let db = db_arc.lock().await;
     // B3: merge ONLY the IAM tables out of the downloaded peer DB into the live
     // connection — the live coordination tables (jobs/leases/outbox/cursors)
-    // stay intact (a file swap would clobber them). Then drop the temp file.
-    let merge = db.merge_iam_from(downloaded, admin_password_hash);
-    let _ = tokio::fs::remove_file(downloaded).await;
-    if let Err(e) = merge {
-        warn!(
-            "Config DB S3 sync ({}): failed to merge IAM after download: {}",
-            context, e
+    // stay intact (a file swap would clobber them). D16: a three-way merge
+    // against the last synced DB, so a change on either side survives.
+    let base = sync_base_path(db.local_path());
+    let merge = db.merge_iam_from(downloaded, Some(&base), admin_password_hash);
+    let report = match merge {
+        Ok(report) => {
+            // The downloaded copy is what the bucket holds now: the next base.
+            if let Err(e) = tokio::fs::rename(downloaded, &base).await {
+                warn!("Config DB S3 sync ({context}): could not record the merge base: {e}");
+                let _ = tokio::fs::remove_file(downloaded).await;
+                let _ = tokio::fs::remove_file(&base).await;
+            }
+            report
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_file(downloaded).await;
+            warn!(
+                "Config DB S3 sync ({}): failed to merge IAM after download: {}",
+                context, e
+            );
+            return false;
+        }
+    };
+    if !report.base_used {
+        info!(
+            "Config DB S3 sync ({context}): no merge base yet — the remote IAM copy won \
+             (first sync or upgrade)"
         );
-        return false;
+    }
+    for c in &report.conflicts {
+        warn!(
+            "Config DB S3 sync ({context}): {} '{}' changed on this node and a peer; kept {}",
+            c.table, c.target, c.resolution
+        );
+        crate::audit::audit_log(
+            "iam_sync_conflict",
+            "config-sync",
+            &format!("{}:{} -> {}", c.table, c.target, c.resolution),
+            &axum::http::HeaderMap::new(),
+            "",
+            "",
+        );
+    }
+    if let Some(sessions) = sessions {
+        let ended = sessions.revoke_external_user_ids(&report.stale_user_ids);
+        if ended > 0 {
+            info!(
+                "Config DB S3 sync ({context}): ended {ended} external session(s) whose user id moved"
+            );
+        }
     }
 
     // Rebuild IAM index from the new DB

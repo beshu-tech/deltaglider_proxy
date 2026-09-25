@@ -1189,40 +1189,29 @@ pub async fn sync_now(
         .as_ref()
         .ok_or(axum::http::StatusCode::NOT_FOUND)?;
 
-    match sync.poll_and_sync().await {
-        Ok(Some(dl)) => {
-            // New state downloaded — merge IAM into the live DB and rebuild,
-            // exactly as the periodic poll does. Kept consistent by funnelling
-            // through the same helper (`reopen_and_rebuild_iam` in the
-            // config_db_sync module).
-            //
-            // Clone the password hash OUT of the RwLock before crossing
-            // `.await`: parking_lot guards are not Send, and holding one
-            // across an await would block the task's Send contract even
-            // though logically we only need the string value.
-            let password_hash = state.password_hash.read().clone();
-            let applied = crate::config_db_sync::reopen_and_rebuild_iam(
-                &state.config_db,
-                &password_hash,
-                &state.iam_state,
-                &state.external_auth,
-                Some(&state.sessions),
-                &dl.temp_path,
-                "sync-now endpoint",
-            )
-            .await;
-            if applied {
-                sync.commit_downloaded_etag(dl.etag).await;
-            }
-            Ok(Json(SyncNowResponse {
-                downloaded: applied,
-                status: if applied {
-                    "Downloaded newer config DB and reloaded IAM".to_string()
-                } else {
-                    "Downloaded newer config DB but IAM merge failed; will retry".to_string()
-                },
-            }))
-        }
+    let password_hash = state.password_hash.read().clone();
+    // Same helper as the periodic poll: download, three-way merge, rebuild.
+    // The hash is cloned OUT of the parking_lot lock before the await (its
+    // guard is not Send).
+    match crate::config_db_sync::pull_and_merge(
+        sync,
+        &state.config_db,
+        &password_hash,
+        &state.iam_state,
+        &state.external_auth,
+        Some(&state.sessions),
+        "sync-now endpoint",
+    )
+    .await
+    {
+        Ok(Some(applied)) => Ok(Json(SyncNowResponse {
+            downloaded: applied,
+            status: if applied {
+                "Downloaded newer config DB and reloaded IAM".to_string()
+            } else {
+                "Downloaded newer config DB but IAM merge failed; will retry".to_string()
+            },
+        })),
         Ok(None) => Ok(Json(SyncNowResponse {
             downloaded: false,
             status: "Local copy is current (ETag unchanged)".to_string(),

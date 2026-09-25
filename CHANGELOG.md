@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Changed — IAM config sync merges changes from every instance
+
+Before, a config-sync download replaced the whole IAM table set with the copy
+in the bucket. When two instances changed IAM at about the same time, one
+instance lost its change, for example a user that it had just created. Now
+each instance keeps the database that it last shared with the bucket
+(`deltaglider_config.db.sync-base`) and uses it as the base of a three-way
+merge. Rows are matched by name. A change that one side made is kept, and a
+delete on one side is a delete on both sides. When both sides change the same
+row, the more recent change wins, a delete wins over an edit, and the proxy
+writes an `iam_sync_conflict` audit entry. External identities, group members,
+and mapping rules follow their user or group by name when an id changes.
+
+Upgrade: the schema moves to v26, which adds a `sync_mtime` column to the IAM
+tables. The first sync after the upgrade has no merge base, so the copy in the
+bucket wins, as before. Upgrade every instance before you expect merges: an
+instance refuses a peer database with a different schema version.
+
 ### Changed — CLI: recursive prefixes are directories, and `rm` globs are relative
 
 `deltaglider_proxy s3 rm -r s3://releases/v2` deleted the keys under `v2/`
