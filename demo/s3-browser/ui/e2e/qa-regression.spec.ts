@@ -260,6 +260,14 @@ test('1. bootstrap login, create bucket, upload, inspect, preview, download, del
   await row('five.txt').click();
   await expect(page.getByRole('heading', { name: 'five.txt' })).toBeVisible();
   await page.getByRole('button', { name: /Delete object/ }).click();
+  // It asks first; Cancel keeps the object.
+  const confirm = page.getByRole('dialog').filter({ hasText: 'Delete permanently?' });
+  await expect(confirm).toContainText('"five.txt"');
+  await confirm.getByRole('button', { name: 'Cancel' }).click();
+  await expect(confirm).toBeHidden();
+  expect(await listKeys(BUCKET)).toContain('five.txt');
+  await page.getByRole('button', { name: /Delete object/ }).click();
+  await confirm.getByRole('button', { name: 'Delete' }).click();
   await expect(row('five.txt')).toBeHidden({ timeout: 30_000 });
   expect(await listKeys(BUCKET)).not.toContain('five.txt');
 });

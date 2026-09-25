@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react';
-import { Button, Modal, message } from 'antd';
+import { Button, message } from 'antd';
 import { DeleteOutlined, CopyOutlined, ScissorOutlined, DownloadOutlined } from '@ant-design/icons';
 import { useColors } from '../ThemeContext';
 import { pluralize } from '../utils';
@@ -7,6 +7,7 @@ import DestinationPickerModal from './DestinationPickerModal';
 import { isSessionExpired, normalizeUiError } from '../errorHandling';
 import { useBackClosesModal } from '../hooks/useOverlayClose';
 import { bulkDeleteConfirmText } from '../bulkSelection';
+import { confirmDelete } from './confirmDelete';
 
 interface Props {
   selectedCount: number;
@@ -139,13 +140,7 @@ export default function BulkActionBar({ selectedCount, selectedFolderCount = 0, 
             size="small"
             icon={<DeleteOutlined />}
             onClick={() =>
-              Modal.confirm({
-                title: 'Delete permanently?',
-                content: bulkDeleteConfirmText(selectedCount, selectedFolderCount),
-                okText: 'Delete',
-                okButtonProps: { danger: true },
-                onOk: () => onDelete?.(),
-              })
+              confirmDelete(bulkDeleteConfirmText(selectedCount, selectedFolderCount), () => onDelete?.())
             }
             loading={deleting}
             disabled={busy}

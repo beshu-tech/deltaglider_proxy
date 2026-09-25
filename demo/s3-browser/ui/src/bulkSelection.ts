@@ -72,3 +72,8 @@ export function bulkDeleteConfirmText(selectedCount: number, folderCount: number
         : ` ${folderCount} of them ${folderCount === 1 ? 'is a folder' : 'are folders'}: everything inside is deleted too.`;
   return `Delete ${items}?${folders} This cannot be undone.`;
 }
+
+/** The inspector's single-object delete confirmation text. */
+export function objectDeleteConfirmText(key: string): string {
+  return `Delete "${key}"? This cannot be undone.`;
+}

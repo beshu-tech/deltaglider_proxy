@@ -13,7 +13,7 @@ const { outputText } = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.ES2020, target: ts.ScriptTarget.ES2020 },
   fileName: 'bulkSelection.ts',
 });
-const { expandSelection, bulkDeleteConfirmText } = await import(
+const { expandSelection, bulkDeleteConfirmText, objectDeleteConfirmText } = await import(
   `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`
 );
 
@@ -67,5 +67,9 @@ await assert.rejects(
 assert.equal(bulkDeleteConfirmText(2, 0), 'Delete 2 selected items? This cannot be undone.');
 assert.equal(bulkDeleteConfirmText(1, 1), 'Delete 1 selected item? It is a folder: everything inside is deleted too. This cannot be undone.');
 assert.equal(bulkDeleteConfirmText(3, 1), 'Delete 3 selected items? 1 of them is a folder: everything inside is deleted too. This cannot be undone.');
+
+// The inspector's single-object delete confirms too (it used to delete on the
+// first click), naming the object.
+assert.equal(objectDeleteConfirmText('builds/v1/app.zip'), 'Delete "builds/v1/app.zip"? This cannot be undone.');
 
 console.log('bulk-selection regression checks passed');

@@ -9,6 +9,8 @@ import { bucketPolicyFor } from '../bucketPolicyLookup';
 import type { S3Object } from '../types';
 import { useColors } from '../ThemeContext';
 import { getPreviewMode } from './filePreviewMode';
+import { confirmDelete } from './confirmDelete';
+import { objectDeleteConfirmText } from '../bulkSelection';
 import { useAdminConfig } from '../queries/config';
 import { useOnClickOutside } from '../useDocumentEvent';
 import { useBackClosesModal } from '../hooks/useOverlayClose';
@@ -754,7 +756,7 @@ export default function InspectorPanel({
               <Button
                 block
                 icon={<DeleteOutlined />}
-                onClick={handleDelete}
+                onClick={() => confirmDelete(objectDeleteConfirmText(object.key), handleDelete)}
                 style={{
                   background: 'transparent',
                   borderColor: BORDER,
