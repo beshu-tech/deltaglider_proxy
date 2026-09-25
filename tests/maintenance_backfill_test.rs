@@ -363,12 +363,8 @@ async fn backfill_s3_self_copy_preserves_etag_and_served_time() {
 /// x-amz-meta-* keys, Cache-Control and Content-Disposition. (The unit
 /// fixture in backfill.rs puts user metadata on the fallback shape, which
 /// production never emits: the S3 fallback HEAD returns no user metadata.)
-///
-/// IGNORED until `storage/s3.rs` `replace_metadata_in_place` /
-/// `put_passthrough_metadata` carries the pre-copy HEAD's headers into the
-/// REPLACE request (storage agent's file). Remove the `ignore` with that fix.
+/// The pure plan is unit-tested in storage/s3.rs (`self_copy_plan_*`).
 #[tokio::test]
-#[ignore = "D17: needs the storage/s3.rs self-copy to restate foreign headers"]
 async fn backfill_s3_self_copy_keeps_foreign_headers() {
     skip_unless_minio!();
     let bucket = "backfill-s3-headers";

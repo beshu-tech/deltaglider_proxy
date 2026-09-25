@@ -87,6 +87,104 @@ pub static DELEGATED_LIST_PROBE_REQUESTS: std::sync::LazyLock<prometheus::IntCou
         .expect("valid metric")
     });
 
+/// What a metadata self-copy (MetadataDirective REPLACE) must restate so
+/// the object keeps everything that is not DG metadata (D17).
+/// NOT restated: the ACL (CopyObject never copies it; the object gets the
+/// bucket default), Object Lock settings, and tags (copied by default).
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct SelfCopyPlan {
+    pub metadata: HashMap<String, String>,
+    pub cache_control: Option<String>,
+    pub content_disposition: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_language: Option<String>,
+    pub expires: Option<aws_sdk_s3::primitives::DateTime>,
+    pub website_redirect_location: Option<String>,
+    pub storage_class: Option<aws_sdk_s3::types::StorageClass>,
+    pub sse: Option<aws_sdk_s3::types::ServerSideEncryption>,
+    pub kms_key_id: Option<String>,
+    pub bucket_key_enabled: Option<bool>,
+}
+
+/// Metadata keys DG owns: the new metadata restates them, so stale values
+/// from the HEAD are dropped (the pre-D17 behaviour for these keys).
+fn is_dg_owned_meta_key(key: &str) -> bool {
+    const LEGACY: &[&str] = &[
+        "tool",
+        "original-name",
+        "source-name",
+        "file-sha256",
+        "file-size",
+        "created-at",
+        "note",
+        "ref-path",
+        "ref-key",
+        "ref-sha256",
+        "delta-size",
+        "delta-cmd",
+        "content-type",
+    ];
+    let k = key.to_ascii_lowercase();
+    k.starts_with("dg-") || k.starts_with("user-") || LEGACY.contains(&k.as_str())
+}
+
+/// Pure: build the self-copy plan from the pre-copy HEAD and the new DG
+/// metadata. `native_sse_configured` = the backend sets its own SSE on the
+/// request; otherwise the object's current SSE is kept.
+pub(crate) fn self_copy_plan(
+    head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+    dg_metadata: HashMap<String, String>,
+    native_sse_configured: bool,
+) -> SelfCopyPlan {
+    use aws_sdk_s3::types::{ServerSideEncryption, StorageClass};
+    let mut metadata: HashMap<String, String> = head
+        .metadata()
+        .map(|m| {
+            m.iter()
+                .filter(|(k, _)| !is_dg_owned_meta_key(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    metadata.extend(dg_metadata);
+    let (sse, kms_key_id, bucket_key_enabled) = if native_sse_configured {
+        (None, None, None)
+    } else {
+        let sse = head.server_side_encryption().cloned();
+        let kms = matches!(
+            sse,
+            Some(ServerSideEncryption::AwsKms | ServerSideEncryption::AwsKmsDsse)
+        );
+        (
+            sse,
+            head.ssekms_key_id().filter(|_| kms).map(String::from),
+            head.bucket_key_enabled().filter(|_| kms),
+        )
+    };
+    SelfCopyPlan {
+        metadata,
+        cache_control: head.cache_control().map(String::from),
+        content_disposition: head.content_disposition().map(String::from),
+        content_encoding: head.content_encoding().map(String::from),
+        content_language: head.content_language().map(String::from),
+        expires: head.expires_string().and_then(|s| {
+            aws_sdk_s3::primitives::DateTime::from_str(
+                s,
+                aws_sdk_s3::primitives::DateTimeFormat::HttpDate,
+            )
+            .ok()
+        }),
+        website_redirect_location: head.website_redirect_location().map(String::from),
+        storage_class: head
+            .storage_class()
+            .filter(|c| **c != StorageClass::Standard)
+            .cloned(),
+        sse,
+        kms_key_id,
+        bucket_key_enabled,
+    }
+}
+
 /// Resolve an object's `created_at` from its (optional) `dg-created-at`
 /// metadata value, falling back to `fallback` (the object's stable S3
 /// `LastModified`) when the value is absent OR unparseable.
@@ -638,7 +736,22 @@ impl S3Backend {
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
         let copy_source = format!("{}/{}", bucket, encode_copy_source_key(key));
-        let headers = self.metadata_to_headers(metadata);
+        // HEAD first: REPLACE drops everything the request does not restate
+        // (a foreign object's own metadata and headers, D17).
+        BACKEND_HEAD_REQUESTS.inc();
+        let head = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::HeadObject))?;
+        let plan = self_copy_plan(
+            &head,
+            self.metadata_to_headers(metadata),
+            !matches!(self.native_encryption, NativeEncryptionConfig::None),
+        );
 
         let mut request = self
             .client
@@ -646,7 +759,17 @@ impl S3Backend {
             .bucket(bucket)
             .copy_source(&copy_source)
             .key(key)
-            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace);
+            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+            .set_cache_control(plan.cache_control)
+            .set_content_disposition(plan.content_disposition)
+            .set_content_encoding(plan.content_encoding)
+            .set_content_language(plan.content_language)
+            .set_expires(plan.expires)
+            .set_website_redirect_location(plan.website_redirect_location)
+            .set_storage_class(plan.storage_class)
+            .set_server_side_encryption(plan.sse)
+            .set_ssekms_key_id(plan.kms_key_id)
+            .set_bucket_key_enabled(plan.bucket_key_enabled);
         if let Some(ct) = metadata.content_type.as_deref() {
             request = request.content_type(ct);
         }
@@ -669,7 +792,7 @@ impl S3Backend {
             }
         }
 
-        for (k, v) in headers {
+        for (k, v) in plan.metadata {
             request = request.metadata(k, v);
         }
 
@@ -2851,6 +2974,80 @@ fn apply_native_encryption_mpu(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn foreign_head() -> aws_sdk_s3::operation::head_object::HeadObjectOutput {
+        use aws_sdk_s3::types::{ServerSideEncryption, StorageClass};
+        aws_sdk_s3::operation::head_object::HeadObjectOutput::builder()
+            .metadata("owner", "bob")
+            .metadata("dg-note", "stale")
+            .metadata("user-old", "stale")
+            .metadata("file-sha256", "legacy-stale")
+            .cache_control("max-age=60")
+            .content_disposition("attachment")
+            .content_encoding("gzip")
+            .content_language("it")
+            .expires_string("Wed, 21 Oct 2026 07:28:00 GMT")
+            .website_redirect_location("/elsewhere")
+            .storage_class(StorageClass::StandardIa)
+            .server_side_encryption(ServerSideEncryption::AwsKms)
+            .ssekms_key_id("arn:kms:k1")
+            .bucket_key_enabled(true)
+            .build()
+    }
+
+    /// D17: REPLACE drops what the request does not restate. The plan keeps
+    /// every foreign x-amz-meta-* key and the object's own headers; the
+    /// DG-owned keys (dg-*, user-*, legacy aliases) come only from the new
+    /// metadata, as before.
+    #[test]
+    fn self_copy_plan_restates_foreign_headers() {
+        use aws_sdk_s3::types::{ServerSideEncryption, StorageClass};
+        let dg = HashMap::from([
+            ("dg-tool".to_string(), "t".to_string()),
+            ("user-new".to_string(), "v".to_string()),
+        ]);
+        let plan = self_copy_plan(&foreign_head(), dg, false);
+        assert_eq!(plan.metadata.get("owner").map(String::as_str), Some("bob"));
+        assert_eq!(plan.metadata.get("dg-tool").map(String::as_str), Some("t"));
+        assert_eq!(plan.metadata.get("user-new").map(String::as_str), Some("v"));
+        for gone in ["dg-note", "user-old", "file-sha256"] {
+            assert!(!plan.metadata.contains_key(gone), "stale {gone} kept");
+        }
+        assert_eq!(plan.cache_control.as_deref(), Some("max-age=60"));
+        assert_eq!(plan.content_disposition.as_deref(), Some("attachment"));
+        assert_eq!(plan.content_encoding.as_deref(), Some("gzip"));
+        assert_eq!(plan.content_language.as_deref(), Some("it"));
+        assert!(plan.expires.is_some(), "Expires must be restated");
+        assert_eq!(
+            plan.website_redirect_location.as_deref(),
+            Some("/elsewhere")
+        );
+        assert_eq!(plan.storage_class, Some(StorageClass::StandardIa));
+        // No native encryption configured: keep the object's own SSE.
+        assert_eq!(plan.sse, Some(ServerSideEncryption::AwsKms));
+        assert_eq!(plan.kms_key_id.as_deref(), Some("arn:kms:k1"));
+        assert_eq!(plan.bucket_key_enabled, Some(true));
+        // With native encryption configured, the backend's settings win.
+        let native = self_copy_plan(&foreign_head(), HashMap::new(), true);
+        assert_eq!(native.sse, None);
+        assert_eq!(native.kms_key_id, None);
+    }
+
+    /// STANDARD is the default: restating it is harmless but some
+    /// S3-compatibles reject an explicit class they do not support.
+    #[test]
+    fn self_copy_plan_omits_default_storage_class_and_sse_s3_key() {
+        use aws_sdk_s3::types::{ServerSideEncryption, StorageClass};
+        let head = aws_sdk_s3::operation::head_object::HeadObjectOutput::builder()
+            .storage_class(StorageClass::Standard)
+            .server_side_encryption(ServerSideEncryption::Aes256)
+            .build();
+        let plan = self_copy_plan(&head, HashMap::new(), false);
+        assert_eq!(plan.storage_class, None);
+        assert_eq!(plan.sse, Some(ServerSideEncryption::Aes256));
+        assert_eq!(plan.kms_key_id, None);
+        assert_eq!(plan.bucket_key_enabled, None);
+    }
 
     /// A client LIST resolves a delta stub from the listing-size cache only
     /// when the cache holds exactly the listed stored object; a miss keeps
