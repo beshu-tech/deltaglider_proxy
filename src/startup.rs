@@ -1694,6 +1694,26 @@ pub async fn init_config_sync(
         }
     }
 
+    // An upload parked before the restart goes FIRST: downloading would merge
+    // the remote copy over the local change it carries.
+    if sync.take_needs_upload() {
+        match deltaglider_proxy::config_db_sync::upload_with_reconcile(
+            &sync,
+            config_db,
+            admin_password_hash,
+            iam_state,
+            external_auth,
+            Some(sessions),
+            "startup flush",
+        )
+        .await
+        {
+            Ok(()) => info!("Config DB S3 sync: parked upload flushed at startup"),
+            Err(e) => warn!("Config DB S3 sync: parked upload flush failed (stays parked): {e}"),
+        }
+        return Some(sync);
+    }
+
     // Try to download a newer version from S3
     match sync.download_if_newer().await {
         Ok(Some(dl)) => {

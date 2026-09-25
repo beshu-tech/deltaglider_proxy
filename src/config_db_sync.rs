@@ -109,26 +109,59 @@ impl ConfigDbSync {
             }
         }
 
+        // A park from before a restart comes back with the ETag its change
+        // was based on, so the flush can still CAS on top of it.
+        let pending = read_pending_marker(&pending_marker_path(&local_path));
+        if pending.is_some() {
+            warn!(
+                "Config DB S3 sync: an upload parked before the restart is pending — \
+                 it is flushed before any download"
+            );
+        }
         Ok(Self {
             s3_client: client,
             bucket: sync_bucket,
             object_key,
+            last_etag: Arc::new(RwLock::new(
+                pending.as_ref().and_then(|p| p.base_etag.clone()),
+            )),
             local_path,
-            last_etag: Arc::new(RwLock::new(None)),
             bootstrap_password_hash,
-            needs_upload: AtomicBool::new(false),
+            needs_upload: AtomicBool::new(pending.is_some()),
             upload_lock: tokio::sync::Mutex::new(()),
         })
     }
 
     /// Queue an upload for the next poll tick (set after retry exhaustion).
-    pub fn mark_needs_upload(&self) {
+    /// Persisted next to the DB (with the base ETag), so a restart does not
+    /// drop the change: the boot flushes it instead of downloading over it.
+    pub async fn mark_needs_upload(&self) {
         self.needs_upload.store(true, Ordering::SeqCst);
+        let marker = PendingUpload {
+            base_etag: self.last_etag.read().await.clone(),
+        };
+        let path = pending_marker_path(&self.local_path);
+        let body = serde_json::to_vec(&marker).unwrap_or_default();
+        if let Err(e) = tokio::fs::write(&path, body).await {
+            warn!(
+                "Config DB S3 sync: could not persist the pending upload marker {}: {e}",
+                path.display()
+            );
+        }
+    }
+
+    /// True while an upload is parked (in memory or from before a restart).
+    pub fn has_pending_upload(&self) -> bool {
+        self.needs_upload.load(Ordering::SeqCst)
     }
 
     /// Consume the pending-upload flag (the poll flush claims the work).
     pub fn take_needs_upload(&self) -> bool {
-        self.needs_upload.swap(false, Ordering::SeqCst)
+        let taken = self.needs_upload.swap(false, Ordering::SeqCst);
+        if taken {
+            let _ = std::fs::remove_file(pending_marker_path(&self.local_path));
+        }
+        taken
     }
 
     /// Build an S3 client from BackendConfig, reusing the same credentials.
@@ -339,11 +372,10 @@ impl ConfigDbSync {
     /// On a precondition failure the upload is reported as
     /// [`UploadError::Conflict`]; `upload_with_reconcile` pulls the peer's
     /// version, merges, and retries on top of the reconciled DB.
-    pub async fn upload(&self) -> Result<(), UploadError> {
-        let data = tokio::fs::read(&self.local_path)
-            .await
-            .map_err(|e| UploadError::Other(format!("Failed to read local config DB: {}", e)))?;
-
+    /// `data` is a consistent snapshot of the DB file: read it with
+    /// [`read_db_snapshot`] (under the DB lock), never straight from disk while
+    /// the connection may be mid-commit (a torn upload).
+    pub async fn upload(&self, data: Vec<u8>) -> Result<(), UploadError> {
         if data.is_empty() {
             return Err(UploadError::Other(
                 "Local config DB is empty — refusing to upload".to_string(),
@@ -767,6 +799,39 @@ fn classify_upload_error(err_str: &str) -> UploadError {
     }
 }
 
+/// Read the DB file while holding the DB lock. Every write goes through the
+/// one locked connection, so no commit can be half-written while we read.
+async fn read_db_snapshot(
+    sync: &ConfigDbSync,
+    config_db: &Option<Arc<Mutex<ConfigDb>>>,
+) -> Result<Vec<u8>, String> {
+    let _guard = match config_db {
+        Some(db) => Some(db.lock().await),
+        None => None,
+    };
+    tokio::fs::read(&sync.local_path)
+        .await
+        .map_err(|e| format!("Failed to read local config DB: {e}"))
+}
+
+/// On-disk park of an upload that exhausted its retries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PendingUpload {
+    /// The remote ETag the parked change was based on (`None` after a
+    /// conflict: the flush then reconciles, last-writer-wins).
+    base_etag: Option<String>,
+}
+
+fn pending_marker_path(local_path: &std::path::Path) -> PathBuf {
+    local_path.with_extension("db.sync-pending")
+}
+
+fn read_pending_marker(path: &std::path::Path) -> Option<PendingUpload> {
+    let bytes = std::fs::read(path).ok()?;
+    // An unreadable marker still means "an upload is pending".
+    Some(serde_json::from_slice(&bytes).unwrap_or(PendingUpload { base_etag: None }))
+}
+
 /// Maximum upload attempts before parking the work on the poll flush.
 const MAX_UPLOAD_ATTEMPTS: u32 = 3;
 
@@ -792,7 +857,16 @@ pub async fn upload_with_reconcile(
     let _guard = sync.upload_lock.lock().await;
     let mut last_err = UploadError::Other("upload never attempted".to_string());
     for attempt in 1..=MAX_UPLOAD_ATTEMPTS {
-        match sync.upload().await {
+        // Re-read per attempt: a reconcile below changes the file.
+        let data = match read_db_snapshot(sync, config_db).await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("Config DB sync ({context}): {e}");
+                last_err = UploadError::Other(e);
+                break;
+            }
+        };
+        match sync.upload(data).await {
             Ok(()) => return Ok(()),
             Err(UploadError::Conflict) => {
                 last_err = UploadError::Conflict;
@@ -839,7 +913,7 @@ pub async fn upload_with_reconcile(
             tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
         }
     }
-    sync.mark_needs_upload();
+    sync.mark_needs_upload().await;
     warn!("Config DB sync ({context}): upload retries exhausted — queued for next poll tick");
     Err(last_err)
 }
@@ -946,6 +1020,82 @@ pub async fn reopen_and_rebuild_iam(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dead_s3_backend() -> BackendConfig {
+        BackendConfig::S3 {
+            // Port 1: connection refused, so every upload fails fast.
+            endpoint: Some("http://127.0.0.1:1".into()),
+            region: "us-east-1".into(),
+            force_path_style: true,
+            access_key_id: Some("k".into()),
+            secret_access_key: Some("s".into()),
+            allow_local: true,
+        }
+    }
+
+    /// D16: an upload that exhausts its retries (S3 down) is parked for the
+    /// poll flush. The park must survive a restart, together with the ETag
+    /// the change was based on: otherwise the next boot downloads the remote
+    /// copy over the local change, and the change (already answered 200) is
+    /// lost on every node.
+    #[tokio::test]
+    async fn parked_upload_survives_a_restart_with_its_base_etag() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("deltaglider_config.db");
+        let db = Arc::new(Mutex::new(
+            ConfigDb::open_or_create(&db_path, "pw").unwrap(),
+        ));
+        let sync = ConfigDbSync::new(
+            &dead_s3_backend(),
+            "sync".into(),
+            "k.db".into(),
+            db_path.clone(),
+            "pw".into(),
+        )
+        .await
+        .unwrap();
+        sync.commit_downloaded_etag(Some("\"base\"".into())).await;
+        let iam: SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Disabled));
+        let res =
+            upload_with_reconcile(&sync, &Some(db.clone()), "pw", &iam, &None, None, "test").await;
+        assert!(res.is_err(), "the dead endpoint must fail the upload");
+        drop(sync);
+
+        let restarted = ConfigDbSync::new(
+            &dead_s3_backend(),
+            "sync".into(),
+            "k.db".into(),
+            db_path.clone(),
+            "pw".into(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            restarted.has_pending_upload(),
+            "the parked upload was lost on restart"
+        );
+        assert_eq!(
+            restarted.last_etag.read().await.as_deref(),
+            Some("\"base\""),
+            "the base ETag must come back, or the flush 412s and loses the change"
+        );
+        assert!(restarted.take_needs_upload());
+        assert!(!restarted.has_pending_upload(), "take clears the park");
+        drop(restarted);
+        let again = ConfigDbSync::new(
+            &dead_s3_backend(),
+            "sync".into(),
+            "k.db".into(),
+            db_path,
+            "pw".into(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !again.has_pending_upload(),
+            "a taken park must not come back"
+        );
+    }
 
     fn head_error(
         status: u16,
