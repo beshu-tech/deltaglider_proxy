@@ -1358,7 +1358,7 @@ async fn copy_one_object(
 /// when nothing copied. (A fuller fix would classify on the typed StorageError
 /// variant before the retry loop — deferred; substring + the page gate closes
 /// the prod incident without re-plumbing the engine error type.)
-fn is_destination_fatal(err: &str) -> bool {
+pub(crate) fn is_destination_fatal(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
     // Dest bucket missing / account suspended (StorageError::BucketNotFound's
     // Display is "Bucket not found: …"; Backblaze returns NoSuchBucket).
@@ -1388,7 +1388,7 @@ fn is_destination_fatal(err: &str) -> bool {
 /// this be a throttle" — the caller's page-level gate (several throttled
 /// objects AND zero successes) keeps a stray token from aborting a healthy
 /// run. Pure so the truth table is unit-tested.
-fn is_backend_throttled(err: &str) -> bool {
+pub(crate) fn is_backend_throttled(err: &str) -> bool {
     let e = err.to_ascii_lowercase();
     e.contains("slowdown")
         || e.contains("throttl") // "throttled"/"throttling" (StorageError::Throttled Display)

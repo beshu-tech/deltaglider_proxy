@@ -660,33 +660,136 @@ async fn drain_rules(
             }
         }
     };
-    let read_from = cursors.values().copied().min().unwrap_or(global);
-    let rows = {
+    let lease_ttl = super::scheduler::lease_ttl_secs(replication);
+    let mut advanced = false;
+
+    // No enabled rule: every row is handled; the global cursor catches up.
+    if rule_names.is_empty() {
         let dbg = db.lock().await;
-        match dbg.event_outbox_since(read_from, DRAIN_BATCH) {
-            Ok(r) => r,
+        let rows_max = match dbg.event_outbox_since(global, DRAIN_BATCH) {
+            Ok(r) => r.last().map(|r| r.id).unwrap_or(global),
             Err(e) => {
                 warn!("event consumer: failed to read outbox: {e}");
                 return;
             }
+        };
+        let next_global = global_watermark(&cursors, global, rows_max);
+        if next_global > global {
+            let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, next_global, now);
+            drop(dbg);
+            super::state_store::bump_replication_event_version();
         }
-    };
-    if rows.is_empty() {
         return;
     }
 
-    let lease_ttl = super::scheduler::lease_ttl_secs(replication);
+    // Each rule reads its batch from its OWN cursor. One shared read from the
+    // slowest cursor let a rule held a whole batch behind (busy lease, a
+    // failing key) fill every batch with rows the other rules had already
+    // handled: they stalled too, one batch later.
+    for rule_name in &rule_names {
+        let rule_cursor = cursors.get(*rule_name).copied().unwrap_or(global);
+        let rows = {
+            let dbg = db.lock().await;
+            match dbg.event_outbox_since(rule_cursor, DRAIN_BATCH) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("event consumer: failed to read outbox: {e}");
+                    return;
+                }
+            }
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        // The ids whose key-action failed (the rule's cursor stops there).
+        let mut failed_ids: BTreeMap<String, std::collections::BTreeSet<i64>> = BTreeMap::new();
+        let groups = group_events_by_key(&rows);
+        if drain_rule_rows(
+            config,
+            db,
+            engine,
+            gate,
+            replication,
+            lease,
+            claims,
+            instance_id,
+            now,
+            lease_ttl,
+            global,
+            rule_name,
+            rule_cursor,
+            &groups,
+            &mut failed_ids,
+        )
+        .await
+        .is_break()
+        {
+            warn!("event consumer: aborting drain, cursors held");
+            break;
+        }
+        // Advance the rule's cursor to its highest CONTIGUOUS handled id
+        // (anything at or past its first failed id is left for next tick).
+        let next = rule_watermark(&rows, failed_ids.get(*rule_name), rule_cursor);
+        if next > rule_cursor {
+            let dbg = db.lock().await;
+            let _ = dbg.listener_cursor_advance(
+                &rule_listener(rule_name),
+                next,
+                current_unix_seconds(),
+            );
+            cursors.insert(rule_name.to_string(), next);
+            advanced = true;
+        }
+    }
 
-    let groups = group_events_by_key(&rows);
+    {
+        let dbg = db.lock().await;
+        let next_global = global_watermark(&cursors, global, global);
+        if next_global > global {
+            let _ = dbg.listener_cursor_advance(
+                REPLICATION_LISTENER,
+                next_global,
+                current_unix_seconds(),
+            );
+            advanced = true;
+        }
+        debug!(
+            "event consumer: global cursor {} -> {}",
+            global, next_global
+        );
+    }
+    if advanced {
+        // Settle barrier: a drain that advanced a cursor handled real events.
+        // Bump after the advance so a test polling the event-version can wait on
+        // a drain instead of polling S3 / sleeping (event-driven writes no run).
+        super::state_store::bump_replication_event_version();
+    }
+}
 
-    // Per rule: the ids whose key-action failed (the rule's cursor stops there).
-    let mut failed_ids: BTreeMap<String, std::collections::BTreeSet<i64>> = BTreeMap::new();
-
-    for ((bucket, key), recs) in &groups {
+/// One rule's pass over its own batch (`groups`, already past its cursor).
+/// `Break` = abort the drain (a lease or state read failed): hold the cursor.
+#[allow(clippy::too_many_arguments)]
+async fn drain_rule_rows(
+    config: &crate::config::SharedConfig,
+    db: &Arc<Mutex<ConfigDb>>,
+    engine: &Arc<crate::deltaglider::DynEngine>,
+    gate: &crate::maintenance::gate::MaintenanceGate,
+    replication: &crate::config_sections::ReplicationConfig,
+    lease: &dyn CoordinationLease,
+    claims: &mut std::collections::HashMap<String, RuleClaim>,
+    instance_id: &str,
+    now: i64,
+    lease_ttl: i64,
+    global: i64,
+    rule_name: &str,
+    rule_cursor: i64,
+    groups: &BTreeMap<(&str, &str), Vec<&EventOutboxRecord>>,
+    failed_ids: &mut BTreeMap<String, std::collections::BTreeSet<i64>>,
+) -> std::ops::ControlFlow<()> {
+    for ((bucket, key), recs) in groups {
+        let (bucket, key) = (*bucket, *key);
         let matched = match_rules(&replication.rules, bucket, key);
-        for rule in matched {
-            // Only the events past THIS rule's cursor.
-            let rule_cursor = cursors.get(&rule.name).copied().unwrap_or(global);
+        for rule in matched.into_iter().filter(|r| r.name == rule_name) {
             let sub: Vec<&EventOutboxRecord> = recs
                 .iter()
                 .copied()
@@ -787,10 +890,7 @@ async fn drain_rules(
                     continue;
                 }
                 RuleClaim::Skip => continue,
-                RuleClaim::Abort => {
-                    warn!("event consumer: aborting drain, cursors held");
-                    return;
-                }
+                RuleClaim::Abort => return std::ops::ControlFlow::Break(()),
             }
 
             let outcome = apply_action(engine, db, rule, bucket, key, action).await;
@@ -832,6 +932,18 @@ async fn drain_rules(
                     if err.downcast_ref::<PermanentKeyError>().is_some() {
                         continue;
                     }
+                    // A destination-wide or transient failure (bucket gone,
+                    // quota, throttle, 5xx, timeout) is not about THIS key:
+                    // it never counts toward giving up, or a short outage
+                    // gave up on every key and dropped its events.
+                    let signal = crate::transfer::error_signal(
+                        &err.to_string(),
+                        &[key, bucket, &rule.destination.bucket],
+                    );
+                    if !failure_counts_toward_give_up(&signal) {
+                        hold();
+                        continue;
+                    }
                     let attempts = dbg
                         .replication_record_object_failure(&rule.name, key, &err.to_string(), now)
                         .unwrap_or(0);
@@ -853,39 +965,17 @@ async fn drain_rules(
         }
     }
 
-    // Advance each rule's cursor to its highest CONTIGUOUS handled id
-    // (anything at or past its first failed id is left for next tick).
-    let rows_max = rows.last().map(|r| r.id).unwrap_or(global);
-    let mut advanced = false;
-    {
-        let dbg = db.lock().await;
-        let t = current_unix_seconds();
-        for (name, cursor) in cursors.iter_mut() {
-            let next = rule_watermark(&rows, failed_ids.get(name), *cursor);
-            if next > *cursor {
-                let _ = dbg.listener_cursor_advance(&rule_listener(name), next, t);
-                *cursor = next;
-                advanced = true;
-            }
-        }
-        let next_global = global_watermark(&cursors, global, rows_max);
-        if next_global > global {
-            let _ = dbg.listener_cursor_advance(REPLICATION_LISTENER, next_global, t);
-            advanced = true;
-        }
-        debug!(
-            "event consumer: global cursor {} -> {} ({} events read)",
-            global,
-            next_global,
-            rows.len()
-        );
-    }
-    if advanced {
-        // Settle barrier: a drain that advanced a cursor handled real events.
-        // Bump after the advance so a test polling the event-version can wait on
-        // a drain instead of polling S3 / sleeping (event-driven writes no run).
-        super::state_store::bump_replication_event_version();
-    }
+    std::ops::ControlFlow::Continue(())
+}
+
+/// Pure: may this failure (its text with user names removed) count toward
+/// giving up on the key? Only a key-specific fault may. Destination-wide and
+/// transient faults hold the key until they clear.
+fn failure_counts_toward_give_up(signal: &str) -> bool {
+    !(super::worker::is_destination_fatal(signal)
+        || super::worker::is_backend_throttled(signal)
+        || crate::transfer::is_transient_copy_error(signal)
+        || signal.to_ascii_lowercase().contains("overloaded"))
 }
 
 /// Pure: has a key used up its attempts?
@@ -1639,8 +1729,17 @@ mod per_rule_cursor_tests {
     }
 
     async fn put(db: &Arc<Mutex<ConfigDb>>, engine: &DynEngine, key: &str) -> i64 {
+        put_bytes(db, engine, key, b"data").await
+    }
+
+    async fn put_bytes(
+        db: &Arc<Mutex<ConfigDb>>,
+        engine: &DynEngine,
+        key: &str,
+        body: &[u8],
+    ) -> i64 {
         engine
-            .store("src", key, b"data", None, Default::default())
+            .store("src", key, body, None, Default::default())
             .await
             .unwrap();
         db.lock()
@@ -1712,11 +1811,24 @@ mod per_rule_cursor_tests {
 
     /// A key that keeps failing holds its rule's cursor for
     /// MAX_EVENT_KEY_ATTEMPTS drains, then the rule gives up on it (with a
-    /// failure row) and moves on.
+    /// failure row) and moves on. The fault must be about the KEY (here: its
+    /// delta reference is gone); a destination-wide fault never gives up.
     #[tokio::test]
     async fn a_failing_key_stops_holding_the_cursor_after_n_attempts() {
-        let (_d, db, config, engine) = fixture(vec![rule("a", "no-such-bucket")]).await;
-        let id = put(&db, &engine, "k.bin").await;
+        let (d, db, config, engine) = fixture(vec![rule("a", "dst-a")]).await;
+        let body: Vec<u8> = (0..65_536u32).map(|n| (n % 7) as u8).collect();
+        let id = put_bytes(&db, &engine, "k.zip", &body).await;
+        let mut refs = 0;
+        for entry in walkdir::WalkDir::new(d.path()).into_iter().flatten() {
+            if entry.file_name() == "reference.bin" {
+                std::fs::remove_file(entry.path()).unwrap();
+                refs += 1;
+            }
+        }
+        assert_eq!(
+            refs, 1,
+            "the delta object's reference must exist to break it"
+        );
         let lease = BusyFor("none");
         for attempt in 1..MAX_EVENT_KEY_ATTEMPTS {
             drain(&config, &db, &engine, &lease).await;
@@ -1776,6 +1888,27 @@ mod per_rule_cursor_tests {
     }
 
     #[test]
+    fn only_key_specific_failures_count_toward_give_up() {
+        for wide in [
+            "Storage error: Bucket not found: <name>",
+            "NoSuchBucket",
+            "QuotaExceeded",
+            "Backend throttled: SlowDown",
+            "S3 error: service unavailable (status=503)",
+            "operation timed out",
+            "Service overloaded: all delta codec slots busy",
+        ] {
+            assert!(!failure_counts_toward_give_up(wide), "{wide}");
+        }
+        for key_fault in [
+            "Missing reference for deltaspace: x",
+            "Checksum mismatch for <name>: expected a, got b",
+        ] {
+            assert!(failure_counts_toward_give_up(key_fault), "{key_fault}");
+        }
+    }
+
+    #[test]
     fn global_watermark_is_the_slowest_rule() {
         let c = BTreeMap::from([("a".to_string(), 5), ("b".to_string(), 9)]);
         assert_eq!(global_watermark(&c, 3, 12), 5);
@@ -1790,7 +1923,6 @@ mod per_rule_cursor_tests {
     /// the same rows, all at or below the other rule's cursor, so the other
     /// rule stalls again: the head-of-line block, one batch later.
     #[tokio::test]
-    #[ignore = "review2: pending fix"]
     async fn review2_a_busy_rule_does_not_stall_another_rule_past_one_batch() {
         let (_d, db, config, engine) = fixture(vec![rule("a", "dst-a"), rule("b", "dst-b")]).await;
         for i in 0..DRAIN_BATCH {
@@ -1813,7 +1945,6 @@ mod per_rule_cursor_tests {
     /// the rule gives up on all of them. Once the outage ends, nothing copies
     /// those events until the next reconcile run (default interval 24 h).
     #[tokio::test]
-    #[ignore = "review2: pending fix"]
     async fn review2_a_short_destination_outage_does_not_drop_events() {
         let (_d, db, config, engine) = fixture(vec![rule("a", "dst-late")]).await;
         put(&db, &engine, "k.bin").await;
