@@ -909,6 +909,46 @@ fn enc_fingerprint(meta: &crate::types::FileMetadata) -> EncFingerprint {
     }
 }
 
+/// Does the target object hold the same content as the source?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContentVerdict {
+    /// Same size and the same SHA-256 (or MD5) on both sides.
+    Same,
+    /// Size or fingerprint differs: a stale copy.
+    Differs,
+    /// No fingerprint both sides carry (e.g. a foreign object without DG
+    /// metadata): cannot prove a match.
+    Unknown,
+    /// Not on the target (or the source HEAD failed).
+    Missing,
+}
+
+/// Pure: compare source and target metadata. Only `Same` lets a caller skip
+/// a copy (migrate, lifecycle transition); a false `Differs`/`Unknown` only
+/// costs a re-copy.
+pub(crate) fn content_verdict(
+    src: &crate::types::FileMetadata,
+    dst: Option<&crate::types::FileMetadata>,
+) -> ContentVerdict {
+    let Some(dst) = dst else {
+        return ContentVerdict::Missing;
+    };
+    if src.file_size != dst.file_size {
+        return ContentVerdict::Differs;
+    }
+    if !src.file_sha256.is_empty() && !dst.file_sha256.is_empty() {
+        return if src.file_sha256 == dst.file_sha256 {
+            ContentVerdict::Same
+        } else {
+            ContentVerdict::Differs
+        };
+    }
+    if !src.md5.is_empty() && src.md5 == dst.md5 {
+        return ContentVerdict::Same;
+    }
+    ContentVerdict::Unknown
+}
+
 /// Pure: does `fresh` (source delta metadata read AFTER the blob) still name
 /// the generation of `head`, and does the blob have that generation's size?
 /// Missing metadata (deleted, or now passthrough) is "changed".
@@ -1321,6 +1361,50 @@ mod tests {
     use crate::config::Config;
     use crate::deltaglider::DeltaGliderEngine;
     use crate::storage::StorageBackend;
+
+    #[test]
+    fn content_verdict_truth_table() {
+        use crate::types::{FileMetadata, StorageInfo};
+        let meta = |size: u64, sha: &str, md5: &str| {
+            let mut m = FileMetadata::fallback(
+                "k".into(),
+                size,
+                md5.into(),
+                chrono::Utc::now(),
+                None,
+                StorageInfo::Passthrough,
+            );
+            m.file_sha256 = sha.into();
+            m
+        };
+        let src = meta(3, "aa", "m1");
+        assert_eq!(content_verdict(&src, None), ContentVerdict::Missing);
+        assert_eq!(
+            content_verdict(&src, Some(&meta(3, "aa", "zz"))),
+            ContentVerdict::Same
+        );
+        assert_eq!(
+            content_verdict(&src, Some(&meta(3, "bb", "m1"))),
+            ContentVerdict::Differs
+        );
+        assert_eq!(
+            content_verdict(&src, Some(&meta(4, "aa", "m1"))),
+            ContentVerdict::Differs
+        );
+        // No SHA on one side: fall back to MD5.
+        assert_eq!(
+            content_verdict(&src, Some(&meta(3, "", "m1"))),
+            ContentVerdict::Same
+        );
+        assert_eq!(
+            content_verdict(&src, Some(&meta(3, "", "m2"))),
+            ContentVerdict::Unknown
+        );
+        assert_eq!(
+            content_verdict(&meta(3, "", ""), Some(&meta(3, "", ""))),
+            ContentVerdict::Unknown
+        );
+    }
 
     fn versioned_bytes(seed: u8, n: usize) -> Vec<u8> {
         // Pseudo-random base (poorly compressible) + a small per-version edit,

@@ -53,7 +53,10 @@ use crate::api::handlers::AppState;
 use crate::config_apply::ConfigMutator;
 use crate::config_db::ConfigDb;
 use crate::job_loop::{Pager, MAX_JOB_PAGES};
-use crate::transfer::{copy_object_with_retries, ObjectTransferRequest, TransferProvenance};
+use crate::transfer::{
+    content_verdict, copy_object_with_retries, ContentVerdict, ObjectTransferRequest,
+    TransferProvenance,
+};
 
 use super::store::MaintenanceJob;
 use super::worker::{
@@ -147,58 +150,19 @@ pub fn real_bucket_name<'a>(
     }
 }
 
-/// Does the target object hold the same content as the source?
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CopyVerdict {
-    /// Same size and the same SHA-256 (or MD5) on both sides.
-    Same,
-    /// Size or fingerprint differs: a stale copy.
-    Differs,
-    /// No fingerprint both sides carry (e.g. a foreign object without DG
-    /// metadata): cannot prove a match.
-    Unknown,
-    /// Not on the target (or the source HEAD failed).
-    Missing,
-}
-
-/// Pure: compare source and target metadata. Only `Same` lets the copy
-/// phase skip; a false `Differs`/`Unknown` only costs a re-copy.
-pub fn copy_verdict(
-    src: &crate::types::FileMetadata,
-    dst: Option<&crate::types::FileMetadata>,
-) -> CopyVerdict {
-    let Some(dst) = dst else {
-        return CopyVerdict::Missing;
-    };
-    if src.file_size != dst.file_size {
-        return CopyVerdict::Differs;
-    }
-    if !src.file_sha256.is_empty() && !dst.file_sha256.is_empty() {
-        return if src.file_sha256 == dst.file_sha256 {
-            CopyVerdict::Same
-        } else {
-            CopyVerdict::Differs
-        };
-    }
-    if !src.md5.is_empty() && src.md5 == dst.md5 {
-        return CopyVerdict::Same;
-    }
-    CopyVerdict::Unknown
-}
-
 async fn copy_verdict_for(
     engine: &crate::deltaglider::DynEngine,
     source_bucket: &str,
     target_bucket: &str,
     key: &str,
-) -> CopyVerdict {
+) -> ContentVerdict {
     let Ok(dst) = engine.head(target_bucket, key).await else {
-        return CopyVerdict::Missing;
+        return ContentVerdict::Missing;
     };
     match engine.head(source_bucket, key).await {
-        Ok(src) => copy_verdict(&src, Some(&dst)),
+        Ok(src) => content_verdict(&src, Some(&dst)),
         // The copy (or verify) reports the source error itself.
-        Err(_) => CopyVerdict::Unknown,
+        Err(_) => ContentVerdict::Unknown,
     }
 }
 
@@ -401,7 +365,7 @@ async fn run_phases(
                 // cancelled earlier attempt leaves copies that the source has
                 // since outgrown.
                 if copy_verdict_for(&engine, bucket, &params.transient_key, key).await
-                    == CopyVerdict::Same
+                    == ContentVerdict::Same
                 {
                     skipped += 1;
                     continue;
@@ -494,17 +458,17 @@ async fn run_phases(
             };
             for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
                 match copy_verdict_for(&engine, bucket, &params.transient_key, key).await {
-                    CopyVerdict::Missing => {
+                    ContentVerdict::Missing => {
                         return Err(format!("verification failed: '{key}' missing on target"));
                     }
-                    CopyVerdict::Differs => {
+                    ContentVerdict::Differs => {
                         return Err(format!(
                             "verification failed: '{key}' on target differs from the source"
                         ));
                     }
                     // Unknown = no common fingerprint (foreign object); the
                     // copy phase re-copied it, so it is current.
-                    CopyVerdict::Same | CopyVerdict::Unknown => {}
+                    ContentVerdict::Same | ContentVerdict::Unknown => {}
                 }
             }
             let more = pager.advance(page.is_truncated, page.next_continuation_token);
@@ -703,50 +667,6 @@ async fn run_phases(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn copy_verdict_truth_table() {
-        use crate::types::{FileMetadata, StorageInfo};
-        let meta = |size: u64, sha: &str, md5: &str| {
-            let mut m = FileMetadata::fallback(
-                "k".into(),
-                size,
-                md5.into(),
-                chrono::Utc::now(),
-                None,
-                StorageInfo::Passthrough,
-            );
-            m.file_sha256 = sha.into();
-            m
-        };
-        let src = meta(3, "aa", "m1");
-        assert_eq!(copy_verdict(&src, None), CopyVerdict::Missing);
-        assert_eq!(
-            copy_verdict(&src, Some(&meta(3, "aa", "zz"))),
-            CopyVerdict::Same
-        );
-        assert_eq!(
-            copy_verdict(&src, Some(&meta(3, "bb", "m1"))),
-            CopyVerdict::Differs
-        );
-        assert_eq!(
-            copy_verdict(&src, Some(&meta(4, "aa", "m1"))),
-            CopyVerdict::Differs
-        );
-        // No SHA on one side: fall back to MD5.
-        assert_eq!(
-            copy_verdict(&src, Some(&meta(3, "", "m1"))),
-            CopyVerdict::Same
-        );
-        assert_eq!(
-            copy_verdict(&src, Some(&meta(3, "", "m2"))),
-            CopyVerdict::Unknown
-        );
-        assert_eq!(
-            copy_verdict(&meta(3, "", ""), Some(&meta(3, "", ""))),
-            CopyVerdict::Unknown
-        );
-    }
 
     #[test]
     fn real_bucket_name_follows_the_routing_rule() {

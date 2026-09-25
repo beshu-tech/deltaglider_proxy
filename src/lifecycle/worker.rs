@@ -823,6 +823,17 @@ async fn execute_action(
             destination_key,
             delete_source_after_success,
         } => {
+            // A copy-mode transition meets the same expired objects on every
+            // run: skip one the destination already holds.
+            if !*delete_source_after_success {
+                if let Ok(dest) = engine.head(destination_bucket, destination_key).await {
+                    if crate::transfer::content_verdict(meta, Some(&dest))
+                        == crate::transfer::ContentVerdict::Same
+                    {
+                        return Ok(ActionOutcome::Skipped);
+                    }
+                }
+            }
             let copied = copy_object_with_retries(
                 engine,
                 ObjectTransferRequest {
@@ -1239,6 +1250,38 @@ mod tests {
             classify_delete_check(t, Err(&EngineError::InvalidArgument("boom".into()))),
             DeleteCheck::HeadFailed(_)
         ));
+    }
+
+    /// A copy-mode transition (source kept) acts on the same expired objects
+    /// on every run. When the destination already holds the same content,
+    /// the run must not copy it again.
+    #[tokio::test]
+    async fn copy_mode_transition_does_not_recopy_an_up_to_date_destination() {
+        use super::ActionOutcome;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine(dir.path()).await;
+        engine
+            .store("b", "c.bin", b"payload", None, Default::default())
+            .await
+            .unwrap();
+        let meta = engine.head("b", "c.bin").await.unwrap();
+        let action = PlannedLifecycleAction::Transition {
+            destination_bucket: "dst".to_string(),
+            destination_key: "c.bin".to_string(),
+            delete_source_after_success: false,
+        };
+        let first = execute_action(None, &engine, &rule(), "c.bin", &meta, &action)
+            .await
+            .unwrap();
+        assert!(matches!(first, ActionOutcome::Acted(_)), "{first:?}");
+        let second = execute_action(None, &engine, &rule(), "c.bin", &meta, &action)
+            .await
+            .unwrap();
+        assert_eq!(
+            second,
+            ActionOutcome::Skipped,
+            "the second run copied again"
+        );
     }
 
     /// An unchanged object is still deleted (the guard must not block the rule).
