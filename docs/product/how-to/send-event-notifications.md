@@ -97,7 +97,7 @@ curl -b cookies -X POST https://s3.acme.example/_/api/admin/event-outbox/requeue
 
 Requeue doesn't create a new event — it flips `failed` back to `pending`, keeps the attempt history, and makes the row due immediately. The Event log page does the same with a button.
 
-Note Slack's Web API returns HTTP 200 even on failure; the dispatcher checks the JSON `ok` field and retries on `{"ok": false}` (e.g. `channel_not_found`), so Slack misconfigurations show up as retries, not silent drops.
+Note Slack's Web API returns HTTP 200 even on failure; the dispatcher checks the JSON `ok` field and retries on `{"ok": false}` (e.g. `channel_not_found`), so Slack misconfigurations show up as retries, not silent drops. When an event goes to several Slack channels or several Incoming Webhook URLs, the proxy records the result of each channel and each URL separately. A retry posts only to the channels and URLs that failed, so a channel that already shows the message does not get it twice.
 
 ## 6. Monitor the event log
 

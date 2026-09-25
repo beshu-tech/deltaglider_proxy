@@ -14,6 +14,15 @@ does this for you: the Runs tab refreshes while a run is in progress. A client
 that read the counters from the run-now response must read them from the run
 history instead.
 
+### Fixed — a Slack retry posts only to the channels and URLs that failed
+
+With several Slack Incoming Webhook URLs, a retry posted the message again to
+the URLs that had already accepted it. In bot-token mode, a message that
+reached at least one channel counted as delivered, so a channel that failed
+never got it. Slack delivery now uses the same per-target state as raw
+webhooks (`event_deliveries`, one row per URL or channel): each failed URL or
+channel retries on its own, and no channel gets the message twice.
+
 ### Fixed — a raw webhook retry posts only to the endpoints that failed
 
 With several `webhook_urls`, the dispatcher posted to the endpoints in order
