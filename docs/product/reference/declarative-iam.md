@@ -126,7 +126,7 @@ The canonical exporter redacts every secret on the way out — a YAML pulled fro
 - `iam_users[*].secret_access_key` → `""`
 - `auth_providers[*].client_secret` → `null`
 
-Secrets in YAML applied through `config apply` or loaded from disk pass through `${env:NAME}` expansion first (see [Configuration](configuration.md)); a raw admin-API document body resolves a `${env:NAME}` reference only when the config file loaded at startup already uses that same name. The server never reads any other environment variable for an admin request, because an admin could otherwise read every secret of the proxy process through error messages or exports. A reference to a name that the file does not use takes its `:-default`, or the request fails. The persist-variant serializer keeps whatever YAML carries on disk across admin-API round-trips.
+Secrets in YAML applied through `config apply` or loaded from disk pass through `${env:NAME}` expansion first (see [Configuration](configuration.md)); a raw admin-API document body resolves a `${env:NAME}` reference only when the config file loaded at startup already uses that same name, or when the operator lists the name in `DGP_CONFIG_ENV_ALLOWLIST`. The server never reads any other environment variable for an admin request, because an admin could otherwise read every secret of the proxy process through error messages or exports. A reference to a name that the file does not use takes its `:-default`, or the request fails. The persist-variant serializer keeps whatever YAML carries on disk across admin-API round-trips.
 
 ## The empty-YAML gate
 

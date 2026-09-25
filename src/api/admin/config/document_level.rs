@@ -259,8 +259,10 @@ fn parse_and_validate_yaml(
     let (yaml, env_refs) = crate::config::expand_env_admin(yaml, known_env).map_err(|e| {
         format!(
             "env expansion error: {e}. The admin API resolves only `${{env:NAME}}` refs \
-             that the config file loaded at boot already uses; reference a new variable \
-             in that file, or expand it client-side (`config apply`)."
+             that the config file loaded at boot already uses, or names listed in \
+             {}; reference a new variable in that file, allowlist it, or expand it \
+             client-side (`config apply`).",
+            crate::config::CONFIG_ENV_ALLOWLIST_VAR
         )
     })?;
     let scrub = |m: String| crate::config::scrub_env_values(&m, &env_refs);
@@ -1365,15 +1367,21 @@ mod review2_tests {
     /// Review-2 (S7): an export keeps `${env:X}` refs. Importing it on a
     /// fresh/DR instance whose boot file does not use X fails, even when the
     /// operator exports X there (the documented IaC contract).
+    ///
+    /// Lead decision: S7 stays; the operator opts a name in through
+    /// DGP_CONFIG_ENV_ALLOWLIST. Without it the ref fails, and the error
+    /// names the opt-in.
     #[test]
-    #[ignore = "review2: pending fix"]
     fn review2_foreign_export_ref_resolves_when_target_sets_the_var() {
         std::env::set_var("REVIEW2_S7_DR_LEVEL", "debug");
-        let r = parse_and_validate_yaml(
-            "log_level: \"${env:REVIEW2_S7_DR_LEVEL}\"\n",
-            &Default::default(),
-        );
+        let doc = "log_level: \"${env:REVIEW2_S7_DR_LEVEL}\"\n";
+        let refused = parse_and_validate_yaml(doc, &Default::default());
+        std::env::set_var(crate::config::CONFIG_ENV_ALLOWLIST_VAR, "REVIEW2_S7_*");
+        let r = parse_and_validate_yaml(doc, &Default::default());
+        std::env::remove_var(crate::config::CONFIG_ENV_ALLOWLIST_VAR);
         std::env::remove_var("REVIEW2_S7_DR_LEVEL");
+        let err = refused.err().expect("S7: not allowlisted, not resolved");
+        assert!(err.contains("DGP_CONFIG_ENV_ALLOWLIST"), "{err}");
         assert!(r.is_ok(), "{:?}", r.err());
     }
 }

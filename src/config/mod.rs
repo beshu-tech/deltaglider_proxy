@@ -342,6 +342,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Security",
     },
     EnvVarEntry {
+        name: "DGP_CONFIG_ENV_ALLOWLIST",
+        description: "Comma-separated env var names (a trailing * matches a prefix) that admin config apply, import and restore may resolve as ${env:NAME}, beyond those the boot config uses. DGP_BOOTSTRAP_*, DGP_*ENCRYPTION_KEY* and DGP_*SECRET* never match",
+        example: "LOG_LEVEL,APP_*",
+        category: "Security",
+    },
+    EnvVarEntry {
         name: "DGP_SESSION_TTL_HOURS",
         description: "Admin session TTL in hours (default: 4)",
         example: "4",
@@ -2902,8 +2908,9 @@ impl Config {
     ///
     /// Lookup order per ref: recorded provenance (`env_refs`) → the ref's
     /// own `:-default` → hard error (fail loud, same contract as file load).
-    /// The process environment is NOT consulted: a section body is admin
-    /// input, and reading any env var for it leaks secrets (S7). Newly resolved names are recorded into
+    /// The process environment is consulted only for names the operator put
+    /// in `DGP_CONFIG_ENV_ALLOWLIST`: a section body is admin input, and
+    /// reading any env var for it leaks secrets (S7). Newly resolved names are recorded into
     /// `env_refs` so future persists re-emit the ref. Only strings that are
     /// EXACTLY one ref resolve — mid-string refs in GUI fields stay literal.
     pub fn resolve_env_ref_scalars(&mut self) -> Result<(), ConfigError> {
@@ -2918,9 +2925,9 @@ impl Config {
                     // recorded, mirroring `expand_env_vars_recording`.
                     let mut hits: Vec<(String, String)> = Vec::new();
                     let resolved = expand_env_with(s, |name| {
-                        // Provenance only, never the process env (S7):
+                        // Provenance, else an allowlisted name only (S7):
                         // see `expand_env_admin`.
-                        let v = refs.get(name).cloned();
+                        let v = expansion::admin_env_lookup(name, refs);
                         if let Some(val) = &v {
                             if !val.is_empty() {
                                 hits.push((name.to_string(), val.clone()));

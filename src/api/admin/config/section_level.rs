@@ -359,7 +359,12 @@ async fn apply_section(
     if let Err(e) = new_cfg.resolve_env_ref_scalars() {
         return reject(
             StatusCode::BAD_REQUEST,
-            format!("env reference in section body did not resolve: {e}").as_str(),
+            format!(
+                "env reference in section body did not resolve: {e}. Only names the boot \
+                 config uses, or names listed in {}, resolve.",
+                crate::config::CONFIG_ENV_ALLOWLIST_VAR
+            )
+            .as_str(),
         );
     }
 

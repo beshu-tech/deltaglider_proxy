@@ -78,11 +78,51 @@ pub fn expand_env_vars_recording(
 /// file does not already use is treated as unset (its `:-default` applies,
 /// else a [`ConfigError::MissingEnvVar`]). To use a new env var, reference it
 /// in the file on disk (boot), or expand client-side (`config apply`).
+///
+/// Opt-in: `DGP_CONFIG_ENV_ALLOWLIST` names extra variables that admin input
+/// may resolve from the server env (see [`admin_env_lookup`]).
 pub fn expand_env_admin(
     input: &str,
     known: &std::collections::BTreeMap<String, String>,
 ) -> Result<(String, std::collections::BTreeMap<String, String>), ConfigError> {
-    expand_env_with_recording(input, |name| known.get(name).cloned())
+    expand_env_with_recording(input, |name| admin_env_lookup(name, known))
+}
+
+/// The operator opt-in for extra env names that admin input may resolve.
+pub const CONFIG_ENV_ALLOWLIST_VAR: &str = "DGP_CONFIG_ENV_ALLOWLIST";
+
+/// THE env lookup for admin-sourced config (document apply/validate/import/
+/// restore and section PUTs): the running config's recorded provenance, else
+/// the server env for a name the operator allowlisted.
+pub fn admin_env_lookup(
+    name: &str,
+    known: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    if let Some(v) = known.get(name) {
+        return Some(v.clone());
+    }
+    let allowlist: String = super::env_parse(CONFIG_ENV_ALLOWLIST_VAR)?;
+    env_name_allowlisted(name, &allowlist)
+        .then(|| std::env::var(name).ok())
+        .flatten()
+}
+
+/// Pure: does `allowlist` (comma-separated names; a trailing `*` matches a
+/// prefix) admit `name`? Bootstrap, encryption-key and secret `DGP_*`
+/// variables never match: admin input must not read the proxy's own secrets.
+pub fn env_name_allowlisted(name: &str, allowlist: &str) -> bool {
+    let never = name.starts_with("DGP_BOOTSTRAP_")
+        || (name.starts_with("DGP_")
+            && (name.contains("ENCRYPTION_KEY") || name.contains("SECRET")));
+    !never
+        && allowlist
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .any(|p| match p.strip_suffix('*') {
+                Some(prefix) => name.starts_with(prefix),
+                None => name == p,
+            })
 }
 
 /// Replace every recorded env value in `msg` with its `${env:NAME}` ref, so
@@ -480,6 +520,29 @@ mod tests {
             msg.contains("unset or empty"),
             "message should cover the empty case, got: {msg}"
         );
+    }
+
+    #[test]
+    fn env_allowlist_truth_table() {
+        let list = "LOG_LEVEL, APP_*,DGP_LISTEN_ADDR";
+        for yes in ["LOG_LEVEL", "APP_X", "APP_", "DGP_LISTEN_ADDR"] {
+            assert!(env_name_allowlisted(yes, list), "{yes}");
+        }
+        for no in ["LOG", "XAPP_X", "HOME", "LOG_LEVEL2"] {
+            assert!(!env_name_allowlisted(no, list), "{no}");
+        }
+        for never in [
+            "DGP_BOOTSTRAP_PASSWORD_HASH",
+            "DGP_ENCRYPTION_KEY",
+            "DGP_BACKEND_X_ENCRYPTION_KEY",
+            "DGP_SECRET_ACCESS_KEY",
+            "DGP_BE_AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(!env_name_allowlisted(never, "*"), "{never}");
+            assert!(!env_name_allowlisted(never, never), "{never}");
+        }
+        assert!(env_name_allowlisted("AWS_REGION", "*"));
+        assert!(!env_name_allowlisted("AWS_REGION", ""));
     }
 
     #[test]

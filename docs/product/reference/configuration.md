@@ -1082,6 +1082,7 @@ Tuning knobs for the large-object streaming multipart copy path (replication + l
 | `DGP_TRUST_PROXY_HEADERS` | false | Trust `X-Forwarded-For` / `X-Real-IP` for the per-IP rate-limit bucket |
 | `DGP_TRUSTED_PROXY_CIDRS` | unset | Comma-separated networks of trusted reverse proxies. Only a connection from these networks can name the client in `X-Forwarded-For` for admission `source_ip`, `aws:SourceIp`, and the login-lockout exemption |
 | `DGP_SESSION_TTL_HOURS` | 4 | Admin session lifetime |
+| `DGP_CONFIG_ENV_ALLOWLIST` | — | Comma-separated names (a trailing `*` matches a prefix) that an admin apply, import, restore or section PUT may resolve as `${env:NAME}` from the server environment, in addition to the names that the boot config file uses. `DGP_BOOTSTRAP_*`, `DGP_*ENCRYPTION_KEY*` and `DGP_*SECRET*` never match |
 | `DGP_CLOCK_SKEW_SECONDS` | 900 | SigV4 clock skew tolerance |
 | `DGP_REPLAY_WINDOW_SECS` | 2 | SigV4 replay detection window |
 | `DGP_SECURE_COOKIES` | true | Require HTTPS for session cookies |
