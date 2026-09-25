@@ -830,7 +830,6 @@ async fn review2_forged_signature_fails_auth_before_the_gate() {
 /// retry is refused as a replay (400 InvalidArgument, not retryable). A
 /// legitimate writer to a busy bucket gets a hard error instead of backoff.
 #[tokio::test]
-#[ignore = "review2: pending fix"]
 async fn review2_sdk_retry_of_a_gated_write_is_not_refused_as_replay() {
     let bucket = "maintretry";
     let (server, admin) = review2_busy_bucket(bucket).await;

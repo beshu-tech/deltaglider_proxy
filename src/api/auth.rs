@@ -228,6 +228,13 @@ pub fn replay_decision(method: &axum::http::Method, is_duplicate: bool) -> Repla
     }
 }
 
+/// Whether a request that claimed a replay-cache slot keeps it once its
+/// response is known: only on success (2xx/3xx). A failed mutation had no
+/// effect, so a byte-identical retry of it is not a replay.
+pub fn replay_slot_kept(status: axum::http::StatusCode) -> bool {
+    status.is_success() || status.is_redirection()
+}
+
 /// Request extension carrying the client-claimed payload hash from
 /// `x-amz-content-sha256`. Inserted by this middleware after identity
 /// resolution (s3s verifies the SIGNATURE, which covers this header value, so
@@ -889,6 +896,9 @@ pub async fn sigv4_auth_middleware(
     // through* instead of 400-ing: the guard protects mutations only. See
     // `replay_decision` and beshu-tech/deltaglider_proxy#24.
     let is_presigned = has_presigned_query_params(request.uri().query().unwrap_or(""));
+    // The cache slot this request claimed (signature + the instant it
+    // stored), so a failed request can give it back below.
+    let mut replay_claim: Option<(ReplayCache, String, Instant)> = None;
     if let Some(ref cache) = replay_cache {
         if is_presigned {
             // No replay detection for presigned URLs (designed to be reused).
@@ -915,6 +925,7 @@ pub async fn sigv4_auth_middleware(
             // so the window is measured from first-seen and a tight retry loop
             // can't keep an idempotent read's slot alive indefinitely.
             let mut is_duplicate = false;
+            let claimed_at = Instant::now();
             cache
                 .entry(sig.clone())
                 .and_modify(|first_seen: &mut Instant| {
@@ -922,13 +933,15 @@ pub async fn sigv4_auth_middleware(
                         is_duplicate = true;
                     } else {
                         // Window expired — reset so the slot can be reused.
-                        *first_seen = Instant::now();
+                        *first_seen = claimed_at;
                     }
                 })
-                .or_insert_with(Instant::now);
+                .or_insert(claimed_at);
 
             match replay_decision(request.method(), is_duplicate) {
-                ReplayVerdict::Fresh => {}
+                ReplayVerdict::Fresh => {
+                    replay_claim = Some((cache.clone(), sig.clone(), claimed_at));
+                }
                 ReplayVerdict::AllowIdempotentReplay => {
                     // Boto3 same-second signature on an idempotent read. Safe to
                     // serve; log at debug only (not a security event) and do not
@@ -991,6 +1004,16 @@ pub async fn sigv4_auth_middleware(
         .insert(SignedPayloadHash(params.payload_hash.clone()));
 
     let response = next.run(request).await;
+    // Only a request that succeeded keeps its signature in the replay cache.
+    // An SDK retries a 503 (gate SlowDown, backend outage) within the same
+    // signing second with a byte-identical signature; refusing that retry
+    // as a replay would turn a retryable error into a hard 400. The slot is
+    // held while the request runs, so a concurrent duplicate still fails.
+    if let Some((cache, sig, claimed_at)) = replay_claim {
+        if !replay_slot_kept(response.status()) {
+            cache.remove_if(&sig, |_, seen| *seen == claimed_at);
+        }
+    }
     match limiter_verdict(&outcome, response.status(), is_presigned) {
         LimiterVerdict::Success => {
             if let Some(m) = &metrics {
@@ -1292,6 +1315,17 @@ mod tests {
             replay_decision(&Method::HEAD, true),
             ReplayVerdict::AllowIdempotentReplay
         );
+    }
+
+    #[test]
+    fn replay_slot_is_kept_only_on_success() {
+        use axum::http::StatusCode;
+        assert!(replay_slot_kept(StatusCode::OK));
+        assert!(replay_slot_kept(StatusCode::NO_CONTENT));
+        assert!(replay_slot_kept(StatusCode::NOT_MODIFIED));
+        assert!(!replay_slot_kept(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!replay_slot_kept(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!replay_slot_kept(StatusCode::FORBIDDEN));
     }
 
     #[test]
