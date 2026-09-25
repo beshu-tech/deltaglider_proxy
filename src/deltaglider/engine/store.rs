@@ -2242,7 +2242,6 @@ mod review2_tests {
     /// `reference.bin`, but take different locks, so two first PUTs can both
     /// create a baseline.
     #[tokio::test]
-    #[ignore = "review2: pending fix"]
     async fn review2_two_virtual_names_of_one_storage_share_the_deltaspace_lock() {
         let tmp = tempfile::tempdir().unwrap();
         let yaml = format!(

@@ -1369,9 +1369,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // A deltaspace is (bucket, prefix): keyed by the prefix alone, the
         // same prefix in two buckets shared one mutex. Same key shape as the
         // reference cache.
+        // Keyed by the STORAGE: two alias names of one real bucket share
+        // its reference.bin, so they must share the lock.
         let mutex = self
             .prefix_locks
-            .entry(Self::cache_key(bucket, prefix))
+            .entry(Self::cache_key(
+                &self.storage.storage_identity(bucket),
+                prefix,
+            ))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         mutex.lock_owned().await
@@ -1395,7 +1400,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let Some(lock) = self.reference_lock.clone() else {
             return Ok(ReferenceLockGuard::inert());
         };
-        let key = crate::coordination::reference_lock::lock_object_key(bucket, deltaspace);
+        let key = crate::coordination::reference_lock::lock_object_key(
+            &self.storage.storage_identity(bucket),
+            deltaspace,
+        );
         let owner = format!("ref-{}", uuid::Uuid::new_v4());
         let deadline = std::time::Instant::now() + lock.acquire_timeout();
         let now_fn = || crate::event_outbox::current_unix_seconds();

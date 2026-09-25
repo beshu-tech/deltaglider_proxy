@@ -526,6 +526,14 @@ pub trait StorageBackend: Send + Sync {
         None
     }
 
+    /// A name for the STORAGE behind `bucket`: two bucket names that store
+    /// into the same real bucket (policy aliases) get the same identity, so
+    /// the engine's deltaspace locks serialise them. An unaliased bucket is
+    /// its own name (the lock keys of existing deployments stay the same).
+    fn storage_identity(&self, bucket: &str) -> String {
+        bucket.to_string()
+    }
+
     // === Scanning operations ===
 
     /// Scan a deltaspace directory and return all file metadata
@@ -1043,6 +1051,9 @@ macro_rules! impl_storage_backend_for_box {
             }
             fn resolved_backend_name(&self, bucket: &str) -> Option<String> {
                 (**self).resolved_backend_name(bucket)
+            }
+            fn storage_identity(&self, bucket: &str) -> String {
+                (**self).storage_identity(bucket)
             }
 
             async fn scan_deltaspace(

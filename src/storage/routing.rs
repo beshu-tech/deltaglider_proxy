@@ -1110,6 +1110,16 @@ impl StorageBackend for RoutingBackend {
         self.default_backend().supports_native_multipart(bucket)
     }
 
+    fn storage_identity(&self, bucket: &str) -> String {
+        match self.routes.get(bucket) {
+            Some(BucketRoute {
+                backend_name,
+                real_bucket: Some(real),
+            }) => format!("{backend_name}\u{0}{real}"),
+            _ => bucket.to_string(),
+        }
+    }
+
     fn resolved_backend_name(&self, bucket: &str) -> Option<String> {
         if let Some(route) = self.routes.get(bucket) {
             return Some(route.backend_name.clone());
