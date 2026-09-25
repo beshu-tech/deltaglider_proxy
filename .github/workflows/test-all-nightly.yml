@@ -22,6 +22,11 @@ env:
   # file:line backtraces; unpacked split debuginfo trims ~0.3 GB off the peak
   # (sccache still caches it). The peak is two ~2 GB rustc (lib unit tests +
   # tests/all) overlapping, so lowering -j does not reduce it further.
+  #
+  # The homelab runners share one host. Three heavy compiles at the same time
+  # (cargo test --all, coverage, tokio_unstable clippy) get the build SIGKILLed
+  # (exit 137). So the jobs below run one after another (`needs:`), and every
+  # heavy step runs under scripts/ci-memwatch.sh to log memory until a kill.
   CARGO_BUILD_JOBS: "16"
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
@@ -81,7 +86,7 @@ jobs:
       - name: cargo test --all --locked
         env:
           RUST_BACKTRACE: "1"
-        run: cargo test --all --locked -- --nocapture
+        run: scripts/ci-memwatch.sh cargo test --all --locked -- --nocapture
       - name: Stop MinIO
         if: always()
         run: docker rm -f minio-nightly 2>/dev/null || true
@@ -92,6 +97,8 @@ jobs:
   #    Tools (cargo-llvm-cov, cargo-deny) are baked into the builder image. ──
   coverage:
     name: Unit Coverage (nightly)
+    needs: test-all-default-features
+    if: ${{ !cancelled() }}
     runs-on: homelab
     timeout-minutes: 20
     continue-on-error: true
@@ -108,7 +115,7 @@ jobs:
       - name: Run lib tests under llvm-cov
         env:
           RUST_BACKTRACE: "1"
-        run: cargo llvm-cov --locked --lib --no-report
+        run: scripts/ci-memwatch.sh cargo llvm-cov --locked --lib --no-report
       - name: Emit summary table (top 20 worst-covered files)
         run: |
           cargo llvm-cov report --summary-only > /tmp/cov-summary.txt
@@ -139,6 +146,8 @@ jobs:
   #    so the gated code is type-checked HERE nightly instead. ──
   tokio-unstable:
     name: tokio_unstable build + tests (nightly)
+    needs: coverage
+    if: ${{ !cancelled() }}
     runs-on: homelab
     timeout-minutes: 30
     container:
@@ -163,11 +172,11 @@ jobs:
       - name: clippy with --cfg tokio_unstable (gated code must stay clean)
         env:
           RUSTFLAGS: "--cfg tokio_unstable"
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: scripts/ci-memwatch.sh cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: lib tests with --cfg tokio_unstable
         env:
           RUSTFLAGS: "--cfg tokio_unstable"
-        run: cargo test --lib --locked
+        run: scripts/ci-memwatch.sh cargo test --lib --locked
 
   supply-chain:
     name: Supply-chain (audit + deny)
