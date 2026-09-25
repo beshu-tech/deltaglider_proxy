@@ -273,18 +273,15 @@ async fn backend_heads(endpoint: &str) -> u64 {
     scrape_counter(endpoint, "deltaglider_backend_head_requests_total").await
 }
 
-/// Issue #92 round 2: a client LIST reports the ORIGINAL size and ETag of a
-/// delta from the listing-size cache, and sends ZERO backend HEADs doing it.
+/// Issue #92 and review C3: a client LIST reports the ORIGINAL size and ETag
+/// of a delta, and sends ZERO backend HEADs doing it, on every node.
 ///
-/// * A proxy that wrote the object (warm) lists the original size and the
-///   same ETag a HEAD returns. Fails before round 1 (the metadata-cache
-///   override replaced the size but kept the stored delta's ETag).
+/// * The proxy that wrote the object (warm) lists the original size and the
+///   same ETag a HEAD returns.
 /// * A second proxy on the same bucket (cold caches: a restart, another
-///   node) lists the stored size without any HEAD. Fails on round 1, which
-///   sent one HEAD per listed delta (up to 1000 per page) to resolve it.
-/// * After that proxy reads the object once (a HEAD), its LIST reports the
-///   original size and ETag, and LastModified does not change between the
-///   cold and the warm LIST.
+///   node) lists the original size and ETag too, from the durable listing
+///   facts, still without a HEAD. Before C3 it listed the stored delta size.
+/// * LastModified does not change between two LISTs.
 #[tokio::test]
 async fn list_reports_original_delta_sizes_without_backend_heads() {
     skip_unless_minio!();
@@ -349,7 +346,7 @@ async fn list_reports_original_delta_sizes_without_backend_heads() {
     assert_eq!(head.content_length(), Some(variant.len() as i64));
     assert_eq!(warm.e_tag(), head.e_tag());
 
-    // Cold (a second proxy on the same bucket): stored size, no HEAD.
+    // Cold (a second proxy on the same bucket): original size, no HEAD.
     let reader = TestServer::s3().await;
     let reader_client = reader.s3_client().await;
     let before = backend_heads(&reader.endpoint()).await;
@@ -359,30 +356,178 @@ async fn list_reports_original_delta_sizes_without_backend_heads() {
         before,
         "a client LIST must not send HEADs"
     );
-    let stored = cold.size().unwrap();
-    assert!(
-        stored < variant.len() as i64,
-        "cold LIST keeps the stored delta size ({stored} B), as before round 1"
+    assert_eq!(
+        cold.size(),
+        Some(variant.len() as i64),
+        "a cold LIST reports the original size from the listing facts"
     );
+    assert_eq!(cold.e_tag(), head.e_tag());
+    let again = list_v1(reader_client, reader.bucket().to_string()).await;
+    assert_eq!(
+        again.last_modified(),
+        cold.last_modified(),
+        "LastModified must not flip between LISTs"
+    );
+}
 
-    // One read through the reader fills its cache; the LIST then matches HEAD.
-    let reader_head = reader_client
+/// Review C3: on a proxy-encrypted S3 backend, a cold LIST (another node,
+/// or after a restart) reports the plaintext size and ETag, not those of the
+/// ciphertext, without a HEAD. A DELETE drops the object's listing facts.
+#[tokio::test]
+async fn cold_list_of_an_encrypted_backend_reports_plaintext_facts() {
+    skip_unless_minio!();
+    const KEY_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let encrypted = || {
+        TestServer::builder()
+            .s3_endpoint(&common::minio_endpoint_url())
+            .bucket(common::MINIO_BUCKET)
+            .encryption_key(KEY_HEX)
+    };
+    let writer = encrypted().build().await;
+    let prefix = unique_prefix();
+    let key = format!("{prefix}/photo.jpg");
+    let body = generate_binary(70_000, 11);
+    let writer_client = writer.s3_client().await;
+    writer_client
+        .put_object()
+        .bucket(writer.bucket())
+        .key(&key)
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await
+        .unwrap();
+    let head = writer_client
         .head_object()
+        .bucket(writer.bucket())
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+
+    let reader = encrypted().build().await;
+    let reader_client = reader.s3_client().await;
+    let before = backend_heads(&reader.endpoint()).await;
+    let listed = reader_client
+        .list_objects_v2()
+        .bucket(reader.bucket())
+        .prefix(format!("{prefix}/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(backend_heads(&reader.endpoint()).await, before);
+    let obj = listed.contents().first().expect("photo.jpg listed").clone();
+    assert_eq!(obj.key(), Some(key.as_str()));
+    assert_eq!(obj.size(), Some(body.len() as i64), "plaintext size");
+    assert_eq!(obj.e_tag(), head.e_tag(), "plaintext ETag");
+
+    // The backend holds one facts entry for the object; a DELETE drops it.
+    let raw = common::minio_client().await;
+    let prefix = &prefix;
+    let facts = |raw: aws_sdk_s3::Client| async move {
+        raw.list_objects_v2()
+            .bucket(common::MINIO_BUCKET)
+            .prefix(".dg/facts/")
+            .send()
+            .await
+            .unwrap()
+            .contents()
+            .iter()
+            .filter_map(|o| o.key().map(str::to_string))
+            .filter(|k| k.contains(prefix.as_str()))
+            .count()
+    };
+    assert_eq!(facts(raw.clone()).await, 1);
+    reader_client
+        .delete_object()
         .bucket(reader.bucket())
         .key(&key)
         .send()
         .await
         .unwrap();
-    let before = backend_heads(&reader.endpoint()).await;
-    let resolved = list_v1(reader_client, reader.bucket().to_string()).await;
-    assert_eq!(backend_heads(&reader.endpoint()).await, before);
-    assert_eq!(resolved.size(), Some(variant.len() as i64));
-    assert_eq!(resolved.e_tag(), reader_head.e_tag());
-    assert_eq!(
-        resolved.last_modified(),
-        cold.last_modified(),
-        "LastModified must not flip between LISTs"
+    assert_eq!(facts(raw).await, 0, "DELETE drops the listing facts");
+}
+
+/// Review C3, lazy backfill: an object stored without listing facts (before
+/// they existed) lists with its stored size until one HEAD of it on a node
+/// whose LIST found the facts missing; that node then writes them, and every
+/// node lists the original size.
+#[tokio::test]
+async fn a_head_backfills_missing_listing_facts() {
+    skip_unless_minio!();
+    let writer = TestServer::s3().await;
+    let http = reqwest::Client::new();
+    let prefix = unique_prefix();
+    let base = generate_binary(100_000, 21);
+    let variant = mutate_binary(&base, 0.01);
+    for (name, body) in [("base.zip", &base), ("v1.zip", &variant)] {
+        let url = format!("{}/{}/{prefix}/{name}", writer.endpoint(), writer.bucket());
+        let resp = http.put(&url).body(body.clone()).send().await.unwrap();
+        assert!(resp.status().is_success());
+    }
+    // Simulate an object from before the facts: drop its entries.
+    let raw = minio_client().await;
+    let facts_keys = |raw: aws_sdk_s3::Client, prefix: String| async move {
+        raw.list_objects_v2()
+            .bucket(MINIO_BUCKET)
+            .prefix(".dg/facts/")
+            .send()
+            .await
+            .unwrap()
+            .contents()
+            .iter()
+            .filter_map(|o| o.key().map(str::to_string))
+            .filter(|k| k.contains(&format!("{prefix}/v1.zip")))
+            .collect::<Vec<_>>()
+    };
+    for k in facts_keys(raw.clone(), prefix.clone()).await {
+        raw.delete_object()
+            .bucket(MINIO_BUCKET)
+            .key(k)
+            .send()
+            .await
+            .unwrap();
+    }
+    let key = format!("{prefix}/v1.zip");
+    let size_on = |server: &TestServer| {
+        let url = format!(
+            "{}/{}?list-type=2&prefix={prefix}/v1",
+            server.endpoint(),
+            server.bucket()
+        );
+        let http = http.clone();
+        async move {
+            let xml = http.get(url).send().await.unwrap().text().await.unwrap();
+            let size = xml
+                .split("<Size>")
+                .nth(1)
+                .unwrap()
+                .split('<')
+                .next()
+                .unwrap();
+            size.parse::<usize>().unwrap()
+        }
+    };
+    let node = TestServer::s3().await;
+    assert!(
+        size_on(&node).await < variant.len(),
+        "no facts: stored size"
     );
+    node.s3_client()
+        .await
+        .head_object()
+        .bucket(node.bucket())
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    // The backfill runs in the background.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while facts_keys(raw.clone(), prefix.clone()).await.is_empty() {
+        assert!(std::time::Instant::now() < deadline, "facts not backfilled");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let other = TestServer::s3().await;
+    assert_eq!(size_on(&other).await, variant.len());
 }
 
 /// Review C9: `metadata=true` must reach the engine. The adapter always

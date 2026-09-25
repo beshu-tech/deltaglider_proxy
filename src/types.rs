@@ -159,6 +159,16 @@ impl ObjectKey {
     /// cleanup. A single trailing `/` (folder marker) is unaffected.
     pub fn validate_ingest(&self) -> Result<(), KeyValidationError> {
         self.validate_object()?;
+        // The S3 backend keeps its listing facts there (review C3).
+        if self
+            .full_key()
+            .starts_with(crate::storage::listing_facts::FACTS_ROOT)
+        {
+            return Err(KeyValidationError(format!(
+                "Keys under '{}' are reserved for internal use",
+                crate::storage::listing_facts::FACTS_ROOT
+            )));
+        }
         // `parse` strips leading `/` and puts no trailing `/` in the prefix, so
         // any empty segment is an internal `//` (including one just before the
         // filename: `a//x` has prefix `a/`).
@@ -803,6 +813,19 @@ mod tests {
         assert!(ObjectKey::parse("b", "a//").validate_ingest().is_err());
         assert!(ObjectKey::parse("b", "../").validate_object().is_err());
         assert!(!ObjectKey::parse("b", "photos/a.jpg").is_directory_marker());
+    }
+
+    #[test]
+    fn listing_facts_namespace_is_reserved_on_ingest() {
+        assert!(ObjectKey::parse("b", ".dg/facts/x!!1.e.1.2.e")
+            .validate_ingest()
+            .is_err());
+        assert!(ObjectKey::parse("b", ".dg/other.txt")
+            .validate_ingest()
+            .is_ok());
+        assert!(ObjectKey::parse("b", "a/.dg/facts/x")
+            .validate_ingest()
+            .is_ok());
     }
 
     #[test]

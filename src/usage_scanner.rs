@@ -411,7 +411,7 @@ impl UsageScanner {
         let stored: Vec<u64> = objects.iter().map(|(_, m)| m.stored_size()).collect();
         let sizes = engine
             .storage()
-            .resolve_listed_sizes(bucket, &mut objects)
+            .resolve_listed_sizes(bucket, &mut objects, false)
             .await;
 
         let totals = aggregate_usage(prefix, &objects, &stored, &sizes, &listing.baselines);

@@ -621,10 +621,15 @@ pub trait StorageBackend: Send + Sync {
     }
 
     /// Replace each listed entry's STORED size and ETag with the logical ones
-    /// when this process knows them for exactly that stored object (see
-    /// [`crate::storage::list_size_cache`]). Sends no request, never fails.
-    /// Returns, per entry, how much of its size is known. `created_at` (the
-    /// listed LastModified) is never changed.
+    /// for exactly that stored object: from this process's
+    /// [`crate::storage::list_size_cache`], else (S3) from the durable
+    /// [`crate::storage::listing_facts`], read with one LIST per page. Never
+    /// fails: an entry without known facts keeps its stored size. Returns,
+    /// per entry, how much of its size is known. `created_at` (the listed
+    /// LastModified) is never changed.
+    ///
+    /// `passthrough_may_differ`: a passthrough entry may be stored in another
+    /// form (the proxy-encryption wrapper sets it), so look its facts up too.
     ///
     /// The default suits a backend whose listing already carries logical
     /// sizes (filesystem: the xattrs are read during the listing): only a
@@ -633,6 +638,7 @@ pub trait StorageBackend: Send + Sync {
         &self,
         _bucket: &str,
         objects: &mut [(String, FileMetadata)],
+        _passthrough_may_differ: bool,
     ) -> Vec<ListedSize> {
         objects
             .iter()
@@ -644,6 +650,17 @@ pub trait StorageBackend: Send + Sync {
                 }
             })
             .collect()
+    }
+
+    /// Drop the listing facts of a deleted passthrough object (see
+    /// [`crate::storage::listing_facts`]). Best effort: a leftover entry
+    /// never matches a later object. Default: nothing to drop.
+    async fn forget_passthrough_listing_facts(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+        _filename: &str,
+    ) {
     }
 
     /// Enrich listed objects with full metadata from HEAD calls.
@@ -1086,8 +1103,21 @@ macro_rules! impl_storage_backend_for_box {
                 &self,
                 bucket: &str,
                 objects: &mut [(String, FileMetadata)],
+                passthrough_may_differ: bool,
             ) -> Vec<ListedSize> {
-                (**self).resolve_listed_sizes(bucket, objects).await
+                (**self)
+                    .resolve_listed_sizes(bucket, objects, passthrough_may_differ)
+                    .await
+            }
+            async fn forget_passthrough_listing_facts(
+                &self,
+                bucket: &str,
+                prefix: &str,
+                filename: &str,
+            ) {
+                (**self)
+                    .forget_passthrough_listing_facts(bucket, prefix, filename)
+                    .await
             }
             async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {
                 (**self).total_size(bucket).await

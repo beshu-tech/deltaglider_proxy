@@ -27,6 +27,7 @@
 //!   - storage/s3/metadata_io.rs    — header/metadata serialisation
 
 use super::list_size_cache::{self, ListedSize, LogicalFacts, StoredObjectId};
+use super::listing_facts;
 use super::traits::{
     BulkListing, DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend,
     StorageError, UploadedPart,
@@ -86,6 +87,26 @@ pub static DELEGATED_LIST_PROBE_REQUESTS: std::sync::LazyLock<prometheus::IntCou
         )
         .expect("valid metric")
     });
+
+/// Requests the proxy sends to S3 to keep the listing facts (see
+/// `storage::listing_facts`), by kind: `list` (a LIST page reads the facts of
+/// its stored keys), `put` (a PUT or a lazy backfill writes one), `delete`
+/// (cleanup of an overwritten or deleted object's facts).
+pub static LISTING_FACTS_REQUESTS: std::sync::LazyLock<prometheus::IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounterVec::new(
+            prometheus::Opts::new(
+                "deltaglider_listing_facts_requests_total",
+                "Requests sent to S3 to read, write or clean up listing facts",
+            ),
+            &["kind"],
+        )
+        .expect("valid metric")
+    });
+
+/// Facts LIST pages one listing page may read. The facts of one page fit in
+/// one or two; more means stale entries, and the rest keep stored sizes.
+const MAX_FACTS_PAGES: usize = 4;
 
 /// What a metadata self-copy (MetadataDirective REPLACE) must restate so
 /// the object keeps everything that is not DG metadata (D17).
@@ -356,6 +377,10 @@ impl S3ListedObject {
     /// lightweight representation.  Returns `None` if the object has no key.
     fn from_s3_object(object: aws_sdk_s3::types::Object) -> Option<Self> {
         let key = object.key?;
+        // Listing facts are internal index entries, never objects.
+        if listing_facts::is_facts_key(&key) {
+            return None;
+        }
         let last_modified = object.last_modified.and_then(|dt| {
             DateTime::parse_from_rfc3339(&dt.to_string())
                 .ok()
@@ -991,6 +1016,14 @@ impl S3Backend {
                         data.len() as u64,
                         metadata,
                     );
+                    self.persist_listing_facts(
+                        bucket,
+                        key,
+                        resp.e_tag().unwrap_or_default(),
+                        data.len() as u64,
+                        metadata,
+                    )
+                    .await;
                     if attempt > 0 {
                         debug!(
                             "S3 PUT {}/{} succeeded on attempt {} ({} bytes)",
@@ -1099,6 +1132,14 @@ impl S3Backend {
                             size,
                             metadata,
                         );
+                        self.persist_listing_facts(
+                            bucket,
+                            key,
+                            resp.e_tag().unwrap_or_default(),
+                            size,
+                            metadata,
+                        )
+                        .await;
                     }
                     return Ok(());
                 }
@@ -1247,13 +1288,10 @@ impl S3Backend {
         if !headers.is_empty() {
             match self.headers_to_metadata(&headers, s3_last_modified) {
                 Ok(meta) => {
-                    self.remember_listed_facts(
-                        bucket,
-                        key,
-                        response.e_tag().unwrap_or_default(),
-                        response.content_length().unwrap_or(0).max(0) as u64,
-                        &meta,
-                    );
+                    let stored_etag = response.e_tag().unwrap_or_default();
+                    let stored_size = response.content_length().unwrap_or(0).max(0) as u64;
+                    self.remember_listed_facts(bucket, key, stored_etag, stored_size, &meta);
+                    self.backfill_listing_facts(bucket, key, stored_etag, stored_size, &meta);
                     return Ok(meta);
                 }
                 Err(e) if delta_critical => {
@@ -1357,6 +1395,203 @@ impl S3Backend {
             },
             LogicalFacts::of(meta),
         );
+    }
+
+    /// Write the durable listing facts of the stored object `key` (see
+    /// `storage::listing_facts`), then drop its older entries. Best effort:
+    /// the object is stored already, and a missing entry only makes a LIST
+    /// report the stored size until a HEAD backfills it.
+    async fn persist_listing_facts(
+        &self,
+        bucket: &str,
+        key: &str,
+        stored_etag: &str,
+        stored_size: u64,
+        meta: &FileMetadata,
+    ) {
+        if key.rsplit('/').next() == Some("reference.bin") {
+            return;
+        }
+        let Some(facts_key) =
+            listing_facts::facts_key(key, stored_etag, stored_size, &LogicalFacts::of(meta))
+        else {
+            return;
+        };
+        if let Err(e) =
+            put_facts_object(&self.client, &self.native_encryption, bucket, &facts_key).await
+        {
+            warn!("listing facts for {bucket}/{key} not written: {e}");
+            return;
+        }
+        // The key's older entries describe objects that no longer exist.
+        drop_listing_facts(&self.client, bucket, key, Some(&facts_key)).await;
+    }
+
+    /// Lazy backfill: a HEAD learned the facts of a stored object that a LIST
+    /// found without durable facts (an object stored before they existed, or
+    /// whose facts write failed). Write them in the background, once.
+    fn backfill_listing_facts(
+        &self,
+        bucket: &str,
+        key: &str,
+        stored_etag: &str,
+        stored_size: u64,
+        meta: &FileMetadata,
+    ) {
+        let id = StoredObjectId {
+            scope: &self.list_cache_scope,
+            bucket,
+            key,
+            etag: stored_etag,
+            size: stored_size,
+        };
+        if !list_size_cache::take_missing_facts(&id) {
+            return;
+        }
+        let Some(facts_key) =
+            listing_facts::facts_key(key, stored_etag, stored_size, &LogicalFacts::of(meta))
+        else {
+            return;
+        };
+        let client = self.client.clone();
+        let native = self.native_encryption.clone();
+        let bucket = bucket.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = put_facts_object(&client, &native, &bucket, &facts_key).await {
+                debug!("listing facts backfill for {bucket} failed: {e}");
+            }
+        });
+    }
+
+    /// Delete every listing-facts object of `bucket` when nothing else is
+    /// stored in it (the keys before and after the facts namespace are
+    /// checked first). A bucket with objects keeps its facts, and
+    /// DeleteBucket then fails as it must.
+    async fn purge_listing_facts_if_only_ones(&self, bucket: &str) -> Result<(), StorageError> {
+        let first_key = |start_after: Option<&str>| {
+            let request = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .max_keys(1)
+                .set_start_after(start_after.map(String::from));
+            async move {
+                request
+                    .send()
+                    .await
+                    .map(|r| r.contents().first().and_then(|o| o.key()).map(String::from))
+                    .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))
+            }
+        };
+        match first_key(None).await? {
+            Some(k) if listing_facts::is_facts_key(&k) => {}
+            _ => return Ok(()),
+        }
+        // Past every key under `.dg/facts/` (`0` follows `/`).
+        let after_facts = format!("{}0", listing_facts::FACTS_ROOT.trim_end_matches('/'));
+        if first_key(Some(&after_facts)).await?.is_some() {
+            return Ok(());
+        }
+        let mut token: Option<String> = None;
+        loop {
+            let resp = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(listing_facts::FACTS_ROOT)
+                .set_continuation_token(token.take())
+                .send()
+                .await
+                .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))?;
+            for key in resp.contents().iter().filter_map(|o| o.key()) {
+                LISTING_FACTS_REQUESTS.with_label_values(&["delete"]).inc();
+                self.delete_s3_object(bucket, key).await?;
+            }
+            match resp.next_continuation_token() {
+                Some(t) if resp.is_truncated().unwrap_or(false) => token = Some(t.to_string()),
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    /// Read the durable listing facts for the unresolved entries of one
+    /// listing page and apply them. `candidates` are indices into `objects`
+    /// with their stored keys. Returns the indices it resolved.
+    async fn apply_durable_listing_facts(
+        &self,
+        bucket: &str,
+        objects: &mut [(String, FileMetadata)],
+        candidates: &[(usize, String)],
+    ) -> Vec<usize> {
+        let Some(scan) = listing_facts::plan_facts_scan(candidates.iter().map(|(_, k)| k.as_str()))
+        else {
+            return Vec::new();
+        };
+        let mut entries: HashMap<String, Vec<listing_facts::FactsEntry>> = HashMap::new();
+        let mut token: Option<String> = None;
+        for _ in 0..MAX_FACTS_PAGES {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(bucket)
+                .prefix(&scan.prefix)
+                .set_delimiter(scan.delimiter.map(String::from));
+            request = match &token {
+                Some(t) => request.continuation_token(t),
+                None => request.start_after(&scan.start_after),
+            };
+            LISTING_FACTS_REQUESTS.with_label_values(&["list"]).inc();
+            let resp = match request.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        "listing facts of {bucket} not read: {}",
+                        Self::classify_s3_error(bucket, &e, S3Op::ListObjects)
+                    );
+                    break;
+                }
+            };
+            let mut past = false;
+            for key in resp.contents().iter().filter_map(|o| o.key()) {
+                if scan.is_past(key) {
+                    past = true;
+                    break;
+                }
+                if let Some(e) = listing_facts::parse_facts_key(key) {
+                    entries.entry(e.stored_key.clone()).or_default().push(e);
+                }
+            }
+            if past || !resp.is_truncated().unwrap_or(false) {
+                break;
+            }
+            match resp.next_continuation_token() {
+                Some(t) => token = Some(t.to_string()),
+                None => break,
+            }
+        }
+        let mut resolved = Vec::new();
+        for (i, stored_key) in candidates {
+            let meta = &mut objects[*i].1;
+            let found = entries
+                .get(stored_key)
+                .and_then(|e| listing_facts::facts_for(e.iter(), &meta.md5, meta.stored_size()));
+            let id = StoredObjectId {
+                scope: &self.list_cache_scope,
+                bucket,
+                key: stored_key,
+                etag: &meta.md5,
+                size: meta.stored_size(),
+            };
+            match found {
+                Some(facts) => {
+                    list_size_cache::record(&id, facts.clone());
+                    list_size_cache::apply(meta, &facts);
+                    resolved.push(*i);
+                }
+                None => list_size_cache::mark_missing_facts(&id),
+            }
+        }
+        resolved
     }
 
     /// The listing-size-cache resolution of one listed entry. Pure apart from
@@ -1682,6 +1917,8 @@ impl StorageBackend for S3Backend {
 
     #[instrument(skip(self))]
     async fn delete_bucket(&self, bucket: &str) -> Result<(), StorageError> {
+        // Listing facts are internal: they must not keep an empty bucket.
+        self.purge_listing_facts_if_only_ones(bucket).await?;
         self.client
             .delete_bucket()
             .bucket(bucket)
@@ -1949,6 +2186,7 @@ impl StorageBackend for S3Backend {
     ) -> Result<(), StorageError> {
         let key = self.delta_key(prefix, filename);
         self.delete_s3_object(bucket, &key).await?;
+        drop_listing_facts(&self.client, bucket, &key, None).await;
         debug!("Deleted delta for {}/{}/{}", bucket, prefix, filename);
         Ok(())
     }
@@ -2507,11 +2745,46 @@ impl StorageBackend for S3Backend {
         &self,
         bucket: &str,
         objects: &mut [(String, FileMetadata)],
+        passthrough_may_differ: bool,
     ) -> Vec<ListedSize> {
-        objects
+        let mut sizes: Vec<ListedSize> = objects
             .iter_mut()
             .map(|(key, meta)| Self::resolve_one_listed(&self.list_cache_scope, bucket, key, meta))
-            .collect()
+            .collect();
+        // What the process cache did not know, the durable facts may.
+        let candidates: Vec<(usize, String)> = objects
+            .iter()
+            .zip(&sizes)
+            .enumerate()
+            .filter_map(|(i, ((key, meta), size))| match size {
+                ListedSize::StoredOnly => Some((i, format!("{key}.delta"))),
+                ListedSize::Listed
+                    if passthrough_may_differ && !key.ends_with('/') && !meta.is_delta() =>
+                {
+                    Some((i, key.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if !candidates.is_empty() {
+            for i in self
+                .apply_durable_listing_facts(bucket, objects, &candidates)
+                .await
+            {
+                sizes[i] = ListedSize::Cached;
+            }
+        }
+        sizes
+    }
+
+    async fn forget_passthrough_listing_facts(&self, bucket: &str, prefix: &str, filename: &str) {
+        drop_listing_facts(
+            &self.client,
+            bucket,
+            &self.passthrough_key(prefix, filename),
+            None,
+        )
+        .await;
     }
 
     /// Optimised listing that delegates delimiter collapsing to upstream S3.
@@ -2751,6 +3024,63 @@ impl StorageBackend for S3Backend {
 /// `StorageError` variant of its own: `S3Backend::classify_s3_error` keeps it
 /// as `S3("<op> failed (status=403): …")`. This helper lives next to that
 /// format so that callers never match on error text themselves.
+/// PUT one zero-byte facts object (native SSE headers as for any object: a
+/// bucket policy may require them).
+async fn put_facts_object(
+    client: &Client,
+    native: &NativeEncryptionConfig,
+    bucket: &str,
+    facts_key: &str,
+) -> Result<(), StorageError> {
+    let mut request = client
+        .put_object()
+        .bucket(bucket)
+        .key(facts_key)
+        .content_length(0)
+        .body(ByteStream::from(Vec::new()));
+    if let Some(marker) = native.marker() {
+        request = request.metadata("dg-encrypted-native", marker);
+    }
+    request = apply_native_encryption(request, native);
+    LISTING_FACTS_REQUESTS.with_label_values(&["put"]).inc();
+    request
+        .send()
+        .await
+        .map_err(|e| S3Backend::classify_s3_error(bucket, &e, S3Op::PutObject))?;
+    Ok(())
+}
+
+/// Delete the facts entries of the stored object `stored_key`, except
+/// `keep`. Best effort (a leftover entry never matches a later object), so
+/// errors are only logged.
+async fn drop_listing_facts(client: &Client, bucket: &str, stored_key: &str, keep: Option<&str>) {
+    let prefix = format!("{}!!", listing_facts::stored_prefix(stored_key));
+    LISTING_FACTS_REQUESTS.with_label_values(&["list"]).inc();
+    let listed = match client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(&prefix)
+        .max_keys(100)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            debug!("listing facts cleanup for {bucket}/{stored_key} skipped: {e:?}");
+            return;
+        }
+    };
+    for key in listed.contents().iter().filter_map(|o| o.key()) {
+        if Some(key) == keep {
+            continue;
+        }
+        LISTING_FACTS_REQUESTS.with_label_values(&["delete"]).inc();
+        if let Err(e) = client.delete_object().bucket(bucket).key(key).send().await {
+            debug!("stale listing facts {bucket}/{key} not deleted: {e:?}");
+        }
+    }
+}
+
 pub fn is_backend_access_denied(e: &StorageError) -> bool {
     matches!(e, StorageError::S3(msg) if msg.contains("(status=403)"))
 }

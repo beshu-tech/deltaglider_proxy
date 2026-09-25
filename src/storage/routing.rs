@@ -1223,9 +1223,22 @@ impl StorageBackend for RoutingBackend {
         &self,
         bucket: &str,
         objects: &mut [(String, FileMetadata)],
+        passthrough_may_differ: bool,
     ) -> Vec<ListedSize> {
         let (backend, real_bucket) = self.resolve_existing(bucket).await;
-        backend.resolve_listed_sizes(&real_bucket, objects).await
+        backend
+            .resolve_listed_sizes(&real_bucket, objects, passthrough_may_differ)
+            .await
+    }
+
+    async fn forget_passthrough_listing_facts(&self, bucket: &str, prefix: &str, filename: &str) {
+        route_existing!(
+            self,
+            bucket,
+            forget_passthrough_listing_facts,
+            prefix,
+            filename
+        )
     }
 
     async fn list_objects_delegated(

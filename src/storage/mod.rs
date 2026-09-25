@@ -5,6 +5,7 @@
 pub mod encrypting;
 mod filesystem;
 pub mod list_size_cache;
+pub mod listing_facts;
 pub(crate) mod routing;
 mod s3;
 mod traits;
@@ -17,7 +18,7 @@ pub use routing::RoutingBackend;
 pub(crate) use s3::guard_s3_endpoint;
 pub use s3::{
     is_backend_access_denied, NativeEncryptionConfig, S3Backend, BACKEND_HEAD_REQUESTS,
-    DELEGATED_LIST_PROBE_REQUESTS, DELEGATED_LIST_UPSTREAM_PAGES,
+    DELEGATED_LIST_PROBE_REQUESTS, DELEGATED_LIST_UPSTREAM_PAGES, LISTING_FACTS_REQUESTS,
 };
 pub use traits::{
     BucketListing, BulkListing, DelegatedListResult, MultipartUpload, StorageBackend, StorageError,

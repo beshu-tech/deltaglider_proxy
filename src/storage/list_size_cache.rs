@@ -118,6 +118,26 @@ pub fn lookup(id: &StoredObjectId<'_>) -> Option<LogicalFacts> {
     CACHE.get(&cache_key(id))
 }
 
+/// Stored objects that a LIST found without durable listing facts (see
+/// [`crate::storage::listing_facts`]). The next HEAD that learns their facts
+/// writes them (lazy backfill for objects stored before the facts existed).
+/// Bounded: an entry that falls out only waits for a later LIST to mark it.
+static MISSING: LazyLock<Cache<String, ()>> =
+    LazyLock::new(|| Cache::builder().max_capacity(100_000).build());
+
+/// Note that a LIST found no durable facts for this stored object.
+pub fn mark_missing_facts(id: &StoredObjectId<'_>) {
+    if !bare_etag(id.etag).is_empty() {
+        MISSING.insert(cache_key(id), ());
+    }
+}
+
+/// Was this stored object marked by [`mark_missing_facts`]? Clears the mark,
+/// so one object is backfilled once.
+pub fn take_missing_facts(id: &StoredObjectId<'_>) -> bool {
+    MISSING.remove(&cache_key(id)).is_some()
+}
+
 /// Replace the size and ETag of a listed entry with the logical ones. Only
 /// those two fields change: `created_at` stays the listed LastModified, so
 /// consecutive LISTs of an unchanged object report the same timestamp whether
@@ -138,7 +158,8 @@ pub enum ListedSize {
     /// The listing itself carries the logical size (a plain passthrough
     /// object, a directory marker, or a backend that lists logical sizes).
     Listed,
-    /// The listing-size cache supplied the logical size and ETag.
+    /// The listing-size cache or the durable listing facts supplied the
+    /// logical size and ETag.
     Cached,
     /// Only the stored size is known.
     StoredOnly,

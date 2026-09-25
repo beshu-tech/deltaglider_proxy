@@ -117,26 +117,40 @@ the size and ETag of its stored delta, not of the object itself. A LIST
 returns only what the backend stores, and the original size and ETag live in
 the object's metadata, which a LIST does not return. A 3 MB `firmware.tar` was
 listed as `46 B`, the object browser showed that size, and a sync tool that
-compares sizes copied the object again on every run.
+compares sizes copied the object again on every run. Objects on a
+proxy-encrypted S3 backend had the same fault: they listed with the size and
+ETag of the encrypted data.
 
-The proxy now remembers the original size and ETag of each stored object that
-it writes or reads: every upload that the proxy sends in one request (large
-uploads that the proxy spools to disk included), and every metadata or download
-request. An object uploaded to the backend in several parts is known after the
-first metadata or download request for it. It
-keys each entry by the stored object's own ETag and size, so an entry can
-never describe an older version of the object, even when another proxy
-instance replaced it. A listing uses these entries and sends no extra request
-to the backend, so a listing is never slower than before. An object that this
-proxy has not written or read since it started still lists with its stored
-size. `LastModified` in a listing is always the time that the backend reports,
-so it does not change between two listings of the same object. The cache holds
-about 120,000 objects by default (for 60-byte keys);
-`DGP_LIST_SIZE_CACHE_MB` (default `32`) sets its size. The same applies to objects on a proxy-encrypted S3 backend, which
-listed with the size of the encrypted data. The new counter
+Every upload that stores an object in another form (a delta, or encrypted
+data) now also writes an empty index object under `.dg/facts/` in the same
+bucket. Its key holds the stored object's key, ETag, and size, and the
+original size and ETag. A listing page reads these index objects with one more
+listing request and reports the original size and ETag, on every proxy
+instance and after a restart. An index object applies only to the stored
+object with exactly that key, ETag, and size, so a stale one is ignored. A
+delete of the object removes its index object, and an overwrite removes the
+old one. Listings never show `.dg/facts/`, and an upload to a key under
+`.dg/facts/` gets `400 InvalidArgument`. A tool that lists the backend bucket
+directly (not through the proxy) sees these zero-byte objects; a delete of an
+empty bucket through the proxy removes them first.
+
+An object stored before this release lists with its stored size until the
+proxy reads its metadata once, with a download or a `HEAD` request, on a
+proxy that listed it before. The proxy then writes the index object in the
+background. A `metadata=true` listing now sends a `HEAD` request for each
+encrypted object whose index object is missing, so it reports the original
+size too.
+
+The proxy also remembers the original size and ETag of each stored object that
+it writes, reads, or lists, so a page whose objects are all in this cache sends
+no extra request. The cache holds about 120,000 objects by default (for
+60-byte keys); `DGP_LIST_SIZE_CACHE_MB` (default `32`) sets its size.
+`LastModified` in a listing is always the time that the backend reports, so it
+does not change between two listings of the same object. The new counter
 `deltaglider_backend_head_requests_total` counts every object metadata (HEAD)
 request that the proxy sends to S3: to the storage backends and to the
-config-sync bucket.
+config-sync bucket. The new counter `deltaglider_listing_facts_requests_total`
+counts the requests for the index objects.
 
 ### Fixed — Folder sizes in the object browser showed the stored size
 

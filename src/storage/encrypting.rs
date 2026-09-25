@@ -1834,7 +1834,15 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         self.inner.delete_delta(b, p, f).await
     }
     async fn delete_passthrough(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
-        self.inner.delete_passthrough(b, p, f).await
+        self.inner.delete_passthrough(b, p, f).await?;
+        // A ciphertext object has listing facts (its logical size and ETag).
+        if self.has_any_key() {
+            self.inner.forget_passthrough_listing_facts(b, p, f).await;
+        }
+        Ok(())
+    }
+    async fn forget_passthrough_listing_facts(&self, b: &str, p: &str, f: &str) {
+        self.inner.forget_passthrough_listing_facts(b, p, f).await
     }
     async fn scan_deltaspace(&self, b: &str, p: &str) -> Result<Vec<FileMetadata>, StorageError> {
         self.inner.scan_deltaspace(b, p).await
@@ -1876,8 +1884,14 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         &self,
         b: &str,
         objects: &mut [(String, FileMetadata)],
+        passthrough_may_differ: bool,
     ) -> Vec<ListedSize> {
-        let mut sizes = self.inner.resolve_listed_sizes(b, objects).await;
+        // With a key (current or legacy), a passthrough entry may be
+        // ciphertext: its facts are looked up like a delta's.
+        let mut sizes = self
+            .inner
+            .resolve_listed_sizes(b, objects, passthrough_may_differ || self.has_any_key())
+            .await;
         // An inner listing of ciphertext (S3) reports the ciphertext size of a
         // passthrough object: without a cache hit, only that is known.
         if self.actively_encrypts() && !self.inner.lite_list_carries_logical_facts(b) {

@@ -1863,23 +1863,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .await?
         };
 
-        // Transparency without extra requests: a lite LIST on an S3 backend
+        // Transparency without a HEAD per key: a lite LIST on an S3 backend
         // reports the STORED object (a delta's `.delta`, a ciphertext). Swap
-        // in the logical size and ETag wherever the listing-size cache knows
-        // this exact stored object (filled by every PUT and HEAD this process
-        // sent). A miss keeps the stored size: a client LIST never sends a
-        // HEAD (issue #82: a large prefix must not list slower). The cache is
-        // keyed by the stored object's ETag and size, so an entry can never
-        // describe an object another node replaced since. Best effort by
-        // construction: no I/O, no error. The old metadata-cache override is
-        // gone: it matched by key only, so it could report the size of an
-        // older object under the same key, and it replaced the size but not
-        // the ETag.
-        if !metadata && !page.objects.is_empty() {
+        // in the logical size and ETag of each exact stored object (same key,
+        // ETag and size), from this process's listing-size cache or from the
+        // durable listing facts (one more LIST per page, any node, after a
+        // restart; see `storage::listing_facts`). A miss keeps the stored
+        // size: a client LIST never sends a HEAD (issue #82). Never fails.
+        let sizes = if page.objects.is_empty() {
+            Vec::new()
+        } else {
             self.storage
-                .resolve_listed_sizes(bucket, &mut page.objects)
-                .await;
-        }
+                .resolve_listed_sizes(bucket, &mut page.objects, false)
+                .await
+        };
 
         // When metadata=true (MinIO extension), enrich objects with full
         // metadata from HEAD calls. Use the metadata cache to avoid HEAD
@@ -1889,9 +1886,19 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             let mut cache_hits = Vec::new();
             let mut cache_misses = Vec::new();
 
-            for (key, meta) in page.objects {
+            for ((key, meta), size) in
+                page.objects
+                    .into_iter()
+                    .zip(sizes.into_iter().chain(std::iter::repeat(
+                        crate::storage::list_size_cache::ListedSize::Listed,
+                    )))
+            {
                 if let Some(cached) = self.metadata_cache.get(bucket, &key) {
                     cache_hits.push((key, cached));
+                } else if !size.is_known() {
+                    // Only the stored size is known (a ciphertext whose facts
+                    // are missing): a HEAD reads the logical one.
+                    cache_misses.push((key, meta));
                 } else if Self::list_entry_needs_head(&self.file_router, &key, &meta) {
                     // Delta or delta-eligible: the LIST entry carries the stored
                     // (delta) size; a HEAD is required to recover the original
