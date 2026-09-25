@@ -4,6 +4,8 @@
 
 This document describes the self-hosted CI infrastructure for DeltaGlider Proxy, the design decisions behind it, and how to reproduce or adapt this setup for other Rust projects.
 
+> **Status (2026-09-25):** `ci.yml`, `test-all-nightly.yml`, `claude.yml` and `claude-code-review.yml` run on GitHub-hosted `ubuntu-latest` runners (4 vCPU, 16 GB RAM). The repo is public, so these runners have no minute cost. They still use the builder image as a `container:` job. sccache uses the GitHub Actions cache backend (`mozilla-actions/sccache-action`), because the in-cluster sccache MinIO is not reachable from GitHub. The reasons for the move: the homelab runner containers have a 5 GB memory limit, and the nightly `cargo test --all` was SIGKILLed at that limit; four runners were shared by CI and the nightly; and a public repo on self-hosted runners lets fork PRs run code on the homelab. Only `release.yml` and `prepare-release.yml` still use the self-hosted `k3s` runners. The rest of this document describes the self-hosted setup.
+
 ## Architecture Overview
 
 ```mermaid
