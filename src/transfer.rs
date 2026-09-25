@@ -154,7 +154,16 @@ pub(crate) async fn copy_object_with_retries(
             Ok(outcome) => return Ok(outcome),
             Err(err) => {
                 let msg = err.to_string();
-                if !is_transient_copy_error(&msg) || attempt == DEFAULT_COPY_MAX_ATTEMPTS {
+                let signal = error_signal(
+                    &msg,
+                    &[
+                        request.source_key,
+                        request.destination_key,
+                        request.source_bucket,
+                        request.destination_bucket,
+                    ],
+                );
+                if !is_transient_copy_error(&signal) || attempt == DEFAULT_COPY_MAX_ATTEMPTS {
                     return Err(if attempt > 1 {
                         format!("{} (after {} attempts)", msg, attempt).into()
                     } else {
@@ -564,7 +573,9 @@ async fn fetch_part_with_resume(
                 if msg.contains(SOURCE_CHANGED_TOKEN) {
                     return Err(msg.into());
                 }
-                if !is_transient_copy_error(&msg) || attempt == MAX_PART_ATTEMPTS {
+                if !is_transient_copy_error(&error_signal(&msg, &[key, bucket]))
+                    || attempt == MAX_PART_ATTEMPTS
+                {
                     return Err(msg.into());
                 }
                 if let Some(m) = metrics {
@@ -774,6 +785,52 @@ async fn maybe_part_barrier() {
         let ms: u64 = crate::config::env_parse_with_default("DGP_TEST_PART_DELAY_MS", 150);
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
+}
+
+/// Pure: the error text with every user-supplied name (key, bucket) removed,
+/// so the substring classifiers (`is_transient_copy_error`, the replication
+/// dest-fatal / throttle checks) see only the backend's words: a key such as
+/// `quota-report.pdf` or `SlowDown-q3.pdf` must not decide the verdict. Only
+/// WHOLE occurrences are removed (delimited by start/end, whitespace, `/`,
+/// quotes, brackets, `:`/`,`/`;`), longest name first: a short key such as
+/// `a` must not cut letters out of `status=503`.
+pub(crate) fn error_signal(err: &str, names: &[&str]) -> String {
+    let is_delim = |c: Option<char>| {
+        c.is_none_or(|c| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '/' | '"' | '\'' | '(' | ')' | '[' | ']' | ':' | ',' | ';'
+                )
+        })
+    };
+    let mut names: Vec<&str> = names.iter().copied().filter(|n| !n.is_empty()).collect();
+    names.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    let mut out = err.to_string();
+    for name in names {
+        let mut result = String::with_capacity(out.len());
+        let mut rest = out.as_str();
+        while let Some(i) = rest.find(name) {
+            let before = rest[..i].chars().next_back();
+            let after = rest[i + name.len()..].chars().next();
+            // `before` of the first match in `rest` is the last char we copied.
+            let before = if i == 0 {
+                result.chars().next_back()
+            } else {
+                before
+            };
+            result.push_str(&rest[..i]);
+            if is_delim(before) && is_delim(after) {
+                result.push_str("<name>");
+            } else {
+                result.push_str(name);
+            }
+            rest = &rest[i + name.len()..];
+        }
+        result.push_str(rest);
+        out = result;
+    }
+    out
 }
 
 /// Marker for a generation-pin failure (see retrieve_stream_range): fatal at
@@ -1361,6 +1418,26 @@ mod tests {
     use crate::config::Config;
     use crate::deltaglider::DeltaGliderEngine;
     use crate::storage::StorageBackend;
+
+    #[test]
+    fn error_signal_removes_whole_names_only() {
+        assert_eq!(
+            error_signal("Not found: reports/quota.pdf", &["reports/quota.pdf"]),
+            "Not found: <name>"
+        );
+        // A short key never cuts into the backend's words.
+        assert_eq!(
+            error_signal("put a failed (status=503): SlowDown", &["a"]),
+            "put <name> failed (status=503): SlowDown"
+        );
+        // The retry classifier ignores a key that only LOOKS transient.
+        let msg = "source head failed: Not found: logs/timeout.txt";
+        assert!(is_transient_copy_error(msg));
+        assert!(!is_transient_copy_error(&error_signal(
+            msg,
+            &["logs/timeout.txt"]
+        )));
+    }
 
     #[test]
     fn content_verdict_truth_table() {

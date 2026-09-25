@@ -1323,11 +1323,17 @@ async fn copy_one_object(
             out.errors = 1;
             out.had_error = true;
             let err_msg = format!("{}", e);
+            // Classify on the message WITHOUT the names in it: the key and the
+            // buckets are user text (`quota-report.pdf`, `SlowDown-q3.pdf`).
+            let signal = crate::transfer::error_signal(
+                &err_msg,
+                &[src_key, dest_key, src_bucket, dst_bucket],
+            );
             // A backend THROTTLE is not an object-specific fault — the driver
             // must not count it toward the poison-skip ledger, or a throttling
             // backend would mass-poison healthy objects into permanent skip.
-            out.throttled = is_backend_throttled(&err_msg);
-            out.dest_fatal = is_destination_fatal(&err_msg);
+            out.throttled = is_backend_throttled(&signal);
+            out.dest_fatal = is_destination_fatal(&signal);
             debug!(
                 "replication rule '{}' object failure src={:?} dst={:?}: {}",
                 rule_name, src_key, dest_key, e
@@ -1914,6 +1920,26 @@ mod tests {
         ] {
             assert!(!is_destination_fatal(ok), "expected non-fatal: {ok}");
         }
+    }
+
+    /// The error text names the object. A key such as `quota-report.pdf` or
+    /// `SlowDown-q3.pdf` must not turn a plain per-object error into a
+    /// dead-destination or throttle verdict.
+    #[test]
+    fn key_text_does_not_classify_the_error() {
+        let keys = ["reports/quota-report.pdf", "SlowDown-q3.pdf"];
+        for key in keys {
+            let msg = format!("source retrieve failed: Not found: {key}");
+            let sig = crate::transfer::error_signal(&msg, &[key, key, "src", "dst"]);
+            assert!(!is_destination_fatal(&sig), "{msg}");
+            assert!(!is_backend_throttled(&sig), "{msg}");
+        }
+        // A real signal next to the key still counts.
+        let msg = "put reports/quota-report.pdf failed: S3 error: NoSuchBucket";
+        assert!(is_destination_fatal(&crate::transfer::error_signal(
+            msg,
+            &["reports/quota-report.pdf"]
+        )));
     }
 
     #[test]
