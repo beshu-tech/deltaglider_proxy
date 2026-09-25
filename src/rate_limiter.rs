@@ -652,6 +652,9 @@ pub struct Blocked {
 pub struct RateLimitGuard<'a> {
     rl: &'a RateLimiter,
     ip: IpAddr,
+    /// The IP the known-good exemption keys on: a forged XFF must not claim
+    /// an operator's exemption, so this ignores XFF without a CIDR list.
+    trusted_ip: IpAddr,
     /// The account-dimension key — empty when the caller didn't
     /// supply one. Currently set by callers via `enter_with_account`.
     subject: String,
@@ -683,8 +686,9 @@ impl<'a> RateLimitGuard<'a> {
         subject: &str,
         event_prefix: &'static str,
     ) -> Result<Self, Blocked> {
-        let ip = extract_client_ip_with_peer(headers, peer_ip)
-            .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let unspecified = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+        let ip = extract_client_ip_with_peer(headers, peer_ip).unwrap_or(unspecified);
+        let trusted_ip = extract_trusted_client_ip(headers, peer_ip).unwrap_or(unspecified);
         if rl.is_limited(&ip) {
             let failure_count = rl.failure_count(&ip);
             tracing::warn!(
@@ -697,7 +701,11 @@ impl<'a> RateLimitGuard<'a> {
         }
         if !subject.is_empty()
             && rl.is_limited_account(subject)
-            && rl.account_lock_applies(subject, &ip, is_direct_local_request(headers, peer_ip))
+            && rl.account_lock_applies(
+                subject,
+                &trusted_ip,
+                is_direct_local_request(headers, peer_ip),
+            )
         {
             tracing::warn!(
                 "SECURITY | event={}_brute_force_blocked | scope=account | subject={} | ip={}",
@@ -717,6 +725,7 @@ impl<'a> RateLimitGuard<'a> {
         Ok(Self {
             rl,
             ip,
+            trusted_ip,
             subject: subject.to_string(),
             event_prefix,
         })
@@ -738,7 +747,7 @@ impl<'a> RateLimitGuard<'a> {
         if !self.rl.is_limited_account(&self.subject) {
             self.rl.record_success_account(&self.subject);
         }
-        self.rl.record_known_good(&self.subject, self.ip);
+        self.rl.record_known_good(&self.subject, self.trusted_ip);
     }
 
     /// Record a failed operation. Increments BOTH bucket counters
@@ -1245,7 +1254,6 @@ mod tests {
     /// sending the operator's IP in the header.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env_lock serialises the env var
-    #[ignore = "review2: pending fix"]
     async fn review2_forged_xff_cannot_claim_known_good_exemption() {
         let _g = env_lock();
         std::env::set_var("DGP_TRUST_PROXY_HEADERS", "true");
