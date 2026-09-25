@@ -316,8 +316,7 @@ async fn apply_section(
     // changes through the section API, mirroring the document-level
     // `apply_config_doc` guard (cfg.rs `document_level.rs:463-476`).
     // The legitimate path is `PUT /api/admin/password`, which
-    // verifies the current password and re-encrypts the config DB
-    // atomically. Accepting an arbitrary hash here would let an
+    // verifies the current password. Accepting an arbitrary hash here would let an
     // admin-session holder lock future admins out of the GUI.
     //
     // MUST run BEFORE the unconditional `new_cfg.bootstrap_password_hash
@@ -328,7 +327,7 @@ async fn apply_section(
     if new_cfg.bootstrap_password_hash != old_cfg.bootstrap_password_hash {
         return reject(
             StatusCode::FORBIDDEN,
-            "bootstrap_password_hash cannot be changed via /config/section; use PUT /api/admin/password (verifies the current password and re-encrypts the config DB atomically)",
+            "bootstrap_password_hash cannot be changed via /config/section; use PUT /api/admin/password (verifies the current password)",
         );
     }
 
@@ -343,8 +342,7 @@ async fn apply_section(
     //
     // bootstrap_password_hash: ALWAYS preserved via this path. It
     // has its own dedicated rotation endpoint (PUT /api/admin/password)
-    // that verifies the current password and re-encrypts the config
-    // DB atomically. The explicit equality guard above ensures we
+    // that verifies the current password. The explicit equality guard above ensures we
     // only reach this line when incoming == old, so this is
     // effectively a defensive no-op for that field.
     new_cfg.bootstrap_password_hash = old_cfg.bootstrap_password_hash.clone();

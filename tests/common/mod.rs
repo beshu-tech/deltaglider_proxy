@@ -39,23 +39,20 @@ pub const TEST_BOOTSTRAP_PASSWORD: &str = "testpass";
 
 /// Deterministic bcrypt hash of [`TEST_BOOTSTRAP_PASSWORD`] (cost 4).
 ///
-/// The running binary uses this string as **both** the admin-login verifier and
-/// the **SQLCipher key material** for `deltaglider_config.db`: the config field
-/// value is passed through to open the DB (same literal as stored in
-/// `bootstrap_password_hash` / env `DGP_BOOTSTRAP_PASSWORD_HASH`). HA
-/// config-sync therefore requires every replica that shares one logical
-/// bootstrap password to emit the **byte-identical** hash string; otherwise
-/// each process derives a different encryption key and cross-replica
-/// downloads are undecryptable garbage.
-///
-/// A fresh `bcrypt::hash(...)` on every default [`TestServer`] build would
-/// produce different salts and different `bootstrap_password_hash` lines,
-/// breaking `config_sync_ha_test` and any multi-process scenario. Default
-/// builders embed this constant instead. Custom passwords via
-/// [`TestServerBuilder::bootstrap_password`] still call `bcrypt::hash` at
-/// config generation time (tests that deliberately mismatch peers use that).
+/// The admin-login verifier of every default [`TestServer`]. A fresh
+/// `bcrypt::hash(...)` per build would give each server a different salt and
+/// hash; a stable constant keeps multi-process scenarios (HA replicas that
+/// share one admin password) and the `mismatch_boot_test` legacy-key path
+/// deterministic. It is NOT the config DB key: that is
+/// [`TEST_CONFIG_DB_KEY`] (sync servers) or a per-server key file.
 pub const TEST_BOOTSTRAP_PASSWORD_HASH: &str =
     "$2b$04$s7/yy6Z363jZoQodArpuDeP00U.zE1QPi0bxM/o9BOZDs6tDbss5q";
+
+/// `DGP_CONFIG_DB_KEY` for every server built with a config sync bucket: HA
+/// replicas share one encrypted DB, so they need one key (the proxy refuses
+/// to start with a sync bucket and no env key). A test that wants a replica
+/// with another key sets `.env("DGP_CONFIG_DB_KEY", ...)`.
+pub const TEST_CONFIG_DB_KEY: &str = "test-config-db-key-0123456789abcdef0123456789abcdef";
 
 /// MinIO configuration constants
 pub const MINIO_BUCKET: &str = "deltaglider-test";
@@ -208,6 +205,7 @@ impl TestServer {
             // test that logs in with [`TEST_BOOTSTRAP_PASSWORD`].
             .env_remove("DGP_BOOTSTRAP_PASSWORD_HASH")
             .env_remove("DGP_ADMIN_PASSWORD_HASH")
+            .env_remove("DGP_CONFIG_DB_KEY")
             // Boot backend-health probe: OFF by default in the harness — many
             // tests deliberately spawn against dead/absent endpoints and must
             // not exit(1) or pay probe timeouts. Gate tests opt back in via
@@ -411,6 +409,7 @@ impl TestServer {
             .env_remove("DGP_ENCRYPTION_KEY")
             .env_remove("DGP_BOOTSTRAP_PASSWORD_HASH")
             .env_remove("DGP_ADMIN_PASSWORD_HASH")
+            .env_remove("DGP_CONFIG_DB_KEY")
             // Boot backend-health probe: OFF by default in the harness — many
             // tests deliberately spawn against dead/absent endpoints and must
             // not exit(1) or pay probe timeouts. Gate tests opt back in via
@@ -565,10 +564,9 @@ impl TestServerBuilder {
     /// + every IAM mutation + every 5-minute poll tick.
     ///
     /// Tests that want to observe propagation between two replicas
-    /// point both at the same sync_bucket (with the same bootstrap
-    /// password). Tests that want to observe rejection of a wrong-
-    /// password replica point at the same sync_bucket with DIFFERENT
-    /// bootstrap passwords via [`bootstrap_password`].
+    /// point both at the same sync_bucket (they share
+    /// [`TEST_CONFIG_DB_KEY`]). Tests that want to observe rejection of a
+    /// wrong-key replica set `.env("DGP_CONFIG_DB_KEY", <other>)`.
     ///
     /// Requires an S3 backend (`s3_endpoint`); the proxy refuses to
     /// start with a filesystem backend + sync_bucket.
@@ -624,7 +622,19 @@ impl TestServerBuilder {
     pub async fn build(self) -> TestServer {
         let (config, data_dir) = self.build_config();
         let auth = self.auth_creds.clone();
-        let extra_env = self.extra_env.clone();
+        let mut extra_env = self.extra_env.clone();
+        if self.config_sync_bucket.is_some()
+            && !extra_env.iter().any(|(k, _)| k == "DGP_CONFIG_DB_KEY")
+        {
+            // Before the test's own env, so `.env(...)` still wins.
+            extra_env.insert(
+                0,
+                (
+                    "DGP_CONFIG_DB_KEY".to_string(),
+                    TEST_CONFIG_DB_KEY.to_string(),
+                ),
+            );
+        }
         TestServer::spawn_with_config(
             &config,
             &self.bucket,
@@ -1509,6 +1519,13 @@ impl TestServer {
     /// Kill + respawn against the SAME config file, data dir, and port —
     /// with `extra` env vars applied AFTER the default `env_remove` calls
     /// (so a test can inject e.g. `DGP_BOOTSTRAP_PASSWORD_HASH`).
+    /// Stop the proxy process (the data dir and config stay). A test edits
+    /// on-disk state here, then calls `respawn_with_env`.
+    pub fn kill(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+    }
+
     pub async fn respawn_with_env(&mut self, extra: &[(&str, &str)]) {
         let _ = self.process.kill();
         let _ = self.process.wait();
@@ -1540,6 +1557,7 @@ impl TestServer {
             .env("DGP_TRUST_PROXY_HEADERS", "true")
             .env_remove("DGP_BOOTSTRAP_PASSWORD_HASH")
             .env_remove("DGP_ADMIN_PASSWORD_HASH")
+            .env_remove("DGP_CONFIG_DB_KEY")
             // Boot backend-health probe: OFF by default in the harness — many
             // tests deliberately spawn against dead/absent endpoints and must
             // not exit(1) or pay probe timeouts. Gate tests opt back in via

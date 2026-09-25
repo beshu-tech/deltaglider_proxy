@@ -52,7 +52,7 @@ const MAX_REPLAY_ENTRIES: usize = 500_000;
 /// Pure decision at a decision point — mirrors `classify_auth_config`
 /// (`config.rs`) / `classify_s3_error` (`storage/s3.rs`).
 enum AuthGateDecision<'a> {
-    /// Config DB is locked (bootstrap password mismatch) — reject all S3 traffic.
+    /// Config DB is locked (no config DB key opens it) — reject all S3 traffic.
     Locked,
     /// No auth configured — open access, pass through.
     Open,
@@ -684,8 +684,8 @@ pub async fn sigv4_auth_middleware(
     // Fold the config-DB lock flag + IamState into ONE exhaustive auth
     // decision. The lock is a first-class match arm (not a pre-match `if`),
     // so a router-layer reorder can never silently un-lock the server. The
-    // `ConfigDbMismatchGuard` marker is injected by `build_s3_router` when the
-    // bootstrap password fails to decrypt the config DB. Absence of the IAM
+    // `ConfigDbMismatchGuard` marker is injected by `build_s3_router` when no
+    // config DB key decrypts the config DB. Absence of the IAM
     // extension is treated as `Disabled` (open access).
     let config_db_locked = request
         .extensions()

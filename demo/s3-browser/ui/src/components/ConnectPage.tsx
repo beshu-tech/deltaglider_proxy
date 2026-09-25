@@ -35,43 +35,6 @@ function finishConnect(onConnect: (outcome: ConnectOutcome) => void, outcome: Co
 /** Tiny diagram for the locked-DB wizard: one password + random salt → two
  *  different hashes; only the original hash is the DB's key. Explains, honestly
  *  and at a glance, why the password alone can't unlock the database. */
-function LockedDbExplainer({ accent, muted, text }: { accent: string; muted: string; text: string }) {
-  const ok = 'var(--accent-success)';
-  const warn = 'var(--accent-warning)';
-  const mono = 'var(--font-mono)';
-  const Pill = ({ color, children }: { color: string; children: React.ReactNode }) => (
-    <span style={{ fontFamily: mono, fontSize: 11, color, border: `1px solid ${color}`, borderRadius: 6, padding: '2px 7px', whiteSpace: 'nowrap' }}>{children}</span>
-  );
-  const Arrow = ({ label }: { label: string }) => (
-    <span style={{ display: 'inline-flex', flexDirection: 'column', alignItems: 'center', color: muted, fontSize: 10, fontFamily: 'var(--font-ui)' }}>
-      <span>{label}</span>
-      <span style={{ fontSize: 14, lineHeight: 1, color: muted }}>→</span>
-    </span>
-  );
-  return (
-    <div style={{ marginTop: 14, padding: 14, borderRadius: 10, background: 'color-mix(in srgb, var(--input-bg) 80%, var(--glass-bg) 20%)', border: '1px solid var(--border-subtle)' }}>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-          <Pill color={accent}>your password</Pill>
-          <Arrow label="+ salt A" />
-          <Pill color={ok}>hash A</Pill>
-          <span style={{ color: ok, fontSize: 13, fontFamily: 'var(--font-ui)' }}>🔓 unlocks the DB</span>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-          <Pill color={accent}>your password</Pill>
-          <Arrow label="+ salt B" />
-          <Pill color={warn}>hash B</Pill>
-          <span style={{ color: warn, fontSize: 13, fontFamily: 'var(--font-ui)' }}>✗ wrong key</span>
-        </div>
-      </div>
-      <div style={{ marginTop: 10, fontSize: 11.5, lineHeight: 1.55, color: text, fontFamily: 'var(--font-ui)' }}>
-        Same password, random salt → a new hash each time. The DB only opens with the
-        <b> exact hash</b> that encrypted it (hash A) — not one freshly made from the password.
-      </div>
-    </div>
-  );
-}
-
 interface Props {
   onConnect: (outcome: ConnectOutcome) => void;
   showError?: boolean;
@@ -104,7 +67,9 @@ export default function ConnectPage({ onConnect, showError }: Props) {
   // (whoami() still reports config_db_mismatch until the operator updates the server
   // config), so the user keeps seeing the hash they need to copy. We must not clear it
   // when re-entering the wizard or that recovered hash would be lost.
-  const [recoveredHash, setRecoveredHash] = useState<{ hash: string; base64: string } | null>(() => {
+  // kind 'config_db_key' carries no key: the operator typed it, and a key is
+  // never written to sessionStorage.
+  const [recoveredHash, setRecoveredHash] = useState<{ kind?: string; hash: string; base64: string } | null>(() => {
     const saved = readStorage('dg-recovered-hash', 'session');
     try {
       return saved ? JSON.parse(saved) : null;
@@ -325,15 +290,16 @@ export default function ConnectPage({ onConnect, showError }: Props) {
     setRecoveryError('');
     try {
       const result = await recoverDb(recoveryPassword);
-      if (result.success && result.correct_hash) {
+      if (result.success && (result.correct_hash || result.key_kind === 'config_db_key')) {
         const recovered = {
-          hash: result.correct_hash,
+          kind: result.key_kind,
+          hash: result.correct_hash || '',
           base64: result.correct_hash_base64 || '',
         };
         setRecoveredHash(recovered);
         writeStorage('dg-recovered-hash', JSON.stringify(recovered), 'session');
       } else {
-        setRecoveryError(result.error || 'Password does not match');
+        setRecoveryError(result.error || 'The key does not open the database');
       }
     } catch (e) {
       setRecoveryError(normalizeUiError(e, 'Recovery failed'));
@@ -389,7 +355,23 @@ export default function ConnectPage({ onConnect, showError }: Props) {
       <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: '100vh', padding: 24 }}>
         <div className="dg-login-card animate-fade-in" style={{ borderRadius: 14, padding: 'clamp(28px, 4vw, 40px)', width: '100%', maxWidth: 520 }}>
           <Space orientation="vertical" size="large" style={{ width: '100%' }}>
-            {recoveredHash ? (
+            {recoveredHash?.kind === 'config_db_key' ? (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+                  <CheckCircleOutlined style={{ fontSize: 28, color: 'var(--accent-success)', flexShrink: 0 }} />
+                  <div style={{ fontSize: 20, fontWeight: 700, color: TEXT_PRIMARY, fontFamily: "var(--font-ui)" }}>
+                    Database Key Found
+                  </div>
+                </div>
+                <div style={{ color: TEXT_SECONDARY, fontSize: 14, fontFamily: "var(--font-ui)", lineHeight: 1.7 }}>
+                  This key opens the preserved config database{' '}
+                  (<code>deltaglider_config.db.bak</code>). Set <code>DGP_CONFIG_DB_KEY</code> to
+                  this key on the server, or write it to the key file{' '}
+                  <code>deltaglider_config.db.key</code> next to the database, and restart. At
+                  startup the server moves the preserved database back into place.
+                </div>
+              </>
+            ) : recoveredHash ? (
               <>
                 <div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
@@ -399,10 +381,12 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     </div>
                   </div>
                   <div style={{ color: TEXT_SECONDARY, fontSize: 14, fontFamily: "var(--font-ui)", lineHeight: 1.7 }}>
-                    Set this hash as your admin password (env <code>DGP_BOOTSTRAP_PASSWORD_HASH</code>
-                    or the config), then restart the server to unlock. Your original config
-                    database is preserved on the server as <code>deltaglider_config.db.bak</code> and
-                    is not modified by recovery.
+                    This database is from a release that encrypted it with the admin password
+                    hash. Set this hash as your admin password hash (env{' '}
+                    <code>DGP_BOOTSTRAP_PASSWORD_HASH</code> or the config), then restart. At
+                    startup the server re-encrypts the preserved database{' '}
+                    (<code>deltaglider_config.db.bak</code>) with the config DB key and moves it
+                    back into place.
                   </div>
                 </div>
                 <div style={{ background: 'color-mix(in srgb, var(--input-bg) 78%, var(--glass-bg) 22%)', borderRadius: 12, padding: 16 }}>
@@ -438,33 +422,35 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                     </div>
                   </div>
                   <div style={{ color: TEXT_SECONDARY, fontSize: 14, lineHeight: 1.7, fontFamily: "var(--font-ui)" }}>
-                    The IAM database is encrypted with your admin password <b>hash</b>, and
-                    the hash loaded at startup doesn’t match the one that encrypted it.
+                    The IAM database is encrypted with the config DB key, and no key loaded at
+                    startup opens it. The key comes from{' '}
+                    <code style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: ACCENT_BLUE }}>DGP_CONFIG_DB_KEY</code>{' '}
+                    or from the key file{' '}
+                    <code style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: ACCENT_BLUE }}>deltaglider_config.db.key</code>{' '}
+                    next to the database.
                   </div>
-                  <LockedDbExplainer accent={ACCENT_BLUE} muted={TEXT_MUTED} text={TEXT_SECONDARY} />
                   <div style={{ color: TEXT_SECONDARY, fontSize: 13, marginTop: 12, lineHeight: 1.7, fontFamily: "var(--font-ui)" }}>
-                    <b>Why not just the password?</b> Each hash bakes in a random salt, so the
-                    same password produces a <i>different</i> hash every time — only the exact
-                    original hash can unlock the DB. Paste it from your previous{' '}
-                    <code style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: ACCENT_BLUE }}>DGP_BOOTSTRAP_PASSWORD_HASH</code>,
-                    env vars, or the <code style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: ACCENT_BLUE }}>.deltaglider_bootstrap_hash</code> file.
+                    Paste the key that encrypted the database: an earlier value of{' '}
+                    <code style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: ACCENT_BLUE }}>DGP_CONFIG_DB_KEY</code>,
+                    or the content of a backup of the key file. A database from an older release
+                    is encrypted with the admin password hash: paste that exact hash (from{' '}
+                    <code style={{ fontFamily: "var(--font-mono)", fontSize: 12, color: ACCENT_BLUE }}>.deltaglider_bootstrap_hash</code>{' '}
+                    or your old env vars).
                   </div>
                   <div style={{ color: TEXT_MUTED, fontSize: 12, marginTop: 8, lineHeight: 1.6, fontFamily: "var(--font-ui)" }}>
-                    Lost the hash? It can’t be recovered — but your data is safe. Run{' '}
-                    <code style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: TEXT_SECONDARY }}>--set-bootstrap-password</code>{' '}
-                    to start fresh; the old DB is preserved as{' '}
-                    <code style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: TEXT_SECONDARY }}>.db.bak</code> in case the hash turns up.
+                    Lost the key? It cannot be recovered, but the old database stays on the server as{' '}
+                    <code style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: TEXT_SECONDARY }}>.db.bak</code> in case the key turns up.
                   </div>
                 </div>
                 {recoveryError && <Alert type="error" title={recoveryError} showIcon />}
                 <div>
                   <label style={{ fontSize: 13, fontWeight: 600, color: TEXT_SECONDARY, fontFamily: "var(--font-ui)", marginBottom: 6, display: 'block' }}>
-                    Original Admin Password Hash
+                    Config DB Key or Legacy Password Hash
                   </label>
                   <Input.TextArea
                     value={recoveryPassword}
                     onChange={(e) => setRecoveryPassword(e.target.value)}
-                    placeholder="$2b$12$... or base64-encoded hash"
+                    placeholder="config DB key, or $2b$12$... / base64-encoded hash"
                     autoFocus
                     rows={2}
                     className="dg-recovery-hash-input"
@@ -480,7 +466,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
                   onClick={handleRecover}
                   style={{ height: 48, borderRadius: 10, fontWeight: 700, fontFamily: "var(--font-ui)", fontSize: 15, letterSpacing: '0.02em', marginTop: 4 }}
                 >
-                  Try Hash
+                  Try Key
                 </Button>
               </>
             )}

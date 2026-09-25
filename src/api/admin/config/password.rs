@@ -2,12 +2,11 @@
 
 //! Password-change and config-database recovery handlers.
 //!
-//! These two flows share a responsibility — custody of the bootstrap
-//! password hash, which is both the admin-GUI session key and the
-//! SQLCipher cipher for the IAM database. They are split out of the
-//! larger config module because their logic is security-critical,
-//! orthogonal to the rest of the config surface, and benefits from
-//! being reviewed as a single unit.
+//! The bootstrap password hash verifies admin-GUI logins and signs session
+//! cookies. It is NOT the SQLCipher key of the IAM database (that is
+//! `DGP_CONFIG_DB_KEY` or the key file, see `config_db::key`), so a password
+//! change never touches the database. Recovery tries a candidate key (or a
+//! legacy bootstrap hash) against a parked config DB.
 
 use crate::api::admin::extract::AdminJson;
 use axum::extract::{ConnectInfo, State};
@@ -18,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use super::super::{audit_log, trigger_config_sync, validate_password, AdminState};
+use super::super::{audit_log, validate_password, AdminState};
 
 #[derive(Deserialize)]
 pub struct PasswordChangeRequest {
@@ -46,8 +45,7 @@ fn password_err(status: StatusCode, msg: impl Into<String>) -> axum::response::R
 }
 
 /// D15: the env var that pins the bootstrap hash, if one is set. That hash
-/// wins at every boot, so a GUI change would re-key the IAM DB with a hash
-/// the next boot never uses: the DB becomes unreadable (IAM lockout).
+/// wins at every boot, so a GUI change would be lost at the next start.
 fn env_pinned_hash_var(env: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
     ["DGP_BOOTSTRAP_PASSWORD_HASH", "DGP_ADMIN_PASSWORD_HASH"]
         .into_iter()
@@ -56,17 +54,9 @@ fn env_pinned_hash_var(env: impl Fn(&str) -> Option<String>) -> Option<&'static 
 
 /// PUT /api/admin/password — change bootstrap password.
 ///
-/// Ordering invariants (do NOT reorder without understanding recovery):
-/// 1. Verify the current password before doing anything else.
-/// 2. Re-encrypt the SQLCipher IAM database with the new hash. If this
-///    fails, bail out WITHOUT touching the hash file or in-memory state —
-///    the DB rekey is the only operation that can leave the system
-///    unrecoverable if it partially succeeds.
-/// 3. Persist the hash to disk. If the write fails, revert the DB
-///    encryption to the old hash so startup still matches the on-disk
-///    state file on next restart.
-/// 4. Only after disk-persist succeeds do we swap the in-memory hash
-///    and update `cfg.bootstrap_password_hash`.
+/// Verify the current password, persist the new hash to the state file, and
+/// only then swap the in-memory hash. The IAM database is not involved: its
+/// key does not depend on the password.
 pub async fn change_password(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
@@ -76,14 +66,12 @@ pub async fn change_password(
         return password_err(
             StatusCode::CONFLICT,
             format!(
-                "{var} is set, and it sets the bootstrap password hash at every start. \
-                 A change here would re-encrypt the IAM database with a hash that the \
-                 next start does not use, so the database would become unreadable. \
-                 To change the password safely: write the current value of {var} into \
-                 .deltaglider_bootstrap_hash, unset {var} and restart; change the \
-                 password here (this re-encrypts the IAM database); then set {var} to \
-                 the new hash from .deltaglider_bootstrap_hash on every instance. Do not \
-                 use the CLI reset: it makes the IAM database unreadable."
+                "{var} is set, and it sets the bootstrap password hash at every start, \
+                 so a change here would be lost at the next start. To change the \
+                 password: run `deltaglider_proxy --set-bootstrap-password` (it reads \
+                 the new password from stdin and prints its hash), set {var} to the new \
+                 hash on every instance, and restart. The IAM database is not affected: \
+                 its key does not depend on the bootstrap password."
             ),
         );
     }
@@ -118,52 +106,13 @@ pub async fn change_password(
         }
     };
 
-    // Re-encrypt the IAM config database with the new password hash FIRST.
-    // If this fails, we must NOT update the in-memory hash or persist — the DB
-    // would become out of sync and the next restart would fail to open it.
-    if let Some(ref db_mutex) = state.config_db {
-        let db = db_mutex.lock().await;
-        if let Err(e) = db.rekey(&new_hash) {
-            tracing::error!(
-                "Failed to re-encrypt config DB after password change: {}",
-                e
-            );
-            return password_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to re-encrypt config database: {}", e),
-            );
-        }
-        tracing::info!("Config DB re-encrypted with new bootstrap password hash");
-        // Upload re-encrypted DB to S3
-        trigger_config_sync(&state);
-    }
-
-    // Persist to state file BEFORE updating in-memory state — if this fails,
-    // the DB was already re-keyed with new_hash but the file still has old_hash.
-    // We must revert the DB encryption to avoid a mismatch on restart.
     let state_file = std::path::Path::new(".deltaglider_bootstrap_hash");
     if let Err(e) = crate::config::write_bootstrap_hash_file(state_file, &new_hash) {
         tracing::error!("Failed to persist new admin hash to disk: {}", e);
-        // Revert DB encryption to match the old hash file
-        if let Some(ref db_mutex) = state.config_db {
-            let db = db_mutex.lock().await;
-            if let Err(revert_err) = db.rekey(&current_hash) {
-                tracing::error!(
-                    "CRITICAL: Failed to revert DB encryption after hash file write failure: {}. \
-                     The config DB may be inaccessible on next restart. \
-                     Use --set-bootstrap-password or the recover-db endpoint.",
-                    revert_err
-                );
-            } else {
-                tracing::info!(
-                    "DB encryption reverted to previous password after file write failure"
-                );
-            }
-        }
         return password_err(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
-                "Failed to persist hash file ({}). Password change aborted and reverted.",
+                "Failed to persist hash file ({}). Password change aborted.",
                 e
             ),
         );
@@ -199,9 +148,14 @@ pub struct RecoverDbRequest {
     candidate_password: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct RecoverDbResponse {
     success: bool,
+    /// What the candidate is: `config_db_key` (set it as `DGP_CONFIG_DB_KEY`
+    /// or write it to the key file) or `bootstrap_hash` (a DB from before S8,
+    /// keyed with the bootstrap password hash: set it as the bootstrap hash).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     correct_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -210,10 +164,35 @@ pub struct RecoverDbResponse {
     error: Option<String>,
 }
 
-/// POST /api/admin/recover-db — try a candidate password against the locked config DB.
+/// Pure: the keys to try for a recovery candidate, with the kind of each.
+/// The candidate as typed is a config DB key; a bcrypt hash (raw or base64)
+/// is also tried as the legacy key.
+fn recovery_candidates(candidate: &str) -> Vec<(&'static str, String)> {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return Vec::new();
+    }
+    if candidate.starts_with("$2") {
+        return vec![("bootstrap_hash", candidate.to_string())];
+    }
+    let mut out = vec![("config_db_key", candidate.to_string())];
+    let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, candidate)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|s| s.starts_with("$2"));
+    if let Some(hash) = decoded {
+        out.push(("bootstrap_hash", hash));
+    }
+    out
+}
+
+/// POST /api/admin/recover-db — try a candidate key against the parked config DB.
 ///
-/// Only available when `config_db_mismatch` is true. Returns the correct bcrypt
-/// hash (and base64 version) if the candidate password successfully decrypts the DB.
+/// Only available when `config_db_mismatch` is true. The candidate is a config
+/// DB key (an earlier `DGP_CONFIG_DB_KEY` or key-file value) or, for a DB from
+/// before S8, the bootstrap password hash (raw or base64). Read-only: the
+/// response says which it is; the operator sets it and restarts, and the boot
+/// promotes the parked DB.
 pub async fn recover_db(
     State(state): State<Arc<AdminState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
@@ -224,10 +203,8 @@ pub async fn recover_db(
         return (
             StatusCode::NOT_FOUND,
             Json(RecoverDbResponse {
-                success: false,
-                correct_hash: None,
-                correct_hash_base64: None,
                 error: Some("No config DB mismatch detected".into()),
+                ..Default::default()
             }),
         )
             .into_response();
@@ -258,50 +235,26 @@ pub async fn recover_db(
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 Json(RecoverDbResponse {
-                    success: false,
-                    correct_hash: None,
-                    correct_hash_base64: None,
                     error: Some("Too many attempts — try again later".into()),
+                    ..Default::default()
                 }),
             )
                 .into_response();
         }
     };
 
-    // The SQLCipher DB is encrypted with the bcrypt HASH string (not the plaintext
-    // password). Accept the hash in either raw ($2b$12$...) or base64 form.
-    let candidate = body.candidate_password.trim().to_string();
-    let candidate_hash = if candidate.starts_with("$2") {
-        // Raw bcrypt hash
-        candidate.clone()
-    } else {
-        // Try base64 decode → UTF-8 → bcrypt hash prefix check
-        let decoded =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &candidate)
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .filter(|s| s.starts_with("$2"));
-
-        match decoded {
-            Some(hash) => hash,
-            None => {
-                guard.record_failure();
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(RecoverDbResponse {
-                        success: false,
-                        correct_hash: None,
-                        correct_hash_base64: None,
-                        error: Some(
-                            "Input is not a bcrypt hash. Provide the hash ($2b$12$...) or its base64 encoding."
-                                .into(),
-                        ),
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    };
+    let candidates = recovery_candidates(&body.candidate_password);
+    if candidates.is_empty() {
+        guard.record_failure();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(RecoverDbResponse {
+                error: Some("Provide a config DB key or a bootstrap password hash.".into()),
+                ..Default::default()
+            }),
+        )
+            .into_response();
+    }
 
     // Try local .db.bak first
     let bak_path = crate::config_db::config_db_path().with_extension("db.bak");
@@ -334,49 +287,45 @@ pub async fn recover_db(
         return (
             StatusCode::NOT_FOUND,
             Json(RecoverDbResponse {
-                success: false,
-                correct_hash: None,
-                correct_hash_base64: None,
                 error: Some(
                     "No config database found to recover (no .bak file and no S3 copy)".into(),
                 ),
+                ..Default::default()
             }),
         )
             .into_response();
     };
 
-    // Try to open with the candidate hash
     let is_recovery_temp = db_path
         .extension()
         .map(|e| e == "recovery")
         .unwrap_or(false);
-    let result = crate::config_db::ConfigDb::open_or_create(&db_path, &candidate_hash);
+    // Read-only probe: the parked DB is never migrated or re-encrypted here.
+    let matched = candidates
+        .into_iter()
+        .find(|(_, key)| crate::config_db::probe_key(&db_path, key).unwrap_or(false));
 
     // Always clean up the recovery temp file (from S3 download), regardless of outcome
     if is_recovery_temp {
         let _ = std::fs::remove_file(&db_path);
     }
 
-    match result {
-        Ok(_db) => {
+    match matched {
+        Some((kind, key)) => {
             guard.record_success();
-
-            let hash_base64 = base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                candidate_hash.as_bytes(),
-            );
-
-            // Recovery is READ-ONLY: it validates the hash against the preserved
-            // .db.bak and hands it back for the operator to set as the bootstrap
-            // password, then restart. It deliberately does NOT write the sidecar
-            // or promote the DB — an earlier auto-write left the empty .db in
-            // place (still undecryptable) while claiming "just restart", which
-            // was false and, before the boot clobber-guard, destructive.
             audit_log("recover_db_success", "admin", "", &headers);
-
-            // Response body contains the bcrypt hash that decrypts
-            // the SQLCipher DB. `no-store` keeps intermediaries
-            // and the browser's bfcache from retaining it.
+            let (correct_hash, correct_hash_base64) = if kind == "bootstrap_hash" {
+                let b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    key.as_bytes(),
+                );
+                (Some(key), Some(b64))
+            } else {
+                // The operator typed the key; never echo it back.
+                (None, None)
+            };
+            // `no-store` keeps intermediaries and the browser's bfcache from
+            // retaining a recovered hash.
             (
                 StatusCode::OK,
                 [
@@ -388,23 +337,21 @@ pub async fn recover_db(
                 ],
                 Json(RecoverDbResponse {
                     success: true,
-                    correct_hash: Some(candidate_hash),
-                    correct_hash_base64: Some(hash_base64),
+                    key_kind: Some(kind),
+                    correct_hash,
+                    correct_hash_base64,
                     error: None,
                 }),
             )
                 .into_response()
         }
-        Err(_) => {
+        None => {
             guard.record_failure();
-
             (
                 StatusCode::UNAUTHORIZED,
                 Json(RecoverDbResponse {
-                    success: false,
-                    correct_hash: None,
-                    correct_hash_base64: None,
-                    error: Some("Password does not match the encrypted database".into()),
+                    error: Some("The key does not open the encrypted database".into()),
+                    ..Default::default()
                 }),
             )
                 .into_response()
@@ -414,6 +361,40 @@ pub async fn recover_db(
 
 #[cfg(test)]
 mod tests {
+    /// S8: the password handler never re-encrypts the config DB (its key does
+    /// not depend on the password). Source guard, so a revert is caught.
+    #[test]
+    fn password_change_never_rekeys_the_config_db() {
+        let src = include_str!("password.rs");
+        let handler = &src[..src.find("mod tests").unwrap()];
+        assert!(
+            !handler.contains(concat!(".re", "key(")),
+            "password.rs calls rekey"
+        );
+    }
+
+    #[test]
+    fn recovery_candidates_truth_table() {
+        use super::recovery_candidates as f;
+        assert!(f("  ").is_empty());
+        assert_eq!(
+            f("$2b$04$abc"),
+            vec![("bootstrap_hash", "$2b$04$abc".to_string())]
+        );
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "$2b$04$abc");
+        assert_eq!(
+            f(&b64),
+            vec![
+                ("config_db_key", b64.clone()),
+                ("bootstrap_hash", "$2b$04$abc".to_string())
+            ]
+        );
+        assert_eq!(
+            f(" 0123abcd "),
+            vec![("config_db_key", "0123abcd".to_string())]
+        );
+    }
+
     #[test]
     fn env_pinned_hash_blocks_password_change() {
         use super::env_pinned_hash_var as f;

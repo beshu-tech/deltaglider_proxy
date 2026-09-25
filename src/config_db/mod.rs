@@ -4,7 +4,8 @@
 //!
 //! Stores IAM users and permissions in an encrypted SQLite database.
 //! The DB file is cached locally and synced to/from S3 for multi-instance
-//! consistency. Encryption key is derived from the admin GUI password.
+//! consistency. The encryption key comes from `DGP_CONFIG_DB_KEY` or the key
+//! file next to the DB (see [`key`]), never from the admin password.
 
 use crate::iam::{IamUser, Permission};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -32,8 +33,23 @@ mod declarative;
 mod groups;
 pub(crate) mod iam_merge;
 pub(crate) mod job_store;
+pub mod key;
 mod users;
 pub(crate) use users::first_free_user_name;
+
+pub use key::{ConfigDbKeys, DbKeySource, DbSecret, FallbackKind};
+
+/// How [`ConfigDb::open_with_keys`] opened the DB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenedWith {
+    /// The file did not exist; it is new, keyed with the primary key.
+    Created,
+    /// The file opened with the primary key.
+    Primary,
+    /// The file opened with a fallback key and is now re-encrypted with the
+    /// primary key.
+    Migrated(FallbackKind),
+}
 
 /// Compute the path to the IAM config database file.
 ///
@@ -143,7 +159,7 @@ impl ConfigDb {
         .map_err(|e| {
             key_check_error(
                 e,
-                "Cannot decrypt config database (wrong bootstrap password?)",
+                "Cannot decrypt config database (wrong DGP_CONFIG_DB_KEY or key file?)",
             )
         })?;
 
@@ -160,6 +176,53 @@ impl ConfigDb {
             local_path: local_path.to_path_buf(),
             s3_etag: None,
         })
+    }
+
+    /// Open (or create) the DB with `keys.primary`. A DB that opens only with a
+    /// fallback key (the legacy bootstrap hash, or a key file that an env key
+    /// replaces) is re-encrypted with the primary key first, see
+    /// [`rekey_file`]. A DB that opens with no key is `WrongPassphrase`.
+    pub fn open_with_keys(
+        local_path: &Path,
+        keys: &ConfigDbKeys,
+    ) -> Result<(Self, OpenedWith), ConfigDbError> {
+        Self::open_with_keys_hooked(local_path, keys, |_| Ok(()))
+    }
+
+    fn open_with_keys_hooked(
+        local_path: &Path,
+        keys: &ConfigDbKeys,
+        before_swap: impl FnOnce(&Path) -> Result<(), ConfigDbError>,
+    ) -> Result<(Self, OpenedWith), ConfigDbError> {
+        let existed = local_path.exists();
+        let primary = keys.primary.expose();
+        let wrong = match Self::open_or_create(local_path, primary) {
+            Ok(db) => {
+                let how = if existed {
+                    OpenedWith::Primary
+                } else {
+                    OpenedWith::Created
+                };
+                return Ok((db, how));
+            }
+            Err(ConfigDbError::WrongPassphrase(msg)) => msg,
+            Err(e) => return Err(e),
+        };
+        for (kind, old) in &keys.fallbacks {
+            if !probe_key(local_path, old.expose())? {
+                continue;
+            }
+            rekey_file_hooked(local_path, old.expose(), primary, before_swap)?;
+            warn!(
+                "Config DB {} opened with {}; it is now re-encrypted with {}",
+                local_path.display(),
+                kind.describe(),
+                keys.source.describe()
+            );
+            let db = Self::open_or_create(local_path, primary)?;
+            return Ok((db, OpenedWith::Migrated(*kind)));
+        }
+        Err(ConfigDbError::WrongPassphrase(wrong))
     }
 
     /// Create an in-memory DB for testing.
@@ -1070,12 +1133,98 @@ impl ConfigDb {
         Ok(rows)
     }
 
-    /// Re-encrypt the database with a new passphrase (after bootstrap password change).
+    /// Re-encrypt the open database in place with a new key.
     pub fn rekey(&self, new_passphrase: &str) -> Result<(), ConfigDbError> {
         self.conn.pragma_update(None, "rekey", new_passphrase)?;
         info!("Config database re-encrypted with new passphrase");
         Ok(())
     }
+}
+
+/// True if `key` decrypts the existing DB file at `path`. Reads only: the
+/// file is never created or migrated. A busy or unreadable file is `Err`, not
+/// `false`, so it is never taken for a wrong key.
+pub fn probe_key(path: &Path, key: &str) -> Result<bool, ConfigDbError> {
+    use rusqlite::OpenFlags;
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.pragma_update(None, "key", key)?;
+    conn.pragma_update(None, "busy_timeout", "5000")?;
+    match conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i32>(0)
+    }) {
+        Ok(_) => Ok(true),
+        Err(e) if is_not_a_database(&e) => Ok(false),
+        Err(e) => Err(ConfigDbError::Sqlite(e)),
+    }
+}
+
+/// Re-encrypt the DB file at `path` from `old` to `new` without a window in
+/// which the original is at risk: rekey a COPY, check that the copy opens
+/// with `new`, then rename it over the original (atomic on one filesystem).
+/// On any failure the copy is removed and the original stays as it was.
+pub fn rekey_file(path: &Path, old: &str, new: &str) -> Result<(), ConfigDbError> {
+    rekey_file_hooked(path, old, new, |_| Ok(()))
+}
+
+/// `before_swap` runs on the re-encrypted copy before the check and the
+/// rename (tests inject failures there).
+fn rekey_file_hooked(
+    path: &Path,
+    old: &str,
+    new: &str,
+    before_swap: impl FnOnce(&Path) -> Result<(), ConfigDbError>,
+) -> Result<(), ConfigDbError> {
+    if new.is_empty() {
+        return Err(ConfigDbError::WrongPassphrase(
+            "Config database key must not be empty".to_string(),
+        ));
+    }
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".rekey.tmp");
+    let tmp = path.with_file_name(tmp_name);
+    // A copy left by an interrupted attempt is never the live DB.
+    let _ = std::fs::remove_file(&tmp);
+    // Open with the old key first: a read rolls back a hot journal, so the
+    // copy below sees a consistent file.
+    if !probe_key(path, old)? {
+        return Err(ConfigDbError::WrongPassphrase(format!(
+            "Cannot re-encrypt {}: the old key does not open it",
+            path.display()
+        )));
+    }
+    let result = (|| -> Result<(), ConfigDbError> {
+        std::fs::copy(path, &tmp).map_err(ConfigDbError::Io)?;
+        {
+            let conn = Connection::open(&tmp)?;
+            conn.pragma_update(None, "key", old)?;
+            conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+                r.get::<_, i32>(0)
+            })?;
+            conn.pragma_update(None, "rekey", new)?;
+        }
+        before_swap(&tmp)?;
+        if !probe_key(&tmp, new)? {
+            return Err(ConfigDbError::Other(
+                "the re-encrypted copy does not open with the new key".to_string(),
+            ));
+        }
+        std::fs::File::open(&tmp)
+            .and_then(|f| f.sync_all())
+            .map_err(ConfigDbError::Io)?;
+        std::fs::rename(&tmp, path).map_err(ConfigDbError::Io)?;
+        if let Some(dir) = path.parent() {
+            // Make the rename durable; best effort (not every FS allows it).
+            let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1909,5 +2058,102 @@ mod tests {
             .query_row("SELECT count(*) FROM permissions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(perm_count, 0, "No orphaned permissions should exist");
+    }
+
+    // === S8: key migration ===
+
+    const HASH: &str = "$2b$04$legacyhashlegacyhashlegacyhashlegacyhash";
+    const NEW_KEY: &str = "new-config-db-key-0123456789abcdef0123456789";
+
+    fn legacy_db(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("deltaglider_config.db");
+        let db = ConfigDb::open_or_create(&path, HASH).unwrap();
+        db.create_user("alice", "AKALICE1", "secret", true, &[])
+            .unwrap();
+        path
+    }
+
+    fn keys() -> ConfigDbKeys {
+        ConfigDbKeys::primary_only(NEW_KEY).with_fallback(FallbackKind::LegacyBootstrapHash, HASH)
+    }
+
+    #[test]
+    fn legacy_hash_keyed_db_migrates_to_the_primary_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = legacy_db(dir.path());
+        let (db, how) = ConfigDb::open_with_keys(&path, &keys()).unwrap();
+        assert_eq!(how, OpenedWith::Migrated(FallbackKind::LegacyBootstrapHash));
+        assert_eq!(db.load_users().unwrap()[0].name, "alice");
+        drop(db);
+        assert!(probe_key(&path, NEW_KEY).unwrap());
+        assert!(!probe_key(&path, HASH).unwrap());
+        assert!(!dir.path().join("deltaglider_config.db.rekey.tmp").exists());
+        // A second open is a plain primary open.
+        let (_, how) = ConfigDb::open_with_keys(&path, &keys()).unwrap();
+        assert_eq!(how, OpenedWith::Primary);
+    }
+
+    #[test]
+    fn a_failed_rekey_leaves_the_original_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = legacy_db(dir.path());
+        let before = std::fs::read(&path).unwrap();
+        // The rekey step fails after the copy is re-encrypted.
+        let err = ConfigDb::open_with_keys_hooked(&path, &keys(), |_| {
+            Err(ConfigDbError::Other("injected".into()))
+        })
+        .err()
+        .expect("the injected failure must surface");
+        assert!(err.to_string().contains("injected"), "{err}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "original bytes changed"
+        );
+        assert!(!dir.path().join("deltaglider_config.db.rekey.tmp").exists());
+        // A copy that is corrupt after the rekey fails the check, not the DB.
+        let err = ConfigDb::open_with_keys_hooked(&path, &keys(), |tmp| {
+            std::fs::write(tmp, b"garbage").map_err(ConfigDbError::Io)
+        })
+        .err()
+        .expect("a corrupt copy must not be swapped in");
+        assert!(!matches!(err, ConfigDbError::Other(ref m) if m.contains("injected")));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // The original still opens with the legacy key, and a clean retry
+        // migrates it.
+        let db = ConfigDb::open_or_create(&path, HASH).unwrap();
+        assert_eq!(db.load_users().unwrap().len(), 1);
+        drop(db);
+        let (_, how) = ConfigDb::open_with_keys(&path, &keys()).unwrap();
+        assert_eq!(how, OpenedWith::Migrated(FallbackKind::LegacyBootstrapHash));
+    }
+
+    #[test]
+    fn a_db_under_an_unknown_key_is_wrong_passphrase_and_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deltaglider_config.db");
+        drop(ConfigDb::open_or_create(&path, "some-other-key").unwrap());
+        let before = std::fs::read(&path).unwrap();
+        let err = ConfigDb::open_with_keys(&path, &keys()).err().unwrap();
+        assert!(matches!(err, ConfigDbError::WrongPassphrase(_)), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_missing_db_is_created_with_the_primary_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deltaglider_config.db");
+        let (_, how) = ConfigDb::open_with_keys(&path, &keys()).unwrap();
+        assert_eq!(how, OpenedWith::Created);
+        assert!(probe_key(&path, NEW_KEY).unwrap());
+    }
+
+    #[test]
+    fn a_leftover_rekey_copy_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = legacy_db(dir.path());
+        std::fs::write(dir.path().join("deltaglider_config.db.rekey.tmp"), b"stale").unwrap();
+        let (db, _) = ConfigDb::open_with_keys(&path, &keys()).unwrap();
+        assert_eq!(db.load_users().unwrap().len(), 1);
     }
 }

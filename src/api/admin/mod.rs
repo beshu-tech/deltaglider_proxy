@@ -181,7 +181,7 @@ pub type ParityCancels =
 pub(crate) enum SyncPush {
     /// No sync bucket configured on this instance.
     Disabled,
-    /// Blocked: bootstrap password mismatch (recovery required).
+    /// Blocked: config DB key mismatch (recovery required).
     BlockedMismatch,
     /// The local DB is durably in S3 (possibly after reconcile retries).
     Uploaded,
@@ -193,18 +193,16 @@ pub(crate) enum SyncPush {
 /// this; fire-and-forget callers go through [`trigger_config_sync`].
 pub(crate) async fn push_config_sync_now(state: &Arc<AdminState>) -> SyncPush {
     if state.config_db_mismatch {
-        tracing::warn!("Config sync blocked — bootstrap password mismatch (recovery required)");
+        tracing::warn!("Config sync blocked — the config DB key does not open the config DB (recovery required)");
         return SyncPush::BlockedMismatch;
     }
     let Some(sync) = state.config_sync.as_ref() else {
         return SyncPush::Disabled;
     };
-    // Clone the hash out of the parking_lot lock before awaiting (guard isn't Send).
-    let password_hash = state.password_hash.read().clone();
     match crate::config_db_sync::upload_with_reconcile(
         sync,
         &state.config_db,
-        &password_hash,
+        sync.db_key(),
         &state.iam_state,
         &state.external_auth,
         Some(&state.sessions),
@@ -222,7 +220,7 @@ pub(crate) async fn push_config_sync_now(state: &Arc<AdminState>) -> SyncPush {
 /// No-op when config_db_mismatch is true (prevents overwriting good DB with empty one).
 pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
     if state.config_db_mismatch {
-        tracing::warn!("Config sync blocked — bootstrap password mismatch (recovery required)");
+        tracing::warn!("Config sync blocked — the config DB key does not open the config DB (recovery required)");
         return;
     }
     if state.config_sync.is_none() {

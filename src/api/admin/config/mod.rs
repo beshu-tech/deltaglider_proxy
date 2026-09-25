@@ -1189,14 +1189,11 @@ pub async fn sync_now(
         .as_ref()
         .ok_or(axum::http::StatusCode::NOT_FOUND)?;
 
-    let password_hash = state.password_hash.read().clone();
     // Same helper as the periodic poll: download, three-way merge, rebuild.
-    // The hash is cloned OUT of the parking_lot lock before the await (its
-    // guard is not Send).
     match crate::config_db_sync::pull_and_merge(
         sync,
         &state.config_db,
-        &password_hash,
+        sync.db_key(),
         &state.iam_state,
         &state.external_auth,
         Some(&state.sessions),

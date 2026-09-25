@@ -790,7 +790,7 @@ pub fn build_s3_router(
 
     if config_db_mismatch {
         error!(
-            "S3 API LOCKED — all requests will be rejected until bootstrap password mismatch is resolved via /_/"
+            "S3 API LOCKED — all requests will be rejected until the config DB key mismatch is resolved via /_/"
         );
         router = router.layer(axum::Extension(ConfigDbMismatchGuard));
     }
@@ -880,9 +880,8 @@ fn should_preserve_as_backup(db_exists: bool, bak_exists: bool) -> bool {
 
 /// What to do about a lingering `.db.bak` when the live config DB OPENED fine.
 /// A lingering backup means an earlier mismatch incident MAY be unresolved.
-/// Promotion is deliberately NOT an Ok-branch option: the real incident's
-/// recovery (correct hash restored) always lands in the ERR branch, so an
-/// Ok-open node never auto-swaps databases.
+/// An Ok-open node promotes only a POPULATED backup over an EMPTY live DB
+/// (the recovery shape); a populated live DB is never swapped out.
 #[derive(Debug, PartialEq, Eq)]
 enum BakDisposition {
     /// No `.db.bak` on disk — the normal healthy boot.
@@ -890,6 +889,10 @@ enum BakDisposition {
     /// Backup undecryptable + live DB EMPTY: the wrong-hash incident shape —
     /// stay mismatched/locked (the good DB is parked in `.db.bak`).
     Sticky,
+    /// Backup decrypts with a key this boot has, holds users, and the live DB
+    /// is EMPTY: the operator restored the right key after an incident —
+    /// promote the backup (the live file is kept as `.db.discarded`).
+    Promote,
     /// Anything else (bak decrypts, or the live DB has users): a stray backup
     /// on a working node — warn loudly, never lock, never touch either file.
     AmbiguousWarn,
@@ -910,17 +913,29 @@ fn classify_lingering_bak(
         // A populated live DB that opens is NOT the incident DB — a stray
         // undecryptable bak must not lock a healthy node.
         (true, None, _) => BakDisposition::AmbiguousWarn,
+        // S8: the key no longer changes with the bootstrap password, so a
+        // recovery boot (right key restored) can open the fresh live DB: the
+        // promotion that used to happen only in the Err branch happens here.
+        (true, Some(n), 0) if n > 0 => BakDisposition::Promote,
         (true, Some(_), _) => BakDisposition::AmbiguousWarn,
     }
 }
 
-/// Probe `.db.bak` with the current hash: `Some(user_count)` when it opens,
-/// `None` when it doesn't. A junk/empty file opens under ANY hash (SQLCipher
-/// treats it as fresh) — the user count is what distinguishes a real parked
-/// IAM DB from junk, so promotion requires `Some(n) with n > 0`.
-fn probe_bak_users(bak_path: &std::path::Path, admin_password_hash: &str) -> Option<usize> {
-    deltaglider_proxy::config_db::ConfigDb::open_or_create(bak_path, admin_password_hash)
-        .ok()
+/// Probe `.db.bak` with the config DB keys (primary, then fallbacks):
+/// `Some(user_count)` when one opens it, `None` when none does. A junk/empty
+/// file opens under ANY key (SQLCipher treats it as fresh) — the user count is
+/// what distinguishes a real parked IAM DB from junk, so promotion requires
+/// `Some(n) with n > 0`. Read-only apart from schema migration: a bak that
+/// opens with a fallback is re-encrypted only when it is promoted.
+fn probe_bak_users(
+    bak_path: &std::path::Path,
+    keys: &deltaglider_proxy::config_db::ConfigDbKeys,
+) -> Option<usize> {
+    use deltaglider_proxy::config_db::{probe_key, ConfigDb};
+    std::iter::once(&keys.primary)
+        .chain(keys.fallbacks.iter().map(|(_, k)| k))
+        .find(|k| probe_key(bak_path, k.expose()).unwrap_or(false))
+        .and_then(|k| ConfigDb::open_or_create(bak_path, k.expose()).ok())
         .and_then(|db| db.load_users().ok())
         .map(|u| u.len())
 }
@@ -932,7 +947,7 @@ fn probe_bak_users(bak_path: &std::path::Path, admin_password_hash: &str) -> Opt
 fn promote_backup_db(
     db_file: &std::path::Path,
     bak_path: &std::path::Path,
-    admin_password_hash: &str,
+    keys: &deltaglider_proxy::config_db::ConfigDbKeys,
 ) -> Result<deltaglider_proxy::config_db::ConfigDb, String> {
     let discarded = db_file.with_extension("db.discarded");
     std::fs::rename(db_file, &discarded).map_err(|e| {
@@ -951,7 +966,7 @@ fn promote_backup_db(
             db_file.display()
         ));
     }
-    let db = deltaglider_proxy::config_db::ConfigDb::open_or_create(db_file, admin_password_hash)
+    let (db, _) = deltaglider_proxy::config_db::ConfigDb::open_with_keys(db_file, keys)
         .map_err(|e| format!("reopen promoted {}: {e}", db_file.display()))?;
     info!(
         "config-db mismatch incident resolved: promoted backup {} over the live DB \
@@ -962,27 +977,102 @@ fn promote_backup_db(
     Ok(db)
 }
 
+/// `--set-bootstrap-password` helper: if the config DB still opens only with
+/// the CURRENT bootstrap hash (a DB from before S8), re-encrypt it with the
+/// config DB key now. Without this, the new hash would leave no key that
+/// opens the DB. No DB, or a DB already on the config DB key: no-op.
+pub fn migrate_legacy_config_db_key() -> Result<(), String> {
+    use deltaglider_proxy::config_db::{key, ConfigDb, OpenedWith};
+    let db_path = config_db_path();
+    if !db_path.exists() {
+        return Ok(());
+    }
+    // The hash this node boots with today: env, then the state files. (A hash
+    // in the YAML config also works: the boot migrates with it.)
+    let current_hash = ["DGP_BOOTSTRAP_PASSWORD_HASH", "DGP_ADMIN_PASSWORD_HASH"]
+        .iter()
+        .find_map(|n| std::env::var(n).ok().filter(|v| !v.trim().is_empty()))
+        .or_else(|| {
+            [".deltaglider_bootstrap_hash", ".deltaglider_admin_hash"]
+                .iter()
+                .find_map(|f| std::fs::read_to_string(f).ok())
+        })
+        .map(|raw| Config::decode_hash(raw.trim()));
+    let keys =
+        key::resolve_config_db_keys(&db_path, current_hash.as_deref(), |n| std::env::var(n).ok())?;
+    match ConfigDb::open_with_keys(&db_path, &keys) {
+        Ok((_, OpenedWith::Migrated(kind))) => {
+            eprintln!(
+                "Config DB {} re-encrypted: it opened with {}, now with {}.",
+                db_path.display(),
+                kind.describe(),
+                keys.source.describe()
+            );
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!(
+            "the config DB {} does not open with the config DB key or the current \
+             bootstrap hash ({e}); fix that before changing the password",
+            db_path.display()
+        )),
+    }
+}
+
+/// Resolve the config DB keys (`DGP_CONFIG_DB_KEY`, else the key file, with
+/// the bootstrap hash as the legacy fallback). Exits on a configuration that
+/// would make the DB unreadable: a short env key, an empty key file, or a
+/// config sync bucket without the env key.
+pub fn resolve_config_db_keys_or_exit(
+    config: &Config,
+    admin_password_hash: &str,
+) -> deltaglider_proxy::config_db::ConfigDbKeys {
+    use deltaglider_proxy::config_db::key::{
+        check_sync_needs_env_key, resolve_config_db_keys, CONFIG_DB_KEY_ENV,
+    };
+    let env_key = std::env::var(CONFIG_DB_KEY_ENV).ok();
+    // Before any key file exists: a multi-instance node must not mint its own.
+    if let Err(e) =
+        check_sync_needs_env_key(config.config_sync_bucket.as_deref(), env_key.as_deref())
+    {
+        error!("FATAL: {e}");
+        std::process::exit(1);
+    }
+    match resolve_config_db_keys(&config_db_path(), Some(admin_password_hash), |n| {
+        std::env::var(n).ok()
+    }) {
+        Ok(keys) => {
+            info!("  Config DB key: {}", keys.source.describe());
+            keys
+        }
+        Err(e) => {
+            error!("FATAL: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Initialize the encrypted IAM config database. If it contains existing
 /// users, switch to IAM mode immediately.
 ///
-/// Returns `(config_db, mismatch)` where `mismatch` is true if the bootstrap
-/// password hash doesn't match the existing DB encryption key.
+/// Returns `(config_db, mismatch)` where `mismatch` is true if no config DB
+/// key (`DGP_CONFIG_DB_KEY`, key file, legacy bootstrap hash) opens the DB.
 pub fn init_config_db(
-    admin_password_hash: &str,
+    keys: &deltaglider_proxy::config_db::ConfigDbKeys,
     iam_state: &SharedIamState,
     config: &Config,
 ) -> (
     Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
     bool,
 ) {
-    init_config_db_attempt(admin_password_hash, iam_state, config, true)
+    init_config_db_attempt(keys, iam_state, config, true)
 }
 
 /// One boot attempt. `allow_promote` bounds the recover-then-retry to a
 /// single pass (a boot with the correct hash finding the live DB locked but
 /// `.db.bak` readable promotes the backup, then re-runs the normal open path).
 fn init_config_db_attempt(
-    admin_password_hash: &str,
+    keys: &deltaglider_proxy::config_db::ConfigDbKeys,
     iam_state: &SharedIamState,
     config: &Config,
     allow_promote: bool,
@@ -991,13 +1081,13 @@ fn init_config_db_attempt(
     bool,
 ) {
     let db_file = config_db_path();
-    match deltaglider_proxy::config_db::ConfigDb::open_or_create(&db_file, admin_password_hash) {
-        Ok(db) => {
+    match deltaglider_proxy::config_db::ConfigDb::open_with_keys(&db_file, keys) {
+        Ok((db, _)) => {
             // Classify a lingering .db.bak BEFORE any boot-time mutation: a
             // node with an unresolved mismatch incident must stay locked.
             let bak_path = db_file.with_extension("db.bak");
             let disposition = if bak_path.exists() {
-                let bak_users = probe_bak_users(&bak_path, admin_password_hash);
+                let bak_users = probe_bak_users(&bak_path, keys);
                 // On a load error err on the side of "has users" — a populated
                 // live DB must never be treated as the incident-empty DB.
                 let live_user_count = db.load_users().map(|u| u.len()).unwrap_or(usize::MAX);
@@ -1009,13 +1099,41 @@ fn init_config_db_attempt(
                 BakDisposition::NoBak => {}
                 BakDisposition::Sticky => {
                     error!(
-                        "Lingering {} does not decrypt with the current bootstrap password hash \
-                         and the live DB is empty — an earlier mismatch incident is unresolved. \
-                         S3 API stays locked; restart with the original bootstrap password or \
-                         use the admin GUI recovery wizard.",
-                        bak_path.display()
+                        "Lingering {} does not decrypt with the config DB key ({}) and the \
+                         live DB is empty — an earlier mismatch incident is unresolved. S3 API \
+                         stays locked; restart with the original DGP_CONFIG_DB_KEY (or key \
+                         file) or use the admin GUI recovery wizard.",
+                        bak_path.display(),
+                        keys.source.describe()
                     );
                     return (Some(Arc::new(tokio::sync::Mutex::new(db))), true);
+                }
+                // The parked DB opens with a key this boot has, and the live DB
+                // is empty: the operator restored the key. The empty DB is kept
+                // as `.db.discarded`.
+                BakDisposition::Promote if allow_promote => {
+                    drop(db);
+                    return match promote_backup_db(&db_file, &bak_path, keys) {
+                        Ok(db) => {
+                            drop(db);
+                            init_config_db_attempt(keys, iam_state, config, false)
+                        }
+                        Err(err) => {
+                            error!(
+                                "Failed to promote {} during recovery: {err} — S3 API stays \
+                                 locked; both files remain on disk for manual recovery.",
+                                bak_path.display()
+                            );
+                            (None, true)
+                        }
+                    };
+                }
+                BakDisposition::Promote => {
+                    warn!(
+                        "Stale {} sits next to a working live config DB — refusing to touch \
+                         either file. Remove the stale backup manually.",
+                        bak_path.display()
+                    );
                 }
                 BakDisposition::AmbiguousWarn => {
                     warn!(
@@ -1198,7 +1316,7 @@ fn init_config_db_attempt(
             }
             (Some(Arc::new(tokio::sync::Mutex::new(db))), false)
         }
-        // Only a wrong key is a password mismatch. A busy file, an I/O error, a
+        // Only a wrong key is a key mismatch. A busy file, an I/O error, a
         // failed migration or a DB from a newer binary must NOT park the good
         // DB as `.db.bak` and boot on an empty one: stop, and leave the file.
         Err(e)
@@ -1224,17 +1342,12 @@ fn init_config_db_attempt(
             if allow_promote
                 && db_file.exists()
                 && bak_path.exists()
-                && probe_bak_users(&bak_path, admin_password_hash).is_some_and(|n| n > 0)
+                && probe_bak_users(&bak_path, keys).is_some_and(|n| n > 0)
             {
-                match promote_backup_db(&db_file, &bak_path, admin_password_hash) {
+                match promote_backup_db(&db_file, &bak_path, keys) {
                     Ok(db) => {
                         drop(db);
-                        return init_config_db_attempt(
-                            admin_password_hash,
-                            iam_state,
-                            config,
-                            false,
-                        );
+                        return init_config_db_attempt(keys, iam_state, config, false);
                     }
                     Err(err) => {
                         error!(
@@ -1260,16 +1373,20 @@ fn init_config_db_attempt(
                     );
                 } else {
                     error!(
-                        "Bootstrap password does not match config DB — original preserved as {}. \
-                         Use the admin GUI recovery wizard to resolve.",
+                        "The config DB key ({}) does not open the config DB ({e}) — original \
+                         preserved as {}. Restore the DGP_CONFIG_DB_KEY or key file that \
+                         encrypted it and restart, or use the admin GUI recovery wizard.",
+                        keys.source.describe(),
                         bak_path.display()
                     );
                 }
             } else if db_file.exists() {
                 // .bak already holds the good DB — leave it untouched.
                 error!(
-                    "Bootstrap password does not match config DB — good backup already \
-                     preserved at {}. Use the admin GUI recovery wizard to resolve.",
+                    "The config DB key ({}) does not open the config DB — good backup \
+                     already preserved at {}. Restore the original key and restart, or use \
+                     the admin GUI recovery wizard.",
+                    keys.source.describe(),
                     bak_path.display()
                 );
             } else {
@@ -1284,7 +1401,7 @@ fn init_config_db_attempt(
             let mismatch = bak_path.exists() || db_file.exists();
             match deltaglider_proxy::config_db::ConfigDb::open_or_create(
                 &db_file,
-                admin_password_hash,
+                keys.primary.expose(),
             ) {
                 Ok(db) => {
                     info!("Created fresh IAM config database: {}", db_file.display());
@@ -1326,7 +1443,7 @@ fn coordination_backend(config: &Config) -> &BackendConfig {
 pub async fn build_coordination_lease(
     config: &Config,
     config_db: &Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>,
-    admin_password_hash: &str,
+    db_keys: &deltaglider_proxy::config_db::ConfigDbKeys,
 ) -> Arc<dyn deltaglider_proxy::coordination::CoordinationLease> {
     use deltaglider_proxy::coordination::{durable_node_id, LocalLease, S3Lease};
 
@@ -1360,7 +1477,7 @@ pub async fn build_coordination_lease(
                 deltaglider_proxy::config_db_sync::DEFAULT_CONFIG_SYNC_OBJECT_KEY.to_string()
             }),
         config_db_path(),
-        admin_password_hash.to_string(),
+        db_keys.clone(),
     )
     .await
     {
@@ -1599,7 +1716,7 @@ pub async fn boot_backend_health_gate(
 #[allow(clippy::too_many_arguments)]
 pub async fn init_config_sync(
     config: &Config,
-    admin_password_hash: &str,
+    db_keys: &deltaglider_proxy::config_db::ConfigDbKeys,
     config_db: &Option<Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>>,
     iam_state: &SharedIamState,
     external_auth: &Option<Arc<deltaglider_proxy::iam::external_auth::ExternalAuthManager>>,
@@ -1628,7 +1745,7 @@ pub async fn init_config_sync(
         sync_bucket.clone(),
         object_key,
         db_file,
-        admin_password_hash.to_string(),
+        db_keys.clone(),
     )
     .await
     {
@@ -1669,7 +1786,7 @@ pub async fn init_config_sync(
         match deltaglider_proxy::config_db_sync::upload_with_reconcile(
             &sync,
             config_db,
-            admin_password_hash,
+            db_keys.primary.expose(),
             iam_state,
             external_auth,
             Some(sessions),
@@ -1687,7 +1804,7 @@ pub async fn init_config_sync(
     match deltaglider_proxy::config_db_sync::pull_and_merge(
         &sync,
         config_db,
-        admin_password_hash,
+        db_keys.primary.expose(),
         iam_state,
         external_auth,
         Some(sessions),
@@ -1715,13 +1832,13 @@ pub fn spawn_config_sync_poll(
     iam_state: &SharedIamState,
     external_auth: &Option<Arc<deltaglider_proxy::iam::external_auth::ExternalAuthManager>>,
     sessions: &Arc<deltaglider_proxy::session::SessionStore>,
-    admin_password_hash: &str,
+    db_key: &deltaglider_proxy::config_db::DbSecret,
 ) {
     let db_arc = config_db.clone();
     let iam = iam_state.clone();
     let ext_auth = external_auth.clone();
     let sessions = sessions.clone();
-    let password_hash = admin_password_hash.to_string();
+    let db_key = db_key.clone();
 
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(300));
@@ -1732,7 +1849,7 @@ pub fn spawn_config_sync_poll(
             match deltaglider_proxy::config_db_sync::pull_and_merge(
                 &sync,
                 &db_arc,
-                &password_hash,
+                db_key.expose(),
                 &iam,
                 &ext_auth,
                 Some(&sessions),
@@ -1754,7 +1871,7 @@ pub fn spawn_config_sync_poll(
                 if let Err(e) = deltaglider_proxy::config_db_sync::upload_with_reconcile(
                     &sync,
                     &db_arc,
-                    &password_hash,
+                    db_key.expose(),
                     &iam,
                     &ext_auth,
                     Some(&sessions),
@@ -1910,10 +2027,11 @@ mod tests {
             classify_lingering_bak(true, None, usize::MAX),
             AmbiguousWarn
         );
-        // A decryptable bak never auto-promotes on an Ok-open boot — the real
-        // incident's recovery always lands in the Err branch.
+        // A decryptable, populated bak next to an EMPTY live DB is the
+        // recovery shape (right key restored): promote. A junk bak (0 users)
+        // or a populated live DB never swaps.
         assert_eq!(classify_lingering_bak(true, Some(0), 0), AmbiguousWarn);
-        assert_eq!(classify_lingering_bak(true, Some(3), 0), AmbiguousWarn);
+        assert_eq!(classify_lingering_bak(true, Some(3), 0), Promote);
         assert_eq!(classify_lingering_bak(true, Some(3), 5), AmbiguousWarn);
     }
 
@@ -1931,7 +2049,8 @@ mod tests {
             deltaglider_proxy::config_db::ConfigDb::open_or_create(&db_file, "$2b$04$wrong")
                 .unwrap(),
         );
-        drop(promote_backup_db(&db_file, &bak, "$2b$04$good").expect("promote must succeed"));
+        let keys = deltaglider_proxy::config_db::ConfigDbKeys::primary_only("$2b$04$good");
+        drop(promote_backup_db(&db_file, &bak, &keys).expect("promote must succeed"));
         assert!(db_file.exists(), "live DB must exist after promote");
         assert!(!bak.exists(), ".db.bak must be consumed by promote");
         assert!(
@@ -1953,13 +2072,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bak = dir.path().join("deltaglider_config.db.bak");
         std::fs::write(&bak, b"").unwrap();
-        let users = probe_bak_users(&bak, "$2b$04$whatever");
+        let keys = deltaglider_proxy::config_db::ConfigDbKeys::primary_only("$2b$04$whatever");
+        let users = probe_bak_users(&bak, &keys);
         assert_eq!(users, Some(0), "junk bak opens but has no users");
         let promotable = users.is_some_and(|n| n > 0);
         assert!(
             !promotable,
             "the Err-branch promote gate must refuse a junk bak"
         );
+    }
+
+    /// A bak under the legacy bootstrap-hash key is found through the
+    /// fallback, and promotion re-encrypts it with the primary key.
+    #[test]
+    fn legacy_keyed_bak_is_probed_and_promoted_with_the_primary_key() {
+        use deltaglider_proxy::config_db::{probe_key, ConfigDb, ConfigDbKeys, FallbackKind};
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("deltaglider_config.db");
+        let bak = db_file.with_extension("db.bak");
+        let db = ConfigDb::open_or_create(&bak, "$2b$04$legacy").unwrap();
+        db.create_user("alice", "AKALICE1", "s", true, &[]).unwrap();
+        drop(db);
+        let primary = "primary-key-0123456789abcdef0123456789";
+        drop(ConfigDb::open_or_create(&db_file, primary).unwrap());
+        let keys = ConfigDbKeys::primary_only(primary)
+            .with_fallback(FallbackKind::LegacyBootstrapHash, "$2b$04$legacy");
+        assert_eq!(probe_bak_users(&bak, &keys), Some(1));
+        drop(promote_backup_db(&db_file, &bak, &keys).unwrap());
+        assert!(probe_key(&db_file, primary).unwrap());
     }
 
     // ── startup_declarative_action policy (IaC cold-start guards) ──────────

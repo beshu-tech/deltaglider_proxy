@@ -1505,8 +1505,7 @@ async fn document_validate_and_apply_report_standing_warnings_apart() {
 }
 
 /// D15: with DGP_BOOTSTRAP_PASSWORD_HASH set, the env hash wins at every
-/// boot. A GUI password change re-keyed the IAM DB with a new hash that the
-/// next boot never uses, so the DB became unreadable (IAM lockout). The
+/// boot, so a GUI password change would be lost at the next start. The
 /// change must be refused while the env var controls the hash.
 #[tokio::test]
 async fn password_change_refused_when_hash_comes_from_env() {
@@ -1534,13 +1533,11 @@ async fn password_change_refused_when_hash_comes_from_env() {
 
 // ── review second pass (failing tests for findings) ──────────────────────
 
-/// Review-2 (D15): the 409 tells the operator to run
-/// `--set-bootstrap-password` and pin its hash. That flag itself warns the
-/// IAM DB becomes unreadable (main.rs), the very lockout D15 prevents. The
-/// safe path is: unset the env var, change the password in the GUI (which
-/// re-keys the DB), then pin the new hash.
+/// Review-2 (D15): the 409 must give a safe path. Since S8 the config DB key
+/// does not depend on the bootstrap hash, so `--set-bootstrap-password` plus
+/// a new env hash is that path, and the IAM database is not affected.
 #[tokio::test]
-async fn review2_d15_refusal_does_not_recommend_the_iam_wiping_path() {
+async fn review2_d15_refusal_gives_a_safe_path() {
     let server = common::TestServer::builder()
         .env(
             "DGP_BOOTSTRAP_PASSWORD_HASH",
@@ -1561,7 +1558,7 @@ async fn review2_d15_refusal_does_not_recommend_the_iam_wiping_path() {
     assert_eq!(r.status().as_u16(), 409);
     let body = r.text().await.unwrap();
     assert!(
-        !body.contains("--set-bootstrap-password"),
-        "the advice makes the IAM DB unreadable: {body}"
+        body.contains("IAM database is not affected"),
+        "the refusal must say the IAM DB is safe: {body}"
     );
 }

@@ -489,26 +489,70 @@ async fn ha_revocation_reaches_peer() {
     }
 }
 
-/// Wrong-passphrase rejection: replica B boots with a DIFFERENT
-/// bootstrap password than A. Its startup sync downloads A's DB,
-/// the `ConfigDb::open_or_create` validation step fails (the SQLCipher
-/// cipher doesn't match), and the download is discarded — B's local
-/// DB is untouched.
-///
-/// Without this guard, B would replace its own DB with an un-
-/// decryptable blob and never authenticate again. The current code
-/// handles this as a WARN log (not an error), returning Ok(false)
-/// from `download_if_newer`.
-///
-/// We can't observe the log directly, but we can observe the
-/// consequence: B's admin login STILL works with B's own password
-/// even after the (failed) download.
+/// S8: the config DB key is NOT the bootstrap password. Replica B with a
+/// DIFFERENT bootstrap password but the SAME `DGP_CONFIG_DB_KEY` (the harness
+/// default for sync servers) pulls A's IAM state at startup.
 #[tokio::test]
-async fn ha_replica_with_wrong_password_preserves_local_state() {
+async fn ha_replica_with_other_bootstrap_password_pulls_state() {
     skip_unless_minio!();
 
     let sync_key = unique_config_sync_object_key();
+    let server_a = TestServer::builder()
+        .auth("HAKEY-A5", "HASECRET-A5-1234567890")
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
+        .config_sync_object_key(&sync_key)
+        .build()
+        .await;
+    let user_name = unique_user_name("ha-other-pw");
+    let resp = admin_http_client(&server_a.endpoint())
+        .await
+        .post(format!("{}/_/api/admin/users", server_a.endpoint()))
+        .json(&json!({
+            "name": user_name,
+            "permissions": [{"actions": ["read"], "resources": ["*"]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201);
+    wait_for_sync_object(&sync_key).await;
 
+    let other_password = "another-bootstrap-password-for-B";
+    let server_b = TestServer::builder()
+        .auth("HAKEY-B5", "HASECRET-B5-1234567890")
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
+        .bootstrap_password(other_password)
+        .config_sync_object_key(&sync_key)
+        .build()
+        .await;
+    let admin_b = admin_http_client_with_password(&server_b.endpoint(), other_password).await;
+    let users: Vec<serde_json::Value> = admin_b
+        .get(format!("{}/_/api/admin/users", server_b.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        users.iter().any(|u| u["name"] == user_name),
+        "B (other bootstrap password, same DB key) must see A's user; got: {users:?}"
+    );
+}
+
+/// Wrong-key rejection: replica B boots with a DIFFERENT `DGP_CONFIG_DB_KEY`.
+/// Its sync refuses A's DB (the SQLCipher key does not open it): B's local
+/// DB stays intact, A's user does not reach B, and an operator-triggered
+/// sync-now reports the failure instead of pretending all is current.
+#[tokio::test]
+async fn ha_replica_with_wrong_db_key_refuses_the_synced_db() {
+    skip_unless_minio!();
+
+    let sync_key = unique_config_sync_object_key();
     let server_a = TestServer::builder()
         .auth("HAKEY-A4", "HASECRET-A4-1234567890")
         .s3_endpoint(&minio_endpoint_url())
@@ -517,70 +561,142 @@ async fn ha_replica_with_wrong_password_preserves_local_state() {
         .config_sync_object_key(&sync_key)
         .build()
         .await;
-    let admin_a = admin_http_client(&server_a.endpoint()).await;
-    admin_a
+    let user_name = unique_user_name("ha-wrong-key");
+    admin_http_client(&server_a.endpoint())
+        .await
         .post(format!("{}/_/api/admin/users", server_a.endpoint()))
         .json(&json!({
-            "name": unique_user_name("ha-wrong-pw"),
+            "name": user_name,
             "permissions": [{"actions": ["read"], "resources": ["*"]}]
         }))
         .send()
         .await
         .unwrap();
+    wait_for_sync_object(&sync_key).await;
 
-    // Wait for A's upload to land.
-    let s3 = server_a.s3_client().await;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if s3
-            .head_object()
-            .bucket(MINIO_BUCKET)
-            .key(&sync_key)
-            .send()
-            .await
-            .is_ok()
-        {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("A's config.db never appeared");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-
-    // Server B: DIFFERENT bootstrap password. Its startup attempt
-    // to apply A's DB must fail the passphrase check gracefully.
-    let wrong_password = "different-password-that-wont-match-A";
     let server_b = TestServer::builder()
         .auth("HAKEY-B4", "HASECRET-B4-1234567890")
         .s3_endpoint(&minio_endpoint_url())
         .bucket(MINIO_BUCKET)
         .config_sync_bucket(MINIO_BUCKET)
-        .bootstrap_password(wrong_password)
+        .env(
+            "DGP_CONFIG_DB_KEY",
+            "a-different-config-db-key-0123456789abcdef",
+        )
         .config_sync_object_key(&sync_key)
         .build()
         .await;
 
-    // Can still log in to B with B's own password — B's local state
-    // wasn't clobbered by the failed download. (If the download had
-    // overwritten B's DB with A's undecryptable blob, this login
-    // would fail because B can't decrypt its own DB.)
-    let _admin_b = admin_http_client_with_password(&server_b.endpoint(), wrong_password).await;
+    // B's own DB still opens (login works) and holds no user of A.
+    let admin_b = admin_http_client(&server_b.endpoint()).await;
+    let users: Vec<serde_json::Value> = admin_b
+        .get(format!("{}/_/api/admin/users", server_b.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !users.iter().any(|u| u["name"] == user_name),
+        "B must not merge a DB under another key; got: {users:?}"
+    );
+    let sync_now = admin_b
+        .post(format!(
+            "{}/_/api/admin/config/sync-now",
+            server_b.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        sync_now.status().as_u16(),
+        502,
+        "sync-now must report the refused download"
+    );
 
-    // Further guard: A's S3 copy must still be decryptable with A's
-    // password. Nothing in B's startup should have overwritten the
-    // sync key. Fetch it raw and check that an admin-login against
-    // A still works (end-to-end: A's DB is unchanged).
-    let admin_a_again = admin_http_client(&server_a.endpoint()).await;
-    let resp = admin_a_again
+    // A's admin API (and its DB) is untouched.
+    let resp = admin_http_client(&server_a.endpoint())
+        .await
         .get(format!("{}/_/api/admin/users", server_a.endpoint()))
         .send()
         .await
         .unwrap();
+    assert!(resp.status().is_success());
+}
+
+/// S8 upgrade path: the sync object was written by a node on the release
+/// before S8, so it is keyed with the bootstrap password hash. A new node
+/// accepts it (legacy fallback), re-encrypts its copy with the DB key, and
+/// merges the IAM state.
+#[tokio::test]
+async fn ha_legacy_hash_keyed_sync_object_is_accepted() {
+    skip_unless_minio!();
+
+    let sync_key = unique_config_sync_object_key();
+    let user_name = unique_user_name("ha-legacy");
+    let dir = tempfile::tempdir().unwrap();
+    let legacy = dir.path().join("legacy.db");
+    {
+        let db = deltaglider_proxy::config_db::ConfigDb::open_or_create(
+            &legacy,
+            common::TEST_BOOTSTRAP_PASSWORD_HASH,
+        )
+        .unwrap();
+        db.create_user(&user_name, "AKLEGACY0001", "legacy-secret", true, &[])
+            .unwrap();
+    }
+    common::minio_client()
+        .await
+        .put_object()
+        .bucket(MINIO_BUCKET)
+        .key(&sync_key)
+        .body(std::fs::read(&legacy).unwrap().into())
+        .send()
+        .await
+        .expect("seed the legacy sync object");
+
+    let server = TestServer::builder()
+        .auth("HAKEY-L1", "HASECRET-L1-1234567890")
+        .s3_endpoint(&minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .config_sync_bucket(MINIO_BUCKET)
+        .config_sync_object_key(&sync_key)
+        .build()
+        .await;
+    let users: Vec<serde_json::Value> = admin_http_client(&server.endpoint())
+        .await
+        .get(format!("{}/_/api/admin/users", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert!(
-        resp.status().is_success(),
-        "A's admin API must still work after B's failed-passphrase sync attempt"
+        users.iter().any(|u| u["name"] == user_name),
+        "a legacy hash-keyed sync object must merge; got: {users:?}"
     );
+}
+
+/// Wait until the sync object exists in MinIO (the upload is a background
+/// task of the admin mutation).
+async fn wait_for_sync_object(sync_key: &str) {
+    let s3 = common::minio_client().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while s3
+        .head_object()
+        .bucket(MINIO_BUCKET)
+        .key(sync_key)
+        .send()
+        .await
+        .is_err()
+    {
+        if std::time::Instant::now() >= deadline {
+            panic!("the config DB never appeared in the sync bucket");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// X-ray H10: concurrent same-node mutations must not self-clobber.

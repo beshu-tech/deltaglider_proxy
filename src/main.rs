@@ -58,7 +58,7 @@ struct Cli {
     init: bool,
 
     /// Set bootstrap password from stdin, then exit.
-    /// WARNING: Changing the bootstrap password invalidates the encrypted IAM database.
+    /// The IAM database is not affected: its key is DGP_CONFIG_DB_KEY or the key file.
     #[arg(long, alias = "set-admin-password")]
     set_bootstrap_password: bool,
 
@@ -332,6 +332,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(1);
         }
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST).expect("bcrypt hashing failed");
+        // A DB from before S8 is keyed with the OLD hash: re-encrypt it with
+        // the config DB key first, so that the new hash does not strand it.
+        if let Err(e) = migrate_legacy_config_db_key() {
+            eprintln!("Error: {e}");
+            eprintln!("The bootstrap password is NOT changed.");
+            std::process::exit(1);
+        }
         // Write to new file, keep old file name as fallback for existing deployments
         let state_file = ".deltaglider_bootstrap_hash";
         deltaglider_proxy::config::write_bootstrap_hash_file(
@@ -340,11 +347,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .expect("Failed to write bootstrap hash file");
         eprintln!();
-        eprintln!("⚠ WARNING: If an encrypted IAM database exists, it will become");
-        eprintln!("  unreadable on next restart (encrypted with the old password).");
-        eprintln!("  All IAM users will be lost. The proxy will return to bootstrap mode.");
-        eprintln!();
         eprintln!("Bootstrap password hash written to {state_file}");
+        eprintln!(
+            "The IAM database is not affected (its key is DGP_CONFIG_DB_KEY or the key file)."
+        );
         // Print base64-encoded version for Docker/env var use (no $ escaping needed)
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&hash);
@@ -684,7 +690,8 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         move || sessions.cleanup_expired()
     });
     let shared_config = config.clone().into_shared();
-    let (config_db, config_db_mismatch) = init_config_db(&admin_password_hash, &iam_state, &config);
+    let db_keys = resolve_config_db_keys_or_exit(&config, &admin_password_hash);
+    let (config_db, config_db_mismatch) = init_config_db(&db_keys, &iam_state, &config);
 
     // Load the synced session-revocation snapshot so a revoke performed on any
     // instance (before this one started) is honored immediately.
@@ -805,7 +812,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Built once here so it's in scope both for the schedulers below AND for the
     // AdminState (so run-now/verify/delete can check the active lease — H14/29/48).
     let coordination_lease = if let Some(db) = config_db.as_ref() {
-        Some(build_coordination_lease(&config, db, &admin_password_hash).await)
+        Some(build_coordination_lease(&config, db, &db_keys).await)
     } else {
         None
     };
@@ -953,7 +960,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // --- Config DB S3 sync ---
     let config_sync = init_config_sync(
         &config,
-        &admin_password_hash,
+        &db_keys,
         &config_db,
         &iam_state,
         &external_auth,
@@ -969,7 +976,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             &iam_state,
             &external_auth,
             &session_store,
-            &admin_password_hash,
+            &db_keys.primary,
         );
     }
 

@@ -634,8 +634,7 @@ pub(crate) async fn apply_config_inner_with_env(
 
     // 4. Defense in depth: refuse to swap the bootstrap password hash
     //    through `apply`. The legitimate path is PUT /api/admin/password,
-    //    which verifies the current password and re-encrypts the config
-    //    database atomically. Accepting an arbitrary hash here would let
+    //    which verifies the current password. Accepting an arbitrary hash here would let
     //    an admin-session holder lock future admins out of the GUI (by
     //    setting a hash whose plaintext they don't share) or seed a hash
     //    whose plaintext they control. Export redaction means round-trips
@@ -651,7 +650,7 @@ pub(crate) async fn apply_config_inner_with_env(
                 requires_restart: false,
                 warnings: vec![],
                 error: Some(
-                    "bootstrap_password_hash cannot be changed via /config/apply; use PUT /api/admin/password (verifies the current password and re-encrypts the config DB atomically)".to_string(),
+                    "bootstrap_password_hash cannot be changed via /config/apply; use PUT /api/admin/password (verifies the current password)".to_string(),
                 ),
                 persisted_path: None,
             },

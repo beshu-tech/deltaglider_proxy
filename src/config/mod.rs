@@ -287,8 +287,14 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_BOOTSTRAP_PASSWORD_HASH",
-        description: "Bcrypt hash of bootstrap password (seeds DB encryption + admin GUI)",
+        description: "Bcrypt hash of the bootstrap password (admin GUI login and session signing)",
         example: "$2b$12$...",
+        category: "Authentication",
+    },
+    EnvVarEntry {
+        name: "DGP_CONFIG_DB_KEY",
+        description: "Encryption key of the IAM config DB, at least 32 characters (default: key file next to the DB, generated on first boot). Required, and the same on every instance, when config_sync_bucket is set",
+        example: "<openssl rand -hex 32>",
         category: "Authentication",
     },
     // ── TLS ─────────────────────────────────────────────────
@@ -2593,7 +2599,7 @@ impl Config {
 
     /// Decode a hash value: if it looks like base64 (no `$` prefix), decode it.
     /// Otherwise return as-is (raw bcrypt hash). Validates the result is a bcrypt hash.
-    fn decode_hash(value: &str) -> String {
+    pub fn decode_hash(value: &str) -> String {
         let trimmed = value.trim();
         let hash = if trimmed.starts_with('$') {
             // Raw bcrypt hash like $2b$12$...

@@ -67,8 +67,10 @@ pub struct ConfigDbSync {
     object_key: String,
     local_path: PathBuf,
     last_etag: Arc<RwLock<Option<String>>>,
-    /// The local bootstrap password hash, used to validate downloaded DBs.
-    bootstrap_password_hash: String,
+    /// The config DB keys, used to validate downloaded DBs. A download under
+    /// a fallback key (a peer on the release before S8) is re-encrypted with
+    /// the primary key before the merge.
+    db_keys: crate::config_db::ConfigDbKeys,
     /// Set when an upload exhausted its retries; the periodic poll flushes it.
     needs_upload: AtomicBool,
     /// Serialises this node's own uploads. Two concurrent same-node uploads
@@ -92,7 +94,7 @@ impl ConfigDbSync {
         sync_bucket: String,
         object_key: String,
         local_path: PathBuf,
-        bootstrap_password_hash: String,
+        db_keys: crate::config_db::ConfigDbKeys,
     ) -> Result<Self, String> {
         let client = Self::build_client(backend_config).await?;
 
@@ -126,10 +128,15 @@ impl ConfigDbSync {
                 pending.as_ref().and_then(|p| p.base_etag.clone()),
             )),
             local_path,
-            bootstrap_password_hash,
+            db_keys,
             needs_upload: AtomicBool::new(pending.is_some()),
             upload_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// The primary config DB key (the key of the local DB after boot).
+    pub fn db_key(&self) -> &str {
+        self.db_keys.primary.expose()
     }
 
     /// Queue an upload for the next poll tick (set after retry exhaustion).
@@ -314,28 +321,45 @@ impl ConfigDbSync {
             .await
             .map_err(|e| format!("Failed to write temp config DB: {}", e))?;
 
-        // Validate we can open the downloaded DB with our local bootstrap password.
-        // If the remote DB was encrypted with a different password, we must NOT replace
-        // our local copy — it would be unreadable and break IAM.
-        match ConfigDb::open_or_create(&tmp_path, &self.bootstrap_password_hash) {
+        // Validate that the downloaded DB opens with our config DB key. A DB
+        // under another key must NOT reach the merge — it would be unreadable.
+        // A DB under a fallback key (the bootstrap hash of a peer that runs the
+        // release before S8) is re-encrypted with our key here, so the merge
+        // below attaches it with the primary key.
+        match ConfigDb::open_with_keys(&tmp_path, &self.db_keys) {
             Ok(_) => {
-                debug!("Downloaded config DB passed passphrase validation");
+                debug!("Downloaded config DB passed key validation");
             }
             Err(e) => {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
-                let why = match e {
+                return match e {
                     crate::config_db::ConfigDbError::WrongPassphrase(_) => {
-                        "is encrypted with a different bootstrap password"
+                        let msg = format!(
+                            "the config DB in s3://{}/{} is encrypted with a different config \
+                             DB key — NOT merging it. Set {} to the same value on every \
+                             instance that shares this sync bucket",
+                            self.bucket,
+                            self.object_key,
+                            crate::config_db::key::CONFIG_DB_KEY_ENV
+                        );
+                        tracing::error!("{msg}");
+                        Err(msg)
                     }
                     crate::config_db::ConfigDbError::SchemaTooNew { .. } => {
-                        "comes from a newer binary (rolling upgrade in progress?)"
+                        tracing::warn!(
+                            "Config DB downloaded from S3 comes from a newer binary (rolling \
+                             upgrade in progress?) — NOT merging into the local copy: {e}"
+                        );
+                        Ok(None)
                     }
-                    _ => "cannot be opened",
+                    _ => {
+                        tracing::warn!(
+                            "Config DB downloaded from S3 cannot be opened — NOT merging into \
+                             the local copy: {e}"
+                        );
+                        Ok(None)
+                    }
                 };
-                tracing::warn!(
-                    "Config DB downloaded from S3 {why} — NOT merging into the local copy: {e}"
-                );
-                return Ok(None);
             }
         }
 
@@ -814,7 +838,7 @@ const MAX_UPLOAD_ATTEMPTS: u32 = 3;
 pub async fn upload_with_reconcile(
     sync: &ConfigDbSync,
     config_db: &Option<Arc<Mutex<ConfigDb>>>,
-    admin_password_hash: &str,
+    db_key: &str,
     iam_state: &SharedIamState,
     external_auth: &Option<Arc<ExternalAuthManager>>,
     sessions: Option<&Arc<crate::session::SessionStore>>,
@@ -849,7 +873,7 @@ pub async fn upload_with_reconcile(
                 if let Err(e) = pull_locked(
                     sync,
                     config_db,
-                    admin_password_hash,
+                    db_key,
                     iam_state,
                     external_auth,
                     sessions,
@@ -883,7 +907,7 @@ pub async fn upload_with_reconcile(
 pub async fn pull_and_merge(
     sync: &ConfigDbSync,
     config_db: &Option<Arc<Mutex<ConfigDb>>>,
-    admin_password_hash: &str,
+    db_key: &str,
     iam_state: &SharedIamState,
     external_auth: &Option<Arc<ExternalAuthManager>>,
     sessions: Option<&Arc<crate::session::SessionStore>>,
@@ -893,7 +917,7 @@ pub async fn pull_and_merge(
     pull_locked(
         sync,
         config_db,
-        admin_password_hash,
+        db_key,
         iam_state,
         external_auth,
         sessions,
@@ -906,7 +930,7 @@ pub async fn pull_and_merge(
 async fn pull_locked(
     sync: &ConfigDbSync,
     config_db: &Option<Arc<Mutex<ConfigDb>>>,
-    admin_password_hash: &str,
+    db_key: &str,
     iam_state: &SharedIamState,
     external_auth: &Option<Arc<ExternalAuthManager>>,
     sessions: Option<&Arc<crate::session::SessionStore>>,
@@ -917,7 +941,7 @@ async fn pull_locked(
     };
     let applied = reopen_and_rebuild_iam(
         config_db,
-        admin_password_hash,
+        db_key,
         iam_state,
         external_auth,
         sessions,
@@ -954,7 +978,7 @@ async fn pull_locked(
 #[allow(clippy::too_many_arguments)]
 pub async fn reopen_and_rebuild_iam(
     config_db: &Option<Arc<Mutex<ConfigDb>>>,
-    admin_password_hash: &str,
+    db_key: &str,
     iam_state: &SharedIamState,
     external_auth: &Option<Arc<ExternalAuthManager>>,
     sessions: Option<&Arc<crate::session::SessionStore>>,
@@ -973,7 +997,7 @@ pub async fn reopen_and_rebuild_iam(
     // stay intact (a file swap would clobber them). D16: a three-way merge
     // against the last synced DB, so a change on either side survives.
     let base = sync_base_path(db.local_path());
-    let merge = db.merge_iam_from(downloaded, Some(&base), admin_password_hash);
+    let merge = db.merge_iam_from(downloaded, Some(&base), db_key);
     let report = match merge {
         Ok(report) => {
             // The downloaded copy is what the bucket holds now: the next base.
@@ -1106,7 +1130,7 @@ mod tests {
             "sync".into(),
             "k.db".into(),
             db_path.clone(),
-            "pw".into(),
+            crate::config_db::ConfigDbKeys::primary_only("pw"),
         )
         .await
         .unwrap();
@@ -1122,7 +1146,7 @@ mod tests {
             "sync".into(),
             "k.db".into(),
             db_path.clone(),
-            "pw".into(),
+            crate::config_db::ConfigDbKeys::primary_only("pw"),
         )
         .await
         .unwrap();
@@ -1143,7 +1167,7 @@ mod tests {
             "sync".into(),
             "k.db".into(),
             db_path,
-            "pw".into(),
+            crate::config_db::ConfigDbKeys::primary_only("pw"),
         )
         .await
         .unwrap();

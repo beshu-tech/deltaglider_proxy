@@ -1114,10 +1114,10 @@ fn backup_secret_conflict_detail(current: &Config, secrets: &BackupSecrets) -> O
 
     Some(
         "secrets.json bootstrap_password_hash differs from the running instance; \
-         full/config-only restore cannot replace it because that hash is tied to \
-         the encrypted config DB key. Use restore mode 'iam-only' to import IAM/admin \
-         data while preserving this instance's admin password and storage config, \
-         or change/rekey the local admin password before attempting a full restore."
+         full/config-only restore does not replace the admin password. Use restore \
+         mode 'iam-only' to import IAM/admin data while preserving this instance's \
+         admin password and storage config, or change the local admin password to \
+         the backup's one before attempting a full restore."
             .to_string(),
     )
 }
@@ -1502,10 +1502,10 @@ async fn import_zip_full_backup(
 /// X-ray fixes (HIGH #2, HIGH #3, MED #2):
 ///
 /// * **bootstrap_password_hash**: refused when the running instance
-///   already has a *different* hash — a hash alone cannot rekey the
-///   SQLCipher DB (that needs the plaintext password via
-///   `/api/admin/change-password`). Initial seeding (no existing hash,
-///   or identical hash) is permitted.
+///   already has a *different* hash — a restore must not swap the admin
+///   password under a running session store (change it via
+///   `PUT /api/admin/password`). Initial seeding (no existing hash, or
+///   identical hash) is permitted.
 /// * **Engine rebuild**: after mutating storage creds under the write
 ///   lock, call `apply_config_transition` so the S3 client picks up
 ///   the new credentials on the next request. Without this, the
@@ -1528,8 +1528,8 @@ async fn apply_secrets(
 
     // Guardrail: refuse hash rotation on a running instance. The only
     // supported path to change the bootstrap password is
-    // /api/admin/change-password which rekeys SQLCipher with the
-    // plaintext. Initial seeding (hash match, or no existing hash)
+    // PUT /api/admin/password, which verifies the current password.
+    // Initial seeding (hash match, or no existing hash)
     // is fine — that covers first-restore into a fresh instance.
     if restore_bootstrap_hash {
         if let Some(detail) = backup_secret_conflict_detail(&old_cfg, secrets) {
