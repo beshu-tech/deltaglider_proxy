@@ -92,6 +92,30 @@ pub(crate) fn strip_encryption_markers(
     user_metadata.remove(ENCRYPTION_KEY_ID_KEY);
 }
 
+/// The wrapper OWNS its markers: a write stores only its own decision. Any
+/// copy the caller carries (a client's `x-amz-meta-dg-encrypted`, a sync
+/// tool replaying GET metadata into a PUT, a marker read from another
+/// object) is dropped first — stored verbatim, it made the body unreadable.
+fn without_markers(metadata: &FileMetadata) -> FileMetadata {
+    let mut meta = metadata.clone();
+    strip_encryption_markers(&mut meta.user_metadata);
+    meta
+}
+
+/// For a metadata-only rewrite (body unchanged): `metadata` with the markers
+/// of the stored object `raw`, never the caller's own.
+fn with_markers_of(metadata: &FileMetadata, raw: Option<&FileMetadata>) -> FileMetadata {
+    let mut meta = without_markers(metadata);
+    if let Some(raw) = raw {
+        for key in [ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY] {
+            if let Some(v) = raw.user_metadata.get(key) {
+                meta.user_metadata.insert(key.to_string(), v.clone());
+            }
+        }
+    }
+    meta
+}
+
 const IV_LEN: usize = 12;
 const GCM_TAG_LEN: usize = 16;
 
@@ -1087,7 +1111,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let mut meta = metadata.clone();
+        let mut meta = without_markers(metadata);
         let enc = self.encrypt_if_enabled(data, &mut meta)?;
         self.inner.put_reference(bucket, prefix, &enc, &meta).await
     }
@@ -1100,7 +1124,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let mut meta = metadata.clone();
+        let mut meta = without_markers(metadata);
         let enc = self.encrypt_if_enabled(data, &mut meta)?;
         self.inner
             .put_delta(bucket, prefix, filename, &enc, &meta)
@@ -1115,7 +1139,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let mut meta = metadata.clone();
+        let mut meta = without_markers(metadata);
         let enc = self.encrypt_if_enabled(data, &mut meta)?;
         self.inner
             .put_passthrough(bucket, prefix, filename, &enc, &meta)
@@ -1140,7 +1164,13 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         let Some((key, key_id)) = self.write_key() else {
             return self
                 .inner
-                .put_passthrough_file(bucket, prefix, filename, source_path, metadata)
+                .put_passthrough_file(
+                    bucket,
+                    prefix,
+                    filename,
+                    source_path,
+                    &without_markers(metadata),
+                )
                 .await;
         };
 
@@ -1191,7 +1221,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         .await
         .map_err(|e| StorageError::Other(format!("encrypt-to-file task join: {e}")))??;
 
-        let mut meta = metadata.clone();
+        let mut meta = without_markers(metadata);
         mark_chunked_encrypted(&mut meta, key_id.as_deref());
         self.inner
             .put_passthrough_file(bucket, prefix, filename, tmp.path(), &meta)
@@ -1215,7 +1245,13 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         if self.write_key().is_none() {
             return self
                 .inner
-                .put_passthrough_parts(bucket, prefix, filename, part_paths, metadata)
+                .put_passthrough_parts(
+                    bucket,
+                    prefix,
+                    filename,
+                    part_paths,
+                    &without_markers(metadata),
+                )
                 .await;
         }
         let parts = part_paths.to_vec();
@@ -1257,7 +1293,13 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         let Some((key, key_id)) = self.write_key() else {
             return self
                 .inner
-                .put_passthrough_chunked(bucket, prefix, filename, chunks, metadata)
+                .put_passthrough_chunked(
+                    bucket,
+                    prefix,
+                    filename,
+                    chunks,
+                    &without_markers(metadata),
+                )
                 .await;
         };
 
@@ -1298,7 +1340,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         }
         out_frames.push(Bytes::from(framer.finish(&key)?));
 
-        let mut meta = metadata.clone();
+        let mut meta = without_markers(metadata);
         mark_chunked_encrypted(&mut meta, key_id.as_deref());
         self.inner
             .put_passthrough_chunked(bucket, prefix, filename, &out_frames, &meta)
@@ -1451,7 +1493,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             ));
         }
         self.inner
-            .create_multipart_upload(bucket, prefix, filename, metadata)
+            .create_multipart_upload(bucket, prefix, filename, &without_markers(metadata))
             .await
     }
 
@@ -1478,7 +1520,14 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         metadata: &FileMetadata,
     ) -> Result<String, StorageError> {
         self.inner
-            .complete_multipart_upload(upload, prefix, filename, parts, assembled, metadata)
+            .complete_multipart_upload(
+                upload,
+                prefix,
+                filename,
+                parts,
+                assembled,
+                &without_markers(metadata),
+            )
             .await
     }
 
@@ -1692,14 +1741,10 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         // decrypted read may lack them. Re-assert the markers from the raw
         // object so a metadata-only rewrite can NEVER strip what makes the
         // object decryptable on read.
-        let mut meta = m.clone();
-        if let Ok(raw) = self.inner.get_passthrough_metadata(b, p, f).await {
-            for key in [ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY] {
-                if let Some(v) = raw.user_metadata.get(key) {
-                    meta.user_metadata.insert(key.to_string(), v.clone());
-                }
-            }
-        }
+        // The markers come from the raw object ONLY: the caller's copy is
+        // dropped, so a rewrite can neither strip nor plant one.
+        let raw = self.inner.get_passthrough_metadata(b, p, f).await;
+        let meta = with_markers_of(m, raw.ok().as_ref());
         self.inner.put_passthrough_metadata(b, p, f, &meta).await
     }
     async fn put_reference_metadata(
@@ -1708,7 +1753,11 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         p: &str,
         m: &FileMetadata,
     ) -> Result<(), StorageError> {
-        self.inner.put_reference_metadata(b, p, m).await
+        // Same rule as put_passthrough_metadata: the body is not rewritten,
+        // so its markers stay those of the stored reference.
+        let raw = self.inner.get_reference_metadata(b, p).await;
+        let meta = with_markers_of(m, raw.ok().as_ref());
+        self.inner.put_reference_metadata(b, p, &meta).await
     }
     async fn delete_reference(&self, b: &str, p: &str) -> Result<(), StorageError> {
         self.inner.delete_reference(b, p).await
@@ -3311,5 +3360,101 @@ mod tests {
             !is_encrypted(&stored),
             "PassThrough must not stamp a marker"
         );
+    }
+
+    /// S15: client metadata that names the wrapper's markers must not decide
+    /// how the body is read. A client `x-amz-meta-dg-encrypted` (e.g. a sync
+    /// tool that copies metadata from a GET into the next PUT) was stored
+    /// verbatim, and the object became unreadable.
+    #[tokio::test]
+    async fn client_supplied_markers_never_reach_storage() {
+        for (mode_name, key) in [("no-key", None), ("encrypt", Some(test_key()))] {
+            let tmp = tempfile::tempdir().unwrap();
+            let inner = crate::storage::FilesystemBackend::new(tmp.path().to_path_buf())
+                .await
+                .unwrap();
+            inner.create_bucket("b").await.unwrap();
+            let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+                key,
+                key_id: None,
+                ..Default::default()
+            })));
+            let wrapper = EncryptingBackend::new(inner, cfg);
+            let body = b"client body".to_vec();
+            let mut meta = FileMetadata::new_passthrough(
+                "x".into(),
+                "0".repeat(64),
+                "0".repeat(32),
+                body.len() as u64,
+                None,
+            );
+            meta.user_metadata
+                .insert(ENCRYPTION_MARKER_KEY.into(), CHUNK_MARKER_VALUE.into());
+            meta.user_metadata
+                .insert(ENCRYPTION_KEY_ID_KEY.into(), "forged-kid".into());
+            meta.user_metadata.insert("team".into(), "ci".into());
+
+            let src = tmp.path().join("src.bin");
+            tokio::fs::write(&src, &body).await.unwrap();
+            wrapper
+                .put_passthrough("b", "p", "a", &body, &meta)
+                .await
+                .unwrap();
+            wrapper
+                .put_passthrough_file("b", "p", "c", &src, &meta)
+                .await
+                .unwrap();
+            wrapper
+                .put_passthrough_chunked("b", "p", "d", &[Bytes::from(body.clone())], &meta)
+                .await
+                .unwrap();
+            wrapper
+                .put_passthrough_parts("b", "p", "e", &[src.clone()], &meta)
+                .await
+                .unwrap();
+            wrapper
+                .put_delta("b", "p", "f", &body, &meta)
+                .await
+                .unwrap();
+            wrapper.put_reference("b", "p", &body, &meta).await.unwrap();
+            for f in ["a", "c", "d", "e"] {
+                assert_eq!(
+                    wrapper.get_passthrough("b", "p", f).await.unwrap(),
+                    body,
+                    "{mode_name}: passthrough {f} must read back"
+                );
+                let stored = wrapper.get_passthrough_metadata("b", "p", f).await.unwrap();
+                assert_ne!(
+                    stamped_key_id(&stored),
+                    Some("forged-kid"),
+                    "{mode_name}: {f}"
+                );
+                assert_eq!(
+                    stored.user_metadata.get("team").map(String::as_str),
+                    Some("ci")
+                );
+            }
+            assert_eq!(
+                wrapper.get_delta("b", "p", "f").await.unwrap(),
+                body,
+                "{mode_name}"
+            );
+            assert_eq!(
+                wrapper.get_reference("b", "p").await.unwrap(),
+                body,
+                "{mode_name}"
+            );
+
+            // A metadata-only rewrite must not plant a marker either.
+            wrapper
+                .put_passthrough_metadata("b", "p", "a", &meta)
+                .await
+                .unwrap();
+            assert_eq!(
+                wrapper.get_passthrough("b", "p", "a").await.unwrap(),
+                body,
+                "{mode_name}: metadata rewrite"
+            );
+        }
     }
 }
