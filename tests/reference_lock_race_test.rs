@@ -249,3 +249,83 @@ async fn reference_lock_release_is_owner_scoped() {
     b.release(&key, "ref-b").await.unwrap();
     cleanup(&a, &key).await;
 }
+
+/// Fencing (the reference write is conditional on what the lock saw), against
+/// a real CAS backend: a fence taken before a peer's write refuses to
+/// overwrite that write with a retryable error, and a current fence passes.
+#[tokio::test]
+async fn s3_reference_writes_are_fenced() {
+    use deltaglider_proxy::storage::{RefFence, RefWrite, S3Backend, StorageBackend, StorageError};
+    use deltaglider_proxy::types::FileMetadata;
+    if !minio_available().await {
+        eprintln!("Skipping s3_reference_writes_are_fenced: MinIO not available");
+        return;
+    }
+    let cfg: deltaglider_proxy::config::BackendConfig = serde_yaml::from_str(&format!(
+        "type: s3\nendpoint: \"{}\"\nregion: us-east-1\nforce_path_style: true\n\
+         access_key_id: {}\nsecret_access_key: {}\nallow_local: true\n",
+        common::minio_endpoint_url(),
+        common::MINIO_ACCESS_KEY,
+        common::MINIO_SECRET_KEY
+    ))
+    .unwrap();
+    let s3 = S3Backend::new(
+        &cfg,
+        deltaglider_proxy::storage::NativeEncryptionConfig::None,
+    )
+    .await
+    .unwrap();
+    let ds = format!("fence/{}", uuid::Uuid::new_v4());
+    let meta = FileMetadata::new_reference(
+        "reference.bin".into(),
+        "a.zip".into(),
+        "0".repeat(64),
+        "0".repeat(32),
+        1,
+        None,
+    );
+    let put = |data: &'static [u8]| RefWrite::Put {
+        data,
+        metadata: &meta,
+    };
+
+    let seen = s3.reference_fence(MINIO_BUCKET, &ds).await.unwrap();
+    assert_eq!(seen, RefFence::Absent);
+    // A peer creates the baseline after our observation.
+    let peer = s3
+        .write_reference_fenced(MINIO_BUCKET, &ds, put(b"P"), &RefFence::Absent)
+        .await
+        .unwrap();
+    assert!(matches!(peer, RefFence::ETag(ref e) if !e.is_empty()));
+    // Our create (fence: absent) must not overwrite it.
+    let err = s3
+        .write_reference_fenced(MINIO_BUCKET, &ds, put(b"A"), &seen)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::Throttled(_)), "{err:?}");
+    assert_eq!(s3.get_reference(MINIO_BUCKET, &ds).await.unwrap(), b"P");
+    // A stale ETag fails the same way, for a metadata update and a delete.
+    let stale = RefFence::ETag("\"00000000000000000000000000000000\"".into());
+    let meta_op = RefWrite::Metadata { metadata: &meta };
+    assert!(matches!(
+        s3.write_reference_fenced(MINIO_BUCKET, &ds, meta_op, &stale)
+            .await,
+        Err(StorageError::Throttled(_))
+    ));
+    assert!(matches!(
+        s3.write_reference_fenced(MINIO_BUCKET, &ds, RefWrite::Delete, &stale)
+            .await,
+        Err(StorageError::Throttled(_))
+    ));
+    // The current fence passes, and the returned fence is the next one.
+    let next = s3
+        .write_reference_fenced(MINIO_BUCKET, &ds, meta_op, &peer)
+        .await
+        .unwrap();
+    let gone = s3
+        .write_reference_fenced(MINIO_BUCKET, &ds, RefWrite::Delete, &next)
+        .await
+        .unwrap();
+    assert_eq!(gone, RefFence::Absent);
+    assert!(!s3.has_reference(MINIO_BUCKET, &ds).await.unwrap());
+}

@@ -283,6 +283,15 @@ single-instance planes below are addressed.
   `reference_writes_go_through_the_guard`), incl. delete-reclaim, sweep-reclaim,
   legacy-reference migration and the replication fast-path seed
   (`with_dest_prefix_lock` holds both locks).
+  FENCED: the acquire observes reference.bin (`StorageBackend::reference_fence`,
+  one HEAD that also replaces the caller's `has_reference`), and every reference
+  write of the hold goes through `write_reference_fenced` conditional on it (S3:
+  `If-None-Match:*` / `If-Match` PUT, `copy-source-if-match` metadata self-copy,
+  HEAD + `If-Match` DELETE). A lost precondition = `StorageError::Throttled`
+  (503 SlowDown, retryable), never an overwrite; 501 (B2, non-CAS) falls back to
+  the unconditional write. Filesystem = trait default (no fence). Every wrapper
+  (Box<dyn>, encrypting, routing) MUST forward both methods (source test
+  `every_wrapper_forwards_the_reference_fence`).
   Single-instance (no coordination bucket) → the field is `None`, in-process lock
   only, zero S3 round-trips. The operator's directory-hash router is still the
   recommended topology (it also handles multipart + metadata-cache locality), but

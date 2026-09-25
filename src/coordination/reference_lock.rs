@@ -55,8 +55,12 @@
 //! ## Fencing
 //!
 //! `epoch` bumps on every steal, but the data writes go to customer buckets,
-//! which cannot check it. Fencing those writes needs backend support; the
-//! renew-and-check above is the defence.
+//! which cannot check it. So the engine fences on reference.bin itself: the
+//! acquire observes its ETag (or its absence), and every reference write of
+//! the hold is conditional on that observation (`If-Match` /
+//! `If-None-Match:*`, see `StorageBackend::write_reference_fenced`). A holder
+//! whose lock lapsed while a peer wrote gets a precondition failure, never an
+//! overwrite. The renew-and-check above still stops most such writes early.
 
 use std::time::Duration;
 

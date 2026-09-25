@@ -328,6 +328,11 @@ struct CrossNodeHold {
     owner: String,
     state: Arc<HoldState>,
     heartbeat: tokio::task::JoinHandle<()>,
+    /// reference.bin as this hold saw it right after the acquire; every
+    /// reference write of the hold is conditional on it (and moves it on).
+    /// A writer whose lock lapsed while a peer wrote cannot overwrite the
+    /// peer's baseline: its condition fails instead.
+    fence: parking_lot::Mutex<crate::storage::RefFence>,
 }
 
 /// Shared between the guard and its heartbeat task.
@@ -371,7 +376,12 @@ impl ReferenceLockGuard {
         Self { hold: None }
     }
 
-    fn held(lock: Arc<dyn crate::coordination::ReferenceLock>, key: String, owner: String) -> Self {
+    fn held(
+        lock: Arc<dyn crate::coordination::ReferenceLock>,
+        key: String,
+        owner: String,
+        fence: crate::storage::RefFence,
+    ) -> Self {
         let state = Arc::new(HoldState {
             lost: std::sync::atomic::AtomicBool::new(false),
             confirmed_at: parking_lot::Mutex::new(std::time::Instant::now()),
@@ -391,8 +401,61 @@ impl ReferenceLockGuard {
                 owner,
                 state,
                 heartbeat,
+                fence: parking_lot::Mutex::new(fence),
             }),
         }
+    }
+
+    /// Whether reference.bin existed when the lock was taken: `Some` for a
+    /// cross-instance hold (saves the caller its own HEAD), `None` when the
+    /// caller must ask the backend.
+    pub(crate) fn observed_reference(&self) -> Option<bool> {
+        use crate::storage::RefFence;
+        match &*self.hold.as_ref()?.fence.lock() {
+            RefFence::Absent => Some(false),
+            RefFence::ETag(_) => Some(true),
+            RefFence::Unfenced => None,
+        }
+    }
+
+    /// One reference write: fenced under a cross-instance hold, plain
+    /// otherwise (single instance: the in-process lock is the whole story).
+    async fn write_reference<B: StorageBackend + ?Sized>(
+        &self,
+        storage: &B,
+        bucket: &str,
+        deltaspace: &str,
+        op: crate::storage::RefWrite<'_>,
+    ) -> Result<(), EngineError> {
+        use crate::storage::RefWrite;
+        self.ensure_held().await?;
+        if let Some(h) = &self.hold {
+            let fence = h.fence.lock().clone();
+            let next = storage
+                .write_reference_fenced(bucket, deltaspace, op, &fence)
+                .await?;
+            *h.fence.lock() = next;
+            return Ok(());
+        }
+        match op {
+            RefWrite::Put { data, metadata } => {
+                storage
+                    .put_reference(bucket, deltaspace, data, metadata)
+                    .await?
+            }
+            RefWrite::PutFile { path, metadata } => {
+                storage
+                    .put_reference_from_file(bucket, deltaspace, path, metadata)
+                    .await?
+            }
+            RefWrite::Metadata { metadata } => {
+                storage
+                    .put_reference_metadata(bucket, deltaspace, metadata)
+                    .await?
+            }
+            RefWrite::Delete => storage.delete_reference(bucket, deltaspace).await?,
+        }
+        Ok(())
     }
 
     /// Renew every `renew_interval` until dropped. A renew that reports the
@@ -508,10 +571,11 @@ impl ReferenceLockGuard {
         data: &[u8],
         meta: &FileMetadata,
     ) -> Result<(), EngineError> {
-        self.ensure_held().await?;
-        Ok(storage
-            .put_reference(bucket, deltaspace, data, meta)
-            .await?)
+        let op = crate::storage::RefWrite::Put {
+            data,
+            metadata: meta,
+        };
+        self.write_reference(storage, bucket, deltaspace, op).await
     }
 
     pub(crate) async fn put_reference_from_file<B: StorageBackend + ?Sized>(
@@ -522,10 +586,11 @@ impl ReferenceLockGuard {
         path: &std::path::Path,
         meta: &FileMetadata,
     ) -> Result<(), EngineError> {
-        self.ensure_held().await?;
-        Ok(storage
-            .put_reference_from_file(bucket, deltaspace, path, meta)
-            .await?)
+        let op = crate::storage::RefWrite::PutFile {
+            path,
+            metadata: meta,
+        };
+        self.write_reference(storage, bucket, deltaspace, op).await
     }
 
     pub(crate) async fn put_reference_metadata<B: StorageBackend + ?Sized>(
@@ -535,10 +600,8 @@ impl ReferenceLockGuard {
         deltaspace: &str,
         meta: &FileMetadata,
     ) -> Result<(), EngineError> {
-        self.ensure_held().await?;
-        Ok(storage
-            .put_reference_metadata(bucket, deltaspace, meta)
-            .await?)
+        let op = crate::storage::RefWrite::Metadata { metadata: meta };
+        self.write_reference(storage, bucket, deltaspace, op).await
     }
 
     pub(crate) async fn delete_reference<B: StorageBackend + ?Sized>(
@@ -547,8 +610,8 @@ impl ReferenceLockGuard {
         bucket: &str,
         deltaspace: &str,
     ) -> Result<(), EngineError> {
-        self.ensure_held().await?;
-        Ok(storage.delete_reference(bucket, deltaspace).await?)
+        let op = crate::storage::RefWrite::Delete;
+        self.write_reference(storage, bucket, deltaspace, op).await
     }
 }
 
@@ -1417,7 +1480,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         )
         .await
         {
-            Ok(true) => Ok(ReferenceLockGuard::held(lock, key, owner)),
+            Ok(true) => {
+                // Observe reference.bin under the lock: the fence of every
+                // reference write this hold makes. On an error the guard is
+                // built first so that its drop releases the lock.
+                let guard =
+                    ReferenceLockGuard::held(lock, key, owner, crate::storage::RefFence::Unfenced);
+                let fence = self.storage.reference_fence(bucket, deltaspace).await?;
+                if let Some(h) = &guard.hold {
+                    *h.fence.lock() = fence;
+                }
+                Ok(guard)
+            }
             Ok(false) => Err(EngineError::Storage(StorageError::Other(format!(
                 "reference lock for deltaspace '{bucket}/{deltaspace}' held by another instance; \
                  write timed out to avoid corrupting reference.bin"
@@ -3764,5 +3838,311 @@ mod reference_lock_hold_tests {
             "the object is already deleted; DELETE must not fail: {}",
             res.err().map(|e| e.to_string()).unwrap_or_default()
         );
+    }
+
+    // ── Fencing: the reference write is conditional on what the lock saw ──
+
+    use crate::storage::{RefFence, RefWrite};
+    use crate::types::FileMetadata as Meta;
+    use futures::stream::BoxStream;
+
+    /// A filesystem backend with S3-style conditional reference writes: a
+    /// version per reference plays the ETag. `peer_race` makes a peer write
+    /// its own reference.bin right before our next reference write lands
+    /// (the lock lapsed under us and the peer stole it).
+    struct FencingFs {
+        inner: FilesystemBackend,
+        versions: parking_lot::Mutex<HashMap<String, u64>>,
+        peer_race: AtomicBool,
+    }
+
+    impl FencingFs {
+        fn slot(b: &str, p: &str) -> String {
+            format!("{b}/{p}")
+        }
+        fn bump(&self, b: &str, p: &str) {
+            *self.versions.lock().entry(Self::slot(b, p)).or_insert(0) += 1;
+        }
+        async fn maybe_peer_write(&self, b: &str, p: &str) {
+            if self.peer_race.swap(false, Ordering::SeqCst) {
+                let meta = Meta::new_reference(
+                    "reference.bin".into(),
+                    "peer.zip".into(),
+                    "0".repeat(64),
+                    "0".repeat(32),
+                    4,
+                    None,
+                );
+                self.inner
+                    .put_reference(b, p, b"PEER", &meta)
+                    .await
+                    .unwrap();
+                self.bump(b, p);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::storage::StorageBackend for FencingFs {
+        async fn create_bucket(&self, b: &str) -> Result<(), StorageError> {
+            self.inner.create_bucket(b).await
+        }
+        async fn delete_bucket(&self, b: &str) -> Result<(), StorageError> {
+            self.inner.delete_bucket(b).await
+        }
+        async fn list_buckets(&self) -> Result<Vec<String>, StorageError> {
+            self.inner.list_buckets().await
+        }
+        async fn head_bucket(&self, b: &str) -> Result<bool, StorageError> {
+            self.inner.head_bucket(b).await
+        }
+        async fn get_reference(&self, b: &str, p: &str) -> Result<Vec<u8>, StorageError> {
+            self.inner.get_reference(b, p).await
+        }
+        async fn put_reference(
+            &self,
+            b: &str,
+            p: &str,
+            d: &[u8],
+            m: &Meta,
+        ) -> Result<(), StorageError> {
+            self.maybe_peer_write(b, p).await;
+            self.inner.put_reference(b, p, d, m).await?;
+            self.bump(b, p);
+            Ok(())
+        }
+        async fn put_reference_metadata(
+            &self,
+            b: &str,
+            p: &str,
+            m: &Meta,
+        ) -> Result<(), StorageError> {
+            self.inner.put_reference_metadata(b, p, m).await
+        }
+        async fn get_reference_metadata(&self, b: &str, p: &str) -> Result<Meta, StorageError> {
+            self.inner.get_reference_metadata(b, p).await
+        }
+        async fn has_reference(&self, b: &str, p: &str) -> Result<bool, StorageError> {
+            self.inner.has_reference(b, p).await
+        }
+        async fn delete_reference(&self, b: &str, p: &str) -> Result<(), StorageError> {
+            self.inner.delete_reference(b, p).await?;
+            self.versions.lock().remove(&Self::slot(b, p));
+            Ok(())
+        }
+        async fn reference_fence(&self, b: &str, p: &str) -> Result<RefFence, StorageError> {
+            Ok(match self.versions.lock().get(&Self::slot(b, p)) {
+                Some(v) => RefFence::ETag(format!("v{v}")),
+                None => RefFence::Absent,
+            })
+        }
+        async fn write_reference_fenced(
+            &self,
+            b: &str,
+            p: &str,
+            op: RefWrite<'_>,
+            fence: &RefFence,
+        ) -> Result<RefFence, StorageError> {
+            self.maybe_peer_write(b, p).await;
+            let now = self.reference_fence(b, p).await?;
+            if *fence != RefFence::Unfenced && *fence != now {
+                return Err(crate::storage::reference_fence_lost(b, p));
+            }
+            match op {
+                RefWrite::Put { data, metadata } => {
+                    self.inner.put_reference(b, p, data, metadata).await?
+                }
+                RefWrite::PutFile { path, metadata } => {
+                    self.inner
+                        .put_reference_from_file(b, p, path, metadata)
+                        .await?
+                }
+                RefWrite::Metadata { metadata } => {
+                    self.inner.put_reference_metadata(b, p, metadata).await?
+                }
+                RefWrite::Delete => {
+                    self.inner.delete_reference(b, p).await?;
+                    self.versions.lock().remove(&Self::slot(b, p));
+                    return Ok(RefFence::Absent);
+                }
+            }
+            self.bump(b, p);
+            self.reference_fence(b, p).await
+        }
+        async fn get_delta(&self, b: &str, p: &str, f: &str) -> Result<Vec<u8>, StorageError> {
+            self.inner.get_delta(b, p, f).await
+        }
+        async fn put_delta(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+            d: &[u8],
+            m: &Meta,
+        ) -> Result<(), StorageError> {
+            self.inner.put_delta(b, p, f, d, m).await
+        }
+        async fn get_delta_metadata(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+        ) -> Result<Meta, StorageError> {
+            self.inner.get_delta_metadata(b, p, f).await
+        }
+        async fn delete_delta(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
+            self.inner.delete_delta(b, p, f).await
+        }
+        async fn get_passthrough(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+        ) -> Result<Vec<u8>, StorageError> {
+            self.inner.get_passthrough(b, p, f).await
+        }
+        async fn put_passthrough(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+            d: &[u8],
+            m: &Meta,
+        ) -> Result<(), StorageError> {
+            self.inner.put_passthrough(b, p, f, d, m).await
+        }
+        async fn get_passthrough_metadata(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+        ) -> Result<Meta, StorageError> {
+            self.inner.get_passthrough_metadata(b, p, f).await
+        }
+        async fn delete_passthrough(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
+            self.inner.delete_passthrough(b, p, f).await
+        }
+        async fn get_passthrough_stream(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+        ) -> Result<BoxStream<'static, Result<bytes::Bytes, StorageError>>, StorageError> {
+            self.inner.get_passthrough_stream(b, p, f).await
+        }
+        async fn get_passthrough_stream_range(
+            &self,
+            b: &str,
+            p: &str,
+            f: &str,
+            start: u64,
+            end: u64,
+        ) -> Result<(BoxStream<'static, Result<bytes::Bytes, StorageError>>, u64), StorageError>
+        {
+            self.inner
+                .get_passthrough_stream_range(b, p, f, start, end)
+                .await
+        }
+        async fn scan_deltaspace(&self, b: &str, p: &str) -> Result<Vec<Meta>, StorageError> {
+            self.inner.scan_deltaspace(b, p).await
+        }
+        async fn list_deltaspaces(&self, b: &str) -> Result<Vec<String>, StorageError> {
+            self.inner.list_deltaspaces(b).await
+        }
+        async fn total_size(&self, b: Option<&str>) -> Result<u64, StorageError> {
+            self.inner.total_size(b).await
+        }
+        async fn bulk_list_objects(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<Vec<(String, Meta)>, StorageError> {
+            self.inner.bulk_list_objects(b, p).await
+        }
+    }
+
+    async fn fencing_engine(
+        lock: Arc<ScriptedLock>,
+    ) -> (tempfile::TempDir, DeltaGliderEngine<FencingFs>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        inner.create_bucket("releases").await.unwrap();
+        let backend = FencingFs {
+            inner,
+            versions: parking_lot::Mutex::new(HashMap::new()),
+            peer_race: AtomicBool::new(false),
+        };
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
+                .with_reference_lock(Some(lock));
+        (tmp, engine)
+    }
+
+    /// The lock lapsed and a peer wrote reference.bin between our lock-time
+    /// observation ("absent") and our baseline write. The write must fail
+    /// retryably (503 SlowDown), and the peer's baseline must stay.
+    #[tokio::test]
+    async fn a_peer_baseline_written_under_us_is_never_overwritten() {
+        let lock = ScriptedLock::new(true, Duration::from_secs(60));
+        let (_tmp, engine) = fencing_engine(lock).await;
+        engine.storage.peer_race.store(true, Ordering::SeqCst);
+        let err = engine
+            .store(
+                "releases",
+                "v1/app.zip",
+                &vec![7u8; 4096],
+                None,
+                HashMap::new(),
+            )
+            .await
+            .expect_err("a lost fence must fail the PUT");
+        assert!(
+            matches!(err, EngineError::Storage(StorageError::Throttled(_))),
+            "a lost fence must be retryable (SlowDown), got {err:?}"
+        );
+        assert_eq!(
+            engine
+                .storage
+                .get_reference("releases", "v1")
+                .await
+                .unwrap(),
+            b"PEER",
+            "the peer's reference.bin was overwritten"
+        );
+    }
+
+    /// Without a race the fenced baseline write goes through, and the second
+    /// PUT (existing reference, fence = its ETag) stores a delta.
+    #[tokio::test]
+    async fn fenced_writes_pass_without_a_race() {
+        let lock = ScriptedLock::new(true, Duration::from_secs(60));
+        let (_tmp, engine) = fencing_engine(lock).await;
+        engine
+            .store(
+                "releases",
+                "v1/a.zip",
+                &vec![7u8; 4096],
+                None,
+                HashMap::new(),
+            )
+            .await
+            .expect("first PUT");
+        engine
+            .store(
+                "releases",
+                "v1/b.zip",
+                &vec![8u8; 4096],
+                None,
+                HashMap::new(),
+            )
+            .await
+            .expect("second PUT");
+        assert!(engine
+            .storage
+            .has_reference("releases", "v1")
+            .await
+            .unwrap());
     }
 }

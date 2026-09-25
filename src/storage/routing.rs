@@ -834,6 +834,24 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, delete_reference, prefix)
     }
 
+    async fn reference_fence(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<super::traits::RefFence, StorageError> {
+        route_existing!(self, bucket, reference_fence, prefix)
+    }
+
+    async fn write_reference_fenced(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        op: super::traits::RefWrite<'_>,
+        fence: &super::traits::RefFence,
+    ) -> Result<super::traits::RefFence, StorageError> {
+        route_existing!(self, bucket, write_reference_fenced, prefix, op, fence)
+    }
+
     // === Delta file operations ===
 
     async fn get_delta(

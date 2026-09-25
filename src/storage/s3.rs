@@ -29,8 +29,8 @@
 use super::list_size_cache::{self, ListedSize, LogicalFacts, StoredObjectId};
 use super::listing_facts;
 use super::traits::{
-    BulkListing, DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend,
-    StorageError, UploadedPart,
+    reference_fence_lost, BulkListing, DelegatedListResult, LiteScanResult, MultipartUpload,
+    RefFence, RefWrite, StorageBackend, StorageError, UploadedPart,
 };
 use crate::config::BackendConfig;
 use crate::types::{FileMetadata, StorageInfo};
@@ -767,6 +767,21 @@ impl S3Backend {
         key: &str,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
+        self.replace_metadata_in_place_fenced(bucket, key, metadata, &RefFence::Unfenced)
+            .await
+            .map(|_| ())
+    }
+
+    /// `replace_metadata_in_place` fenced on the object's ETag: the self-copy
+    /// carries `x-amz-copy-source-if-match`, a condition every S3 backend
+    /// supports. Returns the new ETag.
+    async fn replace_metadata_in_place_fenced(
+        &self,
+        bucket: &str,
+        key: &str,
+        metadata: &FileMetadata,
+        fence: &RefFence,
+    ) -> Result<Option<String>, StorageError> {
         let copy_source = format!("{}/{}", bucket, encode_copy_source_key(key));
         // HEAD first: REPLACE drops everything the request does not restate
         // (a foreign object's own metadata and headers, D17).
@@ -779,6 +794,15 @@ impl S3Backend {
             .send()
             .await
             .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::HeadObject))?;
+        let expect_etag = match fence {
+            RefFence::ETag(e) if !e.is_empty() => Some(e.clone()),
+            _ => None,
+        };
+        if let Some(e) = &expect_etag {
+            if head.e_tag() != Some(e.as_str()) {
+                return Err(reference_fence_lost(bucket, key));
+            }
+        }
         let plan = self_copy_plan(
             &head,
             self.metadata_to_headers(metadata),
@@ -827,11 +851,24 @@ impl S3Backend {
         for (k, v) in plan.metadata {
             request = request.metadata(k, v);
         }
+        if let Some(e) = &expect_etag {
+            request = request.copy_source_if_match(e);
+        }
 
-        request.send().await.map_err(|e| {
+        let resp = request.send().await.map_err(|e| {
+            if expect_etag.is_some()
+                && crate::config_db_sync::is_precondition_failed(
+                    &crate::config_db_sync::sdk_error_signal(&e),
+                )
+            {
+                return reference_fence_lost(bucket, key);
+            }
             Self::classify_s3_error(bucket, &e, S3Op::Other("copy_object (metadata update)"))
         })?;
-        Ok(())
+        Ok(resp
+            .copy_object_result()
+            .and_then(|r| r.e_tag())
+            .map(str::to_string))
     }
 
     /// Convert S3 metadata headers to FileMetadata
@@ -971,6 +1008,22 @@ impl S3Backend {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
+        self.put_object_with_metadata_fenced(bucket, key, data, metadata, &RefFence::Unfenced)
+            .await
+            .map(|_| ())
+    }
+
+    /// `put_object_with_metadata` with a write precondition; returns the new
+    /// ETag. See [`fenced_write_verdict`] for how a refused condition reads.
+    async fn put_object_with_metadata_fenced(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        metadata: &FileMetadata,
+        fence: &RefFence,
+    ) -> Result<Option<String>, StorageError> {
+        let mut fence = fence.clone();
         let mut headers = self.metadata_to_headers(metadata);
         // Stamp the native-encryption marker so reads know this object
         // was encrypted by AWS (not by the proxy's `EncryptingBackend`
@@ -1006,6 +1059,7 @@ impl S3Backend {
                 request = request.metadata(k.clone(), v.clone());
             }
             request = apply_native_encryption(request, &self.native_encryption);
+            request = apply_put_fence(request, &fence);
 
             match request.send().await {
                 Ok(resp) => {
@@ -1024,6 +1078,7 @@ impl S3Backend {
                         metadata,
                     )
                     .await;
+                    let etag = resp.e_tag().map(str::to_string);
                     if attempt > 0 {
                         debug!(
                             "S3 PUT {}/{} succeeded on attempt {} ({} bytes)",
@@ -1040,9 +1095,23 @@ impl S3Backend {
                             data.len()
                         );
                     }
-                    return Ok(());
+                    return Ok(etag);
                 }
                 Err(e) => {
+                    match fenced_write_verdict(&fence, &crate::config_db_sync::sdk_error_signal(&e))
+                    {
+                        FencedWriteVerdict::Lost => return Err(reference_fence_lost(bucket, key)),
+                        // Retry at once without the condition (the last
+                        // attempt reports the 501 instead of falling out of
+                        // the loop).
+                        FencedWriteVerdict::Unsupported if attempt < backoff_ms.len() => {
+                            warn!("S3 PUT {bucket}/{key}: the backend has no conditional writes (501); writing without the fence");
+                            fence = RefFence::Unfenced;
+                            continue;
+                        }
+                        FencedWriteVerdict::Unsupported => {}
+                        FencedWriteVerdict::Other => {}
+                    }
                     let is_retryable = if let SdkError::ServiceError(ref svc) = e {
                         let status = svc.raw().status().as_u16();
                         // Hetzner returns transient 400s with connection:close and no
@@ -1089,6 +1158,28 @@ impl S3Backend {
         source_path: &std::path::Path,
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
+        self.put_object_file_with_metadata_fenced(
+            bucket,
+            key,
+            source_path,
+            metadata,
+            &RefFence::Unfenced,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `put_object_file_with_metadata` with a write precondition; returns
+    /// the new ETag.
+    async fn put_object_file_with_metadata_fenced(
+        &self,
+        bucket: &str,
+        key: &str,
+        source_path: &std::path::Path,
+        metadata: &FileMetadata,
+        fence: &RefFence,
+    ) -> Result<Option<String>, StorageError> {
+        let mut fence = fence.clone();
         let mut headers = self.metadata_to_headers(metadata);
         if let Some(marker) = self.native_encryption.marker() {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
@@ -1121,6 +1212,7 @@ impl S3Backend {
                 request = request.metadata(k.clone(), v.clone());
             }
             request = apply_native_encryption(request, &self.native_encryption);
+            request = apply_put_fence(request, &fence);
 
             match request.send().await {
                 Ok(resp) => {
@@ -1141,9 +1233,23 @@ impl S3Backend {
                         )
                         .await;
                     }
-                    return Ok(());
+                    return Ok(resp.e_tag().map(str::to_string));
                 }
                 Err(e) => {
+                    match fenced_write_verdict(&fence, &crate::config_db_sync::sdk_error_signal(&e))
+                    {
+                        FencedWriteVerdict::Lost => return Err(reference_fence_lost(bucket, key)),
+                        // Retry at once without the condition (the last
+                        // attempt reports the 501 instead of falling out of
+                        // the loop).
+                        FencedWriteVerdict::Unsupported if attempt < backoff_ms.len() => {
+                            warn!("S3 PUT {bucket}/{key}: the backend has no conditional writes (501); writing without the fence");
+                            fence = RefFence::Unfenced;
+                            continue;
+                        }
+                        FencedWriteVerdict::Unsupported => {}
+                        FencedWriteVerdict::Other => {}
+                    }
                     let is_retryable = if let SdkError::ServiceError(ref svc) = e {
                         let status = svc.raw().status().as_u16();
                         status == 400 || status == 503
@@ -1352,6 +1458,63 @@ impl S3Backend {
     }
 
     /// Delete an object from S3
+    /// DELETE with `If-Match` on the fence's ETag. A backend that does not
+    /// support conditional deletes (501) gets the plain DELETE.
+    async fn delete_s3_object_fenced(
+        &self,
+        bucket: &str,
+        key: &str,
+        fence: &RefFence,
+    ) -> Result<(), StorageError> {
+        let RefFence::ETag(etag) = fence else {
+            return self.delete_s3_object(bucket, key).await;
+        };
+        if etag.is_empty() {
+            return self.delete_s3_object(bucket, key).await;
+        }
+        // HEAD first as well: not every S3 backend honours If-Match on
+        // DELETE, and one that ignores it must still not delete a peer's
+        // newer baseline (the HEAD leaves only the request-time window).
+        BACKEND_HEAD_REQUESTS.inc();
+        match self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(head) if head.e_tag() == Some(etag.as_str()) => {}
+            Ok(_) => return Err(reference_fence_lost(bucket, key)),
+            Err(e) => {
+                return match Self::classify_s3_error(bucket, &e, S3Op::HeadObject) {
+                    StorageError::NotFound(_) => Ok(()),
+                    other => Err(other),
+                }
+            }
+        }
+        match self
+            .client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .if_match(etag)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                match fenced_write_verdict(fence, &crate::config_db_sync::sdk_error_signal(&e)) {
+                    FencedWriteVerdict::Lost => Err(reference_fence_lost(bucket, key)),
+                    FencedWriteVerdict::Unsupported => self.delete_s3_object(bucket, key).await,
+                    FencedWriteVerdict::Other => {
+                        Err(Self::classify_s3_error(bucket, &e, S3Op::DeleteObject))
+                    }
+                }
+            }
+        }
+    }
+
     async fn delete_s3_object(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
         self.client
             .delete_object()
@@ -2129,6 +2292,59 @@ impl StorageBackend for S3Backend {
         self.delete_s3_object(bucket, &key).await?;
         debug!("Deleted reference for {}/{}", bucket, prefix);
         Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn reference_fence(&self, bucket: &str, prefix: &str) -> Result<RefFence, StorageError> {
+        let key = self.reference_key(prefix);
+        BACKEND_HEAD_REQUESTS.inc();
+        match self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(&key)
+            .send()
+            .await
+        {
+            Ok(head) => Ok(RefFence::ETag(head.e_tag().unwrap_or_default().to_string())),
+            // Same contract as has_reference: only a real 404 is "absent".
+            Err(e) => match Self::classify_s3_error(bucket, &e, S3Op::HeadObject) {
+                StorageError::NotFound(_) => Ok(RefFence::Absent),
+                other => Err(other),
+            },
+        }
+    }
+
+    #[instrument(skip(self, op))]
+    async fn write_reference_fenced(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        op: RefWrite<'_>,
+        fence: &RefFence,
+    ) -> Result<RefFence, StorageError> {
+        let key = self.reference_key(prefix);
+        let etag = match op {
+            RefWrite::Put { data, metadata } => {
+                self.put_object_with_metadata_fenced(bucket, &key, data, metadata, fence)
+                    .await?
+            }
+            RefWrite::PutFile { path, metadata } => {
+                self.put_object_file_with_metadata_fenced(bucket, &key, path, metadata, fence)
+                    .await?
+            }
+            RefWrite::Metadata { metadata } => {
+                self.replace_metadata_in_place_fenced(bucket, &key, metadata, fence)
+                    .await?
+            }
+            RefWrite::Delete => {
+                self.delete_s3_object_fenced(bucket, &key, fence).await?;
+                return Ok(RefFence::Absent);
+            }
+        };
+        // No ETag in the response: the next write of this hold is unfenced
+        // rather than fenced on a value that can never match.
+        Ok(etag.map(RefFence::ETag).unwrap_or(RefFence::Unfenced))
     }
 
     // === Delta file operations ===
@@ -3234,6 +3450,49 @@ fn probe_hit_serves_candidate(key: &str, candidate: &str) -> bool {
     })
 }
 
+/// Add the fence of a reference write to a PutObject.
+fn apply_put_fence(
+    req: aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder,
+    fence: &RefFence,
+) -> aws_sdk_s3::operation::put_object::builders::PutObjectFluentBuilder {
+    match fence {
+        RefFence::Absent => req.if_none_match("*"),
+        RefFence::ETag(e) if !e.is_empty() => req.if_match(e),
+        _ => req,
+    }
+}
+
+/// How a failed fenced write reads.
+#[derive(Debug, PartialEq, Eq)]
+enum FencedWriteVerdict {
+    /// 412: another writer changed reference.bin — never overwrite it.
+    Lost,
+    /// 501: the backend has no conditional writes (B2). Non-CAS backends are
+    /// refused for multi-instance delta storage, so today's unconditional
+    /// write is the right fallback.
+    Unsupported,
+    /// Not about the condition (or no condition was sent).
+    Other,
+}
+
+/// Pure: classify a failed write by its SDK signal (status + code).
+fn fenced_write_verdict(fence: &RefFence, signal: &str) -> FencedWriteVerdict {
+    let conditional = match fence {
+        RefFence::Unfenced => false,
+        RefFence::Absent => true,
+        RefFence::ETag(e) => !e.is_empty(),
+    };
+    if !conditional {
+        FencedWriteVerdict::Other
+    } else if crate::config_db_sync::is_precondition_failed(signal) {
+        FencedWriteVerdict::Lost
+    } else if crate::config_db_sync::is_not_implemented(signal) {
+        FencedWriteVerdict::Unsupported
+    } else {
+        FencedWriteVerdict::Other
+    }
+}
+
 /// Apply native S3 encryption headers to a PutObject builder in
 /// accordance with the configured mode.
 ///
@@ -3335,6 +3594,37 @@ mod endpoint_guard_source_test {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fenced_write_verdict_truth_table() {
+        use FencedWriteVerdict::*;
+        let etag = RefFence::ETag("\"abc\"".into());
+        assert_eq!(
+            fenced_write_verdict(&etag, "status=412 code=PreconditionFailed"),
+            Lost
+        );
+        assert_eq!(
+            fenced_write_verdict(&RefFence::Absent, "status=412 code="),
+            Lost
+        );
+        assert_eq!(
+            fenced_write_verdict(&etag, "status=501 code=NotImplemented"),
+            Unsupported
+        );
+        assert_eq!(
+            fenced_write_verdict(&etag, "status=503 code=SlowDown"),
+            Other
+        );
+        // No condition sent: a 412 is not ours to interpret.
+        assert_eq!(
+            fenced_write_verdict(&RefFence::Unfenced, "status=412 code="),
+            Other
+        );
+        assert_eq!(
+            fenced_write_verdict(&RefFence::ETag(String::new()), "status=412 code="),
+            Other
+        );
+    }
 
     fn foreign_head() -> aws_sdk_s3::operation::head_object::HeadObjectOutput {
         use aws_sdk_s3::types::{ServerSideEncryption, StorageClass};

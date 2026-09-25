@@ -213,10 +213,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // A backend error here must ABORT the PUT — never fall through to the
         // "create baseline" branch, which would overwrite a reference.bin that
         // may exist and orphan every sibling delta.
-        let has_existing_reference = self
-            .storage
-            .has_reference(ctx.bucket, ctx.deltaspace_id)
-            .await?;
+        let has_existing_reference = match xnode.observed_reference() {
+            Some(seen) => seen,
+            None => {
+                self.storage
+                    .has_reference(ctx.bucket, ctx.deltaspace_id)
+                    .await?
+            }
+        };
 
         // Ensure deltaspace has an internal reference baseline.
         //
@@ -457,7 +461,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
         let xnode = self.acquire_reference_lock(bucket, &deltaspace_id).await?;
         // Write path: a backend error must abort, not read as "no reference".
-        let has_existing_reference = self.storage.has_reference(bucket, &deltaspace_id).await?;
+        let has_existing_reference = match xnode.observed_reference() {
+            Some(seen) => seen,
+            None => self.storage.has_reference(bucket, &deltaspace_id).await?,
+        };
         // A fresh baseline stays in place on both branches below (even when the
         // ratio loses — see the NOTE there), so its bytes are always counted.
         let reference_created_bytes = if has_existing_reference { 0 } else { size };

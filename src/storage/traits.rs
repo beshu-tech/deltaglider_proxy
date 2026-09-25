@@ -28,6 +28,47 @@ pub struct BucketListing {
     pub unavailable: Option<String>,
 }
 
+/// The write precondition on `reference.bin` that fences the cross-instance
+/// reference lock: the engine observes the reference under the lock, and every
+/// reference write of that hold is conditional on the observation. A writer
+/// whose lock lapsed (a peer stole it and wrote) gets a precondition failure
+/// instead of overwriting the peer's baseline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefFence {
+    /// No condition (single instance, or a backend that does not fence).
+    Unfenced,
+    /// The reference must not exist (`If-None-Match: *`).
+    Absent,
+    /// The reference must still carry this ETag (`If-Match`).
+    ETag(String),
+}
+
+/// One fenced write to `reference.bin` (see
+/// [`StorageBackend::write_reference_fenced`]).
+#[derive(Debug, Clone, Copy)]
+pub enum RefWrite<'a> {
+    Put {
+        data: &'a [u8],
+        metadata: &'a FileMetadata,
+    },
+    PutFile {
+        path: &'a Path,
+        metadata: &'a FileMetadata,
+    },
+    Metadata {
+        metadata: &'a FileMetadata,
+    },
+    Delete,
+}
+
+/// The message of a fenced reference write that lost its precondition.
+pub fn reference_fence_lost(bucket: &str, prefix: &str) -> StorageError {
+    StorageError::Throttled(format!(
+        "reference.bin of {bucket}/{prefix} changed after this request took the \
+         deltaspace lock (another instance wrote it); retry the request"
+    ))
+}
+
 /// Errors that can occur during storage operations
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -246,6 +287,50 @@ pub trait StorageBackend: Send + Sync {
 
     /// Delete a reference file and its metadata
     async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError>;
+
+    /// The fence for the reference as it is now: `ETag(..)` when it exists,
+    /// `Absent` when it does not. Same error contract as `has_reference`.
+    /// The default (backends that do not fence) reports existence only.
+    async fn reference_fence(&self, bucket: &str, prefix: &str) -> Result<RefFence, StorageError> {
+        Ok(if self.has_reference(bucket, prefix).await? {
+            RefFence::ETag(String::new())
+        } else {
+            RefFence::Absent
+        })
+    }
+
+    /// Write `reference.bin` only if `fence` still holds, and return the
+    /// fence after the write. A lost precondition is
+    /// [`reference_fence_lost`] (retryable), never an overwrite.
+    ///
+    /// The default ignores the fence and returns `Unfenced`: correct for the
+    /// filesystem backend (single node) and for non-CAS backends, which are
+    /// refused for multi-instance delta storage. EVERY wrapper backend must
+    /// forward this method, or the fence silently disappears below it.
+    async fn write_reference_fenced(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        op: RefWrite<'_>,
+        fence: &RefFence,
+    ) -> Result<RefFence, StorageError> {
+        let _ = fence;
+        match op {
+            RefWrite::Put { data, metadata } => {
+                self.put_reference(bucket, prefix, data, metadata).await?
+            }
+            RefWrite::PutFile { path, metadata } => {
+                self.put_reference_from_file(bucket, prefix, path, metadata)
+                    .await?
+            }
+            RefWrite::Metadata { metadata } => {
+                self.put_reference_metadata(bucket, prefix, metadata)
+                    .await?
+            }
+            RefWrite::Delete => self.delete_reference(bucket, prefix).await?,
+        }
+        Ok(RefFence::Unfenced)
+    }
 
     // === Delta file operations ===
 
@@ -884,6 +969,24 @@ macro_rules! impl_storage_backend_for_box {
                 prefix: &str,
             ) -> Result<(), StorageError> {
                 (**self).delete_reference(bucket, prefix).await
+            }
+            async fn reference_fence(
+                &self,
+                bucket: &str,
+                prefix: &str,
+            ) -> Result<RefFence, StorageError> {
+                (**self).reference_fence(bucket, prefix).await
+            }
+            async fn write_reference_fenced(
+                &self,
+                bucket: &str,
+                prefix: &str,
+                op: RefWrite<'_>,
+                fence: &RefFence,
+            ) -> Result<RefFence, StorageError> {
+                (**self)
+                    .write_reference_fenced(bucket, prefix, op, fence)
+                    .await
             }
 
             async fn get_delta(

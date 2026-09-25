@@ -1830,6 +1830,73 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     async fn delete_reference(&self, b: &str, p: &str) -> Result<(), StorageError> {
         self.inner.delete_reference(b, p).await
     }
+    async fn reference_fence(
+        &self,
+        b: &str,
+        p: &str,
+    ) -> Result<super::traits::RefFence, StorageError> {
+        self.inner.reference_fence(b, p).await
+    }
+    /// The same transformation as the unfenced writes (encrypt the body, keep
+    /// the stored markers on a metadata-only write), then the inner fenced
+    /// write: the fence is on the stored object, which is what the inner
+    /// backend observes.
+    async fn write_reference_fenced(
+        &self,
+        b: &str,
+        p: &str,
+        op: super::traits::RefWrite<'_>,
+        fence: &super::traits::RefFence,
+    ) -> Result<super::traits::RefFence, StorageError> {
+        use super::traits::RefWrite;
+        match op {
+            RefWrite::Put { data, metadata } => {
+                let mut meta = without_markers(metadata);
+                let enc = self.encrypt_if_enabled(data, &mut meta)?;
+                self.inner
+                    .write_reference_fenced(
+                        b,
+                        p,
+                        RefWrite::Put {
+                            data: &enc,
+                            metadata: &meta,
+                        },
+                        fence,
+                    )
+                    .await
+            }
+            // Like the unfenced default of `put_reference_from_file`: read the
+            // file, then encrypt it as a Put.
+            RefWrite::PutFile { path, metadata } => {
+                let data = tokio::fs::read(path).await?;
+                let mut meta = without_markers(metadata);
+                let enc = self.encrypt_if_enabled(&data, &mut meta)?;
+                self.inner
+                    .write_reference_fenced(
+                        b,
+                        p,
+                        RefWrite::Put {
+                            data: &enc,
+                            metadata: &meta,
+                        },
+                        fence,
+                    )
+                    .await
+            }
+            RefWrite::Metadata { metadata } => {
+                let raw = self.inner.get_reference_metadata(b, p).await?;
+                let meta = with_markers_of(metadata, &raw);
+                self.inner
+                    .write_reference_fenced(b, p, RefWrite::Metadata { metadata: &meta }, fence)
+                    .await
+            }
+            RefWrite::Delete => {
+                self.inner
+                    .write_reference_fenced(b, p, RefWrite::Delete, fence)
+                    .await
+            }
+        }
+    }
     async fn delete_delta(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
         self.inner.delete_delta(b, p, f).await
     }

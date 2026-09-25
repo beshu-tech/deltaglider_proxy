@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed — A writer that lost the reference lock can no longer overwrite a peer's baseline
+
+With config sync on, a PUT holds a cross-instance lock while it writes a delta
+prefix's `reference.bin`. A writer whose lock lapsed (a long pause, or a clock
+far ahead) could still write after a peer took the lock, and overwrite the
+peer's new baseline, which orphans the peer's deltas. The write is now
+conditional on the reference that the writer saw when it took the lock
+(`If-Match`, or `If-None-Match: *` for a new baseline). When another writer
+changed it in between, the PUT fails with `503 SlowDown`, which SDKs retry,
+instead of overwriting it. Backends without conditional writes (Backblaze B2)
+keep the old unconditional write; they are refused for multi-instance delta
+storage anyway.
+
 ### Changed — A replayed mutating request is refused for its whole valid life
 
 The replay window was 2 seconds, so a captured PUT or DELETE replayed after
@@ -12,6 +25,7 @@ read has no effect and SDKs repeat read signatures within one second. A
 request that fails still gives its slot back, so SDK retries work.
 `DGP_REPLAY_WINDOW_SECS` still sets another window, and `0` switches the
 check off.
+
 ### Changed — lifecycle run-now starts the run in the background
 
 `POST /_/api/admin/jobs/lifecycle:<name>/run-now` waited until the rule
