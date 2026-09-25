@@ -15,7 +15,9 @@
 
 use crate::cli::aws_creds;
 use crate::cli::config as cli_exit;
-use crate::cli::engine_factory::{build_cli_engine, render_store_error, CliEngineOpts};
+use crate::cli::engine_factory::{
+    build_cli_engine, copy_user_metadata, render_store_error, CliEngineOpts,
+};
 use crate::cli::filter::Filter;
 use crate::cli::keys::{dir_prefix, local_path_for_key, rel_under, LocalPathError};
 use crate::cli::ls::should_allow_local;
@@ -601,10 +603,7 @@ async fn copy_one(
         }
     };
     let ct = args.content_type.clone().or(metadata.content_type);
-    let mut meta = user_meta.clone();
-    if args.no_delta {
-        meta.insert("dg-no-delta".to_string(), "true".to_string());
-    }
+    let meta = copy_user_metadata(&metadata.user_metadata, user_meta, args.no_delta);
     match engine.store(dst_bucket, dst_key, &data, ct, meta).await {
         Ok(_) => cli_exit::EXIT_OK,
         Err(e) => {

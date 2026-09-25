@@ -103,6 +103,25 @@ pub async fn build_raw_s3_client(
     S3Backend::build_client(&backend).await
 }
 
+/// Pure: user metadata for the destination of an S3-to-S3 copy (`cp`,
+/// `sync`, `migrate`). Starts from the source object's user metadata,
+/// drops the source's at-rest encryption markers (the destination
+/// wrapper stamps its own), then applies the `--metadata` flags, which
+/// win, and the `--no-delta` hint.
+pub fn copy_user_metadata(
+    source: &std::collections::HashMap<String, String>,
+    overrides: &std::collections::HashMap<String, String>,
+    no_delta: bool,
+) -> std::collections::HashMap<String, String> {
+    let mut out = source.clone();
+    crate::storage::encrypting::strip_encryption_markers(&mut out);
+    out.extend(overrides.iter().map(|(k, v)| (k.clone(), v.clone())));
+    if no_delta {
+        out.insert("dg-no-delta".to_string(), "true".to_string());
+    }
+    out
+}
+
 /// Render an engine error for the operator. For `TooLarge` we surface
 /// the actionable knob (`--max-object-size-mb`) so users don't have
 /// to dig through docs after their multi-GB release upload fails 100
@@ -268,7 +287,53 @@ mod tests {
         let yaml = serde_yaml::to_string(&b).unwrap();
         assert!(!yaml.contains("SECRET-TOKEN"), "{yaml}");
         let back: BackendConfig = serde_yaml::from_str(&yaml).unwrap();
-        assert!(matches!(back, BackendConfig::S3 { session_token: None, .. }));
+        assert!(matches!(
+            back,
+            BackendConfig::S3 {
+                session_token: None,
+                ..
+            }
+        ));
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn copy_keeps_source_metadata_and_flags_win() {
+        let source = map(&[
+            ("owner", "ci-uploader"),
+            ("build", "41"),
+            ("dg-encrypted", "aes-256-gcm-proxy"),
+            ("dg-encryption-key-id", "k1"),
+        ]);
+        let got = copy_user_metadata(&source, &map(&[("build", "42")]), false);
+        assert_eq!(got, map(&[("owner", "ci-uploader"), ("build", "42")]));
+        let got = copy_user_metadata(&source, &map(&[]), true);
+        assert_eq!(got.get("dg-no-delta").map(String::as_str), Some("true"));
+        assert_eq!(got.get("owner").map(String::as_str), Some("ci-uploader"));
+    }
+
+    /// Guard for the class: every S3-to-S3 copy builds its metadata here.
+    #[test]
+    fn s3_to_s3_copies_use_copy_user_metadata() {
+        for (name, src) in [
+            ("cp.rs", include_str!("cp.rs")),
+            ("sync.rs", include_str!("sync.rs")),
+            ("migrate.rs", include_str!("migrate.rs")),
+        ] {
+            let code = src.split("#[cfg(test)]").next().unwrap();
+            let copy = &code[code.find("async fn copy_one").expect(name)..];
+            let copy = &copy[..copy.find("\n}\n").unwrap()];
+            assert!(
+                copy.contains("copy_user_metadata("),
+                "{name} copy_one drops metadata"
+            );
+        }
     }
 
     #[test]

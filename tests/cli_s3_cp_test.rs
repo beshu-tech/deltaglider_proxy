@@ -449,3 +449,55 @@ async fn cp_recursive_download_never_writes_outside_the_destination() {
     }
     s3.delete_bucket().bucket(&bucket).send().await.ok();
 }
+
+/// S3-to-S3 `cp` keeps the source object's user metadata; a
+/// `--metadata` flag on the copy overrides one key.
+#[tokio::test]
+async fn cp_s3_to_s3_preserves_source_user_metadata() {
+    skip_unless_minio!();
+    let bucket = unique_bucket("meta");
+    let s3 = minio_client().await;
+    s3.create_bucket().bucket(&bucket).send().await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("notes.txt");
+    std::fs::write(&local, b"release notes").unwrap();
+    let mut up = default_args(
+        local.to_string_lossy().to_string(),
+        format!("s3://{bucket}/releases/notes.txt"),
+    );
+    up.metadata = vec!["owner=ci-uploader,build=41".into()];
+    assert_eq!(run(up).await, deltaglider_proxy::cli::config::EXIT_OK);
+
+    let mut copy = default_args(
+        format!("s3://{bucket}/releases/notes.txt"),
+        format!("s3://{bucket}/backup/notes.txt"),
+    );
+    copy.metadata = vec!["build=42".into()];
+    assert_eq!(run(copy).await, deltaglider_proxy::cli::config::EXIT_OK);
+
+    let head = s3
+        .head_object()
+        .bucket(&bucket)
+        .key("backup/notes.txt")
+        .send()
+        .await
+        .unwrap();
+    let values: Vec<String> = head
+        .metadata()
+        .map(|m| m.values().cloned().collect())
+        .unwrap_or_default();
+    assert!(values.iter().any(|v| v == "ci-uploader"), "{values:?}");
+    assert!(values.iter().any(|v| v == "42"), "{values:?}");
+    assert!(!values.iter().any(|v| v == "41"), "{values:?}");
+
+    for key in ["releases/notes.txt", "backup/notes.txt"] {
+        s3.delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .ok();
+    }
+    s3.delete_bucket().bucket(&bucket).send().await.ok();
+}
