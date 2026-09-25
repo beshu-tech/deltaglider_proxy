@@ -35,6 +35,7 @@
 //! and returns an [`Efficiency`] verdict. No I/O, fully unit-testable.
 
 use super::path_guard::{AdminBucket, AdminObjectPath};
+use crate::api::admin::extract::{AdminJson, AdminQuery};
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
@@ -614,7 +615,7 @@ pub struct EfficiencyQuery {
 ///   should poll the same endpoint until it gets a 200.
 pub async fn get_delta_efficiency(
     State(state): State<Arc<AdminState>>,
-    axum::extract::Query(q): axum::extract::Query<EfficiencyQuery>,
+    AdminQuery(q): AdminQuery<EfficiencyQuery>,
 ) -> impl IntoResponse {
     let min_deltas = clamp_min_deltas(q.min_deltas);
 
@@ -663,7 +664,7 @@ pub struct EfficiencyScanRequest {
 /// returns 202.
 pub async fn post_delta_efficiency_scan(
     State(state): State<Arc<AdminState>>,
-    Json(req): Json<EfficiencyScanRequest>,
+    AdminJson(req): AdminJson<EfficiencyScanRequest>,
 ) -> impl IntoResponse {
     let min_deltas = clamp_min_deltas(req.min_deltas);
     let started = state.delta_efficiency_scanner.enqueue_scan(
@@ -744,7 +745,7 @@ pub struct VerifyRequest {
 /// a specific prefix.
 pub async fn verify_delta_efficiency(
     State(state): State<Arc<AdminState>>,
-    Json(req): Json<VerifyRequest>,
+    AdminJson(req): AdminJson<VerifyRequest>,
 ) -> impl IntoResponse {
     let engine = state.s3_state.engine.load_full();
     let scan = match engine

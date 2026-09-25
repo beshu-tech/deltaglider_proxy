@@ -6,6 +6,7 @@
 //! restarting the whole proxy — rotating the IAM key does NOT invalidate an
 //! already-minted session cookie. All routes are admin-GUI-gated.
 
+use crate::api::admin::extract::AdminJson;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -135,7 +136,7 @@ pub(crate) async fn revoke_identities_everywhere(
 pub async fn revoke_user_sessions(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(req): Json<RevokeUserRequest>,
+    AdminJson(req): AdminJson<RevokeUserRequest>,
 ) -> impl IntoResponse {
     let Some(identity) = req.identity.or(req.access_key_id) else {
         return (

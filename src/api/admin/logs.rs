@@ -10,7 +10,8 @@
 //! Captured at an INFO+ floor (see `crate::logs`); the ring is bounded and
 //! per-instance — a GUI convenience for incident debugging, not a log store.
 
-use axum::extract::{Extension, Query};
+use crate::api::admin::extract::AdminQuery;
+use axum::extract::Extension;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -46,7 +47,7 @@ impl LogsQueryParams {
 }
 
 /// GET /_/api/admin/logs — recent log entries (newest first), server-side filtered.
-pub async fn get_logs(Query(params): Query<LogsQueryParams>) -> impl IntoResponse {
+pub async fn get_logs(AdminQuery(params): AdminQuery<LogsQueryParams>) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let query = params.to_log_query();
     // Snapshot the whole ring (bounded), filter, then cap at `limit`.
@@ -62,7 +63,7 @@ pub async fn get_logs(Query(params): Query<LogsQueryParams>) -> impl IntoRespons
 /// session stops being an admin session.
 pub async fn get_logs_stream(
     Extension(session): Extension<AdminSessionCheck>,
-    Query(params): Query<LogsQueryParams>,
+    AdminQuery(params): AdminQuery<LogsQueryParams>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let query = params.to_log_query();
     let rx = logs::log_broadcast().subscribe();

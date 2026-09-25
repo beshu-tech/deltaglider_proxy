@@ -2,6 +2,7 @@
 
 //! Group handlers: list, create, update, delete, add/remove members.
 
+use crate::api::admin::extract::AdminJson;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
@@ -64,7 +65,7 @@ pub async fn list_groups(
 pub async fn create_group(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(body): Json<CreateGroupRequest>,
+    AdminJson(body): AdminJson<CreateGroupRequest>,
 ) -> Result<(StatusCode, Json<Group>), StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
@@ -178,7 +179,7 @@ pub async fn update_group(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(group_id): axum::extract::Path<i64>,
     headers: HeaderMap,
-    Json(body): Json<UpdateGroupRequest>,
+    AdminJson(body): AdminJson<UpdateGroupRequest>,
 ) -> Result<Json<Group>, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
@@ -243,7 +244,7 @@ pub async fn add_group_member(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(group_id): axum::extract::Path<i64>,
     headers: HeaderMap,
-    Json(body): Json<AddGroupMemberRequest>,
+    AdminJson(body): AdminJson<AddGroupMemberRequest>,
 ) -> Result<StatusCode, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;

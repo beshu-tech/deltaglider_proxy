@@ -2,6 +2,7 @@
 
 //! Auth handlers: login, logout, login_as, whoami, check_session, require_session.
 
+use crate::api::admin::extract::AdminJson;
 use axum::{
     extract::{ConnectInfo, State},
     http::{header, HeaderMap, StatusCode},
@@ -503,7 +504,7 @@ pub async fn login(
     State(state): State<Arc<AdminState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     req_headers: HeaderMap,
-    Json(body): Json<LoginRequest>,
+    AdminJson(body): AdminJson<LoginRequest>,
 ) -> impl IntoResponse {
     // Brute-force protection: per-IP cap (catches single-host noise)
     // PLUS per-account cap (catches distributed credential stuffing
@@ -714,7 +715,7 @@ pub async fn resolve_iam_identity(
     State(state): State<Arc<AdminState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     req_headers: HeaderMap,
-    Json(body): Json<ResolveIamIdentityRequest>,
+    AdminJson(body): AdminJson<ResolveIamIdentityRequest>,
 ) -> Result<Json<WhoamiResponse>, StatusCode> {
     let guard = crate::rate_limiter::RateLimitGuard::enter(
         &state.rate_limiter,
@@ -858,7 +859,7 @@ pub async fn login_as(
     State(state): State<Arc<AdminState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     req_headers: HeaderMap,
-    Json(body): Json<LoginAsRequest>,
+    AdminJson(body): AdminJson<LoginAsRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     // Per-IP + per-account brute-force gate. Without the per-account
     // bucket, a botnet rotating IPs could target a specific admin's
@@ -962,7 +963,7 @@ pub async fn browser_session_connect(
     State(state): State<Arc<AdminState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     req_headers: HeaderMap,
-    Json(body): Json<BrowserSessionConnectRequest>,
+    AdminJson(body): AdminJson<BrowserSessionConnectRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let guard = crate::rate_limiter::RateLimitGuard::enter(
         &state.rate_limiter,
@@ -1074,7 +1075,7 @@ pub async fn open_browser_connect(
     State(state): State<Arc<AdminState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     req_headers: HeaderMap,
-    Json(body): Json<OpenBrowserConnectRequest>,
+    AdminJson(body): AdminJson<OpenBrowserConnectRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let guard = crate::rate_limiter::RateLimitGuard::enter(
         &state.rate_limiter,
@@ -1369,7 +1370,7 @@ pub async fn get_s3_session_creds(
 pub async fn set_s3_session_creds(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(creds): Json<S3SessionCredentials>,
+    AdminJson(creds): AdminJson<S3SessionCredentials>,
 ) -> impl IntoResponse {
     let token = match extract_session_token(&headers) {
         Some(t) => t,

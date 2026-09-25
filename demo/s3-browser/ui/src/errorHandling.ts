@@ -64,6 +64,11 @@ async function readResponseBodyMessage(res: Response): Promise<{ code?: string; 
   if (ct.includes('application/json')) {
     try {
       const data = JSON.parse(body) as JsonErrorShape;
+      // `{error: <code>, message: <text>}`: the text is the message and the
+      // short `error` is the code. A lone `error` stays the message.
+      if (data.error && data.message) {
+        return { code: data.code || data.error, message: data.message };
+      }
       return {
         code: data.code,
         message: data.error || data.message || data.details || trimOneLine(body),

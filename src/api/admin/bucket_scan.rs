@@ -50,11 +50,12 @@
 //! scanned.
 
 use super::path_guard::AdminBucket;
+use crate::api::admin::extract::AdminQuery;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{Extension, Query, State};
+use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -555,7 +556,7 @@ pub struct OptionalBucketQuery {
 
 pub async fn get_scan_status(
     State(state): State<Arc<AdminState>>,
-    Query(q): Query<OptionalBucketQuery>,
+    AdminQuery(q): AdminQuery<OptionalBucketQuery>,
 ) -> Result<axum::response::Response, StatusCode> {
     let scanner = &state.bucket_scanner;
     if let Some(bucket) = q.bucket {
@@ -582,7 +583,7 @@ pub async fn get_scan_status(
 /// twice in quick succession returns the same running job.
 pub async fn post_scan_start(
     State(state): State<Arc<AdminState>>,
-    Query(q): Query<BucketQuery>,
+    AdminQuery(q): AdminQuery<BucketQuery>,
 ) -> Result<Json<ScanProgress>, StatusCode> {
     let rx = state
         .bucket_scanner
@@ -594,7 +595,7 @@ pub async fn post_scan_start(
 /// `POST /_/api/admin/diagnostics/scan/stop?bucket=X`
 pub async fn post_scan_stop(
     State(state): State<Arc<AdminState>>,
-    Query(q): Query<BucketQuery>,
+    AdminQuery(q): AdminQuery<BucketQuery>,
 ) -> Json<serde_json::Value> {
     let cancelled = state.bucket_scanner.cancel(&q.bucket);
     Json(serde_json::json!({ "cancelled": cancelled }))
@@ -604,7 +605,7 @@ pub async fn post_scan_stop(
 /// persisted result so the dashboard reverts to "never scanned".
 pub async fn delete_scan(
     State(state): State<Arc<AdminState>>,
-    Query(q): Query<BucketQuery>,
+    AdminQuery(q): AdminQuery<BucketQuery>,
 ) -> Json<serde_json::Value> {
     let forgotten = state.bucket_scanner.forget(&q.bucket);
     Json(serde_json::json!({ "forgotten": forgotten }))
@@ -620,7 +621,7 @@ pub async fn delete_scan(
 pub async fn get_scan_stream(
     State(state): State<Arc<AdminState>>,
     Extension(session): Extension<super::auth::AdminSessionCheck>,
-    Query(q): Query<BucketQuery>,
+    AdminQuery(q): AdminQuery<BucketQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = state
         .bucket_scanner

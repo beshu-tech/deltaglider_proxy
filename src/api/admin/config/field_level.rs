@@ -20,6 +20,7 @@
 //! `BackendInfoResponse`) are the wire shape the legacy GUI depends on.
 //! Changes here are visible to the `/_/api/admin/config` consumers.
 
+use crate::api::admin::extract::AdminJson;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -591,7 +592,7 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
 ///   matching the admin-GUI's legacy expectations.
 pub async fn update_config(
     State(state): State<Arc<AdminState>>,
-    Json(body): Json<ConfigUpdateRequest>,
+    AdminJson(body): AdminJson<ConfigUpdateRequest>,
 ) -> impl IntoResponse {
     let mut cfg = state.config.write().await;
     let mut warnings = Vec::new();

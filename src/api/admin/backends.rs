@@ -2,6 +2,7 @@
 
 //! Admin API for managing named backends (multi-backend routing).
 
+use crate::api::admin::extract::AdminJson;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -273,7 +274,7 @@ pub async fn list_bucket_origins(
 pub async fn create_bucket_on_backend(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(body): Json<CreateBucketOnBackendRequest>,
+    AdminJson(body): AdminJson<CreateBucketOnBackendRequest>,
 ) -> Result<Json<CreateBucketOnBackendResponse>, (StatusCode, String)> {
     let bucket = body.name.trim().to_string();
     if bucket.is_empty() {
@@ -407,7 +408,7 @@ pub async fn create_bucket_on_backend(
 /// POST /api/admin/backends — add a new named backend.
 pub async fn create_backend(
     State(state): State<Arc<AdminState>>,
-    Json(body): Json<CreateBackendRequest>,
+    AdminJson(body): AdminJson<CreateBackendRequest>,
 ) -> impl IntoResponse {
     let name = body.name.trim().to_string();
     if name.is_empty() {

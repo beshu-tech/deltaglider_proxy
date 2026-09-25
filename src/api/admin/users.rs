@@ -3,6 +3,7 @@
 //! User handlers: list, create, update, delete, rotate keys, canned policies,
 //! plus rebuild_iam_index and mask_user helpers.
 
+use crate::api::admin::extract::AdminJson;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -221,7 +222,7 @@ pub async fn list_users(
 pub async fn create_user(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(body): Json<CreateUserRequest>,
+    AdminJson(body): AdminJson<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<IamUser>), StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
@@ -351,7 +352,7 @@ pub async fn update_user(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(user_id): axum::extract::Path<i64>,
     headers: HeaderMap,
-    Json(body): Json<UpdateUserRequest>,
+    AdminJson(body): AdminJson<UpdateUserRequest>,
 ) -> Result<Json<IamUser>, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;

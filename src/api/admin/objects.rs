@@ -25,8 +25,9 @@
 //! progress reporting; for v1 we match the existing client semantics
 //! 1:1 so the migration is risk-free.
 
+use crate::api::admin::extract::{AdminJson, AdminQuery};
 use crate::api::handlers::AppState;
-use axum::extract::{Extension, Query, State};
+use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -257,7 +258,7 @@ pub async fn copy_objects(
     Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     headers: axum::http::HeaderMap,
-    Json(req): Json<CopyRequest>,
+    AdminJson(req): AdminJson<CopyRequest>,
 ) -> Result<Json<CopyResponse>, (StatusCode, String)> {
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
     reject_if_replication_target_only(&state, &req.dest_bucket)?;
@@ -443,7 +444,7 @@ pub async fn move_objects(
     Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     headers: axum::http::HeaderMap,
-    Json(req): Json<MoveRequest>,
+    AdminJson(req): AdminJson<MoveRequest>,
 ) -> Result<Json<MoveResponse>, (StatusCode, String)> {
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
     reject_if_under_maintenance(&state, &req.source_bucket)?;
@@ -598,7 +599,7 @@ pub async fn bulk_delete(
     Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     headers: axum::http::HeaderMap,
-    Json(req): Json<DeleteRequest>,
+    AdminJson(req): AdminJson<DeleteRequest>,
 ) -> Result<Json<DeleteResponse>, (StatusCode, String)> {
     reject_if_under_maintenance(&state, &req.bucket)?;
     reject_if_replication_target_only(&state, &req.bucket)?;
@@ -743,7 +744,7 @@ fn zip_entry_names(items: &[(String, String)]) -> Vec<String> {
 pub async fn download_zip(
     Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
-    Query(q): Query<ZipQuery>,
+    AdminQuery(q): AdminQuery<ZipQuery>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     let parsed: Vec<(String, String)> = q
         .keys
@@ -986,7 +987,7 @@ pub struct ListAllResponse {
 pub async fn list_all(
     Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
-    Query(q): Query<ListAllQuery>,
+    AdminQuery(q): AdminQuery<ListAllQuery>,
 ) -> Result<Json<ListAllResponse>, (StatusCode, String)> {
     if q.prefix.is_empty() {
         return Err((

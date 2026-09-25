@@ -12,6 +12,7 @@ pub mod csrf;
 mod delta_efficiency;
 mod event_outbox;
 pub mod external_auth;
+mod extract;
 mod groups;
 pub(crate) mod jobs;
 mod lifecycle;

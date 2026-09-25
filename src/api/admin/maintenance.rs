@@ -21,6 +21,7 @@
 //!   response carries only status/phase/counts — no config detail.
 
 use super::AdminState;
+use crate::api::admin::extract::AdminJson;
 use crate::maintenance::migrate::{parse_params, pick_transient_key, MigrateParams};
 use crate::maintenance::store::{current_unix_seconds, CancelOutcome, MaintenanceJob};
 use crate::maintenance::{display_percent, resolve_desired};
@@ -106,7 +107,7 @@ pub struct ReencryptResponse {
 pub async fn start_reencrypt(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(req): Json<ReencryptRequest>,
+    AdminJson(req): AdminJson<ReencryptRequest>,
 ) -> Result<Json<ReencryptResponse>, (StatusCode, String)> {
     if req.buckets.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "no buckets given".into()));
@@ -218,7 +219,7 @@ pub struct BackfillRequest {
 pub async fn start_backfill(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(req): Json<BackfillRequest>,
+    AdminJson(req): AdminJson<BackfillRequest>,
 ) -> Result<Json<ReencryptResponse>, (StatusCode, String)> {
     if req.buckets.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "no buckets given".into()));
@@ -324,7 +325,7 @@ pub async fn start_migrate(
     State(state): State<Arc<AdminState>>,
     Path(bucket): Path<String>,
     headers: HeaderMap,
-    Json(body): Json<MigrateBucketRequest>,
+    AdminJson(body): AdminJson<MigrateBucketRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
     let bucket = bucket.trim().to_string();
     let bucket_key = bucket.to_ascii_lowercase();

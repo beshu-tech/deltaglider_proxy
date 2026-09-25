@@ -3,12 +3,13 @@
 //! Admin diagnostics for the durable object-event outbox.
 
 use super::AdminState;
+use crate::api::admin::extract::{AdminJson, AdminQuery};
 use crate::event_delivery::known_status;
 use crate::event_outbox::{
     current_unix_seconds, EventOutboxListQuery as DbEventOutboxListQuery, EventOutboxRecord,
     EventOutboxSort, EventOutboxSortOrder, EventOutboxStatusCounts,
 };
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -48,7 +49,7 @@ pub struct RequeueEventOutboxResponse {
 }
 
 pub async fn list(
-    Query(q): Query<EventOutboxQuery>,
+    AdminQuery(q): AdminQuery<EventOutboxQuery>,
     State(state): State<Arc<AdminState>>,
 ) -> Result<Json<EventOutboxResponse>, (StatusCode, String)> {
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
@@ -161,7 +162,7 @@ pub async fn requeue_one(
 
 pub async fn requeue_many(
     State(state): State<Arc<AdminState>>,
-    Json(req): Json<RequeueEventOutboxRequest>,
+    AdminJson(req): AdminJson<RequeueEventOutboxRequest>,
 ) -> Result<Json<RequeueEventOutboxResponse>, (StatusCode, String)> {
     if req.ids.is_empty() {
         return Ok(Json(RequeueEventOutboxResponse { requeued: 0 }));

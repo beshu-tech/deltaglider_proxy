@@ -2,8 +2,9 @@
 
 //! API handlers for external authentication: OAuth flow, provider CRUD, group mapping.
 
+use crate::api::admin::extract::{AdminJson, AdminQuery};
 use axum::{
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{ConnectInfo, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -160,7 +161,7 @@ pub async fn oauth_authorize(
     State(state): State<Arc<AdminState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     Path(provider_name): Path<String>,
-    Query(params): Query<OAuthAuthorizeQuery>,
+    AdminQuery(params): AdminQuery<OAuthAuthorizeQuery>,
     req_headers: HeaderMap,
 ) -> Response {
     tracing::info!("OAuth authorize request for provider '{}'", provider_name);
@@ -264,7 +265,7 @@ pub async fn oauth_authorize(
 pub async fn oauth_callback(
     State(state): State<Arc<AdminState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
-    Query(params): Query<OAuthCallbackQuery>,
+    AdminQuery(params): AdminQuery<OAuthCallbackQuery>,
     req_headers: HeaderMap,
 ) -> Response {
     tracing::info!(
@@ -690,7 +691,7 @@ pub async fn list_providers(
 pub async fn create_provider(
     State(state): State<Arc<AdminState>>,
     req_headers: HeaderMap,
-    Json(body): Json<CreateAuthProviderRequest>,
+    AdminJson(body): AdminJson<CreateAuthProviderRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let provider = super::with_config_db(&state, "create auth provider", |db| {
         db.create_auth_provider(&body)
@@ -709,7 +710,7 @@ pub async fn update_provider(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
     req_headers: HeaderMap,
-    Json(body): Json<UpdateAuthProviderRequest>,
+    AdminJson(body): AdminJson<UpdateAuthProviderRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let updated = super::with_config_db(&state, "update auth provider", |db| {
         db.update_auth_provider(id, &body)
@@ -796,7 +797,7 @@ pub async fn list_mappings(
 pub async fn create_mapping(
     State(state): State<Arc<AdminState>>,
     req_headers: HeaderMap,
-    Json(body): Json<CreateMappingRuleRequest>,
+    AdminJson(body): AdminJson<CreateMappingRuleRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
@@ -831,7 +832,7 @@ pub async fn update_mapping(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
     req_headers: HeaderMap,
-    Json(body): Json<UpdateMappingRuleRequest>,
+    AdminJson(body): AdminJson<UpdateMappingRuleRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     // Validate match_type / match_value when either is being changed.
     // On a partial update we may have a type without a value (or vice
@@ -909,7 +910,7 @@ pub struct PreviewResponse {
 
 pub async fn preview_mapping(
     State(state): State<Arc<AdminState>>,
-    Json(body): Json<PreviewRequest>,
+    AdminJson(body): AdminJson<PreviewRequest>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;

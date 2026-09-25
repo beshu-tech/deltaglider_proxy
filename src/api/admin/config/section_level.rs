@@ -35,7 +35,8 @@
 //! while keeping the same hot-reload + persist semantics as the full-
 //! document path.
 
-use axum::extract::{Path, Query, State};
+use crate::api::admin::extract::{AdminJson, AdminQuery};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -141,7 +142,7 @@ fn reject(status: StatusCode, error: impl Into<String>) -> Response {
 pub async fn get_section(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
-    Query(query): Query<SectionGetQuery>,
+    AdminQuery(query): AdminQuery<SectionGetQuery>,
 ) -> impl IntoResponse {
     let Some(section) = SectionName::parse(&name) else {
         return reject(StatusCode::NOT_FOUND, unknown_section_error(&name));
@@ -237,7 +238,7 @@ pub async fn put_section(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
     headers: HeaderMap,
-    body: Json<serde_json::Value>,
+    body: AdminJson<serde_json::Value>,
 ) -> impl IntoResponse {
     apply_section(
         state,
@@ -260,7 +261,7 @@ pub async fn put_section(
 pub async fn validate_section(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
-    body: Json<serde_json::Value>,
+    body: AdminJson<serde_json::Value>,
 ) -> impl IntoResponse {
     apply_section(state, name, body.0, ApplyMode::DryRun, None).await
 }

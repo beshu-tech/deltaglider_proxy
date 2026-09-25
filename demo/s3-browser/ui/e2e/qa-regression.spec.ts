@@ -378,8 +378,11 @@ test('3. bulk copy, move, ZIP, delete; refusals for move-into-source and path es
   const r = await page.request.post('/_/api/admin/objects/copy', {
     data: { source_bucket: BUCKET, dest_bucket: BUCKET, dest_prefix: '../escape/', items: [{ source_key: 'mv/a.txt', relative: 'a.txt' }] },
   });
-  expect(r.status()).toBe(422);
-  expect(await r.text()).toContain("'.' and '..' segments are not allowed");
+  expect(r.status()).toBe(400);
+  expect(await r.json()).toEqual({
+    error: 'invalid_path',
+    message: `dest_prefix: invalid path "../escape/": '.' and '..' segments are not allowed`,
+  });
   expect((await listKeys(BUCKET)).some((k) => k.includes('escape'))).toBe(false);
 
   // Upload to a '..' destination: refused on the page, no request is sent.

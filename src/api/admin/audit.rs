@@ -12,7 +12,8 @@
 //! state. This endpoint is a GUI convenience for incident
 //! debugging, not a substitute for durable log shipping.
 
-use axum::{extract::Query, http::StatusCode, response::IntoResponse, Json};
+use crate::api::admin::extract::AdminQuery;
+use axum::{http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
 
 /// Ceiling on `?limit` — keeps one burst request from serialising
@@ -30,7 +31,7 @@ pub struct AuditQuery {
 }
 
 /// GET /_/api/admin/audit — recent audit entries, newest first.
-pub async fn get_audit(Query(q): Query<AuditQuery>) -> impl IntoResponse {
+pub async fn get_audit(AdminQuery(q): AdminQuery<AuditQuery>) -> impl IntoResponse {
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let entries = crate::audit::recent_audit(limit);
     (

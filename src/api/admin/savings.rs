@@ -31,10 +31,11 @@
 //! disk-cached `ScanResult`.
 
 use super::path_guard::{AdminBucket, AdminObjectPath};
+use crate::api::admin::extract::AdminQuery;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -175,7 +176,7 @@ impl Default for SavingsCache {
 /// `GET /_/api/admin/deltaspace/savings?bucket=X&prefix=Y`
 pub async fn get_savings(
     State(state): State<Arc<crate::api::admin::AdminState>>,
-    Query(q): Query<SavingsQuery>,
+    AdminQuery(q): AdminQuery<SavingsQuery>,
 ) -> impl IntoResponse {
     // Defensive: empty bucket is meaningless — clients shouldn't ask
     // and the listing path would explode if they did.

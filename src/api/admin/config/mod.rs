@@ -94,6 +94,7 @@ pub use password::{change_password, recover_db, PasswordChangeRequest, PasswordC
 pub use section_level::{get_section, put_section, validate_section, SectionApplyResponse};
 pub use trace::{trace_config, trace_config_get, TraceRequest, TraceResolved, TraceResponse};
 
+use crate::api::admin::extract::AdminJson;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -991,7 +992,7 @@ pub(crate) fn active_config_path(state: &AdminState) -> String {
 /// POST /api/admin/test-s3 — test S3 connectivity with provided (or saved) credentials.
 pub async fn test_s3_connection(
     State(state): State<Arc<AdminState>>,
-    Json(body): Json<TestS3Request>,
+    AdminJson(body): AdminJson<TestS3Request>,
 ) -> impl IntoResponse {
     let cfg = state.config.read().await;
 

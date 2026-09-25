@@ -5,6 +5,7 @@
 //! `refresh_bucket_usage`.
 
 use super::path_guard::{AdminBucket, AdminObjectPath};
+use crate::api::admin::extract::{AdminJson, AdminQuery};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -32,7 +33,7 @@ pub struct UsageQuery {
 /// POST /_/api/admin/usage/scan — trigger a background usage scan.
 pub async fn scan_usage(
     State(state): State<Arc<AdminState>>,
-    Json(req): Json<ScanUsageRequest>,
+    AdminJson(req): AdminJson<ScanUsageRequest>,
 ) -> impl IntoResponse {
     let prefix = req.prefix.unwrap_or_default().into_string();
     let started =
@@ -57,7 +58,7 @@ pub async fn scan_usage(
 /// This is a potentially long-running operation — runs synchronously and returns results.
 pub async fn migrate_legacy(
     State(state): State<Arc<AdminState>>,
-    Json(req): Json<MigrateRequest>,
+    AdminJson(req): AdminJson<MigrateRequest>,
 ) -> impl IntoResponse {
     let engine = state.s3_state.engine.load();
     match engine.migrate_legacy_references(&req.bucket).await {
@@ -87,7 +88,7 @@ pub struct MigrateRequest {
 /// GET /_/api/admin/usage?bucket=X&prefix=Y — return cached usage entry.
 pub async fn get_usage(
     State(state): State<Arc<AdminState>>,
-    axum::extract::Query(q): axum::extract::Query<UsageQuery>,
+    AdminQuery(q): AdminQuery<UsageQuery>,
 ) -> impl IntoResponse {
     let prefix = q.prefix.unwrap_or_default();
     match state.usage_scanner.get(&q.bucket, &prefix) {
@@ -162,7 +163,7 @@ pub async fn get_bucket_usage(
 /// overwrite the counter with ground truth. The only O(n) path left.
 pub async fn refresh_bucket_usage(
     State(state): State<Arc<AdminState>>,
-    axum::extract::Query(q): axum::extract::Query<UsageQuery>,
+    AdminQuery(q): AdminQuery<UsageQuery>,
 ) -> impl IntoResponse {
     let Some(usage) = state.s3_state.bucket_usage.as_ref() else {
         return (

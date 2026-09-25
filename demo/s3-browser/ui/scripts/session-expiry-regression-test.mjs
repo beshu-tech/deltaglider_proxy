@@ -44,6 +44,15 @@ assert.ok(e instanceof Error);
 assert.equal(e.message, 'Load users failed (401): unauthorized');
 assert.equal(e.status, 401);
 
+// `{error: <code>, message: <text>}` (admin input errors, CSRF, declarative
+// IAM): show the message and keep the code as the code. The UI used to show
+// only the bare code, e.g. "invalid_path".
+const shaped = await thrown(400, '{"error":"invalid_path","message":"dest_prefix: invalid path \\"../x/\\": \'.\' and \'..\' segments are not allowed"}');
+assert.equal(shaped.code, 'invalid_path');
+assert.equal(shaped.message, 'Load users failed (400) [invalid_path]: dest_prefix: invalid path "../x/": \'.\' and \'..\' segments are not allowed');
+// A lone `error` still is the message (and the detail isSessionExpired reads).
+assert.equal((await thrown(403, '{"error":"admin_session_required"}')).detail, 'admin_session_required');
+
 // --- Source guard: no component classifies expiry on message text ----------
 async function* files(dir) {
   for (const d of await readdir(dir, { withFileTypes: true })) {

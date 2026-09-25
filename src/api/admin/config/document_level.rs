@@ -17,7 +17,8 @@
 //! `preserve_sigv4_pair` helpers live here too — they are private details
 //! of this flow and have no callers outside it.
 
-use axum::extract::{Query, State};
+use crate::api::admin::extract::{AdminJson, AdminQuery};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -109,7 +110,7 @@ pub struct SectionFilterQuery {
 /// produce the same shape as a mis-routed GET.
 pub async fn export_config(
     State(state): State<Arc<AdminState>>,
-    Query(query): Query<SectionFilterQuery>,
+    AdminQuery(query): AdminQuery<SectionFilterQuery>,
 ) -> impl IntoResponse {
     let cfg = state.config.read().await;
     let redacted = cfg.redact_all_secrets();
@@ -185,7 +186,9 @@ pub async fn export_config(
 /// what `monaco-yaml` needs when the UI's Monaco editor is bound to
 /// one section's scope. Wave 2 of the admin UI plan reads this for
 /// per-section YAML linting.
-pub async fn config_defaults(Query(query): Query<SectionFilterQuery>) -> impl IntoResponse {
+pub async fn config_defaults(
+    AdminQuery(query): AdminQuery<SectionFilterQuery>,
+) -> impl IntoResponse {
     let schema = match query.section.as_deref() {
         None => serde_json::to_value(schemars::schema_for!(crate::config::Config)),
         Some(name) => match SectionName::parse(name) {
@@ -300,7 +303,7 @@ fn parse_and_validate_yaml(
 /// and by the admin GUI's pre-apply confirmation modal.
 pub async fn validate_config_doc(
     State(state): State<Arc<AdminState>>,
-    Json(body): Json<ConfigDocumentRequest>,
+    AdminJson(body): AdminJson<ConfigDocumentRequest>,
 ) -> impl IntoResponse {
     let current = state.config.read().await.clone();
     match parse_and_validate_yaml(&body.yaml, &current.env_refs) {
@@ -504,7 +507,7 @@ pub(super) fn preserve_runtime_secrets(
 pub async fn apply_config_doc(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(body): Json<ConfigDocumentRequest>,
+    AdminJson(body): AdminJson<ConfigDocumentRequest>,
 ) -> impl IntoResponse {
     // Thin HTTP wrapper. The pipeline lives in `apply_config_inner` so a sibling
     // mutation path (backup restore) can call it directly and read the TYPED
@@ -787,7 +790,7 @@ pub struct ExportIamQuery {
 
 pub async fn export_declarative_iam(
     State(state): State<Arc<AdminState>>,
-    axum::extract::Query(q): axum::extract::Query<ExportIamQuery>,
+    AdminQuery(q): AdminQuery<ExportIamQuery>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let Some(db_arc) = state.config_db.as_ref() else {
@@ -936,7 +939,7 @@ fn parse_iam_yaml(yaml: &str) -> Result<crate::iam::DeclarativeIam, String> {
 /// WITHOUT touching state. Powers the Apply-dialog preview.
 pub async fn validate_declarative_iam(
     State(state): State<Arc<AdminState>>,
-    Json(body): Json<ConfigDocumentRequest>,
+    AdminJson(body): AdminJson<ConfigDocumentRequest>,
 ) -> impl IntoResponse {
     let Some(db_arc) = state.config_db.as_ref() else {
         return (
@@ -961,7 +964,7 @@ pub async fn validate_declarative_iam(
 pub async fn apply_declarative_iam(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(body): Json<ConfigDocumentRequest>,
+    AdminJson(body): AdminJson<ConfigDocumentRequest>,
 ) -> impl IntoResponse {
     let Some(db_arc) = state.config_db.as_ref() else {
         return (

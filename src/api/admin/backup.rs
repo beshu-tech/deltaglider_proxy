@@ -36,8 +36,9 @@
 //!     `?mode=full|iam-only|config-only` (`full` is the default).
 //!   - `application/json` → today's IAM-only flow (unchanged).
 
+use crate::api::admin::extract::AdminQuery;
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -517,7 +518,7 @@ async fn build_iam_backup(state: &Arc<AdminState>) -> Result<IamBackup, StatusCo
 /// scripts; operators should migrate to zip).
 pub async fn export_backup(
     State(state): State<Arc<AdminState>>,
-    Query(q): Query<ExportQuery>,
+    AdminQuery(q): AdminQuery<ExportQuery>,
     headers: axum::http::HeaderMap,
 ) -> Result<Response, StatusCode> {
     let iam = build_iam_backup(&state).await?;
@@ -685,7 +686,7 @@ async fn export_zip(
 ///     legacy IAM-only flow (same shape as v0.8.0).
 pub async fn import_backup(
     State(state): State<Arc<AdminState>>,
-    Query(query): Query<ImportQuery>,
+    AdminQuery(query): AdminQuery<ImportQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ImportResult>, BackupImportError> {

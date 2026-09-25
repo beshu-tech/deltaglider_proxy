@@ -9,7 +9,8 @@
 //! layer identity / IAM / parameters / routing decisions on top of the
 //! same handler shape.
 
-use axum::extract::{Query, State};
+use crate::api::admin::extract::{AdminJson, AdminQuery};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -73,7 +74,7 @@ pub struct TraceResolved {
 /// that a green trace means the real path would produce the same decision.
 pub async fn trace_config(
     State(state): State<Arc<AdminState>>,
-    Json(body): Json<TraceRequest>,
+    AdminJson(body): AdminJson<TraceRequest>,
 ) -> impl IntoResponse {
     let chain = state.admission_chain.load_full();
 
@@ -185,7 +186,7 @@ fn default_path() -> String {
 /// test one IP against the default GET `/`).
 pub async fn trace_config_get(
     State(state): State<Arc<AdminState>>,
-    Query(query): Query<TraceQuery>,
+    AdminQuery(query): AdminQuery<TraceQuery>,
 ) -> impl IntoResponse {
     let body = TraceRequest {
         method: query.method,
@@ -194,5 +195,7 @@ pub async fn trace_config_get(
         authenticated: query.authenticated,
         source_ip: query.source_ip,
     };
-    trace_config(State(state), Json(body)).await.into_response()
+    trace_config(State(state), AdminJson(body))
+        .await
+        .into_response()
 }

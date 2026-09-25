@@ -22,7 +22,8 @@
 //! SUBSYSTEM (stable even as maintenance grows more kinds); `kind` is
 //! reported separately.
 
-use axum::extract::{Path, Query, State};
+use crate::api::admin::extract::AdminQuery;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -582,7 +583,7 @@ pub async fn job_replication_event_version() -> Json<serde_json::Value> {
 /// GET /_/api/admin/jobs/:id/runs
 pub async fn job_runs(
     Path(id): Path<String>,
-    Query(q): Query<LimitQuery>,
+    AdminQuery(q): AdminQuery<LimitQuery>,
     State(state): State<Arc<AdminState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
@@ -669,7 +670,7 @@ pub async fn job_runs(
 /// GET /_/api/admin/jobs/:id/failures
 pub async fn job_failures(
     Path(id): Path<String>,
-    Query(q): Query<LimitQuery>,
+    AdminQuery(q): AdminQuery<LimitQuery>,
     State(state): State<Arc<AdminState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;

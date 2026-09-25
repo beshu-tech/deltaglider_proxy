@@ -9,6 +9,7 @@
 //! orthogonal to the rest of the config surface, and benefits from
 //! being reviewed as a single unit.
 
+use crate::api::admin::extract::AdminJson;
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -69,7 +70,7 @@ fn env_pinned_hash_var(env: impl Fn(&str) -> Option<String>) -> Option<&'static 
 pub async fn change_password(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-    Json(body): Json<PasswordChangeRequest>,
+    AdminJson(body): AdminJson<PasswordChangeRequest>,
 ) -> impl IntoResponse {
     if let Some(var) = env_pinned_hash_var(|n| std::env::var(n).ok()) {
         return password_err(
@@ -214,7 +215,7 @@ pub async fn recover_db(
     State(state): State<Arc<AdminState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
-    Json(body): Json<RecoverDbRequest>,
+    AdminJson(body): AdminJson<RecoverDbRequest>,
 ) -> impl IntoResponse {
     if !state.config_db_mismatch {
         return (
