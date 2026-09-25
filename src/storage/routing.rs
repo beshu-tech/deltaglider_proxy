@@ -193,6 +193,13 @@ impl RoutingBackend {
         None
     }
 
+    /// True when `real_bucket` on `backend_name` is the storage of a route
+    /// under ANOTHER virtual name (an alias).
+    fn alias_owns_real_bucket(&self, backend_name: &str, real_bucket: &str) -> bool {
+        self.reverse_lookup(backend_name, real_bucket)
+            .is_some_and(|virtual_name| virtual_name != real_bucket)
+    }
+
     /// Convert a bucket discovered on a concrete backend into the virtual
     /// bucket name that clients may safely use.
     ///
@@ -478,6 +485,11 @@ impl RoutingBackend {
         names.sort();
         for name in names {
             if name == &self.default_backend {
+                continue;
+            }
+            // A real bucket that a policy's alias owns on this backend is that
+            // policy's storage, not an unconfigured bucket of the same name.
+            if self.alias_owns_real_bucket(name, virtual_bucket) {
                 continue;
             }
             let backend = self.backends[name].as_ref().as_ref();
@@ -1550,6 +1562,43 @@ mod tests {
         assert_eq!(archive_probe.create_calls(), vec!["shared".to_string()]);
     }
 
+    /// An unconfigured name must not resolve to a real bucket that another
+    /// policy's alias owns on a non-default backend (`leftover` → archive:
+    /// `shared`). Before, `create_bucket("shared")` found archive's `shared`,
+    /// so the client bucket `shared` silently became `leftover`'s storage and
+    /// vanished from the default backend's listing.
+    #[tokio::test]
+    async fn unrouted_name_skips_a_real_bucket_owned_by_an_alias() {
+        let primary_probe = TestBackend::default();
+        let primary = Arc::new(Box::new(primary_probe.clone()) as Box<dyn StorageBackend>);
+        let archive_probe = TestBackend::with_buckets(&["shared"]);
+        let archive = Arc::new(Box::new(archive_probe.clone()) as Box<dyn StorageBackend>);
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), primary);
+        backends.insert("archive".to_string(), archive);
+        let mut routes = HashMap::new();
+        routes.insert(
+            "leftover".to_string(),
+            ("archive".to_string(), Some("shared".to_string())),
+        );
+        let routing =
+            RoutingBackend::new(backends, routes, "primary".to_string()).expect("routing backend");
+
+        routing
+            .create_bucket("shared")
+            .await
+            .expect("create on default");
+        assert!(
+            primary_probe.head_bucket("shared").await.unwrap(),
+            "the new bucket must land on the default backend"
+        );
+        assert!(archive_probe.create_calls().is_empty());
+        let origins = routing.list_bucket_origins().await.unwrap();
+        let by_name: HashMap<_, _> = origins.iter().map(|b| (b.name.as_str(), b)).collect();
+        assert_eq!(by_name["shared"].backend_name.as_deref(), Some("primary"));
+        assert_eq!(by_name["leftover"].backend_name.as_deref(), Some("archive"));
+    }
+
     /// Tier 4: every op on an unrouted bucket sent a head_bucket to each
     /// backend in turn (one extra HEAD per request or more). A found bucket
     /// is now remembered; create/delete bucket and errors are not cached.
@@ -2020,6 +2069,42 @@ mod tests {
             .expect("routing backend");
         let names = routing.list_buckets().await.expect("partial must be Ok");
         assert_eq!(names, vec!["alive".to_string()]);
+    }
+
+    /// A bucket on the default backend must stay listed when ANOTHER
+    /// backend's policy aliases a real bucket of the same name: the alias
+    /// names storage on that other backend, not this one.
+    #[tokio::test]
+    async fn list_bucket_origins_keeps_default_bucket_shadowed_by_foreign_alias() {
+        let primary =
+            Arc::new(Box::new(TestBackend::with_buckets(&["shared"])) as Box<dyn StorageBackend>);
+        let archive =
+            Arc::new(Box::new(TestBackend::with_buckets(&["shared"])) as Box<dyn StorageBackend>);
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), primary);
+        backends.insert("archive".to_string(), archive);
+        let mut routes = HashMap::new();
+        routes.insert(
+            "leftover".to_string(),
+            ("archive".to_string(), Some("shared".to_string())),
+        );
+        let routing =
+            RoutingBackend::new(backends, routes, "primary".to_string()).expect("routing backend");
+        let origins = routing.list_bucket_origins().await.expect("origins");
+        let by_name: HashMap<_, _> = origins.iter().map(|b| (b.name.as_str(), b)).collect();
+        assert_eq!(
+            by_name
+                .get("shared")
+                .and_then(|b| b.backend_name.as_deref()),
+            Some("primary"),
+            "the default-backend bucket vanished: {origins:?}"
+        );
+        assert_eq!(
+            by_name
+                .get("leftover")
+                .and_then(|b| b.backend_name.as_deref()),
+            Some("archive")
+        );
     }
 
     #[tokio::test]
