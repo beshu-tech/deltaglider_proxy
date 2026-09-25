@@ -780,19 +780,26 @@ fn classify_delete_check(
     }
 }
 
-/// Pure: do two `created_at` values name one generation? For an object
-/// without DG metadata on S3, the listing gives milliseconds and HEAD's
-/// Last-Modified header whole seconds: an exact compare called every such
-/// object overwritten, and lifecycle never deleted it. When either side has
-/// no sub-second part, compare whole seconds; else compare exactly (an
-/// overwrite within the same second must still count as a change).
+/// Pure: do two `created_at` values name one generation? Backends report it
+/// at different precisions: on S3 the lite LIST entry has milliseconds,
+/// HEAD's `dg-created-at` microseconds, and a Last-Modified header whole
+/// seconds. An exact compare called every such object overwritten, and
+/// lifecycle never deleted it. Both values are truncated to the COARSER
+/// precision of the two; equal precision still compares exactly, so an
+/// overwrite within one second on a precise backend counts as a change.
 fn same_generation(a: chrono::DateTime<Utc>, b: chrono::DateTime<Utc>) -> bool {
     use chrono::Timelike;
-    if a.nanosecond() == 0 || b.nanosecond() == 0 {
-        a.timestamp() == b.timestamp()
-    } else {
-        a == b
-    }
+    // Nanoseconds per unit of a value's precision (1 ns .. 1 s).
+    let unit = |t: chrono::DateTime<Utc>| {
+        let n = t.nanosecond() % 1_000_000_000;
+        [1_000_000_000u32, 1_000_000, 1_000]
+            .into_iter()
+            .find(|u| n % u == 0)
+            .unwrap_or(1)
+    };
+    let u = unit(a).max(unit(b));
+    let trunc = |t: chrono::DateTime<Utc>| (t.timestamp(), (t.nanosecond() % 1_000_000_000) / u);
+    trunc(a) == trunc(b)
 }
 
 /// Every lifecycle delete goes through this re-HEAD: the plan was made on a
@@ -1276,7 +1283,7 @@ mod tests {
     /// header has whole seconds. A passthrough object without DG metadata
     /// therefore always looked overwritten, and lifecycle never deleted it.
     #[test]
-    fn delete_check_compares_at_whole_seconds() {
+    fn delete_check_compares_at_the_coarser_precision() {
         use super::{classify_delete_check, DeleteCheck};
         use chrono::TimeZone;
         let listed = chrono::Utc.timestamp_millis_opt(1_700_000_000_123).unwrap();
@@ -1291,6 +1298,24 @@ mod tests {
         assert_eq!(
             classify_delete_check(listed, Ok(&headed)),
             DeleteCheck::Proceed
+        );
+        // LIST milliseconds vs HEAD `dg-created-at` microseconds.
+        let micros = crate::types::FileMetadata::fallback(
+            "k".into(),
+            1,
+            "e".into(),
+            chrono::Utc.timestamp_micros(1_700_000_000_123_456).unwrap(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        assert_eq!(
+            classify_delete_check(listed, Ok(&micros)),
+            DeleteCheck::Proceed
+        );
+        let later = chrono::Utc.timestamp_millis_opt(1_700_000_000_124).unwrap();
+        assert_eq!(
+            classify_delete_check(later, Ok(&micros)),
+            DeleteCheck::Changed
         );
     }
 
