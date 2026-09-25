@@ -526,8 +526,21 @@ pub(crate) async fn apply_config_inner(
     headers: &HeaderMap,
     body: ConfigDocumentRequest,
 ) -> (StatusCode, ConfigApplyResponse) {
+    apply_config_inner_with_env(state, headers, body, &Default::default()).await
+}
+
+/// [`apply_config_inner`] that may also resolve the `${env:NAME}` refs in
+/// `extra_env` (`name → value`): a backup restore passes the refs it made
+/// for values this host's env already supplies (see `hydrate_restore_doc`).
+pub(crate) async fn apply_config_inner_with_env(
+    state: &Arc<AdminState>,
+    headers: &HeaderMap,
+    body: ConfigDocumentRequest,
+    extra_env: &std::collections::BTreeMap<String, String>,
+) -> (StatusCode, ConfigApplyResponse) {
     // 1. Parse + validate the incoming document (no lock held — pure work).
-    let known_env = state.config.read().await.env_refs.clone();
+    let mut known_env = state.config.read().await.env_refs.clone();
+    known_env.extend(extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
     let (mut incoming, parse_warnings) = match parse_and_validate_yaml(&body.yaml, &known_env) {
         Ok(v) => v,
         Err(err) => {

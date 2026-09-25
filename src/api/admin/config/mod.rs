@@ -77,7 +77,7 @@ pub(super) fn unknown_section_error(name: &str) -> String {
     )
 }
 
-pub(crate) use document_level::apply_config_inner;
+pub(crate) use document_level::apply_config_inner_with_env;
 pub use document_level::{
     apply_config_doc, apply_declarative_iam, config_defaults, export_config,
     export_declarative_iam, validate_config_doc, validate_declarative_iam, ConfigApplyResponse,

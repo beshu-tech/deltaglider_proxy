@@ -1059,20 +1059,50 @@ fn hydrate_config_with_backup_secrets(cfg: &mut Config, secrets: &BackupSecrets)
     }
 }
 
+#[cfg(test)]
 fn config_yaml_hydrated_for_restore(
     yaml_str: &str,
     secrets: Option<&BackupSecrets>,
 ) -> Result<String, String> {
+    hydrate_restore_doc(yaml_str, secrets, &crate::config::process_env).map(|(yaml, _)| yaml)
+}
+
+/// The backup's config.yaml with its secrets.json values put back, ready for
+/// the apply pipeline, plus the `${env:NAME}` refs it now carries.
+///
+/// A hydrated value that a secret env var of this host already supplies
+/// (the normal DR setup: the AES key comes from
+/// `DGP_BACKEND_<NAME>_ENCRYPTION_KEY`) becomes a `${env:NAME}` ref, so the
+/// file never holds the env's secret and the restore is not refused. The
+/// returned map (`name → value`) lets the apply pipeline resolve exactly
+/// those refs: each value is one the backup itself carried, so no other env
+/// value becomes readable (S7).
+fn hydrate_restore_doc(
+    yaml_str: &str,
+    secrets: Option<&BackupSecrets>,
+    env: crate::config::EnvLookup,
+) -> Result<(String, std::collections::BTreeMap<String, String>), String> {
     let mut cfg = Config::from_yaml_str(yaml_str)
         .map_err(|e| format!("config.yaml could not be parsed for secret hydration: {e}"))?;
     if let Some(secrets) = secrets {
         hydrate_config_with_backup_secrets(&mut cfg, secrets);
     }
+    let tree = serde_yaml::to_value(&cfg)
+        .map_err(|e| format!("config.yaml could not be re-serialized: {e}"))?;
+    let mut refs = std::collections::BTreeMap::new();
+    for (name, value) in crate::config::env_overrides::secret_env_values(&cfg, env) {
+        if value.len() >= 4 && crate::config::tree_has_string(&tree, &value) {
+            refs.insert(name, value);
+        }
+    }
+    cfg.env_refs.extend(refs.clone());
     // The persist serializer, not the export one: export strips the AES keys
     // just hydrated (D13). It also escapes `$`, so apply's env pass returns
-    // the hydrated values unchanged.
-    cfg.to_canonical_yaml_for_persist_with(&crate::config::process_env)
-        .map_err(|e| format!("config.yaml could not be re-serialized after secret hydration: {e}"))
+    // the hydrated values unchanged (only the refs above expand).
+    let yaml = cfg.to_canonical_yaml_for_persist_with(env).map_err(|e| {
+        format!("config.yaml could not be re-serialized after secret hydration: {e}")
+    })?;
+    Ok((yaml, refs))
 }
 
 fn backup_secret_conflict_detail(current: &Config, secrets: &BackupSecrets) -> Option<String> {
@@ -1313,8 +1343,9 @@ async fn import_zip_full_backup(
             // Exporters always emit at least `storage:` so this only
             // fires on deliberate-empty zips.
             if !yaml_str.trim().is_empty() {
-                let yaml_str = config_yaml_hydrated_for_restore(&yaml_str, secrets.as_ref())
-                    .map_err(|e| {
+                let (yaml_str, restore_refs) =
+                    hydrate_restore_doc(&yaml_str, secrets.as_ref(), &crate::config::process_env)
+                        .map_err(|e| {
                         import_fail(
                             StatusCode::BAD_REQUEST,
                             "parse_config_yaml",
@@ -1329,8 +1360,13 @@ async fn import_zip_full_backup(
                 let req = crate::api::admin::ConfigDocumentRequest { yaml: yaml_str };
                 // Call the apply pipeline DIRECTLY (typed result) — no self-HTTP
                 // round-trip + response-body re-parse (retired the v0.9 TODO).
-                let (status, result) =
-                    crate::api::admin::apply_config_inner(&state, &headers, req).await;
+                let (status, result) = crate::api::admin::apply_config_inner_with_env(
+                    &state,
+                    &headers,
+                    req,
+                    &restore_refs,
+                )
+                .await;
                 if !status.is_success() {
                     // The persist-failure arm (500) carries its detail in
                     // `warnings`, not `error` — fall back so that message isn't
@@ -2467,7 +2503,6 @@ mod review2_tests {
     /// same key through its env var (the normal DR setup), the guard calls
     /// that a leak and the restore fails.
     #[test]
-    #[ignore = "review2: pending fix"]
     fn review2_dr_restore_with_key_supplied_by_env_is_not_refused() {
         const K: &str = "4444444444444444444444444444444444444444444444444444444444444444";
         let yaml = format!(
@@ -2477,8 +2512,17 @@ mod review2_tests {
         let secrets = harvest_config_secrets(&cfg).unwrap();
         let exported = cfg.redact_all_secrets().to_canonical_yaml().unwrap();
         std::env::set_var("DGP_BACKEND_D13_DR_PROBE_ENCRYPTION_KEY", K);
-        let r = config_yaml_hydrated_for_restore(&exported, Some(&secrets));
+        let r = hydrate_restore_doc(&exported, Some(&secrets), &crate::config::process_env);
         std::env::remove_var("DGP_BACKEND_D13_DR_PROBE_ENCRYPTION_KEY");
         assert!(r.is_ok(), "{r:?}");
+        // The file holds the ref, never the key; the apply pass resolves it.
+        let (yaml, refs) = r.unwrap();
+        assert!(!yaml.contains(K), "{yaml}");
+        assert!(
+            yaml.contains("${env:DGP_BACKEND_D13_DR_PROBE_ENCRYPTION_KEY}"),
+            "{yaml}"
+        );
+        let (expanded, _) = crate::config::expand_env_admin(&yaml, &refs).unwrap();
+        assert!(expanded.contains(K), "{expanded}");
     }
 }

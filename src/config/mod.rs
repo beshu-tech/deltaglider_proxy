@@ -3245,7 +3245,7 @@ pub struct EnvReapply {
 }
 
 /// Does any string scalar in `tree` equal `needle`?
-fn tree_has_string(tree: &serde_yaml::Value, needle: &str) -> bool {
+pub(crate) fn tree_has_string(tree: &serde_yaml::Value, needle: &str) -> bool {
     match tree {
         serde_yaml::Value::String(s) => s == needle,
         serde_yaml::Value::Sequence(seq) => seq.iter().any(|v| tree_has_string(v, needle)),

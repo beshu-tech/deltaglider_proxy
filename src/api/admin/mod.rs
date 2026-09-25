@@ -57,7 +57,7 @@ pub use backup::{export_backup, import_backup, MAX_IMPORT_BODY_BYTES};
 pub use bucket_scan::{
     delete_scan, get_scan_status, get_scan_stream, post_scan_start, post_scan_stop, BucketScanner,
 };
-pub(crate) use config::apply_config_inner;
+pub(crate) use config::apply_config_inner_with_env;
 pub use config::{
     apply_config_doc, apply_declarative_iam, change_password, config_defaults, export_config,
     export_declarative_iam, get_config, get_section, put_section, recover_db, sync_now,
