@@ -357,3 +357,57 @@ async fn backfill_s3_self_copy_preserves_etag_and_served_time() {
     assert_eq!(&got[..part1.len()], part1.as_slice());
     assert_eq!(&got[part1.len()..], part2.as_slice());
 }
+
+/// D17: the S3 self-copy uses MetadataDirective REPLACE. REPLACE drops
+/// everything the request does not restate: the foreign object's own
+/// x-amz-meta-* keys, Cache-Control and Content-Disposition. (The unit
+/// fixture in backfill.rs puts user metadata on the fallback shape, which
+/// production never emits: the S3 fallback HEAD returns no user metadata.)
+///
+/// IGNORED until `storage/s3.rs` `replace_metadata_in_place` /
+/// `put_passthrough_metadata` carries the pre-copy HEAD's headers into the
+/// REPLACE request (storage agent's file). Remove the `ignore` with that fix.
+#[tokio::test]
+#[ignore = "D17: needs the storage/s3.rs self-copy to restate foreign headers"]
+async fn backfill_s3_self_copy_keeps_foreign_headers() {
+    skip_unless_minio!();
+    let bucket = "backfill-s3-headers";
+    let server = TestServer::s3_with_endpoint(&common::minio_endpoint_url(), bucket).await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let raw = common::minio_client().await;
+    let key = "foreign-headers.bin";
+    raw.put_object()
+        .bucket(bucket)
+        .key(key)
+        .metadata("owner", "bob")
+        .cache_control("max-age=60")
+        .content_disposition("attachment; filename=\"x.bin\"")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            FOREIGN_BODY,
+        ))
+        .send()
+        .await
+        .expect("foreign put");
+
+    start_backfill(&admin, &server.endpoint(), server.bucket(), false).await;
+    wait_job_done(&admin, &server.endpoint(), server.bucket()).await;
+
+    let after = raw
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .expect("raw HEAD");
+    let md = after.metadata.clone().unwrap_or_default();
+    assert!(
+        md.contains_key("dg-file-sha256"),
+        "the backfill must stamp the object: {md:?}"
+    );
+    assert_eq!(md.get("owner").map(String::as_str), Some("bob"), "{md:?}");
+    assert_eq!(after.cache_control.as_deref(), Some("max-age=60"));
+    assert_eq!(
+        after.content_disposition.as_deref(),
+        Some("attachment; filename=\"x.bin\"")
+    );
+}
