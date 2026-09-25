@@ -575,10 +575,21 @@ async fn test_filtered_list_tokens_never_reveal_hidden_keys() {
             None => break,
         }
     }
+    // Tokens are opaque (`dg1.` + base64url of the key); decode to check them.
     for t in &tokens {
+        let key = t
+            .strip_prefix("dg1.")
+            .and_then(|b| {
+                use base64::Engine as _;
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(b)
+                    .ok()
+            })
+            .and_then(|k| String::from_utf8(k).ok())
+            .unwrap_or_else(|| t.clone());
         assert!(
-            t.starts_with("alice/") || t.starts_with("zeta/"),
-            "S12 LEAK: continuation token reveals a hidden key: {t:?} (all tokens: {tokens:?})"
+            key.starts_with("alice/") || key.starts_with("zeta/"),
+            "S12 LEAK: continuation token reveals a hidden key: {key:?} (all tokens: {tokens:?})"
         );
     }
     assert_eq!(
