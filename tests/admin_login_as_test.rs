@@ -185,3 +185,52 @@ async fn test_login_as_disabled_user_rejected() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+/// S23: admin audit entries carried the literal actor "admin" whoever made
+/// the change. An IAM admin's mutation must be attributed to that user.
+#[tokio::test]
+async fn test_audit_entry_names_the_iam_admin() {
+    let server = TestServer::builder()
+        .auth("BOOTSTRAP3", "BOOTSTRAPSECRET3")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let (ak, sk) = create_user(&admin, &ep, "dana", admin_perms()).await;
+    let dana = reqwest::Client::builder()
+        .cookie_store(true)
+        .no_proxy()
+        .build()
+        .unwrap();
+    let resp = dana
+        .post(format!("{ep}/_/api/admin/login-as"))
+        .json(&json!({ "access_key_id": ak, "secret_access_key": sk }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = dana
+        .post(format!("{ep}/_/api/admin/groups"))
+        .json(&json!({ "name": "Engineering", "permissions": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let audit: serde_json::Value = admin
+        .get(format!("{ep}/_/api/admin/audit?limit=50"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entries = audit
+        .as_array()
+        .or_else(|| audit["entries"].as_array())
+        .expect("audit list");
+    let e = entries
+        .iter()
+        .find(|e| e["action"] == "create_group")
+        .expect("create_group entry");
+    assert_eq!(e["user"], "dana", "{e}");
+}

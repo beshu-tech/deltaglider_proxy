@@ -1236,13 +1236,45 @@ pub async fn require_admin_gui_session(
             .into_response();
     }
 
+    let actor = state
+        .sessions
+        .admin_gui_auth_method(&token, client_ip)
+        .map(|m| session_actor_label(&m, &state.iam_state.load()))
+        .unwrap_or_else(|| "admin".to_string());
     request.extensions_mut().insert(AdminGuiGate);
     request.extensions_mut().insert(AdminSessionCheck {
         state: state.clone(),
         token,
         client_ip,
     });
-    next.run(request).await.into_response()
+    crate::audit::with_actor(actor, next.run(request))
+        .await
+        .into_response()
+}
+
+/// Audit actor for an admin session: the IAM user name when known.
+fn session_actor_label(method: &AuthMethod, iam: &IamState) -> String {
+    let index = match iam {
+        IamState::Iam(index) => Some(index),
+        _ => None,
+    };
+    match method {
+        // Unchanged label: log queries key on `user=admin` for break-glass.
+        AuthMethod::Bootstrap => "admin".to_string(),
+        AuthMethod::IamLoginAs { access_key_id } => index
+            .and_then(|i| i.get(access_key_id))
+            .map(|u| u.name.clone())
+            .unwrap_or_else(|| format!("iam:{access_key_id}")),
+        AuthMethod::External {
+            provider_name,
+            user_id,
+        } => index
+            .and_then(|i| i.get_by_id(*user_id))
+            .map(|u| u.name.clone())
+            .unwrap_or_else(|| format!("{provider_name}:{user_id}")),
+        AuthMethod::IamBrowserLift { access_key_id } => format!("iam:{access_key_id}"),
+        AuthMethod::OpenLift => "anonymous".to_string(),
+    }
 }
 
 /// Middleware: reject IAM mutation requests when `access.iam_mode` is

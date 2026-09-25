@@ -49,6 +49,26 @@ fn current_request_peer() -> Option<std::net::IpAddr> {
     REQUEST_PEER.try_with(|p| *p).ok().flatten()
 }
 
+tokio::task_local! {
+    /// Principal of the admin session serving this request, set by the
+    /// admin-session middleware (S23: entries used to say just "admin").
+    static REQUEST_ACTOR: String;
+}
+
+/// Run `fut` with `actor` as the audit actor of admin entries in it.
+pub async fn with_actor<F: std::future::Future>(actor: String, fut: F) -> F::Output {
+    REQUEST_ACTOR.scope(actor, fut).await
+}
+
+/// The user an entry records: the caller's own value, unless it is the
+/// generic `admin` / empty placeholder and the admin session is known.
+fn audit_user(user: &str, actor: Option<String>) -> String {
+    match actor {
+        Some(a) if user.is_empty() || user == "admin" => a,
+        _ => user.to_string(),
+    }
+}
+
 /// Sanitize a value for structured audit log output.
 /// Prevents newline injection and pipe-delimiter confusion.
 pub fn sanitize(s: &str) -> String {
@@ -208,7 +228,7 @@ pub fn audit_log(
 ) {
     let (ip, ua) = extract_client_info(headers);
     let s_action = sanitize(action);
-    let s_user = sanitize(user);
+    let s_user = sanitize(&audit_user(user, REQUEST_ACTOR.try_with(Clone::clone).ok()));
     let s_target = sanitize(target);
     let s_ip = sanitize(&ip);
     let s_ua = sanitize(&ua);
@@ -260,6 +280,17 @@ mod audit_filter_tests {
 #[cfg(test)]
 mod request_peer_tests {
     use super::*;
+
+    #[test]
+    fn audit_user_prefers_the_session_actor_over_the_placeholder() {
+        assert_eq!(audit_user("admin", Some("dana".into())), "dana");
+        assert_eq!(audit_user("", Some("dana".into())), "dana");
+        assert_eq!(
+            audit_user("ci-uploader", Some("dana".into())),
+            "ci-uploader"
+        );
+        assert_eq!(audit_user("admin", None), "admin");
+    }
 
     /// Issue #92 hunt: every audit entry showed ip "unknown" without a
     /// reverse proxy, because audit_log read only forwarding headers. Inside
