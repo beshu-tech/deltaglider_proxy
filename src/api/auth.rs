@@ -151,7 +151,7 @@ pub fn resolved_identity_is_verified(
 #[derive(Clone, Default)]
 pub struct AuthOutcome(Arc<AtomicU8>);
 
-const OUTCOME_PENDING: u8 = 0;
+// 0 (the `Default`) is pending: nothing verified or denied yet.
 const OUTCOME_VERIFIED: u8 = 1;
 const OUTCOME_AUTHZ_DENIED: u8 = 2;
 

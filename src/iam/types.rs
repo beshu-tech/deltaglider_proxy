@@ -205,9 +205,12 @@ impl AuthenticatedUser {
         self.name == ANONYMOUS_USER_NAME && self.access_key_id.is_empty()
     }
 
-    /// Check if this user is allowed to perform the given action on the given resource.
-    /// Uses iam-rs for evaluation when policies are available (supports conditions),
-    /// falls back to legacy evaluation otherwise.
+    /// Context-free check, for TESTS only. With no request context iam-rs
+    /// skips every conditioned statement, so an `aws:SourceIp` Deny never
+    /// fires; on an authz path that is a bypass (S14, class 2). Production
+    /// code must call [`Self::can_with_context`]; `cfg(test)` makes the
+    /// compiler refuse any other use.
+    #[cfg(test)]
     pub fn can(&self, action: S3Action, bucket: &str, key: &str) -> bool {
         if !self.iam_policies.is_empty() {
             permissions::evaluate_iam(&self.iam_policies, action, bucket, key, &Default::default())
@@ -216,8 +219,8 @@ impl AuthenticatedUser {
         }
     }
 
-    /// Check with request context (s3:prefix, aws:SourceIp, etc.).
-    /// Used by the authorization middleware to pass conditions from the HTTP request.
+    /// THE authorization check: action on bucket/key under the request's
+    /// policy context (`aws:SourceIp`, `s3:prefix`, ...).
     pub fn can_with_context(
         &self,
         action: S3Action,
@@ -286,7 +289,8 @@ impl AuthenticatedUser {
 /// `GET /bucket?prefix=` (empty) via the `can_see_bucket` fallback,
 /// and the handler returned every key in the bucket — including keys
 /// outside alice/. `ListScope::Filtered` closes that bypass by forcing
-/// the handler to filter the response through `user.can(Read|List, bucket, key)`.
+/// the handler to filter the response through `user_can_see_listed_key`
+/// (per-key Read|List under the request context).
 #[derive(Debug, Clone)]
 pub enum ListScope {
     /// The caller's policy authorises every key under the requested
@@ -295,11 +299,15 @@ pub enum ListScope {
     /// The caller was admitted via `can_see_bucket` fallback (or has
     /// prefix-scoped permissions that don't cover the requested prefix
     /// in full). The handler MUST filter returned keys by
-    /// `user.can(Read|List, bucket, key)`.
+    /// `user_can_see_listed_key` with `context`.
     Filtered {
         /// The authenticated user, captured at authorization time so
         /// the filter uses the exact same policy set.
         user: Box<AuthenticatedUser>,
+        /// The request's policy context (`aws:SourceIp`, ...) WITHOUT
+        /// `s3:prefix`, for the per-key checks. Without it an IP-conditioned
+        /// Deny never fires in the filter.
+        context: Box<iam_rs::Context>,
     },
 }
 

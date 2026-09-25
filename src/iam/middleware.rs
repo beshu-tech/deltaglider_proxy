@@ -113,8 +113,25 @@ pub async fn authorization_middleware(
         return Ok(next.run(request).await);
     }
 
-    // Build IAM evaluation context from request
-    let mut context = Context::new();
+    // Build IAM evaluation context from request. `base_context` holds the
+    // request-wide keys; the per-key LIST filter uses it as is, because the
+    // LIST keys below (`s3:prefix`, ...) describe the request, not each key.
+    let mut base_context = Context::new();
+    // aws:SourceIp — combine `X-Forwarded-For` (when
+    // `DGP_TRUST_PROXY_HEADERS=true`) with the direct TCP peer IP so
+    // policies like `Deny { aws:SourceIp NotIpAddress 10.0.0.0/8 }`
+    // actually fire on a direct-internet deployment where no reverse
+    // proxy is setting XFF. Without the peer fallback, the context
+    // value is `null` and `iam-rs` skips the condition silently.
+    let peer_ip = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    super::permissions::insert_source_ip(
+        &mut base_context,
+        crate::rate_limiter::extract_client_ip_with_peer(request.headers(), peer_ip),
+    );
+    let mut context = base_context.clone();
 
     // s3:prefix — from query parameter on LIST requests
     if action == S3Action::List {
@@ -145,21 +162,6 @@ pub async fn authorization_middleware(
             context.insert("s3:max-keys".to_string(), iam_rs::ContextValue::Number(n));
         }
     }
-
-    // aws:SourceIp — combine `X-Forwarded-For` (when
-    // `DGP_TRUST_PROXY_HEADERS=true`) with the direct TCP peer IP so
-    // policies like `Deny { aws:SourceIp NotIpAddress 10.0.0.0/8 }`
-    // actually fire on a direct-internet deployment where no reverse
-    // proxy is setting XFF. Without the peer fallback, the context
-    // value is `null` and `iam-rs` skips the condition silently.
-    let peer_ip = request
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip());
-    super::permissions::insert_source_ip(
-        &mut context,
-        crate::rate_limiter::extract_client_ip_with_peer(request.headers(), peer_ip),
-    );
 
     // ListObjects (GET /bucket) — four-way evaluation with post-auth scope marker:
     //
@@ -205,6 +207,7 @@ pub async fn authorization_middleware(
                 // unrestricted, assume it isn't.
                 Some(ListScope::Filtered {
                     user: Box::new(user.clone()),
+                    context: Box::new(base_context.clone()),
                 })
             };
             (true, scope)
@@ -222,6 +225,7 @@ pub async fn authorization_middleware(
                 true,
                 Some(ListScope::Filtered {
                     user: Box::new(user.clone()),
+                    context: Box::new(base_context.clone()),
                 }),
             )
         } else {

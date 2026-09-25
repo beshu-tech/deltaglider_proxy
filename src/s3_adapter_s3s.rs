@@ -1564,8 +1564,8 @@ async fn list_page_for_caller(
     metadata: bool,
     scope: Option<&ListScope>,
 ) -> s3s::S3Result<crate::deltaglider::ListObjectsPage> {
-    let user = match scope {
-        Some(ListScope::Filtered { user }) => user,
+    let (user, context) = match scope {
+        Some(ListScope::Filtered { user, context }) => (user, context),
         _ => {
             return engine
                 .list_objects(bucket, prefix, delimiter, max_keys, cursor, metadata)
@@ -1592,12 +1592,12 @@ async fn list_page_for_caller(
         objects.extend(
             page.objects
                 .into_iter()
-                .filter(|(key, _)| user_can_see_listed_key(user, bucket, key)),
+                .filter(|(key, _)| user_can_see_listed_key(user, bucket, key, context)),
         );
         prefixes.extend(
             page.common_prefixes
                 .into_iter()
-                .filter(|p| user_can_see_common_prefix(user, bucket, p)),
+                .filter(|p| user_can_see_common_prefix(user, bucket, p, context)),
         );
         more = page.is_truncated && page.next_continuation_token.is_some();
         cursor = page.next_continuation_token;

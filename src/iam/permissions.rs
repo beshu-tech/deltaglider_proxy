@@ -606,8 +606,13 @@ fn can_list_prefix_with_context(
     user: &super::AuthenticatedUser,
     bucket: &str,
     prefix: &str,
+    request_context: &Context,
 ) -> bool {
-    let context = Context::new().with_string("s3:prefix", prefix);
+    let mut context = request_context.clone();
+    context.insert(
+        "s3:prefix".to_string(),
+        iam_rs::ContextValue::String(prefix.to_string()),
+    );
     user.can_with_context(S3Action::List, bucket, "", &context)
 }
 
@@ -657,19 +662,24 @@ fn allow_references_common_prefix(
 /// and Read is a strict superset in intent (if you can read it, you
 /// can also see it in the listing).
 ///
-/// Kept as a free function (not a method) because:
-/// - It's a lookup used on a hot loop over potentially thousands of
-///   keys; `AuthenticatedUser::can` re-evaluates the full policy graph
-///   each call, and inlining here lets LLVM consolidate the checks.
-/// - It's unit-testable as a pure function without an HTTP stack.
-pub fn user_can_see_listed_key(user: &super::AuthenticatedUser, bucket: &str, key: &str) -> bool {
-    user.can(S3Action::Read, bucket, key)
-        || user.can(S3Action::List, bucket, key)
+/// `context` is the request's policy context without the LIST keys
+/// (`ListScope::Filtered` carries it): an `aws:SourceIp`-conditioned Deny
+/// must fire here as it does on the request itself.
+///
+/// Kept as a free function so it is unit-testable without an HTTP stack.
+pub fn user_can_see_listed_key(
+    user: &super::AuthenticatedUser,
+    bucket: &str,
+    key: &str,
+    context: &Context,
+) -> bool {
+    user.can_with_context(S3Action::Read, bucket, key, context)
+        || user.can_with_context(S3Action::List, bucket, key, context)
         // Prefix-conditioned list grants (the `$anonymous` public-prefix user,
         // and IAM users whose `list` permission carries an `s3:prefix`
         // StringLike condition on the bucket ARN) are NOT resolved by the two
-        // `can(...)` calls above, which evaluate per-key with no request
-        // context. This third disjunct must therefore test THIS KEY against the
+        // calls above, which evaluate the object ARN without `s3:prefix`.
+        // This third disjunct must therefore test THIS KEY against the
         // grant — NOT the request's `prefix` query parameter. Testing the
         // requested prefix waved through every key the backend returned for a
         // string-prefix match, so `?prefix=releases` (no delimiter, no auth)
@@ -678,7 +688,7 @@ pub fn user_can_see_listed_key(user: &super::AuthenticatedUser, bucket: &str, ke
         // does not match `releases-internal/...`, and the bare `releases`
         // pattern matches only the literal prefix object — so per-key
         // evaluation keeps legitimate keys visible while denying siblings.
-        || can_list_prefix_with_context(user, bucket, key)
+        || can_list_prefix_with_context(user, bucket, key, context)
 }
 
 /// Pure predicate: can this user see/navigate a returned CommonPrefix?
@@ -690,11 +700,17 @@ pub fn user_can_see_common_prefix(
     user: &super::AuthenticatedUser,
     bucket: &str,
     prefix: &str,
+    context: &Context,
 ) -> bool {
-    user.can(S3Action::Read, bucket, prefix)
-        || user.can(S3Action::List, bucket, prefix)
-        || can_list_prefix_with_context(user, bucket, prefix)
-        || allow_references_common_prefix(user, bucket, prefix)
+    user.can_with_context(S3Action::Read, bucket, prefix, context)
+        || user.can_with_context(S3Action::List, bucket, prefix, context)
+        || can_list_prefix_with_context(user, bucket, prefix, context)
+        // A descendant Allow makes the prefix navigable, unless a Deny that
+        // fires for this request covers the prefix itself (and so every
+        // key under it).
+        || (allow_references_common_prefix(user, bucket, prefix)
+            && !user.is_explicitly_denied(S3Action::Read, bucket, prefix, context)
+            && !user.is_explicitly_denied(S3Action::List, bucket, prefix, context))
 }
 
 /// Check if a permission set grants full admin access:
@@ -1367,19 +1383,103 @@ mod tests {
         }
     }
 
+    /// LIST filtering must honour an IP-conditioned Deny. The filter used
+    /// the context-free `can()`, which skips every conditioned statement, so
+    /// a caller outside the office still saw the denied keys (class 2).
+    #[test]
+    fn list_filter_honours_ip_conditioned_deny() {
+        let user = make_user_with_permissions(
+            "alice",
+            vec![
+                Permission {
+                    id: 0,
+                    effect: "Allow".into(),
+                    actions: vec!["read".into(), "list".into()],
+                    resources: vec!["prod/alice/*".into()],
+                    conditions: None,
+                },
+                Permission {
+                    id: 0,
+                    effect: "Deny".into(),
+                    actions: vec!["read".into(), "list".into()],
+                    resources: vec!["prod/alice/secret/*".into()],
+                    conditions: Some(serde_json::json!({
+                        "NotIpAddress": {"aws:SourceIp": ["10.0.0.0/8"]}
+                    })),
+                },
+            ],
+        );
+        let at = |ip: &str| {
+            let mut ctx = Context::new();
+            insert_source_ip(&mut ctx, Some(ip.parse().unwrap()));
+            ctx
+        };
+        let (office, outside) = (at("10.1.2.3"), at("203.0.113.9"));
+        assert!(user_can_see_listed_key(
+            &user,
+            "prod",
+            "alice/secret/k",
+            &office
+        ));
+        assert!(!user_can_see_listed_key(
+            &user,
+            "prod",
+            "alice/secret/k",
+            &outside
+        ));
+        assert!(user_can_see_listed_key(&user, "prod", "alice/k", &outside));
+        assert!(user_can_see_common_prefix(
+            &user,
+            "prod",
+            "alice/secret/",
+            &office
+        ));
+        assert!(!user_can_see_common_prefix(
+            &user,
+            "prod",
+            "alice/secret/",
+            &outside
+        ));
+    }
+
     #[test]
     fn test_user_can_see_listed_key_unrestricted_user() {
         let user = make_user("alice", vec!["prod/*"], vec!["read", "list"]);
-        assert!(user_can_see_listed_key(&user, "prod", "alice/file.txt"));
-        assert!(user_can_see_listed_key(&user, "prod", "anything/else.bin"));
+        assert!(user_can_see_listed_key(
+            &user,
+            "prod",
+            "alice/file.txt",
+            &Context::new()
+        ));
+        assert!(user_can_see_listed_key(
+            &user,
+            "prod",
+            "anything/else.bin",
+            &Context::new()
+        ));
     }
 
     #[test]
     fn test_user_can_see_listed_key_prefix_scoped() {
         let user = make_user("alice", vec!["prod/alice/*"], vec!["read"]);
-        assert!(user_can_see_listed_key(&user, "prod", "alice/file.txt"));
-        assert!(!user_can_see_listed_key(&user, "prod", "bob/file.txt"));
-        assert!(!user_can_see_listed_key(&user, "prod", "secret.bin"));
+        assert!(user_can_see_listed_key(
+            &user,
+            "prod",
+            "alice/file.txt",
+            &Context::new()
+        ));
+        assert!(!user_can_see_listed_key(
+            &user,
+            "prod",
+            "bob/file.txt",
+            &Context::new()
+        ));
+        assert!(!user_can_see_listed_key(
+            &user,
+            "prod",
+            "secret.bin",
+            &Context::new()
+        ));
     }
 
     #[test]
@@ -1387,14 +1487,29 @@ mod tests {
         // List-only permission should let the user see keys in listings
         // (they can't Read them, but they can discover them).
         let user = make_user("alice", vec!["prod/public/*"], vec!["list"]);
-        assert!(user_can_see_listed_key(&user, "prod", "public/x.txt"));
-        assert!(!user_can_see_listed_key(&user, "prod", "private/x.txt"));
+        assert!(user_can_see_listed_key(
+            &user,
+            "prod",
+            "public/x.txt",
+            &Context::new()
+        ));
+        assert!(!user_can_see_listed_key(
+            &user,
+            "prod",
+            "private/x.txt",
+            &Context::new()
+        ));
     }
 
     #[test]
     fn test_user_cannot_see_keys_in_different_bucket() {
         let user = make_user("alice", vec!["prod/*"], vec!["read", "list"]);
-        assert!(!user_can_see_listed_key(&user, "staging", "anything"));
+        assert!(!user_can_see_listed_key(
+            &user,
+            "staging",
+            "anything",
+            &Context::new()
+        ));
     }
 
     #[test]
@@ -1431,19 +1546,27 @@ mod tests {
         assert!(user_can_see_listed_key(
             &user,
             "downloads",
-            "releases/v1.0/app.zip"
+            "releases/v1.0/app.zip",
+            &Context::new()
         ));
-        assert!(user_can_see_listed_key(&user, "downloads", "releases"));
+        assert!(user_can_see_listed_key(
+            &user,
+            "downloads",
+            "releases",
+            &Context::new()
+        ));
         // Private siblings that merely share the prefix's name must NOT leak.
         assert!(!user_can_see_listed_key(
             &user,
             "downloads",
-            "releases-internal/secret.txt"
+            "releases-internal/secret.txt",
+            &Context::new()
         ));
         assert!(!user_can_see_listed_key(
             &user,
             "downloads",
-            "releases-old.zip"
+            "releases-old.zip",
+            &Context::new()
         ));
     }
 
@@ -1473,13 +1596,24 @@ mod tests {
             ],
         );
 
-        assert!(user_can_see_common_prefix(&user, "beshu", "ror/"));
         assert!(user_can_see_common_prefix(
             &user,
             "beshu",
-            "ror/e2e_reports/"
+            "ror/",
+            &Context::new()
         ));
-        assert!(!user_can_see_common_prefix(&user, "beshu", "secret/"));
+        assert!(user_can_see_common_prefix(
+            &user,
+            "beshu",
+            "ror/e2e_reports/",
+            &Context::new()
+        ));
+        assert!(!user_can_see_common_prefix(
+            &user,
+            "beshu",
+            "secret/",
+            &Context::new()
+        ));
     }
 
     // === Property-based tests ===
