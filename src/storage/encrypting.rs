@@ -818,9 +818,9 @@ fn final_chunk_index_for_plaintext_size(plaintext_size: u64) -> u32 {
 /// longer carries the encryption marker, and without this check the
 /// wrapper would happily serve ciphertext as plaintext.
 ///
-/// Cost: reads the first emitted `Bytes` of the stream (whatever size
-/// that is — usually ≥4 KiB), inspects up to 4 bytes, then re-emits
-/// the original Bytes unchanged. Zero extra network/disk round-trips.
+/// Cost: buffers the leading chunks until 4 bytes (or EOF) are seen, then
+/// re-emits them as one `Bytes`. Chunks shorter than 4 bytes are joined,
+/// so a split magic is still caught. Zero extra network/disk round-trips.
 fn sniff_dge1_magic<S>(inner: S) -> BoxStream<'static, Result<Bytes, StorageError>>
 where
     S: futures::Stream<Item = Result<Bytes, StorageError>> + Unpin + Send + 'static,
@@ -835,16 +835,23 @@ where
         |st| async move {
             use futures::StreamExt;
             match st {
-                State::Initial(mut inner) => match inner.next().await {
-                    Some(Ok(first)) => {
-                        if first.len() >= 4 && first[..4] == CHUNK_MAGIC {
-                            return Some((Err(stripped_marker_error()), State::Done));
+                State::Initial(mut inner) => {
+                    let mut head = bytes::BytesMut::new();
+                    while head.len() < CHUNK_MAGIC.len() {
+                        match inner.next().await {
+                            Some(Ok(chunk)) => head.extend_from_slice(&chunk),
+                            Some(Err(e)) => return Some((Err(e), State::Done)),
+                            None => break,
                         }
-                        Some((Ok(first), State::Passthrough(inner)))
                     }
-                    Some(Err(e)) => Some((Err(e), State::Done)),
-                    None => None,
-                },
+                    if head.is_empty() {
+                        return None;
+                    }
+                    if head.starts_with(&CHUNK_MAGIC) {
+                        return Some((Err(stripped_marker_error()), State::Done));
+                    }
+                    Some((Ok(head.freeze()), State::Passthrough(inner)))
+                }
                 State::Passthrough(mut inner) => inner
                     .next()
                     .await
@@ -2942,6 +2949,38 @@ mod tests {
             msg.contains("xattrs") || msg.contains("dg-encrypted"),
             "error must explain the xattr-strip scenario, got: {msg}"
         );
+    }
+
+    /// The sniff must see the magic even when the backend emits it split
+    /// over chunks shorter than 4 bytes; the bytes pass through unchanged.
+    #[tokio::test]
+    async fn dge1_sniff_joins_short_leading_chunks() {
+        use futures::TryStreamExt;
+        let split = |parts: &[&'static [u8]]| {
+            let items: Vec<Result<Bytes, StorageError>> =
+                parts.iter().map(|p| Ok(Bytes::from_static(p))).collect();
+            futures::stream::iter(items)
+        };
+        let res: Result<Vec<Bytes>, _> = sniff_dge1_magic(split(&[b"DG", b"E", b"1rest"]))
+            .try_collect()
+            .await;
+        assert!(res.is_err(), "split magic must be caught");
+        let ok: Vec<Bytes> = sniff_dge1_magic(split(&[b"ab", b"c", b"defg"]))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(ok.concat(), b"abcdefg".to_vec());
+        let short: Vec<Bytes> = sniff_dge1_magic(split(&[b"DG"]))
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            short.concat(),
+            b"DG".to_vec(),
+            "a 2-byte object is not ciphertext"
+        );
+        let empty: Vec<Bytes> = sniff_dge1_magic(split(&[])).try_collect().await.unwrap();
+        assert!(empty.is_empty());
     }
 
     /// Tier 4: the range path must refuse a stripped-marker DGE1 body too.
