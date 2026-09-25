@@ -761,3 +761,45 @@ storage:
         assert!(v.cause().contains("endpoint unreachable"));
     }
 }
+
+#[cfg(test)]
+mod review2_tests {
+    use super::*;
+
+    /// Review-2 (S18 incomplete): the pre-commit health probe (and every
+    /// client built by `ConfigDbSync::build_client`: config sync, S3 leases,
+    /// the reference lock, the capability probe) never runs the outbound-URL
+    /// check or the SSRF resolver. The engine refuses the endpoint; the
+    /// probe still sends a signed request to it.
+    #[tokio::test]
+    #[ignore = "review2: pending fix"]
+    async fn review2_probe_never_contacts_an_endpoint_the_backend_validator_refuses() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                .await
+                .is_ok()
+        });
+        let backend = BackendConfig::S3 {
+            endpoint: Some(format!("http://127.0.0.1:{port}")),
+            region: "us-east-1".into(),
+            force_path_style: true,
+            access_key_id: Some("k".into()),
+            secret_access_key: Some("s".into()),
+            allow_local: false,
+            session_token: None,
+        };
+        assert!(
+            crate::storage::S3Backend::build_client(&backend)
+                .await
+                .is_err(),
+            "precondition: the engine's builder refuses this endpoint"
+        );
+        let _ = probe_backend_health(&backend, None).await;
+        assert!(
+            !accepted.await.unwrap(),
+            "the health probe reached an SSRF-refused endpoint"
+        );
+    }
+}

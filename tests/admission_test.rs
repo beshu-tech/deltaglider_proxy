@@ -817,3 +817,64 @@ storage:
         "error must name both conflicting keys, got: {err}"
     );
 }
+
+// ── review second pass (failing tests for findings) ──────────────────────
+
+/// Review-2 (ee7bbb98): admission used the TCP peer; it now uses the
+/// resolved client IP. With `DGP_TRUST_PROXY_HEADERS=true` and no
+/// `DGP_TRUSTED_PROXY_CIDRS` (the harness default, and a common operator
+/// setup) that IP is the first XFF element, which the client writes, so one
+/// header escapes any `source_ip` deny block.
+#[tokio::test]
+#[ignore = "review2: pending fix"]
+async fn review2_source_ip_deny_not_bypassed_by_forged_xff() {
+    let bucket = "xffdeny";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .auth("XFFK", "XFFS")
+        .bucket_policy(bucket, "public: true")
+        .build()
+        .await;
+    server
+        .s3_client()
+        .await
+        .put_object()
+        .bucket(bucket)
+        .key("k.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+    let admin = admin_http_client(&server.endpoint()).await;
+    apply_admission_yaml(
+        &admin,
+        &server.endpoint(),
+        r#"
+admission:
+  blocks:
+    - name: deny-loopback
+      match:
+        source_ip_list: ["127.0.0.1/32"]
+      action: deny
+"#,
+    )
+    .await;
+    let url = format!("{}/{}/k.txt", server.endpoint(), bucket);
+    let http = reqwest::Client::new();
+    assert_eq!(
+        http.get(&url).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "precondition: the deny block matches the loopback client"
+    );
+    let spoofed = http
+        .get(&url)
+        .header("x-forwarded-for", "198.51.100.1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        spoofed.status(),
+        StatusCode::FORBIDDEN,
+        "a forged X-Forwarded-For escaped a source_ip deny block"
+    );
+}

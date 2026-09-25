@@ -1782,4 +1782,50 @@ mod per_rule_cursor_tests {
         assert_eq!(global_watermark(&BTreeMap::new(), 3, 12), 12);
         assert_eq!(global_watermark(&c, 7, 12), 7, "never moves back");
     }
+
+    // ── review second pass (failing tests for findings) ──────────────────
+
+    /// Review-2: the drain reads DRAIN_BATCH rows from the SLOWEST rule's
+    /// cursor. Once a busy rule is one batch behind, every drain re-reads
+    /// the same rows, all at or below the other rule's cursor, so the other
+    /// rule stalls again: the head-of-line block, one batch later.
+    #[tokio::test]
+    #[ignore = "review2: pending fix"]
+    async fn review2_a_busy_rule_does_not_stall_another_rule_past_one_batch() {
+        let (_d, db, config, engine) = fixture(vec![rule("a", "dst-a"), rule("b", "dst-b")]).await;
+        for i in 0..DRAIN_BATCH {
+            put(&db, &engine, &format!("k{i}.bin")).await;
+        }
+        drain(&config, &db, &engine, &BusyFor("a")).await;
+        let late = put(&db, &engine, "late.bin").await;
+        for _ in 0..3 {
+            drain(&config, &db, &engine, &BusyFor("a")).await;
+        }
+        assert!(
+            engine.head("dst-b", "late.bin").await.is_ok(),
+            "rule b waits on busy rule a"
+        );
+        assert!(cursor(&db, &rule_listener("b")).await >= late);
+    }
+
+    /// Review-2: a destination outage makes EVERY key fail together, so every
+    /// key reaches MAX_EVENT_KEY_ATTEMPTS (about 2.5 min at the 30 s tick) and
+    /// the rule gives up on all of them. Once the outage ends, nothing copies
+    /// those events until the next reconcile run (default interval 24 h).
+    #[tokio::test]
+    #[ignore = "review2: pending fix"]
+    async fn review2_a_short_destination_outage_does_not_drop_events() {
+        let (_d, db, config, engine) = fixture(vec![rule("a", "dst-late")]).await;
+        put(&db, &engine, "k.bin").await;
+        let lease = BusyFor("none");
+        for _ in 0..MAX_EVENT_KEY_ATTEMPTS {
+            drain(&config, &db, &engine, &lease).await;
+        }
+        engine.create_bucket("dst-late").await.unwrap(); // the outage ends
+        drain(&config, &db, &engine, &lease).await;
+        assert!(
+            engine.head("dst-late", "k.bin").await.is_ok(),
+            "the event was dropped: only the 24 h reconcile copies it now"
+        );
+    }
 }

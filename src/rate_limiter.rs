@@ -1137,4 +1137,63 @@ mod tests {
         // Counter reset; next failure starts from 1.
         assert!(!limiter.record_failure_account("alice"));
     }
+
+    // ── review second pass (failing tests for findings) ──────────────────
+
+    /// Review-2: an unparseable trusted hop (`ip:port`, as Azure App Gateway
+    /// writes it) must stop the right-to-left walk. Skipping it hands the
+    /// forged hop to its left to aws:SourceIp, the limiter and admission.
+    #[test]
+    #[ignore = "review2: pending fix"]
+    fn review2_unparseable_trusted_hop_does_not_expose_forged_left_hop() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            "x-forwarded-for",
+            "6.6.6.6, 203.0.113.9:4431".parse().unwrap(),
+        );
+        let got = resolve_client_ip(&h, Some(ip("10.0.0.5")), true, &[cidr("10.0.0.0/8")]);
+        assert_ne!(got, Some(ip("6.6.6.6")), "the forged left hop won");
+    }
+
+    /// Review-2: the known-good account-lock exemption (S22) keys on the
+    /// resolved IP. With trust on and no CIDR list, that IP is the first
+    /// XFF element, so an attacker claims the operator's exemption by
+    /// sending the operator's IP in the header.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // env_lock serialises the env var
+    #[ignore = "review2: pending fix"]
+    async fn review2_forged_xff_cannot_claim_known_good_exemption() {
+        let _g = env_lock();
+        std::env::set_var("DGP_TRUST_PROXY_HEADERS", "true");
+        std::env::remove_var("DGP_TRUSTED_PROXY_CIDRS");
+        let rl = RateLimiter::new(100, Duration::from_secs(60), Duration::from_secs(60))
+            .with_account_policy(3, Duration::from_secs(60), Duration::from_secs(60));
+        let op = hdrs(&[("x-forwarded-for", "203.0.113.10")]);
+        RateLimitGuard::enter_with_account(&rl, &op, Some(ip("203.0.113.10")), "bootstrap", "t")
+            .await
+            .unwrap()
+            .record_success();
+        for i in 1..=3 {
+            let a = format!("198.51.100.{i}");
+            let h = hdrs(&[("x-forwarded-for", a.as_str())]);
+            RateLimitGuard::enter_with_account(&rl, &h, Some(ip(&a)), "bootstrap", "t")
+                .await
+                .unwrap()
+                .record_failure();
+        }
+        let forged = hdrs(&[("x-forwarded-for", "203.0.113.10")]);
+        let r = RateLimitGuard::enter_with_account(
+            &rl,
+            &forged,
+            Some(ip("198.51.100.66")),
+            "bootstrap",
+            "t",
+        )
+        .await;
+        std::env::remove_var("DGP_TRUST_PROXY_HEADERS");
+        assert!(
+            r.is_err(),
+            "an attacker claimed the operator's known-good IP through XFF"
+        );
+    }
 }

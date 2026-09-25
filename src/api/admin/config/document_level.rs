@@ -1337,3 +1337,23 @@ mod env_leak_tests {
         assert_eq!(cfg.env_refs.get("LOGF").map(String::as_str), Some("debug"));
     }
 }
+
+#[cfg(test)]
+mod review2_tests {
+    use super::*;
+
+    /// Review-2 (S7): an export keeps `${env:X}` refs. Importing it on a
+    /// fresh/DR instance whose boot file does not use X fails, even when the
+    /// operator exports X there (the documented IaC contract).
+    #[test]
+    #[ignore = "review2: pending fix"]
+    fn review2_foreign_export_ref_resolves_when_target_sets_the_var() {
+        std::env::set_var("REVIEW2_S7_DR_LEVEL", "debug");
+        let r = parse_and_validate_yaml(
+            "log_level: \"${env:REVIEW2_S7_DR_LEVEL}\"\n",
+            &Default::default(),
+        );
+        std::env::remove_var("REVIEW2_S7_DR_LEVEL");
+        assert!(r.is_ok(), "{:?}", r.err());
+    }
+}

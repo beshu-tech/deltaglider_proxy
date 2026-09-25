@@ -2858,3 +2858,73 @@ async fn test_percent_encoded_query_key_cannot_escape_prefix_deny() {
         "prefix Deny bypassed by an encoded parameter name: {status} {body}"
     );
 }
+
+// ── review second pass (failing tests for findings) ──────────────────────
+
+/// Review-2 (S19): ANY verified request resets the IP's failure counter, and
+/// a presigned link is verified. So a wrong-secret loop that fetches one
+/// public presigned link every MAX-1 guesses is never throttled.
+#[tokio::test]
+#[ignore = "review2: pending fix"]
+async fn review2_presigned_hits_do_not_reset_a_wrong_secret_loop() {
+    use aws_sdk_s3::presigning::PresigningConfig;
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_RATE_LIMIT_MAX_ATTEMPTS", "3")
+        .env("DGP_RATE_LIMIT_WINDOW_SECS", "60")
+        .env("DGP_RATE_LIMIT_LOCKOUT_SECS", "60")
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    client
+        .put_object()
+        .bucket(server.bucket())
+        .key("public.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+    let presigned = client
+        .get_object()
+        .bucket(server.bucket())
+        .key("public.txt")
+        .presigned(
+            PresigningConfig::builder()
+                .expires_in(std::time::Duration::from_secs(300))
+                .build()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let path = format!("/{}", server.bucket());
+    let http = reqwest::Client::new();
+    for _ in 0..3 {
+        for _ in 0..2 {
+            let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+            let r = build_signed_get(&server.endpoint(), &path, "testkey", "wrong-secret", &now)
+                .header("x-forwarded-for", "10.0.0.96")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        }
+        let r = http
+            .get(presigned.uri())
+            .header("x-forwarded-for", "10.0.0.96")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "presigned GET");
+    }
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let resp = build_signed_get(&server.endpoint(), &path, "testkey", "testsecret", &now)
+        .header("x-forwarded-for", "10.0.0.96")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        503,
+        "six wrong secrets from one IP must lock it, presigned hits in between or not"
+    );
+}

@@ -2132,3 +2132,100 @@ mod spool_singleton_tests {
         assert!(a.spool.same_budget(&b.spool));
     }
 }
+
+#[cfg(test)]
+mod review2_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::storage::FilesystemBackend;
+
+    /// Review-2 (7692271b): a streaming PUT no longer waits on its OWN body
+    /// spool, but two PUTs still wait on EACH OTHER's (hold-and-wait): both
+    /// hold a body reservation and ask for a pair that only fits once the
+    /// other releases. Both stall until DGP_SPOOL_ACQUIRE_TIMEOUT_SECS, then 503.
+    #[tokio::test]
+    #[ignore = "review2: pending fix"]
+    async fn review2_two_streaming_puts_do_not_deadlock_on_each_others_body_spool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().join("data"))
+            .await
+            .unwrap();
+        backend.create_bucket("b").await.unwrap();
+        let mut engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
+        engine.spool = Arc::new(
+            crate::deltaglider::spool::SpoolDir::new(tmp.path().join("spool"), 4 * 1024 * 1024)
+                .unwrap(),
+        );
+        let v: Vec<u8> = (0..1_500_000u32).map(|n| (n % 251) as u8).collect();
+        let body_a = engine.spool_acquire(v.len() as u64).await.unwrap();
+        let body_b = engine.spool_acquire(v.len() as u64).await.unwrap();
+        tokio::fs::write(body_a.path(), &v).await.unwrap();
+        tokio::fs::write(body_b.path(), &v).await.unwrap();
+        let a = engine.store_spooled_delta(
+            "b",
+            "x/a.zip",
+            &body_a,
+            v.len() as u64,
+            None,
+            HashMap::new(),
+            None,
+        );
+        let b = engine.store_spooled_delta(
+            "b",
+            "y/b.zip",
+            &body_b,
+            v.len() as u64,
+            None,
+            HashMap::new(),
+            None,
+        );
+        let (ra, rb) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures::future::join(a, b),
+        )
+        .await
+        .expect("two streaming PUTs deadlocked on each other's body spool");
+        ra.unwrap();
+        rb.unwrap();
+    }
+
+    /// Review-2 (144b303b): the deltaspace lock is keyed by the VIRTUAL
+    /// bucket. Two bucket names aliased onto one real bucket share one
+    /// `reference.bin`, but take different locks, so two first PUTs can both
+    /// create a baseline.
+    #[tokio::test]
+    #[ignore = "review2: pending fix"]
+    async fn review2_two_virtual_names_of_one_storage_share_the_deltaspace_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"
+storage:
+  backends:
+    - name: local-disk
+      type: filesystem
+      path: {}
+  buckets:
+    releases:
+      backend: local-disk
+      alias: shared
+    downloads:
+      backend: local-disk
+      alias: shared
+"#,
+            tmp.path().display()
+        );
+        let cfg = Config::from_yaml_str(&yaml).unwrap();
+        let engine = DeltaGliderEngine::new(&cfg, None).await.unwrap();
+        let _held = engine.acquire_prefix_lock("releases", "fw").await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                engine.acquire_prefix_lock("downloads", "fw"),
+            )
+            .await
+            .is_err(),
+            "the same real deltaspace through two names must serialise"
+        );
+    }
+}

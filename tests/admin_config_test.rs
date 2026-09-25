@@ -1531,3 +1531,38 @@ async fn password_change_refused_when_hash_comes_from_env() {
     let body = r.text().await.unwrap();
     assert!(body.contains("DGP_BOOTSTRAP_PASSWORD_HASH"), "{body}");
 }
+
+// ── review second pass (failing tests for findings) ──────────────────────
+
+/// Review-2 (D15): the 409 tells the operator to run
+/// `--set-bootstrap-password` and pin its hash. That flag itself warns the
+/// IAM DB becomes unreadable (main.rs), the very lockout D15 prevents. The
+/// safe path is: unset the env var, change the password in the GUI (which
+/// re-keys the DB), then pin the new hash.
+#[tokio::test]
+#[ignore = "review2: pending fix"]
+async fn review2_d15_refusal_does_not_recommend_the_iam_wiping_path() {
+    let server = common::TestServer::builder()
+        .env(
+            "DGP_BOOTSTRAP_PASSWORD_HASH",
+            common::TEST_BOOTSTRAP_PASSWORD_HASH,
+        )
+        .build()
+        .await;
+    let admin = common::admin_http_client(&server.endpoint()).await;
+    let r = admin
+        .put(format!("{}/_/api/admin/password", server.endpoint()))
+        .json(&serde_json::json!({
+            "current_password": common::TEST_BOOTSTRAP_PASSWORD,
+            "new_password": "a-new-Password-123!"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 409);
+    let body = r.text().await.unwrap();
+    assert!(
+        !body.contains("--set-bootstrap-password"),
+        "the advice makes the IAM DB unreadable: {body}"
+    );
+}

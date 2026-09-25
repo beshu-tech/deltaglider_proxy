@@ -3807,3 +3807,197 @@ async fn test_concurrent_if_none_match_star_admits_one_writer() {
         "exactly one create may win"
     );
 }
+
+// ============================================================================
+// Review second pass (failing tests for findings)
+// ============================================================================
+
+/// Review-2 (C4): the conditional check runs only in PutObject.
+/// CompleteMultipartUpload ignores If-None-Match, so a create-only multipart
+/// write (object_store PutMode::Create) silently overwrites.
+#[tokio::test]
+#[ignore = "review2: pending fix"]
+async fn review2_complete_multipart_honours_if_none_match_star() {
+    use aws_sdk_s3::primitives::ByteStream;
+    use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+    let server = TestServer::filesystem().await;
+    let s3 = server.s3_client().await;
+    let b = server.bucket();
+    s3.put_object()
+        .bucket(b)
+        .key("mp-cond.bin")
+        .body(ByteStream::from_static(b"original"))
+        .send()
+        .await
+        .unwrap();
+    let up = s3
+        .create_multipart_upload()
+        .bucket(b)
+        .key("mp-cond.bin")
+        .send()
+        .await
+        .unwrap();
+    let id = up.upload_id().unwrap();
+    let part = s3
+        .upload_part()
+        .bucket(b)
+        .key("mp-cond.bin")
+        .upload_id(id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"replacement"))
+        .send()
+        .await
+        .unwrap();
+    let done = s3
+        .complete_multipart_upload()
+        .bucket(b)
+        .key("mp-cond.bin")
+        .upload_id(id)
+        .if_none_match("*")
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part.e_tag().unwrap())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await;
+    let got = s3
+        .get_object()
+        .bucket(b)
+        .key("mp-cond.bin")
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    assert!(
+        done.is_err(),
+        "If-None-Match: * on an existing key must be 412"
+    );
+    assert_eq!(&got[..], b"original");
+}
+
+/// Review-2 (C8): the 2 KB check counts raw bytes, but the filesystem
+/// backend stores all metadata as ONE JSON xattr. JSON escaping doubles `"`,
+/// so 2047 quotes (within the S3 limit) exceed the ~4 KB ext4 xattr value
+/// limit and the PUT fails with a 5xx.
+#[tokio::test]
+#[ignore = "review2: pending fix"]
+async fn review2_user_metadata_at_limit_with_quotes_stores() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let url = format!("{}/{}/meta-quotes.txt", server.endpoint(), server.bucket());
+    let resp = http
+        .put(&url)
+        .header("x-amz-meta-q", "\"".repeat(2047))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert!(
+        status.is_success() || status.as_u16() == 400,
+        "metadata within the S3 limit must store (or be refused with 400), got {status} {body}"
+    );
+}
+
+/// Review-2 (C2): with `encoding-type=url` <Key> is encoded, but
+/// <NextContinuationToken> is the raw key. A key with a control character
+/// (only NUL and `\` are refused) then makes the XML ill-formed.
+#[tokio::test]
+#[ignore = "review2: pending fix"]
+async fn review2_list_v2_next_token_stays_valid_xml() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    for k in ["ctl/a%01b.txt", "ctl/c.txt"] {
+        let r = http
+            .put(format!("{}/{}/{k}", server.endpoint(), server.bucket()))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "seed {k}: {}", r.status());
+    }
+    let body = http
+        .get(format!(
+            "{}/{}?list-type=2&encoding-type=url&prefix=ctl%2F&max-keys=1",
+            server.endpoint(),
+            server.bucket()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("<Key>ctl/a%01b.txt</Key>"), "{body}");
+    assert!(
+        !body.contains('\u{1}'),
+        "a raw U+0001 makes the XML ill-formed: {body:?}"
+    );
+}
+
+/// Review-2: the LIST XML post-processor (metadata=true) buffers at most
+/// 1 MiB; on overflow it returns an EMPTY body but keeps the status. 1000
+/// long keys exceed that, so the client gets a broken listing.
+#[tokio::test]
+#[ignore = "review2: pending fix"]
+async fn review2_large_metadata_listing_is_not_truncated_to_empty() {
+    let server = TestServer::filesystem().await;
+    let s3 = server.s3_client().await;
+    let b = server.bucket();
+    let dir = format!(
+        "{}/{}/{}",
+        "a".repeat(250),
+        "b".repeat(250),
+        "c".repeat(250)
+    );
+    let mut puts = futures::stream::FuturesUnordered::new();
+    for i in 0..1000 {
+        let s3 = s3.clone();
+        let key = format!("{dir}/{i:0>200}.txt");
+        puts.push(async move {
+            s3.put_object()
+                .bucket(b)
+                .key(key)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+                .send()
+                .await
+                .unwrap();
+        });
+        if puts.len() >= 16 {
+            use futures::StreamExt;
+            puts.next().await;
+        }
+    }
+    {
+        use futures::StreamExt;
+        while puts.next().await.is_some() {}
+    }
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/{}?list-type=2&metadata=true",
+            server.endpoint(),
+            b
+        ))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert!(status.is_success(), "{status}");
+    assert!(
+        text.contains("</ListBucketResult>"),
+        "listing body truncated/empty: {} bytes",
+        text.len()
+    );
+}

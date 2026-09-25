@@ -3479,4 +3479,122 @@ mod reference_lock_hold_tests {
             "write reference.bin through ReferenceLockGuard: {offenders:?}"
         );
     }
+    // ── review second pass (failing tests for findings) ──────────────────
+
+    /// A lock that models `S3ReferenceLock::renew`: read the etag, one round
+    /// trip, then an If-Match PUT; a changed etag is a 412 → `Ok(false)`.
+    struct CasLock {
+        state: parking_lot::Mutex<(u64, Option<String>)>, // (etag, owner)
+        rtt: Duration,
+        interval: Duration,
+    }
+
+    #[async_trait]
+    impl crate::coordination::ReferenceLock for CasLock {
+        async fn try_acquire(&self, _: &str, owner: &str, _: i64) -> Result<bool, String> {
+            let mut s = self.state.lock();
+            if s.1.is_some() {
+                return Ok(false);
+            }
+            s.0 += 1;
+            s.1 = Some(owner.to_string());
+            Ok(true)
+        }
+        async fn release(&self, _: &str, owner: &str) -> Result<(), String> {
+            let mut s = self.state.lock();
+            if s.1.as_deref() == Some(owner) {
+                s.0 += 1;
+                s.1 = None;
+            }
+            Ok(())
+        }
+        async fn renew(&self, _: &str, owner: &str, _: i64) -> Result<bool, String> {
+            let seen = {
+                let s = self.state.lock();
+                if s.1.as_deref() != Some(owner) {
+                    return Ok(false);
+                }
+                s.0
+            };
+            tokio::time::sleep(self.rtt).await; // the If-Match PUT round trip
+            let mut s = self.state.lock();
+            if s.0 != seen {
+                return Ok(false); // 412 -> put_lock Ok(false)
+            }
+            s.0 += 1;
+            Ok(true)
+        }
+        fn ttl_secs(&self) -> i64 {
+            120
+        }
+        fn renew_interval(&self) -> Duration {
+            self.interval
+        }
+        fn acquire_timeout(&self) -> Duration {
+            Duration::from_millis(50)
+        }
+    }
+
+    /// Review-2 (2d4fd1ac): the heartbeat and `ensure_held` (Confirm path)
+    /// renew the SAME lock with the same owner. Confirm fires when the last
+    /// confirmation is `renew_interval` old, i.e. exactly while the
+    /// heartbeat's renew is in flight. Both PUT with If-Match on one etag;
+    /// the loser's 412 reads as "lost", so the commit is refused and the
+    /// hold is marked lost although the lock is still ours.
+    #[tokio::test]
+    #[ignore = "review2: pending fix"]
+    async fn review2_commit_racing_the_heartbeat_renew_keeps_the_lock() {
+        let lock = Arc::new(CasLock {
+            state: parking_lot::Mutex::new((0, None)),
+            rtt: Duration::from_millis(40),
+            interval: Duration::from_millis(100),
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
+                .with_reference_lock(Some(lock.clone()));
+        let guard = engine
+            .acquire_reference_lock("review2-releases", "v1")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(110)).await;
+        let commit = guard.ensure_held().await;
+        let next = guard.ensure_held().await;
+        assert!(lock.state.lock().1.is_some(), "the lock is still ours");
+        assert!(commit.is_ok(), "commit refused: {}", commit.unwrap_err());
+        assert!(next.is_ok(), "hold marked lost: {}", next.unwrap_err());
+    }
+
+    /// Review-2 (b22f6ff8 incomplete): only the reclaim CHECK became
+    /// best-effort. `delete_reference(..).await?` still fails the DELETE
+    /// after the object itself is already gone (lost lock, transient error),
+    /// so the client gets a 500 for a delete that happened.
+    #[tokio::test]
+    #[ignore = "review2: pending fix"]
+    async fn review2_lost_lock_during_reclaim_does_not_fail_the_delete() {
+        let lock = ScriptedLock::new(true, Duration::ZERO); // every commit re-confirms
+        let (_tmp, engine) = engine_with(lock.clone()).await;
+        engine
+            .store(
+                "releases",
+                "v9/app.zip",
+                &vec![7u8; 4096],
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        lock.renew_ok.store(false, Ordering::SeqCst);
+        let res = engine.delete("releases", "v9/app.zip").await;
+        let gone = engine.head("releases", "v9/app.zip").await.is_err();
+        assert!(gone, "precondition: the object is deleted");
+        assert!(
+            res.is_ok(),
+            "the object is already deleted; DELETE must not fail: {}",
+            res.err().map(|e| e.to_string()).unwrap_or_default()
+        );
+    }
 }

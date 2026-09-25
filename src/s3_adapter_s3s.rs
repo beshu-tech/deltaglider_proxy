@@ -3151,3 +3151,108 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod review2_tests {
+    use super::*;
+
+    /// Review-2 (S5): browsers split Content-Type on commas and use the LAST
+    /// valid type (Fetch "extract a MIME type"). `image/png, text/html`
+    /// renders as HTML, but the essence here is taken before the first `;`,
+    /// so it counts as an inert image and gets no sandbox.
+    #[test]
+    #[ignore = "review2: pending fix"]
+    fn review2_sandbox_is_not_bypassed_by_a_content_type_list() {
+        for ct in [
+            "image/png, text/html",
+            "image/png;x=,text/html",
+            "video/mp4,text/html",
+        ] {
+            assert!(
+                content_type_needs_sandbox(ct),
+                "{ct} renders as text/html but gets no sandbox"
+            );
+        }
+    }
+
+    /// Review-2 (S12): the refill scans at most FILTERED_LIST_MAX_ENGINE_PAGES
+    /// engine pages and the token is the last VISIBLE key. More hidden
+    /// entries than the budget between two visible ones make every later
+    /// visible key unreachable: each follow-up restarts at the same token
+    /// and fails. Slow (10k stores); run with `--ignored`.
+    #[tokio::test]
+    #[ignore = "slow: 10k stores + 10k engine pages"]
+    async fn review2_filtered_list_reaches_visible_keys_past_the_scan_budget() {
+        use crate::iam::permissions::permission_to_iam_policy;
+        use crate::iam::Permission;
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine: crate::deltaglider::DynEngine =
+            crate::deltaglider::DeltaGliderEngine::new_with_backend(
+                Arc::new(backend),
+                &crate::config::Config::default(),
+                None,
+            );
+        engine.create_bucket("b").await.unwrap();
+        engine
+            .store("b", "d/a/v.png", b"x", None, Default::default())
+            .await
+            .unwrap();
+        for i in 0..=FILTERED_LIST_MAX_ENGINE_PAGES {
+            engine
+                .store(
+                    "b",
+                    &format!("d/h{i:05}/x.png"),
+                    b"x",
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        engine
+            .store("b", "d/z/v.png", b"x", None, Default::default())
+            .await
+            .unwrap();
+        let allow = Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into(), "list".into()],
+            resources: vec!["b/d/a/*".into(), "b/d/z/*".into()],
+            conditions: None,
+        };
+        let user = AuthenticatedUser {
+            name: "u".into(),
+            access_key_id: "AK".into(),
+            permissions: vec![allow.clone()],
+            iam_policies: vec![permission_to_iam_policy(&allow)],
+        };
+        let scope = ListScope::Filtered {
+            user: Box::new(user),
+            context: Box::new(policy_context_for_ip(None)),
+        };
+        let p1 = list_page_for_caller(&engine, "b", "d/", Some("/"), 1, None, false, Some(&scope))
+            .await
+            .unwrap();
+        assert_eq!(p1.common_prefixes, vec!["d/a/".to_string()]);
+        let p2 = list_page_for_caller(
+            &engine,
+            "b",
+            "d/",
+            Some("/"),
+            1,
+            p1.next_continuation_token.as_deref(),
+            false,
+            Some(&scope),
+        )
+        .await;
+        assert_eq!(
+            p2.expect("d/z/ must stay reachable").common_prefixes,
+            vec!["d/z/".to_string()]
+        );
+    }
+}

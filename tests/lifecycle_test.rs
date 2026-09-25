@@ -758,3 +758,71 @@ async fn test_lifecycle_preview_delete_without_expire_after_is_400_not_500() {
         "a fatal rule's rejected run-now must create no run row, got {runs}"
     );
 }
+
+// ── review second pass (failing tests for findings) ──────────────────────
+
+/// Review-2 (5333c4bc): the re-HEAD before delete compares `created_at`
+/// from the LIST snapshot with `created_at` from a fresh HEAD. On S3 a
+/// passthrough key with a cold metadata cache keeps the lite LIST entry
+/// (`LastModified`, ms precision), while HEAD returns `dg-created-at` (µs).
+/// They never match, so every such object is "Changed" and never expires.
+/// MinIO only (self-skips locally); the filesystem backend reads one xattr
+/// for both and cannot show it.
+#[tokio::test]
+#[ignore = "review2: pending fix"]
+async fn review2_lifecycle_s3_deletes_passthrough_object_with_cold_cache() {
+    crate::skip_unless_minio!();
+    let prefix = format!(
+        "lc-cold-{}/",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let yaml = format!(
+        r#"
+lifecycle:
+  enabled: true
+  tick_interval: "1h"
+  rules:
+    - name: expire-logs
+      enabled: true
+      bucket: deltaglider-test
+      prefix: "{prefix}"
+      expire_after: "1ms"
+      batch_size: 100
+"#
+    );
+    let mut server = TestServer::builder()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket("deltaglider-test")
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(&yaml)
+        .build()
+        .await;
+    let key = format!("{prefix}app.log");
+    server
+        .s3_client()
+        .await
+        .put_object()
+        .bucket("deltaglider-test")
+        .key(&key)
+        .body(ByteStream::from(b"x".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    server.respawn_with_env(&[]).await; // cold metadata cache (= next hourly tick)
+    let admin = admin_http_client(&server.endpoint()).await;
+    let run: Value = admin
+        .post(format!(
+            "{}/_/api/admin/jobs/lifecycle:expire-logs/run-now",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(run["objects_affected"].as_i64(), Some(1), "{run}");
+}

@@ -730,3 +730,132 @@ async fn test_reencrypt_resumes_after_restart() {
         );
     }
 }
+
+// ── review second pass (failing tests for findings) ──────────────────────
+
+#[ignore = "review2: pending fix"]
+async fn review2_busy_bucket(bucket: &str) -> (TestServer, reqwest::Client) {
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .auth("gatekey", "gatesecret")
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let s3 = server.s3_client().await;
+    for i in 0..40 {
+        s3.put_object()
+            .bucket(bucket)
+            .key(format!("rel/f{i:02}.json"))
+            .body(aws_sdk_s3::primitives::ByteStream::from(
+                PLAINTEXT_MARKER.to_vec(),
+            ))
+            .send()
+            .await
+            .expect("seed PUT");
+    }
+    let admin = admin_http_client(&endpoint).await;
+    enable_encryption(&admin, &endpoint).await;
+    let res = start_reencrypt(&admin, &endpoint, bucket).await;
+    assert_eq!(
+        res["started"][0]["bucket"], bucket,
+        "job should start: {res}"
+    );
+    (server, admin)
+}
+
+/// Review-2 (b003703d): an unsigned multipart form POST passes the SigV4
+/// middleware (it carries its policy in the body), so the maintenance gate
+/// answers it first: anonymous callers still learn which bucket is busy.
+#[tokio::test]
+#[ignore = "review2: pending fix"]
+async fn review2_form_post_does_not_reveal_gate_state_unauthenticated() {
+    let bucket = "maintform";
+    let (server, admin) = review2_busy_bucket(bucket).await;
+    let endpoint = server.endpoint();
+    let resp = reqwest::Client::new()
+        .post(format!("{endpoint}/{bucket}"))
+        .header("content-type", "multipart/form-data; boundary=x")
+        .body("--x--\r\n")
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    wait_job_done(&admin, &endpoint, bucket).await;
+    assert_ne!(
+        status.as_u16(),
+        503,
+        "form POST reached the gate unauthenticated: {body}"
+    );
+    assert!(
+        !body.contains("background job"),
+        "gate state leaked: {body}"
+    );
+}
+
+/// Review-2 (b003703d): the gate runs after identity RESOLUTION but before
+/// s3s verifies the signature. A caller who knows only an access key id
+/// gets the gate 503 (and the job text) with a forged signature.
+#[tokio::test]
+#[ignore = "review2: pending fix"]
+async fn review2_forged_signature_fails_auth_before_the_gate() {
+    let bucket = "maintforge";
+    let (server, admin) = review2_busy_bucket(bucket).await;
+    let endpoint = server.endpoint();
+    let bad = server.s3_client_with_creds("gatekey", "WRONG-secret").await;
+    // One attempt: a retry would reuse the signature and hit the replay guard.
+    let bad = aws_sdk_s3::Client::from_conf(
+        bad.config()
+            .to_builder()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .build(),
+    );
+    let err = bad
+        .put_object()
+        .bucket(bucket)
+        .key("x.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .expect_err("a forged signature must fail");
+    let status = err.raw_response().map(|r| r.status().as_u16());
+    wait_job_done(&admin, &endpoint, bucket).await;
+    assert_eq!(
+        status,
+        Some(403),
+        "a forged signature must fail auth, not reach the gate"
+    );
+}
+
+/// Review-2 (b003703d): the gate now runs AFTER the SigV4 middleware, which
+/// records the signature in the replay cache. An SDK retries a 503 SlowDown
+/// within the same signing second with a byte-identical signature, so the
+/// retry is refused as a replay (400 InvalidArgument, not retryable). A
+/// legitimate writer to a busy bucket gets a hard error instead of backoff.
+#[tokio::test]
+#[ignore = "review2: pending fix"]
+async fn review2_sdk_retry_of_a_gated_write_is_not_refused_as_replay() {
+    let bucket = "maintretry";
+    let (server, admin) = review2_busy_bucket(bucket).await;
+    let endpoint = server.endpoint();
+    let s3 = server.s3_client().await;
+    let res = s3
+        .put_object()
+        .bucket(bucket)
+        .key("during-job.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+        .send()
+        .await;
+    let status = res
+        .as_ref()
+        .err()
+        .and_then(|e| e.raw_response())
+        .map(|r| r.status().as_u16());
+    let detail = format!("{res:?}");
+    wait_job_done(&admin, &endpoint, bucket).await;
+    assert_ne!(
+        status,
+        Some(400),
+        "the SDK retry of a gated write was refused as a replay: {detail}"
+    );
+}

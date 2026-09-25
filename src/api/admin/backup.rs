@@ -2450,3 +2450,28 @@ storage:
         assert!(format!("{err}").contains("not a valid zip"), "{err:?}");
     }
 }
+
+#[cfg(test)]
+mod review2_tests {
+    use super::*;
+
+    /// Review-2 (D13): a DR restore hydrates the AES key from secrets.json,
+    /// then persists with the env-leak guard. When the DR host supplies the
+    /// same key through its env var (the normal DR setup), the guard calls
+    /// that a leak and the restore fails.
+    #[test]
+    #[ignore = "review2: pending fix"]
+    fn review2_dr_restore_with_key_supplied_by_env_is_not_refused() {
+        const K: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+        let yaml = format!(
+            "storage:\n  filesystem: /tmp/d13r\n  backends:\n    - name: d13-dr-probe\n      type: filesystem\n      path: /tmp/d13r2\n      encryption:\n        mode: aes256-gcm-proxy\n        key: \"{K}\"\n"
+        );
+        let cfg = crate::config::Config::from_yaml_str(&yaml).unwrap();
+        let secrets = harvest_config_secrets(&cfg).unwrap();
+        let exported = cfg.redact_all_secrets().to_canonical_yaml().unwrap();
+        std::env::set_var("DGP_BACKEND_D13_DR_PROBE_ENCRYPTION_KEY", K);
+        let r = config_yaml_hydrated_for_restore(&exported, Some(&secrets));
+        std::env::remove_var("DGP_BACKEND_D13_DR_PROBE_ENCRYPTION_KEY");
+        assert!(r.is_ok(), "{r:?}");
+    }
+}

@@ -2282,4 +2282,31 @@ mod tests {
             Some("primary"),
         );
     }
+
+    /// Review-2 (37ed29f0, class not fixed): an unconfigured name must not
+    /// resolve to a real bucket that another policy's alias owns. The fix
+    /// skips such buckets on NON-default backends only. On the default
+    /// backend, `realdr` (the storage of policy `dr`) is served under its real
+    /// name, so every policy of `dr` (replication_target_only, quota, public
+    /// prefixes, IAM resources `dr/*`) is bypassed by using the real name.
+    #[tokio::test]
+    #[ignore = "review2: pending fix"]
+    async fn review2_alias_storage_on_the_default_backend_is_not_reachable_by_its_real_name() {
+        let primary =
+            Arc::new(Box::new(TestBackend::with_buckets(&["realdr"])) as Box<dyn StorageBackend>);
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), primary);
+        let mut routes = HashMap::new();
+        routes.insert(
+            "dr".to_string(),
+            ("primary".to_string(), Some("realdr".to_string())),
+        );
+        let routing =
+            RoutingBackend::new(backends, routes, "primary".to_string()).expect("routing backend");
+        assert!(routing.head_bucket("dr").await.unwrap(), "precondition");
+        assert!(
+            !routing.head_bucket("realdr").await.unwrap(),
+            "the alias's storage answers under its real, unconfigured name"
+        );
+    }
 }
