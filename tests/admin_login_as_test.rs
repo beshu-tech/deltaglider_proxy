@@ -234,3 +234,59 @@ async fn test_audit_entry_names_the_iam_admin() {
         .expect("create_group entry");
     assert_eq!(e["user"], "dana", "{e}");
 }
+
+/// A full backup and a full-IAM export with secrets hand out every
+/// credential in plain text, and neither left an audit entry. Both must be
+/// audited and attributed to the admin who took them.
+#[tokio::test]
+async fn test_secret_exports_are_audited() {
+    let server = TestServer::builder()
+        .auth("BOOTSTRAP4", "BOOTSTRAPSECRET4")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let (ak, sk) = create_user(&admin, &ep, "dana", admin_perms()).await;
+    let dana = reqwest::Client::builder()
+        .cookie_store(true)
+        .no_proxy()
+        .build()
+        .unwrap();
+    let resp = dana
+        .post(format!("{ep}/_/api/admin/login-as"))
+        .json(&json!({ "access_key_id": ak, "secret_access_key": sk }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    for path in [
+        "backup",
+        "config/declarative-iam-export?include_secrets=true",
+    ] {
+        let resp = dana
+            .get(format!("{ep}/_/api/admin/{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+    }
+    let audit: serde_json::Value = admin
+        .get(format!("{ep}/_/api/admin/audit?limit=50"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entries = audit
+        .as_array()
+        .or_else(|| audit["entries"].as_array())
+        .expect("audit list");
+    for action in ["export_backup", "export_iam_with_secrets"] {
+        let e = entries
+            .iter()
+            .find(|e| e["action"] == action)
+            .unwrap_or_else(|| panic!("no {action} entry in {audit}"));
+        assert_eq!(e["user"], "dana", "{e}");
+    }
+}

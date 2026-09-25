@@ -518,10 +518,16 @@ async fn build_iam_backup(state: &Arc<AdminState>) -> Result<IamBackup, StatusCo
 pub async fn export_backup(
     State(state): State<Arc<AdminState>>,
     Query(q): Query<ExportQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, StatusCode> {
     let iam = build_iam_backup(&state).await?;
 
     let format = q.format.as_deref().unwrap_or("zip");
+    // Both formats carry live secrets (user keys; zip adds backend creds), so
+    // taking one is an auditable event like any change.
+    if matches!(format, "json" | "zip") {
+        audit_log("export_backup", "admin", format, &headers);
+    }
     match format {
         "json" => Ok(Json(iam).into_response()),
         "zip" => export_zip(&state, &iam).await.map(|(body, filename)| {

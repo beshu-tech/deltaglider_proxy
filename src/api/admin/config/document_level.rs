@@ -788,6 +788,7 @@ pub struct ExportIamQuery {
 pub async fn export_declarative_iam(
     State(state): State<Arc<AdminState>>,
     axum::extract::Query(q): axum::extract::Query<ExportIamQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let Some(db_arc) = state.config_db.as_ref() else {
         return (
@@ -827,6 +828,9 @@ pub async fn export_declarative_iam(
             .into_response();
     }
     drop(db);
+    if q.include_secrets {
+        audit_log("export_iam_with_secrets", "admin", "", &headers);
+    }
 
     // Emit a minimal YAML with `access.iam_mode: declarative` + the
     // 4 IAM slices. Matches the shape `declarative-iam.md` documents.
