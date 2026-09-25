@@ -2315,14 +2315,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             None
         };
         if let Some((xnode, ref_bytes)) = reclaimable {
-            reclaimed_ref_bytes = ref_bytes;
             // Delete storage BEFORE invalidating cache — prevents stale cache entries
             // from a concurrent GET loading between invalidation and deletion.
-            xnode
+            // Best-effort like the check above: the object is gone, so a lost
+            // lock or a transient error must not turn the DELETE into a 500.
+            match xnode
                 .delete_reference(&*self.storage, bucket, &deltaspace_id)
-                .await?;
-            let cache_key = Self::cache_key(bucket, &deltaspace_id);
-            self.cache.invalidate(&cache_key);
+                .await
+            {
+                Ok(()) => {
+                    reclaimed_ref_bytes = ref_bytes;
+                    let cache_key = Self::cache_key(bucket, &deltaspace_id);
+                    self.cache.invalidate(&cache_key);
+                }
+                Err(e) => warn!("reference reclaim failed for {bucket}/{deltaspace_id}: {e}"),
+            }
         }
 
         // Invalidate metadata cache for the deleted key
@@ -3708,7 +3715,6 @@ mod reference_lock_hold_tests {
     /// after the object itself is already gone (lost lock, transient error),
     /// so the client gets a 500 for a delete that happened.
     #[tokio::test]
-    #[ignore = "review2: pending fix"]
     async fn review2_lost_lock_during_reclaim_does_not_fail_the_delete() {
         let lock = ScriptedLock::new(true, Duration::ZERO); // every commit re-confirms
         let (_tmp, engine) = engine_with(lock.clone()).await;
