@@ -2725,14 +2725,16 @@ impl Config {
     /// `${env:NAME}` (a short value found in several fields stays; see
     /// below). Deterministic on collisions (two names with the same
     /// value → the lexicographically-first name wins). Non-string scalars
-    /// (a ref that expanded into a number/bool field) are left materialized.
-    /// Falls back to a plain clone (with a warn) if the round-trip through
-    /// the value tree fails — emitting expanded secrets is strictly better
-    /// than failing a persist.
+    /// (a ref that expanded into a number/bool field) are left materialized,
+    /// and so is a typed field that serializes as a string but cannot hold
+    /// a ref (`listen_addr: SocketAddr`, an enum): that one target is
+    /// skipped, never the whole reinsertion (which wrote every ref-sourced
+    /// secret in plaintext).
     pub fn with_env_refs_reinserted(&self) -> Self {
         /// Shortest env value treated as a secret when it occurs in several
-        /// fields (see the count rule below).
-        const SHARED_REF_MIN_LEN: usize = 8;
+        /// fields (see the count rule below). 16: a region (`us-east-1`) or a
+        /// host name shared by two fields is not a secret.
+        const SHARED_REF_MIN_LEN: usize = 16;
         if self.env_refs.is_empty() {
             return self.clone();
         }
@@ -2771,10 +2773,19 @@ impl Config {
             }
         }
 
-        fn walk(
-            v: &mut serde_yaml::Value,
+        /// One step of a path into the value tree.
+        enum Seg {
+            Key(serde_yaml::Value),
+            Idx(usize),
+        }
+
+        /// The path of every String scalar to rewrite, with its ref.
+        fn collect(
+            v: &serde_yaml::Value,
+            path: &mut Vec<Seg>,
             inverse: &std::collections::BTreeMap<&str, String>,
-            counts: &std::collections::HashMap<String, u32>,
+            counts: &std::collections::HashMap<&str, u32>,
+            out: &mut Vec<(Vec<Seg>, String)>,
         ) {
             match v {
                 serde_yaml::Value::String(s) => {
@@ -2782,54 +2793,103 @@ impl Config {
                         || s.len() >= SHARED_REF_MIN_LEN
                     {
                         if let Some(reference) = inverse.get(s.as_str()) {
-                            *s = reference.clone();
+                            let copy = path
+                                .iter()
+                                .map(|seg| match seg {
+                                    Seg::Key(k) => Seg::Key(k.clone()),
+                                    Seg::Idx(i) => Seg::Idx(*i),
+                                })
+                                .collect();
+                            out.push((copy, reference.clone()));
                         }
                     }
                 }
                 serde_yaml::Value::Sequence(seq) => {
-                    for item in seq {
-                        walk(item, inverse, counts);
+                    for (i, item) in seq.iter().enumerate() {
+                        path.push(Seg::Idx(i));
+                        collect(item, path, inverse, counts, out);
+                        path.pop();
                     }
                 }
                 serde_yaml::Value::Mapping(map) => {
-                    for (_, value) in map.iter_mut() {
-                        walk(value, inverse, counts);
+                    for (key, value) in map {
+                        path.push(Seg::Key(key.clone()));
+                        collect(value, path, inverse, counts, out);
+                        path.pop();
                     }
                 }
                 _ => {}
             }
         }
 
-        let substituted = serde_yaml::to_value(self)
-            .map_err(|e| e.to_string())
-            .and_then(|mut tree| {
-                let mut counts_borrowed: std::collections::HashMap<&str, u32> =
-                    std::collections::HashMap::new();
-                count_values(&tree, &mut counts_borrowed);
-                let counts: std::collections::HashMap<String, u32> = counts_borrowed
-                    .into_iter()
-                    .map(|(k, v)| (k.to_string(), v))
-                    .collect();
-                walk(&mut tree, &inverse, &counts);
-                serde_yaml::from_value::<Config>(tree).map_err(|e| e.to_string())
-            });
-        match substituted {
-            Ok(mut cfg) => {
-                // `env_refs` / `env_shadow` are #[serde(skip)] — restore them
-                // so chained serializers (and future persists) keep the
-                // provenance.
-                cfg.env_refs = self.env_refs.clone();
-                cfg.env_shadow = self.env_shadow.clone();
-                cfg
-            }
+        fn at<'a>(v: &'a mut serde_yaml::Value, path: &[Seg]) -> Option<&'a mut serde_yaml::Value> {
+            path.iter().try_fold(v, |v, seg| match (seg, v) {
+                (Seg::Key(k), serde_yaml::Value::Mapping(m)) => m.get_mut(k),
+                (Seg::Idx(i), serde_yaml::Value::Sequence(s)) => s.get_mut(*i),
+                _ => None,
+            })
+        }
+
+        let mut tree = match serde_yaml::to_value(self) {
+            Ok(tree) => tree,
             Err(e) => {
-                tracing::warn!(
-                    "env-ref reinsertion failed ({e}); persisting/exporting \
-                     materialized values instead"
-                );
-                self.clone()
+                // Serializing Config does not fail in practice (every
+                // persist and export does it); nothing to rewrite without it.
+                tracing::warn!("env-ref reinsertion: cannot serialize config ({e})");
+                return self.clone();
+            }
+        };
+        let mut targets = Vec::new();
+        {
+            let mut counts: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+            count_values(&tree, &mut counts);
+            collect(&tree, &mut Vec::new(), &inverse, &counts, &mut targets);
+        }
+        let original = tree.clone();
+        for (path, reference) in &targets {
+            if let Some(slot) = at(&mut tree, path) {
+                *slot = serde_yaml::Value::String(reference.clone());
             }
         }
+        let mut cfg = match serde_yaml::from_value::<Config>(tree) {
+            Ok(cfg) => cfg,
+            Err(_) => {
+                // Some target is a typed field that cannot hold a ref. Apply
+                // the targets one at a time and keep each that still parses.
+                let mut tree = original;
+                let mut last_good: Option<Config> = None;
+                for (path, reference) in &targets {
+                    let Some(slot) = at(&mut tree, path) else {
+                        continue;
+                    };
+                    let before =
+                        std::mem::replace(slot, serde_yaml::Value::String(reference.clone()));
+                    match serde_yaml::from_value::<Config>(tree.clone()) {
+                        Ok(cfg) => last_good = Some(cfg),
+                        Err(_) => {
+                            if let Some(slot) = at(&mut tree, path) {
+                                *slot = before;
+                            }
+                        }
+                    }
+                }
+                match last_good {
+                    Some(cfg) => cfg,
+                    None => match serde_yaml::from_value::<Config>(tree) {
+                        Ok(cfg) => cfg,
+                        Err(e) => {
+                            tracing::warn!("env-ref reinsertion: config does not round-trip ({e})");
+                            return self.clone();
+                        }
+                    },
+                }
+            }
+        };
+        // `env_refs` / `env_shadow` are #[serde(skip)] — restore them so
+        // chained serializers (and future persists) keep the provenance.
+        cfg.env_refs = self.env_refs.clone();
+        cfg.env_shadow = self.env_shadow.clone();
+        cfg
     }
 
     /// Resolve any full-scalar `${env:NAME}` string field back to its value.
@@ -6370,7 +6430,6 @@ mod review2_tests {
     /// (`listen_addr: SocketAddr`) makes the value-tree round-trip fail, and
     /// the fallback clone writes EVERY ref-sourced secret in plaintext.
     #[test]
-    #[ignore = "review2: pending fix"]
     fn review2_ref_in_typed_field_does_not_abort_reinsertion() {
         let mut cfg = Config {
             secret_access_key: Some("custom-secret-value-1".into()),
@@ -6390,7 +6449,6 @@ mod review2_tests {
     /// materialized, but it is 9 bytes (>= SHARED_REF_MIN_LEN = 8), so every
     /// field that holds it is coupled to the env var.
     #[test]
-    #[ignore = "review2: pending fix"]
     fn review2_region_value_in_two_fields_stays_uncoupled() {
         let mut cfg = Config {
             access_key_id: Some("us-east-1".into()),
