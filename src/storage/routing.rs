@@ -78,7 +78,15 @@ pub struct RoutingBackend {
     /// How long a successful listing stays fresh enough to serve without
     /// re-probing upstream (coalesces near-simultaneous ListBuckets calls).
     list_fresh: std::time::Duration,
+    /// Unrouted bucket → backend name where head_bucket FOUND it, with the
+    /// time found. Only positive answers are kept (a miss may become a hit
+    /// when the bucket is created; an error must re-probe). Cleared on
+    /// create/delete bucket; a peer's change is seen within RESOLVE_TTL.
+    resolved: parking_lot::Mutex<HashMap<String, (String, std::time::Instant)>>,
 }
+
+/// How long a found unrouted bucket stays resolved without a new probe.
+const RESOLVE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl RoutingBackend {
     /// Create a new routing backend.
@@ -164,6 +172,7 @@ impl RoutingBackend {
             list_cooldown,
             list_timeout,
             list_fresh,
+            resolved: Default::default(),
         })
     }
 
@@ -208,20 +217,6 @@ impl RoutingBackend {
         self.backends[&self.default_backend].as_ref().as_ref()
     }
 
-    fn explicit_route<'a>(
-        &'a self,
-        virtual_bucket: &'a str,
-    ) -> Option<(&'a dyn StorageBackend, Cow<'a, str>)> {
-        self.routes.get(virtual_bucket).map(|route| {
-            let backend = &self.backends[&route.backend_name];
-            let real = match &route.real_bucket {
-                Some(alias) => Cow::Borrowed(alias.as_str()),
-                None => Cow::Borrowed(virtual_bucket),
-            };
-            (backend.as_ref().as_ref(), real)
-        })
-    }
-
     /// Resolve existing bucket operations.
     ///
     /// Explicit bucket policies always win. Otherwise, if the default backend
@@ -233,50 +228,8 @@ impl RoutingBackend {
         &'a self,
         virtual_bucket: &'a str,
     ) -> (&'a dyn StorageBackend, Cow<'a, str>) {
-        if let Some(route) = self.explicit_route(virtual_bucket) {
-            return route;
-        }
-
-        // A head_bucket ERROR (503/timeout) is NOT "bucket absent". Treating
-        // it as absent silently reroutes the operation to the WRONG backend —
-        // if the bucket really lives here, writes land elsewhere. So on error
-        // we ROUTE TO THIS backend (the op re-hits it and surfaces the real
-        // error to the client) rather than falling through. Only a clean
-        // Ok(false) means "genuinely not here, keep looking".
-        let default = self.default_backend();
-        match default.head_bucket(virtual_bucket).await {
-            Ok(true) => return (default, Cow::Borrowed(virtual_bucket)),
-            Err(e) => {
-                warn!(
-                    "resolve_existing: default backend head_bucket({virtual_bucket}) failed \
-                     transiently ({e}); routing to default rather than mis-routing"
-                );
-                return (default, Cow::Borrowed(virtual_bucket));
-            }
-            Ok(false) => {}
-        }
-
-        let mut names: Vec<&String> = self.backends.keys().collect();
-        names.sort();
-        for name in names {
-            if name == &self.default_backend {
-                continue;
-            }
-            let backend = self.backends[name].as_ref().as_ref();
-            match backend.head_bucket(virtual_bucket).await {
-                Ok(true) => return (backend, Cow::Borrowed(virtual_bucket)),
-                Err(e) => {
-                    warn!(
-                        "resolve_existing: backend '{name}' head_bucket({virtual_bucket}) failed \
-                         transiently ({e}); routing here rather than mis-routing to default"
-                    );
-                    return (backend, Cow::Borrowed(virtual_bucket));
-                }
-                Ok(false) => {}
-            }
-        }
-
-        (default, Cow::Borrowed(virtual_bucket))
+        let (_, backend, real) = self.resolve_existing_named(virtual_bucket).await;
+        (backend, real)
     }
 }
 
@@ -410,7 +363,32 @@ impl RoutingBackend {
     /// they still back the unavailable-placeholder path) so the next listing
     /// re-probes upstream. Called after create/delete bucket: read-after-write
     /// must see the change immediately, not after the freshness window.
+    fn cached_resolution(&self, virtual_bucket: &str) -> Option<String> {
+        let mut map = self.resolved.lock();
+        match map.get(virtual_bucket) {
+            Some((name, at)) if at.elapsed() < RESOLVE_TTL => Some(name.clone()),
+            Some(_) => {
+                map.remove(virtual_bucket);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn remember_resolution(&self, virtual_bucket: &str, backend_name: &str) {
+        let mut map = self.resolved.lock();
+        // Bound the map: a bucket-name scan must not grow it without limit.
+        if map.len() >= 10_000 {
+            map.clear();
+        }
+        map.insert(
+            virtual_bucket.to_string(),
+            (backend_name.to_string(), std::time::Instant::now()),
+        );
+    }
+
     fn invalidate_listing_freshness(&self) {
+        self.resolved.lock().clear();
         let mut h = self.health.lock();
         h.freshness_epoch = h.freshness_epoch.wrapping_add(1);
         for entry in h.last_known.values_mut() {
@@ -461,6 +439,10 @@ impl RoutingBackend {
             };
             return (route.backend_name.clone(), backend, real);
         }
+        if let Some(name) = self.cached_resolution(virtual_bucket) {
+            let backend = self.backends[&name].as_ref().as_ref();
+            return (name, backend, Cow::Borrowed(virtual_bucket));
+        }
         // A head_bucket ERROR (503/timeout) is NOT "bucket absent" — same
         // hazard as `resolve_existing`: collapsing the error to `false` with
         // `unwrap_or(false)` silently reroutes the multipart operation to the
@@ -472,11 +454,12 @@ impl RoutingBackend {
         let default = self.default_backend();
         match default.head_bucket(virtual_bucket).await {
             Ok(true) => {
+                self.remember_resolution(virtual_bucket, &self.default_backend);
                 return (
                     self.default_backend.clone(),
                     default,
                     Cow::Borrowed(virtual_bucket),
-                )
+                );
             }
             Err(e) => {
                 warn!(
@@ -499,7 +482,10 @@ impl RoutingBackend {
             }
             let backend = self.backends[name].as_ref().as_ref();
             match backend.head_bucket(virtual_bucket).await {
-                Ok(true) => return (name.clone(), backend, Cow::Borrowed(virtual_bucket)),
+                Ok(true) => {
+                    self.remember_resolution(virtual_bucket, name);
+                    return (name.clone(), backend, Cow::Borrowed(virtual_bucket));
+                }
                 Err(e) => {
                     warn!(
                         "resolve_existing_named: backend '{name}' head_bucket({virtual_bucket}) \
@@ -1218,6 +1204,8 @@ mod tests {
         fail_head: Arc<StdMutex<bool>>,
         /// Count of list_buckets calls — asserts the cooldown skips a backend.
         list_calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// Count of head_bucket calls — asserts resolution is cached.
+        head_calls: Arc<std::sync::atomic::AtomicUsize>,
         /// Optional gate awaited INSIDE list_buckets after the call is counted:
         /// lets a test hold a probe "in flight" while it mutates state, to
         /// reproduce the invalidate-during-probe race deterministically.
@@ -1234,6 +1222,7 @@ mod tests {
                 fail_list: Arc::new(StdMutex::new(false)),
                 fail_head: Arc::new(StdMutex::new(false)),
                 list_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                head_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 list_gate: Arc::new(StdMutex::new(None)),
             }
         }
@@ -1290,6 +1279,8 @@ mod tests {
         }
 
         async fn head_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
+            self.head_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if *self.fail_head.lock().unwrap() {
                 return Err(StorageError::S3("simulated head_bucket outage".into()));
             }
@@ -1512,6 +1503,7 @@ mod tests {
             list_cooldown: std::time::Duration::from_secs(30),
             list_timeout: std::time::Duration::from_secs(5),
             list_fresh: std::time::Duration::ZERO,
+            resolved: Default::default(),
         };
 
         assert_eq!(
@@ -1556,6 +1548,46 @@ mod tests {
             "create_bucket must not create a duplicate on the default backend"
         );
         assert_eq!(archive_probe.create_calls(), vec!["shared".to_string()]);
+    }
+
+    /// Tier 4: every op on an unrouted bucket sent a head_bucket to each
+    /// backend in turn (one extra HEAD per request or more). A found bucket
+    /// is now remembered; create/delete bucket and errors are not cached.
+    #[tokio::test]
+    async fn found_bucket_resolution_is_cached() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let primary_probe = TestBackend::with_buckets(&["on-default"]);
+        let archive_probe = TestBackend::with_buckets(&["shared"]);
+        let mut backends = HashMap::new();
+        backends.insert(
+            "primary".to_string(),
+            Arc::new(Box::new(primary_probe.clone()) as Box<dyn StorageBackend>),
+        );
+        backends.insert(
+            "archive".to_string(),
+            Arc::new(Box::new(archive_probe.clone()) as Box<dyn StorageBackend>),
+        );
+        let routing = RoutingBackend::new(backends, HashMap::new(), "primary".to_string())
+            .expect("routing backend");
+        for _ in 0..5 {
+            assert_eq!(routing.resolve_existing_named("shared").await.0, "archive");
+            assert_eq!(routing.resolve_existing("on-default").await.1, "on-default");
+        }
+        let heads =
+            || primary_probe.head_calls.load(SeqCst) + archive_probe.head_calls.load(SeqCst);
+        // shared: primary(no) + archive(yes); on-default: primary(yes).
+        assert_eq!(heads(), 3, "repeat resolutions must not re-probe");
+
+        // A bucket mutation drops the memory.
+        routing.delete_bucket("shared").await.unwrap();
+        let before = heads();
+        let (name, _, _) = routing.resolve_existing_named("shared").await;
+        assert_eq!(name, "primary", "deleted bucket falls back to default");
+        assert!(heads() > before, "delete_bucket must invalidate");
+        // A miss is not cached either.
+        let before = heads();
+        routing.resolve_existing_named("shared").await;
+        assert!(heads() > before);
     }
 
     /// Regression: a transient head_bucket error on the bucket's real home must
