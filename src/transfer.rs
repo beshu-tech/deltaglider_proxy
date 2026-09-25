@@ -1359,16 +1359,49 @@ async fn spooled_copy(
         crate::deltaglider::RetrieveResponse::Buffered { .. } => return Ok(None),
     };
 
+    // Same generation as the HEAD? (The size below is the HEAD's.)
+    let changed = || -> Box<dyn std::error::Error + Send + Sync> {
+        format!(
+            "{SOURCE_CHANGED_TOKEN}: {}/{} was overwritten after HEAD",
+            request.source_bucket, request.source_key
+        )
+        .into()
+    };
+    if !source_head.file_sha256.is_empty()
+        && !meta.file_sha256.is_empty()
+        && source_head.file_sha256 != meta.file_sha256
+    {
+        return Err(changed());
+    }
+
     let spool = engine.spool_acquire(source_size).await?;
     {
+        use sha2::Digest;
+        // Capped at the reservation, hashed on the way: a source that grew
+        // after the HEAD must not overrun the spool budget, and the store must
+        // get exactly the bytes the metadata names.
+        let mut hasher = sha2::Sha256::new();
+        let mut written: u64 = 0;
         let mut file = tokio::fs::File::create(spool.path()).await?;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("source stream error: {e}").into()
             })?;
+            written += chunk.len() as u64;
+            if written > source_size {
+                return Err(changed());
+            }
+            hasher.update(&chunk);
             file.write_all(&chunk).await?;
         }
         file.flush().await?;
+        if written != source_size {
+            return Err(changed());
+        }
+        let sha = hex::encode(hasher.finalize());
+        if !meta.file_sha256.is_empty() && sha != meta.file_sha256 {
+            return Err(changed());
+        }
     }
 
     let content_type = meta.content_type.clone();
@@ -1401,6 +1434,14 @@ async fn spooled_copy(
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("destination spooled store failed: {e}").into()
         })?;
+    // Same post-store check as the buffered path.
+    verify_destination(
+        engine,
+        *request,
+        source_size as usize,
+        source_head.multipart_etag.as_deref(),
+    )
+    .await?;
 
     let label = source_head.storage_info.label();
     Ok(Some(ObjectTransferOutcome {
@@ -1418,6 +1459,68 @@ mod tests {
     use crate::config::Config;
     use crate::deltaglider::DeltaGliderEngine;
     use crate::storage::StorageBackend;
+
+    async fn fs_engine_with(dir: &std::path::Path, buckets: &[&str]) -> Arc<DynEngine> {
+        let backend: Box<dyn StorageBackend> = Box::new(
+            crate::storage::FilesystemBackend::new(dir.to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine: Arc<DynEngine> = Arc::new(DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &Config::default(),
+            None,
+        ));
+        for b in buckets {
+            engine.create_bucket(b).await.unwrap();
+        }
+        engine
+    }
+
+    /// The spooled copy trusted the HEAD's size: a source overwritten with a
+    /// bigger object after the HEAD overran the spool reservation, and the
+    /// store claimed the old size for the new bytes. The copy must write
+    /// exactly one generation or fail as SOURCE_CHANGED (the retry re-HEADs).
+    #[tokio::test]
+    async fn spooled_copy_refuses_a_source_that_grew_after_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = fs_engine_with(dir.path(), &["src", "dst"]).await;
+        let old = vec![1u8; 64 * 1024];
+        let new = vec![2u8; 96 * 1024];
+        engine
+            .store("src", "big.bin", &old, None, Default::default())
+            .await
+            .unwrap();
+        let stale = engine.head("src", "big.bin").await.unwrap();
+        engine
+            .store("src", "big.bin", &new, None, Default::default())
+            .await
+            .unwrap();
+        let request = ObjectTransferRequest {
+            source_bucket: "src",
+            source_key: "big.bin",
+            destination_bucket: "dst",
+            destination_key: "big.bin",
+            provenance: None,
+            strip_user_metadata_keys: &[],
+            operation: "replication",
+            upload_concurrency: None,
+        };
+        match spooled_copy(&engine, &request, &stale, stale.file_size).await {
+            Err(e) => assert!(
+                is_transient_copy_error(&e.to_string()),
+                "a changed source must be retryable: {e}"
+            ),
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                let (got, _) = engine.retrieve("dst", "big.bin").await.unwrap();
+                assert!(
+                    got == old || got == new,
+                    "dest holds a mixed/truncated object"
+                );
+            }
+        }
+    }
 
     #[test]
     fn error_signal_removes_whole_names_only() {
