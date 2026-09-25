@@ -275,14 +275,13 @@ jobs:
 
   test-integration:
     name: Integration Tests
-    # Always run on PRs (review gate), workflow_dispatch (operator opt-in),
-    # and workflow_call (downstream caller). On direct push to main the
-    # MinIO suite is skipped UNLESS the commit message contains
-    # `[ci-integration]` — opt-in keyword so noisy main-branch chores
-    # don't burn ~10 minutes of MinIO time when they don't need it.
+    # Runs on every event. The repo commits straight to main, so a push is
+    # the only gate before production; skipping it there let the whole MinIO
+    # suite gate nothing. `[skip-integration]` in the commit message opts a
+    # docs-only chore out.
     if: >-
       github.event_name != 'push' ||
-      contains(github.event.head_commit.message, '[ci-integration]')
+      !contains(github.event.head_commit.message, '[skip-integration]')
     runs-on: ubuntu-latest
     needs: build-ui
     timeout-minutes: 60
