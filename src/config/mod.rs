@@ -392,8 +392,8 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_CLOCK_SKEW_SECONDS",
-        description: "SigV4 clock skew tolerance in seconds (default: 300)",
-        example: "300",
+        description: "SigV4 clock skew tolerance in seconds (default: 900)",
+        example: "900",
         category: "Security",
     },
     EnvVarEntry {

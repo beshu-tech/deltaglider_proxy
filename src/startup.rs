@@ -269,11 +269,10 @@ fn backend_type_label(config: &Config) -> &'static str {
 /// Create the replay-attack detection cache and spawn its periodic cleanup.
 pub fn init_replay_cache() -> deltaglider_proxy::api::auth::ReplayCache {
     let replay_cache: deltaglider_proxy::api::auth::ReplayCache = Arc::new(dashmap::DashMap::new());
-    // Cleanup cutoff must match the replay detection window (DGP_CLOCK_SKEW_SECONDS,
-    // default 300s). Using a shorter cutoff would evict entries while they're still
-    // within the valid clock-skew window, allowing replayed requests to succeed.
-    let replay_window_secs: u64 =
-        deltaglider_proxy::config::env_parse_with_default("DGP_CLOCK_SKEW_SECONDS", 300);
+    // Backstop sweep. The live window is DGP_REPLAY_WINDOW_SECS (pruned per
+    // request); this cutoff only has to be no shorter than it, and the skew
+    // tolerance is the longest window that can matter.
+    let replay_window_secs = u64::from(deltaglider_proxy::api::auth::clock_skew_secs());
     // #86: the retain is an O(live-signatures) walk — up to 500k shards under
     // load (MAX_REPLAY_ENTRIES) — so it runs on the blocking pool.
     spawn_periodic_blocking(Duration::from_secs(60), {
@@ -599,6 +598,12 @@ pub fn build_s3_router(
         iam_state: iam_state.clone(),
     });
     builder.set_access(VerifiedIdentityS3sAccess);
+    // Pass the documented skew tolerance to s3s; it used its own default.
+    let mut s3s_config = s3s::config::S3Config::default();
+    s3s_config.presigned_url_max_skew_time_secs = deltaglider_proxy::api::auth::clock_skew_secs();
+    builder.set_config(Arc::new(s3s::config::StaticConfigProvider::new(Arc::new(
+        s3s_config,
+    ))));
     let s3_service = HandleError::new(builder.build(), handle_s3s_http_error);
 
     // Form-POST upload interceptor (`POST /<bucket>` with

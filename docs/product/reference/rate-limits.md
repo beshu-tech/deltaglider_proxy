@@ -80,7 +80,7 @@ Caches SigV4 signatures and rejects duplicates within the replay window. This is
 | Setting | Default | Env var |
 |---------|---------|---------|
 | Replay window | 2 s | `DGP_REPLAY_WINDOW_SECS` |
-| Clock skew tolerance | 300 s | `DGP_CLOCK_SKEW_SECONDS` |
+| Clock skew tolerance | 900 s | `DGP_CLOCK_SKEW_SECONDS` |
 | Max cache entries | 500,000 | — |
 
 A duplicate of a **mutating** request (PUT/POST/DELETE) within the window is rejected with 400. A duplicate of an **idempotent read** (GET/HEAD) is tolerated and served — boto3 emits byte-identical signatures for the same request within one signing second, and replaying a read re-reads the same bytes. Replay rejections are not counted toward the auth-failure lockout. `DGP_REPLAY_WINDOW_SECS=0` disables replay rejection entirely. When the cache exceeds 500K entries, expired signatures are evicted first.
@@ -105,7 +105,7 @@ During LIST operations that require per-object metadata, the proxy issues HEAD r
 | `DGP_MAX_CONCURRENT_REQUESTS` | 1024 | Max in-flight HTTP requests |
 | `DGP_REQUEST_TIMEOUT_SECS` | 300 | Per-request timeout |
 | `DGP_MAX_MULTIPART_UPLOADS` | 1000 | Max concurrent multipart uploads |
-| `DGP_CLOCK_SKEW_SECONDS` | 300 | SigV4 request-timestamp drift tolerance |
+| `DGP_CLOCK_SKEW_SECONDS` | 900 | SigV4 request-timestamp drift tolerance |
 | `DGP_REPLAY_WINDOW_SECS` | 2 | SigV4 replay detection window (0 disables) |
 
 ## Related

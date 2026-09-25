@@ -32,6 +32,13 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tracing::{debug, info, warn};
 
+/// SigV4 clock-skew tolerance s3s enforces, in seconds (`DGP_CLOCK_SKEW_SECONDS`).
+/// The default is s3s's own 900 s, which was the effective value while the
+/// variable was documented (as 300 s) but never passed to s3s.
+pub fn clock_skew_secs() -> u32 {
+    crate::config::env_parse_with_default("DGP_CLOCK_SKEW_SECONDS", 900)
+}
+
 /// Shared replay cache type: signature string -> timestamp of first use.
 pub type ReplayCache = Arc<DashMap<String, Instant>>;
 
@@ -848,7 +855,13 @@ pub async fn sigv4_auth_middleware(
     let outcome = AuthOutcome::default();
     request.extensions_mut().insert(outcome.clone());
 
-    // Replay attack detection: reject duplicate signatures within the clock-skew window.
+    // Replay attack detection: reject a duplicate signature within
+    // DGP_REPLAY_WINDOW_SECS (default 2 s). This catches near-duplicates only;
+    // it is NOT the clock-skew window (DGP_CLOCK_SKEW_SECONDS, 900 s), so a
+    // captured mutation replayed after the replay window but inside the skew
+    // still passes. Operators who need the full window raise
+    // DGP_REPLAY_WINDOW_SECS to the skew (memory is capped at
+    // MAX_REPLAY_ENTRIES).
     //
     // Previously this used get() + insert() on two separate DashMap operations, which
     // is not atomic: two concurrent requests with the same signature could both pass
@@ -863,10 +876,9 @@ pub async fn sigv4_auth_middleware(
     // is harmless — it re-reads the same bytes — and is the one pattern boto3
     // produces unavoidably: SigV4 timestamps have 1-second granularity, so the
     // SDK emits byte-identical signatures for the same request issued twice (or
-    // auto-retried) within one signing second. We keep GET/HEAD in the cache
-    // (so a captured signature can't be replayed for the full clock-skew window
-    // as it once could) but let same-window duplicates *pass through* instead
-    // of 400-ing. See `replay_decision` and beshu-tech/deltaglider_proxy#24.
+    // auto-retried) within one signing second. So GET/HEAD duplicates *pass
+    // through* instead of 400-ing: the guard protects mutations only. See
+    // `replay_decision` and beshu-tech/deltaglider_proxy#24.
     let is_presigned = has_presigned_query_params(request.uri().query().unwrap_or(""));
     if let Some(ref cache) = replay_cache {
         if is_presigned {

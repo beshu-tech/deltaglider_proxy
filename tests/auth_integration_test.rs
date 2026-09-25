@@ -434,6 +434,31 @@ async fn test_clock_skew_past_rejected() {
     );
 }
 
+/// `DGP_CLOCK_SKEW_SECONDS` is the tolerance s3s enforces (S23). It was
+/// documented but never passed to s3s, which kept its own 900 s default.
+#[tokio::test]
+async fn test_clock_skew_setting_is_enforced() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_CLOCK_SKEW_SECONDS", "60")
+        .build()
+        .await;
+    let five_min_ago = (chrono::Utc::now() - chrono::Duration::minutes(5))
+        .format("%Y%m%dT%H%M%SZ")
+        .to_string();
+    let resp = build_signed_get(
+        &server.endpoint(),
+        &format!("/{}", server.bucket()),
+        "testkey",
+        "testsecret",
+        &five_min_ago,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "5 min > 60 s skew");
+}
+
 /// Request signed with a timestamp far in the future should be rejected.
 #[tokio::test]
 async fn test_clock_skew_future_rejected() {

@@ -15,7 +15,7 @@ This guide maps the symptoms you'll see in the wild to their fixes. If your symp
 If the audit log is **empty** and you still see 403, the denial is in SigV4 verification, not IAM:
 
 - Check `/_/metrics` for `deltaglider_auth_failures_total{reason="invalid_signature"}`.
-- Is the client's system clock within `DGP_CLOCK_SKEW_SECONDS` (default 300s) of the server? Look for `RequestTimeTooSkewed` in the client error.
+- Is the client's system clock within `DGP_CLOCK_SKEW_SECONDS` (default 900 s) of the server? Look for `RequestTimeTooSkewed` in the client error.
 - Is the access key typo'd? The proxy returns a generic AccessDenied rather than leaking key-existence.
 
 ## Intermittent 403s / one client locks out everyone

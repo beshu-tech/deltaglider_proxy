@@ -546,7 +546,7 @@ SigV4 clock skew tolerance.
 | | |
 |---|---|
 | **Env var** | `DGP_CLOCK_SKEW_SECONDS` |
-| **Default** | `300` (5 min) |
+| **Default** | `900` (15 min) |
 | **Hot-reload** | No |
 
 ### `replay_window_secs`
@@ -1072,7 +1072,7 @@ Tuning knobs for the large-object streaming multipart copy path (replication + l
 |----------|---------|-------------|
 | `DGP_TRUST_PROXY_HEADERS` | false | Trust `X-Forwarded-For` / `X-Real-IP` |
 | `DGP_SESSION_TTL_HOURS` | 4 | Admin session lifetime |
-| `DGP_CLOCK_SKEW_SECONDS` | 300 | SigV4 clock skew tolerance |
+| `DGP_CLOCK_SKEW_SECONDS` | 900 | SigV4 clock skew tolerance |
 | `DGP_REPLAY_WINDOW_SECS` | 2 | SigV4 replay detection window |
 | `DGP_SECURE_COOKIES` | true | Require HTTPS for session cookies |
 | `DGP_RATE_LIMIT_MAX_ATTEMPTS` | 100 | Max auth failures before lockout |
