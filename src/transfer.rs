@@ -66,6 +66,16 @@ pub(crate) const DEFAULT_COPY_MAX_ATTEMPTS: u32 = 3;
 pub(crate) const REPLICATION_RULE_METADATA_KEY: &str = "dg-replication-rule";
 pub(crate) const LIFECYCLE_RULE_METADATA_KEY: &str = "dg-lifecycle-rule";
 
+/// Drop the rule provenance markers from metadata a CLIENT copy carries
+/// over. A marker says "this rule wrote the object", and the rule's delete
+/// paths act on it; a copy made by a client (CopyObject, the CLI) was not
+/// written by the rule.
+pub(crate) fn strip_rule_provenance(meta: &mut std::collections::HashMap<String, String>) {
+    for key in [REPLICATION_RULE_METADATA_KEY, LIFECYCLE_RULE_METADATA_KEY] {
+        meta.remove(key);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TransferProvenance<'a> {
     pub metadata_key: &'a str,

@@ -1063,6 +1063,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         // source's dg-encryption markers. Storing them onto a decrypted body
         // makes the destination unreadable (read path thinks it's encrypted).
         crate::storage::encrypting::strip_encryption_markers(&mut user_metadata);
+        crate::transfer::strip_rule_provenance(&mut user_metadata);
         let result = engine
             .store(
                 &input.bucket,

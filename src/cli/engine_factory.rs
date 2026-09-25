@@ -106,8 +106,8 @@ pub async fn build_raw_s3_client(
 /// Pure: user metadata for the destination of an S3-to-S3 copy (`cp`,
 /// `sync`, `migrate`). Starts from the source object's user metadata,
 /// drops the source's at-rest encryption markers (the destination
-/// wrapper stamps its own), then applies the `--metadata` flags, which
-/// win, and the `--no-delta` hint.
+/// wrapper stamps its own) and its rule provenance markers, then applies
+/// the `--metadata` flags, which win, and the `--no-delta` hint.
 pub fn copy_user_metadata(
     source: &std::collections::HashMap<String, String>,
     overrides: &std::collections::HashMap<String, String>,
@@ -115,6 +115,7 @@ pub fn copy_user_metadata(
 ) -> std::collections::HashMap<String, String> {
     let mut out = source.clone();
     crate::storage::encrypting::strip_encryption_markers(&mut out);
+    crate::transfer::strip_rule_provenance(&mut out);
     out.extend(overrides.iter().map(|(k, v)| (k.clone(), v.clone())));
     if no_delta {
         out.insert("dg-no-delta".to_string(), "true".to_string());
@@ -316,6 +317,20 @@ mod tests {
         let got = copy_user_metadata(&source, &map(&[]), true);
         assert_eq!(got.get("dg-no-delta").map(String::as_str), Some("true"));
         assert_eq!(got.get("owner").map(String::as_str), Some("ci-uploader"));
+    }
+
+    /// A rule's provenance marker says "replication (or lifecycle) wrote
+    /// this object", and the rule's delete paths act on it. A CLI copy of a
+    /// replica is not written by the rule: the marker must not follow it.
+    #[test]
+    fn copy_drops_rule_provenance_markers() {
+        let source = map(&[
+            ("owner", "ci-uploader"),
+            ("dg-replication-rule", "mirror"),
+            ("dg-lifecycle-rule", "archive"),
+        ]);
+        let got = copy_user_metadata(&source, &map(&[]), false);
+        assert_eq!(got, map(&[("owner", "ci-uploader")]));
     }
 
     /// Guard for the class: every S3-to-S3 copy builds its metadata here.
