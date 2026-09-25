@@ -430,3 +430,52 @@ async fn test_migrate_honours_bucket_alias() {
     let leftover = walkdir_files(&dir_a.path().join("real-store"));
     assert!(leftover.is_empty(), "source objects left: {leftover:?}");
 }
+
+/// D10: a key that already exists on the target is not proof of a copy. A
+/// cancelled earlier attempt leaves old copies behind, and the source keeps
+/// taking writes until the retry. The retry must re-copy a target object
+/// that differs from the source, or the flip serves the stale copy and
+/// delete_source removes the only fresh one.
+#[tokio::test]
+async fn test_migrate_recopies_a_stale_target_object() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migstale";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let http = reqwest::Client::new();
+    let endpoint = server.endpoint();
+    let fresh = [MARKER, b" fresh".as_slice()].concat();
+    put_object(
+        &http,
+        &endpoint,
+        bucket,
+        "k.json",
+        fresh.clone(),
+        "application/json",
+    )
+    .await;
+    // Plant the leftover straight on the target backend's disk.
+    let planted = dir_b.path().join(bucket).join("deltaspaces");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(
+        planted.join("k.json"),
+        b"stale copy from a cancelled attempt",
+    )
+    .unwrap();
+
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", true).await;
+    assert_eq!(resp.status(), 202);
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "succeeded", "job: {job}");
+    assert_eq!(
+        get_bytes(&http, &endpoint, bucket, "k.json").await,
+        fresh,
+        "the flip serves the stale target copy"
+    );
+}
