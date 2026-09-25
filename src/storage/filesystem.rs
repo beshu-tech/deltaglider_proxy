@@ -31,6 +31,29 @@ async fn is_dir(path: &Path) -> bool {
 
 use super::io_to_storage_error;
 
+/// Prefix of this backend's own temp files (atomic write-then-rename).
+const INTERNAL_TEMP_PREFIX: &str = ".dg-tmp.";
+
+/// Is `name` one of this backend's temp files, and so never a user object?
+/// `.dg-tmp.*` (current) or tempfile's default `.tmpXXXXXX` (older
+/// releases). Every other `.`-name (`.env`, `.gitignore`) is a user object:
+/// LIST shows it and DeleteBucket must not erase it.
+fn is_internal_temp_name(name: &str) -> bool {
+    if name.starts_with(INTERNAL_TEMP_PREFIX) {
+        return true;
+    }
+    name.strip_prefix(".tmp")
+        .is_some_and(|r| r.len() == 6 && r.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// Temp file for an atomic write in `dir`, named so listings and bucket
+/// deletion recognise it (`is_internal_temp_name`).
+fn internal_temp_in(dir: &Path) -> std::io::Result<NamedTempFile> {
+    tempfile::Builder::new()
+        .prefix(INTERNAL_TEMP_PREFIX)
+        .tempfile_in(dir)
+}
+
 /// Atomically write data + metadata to a file using write-to-temp + xattr + fsync + rename.
 ///
 /// The xattr is written to the temp file BEFORE the rename, so a crash can never
@@ -49,7 +72,7 @@ async fn atomic_write_with_metadata(
     let meta_json = metadata.map(serde_json::to_vec).transpose()?;
 
     tokio::task::spawn_blocking(move || {
-        let mut tmp = NamedTempFile::new_in(&parent).map_err(io_to_storage_error)?;
+        let mut tmp = internal_temp_in(&parent).map_err(io_to_storage_error)?;
         tmp.write_all(&data).map_err(io_to_storage_error)?;
         // Write xattr to temp file BEFORE rename — atomic metadata+data visibility.
         if let Some(json) = &meta_json {
@@ -95,7 +118,7 @@ async fn atomic_copy_with_metadata(
 
     tokio::task::spawn_blocking(move || {
         let mut src = std::fs::File::open(&source).map_err(io_to_storage_error)?;
-        let mut tmp = NamedTempFile::new_in(&parent).map_err(io_to_storage_error)?;
+        let mut tmp = internal_temp_in(&parent).map_err(io_to_storage_error)?;
         std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
         xattr::set(tmp.path(), xattr_meta::XATTR_NAME, &meta_json).map_err(io_to_storage_error)?;
         tmp.as_file().sync_all().map_err(io_to_storage_error)?;
@@ -121,6 +144,12 @@ fn check_path_segments(prefix: &str, filename: &str) -> Result<(), StorageError>
             "Key must not contain '.', '..' or empty path segments on the filesystem backend"
                 .to_string(),
         ));
+    }
+    // A user file with a temp-file name would be hidden and pruned as one.
+    if is_internal_temp_name(filename) {
+        return Err(StorageError::InvalidKey(format!(
+            "Key file name '{filename}' is reserved for temp files on the filesystem backend"
+        )));
     }
     Ok(())
 }
@@ -394,7 +423,7 @@ impl FilesystemBackend {
                         return Ok(true);
                     }
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if !name.starts_with('.') && name != "reference.bin" {
+                    if !is_internal_temp_name(name) && name != "reference.bin" {
                         return Ok(true);
                     }
                 }
@@ -446,7 +475,7 @@ impl FilesystemBackend {
                         has_visible_data = true;
                     }
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with('.') || name == "reference.bin" {
+                    if is_internal_temp_name(name) || name == "reference.bin" {
                         match fs::remove_file(&path).await {
                             Ok(()) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -520,8 +549,7 @@ impl FilesystemBackend {
                 } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     // Any data file (reference, delta, or passthrough with original name)
                     // indicates this directory is an active deltaspace.
-                    if name == "reference.bin" || name.ends_with(".delta") || !name.starts_with('.')
-                    {
+                    if !is_internal_temp_name(name) {
                         has_deltaglider_files = true;
                     }
                 }
@@ -574,8 +602,8 @@ impl FilesystemBackend {
                     }
                     continue;
                 }
-                // Skip hidden files
-                if name.starts_with('.') {
+                // Skip this backend's temp files (not user objects)
+                if is_internal_temp_name(&name) {
                     continue;
                 }
 
@@ -1131,7 +1159,7 @@ impl StorageBackend for FilesystemBackend {
         let meta_json = serde_json::to_vec(metadata)?;
 
         tokio::task::spawn_blocking(move || {
-            let mut tmp = NamedTempFile::new_in(&parent).map_err(io_to_storage_error)?;
+            let mut tmp = internal_temp_in(&parent).map_err(io_to_storage_error)?;
             for path in &parts {
                 let mut src = std::fs::File::open(path).map_err(io_to_storage_error)?;
                 std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
@@ -1211,7 +1239,7 @@ impl StorageBackend for FilesystemBackend {
         let meta_json = serde_json::to_vec(metadata)?;
 
         tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
-            let mut tmp = NamedTempFile::new_in(&parent).map_err(io_to_storage_error)?;
+            let mut tmp = internal_temp_in(&parent).map_err(io_to_storage_error)?;
             for chunk in &chunks {
                 tmp.write_all(chunk).map_err(io_to_storage_error)?;
             }
@@ -1316,8 +1344,7 @@ impl StorageBackend for FilesystemBackend {
 
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 // Match data files: reference.bin, *.delta, or passthrough files (any other file)
-                let is_data_file =
-                    name == "reference.bin" || name.ends_with(".delta") || !name.starts_with('.'); // passthrough files have original names
+                let is_data_file = !is_internal_temp_name(name);
 
                 if is_data_file {
                     match xattr_meta::read_metadata(&path).await {
@@ -1520,9 +1547,8 @@ impl StorageBackend for FilesystemBackend {
 
                 common_prefixes.insert(cp);
             } else {
-                // Dot-FILES stay hidden: they are this backend's temp/internal
-                // namespace (atomic-write temps). reference.bin is DG-internal.
-                if name.starts_with('.') || name == "reference.bin" {
+                // Temp files and reference.bin are internal, not objects.
+                if is_internal_temp_name(&name) || name == "reference.bin" {
                     continue;
                 }
 
@@ -2150,7 +2176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delegated_list_shows_dot_dirs_hides_dg_and_dot_files() {
+    async fn test_delegated_list_shows_dot_dirs_hides_dg_and_temp_files() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let backend = FilesystemBackend::new(tmp.path().to_path_buf())
             .await
@@ -2171,13 +2197,13 @@ mod tests {
             .put_passthrough("bucket", "", "top.txt", b"x", &dummy_metadata("top.txt"))
             .await
             .expect("put root object");
-        // Internal residue at the bucket root: a `.dg` dir and a dot-file.
+        // Internal residue at the bucket root: a `.dg` dir and a temp file.
         let ds = tmp.path().join("bucket").join("deltaspaces");
         fs::create_dir_all(ds.join(".dg")).await.expect("mk .dg");
         fs::write(ds.join(".dg").join("reference.bin"), b"ref")
             .await
             .expect("write ref");
-        fs::write(ds.join(".tmp-upload"), b"partial")
+        fs::write(ds.join(".dg-tmp.upload"), b"partial")
             .await
             .expect("write temp");
 
@@ -2193,7 +2219,7 @@ mod tests {
             "dot-dir with data must list; .dg must stay hidden"
         );
         let keys: Vec<&str> = listed.objects.iter().map(|(k, _)| k.as_str()).collect();
-        assert_eq!(keys, vec!["top.txt"], "dot-files must stay hidden");
+        assert_eq!(keys, vec!["top.txt"], "temp files must stay hidden");
 
         // And the dot-dir's own level lists its content.
         let inner = backend
@@ -2229,7 +2255,7 @@ mod tests {
             .join("bucket")
             .join("deltaspaces")
             .join("ghost")
-            .join(".stale-write");
+            .join(".tmpSt4le0");
         fs::write(hidden, b"tmp").await.expect("write hidden");
         fs::create_dir_all(
             tmp.path()
@@ -2490,5 +2516,79 @@ mod tests {
             xattr::get(&src, xattr_meta::XATTR_NAME).unwrap().is_none(),
             "reference metadata must not land on the source file"
         );
+    }
+
+    /// D4: a client key whose file name starts with `.` is a user object.
+    /// LIST hid it and DeleteBucket deleted it as temp residue. Only this
+    /// backend's own temp files are internal.
+    #[tokio::test]
+    async fn dot_prefixed_user_objects_are_listed_and_block_delete_bucket() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        let meta = |name: &str| {
+            FileMetadata::new_passthrough(name.into(), "0".repeat(64), "0".repeat(32), 1, None)
+        };
+        backend
+            .put_passthrough("bucket", "", ".env", b"x", &meta(".env"))
+            .await
+            .expect("put .env");
+        backend
+            .put_passthrough("bucket", "cfg", ".gitignore", b"x", &meta(".gitignore"))
+            .await
+            .expect("put cfg/.gitignore");
+        // Temp residue of an interrupted atomic write (old and new names).
+        let ds = tmp.path().join("bucket").join("deltaspaces");
+        fs::write(ds.join("cfg").join(".tmpAb12Cd"), b"t")
+            .await
+            .unwrap();
+        fs::write(ds.join("cfg").join(".dg-tmp.Zz99xx"), b"t")
+            .await
+            .unwrap();
+
+        let mut flat: Vec<String> = backend
+            .bulk_list_objects("bucket", "")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        flat.sort();
+        assert_eq!(flat, vec![".env".to_string(), "cfg/.gitignore".to_string()]);
+
+        let delegated = backend
+            .list_objects_delegated("bucket", "cfg/", Some("/"), 1000, None)
+            .await
+            .unwrap()
+            .expect("filesystem delegates");
+        let keys: Vec<&str> = delegated.objects.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["cfg/.gitignore"]);
+
+        let err = backend
+            .delete_bucket("bucket")
+            .await
+            .expect_err("dot-file objects are data");
+        assert!(matches!(err, StorageError::BucketNotEmpty(_)));
+        assert!(ds.join(".env").exists());
+        assert!(ds.join("cfg").join(".gitignore").exists());
+    }
+
+    #[test]
+    fn internal_temp_names() {
+        for n in [".tmpAb12Cd", ".tmp000000", ".dg-tmp.x", ".dg-tmp.Zz99xx"] {
+            assert!(is_internal_temp_name(n), "{n}");
+        }
+        for n in [
+            ".env",
+            ".gitignore",
+            ".tmp",
+            ".tmpfile.txt",
+            ".tmp-lock",
+            "a.tmpAb12Cd",
+        ] {
+            assert!(!is_internal_temp_name(n), "{n}");
+        }
     }
 }

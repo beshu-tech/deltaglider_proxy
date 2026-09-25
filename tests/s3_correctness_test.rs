@@ -84,8 +84,10 @@ async fn test_delete_bucket_succeeds_with_internal_residue_only() {
     std::fs::create_dir_all(bucket_dir.join("deltaspaces/ghost")).expect("create ghost deltaspace");
     std::fs::write(bucket_dir.join("deltaspaces/ghost/reference.bin"), b"ref")
         .expect("write reference residue");
-    std::fs::write(bucket_dir.join("deltaspaces/ghost/.stale"), b"tmp")
-        .expect("write hidden residue");
+    // A temp file of an interrupted atomic write (a plain dot-file such as
+    // `.env` is a user object and blocks the delete).
+    std::fs::write(bucket_dir.join("deltaspaces/ghost/.dg-tmp.Stale0"), b"tmp")
+        .expect("write temp residue");
 
     client
         .delete_bucket()
