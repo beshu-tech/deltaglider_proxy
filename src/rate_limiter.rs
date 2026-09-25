@@ -34,6 +34,10 @@ pub struct RateLimiter {
     /// dimension applicable" — the per-account check short-circuits
     /// to allow.
     account_entries: Arc<DashMap<String, RateLimitEntry>>,
+    /// (subject, IP) pairs that logged in successfully, with the time. A
+    /// locked account still admits these IPs, so a botnet that burns the
+    /// account budget cannot lock the real operator out (S22).
+    account_known_good: Arc<DashMap<(String, IpAddr), Instant>>,
     /// Maximum failed attempts before lockout (per-IP).
     max_attempts: u32,
     /// Rolling window for counting attempts (per-IP).
@@ -71,6 +75,7 @@ impl RateLimiter {
         Self {
             entries: Arc::new(DashMap::new()),
             account_entries: Arc::new(DashMap::new()),
+            account_known_good: Arc::new(DashMap::new()),
             max_attempts,
             window,
             lockout,
@@ -287,6 +292,41 @@ impl RateLimiter {
         self.account_entries.remove(subject);
     }
 
+    /// Remember that `ip` logged in to `subject`. Bounded: past the cap the
+    /// oldest pair is dropped.
+    pub fn record_known_good(&self, subject: &str, ip: IpAddr) {
+        // No resolved IP (the guard's 0.0.0.0 fallback) is not an identity.
+        if subject.is_empty() || ip.is_unspecified() {
+            return;
+        }
+        self.account_known_good
+            .insert((subject.to_string(), ip), Instant::now());
+        if self.account_known_good.len() > MAX_KNOWN_GOOD {
+            let oldest = self
+                .account_known_good
+                .iter()
+                .min_by_key(|e| *e.value())
+                .map(|e| e.key().clone());
+            if let Some(key) = oldest {
+                self.account_known_good.remove(&key);
+            }
+        }
+    }
+
+    /// Whether a lock on `subject` applies to `ip`. It does not for loopback
+    /// (break-glass through an SSH tunnel or port-forward) or for an IP that
+    /// logged in to this subject within `KNOWN_GOOD_TTL`. The per-IP bucket
+    /// still applies to both.
+    pub fn account_lock_applies(&self, subject: &str, ip: &IpAddr) -> bool {
+        if ip.is_loopback() {
+            return false;
+        }
+        !self
+            .account_known_good
+            .get(&(subject.to_string(), *ip))
+            .is_some_and(|seen| seen.elapsed() < KNOWN_GOOD_TTL)
+    }
+
     /// Remove expired entries to prevent unbounded memory growth.
     /// Call this periodically (e.g., every 5 minutes).
     pub fn cleanup_expired(&self) {
@@ -298,8 +338,16 @@ impl RateLimiter {
         self.account_entries.retain(|_subj, entry| {
             should_keep_entry(entry, now, self.account_lockout, self.account_window)
         });
+        self.account_known_good
+            .retain(|_, seen| now.duration_since(*seen) < KNOWN_GOOD_TTL);
     }
 }
+
+/// How long a successful login keeps an IP exempt from its account's lock.
+const KNOWN_GOOD_TTL: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// Bound on remembered (subject, IP) login pairs.
+const MAX_KNOWN_GOOD: usize = 4096;
 
 /// Whether a rate-limit entry should be retained during cleanup.
 ///
@@ -594,7 +642,10 @@ impl<'a> RateLimitGuard<'a> {
             );
             return Err(Blocked { ip, failure_count });
         }
-        if !subject.is_empty() && rl.is_limited_account(subject) {
+        if !subject.is_empty()
+            && rl.is_limited_account(subject)
+            && rl.account_lock_applies(subject, &ip)
+        {
             tracing::warn!(
                 "SECURITY | event={}_brute_force_blocked | scope=account | subject={} | ip={}",
                 event_prefix,
@@ -629,7 +680,12 @@ impl<'a> RateLimitGuard<'a> {
     /// start from zero on either dimension.
     pub fn record_success(&self) {
         self.rl.record_success(&self.ip);
-        self.rl.record_success_account(&self.subject);
+        // A known-good IP may log in while the account is locked; that must
+        // not hand the botnet a fresh account budget.
+        if !self.rl.is_limited_account(&self.subject) {
+            self.rl.record_success_account(&self.subject);
+        }
+        self.rl.record_known_good(&self.subject, self.ip);
     }
 
     /// Record a failed operation. Increments BOTH bucket counters
@@ -708,6 +764,52 @@ mod tests {
     }
     fn cidr(s: &str) -> ipnet::IpNet {
         s.parse().unwrap()
+    }
+
+    /// The per-account bucket stops a botnet, but a global lock let ANYONE
+    /// lock the operator out of break-glass login (S22). An IP that already
+    /// logged in to that account, and loopback, stay admitted; unknown IPs
+    /// stay locked.
+    #[tokio::test]
+    async fn account_lockout_spares_known_good_and_loopback_ips() {
+        let rl = RateLimiter::new(100, Duration::from_secs(60), Duration::from_secs(60))
+            .with_account_policy(3, Duration::from_secs(60), Duration::from_secs(60));
+        let from = |ip: &str| hdrs(&[("x-forwarded-for", ip)]);
+        let enter = |ip: &'static str| {
+            let rl = &rl;
+            async move {
+                RateLimitGuard::enter_with_account(
+                    rl,
+                    &from(ip),
+                    Some(ip.parse().unwrap()),
+                    "bootstrap",
+                    "t",
+                )
+                .await
+            }
+        };
+        // The operator logs in once from their usual IP.
+        enter("203.0.113.10").await.unwrap().record_success();
+        // A botnet burns the account budget from fresh IPs.
+        for i in 1..=3 {
+            let ip: &'static str = Box::leak(format!("198.51.100.{i}").into_boxed_str());
+            enter(ip).await.unwrap().record_failure();
+        }
+        assert!(
+            enter("198.51.100.200").await.is_err(),
+            "unknown IP stays locked"
+        );
+        assert!(
+            enter("203.0.113.10").await.is_ok(),
+            "known-good IP is spared"
+        );
+        assert!(
+            enter("127.0.0.1").await.is_ok(),
+            "loopback break-glass is spared"
+        );
+        // The operator's login while locked keeps the lock for everyone else.
+        enter("203.0.113.10").await.unwrap().record_success();
+        assert!(enter("198.51.100.201").await.is_err(), "lock not reset");
     }
 
     /// A trusted proxy that APPENDS its own `X-Forwarded-For` line (HAProxy
