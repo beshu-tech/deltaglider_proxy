@@ -1380,7 +1380,7 @@ mod review2_tests {
         let r = parse_and_validate_yaml(doc, &Default::default());
         std::env::remove_var(crate::config::CONFIG_ENV_ALLOWLIST_VAR);
         std::env::remove_var("REVIEW2_S7_DR_LEVEL");
-        let err = refused.err().expect("S7: not allowlisted, not resolved");
+        let err = refused.expect_err("S7: not allowlisted, not resolved");
         assert!(err.contains("DGP_CONFIG_ENV_ALLOWLIST"), "{err}");
         assert!(r.is_ok(), "{:?}", r.err());
     }
