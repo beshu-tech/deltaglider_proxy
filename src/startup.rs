@@ -1235,6 +1235,22 @@ fn init_config_db_attempt(
             }
             (Some(Arc::new(tokio::sync::Mutex::new(db))), false)
         }
+        // Only a wrong key is a password mismatch. A busy file, an I/O error, a
+        // failed migration or a DB from a newer binary must NOT park the good
+        // DB as `.db.bak` and boot on an empty one: stop, and leave the file.
+        Err(e)
+            if !matches!(
+                e,
+                deltaglider_proxy::config_db::ConfigDbError::WrongPassphrase(_)
+            ) =>
+        {
+            error!(
+                "Config DB {} failed to open: {e}. The file is left untouched; \
+                 fix the cause and restart.",
+                db_file.display()
+            );
+            std::process::exit(1);
+        }
         Err(e) => {
             let bak_path = db_file.with_extension("db.bak");
             // Recovery boot: the live DB won't open but .db.bak opens with the

@@ -130,26 +130,24 @@ impl ConfigDb {
 
         // Set the encryption key (PRAGMA key must be the first statement)
         conn.pragma_update(None, "key", passphrase)?;
+        // Wait up to 5s for locks instead of failing immediately (also for the
+        // key check below: a busy DB must not read as a wrong key).
+        // Prevents "database is locked" errors during concurrent S3 sync + admin ops.
+        conn.pragma_update(None, "busy_timeout", "5000")?;
 
         // Test that the key is correct by reading the schema
-        match conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
             r.get::<_, i32>(0)
-        }) {
-            Ok(_) => {}
-            Err(e) => {
-                return Err(ConfigDbError::WrongPassphrase(format!(
-                    "Cannot decrypt config database (wrong bootstrap password?): {}",
-                    e
-                )));
-            }
-        }
+        })
+        .map_err(|e| {
+            key_check_error(
+                e,
+                "Cannot decrypt config database (wrong bootstrap password?)",
+            )
+        })?;
 
         // Enable foreign keys (per-connection setting, not persisted)
         conn.pragma_update(None, "foreign_keys", "ON")?;
-
-        // Wait up to 5s for locks instead of failing immediately.
-        // Prevents "database is locked" errors during concurrent S3 sync + admin ops.
-        conn.pragma_update(None, "busy_timeout", "5000")?;
 
         // Run migrations
         Self::migrate(&conn)?;
@@ -176,11 +174,34 @@ impl ConfigDb {
         })
     }
 
+    /// Bring the schema to `SCHEMA_VERSION` in ONE transaction: a crash or a
+    /// failed step leaves the DB exactly at its old version, so the next boot
+    /// retries from a clean state. A DB from a newer binary is refused, never
+    /// stamped down.
     fn migrate(conn: &Connection) -> Result<(), ConfigDbError> {
-        let version: i32 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .unwrap_or(0);
+        let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        match migration_plan(version) {
+            MigrationPlan::UpToDate => return Ok(()),
+            MigrationPlan::TooNew => {
+                return Err(ConfigDbError::SchemaTooNew {
+                    found: version,
+                    supported: SCHEMA_VERSION,
+                })
+            }
+            MigrationPlan::Migrate => {}
+        }
+        let tx = conn.unchecked_transaction()?;
+        Self::migrate_steps(&tx, version)?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
+        debug!("Config DB schema at version {}", SCHEMA_VERSION);
+        Ok(())
+    }
 
+    /// The per-version steps. Runs inside `migrate`'s transaction; a step must
+    /// not open its own. ADD COLUMN steps go through `add_column_if_missing`
+    /// so a DB half-migrated by an older (non-transactional) binary still opens.
+    fn migrate_steps(conn: &Connection, version: i32) -> Result<(), ConfigDbError> {
         if version < 1 {
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS users (
@@ -734,10 +755,11 @@ impl ConfigDb {
             // and fail-closed: an identity stored before this column existed
             // has unknown verification status, so it must NOT grant email-based
             // groups until its next login re-asserts a verified claim.
-            conn.execute(
-                "ALTER TABLE external_identities ADD COLUMN \
-                 email_verified INTEGER NOT NULL DEFAULT 0",
-                [],
+            add_column_if_missing(
+                conn,
+                "external_identities",
+                "email_verified",
+                "INTEGER NOT NULL DEFAULT 0",
             )?;
             info!(
                 "Migrated config DB schema from v{} to v20 (external_identities.email_verified)",
@@ -767,10 +789,11 @@ impl ConfigDb {
             // v22: parity progress denominator. `progress_total` is the object
             // count to compare once listing finishes (0 = unknown → the UI shows
             // an indeterminate bar). Additive, node-local (not in IAM_SYNC_TABLES).
-            conn.execute(
-                "ALTER TABLE replication_parity ADD COLUMN \
-                 progress_total INTEGER NOT NULL DEFAULT 0",
-                [],
+            add_column_if_missing(
+                conn,
+                "replication_parity",
+                "progress_total",
+                "INTEGER NOT NULL DEFAULT 0",
             )?;
             info!(
                 "Migrated config DB schema from v{} to v22 (replication_parity.progress_total)",
@@ -783,11 +806,7 @@ impl ConfigDb {
             // fell back to the lite list's created_at, which on S3 is
             // last_modified — wrong for parity remediation's newer-wins conflict
             // resolution on Transforming rules (H49). Additive, node-local.
-            conn.execute(
-                "ALTER TABLE replication_parity_objects ADD COLUMN \
-                 created_at INTEGER",
-                [],
-            )?;
+            add_column_if_missing(conn, "replication_parity_objects", "created_at", "INTEGER")?;
             info!(
                 "Migrated config DB schema from v{} to v23 (replication_parity_objects.created_at)",
                 version
@@ -816,25 +835,20 @@ impl ConfigDb {
             // two users with one name shared one prefix — and an OAuth user
             // could pick another user's name at the identity provider. Rename
             // the newer user of each same-name pair, then enforce uniqueness.
-            // One transaction: a crash leaves either nothing or both done.
-            let tx = conn.unchecked_transaction()?;
-            for (id, old, new) in users::dedupe_user_names(&tx)? {
+            for (id, old, new) in users::dedupe_user_names(conn)? {
                 warn!(
                     "Config DB v25: user id={id} renamed from '{old}' to '{new}' — another \
                      user already had that name, and user names are now unique. Its \
                      ${{iam:username}} prefix changes with the name."
                 );
             }
-            tx.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name ON users(name);")?;
-            tx.commit()?;
+            conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name ON users(name);")?;
             info!(
                 "Migrated config DB schema from v{} to v25 (unique user names)",
                 version
             );
         }
 
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        debug!("Config DB schema at version {}", SCHEMA_VERSION);
         Ok(())
     }
 
@@ -961,9 +975,7 @@ impl ConfigDb {
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
             r.get::<_, i32>(0)
         })
-        .map_err(|e| {
-            ConfigDbError::WrongPassphrase(format!("Cannot decrypt after re-download: {}", e))
-        })?;
+        .map_err(|e| key_check_error(e, "Cannot decrypt after re-download"))?;
         // Per-connection settings (not persisted in DB)
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "busy_timeout", "5000")?;
@@ -1132,11 +1144,48 @@ impl ConfigDb {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum MigrationPlan {
+    UpToDate,
+    Migrate,
+    TooNew,
+}
+
+/// Pure: what `migrate` does for a DB at `version`.
+fn migration_plan(version: i32) -> MigrationPlan {
+    match version.cmp(&SCHEMA_VERSION) {
+        std::cmp::Ordering::Equal => MigrationPlan::UpToDate,
+        std::cmp::Ordering::Less => MigrationPlan::Migrate,
+        std::cmp::Ordering::Greater => MigrationPlan::TooNew,
+    }
+}
+
+/// Map a failed key-check read. Only "file is not a database" means the key is
+/// wrong (SQLCipher cannot decrypt page 1). Anything else (busy, I/O) is a
+/// plain SQLite error: the caller must NOT park the DB as a mismatch backup.
+fn key_check_error(e: rusqlite::Error, context: &str) -> ConfigDbError {
+    if is_not_a_database(&e) {
+        ConfigDbError::WrongPassphrase(format!("{context}: {e}"))
+    } else {
+        ConfigDbError::Sqlite(e)
+    }
+}
+
+fn is_not_a_database(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(err, _)
+        if err.code == rusqlite::ffi::ErrorCode::NotADatabase)
+}
+
 /// Errors from the config database.
 #[derive(Debug)]
 pub enum ConfigDbError {
     Sqlite(rusqlite::Error),
     WrongPassphrase(String),
+    /// The DB was written by a newer binary (schema `found` > `supported`).
+    SchemaTooNew {
+        found: i32,
+        supported: i32,
+    },
     NotFound(String),
     Io(std::io::Error),
     /// Structural / invariant violations detected by reconcile helpers.
@@ -1150,6 +1199,11 @@ impl std::fmt::Display for ConfigDbError {
         match self {
             Self::Sqlite(e) => write!(f, "SQLite error: {}", e),
             Self::WrongPassphrase(msg) => write!(f, "{}", msg),
+            Self::SchemaTooNew { found, supported } => write!(
+                f,
+                "config DB schema v{found} is newer than this binary supports (v{supported}); \
+                 upgrade the binary or restore a backup"
+            ),
             Self::NotFound(what) => write!(f, "Not found: {}", what),
             Self::Io(e) => write!(f, "I/O error: {}", e),
             Self::Other(msg) => write!(f, "{}", msg),
@@ -1500,6 +1554,129 @@ mod tests {
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| "Ok".into())
         );
+    }
+
+    #[test]
+    fn migration_plan_truth_table() {
+        assert_eq!(migration_plan(0), MigrationPlan::Migrate);
+        assert_eq!(migration_plan(SCHEMA_VERSION - 1), MigrationPlan::Migrate);
+        assert_eq!(migration_plan(SCHEMA_VERSION), MigrationPlan::UpToDate);
+        assert_eq!(migration_plan(SCHEMA_VERSION + 1), MigrationPlan::TooNew);
+    }
+
+    /// D14: a DB written by a NEWER binary must not open (and must not be
+    /// stamped down to our version — the newer binary would then skip its
+    /// own migrations on the next upgrade).
+    #[test]
+    fn open_refuses_newer_schema_and_keeps_its_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("newer.db");
+        {
+            let db = ConfigDb::open_or_create(&path, "pw").unwrap();
+            db.conn
+                .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        let err = ConfigDb::open_or_create(&path, "pw")
+            .err()
+            .expect("must refuse");
+        assert!(
+            matches!(err, ConfigDbError::SchemaTooNew { .. }),
+            "expected SchemaTooNew, got: {err}"
+        );
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "key", "pw").unwrap();
+        let v: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION + 1, "version must not be stamped down");
+    }
+
+    /// Build a fully migrated DB, then stamp `version` on it (simulates an
+    /// older DB, or a crash after some DDL ran but before the stamp).
+    fn db_stamped_at(path: &Path, version: i32) -> Connection {
+        drop(ConfigDb::open_or_create(path, "pw").unwrap());
+        let conn = Connection::open(path).unwrap();
+        conn.pragma_update(None, "key", "pw").unwrap();
+        conn.pragma_update(None, "user_version", version).unwrap();
+        conn
+    }
+
+    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        cols.iter().any(|c| c == column)
+    }
+
+    /// D14: a failed migration must roll back EVERY step it ran, so the next
+    /// boot retries from a clean state instead of re-running a half-applied
+    /// ALTER (duplicate column → the DB never opens again).
+    #[test]
+    fn failed_migration_rolls_back_all_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.db");
+        {
+            let conn = db_stamped_at(&path, 21);
+            // v22 re-adds this column; v24 fails because its table is gone.
+            conn.execute_batch(
+                "ALTER TABLE replication_parity DROP COLUMN progress_total;
+                 DROP TABLE replication_run_history;",
+            )
+            .unwrap();
+        }
+        assert!(ConfigDb::open_or_create(&path, "pw").is_err());
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "key", "pw").unwrap();
+        assert!(
+            !has_column(&conn, "replication_parity", "progress_total"),
+            "the v22 ALTER must roll back with the failed v24 step"
+        );
+        let v: i32 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 21);
+    }
+
+    /// D14: a DB that an OLDER binary left half-migrated (column added, version
+    /// not stamped) must still open — ADD COLUMN steps are idempotent.
+    #[test]
+    fn migration_tolerates_columns_already_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("half.db");
+        drop(db_stamped_at(&path, 19));
+        let db = ConfigDb::open_or_create(&path, "pw").expect("re-run of v20..v25 must succeed");
+        let v: i32 = db
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// D14: only "not a database" (wrong key / not SQLCipher) is a passphrase
+    /// mismatch. A busy DB is NOT — treating it as one moves the good DB to
+    /// `.db.bak` and locks the S3 API.
+    #[test]
+    fn busy_db_is_not_a_wrong_passphrase() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy.db");
+        drop(ConfigDb::open_or_create(&path, "pw").unwrap());
+        let holder = Connection::open(&path).unwrap();
+        holder.pragma_update(None, "key", "pw").unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let err = ConfigDb::open_or_create(&path, "pw")
+            .err()
+            .expect("locked DB must not open");
+        assert!(
+            !matches!(err, ConfigDbError::WrongPassphrase(_)),
+            "a busy DB was reported as a wrong passphrase: {err}"
+        );
+        holder.execute_batch("ROLLBACK;").unwrap();
     }
 
     #[test]

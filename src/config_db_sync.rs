@@ -285,10 +285,17 @@ impl ConfigDbSync {
             }
             Err(e) => {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
+                let why = match e {
+                    crate::config_db::ConfigDbError::WrongPassphrase(_) => {
+                        "is encrypted with a different bootstrap password"
+                    }
+                    crate::config_db::ConfigDbError::SchemaTooNew { .. } => {
+                        "comes from a newer binary (rolling upgrade in progress?)"
+                    }
+                    _ => "cannot be opened",
+                };
                 tracing::warn!(
-                    "Config DB downloaded from S3 is encrypted with a different bootstrap password — \
-                     NOT replacing local copy: {}",
-                    e
+                    "Config DB downloaded from S3 {why} — NOT merging into the local copy: {e}"
                 );
                 return Ok(None);
             }
