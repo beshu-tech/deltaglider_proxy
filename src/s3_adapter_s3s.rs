@@ -35,6 +35,60 @@ pub struct ListMetadataXmlExtensions(
     pub std::collections::HashMap<String, std::collections::HashMap<String, String>>,
 );
 
+fn escape_list_xml(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+impl ListMetadataXmlExtensions {
+    /// Pure: `xml` (a LIST response) with each object's `<UserMetadata>`
+    /// inserted before its `</Contents>`. ONE pass over the body: a search
+    /// of the whole body per key was quadratic on a 1000-key page.
+    pub fn insert_into(&self, xml: &str) -> String {
+        let mut by_key: std::collections::HashMap<
+            String,
+            &std::collections::HashMap<String, String>,
+        > = self
+            .0
+            .iter()
+            .filter(|(_, m)| !m.is_empty())
+            .map(|(k, m)| (escape_list_xml(k), m))
+            .collect();
+        let mut out = String::with_capacity(xml.len() + by_key.len() * 64);
+        let mut rest = xml;
+        while let Some(end) = rest.find("</Contents>") {
+            let block = &rest[..end];
+            out.push_str(block);
+            let key = block
+                .rfind("<Contents>")
+                .map(|start| &block[start..])
+                .and_then(|c| c.split_once("<Key>"))
+                .and_then(|(_, after)| after.split_once("</Key>"))
+                .map(|(k, _)| k);
+            if let Some(metadata) = key.and_then(|k| by_key.remove(k)) {
+                out.push_str("<UserMetadata>");
+                let mut keys: Vec<_> = metadata.keys().collect();
+                keys.sort();
+                for k in keys {
+                    out.push_str(&format!(
+                        "<Items><Key>{}</Key><Value>{}</Value></Items>",
+                        escape_list_xml(k),
+                        escape_list_xml(&metadata[k])
+                    ));
+                }
+                out.push_str("</UserMetadata>");
+            }
+            out.push_str("</Contents>");
+            rest = &rest[end + "</Contents>".len()..];
+        }
+        out.push_str(rest);
+        out
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RecursiveDeleteJson {
     pub deleted: u32,
@@ -2771,6 +2825,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn list_metadata_goes_into_its_own_contents_block() {
+        let ext = ListMetadataXmlExtensions(std::collections::HashMap::from([
+            (
+                "a&b".to_string(),
+                std::collections::HashMap::from([("k".to_string(), "<v>".to_string())]),
+            ),
+            ("z".to_string(), std::collections::HashMap::new()),
+            (
+                "c".to_string(),
+                std::collections::HashMap::from([
+                    ("y".to_string(), "2".to_string()),
+                    ("x".to_string(), "1".to_string()),
+                ]),
+            ),
+        ]));
+        let xml = "<R><Contents><Key>a&amp;b</Key><Size>1</Size></Contents>\
+                   <Contents><Key>z</Key></Contents><Contents><Key>c</Key></Contents>\
+                   <CommonPrefixes><Prefix>p/</Prefix></CommonPrefixes></R>";
+        assert_eq!(
+            ext.insert_into(xml),
+            "<R><Contents><Key>a&amp;b</Key><Size>1</Size><UserMetadata><Items><Key>k</Key>\
+             <Value>&lt;v&gt;</Value></Items></UserMetadata></Contents><Contents><Key>z</Key>\
+             </Contents><Contents><Key>c</Key><UserMetadata><Items><Key>x</Key><Value>1</Value>\
+             </Items><Items><Key>y</Key><Value>2</Value></Items></UserMetadata></Contents>\
+             <CommonPrefixes><Prefix>p/</Prefix></CommonPrefixes></R>"
+        );
     }
 
     #[test]

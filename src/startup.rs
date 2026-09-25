@@ -576,31 +576,7 @@ pub fn build_s3_router(
             );
         }
         if let Some(list_metadata) = list_metadata {
-            for (key, metadata) in list_metadata.0 {
-                if metadata.is_empty() {
-                    continue;
-                }
-                let key_marker = format!("<Key>{}</Key>", escape_xml_local(&key));
-                let Some(key_pos) = text.find(&key_marker) else {
-                    continue;
-                };
-                let Some(contents_end_rel) = text[key_pos..].find("</Contents>") else {
-                    continue;
-                };
-                let mut metadata_xml = String::from("<UserMetadata>");
-                let mut keys: Vec<_> = metadata.keys().collect();
-                keys.sort();
-                for metadata_key in keys {
-                    let value = &metadata[metadata_key];
-                    metadata_xml.push_str(&format!(
-                        "<Items><Key>{}</Key><Value>{}</Value></Items>",
-                        escape_xml_local(metadata_key),
-                        escape_xml_local(value)
-                    ));
-                }
-                metadata_xml.push_str("</UserMetadata>");
-                text.insert_str(key_pos + contents_end_rel, &metadata_xml);
-            }
+            text = list_metadata.insert_into(&text);
         }
         parts.headers.insert(
             axum::http::header::CONTENT_LENGTH,
@@ -608,14 +584,6 @@ pub fn build_s3_router(
                 .unwrap_or_else(|_| axum::http::HeaderValue::from_static("0")),
         );
         axum::http::Response::from_parts(parts, axum::body::Body::from(text))
-    }
-
-    fn escape_xml_local(s: &str) -> String {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&apos;")
     }
 
     let mut builder = S3ServiceBuilder::new(DeltaGliderS3Service::new(state.clone()));
