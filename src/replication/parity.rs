@@ -534,8 +534,18 @@ pub fn annotate_findings(
     let ledger_for = |dest_key: &str| -> Option<&ObjectFailure> {
         dest_to_source.get(dest_key).and_then(|sk| ledger.get(sk))
     };
+    // The keys that may appear in a ledger error (dest key, source key).
+    let names_for = |dest_key: &str| -> Vec<String> {
+        let mut v = vec![dest_key.to_string()];
+        if let Some(sk) = dest_to_source.get(dest_key) {
+            v.push(sk.clone());
+        }
+        v
+    };
     for f in &mut diff.missing_samples {
         let src = source.get(&f.key);
+        let owned = names_for(&f.key);
+        let names: Vec<&str> = owned.iter().map(String::as_str).collect();
         let facts = FindingFacts {
             kind: f.kind,
             policy,
@@ -544,10 +554,13 @@ pub fn annotate_findings(
             dst_created_at: None,
             dest_owned_by_rule: None,
             ledger: ledger_for(&f.key),
+            error_names: &names,
         };
         f.remediation = Some(analyze_finding(&facts));
     }
     for f in &mut diff.mismatch_samples {
+        let owned = names_for(&f.key);
+        let names: Vec<&str> = owned.iter().map(String::as_str).collect();
         let facts = FindingFacts {
             kind: f.kind,
             policy,
@@ -556,11 +569,14 @@ pub fn annotate_findings(
             dst_created_at: dest.get(&f.key).and_then(|d| d.created_at),
             dest_owned_by_rule: None,
             ledger: ledger_for(&f.key),
+            error_names: &names,
         };
         f.remediation = Some(analyze_finding(&facts));
     }
     for f in &mut diff.orphan_samples {
         let dst = dest.get(&f.key);
+        let owned = names_for(&f.key);
+        let names: Vec<&str> = owned.iter().map(String::as_str).collect();
         let facts = FindingFacts {
             kind: f.kind,
             policy,
@@ -569,6 +585,7 @@ pub fn annotate_findings(
             dst_created_at: dst.and_then(|d| d.created_at),
             dest_owned_by_rule: dst.and_then(|d| d.owned_by_rule),
             ledger: ledger_for(&f.key),
+            error_names: &names,
         };
         f.remediation = Some(analyze_finding(&facts));
     }

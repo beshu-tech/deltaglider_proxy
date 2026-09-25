@@ -29,6 +29,9 @@ pub struct FindingFacts<'a> {
     pub dest_owned_by_rule: Option<bool>,
     /// Per-object failure ledger row, if the key is currently failing.
     pub ledger: Option<&'a ObjectFailure>,
+    /// The user-supplied names (source/dest key) that may appear in
+    /// `ledger.last_error`: removed before the error is classified.
+    pub error_names: &'a [&'a str],
 }
 
 /// The diagnosed cause of one finding.
@@ -120,8 +123,13 @@ fn policy_permits_copy_over_existing(policy: ConflictPolicy) -> bool {
 /// read/stall timeouts). A STRUCTURAL error (permissions, missing bucket, quota)
 /// is a hard No until the operator fixes the cause. The old code said No for
 /// both, which mis-advised operators on transient stalls.
-fn copy_failing(ledger: &ObjectFailure) -> Remediation {
-    let transient = crate::transfer::is_transient_copy_error(&ledger.last_error);
+fn copy_failing(ledger: &ObjectFailure, error_names: &[&str]) -> Remediation {
+    // Classify the backend's words only: a key like `logs/timeout.txt` must
+    // not make a permanent error look transient.
+    let transient = crate::transfer::is_transient_copy_error(&crate::transfer::error_signal(
+        &ledger.last_error,
+        error_names,
+    ));
     let reason_detail = format!(
         "copy has failed {} time(s); last error: {}",
         ledger.consecutive_failures, ledger.last_error
@@ -178,7 +186,7 @@ pub fn analyze_finding(facts: &FindingFacts) -> Remediation {
 /// dest. The only fork is the failure ledger.
 fn analyze_missing(facts: &FindingFacts) -> Remediation {
     if let Some(led) = facts.ledger {
-        return copy_failing(led);
+        return copy_failing(led, facts.error_names);
     }
     Remediation {
         reason: ReasonCode::NeverCopied,
@@ -194,7 +202,7 @@ fn analyze_missing(facts: &FindingFacts) -> Remediation {
 fn analyze_mismatch(facts: &FindingFacts) -> Remediation {
     // Ledger overrides policy: the copy isn't landing, so policy is moot.
     if let Some(led) = facts.ledger {
-        return copy_failing(led);
+        return copy_failing(led, facts.error_names);
     }
     match facts.policy {
         ConflictPolicy::ContentDiff => Remediation {
@@ -337,6 +345,7 @@ mod tests {
             dst_created_at: None,
             dest_owned_by_rule: None,
             ledger: None,
+            error_names: &[],
         }
     }
 
@@ -515,6 +524,25 @@ mod tests {
         );
     }
 
+    /// The ledger error names the object. A key that only LOOKS transient
+    /// (`logs/timeout.txt`) must not turn a permanent error into "re-run
+    /// may help".
+    #[test]
+    fn copy_failing_ignores_key_text_in_the_error() {
+        let key = "logs/timeout.txt";
+        let l = led_err(3, &format!("AccessDenied on {key}"));
+        let mut f = facts(FindingKind::MissingOnDest, ConflictPolicy::ContentDiff);
+        f.ledger = Some(&l);
+        let names = [key];
+        f.error_names = &names;
+        assert_eq!(
+            analyze_finding(&f).rerun_helps,
+            RerunVerdict::No {
+                why: NoReason::CopyKeepsFailing
+            }
+        );
+    }
+
     // ─────────────── Orphan (4 rows) ───────────────
 
     #[test]
@@ -611,6 +639,7 @@ mod tests {
                 dst_created_at: dst,
                 dest_owned_by_rule: owned,
                 ledger: has_ledger.then_some(&l),
+                error_names: &[],
             };
             let r = analyze_finding(&f);
 
