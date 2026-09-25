@@ -371,19 +371,6 @@ pub fn trusted_proxy_cidrs() -> Vec<ipnet::IpNet> {
         .collect()
 }
 
-/// Extract client IP from request headers/connection info.
-///
-/// When `DGP_TRUST_PROXY_HEADERS=true`, checks X-Forwarded-For and X-Real-IP
-/// (for deployments behind a trusted reverse proxy). Otherwise ignores these
-/// headers to prevent IP spoofing.
-///
-/// Returns `None` if no IP can be determined. In this case, rate limiting is
-/// skipped for this request (the SigV4 signature check still applies). Callers
-/// with the connection peer IP should use `extract_client_ip_with_peer`.
-pub fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
-    extract_client_ip_with_peer(headers, None)
-}
-
 /// Extract client IP from trusted proxy headers or peer socket fallback.
 /// Reads env (`trust_proxy_headers()`, `trusted_proxy_cidrs()`) then delegates
 /// to the pure [`resolve_client_ip`] so the spoofing truth-table is unit-tested.
@@ -437,7 +424,7 @@ pub fn resolve_client_ip(
             // Walk XFF right-to-left; the first (rightmost) entry that isn't a
             // trusted hop is the real client. If every entry is trusted, fall to
             // X-Real-IP, then the peer.
-            if let Some(xff) = header_str(headers, "x-forwarded-for") {
+            if let Some(xff) = xff_chain(headers) {
                 for hop in xff.rsplit(',') {
                     if let Ok(ip) = hop.trim().parse::<IpAddr>() {
                         if !peer_trusted(ip) {
@@ -456,19 +443,31 @@ pub fn resolve_client_ip(
     }
 }
 
-fn header_str(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
-    headers
-        .get(name)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
+/// The whole `X-Forwarded-For` chain: every header line, in order, joined
+/// with `,`. A proxy may APPEND a new line instead of extending the client's
+/// one, so the first line alone is the client-controlled part (S13).
+fn xff_chain(headers: &axum::http::HeaderMap) -> Option<String> {
+    let lines: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    (!lines.is_empty()).then(|| lines.join(","))
 }
 
+/// A single-IP header. Several lines: the LAST one, written by the nearest
+/// proxy.
 fn header_ip(headers: &axum::http::HeaderMap, name: &str) -> Option<IpAddr> {
-    header_str(headers, name).and_then(|s| s.trim().parse::<IpAddr>().ok())
+    headers
+        .get_all(name)
+        .iter()
+        .next_back()
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<IpAddr>().ok())
 }
 
 fn first_xff(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
-    header_str(headers, "x-forwarded-for")?
+    xff_chain(headers)?
         .split(',')
         .next()?
         .trim()
@@ -711,6 +710,31 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// A trusted proxy that APPENDS its own `X-Forwarded-For` line (HAProxy
+    /// `option forwardfor`) leaves the client's forged line first. The whole
+    /// chain is every line in order; reading only the first line let the
+    /// client pick its IP (S13).
+    #[test]
+    fn resolve_client_ip_reads_every_xff_line() {
+        let mut h = axum::http::HeaderMap::new();
+        h.append("x-forwarded-for", "10.9.9.9".parse().unwrap());
+        h.append("x-forwarded-for", "198.51.100.7".parse().unwrap());
+        let proxy = ip("10.0.0.5");
+        let trusted = vec![cidr("10.0.0.0/8")];
+        assert_eq!(
+            resolve_client_ip(&h, Some(proxy), true, &trusted),
+            Some(ip("198.51.100.7"))
+        );
+        // Several lines, each with several hops: still right-to-left.
+        let mut h = axum::http::HeaderMap::new();
+        h.append("x-forwarded-for", "1.1.1.1, 10.1.1.1".parse().unwrap());
+        h.append("x-forwarded-for", "203.0.113.4, 10.2.2.2".parse().unwrap());
+        assert_eq!(
+            resolve_client_ip(&h, Some(proxy), true, &trusted),
+            Some(ip("203.0.113.4"))
+        );
+    }
+
     #[test]
     fn resolve_client_ip_truth_table() {
         let proxy = ip("10.0.0.1"); // a trusted proxy peer
@@ -785,7 +809,7 @@ mod tests {
         std::env::remove_var("DGP_TRUST_PROXY_HEADERS");
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
-        let ip = extract_client_ip(&headers);
+        let ip = extract_client_ip_with_peer(&headers, None);
         assert_eq!(
             ip, None,
             "XFF should be ignored by default (DGP_TRUST_PROXY_HEADERS=false)"
@@ -795,7 +819,7 @@ mod tests {
     #[test]
     fn test_extract_client_ip_without_headers() {
         let headers = axum::http::HeaderMap::new();
-        let ip = extract_client_ip(&headers);
+        let ip = extract_client_ip_with_peer(&headers, None);
         assert_eq!(ip, None, "should return None when no proxy headers present");
     }
 
@@ -892,7 +916,7 @@ mod tests {
         std::env::set_var("DGP_TRUST_PROXY_HEADERS", "true");
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-forwarded-for", "::ffff:1.2.3.4".parse().unwrap());
-        let ip = extract_client_ip(&headers).unwrap();
+        let ip = extract_client_ip_with_peer(&headers, None).unwrap();
         assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
         std::env::remove_var("DGP_TRUST_PROXY_HEADERS");
     }

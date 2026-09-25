@@ -147,27 +147,24 @@ pub async fn admission_middleware(mut request: Request<Body>, next: Next) -> Res
 /// Bucket, key and list prefix come from `RequestTarget`, decoded as s3s
 /// decodes them, so a block matches the resource s3s will serve.
 ///
-/// Source IP comes from the same extractor the rate limiter uses
-/// (`rate_limiter::extract_client_ip`) — honors `DGP_TRUST_PROXY_HEADERS`
-/// for X-Forwarded-For / X-Real-IP, falls back to `ConnectInfo` when
-/// wired through. Admission's policy on missing IP is documented on
+/// Source IP comes from the same resolver IAM, the rate limiter and the
+/// audit log use (`rate_limiter::extract_client_ip_with_peer`): the TCP
+/// peer, or the trusted `X-Forwarded-For` client when the peer is a
+/// trusted proxy. Admission's policy on missing IP is documented on
 /// [`RequestInfo::source_ip`]: fail-closed.
 fn extract_request_info(request: &Request<Body>) -> OwnedRequestInfo {
     let query_string = request.uri().query().unwrap_or("");
     let authenticated =
         request.headers().contains_key("authorization") || has_presigned_query_params(query_string);
 
-    // Extract source IP. Primary source is axum `ConnectInfo` (wired in
-    // `main.rs` via `into_make_service_with_connect_info`). Fallback is
-    // the rate limiter's X-Forwarded-For / X-Real-IP parser, gated on
-    // `DGP_TRUST_PROXY_HEADERS`. Both paths pass the IP through
-    // `normalize_ip`; see `OwnedRequestInfo::from_raw` for the
-    // IPv4-mapped-IPv6 rationale.
-    let source_ip = request
+    // The peer alone ignored a trusted proxy's `X-Forwarded-For`: behind a
+    // proxy every client was the proxy IP, so `source_ip` blocks matched
+    // the proxy, not the client (S13). Same resolver as IAM `aws:SourceIp`.
+    let peer_ip = request
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|ci| ci.0.ip())
-        .or_else(|| crate::rate_limiter::extract_client_ip(request.headers()));
+        .map(|ci| ci.0.ip());
+    let source_ip = crate::rate_limiter::extract_client_ip_with_peer(request.headers(), peer_ip);
 
     OwnedRequestInfo::from_raw(
         request.method().as_str(),

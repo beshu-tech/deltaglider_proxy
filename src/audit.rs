@@ -70,7 +70,7 @@ fn extract_ua(headers: &HeaderMap) -> String {
 }
 
 /// Extract client IP and user-agent from request headers (headers-only).
-/// Uses `rate_limiter::extract_client_ip` which respects `DGP_TRUST_PROXY_HEADERS`.
+/// Uses `rate_limiter::extract_client_ip_with_peer` which respects `DGP_TRUST_PROXY_HEADERS`.
 /// Prefer [`extract_client_info_with_peer`] where the TCP peer is available —
 /// without it, a client behind a proxy with trust-proxy off resolves to
 /// "unknown" here while the rate limiter keys on the peer IP, producing
