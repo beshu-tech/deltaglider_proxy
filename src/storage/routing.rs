@@ -467,7 +467,14 @@ impl RoutingBackend {
         // surfaces the real error to the client); only a clean Ok(false) means
         // "genuinely not here, keep looking".
         let default = self.default_backend();
-        match default.head_bucket(virtual_bucket).await {
+        // A real bucket that a policy's alias owns on the default backend is
+        // that policy's storage (the same rule as the scan below): skip it.
+        let default_head = if self.alias_owns_real_bucket(&self.default_backend, virtual_bucket) {
+            Ok(false)
+        } else {
+            default.head_bucket(virtual_bucket).await
+        };
+        match default_head {
             Ok(true) => {
                 self.remember_resolution(virtual_bucket, &self.default_backend);
                 return (
@@ -747,7 +754,13 @@ impl StorageBackend for RoutingBackend {
     }
 
     async fn head_bucket(&self, bucket: &str) -> Result<bool, StorageError> {
-        let (backend, real_bucket) = self.resolve_existing(bucket).await;
+        let (name, backend, real_bucket) = self.resolve_existing_named(bucket).await;
+        // Unrouted, and resolved to storage an alias owns (the fallback to
+        // the default backend): the alias's storage is not reachable under
+        // its real name. Every S3 op checks head_bucket first.
+        if !self.routes.contains_key(bucket) && self.alias_owns_real_bucket(&name, &real_bucket) {
+            return Ok(false);
+        }
         backend.head_bucket(&real_bucket).await
     }
 
@@ -2290,7 +2303,6 @@ mod tests {
     /// name, so every policy of `dr` (replication_target_only, quota, public
     /// prefixes, IAM resources `dr/*`) is bypassed by using the real name.
     #[tokio::test]
-    #[ignore = "review2: pending fix"]
     async fn review2_alias_storage_on_the_default_backend_is_not_reachable_by_its_real_name() {
         let primary =
             Arc::new(Box::new(TestBackend::with_buckets(&["realdr"])) as Box<dyn StorageBackend>);
