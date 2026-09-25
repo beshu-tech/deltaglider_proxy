@@ -4,6 +4,8 @@
 
 The admin UI and GitOps integrations talk to this surface. All mutation routes require a session cookie (issued by `POST /_/api/admin/login`). Sessions are IP-bound — a token is rejected from a different source IP — and default to a 4-hour TTL (`DGP_SESSION_TTL_HOURS`).
 
+A browser marks each request with a `Sec-Fetch-Site` header, and it adds an `Origin` header to cross-origin requests. The proxy refuses, with `403 cross_origin_request`, every `POST`, `PUT`, `PATCH` or `DELETE` under `/_/` that such a header marks as coming from another origin. The session cookie is `SameSite=Strict`, but that attribute does not stop a page on a sibling subdomain, because such a page belongs to the same site. A client that sends neither header, such as `curl` or `config apply`, is not a browser page, so the check lets it through. Development mode (`DGP_CORS_PERMISSIVE=true`) turns the check off.
+
 Endpoints documented here are **admin** only. The S3-compatible API lives under `/` and is documented by AWS themselves.
 
 ## Authentication and session

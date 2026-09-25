@@ -8,6 +8,7 @@ pub(crate) mod backends;
 mod backup;
 mod bucket_scan;
 mod config;
+pub mod csrf;
 mod delta_efficiency;
 mod event_outbox;
 pub mod external_auth;

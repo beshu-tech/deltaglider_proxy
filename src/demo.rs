@@ -522,6 +522,8 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .merge(metrics_route)
         .merge(stats_route)
         .merge(static_routes)
+        // CSRF: state-changing requests must prove same origin (S5).
+        .layer(middleware::from_fn(admin::csrf::require_same_origin))
         .layer({
             // SECURITY: In production (single-port architecture), CORS is not needed
             // because the UI is served from the same origin. allow_origin(Any) would

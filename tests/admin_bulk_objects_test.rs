@@ -351,3 +351,42 @@ async fn test_admin_inputs_refuse_path_escapes() {
         .unwrap();
     assert!(r.status().is_client_error(), "savings: {}", r.status());
 }
+
+/// S5 (CSRF): the session cookie is SameSite=Strict, which does not stop a
+/// page on a sibling subdomain (same site, other origin). A state-changing
+/// admin request that the browser marks as not same-origin must be refused;
+/// the same request from our own origin, or from a non-browser client with
+/// no fetch metadata, must pass.
+#[tokio::test]
+async fn test_admin_writes_refuse_cross_origin_browser_requests() {
+    let server = TestServer::filesystem().await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let url = format!("{}/_/api/admin/objects/delete", server.endpoint());
+    let body = json!({ "bucket": server.bucket(), "keys": ["nope.txt"] });
+
+    for (site, origin) in [
+        (Some("same-site"), None),
+        (Some("cross-site"), None),
+        (None, Some("https://evil.example")),
+    ] {
+        let mut req = admin.post(&url).json(&body);
+        if let Some(s) = site {
+            req = req.header("Sec-Fetch-Site", s);
+        }
+        if let Some(o) = origin {
+            req = req.header("Origin", o);
+        }
+        let r = req.send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 403, "site={site:?} origin={origin:?}");
+    }
+    let r = admin
+        .post(&url)
+        .header("Sec-Fetch-Site", "same-origin")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200, "same-origin");
+    let r = admin.post(&url).json(&body).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200, "non-browser client");
+}
