@@ -182,3 +182,35 @@ async fn s3_lease_concurrent_acquire_exactly_one_wins() {
         .await;
     let _ = cleanup.release(SUB, &rule, "cleanup").await;
 }
+
+#[tokio::test]
+async fn s3_lease_replaces_a_corrupt_body() {
+    if !minio_available().await {
+        eprintln!("Skipping s3_lease_replaces_a_corrupt_body: MinIO not available");
+        return;
+    }
+    // An unparsable lease body used to read as "absent": create-if-absent
+    // then 412'd on the existing key on every tick, so the rule never ran.
+    let rule = unique_rule();
+    let key = format!("_dgp/leases/{}/{}.json", SUB.slug(), rule);
+    minio_client()
+        .await
+        .put_object()
+        .bucket(MINIO_BUCKET)
+        .key(&key)
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            b"{truncated",
+        ))
+        .send()
+        .await
+        .unwrap();
+    let node_a = lease_for("nodeA").await;
+    assert!(
+        node_a
+            .try_acquire(SUB, &rule, "task-a1", 1000, 60)
+            .await
+            .unwrap(),
+        "a corrupt lease object must be replaced"
+    );
+    node_a.release(SUB, &rule, "task-a1").await.unwrap();
+}

@@ -86,6 +86,47 @@ pub fn plan_acquire(
     }
 }
 
+/// What a read of the lease key found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseRead {
+    Absent,
+    /// An object whose body does not parse: not a lease anybody holds.
+    Corrupt {
+        etag: String,
+    },
+    Valid {
+        lease: Lease,
+        etag: String,
+    },
+}
+
+impl LeaseRead {
+    fn valid(&self) -> Option<(&Lease, &str)> {
+        match self {
+            LeaseRead::Valid { lease, etag } => Some((lease, etag.as_str())),
+            _ => None,
+        }
+    }
+}
+
+/// [`plan_acquire`] over a raw read. A corrupt body is replaced with
+/// `If-Match(etag)`: reading it as absent sent a create-if-absent, which 412s
+/// on the existing key on every pass, so the rule never ran again.
+pub fn plan_acquire_read(
+    current: &LeaseRead,
+    now: i64,
+    my_node_id: &str,
+    my_boot_id: &str,
+) -> AcquireAction {
+    match current {
+        LeaseRead::Corrupt { etag } => AcquireAction::Steal {
+            etag: etag.clone(),
+            next_epoch: 1,
+        },
+        other => plan_acquire(other.valid(), now, my_node_id, my_boot_id),
+    }
+}
+
 /// What `renew` should do given the current lease object state and the renewer.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RenewAction {
@@ -135,8 +176,8 @@ impl S3Lease {
         format!("_dgp/leases/{}/{}.json", subsystem.slug(), rule)
     }
 
-    /// Read the lease object + its ETag. `Ok(None)` = absent (404-class).
-    async fn read_lease(&self, key: &str) -> Result<Option<(Lease, String)>, String> {
+    /// Read the lease object + its ETag.
+    async fn read_lease(&self, key: &str) -> Result<LeaseRead, String> {
         match self
             .client
             .get_object()
@@ -153,19 +194,16 @@ impl S3Lease {
                     .await
                     .map_err(|e| format!("lease body read: {e}"))?
                     .into_bytes();
-                match serde_json::from_slice::<Lease>(&bytes) {
-                    Ok(lease) => Ok(Some((lease, etag))),
-                    // A corrupt/foreign object at the key → treat as absent so a
-                    // fresh create-if-absent can reclaim it (it will 412 if a
-                    // valid concurrent writer beat us, which is correct).
-                    Err(_) => Ok(None),
-                }
+                Ok(match serde_json::from_slice::<Lease>(&bytes) {
+                    Ok(lease) => LeaseRead::Valid { lease, etag },
+                    Err(_) => LeaseRead::Corrupt { etag },
+                })
             }
             Err(e) => {
                 if crate::config_db_sync::is_object_absent(
                     &crate::config_db_sync::sdk_error_signal(&e),
                 ) {
-                    Ok(None)
+                    Ok(LeaseRead::Absent)
                 } else {
                     Err(format!("{e:?}"))
                 }
@@ -233,12 +271,7 @@ impl CoordinationLease for S3Lease {
         let key = Self::object_key(subsystem, rule);
         let current = self.read_lease(&key).await?;
         let expires_at = now.saturating_add(ttl_secs.max(1));
-        match plan_acquire(
-            current.as_ref().map(|(l, e)| (l, e.as_str())),
-            now,
-            &self.node_id,
-            &self.boot_id,
-        ) {
+        match plan_acquire_read(&current, now, &self.node_id, &self.boot_id) {
             AcquireAction::Blocked => Ok(false),
             AcquireAction::Create => {
                 self.put_lease(&key, self.body_for(owner, 1, expires_at), None)
@@ -288,11 +321,7 @@ impl CoordinationLease for S3Lease {
                     continue;
                 }
             };
-            match plan_renew(
-                current.as_ref().map(|(l, e)| (l, e.as_str())),
-                effective_now,
-                owner,
-            ) {
+            match plan_renew(current.valid(), effective_now, owner) {
                 RenewAction::Lost => return Ok(false),
                 RenewAction::Renew { etag, epoch } => {
                     match self
@@ -327,7 +356,7 @@ impl CoordinationLease for S3Lease {
         let key = Self::object_key(subsystem, rule);
         // Owner-scoped release: only delete the object if WE still own it, so a
         // release can't clobber a lease a peer legitimately stole.
-        if let Some((lease, etag)) = self.read_lease(&key).await? {
+        if let LeaseRead::Valid { lease, etag } = self.read_lease(&key).await? {
             if lease.owner == owner {
                 let _ = self
                     .client
@@ -354,8 +383,8 @@ impl CoordinationLease for S3Lease {
         Ok(self
             .read_lease(&key)
             .await?
-            .map(|(lease, _etag)| lease.expires_at >= now)
-            .unwrap_or(false))
+            .valid()
+            .is_some_and(|(lease, _etag)| lease.expires_at >= now))
     }
 }
 
@@ -435,6 +464,29 @@ mod tests {
         let l = lease("held", "nodeB", 5, 100);
         assert_eq!(
             plan_acquire(Some((&l, "e")), 100, "nodeA", "boot-now"),
+            AcquireAction::Blocked
+        );
+    }
+
+    #[test]
+    fn acquire_corrupt_lease_body_is_replaced_by_etag() {
+        let c = LeaseRead::Corrupt {
+            etag: "junk".into(),
+        };
+        assert_eq!(
+            plan_acquire_read(&c, 100, "nodeA", "boot-now"),
+            AcquireAction::Steal {
+                etag: "junk".into(),
+                next_epoch: 1
+            }
+        );
+        // A valid read still goes through the normal truth table.
+        let live = LeaseRead::Valid {
+            lease: lease("held", "nodeB", 5, 160),
+            etag: "e".into(),
+        };
+        assert_eq!(
+            plan_acquire_read(&live, 100, "nodeA", "boot-now"),
             AcquireAction::Blocked
         );
     }
