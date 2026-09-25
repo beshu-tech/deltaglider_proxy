@@ -67,3 +67,30 @@ AWS-CLI-shaped client verbs that talk directly to an S3 endpoint (no running pro
 | `s3 get-bucket-acl` / `s3 put-bucket-acl` | Read / update a bucket ACL (canned-ACL or grant flags) |
 
 Exit codes `8` (not found), `9` (integrity), and `10` (partial) are specific to this family. `--help` on each verb lists its flags.
+
+### Credentials
+
+The `s3` verbs read credentials in this order: the `--access-key-id` and `--secret-access-key` flags, then the `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` environment variables, then the profile in `~/.aws/credentials` (selected by `--profile`, then `AWS_PROFILE`, then `default`). A session token from the environment or from the profile's `aws_session_token` is sent with every request, so temporary (STS) credentials work.
+
+### Recursive prefixes
+
+`cp -r`, `rm -r`, `sync`, and `migrate` treat a non-empty source prefix as a directory. `s3://releases/v2` and `s3://releases/v2/` both select only the keys under `v2/`. They do not select keys under a sibling such as `v2-rc/`, and they do not select an object whose key is exactly `v2`. This rule is stricter than `aws s3 rm --recursive`, which matches the raw prefix.
+
+A download (`cp -r` or `sync` from S3 to a local directory) writes only below the destination directory. The CLI skips a key that contains an empty path segment (for example a leading `/` or `//`), a `.` or `..` segment, a backslash, a drive letter such as `C:`, or a NUL byte. It prints a warning for each skipped key, and the command exits with `10` (partial) or `5`. The CLI also skips folder markers (keys that end with `/`) without a warning.
+
+### Include and exclude globs
+
+`--include` and `--exclude` match the key relative to the source prefix, in `cp -r`, `rm -r`, `sync`, and `migrate`. A glob without a `/` matches the last path segment of the key (`*.zip`). A glob with a `/` matches the whole relative key: `rm -r s3://releases/v2/ --exclude 'tmp/*'` keeps `v2/tmp/`. When a key matches both an include and an exclude glob, the exclude glob wins.
+
+### S3-to-S3 copies
+
+`cp`, `sync`, and `migrate` between two S3 locations keep the source object's Content-Type and user metadata. A `--metadata K=V` flag on `cp` replaces the value of that key. Cache-Control, Content-Disposition, and Content-Encoding are not copied.
+
+### `s3 verify` results
+
+| Output | Exit code | Meaning |
+|---|---|---|
+| `OK` | `0` | The SHA-256 of the downloaded bytes matches the checksum that DeltaGlider stored with the object. |
+| `UNVERIFIABLE` | `0` | The object has no DeltaGlider checksum, because another tool wrote it. The download succeeded, and the line shows the SHA-256 of the bytes. |
+| `MISMATCH` | `9` | The SHA-256 of the downloaded bytes differs from the stored checksum, or the engine found a checksum error while it reconstructed a delta. |
+| `error: object not found` or `error: bucket not found` | `8` | The key or the bucket does not exist. |

@@ -127,12 +127,13 @@ pub fn detect_direction(src: &str, dst: &str) -> Direction {
     }
 }
 
-/// One entry in a sync inventory: a relative path within the namespace
-/// being synced, the byte size, and a unix-ms mtime (None when the
-/// source can't supply one — e.g. an internal listing without
-/// last-modified).
+/// One entry in a sync inventory, keyed in its map by the path relative
+/// to the synced root. Holds the byte size and a unix-ms mtime (None
+/// when the source can't supply one).
 #[derive(Debug, Clone)]
 pub struct Entry {
+    /// Where the entry really lives: the full on-disk path for a local
+    /// entry, the full object key for an S3 entry. NOT relative.
     pub rel: String,
     pub size: u64,
     pub mtime_ms: Option<i64>,

@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Changed — CLI: recursive prefixes are directories, and `rm` globs are relative
+
+`deltaglider_proxy s3 rm -r s3://releases/v2` deleted the keys under `v2/`
+and also the keys under every sibling that starts with the same letters, such
+as `v2-rc/`. The CLI listed the raw prefix `v2`, and S3 returns every key that
+starts with it. `cp -r`, `sync`, and `migrate` had the same fault; `migrate`
+also wrote destination keys with `//` in them. These verbs now treat a
+non-empty prefix as a directory: `v2` and `v2/` both select only `v2/...`.
+
+`rm -r --include` and `--exclude` globs now match the key relative to the
+prefix, the same as in `cp -r`, `sync`, and `migrate`. A glob that names the
+full key, such as `releases/tmp/*`, must drop the prefix and become `tmp/*`.
+A glob without a `/`, such as `*.zip`, works as before.
+
+### Fixed — CLI downloads could write outside the destination directory
+
+A key such as `pre//etc/cron.d/evil` made `cp -r` and `sync` write to
+`/etc/cron.d/evil`, because the key below the prefix was an absolute path.
+Keys with `..` segments escaped the same way. The CLI now skips, with a
+warning, every key that could resolve outside the destination directory.
+
+### Fixed — CLI: session tokens, copied metadata, and `verify` on foreign objects
+
+- The `s3` verbs now send `AWS_SESSION_TOKEN` (or the profile's
+  `aws_session_token`) with every request, so temporary (STS) credentials
+  work. Before, the CLI read the token and did not send it.
+- `cp`, `sync`, and `migrate` between two S3 locations now keep the source
+  object's user metadata. A `--metadata` flag on `cp` replaces one key.
+- `s3 verify` on an object that another tool wrote reported `MISMATCH`
+  (exit `9`), because the object has no DeltaGlider checksum. It now reports
+  `UNVERIFIABLE` and exits `0`.
+
 ### Fixed — Listings reported the stored delta size instead of the object size
 
 A `ListObjects` request on an S3-backed bucket reported each delta object with
