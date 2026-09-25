@@ -66,6 +66,22 @@ impl SpoolDir {
         Ok(pool)
     }
 
+    /// THE process-wide spool, built from env on first use (the orphan sweep
+    /// runs once, then). Every engine, including one rebuilt on a config
+    /// reload, shares it. A spool per engine gave a reload a second full
+    /// budget while the old engine's requests still held the first, and
+    /// re-ran the sweep each time.
+    pub fn shared() -> std::io::Result<Self> {
+        static SHARED: std::sync::OnceLock<SpoolDir> = std::sync::OnceLock::new();
+        if let Some(pool) = SHARED.get() {
+            return Ok(pool.clone());
+        }
+        let pool = Self::from_env()?;
+        // A racing first caller may win; either way every caller gets the
+        // one stored pool.
+        Ok(SHARED.get_or_init(|| pool).clone())
+    }
+
     pub fn new(dir: PathBuf, max_bytes: u64) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
         // Semaphore permits are usize; we account in MiB to stay well under the
@@ -76,6 +92,12 @@ impl SpoolDir {
             budget: Arc::new(Semaphore::new(max_mib)),
             max_bytes,
         })
+    }
+
+    /// Do both handles draw on one budget?
+    #[cfg(test)]
+    pub(crate) fn same_budget(&self, other: &SpoolDir) -> bool {
+        Arc::ptr_eq(&self.budget, &other.budget)
     }
 
     pub fn max_bytes(&self) -> u64 {
@@ -231,6 +253,13 @@ fn mib_ceil(bytes: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_spool_is_one_budget() {
+        let a = SpoolDir::shared().unwrap();
+        let b = SpoolDir::shared().unwrap();
+        assert!(Arc::ptr_eq(&a.budget, &b.budget), "one budget per process");
+    }
 
     #[test]
     fn mib_ceil_rounds_up() {

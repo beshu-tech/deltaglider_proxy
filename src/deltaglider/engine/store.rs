@@ -2042,3 +2042,25 @@ mod prefix_lock_scope_tests {
         );
     }
 }
+
+/// A rebuilt engine (config reload) must share the spool budget with the
+/// engine it replaces: each built its own, so a reload doubled the budget.
+#[cfg(test)]
+mod spool_singleton_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::storage::FilesystemBackend;
+
+    #[tokio::test]
+    async fn rebuilt_engines_share_one_spool_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            FilesystemBackend::new(tmp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let a = DeltaGliderEngine::new_with_backend(backend.clone(), &Config::default(), None);
+        let b = DeltaGliderEngine::new_with_backend(backend, &Config::default(), None);
+        assert!(a.spool.same_budget(&b.spool));
+    }
+}

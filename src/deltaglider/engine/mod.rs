@@ -751,7 +751,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ),
             bucket_usage: None,
             spool: Arc::new(
-                crate::deltaglider::spool::SpoolDir::from_env()
+                crate::deltaglider::spool::SpoolDir::shared()
                     .unwrap_or_else(|e| panic!("failed to init spool dir: {e}")),
             ),
         }
