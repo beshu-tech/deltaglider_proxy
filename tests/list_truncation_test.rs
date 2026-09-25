@@ -548,6 +548,7 @@ async fn list_objects_v1_raw(endpoint: &str, bucket: &str, qs: Option<&str>) -> 
 /// produces an empty Contents-less response."
 #[tokio::test]
 async fn test_v1_list_objects_empty_prefix() {
+    skip_unless_minio!();
     let server = TestServer::s3().await;
     let unique = format!(
         "v1-empty-{}",
@@ -588,6 +589,7 @@ async fn test_v1_list_objects_empty_prefix() {
 /// Catches the "shim didn't propagate NoSuchBucket" regression.
 #[tokio::test]
 async fn test_v1_list_objects_nonexistent_bucket_returns_404() {
+    skip_unless_minio!();
     let server = TestServer::s3().await;
     let resp = list_objects_v1_raw(
         &server.endpoint(),
@@ -616,6 +618,7 @@ async fn test_v1_list_objects_nonexistent_bucket_returns_404() {
 /// pages to isolate from cross-test contamination.
 #[tokio::test]
 async fn test_v1_list_objects_paginates_via_marker() {
+    skip_unless_minio!();
     let server = TestServer::s3().await;
     let s3 = server.s3_client().await;
     let prefix = format!(
@@ -702,6 +705,7 @@ async fn test_v1_list_objects_paginates_via_marker() {
 /// must clamp to 1000.
 #[tokio::test]
 async fn test_v1_list_objects_max_keys_above_1000_is_clamped() {
+    skip_unless_minio!();
     let server = TestServer::s3().await;
     let resp =
         list_objects_v1_raw(&server.endpoint(), server.bucket(), Some("max-keys=5000")).await;
@@ -720,6 +724,7 @@ async fn test_v1_list_objects_max_keys_above_1000_is_clamped() {
 /// from parallel-test pollution of the shared bucket).
 #[tokio::test]
 async fn test_v1_list_objects_with_delimiter_produces_common_prefixes() {
+    skip_unless_minio!();
     let server = TestServer::s3().await;
     let s3 = server.s3_client().await;
     let prefix = format!(

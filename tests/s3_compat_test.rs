@@ -4006,7 +4006,6 @@ async fn review2_list_v2_next_token_stays_valid_xml() {
 /// 1 MiB; on overflow it returns an EMPTY body but keeps the status. 1000
 /// long keys exceed that, so the client gets a broken listing.
 #[tokio::test]
-#[ignore = "review2: pending fix"]
 async fn review2_large_metadata_listing_is_not_truncated_to_empty() {
     let server = TestServer::filesystem().await;
     let s3 = server.s3_client().await;
