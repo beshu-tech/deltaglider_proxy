@@ -664,7 +664,15 @@ async fn run_or_preview_retain_newest(
     for c in &plan.delete {
         // TOCTOU guard: the ranking used a snapshot taken during collect. An
         // overwrite since then is a new object that might rank in the KEEP set.
-        match recheck_before_delete(engine, &rule.bucket, &c.key, c.created_at).await {
+        let snapshot = match metas.get(&c.key) {
+            Some(meta) => Snapshot::of(meta),
+            None => Snapshot {
+                created_at: c.created_at,
+                etag: String::new(),
+                size: c.size,
+            },
+        };
+        match recheck_before_delete(engine, &rule.bucket, &c.key, &snapshot).await {
             DeleteCheck::Proceed => {}
             DeleteCheck::Changed | DeleteCheck::Gone => {
                 out.objects_skipped += 1;
@@ -762,22 +770,59 @@ enum DeleteCheck {
     HeadFailed(String),
 }
 
-/// Pure: compare the snapshot generation with a fresh HEAD. `created_at`
-/// is the generation marker: every overwrite stamps a new one, and it is
-/// the same field the listing and HEAD both resolve. Compared at the
-/// coarser precision of the two ([`same_generation`]).
+/// What the listing saw of an object: enough to tell a fresh HEAD of the
+/// SAME upload from an overwrite.
+#[derive(Debug, Clone)]
+struct Snapshot {
+    created_at: chrono::DateTime<Utc>,
+    etag: String,
+    size: u64,
+}
+
+impl Snapshot {
+    fn of(meta: &crate::types::FileMetadata) -> Self {
+        Self {
+            created_at: meta.created_at,
+            etag: meta.etag(),
+            size: meta.file_size,
+        }
+    }
+}
+
+/// How far apart two clocks may stamp one upload: the proxy's
+/// `dg-created-at` (before the upload) and the backend's LastModified (at
+/// its end). The SigV4 clock-skew default.
+const STAMP_SKEW_SECS: i64 = 900;
+
+/// Pure: compare the snapshot with a fresh HEAD. `created_at` is the
+/// generation marker: every overwrite stamps a new one. But the two sides
+/// can read it from different clocks: on S3 with a cold metadata cache the
+/// lite LIST entry has the BACKEND's LastModified (end of the upload), and
+/// the HEAD has `dg-created-at`, which the PROXY stamped before the upload.
+/// Those never matched, and lifecycle never deleted such an object. So one
+/// upload is also the same ETag and size with stamps within
+/// [`STAMP_SKEW_SECS`]. An overwrite with the SAME bytes inside that window
+/// counts as the same object (it holds exactly what the rule judged).
 fn classify_delete_check(
-    snapshot_created_at: chrono::DateTime<Utc>,
+    snapshot: &Snapshot,
     head: Result<&crate::types::FileMetadata, &crate::deltaglider::EngineError>,
 ) -> DeleteCheck {
     match head {
-        Ok(current) if same_generation(snapshot_created_at, current.created_at) => {
-            DeleteCheck::Proceed
-        }
+        Ok(current) if same_object(snapshot, current) => DeleteCheck::Proceed,
         Ok(_) => DeleteCheck::Changed,
         Err(crate::deltaglider::EngineError::NotFound(_)) => DeleteCheck::Gone,
         Err(e) => DeleteCheck::HeadFailed(format!("re-check before delete failed: {e}")),
     }
+}
+
+fn same_object(snapshot: &Snapshot, current: &crate::types::FileMetadata) -> bool {
+    same_generation(snapshot.created_at, current.created_at)
+        || (current.etag() == snapshot.etag
+            && current.file_size == snapshot.size
+            && (current.created_at - snapshot.created_at)
+                .num_seconds()
+                .abs()
+                <= STAMP_SKEW_SECS)
 }
 
 /// Pure: do two `created_at` values name one generation? Backends report it
@@ -810,9 +855,9 @@ async fn recheck_before_delete(
     engine: &DynEngine,
     bucket: &str,
     key: &str,
-    snapshot_created_at: chrono::DateTime<Utc>,
+    snapshot: &Snapshot,
 ) -> DeleteCheck {
-    classify_delete_check(snapshot_created_at, engine.head(bucket, key).await.as_ref())
+    classify_delete_check(snapshot, engine.head(bucket, key).await.as_ref())
 }
 
 /// What `execute_action` did with one planned object.
@@ -834,7 +879,7 @@ async fn execute_action(
 ) -> Result<ActionOutcome, Box<dyn std::error::Error + Send + Sync>> {
     match action {
         PlannedLifecycleAction::Delete => {
-            match recheck_before_delete(engine, &rule.bucket, key, meta.created_at).await {
+            match recheck_before_delete(engine, &rule.bucket, key, &Snapshot::of(meta)).await {
                 DeleteCheck::Proceed => {}
                 DeleteCheck::Changed | DeleteCheck::Gone => return Ok(ActionOutcome::Skipped),
                 DeleteCheck::HeadFailed(msg) => return Err(msg.into()),
@@ -889,7 +934,7 @@ async fn execute_action(
             .await;
 
             if *delete_source_after_success {
-                match recheck_before_delete(engine, &rule.bucket, key, meta.created_at).await {
+                match recheck_before_delete(engine, &rule.bucket, key, &Snapshot::of(meta)).await {
                     DeleteCheck::Proceed => {
                         engine.delete(&rule.bucket, key).await?;
                         append_lifecycle_delete_event(
@@ -1263,18 +1308,20 @@ mod tests {
             None,
             crate::types::StorageInfo::Passthrough,
         );
-        let t = meta.created_at;
-        assert_eq!(classify_delete_check(t, Ok(&meta)), DeleteCheck::Proceed);
-        meta.created_at = t + chrono::Duration::milliseconds(1);
-        assert_eq!(classify_delete_check(t, Ok(&meta)), DeleteCheck::Changed);
-        meta.created_at = t + chrono::Duration::seconds(1);
-        assert_eq!(classify_delete_check(t, Ok(&meta)), DeleteCheck::Changed);
+        let t = super::Snapshot::of(&meta);
+        assert_eq!(classify_delete_check(&t, Ok(&meta)), DeleteCheck::Proceed);
+        // An overwrite: new bytes, a new stamp.
+        meta.md5 = "f".into();
+        meta.created_at = t.created_at + chrono::Duration::milliseconds(1);
+        assert_eq!(classify_delete_check(&t, Ok(&meta)), DeleteCheck::Changed);
+        meta.created_at = t.created_at + chrono::Duration::seconds(1);
+        assert_eq!(classify_delete_check(&t, Ok(&meta)), DeleteCheck::Changed);
         assert_eq!(
-            classify_delete_check(t, Err(&EngineError::NotFound("k".into()))),
+            classify_delete_check(&t, Err(&EngineError::NotFound("k".into()))),
             DeleteCheck::Gone
         );
         assert!(matches!(
-            classify_delete_check(t, Err(&EngineError::InvalidArgument("boom".into()))),
+            classify_delete_check(&t, Err(&EngineError::InvalidArgument("boom".into()))),
             DeleteCheck::HeadFailed(_)
         ));
     }
@@ -1286,6 +1333,12 @@ mod tests {
     fn delete_check_compares_at_the_coarser_precision() {
         use super::{classify_delete_check, DeleteCheck};
         use chrono::TimeZone;
+        // Another ETag: only the stamp decides here.
+        let snap = |t| super::Snapshot {
+            created_at: t,
+            etag: "\"other\"".into(),
+            size: 1,
+        };
         let listed = chrono::Utc.timestamp_millis_opt(1_700_000_000_123).unwrap();
         let headed = crate::types::FileMetadata::fallback(
             "k".into(),
@@ -1296,7 +1349,7 @@ mod tests {
             crate::types::StorageInfo::Passthrough,
         );
         assert_eq!(
-            classify_delete_check(listed, Ok(&headed)),
+            classify_delete_check(&snap(listed), Ok(&headed)),
             DeleteCheck::Proceed
         );
         // LIST milliseconds vs HEAD `dg-created-at` microseconds.
@@ -1309,12 +1362,71 @@ mod tests {
             crate::types::StorageInfo::Passthrough,
         );
         assert_eq!(
-            classify_delete_check(listed, Ok(&micros)),
+            classify_delete_check(&snap(listed), Ok(&micros)),
             DeleteCheck::Proceed
         );
         let later = chrono::Utc.timestamp_millis_opt(1_700_000_000_124).unwrap();
         assert_eq!(
-            classify_delete_check(later, Ok(&micros)),
+            classify_delete_check(&snap(later), Ok(&micros)),
+            DeleteCheck::Changed
+        );
+    }
+
+    /// CI on MinIO: an object PUT through the proxy, cold metadata cache.
+    /// The lite LIST entry carries the BACKEND's LastModified (end of the
+    /// upload, 20:45:26.889); the re-HEAD returns `dg-created-at`, which the
+    /// PROXY stamped before the upload (20:45:26.8412345, or even the
+    /// previous second). Two clocks, two instants: no precision rule makes
+    /// them equal, and lifecycle never deleted the object.
+    #[test]
+    fn delete_check_accepts_the_backend_and_proxy_stamps_of_one_upload() {
+        use super::{classify_delete_check, DeleteCheck, Snapshot};
+        let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().to_utc();
+        let head = |created: &str, md5: &str| {
+            crate::types::FileMetadata::fallback(
+                "app.log".into(),
+                1,
+                md5.into(),
+                at(created),
+                None,
+                crate::types::StorageInfo::Passthrough,
+            )
+        };
+        let listed = Snapshot {
+            created_at: at("2026-09-25T20:45:26.889+00:00"),
+            etag: head(
+                "2026-09-25T20:45:26.889+00:00",
+                "9dd4e461268c8034f5c8564e155c67a6",
+            )
+            .etag(),
+            size: 1,
+        };
+        for stamp in [
+            "2026-09-25T20:45:26.841234500Z",
+            "2026-09-25T20:45:25.999999Z",
+        ] {
+            assert_eq!(
+                classify_delete_check(
+                    &listed,
+                    Ok(&head(stamp, "9dd4e461268c8034f5c8564e155c67a6"))
+                ),
+                DeleteCheck::Proceed,
+                "{stamp}"
+            );
+        }
+        // An overwrite: new bytes, or the same bytes stamped well after.
+        assert_eq!(
+            classify_delete_check(&listed, Ok(&head("2026-09-25T20:45:26.900Z", "ffff"))),
+            DeleteCheck::Changed
+        );
+        assert_eq!(
+            classify_delete_check(
+                &listed,
+                Ok(&head(
+                    "2026-09-25T21:45:26Z",
+                    "9dd4e461268c8034f5c8564e155c67a6"
+                ))
+            ),
             DeleteCheck::Changed
         );
     }
