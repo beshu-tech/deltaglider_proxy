@@ -1903,3 +1903,54 @@ advanced:
         edit.to_canonical_yaml_for_persist_with(&same).unwrap();
     }
 }
+
+#[cfg(test)]
+mod transition_lock_guard {
+    /// Source guard for the lock invariant on `apply_config_transition`:
+    /// every caller takes the config WRITE lock earlier in the same fn and
+    /// holds it (backup's `apply_secrets` once took it in an inner block and
+    /// released it before the transition). A crude text check, but it fails
+    /// on that shape.
+    #[test]
+    fn every_transition_caller_holds_the_config_write_lock() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let call = concat!("apply_config_transition", "(");
+        let mut bad = Vec::new();
+        let mut calls = 0;
+        for f in files {
+            let src = std::fs::read_to_string(&f).unwrap();
+            for (at, _) in src.match_indices(call) {
+                let line_start = src[..at].rfind('\n').map_or(0, |i| i + 1);
+                let line = &src[line_start..at];
+                if line.contains("fn ") || line.trim_start().starts_with("//") {
+                    continue;
+                }
+                calls += 1;
+                let fn_start = src[..at].rfind("fn ").unwrap_or(0);
+                let body = &src[fn_start..at];
+                // At fn-body level (4 spaces), not inside an inner block
+                // whose end releases the guard before the call.
+                let held = body.contains("\n    let mut cfg = state.config.write().await;");
+                if !held || body.contains("drop(cfg)") {
+                    bad.push(format!("{}:{}", f.display(), src[..at].lines().count()));
+                }
+            }
+        }
+        assert!(calls >= 4, "guard found only {calls} call sites");
+        assert!(bad.is_empty(), "transition without the write lock: {bad:?}");
+    }
+}

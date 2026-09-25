@@ -1475,8 +1475,13 @@ async fn apply_secrets(
     secrets: &BackupSecrets,
     restore_bootstrap_hash: bool,
 ) -> Result<(), BackupSecretApplyError> {
-    // Snapshot pre-mutation config for apply_config_transition.
-    let old_cfg = state.config.read().await.clone();
+    // Same lock discipline as apply_config_inner: hold the config write lock
+    // across the whole read → transition → swap → persist, and swap only
+    // after the transition succeeds. It used to mutate the live config,
+    // drop the lock, then rebuild: a concurrent apply could interleave, and
+    // a failed rebuild left the new secrets live over the old engine.
+    let mut cfg = state.config.write().await;
+    let old_cfg = cfg.clone();
 
     // Guardrail: refuse hash rotation on a running instance. The only
     // supported path to change the bootstrap password is
@@ -1490,23 +1495,17 @@ async fn apply_secrets(
         }
     }
 
-    // Mutate Config fields under the write lock. Snapshot the post-
-    // mutation Config for apply_config_transition after releasing.
-    let new_cfg = {
-        let mut cfg = state.config.write().await;
-        hydrate_config_secrets(&mut cfg, secrets, restore_bootstrap_hash);
-        // Env wins consistently: the restored secrets reach the file, but an
-        // env-controlled field keeps its env value at runtime.
-        if let Err(e) = crate::api::admin::config::reapply_env(&old_cfg, &mut cfg, false) {
-            tracing::error!("Full-backup import: env overrides could not be re-applied: {e}");
-            *cfg = old_cfg.clone();
-            return Err(BackupSecretApplyError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to re-apply environment overrides after restoring backup secrets",
-            ));
-        }
-        cfg.clone()
-    }; // release write lock before touching config_db
+    let mut new_cfg = old_cfg.clone();
+    hydrate_config_secrets(&mut new_cfg, secrets, restore_bootstrap_hash);
+    // Env wins consistently: the restored secrets reach the file, but an
+    // env-controlled field keeps its env value at runtime.
+    if let Err(e) = crate::api::admin::config::reapply_env(&old_cfg, &mut new_cfg, false) {
+        tracing::error!("Full-backup import: env overrides could not be re-applied: {e}");
+        return Err(BackupSecretApplyError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to re-apply environment overrides after restoring backup secrets",
+        ));
+    }
 
     // Rebuild the S3 engine so the new storage creds take effect
     // immediately. A mismatch between Config and the running engine
@@ -1521,12 +1520,13 @@ async fn apply_secrets(
             "failed to rebuild engine after applying backup secrets",
         ));
     }
+    *cfg = new_cfg;
 
     // Persist the merged config so storage/access creds survive a
     // restart. Without this, the operator would see the restore "work"
     // until the next process restart, then silently revert.
     let path = crate::api::admin::config::active_config_path(state);
-    if let Err(e) = new_cfg.persist_to_file(&path) {
+    if let Err(e) = cfg.persist_to_file(&path) {
         tracing::error!(
             "Full-backup import: persist merged config to {} failed: {}",
             path,
@@ -1537,6 +1537,7 @@ async fn apply_secrets(
             format!("failed to persist merged config to {path}"),
         ));
     }
+    drop(cfg); // before the config-DB lock below
 
     // OAuth client_secret per provider, by name (robust to id
     // reshuffles across restores). Requires the provider row to
