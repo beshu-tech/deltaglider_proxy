@@ -464,11 +464,27 @@ impl Mode {
 
 /// A spawned xdelta3 child with its three pipes taken.
 struct Xdelta3Process {
-    child: std::process::Child,
+    child: ReapOnDrop,
     id: u32,
     stdin: std::process::ChildStdin,
     stdout: std::process::ChildStdout,
     stderr: std::process::ChildStderr,
+}
+
+/// Owns the xdelta3 child and reaps it on every exit path. An early `?`
+/// (capped sink, bomb cap, pipe error) skipped the wait, and each one left a
+/// zombie. Drop kills a child that still runs, then waits. After a normal
+/// `wait` the kill is a no-op (std keeps the exit status; no signal is sent,
+/// so a recycled pid is never hit).
+struct ReapOnDrop(std::process::Child);
+
+impl Drop for ReapOnDrop {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
 }
 
 impl DeltaCodec {
@@ -655,7 +671,7 @@ impl DeltaCodec {
         let output = output?;
         let stderr_bytes = stderr_result.unwrap_or_default();
 
-        let status = wait_with_timeout(&mut proc.child, codec_timeout())?;
+        let status = wait_with_timeout(&mut proc.child.0, codec_timeout())?;
         mode.check_exit(status, &stderr_bytes)?;
         Ok(output)
     }
@@ -709,6 +725,8 @@ impl DeltaCodec {
                 warn!("Failed to execute xdelta3 CLI: {}", e);
                 mode.error(format!("xdelta3 CLI not available: {}", e))
             })?;
+        #[cfg(test)]
+        tests::LAST_PID.with(|p| p.set(child.id()));
         // These .expect() calls are safe: we configured piped stdin/stdout/stderr
         // above, so .take() only returns None if called twice (which we don't).
         Ok(Xdelta3Process {
@@ -716,7 +734,7 @@ impl DeltaCodec {
             stdin: child.stdin.take().expect("piped stdin"),
             stdout: child.stdout.take().expect("piped stdout"),
             stderr: child.stderr.take().expect("piped stderr"),
-            child,
+            child: ReapOnDrop(child),
         })
     }
 
@@ -780,7 +798,7 @@ impl DeltaCodec {
 
         // The streaming watchdog uses raw kill(); reap the child here (its
         // wall-clock is bounded by the absolute ceiling the watchdog enforces).
-        let status = wait_with_timeout(&mut proc.child, codec_absolute_ceiling())?;
+        let status = wait_with_timeout(&mut proc.child.0, codec_absolute_ceiling())?;
         mode.check_exit(status, &stderr_bytes)?;
         out.flush()?;
         Ok(total)
@@ -813,6 +831,62 @@ impl std::fmt::Debug for DeltaCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// pid of the last xdelta3 this thread spawned (test-only probe).
+        pub(super) static LAST_PID: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Is `pid` an unreaped child (zombie) of this process? Linux-only probe.
+    fn is_our_zombie(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false; // reaped (no such process)
+        };
+        // `pid (comm) S ppid ...` — comm may hold spaces; split after ')'.
+        let rest = &stat[stat.rfind(')').unwrap() + 2..];
+        let mut f = rest.split(' ');
+        let state = f.next().unwrap();
+        let ppid: u32 = f.next().unwrap().parse().unwrap();
+        state == "Z" && ppid == std::process::id()
+    }
+
+    /// Tier 4: an early return (capped streaming sink, decompression-bomb
+    /// cap) must still reap xdelta3. Before, the `?` returned before the
+    /// wait, and every capped encode left one zombie.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn early_returns_reap_the_xdelta3_child() {
+        let codec = DeltaCodec::default();
+        let source: Vec<u8> = (0..100_000u32).flat_map(|n| n.to_le_bytes()).collect();
+        let src_file = source_tempfile(&source);
+        let target: Vec<u8> = (0..100_000u32).map(|n| (n * 7919 % 251) as u8).collect();
+
+        // Streaming encode whose sink refuses the first chunk (the ratio cap).
+        struct Refuse;
+        impl Write for Refuse {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("capped"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(codec
+            .encode_from_reader(src_file.path(), &target[..], Refuse)
+            .is_err());
+        let pid = LAST_PID.with(|p| p.get());
+        assert!(
+            !is_our_zombie(pid),
+            "capped streaming encode left zombie {pid}"
+        );
+
+        // Buffered decode whose output exceeds max_size (bomb guard).
+        let delta = codec.encode(&source[..1000], &target).unwrap();
+        let small = DeltaCodec::new(10_000);
+        assert!(small.decode(&source[..1000], &delta).is_err());
+        let pid = LAST_PID.with(|p| p.get());
+        assert!(!is_our_zombie(pid), "bomb-capped decode left zombie {pid}");
+    }
 
     #[test]
     fn test_encode_decode_roundtrip() {
