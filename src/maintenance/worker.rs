@@ -156,6 +156,13 @@ async fn run_job(
         "",
     );
 
+    let keeper = LeaseKeeper::spawn(
+        db.clone(),
+        job.id,
+        instance_id.to_string(),
+        LEASE_TTL_SECS,
+        keeper_interval(LEASE_TTL_SECS),
+    );
     let outcome = match job.kind.as_str() {
         "reencrypt" => execute_phases(config, db, state, instance_id, &job).await,
         "migrate" => {
@@ -166,6 +173,7 @@ async fn run_job(
         }
         other => Err(format!("unknown maintenance job kind '{other}'")),
     };
+    drop(keeper);
 
     if outcome.as_ref().err().is_some_and(|e| e == LEASE_LOST) {
         // Do NOT settle the row: losing the lease means it lapsed (the
@@ -565,6 +573,49 @@ pub(crate) async fn persist(
     }
 }
 
+/// Renews a job lease on a timer for as long as it lives (aborted on drop).
+/// The per-page `heartbeat` is not enough on its own: one page of copy work
+/// can outlast the TTL, and a lapsed lease lets the requeue scan hand the job
+/// back and the write gate open mid-job. The keeper stops at the first
+/// refused renewal; the next per-page `heartbeat` then reports LEASE_LOST.
+pub(crate) struct LeaseKeeper(tokio::task::JoinHandle<()>);
+
+impl LeaseKeeper {
+    pub(crate) fn spawn(
+        db: Arc<Mutex<ConfigDb>>,
+        job_id: i64,
+        instance_id: String,
+        ttl_secs: i64,
+        interval: std::time::Duration,
+    ) -> Self {
+        Self(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let renewed = {
+                    let db = db.lock().await;
+                    db.maintenance_heartbeat(job_id, &instance_id, current_unix_seconds(), ttl_secs)
+                        .unwrap_or(false)
+                };
+                if !renewed {
+                    warn!("maintenance: job #{job_id} lease renewal refused; keeper stops");
+                    return;
+                }
+            }
+        }))
+    }
+}
+
+impl Drop for LeaseKeeper {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Renew three times per TTL, so one slow renewal never lapses the lease.
+fn keeper_interval(ttl_secs: i64) -> std::time::Duration {
+    std::time::Duration::from_millis((ttl_secs.max(1) as u64) * 1000 / 3)
+}
+
 /// Renew the job lease; `Err(LEASE_LOST)` means the renewal was refused
 /// (lapsed, or taken by another instance) and the phase MUST stop — this
 /// is the one subsystem that flips config and deletes source data, so a
@@ -594,5 +645,59 @@ pub(crate) async fn record_failure(db: &Arc<Mutex<ConfigDb>>, job_id: i64, key: 
             "maintenance: failure record failed for job #{}: {}",
             job_id, e
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claimed_job(ttl: i64) -> (Arc<Mutex<ConfigDb>>, i64) {
+        let db = ConfigDb::in_memory("testpass").unwrap();
+        let id = db
+            .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_claim_next_job("inst", current_unix_seconds(), ttl)
+            .unwrap()
+            .expect("claim");
+        (Arc::new(Mutex::new(db)), id)
+    }
+
+    /// D11: one listing page (1000 objects of copy work) can take longer than
+    /// the lease TTL. The per-page heartbeat alone lets the lease lapse, the
+    /// requeue scan hands the job back to the queue and the write gate opens
+    /// mid-job. A lease keeper renews on a timer for the whole job.
+    #[tokio::test]
+    async fn lease_keeper_holds_the_lease_through_a_long_page() {
+        let ttl = 2;
+        // Control: without the keeper, a 3.5s "page" lapses a 2s lease.
+        let (db, _) = claimed_job(ttl);
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+        assert_eq!(db.lock().await.maintenance_requeue_abandoned().unwrap(), 1);
+
+        let (db, id) = claimed_job(ttl);
+        let _keeper = LeaseKeeper::spawn(
+            db.clone(),
+            id,
+            "inst".to_string(),
+            ttl,
+            std::time::Duration::from_millis(300),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+        assert_eq!(
+            db.lock().await.maintenance_requeue_abandoned().unwrap(),
+            0,
+            "the lease lapsed while the keeper ran"
+        );
+    }
+
+    #[test]
+    fn keeper_interval_is_well_inside_the_ttl() {
+        assert!(
+            keeper_interval(LEASE_TTL_SECS) * 3
+                <= std::time::Duration::from_secs(LEASE_TTL_SECS as u64)
+        );
+        assert_eq!(keeper_interval(1), std::time::Duration::from_millis(333));
     }
 }
