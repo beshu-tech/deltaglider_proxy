@@ -648,6 +648,21 @@ pub fn classify_s3_operation(method: &str, path: &str) -> &'static str {
     }
 }
 
+/// Bounded `method` label. Axum accepts any extension method, so the raw
+/// method text as a label let a client create unbounded time series.
+pub fn method_label(method: &str) -> &'static str {
+    match method {
+        "GET" => "GET",
+        "HEAD" => "HEAD",
+        "PUT" => "PUT",
+        "POST" => "POST",
+        "DELETE" => "DELETE",
+        "OPTIONS" => "OPTIONS",
+        "PATCH" => "PATCH",
+        _ => "OTHER",
+    }
+}
+
 /// Record the bounded request counter for paths that short-circuit before
 /// [`http_metrics_middleware`] can observe the response.
 pub fn record_http_request_total(metrics: &Metrics, method: &str, path: &str, status: StatusCode) {
@@ -655,7 +670,7 @@ pub fn record_http_request_total(metrics: &Metrics, method: &str, path: &str, st
     let status = status.as_u16().to_string();
     metrics
         .http_requests_total
-        .with_label_values(&[method, status.as_str(), operation])
+        .with_label_values(&[method_label(method), status.as_str(), operation])
         .inc();
 }
 
@@ -667,9 +682,9 @@ pub async fn http_metrics_middleware(
 ) -> Response {
     let metrics = &state.metrics;
 
-    let method = request.method().to_string();
+    let method = method_label(request.method().as_str());
     let path = request.uri().path().to_string();
-    let operation = classify_s3_operation(&method, &path);
+    let operation = classify_s3_operation(method, &path);
 
     // Record request size from Content-Length if available
     if let Some(cl) = request
@@ -680,7 +695,7 @@ pub async fn http_metrics_middleware(
     {
         metrics
             .http_request_size_bytes
-            .with_label_values(&[&method])
+            .with_label_values(&[method])
             .observe(cl);
     }
 
@@ -690,10 +705,10 @@ pub async fn http_metrics_middleware(
 
     // prometheus 0.14 widened `with_label_values` to a uniform-type slice:
     // pass `&str` for every element.
-    record_http_request_total(metrics, method.as_str(), &path, response.status());
+    record_http_request_total(metrics, method, &path, response.status());
     metrics
         .http_request_duration_seconds
-        .with_label_values(&[method.as_str(), operation])
+        .with_label_values(&[method, operation])
         .observe(duration);
 
     // Record response size from Content-Length if available
@@ -705,7 +720,7 @@ pub async fn http_metrics_middleware(
     {
         metrics
             .http_response_size_bytes
-            .with_label_values(&[&method])
+            .with_label_values(&[method])
             .observe(cl);
     }
 
@@ -913,6 +928,28 @@ mod tests {
     fn build_info_version_label_is_empty_unless_opted_in() {
         assert_eq!(build_info_version_label(false), "");
         assert_eq!(build_info_version_label(true), env!("CARGO_PKG_VERSION"));
+    }
+
+    /// An arbitrary HTTP method (axum accepts extension methods) must not
+    /// become a label value: each new value is a new time series (S23).
+    #[test]
+    fn method_label_is_bounded() {
+        use prometheus::core::Collector;
+        let m = Metrics::new();
+        for i in 0..5 {
+            record_http_request_total(&m, &format!("X{i}"), "/b/k", StatusCode::FORBIDDEN);
+        }
+        record_http_request_total(&m, "GET", "/b/k", StatusCode::OK);
+        let methods: std::collections::BTreeSet<String> = m
+            .http_requests_total
+            .collect()
+            .iter()
+            .flat_map(|f| f.get_metric().to_vec())
+            .flat_map(|metric| metric.get_label().to_vec())
+            .filter(|l| l.name() == "method")
+            .map(|l| l.value().to_string())
+            .collect();
+        assert_eq!(methods, ["GET", "OTHER"].map(String::from).into());
     }
 
     #[test]
