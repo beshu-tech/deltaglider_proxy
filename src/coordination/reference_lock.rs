@@ -30,10 +30,33 @@
 //! ## Ownership
 //!
 //! `owner` is a fresh token per acquisition, so `release` deletes precisely the
-//! object we wrote. `node_id` is the durable node identity, used only for
-//! SELF-RECLAIM: a lock left behind by a crashed-then-restarted same node (or a
-//! re-entrant acquire on the same node) is reclaimable immediately rather than
-//! after a full TTL. A live lock owned by a DIFFERENT node blocks.
+//! object we wrote. `node_id` is diagnostic provenance only. A live lock is
+//! NEVER stolen, not even by the "same" node: node ids come from `HOSTNAME`,
+//! which two live replicas can share, and an engine rebuild runs two engines
+//! in one process. A lock that a crashed node leaves behind frees at its TTL.
+//!
+//! ## Holding for a long time
+//!
+//! A streaming encode can outlast the TTL. The holder renews the lock
+//! (`renew`, owner-scoped `If-Match` extend) every `renew_interval`, and checks
+//! that it still holds it right before each commit (see the engine's
+//! `ReferenceLockGuard::ensure_held`). A holder that cannot renew stops before
+//! it writes.
+//!
+//! ## Clock skew
+//!
+//! `expires_at` is the writer's wall clock; a peer compares it with its own.
+//! The holder trusts its hold for at most `ttl / 2` after its last confirmed
+//! renew (a monotonic clock), and renews every `ttl / 4`. So a peer steals a
+//! live-held lock only when its clock runs more than `ttl / 2` (60s at the
+//! default TTL) ahead of the holder's: the supported skew bound. NTP-synced
+//! nodes are far inside it.
+//!
+//! ## Fencing
+//!
+//! `epoch` bumps on every steal, but the data writes go to customer buckets,
+//! which cannot check it. Fencing those writes needs backend support; the
+//! renew-and-check above is the defence.
 
 use std::time::Duration;
 
@@ -42,10 +65,9 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use serde::{Deserialize, Serialize};
 
-/// Default crash-backstop TTL for a held lock. Comfortably longer than the
-/// longest reference critical section (an xdelta3 encode of a `max_object_size`
-/// object), so a live holder is never mistaken for a dead one, while a genuinely
-/// dead holder's lock still frees within a bounded window.
+/// Default crash-backstop TTL for a held lock. A live holder renews it every
+/// `ttl / 4`, so it keeps the lock through an encode of any length; a dead
+/// holder's lock frees within one TTL.
 pub const DEFAULT_LOCK_TTL_SECS: i64 = 120;
 /// Default ceiling on how long a writer waits to acquire before failing the PUT.
 /// A peer holds the lock only for its own short critical section, so contention
@@ -65,41 +87,70 @@ pub struct RefLock {
     pub expires_at: i64,
 }
 
+/// What a read of the lock key found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Observed {
+    Absent,
+    /// An object whose body does not parse. It is not a lock anybody holds.
+    Corrupt {
+        etag: String,
+    },
+    Held {
+        lock: RefLock,
+        etag: String,
+    },
+}
+
 /// What `try_acquire` should do given the CURRENT lock object state.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LockAction {
     /// No object exists → create with `If-None-Match:*`.
     Create,
-    /// An object exists but is expired or is OURS (same node) → steal with
-    /// `If-Match(etag)`, carrying `next_epoch`.
+    /// An expired lock or an unparsable body → replace with `If-Match(etag)`,
+    /// carrying `next_epoch`. (A create-if-absent on an existing key 412s on
+    /// every pass: a corrupt body wedged the deltaspace forever.)
     Steal { etag: String, next_epoch: u64 },
-    /// A live lock held by a different node → cannot acquire this pass.
+    /// A live lock → cannot acquire this pass, whoever holds it.
     Blocked,
 }
 
-/// Pure acquire decision (mirrors `s3_lease::plan_acquire`). Stealable when
-/// EXPIRED (`expires_at < now`, STRICT — the exact-expiry instant blocks a
-/// foreign holder, never simultaneously stealable-and-live) OR when the lock is
-/// OURS (`node_id` match, self-reclaim). A live foreign lock blocks.
-pub fn plan_lock_acquire(
-    current: Option<(&RefLock, &str)>,
-    now: i64,
-    my_node_id: &str,
-) -> LockAction {
+/// Pure acquire decision. Stealable only when EXPIRED (`expires_at < now`,
+/// STRICT — the exact-expiry instant is never both live and stealable) or
+/// corrupt. There is no same-node self-reclaim (see the module doc).
+pub fn plan_lock_acquire(current: &Observed, now: i64) -> LockAction {
     match current {
-        None => LockAction::Create,
-        Some((lock, etag)) => {
-            let expired = lock.expires_at < now;
-            let mine = lock.node_id == my_node_id;
-            if expired || mine {
-                LockAction::Steal {
-                    etag: etag.to_string(),
-                    next_epoch: lock.epoch.saturating_add(1),
-                }
-            } else {
-                LockAction::Blocked
+        Observed::Absent => LockAction::Create,
+        Observed::Corrupt { etag } => LockAction::Steal {
+            etag: etag.clone(),
+            next_epoch: 1,
+        },
+        Observed::Held { lock, etag } if lock.expires_at < now => LockAction::Steal {
+            etag: etag.clone(),
+            next_epoch: lock.epoch.saturating_add(1),
+        },
+        Observed::Held { .. } => LockAction::Blocked,
+    }
+}
+
+/// What `renew` should do given the current lock state.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RenewLockAction {
+    /// Still ours and live → extend with `If-Match(etag)`.
+    Renew { etag: String, epoch: u64 },
+    /// Gone, corrupt, another owner's, or lapsed → the hold is lost.
+    Lost,
+}
+
+/// Pure renew decision (`>= now`, non-strict: tiles with the strict steal).
+pub fn plan_lock_renew(current: &Observed, now: i64, owner: &str) -> RenewLockAction {
+    match current {
+        Observed::Held { lock, etag } if lock.owner == owner && lock.expires_at >= now => {
+            RenewLockAction::Renew {
+                etag: etag.clone(),
+                epoch: lock.epoch,
             }
         }
+        _ => RenewLockAction::Lost,
     }
 }
 
@@ -117,9 +168,19 @@ pub trait ReferenceLock: Send + Sync {
     /// lapsed. Best-effort: the TTL backstops a failed release.
     async fn release(&self, key: &str, owner: &str) -> Result<(), String>;
 
+    /// Extend a lock this owner still holds. `Ok(false)` = lost (stolen,
+    /// lapsed, gone): the holder must not commit. `Err` = could not tell.
+    async fn renew(&self, key: &str, owner: &str, now: i64) -> Result<bool, String>;
+
     /// The crash-backstop TTL applied to a freshly acquired lock, in seconds.
     fn ttl_secs(&self) -> i64 {
         DEFAULT_LOCK_TTL_SECS
+    }
+
+    /// How often a holder renews, and how old a confirmation may be before a
+    /// commit re-confirms it. `ttl / 4` (see "Clock skew" in the module doc).
+    fn renew_interval(&self) -> Duration {
+        Duration::from_millis((self.ttl_secs().max(1) as u64) * 1000 / 4)
     }
 
     /// How long a writer waits to acquire before failing the write closed.
@@ -167,7 +228,7 @@ impl S3ReferenceLock {
         self
     }
 
-    async fn read_lock(&self, key: &str) -> Result<Option<(RefLock, String)>, String> {
+    async fn read_lock(&self, key: &str) -> Result<Observed, String> {
         match self
             .client
             .get_object()
@@ -184,19 +245,16 @@ impl S3ReferenceLock {
                     .await
                     .map_err(|e| format!("lock body read: {e}"))?
                     .into_bytes();
-                match serde_json::from_slice::<RefLock>(&bytes) {
-                    Ok(lock) => Ok(Some((lock, etag))),
-                    // A corrupt/foreign object at the key → treat as absent so a
-                    // create-if-absent can reclaim it (it 412s if a valid
-                    // concurrent writer beat us, which is correct).
-                    Err(_) => Ok(None),
-                }
+                Ok(match serde_json::from_slice::<RefLock>(&bytes) {
+                    Ok(lock) => Observed::Held { lock, etag },
+                    Err(_) => Observed::Corrupt { etag },
+                })
             }
             Err(e) => {
                 if crate::config_db_sync::is_object_absent(
                     &crate::config_db_sync::sdk_error_signal(&e),
                 ) {
-                    Ok(None)
+                    Ok(Observed::Absent)
                 } else {
                     Err(format!("{e:?}"))
                 }
@@ -251,11 +309,7 @@ impl ReferenceLock for S3ReferenceLock {
     async fn try_acquire(&self, key: &str, owner: &str, now: i64) -> Result<bool, String> {
         let current = self.read_lock(key).await?;
         let expires_at = now.saturating_add(self.ttl_secs.max(1));
-        match plan_lock_acquire(
-            current.as_ref().map(|(l, e)| (l, e.as_str())),
-            now,
-            &self.node_id,
-        ) {
+        match plan_lock_acquire(&current, now) {
             LockAction::Blocked => Ok(false),
             LockAction::Create => {
                 self.put_lock(key, self.body_for(owner, 1, expires_at), None)
@@ -273,7 +327,7 @@ impl ReferenceLock for S3ReferenceLock {
     }
 
     async fn release(&self, key: &str, owner: &str) -> Result<(), String> {
-        if let Some((lock, etag)) = self.read_lock(key).await? {
+        if let Observed::Held { lock, etag } = self.read_lock(key).await? {
             if lock.owner == owner {
                 let _ = self
                     .client
@@ -286,6 +340,19 @@ impl ReferenceLock for S3ReferenceLock {
             }
         }
         Ok(())
+    }
+
+    async fn renew(&self, key: &str, owner: &str, now: i64) -> Result<bool, String> {
+        let current = self.read_lock(key).await?;
+        match plan_lock_renew(&current, now, owner) {
+            RenewLockAction::Lost => Ok(false),
+            // A 412 here means the object moved under us: lost.
+            RenewLockAction::Renew { etag, epoch } => {
+                let expires_at = now.saturating_add(self.ttl_secs.max(1));
+                self.put_lock(key, self.body_for(owner, epoch, expires_at), Some(&etag))
+                    .await
+            }
+        }
     }
 
     fn ttl_secs(&self) -> i64 {
@@ -338,16 +405,26 @@ mod tests {
         }
     }
 
+    fn held(l: RefLock) -> Observed {
+        Observed::Held {
+            lock: l,
+            etag: "e1".into(),
+        }
+    }
+
     #[test]
     fn acquire_free_creates() {
-        assert_eq!(plan_lock_acquire(None, 100, "nodeA"), LockAction::Create);
+        assert_eq!(
+            plan_lock_acquire(&Observed::Absent, 100),
+            LockAction::Create
+        );
     }
 
     #[test]
     fn acquire_expired_steals_with_bumped_epoch() {
         let l = obj("old", "nodeB", 5, 90); // expired at now=100
         assert_eq!(
-            plan_lock_acquire(Some((&l, "e1")), 100, "nodeA"),
+            plan_lock_acquire(&held(l), 100),
             LockAction::Steal {
                 etag: "e1".into(),
                 next_epoch: 6
@@ -358,22 +435,30 @@ mod tests {
     #[test]
     fn acquire_live_foreign_blocks() {
         let l = obj("held", "nodeB", 5, 160); // live at now=100
-        assert_eq!(
-            plan_lock_acquire(Some((&l, "e1")), 100, "nodeA"),
-            LockAction::Blocked
-        );
+        assert_eq!(plan_lock_acquire(&held(l), 100), LockAction::Blocked);
     }
 
+    /// No same-node self-reclaim: two replicas can share a HOSTNAME-derived
+    /// node id, and an engine rebuild runs two engines in one process. A
+    /// live lock blocks whoever asks; a crashed holder's lock frees at TTL.
     #[test]
-    fn acquire_own_live_self_reclaims() {
-        // Same node_id → reclaimable without waiting for expiry (re-entrancy /
-        // crash-restart), so a same-node re-acquire never deadlocks on itself.
-        let l = obj("old-token", "nodeA", 5, 160); // live, but ours
+    fn acquire_live_lock_blocks_even_the_same_node() {
+        let l = obj("old-token", "nodeA", 5, 160);
+        assert_eq!(plan_lock_acquire(&held(l), 100), LockAction::Blocked);
+    }
+
+    /// An unparsable body at the key is not a lock. Create-if-absent 412s on
+    /// it forever, so it must be replaced with `If-Match`.
+    #[test]
+    fn acquire_corrupt_body_is_replaced_by_etag() {
+        let c = Observed::Corrupt {
+            etag: "junk".into(),
+        };
         assert_eq!(
-            plan_lock_acquire(Some((&l, "e1")), 100, "nodeA"),
+            plan_lock_acquire(&c, 100),
             LockAction::Steal {
-                etag: "e1".into(),
-                next_epoch: 6
+                etag: "junk".into(),
+                next_epoch: 1
             }
         );
     }
@@ -383,10 +468,56 @@ mod tests {
         // expires_at == now → NOT expired (strict <), so a foreign live lock
         // still blocks — the exact instant is never both live and stealable.
         let l = obj("held", "nodeB", 5, 100);
+        assert_eq!(plan_lock_acquire(&held(l), 100), LockAction::Blocked);
+    }
+
+    #[test]
+    fn renew_truth_table() {
+        let mine = obj("me", "nodeA", 7, 100);
+        // Live (and the exact expiry instant, non-strict) → renew.
         assert_eq!(
-            plan_lock_acquire(Some((&l, "e")), 100, "nodeA"),
-            LockAction::Blocked
+            plan_lock_renew(&held(mine.clone()), 100, "me"),
+            RenewLockAction::Renew {
+                etag: "e1".into(),
+                epoch: 7
+            }
         );
+        // Lapsed → lost (a peer may already hold it).
+        assert_eq!(
+            plan_lock_renew(&held(mine), 101, "me"),
+            RenewLockAction::Lost
+        );
+        // Stolen by another owner, gone, or corrupt → lost.
+        assert_eq!(
+            plan_lock_renew(&held(obj("peer", "nodeB", 8, 500)), 100, "me"),
+            RenewLockAction::Lost
+        );
+        assert_eq!(
+            plan_lock_renew(&Observed::Absent, 100, "me"),
+            RenewLockAction::Lost
+        );
+        assert_eq!(
+            plan_lock_renew(&Observed::Corrupt { etag: "x".into() }, 100, "me"),
+            RenewLockAction::Lost
+        );
+    }
+
+    #[test]
+    fn renew_interval_is_a_quarter_ttl() {
+        struct T;
+        #[async_trait]
+        impl ReferenceLock for T {
+            async fn try_acquire(&self, _: &str, _: &str, _: i64) -> Result<bool, String> {
+                Ok(true)
+            }
+            async fn release(&self, _: &str, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn renew(&self, _: &str, _: &str, _: i64) -> Result<bool, String> {
+                Ok(true)
+            }
+        }
+        assert_eq!(T.renew_interval(), Duration::from_secs(30));
     }
 
     #[test]
@@ -436,6 +567,9 @@ mod tests {
             }
             Ok(())
         }
+        async fn renew(&self, _key: &str, owner: &str, _now: i64) -> Result<bool, String> {
+            Ok(self.held_by.lock().await.as_deref() == Some(owner))
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -483,6 +617,9 @@ mod tests {
             }
             async fn release(&self, _k: &str, _o: &str) -> Result<(), String> {
                 Ok(())
+            }
+            async fn renew(&self, _k: &str, _o: &str, _n: i64) -> Result<bool, String> {
+                Err("coordination bucket unreachable".into())
             }
         }
         let now_fn = || 1000i64;

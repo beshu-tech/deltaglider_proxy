@@ -260,7 +260,15 @@ single-instance planes below are addressed.
   baseline and corrupt it (closes B1). It is a short-lived S3-CAS lock object
   (`_dgp/locks/reference/<hash>.json`, create-if-absent / steal-on-TTL-expiry /
   owner-scoped release), NOT the 300s leader lease; a peer holding it past the
-  acquire timeout fails the PUT closed rather than risk a second baseline.
+  acquire timeout fails the PUT closed rather than risk a second baseline. The
+  holder renews it every TTL/4 (heartbeat) and `ReferenceLockGuard::ensure_held`
+  runs before every reference/delta commit, so a holder that lost it stops
+  before it writes. A live lock is never stolen, not even by the same node id
+  (HOSTNAME twins, engine rebuilds). Supported clock skew between nodes: TTL/2.
+  Every engine write of reference.bin goes through a guard method (source test
+  `reference_writes_go_through_the_guard`), incl. delete-reclaim, sweep-reclaim,
+  legacy-reference migration and the replication fast-path seed
+  (`with_dest_prefix_lock` holds both locks).
   Single-instance (no coordination bucket) → the field is `None`, in-process lock
   only, zero S3 round-trips. The operator's directory-hash router is still the
   recommended topology (it also handles multipart + metadata-cache locality), but

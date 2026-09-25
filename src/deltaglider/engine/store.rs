@@ -172,7 +172,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // The in-process mutex serializes same-node threads; the cross-instance
         // lock (multi-instance only, inert otherwise) serializes across nodes.
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
-        let _xnode_guard = self.acquire_reference_lock(bucket, &deltaspace_id).await?;
+        let xnode = self.acquire_reference_lock(bucket, &deltaspace_id).await?;
 
         let ctx = StoreContext {
             bucket,
@@ -213,16 +213,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             // Heal a stripped-metadata reference in place (same bytes) so the
             // delta we write next carries a valid ref_sha256 and replication
             // stops re-copying this deltaspace. No-op (zero I/O) when healthy.
-            self.heal_reference_if_corrupt(ctx.bucket, ctx.deltaspace_id, read, None)
+            self.heal_reference_if_corrupt(ctx.bucket, ctx.deltaspace_id, read, None, &xnode)
                 .await?
         } else {
             debug!("No reference in deltaspace, creating baseline");
-            self.set_reference_baseline(&ctx).await?
+            self.set_reference_baseline(&ctx, &xnode).await?
         };
 
         // Encode delta and decide: keep as delta or fall back to direct storage
         let result = match self
-            .encode_and_store(ctx, &ref_meta, has_existing_reference)
+            .encode_and_store(ctx, &ref_meta, has_existing_reference, &xnode)
             .await
         {
             Ok(r) => r,
@@ -233,8 +233,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     // original encode failure.
                     let cache_key = Self::cache_key(bucket, &deltaspace_id);
                     self.cache.invalidate(&cache_key);
-                    if let Err(cleanup_err) =
-                        self.storage.delete_reference(bucket, &deltaspace_id).await
+                    if let Err(cleanup_err) = xnode
+                        .delete_reference(&*self.storage, bucket, &deltaspace_id)
+                        .await
                     {
                         warn!(
                             "S-P1-2: encode failed AND reference rollback failed for {}/{}: encode_err={}, rollback_err={}",
@@ -272,6 +273,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         ctx: StoreContext<'_>,
         ref_meta: &FileMetadata,
         has_existing_reference: bool,
+        xnode: &super::ReferenceLockGuard,
     ) -> Result<StoreResult, EngineError> {
         let (reference, _cache_hit) = self
             .get_reference_cached(ctx.bucket, ctx.deltaspace_id, &ref_meta.file_sha256)
@@ -308,7 +310,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ratio * 100.0
         );
 
-        self.commit_delta_or_passthrough(ctx, ref_meta, has_existing_reference, delta, ratio)
+        self.commit_delta_or_passthrough(ctx, ref_meta, has_existing_reference, delta, ratio, xnode)
             .await
     }
 
@@ -430,7 +432,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // serializes across NODES, so two instances can no longer both create a
         // baseline and corrupt reference.bin (see CLAUDE.md HA contract).
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
-        let _xnode_guard = self.acquire_reference_lock(bucket, &deltaspace_id).await?;
+        let xnode = self.acquire_reference_lock(bucket, &deltaspace_id).await?;
         // Write path: a backend error must abort, not read as "no reference".
         let has_existing_reference = self.storage.has_reference(bucket, &deltaspace_id).await?;
         // A fresh baseline stays in place on both branches below (even when the
@@ -451,8 +453,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 size,
                 content_type.clone(),
             );
-            self.storage
-                .put_reference_from_file(bucket, &deltaspace_id, body.path(), &ref_meta)
+            xnode
+                .put_reference_from_file(
+                    &*self.storage,
+                    bucket,
+                    &deltaspace_id,
+                    body.path(),
+                    &ref_meta,
+                )
                 .await?;
             self.with_metrics(|m| {
                 m.delta_decisions_total
@@ -479,7 +487,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .get_reference_metadata(bucket, &deltaspace_id)
                 .await?;
             Some(
-                self.heal_reference_if_corrupt(bucket, &deltaspace_id, read, Some(body))
+                self.heal_reference_if_corrupt(bucket, &deltaspace_id, read, Some(body), &xnode)
                     .await?,
             )
         } else {
@@ -579,7 +587,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // prefix lock internally, so holding it here would re-entrant-
                 // deadlock; the cross-node lock is released too (passthrough does
                 // not touch reference.bin, so it needs no cross-node exclusion).
-                drop((ref_spool, delta_spool, _guard, _xnode_guard));
+                drop((ref_spool, delta_spool, _guard, xnode));
                 let result = self
                     .store_passthrough_file_inner(
                         bucket,
@@ -627,9 +635,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         content_type.clone(),
                         user_metadata.clone(),
                         multipart_etag.clone(),
+                        &xnode,
                     )
                     .await?;
-                drop((ref_spool, delta_spool, _guard, _xnode_guard));
+                drop((ref_spool, delta_spool, _guard, xnode));
                 self.metadata_cache
                     .insert(bucket, key, result.metadata.clone());
                 Ok(result.with_accounting(prior_for_counter, reference_created_bytes))
@@ -654,6 +663,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         content_type: Option<String>,
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: Option<String>,
+        xnode: &super::ReferenceLockGuard,
     ) -> Result<StoreResult, EngineError> {
         let ref_meta = self
             .storage
@@ -677,6 +687,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         metadata.user_metadata = user_metadata;
         metadata.multipart_etag = multipart_etag;
         let stored_size = delta.len() as u64;
+        // The delta is only valid against the reference we locked.
+        xnode.ensure_held().await?;
         self.storage
             .put_delta(bucket, deltaspace_id, &obj_key.filename, &delta, &metadata)
             .await?;
@@ -699,6 +711,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         has_existing_reference: bool,
         delta: Vec<u8>,
         ratio: f32,
+        xnode: &super::ReferenceLockGuard,
     ) -> Result<StoreResult, EngineError> {
         // S-P1-1: re-evaluate the ratio on every PUT, not just the
         // first one in the deltaspace. Pre-fix, the threshold gate
@@ -755,7 +768,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             if !has_existing_reference {
                 let cache_key = Self::cache_key(&del_bucket, &del_dsid);
                 self.cache.invalidate(&cache_key);
-                if let Err(e) = self.storage.delete_reference(&del_bucket, &del_dsid).await {
+                if let Err(e) = xnode
+                    .delete_reference(&*self.storage, &del_bucket, &del_dsid)
+                    .await
+                {
                     warn!(
                         "Failed to clean up reference after passthrough write: {}",
                         e
@@ -784,7 +800,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         metadata.user_metadata = ctx.user_metadata;
         metadata.multipart_etag = ctx.multipart_etag;
 
-        // Write delta first, then clean up old passthrough variant
+        // Write delta first, then clean up old passthrough variant. The delta
+        // is only valid against the reference we locked.
+        xnode.ensure_held().await?;
         self.storage
             .put_delta(
                 ctx.bucket,
@@ -811,6 +829,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     async fn set_reference_baseline(
         &self,
         ctx: &StoreContext<'_>,
+        xnode: &super::ReferenceLockGuard,
     ) -> Result<FileMetadata, EngineError> {
         let metadata = FileMetadata::new_reference(
             Self::INTERNAL_REFERENCE_NAME.to_string(),
@@ -821,8 +840,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ctx.content_type.clone(),
         );
 
-        self.storage
-            .put_reference(ctx.bucket, ctx.deltaspace_id, ctx.data, &metadata)
+        xnode
+            .put_reference(
+                &*self.storage,
+                ctx.bucket,
+                ctx.deltaspace_id,
+                ctx.data,
+                &metadata,
+            )
             .await?;
 
         self.with_metrics(|m| {
@@ -869,6 +894,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         ref_meta: FileMetadata,
         // A spool the caller already holds (the streaming PUT body).
         held: Option<&crate::deltaglider::spool::Spool>,
+        xnode: &super::ReferenceLockGuard,
     ) -> Result<FileMetadata, EngineError> {
         if !Self::reference_metadata_is_corrupt(&ref_meta) {
             return Ok(ref_meta); // healthy — zero extra I/O
@@ -900,8 +926,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             size,
             ref_meta.content_type.clone(),
         );
-        self.storage
-            .put_reference_from_file(bucket, deltaspace_id, spool.path(), &healed)
+        xnode
+            .put_reference_from_file(&*self.storage, bucket, deltaspace_id, spool.path(), &healed)
             .await?;
         self.cache
             .invalidate(&Self::cache_key(bucket, deltaspace_id));
@@ -1555,6 +1581,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         deltaspace_id: &str,
         filename: &str,
+        xnode: &super::ReferenceLockGuard,
     ) -> Result<bool, EngineError> {
         if !self.storage.has_reference(bucket, deltaspace_id).await? {
             return Ok(false);
@@ -1600,8 +1627,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await?;
 
         ref_meta.original_name = Self::INTERNAL_REFERENCE_NAME.to_string();
-        self.storage
-            .put_reference_metadata(bucket, deltaspace_id, &ref_meta)
+        xnode
+            .put_reference_metadata(&*self.storage, bucket, deltaspace_id, &ref_meta)
             .await?;
 
         // Invalidate cache — reference metadata changed (though data is unchanged,
@@ -1646,8 +1673,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             // This is a legacy reference — migrate it
             let filename = ref_meta.original_name.clone();
             let _guard = self.acquire_prefix_lock(bucket, ds).await;
+            let xnode = match self.acquire_reference_lock(bucket, ds).await {
+                Ok(g) => g,
+                Err(e) => {
+                    tracing::warn!("Failed to migrate {}/{}: {}", bucket, ds, e);
+                    errors += 1;
+                    continue;
+                }
+            };
             match self
-                .migrate_legacy_reference_object_if_needed(bucket, ds, &filename)
+                .migrate_legacy_reference_object_if_needed(bucket, ds, &filename, &xnode)
                 .await
             {
                 Ok(true) => {

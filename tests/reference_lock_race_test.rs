@@ -147,33 +147,80 @@ async fn reference_lock_steals_after_ttl_expiry() {
 }
 
 #[tokio::test]
-async fn reference_lock_self_reclaims_same_node() {
+async fn reference_lock_live_lock_blocks_the_same_node_id() {
     if !minio_available().await {
-        eprintln!("Skipping reference_lock_self_reclaims_same_node: MinIO not available");
+        eprintln!("Skipping reference_lock_live_lock_blocks_the_same_node_id: MinIO not available");
         return;
     }
-    // A same-node re-acquire (re-entrancy, or a crash-restart with the same
-    // durable node id) must reclaim its own still-live lock immediately rather
-    // than deadlock on itself; a DIFFERENT node stays blocked.
+    // Two live replicas can share a HOSTNAME-derived node id, and an engine
+    // rebuild runs two engines in one process. A live lock therefore blocks
+    // even the "same" node; only expiry frees it.
     let key = unique_key();
     let before = lock_for("nodeC").await;
     assert!(
         before.try_acquire(&key, "ref-c-old", 1000).await.unwrap(),
         "node C acquires (still live)"
     );
-    let after = lock_for("nodeC").await; // same node id, fresh owner token
+    let twin = lock_for("nodeC").await; // same node id, fresh owner token
     assert!(
-        after.try_acquire(&key, "ref-c-new", 1050).await.unwrap(),
-        "same node reclaims its own live lock"
+        !twin.try_acquire(&key, "ref-c-new", 1050).await.unwrap(),
+        "a live lock blocks the same node id"
     );
-    let other = lock_for("nodeD").await;
     assert!(
-        !other.try_acquire(&key, "ref-d", 1060).await.unwrap(),
-        "a different node is still blocked by the live lock"
+        twin.try_acquire(&key, "ref-c-new", 1200).await.unwrap(),
+        "after the TTL the lock frees"
     );
 
-    after.release(&key, "ref-c-new").await.unwrap();
-    cleanup(&other, &key).await;
+    twin.release(&key, "ref-c-new").await.unwrap();
+    cleanup(&before, &key).await;
+}
+
+#[tokio::test]
+async fn reference_lock_renew_extends_and_detects_a_steal() {
+    if !minio_available().await {
+        eprintln!("Skipping reference_lock_renew_extends_and_detects_a_steal: MinIO not available");
+        return;
+    }
+    let key = unique_key();
+    let a = lock_for("nodeA").await;
+    let b = lock_for("nodeB").await;
+    assert!(a.try_acquire(&key, "ref-a", 1000).await.unwrap()); // expires 1120
+                                                                // Renew at 1100 → expires 1220: B is still blocked at 1150.
+    assert!(a.renew(&key, "ref-a", 1100).await.unwrap());
+    assert!(!b.try_acquire(&key, "ref-b", 1150).await.unwrap());
+    // B steals after the renewed expiry; A's next renew reports the loss.
+    assert!(b.try_acquire(&key, "ref-b", 1300).await.unwrap());
+    assert!(!a.renew(&key, "ref-a", 1301).await.unwrap());
+
+    b.release(&key, "ref-b").await.unwrap();
+    cleanup(&a, &key).await;
+}
+
+#[tokio::test]
+async fn reference_lock_replaces_a_corrupt_body() {
+    if !minio_available().await {
+        eprintln!("Skipping reference_lock_replaces_a_corrupt_body: MinIO not available");
+        return;
+    }
+    // A body that does not parse used to read as "absent": the create-if-absent
+    // then 412'd on the existing key forever, wedging the deltaspace.
+    let key = unique_key();
+    minio_client()
+        .await
+        .put_object()
+        .bucket(MINIO_BUCKET)
+        .key(&key)
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"not json"))
+        .send()
+        .await
+        .unwrap();
+    let a = lock_for("nodeA").await;
+    assert!(
+        a.try_acquire(&key, "ref-a", 1000).await.unwrap(),
+        "a corrupt lock object must be replaced"
+    );
+    a.release(&key, "ref-a").await.unwrap();
+    cleanup(&a, &key).await;
 }
 
 #[tokio::test]

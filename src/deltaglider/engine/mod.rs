@@ -19,7 +19,7 @@ use md5::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, instrument, warn};
@@ -302,17 +302,234 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
 
 /// RAII guard for the optional cross-instance reference lock. Held for the
 /// duration of a reference read-modify-write, inside the in-process prefix
-/// mutex. On drop it spawns a best-effort async release (Drop cannot be async);
-/// the lock's TTL backstops a release that never completes (crash / shutdown /
-/// no runtime). Inert (`release: None`) for single-instance deployments.
+/// mutex. While held, a heartbeat task renews the lock every
+/// `renew_interval`; [`Self::ensure_held`] runs before each commit so a holder
+/// whose lock lapsed (a long streaming encode, a coordination-bucket outage)
+/// stops before it writes. On drop it stops the heartbeat and spawns a
+/// best-effort async release (Drop cannot be async); the lock's TTL backstops
+/// a release that never completes. Inert (`hold: None`) single-instance.
+///
+/// Every engine write of reference.bin (bytes or metadata) goes through a
+/// method on this guard, so the write cannot happen without the lock. The
+/// source test `reference_writes_go_through_the_guard` keeps it that way.
 pub(crate) struct ReferenceLockGuard {
-    release: Option<(Arc<dyn crate::coordination::ReferenceLock>, String, String)>,
+    hold: Option<CrossNodeHold>,
+}
+
+struct CrossNodeHold {
+    lock: Arc<dyn crate::coordination::ReferenceLock>,
+    key: String,
+    owner: String,
+    state: Arc<HoldState>,
+    heartbeat: tokio::task::JoinHandle<()>,
+}
+
+/// Shared between the guard and its heartbeat task.
+struct HoldState {
+    lost: std::sync::atomic::AtomicBool,
+    /// Monotonic instant of the last confirmed acquire/renew.
+    confirmed_at: parking_lot::Mutex<std::time::Instant>,
+}
+
+/// What a commit must do with a hold, given how old its last confirmation
+/// is. Pure, so the timing rule is unit-tested without a clock.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HoldCheck {
+    /// Confirmed recently: no peer can steal it yet (skew bound: ttl / 2).
+    Trust,
+    /// Old confirmation: renew synchronously before the write.
+    Confirm,
+    /// The heartbeat saw the lock lost.
+    Lost,
+}
+
+pub(crate) fn hold_check(lost: bool, age: Duration, renew_interval: Duration) -> HoldCheck {
+    if lost {
+        HoldCheck::Lost
+    } else if age < renew_interval {
+        HoldCheck::Trust
+    } else {
+        HoldCheck::Confirm
+    }
+}
+
+impl ReferenceLockGuard {
+    pub(crate) fn inert() -> Self {
+        Self { hold: None }
+    }
+
+    fn held(lock: Arc<dyn crate::coordination::ReferenceLock>, key: String, owner: String) -> Self {
+        let state = Arc::new(HoldState {
+            lost: std::sync::atomic::AtomicBool::new(false),
+            confirmed_at: parking_lot::Mutex::new(std::time::Instant::now()),
+        });
+        let heartbeat = tokio::spawn(Self::heartbeat(
+            lock.clone(),
+            key.clone(),
+            owner.clone(),
+            state.clone(),
+        ));
+        Self {
+            hold: Some(CrossNodeHold {
+                lock,
+                key,
+                owner,
+                state,
+                heartbeat,
+            }),
+        }
+    }
+
+    /// Renew every `renew_interval` until dropped. A renew that reports the
+    /// lock lost, or errors for `ttl / 2` since the last confirmation, marks
+    /// the hold lost; the next commit then refuses.
+    async fn heartbeat(
+        lock: Arc<dyn crate::coordination::ReferenceLock>,
+        key: String,
+        owner: String,
+        state: Arc<HoldState>,
+    ) {
+        use std::sync::atomic::Ordering;
+        let every = lock.renew_interval().max(Duration::from_millis(10));
+        let give_up = Duration::from_secs((lock.ttl_secs().max(1) as u64).div_ceil(2));
+        loop {
+            tokio::time::sleep(every).await;
+            let started = std::time::Instant::now();
+            match lock
+                .renew(&key, &owner, crate::event_outbox::current_unix_seconds())
+                .await
+            {
+                Ok(true) => *state.confirmed_at.lock() = started,
+                Ok(false) => {
+                    warn!("reference lock {key} lost while held; the write will be refused");
+                    state.lost.store(true, Ordering::SeqCst);
+                    return;
+                }
+                Err(e) => {
+                    if state.confirmed_at.lock().elapsed() >= give_up {
+                        warn!("reference lock {key}: renew failing for ttl/2 ({e}); hold lost");
+                        state.lost.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    debug!("reference lock {key}: renew failed, retrying: {e}");
+                }
+            }
+        }
+    }
+
+    /// Refuse the caller's next write unless the lock is still ours.
+    pub(crate) async fn ensure_held(&self) -> Result<(), EngineError> {
+        use std::sync::atomic::Ordering;
+        let Some(h) = &self.hold else {
+            return Ok(());
+        };
+        let age = h.state.confirmed_at.lock().elapsed();
+        let lost_err = || {
+            EngineError::Storage(StorageError::Other(format!(
+                "reference lock {} lapsed before the write; refusing to write reference.bin                  or its delta (another instance may own the deltaspace now)",
+                h.key
+            )))
+        };
+        match hold_check(
+            h.state.lost.load(Ordering::SeqCst),
+            age,
+            h.lock.renew_interval(),
+        ) {
+            HoldCheck::Trust => Ok(()),
+            HoldCheck::Lost => Err(lost_err()),
+            HoldCheck::Confirm => {
+                let started = std::time::Instant::now();
+                match h
+                    .lock
+                    .renew(
+                        &h.key,
+                        &h.owner,
+                        crate::event_outbox::current_unix_seconds(),
+                    )
+                    .await
+                {
+                    Ok(true) => {
+                        *h.state.confirmed_at.lock() = started;
+                        Ok(())
+                    }
+                    Ok(false) => {
+                        h.state.lost.store(true, Ordering::SeqCst);
+                        Err(lost_err())
+                    }
+                    Err(e) => Err(EngineError::Storage(StorageError::Other(format!(
+                        "reference lock {} could not be confirmed before the write: {e}",
+                        h.key
+                    )))),
+                }
+            }
+        }
+    }
+
+    /// True when a cross-instance lock is held (multi-instance only).
+    pub(crate) fn is_cross_instance(&self) -> bool {
+        self.hold.is_some()
+    }
+
+    // ── Reference writes: the only engine path to them ──
+
+    pub(crate) async fn put_reference<B: StorageBackend + ?Sized>(
+        &self,
+        storage: &B,
+        bucket: &str,
+        deltaspace: &str,
+        data: &[u8],
+        meta: &FileMetadata,
+    ) -> Result<(), EngineError> {
+        self.ensure_held().await?;
+        Ok(storage
+            .put_reference(bucket, deltaspace, data, meta)
+            .await?)
+    }
+
+    pub(crate) async fn put_reference_from_file<B: StorageBackend + ?Sized>(
+        &self,
+        storage: &B,
+        bucket: &str,
+        deltaspace: &str,
+        path: &std::path::Path,
+        meta: &FileMetadata,
+    ) -> Result<(), EngineError> {
+        self.ensure_held().await?;
+        Ok(storage
+            .put_reference_from_file(bucket, deltaspace, path, meta)
+            .await?)
+    }
+
+    pub(crate) async fn put_reference_metadata<B: StorageBackend + ?Sized>(
+        &self,
+        storage: &B,
+        bucket: &str,
+        deltaspace: &str,
+        meta: &FileMetadata,
+    ) -> Result<(), EngineError> {
+        self.ensure_held().await?;
+        Ok(storage
+            .put_reference_metadata(bucket, deltaspace, meta)
+            .await?)
+    }
+
+    pub(crate) async fn delete_reference<B: StorageBackend + ?Sized>(
+        &self,
+        storage: &B,
+        bucket: &str,
+        deltaspace: &str,
+    ) -> Result<(), EngineError> {
+        self.ensure_held().await?;
+        Ok(storage.delete_reference(bucket, deltaspace).await?)
+    }
 }
 
 impl Drop for ReferenceLockGuard {
     fn drop(&mut self) {
-        if let Some((lock, key, owner)) = self.release.take() {
+        if let Some(h) = self.hold.take() {
+            h.heartbeat.abort();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let (lock, key, owner) = (h.lock, h.key, h.owner);
                 handle.spawn(async move {
                     if let Err(e) = lock.release(&key, &owner).await {
                         tracing::warn!("reference lock release failed for {key}: {e}");
@@ -321,6 +538,40 @@ impl Drop for ReferenceLockGuard {
             }
             // No runtime available (dropped during shutdown) → rely on the TTL.
         }
+    }
+}
+
+tokio::task_local! {
+    /// The cross-instance lock `with_dest_prefix_lock` holds while its closure
+    /// runs, so the raw writers it calls can check it before they write.
+    static HELD_REFERENCE_LOCK: Arc<ReferenceLockGuard>;
+}
+
+/// How a [`DeltaGliderEngine::with_dest_prefix_lock`] result reports that
+/// the cross-instance reference lock could not be taken (the closure did
+/// not run).
+pub trait ReferenceLockFailure {
+    fn reference_lock_failed(err: EngineError) -> Self;
+}
+
+/// Best-effort callers (no result to carry): log and skip.
+impl ReferenceLockFailure for () {
+    fn reference_lock_failed(err: EngineError) -> Self {
+        warn!("deltaspace work skipped: {err}");
+    }
+}
+
+impl<T, E: From<EngineError>> ReferenceLockFailure for Result<T, E> {
+    fn reference_lock_failed(err: EngineError) -> Self {
+        Err(E::from(err))
+    }
+}
+
+/// The raw accessors speak `StorageError`; keep a storage error as-is.
+fn engine_to_storage(e: EngineError) -> StorageError {
+    match e {
+        EngineError::Storage(s) => s,
+        other => StorageError::Other(other.to_string()),
     }
 }
 
@@ -1076,7 +1327,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         deltaspace: &str,
     ) -> Result<ReferenceLockGuard, EngineError> {
         let Some(lock) = self.reference_lock.clone() else {
-            return Ok(ReferenceLockGuard { release: None });
+            return Ok(ReferenceLockGuard::inert());
         };
         let key = crate::coordination::reference_lock::lock_object_key(bucket, deltaspace);
         let owner = format!("ref-{}", uuid::Uuid::new_v4());
@@ -1091,9 +1342,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         )
         .await
         {
-            Ok(true) => Ok(ReferenceLockGuard {
-                release: Some((lock, key, owner)),
-            }),
+            Ok(true) => Ok(ReferenceLockGuard::held(lock, key, owner)),
             Ok(false) => Err(EngineError::Storage(StorageError::Other(format!(
                 "reference lock for deltaspace '{bucket}/{deltaspace}' held by another instance; \
                  write timed out to avoid corrupting reference.bin"
@@ -1154,6 +1403,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
+        // Inside `with_dest_prefix_lock`: the delta is only valid against the
+        // reference the held cross-instance lock protects.
+        if let Ok(held) = HELD_REFERENCE_LOCK.try_with(Arc::clone) {
+            held.ensure_held().await.map_err(engine_to_storage)?;
+        }
         self.storage
             .put_delta(bucket, prefix, filename, data, metadata)
             .await?;
@@ -1190,7 +1444,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.storage.get_reference(bucket, prefix).await
     }
 
-    /// Write a deltaspace reference blob + metadata verbatim.
+    /// Write a deltaspace reference blob + metadata verbatim. Call it inside
+    /// [`Self::with_dest_prefix_lock`]: that holds the cross-instance lock
+    /// the write goes through. Outside it, multi-instance refuses.
     pub async fn put_reference_raw(
         &self,
         bucket: &str,
@@ -1198,9 +1454,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        self.storage
-            .put_reference(bucket, prefix, data, metadata)
+        let held = match HELD_REFERENCE_LOCK.try_with(Arc::clone) {
+            Ok(held) => held,
+            Err(_) if self.reference_lock.is_none() => Arc::new(ReferenceLockGuard::inert()),
+            Err(_) => {
+                return Err(StorageError::Other(format!(
+                    "reference write to {bucket}/{prefix} outside the deltaspace lock"
+                )))
+            }
+        };
+        held.put_reference(&*self.storage, bucket, prefix, data, metadata)
             .await
+            .map_err(engine_to_storage)
     }
 
     /// Reference metadata as a `Result` (errors propagate) — for callers that
@@ -1243,15 +1508,23 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await
     }
 
-    /// Run `f` while holding the per-deltaspace prefix lock, serialising
-    /// the reference seed against concurrent live PUTs to that deltaspace.
+    /// Run `f` while holding the per-deltaspace prefix lock AND the
+    /// cross-instance reference lock, serialising the fast-path reference
+    /// seed against concurrent PUTs to that deltaspace on every node. When
+    /// the cross-instance lock cannot be taken, `f` does not run and `R`
+    /// reports the failure ([`ReferenceLockFailure`]).
     pub async fn with_dest_prefix_lock<F, Fut, R>(&self, bucket: &str, prefix: &str, f: F) -> R
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = R>,
+        R: ReferenceLockFailure,
     {
         let _guard = self.acquire_prefix_lock(bucket, prefix).await;
-        f().await
+        let xnode = match self.acquire_reference_lock(bucket, prefix).await {
+            Ok(g) => Arc::new(g),
+            Err(e) => return R::reference_lock_failed(e),
+        };
+        HELD_REFERENCE_LOCK.scope(xnode, f()).await
     }
 
     /// Parse and validate an S3 key, returning the parsed key and deltaspace ID.
@@ -1831,19 +2104,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         deltaspace_id: &str,
     ) -> Result<(), EngineError> {
         let _guard = self.acquire_prefix_lock(bucket, deltaspace_id).await;
-        let remaining = self.storage.scan_deltaspace(bucket, deltaspace_id).await?;
-        let has_objects = remaining
-            .iter()
-            .any(|m| !matches!(m.storage_info, StorageInfo::Reference { .. }));
-        if has_objects || !self.storage.has_reference(bucket, deltaspace_id).await? {
+        let Some((xnode, reclaimed_ref_bytes)) =
+            self.reclaimable_reference(bucket, deltaspace_id).await?
+        else {
             return Ok(());
-        }
-        let reclaimed_ref_bytes = remaining
-            .iter()
-            .find(|m| matches!(m.storage_info, StorageInfo::Reference { .. }))
-            .map(|m| m.file_size)
-            .unwrap_or(0);
-        self.storage.delete_reference(bucket, deltaspace_id).await?;
+        };
+        xnode
+            .delete_reference(&*self.storage, bucket, deltaspace_id)
+            .await?;
         self.cache
             .invalidate(&Self::cache_key(bucket, deltaspace_id));
         // Mirror `delete`'s accounting: the reclaimed reference bytes leave
@@ -1853,6 +2121,47 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             u.apply_net(bucket, None, None, -(reclaimed_ref_bytes as i64));
         }
         Ok(())
+    }
+
+    /// `Some((lock, reference bytes))` when the deltaspace holds a reference
+    /// and nothing else, so the reference can go. Caller holds the prefix
+    /// lock. Multi-instance: the emptiness scan runs again under the
+    /// cross-instance lock, because a peer can write a delta against the
+    /// reference between the first scan and the delete. The first scan runs
+    /// unlocked so a delete in a non-empty deltaspace pays no lock requests.
+    async fn reclaimable_reference(
+        &self,
+        bucket: &str,
+        deltaspace_id: &str,
+    ) -> Result<Option<(ReferenceLockGuard, u64)>, EngineError> {
+        let only_reference = |remaining: &[FileMetadata]| -> Option<u64> {
+            let mut ref_bytes = None;
+            for m in remaining {
+                match m.storage_info {
+                    StorageInfo::Reference { .. } => ref_bytes = Some(m.file_size),
+                    _ => return None,
+                }
+            }
+            Some(ref_bytes.unwrap_or(0))
+        };
+        let remaining = self.storage.scan_deltaspace(bucket, deltaspace_id).await?;
+        let Some(mut ref_bytes) = only_reference(&remaining) else {
+            return Ok(None);
+        };
+        if !self.storage.has_reference(bucket, deltaspace_id).await? {
+            return Ok(None);
+        }
+        let xnode = self.acquire_reference_lock(bucket, deltaspace_id).await?;
+        if xnode.is_cross_instance() {
+            let remaining = self.storage.scan_deltaspace(bucket, deltaspace_id).await?;
+            match only_reference(&remaining) {
+                Some(b) if self.storage.has_reference(bucket, deltaspace_id).await? => {
+                    ref_bytes = b
+                }
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some((xnode, ref_bytes)))
     }
 
     async fn delete_inner(
@@ -1925,27 +2234,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Bytes of a reclaimed reference.bin (stored-only) — subtracted from the
         // counter so stored_bytes stays exact when the last delta is removed.
         let mut reclaimed_ref_bytes = 0u64;
-        let remaining = if reclaim_reference {
-            self.storage.scan_deltaspace(bucket, &deltaspace_id).await?
+        let reclaimable = if reclaim_reference {
+            self.reclaimable_reference(bucket, &deltaspace_id).await?
         } else {
-            Vec::new()
+            None
         };
-        let has_objects = remaining
-            .iter()
-            .any(|m| !matches!(m.storage_info, StorageInfo::Reference { .. }));
-        if reclaim_reference
-            && !has_objects
-            && self.storage.has_reference(bucket, &deltaspace_id).await?
-        {
-            reclaimed_ref_bytes = remaining
-                .iter()
-                .find(|m| matches!(m.storage_info, StorageInfo::Reference { .. }))
-                .map(|m| m.file_size)
-                .unwrap_or(0);
+        if let Some((xnode, ref_bytes)) = reclaimable {
+            reclaimed_ref_bytes = ref_bytes;
             // Delete storage BEFORE invalidating cache — prevents stale cache entries
             // from a concurrent GET loading between invalidation and deletion.
-            self.storage
-                .delete_reference(bucket, &deltaspace_id)
+            xnode
+                .delete_reference(&*self.storage, bucket, &deltaspace_id)
                 .await?;
             let cache_key = Self::cache_key(bucket, &deltaspace_id);
             self.cache.invalidate(&cache_key);
@@ -2853,5 +3152,309 @@ legacy_key_id: "old-kid"
             StorageInfo::Passthrough,
         );
         assert!(!DeltaGliderEngine::<FilesystemBackend>::is_unresolved_delta_stub(&pt));
+    }
+}
+
+/// Cross-instance reference lock, engine side: loss detection before a
+/// commit, renewal while held, and the reference writes that once skipped
+/// the lock (delete-reclaim, sweep-reclaim, fast-path seed).
+#[cfg(test)]
+mod reference_lock_hold_tests {
+    use super::*;
+    use crate::storage::FilesystemBackend;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// A lock that always grants, and whose renew answer the test sets.
+    struct ScriptedLock {
+        acquires: AtomicUsize,
+        renews: AtomicUsize,
+        renew_ok: AtomicBool,
+        grant: bool,
+        ttl_secs: i64,
+        interval: Duration,
+    }
+
+    impl ScriptedLock {
+        fn new(renew_ok: bool, interval: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                acquires: AtomicUsize::new(0),
+                renews: AtomicUsize::new(0),
+                renew_ok: AtomicBool::new(renew_ok),
+                grant: true,
+                ttl_secs: 120,
+                interval,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl crate::coordination::ReferenceLock for ScriptedLock {
+        async fn try_acquire(&self, _: &str, _: &str, _: i64) -> Result<bool, String> {
+            self.acquires.fetch_add(1, Ordering::SeqCst);
+            Ok(self.grant)
+        }
+        async fn release(&self, _: &str, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn renew(&self, _: &str, _: &str, _: i64) -> Result<bool, String> {
+            self.renews.fetch_add(1, Ordering::SeqCst);
+            Ok(self.renew_ok.load(Ordering::SeqCst))
+        }
+        fn ttl_secs(&self) -> i64 {
+            self.ttl_secs
+        }
+        fn renew_interval(&self) -> Duration {
+            self.interval
+        }
+        fn acquire_timeout(&self) -> Duration {
+            Duration::from_millis(50)
+        }
+    }
+
+    async fn engine_with(
+        lock: Arc<ScriptedLock>,
+    ) -> (tempfile::TempDir, DeltaGliderEngine<FilesystemBackend>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .unwrap();
+        backend.create_bucket("releases").await.unwrap();
+        let engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
+                .with_reference_lock(Some(lock));
+        (tmp, engine)
+    }
+
+    #[test]
+    fn hold_check_truth_table() {
+        let every = Duration::from_secs(30);
+        assert_eq!(
+            hold_check(false, Duration::from_secs(1), every),
+            HoldCheck::Trust
+        );
+        assert_eq!(hold_check(false, every, every), HoldCheck::Confirm);
+        assert_eq!(hold_check(true, Duration::ZERO, every), HoldCheck::Lost);
+    }
+
+    /// A holder whose lock lapsed (renew says "not yours") must not write
+    /// reference.bin. Interval zero: every commit re-confirms.
+    #[tokio::test]
+    async fn lost_lock_refuses_the_reference_write() {
+        let lock = ScriptedLock::new(false, Duration::ZERO);
+        let (_tmp, engine) = engine_with(lock.clone()).await;
+        let err = engine
+            .store(
+                "releases",
+                "v1/app.zip",
+                &vec![7u8; 4096],
+                None,
+                HashMap::new(),
+            )
+            .await
+            .expect_err("a lost lock must fail the PUT");
+        assert!(err.to_string().contains("lapsed"), "{err}");
+        assert!(lock.renews.load(Ordering::SeqCst) >= 1);
+        assert!(
+            !engine
+                .storage
+                .has_reference("releases", "v1")
+                .await
+                .unwrap(),
+            "no reference.bin may be written without the lock"
+        );
+    }
+
+    /// While held, the heartbeat renews the lock; a commit after that finds
+    /// it still ours.
+    #[tokio::test]
+    async fn heartbeat_renews_while_held() {
+        let lock = ScriptedLock::new(true, Duration::from_millis(20));
+        let (_tmp, engine) = engine_with(lock.clone()).await;
+        let guard = engine
+            .acquire_reference_lock("releases", "v1")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            lock.renews.load(Ordering::SeqCst) >= 2,
+            "heartbeat must renew"
+        );
+        guard.ensure_held().await.expect("still held");
+        // The heartbeat sees the lock lost → the next commit refuses at once.
+        lock.renew_ok.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(guard.ensure_held().await.is_err());
+    }
+
+    /// Deleting the last object reclaims reference.bin: a reference write,
+    /// so it takes the cross-instance lock. It once took only the in-process
+    /// one, and a peer's fresh delta could lose its reference.
+    #[tokio::test]
+    async fn delete_reclaim_and_sweep_reclaim_take_the_lock() {
+        let lock = ScriptedLock::new(true, Duration::from_secs(30));
+        let (_tmp, engine) = engine_with(lock.clone()).await;
+        engine
+            .store(
+                "releases",
+                "v1/app.zip",
+                &vec![7u8; 4096],
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let after_store = lock.acquires.load(Ordering::SeqCst);
+        engine.delete("releases", "v1/app.zip").await.unwrap();
+        assert!(
+            lock.acquires.load(Ordering::SeqCst) > after_store,
+            "reclaim-on-delete must take the lock"
+        );
+        assert!(!engine
+            .storage
+            .has_reference("releases", "v1")
+            .await
+            .unwrap());
+
+        engine
+            .store(
+                "releases",
+                "v2/app.zip",
+                &vec![8u8; 4096],
+                None,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        engine
+            .delete_in_sweep("releases", "v2/app.zip")
+            .await
+            .unwrap();
+        let before_sweep = lock.acquires.load(Ordering::SeqCst);
+        engine
+            .reclaim_empty_deltaspace("releases", "v2")
+            .await
+            .unwrap();
+        assert!(lock.acquires.load(Ordering::SeqCst) > before_sweep);
+        assert!(!engine
+            .storage
+            .has_reference("releases", "v2")
+            .await
+            .unwrap());
+    }
+
+    /// The replication fast path seeds a reference inside
+    /// `with_dest_prefix_lock`: it must hold the cross-instance lock, and a
+    /// lock it cannot take must stop the closure.
+    #[tokio::test]
+    async fn fast_path_seed_holds_the_lock() {
+        let lock = ScriptedLock::new(true, Duration::from_secs(30));
+        let (_tmp, engine) = engine_with(lock.clone()).await;
+        let meta = FileMetadata::new_reference(
+            "__reference__".into(),
+            "v1/app.zip".into(),
+            "00".repeat(32),
+            "00".repeat(16),
+            3,
+            None,
+        );
+        let res: Result<(), EngineError> = engine
+            .with_dest_prefix_lock("releases", "v1", || async {
+                Ok(engine
+                    .put_reference_raw("releases", "v1", b"abc", &meta)
+                    .await?)
+            })
+            .await;
+        res.unwrap();
+        assert_eq!(lock.acquires.load(Ordering::SeqCst), 1);
+
+        // Outside the scope, multi-instance refuses the raw write.
+        assert!(engine
+            .put_reference_raw("releases", "v1", b"abc", &meta)
+            .await
+            .is_err());
+
+        // A lock that cannot be taken: the closure never runs.
+        let busy = Arc::new(ScriptedLock {
+            grant: false,
+            ..Arc::try_unwrap(ScriptedLock::new(true, Duration::from_secs(30)))
+                .ok()
+                .unwrap()
+        });
+        let (_tmp2, engine2) = engine_with(busy).await;
+        let ran = AtomicBool::new(false);
+        let res: Result<(), EngineError> = engine2
+            .with_dest_prefix_lock("releases", "v1", || async {
+                ran.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+        assert!(res.is_err());
+        assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    /// Source guard: every engine write of reference.bin goes through a
+    /// `ReferenceLockGuard` method, which checks the lock first. Reference
+    /// RMW paths that called the backend directly skipped the cross-instance
+    /// lock (reclaim-on-delete, sweep reclaim, fast-path seed).
+    #[test]
+    fn reference_writes_go_through_the_guard() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Built at runtime so this file's own text does not match.
+        let forbidden: Vec<String> = [
+            "put_reference",
+            "put_reference_from_file",
+            "put_reference_metadata",
+            "delete_reference",
+        ]
+        .iter()
+        .map(|m| format!("storage.{m}("))
+        .collect();
+        // src/maintenance/worker.rs::rewrite_reference_if_needed carries a raw
+        // rewrite owned by another change; drop it here once it goes through
+        // `with_dest_prefix_lock` + `put_reference_raw`.
+        let allowed = ["src/maintenance/worker.rs"];
+        let mut offenders = Vec::new();
+        let mut stack = vec![root.join("src")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    // Backends implement the writes; they are below the lock.
+                    if !path.ends_with("storage") {
+                        stack.push(path);
+                    }
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                if allowed.contains(&rel.as_str()) {
+                    continue;
+                }
+                let mut text = std::fs::read_to_string(&path).unwrap();
+                if rel == "src/deltaglider/engine/mod.rs" {
+                    // The guard's own methods are the one allowed home.
+                    let start = text.find("impl ReferenceLockGuard {").unwrap();
+                    let end = text.find("impl Drop for ReferenceLockGuard").unwrap();
+                    text.replace_range(start..end, "");
+                }
+                let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                for p in &forbidden {
+                    if text.contains(p.as_str()) {
+                        offenders.push(format!("{rel}: {p}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "write reference.bin through ReferenceLockGuard: {offenders:?}"
+        );
     }
 }
