@@ -351,8 +351,8 @@ async fn apply_section(
     // Carry env-ref provenance through the rebuild (into_flat starts from a
     // default), then resolve any full-scalar `${env:NAME}` strings in the
     // incoming section. Section GETs emit refs for ref-sourced secrets, so a
-    // GUI round-trip echoes them back — resolving here (provenance → server
-    // env → ref default) keeps the real secret AND lets operators type refs
+    // GUI round-trip echoes them back — resolving here (provenance → ref
+    // default; never the server env, S7) keeps the real secret AND lets operators type refs
     // into GUI fields. An unresolvable ref fails the PUT loudly.
     new_cfg.env_refs = old_cfg.env_refs.clone();
     if let Err(e) = new_cfg.resolve_env_ref_scalars() {

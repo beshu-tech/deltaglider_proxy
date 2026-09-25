@@ -448,7 +448,11 @@ async fn apply_async(input: &str, opts: AdminClientOpts) -> Result<i32, CliError
     // Expand ${VAR} / ${VAR:-default} against the OPERATOR's environment before
     // sending — apply-from-disk is symmetric with a server loading the file, so
     // the same secret-free-template-plus-env workflow works for `config apply`.
+    // Escape the result so the server's own expansion pass is a no-op on
+    // it: without this a literal `$$` became `$` twice over, and an expanded
+    // value that contains `${env:..}` was expanded again on the server.
     let yaml = crate::config::expand_env_vars(&yaml)
+        .map(|y| crate::config::escape_dollars(&y))
         .map_err(|e| CliError::Rejected(format!("{input}: {e}")))?;
     if yaml.trim().is_empty() {
         return Err(CliError::Rejected(

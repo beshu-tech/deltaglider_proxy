@@ -2664,9 +2664,10 @@ impl Config {
     /// It also makes refs first-class in the GUI: an operator can type
     /// `${env:NAME}` into a field and it resolves like the file loader would.
     ///
-    /// Lookup order per ref: recorded provenance (`env_refs`) → the process
-    /// environment → the ref's own `:-default` → hard error (fail loud, same
-    /// contract as file load). Newly resolved names are recorded into
+    /// Lookup order per ref: recorded provenance (`env_refs`) → the ref's
+    /// own `:-default` → hard error (fail loud, same contract as file load).
+    /// The process environment is NOT consulted: a section body is admin
+    /// input, and reading any env var for it leaks secrets (S7). Newly resolved names are recorded into
     /// `env_refs` so future persists re-emit the ref. Only strings that are
     /// EXACTLY one ref resolve — mid-string refs in GUI fields stay literal.
     pub fn resolve_env_ref_scalars(&mut self) -> Result<(), ConfigError> {
@@ -2681,7 +2682,9 @@ impl Config {
                     // recorded, mirroring `expand_env_vars_recording`.
                     let mut hits: Vec<(String, String)> = Vec::new();
                     let resolved = expand_env_with(s, |name| {
-                        let v = refs.get(name).cloned().or_else(|| std::env::var(name).ok());
+                        // Provenance only, never the process env (S7):
+                        // see `expand_env_admin`.
+                        let v = refs.get(name).cloned();
                         if let Some(val) = &v {
                             if !val.is_empty() {
                                 hits.push((name.to_string(), val.clone()));
@@ -5788,6 +5791,9 @@ storage:
         assert_eq!(cfg.access_key_id.as_deref(), Some("fallback"));
         // An unresolvable ref fails loudly.
         cfg.access_key_id = Some("${env:DGP_DOES_NOT_EXIST_ANYWHERE}".into());
+        assert!(cfg.resolve_env_ref_scalars().is_err());
+        // S7: a server env var the file never referenced does not resolve.
+        cfg.access_key_id = Some("${env:HOME}".into());
         assert!(cfg.resolve_env_ref_scalars().is_err());
     }
 }

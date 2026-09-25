@@ -238,30 +238,36 @@ pub async fn config_defaults(Query(query): Query<SectionFilterQuery>) -> impl In
 /// The log-filter string is parsed here too (not at swap time) so a
 /// malformed filter cannot enter the runtime config; the admin handler
 /// surfaces the parse error to the caller and leaves state unchanged.
-fn parse_and_validate_yaml(yaml: &str) -> Result<(crate::config::Config, Vec<String>), String> {
+fn parse_and_validate_yaml(
+    yaml: &str,
+    known_env: &std::collections::BTreeMap<String, String>,
+) -> Result<(crate::config::Config, Vec<String>), String> {
     if yaml.trim().is_empty() {
         return Err(
             "empty YAML body: apply requires a full canonical config document. Refusing to reset every field to its default."
                 .to_string(),
         );
     }
-    // Expand `${env:NAME}` references against the SERVER environment, and
-    // record the provenance so persist/export re-emit the refs instead of
-    // the materialized secrets (the IaC round-trip: provision a secret-free
-    // template -> tweak in the GUI -> export -> back into IaC). The `config
-    // apply` CLI also expands client-side against the OPERATOR environment;
-    // this pass is idempotent on already-expanded text and covers documents
-    // POSTed raw (GUI import, curl) whose secrets live in the server env.
-    let (yaml, env_refs) = crate::config::expand_env_vars_recording(yaml)
-        .map_err(|e| format!("env expansion error: {}", e))?;
+    // Expand `${env:NAME}` refs, but ONLY names the running config already
+    // resolved from its file (S7: see `expand_env_admin`), and record the
+    // provenance so persist/export re-emit the refs instead of the values.
+    // The `config apply` CLI expands client-side against the OPERATOR env
+    // and escapes `$`, so this pass leaves its text unchanged.
+    let (yaml, env_refs) = crate::config::expand_env_admin(yaml, known_env).map_err(|e| {
+        format!(
+            "env expansion error: {e}. The admin API resolves only `${{env:NAME}}` refs \
+             that the config file loaded at boot already uses; reference a new variable \
+             in that file, or expand it client-side (`config apply`)."
+        )
+    })?;
+    let scrub = |m: String| crate::config::scrub_env_values(&m, &env_refs);
     // Go through the dual-shape deserializer so GitOps operators can POST
     // either the legacy flat shape or the Phase 3 sectioned shape
     // (admission/access/storage/advanced). Export round-trips re-emit
     // sectioned — if we used plain `serde_yaml::from_str::<Config>` here
     // the roundtrip would break.
     let mut cfg = crate::config::Config::from_yaml_str(&yaml)
-        .map_err(|e| format!("YAML parse error: {}", e))?;
-    cfg.env_refs = env_refs;
+        .map_err(|e| scrub(format!("YAML parse error: {}", e)))?;
     // Validate the log filter up front so it can't silently enter runtime
     // state and then fail at the next process restart. An invalid filter is
     // a non-recoverable structural error for this doc, not a warning.
@@ -270,14 +276,18 @@ fn parse_and_validate_yaml(yaml: &str) -> Result<(crate::config::Config, Vec<Str
         .parse::<tracing_subscriber::EnvFilter>()
         .is_err()
     {
-        return Err(format!(
+        return Err(scrub(format!(
             "invalid log_level filter '{}': expected a tracing-subscriber EnvFilter (e.g. 'info', 'deltaglider_proxy=debug')",
             cfg.log_level
-        ));
+        )));
     }
     let warnings = cfg
         .check_all()
-        .map_err(|fatal| format!("config refused: {}", fatal.join("; ")))?;
+        .map_err(|fatal| scrub(format!("config refused: {}", fatal.join("; "))))?
+        .into_iter()
+        .map(scrub)
+        .collect();
+    cfg.env_refs = env_refs;
     // Lifecycle fatality is decided by the callers via `lifecycle_gate` (needs
     // the RUNNING config to tell a new defect from a pre-existing one).
     Ok((cfg, warnings))
@@ -292,11 +302,11 @@ pub async fn validate_config_doc(
     State(state): State<Arc<AdminState>>,
     Json(body): Json<ConfigDocumentRequest>,
 ) -> impl IntoResponse {
-    match parse_and_validate_yaml(&body.yaml) {
+    let current = state.config.read().await.clone();
+    match parse_and_validate_yaml(&body.yaml, &current.env_refs) {
         Ok((mut cfg, _)) => {
             // Same changed-only gate as apply, so validate can't pass a doc
             // apply would reject (or vice versa for unchanged-invalid rules).
-            let current = state.config.read().await.clone();
             // Validate the SAME view apply runs: runtime secrets preserved,
             // env overrides re-applied (a dry run must not differ from apply).
             let mut side_warnings = preserve_runtime_secrets(&mut cfg, &current, &body.yaml);
@@ -514,7 +524,8 @@ pub(crate) async fn apply_config_inner(
     body: ConfigDocumentRequest,
 ) -> (StatusCode, ConfigApplyResponse) {
     // 1. Parse + validate the incoming document (no lock held — pure work).
-    let (mut incoming, parse_warnings) = match parse_and_validate_yaml(&body.yaml) {
+    let known_env = state.config.read().await.env_refs.clone();
+    let (mut incoming, parse_warnings) = match parse_and_validate_yaml(&body.yaml, &known_env) {
         Ok(v) => v,
         Err(err) => {
             return (
@@ -1283,8 +1294,46 @@ mod tests {
     fn validate_rejects_route_to_undefined_backend() {
         let err = parse_and_validate_yaml(
             "storage:\n  buckets:\n    releases: { backend: hetzner-fsn1 }\n",
+            &Default::default(),
         )
         .expect_err("fatal config must not validate");
         assert!(err.contains("undefined backend 'hetzner-fsn1'"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod env_leak_tests {
+    use super::*;
+
+    /// S7: the admin document path must not read arbitrary server env vars.
+    /// `HOME` is set in every test environment and is not referenced by any
+    /// loaded config, so its value must never appear in the result.
+    #[test]
+    fn admin_doc_does_not_expand_unreferenced_env() {
+        let home = std::env::var("HOME").expect("HOME is set");
+        let res = parse_and_validate_yaml("log_level: \"${env:HOME}\"\n", &Default::default());
+        match res {
+            Ok((cfg, w)) => {
+                assert_ne!(cfg.log_level, home);
+                assert!(!w.iter().any(|w| w.contains(&home)));
+            }
+            Err(e) => assert!(!e.contains(&home), "leaked HOME: {e}"),
+        }
+    }
+
+    /// A name the loaded file already uses still resolves (the IaC
+    /// round-trip), and its value is scrubbed from error text.
+    #[test]
+    fn admin_doc_resolves_known_refs_and_scrubs_errors() {
+        let known: std::collections::BTreeMap<String, String> =
+            [("LOGF".to_string(), "/not/a/filter".to_string())].into();
+        let err = parse_and_validate_yaml("log_level: \"${env:LOGF}\"\n", &known).unwrap_err();
+        assert!(!err.contains("/not/a/filter"), "{err}");
+        assert!(err.contains("${env:LOGF}"), "{err}");
+        let known: std::collections::BTreeMap<String, String> =
+            [("LOGF".to_string(), "debug".to_string())].into();
+        let (cfg, _) = parse_and_validate_yaml("log_level: \"${env:LOGF}\"\n", &known).unwrap();
+        assert_eq!(cfg.log_level, "debug");
+        assert_eq!(cfg.env_refs.get("LOGF").map(String::as_str), Some("debug"));
     }
 }

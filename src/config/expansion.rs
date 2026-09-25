@@ -67,6 +67,47 @@ pub fn expand_env_vars_recording(
     expand_env_with_recording(input, |name| std::env::var(name).ok())
 }
 
+/// Expansion for documents that arrive over the ADMIN API (`/config/apply`,
+/// `/config/validate`, section PUTs). S7: such a document is attacker-shaped
+/// input from any admin session, so it must not read the server environment
+/// at large — `${env:AWS_SECRET_ACCESS_KEY}` in a field that echoes into an
+/// error or an export would hand the admin any env var of the process.
+///
+/// Rule: a ref resolves only from `known` — the `name → value` provenance
+/// the RUNNING config recorded when the file on disk was loaded. A name the
+/// file does not already use is treated as unset (its `:-default` applies,
+/// else a [`ConfigError::MissingEnvVar`]). To use a new env var, reference it
+/// in the file on disk (boot), or expand client-side (`config apply`).
+pub fn expand_env_admin(
+    input: &str,
+    known: &std::collections::BTreeMap<String, String>,
+) -> Result<(String, std::collections::BTreeMap<String, String>), ConfigError> {
+    expand_env_with_recording(input, |name| known.get(name).cloned())
+}
+
+/// Replace every recorded env value in `msg` with its `${env:NAME}` ref, so
+/// an error or warning built from an expanded document never echoes a value.
+/// Values shorter than 4 bytes are left alone (they would mangle ordinary
+/// text and are no secret).
+pub fn scrub_env_values(msg: &str, refs: &std::collections::BTreeMap<String, String>) -> String {
+    let mut out = msg.to_string();
+    // Longest first, so a value that contains another value is replaced whole.
+    let mut pairs: Vec<(&String, &String)> = refs.iter().filter(|(_, v)| v.len() >= 4).collect();
+    pairs.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+    for (name, value) in pairs {
+        out = out.replace(value.as_str(), &format!("${{env:{name}}}"));
+    }
+    out
+}
+
+/// Escape every `$` as `$$`: the inverse of expansion for text that is
+/// already expanded. `config apply` expands on the operator side and then
+/// sends this, so the server's own expansion pass returns the same text
+/// (a literal `$$` or a `${env:..}`-shaped secret is not expanded twice).
+pub fn escape_dollars(s: &str) -> String {
+    s.replace('$', "$$")
+}
+
 /// Testable core of [`expand_env_vars_recording`].
 pub(crate) fn expand_env_with_recording(
     input: &str,
@@ -201,6 +242,42 @@ fn has_unsafe_control_char(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// `config apply` expands on the operator side, then the server expands
+    /// again. Escaping the client result makes the second pass a no-op:
+    /// `pay $$10` stays `pay $10`, and an expanded value that itself looks
+    /// like `${env:X}` is not expanded a second time.
+    #[test]
+    fn client_expand_then_escape_survives_server_pass() {
+        let lookup = |n: &str| (n == "TOK").then(|| "a${env:OTHER}b".to_string());
+        let doc = "k: pay $$10\nt: ${env:TOK}\nh: $2b$10$x\np: ${iam:username}\n";
+        let client = expand_env_with(doc, lookup).unwrap();
+        let sent = escape_dollars(&client);
+        let server = expand_env_with(&sent, |_| None).unwrap();
+        assert_eq!(server, client);
+        assert!(server.contains("pay $10") && server.contains("a${env:OTHER}b"));
+    }
+
+    #[test]
+    fn scrub_replaces_values_longest_first() {
+        let refs: std::collections::BTreeMap<String, String> = [
+            ("A".to_string(), "secret".to_string()),
+            ("B".to_string(), "secret-long".to_string()),
+            ("C".to_string(), "x".to_string()),
+        ]
+        .into();
+        assert_eq!(
+            scrub_env_values("bad 'secret-long' and secret, x", &refs),
+            "bad '${env:B}' and ${env:A}, x"
+        );
+    }
+
+    #[test]
+    fn admin_expansion_ignores_process_env() {
+        let known = std::collections::BTreeMap::new();
+        assert!(expand_env_admin("${env:HOME}", &known).is_err());
+        assert_eq!(expand_env_admin("${env:HOME:-d}", &known).unwrap().0, "d");
+    }
     use super::*;
 
     // ── ${VAR} expansion (expand_env_with) ──────────────────────────────────
