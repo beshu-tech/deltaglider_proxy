@@ -219,3 +219,36 @@ mod tests {
         assert_eq!(t.query_value("k"), Some("%a\u{e9}"));
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Pre-auth input: the decoder never panics, whatever the bytes.
+        #[test]
+        fn parse_never_panics(path in "\\PC{0,64}", query in proptest::option::of("\\PC{0,64}")) {
+            if let Ok(t) = RequestTarget::parse(&path, query.as_deref()) {
+                let _ = t.bucket_and_key();
+                let _ = t.bucket();
+                let _ = t.is_presigned_v4();
+            }
+        }
+
+        /// Percent escapes of arbitrary bytes, mixed with multi-byte text.
+        #[test]
+        fn parse_never_panics_on_escapes(parts in proptest::collection::vec(
+            prop_oneof![
+                any::<u8>().prop_map(|b| format!("%{b:02x}")),
+                Just("%".to_string()),
+                Just("%a".to_string()),
+                "[a-z\u{e9}\u{4e2d}/]{0,4}",
+            ],
+            0..16,
+        )) {
+            let s: String = parts.concat();
+            let _ = RequestTarget::parse(&format!("/{s}"), Some(&s));
+        }
+    }
+}
