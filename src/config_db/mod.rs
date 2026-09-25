@@ -25,7 +25,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 26;
+const SCHEMA_VERSION: i32 = 27;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -859,6 +859,28 @@ impl ConfigDb {
             iam_merge::install_mtime_schema(conn)?;
             info!(
                 "Migrated config DB schema from v{} to v26 (IAM sync_mtime)",
+                version
+            );
+        }
+
+        if version < 27 {
+            // v27: per-endpoint raw-webhook delivery. One outbox row fans out
+            // to N endpoints; a retry posts only to the endpoints that have
+            // not succeeded, so one dead endpoint neither blocks the others
+            // nor makes them receive duplicates. Node-local (not synced).
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS event_deliveries (
+                    outbox_id   INTEGER NOT NULL REFERENCES event_outbox(id) ON DELETE CASCADE,
+                    endpoint_id TEXT NOT NULL,
+                    status      TEXT NOT NULL,
+                    attempts    INTEGER NOT NULL DEFAULT 0,
+                    last_error  TEXT,
+                    updated_at  INTEGER NOT NULL,
+                    PRIMARY KEY (outbox_id, endpoint_id)
+                );",
+            )?;
+            info!(
+                "Migrated config DB schema from v{} to v27 (event_deliveries)",
                 version
             );
         }

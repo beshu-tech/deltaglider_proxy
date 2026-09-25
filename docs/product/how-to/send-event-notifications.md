@@ -14,7 +14,7 @@ advanced:
       authorization: "Bearer YOUR-TOKEN"
 ```
 
-Add fan-out endpoints with `webhook_urls: [...]` — every endpoint receives every event, and a row counts as delivered only when **all** endpoints return 2xx. Each POST body is the `{schema, event}` JSON envelope; full payload schema and tuning knobs (`tick_interval`, `batch_size`, `max_attempts`, retention) are in the [reference](../reference/event-outbox.md#yaml-grammar).
+Add fan-out endpoints with `webhook_urls: [...]` — every endpoint receives every event, and a row counts as delivered only when **all** endpoints return 2xx. The proxy records the result of each endpoint separately. When one endpoint fails, the proxy still posts to the other endpoints, and a retry posts only to the endpoints that have not yet returned 2xx, so the healthy endpoints do not receive the event twice. Each POST body is the `{schema, event}` JSON envelope; full payload schema and tuning knobs (`tick_interval`, `batch_size`, `max_attempts`, retention) are in the [reference](../reference/event-outbox.md#yaml-grammar).
 
 From the admin UI: **Settings → Integrations → Event delivery**.
 

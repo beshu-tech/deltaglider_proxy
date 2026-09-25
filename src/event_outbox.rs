@@ -190,6 +190,18 @@ pub struct EventOutboxRecord {
     pub created_at: i64,
 }
 
+/// One raw-webhook endpoint's delivery state for one outbox row.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EventEndpointDelivery {
+    /// Stable, non-secret id of the endpoint URL (see `event_delivery::endpoint_id`).
+    pub endpoint_id: String,
+    /// `delivered` or `failed`.
+    pub status: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EventOutboxStatusCounts {
     pub pending: i64,
@@ -463,6 +475,65 @@ impl ConfigDb {
         Ok(claimed)
     }
 
+    /// Record one endpoint's outcome for an outbox row (`error = None`: success).
+    pub fn event_delivery_record(
+        &self,
+        outbox_id: i64,
+        endpoint_id: &str,
+        error: Option<&str>,
+        now: i64,
+    ) -> Result<(), ConfigDbError> {
+        let status = if error.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_DELIVERED
+        };
+        self.conn.execute(
+            "INSERT INTO event_deliveries (outbox_id, endpoint_id, status, attempts, last_error, updated_at)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5)
+             ON CONFLICT(outbox_id, endpoint_id) DO UPDATE SET
+               status = excluded.status,
+               attempts = attempts + 1,
+               last_error = excluded.last_error,
+               updated_at = excluded.updated_at",
+            params![outbox_id, endpoint_id, status, error, now],
+        )?;
+        Ok(())
+    }
+
+    /// The endpoints that already received this outbox row.
+    pub fn event_delivery_done_endpoints(
+        &self,
+        outbox_id: i64,
+    ) -> Result<std::collections::HashSet<String>, ConfigDbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT endpoint_id FROM event_deliveries WHERE outbox_id = ? AND status = 'delivered'",
+        )?;
+        let rows = stmt.query_map(params![outbox_id], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Every endpoint's delivery state for one outbox row.
+    pub fn event_deliveries_for(
+        &self,
+        outbox_id: i64,
+    ) -> Result<Vec<EventEndpointDelivery>, ConfigDbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT endpoint_id, status, attempts, last_error, updated_at
+               FROM event_deliveries WHERE outbox_id = ? ORDER BY endpoint_id",
+        )?;
+        let rows = stmt.query_map(params![outbox_id], |r| {
+            Ok(EventEndpointDelivery {
+                endpoint_id: r.get(0)?,
+                status: r.get(1)?,
+                attempts: r.get(2)?,
+                last_error: r.get(3)?,
+                updated_at: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     pub fn event_outbox_mark_delivered(&self, id: i64, now: i64) -> Result<bool, ConfigDbError> {
         let updated = self.conn.execute(
             "UPDATE event_outbox
@@ -710,7 +781,10 @@ impl ConfigDb {
         Ok(deleted)
     }
 
-    fn event_outbox_load(&self, id: i64) -> Result<Option<EventOutboxRecord>, ConfigDbError> {
+    pub(crate) fn event_outbox_load(
+        &self,
+        id: i64,
+    ) -> Result<Option<EventOutboxRecord>, ConfigDbError> {
         let row = self
             .conn
             .query_row(

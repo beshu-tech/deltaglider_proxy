@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed — a raw webhook retry posts only to the endpoints that failed
+
+With several `webhook_urls`, the dispatcher posted to the endpoints in order
+and stopped at the first failure. The endpoints after it did not get the event
+until the failing one recovered, and every retry posted the event again to the
+endpoints that had already accepted it. Now the proxy records the result of
+each endpoint in a new `event_deliveries` table (schema v27). A failing
+endpoint does not stop the others, and a retry posts only to the endpoints
+that have not yet succeeded. Upgrade: rows that are pending at upgrade time
+have no per-endpoint history, so their next attempt posts to every endpoint
+once more.
+
 ### Changed — IAM config sync merges changes from every instance
 
 Before, a config-sync download replaced the whole IAM table set with the copy

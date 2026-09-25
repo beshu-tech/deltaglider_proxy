@@ -69,11 +69,32 @@ pub struct EventWebhookPayload<'a> {
 
 #[async_trait]
 pub trait EventDeliveryClient: Send + Sync + 'static {
+    /// Deliver the whole event (Slack format: one formatted message).
     async fn deliver(
         &self,
         config: &EventDeliveryConfig,
         event: &EventOutboxRecord,
     ) -> Result<(), String>;
+
+    /// Deliver a raw event to ONE webhook endpoint. The dispatcher calls it per
+    /// endpoint and records each outcome, so a retry skips the endpoints that
+    /// already succeeded.
+    async fn deliver_endpoint(
+        &self,
+        config: &EventDeliveryConfig,
+        event: &EventOutboxRecord,
+        endpoint: &str,
+    ) -> Result<(), String> {
+        let _ = endpoint;
+        self.deliver(config, event).await
+    }
+}
+
+/// Stable, non-secret id of a webhook endpoint URL: the URL can carry a token
+/// (Slack-style paths), so only a hash of it is stored.
+pub fn endpoint_id(endpoint: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(&Sha256::digest(endpoint.trim().as_bytes())[..8])
 }
 
 #[derive(Clone)]
@@ -216,11 +237,26 @@ impl EventDeliveryClient for HttpWebhookDeliveryClient {
             EventDeliveryFormat::Raw => self.deliver_raw(config, event, timeout).await,
         }
     }
+
+    async fn deliver_endpoint(
+        &self,
+        config: &EventDeliveryConfig,
+        event: &EventOutboxRecord,
+        endpoint: &str,
+    ) -> Result<(), String> {
+        let timeout = parse_duration_or(
+            &config.request_timeout,
+            DEFAULT_TIMEOUT,
+            MIN_TIMEOUT,
+            "event_delivery.request_timeout",
+        );
+        self.post_raw(config, event, endpoint, timeout).await
+    }
 }
 
 impl HttpWebhookDeliveryClient {
-    /// Existing behavior: POST the `{schema,event}` envelope to every webhook
-    /// endpoint with the configured static headers.
+    /// POST the `{schema,event}` envelope to every webhook endpoint in turn.
+    /// Only for a direct `deliver` call; the dispatcher goes endpoint by endpoint.
     async fn deliver_raw(
         &self,
         config: &EventDeliveryConfig,
@@ -231,38 +267,52 @@ impl HttpWebhookDeliveryClient {
         if endpoints.is_empty() {
             return Err("event delivery enabled without webhook endpoint".to_string());
         }
+        for endpoint in endpoints {
+            self.post_raw(config, event, endpoint, timeout).await?;
+        }
+        Ok(())
+    }
+
+    /// POST the `{schema,event}` envelope to one endpoint with the configured
+    /// static headers.
+    async fn post_raw(
+        &self,
+        config: &EventDeliveryConfig,
+        event: &EventOutboxRecord,
+        endpoint: &str,
+        timeout: Duration,
+    ) -> Result<(), String> {
         let payload = EventWebhookPayload {
             schema: "deltaglider.event.v1",
             event,
         };
-        for endpoint in endpoints {
-            // SSRF guard: reject private/loopback/metadata targets before any
-            // outbound request (the client also refuses to follow redirects).
-            self.check_ssrf(endpoint, "webhook endpoint")?;
-            let url = Url::parse(endpoint).map_err(|e| format!("invalid webhook endpoint: {e}"))?;
-            let mut request = self
-                .client
-                .post(url)
-                .timeout(timeout)
-                .header("user-agent", "deltaglider-proxy-event-outbox");
-            for (name, value) in &config.webhook_headers {
-                let name = HeaderName::from_bytes(name.as_bytes())
-                    .map_err(|e| format!("invalid webhook header name {name:?}: {e}"))?;
-                let value = HeaderValue::from_str(value)
-                    .map_err(|e| format!("invalid webhook header value for {name}: {e}"))?;
-                request = request.header(name, value);
-            }
-            let response =
-                request.json(&payload).send().await.map_err(|e| {
-                    format!("{}: {}", redact_url_for_error(endpoint), e.without_url())
-                })?;
-            if !response.status().is_success() {
-                return Err(format!(
-                    "{}: webhook returned HTTP {}",
-                    redact_url_for_error(endpoint),
-                    response.status()
-                ));
-            }
+        // SSRF guard: reject private/loopback/metadata targets before any
+        // outbound request (the client also refuses to follow redirects).
+        self.check_ssrf(endpoint, "webhook endpoint")?;
+        let url = Url::parse(endpoint).map_err(|e| format!("invalid webhook endpoint: {e}"))?;
+        let mut request = self
+            .client
+            .post(url)
+            .timeout(timeout)
+            .header("user-agent", "deltaglider-proxy-event-outbox");
+        for (name, value) in &config.webhook_headers {
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| format!("invalid webhook header name {name:?}: {e}"))?;
+            let value = HeaderValue::from_str(value)
+                .map_err(|e| format!("invalid webhook header value for {name}: {e}"))?;
+            request = request.header(name, value);
+        }
+        let response = request
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| format!("{}: {}", redact_url_for_error(endpoint), e.without_url()))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "{}: webhook returned HTTP {}",
+                redact_url_for_error(endpoint),
+                response.status()
+            ));
         }
         Ok(())
     }
@@ -546,7 +596,10 @@ pub async fn dispatch_once(
     };
 
     for event in claimed {
-        let outcome = client.deliver(config, &event).await;
+        let outcome = match config.format {
+            EventDeliveryFormat::Raw => deliver_to_endpoints(db, client, config, &event).await,
+            EventDeliveryFormat::Slack => client.deliver(config, &event).await,
+        };
         let db = db.lock().await;
         match outcome {
             Ok(()) => {
@@ -629,6 +682,56 @@ pub async fn dispatch_once(
     // consumed-but-never-delivered accumulation the floor prune guards against
     // only arises when delivery is DISABLED, and the disabled branch of
     // `spawn_dispatcher_with_client` handles that via `prune_while_inactive`.
+}
+
+/// Raw fan-out: post to every configured endpoint that has not yet received
+/// this event, record each outcome, and fail the row (for a retry) when any
+/// endpoint failed. One failing endpoint never stops the others.
+async fn deliver_to_endpoints(
+    db: &Arc<Mutex<ConfigDb>>,
+    client: &dyn EventDeliveryClient,
+    config: &EventDeliveryConfig,
+    event: &EventOutboxRecord,
+) -> Result<(), String> {
+    let endpoints = config.webhook_endpoints();
+    if endpoints.is_empty() {
+        return Err("event delivery enabled without webhook endpoint".to_string());
+    }
+    let mut done = db
+        .lock()
+        .await
+        .event_delivery_done_endpoints(event.id)
+        .map_err(|e| format!("event delivery state unreadable: {e}"))?;
+    let mut errors = Vec::new();
+    for endpoint in endpoints {
+        let id = endpoint_id(endpoint);
+        if done.contains(&id) {
+            continue;
+        }
+        let outcome = client.deliver_endpoint(config, event, endpoint).await;
+        let error = outcome.as_ref().err().map(|e| persistable_error(e));
+        if let Err(e) = db.lock().await.event_delivery_record(
+            event.id,
+            &id,
+            error.as_deref(),
+            current_unix_seconds(),
+        ) {
+            // Unrecorded success: the retry may post to this endpoint again
+            // (at-least-once), never skip it.
+            warn!("Event delivery record failed for {}: {}", event.id, e);
+        }
+        match error {
+            Some(e) => errors.push(e),
+            None => {
+                done.insert(id);
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 pub(crate) fn dispatcher_tick(config: &EventDeliveryConfig) -> Duration {
@@ -965,6 +1068,105 @@ mod tests {
             .expect("undelivered row must NOT be pruned below the replication floor");
         assert_eq!(row.status, STATUS_PENDING);
         assert!(row.next_attempt_at.is_some(), "row is still owed a retry");
+    }
+
+    /// Records every per-endpoint post; the endpoint named `fail_url` fails
+    /// its first `fail_times` posts.
+    struct EndpointClient {
+        fail_url: &'static str,
+        fail_times: usize,
+        failed: AtomicUsize,
+        posts: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl EventDeliveryClient for EndpointClient {
+        async fn deliver(
+            &self,
+            _config: &EventDeliveryConfig,
+            _event: &EventOutboxRecord,
+        ) -> Result<(), String> {
+            unreachable!("raw delivery must go endpoint by endpoint")
+        }
+
+        async fn deliver_endpoint(
+            &self,
+            _config: &EventDeliveryConfig,
+            _event: &EventOutboxRecord,
+            endpoint: &str,
+        ) -> Result<(), String> {
+            self.posts.lock().unwrap().push(endpoint.to_string());
+            if endpoint == self.fail_url
+                && self.failed.fetch_add(1, Ordering::SeqCst) < self.fail_times
+            {
+                Err("HTTP 503".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_posts_only_to_endpoints_that_have_not_succeeded() {
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let id = db.lock().await.event_outbox_insert(&event("fan")).unwrap();
+        let client = EndpointClient {
+            fail_url: "http://b.invalid/hook",
+            fail_times: 1,
+            failed: AtomicUsize::new(0),
+            posts: Default::default(),
+        };
+        let config = EventDeliveryConfig {
+            webhook_url: Some("http://a.invalid/hook".into()),
+            webhook_urls: vec![
+                "http://b.invalid/hook".into(),
+                "http://c.invalid/hook".into(),
+            ],
+            ..cfg()
+        };
+
+        dispatch_once(&db, &client, &config, "w", 200).await;
+        // B failing does not stop C.
+        assert_eq!(
+            *client.posts.lock().unwrap(),
+            vec![
+                "http://a.invalid/hook",
+                "http://b.invalid/hook",
+                "http://c.invalid/hook"
+            ]
+        );
+        let deliveries = db.lock().await.event_deliveries_for(id).unwrap();
+        let status = |url: &str| {
+            deliveries
+                .iter()
+                .find(|d| d.endpoint_id == endpoint_id(url))
+                .map(|d| (d.status.clone(), d.attempts))
+        };
+        assert_eq!(
+            status("http://a.invalid/hook"),
+            Some(("delivered".into(), 1))
+        );
+        assert_eq!(status("http://b.invalid/hook"), Some(("failed".into(), 1)));
+        let row = db.lock().await.event_outbox_load(id).unwrap().unwrap();
+        assert_eq!(row.status, STATUS_PENDING);
+        assert_eq!(row.last_error.as_deref(), Some("HTTP 503"));
+
+        // The retry posts to B only.
+        client.posts.lock().unwrap().clear();
+        dispatch_once(&db, &client, &config, "w", 205).await;
+        assert_eq!(*client.posts.lock().unwrap(), vec!["http://b.invalid/hook"]);
+        let row = db.lock().await.event_outbox_load(id).unwrap().unwrap();
+        assert_eq!(row.status, STATUS_DELIVERED);
+        let deliveries = db.lock().await.event_deliveries_for(id).unwrap();
+        assert!(deliveries.iter().all(|d| d.status == "delivered"));
+        assert_eq!(
+            deliveries
+                .iter()
+                .find(|d| d.endpoint_id == endpoint_id("http://b.invalid/hook"))
+                .unwrap()
+                .attempts,
+            2
+        );
     }
 
     #[tokio::test]
