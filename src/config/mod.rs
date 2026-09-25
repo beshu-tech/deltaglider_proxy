@@ -2553,13 +2553,17 @@ impl Config {
     ///
     /// Mechanics: the config is serialized to a YAML value tree and every
     /// String scalar that EXACTLY equals a recorded env value is replaced by
-    /// `${env:NAME}`. Deterministic on collisions (two names with the same
+    /// `${env:NAME}` (a short value found in several fields stays; see
+    /// below). Deterministic on collisions (two names with the same
     /// value → the lexicographically-first name wins). Non-string scalars
     /// (a ref that expanded into a number/bool field) are left materialized.
     /// Falls back to a plain clone (with a warn) if the round-trip through
     /// the value tree fails — emitting expanded secrets is strictly better
     /// than failing a persist.
     pub fn with_env_refs_reinserted(&self) -> Self {
+        /// Shortest env value treated as a secret when it occurs in several
+        /// fields (see the count rule below).
+        const SHARED_REF_MIN_LEN: usize = 8;
         if self.env_refs.is_empty() {
             return self.clone();
         }
@@ -2576,11 +2580,12 @@ impl Config {
         }
 
         // Count how many string scalars in the whole tree hold each env value.
-        // A value that appears in MORE THAN ONE field is ambiguous — rewriting
-        // either into `${env:NAME}` would COUPLE an unrelated field to that env
-        // var (a later env change would propagate to the wrong field). Only
-        // rewrite values that occur exactly once; leave ambiguous ones
-        // materialized (the comment's "expanded is better than wrong" contract).
+        // A SHORT value that appears in more than one field is ambiguous —
+        // rewriting `9000` or `us-east-1` everywhere would COUPLE an unrelated
+        // field to that env var — so it stays materialized. A secret-length
+        // value (>= SHARED_REF_MIN_LEN) is rewritten in every field (S9): the
+        // file used the ref twice, or a GUI edit copied the secret; either
+        // way plaintext on disk is the worse outcome.
         fn count_values<'a>(
             v: &'a serde_yaml::Value,
             counts: &mut std::collections::HashMap<&'a str, u32>,
@@ -2604,7 +2609,9 @@ impl Config {
         ) {
             match v {
                 serde_yaml::Value::String(s) => {
-                    if counts.get(s.as_str()).copied().unwrap_or(0) == 1 {
+                    if counts.get(s.as_str()).copied().unwrap_or(0) == 1
+                        || s.len() >= SHARED_REF_MIN_LEN
+                    {
                         if let Some(reference) = inverse.get(s.as_str()) {
                             *s = reference.clone();
                         }
@@ -5742,6 +5749,24 @@ storage:
     fn no_refs_is_a_plain_clone() {
         let cfg = Config::default();
         assert_eq!(cfg.with_env_refs_reinserted(), cfg);
+    }
+
+    /// S9: a secret-length ref value that the file uses in two fields must
+    /// not land on disk in plaintext. Both fields get the ref back.
+    #[test]
+    fn shared_secret_ref_is_reinserted_everywhere() {
+        let mut cfg = Config {
+            access_key_id: Some("AKIA-shared-secret-1".into()),
+            secret_access_key: Some("AKIA-shared-secret-1".into()),
+            ..Default::default()
+        };
+        cfg.env_refs
+            .insert("SHARED".into(), "AKIA-shared-secret-1".into());
+        let out = cfg.with_env_refs_reinserted();
+        assert_eq!(out.access_key_id.as_deref(), Some("${env:SHARED}"));
+        assert_eq!(out.secret_access_key.as_deref(), Some("${env:SHARED}"));
+        let yaml = cfg.to_canonical_yaml_for_persist_with(&|_| None).unwrap();
+        assert!(!yaml.contains("AKIA-shared-secret-1"), "{yaml}");
     }
 
     #[test]
