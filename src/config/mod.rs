@@ -2128,6 +2128,21 @@ impl Config {
                 self.default_backend = None;
             }
         }
+        // `alias` is applied by the routing table only together with an
+        // explicit `backend` (the real name lives on THAT backend); without
+        // one the bucket is served under its own name and the alias does
+        // nothing. Say so instead of ignoring it silently.
+        for (bucket, policy) in &self.buckets {
+            if let (Some(alias), None) = (policy.alias.as_deref(), policy.backend.as_deref()) {
+                if alias != bucket {
+                    warnings.push(format!(
+                        "bucket '{bucket}': alias '{alias}' is ignored because the policy \
+                         has no `backend` — set `backend` to the backend that holds \
+                         '{alias}', or remove the alias"
+                    ));
+                }
+            }
+        }
         // replication_target_only coherence. The marker's safety argument is
         // "replication is the SINGLE writer"; warn on configs that weaken it.
         // See docs/product/how-to/backend-capability-validation.md.
@@ -4176,6 +4191,40 @@ storage:
     fn check_yaml(yaml: &str) -> Vec<String> {
         let mut cfg = Config::from_yaml_str(yaml).expect("fixture must parse");
         cfg.check()
+    }
+
+    /// The routing table applies `alias` only with an explicit `backend`;
+    /// without one the alias is ignored, silently. check() now says so.
+    #[test]
+    fn test_check_warns_alias_without_backend() {
+        let warnings = check_yaml(
+            r#"
+storage:
+  buckets:
+    releases:
+      alias: real-releases
+"#,
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("releases") && w.contains("alias") && w.contains("backend")),
+            "alias without backend must warn, got {warnings:?}"
+        );
+        let clean = check_yaml(
+            r#"
+storage:
+  backends:
+    - name: hetzner-fsn1
+      type: filesystem
+      path: /tmp/x
+  buckets:
+    releases:
+      backend: hetzner-fsn1
+      alias: real-releases
+"#,
+        );
+        assert!(!clean.iter().any(|w| w.contains("is ignored")), "{clean:?}");
     }
 
     #[test]
