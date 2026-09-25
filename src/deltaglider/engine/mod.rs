@@ -385,10 +385,7 @@ impl DynEngine {
                 )?;
                 backends.insert(named.name.clone(), Arc::new(wrapped));
             }
-            let default_name = config
-                .default_backend
-                .clone()
-                .unwrap_or_else(|| config.backends[0].name.clone());
+            let default_name = config.default_backend_name();
 
             let registry = crate::bucket_policy::BucketPolicyRegistry::new(
                 config.buckets.clone(),

@@ -1339,6 +1339,13 @@ fn init_config_db_attempt(
     }
 }
 
+/// The coordination bucket's backend (see [`Config::coordination_backend`]).
+/// Falls back to the singleton only for a sync bucket routed to an undefined
+/// backend, which `check_fatal` refuses before this runs.
+fn coordination_backend(config: &Config) -> &BackendConfig {
+    config.coordination_backend().unwrap_or(&config.backend)
+}
+
 /// Build the job-plane leader lease, selecting the impl by whether a
 /// CAS-capable coordination bucket is configured. Called BEFORE the schedulers
 /// spawn so they receive a live handle.
@@ -1380,7 +1387,7 @@ pub async fn build_coordination_lease(
     // validation CRASHES on a silent-clobber backend (data-loss trap); it is
     // idempotent with init_config_sync's later call (witness fast-path).
     let sync = match ConfigDbSync::new(
-        &config.backend,
+        coordination_backend(config),
         sync_bucket.clone(),
         config
             .config_sync_object_key
@@ -1409,7 +1416,7 @@ pub async fn build_coordination_lease(
         std::process::exit(1);
     }
 
-    match ConfigDbSync::build_client(&config.backend).await {
+    match ConfigDbSync::build_client(coordination_backend(config)).await {
         Ok(client) => {
             info!(
                 "Job-plane lease: S3-CAS on bucket '{sync_bucket}' (cross-node failover, \
@@ -1459,7 +1466,7 @@ pub async fn build_reference_lock(
         "DGP_REFERENCE_LOCK_ACQUIRE_TIMEOUT_SECS",
         30,
     );
-    match ConfigDbSync::build_client(&config.backend).await {
+    match ConfigDbSync::build_client(coordination_backend(config)).await {
         Ok(client) => {
             info!(
                 "Reference lock: S3-CAS on bucket '{sync_bucket}' (cross-node reference.bin \
@@ -1494,10 +1501,9 @@ pub async fn build_reference_lock(
 ///    verdict in the cache (GUI banner), NOT a crash — mirrors the "never a
 ///    SPOF" stance of the lease builder above.
 ///
-/// The DEFAULT backend is exempt here: the coordination bucket lives on it
-/// (`ConfigDbSync` builds from `config.backend`), so `validate_coordination_bucket`
-/// already crash-validates it. `replication_target_only` buckets are exempt:
-/// they have no client writers (guard A).
+/// Every S3 backend with a client-writable bucket is probed, the default one
+/// included (unrouted buckets land there). `replication_target_only` buckets
+/// are exempt: they have no client writers (guard A).
 pub async fn validate_backend_write_capability(
     config: &Config,
     cache: &deltaglider_proxy::coordination::BackendCapabilityCache,
@@ -1521,8 +1527,8 @@ pub async fn validate_backend_write_capability(
     let groups = client_writable_s3_backends(config);
     if groups.is_empty() {
         info!(
-            "Backend capability gate: no client-writable buckets on named S3 backends — \
-             nothing to validate (default backend is covered by the coordination gate)"
+            "Backend capability gate: no client-writable buckets on S3 backends — \
+             nothing to validate"
         );
         return;
     }
@@ -1655,7 +1661,7 @@ pub async fn init_config_sync(
         });
 
     let sync = match ConfigDbSync::new(
-        &config.backend,
+        coordination_backend(config),
         sync_bucket.clone(),
         object_key,
         db_file,

@@ -365,18 +365,16 @@ pub async fn start_migrate(
     // under one config read.
     let params = {
         let cfg = state.config.read().await;
-        if !cfg.backends.is_empty() && !cfg.backends.iter().any(|b| b.name == target_backend) {
+        if cfg.backend_by_name(&target_backend).is_none() {
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!("Unknown target backend '{target_backend}'"),
             ));
         }
         let from_backend = cfg
-            .buckets
-            .get(&bucket_key)
-            .and_then(|p| p.backend.clone())
-            .or_else(|| cfg.default_backend.clone())
-            .unwrap_or_else(|| "default".to_string());
+            .effective_backend_for_bucket(&bucket_key)
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| cfg.default_backend_name());
         if from_backend == target_backend {
             return Err((
                 StatusCode::BAD_REQUEST,

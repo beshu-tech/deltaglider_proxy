@@ -402,34 +402,43 @@ fn failure_verdict(failure: ProbeFailure, detail: String) -> HealthVerdict {
     }
 }
 
-/// All backends to health-probe: the default backend under its synthesized
-/// name `"default"` (matching the admin backends API) + every named backend.
-/// For each, a fallback HeadBucket target: the alias-resolved real name of the
-/// first bucket routed to it (scoped-key disambiguation).
+/// All backends to health-probe: the singleton under its synthesized name
+/// `"default"` (matching the admin backends API) while no named backends
+/// exist, else every named backend (the singleton is then unused). For each,
+/// a fallback HeadBucket target: the alias-resolved real name of the first
+/// bucket that routes to it (scoped-key disambiguation).
 pub fn probe_targets(
     config: &crate::config::Config,
 ) -> Vec<(String, BackendConfig, Option<String>)> {
-    let mut out = Vec::new();
-    let fallback_for = |name: Option<&str>| {
+    let fallback_for = |name: &str| {
         config
             .buckets
             .iter()
-            .find(|(_, p)| p.backend.as_deref() == name)
+            .find(|(b, _)| {
+                config
+                    .effective_backend_for_bucket(b)
+                    .is_some_and(|(n, _)| n == name)
+            })
             .map(|(b, p)| p.alias.clone().unwrap_or_else(|| b.clone()))
     };
-    out.push((
-        "default".to_string(),
-        config.backend.clone(),
-        fallback_for(None),
-    ));
-    for named in &config.backends {
-        out.push((
-            named.name.clone(),
-            named.backend.clone(),
-            fallback_for(Some(named.name.as_str())),
-        ));
+    if config.backends.is_empty() {
+        return vec![(
+            "default".to_string(),
+            config.backend.clone(),
+            fallback_for("default"),
+        )];
     }
-    out
+    config
+        .backends
+        .iter()
+        .map(|named| {
+            (
+                named.name.clone(),
+                named.backend.clone(),
+                fallback_for(&named.name),
+            )
+        })
+        .collect()
 }
 
 /// Boot policy for the health gate.
@@ -498,18 +507,9 @@ pub async fn backend_health_gate_middleware(request: Request<Body>, next: Next) 
     // duration just restores pre-gate behavior for a few seconds.
     let resolved = match gate.config.try_read() {
         Err(_) => return next.run(request).await,
-        Ok(cfg) => match cfg.buckets.get(&bucket).and_then(|p| p.backend.clone()) {
-            // The literal "default" is the synthesized singleton name
-            // (accepted by check_fatal + the admin API) — same target as an
-            // unrouted bucket.
-            Some(name) if name == "default" => Some(("default".to_string(), cfg.backend.clone())),
-            Some(name) => cfg
-                .backends
-                .iter()
-                .find(|b| b.name == name)
-                .map(|b| (name.clone(), b.backend.clone())),
-            None => Some(("default".to_string(), cfg.backend.clone())),
-        },
+        Ok(cfg) => cfg
+            .effective_backend_for_bucket(&bucket)
+            .map(|(name, def)| (name, def.clone())),
     };
     let Some((backend_name, backend_cfg)) = resolved else {
         // Route to an undefined backend: unreachable in practice (check_fatal
@@ -646,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_targets_covers_default_and_named_with_fallback_buckets() {
+    fn probe_targets_skips_unused_singleton_with_named_backends() {
         let cfg = crate::config::Config::from_yaml_str(
             r#"
 storage:
@@ -664,19 +664,31 @@ storage:
         )
         .expect("fixture parses");
         let targets = probe_targets(&cfg);
-        assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].0, "default");
+        // Named backends exist → the unused legacy singleton is NOT probed,
+        // and the unrouted `plain` bucket belongs to the named default (b2).
+        assert_eq!(targets.len(), 1, "{targets:?}");
+        assert_eq!(targets[0].0, "b2");
         assert_eq!(
             targets[0].2.as_deref(),
-            Some("plain"),
-            "default's fallback = first bucket routed to it"
-        );
-        assert_eq!(targets[1].0, "b2");
-        assert_eq!(
-            targets[1].2.as_deref(),
             Some("real-mirror"),
-            "alias-resolved real bucket"
+            "alias-resolved real bucket (BTreeMap order: mirror first)"
         );
+    }
+
+    #[test]
+    fn probe_targets_singleton_is_default() {
+        let cfg = crate::config::Config::from_yaml_str(
+            r#"
+storage:
+  buckets:
+    plain: {}
+"#,
+        )
+        .expect("fixture parses");
+        let targets = probe_targets(&cfg);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, "default");
+        assert_eq!(targets[0].2.as_deref(), Some("plain"));
     }
 
     #[test]

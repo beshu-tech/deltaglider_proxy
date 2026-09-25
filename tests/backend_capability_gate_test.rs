@@ -10,9 +10,17 @@ use crate::common;
 
 use common::{admin_http_client, TestServer};
 
-/// The named-backend + routed-bucket fragment shared by every case. The
-/// endpoint is never contacted: the forced verdict short-circuits the probe.
-const B2SIM_YAML: &str = r#"backends:
+/// The named-backend fragment shared by every case. The b2sim endpoint is
+/// never contacted: the forced verdict short-circuits the probe. `local-disk`
+/// comes FIRST, so it is the default backend: unrouted buckets and the
+/// coordination bucket resolve to a filesystem backend (sync degrades to a
+/// warning) and only the capability gate is under test.
+fn b2sim_yaml(local: &std::path::Path) -> String {
+    format!(
+        r#"backends:
+  - name: local-disk
+    type: filesystem
+    path: "{}"
   - name: b2sim
     type: s3
     endpoint: "http://127.0.0.1:1"
@@ -20,7 +28,10 @@ const B2SIM_YAML: &str = r#"backends:
     force_path_style: true
     access_key_id: "x"
     secret_access_key: "y"
-"#;
+"#,
+        local.display()
+    )
+}
 
 /// Spawn the proxy binary directly with a config that must FAIL boot, and
 /// return (exit_ok, combined_output). TestServer can't be used here — it
@@ -54,9 +65,10 @@ fn test_noncas_backend_with_client_writable_bucket_fails_boot() {
          secret_access_key: \"s\"\n\
          config_sync_bucket: \"dgp-sync\"\n\
          backend:\n  type: filesystem\n  path: \"{}\"\n\
-         {B2SIM_YAML}\
+         {}\
          buckets:\n  mirror:\n    backend: b2sim\n",
-        dir.path().display()
+        dir.path().display(),
+        b2sim_yaml(&dir.path().join("local"))
     );
     let (status, output) = spawn_expect_exit(&config);
     assert!(
@@ -80,12 +92,13 @@ fn test_noncas_backend_with_client_writable_bucket_fails_boot() {
 
 #[tokio::test]
 async fn test_single_instance_and_marked_bucket_boot_fine() {
+    let local = tempfile::tempdir().expect("local-disk dir");
     // (a) Single instance (no config_sync_bucket): the gate skips entirely —
     //     the same forced-non-CAS backend + routed bucket boots.
     let server = TestServer::builder()
         .auth("k", "s")
         .bucket_policy("mirror", "backend: b2sim")
-        .extra_yaml_root(B2SIM_YAML)
+        .extra_yaml_root(&b2sim_yaml(local.path()))
         .env("DGP_TEST_FORCE_NONCAS_BACKEND", "b2sim")
         .env("DGP_BACKEND_ALLOW_LOCAL", "true")
         .build()
@@ -99,7 +112,7 @@ async fn test_single_instance_and_marked_bucket_boot_fine() {
         .auth("k", "s")
         .config_sync_bucket("dgp-sync")
         .bucket_policy("mirror", "backend: b2sim\nreplication_target_only: true")
-        .extra_yaml_root(B2SIM_YAML)
+        .extra_yaml_root(&b2sim_yaml(local.path()))
         .env("DGP_TEST_FORCE_NONCAS_BACKEND", "b2sim")
         .env("DGP_BACKEND_ALLOW_LOCAL", "true")
         .build()
@@ -109,13 +122,14 @@ async fn test_single_instance_and_marked_bucket_boot_fine() {
 
 #[tokio::test]
 async fn test_hot_apply_rejects_routing_client_writable_bucket_to_noncas_backend() {
+    let local = tempfile::tempdir().expect("local-disk dir");
     // Boot single-instance (gate skipped), then try to APPLY a config that
     // turns on multi-instance with the client-writable bucket still routed to
     // the forced-non-CAS backend → the pre-commit gate must refuse.
     let server = TestServer::builder()
         .auth("k", "s")
         .bucket_policy("mirror", "backend: b2sim")
-        .extra_yaml_root(B2SIM_YAML)
+        .extra_yaml_root(&b2sim_yaml(local.path()))
         .env("DGP_TEST_FORCE_NONCAS_BACKEND", "b2sim")
         .env("DGP_BACKEND_ALLOW_LOCAL", "true")
         .build()
@@ -166,5 +180,50 @@ async fn test_hot_apply_rejects_routing_client_writable_bucket_to_noncas_backend
     assert_eq!(
         status, 200,
         "marked bucket must make the same transition acceptable, got {status}: {body}"
+    );
+}
+
+/// `POST /_/api/admin/buckets` routes a NEW bucket onto a backend. Under
+/// multi-instance it must pass the same capability gate as a config apply,
+/// or a client-writable bucket lands on a non-CAS backend and the next boot
+/// exit(1)s on the persisted config.
+#[tokio::test]
+async fn test_create_bucket_on_noncas_backend_is_refused_multi_instance() {
+    let local = tempfile::tempdir().expect("local-disk dir");
+    let server = TestServer::builder()
+        .auth("k", "s")
+        .config_sync_bucket("dgp-sync")
+        .extra_yaml_root(&b2sim_yaml(local.path()))
+        .env("DGP_TEST_FORCE_NONCAS_BACKEND", "b2sim")
+        .env("DGP_BACKEND_ALLOW_LOCAL", "true")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let resp = admin
+        .post(format!("{}/_/api/admin/buckets", server.endpoint()))
+        .json(&serde_json::json!({ "name": "downloads", "backend_name": "b2sim" }))
+        .send()
+        .await
+        .expect("create bucket");
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap();
+    assert_ne!(status, 200, "create must be refused, got {status}: {body}");
+    assert!(
+        body.contains("does not support conditional writes")
+            && body.contains("backend-capability-validation"),
+        "refusal must name the cause, got: {body}"
+    );
+    // Nothing was routed: the export carries no `downloads` policy.
+    let export = admin
+        .get(format!("{}/_/api/admin/config/export", server.endpoint()))
+        .send()
+        .await
+        .expect("export")
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !export.contains("downloads"),
+        "route must roll back: {export}"
     );
 }

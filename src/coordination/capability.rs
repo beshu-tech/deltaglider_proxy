@@ -104,15 +104,15 @@ pub struct ClientWritableGroup {
     pub probe_bucket: String,
 }
 
-/// Pure projection: which NAMED S3 backends host at least one client-writable
-/// routed bucket, and therefore need a CAS verdict under multi-instance.
+/// Pure projection: which S3 backends host at least one client-writable
+/// bucket (by [`crate::config::Config::effective_backend_for_bucket`], so an
+/// unrouted bucket counts for the default backend), and therefore need a CAS
+/// verdict under multi-instance.
 ///
-/// Skipped by design: `replication_target_only` buckets (no client writers),
-/// filesystem backends (per-node local, single-writer by nature), and the
-/// DEFAULT backend — it hosts the coordination bucket (`ConfigDbSync` builds
-/// its client from `config.backend`), so the coordination gate already
-/// crash-validates it. Compression policy is deliberately IGNORED: it is
-/// hot-flippable, so a `compression: false` exemption would be unsound.
+/// Skipped by design: `replication_target_only` buckets (no client writers)
+/// and filesystem backends (per-node local, single-writer by nature).
+/// Compression policy is deliberately IGNORED: it is hot-flippable, so a
+/// `compression: false` exemption would be unsound.
 pub fn client_writable_s3_backends(
     config: &crate::config::Config,
 ) -> std::collections::BTreeMap<String, ClientWritableGroup> {
@@ -121,23 +121,17 @@ pub fn client_writable_s3_backends(
         if policy.replication_target_only {
             continue;
         }
-        let Some(backend_name) = policy.backend.as_deref() else {
-            continue; // default backend: covered by the coordination gate
+        let Some((backend_name, backend)) = config.effective_backend_for_bucket(bucket) else {
+            continue; // undefined backend: refused by Config::check_fatal()
         };
-        let Some(named) = config.backends.iter().find(|b| b.name == backend_name) else {
-            continue; // unknown backend: already warned by Config::check()
-        };
-        if matches!(
-            named.backend,
-            crate::config::BackendConfig::Filesystem { .. }
-        ) {
+        if matches!(backend, crate::config::BackendConfig::Filesystem { .. }) {
             continue;
         }
         let real = policy.alias.clone().unwrap_or_else(|| bucket.clone());
         groups
-            .entry(backend_name.to_string())
+            .entry(backend_name)
             .or_insert_with(|| ClientWritableGroup {
-                backend: named.backend.clone(),
+                backend: backend.clone(),
                 buckets: Vec::new(),
                 probe_bucket: real,
             })
@@ -305,21 +299,22 @@ pub async fn migrate_target_capability_gate(
     if policy.is_some_and(|p| p.replication_target_only) {
         return Ok(()); // no client writers → any backend is safe
     }
-    let Some(named) = config.backends.iter().find(|b| b.name == target_backend) else {
-        return Ok(()); // unknown/default backend: validated elsewhere
+    let Some(target_def) = config.backend_by_name(target_backend) else {
+        return Ok(()); // unknown backend: the caller already refused it
     };
-    if matches!(
-        named.backend,
-        crate::config::BackendConfig::Filesystem { .. }
-    ) {
+    if matches!(target_def, crate::config::BackendConfig::Filesystem { .. }) {
         return Ok(());
     }
-    // Prefer probing a bucket already routed to the target (it exists there);
-    // fall back to the migrated bucket's real name.
+    // Prefer probing a bucket already on the target (it exists there); fall
+    // back to the migrated bucket's real name.
     let probe_bucket = config
         .buckets
         .iter()
-        .find(|(_, p)| p.backend.as_deref() == Some(target_backend))
+        .find(|(b, _)| {
+            config
+                .effective_backend_for_bucket(b)
+                .is_some_and(|(n, _)| n == target_backend)
+        })
         .map(|(b, p)| p.alias.clone().unwrap_or_else(|| b.clone()))
         .unwrap_or_else(|| {
             policy
@@ -327,7 +322,7 @@ pub async fn migrate_target_capability_gate(
                 .unwrap_or_else(|| bucket.to_string())
         });
     let group = ClientWritableGroup {
-        backend: named.backend.clone(),
+        backend: target_def.clone(),
         buckets: vec![bucket.to_string()],
         probe_bucket,
     };
@@ -402,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_skips_marked_default_backend_and_filesystem_buckets() {
+    fn projection_skips_marked_and_filesystem_buckets() {
         let cfg = crate::config::Config::from_yaml_str(
             r#"
 storage:
@@ -434,7 +429,8 @@ storage:
         let g = &groups["remote"];
         let mut buckets = g.buckets.clone();
         buckets.sort();
-        assert_eq!(buckets, vec!["also-writable", "writable"]);
+        // `on-default` routes to `remote` (the first named backend).
+        assert_eq!(buckets, vec!["also-writable", "on-default", "writable"]);
         // Probe bucket is the alias-resolved real name of a routed bucket
         // (BTreeMap iteration → first entry, "also-writable", no alias).
         assert!(
@@ -442,6 +438,31 @@ storage:
             "probe bucket must be a real routed bucket, got {}",
             g.probe_bucket
         );
+    }
+
+    /// An unrouted bucket lands on the NAMED default backend. The gate once
+    /// skipped it as "the coordination gate covers the default", which is
+    /// true only for the legacy singleton.
+    #[test]
+    fn projection_includes_unrouted_buckets_on_the_named_default() {
+        let cfg = crate::config::Config::from_yaml_str(
+            r#"
+storage:
+  backends:
+    - name: remote
+      type: s3
+      endpoint: "http://127.0.0.1:1"
+      region: us-east-1
+      access_key_id: x
+      secret_access_key: y
+  buckets:
+    on-default: {}
+"#,
+        )
+        .expect("fixture parses");
+        let groups = client_writable_s3_backends(&cfg);
+        assert_eq!(groups["remote"].buckets, vec!["on-default"]);
+        assert_eq!(groups["remote"].probe_bucket, "on-default");
     }
 
     #[test]

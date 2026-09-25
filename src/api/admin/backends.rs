@@ -218,10 +218,7 @@ pub async fn list_bucket_origins(
             .map(super::config::BackendInfoResponse::from)
             .collect()
     };
-    let default_backend = cfg
-        .default_backend
-        .clone()
-        .or_else(|| backend_infos.first().map(|b| b.name.clone()));
+    let default_backend = Some(cfg.default_backend_name());
     drop(cfg);
 
     let backend_by_name: std::collections::HashMap<_, _> = backend_infos
@@ -317,6 +314,22 @@ pub async fn create_bucket_on_backend(
         Some(backend_name.clone())
     };
     cfg.buckets.insert(bucket_key.clone(), policy);
+
+    // Same write-capability gate as a config apply: this route persists, and
+    // a client-writable bucket on a non-CAS backend under multi-instance
+    // makes the next boot exit(1). No-op single-instance.
+    if let Err(e) = crate::coordination::capability::hot_apply_capability_gate(
+        &cfg,
+        &state.s3_state.backend_capabilities,
+    )
+    .await
+    {
+        match old_policy {
+            Some(previous) => cfg.buckets.insert(bucket_key, previous),
+            None => cfg.buckets.remove(&bucket_key),
+        };
+        return Err((StatusCode::CONFLICT, e));
+    }
 
     if let Err(e) = super::config::rebuild_engine(
         &state,
