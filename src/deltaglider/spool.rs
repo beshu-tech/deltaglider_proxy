@@ -120,14 +120,20 @@ impl SpoolDir {
         }
     }
 
-    /// Reserve `bytes` of budget as a single weighted permit (clamped to the full
-    /// budget). Awaits on back-pressure.
-    async fn reserve(&self, bytes: u64) -> std::io::Result<OwnedSemaphorePermit> {
-        let max_mib = mib_ceil(self.max_bytes).max(1) as u32;
-        let want_mib = (mib_ceil(bytes).max(1) as u32).min(max_mib);
+    /// Reserve `bytes` of budget as a single weighted permit. Clamped so the
+    /// op's TOTAL (with the `held_mib` it already holds) stays within the
+    /// budget: the op can always run alone and never waits for budget it
+    /// holds itself. Awaits on back-pressure.
+    async fn reserve_within(
+        &self,
+        bytes: u64,
+        held_mib: usize,
+    ) -> std::io::Result<OwnedSemaphorePermit> {
+        let max_mib = mib_ceil(self.max_bytes).max(1);
+        let want_mib = mib_ceil(bytes).max(1).min(max_mib.saturating_sub(held_mib));
         self.budget
             .clone()
-            .acquire_many_owned(want_mib)
+            .acquire_many_owned(want_mib as u32)
             .await
             .map_err(|_| std::io::Error::other("spool budget semaphore closed"))
     }
@@ -136,7 +142,15 @@ impl SpoolDir {
     /// the budget is currently exhausted (back-pressure). A single request larger
     /// than the whole budget is clamped to the full budget (it runs alone).
     pub async fn acquire(&self, bytes: u64) -> std::io::Result<Spool> {
-        let permit = self.reserve(bytes).await?;
+        self.acquire_beside(None, bytes).await
+    }
+
+    /// `acquire` for an op that already holds the spool `held`: clamped like
+    /// [`Self::acquire_pair_beside`], so the op never waits on itself.
+    pub async fn acquire_beside(&self, held: Option<&Spool>, bytes: u64) -> std::io::Result<Spool> {
+        let permit = self
+            .reserve_within(bytes, held.map_or(0, Spool::reserved_mib))
+            .await?;
         let file = NamedTempFile::new_in(&self.dir)?;
         Ok(Spool {
             file,
@@ -156,7 +170,25 @@ impl SpoolDir {
         a_bytes: u64,
         b_bytes: u64,
     ) -> std::io::Result<(Spool, Spool)> {
-        let permit = std::sync::Arc::new(self.reserve(a_bytes.saturating_add(b_bytes)).await?);
+        self.acquire_pair_beside(None, a_bytes, b_bytes).await
+    }
+
+    /// `acquire_pair` for an op that already holds the spool `held` (the
+    /// streaming PUT holds its body spool, then needs ref + delta). The pair
+    /// is clamped so the op's total stays within the budget. A plain
+    /// `acquire_pair` there waited for budget the op held itself, until the
+    /// acquire timeout (120 s), whenever body + pair exceeded the budget.
+    pub async fn acquire_pair_beside(
+        &self,
+        held: Option<&Spool>,
+        a_bytes: u64,
+        b_bytes: u64,
+    ) -> std::io::Result<(Spool, Spool)> {
+        let held_mib = held.map_or(0, Spool::reserved_mib);
+        let permit = std::sync::Arc::new(
+            self.reserve_within(a_bytes.saturating_add(b_bytes), held_mib)
+                .await?,
+        );
         let a = NamedTempFile::new_in(&self.dir)?;
         let b = NamedTempFile::new_in(&self.dir)?;
         Ok((
@@ -178,6 +210,15 @@ impl Spool {
     /// the `NamedTempFile`, so the file lives until this drops.
     pub fn path(&self) -> &Path {
         self.file.path()
+    }
+
+    /// Budget this spool holds, in MiB (a pair's shared permit counts once
+    /// per holder; callers pass one spool of a pair at most).
+    fn reserved_mib(&self) -> usize {
+        match &self._permit {
+            SharedOrOwned::Owned(p) => p.num_permits(),
+            SharedOrOwned::Shared(p) => p.num_permits(),
+        }
     }
 }
 
@@ -287,6 +328,23 @@ mod tests {
             .unwrap();
         assert!(a.path().exists() && b.path().exists());
         assert_ne!(a.path(), b.path(), "pair gets two distinct files");
+    }
+
+    /// Tier 4: an op that holds its body spool and then needs a pair must not
+    /// wait for budget it holds itself.
+    #[tokio::test]
+    async fn pair_beside_a_held_spool_never_waits_on_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = SpoolDir::new(tmp.path().to_path_buf(), 8 * 1024 * 1024).unwrap();
+        for body_mib in [4u64, 8, 64] {
+            let body = pool.acquire(body_mib * 1024 * 1024).await.unwrap();
+            let fut = pool.acquire_pair_beside(Some(&body), 6 * 1024 * 1024, 6 * 1024 * 1024);
+            let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(2), fut)
+                .await
+                .unwrap_or_else(|_| panic!("body {body_mib} MiB: pair waited on its own budget"))
+                .unwrap();
+            drop((a, b, body));
+        }
     }
 
     #[tokio::test]

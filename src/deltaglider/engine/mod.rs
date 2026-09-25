@@ -915,6 +915,33 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Self::with_spool_timeout(self.spool.acquire_pair(a, b)).await
     }
 
+    /// `spool_acquire` for an op that may already hold a spool (`held`).
+    pub(crate) async fn spool_acquire_beside(
+        &self,
+        held: Option<&crate::deltaglider::spool::Spool>,
+        bytes: u64,
+    ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
+        Self::with_spool_timeout(self.spool.acquire_beside(held, bytes)).await
+    }
+
+    /// `spool_acquire_pair` for an op that already holds `held` (the streaming
+    /// PUT's body spool): the pair is clamped so the op never waits for budget
+    /// it holds itself.
+    pub(crate) async fn spool_acquire_pair_beside(
+        &self,
+        held: &crate::deltaglider::spool::Spool,
+        a: u64,
+        b: u64,
+    ) -> Result<
+        (
+            crate::deltaglider::spool::Spool,
+            crate::deltaglider::spool::Spool,
+        ),
+        EngineError,
+    > {
+        Self::with_spool_timeout(self.spool.acquire_pair_beside(Some(held), a, b)).await
+    }
+
     /// Whether the codec passes `-a` (armor disabled) to xdelta3 (3.1+ only).
     pub fn codec_armor_disabled(&self) -> bool {
         self.codec.armor_disabled()

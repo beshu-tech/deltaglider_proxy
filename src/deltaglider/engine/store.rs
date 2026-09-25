@@ -213,7 +213,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             // Heal a stripped-metadata reference in place (same bytes) so the
             // delta we write next carries a valid ref_sha256 and replication
             // stops re-copying this deltaspace. No-op (zero I/O) when healthy.
-            self.heal_reference_if_corrupt(ctx.bucket, ctx.deltaspace_id, read)
+            self.heal_reference_if_corrupt(ctx.bucket, ctx.deltaspace_id, read, None)
                 .await?
         } else {
             debug!("No reference in deltaspace, creating baseline");
@@ -479,7 +479,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .get_reference_metadata(bucket, &deltaspace_id)
                 .await?;
             Some(
-                self.heal_reference_if_corrupt(bucket, &deltaspace_id, read)
+                self.heal_reference_if_corrupt(bucket, &deltaspace_id, read, Some(body))
                     .await?,
             )
         } else {
@@ -497,7 +497,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // under-accounted under concurrency (→ ENOSPC). Falls back to `size` for
         // a freshly-created baseline (no reference metadata yet).
         let ref_size = existing_ref_meta.map(|m| m.file_size).unwrap_or(size);
-        let (ref_spool, delta_spool) = self.spool_acquire_pair(ref_size, size).await?;
+        // Clamped beside the body spool this op already holds (else body +
+        // pair > budget waited on itself for the whole acquire timeout).
+        let (ref_spool, delta_spool) = self.spool_acquire_pair_beside(body, ref_size, size).await?;
         self.storage
             .get_reference_to_file(bucket, &deltaspace_id, ref_spool.path())
             .await?;
@@ -865,6 +867,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         deltaspace_id: &str,
         ref_meta: FileMetadata,
+        // A spool the caller already holds (the streaming PUT body).
+        held: Option<&crate::deltaglider::spool::Spool>,
     ) -> Result<FileMetadata, EngineError> {
         if !Self::reference_metadata_is_corrupt(&ref_meta) {
             return Ok(ref_meta); // healthy — zero extra I/O
@@ -878,7 +882,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // with correct metadata. Reserve the spool at the reference's on-disk
         // size (fall back to the fallback-reported size, which is the object's
         // content length — accurate for the reference object).
-        let spool = self.spool_acquire(ref_meta.file_size.max(1)).await?;
+        let spool = self
+            .spool_acquire_beside(held, ref_meta.file_size.max(1))
+            .await?;
         self.storage
             .get_reference_to_file(bucket, deltaspace_id, spool.path())
             .await?;
@@ -1914,6 +1920,54 @@ mod stale_reference_cache_tests {
         // decodes against the stored reference.
         let fresh = DeltaGliderEngine::new_with_backend(backend, &Config::default(), None);
         let (back, _) = fresh.retrieve("b", "rel/b.zip").await.expect("readable");
+        assert_eq!(back, v2);
+    }
+}
+
+/// Tier 4: a streaming PUT holds its body spool while it needs the ref +
+/// delta pair. Under a small budget it waited for its own budget until the
+/// acquire timeout (120 s) and then failed.
+#[cfg(test)]
+mod spool_budget_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::storage::FilesystemBackend;
+
+    #[tokio::test]
+    async fn streaming_put_does_not_wait_on_its_own_body_spool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = FilesystemBackend::new(tmp.path().join("data"))
+            .await
+            .unwrap();
+        backend.create_bucket("b").await.unwrap();
+        let mut engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
+        // 2 MiB budget; each object is 1.5 MiB, so body + pair > budget.
+        engine.spool = Arc::new(
+            crate::deltaglider::spool::SpoolDir::new(tmp.path().join("spool"), 2 * 1024 * 1024)
+                .unwrap(),
+        );
+        let v1: Vec<u8> = (0..1_500_000u32).map(|n| (n % 251) as u8).collect();
+        let mut v2 = v1.clone();
+        v2[700_000..700_100].fill(0xAB);
+        for (key, data) in [("rel/a.zip", &v1), ("rel/b.zip", &v2)] {
+            let body = engine.spool_acquire(data.len() as u64).await.unwrap();
+            tokio::fs::write(body.path(), data).await.unwrap();
+            let put = engine.store_spooled_delta(
+                "b",
+                key,
+                &body,
+                data.len() as u64,
+                None,
+                HashMap::new(),
+                None,
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(10), put)
+                .await
+                .unwrap_or_else(|_| panic!("{key}: streaming PUT stalled on its own spool"))
+                .unwrap();
+        }
+        let (back, _) = engine.retrieve("b", "rel/b.zip").await.unwrap();
         assert_eq!(back, v2);
     }
 }
