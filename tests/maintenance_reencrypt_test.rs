@@ -733,7 +733,6 @@ async fn test_reencrypt_resumes_after_restart() {
 
 // ── review second pass (failing tests for findings) ──────────────────────
 
-#[ignore = "review2: pending fix"]
 async fn review2_busy_bucket(bucket: &str) -> (TestServer, reqwest::Client) {
     let server = TestServer::builder()
         .bucket(bucket)
@@ -767,7 +766,6 @@ async fn review2_busy_bucket(bucket: &str) -> (TestServer, reqwest::Client) {
 /// middleware (it carries its policy in the body), so the maintenance gate
 /// answers it first: anonymous callers still learn which bucket is busy.
 #[tokio::test]
-#[ignore = "review2: pending fix"]
 async fn review2_form_post_does_not_reveal_gate_state_unauthenticated() {
     let bucket = "maintform";
     let (server, admin) = review2_busy_bucket(bucket).await;
@@ -797,7 +795,6 @@ async fn review2_form_post_does_not_reveal_gate_state_unauthenticated() {
 /// s3s verifies the signature. A caller who knows only an access key id
 /// gets the gate 503 (and the job text) with a forged signature.
 #[tokio::test]
-#[ignore = "review2: pending fix"]
 async fn review2_forged_signature_fails_auth_before_the_gate() {
     let bucket = "maintforge";
     let (server, admin) = review2_busy_bucket(bucket).await;
@@ -858,4 +855,68 @@ async fn review2_sdk_retry_of_a_gated_write_is_not_refused_as_replay() {
         Some(400),
         "the SDK retry of a gated write was refused as a replay: {detail}"
     );
+}
+
+/// The gate moved after the form-POST policy check (review-2 #2). A
+/// correctly signed form POST to a busy bucket must still be gated.
+#[tokio::test]
+async fn test_signed_form_post_to_busy_bucket_is_gated() {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+        mac.update(data);
+        mac.finalize().into_bytes().to_vec()
+    }
+    let bucket = "maintsignedform";
+    let (server, admin) = review2_busy_bucket(bucket).await;
+    let endpoint = server.endpoint();
+    let (amz_date, credential) = (
+        "20260507T120000Z",
+        "gatekey/20260507/us-east-1/s3/aws4_request",
+    );
+    let policy = serde_json::json!({
+        "expiration": "2099-01-01T00:00:00.000Z",
+        "conditions": [
+            { "bucket": bucket },
+            ["starts-with", "$key", "post/"],
+            { "x-amz-algorithm": "AWS4-HMAC-SHA256" },
+            { "x-amz-credential": credential },
+            { "x-amz-date": amz_date },
+            ["content-length-range", 1, 1048576]
+        ]
+    });
+    let policy_b64 = base64::engine::general_purpose::STANDARD.encode(policy.to_string());
+    let mut key = hmac(b"AWS4gatesecret", b"20260507");
+    for part in [&b"us-east-1"[..], b"s3", b"aws4_request"] {
+        key = hmac(&key, part);
+    }
+    let form = reqwest::multipart::Form::new()
+        .text("key", "post/x.txt")
+        .text("policy", policy_b64.clone())
+        .text("x-amz-algorithm", "AWS4-HMAC-SHA256")
+        .text("x-amz-credential", credential)
+        .text("x-amz-date", amz_date)
+        .text(
+            "x-amz-signature",
+            hex::encode(hmac(&key, policy_b64.as_bytes())),
+        )
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"x".to_vec())
+                .file_name("x.txt")
+                .mime_str("text/plain")
+                .unwrap(),
+        );
+    let resp = reqwest::Client::new()
+        .post(format!("{endpoint}/{bucket}"))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    wait_job_done(&admin, &endpoint, bucket).await;
+    assert_eq!(status, 503, "a signed form POST must be gated: {body}");
+    assert!(body.contains("SlowDown"), "{body}");
 }

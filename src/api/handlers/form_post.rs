@@ -709,6 +709,7 @@ pub async fn handle_form_post_upload(
     bucket: &str,
     iam_state: Option<&SharedIamState>,
     headers: &HeaderMap,
+    extensions: &axum::http::Extensions,
     body: Bytes,
     client_ip: Option<std::net::IpAddr>,
 ) -> Result<Response, S3Error> {
@@ -741,6 +742,13 @@ pub async fn handle_form_post_upload(
             return Err(e);
         }
     };
+    // Only now, with the policy signature verified: the gates' 503 names a
+    // busy bucket or a backend's state.
+    crate::maintenance::gate::check_verified_request(
+        extensions,
+        &axum::http::Method::POST,
+        &format!("/{bucket}"),
+    )?;
     check_quota(state, bucket, parsed.file_data.len() as u64)?;
     let engine = state.engine.load();
     let size = parsed.file_data.len() as u64;

@@ -40,7 +40,7 @@ use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::http::{Method, Request};
 use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use dashmap::DashMap;
 
 /// Lock-free busy-bucket set (reads) + per-bucket in-flight write counters.
@@ -176,40 +176,71 @@ fn is_write_method(method: &Method) -> bool {
     matches!(*method, Method::PUT | Method::POST | Method::DELETE)
 }
 
-/// Axum middleware on the S3 router: 503-SlowDown writes to busy buckets,
-/// count in-flight writes for everything else. Reads always pass.
+/// Axum middleware on the S3 router: counts in-flight writes. It does NOT
+/// refuse anything: it runs before s3s verifies the signature, and the
+/// refusal names the background job, so an unverified caller would learn
+/// which buckets are busy. The refusal is [`check_verified_request`].
+///
+/// Registering here, before the busy check, keeps the acquire-then-recheck
+/// order (H37): a write that the drain did not see is caught by the later
+/// check. RAII releases the slot on a mid-body disconnect (H12).
 pub async fn maintenance_gate_middleware(request: Request<Body>, next: Next) -> Response {
     let Some(gate) = request.extensions().get::<Arc<MaintenanceGate>>().cloned() else {
         // Gate not wired (shouldn't happen in production) — never block.
         return next.run(request).await;
     };
-
     if !is_write_method(request.method()) {
         return next.run(request).await;
     }
     let Some(bucket) = bucket_from_path(request.uri().path()) else {
         return next.run(request).await;
     };
+    let _write = gate.begin_write(&bucket);
+    next.run(request).await
+}
 
-    // Acquire the in-flight guard FIRST, then re-check busy (acquire-then-
-    // recheck). A plain is_busy→begin_write has a TOCTOU: a write that passes the
-    // check can be preempted before incrementing the counter, so a maintenance
-    // drain sees zero and starts rewriting while this write is still pending, and
-    // the client's bytes get overwritten with stale (H37). Registering first
-    // makes our write visible to the drain, or the re-check catches the arm and
-    // we 503 with the guard dropped. RAII also releases on a mid-body disconnect.
-    let write = gate.begin_write(&bucket);
-    if gate.is_busy(&bucket) {
-        drop(write);
-        // The busy set doesn't carry the job kind — name both candidates.
-        return crate::api::errors::S3Error::SlowDown(format!(
+/// The maintenance refusal for one request: 503 SlowDown for a write to a
+/// busy bucket. Reads always pass.
+pub fn write_gate_refusal(
+    gate: &MaintenanceGate,
+    method: &Method,
+    path: &str,
+) -> Option<crate::api::errors::S3Error> {
+    if !is_write_method(method) {
+        return None;
+    }
+    let bucket = bucket_from_path(path)?;
+    // The busy set doesn't carry the job kind — name both candidates.
+    gate.is_busy(&bucket).then(|| {
+        crate::api::errors::S3Error::SlowDown(format!(
             "bucket '{bucket}' is temporarily read-only while a background job \
              (re-encryption or migration) finishes — please retry shortly"
         ))
-        .into_response();
+    })
+}
+
+/// The request gates whose refusal reveals internal state (a busy bucket,
+/// an unhealthy backend and its cause). Run them ONLY once the caller's
+/// credentials are verified: from the s3s access hook, and from the
+/// form-POST handler after its policy signature check. A forged signature
+/// then gets 403, never the gate's 503. The gates come from the request
+/// extensions the S3 router installs; a missing one never blocks.
+pub fn check_verified_request(
+    extensions: &axum::http::Extensions,
+    method: &Method,
+    path: &str,
+) -> Result<(), crate::api::errors::S3Error> {
+    if let Some(gate) = extensions.get::<Arc<MaintenanceGate>>() {
+        if let Some(refusal) = write_gate_refusal(gate, method, path) {
+            return Err(refusal);
+        }
     }
-    let _write = write;
-    next.run(request).await
+    if let Some(gate) = extensions.get::<crate::coordination::health::BackendHealthGate>() {
+        if let Some(refusal) = crate::coordination::health::health_gate_refusal(gate, path) {
+            return Err(refusal);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -340,6 +371,30 @@ mod tests {
             bucket_from_path("/bucket/key/with/slashes"),
             Some("bucket".into())
         );
+    }
+
+    #[test]
+    fn write_gate_refuses_only_writes_to_a_busy_bucket() {
+        let g = MaintenanceGate::new();
+        g.set_busy("busy");
+        assert!(write_gate_refusal(&g, &Method::PUT, "/busy/k").is_some());
+        assert!(write_gate_refusal(&g, &Method::DELETE, "/Busy/k").is_some());
+        assert!(write_gate_refusal(&g, &Method::POST, "/busy").is_some());
+        assert!(write_gate_refusal(&g, &Method::GET, "/busy/k").is_none());
+        assert!(write_gate_refusal(&g, &Method::PUT, "/idle/k").is_none());
+        assert!(write_gate_refusal(&g, &Method::PUT, "/").is_none());
+    }
+
+    #[test]
+    fn check_verified_request_without_gates_never_blocks() {
+        let ext = axum::http::Extensions::new();
+        assert!(check_verified_request(&ext, &Method::PUT, "/b/k").is_ok());
+        let mut ext = axum::http::Extensions::new();
+        let g = Arc::new(MaintenanceGate::new());
+        g.set_busy("b");
+        ext.insert(g);
+        assert!(check_verified_request(&ext, &Method::PUT, "/b/k").is_err());
+        assert!(check_verified_request(&ext, &Method::HEAD, "/b/k").is_ok());
     }
 
     #[test]

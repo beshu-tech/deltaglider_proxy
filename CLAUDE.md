@@ -114,8 +114,9 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                             destination — planner::rule_write_buckets) is maintenance-gated
   → maintenance/            One-off bucket jobs (DB-born, not YAML): store.rs (maintenance_jobs/failures; maintenance_requeue_abandoned is
                             LEASE-AWARE and runs at boot + every worker poll tick — a synced DB carrying a peer's LIVE job is never resurrected;
-                            maintenance_gate_arm_keys is kind/phase-aware), gate.rs (per-bucket WRITE gate middleware: 503 SlowDown on writes to
-                            busy buckets, reads pass; in-flight write drain; admin bulk copy/move/delete loops participate via
+                            maintenance_gate_arm_keys is kind/phase-aware), gate.rs (per-bucket WRITE gate: the middleware only counts in-flight
+                            writes; `check_verified_request` 503-SlowDowns writes to busy buckets (and runs the backend-health
+                            gate) AFTER signature verification — s3s access hook + form-POST handler; reads pass; in-flight write drain; admin bulk copy/move/delete loops participate via
                             write_started/finished + per-item is_busy), worker.rs (sequential runner, kind dispatch; heartbeat returns
                             Err(LEASE_LOST) on refused renewal → phase stops, row NOT settled), migrate.rs (kind=migrate: stage→copy→verify→
                             flip→cleanup, transient __dgmigrate_* routes — gated from creation, filtered out of all bucket listings, cleared at

@@ -450,7 +450,20 @@ pub fn build_s3_router(
                         outcome.mark_verified();
                     }
                 }
-                Ok(())
+                // The maintenance + backend-health gates run HERE, after s3s
+                // verified the signature: their 503 names a busy bucket or a
+                // backend's state, which a forged signature must not learn.
+                let (method, path) = (cx.method().clone(), cx.uri().path().to_owned());
+                deltaglider_proxy::maintenance::gate::check_verified_request(
+                    cx.extensions_mut(),
+                    &method,
+                    &path,
+                )
+                .map_err(|e| {
+                    let code = s3s::S3ErrorCode::from_bytes(e.code().as_bytes())
+                        .unwrap_or(s3s::S3ErrorCode::ServiceUnavailable);
+                    s3s::S3Error::with_message(code, e.to_string())
+                })
             } else {
                 tracing::warn!(
                     "SECURITY | event=identity_mismatch | resolved={} | verified={}",
@@ -715,6 +728,7 @@ pub fn build_s3_router(
             &bucket,
             iam_state.as_ref(),
             &parts.headers,
+            &parts.extensions,
             body_bytes,
             peer_ip,
         )
@@ -789,24 +803,15 @@ pub fn build_s3_router(
             deltaglider_proxy::metrics::http_metrics_middleware,
         ))
         .layer(middleware::from_fn(authorization_middleware))
-        // Backend-health gate: buckets on an UNHEALTHY backend answer an
-        // honest 503 naming the backend + cause, all verbs — instead of
-        // per-request timeout storms or misleading 404s. Permanent layer
-        // for the same reason as the maintenance gate (dynamic state must
-        // survive config rebuilds). Fail-open: only a definitive unhealthy
-        // verdict gates. Deliberately INSIDE SigV4 (runs after signature
-        // verification): the 503 body names internal backend topology and
-        // credential state — anonymous callers must never see it.
-        .layer(middleware::from_fn(
-            deltaglider_proxy::coordination::health::backend_health_gate_middleware,
-        ))
-        // Maintenance write-gate. A PERMANENT layer whose contents (the
-        // busy-bucket set) swap lock-free — unlike the admission chain it
-        // cannot be lost to a config rebuild mid-job. Writes to a busy
-        // bucket → 503 SlowDown; reads always pass. See
-        // src/maintenance/gate.rs. INSIDE SigV4, like the health gate: its
-        // 503 names the background job, and an unauthenticated caller must
-        // not learn which buckets are busy.
+        // Maintenance in-flight write counter. A PERMANENT layer whose
+        // contents (the busy-bucket set) swap lock-free — unlike the
+        // admission chain it cannot be lost to a config rebuild mid-job.
+        // It only COUNTS writes. The refusals (writes to a busy bucket →
+        // 503 SlowDown; any verb to a bucket on an UNHEALTHY backend → 503
+        // naming the backend) run in `check_verified_request`, called from
+        // the s3s access hook and the form-POST handler, i.e. after the
+        // signature is verified: the 503 names internal state that an
+        // unauthenticated caller must not learn. See src/maintenance/gate.rs.
         .layer(middleware::from_fn(
             deltaglider_proxy::maintenance::gate::maintenance_gate_middleware,
         ))

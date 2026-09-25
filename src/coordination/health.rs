@@ -18,10 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::body::Body;
-use axum::extract::Request;
-use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
+use crate::api::errors::S3Error;
 
 use super::capability::fingerprint;
 use crate::config::BackendConfig;
@@ -479,24 +476,23 @@ pub struct BackendHealthGate {
     pub app: Arc<crate::api::handlers::AppState>,
 }
 
-/// Axum middleware on the S3 router: requests to a bucket whose backend is
-/// UNHEALTHY answer a fast honest 503 naming the backend and cause — all
-/// verbs (a read against a dead backend fails anyway; this replaces the
-/// per-request timeout storm with an actionable error). Recovery lag is
-/// bounded by the re-probe loop (~30s). Buckets on healthy or never-probed
-/// backends always pass (fail-open — only a definitive verdict gates).
-pub async fn backend_health_gate_middleware(request: Request<Body>, next: Next) -> Response {
-    let Some(gate) = request.extensions().get::<BackendHealthGate>().cloned() else {
-        return next.run(request).await;
-    };
+/// The S3 request gate: a request to a bucket whose backend is UNHEALTHY
+/// gets a fast honest 503 naming the backend and cause, for all verbs (a
+/// read against a dead backend fails anyway; this replaces the per-request
+/// timeout storm with an actionable error). Recovery lag is bounded by the
+/// re-probe loop (~30s). Buckets on healthy or never-probed backends always
+/// pass (fail-open: only a definitive verdict gates).
+///
+/// Called only for requests whose credentials were VERIFIED (the s3s access
+/// hook, the form-POST handler after its policy check): the 503 body names
+/// internal backend topology and credential state.
+/// See `maintenance::gate::check_verified_request`.
+pub fn health_gate_refusal(gate: &BackendHealthGate, path: &str) -> Option<S3Error> {
     // Fast path: nothing unhealthy → pass without touching the config lock.
-    let unhealthy = gate.health.unhealthy_names();
-    if unhealthy.is_empty() {
-        return next.run(request).await;
+    if gate.health.unhealthy_names().is_empty() {
+        return None;
     }
-    let Some(bucket) = crate::maintenance::gate::bucket_from_path(request.uri().path()) else {
-        return next.run(request).await;
-    };
+    let bucket = crate::maintenance::gate::bucket_from_path(path)?;
     // Resolve the bucket's backend NAME + DEFINITION, then consult the cache
     // fingerprint-checked: a verdict established against a DIFFERENT
     // definition (e.g. a rejected apply's probe, or a pre-rotation entry)
@@ -507,35 +503,27 @@ pub async fn backend_health_gate_middleware(request: Request<Body>, next: Next) 
     // operator fixing it). Queueing every S3 request behind that writer
     // would be a self-inflicted global stall; failing open for the apply's
     // duration just restores pre-gate behavior for a few seconds.
-    let resolved = match gate.config.try_read() {
-        Err(_) => return next.run(request).await,
-        Ok(cfg) => {
-            let routed = gate
-                .app
-                .engine
-                .load()
-                .storage()
-                .resolved_backend_name(&bucket);
-            gated_backend(&cfg, &bucket, routed)
-        }
-    };
-    let Some((backend_name, backend_cfg)) = resolved else {
+    let (backend_name, backend_cfg) = {
+        let cfg = gate.config.try_read().ok()?;
+        let routed = gate
+            .app
+            .engine
+            .load()
+            .storage()
+            .resolved_backend_name(&bucket);
         // Route to an undefined backend: unreachable in practice (check_fatal
         // blocks it at boot + apply) — fail-open rather than double-enforce.
-        return next.run(request).await;
+        gated_backend(&cfg, &bucket, routed)?
     };
-    if let Some(verdict) = gate.health.get(&backend_name, &backend_cfg) {
-        if verdict.is_gating() {
-            return crate::api::errors::S3Error::ServiceUnavailable(format!(
-                "bucket '{bucket}' is on backend '{backend_name}', which is currently \
-                 unavailable: {}. Requests are blocked until the backend recovers \
-                 (re-checked every 30s); see Storage → Backends for live status",
-                verdict.cause()
-            ))
-            .into_response();
-        }
-    }
-    next.run(request).await
+    let verdict = gate.health.get(&backend_name, &backend_cfg)?;
+    verdict.is_gating().then(|| {
+        S3Error::ServiceUnavailable(format!(
+            "bucket '{bucket}' is on backend '{backend_name}', which is currently \
+             unavailable: {}. Requests are blocked until the backend recovers \
+             (re-checked every 30s); see Storage → Backends for live status",
+            verdict.cause()
+        ))
+    })
 }
 
 /// The backend whose health gates `bucket`: where the router sends it
