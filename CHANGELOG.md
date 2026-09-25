@@ -44,6 +44,20 @@ tables. The first sync after the upgrade has no merge base, so the copy in the
 bucket wins, as before. Upgrade every instance before you expect merges: an
 instance refuses a peer database with a different schema version.
 
+### Fixed — A prefix-scoped user could not list keys that sort after many hidden keys
+
+A user whose policy allows only some prefixes of a bucket, such as
+`releases/team-a/*` and `releases/team-z/*`, got a listing that the proxy
+filtered key by key. To fill a page, the proxy read the whole bucket in key
+order and skipped the hidden keys, up to a limit of 10,000 backend pages. When
+more hidden keys than that sorted between two visible ones, every request for
+the next page failed with `InvalidRequest`, so the later visible keys could not
+be listed. The proxy now reads only the prefixes that the user's `Allow` rules
+can reach and merges those listings in key order. Hidden keys outside those
+prefixes cost nothing, and every visible key can be listed. A policy that
+cannot be narrowed to prefixes, such as an `Allow` on the whole bucket with
+`Deny` exceptions, still uses the limited scan.
+
 ### Changed — CLI: recursive prefixes are directories, and `rm` globs are relative
 
 `deltaglider_proxy s3 rm -r s3://releases/v2` deleted the keys under `v2/`

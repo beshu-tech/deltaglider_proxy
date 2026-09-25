@@ -316,7 +316,7 @@ impl SignedPayloadHash {
 
 /// Build an anonymous `AuthenticatedUser` with read+list permissions scoped
 /// to the given public prefixes. Used for unauthenticated public access.
-fn build_anonymous_user(bucket: &str, public_prefixes: &[String]) -> AuthenticatedUser {
+pub(crate) fn build_anonymous_user(bucket: &str, public_prefixes: &[String]) -> AuthenticatedUser {
     use crate::iam::permissions::permission_to_iam_policy;
 
     let mut permissions = Vec::new();

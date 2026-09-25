@@ -1633,7 +1633,8 @@ fn decode_v2_token(token: Option<&str>) -> Option<String> {
 
 /// Engine pages one filtered LIST may scan before it gives up. A prefix-scoped
 /// user can ask for a prefix where every key is hidden; the scan must end.
-const FILTERED_LIST_MAX_ENGINE_PAGES: usize = 10_000;
+/// Small under test, so a test can pass the budget with few objects.
+const FILTERED_LIST_MAX_ENGINE_PAGES: usize = if cfg!(test) { 16 } else { 10_000 };
 
 /// The engine cursor for a LIST. S3 rule: a continuation token wins, and
 /// `start-after` applies only on the first request (no token). Both mean
@@ -1647,14 +1648,78 @@ fn list_cursor<'a>(
         .or(start_after.filter(|s| !s.is_empty()))
 }
 
+/// One part of a filtered LIST (review S12). A prefix-scoped user's listing
+/// is the merge of these, in key order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ListTarget {
+    /// List this engine prefix with the request's delimiter and filter the
+    /// entries per key.
+    Scan(String),
+    /// Every visible key under `probes` rolls up into this one common
+    /// prefix. It is listed when a probe prefix holds any key.
+    Rollup {
+        common_prefix: String,
+        probes: Vec<String>,
+    },
+}
+
+impl ListTarget {
+    fn start(&self) -> &str {
+        match self {
+            ListTarget::Scan(p) => p,
+            ListTarget::Rollup { common_prefix, .. } => common_prefix,
+        }
+    }
+}
+
+/// Pure: what a filtered LIST of `prefix` must read, given the user's
+/// visible key prefixes (`visible_key_prefixes`: sorted and minimal). The
+/// targets cover disjoint key ranges and come back in key order, so their
+/// listings concatenate into one sorted listing.
+fn list_targets(prefix: &str, delimiter: Option<&str>, visible: &[String]) -> Vec<ListTarget> {
+    // A visible prefix that covers the request: one plain (filtered) scan.
+    if visible.iter().any(|v| prefix.starts_with(v.as_str())) {
+        return vec![ListTarget::Scan(prefix.to_string())];
+    }
+    let delimiter = delimiter.filter(|d| !d.is_empty());
+    let mut targets: Vec<ListTarget> = Vec::new();
+    for v in visible {
+        let Some(rest) = v.strip_prefix(prefix) else {
+            continue; // disjoint from the request
+        };
+        match delimiter.and_then(|d| rest.find(d).map(|i| i + d.len())) {
+            // The engine would fold every key under `v` into this prefix.
+            Some(end) => {
+                let common_prefix = format!("{prefix}{}", &rest[..end]);
+                match targets.iter_mut().find(|t| t.start() == common_prefix) {
+                    Some(ListTarget::Rollup { probes, .. }) => probes.push(v.clone()),
+                    _ => targets.push(ListTarget::Rollup {
+                        common_prefix,
+                        probes: vec![v.clone()],
+                    }),
+                }
+            }
+            // No delimiter between the request prefix and `v`: listing `v`
+            // rolls up at the same points as listing `prefix` would.
+            None => targets.push(ListTarget::Scan(v.clone())),
+        }
+    }
+    targets.sort_by(|a, b| a.start().cmp(b.start()));
+    targets
+}
+
 /// One LIST page as the caller may see it. THE listing path for V1 and V2.
 ///
 /// For a `ListScope::Filtered` caller, the engine's next-token is the last
 /// key of the UNFILTERED page, so returning it leaks a hidden key (review
-/// S12: `max-keys=1` walks the whole bucket through tokens). Here the page
-/// is refilled until it holds `max_keys` visible entries, and the token is
-/// always the last VISIBLE entry. Progress is guaranteed: a truncated
-/// filtered page holds at least one visible entry.
+/// S12: `max-keys=1` walks the whole bucket through tokens). The token is
+/// always the last VISIBLE entry.
+///
+/// The listing reads only the prefixes the user's policy can see
+/// (`list_targets`), so hidden keys outside them cost nothing and every
+/// visible key stays reachable. Only a policy that cannot be narrowed to
+/// prefixes (a bucket-wide Allow with Deny carve-outs) scans hidden keys,
+/// under the `FILTERED_LIST_MAX_ENGINE_PAGES` budget.
 #[allow(clippy::too_many_arguments)]
 async fn list_page_for_caller(
     engine: &crate::deltaglider::DynEngine,
@@ -1675,36 +1740,86 @@ async fn list_page_for_caller(
                 .map_err(engine_error_to_s3s);
         }
     };
+    let visible = crate::iam::permissions::visible_key_prefixes(user, bucket);
+    let mut targets = list_targets(prefix, delimiter, &visible);
+    let engine_takes = |t: &ListTarget| match t {
+        ListTarget::Scan(p) => crate::types::ObjectKey::validate_prefix(p).is_ok(),
+        ListTarget::Rollup { probes, .. } => probes
+            .iter()
+            .all(|p| crate::types::ObjectKey::validate_prefix(p).is_ok()),
+    };
+    if !targets.iter().all(engine_takes) {
+        // A policy literal the engine refuses as a prefix (`a/..` of
+        // `b/a/..*`): fall back to the budgeted scan of the request.
+        targets = vec![ListTarget::Scan(prefix.to_string())];
+    }
+    // One entry past the page tells whether the listing goes on.
+    let want = max_keys as usize + 1;
     let mut objects = Vec::new();
     let mut prefixes = std::collections::BTreeSet::new();
-    let mut cursor = cursor.map(str::to_string);
     let mut more = false;
-    for _ in 0..FILTERED_LIST_MAX_ENGINE_PAGES {
-        let page = engine
-            .list_objects(
-                bucket,
-                prefix,
-                delimiter,
-                max_keys,
-                cursor.as_deref(),
-                metadata,
-            )
-            .await
-            .map_err(engine_error_to_s3s)?;
-        objects.extend(
-            page.objects
-                .into_iter()
-                .filter(|(key, _)| user_can_see_listed_key(user, bucket, key, context)),
-        );
-        prefixes.extend(
-            page.common_prefixes
-                .into_iter()
-                .filter(|p| user_can_see_common_prefix(user, bucket, p, context)),
-        );
-        more = page.is_truncated && page.next_continuation_token.is_some();
-        cursor = page.next_continuation_token;
-        if !more || objects.len() + prefixes.len() >= max_keys as usize {
+    for target in targets {
+        if objects.len() + prefixes.len() >= want {
             break;
+        }
+        match target {
+            ListTarget::Rollup {
+                common_prefix,
+                probes,
+            } => {
+                if cursor.is_some_and(|c| common_prefix.as_str() <= c)
+                    || !user_can_see_common_prefix(user, bucket, &common_prefix, context)
+                {
+                    continue;
+                }
+                for probe in probes {
+                    let page = engine
+                        .list_objects(bucket, &probe, delimiter, 1, None, false)
+                        .await
+                        .map_err(engine_error_to_s3s)?;
+                    if !page.objects.is_empty() || !page.common_prefixes.is_empty() {
+                        prefixes.insert(common_prefix);
+                        break;
+                    }
+                }
+            }
+            ListTarget::Scan(scan_prefix) => {
+                let need = want - objects.len() - prefixes.len();
+                let mut scan_cursor = cursor.map(str::to_string);
+                for _ in 0..FILTERED_LIST_MAX_ENGINE_PAGES {
+                    let page = engine
+                        .list_objects(
+                            bucket,
+                            &scan_prefix,
+                            delimiter,
+                            need as u32,
+                            scan_cursor.as_deref(),
+                            metadata,
+                        )
+                        .await
+                        .map_err(engine_error_to_s3s)?;
+                    objects.extend(
+                        page.objects
+                            .into_iter()
+                            .filter(|(key, _)| user_can_see_listed_key(user, bucket, key, context)),
+                    );
+                    prefixes.extend(
+                        page.common_prefixes
+                            .into_iter()
+                            .filter(|p| user_can_see_common_prefix(user, bucket, p, context)),
+                    );
+                    more = page.is_truncated && page.next_continuation_token.is_some();
+                    scan_cursor = page.next_continuation_token;
+                    if !more || objects.len() + prefixes.len() >= want {
+                        break;
+                    }
+                }
+                if more {
+                    // Stopped inside this scan (page full or budget spent):
+                    // later targets come after its remaining keys.
+                    break;
+                }
+            }
         }
     }
     if more && objects.is_empty() && prefixes.is_empty() {
@@ -1722,7 +1837,7 @@ async fn list_page_for_caller(
         None,
     );
     if more && !page.is_truncated {
-        // Exactly `max_keys` visible entries and the engine has more: the
+        // At most `max_keys` visible entries and the scan stopped early: the
         // token is the last visible entry.
         page.is_truncated = true;
         page.next_continuation_token = page
@@ -3373,9 +3488,8 @@ mod review2_tests {
     /// engine pages and the token is the last VISIBLE key. More hidden
     /// entries than the budget between two visible ones make every later
     /// visible key unreachable: each follow-up restarts at the same token
-    /// and fails. Slow (10k stores); run with `--ignored`.
+    /// and fails.
     #[tokio::test]
-    #[ignore = "slow: 10k stores + 10k engine pages"]
     async fn review2_filtered_list_reaches_visible_keys_past_the_scan_budget() {
         use crate::iam::permissions::permission_to_iam_policy;
         use crate::iam::Permission;
@@ -3448,5 +3562,179 @@ mod review2_tests {
             p2.expect("d/z/ must stay reachable").common_prefixes,
             vec!["d/z/".to_string()]
         );
+    }
+
+    #[test]
+    fn list_targets_read_only_the_visible_prefixes() {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let scan = |p: &str| ListTarget::Scan(p.into());
+        let roll = |cp: &str, probes: &[&str]| ListTarget::Rollup {
+            common_prefix: cp.into(),
+            probes: v(probes),
+        };
+        // A visible prefix covers the request: one scan of the request.
+        assert_eq!(
+            list_targets("d/x/", Some("/"), &v(&["d/"])),
+            vec![scan("d/x/")]
+        );
+        assert_eq!(list_targets("", None, &v(&[""])), vec![scan("")]);
+        // Deeper prefixes roll up at the delimiter, merged per common prefix.
+        assert_eq!(
+            list_targets("d/", Some("/"), &v(&["d/a/x", "d/a/y", "d/b", "e/"])),
+            vec![roll("d/a/", &["d/a/x", "d/a/y"]), scan("d/b")]
+        );
+        // No delimiter: every visible prefix is its own scan.
+        assert_eq!(
+            list_targets("d/", None, &v(&["d/a/", "d/z/"])),
+            vec![scan("d/a/"), scan("d/z/")]
+        );
+        assert!(list_targets("d/", Some("/"), &v(&["e/"])).is_empty());
+    }
+
+    fn scoped(perms: Vec<crate::iam::Permission>) -> ListScope {
+        use crate::iam::permissions::permission_to_iam_policy;
+        let user = AuthenticatedUser {
+            name: "u".into(),
+            access_key_id: "AK".into(),
+            iam_policies: perms.iter().map(permission_to_iam_policy).collect(),
+            permissions: perms,
+        };
+        ListScope::Filtered {
+            user: Box::new(user),
+            context: Box::new(policy_context_for_ip(None)),
+        }
+    }
+
+    fn rule(effect: &str, resources: &[&str]) -> crate::iam::Permission {
+        crate::iam::Permission {
+            id: 0,
+            effect: effect.into(),
+            actions: vec!["read".into(), "list".into()],
+            resources: resources.iter().map(|s| s.to_string()).collect(),
+            conditions: None,
+        }
+    }
+
+    async fn fs_engine(keys: &[&str]) -> (tempfile::TempDir, crate::deltaglider::DynEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine: crate::deltaglider::DynEngine =
+            crate::deltaglider::DeltaGliderEngine::new_with_backend(
+                Arc::new(backend),
+                &crate::config::Config::default(),
+                None,
+            );
+        engine.create_bucket("b").await.unwrap();
+        for k in keys {
+            engine
+                .store("b", k, b"x", None, Default::default())
+                .await
+                .unwrap();
+        }
+        (dir, engine)
+    }
+
+    /// Every entry of a filtered listing, walked page by page.
+    async fn walk(
+        engine: &crate::deltaglider::DynEngine,
+        prefix: &str,
+        delimiter: Option<&str>,
+        max_keys: u32,
+        scope: &ListScope,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..100 {
+            let page = list_page_for_caller(
+                engine,
+                "b",
+                prefix,
+                delimiter,
+                max_keys,
+                token.as_deref(),
+                false,
+                Some(scope),
+            )
+            .await
+            .unwrap();
+            let mut entries: Vec<String> = page.objects.into_iter().map(|(k, _)| k).collect();
+            entries.extend(page.common_prefixes);
+            entries.sort();
+            assert!(entries.len() <= max_keys as usize);
+            out.extend(entries);
+            if !page.is_truncated {
+                return out;
+            }
+            token = page.next_continuation_token;
+        }
+        panic!("listing did not end");
+    }
+
+    /// A prefix-scoped listing returns exactly what the per-key filter
+    /// admits, in order, for every page size, with and without a delimiter.
+    #[tokio::test]
+    async fn filtered_listing_matches_the_per_key_filter_for_every_page_size() {
+        let keys = [
+            "d/a/1.png",
+            "d/a/sub/2.png",
+            "d/ab.png",
+            "d/h1/x.png",
+            "d/h2/x.png",
+            "d/m/deep/3.png",
+            "d/m/other.png",
+            "d/z/4.png",
+            "top.png",
+        ];
+        let (_dir, engine) = fs_engine(&keys).await;
+        let scope = scoped(vec![
+            rule("Allow", &["b/d/a*", "b/d/m/deep/*", "b/d/z/*"]),
+            rule("Deny", &["b/d/a/sub/*"]),
+        ]);
+        let cases: [(&str, Option<&str>, &[&str]); 3] = [
+            ("d/", Some("/"), &["d/a/", "d/ab.png", "d/m/", "d/z/"]),
+            ("", Some("/"), &["d/"]),
+            (
+                "d/",
+                None,
+                &["d/a/1.png", "d/ab.png", "d/m/deep/3.png", "d/z/4.png"],
+            ),
+        ];
+        for (prefix, delimiter, expected) in cases {
+            for max_keys in 1..=5 {
+                assert_eq!(
+                    walk(&engine, prefix, delimiter, max_keys, &scope).await,
+                    expected.to_vec(),
+                    "prefix={prefix:?} delimiter={delimiter:?} max_keys={max_keys}"
+                );
+            }
+        }
+    }
+
+    /// A bucket-wide Allow cannot be narrowed to prefixes: the budgeted scan
+    /// stays the fallback, and a run of hidden keys past the budget fails
+    /// the request instead of leaking a hidden key as the token.
+    #[tokio::test]
+    async fn bucket_wide_allow_with_a_large_deny_keeps_the_budget() {
+        // `max_keys=1` reads two entries per engine page.
+        let mut keys: Vec<String> = (0..=2 * FILTERED_LIST_MAX_ENGINE_PAGES)
+            .map(|i| format!("h/{i:03}.png"))
+            .collect();
+        keys.push("v.png".into());
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let (_dir, engine) = fs_engine(&refs).await;
+        // Read only: a bucket-level `list` would admit every key anyway.
+        let read = |effect: &str, res: &str| crate::iam::Permission {
+            actions: vec!["read".into()],
+            ..rule(effect, &[res])
+        };
+        let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/h/*")]);
+        let err = list_page_for_caller(&engine, "b", "", None, 1, None, false, Some(&scope))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
     }
 }

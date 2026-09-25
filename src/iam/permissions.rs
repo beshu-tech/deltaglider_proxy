@@ -713,6 +713,115 @@ pub fn user_can_see_common_prefix(
             && !user.is_explicitly_denied(S3Action::List, bucket, prefix, context))
 }
 
+/// Pure: key prefixes that together hold every key `user` can see in
+/// `bucket` (review S12). A filtered LIST walks only these prefixes, so its
+/// cost follows what the user can see, not the bucket size.
+///
+/// The set is a SUPERSET of the visible keys; the per-key filter still
+/// decides each key (Deny, IP conditions). Derivation per Allow statement:
+/// - a statement with a `StringLike`/`StringEquals` `s3:prefix` condition
+///   admits only keys that match one of the condition values (the
+///   object-ARN checks cannot pass without `s3:prefix` in the context);
+/// - else each resource gives the literal text before its first wildcard.
+///
+/// `""` in the result means the whole bucket (a policy we cannot narrow).
+/// The result is sorted and minimal: no entry is a prefix of another.
+pub fn visible_key_prefixes(user: &super::AuthenticatedUser, bucket: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for perm in user.permissions.iter().filter(|p| p.effect == "Allow") {
+        let resource_prefixes: Vec<String> = perm
+            .resources
+            .iter()
+            .filter_map(|r| resource_key_prefix(r, bucket))
+            .collect();
+        if resource_prefixes.is_empty() {
+            continue;
+        }
+        match condition_prefix_literals(perm.conditions.as_ref()) {
+            Some(literals) => out.extend(literals),
+            None => out.extend(resource_prefixes),
+        }
+    }
+    minimal_prefix_set(out)
+}
+
+/// The text before the first pattern metacharacter (`*`, `?`, and `$` for
+/// an unexpanded `${...}` variable).
+fn literal_head(pattern: &str) -> (&str, bool) {
+    match pattern.find(['*', '?', '$']) {
+        Some(i) => (&pattern[..i], true),
+        None => (pattern, false),
+    }
+}
+
+/// The key prefix a resource pattern covers in `bucket`, or `None` when it
+/// covers no key there. The bare bucket ARN counts as the whole bucket: an
+/// unconditioned `list` on it lets every key through the `s3:prefix` check.
+fn resource_key_prefix(resource: &str, bucket: &str) -> Option<String> {
+    let resource = resource.strip_prefix("arn:aws:s3:::").unwrap_or(resource);
+    let (head, wild) = literal_head(resource);
+    let bucket_slash = format!("{bucket}/");
+    if let Some(rest) = head.strip_prefix(&bucket_slash) {
+        return Some(rest.to_string());
+    }
+    // The wildcard sits inside the bucket part (`*`, `rel*`), or the
+    // resource is the bucket itself.
+    let covers_bucket = if wild {
+        bucket_slash.starts_with(head)
+    } else {
+        head == bucket
+    };
+    covers_bucket.then(String::new)
+}
+
+/// Literal heads of the `s3:prefix` values of a `StringLike`/`StringEquals`
+/// operator, or `None` when the condition does not bound the key that way.
+fn condition_prefix_literals(conditions: Option<&serde_json::Value>) -> Option<Vec<String>> {
+    let ops = conditions?.as_object()?;
+    for (op, keys) in ops {
+        if op != "StringLike" && op != "StringEquals" {
+            continue;
+        }
+        let Some(values) = keys.get("s3:prefix") else {
+            continue;
+        };
+        let values: Vec<&str> = match values {
+            serde_json::Value::String(s) => vec![s.as_str()],
+            serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_str()).collect(),
+            _ => continue,
+        };
+        return Some(
+            values
+                .into_iter()
+                .map(|v| {
+                    if op == "StringLike" {
+                        literal_head(v).0.to_string()
+                    } else {
+                        v.to_string()
+                    }
+                })
+                .collect(),
+        );
+    }
+    None
+}
+
+/// Sorted, deduplicated, and with every entry that has another entry as its
+/// prefix removed.
+fn minimal_prefix_set(mut prefixes: Vec<String>) -> Vec<String> {
+    prefixes.sort();
+    prefixes.dedup();
+    let mut out: Vec<String> = Vec::with_capacity(prefixes.len());
+    for p in prefixes {
+        // Sorted order puts a covering prefix before everything it covers.
+        if out.last().is_some_and(|last| p.starts_with(last.as_str())) {
+            continue;
+        }
+        out.push(p);
+    }
+    out
+}
+
 /// Pure gate for a batch `POST /bucket?delete` (DeleteObjects).
 ///
 /// The request names no key: the keys are in the body, and the adapter
@@ -2197,5 +2306,113 @@ mod tests {
             ..templated[0].clone()
         }];
         assert!(expand_permission_templates(&plain, "a*", "AK").is_ok());
+    }
+
+    // === visible_key_prefixes (review S12) ===
+
+    fn allow(resources: &[&str], conditions: Option<serde_json::Value>) -> Permission {
+        Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into(), "list".into()],
+            resources: resources.iter().map(|s| s.to_string()).collect(),
+            conditions,
+        }
+    }
+
+    #[test]
+    fn visible_prefixes_follow_the_allow_resources() {
+        let user = make_user_with_permissions(
+            "u",
+            vec![
+                allow(&["b/d/a/*", "b/d/z/*", "other/x/*"], None),
+                allow(&["b/d/a/deep/*", "b/exact.txt", "b/q?x/*"], None),
+            ],
+        );
+        assert_eq!(
+            visible_key_prefixes(&user, "b"),
+            vec!["d/a/", "d/z/", "exact.txt", "q"]
+        );
+        assert!(visible_key_prefixes(&user, "nothing").is_empty());
+    }
+
+    #[test]
+    fn visible_prefixes_widen_to_the_bucket_when_the_policy_does() {
+        for res in [
+            "*",
+            "b",
+            "b/*",
+            "arn:aws:s3:::b/*",
+            "b*",
+            "b/${iam:username}/*",
+        ] {
+            let user = make_user_with_permissions("u", vec![allow(&[res, "b/x/*"], None)]);
+            assert_eq!(visible_key_prefixes(&user, "b"), vec![""], "{res}");
+        }
+        // A wildcard in another bucket's name never reaches this bucket.
+        let user = make_user_with_permissions("u", vec![allow(&["c*"], None)]);
+        assert!(visible_key_prefixes(&user, "b").is_empty());
+    }
+
+    /// The public-prefix reader lists the bucket ARN under an `s3:prefix`
+    /// condition: the condition, not the bucket-wide resource, bounds it.
+    #[test]
+    fn visible_prefixes_use_the_s3_prefix_condition() {
+        let user = crate::api::auth::build_anonymous_user("b", &["rel/".to_string()]);
+        assert_eq!(visible_key_prefixes(&user, "b"), vec!["rel"]);
+        let user = make_user_with_permissions(
+            "u",
+            vec![allow(
+                &["b"],
+                Some(serde_json::json!({"StringEquals": {"s3:prefix": ["x/y", "z"]}})),
+            )],
+        );
+        assert_eq!(visible_key_prefixes(&user, "b"), vec!["x/y", "z"]);
+        // An operator we do not model keeps the resource bound (superset).
+        let user = make_user_with_permissions(
+            "u",
+            vec![allow(
+                &["b/*"],
+                Some(serde_json::json!({"StringLikeIfExists": {"s3:prefix": ["x/*"]}})),
+            )],
+        );
+        assert_eq!(visible_key_prefixes(&user, "b"), vec![""]);
+    }
+
+    proptest::proptest! {
+        /// Soundness: every key the LIST filter lets through lies under one
+        /// of the derived prefixes. A miss would hide a visible key.
+        #[test]
+        fn every_listable_key_is_under_a_visible_prefix(
+            key in "[ab/]{1,6}",
+            lits in proptest::collection::vec("[ab/]{0,4}", 1..4),
+            shapes in proptest::collection::vec(0u8..5, 1..4),
+        ) {
+            let perms: Vec<Permission> = lits
+                .iter()
+                .zip(shapes.iter().cycle())
+                .map(|(lit, shape)| match shape {
+                    0 => allow(&[&format!("b/{lit}*")], None),
+                    1 => allow(&[&format!("b/{lit}")], None),
+                    2 => allow(&[&format!("b/{lit}?b*")], None),
+                    3 => allow(
+                        &["b/*"],
+                        Some(serde_json::json!({"StringLike": {"s3:prefix": [format!("{lit}*")]}})),
+                    ),
+                    _ => allow(
+                        &["b"],
+                        Some(serde_json::json!({"StringEquals": {"s3:prefix": [lit.clone()]}})),
+                    ),
+                })
+                .collect();
+            let user = make_user_with_permissions("u", perms);
+            let visible = visible_key_prefixes(&user, "b");
+            if user_can_see_listed_key(&user, "b", &key, &Context::new()) {
+                proptest::prop_assert!(
+                    visible.iter().any(|p| key.starts_with(p.as_str())),
+                    "{key} visible but not under {visible:?}"
+                );
+            }
+        }
     }
 }
