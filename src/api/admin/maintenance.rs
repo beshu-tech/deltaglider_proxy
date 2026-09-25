@@ -81,7 +81,7 @@ impl From<MaintenanceJob> for MaintenanceJobView {
 
 #[derive(Debug, Deserialize)]
 pub struct ReencryptRequest {
-    pub buckets: Vec<String>,
+    pub buckets: Vec<super::path_guard::AdminBucket>,
 }
 
 #[derive(Debug, Serialize)]
@@ -141,14 +141,14 @@ pub async fn start_reencrypt(
         let key = bucket.to_ascii_lowercase();
         if !real.contains(&key) {
             errors.push(ReencryptError {
-                bucket: bucket.clone(),
+                bucket: bucket.to_string(),
                 error: "bucket not found".into(),
             });
             continue;
         }
         if let Err(reason) = resolve_desired(&cfg, &key) {
             errors.push(ReencryptError {
-                bucket: bucket.clone(),
+                bucket: bucket.to_string(),
                 error: reason,
             });
             continue;
@@ -169,16 +169,16 @@ pub async fn start_reencrypt(
                 // Gate from CREATION: no create→claim window for writes.
                 state.s3_state.maintenance_gate.set_busy(&key);
                 started.push(ReencryptStarted {
-                    bucket: bucket.clone(),
+                    bucket: bucket.to_string(),
                     job_id,
                 });
             }
             Ok(None) => errors.push(ReencryptError {
-                bucket: bucket.clone(),
+                bucket: bucket.to_string(),
                 error: "a maintenance job is already active for this bucket".into(),
             }),
             Err(e) => errors.push(ReencryptError {
-                bucket: bucket.clone(),
+                bucket: bucket.to_string(),
                 error: format!("failed to create job: {e}"),
             }),
         }
@@ -202,7 +202,7 @@ pub async fn start_reencrypt(
 
 #[derive(Debug, Deserialize)]
 pub struct BackfillRequest {
-    pub buckets: Vec<String>,
+    pub buckets: Vec<super::path_guard::AdminBucket>,
     /// `false` (default): the LastModified the proxy serves is unchanged
     /// (`dg-created-at` pinned to the pre-job value). `true`: backfilled
     /// objects read as modified at rewrite time.
@@ -256,7 +256,7 @@ pub async fn start_backfill(
         let key = bucket.to_ascii_lowercase();
         if !real.contains(&key) {
             errors.push(ReencryptError {
-                bucket: bucket.clone(),
+                bucket: bucket.to_string(),
                 error: "bucket not found".into(),
             });
             continue;
@@ -277,16 +277,16 @@ pub async fn start_backfill(
                 // Gate from CREATION: no create→claim window for writes.
                 state.s3_state.maintenance_gate.set_busy(&key);
                 started.push(ReencryptStarted {
-                    bucket: bucket.clone(),
+                    bucket: bucket.to_string(),
                     job_id,
                 });
             }
             Ok(None) => errors.push(ReencryptError {
-                bucket: bucket.clone(),
+                bucket: bucket.to_string(),
                 error: "a maintenance job is already active for this bucket".into(),
             }),
             Err(e) => errors.push(ReencryptError {
-                bucket: bucket.clone(),
+                bucket: bucket.to_string(),
                 error: format!("failed to create job: {e}"),
             }),
         }
@@ -518,7 +518,7 @@ pub async fn cancel_job(
 /// GET /_/api/admin/jobs/bucket/:bucket — session-light tier.
 pub async fn bucket_status(
     State(state): State<Arc<AdminState>>,
-    Path(bucket): Path<String>,
+    Path(bucket): Path<super::path_guard::AdminBucket>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let job = super::with_config_db(&state, "read bucket maintenance status", |db| {
         db.maintenance_active_job_for_bucket(&bucket.to_ascii_lowercase())

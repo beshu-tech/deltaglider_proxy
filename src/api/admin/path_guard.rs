@@ -170,10 +170,15 @@ mod tests {
             let fname = path.file_name().unwrap().to_string_lossy().to_string();
             let lines: Vec<&str> = src.lines().collect();
             for (n, l) in src.lines().enumerate() {
-                // `bucket_status` only reads the job DB; `start_migrate`
-                // calls `check_bucket` after trimming.
+                // A raw `Path<String>` bucket is fine only when the handler
+                // runs `check_bucket` on it at once (`start_migrate` trims
+                // first, which AdminBucket would refuse).
+                let checked_at_once = lines[n..(n + 16).min(lines.len())]
+                    .iter()
+                    .any(|l| l.contains("check_bucket("));
                 if l.contains(concat!("Path(bucket): ", "Path<String>"))
-                    && !["maintenance.rs", "path_guard.rs"].contains(&fname.as_str())
+                    && fname != "path_guard.rs"
+                    && !checked_at_once
                 {
                     offenders.push(format!("{fname}:{}: Path<String> bucket", n + 1));
                 }
@@ -216,6 +221,7 @@ mod tests {
                     if let Some((field, ty)) = f.split_once(':') {
                         let field = field.trim();
                         let pathy = field == "bucket"
+                            || field == "buckets"
                             || field.ends_with("_bucket")
                             || field.ends_with("prefix")
                             || field == "key"
