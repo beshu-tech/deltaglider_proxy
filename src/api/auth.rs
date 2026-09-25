@@ -192,8 +192,17 @@ pub enum LimiterVerdict {
 }
 
 /// Pure decision for [`LimiterVerdict`] from the request outcome and status.
-pub fn limiter_verdict(outcome: &AuthOutcome, status: axum::http::StatusCode) -> LimiterVerdict {
+///
+/// A verified PRESIGNED request is not a success: it proves that the signer
+/// knew the secret, not the caller. Anyone holding a link could otherwise
+/// reset the IP's counter between wrong-secret guesses.
+pub fn limiter_verdict(
+    outcome: &AuthOutcome,
+    status: axum::http::StatusCode,
+    presigned: bool,
+) -> LimiterVerdict {
     match outcome.state() {
+        OUTCOME_VERIFIED if presigned => LimiterVerdict::Neither,
         OUTCOME_VERIFIED => LimiterVerdict::Success,
         OUTCOME_AUTHZ_DENIED => LimiterVerdict::Neither,
         _ if status == axum::http::StatusCode::FORBIDDEN => LimiterVerdict::Failure,
@@ -982,7 +991,7 @@ pub async fn sigv4_auth_middleware(
         .insert(SignedPayloadHash(params.payload_hash.clone()));
 
     let response = next.run(request).await;
-    match limiter_verdict(&outcome, response.status()) {
+    match limiter_verdict(&outcome, response.status(), is_presigned) {
         LimiterVerdict::Success => {
             if let Some(m) = &metrics {
                 m.auth_attempts_total.with_label_values(&["success"]).inc();
@@ -1059,39 +1068,48 @@ mod tests {
         use axum::http::StatusCode;
         let pending = AuthOutcome::default();
         assert_eq!(
-            limiter_verdict(&pending, StatusCode::FORBIDDEN),
+            limiter_verdict(&pending, StatusCode::FORBIDDEN, false),
             LimiterVerdict::Failure
         );
         assert_eq!(
-            limiter_verdict(&pending, StatusCode::OK),
+            limiter_verdict(&pending, StatusCode::OK, false),
             LimiterVerdict::Neither
         );
         assert_eq!(
-            limiter_verdict(&pending, StatusCode::SERVICE_UNAVAILABLE),
+            limiter_verdict(&pending, StatusCode::SERVICE_UNAVAILABLE, false),
             LimiterVerdict::Neither
         );
         let verified = AuthOutcome::default();
         verified.mark_verified();
         assert_eq!(
-            limiter_verdict(&verified, StatusCode::OK),
+            limiter_verdict(&verified, StatusCode::OK, false),
             LimiterVerdict::Success
         );
         // Verified, then a handler-level 403 (per-key deny): still a good key.
         assert_eq!(
-            limiter_verdict(&verified, StatusCode::FORBIDDEN),
+            limiter_verdict(&verified, StatusCode::FORBIDDEN, false),
             LimiterVerdict::Success
         );
         let denied = AuthOutcome::default();
         denied.mark_authz_denied();
         assert_eq!(
-            limiter_verdict(&denied, StatusCode::FORBIDDEN),
+            limiter_verdict(&denied, StatusCode::FORBIDDEN, false),
             LimiterVerdict::Neither
+        );
+        // A verified presigned link resets nothing; a forged one still counts.
+        assert_eq!(
+            limiter_verdict(&verified, StatusCode::OK, true),
+            LimiterVerdict::Neither
+        );
+        assert_eq!(
+            limiter_verdict(&pending, StatusCode::FORBIDDEN, true),
+            LimiterVerdict::Failure
         );
         // Clones share one state: the s3s hook marks what the middleware reads.
         let shared = AuthOutcome::default();
         shared.clone().mark_verified();
         assert_eq!(
-            limiter_verdict(&shared, StatusCode::OK),
+            limiter_verdict(&shared, StatusCode::OK, false),
             LimiterVerdict::Success
         );
     }
