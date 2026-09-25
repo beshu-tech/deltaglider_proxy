@@ -75,6 +75,12 @@ pub enum StorageError {
     #[error("Invalid key: {0}")]
     InvalidKey(String),
 
+    /// The object's metadata is larger than this backend can store (the
+    /// filesystem keeps it in one xattr, and JSON escaping can double user
+    /// metadata that is within the S3 limit). Maps to 400 MetadataTooLarge.
+    #[error("MetadataTooLarge: {0}")]
+    MetadataTooLarge(String),
+
     #[error("Storage error: {0}")]
     Other(String),
 }

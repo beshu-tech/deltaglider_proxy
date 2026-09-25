@@ -3948,7 +3948,6 @@ async fn review2_complete_multipart_honours_if_none_match_star() {
 /// so 2047 quotes (within the S3 limit) exceed the ~4 KB ext4 xattr value
 /// limit and the PUT fails with a 5xx.
 #[tokio::test]
-#[ignore = "review2: pending fix"]
 async fn review2_user_metadata_at_limit_with_quotes_stores() {
     let server = TestServer::filesystem().await;
     let http = reqwest::Client::new();

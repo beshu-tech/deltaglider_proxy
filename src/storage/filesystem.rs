@@ -76,7 +76,7 @@ async fn atomic_write_with_metadata(
         tmp.write_all(&data).map_err(io_to_storage_error)?;
         // Write xattr to temp file BEFORE rename — atomic metadata+data visibility.
         if let Some(json) = &meta_json {
-            xattr::set(tmp.path(), xattr_meta::XATTR_NAME, json).map_err(io_to_storage_error)?;
+            xattr_meta::set_metadata_xattr(tmp.path(), json)?;
         }
         tmp.as_file().sync_all().map_err(io_to_storage_error)?;
         tmp.persist(&path)
@@ -120,7 +120,7 @@ async fn atomic_copy_with_metadata(
         let mut src = std::fs::File::open(&source).map_err(io_to_storage_error)?;
         let mut tmp = internal_temp_in(&parent).map_err(io_to_storage_error)?;
         std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
-        xattr::set(tmp.path(), xattr_meta::XATTR_NAME, &meta_json).map_err(io_to_storage_error)?;
+        xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
         tmp.as_file().sync_all().map_err(io_to_storage_error)?;
         tmp.persist(&target)
             .map_err(|e| io_to_storage_error(e.error))?;
@@ -1164,8 +1164,7 @@ impl StorageBackend for FilesystemBackend {
                 let mut src = std::fs::File::open(path).map_err(io_to_storage_error)?;
                 std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
             }
-            xattr::set(tmp.path(), xattr_meta::XATTR_NAME, &meta_json)
-                .map_err(io_to_storage_error)?;
+            xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
             tmp.as_file().sync_all().map_err(io_to_storage_error)?;
             tmp.persist(&target)
                 .map_err(|e| io_to_storage_error(e.error))?;
@@ -1244,8 +1243,7 @@ impl StorageBackend for FilesystemBackend {
                 tmp.write_all(chunk).map_err(io_to_storage_error)?;
             }
             // Write xattr before rename — atomic metadata+data visibility.
-            xattr::set(tmp.path(), xattr_meta::XATTR_NAME, &meta_json)
-                .map_err(io_to_storage_error)?;
+            xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
             tmp.as_file().sync_all().map_err(io_to_storage_error)?;
             tmp.persist(&target)
                 .map_err(|e| io_to_storage_error(e.error))?;

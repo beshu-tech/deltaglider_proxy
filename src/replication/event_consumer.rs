@@ -504,7 +504,8 @@ fn classify_engine_error(
     use crate::deltaglider::EngineError;
     match e {
         EngineError::InvalidArgument(msg)
-        | EngineError::Storage(crate::storage::StorageError::InvalidKey(msg)) => {
+        | EngineError::Storage(crate::storage::StorageError::InvalidKey(msg))
+        | EngineError::Storage(crate::storage::StorageError::MetadataTooLarge(msg)) => {
             Box::new(PermanentKeyError(msg))
         }
         other => Box::new(other),
