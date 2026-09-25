@@ -3576,7 +3576,7 @@ mod tests {
                 .await
                 .unwrap();
             wrapper
-                .put_passthrough_parts("b", "p", "e", &[src.clone()], &meta)
+                .put_passthrough_parts("b", "p", "e", std::slice::from_ref(&src), &meta)
                 .await
                 .unwrap();
             wrapper
