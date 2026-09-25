@@ -23,10 +23,10 @@ env:
   # (sccache still caches it). The peak is two ~2 GB rustc (lib unit tests +
   # tests/all) overlapping, so lowering -j does not reduce it further.
   #
-  # The homelab runners share one host. Three heavy compiles at the same time
-  # (cargo test --all, coverage, tokio_unstable clippy) get the build SIGKILLed
-  # (exit 137). So the jobs below run one after another (`needs:`), and every
-  # heavy step runs under scripts/ci-memwatch.sh to log memory until a kill.
+  # That peak does not fit: each runner container has a 5 GB limit, and the
+  # job alone was SIGKILLed (exit 137) at 4.3+ GB while the host had 60 GB free.
+  # So test-all builds its targets in separate steps (see there). Every heavy
+  # step runs under scripts/ci-memwatch.sh, which logs memory until a kill.
   CARGO_BUILD_JOBS: "16"
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
@@ -83,6 +83,12 @@ jobs:
           mc mb --ignore-existing local/deltaglider-test
           mc mb --ignore-existing local/deltaglider-data
           echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
+      # Build in two steps so the two ~2 GB rustc processes (lib unit tests and
+      # tests/all) never run at the same time. The last step only runs tests.
+      - name: Build lib unit tests
+        run: scripts/ci-memwatch.sh cargo test --all --locked --lib --no-run
+      - name: Build remaining test targets
+        run: scripts/ci-memwatch.sh cargo test --all --locked --no-run
       - name: cargo test --all --locked
         env:
           RUST_BACKTRACE: "1"
@@ -97,8 +103,6 @@ jobs:
   #    Tools (cargo-llvm-cov, cargo-deny) are baked into the builder image. ──
   coverage:
     name: Unit Coverage (nightly)
-    needs: test-all-default-features
-    if: ${{ !cancelled() }}
     runs-on: homelab
     timeout-minutes: 20
     continue-on-error: true
@@ -146,8 +150,6 @@ jobs:
   #    so the gated code is type-checked HERE nightly instead. ──
   tokio-unstable:
     name: tokio_unstable build + tests (nightly)
-    needs: coverage
-    if: ${{ !cancelled() }}
     runs-on: homelab
     timeout-minutes: 30
     container:
