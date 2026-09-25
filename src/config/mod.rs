@@ -1271,6 +1271,13 @@ pub enum BackendConfig {
         /// is the preferred path going forward.
         #[serde(default, skip_serializing_if = "is_false")]
         allow_local: bool,
+
+        /// Session token of temporary (STS) credentials. Runtime only:
+        /// the CLI sets it from `AWS_SESSION_TOKEN` / the profile. Never
+        /// read from or written to config, so no format change.
+        #[serde(skip)]
+        #[schemars(skip)]
+        session_token: Option<String>,
     },
 }
 
@@ -1826,6 +1833,7 @@ impl Config {
         // it with a filesystem backend.
         if env("DGP_S3_ENDPOINT").is_some() || env("DGP_S3_REGION").is_some() {
             self.backend = BackendConfig::S3 {
+                session_token: None,
                 endpoint: env("DGP_S3_ENDPOINT"),
                 region: env("DGP_S3_REGION").unwrap_or_else(|| "us-east-1".to_string()),
                 force_path_style: lookup_bool(env, "DGP_S3_PATH_STYLE", true),
@@ -3775,6 +3783,7 @@ backend:
                 legacy_key_id: Some("legacy-kid".into()),
             },
             backend: BackendConfig::S3 {
+                session_token: None,
                 endpoint: Some("http://minio:9000".into()),
                 region: "us-east-1".into(),
                 force_path_style: true,
@@ -3787,6 +3796,7 @@ backend:
         cfg.backends.push(NamedBackendConfig {
             name: "hetzner".into(),
             backend: BackendConfig::S3 {
+                session_token: None,
                 endpoint: Some("https://fsn1.your-objectstorage.com".into()),
                 region: "eu-central-1".into(),
                 force_path_style: true,

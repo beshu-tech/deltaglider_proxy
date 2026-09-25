@@ -309,36 +309,49 @@ impl S3Backend {
     /// Build an S3 client from a BackendConfig without creating an S3Backend.
     /// Useful for one-off operations like testing connectivity.
     pub async fn build_client(config: &BackendConfig) -> Result<Client, StorageError> {
-        let (endpoint, region, force_path_style, access_key_id, secret_access_key, allow_local) =
-            match config {
-                BackendConfig::S3 {
-                    endpoint,
-                    region,
-                    force_path_style,
-                    access_key_id,
-                    secret_access_key,
-                    allow_local,
-                } => (
-                    endpoint.clone(),
-                    region.clone(),
-                    *force_path_style,
-                    access_key_id.clone(),
-                    secret_access_key.clone(),
-                    *allow_local,
-                ),
-                _ => {
-                    return Err(StorageError::Other(
-                        "S3Backend requires S3 configuration".to_string(),
-                    ))
-                }
-            };
+        let (
+            endpoint,
+            region,
+            force_path_style,
+            access_key_id,
+            secret_access_key,
+            allow_local,
+            session_token,
+        ) = match config {
+            BackendConfig::S3 {
+                endpoint,
+                region,
+                force_path_style,
+                access_key_id,
+                secret_access_key,
+                allow_local,
+                session_token,
+            } => (
+                endpoint.clone(),
+                region.clone(),
+                *force_path_style,
+                access_key_id.clone(),
+                secret_access_key.clone(),
+                *allow_local,
+                session_token.clone(),
+            ),
+            _ => {
+                return Err(StorageError::Other(
+                    "S3Backend requires S3 configuration".to_string(),
+                ))
+            }
+        };
 
         // Require explicit credentials — never fall back to the default AWS credential chain
         // (env vars, ~/.aws/credentials, instance metadata, etc.)
         let credentials = match (access_key_id, secret_access_key) {
-            (Some(ref key_id), Some(ref secret)) => {
-                Credentials::new(key_id, secret, None, None, "deltaglider_proxy-config")
-            }
+            (Some(ref key_id), Some(ref secret)) => Credentials::new(
+                key_id,
+                secret,
+                session_token,
+                None,
+                "deltaglider_proxy-config",
+            ),
             _ => {
                 return Err(StorageError::Other(
                     "S3 backend requires explicit credentials: set DGP_BE_AWS_ACCESS_KEY_ID and DGP_BE_AWS_SECRET_ACCESS_KEY".to_string(),
@@ -3683,6 +3696,7 @@ mod tests {
             "http://example.com/", // plain http rejected when not in dev mode
         ] {
             let cfg = BackendConfig::S3 {
+                session_token: None,
                 endpoint: Some(bad.to_string()),
                 region: "us-east-1".to_string(),
                 force_path_style: true,
@@ -3705,6 +3719,7 @@ mod tests {
             "https://s3.eu-central-1.amazonaws.com/",
         ] {
             let cfg = BackendConfig::S3 {
+                session_token: None,
                 endpoint: Some(good.to_string()),
                 region: "us-east-1".to_string(),
                 force_path_style: true,
@@ -3786,6 +3801,7 @@ mod tests {
         unsafe { std::env::set_var("DGP_BACKEND_ALLOW_LOCAL", "true") };
 
         let cfg = BackendConfig::S3 {
+            session_token: None,
             endpoint: Some("http://localhost:9000".to_string()),
             region: "us-east-1".to_string(),
             force_path_style: true,
@@ -3799,6 +3815,7 @@ mod tests {
 
         // IMDS still rejected even in dev mode.
         let cfg = BackendConfig::S3 {
+            session_token: None,
             endpoint: Some("http://169.254.169.254/".to_string()),
             region: "us-east-1".to_string(),
             force_path_style: true,
@@ -3828,6 +3845,7 @@ mod tests {
 
         // localhost permitted by typed field (no env mutation).
         let cfg = BackendConfig::S3 {
+            session_token: None,
             endpoint: Some("http://localhost:9000".to_string()),
             region: "us-east-1".to_string(),
             force_path_style: true,
@@ -3841,6 +3859,7 @@ mod tests {
 
         // IMDS still rejected even with allow_local: true (parity with env path).
         let cfg = BackendConfig::S3 {
+            session_token: None,
             endpoint: Some("http://169.254.169.254/".to_string()),
             region: "us-east-1".to_string(),
             force_path_style: true,
@@ -3852,6 +3871,7 @@ mod tests {
 
         // Default `allow_local: false` rejects localhost.
         let cfg = BackendConfig::S3 {
+            session_token: None,
             endpoint: Some("http://localhost:9000".to_string()),
             region: "us-east-1".to_string(),
             force_path_style: true,

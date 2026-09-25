@@ -21,8 +21,7 @@ pub struct CliEngineOpts {
     pub force_path_style: bool,
     pub access_key_id: String,
     pub secret_access_key: String,
-    /// Session token of temporary (STS) credentials, if any. The engine
-    /// cannot sign with it yet (see [`session_token_note`]).
+    /// Session token of temporary (STS) credentials, if any.
     pub session_token: Option<String>,
     /// Override `Config::max_delta_ratio` when set.
     pub max_delta_ratio: Option<f32>,
@@ -51,9 +50,6 @@ pub enum BuildError {
 
 /// Build a one-shot engine pointed at the supplied S3 endpoint.
 pub async fn build_cli_engine(opts: CliEngineOpts) -> Result<DynEngine, BuildError> {
-    if let Some(note) = session_token_note(&opts) {
-        eprintln!("{note}");
-    }
     // `allow_local` flows through the typed `BackendConfig::S3` field
     // instead of via the `DGP_BACKEND_ALLOW_LOCAL` env var. The legacy
     // env path still works for backward compat (handled inside
@@ -62,6 +58,7 @@ pub async fn build_cli_engine(opts: CliEngineOpts) -> Result<DynEngine, BuildErr
     // hazard at startup and makes the engine testable without env
     // munging.
     let backend = BackendConfig::S3 {
+        session_token: opts.session_token,
         endpoint: opts.endpoint,
         region: opts.region,
         force_path_style: opts.force_path_style,
@@ -84,18 +81,6 @@ pub async fn build_cli_engine(opts: CliEngineOpts) -> Result<DynEngine, BuildErr
     Ok(engine)
 }
 
-/// Pure: the warning for a session token the engine verbs cannot send.
-/// `BackendConfig::S3` has no token slot, so the engine signs with the
-/// key pair alone; temporary credentials then fail with a 403 whose
-/// cause is not obvious. Say it up front instead.
-pub fn session_token_note(opts: &CliEngineOpts) -> Option<&'static str> {
-    opts.session_token.as_ref().map(|_| {
-        "warning: a session token is set (AWS_SESSION_TOKEN or aws_session_token), \
-         but this command cannot send it yet; temporary (STS) credentials will be \
-         rejected. Use long-term access keys for this command."
-    })
-}
-
 /// Build a raw SDK client for the verbs that talk to S3 directly
 /// (`purge`, `bucket-acl`). The one place that turns resolved
 /// credentials into a client, so the session token cannot be dropped
@@ -107,6 +92,7 @@ pub async fn build_raw_s3_client(
 ) -> Result<aws_sdk_s3::Client, StorageError> {
     let allow_local = crate::cli::ls::should_allow_local(endpoint.as_deref());
     let backend = BackendConfig::S3 {
+        session_token: creds.session_token.clone(),
         endpoint,
         region: creds.region.clone().unwrap_or_else(|| "us-east-1".into()),
         force_path_style,
@@ -114,25 +100,7 @@ pub async fn build_raw_s3_client(
         secret_access_key: Some(creds.secret_access_key.clone()),
         allow_local,
     };
-    let client = S3Backend::build_client(&backend).await?;
-    let Some(token) = creds.session_token.clone() else {
-        return Ok(client);
-    };
-    // `build_client` signs with a static key pair only; swap in the
-    // same pair plus the token and keep every other client setting.
-    let with_token = aws_credential_types::Credentials::new(
-        &creds.access_key_id,
-        &creds.secret_access_key,
-        Some(token),
-        None,
-        "deltaglider_proxy-cli",
-    );
-    let conf = client
-        .config()
-        .to_builder()
-        .credentials_provider(with_token)
-        .build();
-    Ok(aws_sdk_s3::Client::from_conf(conf))
+    S3Backend::build_client(&backend).await
 }
 
 /// Render an engine error for the operator. For `TooLarge` we surface
@@ -172,6 +140,7 @@ mod tests {
     #[test]
     fn cli_opts_override_default_backend() {
         let backend = BackendConfig::S3 {
+            session_token: None,
             endpoint: Some("https://s3.amazonaws.com".into()),
             region: "eu-central-1".into(),
             force_path_style: false,
@@ -208,15 +177,16 @@ mod tests {
         }
     }
 
-    /// Send one request from `client` to a local socket and return the
-    /// raw request head, so the test sees what goes on the wire.
-    async fn request_head(creds: &ResolvedCreds) -> String {
+    /// Run `send` against a local socket and return the head of the
+    /// first request it makes, so the test sees what goes on the wire.
+    async fn capture_head<F, Fut>(send: F) -> String
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let client = build_raw_s3_client(creds, Some(endpoint), true)
-            .await
-            .unwrap();
         let server = tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut buf = vec![0u8; 16 * 1024];
@@ -228,40 +198,77 @@ mod tests {
                 .await;
             String::from_utf8_lossy(&buf[..n]).to_lowercase()
         });
-        let _ = client.list_buckets().send().await;
+        send(endpoint).await;
         server.await.unwrap()
+    }
+
+    async fn raw_head(creds: &ResolvedCreds) -> String {
+        capture_head(|endpoint| async move {
+            let client = build_raw_s3_client(creds, Some(endpoint), true)
+                .await
+                .unwrap();
+            let _ = client.list_buckets().send().await;
+        })
+        .await
     }
 
     /// Temporary (STS) credentials only work with their session token.
     #[tokio::test]
     async fn raw_client_sends_the_session_token() {
-        let head = request_head(&creds(Some("TOKEN123"))).await;
+        let head = raw_head(&creds(Some("TOKEN123"))).await;
         assert!(head.contains("x-amz-security-token: token123"), "{head}");
     }
 
     #[tokio::test]
     async fn raw_client_without_token_sends_none() {
-        let head = request_head(&creds(None)).await;
+        let head = raw_head(&creds(None)).await;
         assert!(head.contains("authorization: aws4-hmac-sha256"), "{head}");
         assert!(!head.contains("x-amz-security-token"), "{head}");
     }
 
+    /// The engine verbs (cp, sync, rm, ls, stats, verify, migrate) sign
+    /// through `DynEngine`, so the token must reach `BackendConfig::S3`.
+    #[tokio::test]
+    async fn engine_sends_the_session_token() {
+        let head = capture_head(|endpoint| async move {
+            let engine = build_cli_engine(CliEngineOpts {
+                endpoint: Some(endpoint),
+                region: "us-east-1".into(),
+                force_path_style: true,
+                access_key_id: "AK".into(),
+                secret_access_key: "SK".into(),
+                session_token: Some("ENGTOKEN".into()),
+                max_delta_ratio: None,
+                max_object_size: None,
+                allow_local: true,
+            })
+            .await
+            .unwrap();
+            let _ = engine
+                .list_objects("releases", "", None, 1, None, false)
+                .await;
+        })
+        .await;
+        assert!(head.contains("x-amz-security-token: engtoken"), "{head}");
+    }
+
+    /// The token is runtime-only: it must never reach exported or
+    /// persisted config, and config cannot set it.
     #[test]
-    fn engine_verbs_warn_about_a_session_token_they_cannot_send() {
-        let mut opts = CliEngineOpts {
+    fn session_token_is_never_serialized() {
+        let b = BackendConfig::S3 {
             endpoint: None,
             region: "us-east-1".into(),
-            force_path_style: true,
-            access_key_id: "AK".into(),
-            secret_access_key: "SK".into(),
-            session_token: None,
-            max_delta_ratio: None,
-            max_object_size: None,
+            force_path_style: false,
+            access_key_id: Some("AK".into()),
+            secret_access_key: Some("SK".into()),
             allow_local: false,
+            session_token: Some("SECRET-TOKEN".into()),
         };
-        assert!(session_token_note(&opts).is_none());
-        opts.session_token = Some("T".into());
-        assert!(session_token_note(&opts).unwrap().contains("session token"));
+        let yaml = serde_yaml::to_string(&b).unwrap();
+        assert!(!yaml.contains("SECRET-TOKEN"), "{yaml}");
+        let back: BackendConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert!(matches!(back, BackendConfig::S3 { session_token: None, .. }));
     }
 
     #[test]

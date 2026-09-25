@@ -1036,6 +1036,7 @@ pub async fn test_s3_connection(
     drop(cfg);
 
     let test_config = crate::config::BackendConfig::S3 {
+        session_token: None,
         endpoint: merged_endpoint,
         region: merged_region,
         force_path_style: merged_fps,

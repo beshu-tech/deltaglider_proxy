@@ -101,6 +101,7 @@ fn build_backend_config(req: &CreateBackendRequest) -> Result<BackendConfig, Str
                 return Err("S3 backend requires both access_key_id and secret_access_key".into());
             }
             Ok(BackendConfig::S3 {
+                session_token: None,
                 endpoint: req.endpoint.clone(),
                 region: req
                     .region

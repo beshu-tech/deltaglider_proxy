@@ -199,6 +199,7 @@ pub fn run_init_inner(
                     None
                 };
                 break BackendConfig::S3 {
+                    session_token: None,
                     endpoint,
                     region,
                     force_path_style,

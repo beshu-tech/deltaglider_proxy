@@ -607,6 +607,7 @@ mod tests {
     fn health_cache_fingerprint_and_version_semantics() {
         let cache = BackendHealthCache::default();
         let cfg = BackendConfig::S3 {
+            session_token: None,
             endpoint: Some("https://b2.example".into()),
             region: "eu-central-003".into(),
             force_path_style: true,
@@ -633,6 +634,7 @@ mod tests {
         assert!(cache.unhealthy_verdict("b2").is_some());
         // A redefined backend (rotated secret) misses the cache.
         let rotated = BackendConfig::S3 {
+            session_token: None,
             endpoint: Some("https://b2.example".into()),
             region: "eu-central-003".into(),
             force_path_style: true,

@@ -1161,6 +1161,7 @@ impl StorageSection {
                 // then expand.
                 validate_s3_endpoint(self.s3.as_deref().expect("has_s3 asserted above"))?;
                 self.backend = BackendConfig::S3 {
+                    session_token: None,
                     endpoint: self.s3.take(),
                     region: self
                         .region

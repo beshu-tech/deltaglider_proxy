@@ -823,6 +823,7 @@ pub(super) fn apply_backend_patch(
             }
             "s3" => {
                 *backend = crate::config::BackendConfig::S3 {
+                    session_token: None,
                     endpoint: body.backend_endpoint.clone(),
                     region: body
                         .backend_region
@@ -908,6 +909,7 @@ mod tests {
         // what's actually serving traffic.
         let cfg = Config {
             backend: BackendConfig::S3 {
+                session_token: None,
                 endpoint: Some("https://fsn1.your-objectstorage.com".into()),
                 region: "fsn1".into(),
                 force_path_style: true,
@@ -944,6 +946,7 @@ mod tests {
         let named = crate::config::NamedBackendConfig {
             name: "hetzner".into(),
             backend: BackendConfig::S3 {
+                session_token: None,
                 endpoint: Some("https://example".into()),
                 region: "fsn1".into(),
                 force_path_style: true,

@@ -2106,6 +2106,7 @@ mod tests {
         let s3 = |name: &str| NamedBackendConfig {
             name: name.into(),
             backend: BackendConfig::S3 {
+                session_token: None,
                 endpoint: None,
                 region: "us-east-1".into(),
                 force_path_style: true,

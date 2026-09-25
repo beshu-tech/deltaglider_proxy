@@ -355,6 +355,7 @@ mod tests {
 
     fn s3_backend(endpoint: &str) -> crate::config::BackendConfig {
         crate::config::BackendConfig::S3 {
+            session_token: None,
             endpoint: Some(endpoint.to_string()),
             region: "us-east-1".into(),
             force_path_style: true,
