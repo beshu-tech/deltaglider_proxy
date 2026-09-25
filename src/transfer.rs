@@ -909,6 +909,40 @@ fn enc_fingerprint(meta: &crate::types::FileMetadata) -> EncFingerprint {
     }
 }
 
+/// Pure: does `fresh` (source delta metadata read AFTER the blob) still name
+/// the generation of `head`, and does the blob have that generation's size?
+/// Missing metadata (deleted, or now passthrough) is "changed".
+fn same_delta_generation(
+    head: &crate::types::FileMetadata,
+    fresh: Option<&crate::types::FileMetadata>,
+    blob_len: usize,
+) -> bool {
+    use crate::types::StorageInfo;
+    let Some(fresh) = fresh else {
+        return false;
+    };
+    let (
+        StorageInfo::Delta {
+            ref_sha256: head_ref,
+            delta_size: head_size,
+            ..
+        },
+        StorageInfo::Delta {
+            ref_sha256: fresh_ref,
+            delta_size: fresh_size,
+            ..
+        },
+    ) = (&head.storage_info, &fresh.storage_info)
+    else {
+        return false;
+    };
+    head.file_sha256 == fresh.file_sha256
+        && head.created_at == fresh.created_at
+        && (head_ref.is_empty() || head_ref == fresh_ref)
+        && head_size == fresh_size
+        && *fresh_size as usize == blob_len
+}
+
 /// Try the delta fast path. `Ok(None)` = fell back; the caller runs the
 /// existing reconstruct path. Enforces three corruption-defense layers
 /// (gate sha-check, seed sha-assert, post-lock re-gate).
@@ -1015,6 +1049,7 @@ async fn delta_passthrough_copy(
     // closure). The counter must see this fast-path store too — it bypasses the
     // engine store() choke point via put_delta_raw.
     let counter_meta = meta.clone();
+    let meta_generation = source_head.clone();
     let counter_dest_bucket = dest_bucket.clone();
     // Snapshot the dest's PRIOR metadata BEFORE the write — reading it after
     // returns the just-written delta and nets the overwrite to zero.
@@ -1062,6 +1097,21 @@ async fn delta_passthrough_copy(
             let delta_bytes = engine2
                 .get_delta_raw(&src_bucket, &src_prefix2, &src_filename2)
                 .await?;
+            // Generation pin: `meta` comes from the HEAD taken before this
+            // read. Re-read the source metadata AFTER the bytes; if it still
+            // names the HEAD's generation, the bytes are that generation too.
+            // Otherwise the dest would get new bytes with the old sha.
+            let fresh = engine2
+                .delta_meta(&src_bucket, &src_prefix2, &src_filename2)
+                .await
+                .ok();
+            if !same_delta_generation(&meta_generation, fresh.as_ref(), delta_bytes.len()) {
+                return Err(format!(
+                    "{SOURCE_CHANGED_TOKEN}: {src_bucket}/{src_prefix2}/{src_filename2} was \
+                     overwritten after HEAD"
+                )
+                .into());
+            }
             engine2
                 .put_delta_raw(
                     &dest_bucket,
@@ -1268,6 +1318,124 @@ async fn spooled_copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::deltaglider::DeltaGliderEngine;
+    use crate::storage::StorageBackend;
+
+    fn versioned_bytes(seed: u8, n: usize) -> Vec<u8> {
+        // Pseudo-random base (poorly compressible) + a small per-version edit,
+        // so the second version stores as a delta against the first.
+        let mut x: u32 = 0x1234_5678;
+        let mut v: Vec<u8> = (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        for b in v.iter_mut().take(64) {
+            *b = seed;
+        }
+        v
+    }
+
+    /// D7: the fast path ships the CURRENT delta blob with the metadata of the
+    /// HEAD it took earlier. If the source is overwritten in between, the dest
+    /// gets new bytes with the old sha and is unreadable. The copy must fail
+    /// (transient → the retry re-HEADs) instead of writing a broken object.
+    #[tokio::test]
+    async fn delta_fast_path_refuses_a_source_overwritten_after_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<dyn StorageBackend> = Box::new(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine: Arc<DynEngine> = Arc::new(DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &Config::default(),
+            None,
+        ));
+        engine.create_bucket("src").await.unwrap();
+        engine.create_bucket("dst").await.unwrap();
+        let n = 256 * 1024;
+        for (key, seed) in [("p/a.zip", 1u8), ("p/b.zip", 2u8)] {
+            engine
+                .store(
+                    "src",
+                    key,
+                    &versioned_bytes(seed, n),
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let stale_head = engine.head("src", "p/b.zip").await.unwrap();
+        assert!(
+            matches!(
+                stale_head.storage_info,
+                crate::types::StorageInfo::Delta { .. }
+            ),
+            "fixture must store b.zip as a delta, got {:?}",
+            stale_head.storage_info
+        );
+        // Overwrite AFTER the HEAD (the race window).
+        engine
+            .store(
+                "src",
+                "p/b.zip",
+                &versioned_bytes(3, n),
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let request = ObjectTransferRequest {
+            source_bucket: "src",
+            source_key: "p/b.zip",
+            destination_bucket: "dst",
+            destination_key: "p/b.zip",
+            provenance: None,
+            strip_user_metadata_keys: &[],
+            operation: "replication",
+            upload_concurrency: None,
+        };
+        let result = delta_passthrough_copy(&engine, request, &stale_head).await;
+        match result {
+            Err(e) => assert!(
+                is_transient_copy_error(&e.to_string()),
+                "a changed source must be a retryable error, got: {e}"
+            ),
+            Ok(outcome) => {
+                // Either a fallback (None) or a ship: a ship must read back.
+                if outcome.is_some() {
+                    let read = engine.retrieve("dst", "p/b.zip").await;
+                    assert!(
+                        read.is_ok(),
+                        "dest is unreadable after the fast path: {:?}",
+                        read.err()
+                    );
+                    assert_eq!(read.unwrap().0, versioned_bytes(3, n));
+                }
+            }
+        }
+        // With a current HEAD the fast path ships, and the dest reads back.
+        let fresh_head = engine.head("src", "p/b.zip").await.unwrap();
+        let shipped = delta_passthrough_copy(&engine, request, &fresh_head)
+            .await
+            .expect("fresh HEAD must not error");
+        assert!(
+            shipped.is_some(),
+            "unchanged source must take the fast path"
+        );
+        assert_eq!(
+            engine.retrieve("dst", "p/b.zip").await.unwrap().0,
+            versioned_bytes(3, n)
+        );
+    }
 
     /// Round-2 review: `ReplicationObjectCopied` reported the stored delta
     /// size (43 B for a 1 MB object) as `content_length`.
