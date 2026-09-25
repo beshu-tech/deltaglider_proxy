@@ -82,15 +82,13 @@ pub fn rewrite_key(
         // Prefix-swap that happens to be a no-op.
         return Ok(source_key.to_string());
     }
+    // The tail is kept VERBATIM: trimming its leading '/' mapped `p/x` and
+    // `p//x` (two distinct S3 objects) onto one destination key.
     if source_prefix.is_empty() {
-        return Ok(format!(
-            "{}{}",
-            dest_prefix,
-            source_key.trim_start_matches('/')
-        ));
+        return Ok(format!("{dest_prefix}{source_key}"));
     }
     match source_key.strip_prefix(source_prefix) {
-        Some(tail) => Ok(format!("{}{}", dest_prefix, tail.trim_start_matches('/'))),
+        Some(tail) => Ok(format!("{dest_prefix}{tail}")),
         None => Err(PlanError::KeyOutsideSourcePrefix {
             key: source_key.to_string(),
             prefix: source_prefix.to_string(),
@@ -473,8 +471,22 @@ mod tests {
 
     #[test]
     fn rewrite_key_normalizes_slashy_prefixes() {
-        let out = rewrite_key("/ror/builds//", "/lol//", "ror/builds//free/app.zip").unwrap();
+        let out = rewrite_key("/ror/builds//", "/lol//", "ror/builds/free/app.zip").unwrap();
         assert_eq!(out, "lol/free/app.zip");
+    }
+
+    /// D5: `p/x` and `p//x` are two objects (S3 keeps both). The rewrite must
+    /// keep them apart; mapping both to `q/x` makes one replica overwrite the
+    /// other, and a delete of one removes the other's replica.
+    #[test]
+    fn rewrite_key_keeps_double_slash_keys_distinct() {
+        let a = rewrite_key("p/", "q/", "p/x").unwrap();
+        let b = rewrite_key("p/", "q/", "p//x").unwrap();
+        assert_ne!(a, b, "p/x and p//x collide on {a}");
+        assert_eq!(b, "q//x");
+        let a = rewrite_key("", "q/", "x").unwrap();
+        let b = rewrite_key("", "q/", "/x").unwrap();
+        assert_ne!(a, b, "x and /x collide on {a}");
     }
 
     #[test]
@@ -932,6 +944,19 @@ mod rewrite_key_proptests {
             let forward = rewrite_key(&src_prefix, &dst_prefix, &source_key).unwrap();
             let back = rewrite_key(&dst_prefix, &src_prefix, &forward).unwrap();
             prop_assert_eq!(&back, &source_key, "round-trip changed the key: {} -> {} -> {}", source_key, forward, back);
+        }
+
+        /// INJECTIVE: two distinct in-scope keys never share a destination,
+        /// including keys that differ only by empty segments (`//`).
+        #[test]
+        fn rewrite_is_injective(a in "[a/]{1,8}", b in "[a/]{1,8}",
+                                dst in prop::sample::select(vec!["", "q/", "p/"])) {
+            prop_assume!(a != b);
+            let (ka, kb) = (format!("p/{a}"), format!("p/{b}"));
+            prop_assert_ne!(
+                rewrite_key("p/", dst, &ka).unwrap(),
+                rewrite_key("p/", dst, &kb).unwrap()
+            );
         }
 
         /// normalize_prefix is idempotent — a fixpoint.
