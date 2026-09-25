@@ -539,7 +539,7 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         access_key_id: cfg.access_key_id.clone(),
         // Security
         clock_skew_seconds: u64::from(crate::api::auth::clock_skew_secs()),
-        replay_window_secs: env_u64("DGP_REPLAY_WINDOW_SECS", 2),
+        replay_window_secs: crate::api::auth::replay_window().as_secs(),
         rate_limit_max_attempts: env_u64("DGP_RATE_LIMIT_MAX_ATTEMPTS", 100) as u32,
         rate_limit_window_secs: env_u64("DGP_RATE_LIMIT_WINDOW_SECS", 300),
         rate_limit_lockout_secs: env_u64("DGP_RATE_LIMIT_LOCKOUT_SECS", 600),

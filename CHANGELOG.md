@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed — A replayed mutating request is refused for its whole valid life
+
+The replay window was 2 seconds, so a captured PUT or DELETE replayed after
+2 seconds, but inside the 900-second clock-skew tolerance, was accepted. The
+window now defaults to the clock-skew tolerance (`DGP_CLOCK_SKEW_SECONDS`).
+GET and HEAD signatures no longer enter the replay cache, because a replayed
+read has no effect and SDKs repeat read signatures within one second. A
+request that fails still gives its slot back, so SDK retries work.
+`DGP_REPLAY_WINDOW_SECS` still sets another window, and `0` switches the
+check off.
 ### Changed — lifecycle run-now starts the run in the background
 
 `POST /_/api/admin/jobs/lifecycle:<name>/run-now` waited until the rule

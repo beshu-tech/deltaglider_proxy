@@ -565,10 +565,10 @@ SigV4 clock skew tolerance.
 
 ### `replay_window_secs`
 
-SigV4 replay detection window. A request whose signature was already seen within this many seconds is treated as a replay.
+SigV4 replay detection window. A mutating request whose signature was already seen within this many seconds is treated as a replay. The default is the clock skew tolerance (`DGP_CLOCK_SKEW_SECONDS`, 900 s): a signature older than that fails verification anyway, so the default refuses a captured mutation for its whole valid life.
 
 - **Mutating methods (PUT/POST/DELETE/…)** are rejected with `400 Request replay detected`.
-- **Idempotent reads (GET/HEAD)** are *tolerated*: a duplicate within the window is served normally rather than rejected. This is deliberate — boto3/botocore emit **byte-identical SigV4 signatures** for the same request issued (or auto-retried) within one signing second, because SigV4 timestamps have 1-second granularity. A replayed read just re-reads the same bytes, so there is no double-effect to guard against. The signature still stays in the cache, so a captured read signature can't be replayed past the window.
+- **Idempotent reads (GET/HEAD)** are not tracked: their signatures never enter the cache, and a duplicate is served normally. This is deliberate — boto3/botocore emit **byte-identical SigV4 signatures** for the same request issued (or auto-retried) within one signing second, because SigV4 timestamps have 1-second granularity. A replayed read just re-reads the same bytes, so there is no double-effect to guard against.
 - **Presigned URLs** are exempt entirely (they are designed to be reused for their whole expiry).
 - Only a request that **succeeds** (2xx or 3xx) keeps its signature in the cache. When a request fails, for example with `503 SlowDown` while a maintenance job holds the bucket, the proxy forgets its signature, so the SDK can retry it with the same signature inside the same second. A duplicate that arrives while the first request still runs is rejected.
 - A replay rejection is **not** an authentication failure — the signature is valid — so it is audited as `replay_rejected` and does **not** count toward the per-IP brute-force lockout.
@@ -578,7 +578,7 @@ Set `DGP_REPLAY_WINDOW_SECS=0` to disable replay rejection entirely (the window 
 | | |
 |---|---|
 | **Env var** | `DGP_REPLAY_WINDOW_SECS` |
-| **Default** | `2` |
+| **Default** | the value of `DGP_CLOCK_SKEW_SECONDS` (`900`) |
 | **Hot-reload** | No |
 
 ### `secure_cookies`
@@ -1097,7 +1097,7 @@ Tuning knobs for the large-object streaming multipart copy path (replication + l
 | `DGP_SESSION_TTL_HOURS` | 4 | Admin session lifetime |
 | `DGP_CONFIG_ENV_ALLOWLIST` | — | Comma-separated names (a trailing `*` matches a prefix) that an admin apply, import, restore or section PUT may resolve as `${env:NAME}` from the server environment, in addition to the names that the boot config file uses. `DGP_BOOTSTRAP_*`, `DGP_*ENCRYPTION_KEY*` and `DGP_*SECRET*` never match |
 | `DGP_CLOCK_SKEW_SECONDS` | 900 | SigV4 clock skew tolerance |
-| `DGP_REPLAY_WINDOW_SECS` | 2 | SigV4 replay detection window |
+| `DGP_REPLAY_WINDOW_SECS` | clock skew (900) | SigV4 replay detection window for mutating requests (0 disables) |
 | `DGP_SECURE_COOKIES` | true | Require HTTPS for session cookies |
 | `DGP_RATE_LIMIT_MAX_ATTEMPTS` | 100 | Max auth failures before lockout |
 | `DGP_RATE_LIMIT_WINDOW_SECS` | 300 | Rate-limit rolling window |

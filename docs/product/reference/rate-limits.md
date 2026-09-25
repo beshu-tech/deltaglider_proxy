@@ -75,15 +75,15 @@ Caps concurrent in-progress multipart uploads. Each upload holds part data in me
 
 ## Replay detection cache
 
-Caches SigV4 signatures and rejects duplicates within the replay window. This is independent of `DGP_CLOCK_SKEW_SECONDS`, which governs how far a request timestamp may drift from the server clock during SigV4 verification — a different check.
+Caches the SigV4 signatures of mutating requests and rejects duplicates within the replay window. `DGP_CLOCK_SKEW_SECONDS` governs how far a request timestamp may drift from the server clock during SigV4 verification. The replay window defaults to that skew tolerance, because a signature outside the skew tolerance already fails verification: with the default, a captured mutating request is refused for its whole valid life.
 
 | Setting | Default | Env var |
 |---------|---------|---------|
-| Replay window | 2 s | `DGP_REPLAY_WINDOW_SECS` |
+| Replay window | the clock skew tolerance (900 s) | `DGP_REPLAY_WINDOW_SECS` |
 | Clock skew tolerance | 900 s | `DGP_CLOCK_SKEW_SECONDS` |
 | Max cache entries | 500,000 | — |
 
-A duplicate of a **mutating** request (PUT/POST/DELETE) within the window is rejected with 400. A duplicate of an **idempotent read** (GET/HEAD) is tolerated and served — boto3 emits byte-identical signatures for the same request within one signing second, and replaying a read re-reads the same bytes. Replay rejections are not counted toward the auth-failure lockout. `DGP_REPLAY_WINDOW_SECS=0` disables replay rejection entirely. When the cache exceeds 500K entries, expired signatures are evicted first.
+A duplicate of a **mutating** request (PUT/POST/DELETE) within the window is rejected with 400. An **idempotent read** (GET/HEAD) does not enter the cache at all — boto3 emits byte-identical signatures for the same request within one signing second, and replaying a read re-reads the same bytes. Only a request that succeeds keeps its signature in the cache, so an SDK retry of a failed request is not a replay. Replay rejections are not counted toward the auth-failure lockout. `DGP_REPLAY_WINDOW_SECS=0` disables replay rejection entirely. When the cache exceeds 500K entries, the oldest signatures are evicted first. The cache is per instance: behind a load balancer, a replay that reaches another instance is not detected.
 
 ## S3 backend HEAD concurrency
 
@@ -106,7 +106,7 @@ During LIST operations that require per-object metadata, the proxy issues HEAD r
 | `DGP_REQUEST_TIMEOUT_SECS` | 300 | Per-request timeout |
 | `DGP_MAX_MULTIPART_UPLOADS` | 1000 | Max concurrent multipart uploads |
 | `DGP_CLOCK_SKEW_SECONDS` | 900 | SigV4 request-timestamp drift tolerance |
-| `DGP_REPLAY_WINDOW_SECS` | 2 | SigV4 replay detection window (0 disables) |
+| `DGP_REPLAY_WINDOW_SECS` | `DGP_CLOCK_SKEW_SECONDS` (900) | SigV4 replay detection window for mutating requests (0 disables) |
 
 ## Related
 

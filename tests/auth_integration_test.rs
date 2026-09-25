@@ -631,15 +631,9 @@ async fn test_no_auth_header_rejected_when_auth_enabled() {
 
 /// Sending the exact same signed PUT request twice within the replay window
 /// should trigger replay detection.
-///
-/// Security-wave-3 (commit 9f2e085) extended replay detection from
-/// mutating-only methods to all methods including GET/HEAD. The previous
-/// "GET/HEAD exempt" carve-out left captured signed GETs replayable for the
-/// full `DGP_CLOCK_SKEW_SECONDS` window (default 300s). The 2-second default
-/// `DGP_REPLAY_WINDOW_SECS` still tolerates typical retry shapes.
 #[tokio::test]
 async fn test_replay_attack_detected() {
-    // Pin the replay window to the production default. CI sets
+    // Pin a replay window. CI sets
     // `DGP_REPLAY_WINDOW_SECS=0` globally so the bulk-of-tests don't
     // trip on duplicate signatures from assertion-style probes; this
     // test specifically validates the wave-3 contract, so it needs the
@@ -683,6 +677,37 @@ async fn test_replay_attack_detected() {
     );
 }
 
+/// S23: with no `DGP_REPLAY_WINDOW_SECS`, the replay window is the clock-skew
+/// window (900 s). A captured PUT replayed after the old 2 s default, while
+/// its signature is still inside the skew, must be rejected.
+#[tokio::test]
+async fn s23_mutation_replay_after_two_seconds_is_rejected_by_default() {
+    // CI exports DGP_REPLAY_WINDOW_SECS=0 for every test; a blank value
+    // parses as "unset" in the child, so the default applies.
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_REPLAY_WINDOW_SECS", "")
+        .build()
+        .await;
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let path = format!("/{}/s23-replay.txt", server.bucket());
+    let first = build_signed_put(&server.endpoint(), &path, "testkey", "testsecret", &now)
+        .send()
+        .await
+        .unwrap();
+    assert!(first.status().is_success(), "first PUT: {}", first.status());
+    tokio::time::sleep(std::time::Duration::from_millis(3100)).await;
+    let replay = build_signed_put(&server.endpoint(), &path, "testkey", "testsecret", &now)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        replay.status(),
+        StatusCode::BAD_REQUEST,
+        "a PUT replayed after 3 s must be rejected by the default window"
+    );
+}
+
 /// Sending the same signed GET request twice within the replay window must be
 /// TOLERATED, not rejected.
 ///
@@ -690,22 +715,17 @@ async fn test_replay_attack_detected() {
 /// request issued (or auto-retried) within one signing second, because SigV4
 /// timestamps have 1-second granularity. Replaying an idempotent read just
 /// re-reads the same bytes, so the second identical GET is served normally.
-/// The signature still lives in the replay cache, so a captured GET can't be
-/// replayed past the window, and mutating methods (see
-/// `test_replay_attack_detected`) stay strict.
+/// Since S23, GET/HEAD signatures do not enter the replay cache at all;
+/// mutating methods (see `test_replay_attack_detected`) stay strict.
 ///
 /// Regression for beshu-tech/deltaglider_proxy#24: the GET/HEAD exemption that
 /// fixed #7 had been removed in a security wave, which made retry-happy boto3
 /// clients self-DoS via the auth-failure lockout. This locks in read-path
 /// tolerance.
-///
-/// (Historical: security-wave-3 commit 9f2e085 had removed the GET/HEAD exemption,
-/// keeping GET in the cache to close the captured-signed-GET amplifier; #24
-/// keeps the cache entry but tolerates the same-window duplicate read.)
 #[tokio::test]
 async fn test_idempotent_get_replay_within_window_tolerated() {
-    // See test_replay_attack_detected: pin to production default
-    // because CI sets the global to 0 for the other integration tests.
+    // See test_replay_attack_detected: pin a window because CI sets the
+    // global to 0 for the other integration tests.
     let server = TestServer::builder()
         .auth("testkey", "testsecret")
         .env("DGP_REPLAY_WINDOW_SECS", "2")
@@ -716,8 +736,8 @@ async fn test_idempotent_get_replay_within_window_tolerated() {
     let path = format!("/{}", server.bucket());
 
     // Two identical GET requests with the same timestamp produce the same
-    // canonical request, hence an identical SigV4 signature. The second hits
-    // the replay cache, but as an idempotent read it is tolerated, not 400'd.
+    // canonical request, hence an identical SigV4 signature. A read never
+    // enters the replay cache, so the second is served, not 400'd.
     let resp1 = build_signed_get(&server.endpoint(), &path, "testkey", "testsecret", &now)
         .send()
         .await
