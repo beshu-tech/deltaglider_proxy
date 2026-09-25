@@ -36,7 +36,6 @@ import {
 import {
   fetchSessionCredentials,
   storeSessionCredentials,
-  clearSessionCredentials,
 } from './sessionApi';
 import { readStorage, removeStorage, writeStorage } from './safeStorage';
 
@@ -128,7 +127,8 @@ export function disconnect() {
   removeStorage('dg-access-key-id');
   removeStorage('dg-secret-access-key');
   removeStorage('dg-endpoint');
-  clearSessionCredentials();
+  // Local only: the caller clears the server-side copy BEFORE it logs out
+  // (after the logout that request is a 401). See handleLogout in App.tsx.
 }
 
 let cachedClient: S3Client | null = null;
