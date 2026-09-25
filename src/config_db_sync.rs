@@ -560,7 +560,7 @@ pub async fn validate_cas_bucket(
 
     // ── 2. Isolated probe on a random key (fail-closed) ──
     let probe_key = format!(".deltaglider/_cwprobe/{}", uuid::Uuid::new_v4());
-    match probe_conditional_write(client, bucket, &probe_key).await {
+    match crate::coordination::cas_probe::probe_cas(client, bucket, &probe_key).await {
         Ok(true) => {}
         Ok(false) => return Err(CasValidationFailure::NonCas),
         Err(e) => return Err(CasValidationFailure::Indeterminate(e)),
@@ -624,57 +624,6 @@ async fn write_witness(client: &Client, bucket: &str, key: &str, now: i64, overw
     let _ = put.send().await;
 }
 
-/// The isolated two-step conditional-write probe on a caller-owned key.
-/// Three-way outcome: `Ok(true)` = CAS enforced (a real `412`); `Ok(false)` =
-/// DEFINITIVELY unsupported (the condition was silently ignored, or rejected
-/// with a 501/NotImplemented — Backblaze B2's answer); `Err` = the probe
-/// couldn't establish anything (transport error, missing bucket) — callers
-/// must treat that as INDETERMINATE, never as non-CAS, or a network blip
-/// becomes a spurious fatal verdict.
-pub(crate) async fn probe_conditional_write(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-) -> Result<bool, String> {
-    // Step 1: unconditional PUT to establish existence.
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from_static(b"1"))
-        .send()
-        .await
-        .map_err(|e| format!("probe could not write to '{bucket}': {e:?}"))?;
-    // Step 2: re-PUT If-None-Match:* on the SAME key — MUST be 412.
-    let put2 = client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(ByteStream::from_static(b"2"))
-        .if_none_match("*")
-        .send()
-        .await;
-    let supported = match &put2 {
-        Ok(_) => Ok(false), // precondition ignored → silent overwrite
-        Err(e) => {
-            // Classify on status+code only — the debug string is diagnostics.
-            let signal = sdk_error_signal(e);
-            if is_precondition_failed(&signal) {
-                Ok(true)
-            } else if is_not_implemented(&signal) {
-                Ok(false) // loud rejection of the conditional (B2-style 501)
-            } else {
-                Err(format!(
-                    "probe re-PUT to '{bucket}' failed with a non-conditional error ({signal}): {e:?}"
-                ))
-            }
-        }
-    };
-    // Best-effort cleanup.
-    let _ = client.delete_object().bucket(bucket).key(key).send().await;
-    supported
-}
-
 /// Fixed object key for the coordination-bucket validation witness.
 const COORDINATION_WITNESS_KEY: &str = ".deltaglider/coordination-witness.json";
 /// Re-validate a witnessed bucket only after this age — a huge default so normal
@@ -708,13 +657,12 @@ fn witness_is_fresh(validated_at: i64, now: i64, max_age: i64) -> bool {
     now >= validated_at && now - validated_at < max_age
 }
 
-/// Best-effort stable-ish node identifier for witness provenance (hostname or a
-/// random fallback). Purely diagnostic — never used for coordination decisions.
+/// Node identifier for witness provenance: THE durable node id the leases
+/// and locks use (`DGP_NODE_ID`, `HOSTNAME`, else the persisted id), so a
+/// witness names the same node they do. Purely diagnostic.
 fn node_id() -> String {
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("node-{}", uuid::Uuid::new_v4()))
+    let db = crate::config_db::config_db_path();
+    crate::coordination::durable_node_id(db.parent().unwrap_or_else(|| std::path::Path::new(".")))
 }
 
 /// Compact classification signal from a typed SDK error: HTTP status + error

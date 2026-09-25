@@ -20,7 +20,7 @@ pub const CAPABILITY_DOC_URL: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum VerifiedVia {
-    /// Live two-step `If-None-Match:*` probe ran this boot.
+    /// Live `If-None-Match` + `If-Match` probe (`cas_probe`) ran this boot.
     Probe,
 }
 
