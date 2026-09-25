@@ -62,7 +62,8 @@ pub enum UrlValidationError {
 /// **Important**: this does NOT resolve DNS. A hostile DNS A record
 /// pointing `legit.example.com` at `169.254.169.254` would still pass this
 /// cheap first-line check — that DNS-rebinding gap is closed at connect time by
-/// [`SsrfGuardedResolver`], which the OIDC + webhook clients install. Callers
+/// [`SsrfGuardedResolver`], which the OIDC + webhook clients install (the S3
+/// backend client installs [`SdkSsrfGuardedResolver`]). Callers
 /// pair this with `redirect(Policy::none())` and the guarded resolver.
 pub fn validate_outbound_url(url: &str, kind: UrlKind) -> Result<(), UrlValidationError> {
     if url.is_empty() {
@@ -87,7 +88,11 @@ pub fn validate_outbound_url(url: &str, kind: UrlKind) -> Result<(), UrlValidati
 }
 
 fn check_host(host: &str, kind: UrlKind) -> Result<(), UrlValidationError> {
-    let normalised = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    // A trailing dot names the same host (`localhost.` == `localhost`).
+    let normalised = host
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
 
     let name_hit = FORBIDDEN_HOSTNAMES.iter().any(|h| normalised == *h);
     let suffix_hit = FORBIDDEN_SUFFIXES.iter().any(|s| normalised.ends_with(s));
@@ -105,9 +110,56 @@ fn check_host(host: &str, kind: UrlKind) -> Result<(), UrlValidationError> {
         if !ip_is_acceptable(ip, kind) {
             return Err(UrlValidationError::ForbiddenIp(host.to_string()));
         }
+    } else if ips_named_in_hostname(&normalised)
+        .into_iter()
+        .any(|ip| !ip_is_acceptable(ip, kind))
+    {
+        // `169.254.169.254.nip.io` resolves to the IP it spells. The
+        // resolve-time guard catches it too; refusing it here gives the
+        // operator a clear error at config time.
+        return Err(UrlValidationError::ForbiddenIp(host.to_string()));
     }
 
     Ok(())
+}
+
+/// Public wildcard-DNS services that answer with the address written in
+/// the name, in dotted, dashed or hex form.
+const WILDCARD_IP_DNS_SUFFIXES: &[&str] = &["nip.io", "sslip.io", "xip.io", "traefik.me"];
+
+/// Addresses a hostname spells out: any four consecutive decimal labels
+/// (`10.0.0.1.example.com`), plus the dashed (`app-10-0-0-1`, IPv6 `--1`)
+/// and hex (`0a000001`) label forms under a known wildcard-DNS suffix.
+fn ips_named_in_hostname(host: &str) -> Vec<IpAddr> {
+    let labels: Vec<&str> = host.split('.').collect();
+    let mut out = Vec::new();
+    for w in labels.windows(4) {
+        if let Ok(ip) = w.join(".").parse::<Ipv4Addr>() {
+            out.push(IpAddr::V4(ip));
+        }
+    }
+    let wildcard = WILDCARD_IP_DNS_SUFFIXES
+        .iter()
+        .any(|s| host == *s || host.ends_with(&format!(".{s}")));
+    if wildcard {
+        for label in &labels {
+            let parts: Vec<&str> = label.split('-').collect();
+            if parts.len() >= 4 {
+                if let Ok(ip) = parts[parts.len() - 4..].join(".").parse::<Ipv4Addr>() {
+                    out.push(IpAddr::V4(ip));
+                }
+            }
+            if let Ok(ip) = label.replace('-', ":").parse::<Ipv6Addr>() {
+                out.push(IpAddr::V6(ip));
+            }
+            if label.len() == 8 {
+                if let Ok(n) = u32::from_str_radix(label, 16) {
+                    out.push(IpAddr::V4(Ipv4Addr::from(n)));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Bucket-name policy: reject names that parse as an IP in any common
@@ -280,16 +332,40 @@ pub(crate) fn ip_is_acceptable(ip: IpAddr, kind: UrlKind) -> bool {
     matches!(kind, UrlKind::BackendDev)
 }
 
+/// AWS IMDS over IPv6 (Nitro instances).
+const AWS_IMDS_V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
+
 fn ip_is_metadata_service(ip: IpAddr) -> bool {
     match ip {
         // AWS IMDSv1/IMDSv2, Azure IMDS, GCP metadata server (all same v4).
         IpAddr::V4(v4) => v4.octets() == [169, 254, 169, 254],
-        // IPv4-mapped form.
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(|m| m.octets() == [169, 254, 169, 254])
-            .unwrap_or(false),
+        IpAddr::V6(v6) => {
+            v6 == AWS_IMDS_V6
+                || embedded_ipv4(v6).is_some_and(|m| m.octets() == [169, 254, 169, 254])
+        }
     }
+}
+
+/// The IPv4 address an IPv6 address carries, for every transition form
+/// that routes to it: IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible
+/// (`::a.b.c.d`), NAT64 well-known prefix (`64:ff9b::/96`), 6to4
+/// (`2002::/16`) and Teredo (`2001::/32`, client address XOR-obfuscated).
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = ip.segments();
+    let v4 = |hi: u16, lo: u16| Ipv4Addr::from(((hi as u32) << 16) | lo as u32);
+    if let Some(m) = ip.to_ipv4_mapped() {
+        return Some(m);
+    }
+    if s[..6] == [0; 6] || (s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0; 4]) {
+        return Some(v4(s[6], s[7]));
+    }
+    if s[0] == 0x2002 {
+        return Some(v4(s[1], s[2]));
+    }
+    if s[0] == 0x2001 && s[1] == 0 {
+        return Some(v4(!s[6], !s[7]));
+    }
+    None
 }
 
 fn ipv4_is_private(ip: Ipv4Addr) -> bool {
@@ -301,6 +377,8 @@ fn ipv4_is_private(ip: Ipv4Addr) -> bool {
         || ip.is_unspecified()
         || ip.is_multicast()
         || ip.is_private()
+        // 0.0.0.0/8 — "this network"; Linux routes it to the local host
+        || o[0] == 0
         // 100.64.0.0/10 — CGNAT (RFC 6598)
         || (o[0] == 100 && (o[1] & 0xC0) == 64)
         // 192.0.0.0/24 — IETF reserved
@@ -317,8 +395,11 @@ fn ipv6_is_private(ip: Ipv6Addr) -> bool {
         || (ip.segments()[0] & 0xfe00) == 0xfc00
         // fe80::/10 — link-local
         || (ip.segments()[0] & 0xffc0) == 0xfe80
-        // IPv4-mapped (::ffff:0:0/96) — reject; let the IPv4 path handle it
-        || ip.to_ipv4_mapped().is_some()
+        // NAT64 local-use prefix (RFC 8215) — never globally routed
+        || (ip.segments()[0] == 0x64 && ip.segments()[1] == 0xff9b && ip.segments()[2] == 1)
+        // Transition forms (mapped, compatible, NAT64, 6to4, Teredo) are as
+        // private as the IPv4 address they carry.
+        || embedded_ipv4(ip).is_some_and(ipv4_is_private)
 }
 
 /// Hard-coded allowlist of JWT signing algorithms we accept. RFC 7518
@@ -386,6 +467,110 @@ impl reqwest::dns::Resolve for SsrfGuardedResolver {
             }
             let iter: reqwest::dns::Addrs = Box::new(safe.into_iter());
             Ok(iter)
+        })
+    }
+}
+
+/// Does the S3 client's resolver guard `name`? It guards the endpoint
+/// host and its subdomains (virtual-hosted-style `bucket.host`). Any other
+/// name is an HTTP(S) proxy host from the environment: the operator put it
+/// there, and it often lives in private space.
+pub(crate) fn sdk_resolver_guards_name(endpoint_host: &str, name: &str) -> bool {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    name == endpoint_host || name.ends_with(&format!(".{endpoint_host}"))
+}
+
+/// Is a RESOLVED address for an S3 backend endpoint refused?
+///
+/// Backend endpoints are admin-configured, and on-prem MinIO/Ceph behind
+/// internal DNS (`https://minio.corp` → 10.0.0.5) is a normal deployment. So
+/// a resolved name may point at private space; only the cloud-credential
+/// targets are refused: link-local (169.254.0.0/16 incl. IMDS, fe80::/10),
+/// AWS IPv6 IMDS, and their IPv4-embedded IPv6 forms. `BackendDev` refuses
+/// metadata only. Other kinds keep the full [`ip_is_acceptable`] policy.
+pub(crate) fn resolved_backend_ip_refused(ip: IpAddr, kind: UrlKind) -> bool {
+    match kind {
+        UrlKind::Backend => ip_is_metadata_service(ip) || ip_is_link_local(ip),
+        UrlKind::BackendDev => ip_is_metadata_service(ip),
+        UrlKind::Oidc | UrlKind::Webhook => !ip_is_acceptable(ip, kind),
+    }
+}
+
+fn ip_is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80
+                || embedded_ipv4(v6).is_some_and(|m| m.is_link_local())
+        }
+    }
+}
+
+fn refused_resolution_message(host: &str, refused: &[IpAddr], kind: UrlKind) -> String {
+    let addrs: Vec<String> = refused.iter().map(IpAddr::to_string).collect();
+    let fix = match kind {
+        UrlKind::Backend | UrlKind::BackendDev => {
+            "Cloud-metadata and link-local addresses are never allowed for an S3 endpoint; \
+             `allow_local: true` does NOT permit them. Point the endpoint's DNS at the \
+             storage server's real address."
+        }
+        UrlKind::Oidc | UrlKind::Webhook => {
+            "Private, loopback and metadata addresses are not allowed for this URL."
+        }
+    };
+    format!(
+        "SSRF guard: '{host}' resolved only to refused address(es) [{}]. {fix}",
+        addrs.join(", ")
+    )
+}
+
+/// DNS resolver for the AWS SDK S3 client: the S3 twin of
+/// [`SsrfGuardedResolver`]. `validate_outbound_url` checks only the
+/// endpoint TEXT, so an endpoint name whose A/AAAA record points at IMDS
+/// (or later rebinds there) passed. This resolver drops every address that
+/// [`resolved_backend_ip_refused`] refuses for the endpoint host, so the
+/// connection fails closed. Literal-IP endpoints never reach a resolver;
+/// the text check covers them.
+#[derive(Debug, Clone)]
+pub struct SdkSsrfGuardedResolver {
+    kind: UrlKind,
+    /// Lowercase endpoint host, no trailing dot.
+    endpoint_host: String,
+}
+
+impl SdkSsrfGuardedResolver {
+    pub fn new(kind: UrlKind, endpoint_host: &str) -> Self {
+        Self {
+            kind,
+            endpoint_host: endpoint_host.trim_end_matches('.').to_ascii_lowercase(),
+        }
+    }
+}
+
+impl aws_smithy_runtime_api::client::dns::ResolveDns for SdkSsrfGuardedResolver {
+    fn resolve_dns<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> aws_smithy_runtime_api::client::dns::DnsFuture<'a> {
+        use aws_smithy_runtime_api::client::dns::{DnsFuture, ResolveDnsError};
+        DnsFuture::new(async move {
+            let ips: Vec<IpAddr> = tokio::net::lookup_host((name, 0))
+                .await
+                .map_err(ResolveDnsError::new)?
+                .map(|sa| sa.ip())
+                .collect();
+            if !sdk_resolver_guards_name(&self.endpoint_host, name) {
+                return Ok(ips);
+            }
+            let (refused, safe): (Vec<IpAddr>, Vec<IpAddr>) = ips
+                .into_iter()
+                .partition(|ip| resolved_backend_ip_refused(*ip, self.kind));
+            if safe.is_empty() {
+                return Err(ResolveDnsError::new(std::io::Error::other(
+                    refused_resolution_message(name, &refused, self.kind),
+                )));
+            }
+            Ok(safe)
         })
     }
 }
@@ -462,6 +647,66 @@ mod tests {
             assert!(
                 validate_outbound_url(u, UrlKind::Backend).is_err(),
                 "should reject: {u}"
+            );
+        }
+    }
+
+    /// S18: forms that reached IMDS / private space past the literal check.
+    #[test]
+    fn validate_url_blocks_ssrf_bypass_forms() {
+        let cases = [
+            // Trailing dot: the same host as the dotless name.
+            "https://localhost./",
+            "https://metadata.google.internal./",
+            "https://foo.internal./",
+            // Wildcard DNS that answers with the IP written in the name.
+            "https://169.254.169.254.nip.io/",
+            "https://10.0.0.1.sslip.io/",
+            "https://app.127-0-0-1.sslip.io/",
+            "https://a9fea9fe.nip.io/",
+            // IPv6 forms that carry an IPv4 address.
+            "https://[64:ff9b::a9fe:a9fe]/", // NAT64 well-known prefix
+            "https://[64:ff9b:1::a9fe:a9fe]/", // NAT64 local-use prefix
+            "https://[2002:a9fe:a9fe::]/",   // 6to4
+            "https://[::a9fe:a9fe]/",        // IPv4-compatible
+            "https://[2002:0a00:0001::]/",   // 6to4 of 10.0.0.1
+            // AWS IMDS over IPv6.
+            "https://[fd00:ec2::254]/",
+            // 0.0.0.0/8 "this network".
+            "https://0.1.2.3/",
+        ];
+        for u in cases {
+            assert!(
+                validate_outbound_url(u, UrlKind::Backend).is_err(),
+                "should reject: {u}"
+            );
+        }
+        // Metadata stays blocked even in dev, in every carrier form.
+        for u in [
+            "http://[fd00:ec2::254]/",
+            "http://[64:ff9b::a9fe:a9fe]/",
+            "http://[2002:a9fe:a9fe::]/",
+            "http://[::a9fe:a9fe]/",
+            "http://169.254.169.254.nip.io/",
+        ] {
+            assert!(
+                validate_outbound_url(u, UrlKind::BackendDev).is_err(),
+                "dev must still reject metadata: {u}"
+            );
+        }
+        // Dev keeps its local targets.
+        assert!(validate_outbound_url("http://localhost.:9000/", UrlKind::BackendDev).is_ok());
+        // Public names with digits stay usable.
+        for u in [
+            "https://s3.eu-central-1.amazonaws.com/",
+            "https://fsn1.your-objectstorage.com/",
+            "https://s3.us-west-000.backblazeb2.com/",
+            "https://8.8.8.8.example.com/",
+            "https://[2001:db9::1]/",
+        ] {
+            assert!(
+                validate_outbound_url(u, UrlKind::Backend).is_ok(),
+                "should accept: {u}"
             );
         }
     }
@@ -653,6 +898,143 @@ mod tests {
         // A public literal → at least one acceptable addr → Ok.
         let ok = resolve("8.8.8.8").await.expect("public addr accepted");
         assert!(ok.count() >= 1);
+    }
+
+    #[test]
+    fn resolved_backend_ip_policy_table() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        // (address, refused for Backend, refused for BackendDev)
+        for (a, backend, dev) in [
+            ("169.254.169.254", true, true),
+            ("169.254.10.20", true, false),
+            ("fe80::1", true, false),
+            ("fd00:ec2::254", true, true),
+            ("64:ff9b::a9fe:a9fe", true, true),
+            ("2002:a9fe:a9fe::", true, true),
+            ("::a9fe:a9fe", true, true),
+            ("::ffff:169.254.169.254", true, true),
+            ("64:ff9b::a9fe:0101", true, false),
+            ("10.0.0.5", false, false),
+            ("172.16.0.1", false, false),
+            ("127.0.0.1", false, false),
+            ("::1", false, false),
+            ("fd12::5", false, false),
+            ("8.8.8.8", false, false),
+        ] {
+            assert_eq!(
+                resolved_backend_ip_refused(ip(a), UrlKind::Backend),
+                backend,
+                "{a}"
+            );
+            assert_eq!(
+                resolved_backend_ip_refused(ip(a), UrlKind::BackendDev),
+                dev,
+                "{a}"
+            );
+        }
+        // OIDC/webhook keep the strict policy.
+        assert!(resolved_backend_ip_refused(ip("10.0.0.5"), UrlKind::Oidc));
+        assert!(resolved_backend_ip_refused(
+            ip("127.0.0.1"),
+            UrlKind::Webhook
+        ));
+    }
+
+    #[test]
+    fn sdk_resolver_guards_endpoint_host_and_subdomains_only() {
+        assert!(sdk_resolver_guards_name("s3.example.com", "s3.example.com"));
+        assert!(sdk_resolver_guards_name(
+            "s3.example.com",
+            "S3.Example.com."
+        ));
+        assert!(sdk_resolver_guards_name(
+            "s3.example.com",
+            "releases.s3.example.com"
+        ));
+        // A proxy host (or a look-alike) is not the endpoint.
+        assert!(!sdk_resolver_guards_name("s3.example.com", "proxy.corp"));
+        assert!(!sdk_resolver_guards_name(
+            "s3.example.com",
+            "evils3.example.com"
+        ));
+    }
+
+    #[tokio::test]
+    async fn sdk_resolver_rejects_forbidden_addresses_for_the_endpoint() {
+        use aws_smithy_runtime_api::client::dns::ResolveDns;
+        // A literal resolves to itself via lookup_host: no real DNS needed.
+        let strict = SdkSsrfGuardedResolver::new(UrlKind::Backend, "169.254.169.254");
+        let err = strict.resolve_dns("169.254.169.254").await.unwrap_err();
+        let msg = std::error::Error::source(&err).unwrap().to_string();
+        assert!(msg.contains("'169.254.169.254'"), "{msg}");
+        assert!(msg.contains("[169.254.169.254]"), "{msg}");
+        assert!(msg.contains("allow_local: true` does NOT permit"), "{msg}");
+        // On-prem storage behind internal DNS: a private answer is fine.
+        for ip in ["10.0.0.5", "192.168.1.9", "127.0.0.1", "fd12::5"] {
+            let r = SdkSsrfGuardedResolver::new(UrlKind::Backend, ip);
+            assert!(r.resolve_dns(ip).await.is_ok(), "private answer {ip}");
+        }
+        for ip in ["169.254.1.1", "fe80::1", "fd00:ec2::254"] {
+            let r = SdkSsrfGuardedResolver::new(UrlKind::Backend, ip);
+            assert!(r.resolve_dns(ip).await.is_err(), "metadata/link-local {ip}");
+        }
+        // Dev allows private space but never metadata.
+        let dev = SdkSsrfGuardedResolver::new(UrlKind::BackendDev, "10.0.0.1");
+        assert!(dev.resolve_dns("10.0.0.1").await.is_ok());
+        let dev = SdkSsrfGuardedResolver::new(UrlKind::BackendDev, "169.254.169.254");
+        assert!(dev.resolve_dns("169.254.169.254").await.is_err());
+        // A non-endpoint name (an env proxy) passes through unfiltered.
+        let strict = SdkSsrfGuardedResolver::new(UrlKind::Backend, "s3.example.com");
+        assert!(strict.resolve_dns("10.0.0.1").await.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod outbound_url_proptests {
+    use super::{validate_outbound_url, UrlKind};
+    use proptest::prelude::*;
+    use std::net::Ipv4Addr;
+
+    fn forbidden_v4() -> impl Strategy<Value = Ipv4Addr> {
+        prop_oneof![
+            Just(Ipv4Addr::new(169, 254, 169, 254)),
+            any::<[u8; 3]>().prop_map(|o| Ipv4Addr::new(10, o[0], o[1], o[2])),
+            any::<[u8; 3]>().prop_map(|o| Ipv4Addr::new(127, o[0], o[1], o[2])),
+            any::<[u8; 2]>().prop_map(|o| Ipv4Addr::new(192, 168, o[0], o[1])),
+        ]
+    }
+
+    proptest! {
+        /// A forbidden IPv4 address stays forbidden in every carrier form:
+        /// literal, trailing dot, wildcard DNS name, and each IPv6 embedding.
+        #[test]
+        fn forbidden_v4_rejected_in_every_carrier(ip in forbidden_v4(), sub in "[a-z]{1,8}") {
+            let [a, b, c, d] = ip.octets();
+            let hex = u32::from(ip);
+            let (hi, lo) = (hex >> 16, hex & 0xffff);
+            let urls = [
+                format!("https://{ip}/"),
+                format!("https://{ip}./"),
+                format!("https://{ip}.nip.io/"),
+                format!("https://{sub}.{ip}.sslip.io/"),
+                format!("https://{sub}-{a}-{b}-{c}-{d}.sslip.io/"),
+                format!("https://{hex:08x}.nip.io/"),
+                format!("https://[::ffff:{ip}]/"),
+                format!("https://[64:ff9b::{hi:x}:{lo:x}]/"),
+                format!("https://[2002:{hi:x}:{lo:x}::1]/"),
+                format!("https://[::{hi:x}:{lo:x}]/"),
+            ];
+            for u in urls {
+                prop_assert!(validate_outbound_url(&u, UrlKind::Backend).is_err(), "accepted {}", u);
+            }
+        }
+
+        /// The validator never panics.
+        #[test]
+        fn outbound_never_panics(s in ".{0,120}") {
+            let _ = validate_outbound_url(&s, UrlKind::Backend);
+            let _ = validate_outbound_url(&format!("https://{s}/"), UrlKind::BackendDev);
+        }
     }
 }
 

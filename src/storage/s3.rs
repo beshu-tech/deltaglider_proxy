@@ -128,6 +128,26 @@ fn resolve_created_at(meta_value: Option<String>, fallback: DateTime<Utc>) -> Da
         .unwrap_or(fallback)
 }
 
+/// The SDK's default HTTPS client (hyper 1 + rustls/aws-lc, env proxy
+/// config, SDK connector settings), with an SSRF-guarded DNS resolver.
+/// Mirrors `aws_smithy_runtime::client::http::default_https_client`.
+fn ssrf_guarded_http_client(
+    resolver: crate::security::SdkSsrfGuardedResolver,
+) -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    use aws_smithy_http_client::{proxy::ProxyConfig, tls, Builder, ConnectorBuilder};
+    Builder::new().build_with_connector_fn(move |settings, runtime_components| {
+        let mut conn = ConnectorBuilder::default().tls_provider(tls::Provider::Rustls(
+            tls::rustls_provider::CryptoMode::AwsLc,
+        ));
+        conn.set_connector_settings(settings.cloned());
+        if let Some(rc) = runtime_components {
+            conn.set_sleep_impl(rc.sleep_impl());
+        }
+        conn.set_proxy_config(Some(ProxyConfig::from_env()));
+        conn.build_with_resolver(resolver.clone())
+    })
+}
+
 /// Operation context for S3 error classification.
 #[derive(Debug, Clone, Copy)]
 enum S3Op {
@@ -401,6 +421,20 @@ impl S3Backend {
                 ))
             })?;
             s3_config_builder = s3_config_builder.endpoint_url(ep);
+            // The text check above cannot see DNS: a name whose record
+            // points at IMDS (or rebinds there) passed. Private answers stay
+            // allowed: on-prem storage behind internal DNS is normal.
+            if let Some(host) = reqwest::Url::parse(ep)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+            {
+                s3_config_builder = s3_config_builder.http_client(ssrf_guarded_http_client(
+                    crate::security::SdkSsrfGuardedResolver::new(
+                        kind,
+                        host.trim_matches(['[', ']']),
+                    ),
+                ));
+            }
         }
 
         Ok(Client::from_conf(s3_config_builder.build()))
@@ -3688,6 +3722,57 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("DGP_BACKEND_ALLOW_LOCAL", v) },
             None => unsafe { std::env::remove_var("DGP_BACKEND_ALLOW_LOCAL") },
         };
+    }
+
+    /// S18: the S3 client resolves its endpoint through the SSRF guard. A
+    /// name that resolves to a refused address never gets a connection. The
+    /// strict (OIDC) policy refuses loopback, so it proves the wiring; the
+    /// Backend policy allows a private/loopback answer (on-prem MinIO).
+    #[tokio::test]
+    async fn s3_client_endpoint_resolution_goes_through_the_ssrf_guard() {
+        use crate::security::{SdkSsrfGuardedResolver, UrlKind};
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use std::sync::Arc;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                counter.fetch_add(1, SeqCst);
+                drop(sock);
+            }
+        });
+        let client_for = |kind| {
+            let conf = aws_sdk_s3::config::Builder::new()
+                .behavior_version(BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("us-east-1"))
+                .credentials_provider(Credentials::new("a", "b", None, None, "t"))
+                .force_path_style(true)
+                .endpoint_url(format!("http://localhost:{port}"))
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+                .http_client(ssrf_guarded_http_client(SdkSsrfGuardedResolver::new(
+                    kind,
+                    "localhost",
+                )))
+                .build();
+            Client::from_conf(conf)
+        };
+        let err = client_for(UrlKind::Oidc)
+            .list_buckets()
+            .send()
+            .await
+            .expect_err("the guard must refuse a loopback endpoint");
+        assert_eq!(
+            accepted.load(SeqCst),
+            0,
+            "no connection may reach a forbidden address: {err:?}"
+        );
+        let _ = client_for(UrlKind::Backend).list_buckets().send().await;
+        assert!(
+            accepted.load(SeqCst) >= 1,
+            "Backend policy must connect to a private answer"
+        );
     }
 
     /// With `DGP_BACKEND_ALLOW_LOCAL=true`, http:// + private IPs are
