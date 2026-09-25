@@ -67,7 +67,9 @@ async fn atomic_write_with_metadata(
 /// Materialise `src` at `dest` cheaply: hardlink (O(1), no extra bytes) when on
 /// the same filesystem, byte-copy as fallback across fs boundaries (EXDEV).
 /// `dest` is removed first (hard_link refuses an existing target — the caller may
-/// hand a pre-created spool temp). Shared by `get_reference_to_file` and
+/// hand a pre-created spool temp). READ side only (`get_reference_to_file`):
+/// the spool gets a snapshot inode that a later reference rename never
+/// touches. Never use it to WRITE a stored object — see
 /// `put_reference_from_file`.
 async fn hardlink_or_copy(src: &Path, dest: &Path) -> Result<(), StorageError> {
     let _ = fs::remove_file(dest).await;
@@ -903,8 +905,10 @@ impl StorageBackend for FilesystemBackend {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).await?;
         }
-        hardlink_or_copy(source_path, &dest).await?;
-        xattr_meta::write_metadata(&dest, metadata).await
+        // Copy to a temp file + xattr + fsync + rename. Delete-then-copy lost
+        // the baseline on a failed or short copy, and a hardlink shared the
+        // inode (and so the xattr) with the caller's source file.
+        atomic_copy_with_metadata(source_path, &dest, metadata).await
     }
 
     async fn put_reference_metadata(
@@ -2414,5 +2418,77 @@ mod tests {
             .await
             .expect_err("missing reference must error");
         assert!(matches!(err, StorageError::NotFound(_)));
+    }
+
+    fn ref_meta(len: usize) -> FileMetadata {
+        FileMetadata::new_reference(
+            "reference.bin".into(),
+            "source.bin".into(),
+            "0".repeat(64),
+            "0".repeat(32),
+            len as u64,
+            None,
+        )
+    }
+
+    /// D2: a failed replace must leave the old reference intact. Before, the
+    /// old file was deleted first, then the copy failed (or stopped short on
+    /// a full disk across filesystems) and the deltaspace lost its baseline.
+    #[tokio::test]
+    async fn put_reference_from_file_failure_keeps_old_reference() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        backend
+            .put_reference("bucket", "d", b"old-baseline", &ref_meta(12))
+            .await
+            .expect("put reference");
+        let missing = tmp.path().join("no-such-spool-file");
+        backend
+            .put_reference_from_file("bucket", "d", &missing, &ref_meta(3))
+            .await
+            .expect_err("unreadable source must fail");
+        assert_eq!(
+            backend
+                .get_reference("bucket", "d")
+                .await
+                .expect("still there"),
+            b"old-baseline"
+        );
+    }
+
+    /// D2: the stored reference must be its own file. A hardlink shared the
+    /// inode with the source, so a later write to the source (or the xattr
+    /// write for the reference) changed both.
+    #[tokio::test]
+    async fn put_reference_from_file_does_not_share_the_source_inode() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        let src = tmp.path().join("spool.bin");
+        fs::write(&src, b"baseline").await.expect("write src");
+        backend
+            .put_reference_from_file("bucket", "d", &src, &ref_meta(8))
+            .await
+            .expect("put from file");
+        // Overwrite the source in place (same inode).
+        {
+            use std::io::{Seek, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&src).unwrap();
+            f.seek(std::io::SeekFrom::Start(0)).unwrap();
+            f.write_all(b"XXXXXXXX").unwrap();
+        }
+        assert_eq!(
+            backend.get_reference("bucket", "d").await.expect("get"),
+            b"baseline"
+        );
+        assert!(
+            xattr::get(&src, xattr_meta::XATTR_NAME).unwrap().is_none(),
+            "reference metadata must not land on the source file"
+        );
     }
 }
