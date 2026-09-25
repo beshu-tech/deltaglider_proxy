@@ -390,3 +390,53 @@ async fn test_admin_writes_refuse_cross_origin_browser_requests() {
     let r = admin.post(&url).json(&body).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 200, "non-browser client");
 }
+
+/// D12: moving folder `f/` into its own subfolder `f/sub/` maps `f/1` onto
+/// `f/sub/1`, which is itself a selected source not yet copied. The copy
+/// loop overwrote it, then the delete phase removed it: `f/sub/1`'s bytes
+/// were lost. A plan whose destination is another selected source must be
+/// refused before anything is written.
+#[tokio::test]
+async fn test_move_into_own_subfolder_is_refused() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let bucket = server.bucket();
+    for (key, body) in [("f/1", "top"), ("f/sub/1", "nested")] {
+        http.put(format!("{ep}/{bucket}/{key}"))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+    }
+    let body = json!({
+        "source_bucket": bucket,
+        "dest_bucket": bucket,
+        "dest_prefix": "f/sub/",
+        "items": [
+            { "source_key": "f/1", "relative": "1" },
+            { "source_key": "f/sub/1", "relative": "sub/1" }
+        ]
+    });
+    for op in ["move", "copy"] {
+        let r = admin
+            .post(format!("{ep}/_/api/admin/objects/{op}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 409, "{op}");
+    }
+    for (key, want) in [("f/1", "top"), ("f/sub/1", "nested")] {
+        let got = http
+            .get(format!("{ep}/{bucket}/{key}"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(got, want, "{key} must be intact");
+    }
+}

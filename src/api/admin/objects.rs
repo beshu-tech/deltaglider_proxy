@@ -171,6 +171,59 @@ fn detect_collisions(items: &[CopyItem], dest_prefix: &str) -> Vec<String> {
         .collect()
 }
 
+/// First destination key (same bucket) that is ANOTHER item's source key.
+/// The loop copies items in order, so such a destination overwrites a source
+/// before it is read, and a move then deletes it (D12: moving `f/` into
+/// `f/sub/`). An item whose destination is its own source is the
+/// same-location case, handled in the delete loop.
+fn dest_overwrites_other_source(
+    items: &[CopyItem],
+    source_bucket: &str,
+    dest_bucket: &str,
+    dest_prefix: &str,
+) -> Option<String> {
+    if source_bucket != dest_bucket {
+        return None;
+    }
+    let sources: std::collections::HashSet<&str> =
+        items.iter().map(|i| i.source_key.as_str()).collect();
+    items.iter().find_map(|it| {
+        let dk = dest_key(dest_prefix, &it.relative);
+        (dk != *it.source_key && sources.contains(dk.as_str())).then_some(dk)
+    })
+}
+
+/// Plan checks shared by copy and move: no two items to one destination, and
+/// no destination that is another selected source.
+fn validate_plan(
+    items: &[CopyItem],
+    source_bucket: &str,
+    dest_bucket: &str,
+    dest_prefix: &str,
+) -> Result<(), (StatusCode, String)> {
+    let collisions = detect_collisions(items, dest_prefix);
+    if !collisions.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "{} destination key(s) would overwrite each other (e.g. {:?})",
+                collisions.len(),
+                collisions.first().cloned().unwrap_or_default()
+            ),
+        ));
+    }
+    if let Some(k) = dest_overwrites_other_source(items, source_bucket, dest_bucket, dest_prefix) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "destination {k:?} is also a selected source: the operation would overwrite \
+                 it before it is copied (is the destination inside the selection?)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // POST /_/api/admin/objects/copy
 // ---------------------------------------------------------------------------
@@ -221,17 +274,12 @@ pub async fn copy_objects(
         ));
     }
 
-    let collisions = detect_collisions(&req.items, &req.dest_prefix);
-    if !collisions.is_empty() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "{} destination key(s) would overwrite each other (e.g. {:?})",
-                collisions.len(),
-                collisions.first().cloned().unwrap_or_default()
-            ),
-        ));
-    }
+    validate_plan(
+        &req.items,
+        &req.source_bucket,
+        &req.dest_bucket,
+        &req.dest_prefix,
+    )?;
 
     let s3 = state.s3_state.clone();
     let res = run_copy_loop(&s3, &req).await;
@@ -381,17 +429,12 @@ pub async fn move_objects(
         ));
     }
 
-    let collisions = detect_collisions(&req.items, &req.dest_prefix);
-    if !collisions.is_empty() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "{} destination key(s) would overwrite each other (e.g. {:?})",
-                collisions.len(),
-                collisions.first().cloned().unwrap_or_default()
-            ),
-        ));
-    }
+    validate_plan(
+        &req.items,
+        &req.source_bucket,
+        &req.dest_bucket,
+        &req.dest_prefix,
+    )?;
 
     let s3 = state.s3_state.clone();
     let copy_req = CopyRequest {
