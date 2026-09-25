@@ -588,6 +588,81 @@ async fn test_batch_delete_enforces_prefix_carveout() {
     );
 }
 
+/// Review S14: the per-key checks inside DeleteObjects and the recursive
+/// `DELETE prefix/` sweep must see `aws:SourceIp`. A Deny conditioned on the
+/// client IP was skipped by the context-free check, so the key was deleted.
+/// The test client connects from 127.0.0.1, which is outside 10.0.0.0/8.
+#[tokio::test]
+async fn test_batch_and_recursive_delete_honor_source_ip_deny() {
+    let h = IamTestHarness::setup().await;
+    let admin_client = admin_http_client(&h.server.endpoint()).await;
+    let ip_user = create_iam_user(
+        &admin_client,
+        &h.server,
+        "ip_user",
+        vec![
+            json!({"effect": "Allow", "actions": ["*"], "resources": ["bucket-a/*"]}),
+            json!({
+                "effect": "Deny",
+                "actions": ["delete"],
+                "resources": ["bucket-a/ipguard/*"],
+                "conditions": {"NotIpAddress": {"aws:SourceIp": ["10.0.0.0/8"]}}
+            }),
+        ],
+    )
+    .await;
+    seed_object(&h, "bucket-a", "ipguard/batch.txt").await;
+    seed_object(&h, "bucket-a", "ipguard/sweep/one.txt").await;
+
+    let client = h.client_for(&ip_user).await;
+    let out = client
+        .delete_objects()
+        .bucket("bucket-a")
+        .delete(
+            aws_sdk_s3::types::Delete::builder()
+                .objects(
+                    aws_sdk_s3::types::ObjectIdentifier::builder()
+                        .key("ipguard/batch.txt")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .expect("batch delete returns 200 with per-key results");
+    assert_eq!(
+        out.errors().first().and_then(|e| e.code()),
+        Some("AccessDenied"),
+        "IP-conditioned Deny must block the batch delete: {:?}",
+        out.errors()
+    );
+
+    // Recursive sweep: a key with a trailing slash goes through the sweep's
+    // per-key check.
+    let _ = client
+        .delete_object()
+        .bucket("bucket-a")
+        .key("ipguard/sweep/")
+        .send()
+        .await;
+
+    let admin = h.client_for(&h.admin_user).await;
+    for key in ["ipguard/batch.txt", "ipguard/sweep/one.txt"] {
+        assert!(
+            admin
+                .head_object()
+                .bucket("bucket-a")
+                .key(key)
+                .send()
+                .await
+                .is_ok(),
+            "{key} must survive: the IP-conditioned Deny applies"
+        );
+    }
+}
+
 // ============================================================================
 // Disabled user
 // ============================================================================

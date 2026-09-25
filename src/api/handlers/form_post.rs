@@ -520,6 +520,13 @@ async fn parse_form_post_upload(
         fields_ci.insert(lc_name, value);
     }
 
+    if let Err(size) = super::object_helpers::user_metadata_size_check(&user_metadata) {
+        return Err(S3Error::InvalidArgument(format!(
+            "MetadataTooLarge: user metadata is {size} bytes; the limit is {} bytes",
+            super::object_helpers::USER_METADATA_MAX_BYTES
+        )));
+    }
+
     let key_field = lookup_form_field(&fields_ci, "key")
         .ok_or_else(|| {
             S3Error::InvalidArgument("POST form upload is missing required 'key' field".into())

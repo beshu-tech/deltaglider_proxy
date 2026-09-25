@@ -515,3 +515,75 @@ async fn test_condition_scoped_beshu_reports_common_prefix_navigation() {
         "private prefix should be filtered empty"
     );
 }
+
+/// Review S12: a filtered LIST must never hand out a hidden key as its
+/// continuation token. With `max-keys=1` the engine token is the last key of
+/// the UNFILTERED page, so paging used to walk every key in the bucket.
+#[tokio::test]
+async fn test_filtered_list_tokens_never_reveal_hidden_keys() {
+    let h = ScopeHarness::setup().await;
+    let admin = h.admin_client().await;
+    let _ = admin.create_bucket().bucket("prod").send().await;
+    for key in &[
+        "alice/a1.txt",
+        "alice/a2.txt",
+        "bob/b1.txt",
+        "secrets/password.txt",
+        "zeta/alice-last.txt",
+    ] {
+        admin
+            .put_object()
+            .bucket("prod")
+            .key(*key)
+            .body(ByteStream::from(b"d".to_vec()))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let (key, secret) = h
+        .create_user(
+            "alice-tokens",
+            vec![json!({
+                "effect": "Allow",
+                "actions": ["read", "list"],
+                "resources": ["prod/alice/*", "prod/zeta/*"],
+            })],
+        )
+        .await;
+    let alice = h.user_client(&key, &secret).await;
+
+    let mut seen_keys = Vec::new();
+    let mut tokens = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..20 {
+        let resp = alice
+            .list_objects_v2()
+            .bucket("prod")
+            .max_keys(1)
+            .set_continuation_token(token.clone())
+            .send()
+            .await
+            .expect("filtered list");
+        seen_keys.extend(
+            resp.contents()
+                .iter()
+                .filter_map(|o| o.key().map(str::to_string)),
+        );
+        token = resp.next_continuation_token().map(str::to_string);
+        match &token {
+            Some(t) => tokens.push(t.clone()),
+            None => break,
+        }
+    }
+    for t in &tokens {
+        assert!(
+            t.starts_with("alice/") || t.starts_with("zeta/"),
+            "S12 LEAK: continuation token reveals a hidden key: {t:?} (all tokens: {tokens:?})"
+        );
+    }
+    assert_eq!(
+        seen_keys,
+        vec!["alice/a1.txt", "alice/a2.txt", "zeta/alice-last.txt"],
+        "paging must still reach every visible key, past hidden ones"
+    );
+}

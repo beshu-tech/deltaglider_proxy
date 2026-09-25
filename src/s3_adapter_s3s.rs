@@ -167,7 +167,12 @@ impl s3s::S3 for DeltaGliderS3Service {
         req: s3s::S3Request<s3s::dto::GetObjectInput>,
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::GetObjectOutput>> {
         let reader = Reader::of(&req.extensions);
+        let anonymous_principal = req
+            .extensions
+            .get::<AuthenticatedUser>()
+            .is_some_and(|u| u.is_anonymous());
         let input = req.input;
+        check_response_overrides_allowed(&input, anonymous_principal)?;
         let engine = self.state.engine.load();
         let head = engine
             .head(&input.bucket, &input.key)
@@ -202,6 +207,7 @@ impl s3s::S3 for DeltaGliderS3Service {
                 let mut resp =
                     s3s::S3Response::with_status(output, axum::http::StatusCode::PARTIAL_CONTENT);
                 add_storage_debug_headers(&mut resp.headers, &metadata);
+                add_get_object_security_headers(&mut resp);
                 return Ok(resp);
             }
 
@@ -231,6 +237,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             let mut resp =
                 s3s::S3Response::with_status(output, axum::http::StatusCode::PARTIAL_CONTENT);
             add_storage_debug_headers(&mut resp.headers, &metadata);
+            add_get_object_security_headers(&mut resp);
             return Ok(resp);
         }
 
@@ -257,6 +264,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         apply_get_response_overrides(&input, &mut output);
         let mut resp = s3s::S3Response::new(output);
         add_storage_debug_headers(&mut resp.headers, &metadata);
+        add_get_object_security_headers(&mut resp);
         Ok(resp)
     }
 
@@ -281,33 +289,25 @@ impl s3s::S3 for DeltaGliderS3Service {
         let list_scope = req.extensions.get::<ListScope>().cloned();
         let input = req.input;
         let max_keys = input.max_keys.unwrap_or(1000).clamp(1, 1000) as u32;
-        let mut page = self
-            .state
-            .engine
-            .load()
-            .list_objects(
-                &input.bucket,
-                input.prefix.as_deref().unwrap_or(""),
-                input.delimiter.as_deref(),
-                max_keys,
-                input.marker.as_deref(),
-                false,
-            )
-            .await
-            .map_err(engine_error_to_s3s)?;
-        if let Some(ListScope::Filtered { user }) = list_scope {
-            page.objects
-                .retain(|(key, _)| user_can_see_listed_key(&user, &input.bucket, key));
-            page.common_prefixes
-                .retain(|prefix| user_can_see_common_prefix(&user, &input.bucket, prefix));
-        }
+        let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
+        let page = list_page_for_caller(
+            &self.state.engine.load(),
+            &input.bucket,
+            input.prefix.as_deref().unwrap_or(""),
+            input.delimiter.as_deref(),
+            max_keys,
+            list_cursor(input.marker.as_deref(), None),
+            false,
+            list_scope.as_ref(),
+        )
+        .await?;
         let next_marker = page.next_continuation_token.clone();
         let is_truncated = page.next_continuation_token.is_some();
         let contents: Vec<s3s::dto::Object> = page
             .objects
             .iter()
             .map(|(key, meta)| s3s::dto::Object {
-                key: Some(key.clone()),
+                key: Some(enc.apply(key.clone())),
                 size: Some(meta.file_size as i64),
                 e_tag: parse_s3s_etag(&meta.etag()).ok(),
                 last_modified: Some(SystemTime::from(meta.created_at).into()),
@@ -321,15 +321,15 @@ impl s3s::S3 for DeltaGliderS3Service {
             .common_prefixes
             .iter()
             .map(|p| s3s::dto::CommonPrefix {
-                prefix: Some(p.clone()),
+                prefix: Some(enc.apply(p.clone())),
             })
             .collect();
         Ok(s3s::S3Response::new(s3s::dto::ListObjectsOutput {
             name: Some(input.bucket.clone()),
-            prefix: input.prefix.clone(),
-            delimiter: input.delimiter.clone(),
-            marker: input.marker.clone(),
-            next_marker,
+            prefix: enc.apply_opt(input.prefix.clone()),
+            delimiter: enc.apply_opt(input.delimiter.clone()),
+            marker: enc.apply_opt(input.marker.clone()),
+            next_marker: enc.apply_opt(next_marker),
             max_keys: Some(max_keys as i32),
             is_truncated: Some(is_truncated),
             contents: Some(contents),
@@ -348,26 +348,21 @@ impl s3s::S3 for DeltaGliderS3Service {
         let include_metadata = query_flag(&req.uri, "metadata", "true");
         let input = req.input;
         let max_keys = input.max_keys.unwrap_or(1000).clamp(1, 1000) as u32;
-        let mut page = self
-            .state
-            .engine
-            .load()
-            .list_objects(
-                &input.bucket,
-                input.prefix.as_deref().unwrap_or(""),
-                input.delimiter.as_deref(),
-                max_keys,
+        let page = list_page_for_caller(
+            &self.state.engine.load(),
+            &input.bucket,
+            input.prefix.as_deref().unwrap_or(""),
+            input.delimiter.as_deref(),
+            max_keys,
+            list_cursor(
                 input.continuation_token.as_deref(),
-                false,
-            )
-            .await
-            .map_err(engine_error_to_s3s)?;
-        if let Some(ListScope::Filtered { user }) = list_scope {
-            page.objects
-                .retain(|(key, _)| user_can_see_listed_key(&user, &input.bucket, key));
-            page.common_prefixes
-                .retain(|prefix| user_can_see_common_prefix(&user, &input.bucket, prefix));
-        }
+                input.start_after.as_deref(),
+            ),
+            include_metadata,
+            list_scope.as_ref(),
+        )
+        .await?;
+        let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
         let metadata_ext = include_metadata.then(|| {
             ListMetadataXmlExtensions(
                 page.objects
@@ -375,7 +370,8 @@ impl s3s::S3 for DeltaGliderS3Service {
                     .map(|(key, meta)| {
                         let mut amz = meta.all_amz_metadata();
                         strip_fingerprint_metadata(&mut amz, reader);
-                        (key.clone(), amz)
+                        // Matched against the rendered <Key>, so encode alike.
+                        (enc.apply(key.clone()), amz)
                     })
                     .collect(),
             )
@@ -652,6 +648,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         req: s3s::S3Request<s3s::dto::DeleteObjectInput>,
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::DeleteObjectOutput>> {
         let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
+        let policy_context = request_policy_context(&req.extensions);
         let input = req.input;
         crate::api::handlers::object_helpers::check_client_write_allowed(
             &self.state,
@@ -662,6 +659,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             let (deleted, denied) = recursive_delete_prefix_s3s(
                 &self.state,
                 auth_user.as_ref(),
+                &policy_context,
                 &input.bucket,
                 &input.key,
             )
@@ -718,16 +716,23 @@ impl s3s::S3 for DeltaGliderS3Service {
         // carve-out (or a prefix-scoped Allow) is silently ignored and
         // protected objects get batch-deleted. (X-ray H6/H26.)
         let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
+        let policy_context = request_policy_context(&req.extensions);
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
         // Collect ObjectDeleted events for keys that were ACTUALLY deleted
         // (Ok, not NotFound), filtered to user objects, and batch-insert once
         // after the loop (single DB lock).
         let mut delete_events: Vec<crate::event_outbox::NewEvent> = Vec::new();
+        // Review C9: a plain `delete` lists the whole deltaspace after each
+        // key to decide reference reclamation, so a 1000-key batch in one
+        // deltaspace was O(N²). Delete in sweep mode and reclaim once per
+        // touched deltaspace, as the recursive prefix delete does.
+        let engine = self.state.engine.load();
+        let mut touched_deltaspaces: std::collections::BTreeSet<String> = Default::default();
         for obj in input.delete.objects {
             let key = obj.key.trim_start_matches('/').to_string();
             if let Some(user) = auth_user.as_ref() {
-                if !user.can(S3Action::Delete, &input.bucket, &key) {
+                if !user.can_with_context(S3Action::Delete, &input.bucket, &key, &policy_context) {
                     crate::audit::audit_log(
                         "access_denied",
                         &user.name,
@@ -746,8 +751,11 @@ impl s3s::S3 for DeltaGliderS3Service {
                     continue;
                 }
             }
-            match self.state.engine.load().delete(&input.bucket, &key).await {
+            match engine.delete_in_sweep(&input.bucket, &key).await {
                 Ok(_) => {
+                    touched_deltaspaces.insert(
+                        crate::types::ObjectKey::parse(&input.bucket, &key).deltaspace_id(),
+                    );
                     if crate::replication::event_consumer::is_user_object_key(&key) {
                         delete_events.push(crate::event_outbox::NewEvent::new(
                             crate::event_outbox::EventKind::ObjectDeleted,
@@ -786,6 +794,15 @@ impl s3s::S3 for DeltaGliderS3Service {
                 }
             }
         }
+        for ds in &touched_deltaspaces {
+            // Best effort, like the sweep: the objects are gone already.
+            if let Err(e) = engine.reclaim_empty_deltaspace(&input.bucket, ds).await {
+                tracing::warn!(
+                    "DeleteObjects reference reclaim failed for {}/{ds}: {e}",
+                    input.bucket
+                );
+            }
+        }
         crate::api::handlers::object_helpers::enqueue_object_events(&self.state, &delete_events)
             .await;
         Ok(s3s::S3Response::new(s3s::dto::DeleteObjectsOutput {
@@ -799,7 +816,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         &self,
         req: s3s::S3Request<s3s::dto::PutObjectInput>,
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::PutObjectOutput>> {
-        let headers = req.headers.clone();
+        let chunked_headers = headers_if_still_aws_chunked(&req);
         let signed_payload_hash = req
             .extensions
             .get::<crate::api::auth::SignedPayloadHash>()
@@ -814,6 +831,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             &input.bucket,
         )
         .map_err(engine_error_to_s3s)?;
+        check_user_metadata_size_s3s(input.metadata.as_ref())?;
         if !engine
             .head_bucket(&input.bucket)
             .await
@@ -822,8 +840,12 @@ impl s3s::S3 for DeltaGliderS3Service {
             return Err(s3s::s3_error!(NoSuchBucket));
         }
 
-        let data =
-            collect_blob_limited(input.body, engine.max_object_size(), Some(&headers)).await?;
+        let data = collect_blob_limited(
+            input.body,
+            engine.max_object_size(),
+            chunked_headers.as_ref(),
+        )
+        .await?;
         verify_signed_payload_hash_s3s(signed_payload_hash.as_ref(), &data)?;
         validate_content_md5_s3s(input.content_md5.as_deref(), &data)?;
         // Per-bucket storage quota enforcement (parity with axum's
@@ -839,6 +861,9 @@ impl s3s::S3 for DeltaGliderS3Service {
             data.len() as u64,
         )
         .map_err(engine_error_to_s3s)?;
+        // Held until the store returns, so the conditional check below and
+        // the write are one step for this key.
+        let _write_lock = acquire_object_write_lock(&input.bucket, &input.key).await;
         evaluate_put_etag_conditionals_s3s(
             engine.as_ref(),
             &input.bucket,
@@ -967,6 +992,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             .map(|d| d.as_str())
             .unwrap_or(s3s::dto::MetadataDirective::COPY);
         let (content_type, mut user_metadata) = if directive.eq_ignore_ascii_case("REPLACE") {
+            check_user_metadata_size_s3s(input.metadata.as_ref())?;
             (input.content_type, input.metadata.unwrap_or_default())
         } else if directive.eq_ignore_ascii_case("COPY") {
             (
@@ -1028,6 +1054,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             &input.bucket,
         )
         .map_err(engine_error_to_s3s)?;
+        check_user_metadata_size_s3s(input.metadata.as_ref())?;
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
         let delta_limit = crate::config::env_parse_with_default(
             "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
@@ -1059,15 +1086,14 @@ impl s3s::S3 for DeltaGliderS3Service {
         &self,
         req: s3s::S3Request<s3s::dto::UploadPartInput>,
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::UploadPartOutput>> {
-        let headers = req.headers.clone();
+        let chunked_headers = headers_if_still_aws_chunked(&req);
         let input = req.input;
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
-        let data = collect_blob_limited(
-            input.body,
-            self.state.engine.load().max_object_size(),
-            Some(&headers),
-        )
-        .await?;
+        let max_object_size = self.state.engine.load().max_object_size();
+        // Review C9: the store's per-upload cap follows the live config.
+        self.state.multipart.set_max_object_size(max_object_size);
+        let data =
+            collect_blob_limited(input.body, max_object_size, chunked_headers.as_ref()).await?;
         validate_content_md5_s3s(input.content_md5.as_deref(), &data)?;
         let etag = self
             .state
@@ -1155,6 +1181,9 @@ impl s3s::S3 for DeltaGliderS3Service {
         .map_err(engine_error_to_s3s)?;
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
         let requested_parts = completed_parts_to_request(input.multipart_upload.as_ref())?;
+        self.state
+            .multipart
+            .set_max_object_size(self.state.engine.load().max_object_size());
 
         // Completion registry: exactly one request runs the store pipeline, on a
         // DETACHED task (a client disconnect must not cancel a half-done store);
@@ -1264,6 +1293,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         let input = req.input;
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
         let max_uploads = input.max_uploads.unwrap_or(1000).clamp(1, 1000) as u32;
+        let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
         let (uploads, is_truncated, next_key, next_upload_id) =
             self.state.multipart.list_uploads_paginated(
                 Some(&input.bucket),
@@ -1275,7 +1305,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         let uploads = uploads
             .into_iter()
             .map(|u| s3s::dto::MultipartUpload {
-                key: Some(u.key),
+                key: Some(enc.apply(u.key)),
                 upload_id: Some(u.upload_id),
                 initiated: Some(SystemTime::from(u.initiated).into()),
                 ..Default::default()
@@ -1283,14 +1313,14 @@ impl s3s::S3 for DeltaGliderS3Service {
             .collect();
         Ok(s3s::S3Response::new(s3s::dto::ListMultipartUploadsOutput {
             bucket: Some(input.bucket),
-            delimiter: input.delimiter,
+            delimiter: enc.apply_opt(input.delimiter),
             encoding_type: input.encoding_type,
             is_truncated: Some(is_truncated),
-            key_marker: input.key_marker,
+            key_marker: enc.apply_opt(input.key_marker),
             max_uploads: Some(max_uploads as i32),
-            next_key_marker: (!next_key.is_empty()).then_some(next_key),
+            next_key_marker: enc.apply_opt((!next_key.is_empty()).then_some(next_key)),
             next_upload_id_marker: (!next_upload_id.is_empty()).then_some(next_upload_id),
-            prefix: input.prefix,
+            prefix: enc.apply_opt(input.prefix),
             upload_id_marker: input.upload_id_marker,
             uploads: Some(uploads),
             ..Default::default()
@@ -1349,6 +1379,9 @@ impl s3s::S3 for DeltaGliderS3Service {
         if data.len() as u64 > engine.max_object_size() {
             return Err(s3s::s3_error!(EntityTooLarge));
         }
+        self.state
+            .multipart
+            .set_max_object_size(engine.max_object_size());
         let part = if let Some(range) = input.copy_source_range.as_deref() {
             let (start, end) = parse_copy_range(range, data.len())?;
             bytes::Bytes::from(data[start..=end].to_vec())
@@ -1401,6 +1434,25 @@ impl Stream for SyncStorageStream {
 }
 
 impl s3s::stream::ByteStream for SyncStorageStream {}
+
+/// True when s3s already removed the aws-chunked framing. It does so for
+/// every SigV4 HEADER-signed streaming request (it verifies each chunk
+/// signature while it decodes). Decoding again made every signed SDK
+/// streaming PUT / UploadPart fail with 400 (review C1). Unsigned or
+/// presigned streaming bodies still reach us framed.
+fn s3s_decoded_aws_chunked(headers: &axum::http::HeaderMap, has_credentials: bool) -> bool {
+    has_credentials
+        && headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("AWS4-HMAC-SHA256 "))
+}
+
+/// The headers `collect_blob_limited` needs to decode aws-chunked framing,
+/// or `None` when s3s already decoded the body.
+fn headers_if_still_aws_chunked<T>(req: &s3s::S3Request<T>) -> Option<axum::http::HeaderMap> {
+    (!s3s_decoded_aws_chunked(&req.headers, req.credentials.is_some())).then(|| req.headers.clone())
+}
 
 async fn collect_blob_limited(
     body: Option<s3s::dto::StreamingBlob>,
@@ -1477,6 +1529,159 @@ async fn collect_blob_limited(
     Ok(body)
 }
 
+/// Engine pages one filtered LIST may scan before it gives up. A prefix-scoped
+/// user can ask for a prefix where every key is hidden; the scan must end.
+const FILTERED_LIST_MAX_ENGINE_PAGES: usize = 10_000;
+
+/// The engine cursor for a LIST. S3 rule: a continuation token wins, and
+/// `start-after` applies only on the first request (no token). Both mean
+/// "entries strictly after this string", which is what the engine takes.
+fn list_cursor<'a>(
+    continuation_token: Option<&'a str>,
+    start_after: Option<&'a str>,
+) -> Option<&'a str> {
+    continuation_token
+        .filter(|t| !t.is_empty())
+        .or(start_after.filter(|s| !s.is_empty()))
+}
+
+/// One LIST page as the caller may see it. THE listing path for V1 and V2.
+///
+/// For a `ListScope::Filtered` caller, the engine's next-token is the last
+/// key of the UNFILTERED page, so returning it leaks a hidden key (review
+/// S12: `max-keys=1` walks the whole bucket through tokens). Here the page
+/// is refilled until it holds `max_keys` visible entries, and the token is
+/// always the last VISIBLE entry. Progress is guaranteed: a truncated
+/// filtered page holds at least one visible entry.
+#[allow(clippy::too_many_arguments)]
+async fn list_page_for_caller(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    max_keys: u32,
+    cursor: Option<&str>,
+    metadata: bool,
+    scope: Option<&ListScope>,
+) -> s3s::S3Result<crate::deltaglider::ListObjectsPage> {
+    let user = match scope {
+        Some(ListScope::Filtered { user }) => user,
+        _ => {
+            return engine
+                .list_objects(bucket, prefix, delimiter, max_keys, cursor, metadata)
+                .await
+                .map_err(engine_error_to_s3s);
+        }
+    };
+    let mut objects = Vec::new();
+    let mut prefixes = std::collections::BTreeSet::new();
+    let mut cursor = cursor.map(str::to_string);
+    let mut more = false;
+    for _ in 0..FILTERED_LIST_MAX_ENGINE_PAGES {
+        let page = engine
+            .list_objects(
+                bucket,
+                prefix,
+                delimiter,
+                max_keys,
+                cursor.as_deref(),
+                metadata,
+            )
+            .await
+            .map_err(engine_error_to_s3s)?;
+        objects.extend(
+            page.objects
+                .into_iter()
+                .filter(|(key, _)| user_can_see_listed_key(user, bucket, key)),
+        );
+        prefixes.extend(
+            page.common_prefixes
+                .into_iter()
+                .filter(|p| user_can_see_common_prefix(user, bucket, p)),
+        );
+        more = page.is_truncated && page.next_continuation_token.is_some();
+        cursor = page.next_continuation_token;
+        if !more || objects.len() + prefixes.len() >= max_keys as usize {
+            break;
+        }
+    }
+    if more && objects.is_empty() && prefixes.is_empty() {
+        // No visible entry to anchor a token on, and a hidden key must never
+        // be one. Fail instead of pretending the listing ended.
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "no visible key within the listing scan budget; use a narrower prefix"
+        ));
+    }
+    let mut page = crate::deltaglider::interleave_and_paginate(
+        objects,
+        prefixes.into_iter().collect(),
+        max_keys,
+        None,
+    );
+    if more && !page.is_truncated {
+        // Exactly `max_keys` visible entries and the engine has more: the
+        // token is the last visible entry.
+        page.is_truncated = true;
+        page.next_continuation_token = page
+            .objects
+            .last()
+            .map(|(k, _)| k.clone())
+            .into_iter()
+            .chain(page.common_prefixes.last().cloned())
+            .max();
+    }
+    Ok(crate::deltaglider::ListObjectsPage {
+        objects: page.objects,
+        common_prefixes: page.common_prefixes,
+        is_truncated: page.is_truncated,
+        next_continuation_token: page.next_continuation_token,
+    })
+}
+
+/// `encoding-type=url` (review C2): S3 then URL-encodes every key-shaped
+/// field it returns, and aws-cli sets it by default and decodes with
+/// `unquote_plus`. Echoing the flag over raw keys turns `+` into a space and
+/// breaks `%`. Unreserved bytes and `/` stay literal, like S3.
+fn s3_url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Key-field encoder for one LIST response: identity unless the client asked
+/// for `encoding-type=url`.
+#[derive(Clone, Copy)]
+struct ListKeyEncoding {
+    url: bool,
+}
+
+impl ListKeyEncoding {
+    fn of(encoding_type: Option<&s3s::dto::EncodingType>) -> Self {
+        Self {
+            url: encoding_type.is_some_and(|e| e.as_str().eq_ignore_ascii_case("url")),
+        }
+    }
+
+    fn apply(self, s: String) -> String {
+        if self.url {
+            s3_url_encode(&s)
+        } else {
+            s
+        }
+    }
+
+    fn apply_opt(self, s: Option<String>) -> Option<String> {
+        s.map(|s| self.apply(s))
+    }
+}
+
 async fn ensure_bucket_exists_s3s(state: &Arc<AppState>, bucket: &str) -> s3s::S3Result<()> {
     if state
         .engine
@@ -1494,6 +1699,7 @@ async fn ensure_bucket_exists_s3s(state: &Arc<AppState>, bucket: &str) -> s3s::S
 async fn recursive_delete_prefix_s3s(
     state: &Arc<AppState>,
     auth_user: Option<&AuthenticatedUser>,
+    policy_context: &iam_rs::Context,
     bucket: &str,
     prefix: &str,
 ) -> s3s::S3Result<(u32, u32)> {
@@ -1529,7 +1735,7 @@ async fn recursive_delete_prefix_s3s(
 
         for (obj_key, _) in &page.objects {
             if let Some(user) = auth_user {
-                if !user.can(S3Action::Delete, bucket, obj_key) {
+                if !user.can_with_context(S3Action::Delete, bucket, obj_key, policy_context) {
                     denied = denied.saturating_add(1);
                     continue;
                 }
@@ -1597,6 +1803,21 @@ fn copy_source_bucket_key(source: &s3s::dto::CopySource) -> s3s::S3Result<(Strin
     }
 }
 
+/// Policy context for the per-key checks the adapter runs itself (batch and
+/// recursive delete, copy-source read). The middleware authorizes only the
+/// request line; without `aws:SourceIp` here an IP-conditioned Deny is
+/// skipped (X-ray H17, review S14). Never call the context-free `can()` on an
+/// authz path: `adapter_authz_never_uses_context_free_can` guards it.
+fn request_policy_context(ext: &axum::http::Extensions) -> iam_rs::Context {
+    policy_context_for_ip(ext.get::<crate::api::auth::RequestClientIp>().map(|c| c.0))
+}
+
+fn policy_context_for_ip(client_ip: Option<std::net::IpAddr>) -> iam_rs::Context {
+    let mut context = iam_rs::Context::new();
+    crate::iam::permissions::insert_source_ip(&mut context, client_ip);
+    context
+}
+
 fn check_copy_source_access_s3s(
     auth_user: Option<&AuthenticatedUser>,
     source_bucket: &str,
@@ -1606,11 +1827,7 @@ fn check_copy_source_access_s3s(
     let Some(user) = auth_user else {
         return Ok(());
     };
-    // Build a policy context with aws:SourceIp so IP-scoped conditions on the
-    // source (e.g. Deny read unless from an office CIDR) actually fire. Using
-    // the context-free can() here silently ignored those conditions (X-ray H17).
-    let mut context = iam_rs::Context::new();
-    crate::iam::permissions::insert_source_ip(&mut context, client_ip);
+    let context = policy_context_for_ip(client_ip);
     if user.can_with_context(S3Action::Read, source_bucket, source_key, &context) {
         return Ok(());
     }
@@ -1760,6 +1977,60 @@ fn evaluate_read_conditionals_s3s(
     Ok(())
 }
 
+/// Object bytes are uploader-controlled and share the admin UI's origin.
+/// An uploaded `text/html` or SVG opened in a browser ran script on that
+/// origin: stored XSS against every admin who clicks it (review S5).
+/// `sandbox` gives such a document an opaque origin and no script. Media and
+/// PDF keep working: browsers render them without the page's origin.
+/// `nosniff` is set globally for every response (main.rs).
+fn add_get_object_security_headers(resp: &mut s3s::S3Response<s3s::dto::GetObjectOutput>) {
+    let content_type = resp.output.content_type.as_deref().unwrap_or("");
+    if content_type_needs_sandbox(content_type) {
+        resp.headers.insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static("sandbox"),
+        );
+    }
+}
+
+/// Pure: may a browser treat this content type as an active document?
+/// Unknown types count as active: only inert media and PDF are exempt.
+fn content_type_needs_sandbox(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let inert = (essence.starts_with("image/") && !essence.contains("svg"))
+        || essence.starts_with("video/")
+        || essence.starts_with("audio/")
+        || essence == "application/pdf";
+    !inert
+}
+
+/// S3 refuses `response-*` overrides on anonymous requests (400
+/// InvalidRequest). Honouring them let anyone relabel a public object as
+/// `text/html` (review S5). Presigned URLs are signed, so they keep them.
+fn check_response_overrides_allowed(
+    input: &s3s::dto::GetObjectInput,
+    anonymous_principal: bool,
+) -> s3s::S3Result<()> {
+    let any_override = input.response_content_type.is_some()
+        || input.response_content_disposition.is_some()
+        || input.response_content_encoding.is_some()
+        || input.response_content_language.is_some()
+        || input.response_cache_control.is_some()
+        || input.response_expires.is_some();
+    if anonymous_principal && any_override {
+        return Err(s3s::s3_error!(
+            InvalidRequest,
+            "Request specific response headers cannot be used for anonymous GET requests."
+        ));
+    }
+    Ok(())
+}
+
 fn apply_get_response_overrides(
     input: &s3s::dto::GetObjectInput,
     output: &mut s3s::dto::GetObjectOutput,
@@ -1815,7 +2086,13 @@ async fn evaluate_put_etag_conditionals_s3s(
     if if_match.is_none() && if_none_match.is_none() {
         return Ok(());
     }
-    let existing = engine.head(bucket, key).await.ok();
+    // Fail closed (review C4): only NotFound means "absent". Any other HEAD
+    // error used to read as absent, so `If-None-Match: *` overwrote.
+    let existing = match engine.head(bucket, key).await {
+        Ok(meta) => Some(meta),
+        Err(crate::deltaglider::EngineError::NotFound(_)) => None,
+        Err(e) => return Err(engine_error_to_s3s(e)),
+    };
     if let Some(cond) = if_match {
         let Some(meta) = existing.as_ref() else {
             return Err(s3s::s3_error!(PreconditionFailed));
@@ -1844,6 +2121,28 @@ async fn evaluate_put_etag_conditionals_s3s(
         }
     }
     Ok(())
+}
+
+/// Per-object write locks for PutObject, keyed by `bucket/key` (review C4).
+/// A conditional PUT checks and then stores; the lock makes that pair atomic
+/// against every other PutObject of the same key on THIS process. It is
+/// separate from, and always taken before, the engine's per-deltaspace lock.
+/// Not covered: CopyObject, CompleteMultipartUpload, form POST, and other
+/// instances. Idle entries are pruned like the engine's prefix locks.
+static OBJECT_WRITE_LOCKS: std::sync::LazyLock<
+    dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+async fn acquire_object_write_lock(bucket: &str, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    const CLEANUP_THRESHOLD: usize = 1024;
+    if OBJECT_WRITE_LOCKS.len() > CLEANUP_THRESHOLD {
+        OBJECT_WRITE_LOCKS.retain(|_, m| Arc::strong_count(m) > 1);
+    }
+    let mutex = OBJECT_WRITE_LOCKS
+        .entry(format!("{bucket}/{key}"))
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    mutex.lock_owned().await
 }
 
 /// Await a joined completion's outcome (initial watch value is None).
@@ -2042,6 +2341,22 @@ fn completed_parts_to_request(
         .collect()
 }
 
+fn check_user_metadata_size_s3s(
+    metadata: Option<&std::collections::HashMap<String, String>>,
+) -> s3s::S3Result<()> {
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
+    crate::api::handlers::object_helpers::user_metadata_size_check(metadata).map_err(|size| {
+        s3s::s3_error!(
+            MetadataTooLarge,
+            "user metadata is {} bytes; the limit is {} bytes",
+            size,
+            crate::api::handlers::object_helpers::USER_METADATA_MAX_BYTES
+        )
+    })
+}
+
 fn validate_delete_objects_count(count: usize) -> s3s::S3Result<()> {
     if count > 1000 {
         return Err(s3s::s3_error!(
@@ -2203,23 +2518,24 @@ fn list_objects_v2_output_from_page(
     max_keys: u32,
     page: crate::deltaglider::ListObjectsPage,
 ) -> s3s::S3Result<s3s::dto::ListObjectsV2Output> {
+    let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
     let contents: s3s::dto::ObjectList = page
         .objects
         .into_iter()
-        .map(|(key, meta)| object_from_metadata(key, &meta))
+        .map(|(key, meta)| object_from_metadata(enc.apply(key), &meta))
         .collect::<s3s::S3Result<_>>()?;
     let common_prefixes: s3s::dto::CommonPrefixList = page
         .common_prefixes
         .into_iter()
         .map(|prefix| s3s::dto::CommonPrefix {
-            prefix: Some(prefix),
+            prefix: Some(enc.apply(prefix)),
         })
         .collect();
     let key_count = contents.len().saturating_add(common_prefixes.len());
     Ok(s3s::dto::ListObjectsV2Output {
         name: Some(input.bucket.clone()),
-        prefix: input.prefix.clone(),
-        delimiter: input.delimiter.clone(),
+        prefix: enc.apply_opt(input.prefix.clone()),
+        delimiter: enc.apply_opt(input.delimiter.clone()),
         max_keys: Some(max_keys as i32),
         key_count: Some(i32::try_from(key_count).unwrap_or(i32::MAX)),
         continuation_token: input.continuation_token.clone(),
@@ -2228,7 +2544,7 @@ fn list_objects_v2_output_from_page(
         contents: Some(contents),
         common_prefixes: Some(common_prefixes),
         encoding_type: input.encoding_type.clone(),
-        start_after: input.start_after.clone(),
+        start_after: enc.apply_opt(input.start_after.clone()),
         ..Default::default()
     })
 }
@@ -2353,6 +2669,108 @@ mod tests {
             .is_ok(),
             "an IP outside the Deny CIDR must be allowed"
         );
+    }
+
+    /// Review S14 class guard: every per-key authz in the adapter and the
+    /// shared handlers must pass the request context. The context-free
+    /// `can()` skips `aws:SourceIp` conditions, so an IP-scoped Deny is lost.
+    #[test]
+    fn adapter_authz_never_uses_context_free_can() {
+        let sources = [
+            ("s3_adapter_s3s.rs", include_str!("s3_adapter_s3s.rs")),
+            ("form_post.rs", include_str!("api/handlers/form_post.rs")),
+            (
+                "object_helpers.rs",
+                include_str!("api/handlers/object_helpers.rs"),
+            ),
+            ("handlers/mod.rs", include_str!("api/handlers/mod.rs")),
+            ("status.rs", include_str!("api/handlers/status.rs")),
+        ];
+        for (name, src) in sources {
+            let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+            for (i, line) in prod.lines().enumerate() {
+                assert!(
+                    !line.contains(".can(S3Action"),
+                    "{name}:{}: context-free can() on an authz path; use \
+                     can_with_context with request_policy_context",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn list_cursor_token_wins_over_start_after() {
+        assert_eq!(list_cursor(None, None), None);
+        assert_eq!(list_cursor(None, Some("b")), Some("b"));
+        assert_eq!(list_cursor(Some("c"), Some("b")), Some("c"));
+        assert_eq!(list_cursor(Some(""), Some("b")), Some("b"));
+        assert_eq!(list_cursor(None, Some("")), None);
+    }
+
+    #[test]
+    fn url_encoding_matches_s3() {
+        assert_eq!(s3_url_encode("a/b-c_d.e~f"), "a/b-c_d.e~f");
+        assert_eq!(s3_url_encode("a+b c%41"), "a%2Bb%20c%2541");
+        assert_eq!(s3_url_encode("é"), "%C3%A9");
+        assert_eq!(s3_url_encode("x&y<z>"), "x%26y%3Cz%3E");
+    }
+
+    #[test]
+    fn sandbox_applies_to_active_content_types() {
+        for active in [
+            "text/html",
+            "TEXT/HTML; charset=utf-8",
+            "image/svg+xml",
+            "application/xhtml+xml",
+            "text/xml",
+            "application/octet-stream",
+            "text/plain",
+            "",
+        ] {
+            assert!(content_type_needs_sandbox(active), "{active:?}");
+        }
+        for inert in ["image/png", "video/mp4", "audio/mpeg", "application/pdf"] {
+            assert!(!content_type_needs_sandbox(inert), "{inert:?}");
+        }
+    }
+
+    #[test]
+    fn s3s_decodes_only_header_signed_sigv4() {
+        let mut h = axum::http::HeaderMap::new();
+        assert!(!s3s_decoded_aws_chunked(&h, false));
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "AWS4-HMAC-SHA256 Credential=a/b".parse().unwrap(),
+        );
+        assert!(s3s_decoded_aws_chunked(&h, true));
+        assert!(
+            !s3s_decoded_aws_chunked(&h, false),
+            "no verified credentials: s3s did not decode"
+        );
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "AWS a:b".parse().unwrap(),
+        );
+        assert!(!s3s_decoded_aws_chunked(&h, true), "SigV2 is not decoded");
+    }
+
+    #[test]
+    fn anonymous_response_overrides_are_refused() {
+        let input = s3s::dto::GetObjectInput {
+            bucket: "b".into(),
+            key: "k".into(),
+            response_content_type: Some("text/html".into()),
+            ..Default::default()
+        };
+        assert!(check_response_overrides_allowed(&input, true).is_err());
+        assert!(check_response_overrides_allowed(&input, false).is_ok());
+        let plain = s3s::dto::GetObjectInput {
+            bucket: "b".into(),
+            key: "k".into(),
+            ..Default::default()
+        };
+        assert!(check_response_overrides_allowed(&plain, true).is_ok());
     }
 
     fn assert_s3_service<T: s3s::S3>() {}

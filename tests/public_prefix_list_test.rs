@@ -326,3 +326,71 @@ async fn anonymous_object_metadata_has_no_tool_stamp() {
         "presigned GET leaked dg-tool to the link holder"
     );
 }
+
+/// Review S5: object bytes share the admin UI's origin. An uploaded HTML page
+/// must reach a browser sandboxed, and an anonymous caller must not relabel a
+/// public object with `response-content-type` (S3 refuses that with 400).
+#[tokio::test]
+async fn get_object_is_sandboxed_and_anonymous_overrides_are_refused() {
+    let (server, anon) = server_with_public_prefix("testbk", "ror/libs/").await;
+    let signed = aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::Config::builder()
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "admin",
+                "admin-secret-1234567890",
+                None,
+                None,
+                "test",
+            ))
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url(server.endpoint())
+            .force_path_style(true)
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .build(),
+    );
+    signed
+        .put_object()
+        .bucket("testbk")
+        .key("ror/libs/page.html")
+        .content_type("text/html")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(
+            b"<script>alert(document.cookie)</script>",
+        ))
+        .send()
+        .await
+        .expect("seed html");
+
+    let resp = anon
+        .get(format!("{}/testbk/ror/libs/page.html", server.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok()),
+        Some("sandbox"),
+        "an uploaded HTML page must be served sandboxed"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
+
+    let relabel = anon
+        .get(format!(
+            "{}/testbk/ror/libs/alpha.txt?response-content-type=text/html",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        relabel.status(),
+        StatusCode::BAD_REQUEST,
+        "anonymous response-* override must be refused"
+    );
+}

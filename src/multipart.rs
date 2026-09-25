@@ -324,7 +324,9 @@ pub struct MultipartStore {
     uploads: RwLock<HashMap<String, MultipartUpload>>,
     /// CompleteMultipartUpload registry: in-flight completions + success tombstones.
     completions: parking_lot::Mutex<HashMap<String, CompletionSlot>>,
-    max_object_size: u64,
+    /// Per-upload byte cap. Atomic so a hot config apply reaches it: the S3
+    /// adapter refreshes it from the live engine on every part and complete.
+    max_object_size: std::sync::atomic::AtomicU64,
     max_uploads: usize,
     /// Global in-flight bytes across all uploads. Kept consistent with
     /// the sum of `MultipartUpload.parts[*].size` — updated under the
@@ -344,7 +346,7 @@ impl MultipartStore {
         Self {
             uploads: RwLock::new(HashMap::new()),
             completions: parking_lot::Mutex::new(HashMap::new()),
-            max_object_size,
+            max_object_size: std::sync::atomic::AtomicU64::new(max_object_size),
             max_uploads,
             in_flight_bytes: std::sync::atomic::AtomicU64::new(0),
             max_total_multipart_bytes,
@@ -362,7 +364,7 @@ impl MultipartStore {
         Self {
             uploads: RwLock::new(HashMap::new()),
             completions: parking_lot::Mutex::new(HashMap::new()),
-            max_object_size,
+            max_object_size: std::sync::atomic::AtomicU64::new(max_object_size),
             max_uploads: 1000,
             in_flight_bytes: std::sync::atomic::AtomicU64::new(0),
             max_total_multipart_bytes,
@@ -375,6 +377,19 @@ impl MultipartStore {
     pub(crate) fn in_flight_bytes(&self) -> u64 {
         self.in_flight_bytes
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Per-upload byte cap in force now.
+    pub fn max_object_size(&self) -> u64 {
+        self.max_object_size
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Adopt the engine's current `max_object_size` (it hot-reloads; the
+    /// value captured at startup did not follow a config apply).
+    pub fn set_max_object_size(&self, max_object_size: u64) {
+        self.max_object_size
+            .store(max_object_size, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Create a new multipart upload, returns the upload ID.
@@ -508,10 +523,11 @@ impl MultipartStore {
             .saturating_sub(old_part_size)
             .saturating_add(size);
 
-        if cumulative_after > self.max_object_size {
+        let max_object_size = self.max_object_size();
+        if cumulative_after > max_object_size {
             return Err(S3Error::EntityTooLarge {
                 size: cumulative_after,
-                max: self.max_object_size,
+                max: max_object_size,
             });
         }
 
@@ -918,10 +934,11 @@ impl MultipartStore {
             }
 
             total_size += part.size;
-            if total_size > self.max_object_size {
+            if total_size > self.max_object_size() {
                 return Err(S3Error::InvalidArgument(format!(
                     "Assembled object size {} exceeds maximum {}",
-                    total_size, self.max_object_size
+                    total_size,
+                    self.max_object_size()
                 )));
             }
 

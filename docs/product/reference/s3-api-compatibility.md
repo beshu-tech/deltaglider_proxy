@@ -15,9 +15,9 @@ Status legend:
 
 | Operation | Status | Notes |
 |---|---|---|
-| `GetObject` | ✅ Full | Delta-decoded on read; range requests and `If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since` conditionals supported; response-header overrides via query params. |
+| `GetObject` | ✅ Full | Delta-decoded on read; range requests and `If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since` conditionals supported; response-header overrides via query params (refused with `400 InvalidRequest` on anonymous requests, as on S3). Responses whose content type a browser could run as a document carry `Content-Security-Policy: sandbox`. |
 | `HeadObject` | ✅ Full | Returns object metadata; same conditional headers as `GetObject`. |
-| `PutObject` | ✅ Full | Delta-encoded on write for eligible types; quota-enforced; `If-Match`/`If-None-Match` conditionals; user metadata preserved. |
+| `PutObject` | ✅ Full | Delta-encoded on write for eligible types; quota-enforced; `If-Match`/`If-None-Match` conditionals (the check and the write are atomic against other `PutObject` requests to the same key on one instance); user metadata preserved, up to the S3 limit of 2 KB (larger metadata gets `400 MetadataTooLarge`). |
 | `CopyObject` | ✅ Full | Source authorization + conditionals checked; `COPY`/`REPLACE` metadata directive; destination quota enforced. |
 | `DeleteObject` | ✅ Full | Single key, or recursive prefix delete when the key ends in `/`. A missing key is treated as success (S3 semantics). |
 | `DeleteObjects` | ✅ Full | Batch delete up to 1000 keys; `Quiet` flag and per-key error reporting honoured. |
@@ -26,7 +26,7 @@ Status legend:
 
 | Operation | Status | Notes |
 |---|---|---|
-| `ListObjectsV2` | ✅ Full | Continuation-token pagination; delimiter / common-prefix; IAM-filtered (a user sees only objects they can read). |
+| `ListObjectsV2` | ✅ Full | Continuation-token and `start-after` pagination; delimiter / common-prefix; `encoding-type=url`; IAM-filtered (a user sees only objects they can read, and a continuation token never names a hidden key). |
 | `ListObjects` | ✅ Full | Legacy marker-based listing, implemented over the same path as V2. |
 | `ListBuckets` | ✅ Full | IAM-filtered; optional prefix / `max-buckets` pagination. |
 

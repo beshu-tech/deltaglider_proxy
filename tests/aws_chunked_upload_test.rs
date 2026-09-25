@@ -286,3 +286,234 @@ async fn production_corruption_pattern_is_fixed() {
         "GET body must equal payload byte-for-byte"
     );
 }
+
+// ============================================================================
+// Review C1: the SAME framing through a server that verifies SigV4.
+//
+// The tests above run in open-access mode without an Authorization header, so
+// s3s never decodes the framing and the adapter must. Real SDK traffic is
+// header-signed: s3s verifies every chunk signature and strips the framing,
+// and the adapter used to decode a second time → 400 on every signed
+// streaming PutObject and UploadPart. These requests carry REAL seed and
+// chunk signatures, the shape production emits.
+// ============================================================================
+
+mod signed {
+    use super::common::TestServer;
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+
+    const AK: &str = "chunk-ak";
+    const SK: &str = "chunk-secret-key";
+    const REGION: &str = "us-east-1";
+    const EMPTY_SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).unwrap();
+        mac.update(data);
+        mac.finalize().into_bytes().to_vec()
+    }
+
+    fn sha_hex(data: &[u8]) -> String {
+        hex::encode(Sha256::digest(data))
+    }
+
+    fn signing_key(date: &str) -> Vec<u8> {
+        let k = hmac(format!("AWS4{SK}").as_bytes(), date.as_bytes());
+        let k = hmac(&k, REGION.as_bytes());
+        let k = hmac(&k, b"s3");
+        hmac(&k, b"aws4_request")
+    }
+
+    fn uri_encode(s: &str) -> String {
+        let mut out = String::new();
+        for b in s.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    }
+
+    /// Send a `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` PUT with valid seed and
+    /// chunk signatures. `query` is `(name, value)` pairs, already sorted.
+    async fn signed_streaming_put(
+        server: &TestServer,
+        path: &str,
+        query: &[(&str, &str)],
+        payload: &[u8],
+    ) -> reqwest::Response {
+        let now = chrono::Utc::now();
+        let ts = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let date = &ts[..8];
+        let scope = format!("{date}/{REGION}/s3/aws4_request");
+        let host = server.endpoint().trim_start_matches("http://").to_string();
+        let content_sha = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+        let canonical_query = query
+            .iter()
+            .map(|(k, v)| format!("{}={}", uri_encode(k), uri_encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let signed_headers =
+            "content-encoding;host;x-amz-content-sha256;x-amz-date;x-amz-decoded-content-length";
+        let canonical_headers = format!(
+            "content-encoding:aws-chunked\nhost:{host}\nx-amz-content-sha256:{content_sha}\n\
+             x-amz-date:{ts}\nx-amz-decoded-content-length:{}\n",
+            payload.len()
+        );
+        let canonical_request = format!(
+            "PUT\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{content_sha}"
+        );
+        let key = signing_key(date);
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{ts}\n{scope}\n{}",
+            sha_hex(canonical_request.as_bytes())
+        );
+        let seed = hex::encode(hmac(&key, string_to_sign.as_bytes()));
+
+        // One data chunk plus the terminating empty chunk, each signed over
+        // the previous signature (the chunk-signature chain).
+        let mut body = Vec::new();
+        let mut prev = seed.clone();
+        for chunk in [payload, &[][..]] {
+            let sts = format!(
+                "AWS4-HMAC-SHA256-PAYLOAD\n{ts}\n{scope}\n{prev}\n{EMPTY_SHA}\n{}",
+                sha_hex(chunk)
+            );
+            let sig = hex::encode(hmac(&key, sts.as_bytes()));
+            body.extend_from_slice(
+                format!("{:x};chunk-signature={sig}\r\n", chunk.len()).as_bytes(),
+            );
+            body.extend_from_slice(chunk);
+            body.extend_from_slice(b"\r\n");
+            prev = sig;
+        }
+
+        let url = if canonical_query.is_empty() {
+            format!("{}{path}", server.endpoint())
+        } else {
+            format!("{}{path}?{canonical_query}", server.endpoint())
+        };
+        reqwest::Client::new()
+            .put(url)
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential={AK}/{scope}, SignedHeaders={signed_headers}, \
+                     Signature={seed}"
+                ),
+            )
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-content-sha256", content_sha)
+            .header("x-amz-date", &ts)
+            .header("x-amz-decoded-content-length", payload.len().to_string())
+            .header("content-length", body.len().to_string())
+            .body(body)
+            .send()
+            .await
+            .expect("signed streaming PUT sends")
+    }
+
+    async fn authed_server() -> TestServer {
+        TestServer::builder().auth(AK, SK).build().await
+    }
+
+    #[tokio::test]
+    async fn signed_streaming_put_object_roundtrips() {
+        let server = authed_server().await;
+        let payload: Vec<u8> = (0..5000u32).map(|i| ((i * 7) & 0xff) as u8).collect();
+        let path = format!("/{}/signed-stream.bin", server.bucket());
+        let resp = signed_streaming_put(&server, &path, &[], &payload).await;
+        let status = resp.status();
+        assert!(
+            status.is_success(),
+            "signed streaming PUT must succeed, got {status}: {:?}",
+            resp.text().await.ok()
+        );
+        let got = server
+            .s3_client()
+            .await
+            .get_object()
+            .bucket(server.bucket())
+            .key("signed-stream.bin")
+            .send()
+            .await
+            .expect("GET")
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(got.as_ref(), payload.as_slice(), "no framing may leak");
+    }
+
+    #[tokio::test]
+    async fn signed_streaming_upload_part_roundtrips() {
+        let server = authed_server().await;
+        let s3 = server.s3_client().await;
+        let bucket = server.bucket().to_string();
+        let key = "signed-mpu.bin";
+        let upload_id = s3
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("create MPU")
+            .upload_id()
+            .unwrap()
+            .to_string();
+        let payload: Vec<u8> = (0..3000u32).map(|i| ((i * 13) & 0xff) as u8).collect();
+        let path = format!("/{bucket}/{key}");
+        let resp = signed_streaming_put(
+            &server,
+            &path,
+            &[("partNumber", "1"), ("uploadId", &upload_id)],
+            &payload,
+        )
+        .await;
+        let status = resp.status();
+        let etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        assert!(
+            status.is_success(),
+            "signed streaming UploadPart must succeed, got {status}: {:?}",
+            resp.text().await.ok()
+        );
+        s3.complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                    .parts(
+                        aws_sdk_s3::types::CompletedPart::builder()
+                            .part_number(1)
+                            .e_tag(etag.expect("part ETag"))
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .expect("complete MPU");
+        let got = s3
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("GET")
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(got.as_ref(), payload.as_slice(), "no framing may leak");
+    }
+}

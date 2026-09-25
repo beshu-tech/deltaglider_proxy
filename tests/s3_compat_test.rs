@@ -3636,3 +3636,174 @@ async fn test_usage_cache_returns_result() {
     assert_eq!(result["total_objects"], 1);
     assert_eq!(result["total_size"], 14); // "cached content" = 14 bytes
 }
+
+// ============================================================================
+// Backend review 2026-09: LIST cursor + key encoding, metadata limit,
+// conditional PUT atomicity
+// ============================================================================
+
+/// Review C5: ListObjectsV2 must honour `start-after` (and a continuation
+/// token must win over it).
+#[tokio::test]
+async fn test_list_v2_honours_start_after() {
+    let server = TestServer::filesystem().await;
+    let s3 = server.s3_client().await;
+    let bucket = server.bucket();
+    for key in ["sa/a.txt", "sa/b.txt", "sa/c.txt"] {
+        s3.put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+            .send()
+            .await
+            .unwrap();
+    }
+    let keys = |out: aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output| -> Vec<String> {
+        out.contents()
+            .iter()
+            .filter_map(|o| o.key().map(str::to_string))
+            .collect()
+    };
+    let out = s3
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix("sa/")
+        .start_after("sa/a.txt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(keys(out), vec!["sa/b.txt", "sa/c.txt"]);
+    let out = s3
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix("sa/")
+        .start_after("sa/a.txt")
+        .continuation_token("sa/b.txt")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(keys(out), vec!["sa/c.txt"], "a continuation token wins");
+}
+
+/// Review C2: with `encoding-type=url` S3 URL-encodes the keys it returns.
+/// aws-cli always sets it and decodes with `unquote_plus`, so a raw `+`
+/// came back as a space and `%` sequences were mangled.
+#[tokio::test]
+async fn test_list_encoding_type_url_encodes_keys() {
+    let server = TestServer::filesystem().await;
+    let s3 = server.s3_client().await;
+    let bucket = server.bucket();
+    let key = "enc dir/a+b c%41.txt";
+    s3.put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+    let http = reqwest::Client::new();
+    for list in ["list-type=2&", ""] {
+        let body = http
+            .get(format!(
+                "{}/{}?{list}encoding-type=url&prefix=enc%20dir%2F",
+                server.endpoint(),
+                bucket
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains("<Key>enc%20dir/a%2Bb%20c%2541.txt</Key>"),
+            "keys must be URL-encoded ({list:?}): {body}"
+        );
+        assert!(
+            body.contains("<Prefix>enc%20dir/</Prefix>"),
+            "the prefix echo must be URL-encoded too ({list:?}): {body}"
+        );
+    }
+    // The SDK decodes what it asked for: the round trip is lossless.
+    let out = s3
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix("enc dir/")
+        .encoding_type(aws_sdk_s3::types::EncodingType::Url)
+        .send()
+        .await
+        .unwrap();
+    let got: Vec<&str> = out.contents().iter().filter_map(|o| o.key()).collect();
+    assert!(
+        got == vec![key] || got == vec!["enc%20dir/a%2Bb%20c%2541.txt"],
+        "unexpected keys {got:?}"
+    );
+}
+
+/// Review C8: S3 caps user metadata at 2 KB and answers 400. The proxy used
+/// to pass it to storage: 500 on S3, "disk full" from xattrs on filesystem.
+#[tokio::test]
+async fn test_oversized_user_metadata_is_400() {
+    let server = TestServer::filesystem().await;
+    let http = reqwest::Client::new();
+    let url = format!("{}/{}/meta-big.txt", server.endpoint(), server.bucket());
+    let resp = http
+        .put(&url)
+        .header("x-amz-meta-big", "v".repeat(3000))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap();
+    assert_eq!(
+        status, 400,
+        "oversized metadata must be a client error: {body}"
+    );
+    assert!(body.contains("MetadataTooLarge"), "{body}");
+
+    let ok = http
+        .put(&url)
+        .header("x-amz-meta-small", "v".repeat(1000))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert!(ok.status().is_success(), "metadata under the limit is fine");
+}
+
+/// Review C4: `If-None-Match: *` is create-only. Concurrent creators of one
+/// key used to all pass the check and all write (4/4 succeeded).
+#[tokio::test]
+async fn test_concurrent_if_none_match_star_admits_one_writer() {
+    let server = TestServer::filesystem().await;
+    let url = format!("{}/{}/race/once.bin", server.endpoint(), server.bucket());
+    let body = generate_binary(4 * 1024 * 1024, 42);
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let url = url.clone();
+            let body = body.clone();
+            tokio::spawn(async move {
+                reqwest::Client::new()
+                    .put(&url)
+                    .header("if-none-match", "*")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .as_u16()
+            })
+        })
+        .collect();
+    let mut statuses = Vec::new();
+    for h in handles {
+        statuses.push(h.await.unwrap());
+    }
+    statuses.sort_unstable();
+    assert_eq!(
+        statuses,
+        vec![200, 412, 412, 412],
+        "exactly one create may win"
+    );
+}

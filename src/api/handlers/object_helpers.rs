@@ -148,6 +148,44 @@ pub(crate) fn quota_decision(quota: u64, used: Option<u64>, incoming: u64) -> Re
     }
 }
 
+/// S3's limit on user-defined metadata: the UTF-8 bytes of every
+/// `x-amz-meta-*` key (without the prefix) and value, summed.
+pub(crate) const USER_METADATA_MAX_BYTES: usize = 2048;
+
+/// Pure metadata-size verdict for every client write that carries user
+/// metadata (PUT, CreateMultipartUpload, CopyObject REPLACE, form POST).
+/// Oversized metadata used to reach storage and fail there: 500 on S3
+/// (header too large) and ENOSPC ("disk full") from xattrs on the
+/// filesystem backend (review C8). `Err` carries the measured size.
+pub(crate) fn user_metadata_size_check(
+    metadata: &std::collections::HashMap<String, String>,
+) -> Result<(), usize> {
+    let size: usize = metadata.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if size > USER_METADATA_MAX_BYTES {
+        Err(size)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod metadata_size_tests {
+    use super::{user_metadata_size_check, USER_METADATA_MAX_BYTES};
+    use std::collections::HashMap;
+
+    #[test]
+    fn limit_counts_keys_and_values() {
+        let at_limit = HashMap::from([("k".to_string(), "v".repeat(USER_METADATA_MAX_BYTES - 1))]);
+        assert_eq!(user_metadata_size_check(&at_limit), Ok(()));
+        let over = HashMap::from([("kk".to_string(), "v".repeat(USER_METADATA_MAX_BYTES - 1))]);
+        assert_eq!(
+            user_metadata_size_check(&over),
+            Err(USER_METADATA_MAX_BYTES + 1)
+        );
+        assert_eq!(user_metadata_size_check(&HashMap::new()), Ok(()));
+    }
+}
+
 #[cfg(test)]
 mod quota_tests {
     use super::quota_decision;

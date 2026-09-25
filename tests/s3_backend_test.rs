@@ -384,3 +384,41 @@ async fn list_reports_original_delta_sizes_without_backend_heads() {
         "LastModified must not flip between LISTs"
     );
 }
+
+/// Review C9: `metadata=true` must reach the engine. The adapter always
+/// listed in lite mode, so on an S3 backend (whose LIST carries no user
+/// metadata) the `<UserMetadata>` extension came back without the user's
+/// `x-amz-meta-*` pairs. The filesystem backend reads them during LIST
+/// anyway, so only an S3 backend shows the defect.
+#[tokio::test]
+async fn test_s3_list_metadata_true_carries_user_metadata() {
+    skip_unless_minio!();
+    let server = TestServer::s3().await;
+    let client = server.s3_client().await;
+    let prefix = unique_prefix();
+    client
+        .put_object()
+        .bucket(server.bucket())
+        .key(format!("{prefix}/meta.txt"))
+        .metadata("color", "teal-4711")
+        .body(ByteStream::from_static(b"hello"))
+        .send()
+        .await
+        .expect("PUT");
+    let body = reqwest::Client::new()
+        .get(format!(
+            "{}/{}?list-type=2&metadata=true&prefix={prefix}/",
+            server.endpoint(),
+            server.bucket()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("teal-4711"),
+        "metadata=true LIST must carry the user's metadata: {body}"
+    );
+}
