@@ -440,3 +440,88 @@ async fn test_move_into_own_subfolder_is_refused() {
         assert_eq!(got, want, "{key} must be intact");
     }
 }
+
+/// Tier 4: admin bulk copy/move/delete called the engine directly and
+/// skipped the quota gate, the event outbox and the audit log that the S3
+/// path applies to the same writes.
+#[tokio::test]
+async fn test_bulk_ops_honour_quota_and_record_events_and_audit() {
+    let server = TestServer::builder()
+        .bucket_policy("frozen-bkt", "quota_bytes: 0")
+        .build()
+        .await;
+    let http = reqwest::Client::new();
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let bucket = server.bucket();
+    http.put(format!("{ep}/{bucket}/src.txt"))
+        .body("payload")
+        .send()
+        .await
+        .unwrap();
+    let r = http.put(format!("{ep}/frozen-bkt")).send().await.unwrap();
+    assert!(r.status().is_success(), "create frozen-bkt: {}", r.status());
+
+    // Quota: a frozen destination refuses the copy.
+    let r: Value = admin
+        .post(format!("{ep}/_/api/admin/objects/copy"))
+        .json(&json!({
+            "source_bucket": bucket, "dest_bucket": "frozen-bkt",
+            "items": [{ "source_key": "src.txt", "relative": "src.txt" }]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["succeeded"].as_u64(), Some(0), "{r}");
+    assert_eq!(r["failed"].as_u64(), Some(1), "{r}");
+
+    // Outbox + audit: a copy and a delete are recorded.
+    let r = admin
+        .post(format!("{ep}/_/api/admin/objects/copy"))
+        .json(&json!({
+            "source_bucket": bucket, "dest_bucket": bucket, "dest_prefix": "cp/",
+            "items": [{ "source_key": "src.txt", "relative": "src.txt" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let r = admin
+        .post(format!("{ep}/_/api/admin/objects/delete"))
+        .json(&json!({ "bucket": bucket, "keys": ["cp/src.txt"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let outbox: Value = admin
+        .get(format!("{ep}/_/api/admin/event-outbox?limit=100"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = outbox["rows"].as_array().expect("outbox rows");
+    let has = |kind: &str| {
+        rows.iter()
+            .any(|e| e["kind"] == kind && e["key"] == "cp/src.txt")
+    };
+    assert!(has("ObjectCopied"), "no ObjectCopied: {outbox}");
+    assert!(has("ObjectDeleted"), "no ObjectDeleted: {outbox}");
+    let audit: Value = admin
+        .get(format!("{ep}/_/api/admin/audit?limit=100"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let text = audit.to_string();
+    assert!(
+        text.contains("bulk_copy") && text.contains("bulk_delete"),
+        "{text}"
+    );
+}

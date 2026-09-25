@@ -256,6 +256,7 @@ fn reject_if_replication_target_only(
 pub async fn copy_objects(
     Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CopyRequest>,
 ) -> Result<Json<CopyResponse>, (StatusCode, String)> {
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
@@ -286,6 +287,15 @@ pub async fn copy_objects(
     info!(
         "bulk copy: src={} dst={}/{} succeeded={} failed={}",
         req.source_bucket, req.dest_bucket, req.dest_prefix, res.succeeded, res.failed
+    );
+    super::audit_log(
+        "bulk_copy",
+        "admin",
+        &format!(
+            "{} -> {}/{} ok={} failed={}",
+            req.source_bucket, req.dest_bucket, req.dest_prefix, res.succeeded, res.failed
+        ),
+        &headers,
     );
     Ok(Json(res))
 }
@@ -324,6 +334,7 @@ async fn run_copy_loop(s3: &Arc<AppState>, req: &CopyRequest) -> CopyResponse {
         }
         let dk = dest_key(&req.dest_prefix, &it.relative);
         let result = copy_one(
+            s3,
             &engine,
             &req.source_bucket,
             &it.source_key,
@@ -353,52 +364,75 @@ async fn run_copy_loop(s3: &Arc<AppState>, req: &CopyRequest) -> CopyResponse {
     }
 }
 
+/// Copy one object the way a client write is handled: quota gate on the
+/// destination, the shared engine-routed transfer (streams or spools large
+/// objects instead of holding them in RAM; strips encryption markers; keeps
+/// multipart ETags), then an `ObjectCopied` outbox event.
 async fn copy_one(
+    s3: &Arc<AppState>,
     engine: &Arc<crate::deltaglider::DynEngine>,
     src_bucket: &str,
     src_key: &str,
     dst_bucket: &str,
     dst_key: &str,
 ) -> Result<(), String> {
-    // Engine-level retrieve+store so encryption/compression stays
-    // transparent (matches replication's copy_one design).
-    let (data, mut meta) = engine
-        .retrieve(src_bucket, src_key)
+    let head = engine
+        .head(src_bucket, src_key)
         .await
-        .map_err(|e| format!("retrieve {}/{}: {}", src_bucket, src_key, e))?;
-
-    // retrieve() returns PLAINTEXT but the metadata still carries the source's
-    // `dg-encrypted` / `dg-encryption-key-id` markers. Storing them onto the
-    // destination makes its read path think the (now-plaintext) bytes are
-    // encrypted → unreadable — and bulk-MOVE then deletes the source, so the
-    // only readable copy is gone. Strip them, exactly like transfer.rs.
-    crate::storage::encrypting::strip_encryption_markers(&mut meta.user_metadata);
-
-    if let Some(mp_etag) = meta.multipart_etag.clone() {
-        engine
-            .store_with_multipart_etag(
-                dst_bucket,
-                dst_key,
-                &data,
-                meta.content_type.clone(),
-                meta.user_metadata.clone(),
-                mp_etag,
-            )
-            .await
-            .map_err(|e| format!("store {}/{}: {}", dst_bucket, dst_key, e))?;
-    } else {
-        engine
-            .store(
-                dst_bucket,
-                dst_key,
-                &data,
-                meta.content_type.clone(),
-                meta.user_metadata.clone(),
-            )
-            .await
-            .map_err(|e| format!("store {}/{}: {}", dst_bucket, dst_key, e))?;
-    }
+        .map_err(|e| format!("head {}/{}: {}", src_bucket, src_key, e))?;
+    crate::api::handlers::object_helpers::check_quota(s3, dst_bucket, head.file_size)
+        .map_err(|e| e.to_string())?;
+    let outcome = crate::transfer::copy_object_with_retries(
+        engine,
+        crate::transfer::ObjectTransferRequest {
+            source_bucket: src_bucket,
+            source_key: src_key,
+            destination_bucket: dst_bucket,
+            destination_key: dst_key,
+            provenance: None,
+            strip_user_metadata_keys: &[],
+            operation: "admin bulk copy",
+            upload_concurrency: None,
+        },
+    )
+    .await
+    .map_err(|e| format!("copy {src_bucket}/{src_key} -> {dst_bucket}/{dst_key}: {e}"))?;
+    emit_event(
+        s3,
+        crate::event_outbox::EventKind::ObjectCopied,
+        dst_bucket,
+        dst_key,
+        serde_json::json!({
+            "content_length": outcome.content_length(),
+            "source_bucket": src_bucket,
+            "source_key": src_key,
+        }),
+    )
+    .await;
     Ok(())
+}
+
+/// Outbox append for an admin write, same shape as the S3 adapter's (source
+/// `S3Api`: these are client writes, so replication and webhooks see them).
+async fn emit_event(
+    s3: &Arc<AppState>,
+    kind: crate::event_outbox::EventKind,
+    bucket: &str,
+    key: &str,
+    payload: serde_json::Value,
+) {
+    crate::api::handlers::object_helpers::enqueue_object_event(
+        s3,
+        crate::event_outbox::NewEvent::new(
+            kind,
+            bucket,
+            key,
+            crate::event_outbox::EventSource::S3Api,
+            crate::replication::current_unix_seconds(),
+            payload,
+        ),
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -408,6 +442,7 @@ async fn copy_one(
 pub async fn move_objects(
     Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<MoveRequest>,
 ) -> Result<Json<MoveResponse>, (StatusCode, String)> {
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
@@ -493,7 +528,17 @@ pub async fn move_objects(
                 continue;
             }
             match engine.delete(&req.source_bucket, &it.source_key).await {
-                Ok(_) => deleted += 1,
+                Ok(_) => {
+                    deleted += 1;
+                    emit_event(
+                        &s3,
+                        crate::event_outbox::EventKind::ObjectDeleted,
+                        &req.source_bucket,
+                        &it.source_key,
+                        serde_json::json!({}),
+                    )
+                    .await;
+                }
                 Err(e) => {
                     warn!(
                         "bulk move: delete source {}/{} failed: {}",
@@ -523,6 +568,20 @@ pub async fn move_objects(
         copy_result.failed,
         deleted
     );
+    super::audit_log(
+        "bulk_move",
+        "admin",
+        &format!(
+            "{} -> {}/{} ok={} failed={} deleted={}",
+            req.source_bucket,
+            req.dest_bucket,
+            req.dest_prefix,
+            copy_result.succeeded,
+            copy_result.failed,
+            deleted
+        ),
+        &headers,
+    );
     Ok(Json(MoveResponse {
         succeeded: copy_result.succeeded,
         failed: copy_result.failed,
@@ -538,6 +597,7 @@ pub async fn move_objects(
 pub async fn bulk_delete(
     Extension(_gate): Extension<AdminGuiGate>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<DeleteRequest>,
 ) -> Result<Json<DeleteResponse>, (StatusCode, String)> {
     reject_if_under_maintenance(&state, &req.bucket)?;
@@ -583,7 +643,17 @@ pub async fn bulk_delete(
             break;
         }
         match engine.delete(&req.bucket, key).await {
-            Ok(_) => deleted += 1,
+            Ok(_) => {
+                deleted += 1;
+                emit_event(
+                    &state.s3_state,
+                    crate::event_outbox::EventKind::ObjectDeleted,
+                    &req.bucket,
+                    key,
+                    serde_json::json!({}),
+                )
+                .await;
+            }
             Err(e) => {
                 // Not-found is treated as deleted (idempotent).
                 let s3_err: crate::api::S3Error = e.into();
@@ -606,6 +676,12 @@ pub async fn bulk_delete(
     info!(
         "bulk delete: bucket={} deleted={} failed={}",
         req.bucket, deleted, failed
+    );
+    super::audit_log(
+        "bulk_delete",
+        "admin",
+        &format!("{} deleted={} failed={}", req.bucket, deleted, failed),
+        &headers,
     );
     Ok(Json(DeleteResponse {
         deleted,
