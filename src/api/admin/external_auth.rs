@@ -730,12 +730,14 @@ pub async fn delete_provider(
     Path(id): Path<i64>,
     req_headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
-    super::with_config_db(&state, "delete auth provider", |db| {
+    let target = super::with_config_db(&state, "delete auth provider", |db| {
+        let name = db.get_auth_provider(id).ok().map(|p| p.name);
         db.delete_auth_provider(id)
+            .map(|()| super::named_target(name.as_deref(), id))
     })
     .await?;
 
-    audit_log("delete_auth_provider", "", &id.to_string(), &req_headers);
+    audit_log("delete_auth_provider", "", &target, &req_headers);
     rebuild_external_auth(&state).await?;
     trigger_config_sync(&state);
 
@@ -809,6 +811,7 @@ pub async fn create_mapping(
         tracing::error!("Failed to create mapping rule: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    let target = rule_target(&db, &rule);
 
     // Canonical post-mutation order (see users.rs / groups.rs): rebuild the
     // IAM index so group resolution reflects the new rule, THEN trigger
@@ -817,12 +820,7 @@ pub async fn create_mapping(
     rebuild_iam_index(&db, &state.iam_state)?;
     drop(db);
     trigger_config_sync(&state);
-    audit_log(
-        "create_mapping_rule",
-        "admin",
-        &body.match_type,
-        &req_headers,
-    );
+    audit_log("create_mapping_rule", "admin", &target, &req_headers);
 
     Ok((StatusCode::CREATED, Json(rule)))
 }
@@ -855,16 +853,12 @@ pub async fn update_mapping(
         tracing::error!("Failed to update mapping rule: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    let target = rule_target(&db, &rule);
 
     rebuild_iam_index(&db, &state.iam_state)?;
     drop(db);
     trigger_config_sync(&state);
-    audit_log(
-        "update_mapping_rule",
-        "admin",
-        &id.to_string(),
-        &req_headers,
-    );
+    audit_log("update_mapping_rule", "admin", &target, &req_headers);
 
     Ok(Json(rule))
 }
@@ -877,6 +871,12 @@ pub async fn delete_mapping(
 ) -> Result<impl IntoResponse, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
+    let target = db
+        .load_group_mapping_rules()
+        .ok()
+        .and_then(|rs| rs.into_iter().find(|r| r.id == id))
+        .map(|r| rule_target(&db, &r))
+        .unwrap_or_else(|| format!("rule {id}"));
 
     db.delete_group_mapping_rule(id).map_err(|e| {
         tracing::error!("Failed to delete mapping rule: {}", e);
@@ -886,12 +886,7 @@ pub async fn delete_mapping(
     rebuild_iam_index(&db, &state.iam_state)?;
     drop(db);
     trigger_config_sync(&state);
-    audit_log(
-        "delete_mapping_rule",
-        "admin",
-        &id.to_string(),
-        &req_headers,
-    );
+    audit_log("delete_mapping_rule", "admin", &target, &req_headers);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1183,6 +1178,21 @@ fn symmetric_diff_count(a: &[i64], b: &[i64]) -> usize {
     let in_a_not_b = a.iter().filter(|x| !b.contains(x)).count();
     let in_b_not_a = b.iter().filter(|x| !a.contains(x)).count();
     in_a_not_b + in_b_not_a
+}
+
+/// Audit label of a mapping rule (rules have no name): what it matches and
+/// the group it grants.
+fn rule_target(
+    db: &crate::config_db::ConfigDb,
+    rule: &crate::config_db::auth_providers::GroupMappingRule,
+) -> String {
+    format!(
+        "rule {}: {} {} -> group {}",
+        rule.id,
+        rule.match_type,
+        rule.match_value,
+        super::groups::group_target(db, rule.group_id)
+    )
 }
 
 #[cfg(test)]

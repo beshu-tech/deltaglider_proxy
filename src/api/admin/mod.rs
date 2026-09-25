@@ -297,6 +297,15 @@ pub(crate) fn audit_log(
     crate::audit::audit_log(action, admin_user, target, headers, "", "");
 }
 
+/// Audit target for an IAM row: `name (id N)`, or `id N` when the name is
+/// unknown. A bare id says nothing once the row is deleted.
+pub(crate) fn named_target(name: Option<&str>, id: i64) -> String {
+    match name {
+        Some(n) => format!("{n} (id {id})"),
+        None => format!("id {id}"),
+    }
+}
+
 /// Status for a failed config-DB write: 409 when a UNIQUE constraint
 /// refused it (a user or group name in use), else `otherwise`.
 pub(crate) fn db_write_status(

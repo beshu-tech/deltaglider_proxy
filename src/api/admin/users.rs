@@ -417,6 +417,14 @@ pub async fn delete_user(
     // Capture every revocation identity BEFORE the rows disappear: the access
     // key plus each external login (`provider:user_id`, see AuthMethod).
     let identities = revocation_identities_for_user(&db, user_id);
+    let target = super::named_target(
+        db.load_users()
+            .ok()
+            .and_then(|us| us.into_iter().find(|u| u.id == user_id))
+            .map(|u| u.name)
+            .as_deref(),
+        user_id,
+    );
 
     db.delete_user(user_id).map_err(|e| {
         tracing::warn!("Failed to delete user {}: {}", user_id, e);
@@ -426,7 +434,10 @@ pub async fn delete_user(
     // Check if this was the last user before rebuilding
     let remaining = db.load_users().map(|u| u.len()).unwrap_or(0);
     if remaining == 0 {
-        tracing::warn!("Last IAM user deleted — switching to open access (no authentication)");
+        tracing::warn!(
+            "Last IAM user deleted: falling back to the bootstrap credential \
+             (open access only when authentication is explicitly none)"
+        );
     }
 
     // Rebuild AFTER capturing the result — the revocation below must run even
@@ -450,7 +461,7 @@ pub async fn delete_user(
         user_id,
         remaining
     );
-    audit_log("delete_user", "admin", &user_id.to_string(), &headers);
+    audit_log("delete_user", "admin", &target, &headers);
     Ok(StatusCode::NO_CONTENT)
 }
 

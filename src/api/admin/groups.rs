@@ -225,6 +225,7 @@ pub async fn delete_group(
 ) -> Result<StatusCode, StatusCode> {
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
+    let target = group_target(&db, group_id);
 
     db.delete_group(group_id).map_err(|e| {
         tracing::warn!("Failed to delete group {}: {}", group_id, e);
@@ -235,7 +236,7 @@ pub async fn delete_group(
     trigger_config_sync(&state);
 
     tracing::info!("IAM group {} deleted", group_id);
-    audit_log("delete_group", "admin", &group_id.to_string(), &headers);
+    audit_log("delete_group", "admin", &target, &headers);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -258,17 +259,17 @@ pub async fn add_group_member(
         );
         StatusCode::BAD_REQUEST
     })?;
+    let target = format!(
+        "user {} to group {}",
+        user_target(&db, body.user_id),
+        group_target(&db, group_id)
+    );
 
     rebuild_iam_index(&db, &state.iam_state)?;
     trigger_config_sync(&state);
 
     tracing::info!("User {} added to group {}", body.user_id, group_id);
-    audit_log(
-        "add_member",
-        "admin",
-        &format!("group:{}+user:{}", group_id, body.user_id),
-        &headers,
-    );
+    audit_log("add_member", "admin", &target, &headers);
     Ok(StatusCode::OK)
 }
 
@@ -290,16 +291,31 @@ pub async fn remove_group_member(
         );
         StatusCode::BAD_REQUEST
     })?;
+    let target = format!(
+        "user {} from group {}",
+        user_target(&db, user_id),
+        group_target(&db, group_id)
+    );
 
     rebuild_iam_index(&db, &state.iam_state)?;
     trigger_config_sync(&state);
 
     tracing::info!("User {} removed from group {}", user_id, group_id);
-    audit_log(
-        "remove_member",
-        "admin",
-        &format!("group:{}+user:{}", group_id, user_id),
-        &headers,
-    );
+    audit_log("remove_member", "admin", &target, &headers);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Audit label of a group: `name (id N)`.
+pub(crate) fn group_target(db: &crate::config_db::ConfigDb, id: i64) -> String {
+    super::named_target(db.get_group_by_id(id).ok().map(|g| g.name).as_deref(), id)
+}
+
+/// Audit label of a user: `name (id N)`.
+fn user_target(db: &crate::config_db::ConfigDb, id: i64) -> String {
+    let name = db
+        .load_users()
+        .ok()
+        .and_then(|us| us.into_iter().find(|u| u.id == id))
+        .map(|u| u.name);
+    super::named_target(name.as_deref(), id)
 }

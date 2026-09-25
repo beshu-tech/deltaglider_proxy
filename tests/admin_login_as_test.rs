@@ -290,3 +290,135 @@ async fn test_secret_exports_are_audited() {
         assert_eq!(e["user"], "dana", "{e}");
     }
 }
+
+/// IAM audit entries named deleted users, groups, members, providers and
+/// mapping rules by their numeric id only, which says nothing once the row
+/// is gone. Every target must carry the name (and the id).
+#[tokio::test]
+async fn test_iam_audit_targets_carry_names() {
+    let server = TestServer::builder()
+        .auth("BOOTSTRAP5", "BOOTSTRAPSECRET5")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let users: serde_json::Value = {
+        create_user(&admin, &ep, "dana", readonly_perms()).await;
+        admin
+            .get(format!("{ep}/_/api/admin/users"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    };
+    let dana_id = users
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["name"] == "dana")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let group: serde_json::Value = admin
+        .post(format!("{ep}/_/api/admin/groups"))
+        .json(&json!({ "name": "Engineering", "permissions": [] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let gid = group["id"].as_i64().unwrap();
+    let ok = |r: reqwest::Response| assert!(r.status().is_success(), "{}", r.status());
+    ok(admin
+        .post(format!("{ep}/_/api/admin/groups/{gid}/members"))
+        .json(&json!({ "user_id": dana_id }))
+        .send()
+        .await
+        .unwrap());
+    ok(admin
+        .delete(format!("{ep}/_/api/admin/groups/{gid}/members/{dana_id}"))
+        .send()
+        .await
+        .unwrap());
+    let rule: serde_json::Value = admin
+        .post(format!("{ep}/_/api/admin/ext-auth/mappings"))
+        .json(
+            &json!({ "match_type": "email_domain", "match_value": "example.com", "group_id": gid }),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rid = rule["id"].as_i64().unwrap();
+    let provider: serde_json::Value = admin
+        .post(format!("{ep}/_/api/admin/ext-auth/providers"))
+        .json(&json!({
+            "name": "corp-sso",
+            "provider_type": "oidc",
+            "enabled": false,
+            "client_id": "client",
+            "client_secret": "secret",
+            "issuer_url": "https://accounts.google.com",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pid = provider["id"].as_i64().unwrap();
+    for path in [
+        format!("ext-auth/providers/{pid}"),
+        format!("ext-auth/mappings/{rid}"),
+        format!("groups/{gid}"),
+        format!("users/{dana_id}"),
+    ] {
+        ok(admin
+            .delete(format!("{ep}/_/api/admin/{path}"))
+            .send()
+            .await
+            .unwrap());
+    }
+    let audit: serde_json::Value = admin
+        .get(format!("{ep}/_/api/admin/audit?limit=50"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let target = |action: &str| {
+        audit["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["action"] == action)
+            .unwrap_or_else(|| panic!("no {action} in {audit}"))["target"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(
+        target("add_member"),
+        format!("user dana (id {dana_id}) to group Engineering (id {gid})")
+    );
+    assert_eq!(
+        target("remove_member"),
+        format!("user dana (id {dana_id}) from group Engineering (id {gid})")
+    );
+    assert_eq!(
+        target("delete_mapping_rule"),
+        format!("rule {rid}: email_domain example.com -> group Engineering (id {gid})")
+    );
+    assert_eq!(target("delete_group"), format!("Engineering (id {gid})"));
+    assert_eq!(
+        target("delete_auth_provider"),
+        format!("corp-sso (id {pid})")
+    );
+    assert_eq!(target("delete_user"), format!("dana (id {dana_id})"));
+}
