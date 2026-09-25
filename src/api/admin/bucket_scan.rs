@@ -49,6 +49,7 @@
 //! rest, and the cache file is naturally keyed by what was actually
 //! scanned.
 
+use super::path_guard::AdminBucket;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -571,7 +572,7 @@ async fn run_scan(
 /// Query for any of the per-bucket endpoints.
 #[derive(Deserialize)]
 pub struct BucketQuery {
-    pub bucket: String,
+    pub bucket: AdminBucket,
 }
 
 /// Status snapshot payload for the JSON endpoint.
@@ -599,7 +600,7 @@ pub struct AllStatusResponse {
 
 #[derive(Deserialize)]
 pub struct OptionalBucketQuery {
-    pub bucket: Option<String>,
+    pub bucket: Option<AdminBucket>,
 }
 
 pub async fn get_scan_status(
@@ -635,7 +636,7 @@ pub async fn post_scan_start(
 ) -> Result<Json<ScanProgress>, StatusCode> {
     let rx = state
         .bucket_scanner
-        .start(q.bucket.clone(), state.s3_state.clone());
+        .start(q.bucket.into_string(), state.s3_state.clone());
     let snapshot = rx.borrow().clone();
     Ok(Json(snapshot))
 }
@@ -673,7 +674,7 @@ pub async fn get_scan_stream(
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = state
         .bucket_scanner
-        .start(q.bucket.clone(), state.s3_state.clone());
+        .start(q.bucket.into_string(), state.s3_state.clone());
 
     // Emit the current frame immediately so the client gets state
     // without waiting for the next page.

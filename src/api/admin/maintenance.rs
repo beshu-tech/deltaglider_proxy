@@ -335,6 +335,7 @@ pub async fn start_migrate(
             "bucket and target_backend are required".into(),
         ));
     }
+    super::path_guard::check_bucket(&bucket).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let db = state
         .config_db
         .as_ref()

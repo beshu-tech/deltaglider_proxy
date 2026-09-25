@@ -291,3 +291,63 @@ async fn test_list_all_refuses_empty_prefix() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 400);
 }
+
+/// S6: admin handlers call the engine directly, so s3s never validates their
+/// bucket names. A bucket like `../x` or `/etc` must be refused before any
+/// filesystem path is built from it; so must `..` key segments.
+#[tokio::test]
+async fn test_admin_inputs_refuse_path_escapes() {
+    let server = TestServer::filesystem().await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let bucket = server.bucket();
+
+    let copy = |src: &str, key: &str| {
+        json!({
+            "source_bucket": src,
+            "dest_bucket": bucket,
+            "items": [{ "source_key": key, "relative": "x" }]
+        })
+    };
+    for body in [
+        copy("../escape", "a"),
+        copy("/etc", "passwd"),
+        copy(&bucket, "../../x"),
+    ] {
+        let r = admin
+            .post(format!("{ep}/_/api/admin/objects/copy"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_client_error(), "copy {body}: {}", r.status());
+    }
+    let r = admin
+        .post(format!("{ep}/_/api/admin/objects/delete"))
+        .json(&json!({ "bucket": bucket, "keys": ["../../outside"] }))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error(), "delete: {}", r.status());
+    let r = admin
+        .get(format!("{ep}/_/api/admin/objects/zip?keys=..%2Fx%2Fsecret"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 400, "zip");
+    let r = admin
+        .post(format!("{ep}/_/api/admin/usage/scan"))
+        .json(&json!({ "bucket": "/tmp", "prefix": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error(), "usage scan: {}", r.status());
+    let r = admin
+        .get(format!(
+            "{ep}/_/api/admin/deltaspace/savings?bucket={bucket}&prefix=..%2F..%2F"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_client_error(), "savings: {}", r.status());
+}

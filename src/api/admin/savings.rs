@@ -30,6 +30,7 @@
 //! `/_/api/admin/diagnostics/scan/start` which writes to a shared
 //! disk-cached `ScanResult`.
 
+use super::path_guard::{AdminBucket, AdminObjectPath};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,10 +65,10 @@ const CACHE_MAX_ENTRIES: u64 = 4096;
 
 #[derive(Deserialize)]
 pub struct SavingsQuery {
-    pub bucket: String,
+    pub bucket: AdminBucket,
     /// Default empty = whole bucket (same shape as the bucket scan).
     #[serde(default)]
-    pub prefix: String,
+    pub prefix: AdminObjectPath,
 }
 
 #[derive(Serialize, Clone)]

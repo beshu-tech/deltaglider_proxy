@@ -4,6 +4,7 @@
 //! O(1) bucket-usage COUNTER (`get_bucket_usage`) and its full-scan
 //! `refresh_bucket_usage`.
 
+use super::path_guard::{AdminBucket, AdminObjectPath};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -18,14 +19,14 @@ use crate::deltaglider::savings::SavingsTotals;
 
 #[derive(Deserialize)]
 pub struct ScanUsageRequest {
-    bucket: String,
-    prefix: Option<String>,
+    bucket: AdminBucket,
+    prefix: Option<AdminObjectPath>,
 }
 
 #[derive(Deserialize)]
 pub struct UsageQuery {
-    bucket: String,
-    prefix: Option<String>,
+    bucket: AdminBucket,
+    prefix: Option<AdminObjectPath>,
 }
 
 /// POST /_/api/admin/usage/scan — trigger a background usage scan.
@@ -33,10 +34,11 @@ pub async fn scan_usage(
     State(state): State<Arc<AdminState>>,
     Json(req): Json<ScanUsageRequest>,
 ) -> impl IntoResponse {
-    let prefix = req.prefix.unwrap_or_default();
-    let started = state
-        .usage_scanner
-        .enqueue_scan(req.bucket, prefix, state.s3_state.clone());
+    let prefix = req.prefix.unwrap_or_default().into_string();
+    let started =
+        state
+            .usage_scanner
+            .enqueue_scan(req.bucket.into_string(), prefix, state.s3_state.clone());
     if started {
         (
             StatusCode::ACCEPTED,
@@ -79,7 +81,7 @@ pub async fn migrate_legacy(
 
 #[derive(Deserialize)]
 pub struct MigrateRequest {
-    bucket: String,
+    bucket: AdminBucket,
 }
 
 /// GET /_/api/admin/usage?bucket=X&prefix=Y — return cached usage entry.
@@ -137,15 +139,8 @@ fn usage_json(bucket: &str, row: Option<crate::bucket_usage::BucketUsageRow>) ->
 /// GET /_/api/admin/usage/bucket/:bucket — O(1) counter read (no scan).
 pub async fn get_bucket_usage(
     State(state): State<Arc<AdminState>>,
-    Path(bucket): Path<String>,
+    Path(bucket): Path<AdminBucket>,
 ) -> impl IntoResponse {
-    if let Err(e) = crate::security::validate_bucket_name(&bucket) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("invalid bucket name: {}", e)})),
-        )
-            .into_response();
-    }
     let Some(usage) = state.s3_state.bucket_usage.as_ref() else {
         return (
             StatusCode::OK,
@@ -169,13 +164,6 @@ pub async fn refresh_bucket_usage(
     State(state): State<Arc<AdminState>>,
     axum::extract::Query(q): axum::extract::Query<UsageQuery>,
 ) -> impl IntoResponse {
-    if let Err(e) = crate::security::validate_bucket_name(&q.bucket) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": format!("invalid bucket name: {}", e)})),
-        )
-            .into_response();
-    }
     let Some(usage) = state.s3_state.bucket_usage.as_ref() else {
         return (
             StatusCode::OK,

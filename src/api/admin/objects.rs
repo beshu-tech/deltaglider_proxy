@@ -35,6 +35,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::auth::AdminGuiGate;
+use super::path_guard::{AdminBucket, AdminObjectPath};
 
 // ---------------------------------------------------------------------------
 // Request/response shapes
@@ -43,12 +44,12 @@ use super::auth::AdminGuiGate;
 #[derive(Debug, Deserialize)]
 pub struct CopyRequest {
     /// Source bucket — every key in `keys` is read from here.
-    pub source_bucket: String,
+    pub source_bucket: AdminBucket,
     /// Destination bucket. May be the same as source.
-    pub dest_bucket: String,
+    pub dest_bucket: AdminBucket,
     /// Optional prefix prepended to every destination key.
     #[serde(default)]
-    pub dest_prefix: String,
+    pub dest_prefix: AdminObjectPath,
     /// Pairs of (source_key, relative_dest_suffix). The dest key is
     /// `dest_prefix + relative_suffix`. The client computes relatives
     /// because folder-selection semantics are UI-driven (which prefix
@@ -58,8 +59,8 @@ pub struct CopyRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct CopyItem {
-    pub source_key: String,
-    pub relative: String,
+    pub source_key: AdminObjectPath,
+    pub relative: AdminObjectPath,
 }
 
 #[derive(Debug, Serialize)]
@@ -79,10 +80,10 @@ pub struct CopyFailure {
 
 #[derive(Debug, Deserialize)]
 pub struct MoveRequest {
-    pub source_bucket: String,
-    pub dest_bucket: String,
+    pub source_bucket: AdminBucket,
+    pub dest_bucket: AdminBucket,
     #[serde(default)]
-    pub dest_prefix: String,
+    pub dest_prefix: AdminObjectPath,
     pub items: Vec<CopyItem>,
 }
 
@@ -98,8 +99,8 @@ pub struct MoveResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct DeleteRequest {
-    pub bucket: String,
-    pub keys: Vec<String>,
+    pub bucket: AdminBucket,
+    pub keys: Vec<AdminObjectPath>,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,7 +263,7 @@ async fn run_copy_loop(s3: &Arc<AppState>, req: &CopyRequest) -> CopyResponse {
             failed += remaining;
             if failures.len() < MAX_FAILURE_ENTRIES {
                 failures.push(CopyFailure {
-                    source_key: it.source_key.clone(),
+                    source_key: it.source_key.to_string(),
                     dest_key: String::new(),
                     error: format!(
                         "a maintenance job started on bucket '{}' — {} remaining \
@@ -288,7 +289,7 @@ async fn run_copy_loop(s3: &Arc<AppState>, req: &CopyRequest) -> CopyResponse {
                 failed += 1;
                 if failures.len() < MAX_FAILURE_ENTRIES {
                     failures.push(CopyFailure {
-                        source_key: it.source_key.clone(),
+                        source_key: it.source_key.to_string(),
                         dest_key: dk,
                         error: e,
                     });
@@ -528,7 +529,7 @@ pub async fn bulk_delete(
             failed += remaining;
             if failures.len() < MAX_FAILURE_ENTRIES {
                 failures.push(DeleteFailure {
-                    key: key.clone(),
+                    key: key.to_string(),
                     error: format!(
                         "a maintenance job started on bucket '{}' — {} remaining \
                          key(s) skipped; retry after the job finishes",
@@ -549,7 +550,7 @@ pub async fn bulk_delete(
                     failed += 1;
                     if failures.len() < MAX_FAILURE_ENTRIES {
                         failures.push(DeleteFailure {
-                            key: key.clone(),
+                            key: key.to_string(),
                             error: format!("{}", s3_err),
                         });
                     }
@@ -641,6 +642,11 @@ pub async fn download_zip(
             StatusCode::BAD_REQUEST,
             "?keys must be a comma-separated list of bucket/key entries".into(),
         ));
+    }
+    for (b, k) in &parsed {
+        super::path_guard::check_bucket(b)
+            .and_then(|()| super::path_guard::check_object_path(k))
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     }
     if parsed.len() > MAX_BULK_OBJECTS {
         return Err((
@@ -847,9 +853,9 @@ fn zip_skip_report(
 
 #[derive(Debug, Deserialize)]
 pub struct ListAllQuery {
-    pub bucket: String,
+    pub bucket: AdminBucket,
     #[serde(default)]
-    pub prefix: String,
+    pub prefix: AdminObjectPath,
 }
 
 #[derive(Debug, Serialize)]

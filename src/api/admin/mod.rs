@@ -17,6 +17,7 @@ mod lifecycle;
 mod logs;
 pub(crate) mod maintenance;
 pub(crate) mod objects;
+mod path_guard;
 pub(crate) mod replication;
 mod savings;
 mod scanner;

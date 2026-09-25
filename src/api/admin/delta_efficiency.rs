@@ -34,6 +34,7 @@
 //! [`classify_deltaspace`] takes only `(reference_size, &[delta_size])`
 //! and returns an [`Efficiency`] verdict. No I/O, fully unit-testable.
 
+use super::path_guard::{AdminBucket, AdminObjectPath};
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
@@ -614,7 +615,7 @@ fn clamp_min_deltas(min_deltas: Option<usize>) -> usize {
 #[derive(Deserialize)]
 pub struct EfficiencyQuery {
     /// Bucket to scan. Required to bound work per request.
-    pub bucket: String,
+    pub bucket: AdminBucket,
     /// Skip prefixes with fewer than this many deltas. Default 3.
     #[serde(default)]
     pub min_deltas: Option<usize>,
@@ -645,7 +646,7 @@ pub async fn get_delta_efficiency(
     // because "the work has been accepted" is the more accurate
     // semantic than "not found".
     let started = state.delta_efficiency_scanner.enqueue_scan(
-        q.bucket.clone(),
+        q.bucket.to_string(),
         min_deltas,
         state.s3_state.clone(),
     );
@@ -668,7 +669,7 @@ pub async fn get_delta_efficiency(
 
 #[derive(Deserialize)]
 pub struct EfficiencyScanRequest {
-    pub bucket: String,
+    pub bucket: AdminBucket,
     #[serde(default)]
     pub min_deltas: Option<usize>,
 }
@@ -683,7 +684,7 @@ pub async fn post_delta_efficiency_scan(
 ) -> impl IntoResponse {
     let min_deltas = clamp_min_deltas(req.min_deltas);
     let started = state.delta_efficiency_scanner.enqueue_scan(
-        req.bucket.clone(),
+        req.bucket.to_string(),
         min_deltas,
         state.s3_state.clone(),
     );
@@ -738,8 +739,8 @@ pub struct VerifyResponse {
 
 #[derive(Deserialize)]
 pub struct VerifyRequest {
-    pub bucket: String,
-    pub prefix: String,
+    pub bucket: AdminBucket,
+    pub prefix: AdminObjectPath,
 }
 
 /// `POST /_/api/admin/diagnostics/delta-efficiency/verify` — operator
