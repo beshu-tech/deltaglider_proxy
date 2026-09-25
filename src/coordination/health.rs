@@ -761,6 +761,12 @@ mod review2_tests {
     /// probe still sends a signed request to it.
     #[tokio::test]
     async fn review2_probe_never_contacts_an_endpoint_the_backend_validator_refuses() {
+        // The env override lets every builder accept a local endpoint, so the
+        // premise (the engine refuses it) cannot hold. The nightly job sets it.
+        if crate::config::env_bool("DGP_BACKEND_ALLOW_LOCAL", false) {
+            eprintln!("skipped: DGP_BACKEND_ALLOW_LOCAL is set");
+            return;
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accepted = tokio::spawn(async move {
