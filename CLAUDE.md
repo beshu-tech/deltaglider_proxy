@@ -231,8 +231,8 @@ single-instance planes below are addressed.
   (operator one-offs) and PARITY — those still double-run under round-robin. **Cross-node kill/pause,
   resume-from-cursor on takeover, and post-failover run-history are NOT delivered**
   (cursor / `cancelling`+`paused` rows / run_history stay node-local) — a cross-node
-  takeover RESTARTS the run (safe: idempotent copy / generation-pin / provenance-
-  gated delete — just wasteful). A non-CAS coordination backend (B2/501) falls back
+  takeover RESTARTS the run (safe: idempotent copy / generation-pin / delete only after
+  re-confirming the source key is absent — just wasteful). A non-CAS coordination backend (B2/501) falls back
   to `LocalLease` (every node runs; tolerable churn) — never a SPOF.
 - **Admin/browser sessions** (`session.rs`, in-memory) — a cookie minted on node A
   is invalid on B (intermittent 401s). Sticky sessions required for the admin GUI.
