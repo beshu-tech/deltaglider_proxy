@@ -1331,8 +1331,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     }
 
     /// Build the cache key for a deltaspace's reference.
-    fn cache_key(bucket: &str, deltaspace_id: &str) -> String {
-        format!("{}/{}", bucket, deltaspace_id)
+    /// THE per-deltaspace key: the reference cache and the in-process
+    /// deltaspace lock. Keyed by the STORAGE, so two alias names of one real
+    /// bucket (one reference.bin) share the entry and the lock.
+    fn cache_key(&self, bucket: &str, deltaspace_id: &str) -> String {
+        format!(
+            "{}/{}",
+            self.storage.storage_identity(bucket),
+            deltaspace_id
+        )
     }
 
     /// Try to acquire a codec permit, returning `Overloaded` if all slots are busy.
@@ -1366,17 +1373,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> tokio::sync::OwnedMutexGuard<()> {
         // Periodic cleanup on every lock acquisition (cheap — just checks len())
         self.cleanup_prefix_locks();
-        // A deltaspace is (bucket, prefix): keyed by the prefix alone, the
-        // same prefix in two buckets shared one mutex. Same key shape as the
-        // reference cache.
-        // Keyed by the STORAGE: two alias names of one real bucket share
-        // its reference.bin, so they must share the lock.
+        // A deltaspace is (storage, prefix): keyed by the prefix alone, the
+        // same prefix in two buckets shared one mutex (see `cache_key`).
         let mutex = self
             .prefix_locks
-            .entry(Self::cache_key(
-                &self.storage.storage_identity(bucket),
-                prefix,
-            ))
+            .entry(self.cache_key(bucket, prefix))
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         mutex.lock_owned().await
@@ -2187,7 +2188,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .delete_reference(&*self.storage, bucket, deltaspace_id)
             .await?;
         self.cache
-            .invalidate(&Self::cache_key(bucket, deltaspace_id));
+            .invalidate(&self.cache_key(bucket, deltaspace_id));
         // Mirror `delete`'s accounting: the reclaimed reference bytes leave
         // stored_bytes (no object count change — the objects were counted as
         // they were individually deleted).
@@ -2333,7 +2334,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             {
                 Ok(()) => {
                     reclaimed_ref_bytes = ref_bytes;
-                    let cache_key = Self::cache_key(bucket, &deltaspace_id);
+                    let cache_key = self.cache_key(bucket, &deltaspace_id);
                     self.cache.invalidate(&cache_key);
                 }
                 Err(e) => warn!("reference reclaim failed for {bucket}/{deltaspace_id}: {e}"),
@@ -2367,7 +2368,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         deltaspace_id: &str,
         expected_sha256: &str,
     ) -> Result<(bytes::Bytes, bool), EngineError> {
-        let cache_key = Self::cache_key(bucket, deltaspace_id);
+        let cache_key = self.cache_key(bucket, deltaspace_id);
 
         // Check cache first (Bytes clone is a cheap refcount increment)
         if let Some(data) = self.cache.get_matching(&cache_key, expected_sha256) {

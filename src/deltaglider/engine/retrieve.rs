@@ -354,7 +354,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // PRE-FLIGHT INTEGRITY GATE — before any byte ships.
         if actual_sha != expected_sha {
-            let cache_key = Self::cache_key(bucket, deltaspace_id);
+            let cache_key = self.cache_key(bucket, deltaspace_id);
             self.cache.invalidate(&cache_key);
             warn!(
                 "Checksum mismatch (spooled) for {}: expected {}, got {}",
@@ -630,7 +630,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                                 );
                                 let sha = hex::encode(Sha256::digest(&data));
                                 let bytes = bytes::Bytes::from(data);
-                                let cache_key = Self::cache_key(bucket, deltaspace_id);
+                                let cache_key = self.cache_key(bucket, deltaspace_id);
                                 self.cache.put(&cache_key, bytes.clone(), &sha);
                                 (bytes, false)
                             }
@@ -707,7 +707,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             // from storage would poison the cache indefinitely, causing every
             // subsequent delta GET in this deltaspace to fail until the cache
             // entry is naturally evicted or the process restarts.
-            let cache_key = Self::cache_key(bucket, deltaspace_id);
+            let cache_key = self.cache_key(bucket, deltaspace_id);
             self.cache.invalidate(&cache_key);
             warn!(
                 "Checksum mismatch for {} (cache evicted for {}): expected {}, got {}",

@@ -231,7 +231,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     // Best-effort: undo the reference we just created.
                     // Errors here are logged but do not mask the
                     // original encode failure.
-                    let cache_key = Self::cache_key(bucket, &deltaspace_id);
+                    let cache_key = self.cache_key(bucket, &deltaspace_id);
                     self.cache.invalidate(&cache_key);
                     if let Err(cleanup_err) = xnode
                         .delete_reference(&*self.storage, bucket, &deltaspace_id)
@@ -470,7 +470,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             // The streaming path doesn't pre-cache the reference bytes; next GET
             // loads fresh.
             self.cache
-                .invalidate(&Self::cache_key(bucket, &deltaspace_id));
+                .invalidate(&self.cache_key(bucket, &deltaspace_id));
             // Fall through — the encode block below now sees has_existing_reference
             // effectively true (the reference is on disk).
         }
@@ -814,7 +814,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             // for this PUT (case 1). If the reference pre-existed, it
             // belongs to other delta siblings and must stay.
             if !has_existing_reference {
-                let cache_key = Self::cache_key(&del_bucket, &del_dsid);
+                let cache_key = self.cache_key(&del_bucket, &del_dsid);
                 self.cache.invalidate(&cache_key);
                 if let Err(e) = xnode
                     .delete_reference(&*self.storage, &del_bucket, &del_dsid)
@@ -904,7 +904,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .inc()
         });
 
-        let cache_key = Self::cache_key(ctx.bucket, ctx.deltaspace_id);
+        let cache_key = self.cache_key(ctx.bucket, ctx.deltaspace_id);
         self.cache
             .put(&cache_key, Bytes::copy_from_slice(ctx.data), &ctx.sha256);
 
@@ -978,7 +978,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .put_reference_from_file(&*self.storage, bucket, deltaspace_id, spool.path(), &healed)
             .await?;
         self.cache
-            .invalidate(&Self::cache_key(bucket, deltaspace_id));
+            .invalidate(&self.cache_key(bucket, deltaspace_id));
         Ok(healed)
     }
 
@@ -1681,7 +1681,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // Invalidate cache — reference metadata changed (though data is unchanged,
         // the cached Bytes doesn't include metadata, so this is precautionary).
-        let cache_key = Self::cache_key(bucket, deltaspace_id);
+        let cache_key = self.cache_key(bucket, deltaspace_id);
         self.cache.invalidate(&cache_key);
 
         Ok(true)
@@ -2263,6 +2263,16 @@ storage:
         );
         let cfg = Config::from_yaml_str(&yaml).unwrap();
         let engine = DeltaGliderEngine::new(&cfg, None).await.unwrap();
+        // The reference cache too: one entry for one reference.bin, so an
+        // invalidation through one name reaches a read through the other.
+        assert_eq!(
+            engine.cache_key("releases", "fw"),
+            engine.cache_key("downloads", "fw")
+        );
+        assert_ne!(
+            engine.cache_key("releases", "fw"),
+            engine.cache_key("releases", "fx")
+        );
         let _held = engine.acquire_prefix_lock("releases", "fw").await;
         assert!(
             tokio::time::timeout(
