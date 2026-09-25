@@ -66,35 +66,23 @@ pub enum DesiredEncryption {
 
 /// Resolve the bucket's desired at-rest state from the config.
 ///
-/// Follows the same routing the engine uses: explicit bucket-policy
-/// `backend`, else the default backend, else the first named backend,
-/// else the legacy singleton (synthetic name `default` — the same name
-/// the engine mixes into the derived key id, so the ids match what the
-/// wrapper stamps).
+/// Follows the routing the engine uses (`Config::effective_backend_for_bucket`;
+/// the singleton's synthetic name `default` is the name the engine mixes
+/// into the derived key id, so the ids match what the wrapper stamps).
 ///
 /// Returns `Err(reason)` for configurations the v1 job cannot verify or
 /// normalize: SSE modes (encryption happens AWS-side, no per-object
 /// proxy marker to check) and proxy mode without a key (writes would be
 /// plaintext — a misconfiguration to fix before running a job).
 pub fn resolve_desired(config: &Config, bucket: &str) -> Result<DesiredEncryption, String> {
-    let bucket_key = bucket.to_ascii_lowercase();
-    let (backend_name, enc) = if config.backends.is_empty() {
-        ("default".to_string(), config.backend_encryption.clone())
-    } else {
-        let explicit = config
-            .buckets
-            .get(&bucket_key)
-            .and_then(|p| p.backend.clone());
-        let name = explicit
-            .or_else(|| config.default_backend.clone())
-            .unwrap_or_else(|| config.backends[0].name.clone());
-        let named = config
-            .backends
-            .iter()
-            .find(|b| b.name == name)
-            .ok_or_else(|| format!("bucket '{bucket}' routes to unknown backend '{name}'"))?;
-        (name, named.encryption.clone())
-    };
+    let backend_name = config
+        .effective_backend_for_bucket(bucket)
+        .map(|(name, _)| name)
+        .ok_or_else(|| format!("bucket '{bucket}' routes to an unknown backend"))?;
+    let enc = config
+        .backend_encryption_by_name(&backend_name)
+        .cloned()
+        .ok_or_else(|| format!("bucket '{bucket}' routes to unknown backend '{backend_name}'"))?;
 
     match enc {
         BackendEncryptionConfig::None { .. } => Ok(DesiredEncryption::Plain),

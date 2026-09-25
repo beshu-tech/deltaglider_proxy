@@ -2445,6 +2445,18 @@ impl Config {
             .map(|b| &b.backend)
     }
 
+    /// Encryption config of a backend by NAME (same `"default"` rule as
+    /// [`Self::backend_by_name`]).
+    pub fn backend_encryption_by_name(&self, name: &str) -> Option<&BackendEncryptionConfig> {
+        if self.backends.is_empty() {
+            return (name == "default").then_some(&self.backend_encryption);
+        }
+        self.backends
+            .iter()
+            .find(|b| b.name == name)
+            .map(|b| &b.encryption)
+    }
+
     /// `(name, definition)` of the backend a bucket routes to by config: its
     /// explicit route, else [`Self::default_backend_name`]. `None` = the route
     /// names an undefined backend. Every "which backend is this bucket on"
@@ -6268,10 +6280,7 @@ storage:
             regex_lite::Regex::new(r"build_client\(&(config|cfg)\.backend\)").unwrap(),
             regex_lite::Regex::new(r"ConfigDbSync::new\(&(config|cfg)\.backend,").unwrap(),
         ];
-        // src/config/mod.rs is the home. src/maintenance/mod.rs::resolve_desired
-        // carries an equivalent copy owned by another change; drop it from
-        // this list when it calls the resolver.
-        let allowed = ["src/config/mod.rs", "src/maintenance/mod.rs"];
+        let allowed = ["src/config/mod.rs"];
         let mut offenders = Vec::new();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut stack = vec![root.join("src")];
