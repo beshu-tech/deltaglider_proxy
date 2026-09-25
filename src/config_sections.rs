@@ -1631,15 +1631,107 @@ pub fn replication_gate(
     old: &ReplicationConfig,
     new: &ReplicationConfig,
 ) -> Result<(), Vec<String>> {
-    let dups = replication_duplicate_rule_names(new);
-    if dups.is_empty() || old == new {
+    if old == new {
+        return Ok(());
+    }
+    let mut errors: Vec<String> = replication_duplicate_rule_names(new)
+        .into_iter()
+        .map(|n| format!("replication rule name '{n}' is duplicated — rename one copy"))
+        .collect();
+    errors.extend(replication_nesting_errors(&new.rules));
+    if errors.is_empty() {
         Ok(())
     } else {
-        Err(dups
-            .into_iter()
-            .map(|n| format!("replication rule name '{n}' is duplicated — rename one copy"))
-            .collect())
+        Err(errors)
     }
+}
+
+/// Enabled rules whose output is copied again with a LONGER key, without end:
+/// `b/` → `b/backup/` writes `backup/x`, then `backup/backup/x`, … (also via a
+/// chain of rules). Pure. Found by pushing a probe key through the rules; the
+/// key only grows when a rule's destination lies inside a source scope, and
+/// a glob that excludes the rewritten key stops it. A rule with include globs
+/// is not a starting point (its probe key is ambiguous). A plain A↔B mirror
+/// revisits the same key and is not reported here (`detect_replication_cycles`
+/// warns about it).
+pub fn replication_nesting_errors(rules: &[ReplicationRule]) -> Vec<String> {
+    use crate::replication::planner::compile_rule_globs;
+    use crate::replication::{normalize_prefix, rewrite_key};
+    const MAX_KEY_LEN: usize = 1024; // the S3 key limit
+    const MAX_STATES: usize = 10_000;
+
+    struct Hop<'a> {
+        name: &'a str,
+        src_bucket: &'a str,
+        src_prefix: String,
+        dst_bucket: &'a str,
+        dst_prefix: String,
+        include: globset::GlobSet,
+        exclude: globset::GlobSet,
+    }
+    let hops: Vec<Hop> = rules
+        .iter()
+        .filter(|r| r.enabled)
+        .filter_map(|r| {
+            let (include, exclude) = compile_rule_globs(r).ok()?;
+            Some(Hop {
+                name: &r.name,
+                src_bucket: &r.source.bucket,
+                src_prefix: normalize_prefix(&r.source.prefix),
+                dst_bucket: &r.destination.bucket,
+                dst_prefix: normalize_prefix(&r.destination.prefix),
+                include,
+                exclude,
+            })
+        })
+        .collect();
+    let applies = |h: &Hop, bucket: &str, key: &str| {
+        h.src_bucket == bucket
+            && key.starts_with(&h.src_prefix)
+            && (h.include.is_empty() || h.include.is_match(key))
+            && !h.exclude.is_match(key)
+    };
+
+    let mut errors = Vec::new();
+    for start in hops.iter().filter(|h| h.include.is_empty()) {
+        let probe = format!("{}probe", start.src_prefix);
+        let mut stack: Vec<(String, String, Vec<&str>)> =
+            vec![(start.src_bucket.to_string(), probe, Vec::new())];
+        let mut seen = std::collections::HashSet::new();
+        'search: while let Some((bucket, key, path)) = stack.pop() {
+            if seen.len() >= MAX_STATES {
+                break;
+            }
+            if !seen.insert((bucket.clone(), key.clone())) {
+                continue;
+            }
+            for h in hops.iter().filter(|h| applies(h, &bucket, &key)) {
+                let Ok(next) = rewrite_key(&h.src_prefix, &h.dst_prefix, &key) else {
+                    continue;
+                };
+                let mut next_path = path.clone();
+                next_path.push(h.name);
+                if next.len() > MAX_KEY_LEN {
+                    errors.push(format!(
+                        "replication rule(s) {} copy their own output into a deeper \
+                         prefix without end (e.g. a destination inside the source \
+                         prefix) — move the destination out of the source scope, or \
+                         exclude it with exclude_globs",
+                        next_path
+                            .iter()
+                            .map(|n| format!("'{n}'"))
+                            .collect::<Vec<_>>()
+                            .join(" -> ")
+                    ));
+                    break 'search;
+                }
+                stack.push((h.dst_bucket.to_string(), next, next_path));
+            }
+        }
+    }
+    errors.sort();
+    errors.dedup();
+    errors
 }
 
 pub fn validate_replication(cfg: &ReplicationConfig) -> Vec<String> {
@@ -1818,6 +1910,9 @@ pub fn validate_replication(cfg: &ReplicationConfig) -> Vec<String> {
     // overlapping prefixes) would cause pathological write-amplification
     // because each tick finds objects to copy back.
     warnings.extend(detect_replication_cycles(&cfg.rules));
+    // Fatal in `replication_gate` (on change); a warning here so a config that
+    // already had it still loads and says so.
+    warnings.extend(replication_nesting_errors(&cfg.rules));
 
     warnings
 }
@@ -2587,6 +2682,58 @@ mod tests {
         };
         let warnings = validate_replication(&cfg);
         assert!(warnings.iter().any(|w| w.contains("duplicated")));
+    }
+
+    /// D18: a rule whose destination lies inside its own source scope copies
+    /// its own output again on every run: `b/` → `b/backup/` writes
+    /// `backup/x`, then `backup/backup/x`, and so on. Same for a chain of rules
+    /// whose composed rewrite grows the key. Unambiguous → a fatal gate error.
+    #[test]
+    fn replication_gate_rejects_unbounded_nesting() {
+        let clean = ReplicationConfig::default();
+        let nest = |rules: Vec<ReplicationRule>| ReplicationConfig {
+            rules,
+            ..Default::default()
+        };
+        // Self-nesting.
+        let err = replication_gate(
+            &clean,
+            &nest(vec![rule("self", ("b", ""), ("b", "backup/"), "1h")]),
+        )
+        .expect_err("b/ -> b/backup/ must be fatal");
+        assert!(err.iter().any(|e| e.contains("self")), "{err:?}");
+        // Two rules that together grow the key: a/ -> c/x/, c/ -> a/y/.
+        assert!(replication_gate(
+            &clean,
+            &nest(vec![
+                rule("r1", ("a", ""), ("c", "x/"), "1h"),
+                rule("r2", ("c", ""), ("a", "y/"), "1h"),
+            ])
+        )
+        .is_err());
+        // An exclude glob that stops the recursion makes it safe.
+        let mut guarded = rule("guarded", ("b", ""), ("b", "backup/"), "1h");
+        guarded.exclude_globs.push("backup/**".into());
+        assert!(replication_gate(&clean, &nest(vec![guarded])).is_ok());
+        // Disjoint prefixes in one bucket are fine.
+        assert!(replication_gate(
+            &clean,
+            &nest(vec![rule("ok", ("b", "src/"), ("b", "dst/"), "1h")])
+        )
+        .is_ok());
+        // A plain A<->B mirror does not grow keys: not fatal (still warned).
+        assert!(replication_gate(
+            &clean,
+            &nest(vec![
+                rule("ab", ("a", ""), ("b", ""), "1h"),
+                rule("ba", ("b", ""), ("a", ""), "1h"),
+            ])
+        )
+        .is_ok());
+        // A disabled rule does not run: not fatal.
+        let mut off = rule("off", ("b", ""), ("b", "backup/"), "1h");
+        off.enabled = false;
+        assert!(replication_gate(&clean, &nest(vec![off])).is_ok());
     }
 
     #[test]
