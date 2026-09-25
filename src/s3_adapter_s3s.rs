@@ -1243,6 +1243,19 @@ impl s3s::S3 for DeltaGliderS3Service {
                     total_parts_size,
                 )
                 .map_err(engine_error_to_s3s)?;
+                // Same conditional write as PutObject (If-None-Match: * is
+                // create-only), under the same per-key lock, held until the
+                // store ends. Only the owner checks: a retry that joins or
+                // hits the tombstone sees its OWN object and must not 412.
+                let write_lock = acquire_object_write_lock(&input.bucket, &input.key).await;
+                evaluate_put_etag_conditionals_s3s(
+                    self.state.engine.load().as_ref(),
+                    &input.bucket,
+                    &input.key,
+                    input.if_match.as_ref(),
+                    input.if_none_match.as_ref(),
+                )
+                .await?;
                 let delta_limit = crate::config::env_parse_with_default(
                     "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
                     64 * 1024 * 1024,
@@ -1258,6 +1271,7 @@ impl s3s::S3 for DeltaGliderS3Service {
                 );
                 let parts = requested_parts.clone();
                 let handle = tokio::spawn(async move {
+                    let _write_lock = write_lock;
                     let result = run_multipart_completion(
                         state,
                         bucket,
@@ -2144,8 +2158,8 @@ async fn evaluate_put_etag_conditionals_s3s(
 /// A conditional PUT checks and then stores; the lock makes that pair atomic
 /// against every other PutObject of the same key on THIS process. It is
 /// separate from, and always taken before, the engine's per-deltaspace lock.
-/// Not covered: CopyObject, CompleteMultipartUpload, form POST, and other
-/// instances. Idle entries are pruned like the engine's prefix locks.
+/// CompleteMultipartUpload takes it too. Not covered: CopyObject (s3s
+/// models no conditional headers for it), form POST, and other instances. Idle entries are pruned like the engine's prefix locks.
 static OBJECT_WRITE_LOCKS: std::sync::LazyLock<
     dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
 > = std::sync::LazyLock::new(dashmap::DashMap::new);

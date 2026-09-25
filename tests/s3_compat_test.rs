@@ -3875,7 +3875,6 @@ async fn test_concurrent_if_none_match_star_admits_one_writer() {
 /// CompleteMultipartUpload ignores If-None-Match, so a create-only multipart
 /// write (object_store PutMode::Create) silently overwrites.
 #[tokio::test]
-#[ignore = "review2: pending fix"]
 async fn review2_complete_multipart_honours_if_none_match_star() {
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
