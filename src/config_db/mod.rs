@@ -213,6 +213,7 @@ impl ConfigDb {
                 continue;
             }
             rekey_file_hooked(local_path, old.expose(), primary, before_swap)?;
+            rekey_companions(local_path, old.expose(), primary);
             warn!(
                 "Config DB {} opened with {}; it is now re-encrypted with {}",
                 local_path.display(),
@@ -1158,6 +1159,31 @@ pub fn probe_key(path: &Path, key: &str) -> Result<bool, ConfigDbError> {
         Ok(_) => Ok(true),
         Err(e) if is_not_a_database(&e) => Ok(false),
         Err(e) => Err(ConfigDbError::Sqlite(e)),
+    }
+}
+
+/// Files next to the DB that are encrypted with its key: the config sync's
+/// merge base (`config_db_sync::sync_base_path`).
+fn key_companions(db_path: &Path) -> Vec<PathBuf> {
+    vec![db_path.with_extension("db.sync-base")]
+}
+
+/// After the DB moved to a new key, move its companions too. A companion
+/// that does not re-encrypt is removed: a missing merge base only makes the
+/// next sync fall back to remote-wins, while a base under the old key would
+/// be unreadable.
+fn rekey_companions(db_path: &Path, old: &str, new: &str) {
+    for c in key_companions(db_path) {
+        if !c.exists() {
+            continue;
+        }
+        if let Err(e) = rekey_file(&c, old, new) {
+            warn!(
+                "{} did not re-encrypt with the new config DB key ({e}); removing it",
+                c.display()
+            );
+            let _ = std::fs::remove_file(&c);
+        }
     }
 }
 
@@ -2146,6 +2172,29 @@ mod tests {
         let (_, how) = ConfigDb::open_with_keys(&path, &keys()).unwrap();
         assert_eq!(how, OpenedWith::Created);
         assert!(probe_key(&path, NEW_KEY).unwrap());
+    }
+
+    #[test]
+    fn migration_rekeys_the_sync_merge_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = legacy_db(dir.path());
+        let base = crate::config_db_sync::sync_base_path(&path);
+        assert_eq!(key_companions(&path), vec![base.clone()]);
+        std::fs::copy(&path, &base).unwrap();
+        ConfigDb::open_with_keys(&path, &keys()).unwrap();
+        assert!(
+            probe_key(&base, NEW_KEY).unwrap(),
+            "the base must follow the DB key"
+        );
+        // A base that no key opens is removed, not left unreadable.
+        std::fs::remove_file(&base).unwrap();
+        drop(ConfigDb::open_or_create(&base, "a-foreign-key").unwrap());
+        let db2 = dir.path().join("second.db");
+        drop(ConfigDb::open_or_create(&db2, HASH).unwrap());
+        let base2 = crate::config_db_sync::sync_base_path(&db2);
+        std::fs::copy(&base, &base2).unwrap();
+        ConfigDb::open_with_keys(&db2, &keys()).unwrap();
+        assert!(!base2.exists());
     }
 
     #[test]
