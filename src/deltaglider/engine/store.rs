@@ -82,6 +82,26 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok(result)
     }
 
+    /// `PUT photos/` with an empty body (review D3): a zero-byte folder
+    /// marker, the object S3 clients create for an empty folder. The backend
+    /// stores it as-is (never encrypted, never a delta), so an S3 listing
+    /// still shows it as a zero-byte `photos/`.
+    async fn store_directory_marker(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<StoreResult, EngineError> {
+        let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
+        let prior_for_counter = self.prior_for_counter(bucket, key).await;
+        let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
+        self.storage
+            .put_directory_marker(bucket, &obj_key.full_key())
+            .await?;
+        let metadata = FileMetadata::directory_marker(&obj_key.full_key());
+        self.metadata_cache.insert(bucket, key, metadata.clone());
+        Ok(StoreResult::new(metadata, 0).with_accounting(prior_for_counter, 0))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn store_inner(
         &self,
@@ -104,6 +124,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             });
         }
 
+        if data.is_empty() && ObjectKey::parse(bucket, key).is_directory_marker() {
+            return self.store_directory_marker(bucket, key).await;
+        }
         let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
 
         // Usage-counter accounting: capture the PRIOR object metadata (S3 PUT is

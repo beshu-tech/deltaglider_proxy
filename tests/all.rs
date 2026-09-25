@@ -76,6 +76,8 @@ mod encryption_test;
 mod error_test;
 #[path = "external_auth_test.rs"]
 mod external_auth_test;
+#[path = "folder_marker_test.rs"]
+mod folder_marker_test;
 #[path = "generation_pin_test.rs"]
 mod generation_pin_test;
 #[path = "iam_authorization_test.rs"]
@@ -128,8 +130,6 @@ mod public_prefix_list_test;
 mod public_prefix_test;
 #[path = "quota_test.rs"]
 mod quota_test;
-#[path = "recursive_delete_test.rs"]
-mod recursive_delete_test;
 #[path = "reference_lock_race_test.rs"]
 mod reference_lock_race_test;
 #[path = "replication_target_only_test.rs"]

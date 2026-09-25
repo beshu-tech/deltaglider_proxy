@@ -121,7 +121,7 @@ ConnectError("tcp open error", Os { code: 24, message: "Too many open files" })
 ```
 
 It typically panics mid-seed in whichever test opens the most connections (historically
-`recursive_delete_test`, which seeds 1100 objects), but the root cause is the shared,
+the old `recursive_delete_test`, which seeded 1100 objects), but the root cause is the shared,
 under-sized fd table, not any single test. Two layers fix it (keep BOTH):
 
 1. **Host side (the real fix).** On the Ryzen host, raise the LXC container's limit so

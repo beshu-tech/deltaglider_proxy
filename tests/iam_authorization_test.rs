@@ -654,12 +654,12 @@ async fn test_batch_delete_enforces_prefix_carveout() {
     );
 }
 
-/// Review S14: the per-key checks inside DeleteObjects and the recursive
-/// `DELETE prefix/` sweep must see `aws:SourceIp`. A Deny conditioned on the
-/// client IP was skipped by the context-free check, so the key was deleted.
+/// Review S14: the per-key checks inside DeleteObjects must see
+/// `aws:SourceIp`. A Deny conditioned on the client IP was skipped by the
+/// context-free check, so the key was deleted.
 /// The test client connects from 127.0.0.1, which is outside 10.0.0.0/8.
 #[tokio::test]
-async fn test_batch_and_recursive_delete_honor_source_ip_deny() {
+async fn test_batch_delete_honors_source_ip_deny() {
     let h = IamTestHarness::setup().await;
     let admin_client = admin_http_client(&h.server.endpoint()).await;
     let ip_user = create_iam_user(
@@ -678,7 +678,6 @@ async fn test_batch_and_recursive_delete_honor_source_ip_deny() {
     )
     .await;
     seed_object(&h, "bucket-a", "ipguard/batch.txt").await;
-    seed_object(&h, "bucket-a", "ipguard/sweep/one.txt").await;
 
     let client = h.client_for(&ip_user).await;
     let out = client
@@ -705,17 +704,8 @@ async fn test_batch_and_recursive_delete_honor_source_ip_deny() {
         out.errors()
     );
 
-    // Recursive sweep: a key with a trailing slash goes through the sweep's
-    // per-key check.
-    let _ = client
-        .delete_object()
-        .bucket("bucket-a")
-        .key("ipguard/sweep/")
-        .send()
-        .await;
-
     let admin = h.client_for(&h.admin_user).await;
-    for key in ["ipguard/batch.txt", "ipguard/sweep/one.txt"] {
+    for key in ["ipguard/batch.txt"] {
         assert!(
             admin
                 .head_object()

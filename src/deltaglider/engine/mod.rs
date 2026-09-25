@@ -1626,6 +1626,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         obj_key
             .validate_ingest()
             .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
+        // A folder marker is stored only by `store` (zero bytes, through
+        // `put_directory_marker`). Every other ingest path would write a data
+        // object under the marker's name, so they all refuse it here.
+        if obj_key.is_directory_marker() {
+            return Err(EngineError::InvalidArgument(
+                "A key that ends in '/' is a folder marker and must have an empty body".to_string(),
+            ));
+        }
         let deltaspace_id = obj_key.deltaspace_id();
         Ok((obj_key, deltaspace_id))
     }
@@ -2428,6 +2436,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Ok((bytes, false))
     }
 }
+
+#[cfg(test)]
+mod folder_marker_tests;
 
 #[cfg(test)]
 mod tests {

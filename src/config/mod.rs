@@ -439,12 +439,6 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Server",
     },
     EnvVarEntry {
-        name: "DGP_RECURSIVE_DELETE_PAGE_SIZE",
-        description: "Objects listed+deleted per page of a recursive prefix delete. Lower it on memory-constrained nodes; bounded so a huge prefix can't balloon memory (default: 1000)",
-        example: "1000",
-        category: "Server",
-    },
-    EnvVarEntry {
         name: "DGP_READY_TIMEOUT_SECS",
         description: "Per-attempt backend timeout for the /_/ready probe (default: 3)",
         example: "3",

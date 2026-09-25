@@ -418,7 +418,7 @@ jobs:
             multipart_complete_resilience_test:: \
             public_prefix_list_test:: \
             public_prefix_test:: \
-            recursive_delete_test:: \
+            folder_marker_test:: \
             s3_correctness_test::
       - name: Clean up MinIO test data
         if: always()

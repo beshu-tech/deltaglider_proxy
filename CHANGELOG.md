@@ -44,6 +44,26 @@ tables. The first sync after the upgrade has no merge base, so the copy in the
 bucket wins, as before. Upgrade every instance before you expect merges: an
 instance refuses a peer database with a different schema version.
 
+### Changed — `DELETE photos/` deletes only the folder marker, as on S3
+
+A `DeleteObject` request for a key that ends in `/` deleted every key under
+that prefix. On S3, the same request deletes only the object named `photos/`,
+which S3 clients create as the marker of an empty folder. A client that
+cleaned up a folder marker lost the whole folder. The proxy now deletes only
+the marker, and a missing marker is a success with nothing deleted. To delete
+a folder, list its keys and delete them with `DeleteObjects`: the object
+browser, `aws s3 rm --recursive`, and `deltaglider_proxy s3 rm -r` all do
+this. The environment variable `DGP_RECURSIVE_DELETE_PAGE_SIZE` is gone.
+
+A `PutObject` request for a key that ends in `/` failed with
+`InvalidArgument`. It now stores a zero-byte folder marker, and a listing shows
+the marker as a zero-byte object. A request with a body for such a key still
+gets `400 InvalidArgument`. On the filesystem backend, the marker is a file
+named `.dg-folder-marker` inside the folder, so a key whose last part is
+`.dg-folder-marker` is refused there. `deltaglider_proxy s3 rm -r` now also
+deletes the folder markers under the prefix and the marker of the folder
+itself, unless `--include` or `--exclude` narrows the delete.
+
 ### Fixed — A prefix-scoped user could not list keys that sort after many hidden keys
 
 A user whose policy allows only some prefixes of a bucket, such as

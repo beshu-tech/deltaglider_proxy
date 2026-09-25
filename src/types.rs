@@ -112,10 +112,19 @@ impl ObjectKey {
         self.prefix.clone()
     }
 
+    /// A folder marker: a key that ends in `/` (`photos/`), so the parsed
+    /// file name is empty. S3 stores it as a zero-byte object of its own.
+    pub fn is_directory_marker(&self) -> bool {
+        self.filename.is_empty() && !self.prefix.is_empty()
+    }
+
     /// Validate this key for object operations (PUT/GET/HEAD/DELETE).
     pub fn validate_object(&self) -> Result<(), KeyValidationError> {
         validate_key_path(&self.prefix, true)?;
         validate_key_path(&self.filename, false)?;
+        if self.is_directory_marker() {
+            return Ok(());
+        }
         if self.filename.is_empty() {
             return Err(KeyValidationError(
                 "Object key must not be empty".to_string(),
@@ -736,8 +745,10 @@ mod tests {
 
     #[test]
     fn test_validate_rejects_empty_filename() {
-        let key = ObjectKey::parse("bucket", "prefix/");
-        assert!(key.validate_object().is_err());
+        // `prefix/` is a folder marker (review D3); only the empty key and a
+        // bare `/` have no object name.
+        assert!(ObjectKey::parse("bucket", "").validate_object().is_err());
+        assert!(ObjectKey::parse("bucket", "/").validate_object().is_err());
     }
 
     #[test]
@@ -777,6 +788,21 @@ mod tests {
             .validate_ingest()
             .is_ok());
         assert!(ObjectKey::validate_prefix("ror/builds/").is_ok());
+    }
+
+    /// Review D3: `photos/` is an object key (a folder marker), valid for
+    /// every object operation. `/` alone and `a//` are not.
+    #[test]
+    fn folder_marker_keys_are_valid_objects() {
+        let marker = ObjectKey::parse("b", "photos/2024/");
+        assert!(marker.is_directory_marker());
+        assert_eq!(marker.full_key(), "photos/2024/");
+        assert!(marker.validate_object().is_ok());
+        assert!(marker.validate_ingest().is_ok());
+        assert!(ObjectKey::parse("b", "/").validate_object().is_err());
+        assert!(ObjectKey::parse("b", "a//").validate_ingest().is_err());
+        assert!(ObjectKey::parse("b", "../").validate_object().is_err());
+        assert!(!ObjectKey::parse("b", "photos/a.jpg").is_directory_marker());
     }
 
     #[test]

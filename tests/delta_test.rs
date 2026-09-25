@@ -594,13 +594,11 @@ async fn test_batch_delete_cleans_reference_on_last_delta() {
     );
 }
 
-/// Recursive prefix delete (DELETE `/{bucket}/{prefix}/`) is a
-/// proxy-specific convenience; `aws s3 rm --recursive` actually issues
-/// per-object DELETEs, but the embedded UI's "delete folder" calls
-/// this. Same invariant: when the prefix is empty, no orphan
-/// `reference.bin` should remain.
+/// A folder delete (the UI and `aws s3 rm --recursive` list the keys and
+/// delete them, here in one DeleteObjects batch): when the prefix ends up
+/// empty, no orphan `reference.bin` remains.
 #[tokio::test]
-async fn test_recursive_delete_cleans_reference() {
+async fn test_batch_delete_of_a_folder_cleans_reference() {
     let server = TestServer::filesystem().await;
     let http = reqwest::Client::new();
 
@@ -638,18 +636,33 @@ async fn test_recursive_delete_cleans_reference() {
         "reference.bin should exist after the two PUTs"
     );
 
-    // Recursive delete of the prefix.
-    let url = format!("{}/{}/purge/", server.endpoint(), server.bucket());
-    let resp = http.delete(&url).send().await.unwrap();
-    assert!(
-        resp.status().is_success(),
-        "recursive delete should succeed, got {}",
-        resp.status()
-    );
+    let client = server.s3_client().await;
+    let ids: Vec<aws_sdk_s3::types::ObjectIdentifier> = ["purge/a.zip", "purge/b.zip"]
+        .into_iter()
+        .map(|k| {
+            aws_sdk_s3::types::ObjectIdentifier::builder()
+                .key(k)
+                .build()
+                .unwrap()
+        })
+        .collect();
+    let out = client
+        .delete_objects()
+        .bucket(server.bucket())
+        .delete(
+            aws_sdk_s3::types::Delete::builder()
+                .set_objects(Some(ids))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(out.errors().is_empty(), "{:?}", out.errors());
 
     assert!(
         !ref_path.exists(),
-        "reference.bin must be removed after recursive prefix delete, still found at {:?}",
+        "reference.bin must be removed after the folder delete, still found at {:?}",
         ref_path,
     );
 }

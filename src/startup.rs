@@ -519,29 +519,6 @@ pub fn build_s3_router(
             .extensions()
             .get::<deltaglider_proxy::s3_adapter_s3s::ListMetadataXmlExtensions>()
             .cloned();
-        let recursive_delete = response
-            .extensions()
-            .get::<deltaglider_proxy::s3_adapter_s3s::RecursiveDeleteJson>()
-            .cloned();
-        if let Some(recursive_delete) = recursive_delete {
-            let (mut parts, _body) = response.into_parts();
-            parts.status = axum::http::StatusCode::OK;
-            let text = serde_json::json!({
-                "deleted": recursive_delete.deleted,
-                "denied": recursive_delete.denied,
-            })
-            .to_string();
-            parts.headers.insert(
-                axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("application/json"),
-            );
-            parts.headers.insert(
-                axum::http::header::CONTENT_LENGTH,
-                axum::http::HeaderValue::from_str(&text.len().to_string())
-                    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("0")),
-            );
-            return axum::http::Response::from_parts(parts, axum::body::Body::from(text));
-        }
         if !content_type_is_xml || (!is_error && !is_acl_request && list_metadata.is_none()) {
             return response;
         }

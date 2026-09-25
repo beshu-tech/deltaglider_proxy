@@ -89,12 +89,6 @@ impl ListMetadataXmlExtensions {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct RecursiveDeleteJson {
-    pub deleted: u32,
-    pub denied: u32,
-}
-
 /// Thin service object that will implement the `s3s::S3` trait operation by
 /// operation. For now, the empty trait impl intentionally returns `s3s`'s
 /// default NotImplemented responses for every operation.
@@ -701,31 +695,14 @@ impl s3s::S3 for DeltaGliderS3Service {
         &self,
         req: s3s::S3Request<s3s::dto::DeleteObjectInput>,
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::DeleteObjectOutput>> {
-        let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
-        let policy_context = request_policy_context(&req.extensions);
         let input = req.input;
         crate::api::handlers::object_helpers::check_client_write_allowed(
             &self.state,
             &input.bucket,
         )
         .map_err(engine_error_to_s3s)?;
-        if input.key.ends_with('/') {
-            let (deleted, denied) = recursive_delete_prefix_s3s(
-                &self.state,
-                auth_user.as_ref(),
-                &policy_context,
-                &input.bucket,
-                &input.key,
-            )
-            .await?;
-            let mut resp = s3s::S3Response::with_status(
-                s3s::dto::DeleteObjectOutput::default(),
-                axum::http::StatusCode::OK,
-            );
-            resp.extensions
-                .insert(RecursiveDeleteJson { deleted, denied });
-            return Ok(resp);
-        }
+        // `DELETE photos/` deletes the folder marker `photos/` only, as on S3
+        // (review D3). Folder deletes list and batch-delete the keys.
         match self
             .state
             .engine
@@ -780,7 +757,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         // Review C9: a plain `delete` lists the whole deltaspace after each
         // key to decide reference reclamation, so a 1000-key batch in one
         // deltaspace was O(N²). Delete in sweep mode and reclaim once per
-        // touched deltaspace, as the recursive prefix delete does.
+        // touched deltaspace.
         let engine = self.state.engine.load();
         let mut touched_deltaspaces: std::collections::BTreeSet<String> = Default::default();
         for obj in input.delete.objects {
@@ -849,7 +826,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             }
         }
         for ds in &touched_deltaspaces {
-            // Best effort, like the sweep: the objects are gone already.
+            // Best effort: the objects are gone already.
             if let Err(e) = engine.reclaim_empty_deltaspace(&input.bucket, ds).await {
                 tracing::warn!(
                     "DeleteObjects reference reclaim failed for {}/{ds}: {e}",
@@ -1913,86 +1890,6 @@ async fn ensure_bucket_exists_s3s(state: &Arc<AppState>, bucket: &str) -> s3s::S
     }
 }
 
-async fn recursive_delete_prefix_s3s(
-    state: &Arc<AppState>,
-    auth_user: Option<&AuthenticatedUser>,
-    policy_context: &iam_rs::Context,
-    bucket: &str,
-    prefix: &str,
-) -> s3s::S3Result<(u32, u32)> {
-    // Objects listed+deleted per page of the sweep. Bounded (not `u32::MAX`) so a
-    // prefix with millions of keys can't balloon proxy memory before the first
-    // delete. Configurable via `DGP_RECURSIVE_DELETE_PAGE_SIZE` (default 1000):
-    // operators on memory-constrained nodes can lower it, and tests use a small
-    // window to exercise the continuation-token loop without seeding thousands
-    // of objects. Clamped to >= 1 so a zero can't wedge the loop.
-    let delete_page_size: u32 =
-        crate::config::env_parse_with_default("DGP_RECURSIVE_DELETE_PAGE_SIZE", 1000u32).max(1);
-
-    let engine = state.engine.load();
-    let mut deleted = 0u32;
-    let mut denied = 0u32;
-    let mut next_token: Option<String> = None;
-    // Deltaspaces touched by the sweep — reference reclamation runs once per
-    // deltaspace at the end rather than once per deleted object.
-    let mut swept_deltaspaces: std::collections::BTreeSet<String> = Default::default();
-
-    loop {
-        let page = engine
-            .list_objects(
-                bucket,
-                prefix,
-                None,
-                delete_page_size,
-                next_token.as_deref(),
-                false,
-            )
-            .await
-            .map_err(engine_error_to_s3s)?;
-
-        for (obj_key, _) in &page.objects {
-            if let Some(user) = auth_user {
-                if !user.can_with_context(S3Action::Delete, bucket, obj_key, policy_context) {
-                    denied = denied.saturating_add(1);
-                    continue;
-                }
-            }
-            // `delete_in_sweep` skips the per-object "is this deltaspace empty?"
-            // scan, which lists the WHOLE deltaspace and made a prefix sweep
-            // O(N²) in directory reads (a 1100-object prefix took minutes and
-            // tripped the request timeout). We reclaim the reference once below.
-            match engine.delete_in_sweep(bucket, obj_key).await {
-                Ok(_) | Err(crate::deltaglider::EngineError::NotFound(_)) => {
-                    deleted = deleted.saturating_add(1);
-                }
-                Err(e) => return Err(engine_error_to_s3s(e)),
-            }
-            swept_deltaspaces
-                .insert(crate::types::ObjectKey::parse(bucket, obj_key).deltaspace_id());
-        }
-
-        if !page.is_truncated {
-            break;
-        }
-        next_token = page.next_continuation_token;
-        if next_token.is_none() {
-            break;
-        }
-    }
-
-    // Reference reclamation, ONCE per touched deltaspace, after the sweep.
-    // Best-effort: the objects are already gone, so a failed reclaim leaves an
-    // orphan reference.bin (harmless — reclaimed by the next delete) rather
-    // than failing a delete the client already succeeded at.
-    for ds in &swept_deltaspaces {
-        if let Err(e) = engine.reclaim_empty_deltaspace(bucket, ds).await {
-            tracing::warn!("post-sweep reference reclaim failed for {bucket}/{ds}: {e}");
-        }
-    }
-
-    Ok((deleted, denied))
-}
-
 fn copy_source_bucket_key(source: &s3s::dto::CopySource) -> s3s::S3Result<(String, String)> {
     match source {
         s3s::dto::CopySource::Bucket {
@@ -2020,8 +1917,8 @@ fn copy_source_bucket_key(source: &s3s::dto::CopySource) -> s3s::S3Result<(Strin
     }
 }
 
-/// Policy context for the per-key checks the adapter runs itself (batch and
-/// recursive delete, copy-source read). The middleware authorizes only the
+/// Policy context for the per-key checks the adapter runs itself (batch
+/// delete, copy-source read). The middleware authorizes only the
 /// request line; without `aws:SourceIp` here an IP-conditioned Deny is
 /// skipped (X-ray H17, review S14). Never call the context-free `can()` on an
 /// authz path: `adapter_authz_never_uses_context_free_can` guards it.

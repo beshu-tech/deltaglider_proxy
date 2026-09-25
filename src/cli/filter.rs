@@ -34,6 +34,11 @@ impl Filter {
         })
     }
 
+    /// No include and no exclude pattern: the filter accepts every key.
+    pub fn accepts_all(&self) -> bool {
+        !self.has_include && self.exclude.is_empty()
+    }
+
     /// Returns true iff this filter would accept `key`. Pure: no I/O,
     /// no side effects.
     pub fn matches(&self, key: &str) -> bool {

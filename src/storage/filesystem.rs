@@ -34,6 +34,21 @@ use super::io_to_storage_error;
 /// Prefix of this backend's own temp files (atomic write-then-rename).
 const INTERNAL_TEMP_PREFIX: &str = ".dg-tmp.";
 
+/// File that stores the folder marker `photos/` (review D3): the key's file
+/// name is empty, and a directory cannot also be a file, so the marker lives
+/// inside the directory under this reserved name.
+const DIR_MARKER_FILE: &str = ".dg-folder-marker";
+
+/// The file name part of the key that a data file named `name` stores:
+/// empty for a folder marker, the name itself otherwise.
+fn key_filename(name: &str) -> &str {
+    if name == DIR_MARKER_FILE {
+        ""
+    } else {
+        name
+    }
+}
+
 /// Is `name` one of this backend's temp files, and so never a user object?
 /// `.dg-tmp.*` (current) or tempfile's default `.tmpXXXXXX` (older
 /// releases). Every other `.`-name (`.env`, `.gitignore`) is a user object:
@@ -144,6 +159,12 @@ fn check_path_segments(prefix: &str, filename: &str) -> Result<(), StorageError>
             "Key must not contain '.', '..' or empty path segments on the filesystem backend"
                 .to_string(),
         ));
+    }
+    // A user file with the marker name would read back as the folder marker.
+    if filename == DIR_MARKER_FILE {
+        return Err(StorageError::InvalidKey(format!(
+            "Key file name '{filename}' is reserved for folder markers on the filesystem backend"
+        )));
     }
     // A user file with a temp-file name would be hidden and pruned as one.
     if is_internal_temp_name(filename) {
@@ -260,7 +281,8 @@ impl FilesystemBackend {
             .join(format!("{}.delta", filename)))
     }
 
-    /// Get the path for a passthrough file (stored with original filename)
+    /// Get the path for a passthrough file (stored with original filename).
+    /// An empty filename under a prefix is the folder marker `prefix/`.
     fn passthrough_path(
         &self,
         bucket: &str,
@@ -268,6 +290,14 @@ impl FilesystemBackend {
         filename: &str,
     ) -> Result<PathBuf, StorageError> {
         check_path_segments("", filename)?;
+        if filename.is_empty() {
+            if prefix.is_empty() {
+                return Err(StorageError::InvalidKey(
+                    "Object key must not be empty".to_string(),
+                ));
+            }
+            return Ok(self.deltaspace_dir(bucket, prefix)?.join(DIR_MARKER_FILE));
+        }
         Ok(self.deltaspace_dir(bucket, prefix)?.join(filename))
     }
 
@@ -315,7 +345,7 @@ impl FilesystemBackend {
         let synthetic_etag = synthesise_unmanaged_etag(stat.len(), &modified);
 
         Ok(FileMetadata::fallback(
-            filename.to_string(),
+            key_filename(filename).to_string(),
             stat.len(),
             synthetic_etag,
             modified,
@@ -639,10 +669,19 @@ impl FilesystemBackend {
                     .unwrap_or(Path::new(""));
                 let dir_str = relative_dir.to_string_lossy();
 
-                let user_key = if dir_str.is_empty() {
-                    meta.original_name.clone()
+                // The marker file is the key `dir/`, whatever its xattr says.
+                let key_name = if name == DIR_MARKER_FILE {
+                    ""
                 } else {
-                    format!("{}/{}", dir_str, meta.original_name)
+                    meta.original_name.as_str()
+                };
+                if dir_str.is_empty() && key_name.is_empty() {
+                    continue;
+                }
+                let user_key = if dir_str.is_empty() {
+                    key_name.to_string()
+                } else {
+                    format!("{}/{}", dir_str, key_name)
                 };
 
                 results.push((user_key, meta));
@@ -1383,6 +1422,22 @@ impl StorageBackend for FilesystemBackend {
         Ok(prefixes.into_iter().collect())
     }
 
+    async fn put_directory_marker(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
+        let obj = crate::types::ObjectKey::parse(bucket, key);
+        if !obj.is_directory_marker() {
+            return Err(StorageError::InvalidKey(format!(
+                "not a folder marker key: {key}"
+            )));
+        }
+        self.require_bucket_exists(bucket).await?;
+        let path = self.passthrough_path(bucket, &obj.prefix, "")?;
+        let mut meta = FileMetadata::directory_marker(key);
+        // The key's file name, as for every other object on this backend.
+        meta.original_name = String::new();
+        self.put_object_file(bucket, &path, &[], &meta, "folder marker", &obj.prefix, "")
+            .await
+    }
+
     async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {
         if let Some(b) = bucket {
             self.dir_size(&self.bucket_dir(b)).await
@@ -1555,15 +1610,18 @@ impl StorageBackend for FilesystemBackend {
                     // Strip ".delta" suffix to get the user-visible name.
                     name[..name.len() - 6].to_string()
                 } else {
-                    name.clone()
+                    key_filename(&name).to_string()
                 };
 
-                // Apply name filter.
-                if !name_filter.is_empty() && !user_filename.starts_with(name_filter) {
+                // Apply name filter. A marker file at the bucket root names
+                // no key.
+                if (!name_filter.is_empty() && !user_filename.starts_with(name_filter))
+                    || (dir_part.is_empty() && user_filename.is_empty())
+                {
                     continue;
                 }
 
-                // Build the full user-visible key.
+                // Build the full user-visible key (`dir/` for the marker).
                 let user_key = if dir_part.is_empty() {
                     user_filename
                 } else {

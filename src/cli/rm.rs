@@ -215,12 +215,17 @@ async fn rm_recursive(engine: &DynEngine, args: &RmArgs, bucket: &str, prefix: &
 /// Pure: the keys of one listing page that `rm -r` deletes. Globs see
 /// the key relative to the prefix, the same as `cp -r`. `prefix`
 /// is normalised with [`dir_prefix`] here too, so a caller cannot
-/// forget it.
+/// forget it. The folder marker of the directory itself (the key
+/// `releases/`) goes too, as with `aws s3 rm --recursive`, unless a glob
+/// narrows the delete: then the folder stays.
 pub(crate) fn rm_targets<'a>(keys: &[&'a str], prefix: &str, filter: &Filter) -> Vec<&'a str> {
     let dir = dir_prefix(prefix);
     keys.iter()
         .copied()
-        .filter(|k| rel_under(k, &dir).is_some_and(|rel| filter.matches(rel)))
+        .filter(|k| {
+            rel_under(k, &dir).is_some_and(|rel| filter.matches(rel))
+                || (!dir.is_empty() && *k == dir && filter.accepts_all())
+        })
         .collect()
 }
 
@@ -262,6 +267,31 @@ mod tests {
         assert_eq!(
             rm_targets(KEYS, "releases/", &filter(&["tmp/*"], &[])),
             vec!["releases/tmp/scratch.zip"]
+        );
+    }
+
+    /// Review D3: `rm -r` deletes folder markers (keys ending in `/`) by
+    /// key, the directory's own marker included, and never relies on a
+    /// server-side prefix sweep.
+    #[test]
+    fn folder_markers_are_deleted_by_key() {
+        let keys = &[
+            "releases/",
+            "releases/tmp/",
+            "releases/v1.zip",
+            "releases-old/",
+        ];
+        assert_eq!(
+            rm_targets(keys, "releases", &filter(&[], &[])),
+            vec!["releases/", "releases/tmp/", "releases/v1.zip"]
+        );
+        assert_eq!(
+            rm_targets(keys, "releases/", &filter(&["*.zip"], &[])),
+            vec!["releases/v1.zip"]
+        );
+        assert_eq!(
+            rm_targets(keys, "releases/", &filter(&[], &["tmp/"])),
+            vec!["releases/v1.zip"]
         );
     }
 

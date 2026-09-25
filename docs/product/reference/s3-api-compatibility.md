@@ -17,16 +17,16 @@ Status legend:
 |---|---|---|
 | `GetObject` | ✅ Full | Delta-decoded on read; range requests and `If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since` conditionals supported; response-header overrides via query params (refused with `400 InvalidRequest` on anonymous requests, as on S3). Responses whose content type a browser could run as a document carry `Content-Security-Policy: sandbox`. |
 | `HeadObject` | ✅ Full | Returns object metadata; same conditional headers as `GetObject`. |
-| `PutObject` | ✅ Full | Delta-encoded on write for eligible types; quota-enforced; `If-Match`/`If-None-Match` conditionals (the check and the write are atomic against other `PutObject` requests to the same key on one instance); user metadata preserved, up to the S3 limit of 2 KB (larger metadata gets `400 MetadataTooLarge`). |
+| `PutObject` | ✅ Full | Delta-encoded on write for eligible types; quota-enforced; `If-Match`/`If-None-Match` conditionals (the check and the write are atomic against other `PutObject` requests to the same key on one instance); user metadata preserved, up to the S3 limit of 2 KB (larger metadata gets `400 MetadataTooLarge`). A key that ends in `/` (such as `photos/`) is a folder marker: a request with an empty body stores a zero-byte object under that key, and a request with a body gets `400 InvalidArgument`. The proxy stores a folder marker without its content type or user metadata, and never encrypts it. |
 | `CopyObject` | ✅ Full | Source authorization + conditionals checked; `COPY`/`REPLACE` metadata directive; destination quota enforced. |
-| `DeleteObject` | ✅ Full | Single key, or recursive prefix delete when the key ends in `/`. A missing key is treated as success (S3 semantics). |
+| `DeleteObject` | ✅ Full | Deletes one key. A key that ends in `/` deletes only the folder marker with that name, never the keys under it, as on S3. To delete a folder, list its keys and delete them with `DeleteObjects` (the object browser and `aws s3 rm --recursive` do this). A missing key is treated as success (S3 semantics). |
 | `DeleteObjects` | ✅ Full | Batch delete up to 1000 keys; `Quiet` flag and per-key error reporting honoured. |
 
 ## List operations
 
 | Operation | Status | Notes |
 |---|---|---|
-| `ListObjectsV2` | ✅ Full | Continuation-token and `start-after` pagination; delimiter / common-prefix; `encoding-type=url`; IAM-filtered (a user sees only objects they can read, and a continuation token never names a hidden key). |
+| `ListObjectsV2` | ✅ Full | Continuation-token and `start-after` pagination; delimiter / common-prefix; `encoding-type=url`; IAM-filtered (a user sees only objects they can read, and a continuation token never names a hidden key; the proxy reads only the prefixes that the user's policy can reach, see [ListBucket prefix scoping](iam-permissions.md#listbucket-prefix-scoping)). Folder markers are listed as zero-byte objects. |
 | `ListObjects` | ✅ Full | Legacy marker-based listing, implemented over the same path as V2. |
 | `ListBuckets` | ✅ Full | IAM-filtered; optional prefix / `max-buckets` pagination. |
 

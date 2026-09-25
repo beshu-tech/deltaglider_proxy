@@ -76,6 +76,8 @@ The `s3` verbs read credentials in this order: the `--access-key-id` and `--secr
 
 `cp -r`, `rm -r`, `sync`, and `migrate` treat a non-empty source prefix as a directory. `s3://releases/v2` and `s3://releases/v2/` both select only the keys under `v2/`. They do not select keys under a sibling such as `v2-rc/`, and they do not select an object whose key is exactly `v2`. This rule is stricter than `aws s3 rm --recursive`, which matches the raw prefix.
 
+`rm -r` deletes each key with its own request, folder markers (keys that end with `/`) included. It also deletes the folder marker of the directory itself, such as the key `v2/`, when no `--include` or `--exclude` glob narrows the delete.
+
 A download (`cp -r` or `sync` from S3 to a local directory) writes only below the destination directory. The CLI skips a key that contains an empty path segment (for example a leading `/` or `//`), a `.` or `..` segment, a backslash, a drive letter such as `C:`, or a NUL byte. It prints a warning for each skipped key, and the command exits with `10` (partial) or `5`. The CLI also skips folder markers (keys that end with `/`) without a warning.
 
 ### Include and exclude globs
