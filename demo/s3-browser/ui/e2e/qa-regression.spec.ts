@@ -507,12 +507,16 @@ test('5. IAM: create prefix-scoped user and a group, delete the last user → bo
   await page.getByPlaceholder('e.g. mysecretkey or leave empty').fill(SCOPED_SECRET);
   const resource = page.getByRole('combobox', { name: 'my-bucket/builds/*' });
   await resource.fill(`${BUCKET}/scoped/*`);
-  // Leave the field and let its suggestion chips collapse first: they sit in
-  // the flow above CAN DO, so the chips move up about 60 px on blur (see
-  // report: a click that straddles the collapse misses).
+  // Leaving the WHERE field must not move CAN DO: its suggestion chips used
+  // to collapse on blur and shift the action chips up under the pointer.
+  const write = page.getByRole('checkbox', { name: 'Write' });
+  const before = await write.boundingBox();
   await resource.blur();
-  await expect(page.getByText(/buckets? available\./)).toBeVisible();
-  await page.getByRole('checkbox', { name: 'Write' }).check();
+  await page.waitForTimeout(300); // longer than the field's 150 ms blur timer
+  expect(await write.boundingBox()).toEqual(before);
+  await resource.focus();
+  // Click straight from the focused field, as a user does.
+  await write.check();
   await page.getByRole('button', { name: 'Create user' }).click();
   const userItem = page.getByText(`qa-scoped-${RUN}`, { exact: true }).first();
   await expect(userItem).toBeVisible({ timeout: 30_000 });

@@ -84,8 +84,14 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
     emitNow();
   };
 
-  const focusedRow = focusedId === null ? null : rows.find((r) => r.id === focusedId) || null;
-  const activeValue = focusedRow?.text || '';
+  // The row the suggestion chips act on: the focused one, else the last one
+  // focused, else the first. The chips stay rendered after blur (same row,
+  // same content), so nothing below them moves when the field loses focus:
+  // they used to vanish on blur and shift CAN DO up under the pointer.
+  const [lastFocusedId, setLastFocusedId] = useState<string | null>(null);
+  const activeRow =
+    rows.find((r) => r.id === (focusedId ?? lastFocusedId)) ?? rows[0] ?? null;
+  const activeValue = activeRow?.text || '';
   const activePattern = useMemo(() => parseResourcePattern(activeValue), [activeValue]);
   const knownBucket = activePattern.bucket && (buckets.includes(activePattern.bucket) || activeValue.includes('/'))
     ? activePattern.bucket
@@ -232,8 +238,8 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
   };
 
   const applySuggestion = (pattern: string) => {
-    if (focusedId === null) return;
-    updateRow(focusedId, pattern);
+    if (!activeRow) return;
+    updateRow(activeRow.id, pattern);
   };
 
   // Normalize ONLY the blurred row's text, in local state — no reparse of a
@@ -254,7 +260,7 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: style?.marginTop }}>
         {rows.map((row) => (
           <div key={row.id} style={{ display: 'flex', gap: 6, alignItems: 'center', width: '100%' }}>
-            <div style={{ flex: 1, minWidth: 0 }} onFocusCapture={() => setFocusedId(row.id)}>
+            <div style={{ flex: 1, minWidth: 0 }} onFocusCapture={() => { setFocusedId(row.id); setLastFocusedId(row.id); }}>
               <SimpleAutoComplete
                 value={row.text}
                 filterText={row.text}
@@ -292,7 +298,7 @@ export default function ResourcePatternInput({ value, onChange, buckets = [], st
       >
         Add resource
       </Button>
-      {focusedId !== null && (
+      {activeRow && (
         <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 6, alignItems: 'center' }}>
           {chipSuggestions.map((pattern) => (
             <Button
