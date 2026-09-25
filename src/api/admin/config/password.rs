@@ -79,8 +79,11 @@ pub async fn change_password(
                 "{var} is set, and it sets the bootstrap password hash at every start. \
                  A change here would re-encrypt the IAM database with a hash that the \
                  next start does not use, so the database would become unreadable. \
-                 To change the password, run `deltaglider_proxy --set-bootstrap-password` \
-                 and put the printed hash into {var}, on every instance."
+                 To change the password safely: write the current value of {var} into \
+                 .deltaglider_bootstrap_hash, unset {var} and restart; change the \
+                 password here (this re-encrypts the IAM database); then set {var} to \
+                 the new hash from .deltaglider_bootstrap_hash on every instance. Do not \
+                 use the CLI reset: it makes the IAM database unreadable."
             ),
         );
     }

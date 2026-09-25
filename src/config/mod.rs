@@ -3413,10 +3413,13 @@ fn first_run_banner(password: &str, hash: &str, is_tty: bool) -> Vec<String> {
             "BOOTSTRAP PASSWORD auto-generated (not a TTY — password and hash hidden).".into(),
         );
         out.push("  The hash is in .deltaglider_bootstrap_hash (mode 0600).".into());
+        out.push("  To choose a password, change it in the admin GUI (this keeps".into());
+        out.push("  the IAM database readable). Before any IAM user exists, you can".into());
         out.push(
-            "  To choose a password, run `deltaglider_proxy --set-bootstrap-password <pw>`".into(),
+            "  also run `printf '%s\\n' '<pw>' | deltaglider_proxy --set-bootstrap-password`"
+                .into(),
         );
-        out.push("  (safe on a first run: no IAM data exists yet), or set".into());
+        out.push("  (it reads the password from stdin), or set".into());
         out.push("  DGP_BOOTSTRAP_PASSWORD_HASH before the first start.".into());
     }
     out.push(String::new());
@@ -6479,7 +6482,6 @@ mod review2_tests {
     /// that reads the password from stdin; the binary answers
     /// `error: unrecognized subcommand '<pw>'`.
     #[test]
-    #[ignore = "review2: pending fix"]
     fn review2_first_run_banner_advises_a_command_that_parses() {
         let lines = first_run_banner("pw", "hash", false);
         assert!(
@@ -6487,6 +6489,12 @@ mod review2_tests {
                 .iter()
                 .any(|l| l.contains("--set-bootstrap-password <pw>")),
             "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("' | deltaglider_proxy --set-bootstrap-password`")),
+            "the stdin form: {lines:?}"
         );
     }
 }

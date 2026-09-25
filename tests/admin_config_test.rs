@@ -1540,7 +1540,6 @@ async fn password_change_refused_when_hash_comes_from_env() {
 /// safe path is: unset the env var, change the password in the GUI (which
 /// re-keys the DB), then pin the new hash.
 #[tokio::test]
-#[ignore = "review2: pending fix"]
 async fn review2_d15_refusal_does_not_recommend_the_iam_wiping_path() {
     let server = common::TestServer::builder()
         .env(
