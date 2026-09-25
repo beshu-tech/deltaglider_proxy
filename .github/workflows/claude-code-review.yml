@@ -18,7 +18,7 @@ jobs:
     #   github.event.pull_request.user.login == 'new-developer' ||
     #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
 
-    runs-on: k3s
+    runs-on: ubuntu-latest
     # Same builder container as ci.yml so the toolchain (and `unzip` for the
     # action's Bun bootstrap) is the image's, not a per-run apt-get. The
     # checkout under /__w is written by the bare runner as `runner`, and the

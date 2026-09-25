@@ -17,34 +17,23 @@ permissions:
   packages: read
 
 env:
-  # Measured on the homelab runners (5 GB RAM, full nightly job): with one test
-  # binary, -j16 is the fastest setting and peaks at ~4.7-4.8 GB. Line tables keep
-  # file:line backtraces; unpacked split debuginfo trims ~0.3 GB off the peak
-  # (sccache still caches it). The peak is two ~2 GB rustc (lib unit tests +
-  # tests/all) overlapping, so lowering -j does not reduce it further.
-  #
-  # That peak does not fit: each runner container has a 5 GB limit, and the
-  # job alone was SIGKILLed (exit 137) at 4.3+ GB while the host had 60 GB free.
-  # So test-all builds its targets in separate steps (see there). Every heavy
-  # step runs under scripts/ci-memwatch.sh, which logs memory until a kill.
-  CARGO_BUILD_JOBS: "16"
+  # GitHub-hosted ubuntu-latest runners (4 vCPU, 16 GB RAM): cargo runs one job
+  # per vCPU. Line tables keep file:line backtraces; unpacked split debuginfo
+  # keeps the link peak lower.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
   CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
   CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: unpacked
+  # ── sccache: GitHub Actions cache backend. Each compiling job runs
+  #    mozilla-actions/sccache-action, which exports the cache credentials. ──
   RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
   CARGO_INCREMENTAL: "0"
-  SCCACHE_BUCKET: sccache-rust
-  SCCACHE_ENDPOINT: http://sccache-minio.sccache.svc.cluster.local:9000
-  SCCACHE_REGION: auto
-  SCCACHE_S3_USE_SSL: "false"
-  AWS_ACCESS_KEY_ID: sccache
-  AWS_SECRET_ACCESS_KEY: sccache-secret-key
 
 jobs:
   test-all-default-features:
     name: cargo test --all (default features)
-    runs-on: homelab
+    runs-on: ubuntu-latest
     timeout-minutes: 120
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -62,6 +51,7 @@ jobs:
       DGP_REPLAY_WINDOW_SECS: "0"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Build demo UI (rust-embed)
         run: cd demo/s3-browser/ui && npm ci && npm run build
       - name: Clean stale config DB artifacts
@@ -103,8 +93,8 @@ jobs:
   #    Tools (cargo-llvm-cov, cargo-deny) are baked into the builder image. ──
   coverage:
     name: Unit Coverage (nightly)
-    runs-on: homelab
-    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
     continue-on-error: true
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -114,6 +104,7 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Build demo UI (rust-embed)
         run: cd demo/s3-browser/ui && npm ci && npm run build
       - name: Run lib tests under llvm-cov
@@ -150,25 +141,17 @@ jobs:
   #    so the gated code is type-checked HERE nightly instead. ──
   tokio-unstable:
     name: tokio_unstable build + tests (nightly)
-    runs-on: homelab
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       options: --ulimit nofile=1048576:1048576
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    env:
-      RUSTC_WRAPPER: sccache
-      CARGO_INCREMENTAL: "0"
-      SCCACHE_BUCKET: sccache-rust
-      SCCACHE_ENDPOINT: http://sccache-minio.sccache.svc.cluster.local:9000
-      SCCACHE_REGION: auto
-      SCCACHE_S3_USE_SSL: "false"
-      AWS_ACCESS_KEY_ID: sccache
-      AWS_SECRET_ACCESS_KEY: sccache-secret-key
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Build demo UI (rust-embed)
         run: cd demo/s3-browser/ui && npm ci && npm run build
       - name: clippy with --cfg tokio_unstable (gated code must stay clean)
@@ -182,7 +165,7 @@ jobs:
 
   supply-chain:
     name: Supply-chain (audit + deny)
-    runs-on: homelab
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     continue-on-error: true
     container:

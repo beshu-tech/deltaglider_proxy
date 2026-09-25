@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Run a command and log memory every 10 s: this job's cgroup and the host.
+# Run a command and log memory and free disk every 10 s.
 #
-# WHY: the homelab runners share one host. When memory runs out, the kernel
-# SIGKILLs the build (exit 137) or the whole runner, and the log shows no reason.
-# These lines stream to the step log until the kill, so the last one shows
-# which limit was hit: the cgroup limit (cgroup near max) or the host
-# (host_available near 0).
+# WHY: when a runner runs out of memory, the kernel SIGKILLs the build
+# (exit 137) or the whole runner, and the log shows no reason. These lines
+# stream to the step log until the kill, so the last one shows which limit was
+# hit: the cgroup limit (cgroup near max), the host (host_available near 0),
+# or the disk (disk_free near 0).
 #
 # Usage: scripts/ci-memwatch.sh <command> [args...]
 set -euo pipefail
@@ -27,7 +27,7 @@ host() { awk -v k="$1:" '$1 == k { printf "%dMiB", $2 / 1024 }' /proc/meminfo; }
 echo "[memwatch] cgroup_max=$(mib "$max_file") host_total=$(host MemTotal)"
 (
   while :; do
-    echo "[memwatch] $(date -u +%T) cgroup=$(mib "$cur_file") host_available=$(host MemAvailable)"
+    echo "[memwatch] $(date -u +%T) cgroup=$(mib "$cur_file") host_available=$(host MemAvailable) disk_free=$(df -m --output=avail . | tail -1 | tr -d ' ')MiB"
     sleep 10
   done
 ) &

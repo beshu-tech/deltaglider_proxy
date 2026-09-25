@@ -16,26 +16,19 @@ permissions:
   packages: read
 
 env:
-  # Measured on the homelab runners (5 GB RAM, full nightly job): with one test
-  # binary, -j16 is the fastest setting and peaks at ~4.7-4.8 GB. Line tables keep
-  # file:line backtraces; unpacked split debuginfo trims ~0.3 GB off the peak
-  # (sccache still caches it). The peak is two ~2 GB rustc (lib unit tests +
-  # tests/all) overlapping, so lowering -j does not reduce it further.
-  CARGO_BUILD_JOBS: "16"
+  # GitHub-hosted ubuntu-latest runners (4 vCPU, 16 GB RAM): cargo runs one job
+  # per vCPU. Line tables keep file:line backtraces; unpacked split debuginfo
+  # keeps the link peak lower.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
   CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
   CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: unpacked
   BUILDER_IMAGE: ghcr.io/${{ github.repository }}/builder:latest
-  # ── sccache: local MinIO compilation cache (NOT the CI test MinIO) ──
+  # ── sccache: GitHub Actions cache backend. Each compiling job runs
+  #    mozilla-actions/sccache-action, which exports the cache credentials. ──
   RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
   CARGO_INCREMENTAL: "0"
-  SCCACHE_BUCKET: sccache-rust
-  SCCACHE_ENDPOINT: http://sccache-minio.sccache.svc.cluster.local:9000
-  SCCACHE_REGION: auto
-  SCCACHE_S3_USE_SSL: "false"
-  AWS_ACCESS_KEY_ID: sccache
-  AWS_SECRET_ACCESS_KEY: sccache-secret-key
 
 jobs:
   # ── Build-once, consume-many ─────────────────────────────────────────
@@ -45,7 +38,7 @@ jobs:
   # re-running `npm ci` / `cargo build --release`.
   build-ui:
     name: Build UI (dist artifact)
-    runs-on: homelab
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -72,8 +65,8 @@ jobs:
 
   build-bin:
     name: Build release binary (artifact)
-    runs-on: homelab
-    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
     needs: build-ui
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
@@ -86,11 +79,12 @@ jobs:
         shell: bash
         run: rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
         with:
           name: ui-dist
           path: demo/s3-browser/ui/dist
-      - name: cargo build --release (sccache warm — same cache as the test jobs)
+      - name: cargo build --release
         env:
           RUST_BACKTRACE: "1"
         run: cargo build --locked --release --bin deltaglider_proxy
@@ -159,17 +153,11 @@ jobs:
 
   fmt:
     name: Rustfmt
-    runs-on: homelab
+    runs-on: ubuntu-latest
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      # Raise the open-file limit. These jobs run on the self-hosted
-      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
-      # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + MinIO sockets, so the
-      # aggregate fd count blows past 1024 and surfaces as
-      # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
-      # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
-      # belt-and-suspenders so the workflow is self-documenting and portable.
+      # Raise the open-file limit: the integration suite runs many proxies
+      # and MinIO sockets in parallel and passes the default ~1024.
       options: --ulimit nofile=1048576:1048576
       credentials:
         username: ${{ github.actor }}
@@ -187,18 +175,12 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: homelab
+    runs-on: ubuntu-latest
     needs: build-ui
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      # Raise the open-file limit. These jobs run on the self-hosted
-      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
-      # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + MinIO sockets, so the
-      # aggregate fd count blows past 1024 and surfaces as
-      # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
-      # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
-      # belt-and-suspenders so the workflow is self-documenting and portable.
+      # Raise the open-file limit: the integration suite runs many proxies
+      # and MinIO sockets in parallel and passes the default ~1024.
       options: --ulimit nofile=1048576:1048576
       credentials:
         username: ${{ github.actor }}
@@ -209,8 +191,6 @@ jobs:
         run: |
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: sccache stats (pre)
-        run: sccache --show-stats
       - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
         with:
           name: ui-dist
@@ -252,9 +232,6 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit $rc
-      - name: sccache stats (post)
-        if: always()
-        run: sccache --show-stats
 
   # ── Test jobs: split into 3 parallel groups for ~3x faster wall-clock ──
   # Each job compiles via sccache (near-instant after first job populates cache).
@@ -262,19 +239,13 @@ jobs:
 
   test-unit:
     name: Unit Tests
-    runs-on: homelab
+    runs-on: ubuntu-latest
     needs: build-ui
-    timeout-minutes: 15
+    timeout-minutes: 30
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      # Raise the open-file limit. These jobs run on the self-hosted
-      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
-      # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + MinIO sockets, so the
-      # aggregate fd count blows past 1024 and surfaces as
-      # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
-      # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
-      # belt-and-suspenders so the workflow is self-documenting and portable.
+      # Raise the open-file limit: the integration suite runs many proxies
+      # and MinIO sockets in parallel and passes the default ~1024.
       options: --ulimit nofile=1048576:1048576
       credentials:
         username: ${{ github.actor }}
@@ -285,6 +256,7 @@ jobs:
         run: |
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
         with:
           name: ui-dist
@@ -311,19 +283,13 @@ jobs:
     if: >-
       github.event_name != 'push' ||
       contains(github.event.head_commit.message, '[ci-integration]')
-    runs-on: homelab
+    runs-on: ubuntu-latest
     needs: build-ui
-    timeout-minutes: 50
+    timeout-minutes: 60
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      # Raise the open-file limit. These jobs run on the self-hosted
-      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
-      # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + MinIO sockets, so the
-      # aggregate fd count blows past 1024 and surfaces as
-      # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
-      # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
-      # belt-and-suspenders so the workflow is self-documenting and portable.
+      # Raise the open-file limit: the integration suite runs many proxies
+      # and MinIO sockets in parallel and passes the default ~1024.
       options: --ulimit nofile=1048576:1048576
       credentials:
         username: ${{ github.actor }}
@@ -350,6 +316,7 @@ jobs:
         run: |
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
         with:
           name: ui-dist
@@ -361,8 +328,8 @@ jobs:
       # pgsty/silo is the maintained MinIO fork (same MINIO_* env, same
       # `server /data`, S3 + admin API unchanged); minio/minio left Docker Hub.
       # Pinned by digest (tag RELEASE.2026-09-16T00-00-00Z): the ephemeral
-      # backend shares the runner's network namespace, so a re-pushed tag would
-      # get a foothold next to the sccache store.
+      # backend shares the job container's network namespace, so a re-pushed
+      # tag would run next to the job and its cache credentials.
       - name: Start MinIO for tests
         run: |
           docker run -d --name minio-ci --network container:$(hostname) \
@@ -465,19 +432,13 @@ jobs:
 
   test-delta:
     name: Delta & Optimization Tests
-    runs-on: homelab
+    runs-on: ubuntu-latest
     needs: build-ui
-    timeout-minutes: 15
+    timeout-minutes: 30
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      # Raise the open-file limit. These jobs run on the self-hosted
-      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
-      # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + MinIO sockets, so the
-      # aggregate fd count blows past 1024 and surfaces as
-      # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
-      # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
-      # belt-and-suspenders so the workflow is self-documenting and portable.
+      # Raise the open-file limit: the integration suite runs many proxies
+      # and MinIO sockets in parallel and passes the default ~1024.
       options: --ulimit nofile=1048576:1048576
       credentials:
         username: ${{ github.actor }}
@@ -488,6 +449,7 @@ jobs:
         run: |
           rm -rf .claude/worktrees .git/modules/.claude 2>/dev/null || true
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
         with:
           name: ui-dist
@@ -503,19 +465,13 @@ jobs:
 
   e2e-smoke:
     name: E2E smoke (embedded UI)
-    runs-on: homelab
+    runs-on: ubuntu-latest
     needs: build-bin
     timeout-minutes: 35
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      # Raise the open-file limit. These jobs run on the self-hosted
-      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
-      # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + MinIO sockets, so the
-      # aggregate fd count blows past 1024 and surfaces as
-      # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
-      # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
-      # belt-and-suspenders so the workflow is self-documenting and portable.
+      # Raise the open-file limit: the integration suite runs many proxies
+      # and MinIO sockets in parallel and passes the default ~1024.
       options: --ulimit nofile=1048576:1048576
       credentials:
         username: ${{ github.actor }}
@@ -545,17 +501,11 @@ jobs:
 
   frontend-lint:
     name: Frontend Lint
-    runs-on: homelab
+    runs-on: ubuntu-latest
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      # Raise the open-file limit. These jobs run on the self-hosted
-      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
-      # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + MinIO sockets, so the
-      # aggregate fd count blows past 1024 and surfaces as
-      # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
-      # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
-      # belt-and-suspenders so the workflow is self-documenting and portable.
+      # Raise the open-file limit: the integration suite runs many proxies
+      # and MinIO sockets in parallel and passes the default ~1024.
       options: --ulimit nofile=1048576:1048576
       credentials:
         username: ${{ github.actor }}
@@ -586,7 +536,7 @@ jobs:
 
   docs:
     name: Docs bundling + link check + YAML examples
-    runs-on: homelab
+    runs-on: ubuntu-latest
     needs: build-bin
     # The from-scratch release build (the old dominant cost) is gone — the
     # config-lint now consumes the shared build-bin artifact. Only the docs
@@ -595,14 +545,8 @@ jobs:
     timeout-minutes: 15
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      # Raise the open-file limit. These jobs run on the self-hosted
-      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
-      # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + MinIO sockets, so the
-      # aggregate fd count blows past 1024 and surfaces as
-      # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
-      # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
-      # belt-and-suspenders so the workflow is self-documenting and portable.
+      # Raise the open-file limit: the integration suite runs many proxies
+      # and MinIO sockets in parallel and passes the default ~1024.
       options: --ulimit nofile=1048576:1048576
       credentials:
         username: ${{ github.actor }}
@@ -675,19 +619,13 @@ jobs:
 
   config-schema:
     name: Config JSON Schema
-    runs-on: homelab
+    runs-on: ubuntu-latest
     needs: build-bin
     timeout-minutes: 10
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
-      # Raise the open-file limit. These jobs run on the self-hosted
-      # `homelab`-labelled Ryzen LXC runners, where the container inherits a low
-      # default nofile (~1024). The integration suite spawns ~35 test
-      # binaries in parallel, each with its own proxy + MinIO sockets, so the
-      # aggregate fd count blows past 1024 and surfaces as
-      # `ConnectError("tcp open error", Os code 24 "Too many open files")`.
-      # The LXC host also bumps nofile (lxc.prlimit.nofile) — this is the
-      # belt-and-suspenders so the workflow is self-documenting and portable.
+      # Raise the open-file limit: the integration suite runs many proxies
+      # and MinIO sockets in parallel and passes the default ~1024.
       options: --ulimit nofile=1048576:1048576
       credentials:
         username: ${{ github.actor }}
