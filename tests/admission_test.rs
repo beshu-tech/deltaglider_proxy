@@ -826,7 +826,6 @@ storage:
 /// setup) that IP is the first XFF element, which the client writes, so one
 /// header escapes any `source_ip` deny block.
 #[tokio::test]
-#[ignore = "review2: pending fix"]
 async fn review2_source_ip_deny_not_bypassed_by_forged_xff() {
     let bucket = "xffdeny";
     let server = TestServer::builder()

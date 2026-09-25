@@ -507,6 +507,8 @@ admission:
 
 `continue` is an explicit terminal that falls through to authentication — useful as the final block for diagnostic visibility in trace output.
 
+The `source_ip` and `source_ip_list` conditions match the address of the TCP connection. The proxy reads the client address from `X-Forwarded-For` only when the connection comes from a network that `DGP_TRUSTED_PROXY_CIDRS` lists. `DGP_TRUST_PROXY_HEADERS=true` alone is not enough, because without the list the proxy cannot tell a header that a reverse proxy wrote from a header that the client forged.
+
 ### Round-trip
 
 `source_ip_list` entries round-trip verbatim (bare IPs stay bare, CIDRs stay CIDRs) so GitOps diffs don't flip on every apply.

@@ -448,6 +448,36 @@ pub fn extract_client_ip_with_peer(
     )
 }
 
+/// Client IP for decisions a forged header must never win: admission
+/// `source_ip` blocks and the known-good account-lock exemption. Reads env,
+/// then delegates to the pure [`resolve_trusted_client_ip`].
+pub fn extract_trusted_client_ip(
+    headers: &axum::http::HeaderMap,
+    peer_ip: Option<IpAddr>,
+) -> Option<IpAddr> {
+    resolve_trusted_client_ip(
+        headers,
+        peer_ip,
+        trust_proxy_headers(),
+        &trusted_proxy_cidrs(),
+    )
+}
+
+/// Like [`resolve_client_ip`], without the legacy "trust on, no CIDR list"
+/// path: there the first XFF element is client-written, so this returns the
+/// TCP peer. Only a `DGP_TRUSTED_PROXY_CIDRS` peer can name another client.
+pub fn resolve_trusted_client_ip(
+    headers: &axum::http::HeaderMap,
+    peer_ip: Option<IpAddr>,
+    trust: bool,
+    trusted_cidrs: &[ipnet::IpNet],
+) -> Option<IpAddr> {
+    if trusted_cidrs.is_empty() {
+        return peer_ip.map(normalize_ip);
+    }
+    resolve_client_ip(headers, peer_ip, trust, trusted_cidrs)
+}
+
 /// Pure client-IP resolver — the anti-spoofing decision, injectable for tests.
 ///
 /// - `trust == false`: proxy headers are ignored entirely; the TCP `peer_ip` is
@@ -1181,6 +1211,31 @@ mod tests {
             resolve_client_ip(&h, Some(ip("10.0.0.5")), true, &trusted),
             Some(ip("203.0.113.9")),
             "a v4-mapped trusted hop must be skipped as trusted"
+        );
+    }
+
+    /// Truth table for the resolver admission and the known-good exemption
+    /// use: without a CIDR list the XFF header never wins, even with trust on.
+    #[test]
+    fn trusted_client_ip_ignores_xff_without_a_cidr_list() {
+        let h = hdrs(&[("x-forwarded-for", "198.51.100.1")]);
+        let peer = Some(ip("127.0.0.1"));
+        assert_eq!(resolve_trusted_client_ip(&h, peer, true, &[]), peer);
+        assert_eq!(resolve_trusted_client_ip(&h, peer, false, &[]), peer);
+        assert_eq!(
+            resolve_trusted_client_ip(&h, Some(ip("::ffff:127.0.0.1")), true, &[]),
+            peer,
+            "the peer is normalized"
+        );
+        // A listed proxy may name the client.
+        assert_eq!(
+            resolve_trusted_client_ip(&h, peer, true, &[cidr("127.0.0.0/8")]),
+            Some(ip("198.51.100.1"))
+        );
+        // An unlisted peer may not.
+        assert_eq!(
+            resolve_trusted_client_ip(&h, peer, true, &[cidr("10.0.0.0/8")]),
+            peer
         );
     }
 
