@@ -80,7 +80,17 @@ async fn observe_env_secret(client: &Client, ns: &str, cr: &DeltaGliderProxy) ->
     }
 }
 
-/// Create `<name>-bootstrap` once if autoGenerate is on. Never overwrites.
+/// A random config DB key: 32 bytes, hex.
+fn generate_db_key() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Create `<name>-bootstrap` once if autoGenerate is on. Never overwrites a key.
+/// A Secret from an operator release before the config DB key has no `dbKey`:
+/// add one (the pods then re-encrypt their IAM DB from the hash on restart).
 async fn ensure_bootstrap_secret(
     client: &Client,
     ns: &str,
@@ -91,7 +101,19 @@ async fn ensure_bootstrap_secret(
     }
     let name = format!("{}-bootstrap", resources::cr_name(cr));
     let api: Api<Secret> = Api::namespaced(client.clone(), ns);
-    if api.get_opt(&name).await?.is_some() {
+    if let Some(existing) = api.get_opt(&name).await? {
+        let has_key = existing
+            .data
+            .as_ref()
+            .is_some_and(|d| d.contains_key(resources::DB_KEY_SECRET_KEY));
+        if !has_key {
+            // A strategic-merge patch adds the key and leaves the others alone.
+            let patch =
+                json!({ "stringData": { resources::DB_KEY_SECRET_KEY: generate_db_key() } });
+            api.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+                .await?;
+            tracing::info!(%name, %ns, "added the config DB key to the bootstrap Secret");
+        }
         return Ok(());
     }
     use rand::distributions::{Alphanumeric, DistString};
@@ -101,7 +123,7 @@ async fn ensure_bootstrap_secret(
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(hash)
     };
-    let obj = resources::bootstrap_secret(cr, &password, &hash_b64);
+    let obj = resources::bootstrap_secret(cr, &password, &hash_b64, &generate_db_key());
     let secret: Secret = serde_json::from_value(obj).expect("builder output is a valid Secret");
     match api.create(&Default::default(), &secret).await {
         Ok(_) => {

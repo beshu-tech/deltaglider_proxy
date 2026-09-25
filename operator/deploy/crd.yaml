@@ -28,7 +28,7 @@ spec:
           spec:
             properties:
               bootstrapPassword:
-                description: Bootstrap password management. With autoGenerate, the operator creates a Secret `<name>-bootstrap` holding a random password and its hash, and injects it into every pod — no manual --set-bootstrap-password step.
+                description: Bootstrap password management. With autoGenerate, the operator creates a Secret `<name>-bootstrap` holding a random password, its hash, and a random config DB key, and injects the hash and the key into every pod — no manual --set-bootstrap-password step.
                 nullable: true
                 properties:
                   autoGenerate:
@@ -41,7 +41,7 @@ spec:
                 nullable: true
                 type: string
               envFromSecret:
-                description: Name of an existing Secret whose keys are injected as environment variables (DGP_ACCESS_KEY_ID, DGP_SECRET_ACCESS_KEY, DGP_BOOTSTRAP_PASSWORD_HASH, DGP_BE_AWS_* backend credentials, ...).
+                description: Name of an existing Secret whose keys are injected as environment variables (DGP_ACCESS_KEY_ID, DGP_SECRET_ACCESS_KEY, DGP_BOOTSTRAP_PASSWORD_HASH, DGP_CONFIG_DB_KEY, DGP_BE_AWS_* backend credentials, ...).
                 nullable: true
                 type: string
               image:
@@ -49,7 +49,7 @@ spec:
                 nullable: true
                 type: string
               replicas:
-                description: 'Number of proxy pods. Above 1, read the HA notes in the operator README first: you need an S3 storage backend, a shared bootstrap password hash, and a config sync bucket. Multipart uploads work because the managed router consistently hashes requests by URL path, pinning each object''s requests to one pod.'
+                description: 'Number of proxy pods. Above 1, read the HA notes in the operator README first: you need an S3 storage backend, a shared config DB key and bootstrap password hash, and a config sync bucket. Multipart uploads work because the managed router consistently hashes requests by URL path, pinning each object''s requests to one pod.'
                 format: int32
                 nullable: true
                 type: integer

@@ -27,8 +27,8 @@ pub const PROXY_PORT: i32 = 9000;
 #[serde(rename_all = "camelCase")]
 pub struct DeltaGliderProxySpec {
     /// Number of proxy pods. Above 1, read the HA notes in the operator README first:
-    /// you need an S3 storage backend, a shared bootstrap password hash, and a config
-    /// sync bucket. Multipart uploads work because the managed router consistently
+    /// you need an S3 storage backend, a shared config DB key and bootstrap password
+    /// hash, and a config sync bucket. Multipart uploads work because the managed router consistently
     /// hashes requests by URL path, pinning each object's requests to one pod.
     pub replicas: Option<i32>,
     /// Proxy container image. Defaults to the operator's pinned release.
@@ -39,7 +39,7 @@ pub struct DeltaGliderProxySpec {
     pub config_yaml: Option<String>,
     /// Name of an existing Secret whose keys are injected as environment variables
     /// (DGP_ACCESS_KEY_ID, DGP_SECRET_ACCESS_KEY, DGP_BOOTSTRAP_PASSWORD_HASH,
-    /// DGP_BE_AWS_* backend credentials, ...).
+    /// DGP_CONFIG_DB_KEY, DGP_BE_AWS_* backend credentials, ...).
     pub env_from_secret: Option<String>,
     /// Per-pod persistent volume for /data (config DB, filesystem-backend objects).
     pub storage: Option<StorageSpec>,
@@ -50,8 +50,9 @@ pub struct DeltaGliderProxySpec {
     /// Proxy container resources.
     pub resources: Option<ResourcesSpec>,
     /// Bootstrap password management. With autoGenerate, the operator creates a
-    /// Secret `<name>-bootstrap` holding a random password and its hash, and injects
-    /// it into every pod — no manual --set-bootstrap-password step.
+    /// Secret `<name>-bootstrap` holding a random password, its hash, and a random
+    /// config DB key, and injects the hash and the key into every pod — no manual
+    /// --set-bootstrap-password step.
     pub bootstrap_password: Option<BootstrapPasswordSpec>,
 }
 

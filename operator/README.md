@@ -39,7 +39,8 @@ kubectl create namespace dgp
 kubectl -n dgp create secret generic dgp-env \
   --from-literal=DGP_ACCESS_KEY_ID=admin \
   --from-literal=DGP_SECRET_ACCESS_KEY=replace-me \
-  --from-literal=DGP_BOOTSTRAP_PASSWORD_HASH="JDJiJDEyJ..."
+  --from-literal=DGP_BOOTSTRAP_PASSWORD_HASH="JDJiJDEyJ..." \
+  --from-literal=DGP_CONFIG_DB_KEY="$(openssl rand -hex 32)"
 kubectl apply -f deploy/example.yaml
 kubectl -n dgp get dgp dgp        # the phase becomes Ready when everything is up
 ```
@@ -110,10 +111,10 @@ Two more operational notes:
   volume. After you scale `replicas` down, reclaim the removed pods' volumes manually
   if you want the storage back.
 - **The bootstrap Secret survives deletion of the resource.** `<name>-bootstrap`
-  deliberately carries no owner reference: the hash inside it decrypts the IAM
-  database on the persistent volumes, and those volumes survive a `kubectl delete
-  dgp`. If the Secret were garbage-collected with the resource, recreating it would
-  generate a new password and permanently lock the surviving data out. For a truly
+  deliberately carries no owner reference: its `dbKey` decrypts the IAM database on
+  the persistent volumes, and those volumes survive a `kubectl delete dgp`. If the
+  Secret were garbage-collected with the resource, recreating it would generate a new
+  key and permanently lock the surviving data out. For a truly
   clean teardown, delete the Secret and the volumes together, by hand.
 
 ## Requirements for `replicas > 1` (enforced)
@@ -124,13 +125,17 @@ requires:
 
 1. **An S3 storage backend.** The filesystem backend is local disk on each pod, so with
    more than one pod each pod would see different data.
-2. **The same `DGP_BOOTSTRAP_PASSWORD_HASH` on every pod.** This hash encrypts the
-   shared IAM database. The operator injects one Secret into all pods, which guarantees
-   that they agree. If you would rather not create the hash yourself, set
-   `spec.bootstrapPassword.autoGenerate: true` and the operator generates a random
-   password and its hash once, stores both in a Secret named `<name>-bootstrap`, and
-   injects the hash into every pod. Read the password with:
+2. **The same `DGP_CONFIG_DB_KEY` and `DGP_BOOTSTRAP_PASSWORD_HASH` on every pod.**
+   The config DB key encrypts the shared IAM database, and a pod with a sync bucket but
+   without the key refuses to start. The hash is the admin password. The operator
+   injects one Secret into all pods, which guarantees that they agree. If you would
+   rather not create them yourself, set `spec.bootstrapPassword.autoGenerate: true` and
+   the operator generates a random password, its hash, and a random config DB key once,
+   stores them in a Secret named `<name>-bootstrap`, and injects the hash and the key
+   into every pod. Read the password with:
    `kubectl get secret <name>-bootstrap -o jsonpath='{.data.password}' | base64 -d`.
+   A `<name>-bootstrap` Secret from an older operator release gets its `dbKey` added on
+   the next reconcile.
 3. **A config sync bucket** (`advanced.config_sync_bucket`). It carries IAM users and
    groups between the pods and hosts the leader leases for replication rules.
 4. **One admin writer at a time.** Make IAM changes through one pod only, or switch to
@@ -138,7 +143,7 @@ requires:
 
 The operator checks points 1–3 before it scales. If you set `replicas: 3` but the spec
 violates the contract — no sync bucket, a filesystem backend, a missing Secret, or no
-bootstrap hash — the operator refuses to scale up: a fresh deployment comes up with
+bootstrap hash or config DB key — the operator refuses to scale up: a fresh deployment comes up with
 **one** pod, and a fleet that is already running keeps its current size (the operator
 never kills healthy pods over a preflight problem). Either way the resource's phase
 becomes `Degraded` and `status.message` lists the exact problems. Fix the spec and the

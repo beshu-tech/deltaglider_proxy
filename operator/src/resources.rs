@@ -136,10 +136,19 @@ pub fn router_configmap(cr: &DeltaGliderProxy, proxy_replicas: i32) -> Value {
     })
 }
 
-/// The auto-generated bootstrap Secret (`password` for the human, `hash` for the pods).
-/// Create-once and NO ownerReference: the hash decrypts IAM data on PVCs that survive
-/// CR deletion, so the Secret must survive too (manual teardown, like the PVCs).
-pub fn bootstrap_secret(cr: &DeltaGliderProxy, password: &str, hash_b64: &str) -> Value {
+/// Key of the config DB key in the bootstrap Secret (`DGP_CONFIG_DB_KEY` of every pod).
+pub const DB_KEY_SECRET_KEY: &str = "dbKey";
+
+/// The auto-generated bootstrap Secret (`password` for the human, `hash` and `dbKey`
+/// for the pods). Create-once and NO ownerReference: `dbKey` decrypts IAM data on
+/// PVCs that survive CR deletion, so the Secret must survive too (manual teardown,
+/// like the PVCs).
+pub fn bootstrap_secret(
+    cr: &DeltaGliderProxy,
+    password: &str,
+    hash_b64: &str,
+    db_key: &str,
+) -> Value {
     let name = format!("{}-bootstrap", cr_name(cr));
     json!({
         "apiVersion": "v1",
@@ -150,7 +159,7 @@ pub fn bootstrap_secret(cr: &DeltaGliderProxy, password: &str, hash_b64: &str) -
             "labels": labels(cr.meta().name.as_deref().unwrap_or_default(), "proxy"),
         },
         "type": "Opaque",
-        "stringData": { "password": password, "hash": hash_b64 },
+        "stringData": { "password": password, "hash": hash_b64, DB_KEY_SECRET_KEY: db_key },
     })
 }
 
@@ -208,6 +217,12 @@ pub fn proxy_statefulset(cr: &DeltaGliderProxy, replicas: i32) -> Value {
             "name": "DGP_BOOTSTRAP_PASSWORD_HASH",
             "valueFrom": { "secretKeyRef": {
                 "name": format!("{name}-bootstrap"), "key": "hash",
+            }},
+        }));
+        env.push(json!({
+            "name": "DGP_CONFIG_DB_KEY",
+            "valueFrom": { "secretKeyRef": {
+                "name": format!("{name}-bootstrap"), "key": DB_KEY_SECRET_KEY,
             }},
         }));
     }
@@ -573,13 +588,15 @@ mod tests {
     #[test]
     fn bootstrap_secret_survives_cr_deletion() {
         use k8s_openapi::api::core::v1::Secret;
-        let s: Secret = serde_json::from_value(bootstrap_secret(&cr(1), "pw", "aGFzaA==")).unwrap();
+        let s: Secret =
+            serde_json::from_value(bootstrap_secret(&cr(1), "pw", "aGFzaA==", "k")).unwrap();
         assert!(
             s.metadata.owner_references.is_none(),
-            "an ownerReference would GC the hash while the PVCs survive → IAM DB lockout"
+            "an ownerReference would GC the dbKey while the PVCs survive → IAM DB lockout"
         );
         let data = s.string_data.unwrap();
         assert!(data.contains_key("password") && data.contains_key("hash"));
+        assert!(data.contains_key(DB_KEY_SECRET_KEY));
     }
 
     #[test]

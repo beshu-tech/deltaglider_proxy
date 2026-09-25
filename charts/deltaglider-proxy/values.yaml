@@ -130,6 +130,11 @@ auth:
   #   deltaglider_proxy --set-bootstrap-password
   # Default hash is for the development password: change-me-in-production
   bootstrapPasswordHash: "JDJiJDEyJDRzb0o5TjNXMWRSQ0gzaGxvVkxjLi55Vy5GTVAwNTNZUHVzQkZ5M1VSS0xpWVEuL1dWOU0u"
+  # Encryption key of the IAM config DB (DGP_CONFIG_DB_KEY), at least 32
+  # characters, e.g. from `openssl rand -hex 32`. Leave empty for one replica:
+  # the proxy then generates a key file next to the DB on the PVC. Required,
+  # and the same on every replica, when advanced.config_sync_bucket is set.
+  configDbKey: ""
   # Additional secret-valued environment variables to include only when this
   # chart creates the Secret. When auth.existingSecret is set, put these keys
   # in that external Secret instead.

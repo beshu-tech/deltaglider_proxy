@@ -133,21 +133,31 @@ pub fn multi_replica_problems(cr: &DeltaGliderProxy, env_secret: &EnvSecret) -> 
         }
         EnvSecret::NotNamed if !cr.bootstrap_auto_generate() => {
             problems.push(
-                "no bootstrap password hash: every pod must share DGP_BOOTSTRAP_PASSWORD_HASH \
-                 (it encrypts the shared IAM database). Set spec.envFromSecret to a Secret \
-                 carrying it, or set spec.bootstrapPassword.autoGenerate: true"
+                "no bootstrap password hash and no config DB key: every pod must share \
+                 DGP_BOOTSTRAP_PASSWORD_HASH (the admin password) and DGP_CONFIG_DB_KEY (it \
+                 encrypts the shared IAM database). Set spec.envFromSecret to a Secret \
+                 carrying both, or set spec.bootstrapPassword.autoGenerate: true"
                     .to_string(),
             );
         }
-        EnvSecret::Keys(_)
-            if !secret_has("DGP_BOOTSTRAP_PASSWORD_HASH") && !cr.bootstrap_auto_generate() =>
-        {
-            problems.push(
-                "the env Secret has no DGP_BOOTSTRAP_PASSWORD_HASH key: every pod must share \
-                 the same hash (it encrypts the shared IAM database). Add the key, or set \
-                 spec.bootstrapPassword.autoGenerate: true"
-                    .to_string(),
-            );
+        EnvSecret::Keys(_) if !cr.bootstrap_auto_generate() => {
+            if !secret_has("DGP_BOOTSTRAP_PASSWORD_HASH") {
+                problems.push(
+                    "the env Secret has no DGP_BOOTSTRAP_PASSWORD_HASH key: every pod must \
+                     share the same hash (the admin password). Add the key, or set \
+                     spec.bootstrapPassword.autoGenerate: true"
+                        .to_string(),
+                );
+            }
+            if !secret_has("DGP_CONFIG_DB_KEY") {
+                problems.push(
+                    "the env Secret has no DGP_CONFIG_DB_KEY key: every pod must share the \
+                     same key (it encrypts the shared IAM database; a pod with a sync bucket \
+                     and no key refuses to start). Add it (for example from `openssl rand \
+                     -hex 32`), or set spec.bootstrapPassword.autoGenerate: true"
+                        .to_string(),
+                );
+            }
         }
         _ => {}
     }
@@ -214,18 +224,26 @@ mod tests {
     #[test]
     fn good_ha_config_passes() {
         let c = cr(3, Some(GOOD_HA_YAML), false);
-        assert!(multi_replica_problems(&c, &keys(&["DGP_BOOTSTRAP_PASSWORD_HASH"])).is_empty());
+        assert!(multi_replica_problems(
+            &c,
+            &keys(&["DGP_BOOTSTRAP_PASSWORD_HASH", "DGP_CONFIG_DB_KEY"])
+        )
+        .is_empty());
     }
 
     #[test]
     fn missing_sync_bucket_blocks_unless_in_secret() {
         let yaml = "storage:\n  s3: https://s3.example.com\n";
         let c = cr(3, Some(yaml), false);
-        let hash_only = keys(&["DGP_BOOTSTRAP_PASSWORD_HASH"]);
+        let hash_only = keys(&["DGP_BOOTSTRAP_PASSWORD_HASH", "DGP_CONFIG_DB_KEY"]);
         assert!(multi_replica_problems(&c, &hash_only)
             .iter()
             .any(|p| p.contains("config sync bucket")));
-        let both = keys(&["DGP_BOOTSTRAP_PASSWORD_HASH", "DGP_CONFIG_SYNC_BUCKET"]);
+        let both = keys(&[
+            "DGP_BOOTSTRAP_PASSWORD_HASH",
+            "DGP_CONFIG_DB_KEY",
+            "DGP_CONFIG_SYNC_BUCKET",
+        ]);
         assert!(multi_replica_problems(&c, &both).is_empty());
     }
 
@@ -238,7 +256,7 @@ mod tests {
         ] {
             let c = cr(2, Some(yaml), false);
             assert!(
-                multi_replica_problems(&c, &keys(&["DGP_BOOTSTRAP_PASSWORD_HASH"]))
+                multi_replica_problems(&c, &keys(&["DGP_BOOTSTRAP_PASSWORD_HASH", "DGP_CONFIG_DB_KEY"]))
                     .iter()
                     .any(|p| p.contains("filesystem")),
                 "should block: {yaml}"
@@ -254,6 +272,18 @@ mod tests {
             .any(|p| p.contains("DGP_BOOTSTRAP_PASSWORD_HASH")));
         let auto = cr(3, Some(GOOD_HA_YAML), true);
         assert!(multi_replica_problems(&auto, &keys(&["DGP_ACCESS_KEY_ID"])).is_empty());
+    }
+
+    #[test]
+    fn missing_config_db_key_blocks_unless_auto_generated() {
+        let c = cr(3, Some(GOOD_HA_YAML), false);
+        assert!(
+            multi_replica_problems(&c, &keys(&["DGP_BOOTSTRAP_PASSWORD_HASH"]))
+                .iter()
+                .any(|p| p.contains("DGP_CONFIG_DB_KEY"))
+        );
+        let auto = cr(3, Some(GOOD_HA_YAML), true);
+        assert!(multi_replica_problems(&auto, &keys(&[])).is_empty());
     }
 
     #[test]
@@ -300,10 +330,11 @@ mod tests {
     #[test]
     fn invalid_yaml_blocks_with_parse_error() {
         let c = cr(2, Some(": not yaml : ["), false);
-        assert!(
-            multi_replica_problems(&c, &keys(&["DGP_BOOTSTRAP_PASSWORD_HASH"]))
-                .iter()
-                .any(|p| p.contains("not valid YAML"))
-        );
+        assert!(multi_replica_problems(
+            &c,
+            &keys(&["DGP_BOOTSTRAP_PASSWORD_HASH", "DGP_CONFIG_DB_KEY"])
+        )
+        .iter()
+        .any(|p| p.contains("not valid YAML")));
     }
 }
