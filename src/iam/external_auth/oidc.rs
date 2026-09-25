@@ -411,14 +411,7 @@ impl OidcProvider {
         // Configure validation — alg is gated by `jwt_alg_is_allowed`
         // above, so header.alg is a safe public-key algorithm at this
         // point. The JWKS key's own `alg` field further constrains.
-        let mut validation = Validation::new(header.alg);
-        validation.set_audience(&[&self.client_id]);
-        // Pin issuer to the CONFIGURED issuer_url, not whatever the
-        // discovery doc claimed. `fetch_discovery` already enforces
-        // `issuers_match(doc.issuer, self.issuer_url)`, so the cached
-        // doc's value can never drift from this — but pinning here
-        // makes the property local to one place.
-        validation.set_issuer(&[self.issuer_url.as_str()]);
+        let validation = id_token_validation(header.alg, &self.client_id, &self.issuer_url);
 
         let token_data = decode::<IdTokenClaims>(token, &decoding_key, &validation)
             .map_err(|e| ExternalAuthError::TokenValidationFailed(e.to_string()))?;
@@ -442,6 +435,25 @@ impl OidcProvider {
 
         Ok(token_data.claims)
     }
+}
+
+/// ID-token validation rules: audience = our client id, issuer pinned to
+/// the CONFIGURED issuer_url (not whatever the discovery doc claimed;
+/// `fetch_discovery` already enforces `issuers_match(doc.issuer,
+/// issuer_url)`, and pinning here keeps the property local).
+fn id_token_validation(
+    alg: jsonwebtoken::Algorithm,
+    client_id: &str,
+    issuer_url: &str,
+) -> Validation {
+    let mut validation = Validation::new(alg);
+    validation.set_audience(&[client_id]);
+    // Both slash forms of the ONE configured URL: the same tolerance as
+    // `issuers_match`, so an IdP whose `iss` carries the trailing slash
+    // (as its discovery doc did) validates. The host stays pinned.
+    let bare = issuer_url.trim_end_matches('/');
+    validation.set_issuer(&[bare.to_string(), format!("{bare}/")]);
+    validation
 }
 
 /// RFC 8414 §3.3 issuer compare. Allows operator to configure
@@ -563,6 +575,40 @@ mod tests {
         assert!(encoded
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    /// Discovery accepts a doc issuer that differs from the configured URL
+    /// only by a trailing slash, and the IdP stamps that exact issuer into
+    /// `iss`. The token check must accept it too, or every login fails.
+    #[test]
+    fn id_token_issuer_tolerates_the_trailing_slash_discovery_accepts() {
+        let enc = |v: serde_json::Value| URL_SAFE_NO_PAD.encode(v.to_string());
+        let token_with_iss = |iss: &str| {
+            format!(
+                "{}.{}.{}",
+                enc(serde_json::json!({"alg": "RS256", "kid": "k"})),
+                enc(serde_json::json!({"iss": iss, "aud": "dgp", "exp": 4_000_000_000u64})),
+                URL_SAFE_NO_PAD.encode(b"sig")
+            )
+        };
+        let check = |configured: &str, iss: &str| {
+            let mut v = id_token_validation(jsonwebtoken::Algorithm::RS256, "dgp", configured);
+            v.insecure_disable_signature_validation();
+            decode::<serde_json::Value>(&token_with_iss(iss), &DecodingKey::from_secret(b""), &v)
+                .is_ok()
+        };
+        assert!(check("https://idp.example.com", "https://idp.example.com/"));
+        assert!(check("https://idp.example.com/", "https://idp.example.com"));
+        assert!(check("https://idp.example.com", "https://idp.example.com"));
+        // Still pinned: another host or path is refused.
+        assert!(!check(
+            "https://idp.example.com",
+            "https://evil.example.com/"
+        ));
+        assert!(!check(
+            "https://idp.example.com",
+            "https://idp.example.com/tenant"
+        ));
     }
 
     #[test]
