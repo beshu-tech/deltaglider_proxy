@@ -840,14 +840,7 @@ where
                 State::Initial(mut inner) => match inner.next().await {
                     Some(Ok(first)) => {
                         if first.len() >= 4 && first[..4] == CHUNK_MAGIC {
-                            let err = Err(StorageError::Encryption(
-                                "object body begins with chunked-encryption magic but \
-                                 metadata has no dg-encrypted marker — xattrs may have \
-                                 been stripped during backup/restore. Refusing to serve \
-                                 ciphertext as plaintext."
-                                    .into(),
-                            ));
-                            return Some((err, State::Done));
+                            return Some((Err(stripped_marker_error()), State::Done));
                         }
                         Some((Ok(first), State::Passthrough(inner)))
                     }
@@ -862,6 +855,39 @@ where
             }
         },
     ))
+}
+
+fn stripped_marker_error() -> StorageError {
+    StorageError::Encryption(
+        "object body begins with chunked-encryption magic but \
+         metadata has no dg-encrypted marker — xattrs may have \
+         been stripped during backup/restore. Refusing to serve \
+         ciphertext as plaintext."
+            .into(),
+    )
+}
+
+/// First `n` bytes of an object (fewer for a shorter object), by range.
+async fn read_prefix<B: StorageBackend + ?Sized>(
+    inner: &B,
+    bucket: &str,
+    prefix: &str,
+    filename: &str,
+    n: usize,
+) -> Result<Vec<u8>, StorageError> {
+    use futures::StreamExt;
+    let (mut stream, _) = inner
+        .get_passthrough_stream_range(bucket, prefix, filename, 0, n as u64 - 1)
+        .await?;
+    let mut buf = Vec::with_capacity(n);
+    while buf.len() < n {
+        match stream.next().await {
+            Some(chunk) => buf.extend_from_slice(&chunk?),
+            None => break,
+        }
+    }
+    buf.truncate(n);
+    Ok(buf)
 }
 
 /// Fetch the 16-byte `[magic][base_iv]` header via a short range request
@@ -947,6 +973,13 @@ impl<B: StorageBackend> EncryptingBackend<B> {
             return None;
         }
         cfg.key.clone().map(|key| (key, cfg.key_id.clone()))
+    }
+
+    /// True when this wrapper holds any key (primary or decrypt-only
+    /// legacy), so the backend may hold proxy-encrypted bodies.
+    fn has_any_key(&self) -> bool {
+        let cfg = self.config.load();
+        cfg.key.is_some() || cfg.legacy_key.is_some()
     }
 
     /// True when this wrapper encrypts object bodies in-process. Gates the
@@ -1679,10 +1712,27 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             return Ok((Box::pin(futures::stream::once(async { Ok(slice) })), len));
         }
 
-        // Not encrypted — delegate.
-        self.inner
+        // Not encrypted per metadata. Same DGE1 belt-and-suspenders as the
+        // full-stream path (a stripped marker must not serve ciphertext).
+        // A range from 0 carries the magic itself: sniff it for free. A
+        // later range needs a 4-byte probe; only a backend with a key
+        // (primary or legacy) can hold such bodies, so a plain backend pays
+        // no extra request.
+        if start > 0 && self.has_any_key() {
+            let magic =
+                read_prefix(&self.inner, bucket, prefix, filename, CHUNK_MAGIC.len()).await?;
+            if magic == CHUNK_MAGIC {
+                return Err(stripped_marker_error());
+            }
+        }
+        let (stream, len) = self
+            .inner
             .get_passthrough_stream_range(bucket, prefix, filename, start, end)
-            .await
+            .await?;
+        if start == 0 {
+            return Ok((sniff_dge1_magic(stream), len));
+        }
+        Ok((stream, len))
     }
 
     // ── Pass-through (no encryption) ──
@@ -2872,6 +2922,66 @@ mod tests {
             msg.contains("xattrs") || msg.contains("dg-encrypted"),
             "error must explain the xattr-strip scenario, got: {msg}"
         );
+    }
+
+    /// Tier 4: the range path must refuse a stripped-marker DGE1 body too.
+    /// It delegated straight to the inner backend, so a range GET served
+    /// ciphertext where a full GET refused.
+    #[tokio::test]
+    async fn test_stripped_xattr_with_dge1_body_refuses_range_reads() {
+        use futures::TryStreamExt;
+        let key = test_key();
+        let plaintext: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+        let (ciphertext, _iv, _final) = encode_chunked(&key, &plaintext);
+        let meta = FileMetadata::fallback(
+            "test.bin".into(),
+            ciphertext.len() as u64,
+            "md5".into(),
+            Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        for (configured, start) in [
+            (None, 0u64),
+            (Some(key.clone()), 0),
+            (Some(key.clone()), 100),
+        ] {
+            let mut backend = CountingBackend::new();
+            backend.set_contents(ciphertext.clone(), meta.clone());
+            let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+                key: configured.clone(),
+                key_id: None,
+                ..Default::default()
+            })));
+            let wrapper = EncryptingBackend::new(backend, cfg);
+            let res = match wrapper
+                .get_passthrough_stream_range("b", "p", "test.bin", start, start + 50)
+                .await
+            {
+                Ok((stream, _)) => stream.try_collect::<Vec<Bytes>>().await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            assert!(
+                res.is_err(),
+                "key={} start={start}: range read served ciphertext",
+                configured.is_some()
+            );
+        }
+        // A plaintext object is still served by range.
+        let mut backend = CountingBackend::new();
+        backend.set_contents(plaintext.clone(), meta.clone());
+        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key: Some(key),
+            key_id: None,
+            ..Default::default()
+        })));
+        let wrapper = EncryptingBackend::new(backend, cfg);
+        let (stream, _) = wrapper
+            .get_passthrough_stream_range("b", "p", "test.bin", 100, 150)
+            .await
+            .unwrap();
+        let got: Vec<Bytes> = stream.try_collect().await.unwrap();
+        assert_eq!(got.concat(), plaintext[100..=150].to_vec());
     }
 
     #[tokio::test]
