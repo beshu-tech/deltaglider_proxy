@@ -331,7 +331,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_TRUST_PROXY_HEADERS",
-        description: "Trust X-Forwarded-For/X-Real-IP for rate limiting and IAM conditions",
+        description: "Trust X-Forwarded-For/X-Real-IP for the per-IP rate-limit bucket; admission, aws:SourceIp and the lockout exemption read them only from DGP_TRUSTED_PROXY_CIDRS peers",
         example: "false",
         category: "Security",
     },
