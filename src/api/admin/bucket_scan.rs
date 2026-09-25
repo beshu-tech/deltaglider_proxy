@@ -279,6 +279,11 @@ impl BucketScanner {
             return job.progress_rx.clone();
         }
 
+        // Kept so a cancelled / failed re-scan puts it back.
+        let previous = match buckets.get(&bucket) {
+            Some(BucketState::Done(r)) => Some(r.clone()),
+            _ => None,
+        };
         let (tx, rx) = watch::channel(ScanProgress::initial(&bucket));
         let cancel = CancellationToken::new();
         let job = RunningJob {
@@ -304,45 +309,37 @@ impl BucketScanner {
             )
             .await;
 
-            // Drop the running entry. On success we replace with the
-            // completed Done; on cancel/error we leave whatever Done
-            // was there previously alone (or remove if none).
+            // Replace the running entry: the new result on success, the
+            // previous one (or nothing) on cancel / error.
             let mut buckets = scanner_buckets.write();
-            match outcome {
+            match &outcome {
                 Ok(result) => {
                     // Persist to disk before we publish into the
                     // in-memory map. If the write fails the warn
                     // shows up in the logs but the in-memory result
                     // is still valid for THIS process — restart
                     // would lose it.
-                    persist_scan(&scan_dir, &result);
-                    let duration_ms = started_instant.elapsed().as_millis() as u64;
+                    persist_scan(&scan_dir, result);
                     debug!(
                         bucket = %bucket_for_task,
                         objects = result.total_objects,
-                        duration_ms,
+                        duration_ms = started_instant.elapsed().as_millis() as u64,
                         "Bucket scan complete"
                     );
-                    buckets.insert(bucket_for_task.clone(), BucketState::Done(result));
                 }
-                Err(ScanFailure::Cancelled) => {
-                    // Leave any pre-existing Done in place; otherwise
-                    // drop the Running entry so the bucket appears
-                    // Idle on next status poll.
-                    if matches!(buckets.get(&bucket_for_task), Some(BucketState::Running(_))) {
-                        buckets.remove(&bucket_for_task);
-                    }
-                }
+                Err(ScanFailure::Cancelled) => {}
                 Err(ScanFailure::Error(e)) => {
-                    warn!(
-                        bucket = %bucket_for_task,
-                        error = %e,
-                        "Bucket scan failed"
-                    );
-                    if matches!(buckets.get(&bucket_for_task), Some(BucketState::Running(_))) {
-                        buckets.remove(&bucket_for_task);
-                    }
+                    warn!(bucket = %bucket_for_task, error = %e, "Bucket scan failed");
                 }
+            }
+            // Only settle our own Running entry (a forget() may have run).
+            if matches!(buckets.get(&bucket_for_task), Some(BucketState::Running(_)))
+                || outcome.is_ok()
+            {
+                match result_after_scan(previous, outcome) {
+                    Some(r) => buckets.insert(bucket_for_task.clone(), BucketState::Done(r)),
+                    None => buckets.remove(&bucket_for_task),
+                };
             }
         });
 
@@ -431,6 +428,19 @@ fn sanitise_bucket_for_filename(bucket: &str) -> String {
 enum ScanFailure {
     Cancelled,
     Error(String),
+}
+
+/// The result a bucket shows once a scan ends: the new one on success; on
+/// cancel or error, the result from BEFORE the scan (it is still the latest
+/// complete one, and it is still on disk).
+fn result_after_scan(
+    previous: Option<ScanResult>,
+    outcome: Result<ScanResult, ScanFailure>,
+) -> Option<ScanResult> {
+    match outcome {
+        Ok(r) => Some(r),
+        Err(_) => previous,
+    }
 }
 
 /// The actual paginated scan loop. Yields progress through `tx` and
@@ -723,6 +733,32 @@ pub async fn get_scan_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tier 4: cancelling a re-scan dropped the previous complete result
+    /// from memory, so the dashboard showed "never scanned".
+    #[test]
+    fn cancelled_or_failed_rescan_keeps_the_previous_result() {
+        let r = |n: u64| ScanResult {
+            bucket: "releases".into(),
+            total_objects: n,
+            total_original_bytes: 0,
+            total_stored_bytes: 0,
+            total_reference_bytes: 0,
+            savings_percentage: 0.0,
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            duration_ms: 0,
+            version: default_version(),
+        };
+        let got = |prev, out| result_after_scan(prev, out).map(|x: ScanResult| x.total_objects);
+        assert_eq!(got(Some(r(1)), Err(ScanFailure::Cancelled)), Some(1));
+        assert_eq!(
+            got(Some(r(1)), Err(ScanFailure::Error("x".into()))),
+            Some(1)
+        );
+        assert_eq!(got(Some(r(1)), Ok(r(2))), Some(2));
+        assert_eq!(got(None, Err(ScanFailure::Cancelled)), None);
+    }
 
     #[test]
     fn sanitise_keeps_valid_bucket_chars() {
