@@ -33,6 +33,7 @@ const {
   stepPendingReverify,
   runNowMessage,
   jobsPollInterval,
+  runsPollInterval,
   ACTIVE_POLL_MS,
   IDLE_POLL_MS,
   kindTone,
@@ -436,16 +437,24 @@ assert.equal(editorAfterDiscard(true), 'refresh');
   );
 }
 
-// ── runNowMessage (replication run-now is async → no fake count) ────────────
+// ── runNowMessage (run-now is async for both rule kinds → no fake count) ────
 {
-  // Replication returns 202 {status:'running', objects_copied:0}: the count is meaningless.
+  // Both kinds answer 202 {status:'running'}: a count would be meaningless.
   const m = runNowMessage('replication', { status: 'running', objects_copied: 0 });
   assert.equal(m, 'Run started — progress shows in the row and the Runs tab');
   assert.equal(/0 objects/.test(m), false);
-  // Lifecycle runs synchronously → keep the count.
-  assert.equal(runNowMessage('lifecycle', { status: 'succeeded', objects_affected: 3 }), 'Run succeeded: 3 objects processed');
-  assert.equal(runNowMessage('lifecycle', { objects_affected: 1 }), 'Run finished: 1 object processed');
-  assert.equal(runNowMessage('lifecycle', null), 'Run finished');
+  assert.equal(
+    runNowMessage('lifecycle', { status: 'running', run_id: 7, objects_affected: 0 }),
+    'Run started — progress shows in the row and the Runs tab',
+  );
+  assert.equal(runNowMessage('lifecycle', null), 'Run started — progress shows in the row and the Runs tab');
+}
+
+// ── runsPollInterval (the Runs tab polls while a run is in flight) ──────────
+{
+  assert.equal(runsPollInterval([{ status: 'running' }, { status: 'succeeded' }]), ACTIVE_POLL_MS);
+  assert.equal(runsPollInterval([{ status: 'succeeded' }, { status: 'failed' }]), false);
+  assert.equal(runsPollInterval([]), false);
 }
 
 // ── jobsPollInterval (idle floor: scheduled runs must still appear) ─────────

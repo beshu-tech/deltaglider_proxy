@@ -89,19 +89,49 @@ pub async fn run_rule(
     lease: Option<RunLease>,
     maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
 ) -> Result<LifecycleRunOutcome, String> {
-    let started_at = super::current_unix_seconds();
-    let run_id = if let Some(db) = db.as_ref() {
-        let db = db.lock().await;
-        db.lifecycle_ensure_state(&rule.name, started_at)
-            .map_err(|err| err.to_string())?;
-        Some(
-            db.lifecycle_begin_run(&rule.name, started_at, triggered_by)
-                .map_err(|err| err.to_string())?,
-        )
-    } else {
-        None
-    };
+    let run_id = begin_run(db.as_ref(), rule, triggered_by).await?;
+    run_begun_rule(
+        db,
+        engine,
+        rule,
+        max_failures_retained,
+        run_id,
+        next_due_delay_secs,
+        lease,
+        maintenance_gate,
+    )
+    .await
+}
 
+/// Open the run-history row (`running`) and return its id. Split from the run
+/// so an async caller (admin run-now) can answer with the id before the run.
+pub async fn begin_run(
+    db: Option<&Arc<Mutex<ConfigDb>>>,
+    rule: &LifecycleRule,
+    triggered_by: &str,
+) -> Result<Option<i64>, String> {
+    let Some(db) = db else { return Ok(None) };
+    let started_at = super::current_unix_seconds();
+    let db = db.lock().await;
+    db.lifecycle_ensure_state(&rule.name, started_at)
+        .map_err(|err| err.to_string())?;
+    db.lifecycle_begin_run(&rule.name, started_at, triggered_by)
+        .map(Some)
+        .map_err(|err| err.to_string())
+}
+
+/// Execute a run whose history row `begin_run` opened, and settle that row.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_begun_rule(
+    db: Option<Arc<Mutex<ConfigDb>>>,
+    engine: &Arc<DynEngine>,
+    rule: &LifecycleRule,
+    max_failures_retained: u32,
+    run_id: Option<i64>,
+    next_due_delay_secs: i64,
+    lease: Option<RunLease>,
+    maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
+) -> Result<LifecycleRunOutcome, String> {
     let lease_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let heartbeat_handle =
         spawn_lease_heartbeat(db.clone(), &rule.name, lease.clone(), lease_alive.clone());

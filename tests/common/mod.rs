@@ -1124,6 +1124,61 @@ pub async fn wait_for_run_after(
     }
 }
 
+/// Poll a job's run history until the run `run_id` reaches a terminal status,
+/// then return that run-history row. `job` is the unified job id
+/// (`lifecycle:<rule>`, `replication:<rule>`).
+pub async fn wait_for_job_run(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    job: &str,
+    run_id: i64,
+) -> serde_json::Value {
+    let url = format!("{endpoint}/_/api/admin/jobs/{job}/runs");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let h: serde_json::Value = admin.get(&url).send().await.unwrap().json().await.unwrap();
+        if let Some(run) = h["runs"]
+            .as_array()
+            .and_then(|r| r.iter().find(|x| x["id"].as_i64() == Some(run_id)))
+        {
+            if !matches!(
+                run["status"].as_str(),
+                Some("running" | "queued" | "cancelling")
+            ) {
+                return run.clone();
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run {run_id} of {job} did not settle in 60s; last history: {h}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Fire a lifecycle rule's run-now (async: 202 + `run_id`) and wait for that
+/// run to settle. Returns the run-history row (`status`, `objects_processed`,
+/// `errors`, ...).
+pub async fn lifecycle_run_now_and_wait(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    rule: &str,
+) -> serde_json::Value {
+    let resp = admin
+        .post(format!(
+            "{endpoint}/_/api/admin/jobs/lifecycle:{rule}/run-now"
+        ))
+        .send()
+        .await
+        .expect("run-now request");
+    let code = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    assert_eq!(code, 202, "lifecycle run-now must be accepted: {body}");
+    assert_eq!(body["status"].as_str(), Some("running"), "{body}");
+    let run_id = body["run_id"].as_i64().expect("run-now returns run_id");
+    wait_for_job_run(admin, endpoint, &format!("lifecycle:{rule}"), run_id).await
+}
+
 /// Read the proxy's external-auth (OAuth/OIDC provider) version counter.
 ///
 /// Backed by `GET /_/api/admin/ext-auth/version`, incremented by

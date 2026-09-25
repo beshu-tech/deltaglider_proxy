@@ -21,7 +21,10 @@ pub use planner::{
 pub use state_store::{
     LifecycleFailureRecord, LifecycleRunRecord, LifecycleRunTotals, LifecycleState,
 };
-pub use worker::{preview_rule, run_rule, LifecycleFailure, LifecycleRunOutcome, PreviewObject};
+pub use worker::{
+    begin_run, preview_rule, run_begun_rule, run_rule, LifecycleFailure, LifecycleRunOutcome,
+    PreviewObject,
+};
 
 /// HTTP status for a lifecycle run/preview error. Config-attribute problems
 /// (missing `expire_after`, unparseable/out-of-range duration, malformed glob,

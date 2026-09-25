@@ -10,7 +10,7 @@
  * rule definitions.
  */
 
-import type { ConflictPolicy, FixAction, RerunVerdict } from './adminApi';
+import type { ConflictPolicy, FixAction, JobRunEntry, RerunVerdict } from './adminApi';
 
 export type JobKind = 'replication' | 'lifecycle' | 'reencrypt' | 'migrate' | string;
 export type JobAction = 'pause' | 'resume' | 'run-now' | 'preview' | 'cancel' | 'delete' | 'kill';
@@ -301,17 +301,17 @@ export function draftBlocksAction(
 }
 
 /**
- * Toast after a successful run-now. Replication answers 202 and runs in the
- * background (its body's `objects_copied` is always 0), so it gets no count;
- * lifecycle runs synchronously and reports what it processed.
+ * Toast after a successful run-now. Both rule kinds answer 202 and run in the
+ * background (the body carries no final counts), so the toast points at the
+ * row and the Runs tab, which poll until the run settles.
  */
-export function runNowMessage(kind: JobKind, result: unknown): string {
-  if (kind === 'replication') return 'Run started — progress shows in the row and the Runs tab';
-  const r = result as { objects_copied?: number; objects_affected?: number; status?: string } | null;
-  const n = r?.objects_copied ?? r?.objects_affected;
-  return n != null
-    ? `Run ${r?.status ?? 'finished'}: ${n} object${n === 1 ? '' : 's'} processed`
-    : 'Run finished';
+export function runNowMessage(_kind: JobKind, _result: unknown): string {
+  return 'Run started — progress shows in the row and the Runs tab';
+}
+
+/** Runs tab poll: fast while any run in the table is still in flight, else off. */
+export function runsPollInterval(runs: Pick<JobRunEntry, 'status'>[]): number | false {
+  return runs.some((r) => isActiveJobStatus(r.status)) ? ACTIVE_POLL_MS : false;
 }
 
 /** Compact progress label for the table row. */

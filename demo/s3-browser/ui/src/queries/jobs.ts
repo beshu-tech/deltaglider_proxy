@@ -14,7 +14,7 @@ import {
   startVerifyParity,
 } from '../adminApi';
 import type { ParityStatus } from '../adminApi';
-import { jobsPollInterval } from '../jobsView';
+import { jobsPollInterval, runsPollInterval } from '../jobsView';
 import { qk } from './keys';
 
 /**
@@ -39,6 +39,8 @@ export function useJobRuns(id: string | null) {
     queryKey: qk.jobs.runs(id ?? ''),
     queryFn: () => getJobRuns(id as string),
     enabled: !!id,
+    // run-now is async: keep the Runs tab live until the new run settles.
+    refetchInterval: (query) => runsPollInterval(query.state.data?.runs ?? []),
   });
 }
 

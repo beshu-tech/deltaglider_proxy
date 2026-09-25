@@ -6,7 +6,7 @@ use super::AdminState;
 use crate::lifecycle;
 use axum::http::{HeaderMap, StatusCode};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 pub async fn preview(
     state: Arc<AdminState>,
@@ -100,7 +100,7 @@ pub async fn run_now(
     state: Arc<AdminState>,
     name: String,
     headers: &HeaderMap,
-) -> Result<lifecycle::LifecycleRunOutcome, (StatusCode, String)> {
+) -> Result<(StatusCode, lifecycle::LifecycleRunOutcome), (StatusCode, String)> {
     let lifecycle_cfg = { state.config.read().await.lifecycle.clone() };
     let rule = lifecycle_cfg
         .rules
@@ -162,7 +162,7 @@ pub async fn run_now(
         ));
     }
 
-    let Some(_guard) = lifecycle::try_acquire_rule(&rule.name) else {
+    let Some(guard) = lifecycle::try_acquire_rule(&rule.name) else {
         return Err((
             StatusCode::CONFLICT,
             "rule is already running; wait for the current run to finish".to_string(),
@@ -215,29 +215,18 @@ pub async fn run_now(
     }
 
     info!("Lifecycle run-now via admin API: rule='{}'", name);
-    let engine = state.s3_state.engine.load().clone();
-    let outcome = lifecycle::run_rule(
-        Some(db_arc.clone()),
-        &engine,
-        &rule,
-        lifecycle_cfg.max_failures_retained,
-        "run-now",
-        lifecycle::scheduler::scheduler_tick(&lifecycle_cfg).as_secs() as i64,
-        Some(lifecycle::RunLease {
-            owner: lease_owner.clone(),
-            ttl_secs: lifecycle::scheduler::lease_ttl_secs(),
-            heartbeat_secs: lifecycle::scheduler::heartbeat_secs(),
-        }),
-        Some(state.s3_state.maintenance_gate.clone()),
-    )
-    .await
-    .map_err(|err| (lifecycle::classify_lifecycle_run_error(&err), err));
-    {
-        let db = db_arc.lock().await;
-        let _ = db.lifecycle_release_lease(&rule.name, &lease_owner);
-    }
-    let outcome = outcome?;
-
+    // Open the run-history row now, so the 202 carries the run id the UI and
+    // clients poll (GET /jobs/lifecycle:<rule>/runs).
+    let run_id = match lifecycle::begin_run(Some(&db_arc), &rule, "run-now").await {
+        Ok(id) => id,
+        Err(err) => {
+            let _ = db_arc
+                .lock()
+                .await
+                .lifecycle_release_lease(&rule.name, &lease_owner);
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, err));
+        }
+    };
     crate::audit::audit_log(
         "lifecycle_run_now",
         "admin",
@@ -247,5 +236,48 @@ pub async fn run_now(
         &rule.prefix,
     );
 
-    Ok(outcome)
+    // Run in the BACKGROUND, like replication run-now: a rule can sweep a large
+    // bucket, and the admin request must not hang on it. The task owns the
+    // lease and the process-local single-flight guard until the run settles.
+    let engine = state.s3_state.engine.load().clone();
+    let gate = state.s3_state.maintenance_gate.clone();
+    let rule_owned = rule.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        let result = lifecycle::run_begun_rule(
+            Some(db_arc.clone()),
+            &engine,
+            &rule_owned,
+            lifecycle_cfg.max_failures_retained,
+            run_id,
+            lifecycle::scheduler::scheduler_tick(&lifecycle_cfg).as_secs() as i64,
+            Some(lifecycle::RunLease {
+                owner: lease_owner.clone(),
+                ttl_secs: lifecycle::scheduler::lease_ttl_secs(),
+                heartbeat_secs: lifecycle::scheduler::heartbeat_secs(),
+            }),
+            Some(gate),
+        )
+        .await;
+        let _ = db_arc
+            .lock()
+            .await
+            .lifecycle_release_lease(&rule_owned.name, &lease_owner);
+        if let Err(e) = result {
+            warn!(
+                "Lifecycle run-now background task failed: rule='{}': {}",
+                rule_owned.name, e
+            );
+        }
+    });
+
+    Ok((
+        StatusCode::ACCEPTED,
+        lifecycle::LifecycleRunOutcome {
+            run_id,
+            rule_name: rule.name.clone(),
+            status: "running".to_string(),
+            ..Default::default()
+        },
+    ))
 }

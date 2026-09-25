@@ -81,12 +81,14 @@ All endpoints are session-gated. Lifecycle shares the unified Jobs API: the job 
 |---|---|---|
 | `GET` | `/_/api/admin/jobs` | All jobs, lifecycle rules included: status, pause flag, runtime state |
 | `POST` | `/_/api/admin/jobs/lifecycle:<name>/preview` | Dry-run a rule and return candidate keys — read-only, no history rows, no leases |
-| `POST` | `/_/api/admin/jobs/lifecycle:<name>/run-now` | Execute a rule synchronously; 409 if global/rule disabled, paused, or already running |
+| `POST` | `/_/api/admin/jobs/lifecycle:<name>/run-now` | Start a run in the background: `202` with `run_id` and `status: "running"`; 409 if global/rule disabled, paused, or already running |
 | `POST` | `/_/api/admin/jobs/lifecycle:<name>/pause` / `/resume` | Pause controls — persisted across restarts; paused rules are skipped by the scheduler and run-now alike |
 | `GET` | `/_/api/admin/jobs/lifecycle:<name>/runs?limit=N` | Recent persisted executions, newest first |
 | `GET` | `/_/api/admin/jobs/lifecycle:<name>/failures?limit=N` | Recent per-object failures, newest first |
 
-Run-now and preview return `objects_scanned`, `objects_affected`, `objects_skipped`, `bytes_affected`, `errors`, a `candidates` array (bucket, key, action, destination coordinates, `created_at`, `size`), and a response-local `failures` array. `run_id` is present only for actual executions. `candidates` and response-local `failures` are capped by `max_failures_retained`; counters still reflect the whole run.
+Preview returns `objects_scanned`, `objects_affected`, `objects_skipped`, `bytes_affected`, `errors`, a `candidates` array (bucket, key, action, destination coordinates, `created_at`, `size`), and a response-local `failures` array. `candidates` and `failures` are capped by `max_failures_retained`; counters still reflect the whole sweep.
+
+Run-now does not wait for the run. The proxy opens the run-history row, starts the run in the background, and answers `202` with the new `run_id` and `status: "running"`; the counters in that response are zero. To get the result, poll `GET /_/api/admin/jobs/lifecycle:<name>/runs` until the row with that `id` has a terminal `status`. The row carries the counters (`objects_processed` is the affected count) and `errors`, and the failures of the run are in `GET …/failures`. The Jobs screen polls in the same way.
 
 History rows include `id`, `triggered_by` (`scheduler` or `run-now`), `started_at`, `finished_at`, affected object/byte counters, `errors`, and terminal `status`. `objects_affected` / `bytes_affected` means deleted objects/bytes for delete rules and transitioned objects/copied bytes for transition rules. Failure rows include `run_id`, `bucket`, `object_key`, `occurred_at`, and `error_message`.
 

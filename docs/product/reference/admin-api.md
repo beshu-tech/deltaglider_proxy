@@ -192,7 +192,7 @@ maintenance one-offs are DB-born. See [replication.md](replication.md) and
 | `GET` | `/_/api/admin/jobs/:id/runs?limit=N` | Recent runs, newest first. A maintenance one-off synthesizes a single run — the job IS its run. |
 | `GET` | `/_/api/admin/jobs/:id/failures?limit=N` | Recent per-object failures, newest first. |
 | `POST` | `/_/api/admin/jobs/:id/pause` / `/resume` | Replication and lifecycle rules. Persists across restarts. |
-| `POST` | `/_/api/admin/jobs/:id/run-now` | Replication and lifecycle rules. Synchronous; 409 when paused or already leased. |
+| `POST` | `/_/api/admin/jobs/:id/run-now` | Replication and lifecycle rules. Starts the run in the background and answers `202` with the `run_id` and `status: "running"`; poll `GET /jobs/:id/runs` for the result. Lifecycle answers 409 when the rule is disabled, paused, or already running. |
 | `POST` | `/_/api/admin/jobs/:id/preview` | Lifecycle only — dry-run candidate keys. Read-only: no deletes, no history rows. |
 | `POST` | `/_/api/admin/jobs/:id/cancel` | Maintenance only — cancel a queued or running one-off. A pre-flip migrate cancel unwinds cleanly. |
 | `POST` | `/_/api/admin/jobs/reencrypt` | `{"buckets": [...]}` (max 100) → one durable re-encrypt job per bucket: `{started: [{bucket, job_id}], errors: [...]}`. |

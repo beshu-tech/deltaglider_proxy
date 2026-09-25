@@ -782,11 +782,9 @@ pub async fn job_action(
             Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
         }
         (JobSubsystem::Lifecycle, JobAction::RunNow) => {
-            let resp = super::lifecycle::run_now(state, name, &headers).await?;
-            Ok((
-                StatusCode::OK,
-                Json(serde_json::to_value(resp).map_err(internal)?),
-            ))
+            // Background run — returns 202 + the run id immediately.
+            let (code, resp) = super::lifecycle::run_now(state, name, &headers).await?;
+            Ok((code, Json(serde_json::to_value(resp).map_err(internal)?)))
         }
         (JobSubsystem::Lifecycle, JobAction::Preview) => {
             let resp = super::lifecycle::preview(state, name).await?;

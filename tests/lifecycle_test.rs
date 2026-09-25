@@ -5,7 +5,7 @@
 use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{admin_http_client, TestServer};
+use common::{admin_http_client, lifecycle_run_now_and_wait, TestServer};
 use serde_json::Value;
 
 const LIFECYCLE_YAML: &str = r#"
@@ -149,22 +149,10 @@ async fn test_lifecycle_run_now_deletes_visible_expired_and_preserves_skipped_ke
         "preview must stay read-only and not create lifecycle history: {history_before}"
     );
 
-    let run: Value = admin
-        .post(format!(
-            "{}/_/api/admin/jobs/lifecycle:expire-old-prefix/run-now",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .expect("run-now request")
-        .json()
-        .await
-        .unwrap();
+    let run = lifecycle_run_now_and_wait(&admin, &server.endpoint(), "expire-old-prefix").await;
     assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
-    assert_eq!(run["objects_affected"].as_i64(), Some(1), "{run}");
-    let run_id = run["run_id"]
-        .as_i64()
-        .expect("run-now should return run_id");
+    assert_eq!(run["objects_processed"].as_i64(), Some(1), "{run}");
+    let run_id = run["id"].as_i64().expect("the settled run has an id");
 
     let history_after: Value = admin
         .get(format!(
@@ -273,19 +261,9 @@ async fn test_lifecycle_transition_copies_expired_object_and_preserves_source() 
         Some("cold/app.zip")
     );
 
-    let run: Value = admin
-        .post(format!(
-            "{}/_/api/admin/jobs/lifecycle:archive-old/run-now",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .expect("run-now request")
-        .json()
-        .await
-        .unwrap();
+    let run = lifecycle_run_now_and_wait(&admin, &server.endpoint(), "archive-old").await;
     assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
-    assert_eq!(run["objects_affected"].as_i64(), Some(1), "{run}");
+    assert_eq!(run["objects_processed"].as_i64(), Some(1), "{run}");
 
     let archived = client
         .get_object()
@@ -333,17 +311,7 @@ async fn test_lifecycle_transition_delete_source_after_success() {
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
     let admin = admin_http_client(&server.endpoint()).await;
-    let run: Value = admin
-        .post(format!(
-            "{}/_/api/admin/jobs/lifecycle:move-old/run-now",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .expect("run-now request")
-        .json()
-        .await
-        .unwrap();
+    let run = lifecycle_run_now_and_wait(&admin, &server.endpoint(), "move-old").await;
     assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
 
     client
@@ -386,19 +354,9 @@ async fn test_lifecycle_transition_copy_failure_does_not_delete_source() {
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
     let admin = admin_http_client(&server.endpoint()).await;
-    let run: Value = admin
-        .post(format!(
-            "{}/_/api/admin/jobs/lifecycle:failed-move/run-now",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .expect("run-now request")
-        .json()
-        .await
-        .unwrap();
+    let run = lifecycle_run_now_and_wait(&admin, &server.endpoint(), "failed-move").await;
     assert_eq!(run["status"].as_str(), Some("failed"), "{run}");
-    assert_eq!(run["objects_affected"].as_i64(), Some(0), "{run}");
+    assert_eq!(run["objects_processed"].as_i64(), Some(0), "{run}");
     assert_eq!(run["errors"].as_i64(), Some(1), "{run}");
 
     client
@@ -622,18 +580,8 @@ async fn test_lifecycle_retain_newest_keeps_reals_and_ignores_junk() {
     );
 
     // Run it.
-    let run: Value = admin
-        .post(format!(
-            "{}/_/api/admin/jobs/lifecycle:keep-last-two/run-now",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .expect("run-now")
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(run["objects_affected"].as_i64(), Some(1), "{run}");
+    let run = lifecycle_run_now_and_wait(&admin, &server.endpoint(), "keep-last-two").await;
+    assert_eq!(run["objects_processed"].as_i64(), Some(1), "{run}");
     assert_eq!(run["errors"].as_i64(), Some(0), "{run}");
 
     // dump-1 (oldest real) is gone.
@@ -812,16 +760,6 @@ lifecycle:
         .unwrap();
     server.respawn_with_env(&[]).await; // cold metadata cache (= next hourly tick)
     let admin = admin_http_client(&server.endpoint()).await;
-    let run: Value = admin
-        .post(format!(
-            "{}/_/api/admin/jobs/lifecycle:expire-logs/run-now",
-            server.endpoint()
-        ))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(run["objects_affected"].as_i64(), Some(1), "{run}");
+    let run = lifecycle_run_now_and_wait(&admin, &server.endpoint(), "expire-logs").await;
+    assert_eq!(run["objects_processed"].as_i64(), Some(1), "{run}");
 }

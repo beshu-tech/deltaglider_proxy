@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed — lifecycle run-now starts the run in the background
+
+`POST /_/api/admin/jobs/lifecycle:<name>/run-now` waited until the rule
+finished, so a rule over a large bucket held the admin request open for the
+whole sweep. The endpoint now works like replication run-now: it takes the
+rule lease, opens the run-history row, starts the run in the background, and
+answers `202` with `run_id` and `status: "running"`. Poll
+`GET /_/api/admin/jobs/lifecycle:<name>/runs` for the result. The Jobs screen
+does this for you: the Runs tab refreshes while a run is in progress. A client
+that read the counters from the run-now response must read them from the run
+history instead.
+
 ### Fixed — a raw webhook retry posts only to the endpoints that failed
 
 With several `webhook_urls`, the dispatcher posted to the endpoints in order
