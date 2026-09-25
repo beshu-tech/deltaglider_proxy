@@ -93,7 +93,7 @@ Every successful OAuth login shows as `external_login` in **Settings → Observa
 
 Three failure modes are provider-side, not proxy-side:
 
-1. **`invalid_redirect_uri` at the provider.** The registered URI doesn't byte-for-byte match `https://s3.acme.example/_/api/admin/oauth/callback` — watch trailing slashes and `http` vs `https`. If a reverse proxy fronts DeltaGlider, also confirm it forwards the same `Host` header the user sees.
+1. **`invalid_redirect_uri` at the provider.** The registered URI doesn't byte-for-byte match `https://s3.acme.example/_/api/admin/oauth/callback` — watch trailing slashes and `http` vs `https`. If a reverse proxy fronts DeltaGlider, also confirm it forwards the same `Host` header the user sees. The proxy builds the callback URL from the `Host` header. It uses `X-Forwarded-Host` and `X-Forwarded-Proto` only when `DGP_TRUST_PROXY_HEADERS=true`, because otherwise any client could choose the host that receives the authorization code.
 2. **Azure `groups` claim missing.** Azure AD omits groups by default; in the app registration go to Token configuration → Add groups claim, then retry the flow.
 3. **"Token exchange failed" in the audit log.** The proxy couldn't reach the provider's token endpoint. From the proxy container, run `curl -v https://<issuer>/.well-known/openid-configuration` — if that fails, fix DNS/network/TLS first; it isn't an OAuth problem.
 

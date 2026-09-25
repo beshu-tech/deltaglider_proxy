@@ -1058,24 +1058,32 @@ fn validate_mapping_rule(match_type: &str, match_value: &str) -> Result<(), Stri
 }
 
 /// Build the OAuth callback URI from request headers.
-/// Respects X-Forwarded-Proto/X-Forwarded-Host from reverse proxies.
 fn build_callback_uri(headers: &HeaderMap) -> String {
-    let host = headers
-        .get("x-forwarded-host")
-        .or_else(|| headers.get(header::HOST))
-        .and_then(|v| v.to_str().ok())
+    build_callback_uri_with(headers, crate::rate_limiter::trust_proxy_headers())
+}
+
+/// Pure core. X-Forwarded-Proto/-Host count only when proxy headers are
+/// trusted (S23): otherwise any client picks the redirect_uri host, and the
+/// IdP (if it allows that URI) sends the authorization code there.
+fn build_callback_uri_with(headers: &HeaderMap, trust_proxy: bool) -> String {
+    let fwd = |name: &str| {
+        trust_proxy
+            .then(|| headers.get(name))
+            .flatten()
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(',').next().unwrap_or(v).trim())
+    };
+    let host = fwd("x-forwarded-host")
+        .or_else(|| headers.get(header::HOST).and_then(|v| v.to_str().ok()))
         .unwrap_or("localhost");
 
-    let scheme = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_else(|| {
-            if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
-                "http"
-            } else {
-                "https"
-            }
-        });
+    let scheme = fwd("x-forwarded-proto").unwrap_or_else(|| {
+        if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
+            "http"
+        } else {
+            "https"
+        }
+    });
 
     format!("{}://{}/_/api/admin/oauth/callback", scheme, host)
 }
@@ -1273,6 +1281,24 @@ mod tests {
         assert_eq!(sanitize_next_param("/_/admin\u{007F}"), None);
         // Non-ASCII unicode (anything ≥ 0x80).
         assert_eq!(sanitize_next_param("/_/админ"), None);
+    }
+
+    /// S23: without DGP_TRUST_PROXY_HEADERS, a client-sent X-Forwarded-Host
+    /// must not choose the OAuth redirect_uri host.
+    #[test]
+    fn callback_uri_ignores_forwarded_host_unless_trusted() {
+        let mut h = HeaderMap::new();
+        h.insert(axum::http::header::HOST, "s3.acme.example".parse().unwrap());
+        h.insert("x-forwarded-host", "evil.example".parse().unwrap());
+        h.insert("x-forwarded-proto", "http".parse().unwrap());
+        assert_eq!(
+            super::build_callback_uri_with(&h, false),
+            "https://s3.acme.example/_/api/admin/oauth/callback"
+        );
+        assert_eq!(
+            super::build_callback_uri_with(&h, true),
+            "http://evil.example/_/api/admin/oauth/callback"
+        );
     }
 
     #[test]
