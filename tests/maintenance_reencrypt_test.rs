@@ -179,6 +179,55 @@ fn assert_file_lacks_marker(path: &std::path::Path) {
 // Full enable → re-encrypt cycle
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// S23: the maintenance gate runs after SigV4, so an unauthenticated
+/// caller cannot learn that a bucket is busy. Before, the gate ran first
+/// and answered an unsigned PUT with a 503 naming the background job.
+#[tokio::test]
+async fn test_gate_state_hidden_from_unauthenticated_writers() {
+    let bucket = "maintauth";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .auth("gatekey", "gatesecret")
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let s3 = server.s3_client().await;
+    for i in 0..40 {
+        s3.put_object()
+            .bucket(bucket)
+            .key(format!("rel/f{i:02}.json"))
+            .body(aws_sdk_s3::primitives::ByteStream::from(
+                PLAINTEXT_MARKER.to_vec(),
+            ))
+            .send()
+            .await
+            .expect("seed PUT");
+    }
+    let admin = admin_http_client(&endpoint).await;
+    enable_encryption(&admin, &endpoint).await;
+    let res = start_reencrypt(&admin, &endpoint, bucket).await;
+    assert_eq!(
+        res["started"][0]["bucket"], bucket,
+        "job should start: {res}"
+    );
+
+    let resp = reqwest::Client::new()
+        .put(format!("{endpoint}/{bucket}/gate-probe.txt"))
+        .body("anonymous")
+        .send()
+        .await
+        .expect("unsigned PUT failed to send");
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(status, 403, "unsigned write must fail auth first: {body}");
+    assert!(
+        !body.contains("background job"),
+        "gate state leaked: {body}"
+    );
+
+    wait_job_done(&admin, &endpoint, bucket).await;
+}
+
 #[tokio::test]
 async fn test_reencrypt_full_cycle() {
     let bucket = "maintbkt";

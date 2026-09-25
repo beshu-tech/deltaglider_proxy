@@ -795,15 +795,17 @@ pub fn build_s3_router(
         .layer(middleware::from_fn(
             deltaglider_proxy::coordination::health::backend_health_gate_middleware,
         ))
-        .layer(middleware::from_fn(sigv4_auth_middleware))
-        // Maintenance write-gate: runs after admission, before SigV4. A
-        // PERMANENT layer whose contents (the busy-bucket set) swap
-        // lock-free — unlike the admission chain it cannot be lost to a
-        // config rebuild mid-job. Writes to a busy bucket → 503 SlowDown;
-        // reads always pass. See src/maintenance/gate.rs.
+        // Maintenance write-gate. A PERMANENT layer whose contents (the
+        // busy-bucket set) swap lock-free — unlike the admission chain it
+        // cannot be lost to a config rebuild mid-job. Writes to a busy
+        // bucket → 503 SlowDown; reads always pass. See
+        // src/maintenance/gate.rs. INSIDE SigV4, like the health gate: its
+        // 503 names the background job, and an unauthenticated caller must
+        // not learn which buckets are busy.
         .layer(middleware::from_fn(
             deltaglider_proxy::maintenance::gate::maintenance_gate_middleware,
         ))
+        .layer(middleware::from_fn(sigv4_auth_middleware))
         .layer(middleware::from_fn(
             deltaglider_proxy::admission::admission_middleware,
         ))
