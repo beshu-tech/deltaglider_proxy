@@ -104,13 +104,11 @@ fn without_markers(metadata: &FileMetadata) -> FileMetadata {
 
 /// For a metadata-only rewrite (body unchanged): `metadata` with the markers
 /// of the stored object `raw`, never the caller's own.
-fn with_markers_of(metadata: &FileMetadata, raw: Option<&FileMetadata>) -> FileMetadata {
+fn with_markers_of(metadata: &FileMetadata, raw: &FileMetadata) -> FileMetadata {
     let mut meta = without_markers(metadata);
-    if let Some(raw) = raw {
-        for key in [ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY] {
-            if let Some(v) = raw.user_metadata.get(key) {
-                meta.user_metadata.insert(key.to_string(), v.clone());
-            }
+    for key in [ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY] {
+        if let Some(v) = raw.user_metadata.get(key) {
+            meta.user_metadata.insert(key.to_string(), v.clone());
         }
     }
     meta
@@ -1793,8 +1791,10 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         // object decryptable on read.
         // The markers come from the raw object ONLY: the caller's copy is
         // dropped, so a rewrite can neither strip nor plant one.
-        let raw = self.inner.get_passthrough_metadata(b, p, f).await;
-        let meta = with_markers_of(m, raw.ok().as_ref());
+        // Fail CLOSED: without the stored markers the rewrite would drop
+        // them and make an encrypted body unreadable.
+        let raw = self.inner.get_passthrough_metadata(b, p, f).await?;
+        let meta = with_markers_of(m, &raw);
         self.inner.put_passthrough_metadata(b, p, f, &meta).await
     }
     async fn put_reference_metadata(
@@ -1805,8 +1805,8 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     ) -> Result<(), StorageError> {
         // Same rule as put_passthrough_metadata: the body is not rewritten,
         // so its markers stay those of the stored reference.
-        let raw = self.inner.get_reference_metadata(b, p).await;
-        let meta = with_markers_of(m, raw.ok().as_ref());
+        let raw = self.inner.get_reference_metadata(b, p).await?;
+        let meta = with_markers_of(m, &raw);
         self.inner.put_reference_metadata(b, p, &meta).await
     }
     async fn delete_reference(&self, b: &str, p: &str) -> Result<(), StorageError> {
@@ -2561,6 +2561,8 @@ mod tests {
         bytes: Vec<u8>,
         metadata: Mutex<Option<FileMetadata>>,
         ranges_requested: Mutex<Vec<(u64, u64)>>,
+        /// Make metadata READS fail (a transient backend error).
+        fail_meta_reads: std::sync::atomic::AtomicBool,
     }
 
     impl CountingBackend {
@@ -2569,6 +2571,7 @@ mod tests {
                 bytes: Vec::new(),
                 metadata: Mutex::new(None),
                 ranges_requested: Mutex::new(Vec::new()),
+                fail_meta_reads: Default::default(),
             }
         }
 
@@ -2621,7 +2624,24 @@ mod tests {
             _: &str,
             _: &str,
         ) -> Result<FileMetadata, StorageError> {
+            if self
+                .fail_meta_reads
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(StorageError::Throttled("transient".into()));
+            }
             self.metadata.lock().unwrap().clone().ok_or_else(cb_err)
+        }
+
+        async fn put_passthrough_metadata(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            m: &FileMetadata,
+        ) -> Result<(), StorageError> {
+            *self.metadata.lock().unwrap() = Some(m.clone());
+            Ok(())
         }
 
         // All other trait methods: not needed for these tests.
@@ -2982,6 +3002,43 @@ mod tests {
             .unwrap();
         let got: Vec<Bytes> = stream.try_collect().await.unwrap();
         assert_eq!(got.concat(), plaintext[100..=150].to_vec());
+    }
+
+    /// Tier 4: a metadata-only rewrite must fail CLOSED when it cannot read
+    /// the stored markers. It wrote the caller's metadata without them, so
+    /// one transient HEAD error made an encrypted object unreadable.
+    #[tokio::test]
+    async fn put_passthrough_metadata_fails_closed_without_the_stored_markers() {
+        let key = test_key();
+        let (ciphertext, _iv, _f) = encode_chunked(&key, b"secret body");
+        let mut stored = FileMetadata::fallback(
+            "o".into(),
+            11,
+            "md5".into(),
+            Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        mark_chunked_encrypted(&mut stored, None);
+        let mut backend = CountingBackend::new();
+        backend.set_contents(ciphertext, stored.clone());
+        backend
+            .fail_meta_reads
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key: Some(key),
+            key_id: None,
+            ..Default::default()
+        })));
+        let wrapper = EncryptingBackend::new(backend, cfg);
+        let mut rewrite = stored.clone();
+        strip_encryption_markers(&mut rewrite.user_metadata);
+        assert!(wrapper
+            .put_passthrough_metadata("b", "p", "o", &rewrite)
+            .await
+            .is_err());
+        let now = wrapper.inner.metadata.lock().unwrap().clone().unwrap();
+        assert!(is_chunked_encrypted(&now), "the stored marker must survive");
     }
 
     #[tokio::test]
