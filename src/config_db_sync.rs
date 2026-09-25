@@ -1030,6 +1030,7 @@ mod tests {
             access_key_id: Some("k".into()),
             secret_access_key: Some("s".into()),
             allow_local: true,
+            session_token: None,
         }
     }
 
