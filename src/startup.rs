@@ -441,6 +441,16 @@ pub fn build_s3_router(
                 resolved,
                 verified.as_deref(),
             ) {
+                // Only a real verified credential counts as an auth success
+                // for the brute-force limiter; anonymous/open requests don't.
+                if verified.is_some() {
+                    if let Some(outcome) = cx
+                        .extensions_mut()
+                        .get::<deltaglider_proxy::api::auth::AuthOutcome>()
+                    {
+                        outcome.mark_verified();
+                    }
+                }
                 Ok(())
             } else {
                 tracing::warn!(

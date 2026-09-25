@@ -232,6 +232,10 @@ pub async fn authorization_middleware(
     };
 
     if !allowed {
+        // Not a credential failure: s3s never checks this signature.
+        if let Some(outcome) = request.extensions().get::<crate::api::auth::AuthOutcome>() {
+            outcome.mark_authz_denied();
+        }
         debug!(
             "IAM denied: user='{}' action={:?} bucket='{}' key='{}'",
             user.name, action, bucket, key

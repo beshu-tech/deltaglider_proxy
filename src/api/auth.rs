@@ -26,6 +26,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
@@ -138,6 +139,58 @@ pub fn resolved_identity_is_verified(
         Some(user) => verified_access_key.is_some_and(|verified| {
             crate::security::secret_eq(verified.as_bytes(), user.access_key_id.as_bytes())
         }),
+    }
+}
+
+/// Per-request record of how far authentication got, shared (one `Arc`)
+/// between this middleware, the IAM authorization middleware and the s3s
+/// access hook. This middleware only RESOLVES identity; s3s verifies the
+/// signature later. So the brute-force limiter can only learn the outcome
+/// after the inner layers ran: success is a signature s3s verified, failure
+/// is a 403 that never reached that point.
+#[derive(Clone, Default)]
+pub struct AuthOutcome(Arc<AtomicU8>);
+
+const OUTCOME_PENDING: u8 = 0;
+const OUTCOME_VERIFIED: u8 = 1;
+const OUTCOME_AUTHZ_DENIED: u8 = 2;
+
+impl AuthOutcome {
+    /// s3s verified the signature of the resolved identity.
+    pub fn mark_verified(&self) {
+        self.0.store(OUTCOME_VERIFIED, Ordering::Release);
+    }
+
+    /// IAM authorization refused the resolved identity before s3s ran. Not
+    /// a credential failure: the signature was never checked.
+    pub fn mark_authz_denied(&self) {
+        self.0.store(OUTCOME_AUTHZ_DENIED, Ordering::Release);
+    }
+
+    fn state(&self) -> u8 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// What the brute-force limiter records once the response is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimiterVerdict {
+    /// s3s verified the signature: reset the IP's failure counter.
+    Success,
+    /// A 403 before verification: bad signature, expired or skewed
+    /// request, or an identity s3s did not verify.
+    Failure,
+    /// Nothing learned about the credential (authz denial, gate 503, ...).
+    Neither,
+}
+
+/// Pure decision for [`LimiterVerdict`] from the request outcome and status.
+pub fn limiter_verdict(outcome: &AuthOutcome, status: axum::http::StatusCode) -> LimiterVerdict {
+    match outcome.state() {
+        OUTCOME_VERIFIED => LimiterVerdict::Success,
+        OUTCOME_AUTHZ_DENIED => LimiterVerdict::Neither,
+        _ if status == axum::http::StatusCode::FORBIDDEN => LimiterVerdict::Failure,
+        _ => LimiterVerdict::Neither,
     }
 }
 
@@ -789,14 +842,11 @@ pub async fn sigv4_auth_middleware(
 
     // Identity resolved (a known, enabled access key). s3s verifies the
     // signature downstream; a forged one is rejected there before any handler.
-    if let Some(m) = &metrics {
-        m.auth_attempts_total.with_label_values(&["success"]).inc();
-    }
-    // Reset the brute-force limiter for this IP now that a valid identity was
-    // presented (access-key-guessing failures above still record + lock out).
-    if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
-        rl.record_success(ip);
-    }
+    // Success and failure are recorded only after that (see `AuthOutcome`):
+    // resetting the limiter here, before verification, meant a wrong-secret
+    // loop on a known key was never counted (S19).
+    let outcome = AuthOutcome::default();
+    request.extensions_mut().insert(outcome.clone());
 
     // Replay attack detection: reject duplicate signatures within the clock-skew window.
     //
@@ -919,7 +969,20 @@ pub async fn sigv4_auth_middleware(
         .extensions_mut()
         .insert(SignedPayloadHash(params.payload_hash.clone()));
 
-    Ok(next.run(request).await)
+    let response = next.run(request).await;
+    match limiter_verdict(&outcome, response.status()) {
+        LimiterVerdict::Success => {
+            if let Some(m) = &metrics {
+                m.auth_attempts_total.with_label_values(&["success"]).inc();
+            }
+            if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
+                rl.record_success(ip);
+            }
+        }
+        LimiterVerdict::Failure => record_auth_failure("signature_rejected"),
+        LimiterVerdict::Neither => {}
+    }
+    Ok(response)
 }
 
 /// Parsed components of an AWS SigV4 Authorization header.
@@ -975,6 +1038,51 @@ fn parse_auth_header(header: &str) -> Option<ParsedAuthHeader> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// Only an s3s-verified signature resets the limiter; a 403 before
+    /// verification is a failure; an authz denial or other status teaches
+    /// nothing about the credential (S19).
+    #[test]
+    fn limiter_verdict_truth_table() {
+        use axum::http::StatusCode;
+        let pending = AuthOutcome::default();
+        assert_eq!(
+            limiter_verdict(&pending, StatusCode::FORBIDDEN),
+            LimiterVerdict::Failure
+        );
+        assert_eq!(
+            limiter_verdict(&pending, StatusCode::OK),
+            LimiterVerdict::Neither
+        );
+        assert_eq!(
+            limiter_verdict(&pending, StatusCode::SERVICE_UNAVAILABLE),
+            LimiterVerdict::Neither
+        );
+        let verified = AuthOutcome::default();
+        verified.mark_verified();
+        assert_eq!(
+            limiter_verdict(&verified, StatusCode::OK),
+            LimiterVerdict::Success
+        );
+        // Verified, then a handler-level 403 (per-key deny): still a good key.
+        assert_eq!(
+            limiter_verdict(&verified, StatusCode::FORBIDDEN),
+            LimiterVerdict::Success
+        );
+        let denied = AuthOutcome::default();
+        denied.mark_authz_denied();
+        assert_eq!(
+            limiter_verdict(&denied, StatusCode::FORBIDDEN),
+            LimiterVerdict::Neither
+        );
+        // Clones share one state: the s3s hook marks what the middleware reads.
+        let shared = AuthOutcome::default();
+        shared.clone().mark_verified();
+        assert_eq!(
+            limiter_verdict(&shared, StatusCode::OK),
+            LimiterVerdict::Success
+        );
+    }
 
     /// Truth table for binding the resolved identity to the s3s-verified key.
     #[test]

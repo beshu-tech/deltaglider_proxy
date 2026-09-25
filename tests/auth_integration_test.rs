@@ -1234,6 +1234,50 @@ async fn test_user_lifecycle_crud() {
 // 7. Rate limiting / brute force protection
 // ============================================================================
 
+/// Wrong-SECRET signatures (a known access key) feed the brute-force
+/// limiter, and a valid identity no longer resets it before s3s verifies the
+/// signature (S19). Before the fix every attempt called `record_success`, so
+/// the counter never grew and a secret-guessing loop was never throttled.
+#[tokio::test]
+async fn test_wrong_secret_signatures_are_rate_limited() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_RATE_LIMIT_MAX_ATTEMPTS", "3")
+        .env("DGP_RATE_LIMIT_WINDOW_SECS", "60")
+        .env("DGP_RATE_LIMIT_LOCKOUT_SECS", "60")
+        .build()
+        .await;
+    let path = format!("/{}", server.bucket());
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    for _ in 0..3 {
+        let resp = build_signed_get(&server.endpoint(), &path, "testkey", "wrong-secret", &now)
+            .header("x-forwarded-for", "10.0.0.98")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+    // The IP is locked out now: even the right secret gets SlowDown.
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let resp = build_signed_get(&server.endpoint(), &path, "testkey", "testsecret", &now)
+        .header("x-forwarded-for", "10.0.0.98")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        503,
+        "wrong-secret signatures must lock the IP out"
+    );
+    // Another IP is not affected, and a verified request still succeeds.
+    let resp = build_signed_get(&server.endpoint(), &path, "testkey", "testsecret", &now)
+        .header("x-forwarded-for", "10.0.0.97")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
 /// Multiple rapid auth failures should trigger rate limiting (progressive delay or lockout).
 #[tokio::test]
 async fn test_brute_force_rate_limiting() {
@@ -1252,11 +1296,8 @@ async fn test_brute_force_rate_limiting() {
 
     // Send rapid requests with UNKNOWN access keys from the same "IP" (via
     // X-Forwarded-For, trusted because DGP_TRUST_PROXY_HEADERS=true in tests).
-    // NOTE: the brute-force lockout keys on credential (access-key) failures —
-    // the enumeration attack that matters. Since the SigV4-dedup refactor, a
-    // valid-AKID/wrong-SECRET forged signature is rejected by s3s (403) and does
-    // NOT feed this limiter (guessing an HMAC secret is infeasible anyway); the
-    // access-key path below is the surviving, meaningful defense.
+    // Unknown access keys; wrong-secret signatures on a known key are
+    // covered by `test_wrong_secret_signatures_are_rate_limited`.
     let mut statuses = Vec::new();
     for i in 0..15 {
         let resp = build_signed_get(
