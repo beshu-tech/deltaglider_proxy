@@ -594,7 +594,7 @@ enum Fallback {
 /// First URL segments the SPA router owns — mirrors `SEGMENT_TO_VIEW` in
 /// `demo/s3-browser/ui/src/urlState.ts`. Everything else under `/_/` is
 /// either an embedded asset or a 404.
-const SPA_ROUTE_SEGMENTS: &[&str] = &["browse", "upload", "metrics", "docs", "admin"];
+const SPA_ROUTE_SEGMENTS: &[&str] = &["browse", "upload", "docs", "admin"];
 
 fn fallback_for(path: &str) -> Fallback {
     if path == "api" || path.starts_with("api/") {
@@ -659,7 +659,6 @@ mod tests {
             "browse",
             "browse/bucket/dir",
             "upload",
-            "metrics/x",
             "docs/how-to/x",
             "admin/users",
         ] {

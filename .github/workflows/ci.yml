@@ -293,6 +293,13 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
         run: cargo test --lib --locked
+      # Unit tests inside the binary crate (src/main.rs module tree: demo.rs,
+      # startup.rs). `--lib` does not run them; before this step only the
+      # nightly did.
+      - name: cargo test --bins
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo test --bins --locked
 
   test-integration:
     name: Integration Tests
