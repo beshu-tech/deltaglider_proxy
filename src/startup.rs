@@ -822,6 +822,7 @@ pub fn build_s3_router(
             deltaglider_proxy::coordination::health::BackendHealthGate {
                 health: state.backend_health.clone(),
                 config: shared_config.clone(),
+                app: state.clone(),
             },
         ));
 

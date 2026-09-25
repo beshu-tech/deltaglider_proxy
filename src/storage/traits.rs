@@ -512,6 +512,14 @@ pub trait StorageBackend: Send + Sync {
         true
     }
 
+    /// Name of the backend this bucket's requests go to, when the backend
+    /// knows without I/O (an explicit route, or where it last FOUND an
+    /// unrouted bucket). `None` = unknown here; the caller falls back to
+    /// `Config::effective_backend_for_bucket`. Only `RoutingBackend` knows.
+    fn resolved_backend_name(&self, _bucket: &str) -> Option<String> {
+        None
+    }
+
     // === Scanning operations ===
 
     /// Scan a deltaspace directory and return all file metadata
@@ -1026,6 +1034,9 @@ macro_rules! impl_storage_backend_for_box {
             }
             fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
                 (**self).lite_list_carries_logical_facts(bucket)
+            }
+            fn resolved_backend_name(&self, bucket: &str) -> Option<String> {
+                (**self).resolved_backend_name(bucket)
             }
 
             async fn scan_deltaspace(

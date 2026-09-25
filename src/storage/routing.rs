@@ -371,15 +371,23 @@ impl RoutingBackend {
     /// re-probes upstream. Called after create/delete bucket: read-after-write
     /// must see the change immediately, not after the freshness window.
     fn cached_resolution(&self, virtual_bucket: &str) -> Option<String> {
-        let mut map = self.resolved.lock();
+        let map = self.resolved.lock();
         match map.get(virtual_bucket) {
+            // A stale entry stays: `last_known_resolution` uses it while
+            // the default backend errors. create/delete bucket clear it.
             Some((name, at)) if at.elapsed() < RESOLVE_TTL => Some(name.clone()),
-            Some(_) => {
-                map.remove(virtual_bucket);
-                None
-            }
-            None => None,
+            _ => None,
         }
+    }
+
+    /// Where an unrouted bucket was last FOUND, however long ago. Evidence
+    /// that it is not on the default backend (a non-default entry is only
+    /// stored after the default answered "absent").
+    fn last_known_resolution(&self, virtual_bucket: &str) -> Option<String> {
+        self.resolved
+            .lock()
+            .get(virtual_bucket)
+            .map(|(name, _)| name.clone())
     }
 
     fn remember_resolution(&self, virtual_bucket: &str, backend_name: &str) {
@@ -469,6 +477,19 @@ impl RoutingBackend {
                 );
             }
             Err(e) => {
+                // The default is down. If the bucket was last FOUND on
+                // another backend (so the default once said "absent") and
+                // is still there, keep serving it from there.
+                if let Some(name) = self
+                    .last_known_resolution(virtual_bucket)
+                    .filter(|n| n != &self.default_backend)
+                {
+                    let backend = self.backends[&name].as_ref().as_ref();
+                    if matches!(backend.head_bucket(virtual_bucket).await, Ok(true)) {
+                        self.remember_resolution(virtual_bucket, &name);
+                        return (name, backend, Cow::Borrowed(virtual_bucket));
+                    }
+                }
                 warn!(
                     "resolve_existing_named: default backend head_bucket({virtual_bucket}) failed \
                      transiently ({e}); routing to default rather than mis-routing"
@@ -1076,6 +1097,13 @@ impl StorageBackend for RoutingBackend {
         self.default_backend().supports_native_multipart(bucket)
     }
 
+    fn resolved_backend_name(&self, bucket: &str) -> Option<String> {
+        if let Some(route) = self.routes.get(bucket) {
+            return Some(route.backend_name.clone());
+        }
+        self.last_known_resolution(bucket)
+    }
+
     fn lite_list_carries_logical_facts(&self, bucket: &str) -> bool {
         if let Some(route) = self.routes.get(bucket) {
             return self.backends[&route.backend_name]
@@ -1677,6 +1705,36 @@ mod tests {
             name, "primary",
             "default-backend head error must route to default, not mis-route elsewhere"
         );
+    }
+
+    /// The default backend errors, but the bucket was last FOUND on another
+    /// backend (so the default once said "absent") and is still there:
+    /// keep serving it there, past the fresh-cache TTL. With no such
+    /// evidence the default-error rule above still routes to default.
+    #[tokio::test]
+    async fn default_error_keeps_a_bucket_last_found_elsewhere() {
+        let primary_probe = TestBackend::with_buckets(&[]);
+        let primary = Arc::new(Box::new(primary_probe.clone()) as Box<dyn StorageBackend>);
+        let archive =
+            Arc::new(Box::new(TestBackend::with_buckets(&["shared"])) as Box<dyn StorageBackend>);
+        let mut backends = HashMap::new();
+        backends.insert("primary".to_string(), primary);
+        backends.insert("archive".to_string(), archive);
+        let routing = RoutingBackend::new(backends, HashMap::new(), "primary".to_string())
+            .expect("routing backend");
+        assert_eq!(routing.resolve_existing_named("shared").await.0, "archive");
+        assert_eq!(
+            routing.resolved_backend_name("shared").as_deref(),
+            Some("archive")
+        );
+        // Age the entry past the TTL, then take the default down.
+        routing.resolved.lock().get_mut("shared").unwrap().1 =
+            std::time::Instant::now() - RESOLVE_TTL - std::time::Duration::from_secs(1);
+        *primary_probe.fail_head.lock().unwrap() = true;
+        assert_eq!(routing.resolve_existing_named("shared").await.0, "archive");
+        // Unknown bucket: no evidence → default.
+        assert_eq!(routing.resolve_existing_named("other").await.0, "primary");
+        assert_eq!(routing.resolved_backend_name("other"), None);
     }
 
     /// Regression (prod RCA 2026-07-05): when EVERY backend errors on

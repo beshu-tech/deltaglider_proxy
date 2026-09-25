@@ -198,3 +198,63 @@ storage:
     };
     assert_eq!(status.code(), Some(1), "expected exit(1), got {status:?}");
 }
+
+/// The gate must judge a bucket by the backend the ROUTER sends it to. An
+/// unrouted bucket that lives on a healthy named backend was gated by the
+/// default backend's health (the config-only resolution), so an outage of
+/// the default 503'd buckets it does not host.
+#[tokio::test]
+async fn unrouted_bucket_on_a_healthy_backend_is_served_while_the_default_is_down() {
+    let primary_dir = tempfile::tempdir().expect("tempdir");
+    let primary = primary_dir.path().join("primary");
+    let disk_dir = tempfile::tempdir().expect("tempdir");
+    // `downloads` exists on local-disk only and has no bucket policy.
+    std::fs::create_dir_all(disk_dir.path().join("downloads")).unwrap();
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(&format!(
+            r#"
+backends:
+  - name: primary
+    type: filesystem
+    path: {}
+  - name: local-disk
+    type: filesystem
+    path: {}
+"#,
+            primary.display(),
+            disk_dir.path().display()
+        ))
+        .env("DGP_BOOT_BACKEND_PROBE", "enforce")
+        .build()
+        .await;
+    let s3 = server.s3_client().await;
+    s3.list_objects_v2()
+        .bucket("downloads")
+        .send()
+        .await
+        .expect("healthy: the router finds downloads on local-disk");
+
+    // Take the default backend down (its root becomes a file) and re-probe.
+    std::fs::remove_dir_all(&primary).unwrap();
+    std::fs::write(&primary, b"not a directory").unwrap();
+    let admin = common::admin_http_client(&server.endpoint()).await;
+    let probe: serde_json::Value = admin
+        .post(format!(
+            "{}/_/api/admin/backends/primary/probe",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .expect("probe")
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(probe["verdict"], "healthy", "default must be down: {probe}");
+
+    s3.list_objects_v2()
+        .bucket("downloads")
+        .send()
+        .await
+        .expect("a bucket on the healthy named backend must still be served");
+}

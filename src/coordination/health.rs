@@ -475,6 +475,8 @@ pub fn boot_probe_mode() -> BootProbeMode {
 pub struct BackendHealthGate {
     pub health: Arc<BackendHealthCache>,
     pub config: crate::config::SharedConfig,
+    /// The router knows where an unrouted bucket actually lives.
+    pub app: Arc<crate::api::handlers::AppState>,
 }
 
 /// Axum middleware on the S3 router: requests to a bucket whose backend is
@@ -507,9 +509,15 @@ pub async fn backend_health_gate_middleware(request: Request<Body>, next: Next) 
     // duration just restores pre-gate behavior for a few seconds.
     let resolved = match gate.config.try_read() {
         Err(_) => return next.run(request).await,
-        Ok(cfg) => cfg
-            .effective_backend_for_bucket(&bucket)
-            .map(|(name, def)| (name, def.clone())),
+        Ok(cfg) => {
+            let routed = gate
+                .app
+                .engine
+                .load()
+                .storage()
+                .resolved_backend_name(&bucket);
+            gated_backend(&cfg, &bucket, routed)
+        }
     };
     let Some((backend_name, backend_cfg)) = resolved else {
         // Route to an undefined backend: unreachable in practice (check_fatal
@@ -528,6 +536,23 @@ pub async fn backend_health_gate_middleware(request: Request<Body>, next: Next) 
         }
     }
     next.run(request).await
+}
+
+/// The backend whose health gates `bucket`: where the router sends it
+/// (`routed`, from `resolved_backend_name`), else the config resolver.
+/// Judging an unrouted bucket by the config alone gated it by the DEFAULT
+/// backend even when the router serves it from another one.
+pub fn gated_backend(
+    cfg: &crate::config::Config,
+    bucket: &str,
+    routed: Option<String>,
+) -> Option<(String, BackendConfig)> {
+    match routed {
+        Some(name) => cfg.backend_by_name(&name).map(|def| (name, def.clone())),
+        None => cfg
+            .effective_backend_for_bucket(bucket)
+            .map(|(name, def)| (name, def.clone())),
+    }
 }
 
 /// Hot-apply pre-commit HEALTH gate: probe backends whose DEFINITION changed
@@ -689,6 +714,32 @@ storage:
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].0, "default");
         assert_eq!(targets[0].2.as_deref(), Some("plain"));
+    }
+
+    #[test]
+    fn gated_backend_prefers_the_routers_answer() {
+        let cfg = crate::config::Config::from_yaml_str(
+            r#"
+storage:
+  backends:
+    - name: primary
+      type: filesystem
+      path: /tmp/dgp-gate-a
+    - name: local-disk
+      type: filesystem
+      path: /tmp/dgp-gate-b
+"#,
+        )
+        .unwrap();
+        // Unrouted, router unaware → the config default.
+        assert_eq!(gated_backend(&cfg, "downloads", None).unwrap().0, "primary");
+        // The router found it on local-disk → that backend gates it.
+        assert_eq!(
+            gated_backend(&cfg, "downloads", Some("local-disk".into()))
+                .unwrap()
+                .0,
+            "local-disk"
+        );
     }
 
     #[test]
