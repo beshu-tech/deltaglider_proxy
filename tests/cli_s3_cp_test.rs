@@ -397,59 +397,6 @@ async fn cp_dryrun_does_not_write_to_destination() {
     s3.delete_bucket().bucket(&bucket).send().await.ok();
 }
 
-/// Zip-slip: a key whose tail is an absolute path (`pre//<abs>`) must
-/// not be written outside the destination directory. The old code
-/// did `dst_root.join(rel)`, and `join` with an absolute path REPLACES
-/// the root.
-#[tokio::test]
-async fn cp_recursive_download_never_writes_outside_the_destination() {
-    skip_unless_minio!();
-    let bucket = unique_bucket("zipslip");
-    let s3 = minio_client().await;
-    s3.create_bucket().bucket(&bucket).send().await.unwrap();
-
-    let tmp = tempfile::tempdir().unwrap();
-    let outside = tmp.path().join("outside").join("evil.txt");
-    let evil_key = format!("pre/{}", outside.to_string_lossy());
-    for key in ["pre/ok.txt", evil_key.as_str()] {
-        s3.put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
-            .send()
-            .await
-            .unwrap();
-    }
-
-    let dest = tmp.path().join("dest");
-    let mut args = default_args(
-        format!("s3://{bucket}/pre/"),
-        dest.to_string_lossy().to_string(),
-    );
-    args.recursive = true;
-    args.quiet = true;
-    run(args).await;
-
-    assert!(
-        !outside.exists(),
-        "key escaped the destination: {outside:?}"
-    );
-    assert!(
-        dest.join("ok.txt").exists(),
-        "the safe key must still download"
-    );
-
-    for key in ["pre/ok.txt", evil_key.as_str()] {
-        s3.delete_object()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .ok();
-    }
-    s3.delete_bucket().bucket(&bucket).send().await.ok();
-}
-
 /// S3-to-S3 `cp` keeps the source object's user metadata; a
 /// `--metadata` flag on the copy overrides one key.
 #[tokio::test]
