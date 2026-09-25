@@ -442,13 +442,6 @@ impl ConfigDbSync {
         Ok(())
     }
 
-    /// Poll S3 for ETag changes. Called periodically (every 5 minutes).
-    /// Returns `Some(temp_path)` when a new version was downloaded (caller merges
-    /// IAM tables + deletes the temp), `None` otherwise.
-    pub async fn poll_and_sync(&self) -> Result<Option<DownloadedDb>, String> {
-        self.download_if_newer().await
-    }
-
     /// Download the raw config DB bytes from S3 without passphrase validation.
     /// Used by the recovery endpoint to try candidate passwords against the S3 copy.
     pub async fn download_raw(&self) -> Result<Vec<u8>, String> {
