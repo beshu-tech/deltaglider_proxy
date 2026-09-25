@@ -1146,13 +1146,28 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     where
         F: std::future::Future<Output = std::io::Result<T>>,
     {
+        Self::with_spool_timeout_io(fut).await?.map_err(|e| {
+            // A holder refused a wait (hold-and-wait guard): retryable.
+            if e.kind() == crate::deltaglider::spool::CONTENDED {
+                EngineError::Overloaded(e.to_string())
+            } else {
+                EngineError::Storage(StorageError::from(e))
+            }
+        })
+    }
+
+    /// [`Self::with_spool_timeout`] that hands back the acquisition's own
+    /// `io::Result`, for a caller that acts on its error kind.
+    async fn with_spool_timeout_io<T, F>(fut: F) -> Result<std::io::Result<T>, EngineError>
+    where
+        F: std::future::Future<Output = std::io::Result<T>>,
+    {
         let secs = crate::config::env_parse_with_default("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", 120u64);
         tokio::time::timeout(std::time::Duration::from_secs(secs), fut)
             .await
             .map_err(|_| {
                 EngineError::Overloaded("spool budget exhausted; retry shortly".to_string())
-            })?
-            .map_err(|e| EngineError::Storage(StorageError::from(e)))
+            })
     }
 
     /// Acquire a spool file (timed). For the adapter to stage a large PUT/POST
@@ -1190,20 +1205,26 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// `spool_acquire_pair` for an op that already holds `held` (the streaming
     /// PUT's body spool): the pair is clamped so the op never waits for budget
-    /// it holds itself.
+    /// it holds itself. `None`: the budget is not free now, and a holder
+    /// never waits (hold-and-wait deadlock, see `SpoolDir::reserve_within`);
+    /// the caller goes on without the pair.
     pub(crate) async fn spool_acquire_pair_beside(
         &self,
         held: &crate::deltaglider::spool::Spool,
         a: u64,
         b: u64,
     ) -> Result<
-        (
+        Option<(
             crate::deltaglider::spool::Spool,
             crate::deltaglider::spool::Spool,
-        ),
+        )>,
         EngineError,
     > {
-        Self::with_spool_timeout(self.spool.acquire_pair_beside(Some(held), a, b)).await
+        match Self::with_spool_timeout_io(self.spool.acquire_pair_beside(Some(held), a, b)).await? {
+            Ok(pair) => Ok(Some(pair)),
+            Err(e) if e.kind() == crate::deltaglider::spool::CONTENDED => Ok(None),
+            Err(e) => Err(EngineError::Storage(StorageError::from(e))),
+        }
     }
 
     /// Whether the codec passes `-a` (armor disabled) to xdelta3 (3.1+ only).

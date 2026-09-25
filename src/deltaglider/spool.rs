@@ -29,6 +29,10 @@ pub struct SpoolDir {
     max_bytes: u64,
 }
 
+/// `io::ErrorKind` of a reservation refused to an op that already holds a
+/// spool, because the budget is not free now (see `reserve_within`).
+pub const CONTENDED: std::io::ErrorKind = std::io::ErrorKind::WouldBlock;
+
 /// A spool's budget permit: either solely owned (single `acquire`) or shared
 /// across a pair (`acquire_pair`, so two files draw on ONE reservation). The
 /// budget is released when the last holder drops. The inner permits are RAII
@@ -146,6 +150,11 @@ impl SpoolDir {
     /// op's TOTAL (with the `held_mib` it already holds) stays within the
     /// budget: the op can always run alone and never waits for budget it
     /// holds itself. Awaits on back-pressure.
+    ///
+    /// An op that already holds budget (`held_mib > 0`) NEVER waits: it gets
+    /// the space now or a [`CONTENDED`] error, and goes on without it. Two
+    /// holders that wait can each wait for the budget the other holds
+    /// (hold-and-wait), until the acquire timeout.
     async fn reserve_within(
         &self,
         bytes: u64,
@@ -153,11 +162,23 @@ impl SpoolDir {
     ) -> std::io::Result<OwnedSemaphorePermit> {
         let max_mib = mib_ceil(self.max_bytes).max(1);
         let want_mib = mib_ceil(bytes).max(1).min(max_mib.saturating_sub(held_mib));
-        self.budget
-            .clone()
-            .acquire_many_owned(want_mib as u32)
-            .await
-            .map_err(|_| std::io::Error::other("spool budget semaphore closed"))
+        let closed = || std::io::Error::other("spool budget semaphore closed");
+        if held_mib == 0 {
+            return self
+                .budget
+                .clone()
+                .acquire_many_owned(want_mib as u32)
+                .await
+                .map_err(|_| closed());
+        }
+        match self.budget.clone().try_acquire_many_owned(want_mib as u32) {
+            Ok(permit) => Ok(permit),
+            Err(tokio::sync::TryAcquireError::Closed) => Err(closed()),
+            Err(tokio::sync::TryAcquireError::NoPermits) => Err(std::io::Error::new(
+                CONTENDED,
+                "spool budget contended: an op that holds a spool does not wait for more",
+            )),
+        }
     }
 
     /// Reserve `bytes` of spool budget and create a temp file for it. Awaits if
@@ -305,6 +326,22 @@ mod tests {
             .expect("waiter should finish once budget freed")
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_holder_never_waits_for_more_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = SpoolDir::new(tmp.path().to_path_buf(), 4 * 1024 * 1024).unwrap();
+        let a = pool.acquire(2 * 1024 * 1024).await.unwrap();
+        let _b = pool.acquire(2 * 1024 * 1024).await.unwrap();
+        let err = pool
+            .acquire_pair_beside(Some(&a), 1024 * 1024, 1024 * 1024)
+            .await
+            .err()
+            .expect("the budget is full: a holder must not get more");
+        assert_eq!(err.kind(), CONTENDED);
+        drop(_b);
+        assert!(pool.acquire_beside(Some(&a), 1024 * 1024).await.is_ok());
     }
 
     #[tokio::test]

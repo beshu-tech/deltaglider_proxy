@@ -507,7 +507,27 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let ref_size = existing_ref_meta.map(|m| m.file_size).unwrap_or(size);
         // Clamped beside the body spool this op already holds (else body +
         // pair > budget waited on itself for the whole acquire timeout).
-        let (ref_spool, delta_spool) = self.spool_acquire_pair_beside(body, ref_size, size).await?;
+        let pair = self.spool_acquire_pair_beside(body, ref_size, size).await?;
+        let Some((ref_spool, delta_spool)) = pair else {
+            // No budget free now. Waiting while this PUT holds its body could
+            // deadlock with another PUT that waits on ours. Store it as
+            // passthrough, exactly as when the ratio loses (a fresh baseline
+            // stays: see the NOTE in that branch).
+            tracing::debug!("streaming PUT {bucket}/{key}: spool contended, storing passthrough");
+            drop((_guard, xnode));
+            return self
+                .store_spooled_body_as_passthrough(
+                    bucket,
+                    key,
+                    body,
+                    size,
+                    content_type,
+                    user_metadata,
+                    etag,
+                )
+                .await
+                .map(|r| r.with_accounting(prior_for_counter, reference_created_bytes));
+        };
         self.storage
             .get_reference_to_file(bucket, &deltaspace_id, ref_spool.path())
             .await?;
@@ -589,10 +609,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // not touch reference.bin, so it needs no cross-node exclusion).
                 drop((ref_spool, delta_spool, _guard, xnode));
                 let result = self
-                    .store_passthrough_file_inner(
+                    .store_spooled_body_as_passthrough(
                         bucket,
                         key,
-                        body.path(),
+                        body,
                         size,
                         content_type.clone(),
                         user_metadata.clone(),
@@ -610,8 +630,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 // GET). A reference with no delta pointing at it is harmless: a
                 // later sibling PUT may delta against it, and it's reclaimed when
                 // the deltaspace empties. Correctness over a minor cleanup.
-                self.metadata_cache
-                    .insert(bucket, key, result.metadata.clone());
                 Ok(result.with_accounting(prior_for_counter, reference_created_bytes))
             }
             Some(delta_size) => {
@@ -644,6 +662,36 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 Ok(result.with_accounting(prior_for_counter, reference_created_bytes))
             }
         }
+    }
+
+    /// The streaming PUT's body, stored as passthrough (the ratio lost, or no
+    /// spool for the encode). The caller holds no deltaspace lock:
+    /// `store_passthrough_file_inner` takes it.
+    #[allow(clippy::too_many_arguments)]
+    async fn store_spooled_body_as_passthrough(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: &crate::deltaglider::spool::Spool,
+        size: u64,
+        content_type: Option<String>,
+        user_metadata: std::collections::HashMap<String, String>,
+        etag: String,
+    ) -> Result<StoreResult, EngineError> {
+        let result = self
+            .store_passthrough_file_inner(
+                bucket,
+                key,
+                body.path(),
+                size,
+                content_type,
+                user_metadata,
+                etag,
+            )
+            .await?;
+        self.metadata_cache
+            .insert(bucket, key, result.metadata.clone());
+        Ok(result)
     }
 
     /// Persist a pre-computed delta (from the streaming PUT path) as a delta
@@ -2144,7 +2192,6 @@ mod review2_tests {
     /// hold a body reservation and ask for a pair that only fits once the
     /// other releases. Both stall until DGP_SPOOL_ACQUIRE_TIMEOUT_SECS, then 503.
     #[tokio::test]
-    #[ignore = "review2: pending fix"]
     async fn review2_two_streaming_puts_do_not_deadlock_on_each_others_body_spool() {
         let tmp = tempfile::tempdir().unwrap();
         let backend = FilesystemBackend::new(tmp.path().join("data"))
