@@ -2250,8 +2250,17 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // Bytes of a reclaimed reference.bin (stored-only) — subtracted from the
         // counter so stored_bytes stays exact when the last delta is removed.
         let mut reclaimed_ref_bytes = 0u64;
+        // The object is already gone: a failed reclaim check (a peer holds
+        // the reference lock, a listing error) must not fail the DELETE.
+        // The orphan reference is harmless and reclaimed on a later delete.
         let reclaimable = if reclaim_reference {
-            self.reclaimable_reference(bucket, &deltaspace_id).await?
+            match self.reclaimable_reference(bucket, &deltaspace_id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("reference reclaim skipped for {bucket}/{deltaspace_id}: {e}");
+                    None
+                }
+            }
         } else {
             None
         };
