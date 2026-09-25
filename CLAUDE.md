@@ -218,7 +218,10 @@ single-instance planes below are addressed.
   else local if free, else fresh; FKs resolve through names (external
   identities follow), and local user ids that change owner end their live
   external sessions. No base (upgrade/first sync/unreadable) → remote wins
-  (the old table-replace). `session_revocations` stays a monotonic `MAX`
+  (the old table-replace). Mapping rules are keyed by `rule_uid` (v28: random
+  on GUI insert via trigger, content-derived for the declarative reconcile and
+  the v28 backfill so equal rules on two nodes share one uid; an edit keeps
+  it). `session_revocations` stays a monotonic `MAX`
   merge. So: linearizable blob, row-level merge, coordination tables excluded
   entirely. This shape is fine for human-paced identity and structurally
   WRONG for leases/locks — which is exactly why B3 dropped the coordination

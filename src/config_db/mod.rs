@@ -25,7 +25,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 27;
+const SCHEMA_VERSION: i32 = 28;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -881,6 +881,18 @@ impl ConfigDb {
             )?;
             info!(
                 "Migrated config DB schema from v{} to v27 (event_deliveries)",
+                version
+            );
+        }
+
+        if version < 28 {
+            // v28: `group_mapping_rules.rule_uid` (+ sync_mtime). Rules have no
+            // name, so the sync merge keyed them by content, and two nodes
+            // editing one rule kept both versions. Existing rules get a
+            // content-derived uid, so equal rules on two nodes get one uid.
+            iam_merge::install_rule_uid_schema(conn)?;
+            info!(
+                "Migrated config DB schema from v{} to v28 (mapping rule uid)",
                 version
             );
         }

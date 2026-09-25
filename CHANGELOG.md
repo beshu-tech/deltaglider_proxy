@@ -47,9 +47,13 @@ delete on one side is a delete on both sides. When both sides change the same
 row, the more recent change wins, a delete wins over an edit, and the proxy
 writes an `iam_sync_conflict` audit entry. External identities, group members,
 and mapping rules follow their user or group by name when an id changes.
+Mapping rules have no name, so schema v28 gives each rule a `rule_uid`. When
+two instances edit the same rule, the merge keeps one rule (the more recent
+edit) instead of both versions. The upgrade derives the uid of an existing
+rule from its content, so equal rules on two instances get the same uid.
 
-Upgrade: the schema moves to v26, which adds a `sync_mtime` column to the IAM
-tables. The first sync after the upgrade has no merge base, so the copy in the
+Upgrade: the schema moves to v26 and v28, which add a `sync_mtime` column to
+the IAM tables and a `rule_uid` column to the mapping rules. The first sync after the upgrade has no merge base, so the copy in the
 bucket wins, as before. Upgrade every instance before you expect merges: an
 instance refuses a peer database with a different schema version.
 

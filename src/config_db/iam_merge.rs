@@ -47,6 +47,7 @@ const MTIME_TABLES: &[(&str, Option<(&str, &str)>)] = &[
     ("groups", Some(("group_permissions", "group_id"))),
     ("auth_providers", None),
     ("external_identities", None),
+    ("group_mapping_rules", None),
 ];
 
 /// v26 migration: `sync_mtime` columns plus the triggers that maintain them.
@@ -71,6 +72,107 @@ pub(crate) fn install_mtime_schema(conn: &Connection) -> Result<(), ConfigDbErro
             }
         }
     }
+    Ok(())
+}
+
+/// Pure: a mapping rule's identity derived from its content. Used where two
+/// nodes create the same rule independently (the v28 backfill, the declarative
+/// reconcile), so they agree on one uid. A rule created in the GUI gets a
+/// random uid instead (trigger), and an edit never changes the uid.
+pub(crate) fn content_rule_uid(
+    provider: Option<&str>,
+    priority: i64,
+    match_type: &str,
+    match_field: &str,
+    match_value: &str,
+    group: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let provider = provider.map_or_else(|| "\u{0}".to_string(), str::to_string);
+    let content = [
+        provider.as_str(),
+        &priority.to_string(),
+        match_type,
+        match_field,
+        match_value,
+        group,
+    ]
+    .join("\u{1f}");
+    format!(
+        "c-{}",
+        hex::encode(&Sha256::digest(content.as_bytes())[..16])
+    )
+}
+
+/// `base`, or `base-2`, `base-3`, ... when an equal rule already took it.
+pub(crate) fn unique_rule_uid(base: String, taken: &mut HashSet<String>) -> String {
+    let mut uid = base.clone();
+    let mut n = 1;
+    while !taken.insert(uid.clone()) {
+        n += 1;
+        uid = format!("{base}-{n}");
+    }
+    uid
+}
+
+/// Give every mapping rule without a uid its content uid (v28 upgrade).
+pub(crate) fn backfill_rule_uids(conn: &Connection) -> Result<(), ConfigDbError> {
+    let mut taken: HashSet<String> = conn
+        .prepare("SELECT rule_uid FROM group_mapping_rules WHERE rule_uid IS NOT NULL")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    type RuleRow = (i64, Option<String>, i64, String, String, String, String);
+    let rows: Vec<RuleRow> = conn
+        .prepare(
+            "SELECT r.id, p.name, r.priority, r.match_type, r.match_field, r.match_value, g.name
+               FROM group_mapping_rules r
+               JOIN groups g ON g.id = r.group_id
+               LEFT JOIN auth_providers p ON p.id = r.provider_id
+              WHERE r.rule_uid IS NULL
+              ORDER BY r.id",
+        )?
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    for (id, provider, priority, mtype, field, value, group) in rows {
+        let base = content_rule_uid(
+            provider.as_deref(),
+            priority,
+            &mtype,
+            &field,
+            &value,
+            &group,
+        );
+        let uid = unique_rule_uid(base, &mut taken);
+        conn.execute(
+            "UPDATE group_mapping_rules SET rule_uid = ?1 WHERE id = ?2",
+            rusqlite::params![uid, id],
+        )?;
+    }
+    Ok(())
+}
+
+/// v28 migration: a content-independent identity for mapping rules, so two
+/// nodes that edit one rule converge on one row in the sync merge.
+pub(crate) fn install_rule_uid_schema(conn: &Connection) -> Result<(), ConfigDbError> {
+    install_mtime_schema(conn)?;
+    super::add_column_if_missing(conn, "group_mapping_rules", "rule_uid", "TEXT")?;
+    backfill_rule_uids(conn)?;
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_mapping_rule_uid ON group_mapping_rules(rule_uid);
+         CREATE TRIGGER IF NOT EXISTS trg_group_mapping_rules_uid AFTER INSERT ON group_mapping_rules
+           WHEN NEW.rule_uid IS NULL
+         BEGIN UPDATE group_mapping_rules SET rule_uid = lower(hex(randomblob(16))) WHERE id = NEW.id; END;",
+    )?;
     Ok(())
 }
 
@@ -123,8 +225,6 @@ enum Key {
     Name,
     /// A tuple of columns (FKs already translated to names).
     Columns(&'static [&'static str]),
-    /// The whole compared content: a row without a natural key is a set member.
-    Content,
 }
 
 struct Spec {
@@ -183,7 +283,7 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         table: "group_mapping_rules",
-        key: Key::Content,
+        key: Key::Columns(&["rule_uid"]),
         has_id: true,
         fks: &[
             ("provider_id", Parent::Providers),
@@ -267,7 +367,6 @@ fn logical_key(spec: &Spec, row: &Row) -> String {
             .map(|c| text(row.get(*c)))
             .collect::<Vec<_>>()
             .join("\u{1f}"),
-        Key::Content => format!("{:?}", compared(row)),
     }
 }
 
@@ -1106,6 +1205,150 @@ mod tests {
         tick();
         db.update_user(u.id, None, Some(false), None).unwrap();
         assert!(mtime(&db) > t1, "a row update stamps it");
+    }
+
+    use super::super::auth_providers::{CreateMappingRuleRequest, UpdateMappingRuleRequest};
+
+    fn seed_rule(db: &ConfigDb) {
+        let g = db.create_group("eng", "", &[]).unwrap();
+        db.create_group_mapping_rule(&CreateMappingRuleRequest {
+            provider_id: None,
+            priority: 0,
+            match_type: "email_domain".into(),
+            match_field: "email".into(),
+            match_value: "acme.example".into(),
+            group_id: g.id,
+        })
+        .unwrap();
+    }
+
+    fn set_rule_value(db: &ConfigDb, value: &str) {
+        let id = db.load_group_mapping_rules().unwrap()[0].id;
+        db.update_group_mapping_rule(
+            id,
+            &UpdateMappingRuleRequest {
+                provider_id: None,
+                priority: None,
+                match_type: None,
+                match_field: None,
+                match_value: Some(value.into()),
+                group_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn rule_values(db: &ConfigDb) -> Vec<String> {
+        db.load_group_mapping_rules()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.match_value)
+            .collect()
+    }
+
+    #[test]
+    fn a_mapping_rule_edited_on_one_side_is_updated_not_duplicated() {
+        let t = trio(seed_rule);
+        let local = open(&t.local);
+        set_rule_value(&local, "local.example");
+        let report = local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .unwrap();
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        assert_eq!(rule_values(&local), vec!["local.example"]);
+    }
+
+    #[test]
+    fn a_mapping_rule_edited_on_both_sides_converges_to_the_newer_edit() {
+        let t = trio(seed_rule);
+        let local = open(&t.local);
+        set_rule_value(&local, "local.example");
+        tick();
+        {
+            let remote = open(&t.remote);
+            set_rule_value(&remote, "remote.example");
+        }
+        let report = local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .unwrap();
+        assert_eq!(
+            rule_values(&local),
+            vec!["remote.example"],
+            "one rule, not both"
+        );
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(report.conflicts[0].table, "group_mapping_rules");
+        assert_eq!(report.conflicts[0].resolution, "remote");
+    }
+
+    #[test]
+    fn rule_uid_is_stamped_on_insert_and_kept_on_update() {
+        let db = ConfigDb::in_memory(PASS).unwrap();
+        seed_rule(&db);
+        let uid = |db: &ConfigDb| -> Option<String> {
+            db.conn
+                .query_row("SELECT rule_uid FROM group_mapping_rules", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = uid(&db).expect("a new rule gets a uid");
+        set_rule_value(&db, "other.example");
+        assert_eq!(uid(&db).unwrap(), before, "an edit keeps the identity");
+    }
+
+    #[test]
+    fn content_rule_uid_is_deterministic_and_content_sensitive() {
+        let a = content_rule_uid(
+            Some("okta"),
+            0,
+            "email_domain",
+            "email",
+            "acme.example",
+            "eng",
+        );
+        assert_eq!(
+            a,
+            content_rule_uid(
+                Some("okta"),
+                0,
+                "email_domain",
+                "email",
+                "acme.example",
+                "eng"
+            )
+        );
+        assert_ne!(
+            a,
+            content_rule_uid(None, 0, "email_domain", "email", "acme.example", "eng")
+        );
+        assert_ne!(
+            a,
+            content_rule_uid(
+                Some("okta"),
+                1,
+                "email_domain",
+                "email",
+                "acme.example",
+                "eng"
+            )
+        );
+    }
+
+    #[test]
+    fn the_v28_backfill_gives_equal_rules_on_two_nodes_one_uid() {
+        // Two nodes with the same rule, both upgraded from v27: the backfill
+        // must pick one uid, or the first merge would keep both copies.
+        let uid_after_upgrade = || -> String {
+            let db = ConfigDb::in_memory(PASS).unwrap();
+            seed_rule(&db);
+            db.conn
+                .execute("UPDATE group_mapping_rules SET rule_uid = NULL", [])
+                .unwrap();
+            backfill_rule_uids(&db.conn).unwrap();
+            db.conn
+                .query_row("SELECT rule_uid FROM group_mapping_rules", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(uid_after_upgrade(), uid_after_upgrade());
     }
 
     #[test]

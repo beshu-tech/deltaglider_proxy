@@ -221,6 +221,9 @@ impl ConfigDb {
         //      ClearAll has already done its DELETE in step 1; Keep
         //      is a no-op.
         if let MappingRulesAction::ReplaceWith(ref rules) = diff.mapping_rules {
+            // Content uids: every node that applies this YAML writes the same
+            // uids, so the sync merge sees one rule set, not two.
+            let mut taken = std::collections::HashSet::new();
             for r in rules {
                 let provider_id: Option<i64> = match &r.provider {
                     Some(name) => Some(*provider_name_to_id.get(name).ok_or_else(|| {
@@ -241,10 +244,21 @@ impl ConfigDb {
                         r.group
                     ))
                 })?;
+                let uid = super::iam_merge::unique_rule_uid(
+                    super::iam_merge::content_rule_uid(
+                        r.provider.as_deref(),
+                        r.priority,
+                        &r.match_type,
+                        &r.match_field,
+                        &r.match_value,
+                        &r.group,
+                    ),
+                    &mut taken,
+                );
                 tx.execute(
                     "INSERT INTO group_mapping_rules \
-                     (provider_id, priority, match_type, match_field, match_value, group_id) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (provider_id, priority, match_type, match_field, match_value, group_id, rule_uid) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         provider_id,
                         r.priority,
@@ -252,6 +266,7 @@ impl ConfigDb {
                         r.match_field,
                         r.match_value,
                         group_id,
+                        uid,
                     ],
                 )?;
             }

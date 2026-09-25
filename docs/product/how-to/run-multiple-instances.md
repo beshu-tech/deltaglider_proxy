@@ -21,7 +21,7 @@ After every IAM mutation, the mutating instance uploads the encrypted DB to the 
 
 ## 2. Decide where operators edit IAM
 
-Any instance can accept IAM changes. Each instance keeps a copy of the database that it last shared with the bucket, and it uses that copy as a merge base. When an instance downloads a newer database, it compares both its own database and the downloaded one with the merge base, row by row, and it matches the rows by name. A change that only one side made is kept. A user, group, or provider that one side deleted is deleted on both sides. Two instances can therefore add, change, or delete different users at the same time, and every change survives.
+Any instance can accept IAM changes. Each instance keeps a copy of the database that it last shared with the bucket, and it uses that copy as a merge base. When an instance downloads a newer database, it compares both its own database and the downloaded one with the merge base, row by row, and it matches the rows by name. A group mapping rule has no name, so each rule carries a generated id that stays the same when you edit the rule. A change that only one side made is kept. A user, group, or provider that one side deleted is deleted on both sides. Two instances can therefore add, change, or delete different users at the same time, and every change survives.
 
 A conflict happens only when two instances change the same row before they sync. In that case, the more recent change wins, and a delete wins over an edit, because a deleted identity must not come back. Each conflict writes an `iam_sync_conflict` entry to the audit log that names the row and the side that was kept. If you want predictable results, you can still make one instance the place where operators edit IAM.
 
