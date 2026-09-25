@@ -154,6 +154,49 @@ fn redact_url_for_error(raw: &str) -> String {
     }
 }
 
+/// Redact EVERY URL inside a free-text error (pure). Error sources we do not
+/// format ourselves embed the full URL — reqwest's Display is
+/// `error sending request for url (https://hooks.slack.com/services/…)` —
+/// so the persistence boundary scrubs the whole message, not just the parts
+/// we built. Each `scheme://…` run (up to whitespace or a closing delimiter)
+/// goes through `redact_url_for_error`.
+fn redact_urls_in_text(text: &str) -> String {
+    let is_url_end = |c: char| c.is_whitespace() || matches!(c, ')' | '(' | '"' | '\'' | '<' | '>');
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(sep) = rest.find("://") {
+        let scheme_start = rest[..sep]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        if scheme_start == sep {
+            // "://" without a scheme: not a URL; copy through it.
+            out.push_str(&rest[..sep + 3]);
+            rest = &rest[sep + 3..];
+            continue;
+        }
+        let end = rest[sep + 3..]
+            .find(is_url_end)
+            .map(|i| sep + 3 + i)
+            .unwrap_or(rest.len());
+        // A trailing ':' / ',' / ';' / '.' is punctuation, not URL.
+        let url_end = scheme_start
+            + rest[scheme_start..end]
+                .trim_end_matches([':', ',', ';', '.'])
+                .len();
+        out.push_str(&rest[..scheme_start]);
+        out.push_str(&redact_url_for_error(&rest[scheme_start..url_end]));
+        rest = &rest[url_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The one shape every delivery error takes before it is persisted.
+fn persistable_error(error: &str) -> String {
+    truncate_error(&redact_urls_in_text(error))
+}
+
 #[async_trait]
 impl EventDeliveryClient for HttpWebhookDeliveryClient {
     async fn deliver(
@@ -209,11 +252,10 @@ impl HttpWebhookDeliveryClient {
                     .map_err(|e| format!("invalid webhook header value for {name}: {e}"))?;
                 request = request.header(name, value);
             }
-            let response = request
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|e| format!("{}: {e}", redact_url_for_error(endpoint)))?;
+            let response =
+                request.json(&payload).send().await.map_err(|e| {
+                    format!("{}: {}", redact_url_for_error(endpoint), e.without_url())
+                })?;
             if !response.status().is_success() {
                 return Err(format!(
                     "{}: webhook returned HTTP {}",
@@ -358,7 +400,11 @@ impl HttpWebhookDeliveryClient {
                 .send()
                 .await;
             match result {
-                Err(e) => errors.push(format!("{}: {e}", redact_url_for_error(endpoint))),
+                Err(e) => errors.push(format!(
+                    "{}: {}",
+                    redact_url_for_error(endpoint),
+                    e.without_url()
+                )),
                 Ok(response) if !response.status().is_success() => errors.push(format!(
                     "{}: slack webhook returned HTTP {}",
                     redact_url_for_error(endpoint),
@@ -514,7 +560,7 @@ pub async fn dispatch_once(
             Err(err) => {
                 let next_attempt_at = next_attempt_after(config, event.attempts, now);
                 if let Err(mark_err) =
-                    db.event_outbox_mark_failed(event.id, &truncate_error(&err), next_attempt_at)
+                    db.event_outbox_mark_failed(event.id, &persistable_error(&err), next_attempt_at)
                 {
                     warn!(
                         "Event outbox mark failed failed for {}: {}",
@@ -1130,6 +1176,51 @@ mod tests {
         }
         let _ = created;
         server.abort();
+    }
+
+    /// S17: a Slack incoming-webhook URL is a bearer secret. A transport error
+    /// (reqwest Display embeds the full URL) must not carry it into the
+    /// persisted `last_error`, for raw and Slack formats alike.
+    #[tokio::test]
+    async fn transport_error_does_not_persist_the_webhook_secret() {
+        for format in [EventDeliveryFormat::Raw, EventDeliveryFormat::Slack] {
+            let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+            db.lock()
+                .await
+                .event_outbox_insert(&event("ror/app.zip"))
+                .unwrap();
+            let mut config = cfg();
+            config.format = format;
+            // Port 1: connection refused → a reqwest transport error.
+            config.webhook_url = Some("http://127.0.0.1:1/services/T0/B0/SECRETTOKEN".into());
+            config.webhook_urls = Vec::new();
+            dispatch_once(
+                &db,
+                &HttpWebhookDeliveryClient::for_tests(),
+                &config,
+                "w",
+                200,
+            )
+            .await;
+            let rows = db.lock().await.event_outbox_recent(10).unwrap();
+            let err = rows[0].last_error.clone().expect("delivery must fail");
+            assert!(
+                !err.contains("SECRETTOKEN"),
+                "{format:?}: webhook secret persisted in last_error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_urls_in_text_scrubs_every_url() {
+        let msg = "error sending request for url (https://hooks.slack.com/services/T/B/X?q=1): \
+                   refused; also http://h:8080/p";
+        let out = redact_urls_in_text(msg);
+        assert!(!out.contains("/services/"), "{out}");
+        assert!(!out.contains("/p"), "{out}");
+        assert!(out.contains("https://hooks.slack.com/<redacted>"), "{out}");
+        assert!(out.contains("http://h:8080/<redacted>"), "{out}");
+        assert_eq!(redact_urls_in_text("no url here"), "no url here");
     }
 
     #[test]
