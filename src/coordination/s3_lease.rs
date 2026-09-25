@@ -13,6 +13,11 @@
 //! The DECISION logic (what action a given lease state warrants) is factored into
 //! the pure [`plan_acquire`] / [`plan_renew`] kernels so the full edge-case truth
 //! table is unit-testable without a live backend; the async methods do the I/O.
+//!
+//! Clock skew: `expires_at` is the writer's wall clock and a peer compares it
+//! with its own. A peer whose clock runs ahead by more than (TTL − the
+//! holder's renew interval) steals a live lease. At the replication defaults
+//! (300s TTL) that bound is minutes; NTP-synced nodes are far inside it.
 
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
