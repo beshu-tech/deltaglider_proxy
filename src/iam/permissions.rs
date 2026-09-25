@@ -713,6 +713,35 @@ pub fn user_can_see_common_prefix(
             && !user.is_explicitly_denied(S3Action::List, bucket, prefix, context))
 }
 
+/// Pure gate for a batch `POST /bucket?delete` (DeleteObjects).
+///
+/// The request names no key: the keys are in the body, and the adapter
+/// checks each one with the request context. A bucket-ARN check here
+/// refused a user whose delete grant is prefix-scoped (`b/alice/*`), so
+/// DeleteObjects was unusable for them (C7). Admit a caller that may delete
+/// on the bucket at all; the per-key check decides every key.
+pub fn may_attempt_batch_delete(
+    user: &super::AuthenticatedUser,
+    bucket: &str,
+    context: &Context,
+) -> bool {
+    if user.can_with_context(S3Action::Delete, bucket, "", context) {
+        return true;
+    }
+    !user.is_anonymous()
+        && user.permissions.iter().any(|perm| {
+            perm.effect == "Allow"
+                && perm
+                    .actions
+                    .iter()
+                    .any(|a| matches!(a.as_str(), "*" | "delete" | "s3:*" | "s3:DeleteObject"))
+                && perm
+                    .resources
+                    .iter()
+                    .any(|r| r == "*" || r == bucket || r.starts_with(&format!("{bucket}/")))
+        })
+}
+
 /// Check if a permission set grants full admin access:
 /// actions must contain "*" or "admin", AND resources must contain "*".
 /// Respects Deny overrides.
@@ -1381,6 +1410,25 @@ mod tests {
             permissions,
             iam_policies,
         }
+    }
+
+    /// A prefix-scoped delete grant may use DeleteObjects; the per-key check
+    /// then keeps it inside its prefix. No delete grant on the bucket, or
+    /// anonymous: refused at the gate.
+    #[test]
+    fn batch_delete_gate_admits_prefix_scoped_delete() {
+        let ctx = Context::new();
+        let alice = make_user("alice", vec!["prod/alice/*"], vec!["delete", "list"]);
+        assert!(may_attempt_batch_delete(&alice, "prod", &ctx));
+        assert!(alice.can_with_context(S3Action::Delete, "prod", "alice/x", &ctx));
+        assert!(!alice.can_with_context(S3Action::Delete, "prod", "bob/x", &ctx));
+        assert!(!may_attempt_batch_delete(&alice, "staging", &ctx));
+        let reader = make_user("r", vec!["prod/*"], vec!["read", "list"]);
+        assert!(!may_attempt_batch_delete(&reader, "prod", &ctx));
+        let admin = make_user("a", vec!["*"], vec!["*"]);
+        assert!(may_attempt_batch_delete(&admin, "prod", &ctx));
+        let iam_style = make_user("i", vec!["prod/alice/*"], vec!["s3:DeleteObject"]);
+        assert!(may_attempt_batch_delete(&iam_style, "prod", &ctx));
     }
 
     /// LIST filtering must honour an IP-conditioned Deny. The filter used

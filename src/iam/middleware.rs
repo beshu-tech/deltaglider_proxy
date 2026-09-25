@@ -98,12 +98,15 @@ pub async fn authorization_middleware(
     // Determine the S3 action
     let mut action = classify_action(&method, path);
 
-    // POST /{bucket}?delete is a batch DELETE, not a write.
+    let (bucket, key) = target.bucket_and_key();
+
+    // POST /{bucket}?delete is a batch DELETE, not a write. Its keys are in
+    // the body; the adapter checks each one.
+    let is_batch_delete =
+        method == axum::http::Method::POST && target.has_query("delete") && key.is_empty();
     if method == axum::http::Method::POST && target.has_query("delete") {
         action = S3Action::Delete;
     }
-
-    let (bucket, key) = target.bucket_and_key();
 
     // ListBuckets (GET /) is filtered at the handler level, not denied outright.
     // This lets IAM users see only the buckets they have permissions on. Only
@@ -231,6 +234,11 @@ pub async fn authorization_middleware(
         } else {
             (false, None)
         }
+    } else if is_batch_delete {
+        (
+            super::permissions::may_attempt_batch_delete(&user, bucket, &context),
+            None,
+        )
     } else {
         (user.can_with_context(action, bucket, key, &context), None)
     };
