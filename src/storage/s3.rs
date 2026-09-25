@@ -36,7 +36,7 @@ use crate::types::{FileMetadata, StorageInfo};
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::BehaviorVersion;
-use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use bytes::Bytes;
@@ -129,7 +129,7 @@ fn resolve_created_at(meta_value: Option<String>, fallback: DateTime<Utc>) -> Da
 }
 
 /// Operation context for S3 error classification.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum S3Op {
     ListObjects,
     CreateBucket,
@@ -442,7 +442,7 @@ impl S3Backend {
     /// non-existent buckets to prevent enumeration).
     fn classify_s3_error(
         bucket: &str,
-        e: &SdkError<impl std::fmt::Debug>,
+        e: &SdkError<impl std::fmt::Debug + ProvideErrorMetadata>,
         op: S3Op,
     ) -> StorageError {
         // Extract diagnostic details from the SDK error
@@ -467,9 +467,12 @@ impl S3Backend {
             e,
         );
 
-        let debug_str = format!("{:?}", e);
-        // Explicit NoSuchBucket in the error body → bucket doesn't exist.
-        if debug_str.contains("NoSuchBucket") {
+        // Classify by the structured error CODE only. The Debug text embeds
+        // the error message, which names the key: a key `SlowDown-q3.pdf`
+        // turned every error on it into a 503 forever.
+        let code = e.code().unwrap_or("");
+        // Explicit NoSuchBucket → bucket doesn't exist.
+        if code == "NoSuchBucket" {
             return StorageError::BucketNotFound(bucket.to_string());
         }
         // NoSuchKey (object-level 404) → NotFound, not a 500. This generic
@@ -480,8 +483,7 @@ impl S3Backend {
         // does this via `classify_get_error`; this covers the rest. Guard on
         // the op NOT being bucket-level so a 404 on a bucket op stays a
         // BucketNotFound concern, not a key NotFound.
-        if !op.is_bucket_level() && (debug_str.contains("NoSuchKey") || matches!(status, Some(404)))
-        {
+        if !op.is_bucket_level() && (code == "NoSuchKey" || matches!(status, Some(404))) {
             return StorageError::NotFound(format!("{} key not found", op));
         }
         // Bucket-level 404 → the bucket is absent. HEAD responses carry NO
@@ -517,10 +519,10 @@ impl S3Backend {
             // Cloudflare R2 (and some S3-compatibles) where AWS uses 503 SlowDown.
             // Classify it the same, or it falls into the S3(...) catch-all → 500,
             // which SDKs treat as permanent and don't back off on.
-            if s == 503 || s == 429 || debug_str.contains("SlowDown") {
+            if s == 503 || s == 429 || code == "SlowDown" {
                 return StorageError::Throttled(format!("{} throttled (status={}): {}", op, s, e));
             }
-        } else if debug_str.contains("SlowDown") {
+        } else if code == "SlowDown" {
             return StorageError::Throttled(format!("{} throttled: {}", op, e));
         }
         StorageError::S3(format!(
@@ -3390,6 +3392,79 @@ mod tests {
                 !matches!(classified, StorageError::NotFound(_)),
                 "transient status {status} must NOT be NotFound (would corrupt reference.bin), got {classified:?}"
             );
+        }
+    }
+
+    /// Classification reads the structured error CODE, never the Debug text.
+    /// The Debug text carries the error message, which often names the key
+    /// (`<Key>` / `Resource`), so a key named `SlowDown-q3.pdf` or
+    /// `NoSuchBucket.zip` must not change the class of an unrelated error.
+    #[test]
+    fn classify_s3_error_ignores_marker_words_in_the_message() {
+        let err_with = |code: &str, msg: &str, status: u16| {
+            let inner = GetObjectError::generic(
+                aws_smithy_types::error::ErrorMetadata::builder()
+                    .code(code)
+                    .message(msg)
+                    .build(),
+            );
+            SdkError::service_error(inner, http_response(status, Some("req-c6")))
+        };
+        // (code, message naming a key, status, op) -> expected class
+        let cases: [(&str, &str, u16, S3Op, &str); 6] = [
+            (
+                "AccessDenied",
+                "denied: SlowDown-q3.pdf",
+                403,
+                S3Op::GetObject,
+                "S3",
+            ),
+            (
+                "AccessDenied",
+                "denied: NoSuchBucket.zip",
+                403,
+                S3Op::GetObject,
+                "S3",
+            ),
+            (
+                "AccessDenied",
+                "denied: NoSuchKey.bin",
+                403,
+                S3Op::HeadObject,
+                "S3",
+            ),
+            (
+                "InternalError",
+                "SlowDown-q3.pdf",
+                500,
+                S3Op::PutObject,
+                "S3",
+            ),
+            (
+                "SlowDown",
+                "please reduce your rate",
+                400,
+                S3Op::PutObject,
+                "Throttled",
+            ),
+            (
+                "NoSuchBucket",
+                "gone",
+                400,
+                S3Op::GetObject,
+                "BucketNotFound",
+            ),
+        ];
+        for (code, msg, status, op, want) in cases {
+            let err = err_with(code, msg, status);
+            let got = match S3Backend::classify_s3_error("bucket", &err, op) {
+                StorageError::S3(_) => "S3",
+                StorageError::Throttled(_) => "Throttled",
+                StorageError::BucketNotFound(_) => "BucketNotFound",
+                StorageError::NotFound(_) => "NotFound",
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(got, want, "code={code} msg={msg} status={status} op={op}");
         }
     }
 
