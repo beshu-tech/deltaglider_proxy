@@ -308,6 +308,11 @@ pub struct SpoolReservation {
 }
 
 impl SpoolReservation {
+    /// Budget this reservation holds, in MiB.
+    pub fn reserved_mib(&self) -> usize {
+        self.permit.num_permits()
+    }
+
     fn file(&self) -> std::io::Result<Spool> {
         Ok(Spool {
             file: NamedTempFile::new_in(&self.dir)?,

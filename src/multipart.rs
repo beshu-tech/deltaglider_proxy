@@ -44,6 +44,16 @@ use crate::deltaglider::spool::{mib_ceil, SpoolDir, SpoolReservation, CONTENDED}
 /// Relay root, under the spool dir (it was under the system temp dir).
 const RELAY_ROOT_DIR: &str = "deltaglider-mpu-relay";
 
+/// A relayed multipart upload holds at most 1/`RELAY_UPLOAD_SHARE` of the
+/// spool budget (`DGP_SPOOL_MAX_BYTES`), so one upload never pins the
+/// budget of every other request. A part past that fails `EntityTooLarge`.
+pub const RELAY_UPLOAD_SHARE: u64 = 4;
+
+/// The relay bytes one upload may hold, for a spool of `spool_max_bytes`.
+pub fn relay_upload_cap(spool_max_bytes: u64) -> u64 {
+    (spool_max_bytes / RELAY_UPLOAD_SHARE).max(1024 * 1024)
+}
+
 /// Data for a single uploaded part
 enum PartPayload {
     InMemory(Bytes),
@@ -578,7 +588,7 @@ impl MultipartStore {
         let payload = match &upload.relay_strategy {
             RelayStrategy::InMemory { .. } => PartPayload::InMemory(data),
             RelayStrategy::Relayed { relay_dir } => {
-                let budget = self.reserve_relay_part(upload, size)?;
+                let budget = self.reserve_relay_part(upload, size, Some(part_number))?;
                 let path = part_path(relay_dir, part_number);
                 write_part_file(&path, &data)?;
                 PartPayload::RelayedFile(path, budget)
@@ -1327,7 +1337,7 @@ impl MultipartStore {
             .collect();
         for part_number in in_memory {
             let size = upload.parts[&part_number].size;
-            let budget = self.reserve_relay_part(upload, size)?;
+            let budget = self.reserve_relay_part(upload, size, None)?;
             let part = upload.parts.get_mut(&part_number).expect("collected above");
             if let PartPayload::InMemory(bytes) = &part.payload {
                 let path = part_path(&relay_dir, part_number);
@@ -1342,24 +1352,47 @@ impl MultipartStore {
     /// Spool budget for one relay part of `size` bytes. Never waits: this
     /// runs under the uploads lock, and an upload that holds relay parts is
     /// a holder (the review2 rule). A full budget is a retryable SlowDown.
+    ///
+    /// One upload holds at most 1/[`RELAY_UPLOAD_SHARE`] of the budget. The
+    /// reservation used to be clamped to what the upload did not hold yet,
+    /// so once an upload held the whole budget every further part reserved
+    /// 0 MiB and was written anyway: the disk use of one upload grew without
+    /// a bound while it pinned the budget of every other request.
     fn reserve_relay_part(
         &self,
         upload: &MultipartUpload,
         size: u64,
+        replacing: Option<u32>,
     ) -> Result<SpoolReservation, S3Error> {
         let held: u64 = upload
             .parts
-            .values()
-            .filter(|p| matches!(p.payload, PartPayload::RelayedFile(..)))
-            .map(|p| p.size)
+            .iter()
+            .filter(|(n, p)| {
+                Some(**n) != replacing && matches!(p.payload, PartPayload::RelayedFile(..))
+            })
+            .map(|(_, p)| p.size)
             .sum();
-        self.spool.try_reserve(size, mib_ceil(held)).map_err(|e| {
+        let cap = relay_upload_cap(self.spool.max_bytes());
+        if held.saturating_add(size) > cap {
+            return Err(S3Error::EntityTooLarge {
+                size: held.saturating_add(size),
+                max: cap,
+            });
+        }
+        let reservation = self.spool.try_reserve(size, mib_ceil(held)).map_err(|e| {
             if e.kind() == CONTENDED {
                 S3Error::SlowDown(format!("spool budget in use by other requests: {e}"))
             } else {
                 S3Error::InternalError(format!("spool reservation failed: {e}"))
             }
-        })
+        })?;
+        // Never write a part the reservation does not cover.
+        if reservation.reserved_mib() < mib_ceil(size) {
+            return Err(S3Error::SlowDown(
+                "spool budget in use by other requests".to_string(),
+            ));
+        }
+        Ok(reservation)
     }
 
     /// Parent of all per-process relay roots on this host.
@@ -2514,7 +2547,7 @@ mod tests {
     #[test]
     fn relay_parts_hold_spool_budget_until_dropped() {
         let dir = tempfile::tempdir().unwrap();
-        let spool = small_spool(&dir, 8);
+        let spool = small_spool(&dir, 32); // one upload may hold 8 MiB
         let store = MultipartStore::new(64 << 20).with_spool(spool.clone());
         let id = store
             .create_with_relay_policy("b", "k", None, HashMap::new(), None, true)
@@ -2522,23 +2555,23 @@ mod tests {
         let mib = |n: usize| Bytes::from(vec![7u8; n << 20]);
         store.upload_part(&id, "b", "k", 1, mib(2)).unwrap();
         store.upload_part(&id, "b", "k", 2, mib(3)).unwrap();
-        assert_eq!(spool.free_mib(), 3);
+        assert_eq!(spool.free_mib(), 27);
         // Overwrite: the old part's budget goes back.
         store.upload_part(&id, "b", "k", 2, mib(1)).unwrap();
-        assert_eq!(spool.free_mib(), 5);
+        assert_eq!(spool.free_mib(), 29);
         store.abort(&id, "b", "k").unwrap();
-        assert_eq!(spool.free_mib(), 8);
+        assert_eq!(spool.free_mib(), 32);
 
         // Promotion reserves for the parts that were in memory.
         let id = store
             .create_with_relay_policy("b", "k", None, HashMap::new(), Some(3 << 20), false)
             .unwrap();
         store.upload_part(&id, "b", "k", 1, mib(2)).unwrap();
-        assert_eq!(spool.free_mib(), 8, "in-memory parts hold no spool");
+        assert_eq!(spool.free_mib(), 32, "in-memory parts hold no spool");
         store.upload_part(&id, "b", "k", 2, mib(2)).unwrap();
-        assert_eq!(spool.free_mib(), 4);
+        assert_eq!(spool.free_mib(), 28);
         store.finish_upload(&id);
-        assert_eq!(spool.free_mib(), 8);
+        assert_eq!(spool.free_mib(), 32);
     }
 
     /// UploadPart never waits for spool budget (it runs under the uploads
@@ -2573,26 +2606,30 @@ mod review3_tests {
     /// node (up to the 24 h idle TTL for an abandoned upload) while the disk
     /// use of this one upload grows without a bound.
     #[test]
-    #[ignore = "review3: pending fix"]
     fn review3_relay_parts_past_the_budget_are_not_written_for_free() {
         let dir = tempfile::tempdir().unwrap();
-        let spool = SpoolDir::new(dir.path().join("spool"), 4 << 20).unwrap();
+        // 16 MiB budget: one upload may hold 4 MiB of it.
+        let spool = SpoolDir::new(dir.path().join("spool"), 16 << 20).unwrap();
         let store = MultipartStore::new(64 << 20).with_spool(spool.clone());
         let id = store
             .create_with_relay_policy("b", "k", None, HashMap::new(), None, true)
             .unwrap();
         let mib = |n: usize| Bytes::from(vec![7u8; n << 20]);
         store.upload_part(&id, "b", "k", 1, mib(4)).unwrap();
-        assert_eq!(spool.free_mib(), 0);
+        assert_eq!(spool.free_mib(), 12);
         let mut accepted = 0;
         for n in 2..=4 {
-            if store.upload_part(&id, "b", "k", n, mib(4)).is_ok() {
-                accepted += 1;
+            match store.upload_part(&id, "b", "k", n, mib(4)) {
+                Ok(_) => accepted += 1,
+                Err(e) => assert!(matches!(e, S3Error::EntityTooLarge { .. }), "{e:?}"),
             }
         }
         assert_eq!(
             accepted, 0,
-            "{accepted} more 4 MiB parts were written to the spool dir with no budget (budget 4 MiB)"
+            "{accepted} more 4 MiB parts were written past the upload's share of the budget"
         );
+        assert_eq!(spool.free_mib(), 12, "a refused part reserves nothing");
+        // Re-uploading part 1 replaces it: within the share.
+        store.upload_part(&id, "b", "k", 1, mib(4)).unwrap();
     }
 }

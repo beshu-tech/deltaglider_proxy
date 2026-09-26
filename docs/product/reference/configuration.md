@@ -1042,7 +1042,7 @@ The list of `DGP_*` variables that the server reads. The unit test `every_dgp_li
 | `DGP_MAX_OBJECT_SIZE` | 104857600 | Max bytes eligible for delta (xdelta3 mem cap) |
 | `DGP_CACHE_MB` | 100 | Reference cache size in MB |
 | `DGP_SPOOL_DIR` | `<system temp>/dgp-spool` | Directory for every scratch file of the proxy: the delta codec's files, the multipart relay parts, and the temporary files of encrypted uploads |
-| `DGP_SPOOL_MAX_BYTES` | 17179869184 (16 GiB) | Byte budget for all the files in `DGP_SPOOL_DIR`. A request that needs spool space while it holds none waits for it (up to `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS`). A request that already holds spool space, or that holds a lock, does not wait: it fails with `503 SlowDown`, and S3 clients retry it |
+| `DGP_SPOOL_MAX_BYTES` | 17179869184 (16 GiB) | Byte budget for all the files in `DGP_SPOOL_DIR`. A request that needs spool space while it holds none waits for it (up to `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS`). A request that already holds spool space, or that holds a lock, does not wait: it fails with `503 SlowDown`, and S3 clients retry it. One multipart upload that the proxy relays to disk (an upload larger than 64 MiB) can hold at most a quarter of this budget. A part that would take the upload past that share fails with `400 EntityTooLarge`, so the largest multipart upload is a quarter of the budget (4 GiB with the default) |
 | `DGP_METADATA_CACHE_MB` | 50 | `FileMetadata` cache size in MB (0 to disable) |
 | `DGP_LIST_SIZE_CACHE_MB` | 32 | Listing-size cache in MB: the original size and ETag of stored deltas, for listings |
 | `DGP_CODEC_CONCURRENCY` | `num_cpus * 4` (min 16) | Max concurrent xdelta3 subprocesses |

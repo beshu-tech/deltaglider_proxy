@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Changed — One multipart upload can hold at most a quarter of the spool budget
+
+A multipart upload larger than 64 MiB keeps its parts in the spool directory
+until it completes. A part used to reserve only the budget that its upload did
+not hold yet. So when one upload held the whole budget, each further part
+reserved nothing and the proxy wrote it anyway. The disk use of that upload had
+no limit, and every other request that needed spool space failed until the
+upload completed or expired. Now one upload can hold at most a quarter of
+`DGP_SPOOL_MAX_BYTES` (4 GiB with the default of 16 GiB). A part that would
+take the upload past that share fails with `400 EntityTooLarge`. To upload
+larger objects in multipart, raise `DGP_SPOOL_MAX_BYTES` to at least four
+times the object size. A part that finds no free budget fails with
+`503 SlowDown`, as before.
+
 ### Fixed — Listings skip the internal listing-facts namespace
 
 On an S3 backend the proxy keeps one small object per delta or encrypted
