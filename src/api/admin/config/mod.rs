@@ -258,6 +258,16 @@ pub(crate) async fn apply_config_transition(
     if !fatal.is_empty() {
         return Err(format!("config refused: {}", fatal.join("; ")));
     }
+    // S8: the boot refuses a sync bucket without DGP_CONFIG_DB_KEY; an apply
+    // must not set one up for the next restart either.
+    crate::config_db::key::check_sync_bucket_change(
+        old_cfg.config_sync_bucket.as_deref(),
+        new_cfg.config_sync_bucket.as_deref(),
+        std::env::var(crate::config_db::key::CONFIG_DB_KEY_ENV)
+            .ok()
+            .as_deref(),
+    )
+    .map_err(|e| format!("config refused: {e}"))?;
 
     // 0. Backend write-capability pre-commit gate (guard B, hot-apply half):
     //    refuse a transition that would route a client-writable bucket onto a

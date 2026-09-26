@@ -202,6 +202,20 @@ pub fn check_sync_needs_env_key(
     Ok(())
 }
 
+/// Pure: an admin apply that sets or changes `config_sync_bucket` is refused
+/// without `DGP_CONFIG_DB_KEY` (the check the boot runs, see
+/// [`check_sync_needs_env_key`]). An unchanged bucket is never re-checked.
+pub fn check_sync_bucket_change(
+    old_bucket: Option<&str>,
+    new_bucket: Option<&str>,
+    env_key: Option<&str>,
+) -> Result<(), String> {
+    if old_bucket == new_bucket {
+        return Ok(());
+    }
+    check_sync_needs_env_key(new_bucket, env_key)
+}
+
 /// Resolve the config DB keys for `db_path`: the primary key (env, else key
 /// file, else a new key file) and the fallbacks. `env` is injected for tests.
 ///
@@ -362,6 +376,16 @@ mod tests {
         let err = check_sync_needs_env_key(Some("b"), None).unwrap_err();
         assert!(err.contains(CONFIG_DB_KEY_ENV), "{err}");
         assert!(check_sync_needs_env_key(Some("b"), Some("  ")).is_err());
+    }
+
+    #[test]
+    fn an_apply_that_enables_sync_needs_the_env_key() {
+        assert!(check_sync_bucket_change(None, Some("b"), None).is_err());
+        assert!(check_sync_bucket_change(Some("a"), Some("b"), None).is_err());
+        assert!(check_sync_bucket_change(None, Some("b"), Some("k")).is_ok());
+        // Disabling, or leaving it as it is, never needs the key.
+        assert!(check_sync_bucket_change(Some("a"), None, None).is_ok());
+        assert!(check_sync_bucket_change(Some("a"), Some("a"), None).is_ok());
     }
 
     #[test]

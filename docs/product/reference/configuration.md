@@ -656,7 +656,7 @@ advanced:
   config_sync_bucket: dgp-iam-sync
 ```
 
-Every instance that shares the bucket must set `DGP_CONFIG_DB_KEY` to the same value: the synced DB is encrypted with that key, and the proxy refuses to start with a sync bucket but without the variable. An instance whose key does not open the synced DB refuses to merge it and logs an error that names `DGP_CONFIG_DB_KEY`.
+Every instance that shares the bucket must set `DGP_CONFIG_DB_KEY` to the same value: the synced DB is encrypted with that key, and the proxy refuses to start with a sync bucket but without the variable. For the same reason, the admin API refuses a configuration change that sets or changes `config_sync_bucket` when the instance runs without `DGP_CONFIG_DB_KEY`. An instance whose key does not open the synced DB refuses to merge it and logs an error that names `DGP_CONFIG_DB_KEY`.
 
 Sync uses the same S3 credentials as the storage backend (`DGP_BE_AWS_*`) and only works when the storage backend is S3 (not filesystem). On every IAM mutation, the DB is uploaded to `s3://<bucket>/.deltaglider/config.db`; readers poll the S3 ETag every 5 minutes and download on change.
 

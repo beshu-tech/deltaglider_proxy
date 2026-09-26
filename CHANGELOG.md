@@ -316,7 +316,8 @@ Upgrade steps:
 - **Several instances with `config_sync_bucket`:** generate one key
   (`openssl rand -hex 32`) and set it as `DGP_CONFIG_DB_KEY` on every
   instance before you start this release. An instance with a sync bucket and
-  without the variable refuses to start. Upgrade all instances together and
+  without the variable refuses to start, and the admin API refuses to set or
+  change `config_sync_bucket` on an instance without the variable. Upgrade all instances together and
   make no IAM changes during the rollout: instances on the old release cannot
   read uploads under the new key. For the rollout, also set
   `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC=true` on every instance, so that the new

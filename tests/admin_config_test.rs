@@ -1562,3 +1562,41 @@ async fn review2_d15_refusal_gives_a_safe_path() {
         "the refusal must say the IAM DB is safe: {body}"
     );
 }
+
+/// S8: every instance that shares a sync bucket needs the same
+/// DGP_CONFIG_DB_KEY (the boot refuses a sync bucket without it). The admin
+/// API must not enable one either: after the restart this node would run on
+/// its own key file, and its uploads would be unreadable to the peers.
+#[tokio::test]
+async fn enabling_config_sync_without_the_db_key_is_refused() {
+    let server = TestServer::builder()
+        .auth("SYNCKEYAK", "SYNCKEYSECRET")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let resp = admin
+        .put(format!(
+            "{}/_/api/admin/config/section/advanced",
+            server.endpoint()
+        ))
+        .json(&json!({ "config_sync_bucket": "dgp-sync" }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.contains("DGP_CONFIG_DB_KEY"), "{body}");
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        cfg["config_sync_bucket"].is_null(),
+        "the refused bucket must not be applied: {cfg}"
+    );
+}
