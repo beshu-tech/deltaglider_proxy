@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — A large request that waits for spool space no longer blocks small requests
+
+The spool budget was a semaphore that gives free space to the request at the
+head of its wait queue. While one large delta GET waited for space, every
+request that must not wait (a small delta PUT, a relayed multipart part, an
+encrypted upload) found no free space and failed with `503 SlowDown`, even
+when most of the budget was free. Now a request that must not wait gets any
+space that is free. A waiting request takes only the space that other
+requests release while it waits, so it still gets its space when enough
+requests finish.
+
 ### Fixed — A delta written against a replaced baseline is no longer acknowledged
 
 With config sync on, the fence of the cross-instance reference lock covered

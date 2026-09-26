@@ -8,8 +8,8 @@
 //! exhaust `/tmp` (ENOSPC) — the adversarial review flagged this (blocker 7).
 //!
 //! `SpoolDir` gates spool allocation on a BYTE budget: acquiring space for N
-//! bytes takes a weighted permit from a semaphore; the returned `Spool` holds a
-//! `NamedTempFile` in the configured directory and releases the permit on drop.
+//! bytes takes a share of the budget (see `Budget`); the returned `Spool` holds
+//! a `NamedTempFile` in the configured directory and releases the share on drop.
 //! When the budget is exhausted, acquirers wait (back-pressure) rather than
 //! failing the underlying storage with ENOSPC.
 //!
@@ -22,13 +22,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// A weighted-semaphore-gated pool of temp spool bytes.
+/// A byte-budget-gated pool of temp spool bytes.
 #[derive(Clone)]
 pub struct SpoolDir {
     dir: PathBuf,
-    budget: Arc<Semaphore>,
+    budget: Arc<Budget>,
     max_bytes: u64,
 }
 
@@ -42,8 +41,8 @@ pub const CONTENDED: std::io::ErrorKind = std::io::ErrorKind::WouldBlock;
 /// guards — never read, held purely so their Drop frees the semaphore.
 #[allow(dead_code)]
 enum SharedOrOwned {
-    Owned(OwnedSemaphorePermit),
-    Shared(std::sync::Arc<OwnedSemaphorePermit>),
+    Owned(BudgetPermit),
+    Shared(std::sync::Arc<BudgetPermit>),
 }
 
 /// A reserved spool file. Holds its share of the budget until dropped.
@@ -91,12 +90,11 @@ impl SpoolDir {
 
     pub fn new(dir: PathBuf, max_bytes: u64) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;
-        // Semaphore permits are usize; we account in MiB to stay well under the
-        // permit cap (Semaphore::MAX_PERMITS) for terabyte-scale budgets.
+        // Accounted in MiB: small numbers for terabyte-scale budgets.
         let max_mib = mib_ceil(max_bytes).max(1);
         Ok(Self {
             dir,
-            budget: Arc::new(Semaphore::new(max_mib)),
+            budget: Budget::new(max_mib),
             max_bytes,
         })
     }
@@ -119,7 +117,7 @@ impl SpoolDir {
     /// Budget not reserved right now, in MiB.
     #[cfg(test)]
     pub(crate) fn free_mib(&self) -> usize {
-        self.budget.available_permits()
+        self.budget.free()
     }
 
     /// Delete STALE spool files orphaned by a hard crash before `NamedTempFile`'s
@@ -173,14 +171,9 @@ impl SpoolDir {
         &self,
         bytes: u64,
         held_mib: usize,
-    ) -> std::io::Result<OwnedSemaphorePermit> {
+    ) -> std::io::Result<BudgetPermit> {
         if held_mib == 0 {
-            return self
-                .budget
-                .clone()
-                .acquire_many_owned(self.want_mib(bytes, 0) as u32)
-                .await
-                .map_err(|_| std::io::Error::other("spool budget semaphore closed"));
+            return Ok(self.budget.acquire(self.want_mib(bytes, 0)).await);
         }
         self.try_permit(bytes, held_mib)
     }
@@ -193,17 +186,15 @@ impl SpoolDir {
 
     /// The no-wait half of [`Self::reserve_within`]: the space now, or
     /// [`CONTENDED`]. Sync, so a sync caller under a lock can use it.
-    fn try_permit(&self, bytes: u64, held_mib: usize) -> std::io::Result<OwnedSemaphorePermit> {
-        let want_mib = self.want_mib(bytes, held_mib);
-        let closed = || std::io::Error::other("spool budget semaphore closed");
-        match self.budget.clone().try_acquire_many_owned(want_mib as u32) {
-            Ok(permit) => Ok(permit),
-            Err(tokio::sync::TryAcquireError::Closed) => Err(closed()),
-            Err(tokio::sync::TryAcquireError::NoPermits) => Err(std::io::Error::new(
-                CONTENDED,
-                "spool budget contended: an op that holds a spool, or a storage write, does not wait for more",
-            )),
-        }
+    fn try_permit(&self, bytes: u64, held_mib: usize) -> std::io::Result<BudgetPermit> {
+        self.budget
+            .try_acquire(self.want_mib(bytes, held_mib))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    CONTENDED,
+                    "spool budget contended: an op that holds a spool, or a storage write, does not wait for more",
+                )
+            })
     }
 
     /// Reserve `bytes` of spool budget and create a temp file for it. Awaits if
@@ -300,7 +291,7 @@ impl SpoolDir {
         self.reservation(self.try_permit(bytes, 0)?).file()
     }
 
-    fn reservation(&self, permit: OwnedSemaphorePermit) -> SpoolReservation {
+    fn reservation(&self, permit: BudgetPermit) -> SpoolReservation {
         SpoolReservation {
             dir: self.dir.clone(),
             permit: Arc::new(permit),
@@ -313,7 +304,7 @@ impl SpoolDir {
 /// and every file made from it drop.
 pub struct SpoolReservation {
     dir: PathBuf,
-    permit: Arc<OwnedSemaphorePermit>,
+    permit: Arc<BudgetPermit>,
 }
 
 impl SpoolReservation {
@@ -394,10 +385,171 @@ impl Spool {
     }
 }
 
-/// Bytes → MiB, rounded up. Budget accounting unit (keeps semaphore permits small).
+/// Bytes → MiB, rounded up. Budget accounting unit.
 pub(crate) fn mib_ceil(bytes: u64) -> usize {
     const MIB: u64 = 1024 * 1024;
     bytes.div_ceil(MIB) as usize
+}
+
+/// The spool byte budget, in MiB. Not a tokio `Semaphore`: that one hands
+/// free permits to the head of its wait queue, so one large waiting GET made
+/// the whole free budget unavailable to every no-wait caller (buffered delta
+/// PUTs, relayed parts: all SlowDown).
+///
+/// Here a no-wait caller gets any budget that is free now, whatever the
+/// queue. A waiter (FIFO) never takes budget that is free when it queues;
+/// it collects only budget RELEASED while it waits, and completes once what
+/// it collected plus what is free covers its need. Every holder releases
+/// eventually, so a waiter is never starved forever.
+struct Budget {
+    max: usize,
+    state: parking_lot::Mutex<BudgetState>,
+}
+
+struct BudgetState {
+    /// Held by permits plus collected by waiters.
+    used: usize,
+    queue: std::collections::VecDeque<Arc<Waiter>>,
+}
+
+struct Waiter {
+    need: usize,
+    /// Released budget this waiter holds already (changed under the lock).
+    collected: std::sync::atomic::AtomicUsize,
+    granted: std::sync::atomic::AtomicBool,
+    wake: tokio::sync::Notify,
+}
+
+/// A held share of the budget; released on drop.
+pub(crate) struct BudgetPermit {
+    budget: Arc<Budget>,
+    n: usize,
+}
+
+impl BudgetPermit {
+    fn num_permits(&self) -> usize {
+        self.n
+    }
+}
+
+impl Drop for BudgetPermit {
+    fn drop(&mut self) {
+        self.budget.release(self.n);
+    }
+}
+
+impl Budget {
+    fn new(max: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max,
+            state: parking_lot::Mutex::new(BudgetState {
+                used: 0,
+                queue: Default::default(),
+            }),
+        })
+    }
+
+    #[cfg(test)]
+    fn free(&self) -> usize {
+        self.max - self.state.lock().used
+    }
+
+    fn permit(self: &Arc<Self>, n: usize) -> BudgetPermit {
+        BudgetPermit {
+            budget: self.clone(),
+            n,
+        }
+    }
+
+    /// `n` now, or `None`. Queued waiters do not count.
+    fn try_acquire(self: &Arc<Self>, n: usize) -> Option<BudgetPermit> {
+        let n = n.min(self.max);
+        let mut st = self.state.lock();
+        if self.max - st.used < n {
+            return None;
+        }
+        st.used += n;
+        Some(self.permit(n))
+    }
+
+    async fn acquire(self: &Arc<Self>, n: usize) -> BudgetPermit {
+        use std::sync::atomic::Ordering;
+        let n = n.min(self.max);
+        let waiter = {
+            let mut st = self.state.lock();
+            if n == 0 || (st.queue.is_empty() && self.max - st.used >= n) {
+                st.used += n;
+                return self.permit(n);
+            }
+            let w = Arc::new(Waiter {
+                need: n,
+                collected: 0.into(),
+                granted: false.into(),
+                wake: tokio::sync::Notify::new(),
+            });
+            st.queue.push_back(w.clone());
+            w
+        };
+        // Gives the waiter's share back if the future is dropped (timeout).
+        struct Cancel<'a>(&'a Budget, Option<Arc<Waiter>>);
+        impl Drop for Cancel<'_> {
+            fn drop(&mut self) {
+                if let Some(w) = self.1.take() {
+                    self.0.cancel(&w);
+                }
+            }
+        }
+        let mut cancel = Cancel(self, Some(waiter.clone()));
+        while !waiter.granted.load(Ordering::SeqCst) {
+            // `notify_one` stores a wake-up, so a grant between the check
+            // and this await is not lost.
+            waiter.wake.notified().await;
+        }
+        cancel.1 = None;
+        self.permit(n)
+    }
+
+    fn release(&self, n: usize) {
+        let mut st = self.state.lock();
+        st.used -= n;
+        self.hand_out(&mut st, n);
+    }
+
+    fn cancel(&self, w: &Arc<Waiter>) {
+        use std::sync::atomic::Ordering;
+        let mut st = self.state.lock();
+        let give_back = if w.granted.load(Ordering::SeqCst) {
+            w.need
+        } else {
+            st.queue.retain(|q| !Arc::ptr_eq(q, w));
+            w.collected.load(Ordering::SeqCst)
+        };
+        st.used -= give_back;
+        self.hand_out(&mut st, give_back);
+    }
+
+    /// Give `released` MiB to the queue head, then grant every head whose
+    /// collected share plus the free budget covers its need.
+    fn hand_out(&self, st: &mut BudgetState, mut released: usize) {
+        use std::sync::atomic::Ordering;
+        while let Some(head) = st.queue.front().cloned() {
+            let collected = head.collected.load(Ordering::SeqCst);
+            let take = released.min(head.need - collected);
+            released -= take;
+            st.used += take;
+            let collected = collected + take;
+            head.collected.store(collected, Ordering::SeqCst);
+            let rest = head.need - collected;
+            if self.max - st.used < rest {
+                break;
+            }
+            st.used += rest;
+            head.collected.store(head.need, Ordering::SeqCst);
+            head.granted.store(true, Ordering::SeqCst);
+            head.wake.notify_one();
+            st.queue.pop_front();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -689,7 +841,6 @@ mod review3_tests {
     /// 4 MiB free is refused: every buffered delta PUT and relayed part is
     /// a SlowDown while one large GET waits.
     #[tokio::test]
-    #[ignore = "review3: pending fix"]
     async fn review3_a_queued_waiter_starves_every_no_wait_request() {
         const MIB: u64 = 1024 * 1024;
         let tmp = tempfile::tempdir().unwrap();
@@ -702,5 +853,52 @@ mod review3_tests {
             pool.try_acquire(MIB).is_ok(),
             "4 MiB of 8 are not in use, but a no-wait 1 MiB request is refused"
         );
+    }
+
+    /// The other half of the rule: no-wait traffic that never leaves the
+    /// budget free does not starve a waiter. It collects what is released.
+    #[tokio::test]
+    async fn a_waiter_collects_released_budget_under_no_wait_traffic() {
+        const MIB: u64 = 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = SpoolDir::new(tmp.path().to_path_buf(), 8 * MIB).unwrap();
+        let mut held: Vec<Spool> = Vec::new();
+        for _ in 0..8 {
+            held.push(pool.try_acquire(MIB).unwrap());
+        }
+        let p2 = pool.clone();
+        let waiter = tokio::spawn(async move { p2.acquire(6 * MIB).await.map(|_| ()) });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Each release goes to the waiter; a no-wait caller that tries to
+        // take the slot right away finds none.
+        for _ in 0..6 {
+            held.pop();
+            assert!(pool.try_acquire(MIB).is_err(), "released budget went to the waiter");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("the waiter completes once 6 MiB are released")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pool.free_mib(), 6, "the waiter's spool dropped");
+    }
+
+    /// A waiter that gives up (acquire timeout) returns what it collected.
+    #[tokio::test]
+    async fn a_cancelled_waiter_returns_its_collected_share() {
+        const MIB: u64 = 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = SpoolDir::new(tmp.path().to_path_buf(), 8 * MIB).unwrap();
+        let a = pool.acquire(4 * MIB).await.unwrap();
+        let _b = pool.acquire(4 * MIB).await.unwrap();
+        let p2 = pool.clone();
+        let waiter = tokio::spawn(async move { p2.acquire(6 * MIB).await.map(|_| ()) });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(a);
+        assert_eq!(pool.free_mib(), 0, "4 MiB collected by the waiter");
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(pool.free_mib(), 4, "the cancelled waiter gave its share back");
+        assert!(pool.try_acquire(4 * MIB).is_ok());
     }
 }
