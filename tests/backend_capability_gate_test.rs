@@ -37,10 +37,26 @@ fn b2sim_yaml(local: &std::path::Path) -> String {
 /// return (exit_ok, combined_output). TestServer can't be used here — it
 /// panics when the child exits before ready.
 fn spawn_expect_exit(config: &str) -> (std::process::ExitStatus, String) {
+    spawn_expect_exit_with_db_key(config, Some(common::TEST_CONFIG_DB_KEY))
+}
+
+/// `spawn_expect_exit` with a chosen `DGP_CONFIG_DB_KEY`. Every config here
+/// sets a sync bucket, and a sync bucket without the key is its own fatal
+/// error (S8), which boot reports before the capability gate: the gate
+/// tests pass the key so that the gate is what they see.
+fn spawn_expect_exit_with_db_key(
+    config: &str,
+    db_key: Option<&str>,
+) -> (std::process::ExitStatus, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let config_path = dir.path().join("test.yaml");
     std::fs::write(&config_path, config).expect("write config");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"))
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
+    cmd.env_remove("DGP_CONFIG_DB_KEY");
+    if let Some(k) = db_key {
+        cmd.env("DGP_CONFIG_DB_KEY", k);
+    }
+    let out = cmd
         .env("DGP_CONFIG", &config_path)
         .env("RUST_LOG", "deltaglider_proxy=info")
         .env("DGP_TEST_FORCE_NONCAS_BACKEND", "b2sim")
@@ -87,6 +103,27 @@ fn test_noncas_backend_with_client_writable_bucket_fails_boot() {
         output.contains("replication targets only")
             && output.contains("deltaglider.com/docs/how-to/backend-capability-validation"),
         "FATAL line must state both fixes + the doc link, output:\n{output}"
+    );
+}
+
+/// S8: a sync bucket without DGP_CONFIG_DB_KEY fails boot with a FATAL line
+/// that names the variable (every instance must share the key).
+#[test]
+fn test_sync_bucket_without_config_db_key_fails_boot() {
+    let dir = tempfile::tempdir().expect("data dir");
+    let config = format!(
+        "listen_addr: \"127.0.0.1:0\"\n\
+         access_key_id: \"k\"\n\
+         secret_access_key: \"s\"\n\
+         config_sync_bucket: \"dgp-sync\"\n\
+         backend:\n  type: filesystem\n  path: \"{}\"\n",
+        dir.path().display(),
+    );
+    let (status, output) = spawn_expect_exit_with_db_key(&config, None);
+    assert!(!status.success(), "boot must FAIL, output:\n{output}");
+    assert!(
+        output.contains("FATAL") && output.contains("DGP_CONFIG_DB_KEY"),
+        "FATAL line must name DGP_CONFIG_DB_KEY, output:\n{output}"
     );
 }
 
