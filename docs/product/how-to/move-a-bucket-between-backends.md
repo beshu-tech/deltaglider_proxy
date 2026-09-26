@@ -53,7 +53,7 @@ curl -b cookies https://s3.acme.example/_/api/admin/jobs
 curl -b cookies https://s3.acme.example/_/api/admin/jobs/maintenance:7/failures
 ```
 
-If something looks wrong, cancel from the job row (or `POST /_/api/admin/jobs/maintenance:7/cancel`). A cancel before the routing flip unwinds cleanly, and the source is never deleted on a failed or cancelled run.
+If something looks wrong, cancel from the job row (or `POST /_/api/admin/jobs/maintenance:7/cancel`). The job checks for a cancel every 20 objects. A cancel before the routing flip unwinds cleanly: writes to the source bucket resume at once, the job deletes the copies that it wrote to the destination, and the source is never deleted on a failed or cancelled run.
 
 A proxy restart mid-job does not orphan the bucket: the job is re-queued on boot and resumes from its cursor ([details](../explanation/jobs-and-durability.md)).
 

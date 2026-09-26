@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — A migrate cancel stops within 20 objects and removes its copies
+
+A migrate job checked for a cancel only once per 1000-object page, so a
+cancel waited for the page to end, and the cancelled job left its copies on
+the destination. Now the job checks every 20 objects and saves its progress
+at the same points. A cancel or a failure before the routing flip releases
+the source bucket's write gate at once, then deletes the copies that this
+job wrote to the destination (found by the job id in their `dg-migration`
+metadata; other objects stay), then removes the staging route.
+
 ### Fixed — Moving a bucket back no longer brings deleted objects back
 
 A migrate job copied the source on top of whatever the destination bucket

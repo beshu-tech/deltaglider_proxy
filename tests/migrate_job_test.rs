@@ -728,3 +728,95 @@ async fn test_migrate_mirror_deletes_destination_extras() {
         "no audit entry: {audit}"
     );
 }
+
+/// Explore #9: a cancel used to wait for the end of a 1000-object page, so a
+/// bucket smaller than one page could not be cancelled at all, and the
+/// cancelled attempt left its copies on the destination. Now the job checks
+/// for a cancel every few objects, removes the copies it made (and only
+/// those), and releases the write gate.
+#[tokio::test]
+async fn test_migrate_cancel_mid_copy_removes_its_staged_copies() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migcanmid";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    seed(&http, &endpoint, bucket, 400).await;
+    // An object that was on the destination before the job: not ours.
+    let planted_dir = dir_b.path().join(bucket).join("deltaspaces");
+    std::fs::create_dir_all(&planted_dir).unwrap();
+    std::fs::write(planted_dir.join("zz-foreign.json"), b"not from this job").unwrap();
+
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate_body(
+        &admin,
+        &endpoint,
+        bucket,
+        serde_json::json!({ "target_backend": "dst", "target": "mirror" }),
+    )
+    .await;
+    assert_eq!(resp.status(), 202);
+    let job_id = resp.json::<serde_json::Value>().await.unwrap()["job_id"]
+        .as_i64()
+        .unwrap();
+
+    // Wait until the copy is under way (progress is persisted mid-page).
+    for _ in 0..1000 {
+        let job = newest_job(&admin, &endpoint).await;
+        let status = job["status"].as_str().unwrap_or_default();
+        if job["progress"]["processed"].as_i64().unwrap_or(0) >= 20
+            || matches!(status, "succeeded" | "failed" | "cancelled")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let cancel = admin
+        .post(format!(
+            "{endpoint}/_/api/admin/jobs/maintenance:{job_id}/cancel"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(cancel.status().is_success(), "cancel: {}", cancel.status());
+    wait_job_done(&admin, &endpoint, bucket).await;
+
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "cancelled", "job: {job}");
+    let processed = job["progress"]["processed"].as_i64().unwrap_or(0);
+    assert!(
+        (20..400).contains(&processed),
+        "the cancel must stop the copy mid-page, after it started: {job}"
+    );
+    assert_ne!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        Some("dst")
+    );
+    assert!(transient_keys(&admin, &endpoint).await.is_empty());
+    let left: Vec<String> = walkdir_files(&dir_b.path().join(bucket))
+        .into_iter()
+        .filter(|p| p.contains("obj-"))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "staged copies left on the destination: {left:?}"
+    );
+    assert!(
+        planted_dir.join("zz-foreign.json").exists(),
+        "the cleanup deleted an object this job did not write"
+    );
+    put_object(
+        &http,
+        &endpoint,
+        bucket,
+        "after.json",
+        b"ok".to_vec(),
+        "application/json",
+    )
+    .await;
+}

@@ -32,10 +32,13 @@
 //!    route. Delete failures are recorded but do not fail the migration
 //!    (the flip already happened).
 //!
-//! Cancellation: pre-flip → unwind the transient route and settle
-//! `cancelled` (source untouched, still authoritative). The flip itself
-//! is not interruptible (cancel is checked between pages/phases); during
-//! cleanup a cancel stops deleting and settles with a note.
+//! Cancellation: checked every [`CANCEL_CHECK_EVERY`] objects. Pre-flip →
+//! release the source gate, delete the staged copies THIS job made (by
+//! their job-stamped `dg-migration` value), unwind the transient route
+//! and settle `cancelled` (source untouched, still authoritative). A
+//! pre-flip failure unwinds the same way. The flip itself is not
+//! interruptible; during cleanup a cancel stops deleting and settles with
+//! a note.
 //!
 //! Multi-instance caveat (bigger blast radius than reencrypt, restated
 //! deliberately): the route flip mutates THIS instance's config file +
@@ -65,6 +68,9 @@ use super::worker::{
 
 pub const TRANSIENT_PREFIX: &str = "__dgmigrate_";
 const PAGE_SIZE: u32 = 1000;
+/// Pre-flip loops check for a cancel (and the copy persists its counters)
+/// every this many objects, not only once per 1000-object page.
+const CANCEL_CHECK_EVERY: usize = 20;
 
 /// What the migrate does with objects that already sit in the destination
 /// bucket.
@@ -342,7 +348,15 @@ async fn prune_destination_extras(
             )
             .await
             .map_err(|e| format!("mirror: list destination failed: {e}"))?;
-        for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
+        for (i, (key, _)) in page
+            .objects
+            .iter()
+            .filter(|(k, _)| !k.ends_with('/'))
+            .enumerate()
+        {
+            if i > 0 && i % CANCEL_CHECK_EVERY == 0 {
+                check_cancel(db, job.id).await?;
+            }
             match engine.head(bucket, key).await {
                 Ok(_) => continue,
                 Err(e) if e.is_not_found() => {}
@@ -387,6 +401,77 @@ async fn prune_destination_extras(
     Ok(())
 }
 
+/// Pre-flip unwind: delete the destination objects THIS job copied (their
+/// `dg-migration` value carries the job id), and nothing else — objects
+/// this job did not write stay. Best effort: a
+/// failure is recorded on the job and the unwind goes on.
+async fn remove_staged_copies(
+    mutator: &ConfigMutator,
+    db: &Arc<Mutex<ConfigDb>>,
+    state: &Arc<AppState>,
+    job: &MaintenanceJob,
+    params: &MigrateParams,
+) {
+    let fail = |e: String| async move {
+        tracing::warn!("migrate: job #{} staged-copy cleanup: {e}", job.id);
+        record_failure(db, job.id, "", &format!("staged-copy cleanup: {e}")).await;
+    };
+    // A config apply can wipe the staging route; without it the deletes
+    // would hit the default backend.
+    if let Err(e) = ensure_route(
+        mutator,
+        &params.transient_key,
+        &params.target_backend,
+        &job.bucket,
+        "Migration staging route re-asserted for cleanup",
+    )
+    .await
+    {
+        fail(format!("staging route unavailable: {e}")).await;
+        return;
+    }
+    let ours = provenance_value(params, job.id);
+    let mut pager = Pager::resuming(None);
+    let mut removed = 0u64;
+    while pager.begin_page().is_some() {
+        let engine = state.engine.load().clone();
+        let page = match engine
+            .list_objects(
+                &params.transient_key,
+                "",
+                None,
+                PAGE_SIZE,
+                pager.token(),
+                false,
+            )
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return fail(format!("list destination failed: {e}")).await,
+        };
+        // Tokens are key-based, so deleting listed keys never skips one.
+        for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
+            let Ok(meta) = engine.head(&params.transient_key, key).await else {
+                continue;
+            };
+            if meta.user_metadata.get("dg-migration") != Some(&ours) {
+                continue;
+            }
+            match engine.delete(&params.transient_key, key).await {
+                Ok(_) => removed += 1,
+                Err(e) => fail(format!("delete of staged copy '{key}' failed: {e}")).await,
+            }
+        }
+        if !pager.advance(page.is_truncated, page.next_continuation_token) {
+            break;
+        }
+    }
+    info!(
+        "migrate: job #{} removed {removed} staged copy(ies) from the destination",
+        job.id
+    );
+}
+
 /// Run one migrate job to completion (or error). The caller settles the
 /// job row and clears the gate; THIS function unwinds the transient
 /// route on any PRE-FLIP termination (cancel or failure).
@@ -415,7 +500,14 @@ pub async fn execute_migrate_phases(
                 .unwrap_or_else(|| job.phase.clone())
         };
         if unwinds_on_failure(&phase) {
-            // Source stays authoritative; remove the staging route.
+            // Source stays authoritative: clients may write to it again
+            // now, not after the staged-copy cleanup below.
+            state.maintenance_gate.clear(&job.bucket);
+            // Stage copies nothing, so there is nothing to remove.
+            if phase != "stage" {
+                remove_staged_copies(mutator, db, state, job, &params).await;
+            }
+            // Remove the staging route.
             remove_routes(
                 mutator,
                 std::slice::from_ref(&params.transient_key),
@@ -527,7 +619,29 @@ async fn run_phases(
                 }
                 Err(e) => return Err(format!("list source failed: {e}")),
             };
-            for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
+            for (i, (key, _)) in page
+                .objects
+                .iter()
+                .filter(|(k, _)| !k.ends_with('/'))
+                .enumerate()
+            {
+                if i > 0 && i % CANCEL_CHECK_EVERY == 0 {
+                    // Resume token = this page's: HEAD-skip makes the redo
+                    // of its first part idempotent.
+                    persist(
+                        db,
+                        job,
+                        "copy",
+                        None,
+                        done,
+                        skipped,
+                        failed,
+                        bytes,
+                        pager.token(),
+                    )
+                    .await;
+                    check_cancel(db, job.id).await?;
+                }
                 // Skip only a target copy that PROVABLY matches the source: a
                 // cancelled earlier attempt leaves copies that the source has
                 // since outgrown.
@@ -624,7 +738,15 @@ async fn run_phases(
                 }
                 Err(e) => return Err(format!("verify list failed: {e}")),
             };
-            for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
+            for (i, (key, _)) in page
+                .objects
+                .iter()
+                .filter(|(k, _)| !k.ends_with('/'))
+                .enumerate()
+            {
+                if i > 0 && i % CANCEL_CHECK_EVERY == 0 {
+                    check_cancel(db, job.id).await?;
+                }
                 match copy_verdict_for(&engine, bucket, &params.transient_key, key).await {
                     ContentVerdict::Missing => {
                         return Err(format!("verification failed: '{key}' missing on target"));
