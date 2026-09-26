@@ -134,7 +134,12 @@ pub async fn run_begun_rule(
 ) -> Result<LifecycleRunOutcome, String> {
     let lease_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let heartbeat = RunLeaseGuard {
-        heartbeat: spawn_lease_heartbeat(db.clone(), &rule.name, lease.clone(), lease_alive.clone()),
+        heartbeat: spawn_lease_heartbeat(
+            db.clone(),
+            &rule.name,
+            lease.clone(),
+            lease_alive.clone(),
+        ),
         release: db
             .clone()
             .zip(lease.as_ref())
@@ -1054,7 +1059,9 @@ fn spawn_lease_heartbeat(
                 HeartbeatStep::Renewed => last_ok = std::time::Instant::now(),
                 HeartbeatStep::Retry => {
                     if let Err(e) = &renewed {
-                        warn!("Lifecycle lease renew for rule '{rule_name}' failed ({e}); retrying");
+                        warn!(
+                            "Lifecycle lease renew for rule '{rule_name}' failed ({e}); retrying"
+                        );
                     }
                 }
                 HeartbeatStep::Lost => {
@@ -1180,7 +1187,10 @@ async fn renew_run_lease(
                 // Not a lost lease: the heartbeat retries it and marks the
                 // lease lost only when the TTL runs out.
                 Err(err) => {
-                    warn!("Lifecycle lease renew for rule '{}' failed ({err}); going on", rule.name);
+                    warn!(
+                        "Lifecycle lease renew for rule '{}' failed ({err}); going on",
+                        rule.name
+                    );
                     true
                 }
             }
@@ -1752,10 +1762,19 @@ mod heartbeat_db_error_tests {
         };
         let secs = std::time::Duration::from_secs;
         let err: Result<bool, &str> = Err("busy");
-        assert_eq!(heartbeat_step(&Ok::<_, ()>(true), secs(999), &lease), HeartbeatStep::Renewed);
-        assert_eq!(heartbeat_step(&Ok::<_, ()>(false), secs(0), &lease), HeartbeatStep::Lost);
+        assert_eq!(
+            heartbeat_step(&Ok::<_, ()>(true), secs(999), &lease),
+            HeartbeatStep::Renewed
+        );
+        assert_eq!(
+            heartbeat_step(&Ok::<_, ()>(false), secs(0), &lease),
+            HeartbeatStep::Lost
+        );
         assert_eq!(heartbeat_step(&err, secs(60), &lease), HeartbeatStep::Retry);
-        assert_eq!(heartbeat_step(&err, secs(239), &lease), HeartbeatStep::Retry);
+        assert_eq!(
+            heartbeat_step(&err, secs(239), &lease),
+            HeartbeatStep::Retry
+        );
         // The next retry would land at the expiry: lost now.
         assert_eq!(heartbeat_step(&err, secs(240), &lease), HeartbeatStep::Lost);
     }

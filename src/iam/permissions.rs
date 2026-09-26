@@ -1417,18 +1417,30 @@ mod tests {
             p("Allow", &["read", "list"], &["carve", "carve/*"]),
             p("Deny", &["read", "list"], &["carve/secret/*"]),
         ];
-        assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "carve", ""));
-        assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "carve", "secret/x/"));
-        assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "carve", "sec"));
+        assert!(!has_unrestricted_allow_for_bucket_prefix(
+            &perms, "carve", ""
+        ));
+        assert!(!has_unrestricted_allow_for_bucket_prefix(
+            &perms,
+            "carve",
+            "secret/x/"
+        ));
+        assert!(!has_unrestricted_allow_for_bucket_prefix(
+            &perms, "carve", "sec"
+        ));
         // The Deny cannot match a key under `pub/`.
-        assert!(has_unrestricted_allow_for_bucket_prefix(&perms, "carve", "pub/"));
+        assert!(has_unrestricted_allow_for_bucket_prefix(
+            &perms, "carve", "pub/"
+        ));
         // A Deny on another bucket, or on writes only, hides nothing here.
         let perms = vec![
             p("Allow", &["read", "list"], &["carve/*"]),
             p("Deny", &["read"], &["other/*"]),
             p("Deny", &["write", "delete"], &["carve/*"]),
         ];
-        assert!(has_unrestricted_allow_for_bucket_prefix(&perms, "carve", ""));
+        assert!(has_unrestricted_allow_for_bucket_prefix(
+            &perms, "carve", ""
+        ));
         let perms = vec![p("Allow", &["*"], &["*"]), p("Deny", &["*"], &["*"])];
         assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "b", ""));
     }
@@ -1449,7 +1461,12 @@ mod tests {
         };
         let ctx = Context::new();
         assert!(user_can_see_listed_key(&user, "carve", "pub/a.txt", &ctx));
-        assert!(!user_can_see_listed_key(&user, "carve", "secret/b.txt", &ctx));
+        assert!(!user_can_see_listed_key(
+            &user,
+            "carve",
+            "secret/b.txt",
+            &ctx
+        ));
     }
 
     /// Review3 #10: a write-only grant shows no key, so it neither makes a
@@ -1467,7 +1484,10 @@ mod tests {
             iam_policies: perms.iter().map(permission_to_iam_policy).collect(),
             permissions: perms,
         };
-        assert_eq!(visible_key_prefixes(&user, "b"), vec!["releases/".to_string()]);
+        assert_eq!(
+            visible_key_prefixes(&user, "b"),
+            vec!["releases/".to_string()]
+        );
     }
 
     #[test]

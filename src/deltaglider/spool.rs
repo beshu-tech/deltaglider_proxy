@@ -167,11 +167,7 @@ impl SpoolDir {
     /// the space now or a [`CONTENDED`] error, and goes on without it. Two
     /// holders that wait can each wait for the budget the other holds
     /// (hold-and-wait), until the acquire timeout.
-    async fn reserve_within(
-        &self,
-        bytes: u64,
-        held_mib: usize,
-    ) -> std::io::Result<BudgetPermit> {
+    async fn reserve_within(&self, bytes: u64, held_mib: usize) -> std::io::Result<BudgetPermit> {
         if held_mib == 0 {
             return Ok(self.budget.acquire(self.want_mib(bytes, 0)).await);
         }
@@ -878,7 +874,10 @@ mod review3_tests {
         // take the slot right away finds none.
         for _ in 0..6 {
             held.pop();
-            assert!(pool.try_acquire(MIB).is_err(), "released budget went to the waiter");
+            assert!(
+                pool.try_acquire(MIB).is_err(),
+                "released budget went to the waiter"
+            );
         }
         tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
             .await
@@ -903,7 +902,11 @@ mod review3_tests {
         assert_eq!(pool.free_mib(), 0, "4 MiB collected by the waiter");
         waiter.abort();
         let _ = waiter.await;
-        assert_eq!(pool.free_mib(), 4, "the cancelled waiter gave its share back");
+        assert_eq!(
+            pool.free_mib(),
+            4,
+            "the cancelled waiter gave its share back"
+        );
         assert!(pool.try_acquire(4 * MIB).is_ok());
     }
 }

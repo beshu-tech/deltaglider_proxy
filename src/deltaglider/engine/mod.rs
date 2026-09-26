@@ -4229,7 +4229,10 @@ mod reference_lock_hold_tests {
             .store("releases", "v1/b.zip", &b, None, HashMap::new())
             .await;
         assert!(
-            matches!(stored, Err(EngineError::Storage(StorageError::Throttled(_)))),
+            matches!(
+                stored,
+                Err(EngineError::Storage(StorageError::Throttled(_)))
+            ),
             "a delta against a replaced baseline must fail retryably, got {stored:?}"
         );
         assert!(

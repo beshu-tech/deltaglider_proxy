@@ -1209,7 +1209,14 @@ impl S3Backend {
         key: &str,
         body_md5_hex: &str,
     ) -> Result<String, StorageError> {
-        let head = self.client.head_object().bucket(bucket).key(key).send().await;
+        BACKEND_HEAD_REQUESTS.inc();
+        let head = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
         match head.ok().and_then(|h| h.e_tag().map(str::to_string)) {
             Some(etag) if etag_is_body_md5(&etag, body_md5_hex) => {
                 debug!("S3 PUT {bucket}/{key}: the refused retry met its own landed write");
@@ -2139,7 +2146,9 @@ impl S3Backend {
 
             if response.is_truncated.unwrap_or(false) {
                 continuation_token = response.next_continuation_token;
-                skip_to = page_last.as_deref().and_then(listing_facts::skip_past_facts);
+                skip_to = page_last
+                    .as_deref()
+                    .and_then(listing_facts::skip_past_facts);
             } else {
                 break;
             }
@@ -3172,7 +3181,9 @@ impl StorageBackend for S3Backend {
 
             if response.is_truncated.unwrap_or(false) {
                 upstream_token = response.next_continuation_token;
-                skip_to = page_last.as_deref().and_then(listing_facts::skip_past_facts);
+                skip_to = page_last
+                    .as_deref()
+                    .and_then(listing_facts::skip_past_facts);
             } else {
                 break;
             }
@@ -4853,7 +4864,10 @@ mod review3_tests {
             FencedWriteVerdict::Lost
         );
         assert_eq!(
-            fenced_write_verdict(&RefFence::Absent, "status=409 code=ConditionalRequestConflict"),
+            fenced_write_verdict(
+                &RefFence::Absent,
+                "status=409 code=ConditionalRequestConflict"
+            ),
             FencedWriteVerdict::Lost
         );
         assert_eq!(
@@ -4900,11 +4914,12 @@ mod lost_response_tests {
                         {
                             let mut objs = f.objects.lock();
                             let cur = objs.get(&path).cloned();
-                            let refused = match (headers.get("if-none-match"), headers.get("if-match")) {
-                                (Some(_), _) => cur.is_some(),
-                                (_, Some(m)) => cur.as_deref() != m.to_str().ok(),
-                                _ => false,
-                            };
+                            let refused =
+                                match (headers.get("if-none-match"), headers.get("if-match")) {
+                                    (Some(_), _) => cur.is_some(),
+                                    (_, Some(m)) => cur.as_deref() != m.to_str().ok(),
+                                    _ => false,
+                                };
                             if refused {
                                 return (
                                     StatusCode::PRECONDITION_FAILED,

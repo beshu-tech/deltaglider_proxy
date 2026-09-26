@@ -254,11 +254,7 @@ impl FactsCleanupQueue {
     }
 }
 
-async fn drain(
-    client: Client,
-    mut rx: mpsc::UnboundedReceiver<Queued>,
-    rewritten: Rewritten,
-) {
+async fn drain(client: Client, mut rx: mpsc::UnboundedReceiver<Queued>, rewritten: Rewritten) {
     while let Some(first) = rx.recv().await {
         let mut batch = vec![first];
         while batch.len() < MAX_BATCH {
@@ -290,7 +286,11 @@ async fn drain(
         let mut by_bucket: HashMap<String, HashMap<String, Option<i64>>> = HashMap::new();
         for (bucket, key, at) in batch {
             // The same key deleted twice: the later delete rules.
-            let slot = by_bucket.entry(bucket).or_default().entry(key).or_insert(at);
+            let slot = by_bucket
+                .entry(bucket)
+                .or_default()
+                .entry(key)
+                .or_insert(at);
             *slot = (*slot).max(at);
         }
         for (bucket, keys) in by_bucket {
