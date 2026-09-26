@@ -137,8 +137,8 @@ export default function ReencryptProposalModal({
         description={
           <span style={{ fontSize: 12 }}>
             Reads keep working; <strong>uploads and deletes get a temporary 503</strong> (S3
-            clients retry automatically). Rewritten objects get a new Last-Modified timestamp —
-            sync tools may re-download them.
+            clients retry automatically). Rewritten objects keep their Last-Modified time and
+            their content, so sync tools do not download them again.
           </span>
         }
       />

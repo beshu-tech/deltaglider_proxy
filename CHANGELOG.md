@@ -83,6 +83,8 @@ audited as `maintenance_migrate_mirror_delete`.
   files (assets, source maps) still get the plain 404.
 - An unknown settings page no longer marks Dashboard as the current page in
   the sidebar.
+- The re-encrypt proposal no longer says that rewritten objects get a new
+  Last-Modified. The job keeps each object's Last-Modified and ETag.
 
 ### Fixed — The Credentials page shows the bootstrap access key and removes it on request
 

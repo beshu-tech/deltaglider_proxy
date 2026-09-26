@@ -670,6 +670,15 @@ async fn test_rotation_without_legacy_in_body_keeps_old_objects_readable() {
         "object written under the old key must stay readable after rotation"
     );
 
+    let lm_etag = |h: reqwest::header::HeaderMap| {
+        let v = |n: &str| h.get(n).map(|v| v.to_str().unwrap().to_string());
+        (v("last-modified"), v("etag"))
+    };
+    let before = lm_etag(common::head_headers(&http, &endpoint, bucket, "old.json").await);
+    // Last-Modified has 1 s resolution: a rewrite in the same second would
+    // look unchanged even if it restamped the time.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
     start_reencrypt(&admin, &endpoint, bucket).await;
     wait_job_done(&admin, &endpoint, bucket).await;
     let job = newest_job(&admin, &endpoint).await;
@@ -677,6 +686,12 @@ async fn test_rotation_without_legacy_in_body_keeps_old_objects_readable() {
     assert_eq!(job["progress"]["failed"], 0, "rotation job: {job}");
     assert_eq!(job["progress"]["processed"], 1, "rotation job: {job}");
     assert_eq!(get_bytes(&http, &endpoint, bucket, "old.json").await, body);
+    // The re-encrypt proposal promises sync tools see no change.
+    assert_eq!(
+        lm_etag(common::head_headers(&http, &endpoint, bucket, "old.json").await),
+        before,
+        "re-encryption keeps Last-Modified and ETag"
+    );
 
     // A second rotation while the shim still holds the first key is refused:
     // the one legacy slot cannot hold two keys.
