@@ -1401,7 +1401,7 @@ async fn import_zip_full_backup(
                 oauth_client_secret_count = secrets.oauth_client_secrets.len(),
                 "Full-backup import: applying secrets.json"
             );
-            apply_secrets(&state, secrets, mode.restores_bootstrap())
+            apply_secrets(&state, secrets, mode.restores_bootstrap(), &headers)
                 .await
                 .map_err(|err| {
                     import_fail(err.status, "apply_secrets", "secrets.json", err.detail)
@@ -1505,6 +1505,7 @@ async fn apply_secrets(
     state: &Arc<AdminState>,
     secrets: &BackupSecrets,
     restore_bootstrap_hash: bool,
+    headers: &HeaderMap,
 ) -> Result<(), BackupSecretApplyError> {
     // Same lock discipline as apply_config_inner: hold the config write lock
     // across the whole read → transition → swap → persist, and swap only
@@ -1586,12 +1587,7 @@ async fn apply_secrets(
                 format!("config restored, but the admin password could not be written: {e}"),
             ));
         }
-        super::audit_log(
-            "restore_bootstrap_password",
-            "admin",
-            "bootstrap",
-            &axum::http::HeaderMap::new(),
-        );
+        super::audit_log("restore_bootstrap_password", "admin", "bootstrap", headers);
     }
 
     // OAuth client_secret per provider, by name (robust to id

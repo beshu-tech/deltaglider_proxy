@@ -174,6 +174,7 @@ pub async fn list_backends(State(state): State<Arc<AdminState>>) -> impl IntoRes
 pub async fn probe_backend(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<crate::coordination::health::HealthEntry>, (StatusCode, String)> {
     let target = {
         let cfg = state.config.read().await;
@@ -193,14 +194,7 @@ pub async fn probe_backend(
         .snapshot()
         .remove(&name)
         .expect("entry just set");
-    crate::audit::audit_log(
-        "backend_probe",
-        "admin",
-        &name,
-        &axum::http::HeaderMap::new(),
-        "",
-        "",
-    );
+    audit_log("backend_probe", "admin", &name, &headers);
     Ok(Json(entry))
 }
 

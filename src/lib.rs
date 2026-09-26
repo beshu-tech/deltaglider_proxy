@@ -262,6 +262,94 @@ mod source_guards {
         out
     }
 
+    /// A request handler audits with the request's headers, so the entry
+    /// names the client (user agent, forwarded IP). An empty header map
+    /// dropped both (`backend_probe`, DeleteObjects/CopySource denials,
+    /// the backup restore). Background tasks have no request and are out of
+    /// scope (they live outside src/api and the adapter).
+    #[test]
+    fn request_audits_carry_the_request_headers() {
+        const ALLOWED: [(&str, &str); 1] = [(
+            "src/api/admin/config/mod.rs",
+            "declarative reconcile entries from apply_config_transition, which takes no headers",
+        )];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![root.join("src/s3_adapter_s3s.rs")];
+        rust_files(&root.join("src/api"), &mut files);
+        let empty = ["HeaderMap", "::new()"].concat();
+        let mut offenders = Vec::new();
+        let mut allowed_hits = std::collections::BTreeSet::new();
+        for file in files {
+            let rel = file
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&file).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            let tests_from = test_module_lines(&text).first().map(|(n, _)| *n);
+            for (i, line) in lines.iter().enumerate() {
+                if tests_from.is_some_and(|t| i + 1 >= t) {
+                    break;
+                }
+                let Some(at) = line.find("audit_log(") else {
+                    continue;
+                };
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                // The call's arguments, until its parentheses balance.
+                let mut depth = 0i64;
+                let mut args = String::new();
+                'scan: for (k, l) in lines[i..].iter().enumerate() {
+                    for c in l[if k == 0 { at } else { 0 }..].chars() {
+                        args.push(c);
+                        match c {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break 'scan;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // An empty map inline, or a local bound to one just above.
+                let bound_empty = lines[i.saturating_sub(10)..i].iter().find_map(|l| {
+                    let l = l.trim();
+                    let rest = l.strip_prefix("let ")?;
+                    let (name, value) = rest.split_once('=')?;
+                    value
+                        .contains(empty.as_str())
+                        .then(|| name.trim().to_string())
+                });
+                let uses_empty = args.contains(empty.as_str())
+                    || bound_empty.is_some_and(|n| args.contains(&format!("&{n}")));
+                if !uses_empty {
+                    continue;
+                }
+                if ALLOWED.iter().any(|(f, _)| *f == rel) {
+                    allowed_hits.insert(rel.clone());
+                } else {
+                    offenders.push(format!("{rel}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "pass the request's headers to audit_log, not an empty map:\n{}",
+            offenders.join("\n")
+        );
+        for (f, why) in ALLOWED {
+            assert!(
+                allowed_hits.contains(f),
+                "{f} ({why}) no longer audits with an empty map: drop it from ALLOWED"
+            );
+        }
+    }
+
     /// Admin handlers map a config-DB error to its status through
     /// `api::admin::db_error_status` (missing row 404, UNIQUE violation 409,
     /// the rest 500), never through a hand-picked code: `delete_user`

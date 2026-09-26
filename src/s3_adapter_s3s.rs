@@ -733,6 +733,7 @@ impl s3s::S3 for DeltaGliderS3Service {
         &self,
         req: s3s::S3Request<s3s::dto::DeleteObjectsInput>,
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::DeleteObjectsOutput>> {
+        let headers = req.headers.clone();
         let input = req.input;
         crate::api::handlers::object_helpers::check_client_write_allowed(
             &self.state,
@@ -768,7 +769,7 @@ impl s3s::S3 for DeltaGliderS3Service {
                         "access_denied",
                         &user.name,
                         "DeleteObjects",
-                        &axum::http::HeaderMap::new(),
+                        &headers,
                         &input.bucket,
                         &key,
                     );
@@ -977,7 +978,13 @@ impl s3s::S3 for DeltaGliderS3Service {
             .extensions
             .get::<crate::api::auth::RequestClientIp>()
             .map(|c| c.0);
-        check_copy_source_access_s3s(auth_user.as_ref(), &source_bucket, &source_key, client_ip)?;
+        check_copy_source_access_s3s(
+            auth_user.as_ref(),
+            &source_bucket,
+            &source_key,
+            client_ip,
+            &req.headers,
+        )?;
         // Gate on the DESTINATION bucket first — copy-into is a client write,
         // refused regardless of backend reachability (403-before-404).
         crate::api::handlers::object_helpers::check_client_write_allowed(
@@ -1384,7 +1391,13 @@ impl s3s::S3 for DeltaGliderS3Service {
             .extensions
             .get::<crate::api::auth::RequestClientIp>()
             .map(|c| c.0);
-        check_copy_source_access_s3s(auth_user.as_ref(), &source_bucket, &source_key, client_ip)?;
+        check_copy_source_access_s3s(
+            auth_user.as_ref(),
+            &source_bucket,
+            &source_key,
+            client_ip,
+            &req.headers,
+        )?;
         // Gate on the DESTINATION bucket — part-copy feeds a client write
         // (403-before-404, no backend I/O for a doomed request).
         crate::api::handlers::object_helpers::check_client_write_allowed(
@@ -1953,6 +1966,7 @@ fn check_copy_source_access_s3s(
     source_bucket: &str,
     source_key: &str,
     client_ip: Option<std::net::IpAddr>,
+    headers: &axum::http::HeaderMap,
 ) -> s3s::S3Result<()> {
     let Some(user) = auth_user else {
         return Ok(());
@@ -1965,7 +1979,7 @@ fn check_copy_source_access_s3s(
         "access_denied",
         &user.name,
         "CopySourceRead",
-        &axum::http::HeaderMap::new(),
+        headers,
         source_bucket,
         source_key,
     );
@@ -2813,7 +2827,8 @@ mod tests {
                 Some(&user),
                 "src",
                 "k",
-                Some("10.1.2.3".parse().unwrap())
+                Some("10.1.2.3".parse().unwrap()),
+                &axum::http::HeaderMap::new()
             )
             .is_err(),
             "IP-scoped Deny on the source must be enforced"
@@ -2824,7 +2839,8 @@ mod tests {
                 Some(&user),
                 "src",
                 "k",
-                Some("192.168.1.1".parse().unwrap())
+                Some("192.168.1.1".parse().unwrap()),
+                &axum::http::HeaderMap::new()
             )
             .is_ok(),
             "an IP outside the Deny CIDR must be allowed"
