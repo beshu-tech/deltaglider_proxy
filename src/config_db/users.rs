@@ -310,8 +310,11 @@ mod unique_name_tests {
         db.create_user("dana", "AKLOCAL", "s", true, &[]).unwrap();
         let first = db.create_external_user("dana", "AKEXT1", "s").unwrap();
         let second = db.create_external_user("dana", "AKEXT2", "s").unwrap();
-        assert_eq!(first.name, "dana-2");
-        assert_eq!(second.name, "dana-3");
+        assert_eq!(first.name, "dana-akext1");
+        assert_eq!(second.name, "dana-akext2");
+        // Same key prefix: the counter still makes the name unique.
+        let third = db.create_external_user("dana", "AKEXT1ZZ", "s").unwrap();
+        assert_eq!(third.name, "dana-akext1-2");
         // An admin create or rename to a taken name is refused by the index.
         assert!(db.create_user("dana", "AKOTHER", "s", true, &[]).is_err());
         assert!(db.update_user(first.id, Some("dana"), None, None).is_err());

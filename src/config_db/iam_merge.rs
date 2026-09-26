@@ -509,15 +509,123 @@ fn merge_table(
 
 type Merged = BTreeMap<&'static str, BTreeMap<String, (Entity, Side)>>;
 
+/// The result of [`merge_snapshots`].
+pub(crate) struct MergeOutcome {
+    pub(crate) merged: Merged,
+    pub(crate) conflicts: Vec<MergeConflict>,
+    /// Local and remote after the renames the merge applied to them: their
+    /// keys match `merged`, so ids are planned from these.
+    pub(crate) local: Snapshot,
+    pub(crate) remote: Snapshot,
+}
+
+/// Rename the parent row `old` to `new` inside ONE snapshot, together with
+/// every foreign key in that snapshot that names it. Child rows keyed by the
+/// parent name (group members, identities) are re-keyed.
+fn rename_parent(snap: &mut Snapshot, parent: Parent, old: &str, new: &str) {
+    if let Some(t) = snap.get_mut(parent.table()) {
+        if let Some(mut e) = t.remove(old) {
+            e.row.insert("name".into(), Value::Text(new.into()));
+            t.insert(new.into(), e);
+        }
+    }
+    for spec in SPECS
+        .iter()
+        .filter(|s| s.fks.iter().any(|(_, p)| *p == parent))
+    {
+        let Some(t) = snap.get_mut(spec.table) else {
+            continue;
+        };
+        for (_, mut e) in std::mem::take(t) {
+            for (col, p) in spec.fks {
+                if *p != parent {
+                    continue;
+                }
+                if let Some(v) = e.row.get_mut(*col) {
+                    if matches!(v, Value::Text(n) if n == old) {
+                        *v = Value::Text(new.into());
+                    }
+                }
+            }
+            t.insert(logical_key(spec, &e.row), e);
+        }
+    }
+}
+
+/// Pure: the name a user takes when another user holds its name:
+/// `<name>-<first 6 chars of its access key, lowercased>`, then `-2`, `-3`,
+/// ... past names in use. Every node derives the same name from the same key.
+pub(crate) fn access_key_suffixed_name(
+    name: &str,
+    access_key_id: &str,
+    taken: impl Fn(&str) -> bool,
+) -> String {
+    let tag: String = access_key_id
+        .chars()
+        .take(6)
+        .collect::<String>()
+        .to_lowercase();
+    super::users::first_free_user_name(&format!("{name}-{tag}"), taken)
+}
+
+/// Two different users with one name: both sides created a user `name` that
+/// the base does not have, with different access keys (for example two IdP
+/// people with one display name whose first logins land on two nodes). They
+/// are two users. The one whose access key sorts later is renamed with
+/// [`access_key_suffixed_name`] on its side, children included, so every
+/// node picks the same name. Without a base file, an equal `created_at`
+/// means one user whose key changed (a rotation), not two users.
+fn split_same_name_users(
+    base: &Snapshot,
+    has_base: bool,
+    local: &mut Snapshot,
+    remote: &mut Snapshot,
+    conflicts: &mut Vec<MergeConflict>,
+) {
+    let users = |s: &Snapshot| s.get("users").cloned().unwrap_or_default();
+    let (b, l, r) = (users(base), users(local), users(remote));
+    let mut taken: HashSet<String> = b.keys().chain(l.keys()).chain(r.keys()).cloned().collect();
+    for (name, le) in &l {
+        let Some(re) = r.get(name) else { continue };
+        if b.contains_key(name) {
+            continue;
+        }
+        let (lak, rak) = (
+            text(le.row.get("access_key_id")),
+            text(re.row.get("access_key_id")),
+        );
+        let same_row = !has_base && le.row.get("created_at") == re.row.get("created_at");
+        if lak == rak || same_row {
+            continue;
+        }
+        let (side, ak) = if lak > rak {
+            (&mut *local, lak)
+        } else {
+            (&mut *remote, rak)
+        };
+        let new = access_key_suffixed_name(name, &ak, |c| taken.contains(c));
+        taken.insert(new.clone());
+        rename_parent(side, Parent::Users, name, &new);
+        conflicts.push(MergeConflict {
+            table: "users",
+            target: format!("{name} -> {new}"),
+            resolution: "renamed",
+        });
+    }
+}
+
 /// Pure three-way merge of every IAM table. `base = None` → local is the base.
 pub(crate) fn merge_snapshots(
     base: Option<&Snapshot>,
     local: &Snapshot,
     remote: &Snapshot,
-) -> (Merged, Vec<MergeConflict>) {
+) -> MergeOutcome {
     let empty = BTreeMap::new();
-    let base = base.unwrap_or(local);
+    let has_base = base.is_some();
+    let base = base.unwrap_or(local).clone();
+    let (mut local, mut remote) = (local.clone(), remote.clone());
     let mut conflicts = Vec::new();
+    split_same_name_users(&base, has_base, &mut local, &mut remote, &mut conflicts);
     let mut merged = Merged::new();
     for spec in SPECS {
         let get = |s: &'static str, snap: &Snapshot| -> BTreeMap<String, Entity> {
@@ -525,9 +633,9 @@ pub(crate) fn merge_snapshots(
         };
         let t = merge_table(
             spec,
-            &get(spec.table, base),
-            &get(spec.table, local),
-            &get(spec.table, remote),
+            &get(spec.table, &base),
+            &get(spec.table, &local),
+            &get(spec.table, &remote),
             &mut conflicts,
         );
         merged.insert(spec.table, t);
@@ -583,7 +691,12 @@ pub(crate) fn merge_snapshots(
             });
         }
     }
-    (merged, conflicts)
+    MergeOutcome {
+        merged,
+        conflicts,
+        local,
+        remote,
+    }
 }
 
 /// Pure: the id each merged row gets. Remote id when the remote has the row;
@@ -728,6 +841,38 @@ fn write_merged(
     Ok(ids)
 }
 
+/// Pure: the local user ids that no longer name the same user. A user is
+/// followed through the renames the merge applied (`prepared`, same ids as
+/// `local`); its id is stale when the user is gone, moved to another id, or
+/// the row at its name is another user (a different `created_at`).
+fn stale_user_ids(
+    local: &Snapshot,
+    prepared: &Snapshot,
+    merged: &Merged,
+    new_ids: Option<&HashMap<String, i64>>,
+) -> Vec<i64> {
+    let by_id: HashMap<i64, &String> = prepared
+        .get("users")
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, e)| e.id.map(|i| (i, k)))
+        .collect();
+    let mut out = Vec::new();
+    for (name, e) in local.get("users").into_iter().flatten() {
+        let Some(old) = e.id else { continue };
+        let key = by_id.get(&old).copied().unwrap_or(name);
+        let now = new_ids.and_then(|m| m.get(key)).copied();
+        let same_person = merged
+            .get("users")
+            .and_then(|t| t.get(key))
+            .is_some_and(|(m, _)| m.row.get("created_at") == e.row.get("created_at"));
+        if now != Some(old) || !same_person {
+            out.push(old);
+        }
+    }
+    out
+}
+
 /// True when writing `merged` with `plan` would leave `local` as it is
 /// (content, ids and mtimes).
 fn unchanged(merged: &Merged, plan: &IdPlan, local: &Snapshot) -> bool {
@@ -770,23 +915,19 @@ impl ConfigDb {
             self.conn.execute_batch("BEGIN IMMEDIATE;")?;
             let tx = (|| -> Result<MergeReport, ConfigDbError> {
                 let local = read_snapshot(&self.conn, "main")?;
-                let (merged, conflicts) = merge_snapshots(base.as_ref(), &local, &remote);
+                let out = merge_snapshots(base.as_ref(), &local, &remote);
                 let mut report = MergeReport {
-                    conflicts,
+                    conflicts: out.conflicts,
                     base_used: base.is_some(),
                     ..Default::default()
                 };
-                let plan = plan_ids(&merged, &local, &remote);
+                let merged = out.merged;
+                let plan = plan_ids(&merged, &out.local, &out.remote);
                 if !unchanged(&merged, &plan, &local) {
                     let ids = write_merged(&self.conn, &merged, &plan)?;
                     report.changed = true;
-                    let new_users = ids.get(&Parent::Users);
-                    for (name, e) in local.get("users").into_iter().flatten() {
-                        let now = new_users.and_then(|m| m.get(name)).copied();
-                        if let Some(old) = e.id.filter(|old| now != Some(*old)) {
-                            report.stale_user_ids.push(old);
-                        }
-                    }
+                    report.stale_user_ids =
+                        stale_user_ids(&local, &out.local, &merged, ids.get(&Parent::Users));
                 }
                 self.conn.execute(
                     "INSERT INTO main.session_revocations (identity, revoked_since)
@@ -1360,8 +1501,9 @@ mod tests {
         let b = read_snapshot(&base.conn, "main").unwrap();
         let l = read_snapshot(&local.conn, "main").unwrap();
         let r = read_snapshot(&remote.conn, "main").unwrap();
-        let (m1, c1) = merge_snapshots(Some(&b), &l, &r);
-        let (m2, c2) = merge_snapshots(Some(&b), &r, &l);
+        let o1 = merge_snapshots(Some(&b), &l, &r);
+        let o2 = merge_snapshots(Some(&b), &r, &l);
+        let (m1, c1, m2, c2) = (o1.merged, o1.conflicts, o2.merged, o2.conflicts);
         let keys = |m: &Merged| m["users"].keys().cloned().collect::<Vec<_>>();
         assert_eq!(keys(&m1), vec!["u3"]);
         assert_eq!(keys(&m1), keys(&m2));
@@ -1462,7 +1604,6 @@ mod review3_tests {
     /// name, keeps one row, and binds BOTH identities to it: two people now
     /// share one access key, one secret and one `${iam:username}` home.
     #[test]
-    #[ignore = "review3: pending fix"]
     fn review3_two_idp_people_with_one_display_name_stay_two_users() {
         let t = trio(seed_okta);
         let local = open(&t.local);
@@ -1493,6 +1634,30 @@ mod review3_tests {
                 "two IdP subjects are bound to one IAM user after the merge"
             );
         }
+        // The later access key takes the suffixed name, on every node.
+        assert_eq!(names(&local), vec!["Alex", "Alex-akalex"]);
+        let iy = local.find_external_identity(p, "sub-y").unwrap().unwrap();
+        assert_eq!(user_id(&local, "Alex-akalex"), iy.user_id);
+    }
+
+    /// The split is symmetric: the node on the other side picks the same names.
+    #[test]
+    fn a_same_name_split_picks_one_name_on_both_nodes() {
+        let t = trio(|_| {});
+        let (base, local, remote) = (open(&t.base), open(&t.local), open(&t.remote));
+        local
+            .create_external_user("Alex", "AKAAAAAA1", "s")
+            .unwrap();
+        remote
+            .create_external_user("Alex", "AKBBBBBB1", "s")
+            .unwrap();
+        let b = read_snapshot(&base.conn, "main").unwrap();
+        let l = read_snapshot(&local.conn, "main").unwrap();
+        let r = read_snapshot(&remote.conn, "main").unwrap();
+        let keys = |o: MergeOutcome| o.merged["users"].keys().cloned().collect::<Vec<_>>();
+        let a = keys(merge_snapshots(Some(&b), &l, &r));
+        assert_eq!(a, vec!["Alex", "Alex-akbbbb"]);
+        assert_eq!(a, keys(merge_snapshots(Some(&b), &r, &l)));
     }
 
     /// A key rotation (the old key leaked) on node A and a later permission

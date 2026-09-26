@@ -614,12 +614,18 @@ impl ConfigDb {
         let tx = self.conn.unchecked_transaction()?;
         // The IdP controls `name` (many let the user edit it), and user names
         // are unique: a name in use gets a suffix instead of another user's
-        // `${iam:username}` prefix.
+        // `${iam:username}` prefix. The suffix comes from the new access key,
+        // not a counter, so two nodes that provision one name at the same
+        // time pick different names (a counter gives both `name-2`).
         let taken: std::collections::HashSet<String> = tx
             .prepare("SELECT name FROM users")?
             .query_map([], |r| r.get(0))?
             .collect::<Result<_, _>>()?;
-        let name = super::users::first_free_user_name(name, |c| taken.contains(c));
+        let name = if taken.contains(name) {
+            super::iam_merge::access_key_suffixed_name(name, access_key_id, |c| taken.contains(c))
+        } else {
+            name.to_string()
+        };
         tx.execute(
             "INSERT INTO users (name, access_key_id, secret_access_key, enabled, auth_source) \
              VALUES (?1, ?2, ?3, 1, 'external')",
