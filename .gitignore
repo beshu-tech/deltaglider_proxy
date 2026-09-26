@@ -100,3 +100,6 @@ deltaglider-demo-90s-music.mp4
 
 # Local smoke-test scratch artifacts (screenshots, transcripts)
 .smoke-shots/
+
+# llvm-cov profiles (scripts/coverage.sh)
+*.profraw
