@@ -83,13 +83,14 @@ jobs:
 
   # ── Moved off the PR critical path (were `continue-on-error` on ci.yml,
   #    i.e. non-gating). A failure here now fails the nightly (and opens the
-  #    `nightly-failure` issue, see `report`). Coverage re-runs the whole --lib suite under
-  #    instrumentation; supply-chain drift is a daily concern, not per-commit.
+  #    `nightly-failure` issue, see `report`). Coverage re-runs the lib AND
+  #    integration suites under instrumentation; supply-chain drift is a
+  #    daily concern, not per-commit.
   #    Tools (cargo-llvm-cov, cargo-deny) are baked into the builder image. ──
   coverage:
-    name: Unit Coverage (nightly)
+    name: Coverage, lib + integration (nightly)
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 120
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       options: --ulimit nofile=1048576:1048576
@@ -101,32 +102,60 @@ jobs:
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
       - name: Build demo UI (rust-embed)
         run: cd demo/s3-browser/ui && npm ci && npm run build
-      - name: Run lib tests under llvm-cov
+      - name: Clean stale config DB artifacts
+        run: |
+          rm -f deltaglider_config.db deltaglider_config.db.bak .deltaglider_bootstrap_hash
+          rm -f /tmp/deltaglider_config.db /tmp/deltaglider_config.db.bak /tmp/.deltaglider_bootstrap_hash
+      # Same MinIO as the test job: the S3 backend paths count too.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio-coverage --network container:$(hostname) \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            pgsty/silo@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46 server /data
+          for i in $(seq 1 30); do
+            mc alias set local http://localhost:9000 minioadmin minioadmin 2>/dev/null && break
+            sleep 1
+          done
+          mc mb --ignore-existing local/deltaglider-test
+          mc mb --ignore-existing local/deltaglider-data
+          echo "MINIO_ENDPOINT=http://localhost:9000" >> $GITHUB_ENV
+      # Lib tests, then every integration test, under one instrumented
+      # build: `show-env` makes the proxy children the harness spawns write
+      # profiles too (scripts/coverage.sh).
+      - name: Lib + integration tests under llvm-cov
         env:
           RUST_BACKTRACE: "1"
-        run: scripts/ci-memwatch.sh cargo llvm-cov --locked --lib --no-report
-      - name: Emit summary table (top 20 worst-covered files)
-        run: |
-          cargo llvm-cov report --summary-only > /tmp/cov-summary.txt
-          echo "## Unit-test coverage summary" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cat /tmp/cov-summary.txt >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          echo "### Worst-covered files (line %)" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          cargo llvm-cov report \
-            | awk 'NR>2 && $1 !~ /^TOTAL/ && $1 !~ /^-/ {gsub(/%/, "", $10); printf "%6s  %s\n", $10, $1}' \
-            | sort -n | head -20 >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-      - name: Upload lcov artifact
+          COV_OUT: /tmp/coverage
+        run: scripts/ci-memwatch.sh scripts/coverage.sh
+      - name: Coverage summary (lib only vs lib + integration)
         if: always()
-        run: cargo llvm-cov report --lcov --output-path /tmp/lcov.info || true
+        run: |
+          {
+            echo "## Coverage: lib only vs lib + integration"
+            cat /tmp/coverage/compare.md
+            echo
+            echo "<details><summary>Full lib + integration table</summary>"
+            echo
+            echo '```'
+            cat /tmp/coverage/summary-combined.txt
+            echo '```'
+            echo "</details>"
+          } >> $GITHUB_STEP_SUMMARY
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: lcov-coverage
-          path: /tmp/lcov.info
+          path: |
+            /tmp/coverage/lcov.info
+            /tmp/coverage/lcov-lib.info
+            /tmp/coverage/summary-lib.txt
+            /tmp/coverage/summary-combined.txt
+            /tmp/coverage/compare.md
           if-no-files-found: ignore
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio-coverage 2>/dev/null || true
 
   # ── tokio_unstable type-check + smoke (#87): the runtime-metrics sampler
   #    (src/metrics.rs, cfg-gated) and the poll-time-histogram builder opt-in

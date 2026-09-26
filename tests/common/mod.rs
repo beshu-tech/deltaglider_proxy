@@ -501,8 +501,7 @@ impl TestServer {
     /// config changes. Falls through the same readiness probe as the
     /// initial spawn.
     pub async fn respawn_without_encryption_key(&mut self) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
+        stop_child(&mut self.process);
         // Poll until the kernel has actually released the listening
         // socket before we spawn the new child. A hard 200 ms sleep
         // was racy on slow hosts (EADDRINUSE) and over-long on fast
@@ -887,8 +886,30 @@ impl TestServerBuilder {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        let _ = self.process.kill();
+        stop_child(&mut self.process);
     }
+}
+
+/// Stop a proxy child. Normally SIGKILL (fast). Under coverage
+/// (`LLVM_PROFILE_FILE` set, e.g. `cargo llvm-cov`) a killed child writes
+/// no profile, so it gets SIGTERM, which the proxy handles with a graceful
+/// shutdown and a normal exit, and SIGKILL only after 10 s.
+fn stop_child(child: &mut Child) {
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        // SAFETY: plain kill(2) on our own child's pid.
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(_)) = child.try_wait() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Create a reqwest client that is logged in to the admin API.
@@ -1681,13 +1702,11 @@ impl TestServer {
     /// Stop the proxy process (the data dir and config stay). A test edits
     /// on-disk state here, then calls `respawn_with_env`.
     pub fn kill(&mut self) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
+        stop_child(&mut self.process);
     }
 
     pub async fn respawn_with_env(&mut self, extra: &[(&str, &str)]) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
+        stop_child(&mut self.process);
         // Poll until the kernel releases the listening socket (mirrors
         // `respawn_without_encryption_key`); bounded to ~2s.
         let addr = format!("127.0.0.1:{}", self.port);
