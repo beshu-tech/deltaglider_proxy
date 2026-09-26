@@ -136,6 +136,8 @@ mod public_prefix_list_test;
 mod public_prefix_test;
 #[path = "quota_test.rs"]
 mod quota_test;
+#[path = "race_conditions_test.rs"]
+mod race_conditions_test;
 #[path = "reference_lock_race_test.rs"]
 mod reference_lock_race_test;
 #[path = "replication_target_only_test.rs"]
