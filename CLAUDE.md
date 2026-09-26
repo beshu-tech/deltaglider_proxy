@@ -20,7 +20,7 @@ npm run dev                    # dev server on :5173, proxies /api to :9001
 
 # Tests
 # Merge gate (see `.github/workflows/ci.yml`): `cargo test --lib`, curated
-# integration batches, delta/memory, frontend lint/tsc/knip, Node
+# integration batches, delta/memory, frontend lint/tsc/knip,
 # vitest unit + component tests, E2E smoke — not a single `cargo test --all`.
 cargo test --lib --locked
 ./scripts/check-integration-tests-in-ci.sh   # every tests/*.rs appears in ci.yml
