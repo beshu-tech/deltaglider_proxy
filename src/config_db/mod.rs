@@ -26,7 +26,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-const SCHEMA_VERSION: i32 = 28;
+pub(crate) const SCHEMA_VERSION: i32 = 28;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -1164,11 +1164,18 @@ impl ConfigDb {
 /// opens it. A busy or unreadable file is `Err`, not
 /// `false`, so it is never taken for a wrong key.
 pub fn probe_key(path: &Path, key: &str) -> Result<bool, ConfigDbError> {
+    Ok(probe_schema_version(path, key)?.is_some())
+}
+
+/// The schema version of the DB file at `path` when `key` opens it, `None`
+/// when it does not. Read-only, like [`probe_key`]: it reads the version a
+/// peer wrote BEFORE any migration touches the file.
+pub fn probe_schema_version(path: &Path, key: &str) -> Result<Option<i32>, ConfigDbError> {
     use rusqlite::OpenFlags;
     // SQLite reads a zero-byte file as a fresh DB under ANY key, so without
     // this every candidate would "open" an empty backup.
     if std::fs::metadata(path).map_err(ConfigDbError::Io)?.len() == 0 {
-        return Ok(false);
+        return Ok(None);
     }
     let conn = crate::sqlite_open::open_with_flags(
         path,
@@ -1179,8 +1186,12 @@ pub fn probe_key(path: &Path, key: &str) -> Result<bool, ConfigDbError> {
     match conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
         r.get::<_, i32>(0)
     }) {
-        Ok(_) => Ok(true),
-        Err(e) if is_not_a_database(&e) => Ok(false),
+        Ok(_) => Ok(Some(conn.pragma_query_value(
+            None,
+            "user_version",
+            |r| r.get(0),
+        )?)),
+        Err(e) if is_not_a_database(&e) => Ok(None),
         Err(e) => Err(ConfigDbError::Sqlite(e)),
     }
 }

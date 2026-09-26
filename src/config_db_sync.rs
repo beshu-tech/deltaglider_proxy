@@ -41,6 +41,24 @@ pub struct DownloadedDb {
     /// merge: the synced object is still under the old key, so it must be
     /// uploaded again (under the primary key) after the merge.
     pub migrated: bool,
+    /// The schema version the peer wrote, read BEFORE the copy was migrated
+    /// for the merge.
+    pub peer_schema: Option<i32>,
+}
+
+/// The schema version of a downloaded copy as the peer wrote it, read with
+/// the keys a synced copy may open with, before any migration. `None` when
+/// none of them opens it.
+pub(crate) fn peer_schema_version(
+    path: &std::path::Path,
+    keys: &crate::config_db::ConfigDbKeys,
+) -> Result<Option<i32>, crate::config_db::ConfigDbError> {
+    for k in std::iter::once(&keys.primary).chain(keys.fallbacks.iter().map(|(_, k)| k)) {
+        if let Some(v) = crate::config_db::probe_schema_version(path, k.expose())? {
+            return Ok(Some(v));
+        }
+    }
+    Ok(None)
 }
 
 /// Why an upload failed: a CAS conflict (peer wrote concurrently — reconcile
@@ -345,6 +363,35 @@ impl ConfigDbSync {
         // the bootstrap hash with DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC) is
         // re-encrypted with our key here, so the merge attaches it with the
         // primary key.
+        // Read the peer's schema version BEFORE the open below migrates the
+        // copy: after that, every copy reads as the current version.
+        let peer_schema = match peer_schema_version(&tmp_path, &self.db_keys) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                warn!("Config DB downloaded from S3 cannot be read — NOT merging it: {e}");
+                return Ok(None);
+            }
+        };
+        match peer_schema {
+            Some(v) if v > crate::config_db::SCHEMA_VERSION => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                warn!(
+                    "Config DB downloaded from S3 has schema v{v}, newer than this binary's \
+                     v{} (rolling upgrade in progress?) — NOT merging it",
+                    crate::config_db::SCHEMA_VERSION
+                );
+                return Ok(None);
+            }
+            Some(v) if v < crate::config_db::SCHEMA_VERSION => warn!(
+                "Config DB downloaded from S3 has schema v{v}, older than this binary's v{} \
+                 (a peer on an older release): a copy is migrated for the merge. Its rows \
+                 without a sync_mtime have an unknown age, so a conflict with them goes to \
+                 the bucket's copy",
+                crate::config_db::SCHEMA_VERSION
+            ),
+            _ => {}
+        }
         let migrated = match ConfigDb::open_with_keys(&tmp_path, &self.db_keys) {
             Ok((_, opened)) => {
                 debug!("Downloaded config DB passed key validation");
@@ -398,6 +445,7 @@ impl ConfigDbSync {
             temp_path: tmp_path,
             etag: remote_etag,
             migrated,
+            peer_schema,
         }))
     }
 
@@ -1166,6 +1214,30 @@ mod tests {
             allow_local: true,
             session_token: None,
         }
+    }
+
+    /// D16: the schema version of a peer copy is read before the download
+    /// check migrates it; after the migration it always reads as current, so
+    /// a check made then can never see an older peer.
+    #[test]
+    fn an_older_peer_copy_is_detected_before_its_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("peer.db");
+        let key = "k".repeat(40);
+        {
+            let db = ConfigDb::open_or_create(&copy, &key).unwrap();
+            db.conn.pragma_update(None, "user_version", 25).unwrap();
+        }
+        let keys = crate::config_db::ConfigDbKeys::primary_only(&key);
+        assert_eq!(peer_schema_version(&copy, &keys).unwrap(), Some(25));
+        drop(ConfigDb::open_with_keys(&copy, &keys).unwrap());
+        assert_eq!(
+            peer_schema_version(&copy, &keys).unwrap(),
+            Some(crate::config_db::SCHEMA_VERSION),
+            "the migration hides the peer's version"
+        );
+        let other = crate::config_db::ConfigDbKeys::primary_only(&"x".repeat(40));
+        assert_eq!(peer_schema_version(&copy, &other).unwrap(), None);
     }
 
     /// Every migration of the live DB queues the upload that moves the synced

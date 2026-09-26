@@ -1146,10 +1146,14 @@ impl ConfigDb {
             let remote_version: i32 =
                 self.conn
                     .query_row("PRAGMA remote.user_version", [], |r| r.get(0))?;
+            // The sync reads the peer's version first and migrates a copy of
+            // an older one (`config_db_sync::peer_schema_version`); a copy at
+            // another version here was not migrated, and its snapshot would
+            // miss columns (e.g. `rule_uid`, the mapping-rule key).
             if remote_version != SCHEMA_VERSION {
                 return Err(ConfigDbError::Other(format!(
                     "peer config DB schema v{remote_version} != local v{SCHEMA_VERSION}; \
-                     skipping IAM merge until the rolling upgrade completes"
+                     migrate a copy before the merge (a newer one is never merged)"
                 )));
             }
             let remote = read_snapshot(&self.conn, "remote")?;
