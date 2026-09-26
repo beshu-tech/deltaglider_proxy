@@ -134,7 +134,7 @@ impl BucketUsage {
     /// power cut is a few lost counter deltas that a Refresh reconciles — which
     /// is exactly what the existing drift-reconciliation path exists to fix.
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open(path)?;
+        let conn = crate::sqlite_open::open(path)?;
         // Best-effort: a backend that refuses WAL (rare, e.g. some network FS)
         // still works correctly, just slower — never fail startup over a pragma.
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
@@ -150,7 +150,7 @@ impl BucketUsage {
     /// In-memory instance for tests.
     #[cfg(test)]
     pub fn in_memory() -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open_in_memory()?;
+        let conn = crate::sqlite_open::open_in_memory()?;
         let db = Self {
             conn: Mutex::new(conn),
             pending: DashMap::new(),

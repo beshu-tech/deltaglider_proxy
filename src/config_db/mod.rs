@@ -143,7 +143,7 @@ impl ConfigDb {
             ));
         }
 
-        let conn = Connection::open(local_path)?;
+        let conn = crate::sqlite_open::open(local_path)?;
 
         // Set the encryption key (PRAGMA key must be the first statement)
         conn.pragma_update(None, "key", passphrase)?;
@@ -228,7 +228,7 @@ impl ConfigDb {
 
     /// Create an in-memory DB for testing.
     pub fn in_memory(passphrase: &str) -> Result<Self, ConfigDbError> {
-        let conn = Connection::open_in_memory()?;
+        let conn = crate::sqlite_open::open_in_memory()?;
         conn.pragma_update(None, "key", passphrase)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Self::migrate(&conn)?;
@@ -1081,7 +1081,7 @@ impl ConfigDb {
 
     /// Re-open the DB from the local file (after downloading a new version from S3).
     pub fn reopen(&mut self, passphrase: &str) -> Result<(), ConfigDbError> {
-        let conn = Connection::open(&self.local_path)?;
+        let conn = crate::sqlite_open::open(&self.local_path)?;
         conn.pragma_update(None, "key", passphrase)?;
         // Verify key works
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
@@ -1693,7 +1693,7 @@ mod tests {
             matches!(err, ConfigDbError::SchemaTooNew { .. }),
             "expected SchemaTooNew, got: {err}"
         );
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::sqlite_open::open(&path).unwrap();
         conn.pragma_update(None, "key", "pw").unwrap();
         let v: i32 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
@@ -1705,7 +1705,7 @@ mod tests {
     /// older DB, or a crash after some DDL ran but before the stamp).
     fn db_stamped_at(path: &Path, version: i32) -> Connection {
         drop(ConfigDb::open_or_create(path, "pw").unwrap());
-        let conn = Connection::open(path).unwrap();
+        let conn = crate::sqlite_open::open(path).unwrap();
         conn.pragma_update(None, "key", "pw").unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
         conn
@@ -1740,7 +1740,7 @@ mod tests {
             .unwrap();
         }
         assert!(ConfigDb::open_or_create(&path, "pw").is_err());
-        let conn = Connection::open(&path).unwrap();
+        let conn = crate::sqlite_open::open(&path).unwrap();
         conn.pragma_update(None, "key", "pw").unwrap();
         assert!(
             !has_column(&conn, "replication_parity", "progress_total"),
@@ -1775,7 +1775,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("busy.db");
         drop(ConfigDb::open_or_create(&path, "pw").unwrap());
-        let holder = Connection::open(&path).unwrap();
+        let holder = crate::sqlite_open::open(&path).unwrap();
         holder.pragma_update(None, "key", "pw").unwrap();
         holder.execute_batch("BEGIN EXCLUSIVE;").unwrap();
         let err = ConfigDb::open_or_create(&path, "pw")

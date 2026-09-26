@@ -307,7 +307,7 @@ mod tests {
 
     /// Minimal table carrying the lease columns + a failure ring table.
     fn conn() -> Connection {
-        let c = Connection::open_in_memory().unwrap();
+        let c = crate::sqlite_open::open_in_memory().unwrap();
         c.execute_batch(
             "CREATE TABLE jobs (
                 name TEXT PRIMARY KEY,
