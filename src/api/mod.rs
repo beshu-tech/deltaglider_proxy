@@ -10,6 +10,9 @@ pub mod handlers;
 pub mod request_target;
 pub mod s3s_hooks;
 
+#[cfg(test)]
+mod s3s_contract_tests;
+
 pub use errors::S3Error;
 
 /// Marker type: when present as an Extension, the S3 API rejects all requests.
