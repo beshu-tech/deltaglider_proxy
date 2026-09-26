@@ -833,7 +833,6 @@ async fn review3_the_facts_namespace_is_not_listed() {
 /// logical) gets a facts object on PUT, but the raw `delete_passthrough`
 /// queues no cleanup: the entry stays forever.
 #[tokio::test]
-#[ignore = "review3: pending fix"]
 async fn review3_a_deleted_multipart_passthrough_leaves_no_facts() {
     skip_unless_minio!();
     let bucket = review3_bucket("mpufacts").await;

@@ -753,17 +753,6 @@ pub trait StorageBackend: Send + Sync {
             .collect()
     }
 
-    /// Drop the listing facts of a deleted passthrough object (see
-    /// [`crate::storage::listing_facts`]). Best effort: a leftover entry
-    /// never matches a later object. Default: nothing to drop.
-    async fn forget_passthrough_listing_facts(
-        &self,
-        _bucket: &str,
-        _prefix: &str,
-        _filename: &str,
-    ) {
-    }
-
     /// Enrich listed objects with full metadata from HEAD calls.
     /// Used by the `metadata=true` MinIO ListObjectsV2 extension.
     ///
@@ -1233,16 +1222,6 @@ macro_rules! impl_storage_backend_for_box {
             ) -> Vec<ListedSize> {
                 (**self)
                     .resolve_listed_sizes(bucket, objects, passthrough_may_differ)
-                    .await
-            }
-            async fn forget_passthrough_listing_facts(
-                &self,
-                bucket: &str,
-                prefix: &str,
-                filename: &str,
-            ) {
-                (**self)
-                    .forget_passthrough_listing_facts(bucket, prefix, filename)
                     .await
             }
             async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {

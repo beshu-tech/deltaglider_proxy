@@ -1257,16 +1257,6 @@ impl StorageBackend for RoutingBackend {
             .await
     }
 
-    async fn forget_passthrough_listing_facts(&self, bucket: &str, prefix: &str, filename: &str) {
-        route_existing!(
-            self,
-            bucket,
-            forget_passthrough_listing_facts,
-            prefix,
-            filename
-        )
-    }
-
     async fn list_objects_delegated(
         &self,
         bucket: &str,

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed — The listing-facts cleanup no longer removes a peer's new entry, and misses no deleted object
+
+On an S3 backend, deleting a delta or encrypted object queues the removal of
+its listing-facts entries. When another instance wrote the same key again
+before the queue ran, the removal deleted the new entry too, so a LIST
+reported the stored size of the new object until a HEAD restored the entry.
+Now the removal deletes only the entries that the S3 server stored before
+the delete (by the `Date` of the delete response). The delete of a plain
+object also removes its entries now: an object from a multipart upload that
+the proxy assembled has one, and it stayed forever. When `DeleteBucket`
+removes the facts of an otherwise empty bucket, it now uses one batch
+request per 1000 entries instead of one request per entry.
+
 ### Fixed — The replay cache costs nothing when it is off, and less under load
 
 With `DGP_REPLAY_WINDOW_SECS=0` the replay check is off, but the proxy still

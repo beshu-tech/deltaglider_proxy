@@ -1991,15 +1991,8 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         self.inner.delete_delta(b, p, f).await
     }
     async fn delete_passthrough(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
-        self.inner.delete_passthrough(b, p, f).await?;
-        // A ciphertext object has listing facts (its logical size and ETag).
-        if self.has_any_key() {
-            self.inner.forget_passthrough_listing_facts(b, p, f).await;
-        }
-        Ok(())
-    }
-    async fn forget_passthrough_listing_facts(&self, b: &str, p: &str, f: &str) {
-        self.inner.forget_passthrough_listing_facts(b, p, f).await
+        // The inner backend drops the listing facts of the ciphertext.
+        self.inner.delete_passthrough(b, p, f).await
     }
     async fn scan_deltaspace(&self, b: &str, p: &str) -> Result<Vec<FileMetadata>, StorageError> {
         self.inner.scan_deltaspace(b, p).await

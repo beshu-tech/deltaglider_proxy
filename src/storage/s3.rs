@@ -1577,16 +1577,30 @@ impl S3Backend {
     }
 
     async fn delete_s3_object(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
+        self.delete_s3_object_dated(bucket, key).await.map(|_| ())
+    }
+
+    /// DELETE, and return the server time of the delete (the response's
+    /// `Date`, when it has one): the facts cleanup keeps entries written
+    /// after it.
+    async fn delete_s3_object_dated(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<i64>, StorageError> {
+        let date = crate::coordination::server_clock::ServerDate::default();
         self.client
             .delete_object()
             .bucket(bucket)
             .key(key)
+            .customize()
+            .interceptor(date.clone())
             .send()
             .await
             .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::DeleteObject))?;
 
         debug!("S3 DELETE {}/{}", bucket, key);
-        Ok(())
+        Ok(date.get())
     }
 
     // (object_exists removed: it mapped every HEAD error to `false`, which is
@@ -1729,10 +1743,14 @@ impl S3Backend {
                 .send()
                 .await
                 .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))?;
-            for key in resp.contents().iter().filter_map(|o| o.key()) {
-                LISTING_FACTS_REQUESTS.with_label_values(&["delete"]).inc();
-                self.delete_s3_object(bucket, key).await?;
-            }
+            // One DeleteObjects per page, not a DELETE per facts object. A
+            // key left behind makes DeleteBucket fail, as it must.
+            let keys: Vec<String> = resp
+                .contents()
+                .iter()
+                .filter_map(|o| o.key().map(str::to_string))
+                .collect();
+            super::facts_cleanup::delete_facts_keys(&self.client, bucket, keys).await;
             match resp.next_continuation_token() {
                 Some(t) if resp.is_truncated().unwrap_or(false) => token = Some(t.to_string()),
                 _ => return Ok(()),
@@ -2470,8 +2488,8 @@ impl StorageBackend for S3Backend {
         filename: &str,
     ) -> Result<(), StorageError> {
         let key = self.delta_key(prefix, filename);
-        self.delete_s3_object(bucket, &key).await?;
-        self.facts_cleanup.enqueue(bucket, &key);
+        let at = self.delete_s3_object_dated(bucket, &key).await?;
+        self.facts_cleanup.enqueue(bucket, &key, at);
         debug!("Deleted delta for {}/{}/{}", bucket, prefix, filename);
         Ok(())
     }
@@ -2550,7 +2568,11 @@ impl StorageBackend for S3Backend {
         filename: &str,
     ) -> Result<(), StorageError> {
         let key = self.passthrough_key(prefix, filename);
-        self.delete_s3_object(bucket, &key).await?;
+        let at = self.delete_s3_object_dated(bucket, &key).await?;
+        // A plain passthrough has facts too when its stored ETag is not the
+        // logical one (a proxy-assembled multipart upload), and a ciphertext
+        // always: queue the cleanup for every passthrough delete.
+        self.facts_cleanup.enqueue(bucket, &key, at);
         debug!("Deleted passthrough for {}/{}/{}", bucket, prefix, filename);
         Ok(())
     }
@@ -3061,11 +3083,6 @@ impl StorageBackend for S3Backend {
             }
         }
         sizes
-    }
-
-    async fn forget_passthrough_listing_facts(&self, bucket: &str, prefix: &str, filename: &str) {
-        self.facts_cleanup
-            .enqueue(bucket, &self.passthrough_key(prefix, filename));
     }
 
     /// Optimised listing that delegates delimiter collapsing to upstream S3.

@@ -107,12 +107,20 @@ pub(super) async fn cleanup_after_write(
 }
 
 /// The entries to delete for one deleted stored key. A key that was written
-/// again after its delete was queued keeps its newest entry.
-fn doomed(entries: &[Listed], rewritten: bool) -> Vec<String> {
+/// again after its delete was queued keeps its newest entry. With the
+/// server time of the delete (`deleted_at`, the `Date` of its response),
+/// only entries the server stored BEFORE that second go: an entry of a
+/// peer's write after the delete (another node, so no local rewrite mark)
+/// stays. An entry of the same second stays too; it is garbage at worst.
+fn doomed(entries: &[Listed], rewritten: bool, deleted_at: Option<i64>) -> Vec<String> {
     let newest = entries.iter().filter_map(|(_, t)| *t).max();
     entries
         .iter()
         .filter(|(_, t)| !(rewritten && t.is_some() && *t == newest))
+        .filter(|(_, t)| match (deleted_at, t) {
+            (Some(at), Some((secs, _))) => *secs < at,
+            _ => true,
+        })
         .map(|(k, _)| k.clone())
         .collect()
 }
@@ -121,9 +129,10 @@ fn doomed(entries: &[Listed], rewritten: bool) -> Vec<String> {
 async fn flush_bucket(
     client: &Client,
     bucket: &str,
-    stored_keys: Vec<String>,
+    deleted: HashMap<String, Option<i64>>,
     rewritten: &HashSet<String>,
 ) {
+    let stored_keys: Vec<String> = deleted.keys().cloned().collect();
     let mut by_key: HashMap<String, Vec<Listed>> = HashMap::new();
     let mut per_key: Vec<String> = Vec::new();
     for read in listing_facts::plan_cleanup(stored_keys) {
@@ -183,7 +192,8 @@ async fn flush_bucket(
     }
     let mut delete = Vec::new();
     for (k, entries) in by_key {
-        delete.extend(doomed(&entries, rewritten.contains(&k)));
+        let at = deleted.get(&k).copied().flatten();
+        delete.extend(doomed(&entries, rewritten.contains(&k), at));
     }
     if !delete.is_empty() {
         delete_facts_keys(client, bucket, delete).await;
@@ -200,9 +210,12 @@ struct QueueState {
 
 type Rewritten = Arc<Mutex<QueueState>>;
 
+/// `(bucket, stored key, server time of the delete)`.
+type Queued = (String, String, Option<i64>);
+
 /// Queue of deleted stored keys whose facts the background task removes.
 pub(super) struct FactsCleanupQueue {
-    tx: mpsc::UnboundedSender<(String, String)>,
+    tx: mpsc::UnboundedSender<Queued>,
     rewritten: Rewritten,
 }
 
@@ -216,14 +229,15 @@ impl FactsCleanupQueue {
         Self { tx, rewritten }
     }
 
-    /// The object `stored_key` is gone: drop its facts soon.
-    pub(super) fn enqueue(&self, bucket: &str, stored_key: &str) {
+    /// The object `stored_key` is gone (deleted at `deleted_at` on the
+    /// server clock, when known): drop its facts soon.
+    pub(super) fn enqueue(&self, bucket: &str, stored_key: &str, deleted_at: Option<i64>) {
         let pair = (bucket.to_string(), stored_key.to_string());
         if let Ok(mut st) = self.rewritten.lock() {
             st.rewritten.remove(&pair);
             st.pending.insert(pair.clone());
         }
-        if self.tx.send(pair).is_err() {
+        if self.tx.send((pair.0, pair.1, deleted_at)).is_err() {
             debug!("facts cleanup queue closed; {bucket}/{stored_key} keeps its entries");
         }
     }
@@ -242,7 +256,7 @@ impl FactsCleanupQueue {
 
 async fn drain(
     client: Client,
-    mut rx: mpsc::UnboundedReceiver<(String, String)>,
+    mut rx: mpsc::UnboundedReceiver<Queued>,
     rewritten: Rewritten,
 ) {
     while let Some(first) = rx.recv().await {
@@ -259,23 +273,25 @@ async fn drain(
                 }
             }
         }
-        let mut by_bucket: HashMap<String, Vec<String>> = HashMap::new();
         // A write after this point is not seen by the flush: its new entry
         // can be deleted, which only makes a LIST report the stored size
         // until a HEAD backfills it.
         let rewritten_now: HashSet<(String, String)> = match rewritten.lock() {
             Ok(mut st) => batch
                 .iter()
+                .map(|(b, k, _)| (b.clone(), k.clone()))
                 .filter(|p| {
-                    st.pending.remove(*p);
-                    st.rewritten.remove(*p)
+                    st.pending.remove(p);
+                    st.rewritten.remove(p)
                 })
-                .cloned()
                 .collect(),
             Err(_) => HashSet::new(),
         };
-        for (bucket, key) in batch {
-            by_bucket.entry(bucket).or_default().push(key);
+        let mut by_bucket: HashMap<String, HashMap<String, Option<i64>>> = HashMap::new();
+        for (bucket, key, at) in batch {
+            // The same key deleted twice: the later delete rules.
+            let slot = by_bucket.entry(bucket).or_default().entry(key).or_insert(at);
+            *slot = (*slot).max(at);
         }
         for (bucket, keys) in by_bucket {
             let rw: HashSet<String> = rewritten_now
@@ -296,7 +312,18 @@ mod tests {
     fn a_rewritten_key_keeps_its_newest_entry() {
         let e = |k: &str, t: i64| (k.to_string(), Some((t, 0)));
         let entries = vec![e("a", 1), e("b", 3), e("c", 2)];
-        assert_eq!(doomed(&entries, false), vec!["a", "b", "c"]);
-        assert_eq!(doomed(&entries, true), vec!["a", "c"]);
+        assert_eq!(doomed(&entries, false, None), vec!["a", "b", "c"]);
+        assert_eq!(doomed(&entries, true, None), vec!["a", "c"]);
+    }
+
+    /// C3: node A deletes a key and queues its cleanup; node B writes the
+    /// key again before A's flush. B's entry is newer than the delete (on
+    /// the server clock), so A must keep it. A saw no local rewrite and
+    /// deleted every entry: B's object then lists with its stored size.
+    #[test]
+    fn a_peer_write_after_the_delete_keeps_its_entry() {
+        let e = |k: &str, t: i64| (k.to_string(), Some((t, 0)));
+        let entries = vec![e("old", 1), e("peer-new", 5)];
+        assert_eq!(doomed(&entries, false, Some(3)), vec!["old"]);
     }
 }
