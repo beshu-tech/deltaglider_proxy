@@ -324,6 +324,7 @@ async fn test_s3_verbs_refuse_a_deltaglider_proxy_endpoint() {
             .env("AWS_ACCESS_KEY_ID", "CLIPROXYK")
             .env("AWS_SECRET_ACCESS_KEY", "CLIPROXYS")
             .env("AWS_REGION", "us-east-1")
+            .current_dir(std::env::temp_dir())
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
