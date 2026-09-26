@@ -16,10 +16,12 @@
 //!
 //! This module moves the orchestration into the proxy where the
 //! engine is already running. Endpoints live under `/_/api/admin/objects/*`
-//! behind **`require_admin_gui_session`** (not browser-lift). They call
-//! `engine.retrieve` / `store` / `delete` directly — there is **no**
-//! per-object IAM evaluation inside these handlers; the admin-GUI
-//! session is the authorization boundary.
+//! behind **`require_bulk_session`**. They call `engine.retrieve` / `store`
+//! / `delete` directly. For an admin GUI session the session is the
+//! authorization boundary. For a non-admin browser session (S3BrowserLift)
+//! every key is authorized with the user's IAM policy before it is touched
+//! — the same `can_with_context` check, with `aws:SourceIp`, that the S3
+//! API runs — and a denied key is reported per key ([`BulkActor`]).
 //!
 //! Future iterations can stream zip output and add server-side
 //! progress reporting; for v1 we match the existing client semantics
@@ -35,8 +37,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use super::auth::AdminGuiGate;
+use super::auth::BulkSession;
 use super::path_guard::{AdminBucket, AdminObjectPath};
+use crate::iam::{AuthenticatedUser, S3Action};
 
 // ---------------------------------------------------------------------------
 // Request/response shapes
@@ -228,6 +231,106 @@ fn validate_plan(
 // ---------------------------------------------------------------------------
 // POST /_/api/admin/objects/copy
 // ---------------------------------------------------------------------------
+// Per-key authorization
+// ---------------------------------------------------------------------------
+
+/// Who a bulk request acts as.
+enum BulkActor {
+    /// Admin GUI or open mode: no per-key check.
+    Unrestricted,
+    /// A browser session's IAM user and the request's policy context.
+    User {
+        user: Box<AuthenticatedUser>,
+        context: Box<iam_rs::Context>,
+    },
+}
+
+impl BulkActor {
+    /// The actor for a session. An IAM user that is gone or disabled
+    /// since the session began gets 403.
+    fn for_session(
+        state: &crate::api::admin::AdminState,
+        session: &BulkSession,
+    ) -> Result<Self, (StatusCode, String)> {
+        let (access_key_id, client_ip) = match session {
+            BulkSession::AdminGui | BulkSession::Open => return Ok(Self::Unrestricted),
+            BulkSession::IamUser {
+                access_key_id,
+                client_ip,
+            } => (access_key_id, *client_ip),
+        };
+        let iam = state.iam_state.load();
+        let user = match iam.as_ref() {
+            crate::iam::IamState::Iam(index) => index.get(access_key_id),
+            _ => None,
+        }
+        .filter(|u| u.enabled)
+        .ok_or((
+            StatusCode::FORBIDDEN,
+            "AccessDenied: user disabled or gone".to_string(),
+        ))?;
+        let mut context = iam_rs::Context::new();
+        crate::iam::permissions::insert_source_ip(&mut context, client_ip);
+        Ok(Self::User {
+            user: Box::new(AuthenticatedUser::from(user)),
+            context: Box::new(context),
+        })
+    }
+
+    /// Ok when the actor may do `action` on `bucket/key`; else the per-key
+    /// error text.
+    fn check(&self, action: S3Action, bucket: &str, key: &str) -> Result<(), String> {
+        match self {
+            Self::Unrestricted => Ok(()),
+            Self::User { user, context } => {
+                if user.can_with_context(action, bucket, key, context) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "AccessDenied: {} may not {} {bucket}/{key}",
+                        user.name,
+                        action.as_str()
+                    ))
+                }
+            }
+        }
+    }
+
+    /// May the actor list `bucket` under `prefix` (`s3:prefix` = prefix)?
+    fn may_list(&self, bucket: &str, prefix: &str) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            Self::User { user, context } => {
+                let mut ctx = (**context).clone();
+                ctx.insert(
+                    "s3:prefix".to_string(),
+                    iam_rs::ContextValue::String(prefix.to_string()),
+                );
+                user.can_with_context(S3Action::List, bucket, prefix, &ctx)
+                    || (!user.is_explicitly_denied(S3Action::List, bucket, prefix, &ctx)
+                        && user.can_see_bucket(bucket))
+            }
+        }
+    }
+
+    /// May the actor see `key` in a listing (the S3 LIST filter)?
+    fn may_see(&self, bucket: &str, key: &str) -> bool {
+        match self {
+            Self::Unrestricted => true,
+            Self::User { user, context } => {
+                crate::iam::permissions::user_can_see_listed_key(user, bucket, key, context)
+            }
+        }
+    }
+
+    /// The audit actor.
+    fn label(&self) -> &str {
+        match self {
+            Self::Unrestricted => "admin",
+            Self::User { user, .. } => &user.name,
+        }
+    }
+}
 
 /// 409 when the bucket is under maintenance (re-encryption rewrites the
 /// bucket in place; admin writes bypass the S3 gate, so check explicitly).
@@ -255,7 +358,7 @@ fn reject_if_replication_target_only(
 }
 
 pub async fn copy_objects(
-    Extension(_gate): Extension<AdminGuiGate>,
+    Extension(session): Extension<BulkSession>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     headers: axum::http::HeaderMap,
     AdminJson(req): AdminJson<CopyRequest>,
@@ -283,15 +386,16 @@ pub async fn copy_objects(
         &req.dest_prefix,
     )?;
 
+    let actor = BulkActor::for_session(&state, &session)?;
     let s3 = state.s3_state.clone();
-    let (res, _) = run_copy_loop(&s3, &req).await;
+    let (res, _) = run_copy_loop(&s3, &req, &actor, false).await;
     info!(
         "bulk copy: src={} dst={}/{} succeeded={} failed={}",
         req.source_bucket, req.dest_bucket, req.dest_prefix, res.succeeded, res.failed
     );
     super::audit_log(
         "bulk_copy",
-        "admin",
+        actor.label(),
         &format!(
             "{} -> {}/{} ok={} failed={}",
             req.source_bucket, req.dest_bucket, req.dest_prefix, res.succeeded, res.failed
@@ -303,9 +407,12 @@ pub async fn copy_objects(
 
 /// Also returns, per item, the source object as it was copied (`None`: not
 /// copied), so a move deletes a source only while it is still that object.
+/// `delete_source`: a move, so the actor also needs delete on each source.
 async fn run_copy_loop(
     s3: &Arc<AppState>,
     req: &CopyRequest,
+    actor: &BulkActor,
+    delete_source: bool,
 ) -> (CopyResponse, Vec<Option<crate::types::FileMetadata>>) {
     let engine = s3.engine.load();
     let mut copied = vec![None; req.items.len()];
@@ -340,15 +447,32 @@ async fn run_copy_loop(
             break;
         }
         let dk = dest_key(&req.dest_prefix, &it.relative);
-        let result = copy_one(
-            s3,
-            &engine,
-            &req.source_bucket,
-            &it.source_key,
-            &req.dest_bucket,
-            &dk,
-        )
-        .await;
+        // The same checks the S3 API runs for GET source + PUT dest (+ the
+        // source DELETE of a move), before any byte moves.
+        let allowed = actor
+            .check(S3Action::Read, &req.source_bucket, &it.source_key)
+            .and_then(|()| actor.check(S3Action::Write, &req.dest_bucket, &dk))
+            .and_then(|()| {
+                if delete_source {
+                    actor.check(S3Action::Delete, &req.source_bucket, &it.source_key)
+                } else {
+                    Ok(())
+                }
+            });
+        let result = match allowed {
+            Ok(()) => {
+                copy_one(
+                    s3,
+                    &engine,
+                    &req.source_bucket,
+                    &it.source_key,
+                    &req.dest_bucket,
+                    &dk,
+                )
+                .await
+            }
+            Err(denied) => Err(denied),
+        };
         match result {
             Ok(source) => {
                 succeeded += 1;
@@ -454,7 +578,7 @@ async fn emit_event(
 // ---------------------------------------------------------------------------
 
 pub async fn move_objects(
-    Extension(_gate): Extension<AdminGuiGate>,
+    Extension(session): Extension<BulkSession>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     headers: axum::http::HeaderMap,
     AdminJson(req): AdminJson<MoveRequest>,
@@ -499,7 +623,8 @@ pub async fn move_objects(
             })
             .collect(),
     };
-    let (copy_result, copied) = run_copy_loop(&s3, &copy_req).await;
+    let actor = BulkActor::for_session(&state, &session)?;
+    let (copy_result, copied) = run_copy_loop(&s3, &copy_req, &actor, true).await;
 
     // Atomicity rule: only delete sources if EVERY copy succeeded.
     // Pre-migration the client implemented this same rule client-side;
@@ -597,7 +722,7 @@ pub async fn move_objects(
     );
     super::audit_log(
         "bulk_move",
-        "admin",
+        actor.label(),
         &format!(
             "{} -> {}/{} ok={} failed={} deleted={}",
             req.source_bucket,
@@ -622,7 +747,7 @@ pub async fn move_objects(
 // ---------------------------------------------------------------------------
 
 pub async fn bulk_delete(
-    Extension(_gate): Extension<AdminGuiGate>,
+    Extension(session): Extension<BulkSession>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     headers: axum::http::HeaderMap,
     AdminJson(req): AdminJson<DeleteRequest>,
@@ -643,6 +768,7 @@ pub async fn bulk_delete(
         ));
     }
 
+    let actor = BulkActor::for_session(&state, &session)?;
     let engine = state.s3_state.engine.load();
     let mut deleted = 0usize;
     let mut failed = 0usize;
@@ -668,6 +794,16 @@ pub async fn bulk_delete(
                 });
             }
             break;
+        }
+        if let Err(denied) = actor.check(S3Action::Delete, &req.bucket, key) {
+            failed += 1;
+            if failures.len() < MAX_FAILURE_ENTRIES {
+                failures.push(DeleteFailure {
+                    key: key.to_string(),
+                    error: denied,
+                });
+            }
+            continue;
         }
         match engine.delete(&req.bucket, key).await {
             Ok(_) => {
@@ -706,7 +842,7 @@ pub async fn bulk_delete(
     );
     super::audit_log(
         "bulk_delete",
-        "admin",
+        actor.label(),
         &format!("{} deleted={} failed={}", req.bucket, deleted, failed),
         &headers,
     );
@@ -768,7 +904,7 @@ fn zip_entry_names(items: &[(String, String)]) -> Vec<String> {
 }
 
 pub async fn download_zip(
-    Extension(_gate): Extension<AdminGuiGate>,
+    Extension(session): Extension<BulkSession>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     AdminQuery(q): AdminQuery<ZipQuery>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
@@ -805,6 +941,7 @@ pub async fn download_zip(
         ));
     }
 
+    let actor = BulkActor::for_session(&state, &session)?;
     let engine = state.s3_state.engine.load();
     let names = zip_entry_names(&parsed);
     let mut bytes_total: u64 = 0;
@@ -812,6 +949,11 @@ pub async fn download_zip(
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut failures: Vec<ZipFailure> = Vec::new();
     for ((bucket, key), zip_name) in parsed.iter().zip(names) {
+        if let Err(denied) = actor.check(S3Action::Read, bucket, key) {
+            failures.push(ZipFailure::AccessDenied);
+            skipped.push((format!("{bucket}/{key}"), denied));
+            continue;
+        }
         match engine.retrieve(bucket, key).await {
             Ok((data, _meta)) => {
                 bytes_total += data.len() as u64;
@@ -1011,7 +1153,7 @@ pub struct ListAllResponse {
 }
 
 pub async fn list_all(
-    Extension(_gate): Extension<AdminGuiGate>,
+    Extension(session): Extension<BulkSession>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     AdminQuery(q): AdminQuery<ListAllQuery>,
 ) -> Result<Json<ListAllResponse>, (StatusCode, String)> {
@@ -1022,6 +1164,18 @@ pub async fn list_all(
         ));
     }
 
+    let actor = BulkActor::for_session(&state, &session)?;
+    if !actor.may_list(&q.bucket, &q.prefix) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "AccessDenied: {} may not list {}/{}",
+                actor.label(),
+                &*q.bucket,
+                &*q.prefix
+            ),
+        ));
+    }
     let engine = state.s3_state.engine.load();
     let mut keys: Vec<String> = Vec::new();
     let mut continuation: Option<String> = None;
@@ -1039,6 +1193,10 @@ pub async fn list_all(
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
         for (k, _) in &page.objects {
+            // The S3 LIST filter: a key the actor cannot see is left out.
+            if !actor.may_see(&q.bucket, k) {
+                continue;
+            }
             keys.push(k.clone());
             if keys.len() >= MAX_BULK_OBJECTS {
                 return Ok(Json(ListAllResponse {

@@ -44,10 +44,10 @@ use crate::usage_scanner::UsageScanner;
 pub use audit::get_audit;
 pub use auth::{
     browser_session_connect, check_session, clear_s3_session_creds, get_s3_session_creds, login,
-    login_as, logout, open_browser_connect, require_admin_gui_session, require_metrics_access,
-    require_not_declarative, require_session, resolve_iam_identity, set_s3_session_creds, whoami,
-    BrowserSessionConnectRequest, LoginAsRequest, LoginResponse, OpenBrowserConnectRequest,
-    ResolveIamIdentityRequest, SessionResponse, WhoamiResponse,
+    login_as, logout, open_browser_connect, require_admin_gui_session, require_bulk_session,
+    require_metrics_access, require_not_declarative, require_session, resolve_iam_identity,
+    set_s3_session_creds, whoami, BrowserSessionConnectRequest, LoginAsRequest, LoginResponse,
+    OpenBrowserConnectRequest, ResolveIamIdentityRequest, SessionResponse, WhoamiResponse,
 };
 pub use backends::{
     create_backend, create_bucket_on_backend, delete_backend, list_backends, list_bucket_origins,

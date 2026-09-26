@@ -14,6 +14,12 @@ type SessionCapabilities = {
   canLoadBucketOrigins: boolean;
   /** `GET /api/admin/config` (Inspector bucket policy, etc.). */
   canFetchFullAdminConfig: boolean;
+  /**
+   * Bulk copy / move / delete / ZIP (`/api/admin/objects/*`). Any signed-in
+   * session: for a files-only session the server checks every key against
+   * the user's own permissions and reports denied keys one by one.
+   */
+  canUseBulkActions: boolean;
 };
 
 const NONE: SessionCapabilities = {
@@ -21,6 +27,7 @@ const NONE: SessionCapabilities = {
   signedInForFilesOnly: false,
   canLoadBucketOrigins: false,
   canFetchFullAdminConfig: false,
+  canUseBulkActions: false,
 };
 
 export function deriveSessionCapabilities(s: SessionCheck): SessionCapabilities {
@@ -32,5 +39,6 @@ export function deriveSessionCapabilities(s: SessionCheck): SessionCapabilities 
     signedInForFilesOnly,
     canLoadBucketOrigins: adminGui,
     canFetchFullAdminConfig: adminGui,
+    canUseBulkActions: true,
   };
 }

@@ -363,19 +363,6 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             post(admin::jobs_verify_cancel),
         )
         .route("/_/api/admin/jobs/:id/:action", post(admin::jobs_action))
-        // Server-side bulk object operations. Replaces what the
-        // browser used to do via @aws-sdk/client-s3. Handlers call the
-        // engine directly (no per-key SigV4 / IAM re-check on each
-        // object). **`require_admin_gui_session` is the trust boundary:**
-        // only full GUI sessions may invoke these routes.
-        .route("/_/api/admin/objects/copy", post(admin::copy_objects))
-        .route("/_/api/admin/objects/move", post(admin::move_objects))
-        .route(
-            "/_/api/admin/objects/delete",
-            post(admin::bulk_delete_objects),
-        )
-        .route("/_/api/admin/objects/zip", get(admin::download_zip))
-        .route("/_/api/admin/objects/list", get(admin::list_all_objects))
         // Merge the IAM-gated subrouter in; it already carries its own
         // `require_not_declarative` layer.
         .merge(iam_gated)
@@ -391,6 +378,25 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // bound only for authenticated operators, not the S3 surface.
         .layer(axum::extract::DefaultBodyLimit::max(
             admin::MAX_IMPORT_BODY_BYTES,
+        ))
+        .with_state(admin_state.clone());
+
+    // Server-side bulk object operations (replaces what the browser used to
+    // do via @aws-sdk/client-s3). Admin GUI sessions AND non-admin browser
+    // sessions: for the latter the handlers authorize every key with the
+    // user's IAM policy (see `api/admin/objects.rs`).
+    let bulk_objects = Router::new()
+        .route("/_/api/admin/objects/copy", post(admin::copy_objects))
+        .route("/_/api/admin/objects/move", post(admin::move_objects))
+        .route(
+            "/_/api/admin/objects/delete",
+            post(admin::bulk_delete_objects),
+        )
+        .route("/_/api/admin/objects/zip", get(admin::download_zip))
+        .route("/_/api/admin/objects/list", get(admin::list_all_objects))
+        .layer(middleware::from_fn_with_state(
+            admin_state.clone(),
+            admin::require_bulk_session,
         ))
         .with_state(admin_state.clone());
 
@@ -517,6 +523,7 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
     Router::new()
         .merge(session_light)
         .merge(admin_gui_protected)
+        .merge(bulk_objects)
         .merge(public_admin)
         .merge(operational_routes)
         .merge(metrics_route)

@@ -179,6 +179,8 @@ Server-side helpers behind the embedded S3 browser's bulk actions.
 | `POST` | `/_/api/admin/objects/delete` | Bulk delete selected objects |
 | `GET` | `/_/api/admin/objects/zip` | Stream selected objects as a ZIP |
 
+These endpoints accept an admin GUI session and also the browser session of a user without admin rights (the session that an access-key sign-in in the file browser creates). For an admin session, the session is the authorization boundary. For a user without admin rights, the proxy checks every key against that user's own IAM permissions before it touches the key, with the same rules as the S3 API, including `aws:SourceIp` conditions. A copy needs `read` on the source key and `write` on the destination key; a move needs `delete` on the source key too; a delete needs `delete`; a ZIP needs `read`. A key that the user may not use is not touched: the response lists it under `failures` with an `AccessDenied` error, and the other keys are processed. A ZIP leaves such a key out and names it in the skip report inside the archive; when no selected key may be read, the ZIP answers `403`. A folder listing (`objects/list`) returns only the keys that the user can see, like an S3 `LIST`. Because a move deletes its sources only when every copy succeeded, one denied key keeps all the sources of that move in place. In open mode (`authentication: none`) an open browser session may use the endpoints without checks, like the S3 API in open mode.
+
 ## Jobs — one surface for everything background
 
 Replication rules, lifecycle rules, and one-off maintenance jobs (re-encrypt,

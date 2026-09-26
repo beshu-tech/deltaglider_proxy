@@ -20,7 +20,8 @@ import { virtualWritableChildren } from './permissions';
 import { expandSelection } from './bulkSelection';
 import { ZIP_MAX_BYTES, downloadZip as saveZip, zipPreflightError } from './zipDownload';
 import { formatBytes } from './utils';
-// Bulk actions → admin objects API; App gates them on `sessionCaps.adminGui`.
+// Bulk actions → admin objects API; App gates them on `sessionCaps.canUseBulkActions`
+// (the server authorizes each key for a files-only session).
 import type { S3Object } from './types';
 import { readStorage, writeStorage } from './safeStorage';
 

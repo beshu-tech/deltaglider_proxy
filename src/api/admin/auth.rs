@@ -1253,6 +1253,93 @@ pub async fn require_admin_gui_session(
         .into_response()
 }
 
+/// Who runs a bulk object request (`/_/api/admin/objects/*`), inserted by
+/// [`require_bulk_session`].
+#[derive(Clone, Debug)]
+pub enum BulkSession {
+    /// An admin GUI session: the session is the authorization boundary.
+    AdminGui,
+    /// A non-admin browser session (S3BrowserLift): every key is authorized
+    /// with this IAM user's policy, like the S3 API. `client_ip` is the
+    /// trusted client address, for `aws:SourceIp` conditions.
+    IamUser {
+        access_key_id: String,
+        client_ip: Option<IpAddr>,
+    },
+    /// An open-mode browser session (`authentication: none`): the S3 API
+    /// is unrestricted, so these requests are too.
+    Open,
+}
+
+/// Middleware for the bulk object endpoints: an admin GUI session, or a
+/// browser session of an IAM user (its keys are authorized one by one in
+/// the handler), or an open-mode session while access is open.
+pub async fn require_bulk_session(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> impl IntoResponse {
+    let peer_ip = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let client_ip = rate_limiter::extract_client_ip_with_peer(&headers, peer_ip);
+    let unauthorized = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response()
+    };
+    let Some(token) = extract_session_token(&headers) else {
+        return unauthorized();
+    };
+    if !state.sessions.validate(&token, client_ip) {
+        return unauthorized();
+    }
+    let iam = state.iam_state.load();
+    let (session, actor) = if admin_gui_session_ok(&state, &token, client_ip) {
+        let actor = state
+            .sessions
+            .admin_gui_auth_method(&token, client_ip)
+            .map(|m| session_actor_label(&m, &iam))
+            .unwrap_or_else(|| "admin".to_string());
+        (BulkSession::AdminGui, actor)
+    } else {
+        match state.sessions.auth_method(&token, client_ip) {
+            Some(AuthMethod::IamBrowserLift { access_key_id }) => {
+                let actor = match iam.as_ref() {
+                    IamState::Iam(index) => index.get(&access_key_id).map(|u| u.name.clone()),
+                    _ => None,
+                }
+                .unwrap_or_else(|| access_key_id.clone());
+                (
+                    BulkSession::IamUser {
+                        access_key_id,
+                        client_ip: rate_limiter::extract_trusted_client_ip(&headers, peer_ip),
+                    },
+                    actor,
+                )
+            }
+            Some(AuthMethod::OpenLift) if matches!(iam.as_ref(), IamState::Disabled) => {
+                (BulkSession::Open, "anonymous".to_string())
+            }
+            _ => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "admin_session_required"})),
+                )
+                    .into_response()
+            }
+        }
+    };
+    request.extensions_mut().insert(session);
+    crate::audit::with_actor(actor, next.run(request))
+        .await
+        .into_response()
+}
+
 /// Audit actor for an admin session: the IAM user name when known.
 fn session_actor_label(method: &AuthMethod, iam: &IamState) -> String {
     let index = match iam {

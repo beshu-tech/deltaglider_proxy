@@ -531,3 +531,177 @@ async fn test_bulk_ops_honour_quota_and_record_events_and_audit() {
         "{text}"
     );
 }
+
+/// Browser review #11: a non-admin browser session (S3BrowserLift) may use
+/// the bulk endpoints, and every key is authorized with the user's own IAM
+/// policy, like the S3 API. Allowed keys work; denied keys are reported one
+/// by one.
+#[tokio::test]
+async fn browser_session_bulk_ops_are_authorized_per_key() {
+    let server = TestServer::builder()
+        .auth("BULKLIFT", "BULKLIFTSECRET")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let bucket = server.bucket().to_string();
+    let admin = admin_http_client(&ep).await;
+    let s3 = server.s3_client().await;
+    for key in ["dana/a.txt", "dana/b.txt", "shared/c.txt"] {
+        s3.put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+            .send()
+            .await
+            .unwrap();
+    }
+    // dana: everything under dana/, nothing else.
+    let resp = admin
+        .post(format!("{ep}/_/api/admin/users"))
+        .json(&json!({
+            "name": "dana",
+            "permissions": [{
+                "actions": ["read", "write", "delete", "list"],
+                "resources": [format!("{bucket}/dana/*")]
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201);
+    let user: Value = resp.json().await.unwrap();
+    let dana = reqwest::Client::builder()
+        .cookie_store(true)
+        .no_proxy()
+        .build()
+        .unwrap();
+    let resp = dana
+        .post(format!("{ep}/_/api/admin/session/browser-connect"))
+        .json(&json!({
+            "access_key_id": user["access_key_id"],
+            "secret_access_key": user["secret_access_key"],
+            "endpoint": ep,
+            "bucket": "",
+            "region": "us-east-1",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Copy: the allowed item lands, the denied source is reported.
+    let resp = dana
+        .post(format!("{ep}/_/api/admin/objects/copy"))
+        .json(&json!({
+            "source_bucket": bucket,
+            "dest_bucket": bucket,
+            "dest_prefix": "dana/copies/",
+            "items": [
+                { "source_key": "dana/a.txt", "relative": "a.txt" },
+                { "source_key": "shared/c.txt", "relative": "c.txt" }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    let r: Value = resp.json().await.unwrap();
+    assert_eq!(
+        (r["succeeded"].as_u64(), r["failed"].as_u64()),
+        (Some(1), Some(1)),
+        "{r}"
+    );
+    assert_eq!(r["failures"][0]["source_key"], "shared/c.txt", "{r}");
+    assert!(
+        r["failures"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("AccessDenied"),
+        "{r}"
+    );
+
+    // Copy INTO a prefix dana may not write: denied per key.
+    let resp = dana
+        .post(format!("{ep}/_/api/admin/objects/copy"))
+        .json(&json!({
+            "source_bucket": bucket,
+            "dest_bucket": bucket,
+            "dest_prefix": "shared/",
+            "items": [{ "source_key": "dana/a.txt", "relative": "a.txt" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let r: Value = resp.json().await.unwrap();
+    assert_eq!(r["failed"].as_u64(), Some(1), "{r}");
+
+    // Delete: the allowed key goes, the denied key stays and is reported.
+    let resp = dana
+        .post(format!("{ep}/_/api/admin/objects/delete"))
+        .json(&json!({ "bucket": bucket, "keys": ["dana/b.txt", "shared/c.txt"] }))
+        .send()
+        .await
+        .unwrap();
+    let r: Value = resp.json().await.unwrap();
+    assert_eq!(
+        (r["deleted"].as_u64(), r["failed"].as_u64()),
+        (Some(1), Some(1)),
+        "{r}"
+    );
+    assert_eq!(r["failures"][0]["key"], "shared/c.txt", "{r}");
+    s3.head_object()
+        .bucket(&bucket)
+        .key("shared/c.txt")
+        .send()
+        .await
+        .expect("the denied key must survive");
+
+    // ZIP: a denied key is not in the archive; only denied keys → 403.
+    let resp = dana
+        .get(format!("{ep}/_/api/admin/objects/zip"))
+        .query(&[("keys", format!("{bucket}/shared/c.txt"))])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 403);
+    let resp = dana
+        .get(format!("{ep}/_/api/admin/objects/zip"))
+        .query(&[("keys", format!("{bucket}/dana/a.txt,{bucket}/shared/c.txt"))])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // List: dana's folder expands; another folder lists as empty (the S3
+    // LIST rule: admitted, and filtered to the keys the user can see).
+    let resp = dana
+        .get(format!("{ep}/_/api/admin/objects/list"))
+        .query(&[("bucket", bucket.as_str()), ("prefix", "dana/")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let r: Value = resp.json().await.unwrap();
+    assert!(
+        r["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|k| k.as_str().unwrap().starts_with("dana/")),
+        "{r}"
+    );
+    let resp = dana
+        .get(format!("{ep}/_/api/admin/objects/list"))
+        .query(&[("bucket", bucket.as_str()), ("prefix", "shared/")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let r: Value = resp.json().await.unwrap();
+    assert_eq!(r["keys"], json!([]), "{r}");
+}

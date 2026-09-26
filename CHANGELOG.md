@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed — Bulk copy, move, delete and ZIP work for users without admin rights
+
+The bulk actions in the file browser needed an administrator session, so a
+user who signed in with an access key could select files but not act on
+them. Now the bulk endpoints (`/_/api/admin/objects/*`) also accept that
+browser session, and the proxy checks every key against the user's own IAM
+permissions with the S3 API's rules (`aws:SourceIp` included). A key that
+the user may not use is reported per key with `AccessDenied`; the others are
+processed. A folder listing returns only the keys that the user can see.
+
 ### Fixed — Two tabs editing one config section no longer overwrite each other
 
 The config endpoints were last-writer-wins: a second browser tab applied its

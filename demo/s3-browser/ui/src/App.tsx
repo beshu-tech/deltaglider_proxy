@@ -560,19 +560,14 @@ export default function App() {
           <BulkActionBar
             selectedCount={s3.selectedKeys.size}
             selectedFolderCount={[...s3.selectedKeys].filter((k) => k.startsWith('folder:')).length}
-            onDelete={canDeleteSelected && hasAdminSession ? s3.bulkDelete : undefined}
-            onCopy={canCopyFromActiveBucket && hasAdminSession ? s3.bulkCopy : undefined}
-            onMove={canMoveFromActiveBucket && hasAdminSession ? s3.bulkMove : undefined}
-            onDownloadZip={canReadSelected && hasAdminSession ? s3.downloadZip : undefined}
+            onDelete={canDeleteSelected && sessionCaps.canUseBulkActions ? s3.bulkDelete : undefined}
+            onCopy={canCopyFromActiveBucket && sessionCaps.canUseBulkActions ? s3.bulkCopy : undefined}
+            onMove={canMoveFromActiveBucket && sessionCaps.canUseBulkActions ? s3.bulkMove : undefined}
+            onDownloadZip={canReadSelected && sessionCaps.canUseBulkActions ? s3.downloadZip : undefined}
             deleting={s3.deleting}
             currentPrefix={s3.prefix}
             selectionKeys={s3.selectedKeys}
             onSessionExpired={handleSessionExpired}
-            hint={
-              hasAdminSession
-                ? undefined
-                : 'Bulk copy, move, ZIP, and delete are available after you open Settings and sign in as an administrator. Access-key sign-in is for browsing files only.'
-            }
           />
         )}
 
