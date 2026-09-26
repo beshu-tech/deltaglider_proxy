@@ -37,6 +37,8 @@ Use this when the existing data can stay where it is. Example: the legacy AWS bu
 
 3. Done. Existing objects are served as passthrough (the proxy reads them as-is). New uploads — say `ci-uploader` pushing `firmware/widget-3000/fw-2.4.1.tar` — go through the delta router and start saving space immediately.
 
+4. Optional: give the existing objects the proxy's metadata (content hash and created-at), so that the admin UI shows their checksum and the proxy can verify them. Open **Settings → Jobs → New job → Backfill metadata…**, select `releases`, and start the job. The job reads each object once and rewrites only its metadata; it keeps each object's Last-Modified time. Writes to the bucket get `503 SlowDown` while the job runs. The details are in the [jobs reference](../reference/jobs.md#metadata-backfill).
+
 **The caveat:** objects that entered the bucket before the proxy never retro-compress. The proxy only delta-encodes at write time; a passthrough object stays passthrough forever unless something rewrites it through the proxy. If historical savings matter, use route 2.
 
 ## Route 2: copy through the proxy

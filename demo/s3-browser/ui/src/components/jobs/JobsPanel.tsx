@@ -60,6 +60,7 @@ import { useCardStyles, contentColumn, CONTENT_WIDE } from '../shared-styles';
 import ApplyDialog from '../ApplyDialog';
 import StickyDirtyBar from '../StickyDirtyBar';
 import ReencryptProposalModal from '../ReencryptProposalModal';
+import BackfillMetadataModal from '../BackfillMetadataModal';
 import MigrateBucketModal from '../MigrateBucketModal';
 import JobDrawer from './JobDrawer';
 import LifecycleRunConfirm from './LifecycleRunConfirm';
@@ -291,6 +292,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
   const [drawerTab, setDrawerTab] = useState<string>(queryParams.tab ?? 'definition');
   const [newJobMenuOpen, setNewJobMenuOpen] = useState(false);
   const [reencryptOpen, setReencryptOpen] = useState(false);
+  const [backfillOpen, setBackfillOpen] = useState(false);
   const [migrateOpen, setMigrateOpen] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [confirmRun, setConfirmRun] = useState<JobRow | null>(null);
@@ -397,6 +399,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
       { type: 'divider' as const },
       { key: 'reencrypt', label: 'Re-encrypt buckets… — one-off rewrite' },
       { key: 'migrate', label: 'Migrate bucket… — one-off move' },
+      { key: 'backfill', label: 'Backfill metadata… — for objects written without the proxy' },
     ],
     onClick: ({ key }: { key: string }) => {
       // Close the menu explicitly: opening a drawer / modal synchronously in
@@ -413,6 +416,8 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
         openDrawer(`lifecycle:${rule.name}`);
       } else if (key === 'reencrypt') {
         setReencryptOpen(true);
+      } else if (key === 'backfill') {
+        setBackfillOpen(true);
       } else {
         setMigrateOpen(true);
       }
@@ -621,6 +626,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
         pickBuckets
         onClose={() => setReencryptOpen(false)}
       />
+      <BackfillMetadataModal open={backfillOpen} onClose={() => setBackfillOpen(false)} />
       <MigrateBucketModal
         open={migrateOpen}
         bucket={null}
@@ -683,7 +689,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
               columns={columns}
               rowKey={(d) => d.row.id}
               onRowClick={(d) => openDrawer(d.row.id)}
-              empty='No jobs yet. Use "New job" to add a replication or lifecycle rule, or start a one-off re-encrypt or migrate job.'
+              empty='No jobs yet. Use "New job" to add a replication or lifecycle rule, or start a one-off re-encrypt, migrate or metadata-backfill job.'
             />
           </div>
         )}

@@ -1,6 +1,6 @@
 # Jobs
 
-One API surface and one admin screen for everything that runs in the background: replication rules, lifecycle rules, and one-off maintenance jobs (bucket re-encryption, bucket migration).
+One API surface and one admin screen for everything that runs in the background: replication rules, lifecycle rules, and one-off maintenance jobs (bucket re-encryption, bucket migration, metadata backfill).
 
 ## The model
 
@@ -25,14 +25,21 @@ Rules are recurring and YAML-authored; maintenance jobs are one-offs born in the
 | `GET` | `/_/api/admin/jobs/:id/failures?limit=N` | Recent per-object failures |
 | `POST` | `/_/api/admin/jobs/:id/pause` / `resume` / `run-now` / `preview` / `cancel` / `verify` / `kill` / `delete` | Per-kind actions; `405` outside the matrix |
 | `POST` | `/_/api/admin/jobs/reencrypt` | Create re-encrypt jobs: `{"buckets": [...]}` (max 100), one job per bucket |
+| `POST` | `/_/api/admin/jobs/backfill-metadata` | Create metadata-backfill jobs: `{"buckets": [...], "refresh_last_modified": false}` (max 100), one job per bucket |
 | `POST` | `/_/api/admin/buckets/:bucket/migrate` | Create a migrate job: `{"target_backend", "delete_source", "target"}` → `202` + `maintenance:<n>`. `target` is `empty` (default: the job fails in `stage` when the destination holds objects) or `mirror` (destination objects absent at the source are deleted before the flip, audited) |
 | `GET` | `/_/api/admin/jobs/bucket/:bucket` | Busy state for one bucket; readable by non-admin browser sessions |
 
 All routes except the last are session-gated admin routes.
 
+## Metadata backfill
+
+An object that reached the backend without the proxy (it was there before the proxy, or another tool wrote it) has none of the proxy's metadata: no content hash, no created-at. The proxy still serves it, but it cannot show or verify its checksum. The `backfill-metadata` job adds that metadata. It reads each such object once to compute its hashes and then rewrites only the metadata: an S3 backend does a server-side copy of the object onto itself, and a filesystem backend rewrites the extended attributes. The object bytes are not uploaded again, and objects that the proxy wrote are skipped.
+
+By default the job keeps the Last-Modified time that the proxy serves for each object, so sync tools and replication do not copy the objects again. Set `refresh_last_modified: true` to make the backfilled objects read as modified at the time of the job. A multipart object keeps the ETag that clients know. Start the job from **Settings → Jobs → New job → Backfill metadata…**, or with the API row above.
+
 ## The write gate
 
-While a re-encrypt or migrate job is active, S3 **writes** (PUT, DELETE, POST, multipart) to that bucket return `503 SlowDown`; AWS SDKs back off and retry automatically. Reads pass untouched. The gate engages at job creation (no create-to-claim window), drains in-flight writes before the copy starts, and lifts when the job finishes — for migrations, writes resume the moment the bucket flips to the new backend, before any optional source cleanup. The embedded object browser shows a busy banner on gated buckets via `GET /_/api/admin/jobs/bucket/:bucket`.
+While a re-encrypt, migrate or backfill job is active, S3 **writes** (PUT, DELETE, POST, multipart) to that bucket return `503 SlowDown`; AWS SDKs back off and retry automatically. Reads pass untouched. The gate engages at job creation (no create-to-claim window), drains in-flight writes before the copy starts, and lifts when the job finishes — for migrations, writes resume the moment the bucket flips to the new backend, before any optional source cleanup. The embedded object browser shows a busy banner on gated buckets via `GET /_/api/admin/jobs/bucket/:bucket`.
 
 ## Durability
 

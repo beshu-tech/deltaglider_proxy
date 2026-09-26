@@ -263,6 +263,24 @@ export async function startReencrypt(buckets: string[]): Promise<{
 /** What the migrate does with objects already in the destination bucket:
  *  `empty` refuses a non-empty destination; `mirror` deletes the extras. */
 export type MigrateTargetMode = 'empty' | 'mirror';
+/**
+ * Queue metadata-backfill jobs (stamp DG metadata onto objects written
+ * without the proxy). `refreshLastModified: false` keeps each object's
+ * served Last-Modified.
+ */
+export async function startBackfillMetadata(
+  buckets: string[],
+  refreshLastModified: boolean,
+): Promise<{
+  started: Array<{ bucket: string; job_id: number }>;
+  errors: Array<{ bucket: string; error: string }>;
+}> {
+  return adminJson('/api/admin/jobs/backfill-metadata', {
+    method: 'POST',
+    body: { buckets, refresh_last_modified: refreshLastModified },
+    context: 'Start metadata backfill',
+  });
+}
 
 /** Create a durable migrate job; returns 202 with the job id. */
 export async function createMigrateJob(

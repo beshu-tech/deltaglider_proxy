@@ -87,6 +87,8 @@ audited as `maintenance_migrate_mirror_delete`.
   Last-Modified. The job keeps each object's Last-Modified and ETag.
 - The docs no longer call `/_/stats` unauthenticated. It answers only an
   admin session (`401` otherwise); the examples now sign in first.
+- The Jobs screen can start the metadata-backfill job: **New job → Backfill
+  metadata…**. The job and its API are documented in the jobs reference.
 
 ### Fixed — The Credentials page shows the bootstrap access key and removes it on request
 
