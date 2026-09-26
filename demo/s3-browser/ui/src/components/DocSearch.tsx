@@ -4,6 +4,7 @@ import { SearchOutlined, CloseCircleFilled } from '@ant-design/icons';
 import MiniSearch from 'minisearch';
 import type { DocEntry } from '../docsBundle';
 import { useColors } from '../ThemeContext';
+import { docSearchSnippet, docSearchText } from '../docSearchText';
 
 interface SearchResult {
   docId: string;
@@ -13,37 +14,12 @@ interface SearchResult {
   score: number;
 }
 
-/** Strip markdown formatting for indexing */
-function stripMarkdown(md: string): string {
-  return md
-    .replace(/```[\s\S]*?```/g, '')           // remove code blocks
-    .replace(/`[^`]+`/g, '')                   // remove inline code
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')  // links → text
-    .replace(/[#*_~>|]/g, '')                  // strip formatting chars
-    .replace(/\n{2,}/g, '\n')                 // collapse blank lines
-    .trim();
-}
-
 /** Extract h2/h3 headings as searchable text */
 function extractHeadingText(md: string): string {
   return md.split('\n')
     .filter(l => /^#{2,3}\s/.test(l))
     .map(l => l.replace(/^#+\s+/, ''))
     .join(' ');
-}
-
-/** Get a context snippet around a match */
-function getSnippet(text: string, query: string, maxLen = 120): string {
-  const lower = text.toLowerCase();
-  const qLower = query.toLowerCase().split(/\s+/)[0] || '';
-  const idx = lower.indexOf(qLower);
-  if (idx === -1) return text.substring(0, maxLen) + '...';
-  const start = Math.max(0, idx - 40);
-  const end = Math.min(text.length, idx + maxLen - 40);
-  let snippet = text.substring(start, end);
-  if (start > 0) snippet = '...' + snippet;
-  if (end < text.length) snippet = snippet + '...';
-  return snippet;
 }
 
 interface Props {
@@ -73,7 +49,7 @@ export default function DocSearch({ docs, onSelect }: Props) {
       id: d.id,
       title: d.title,
       headings: extractHeadingText(d.content),
-      body: stripMarkdown(d.content),
+      body: docSearchText(d.content),
     })));
     return index;
   }, [docs]);
@@ -84,12 +60,12 @@ export default function DocSearch({ docs, onSelect }: Props) {
     const raw = searchIndex.search(query, { combineWith: 'AND' });
     return raw.slice(0, 8).map(r => {
       const doc = docs.find(d => d.id === r.id)!;
-      const bodyText = stripMarkdown(doc.content);
+      const bodyText = docSearchText(doc.content);
       return {
         docId: r.id,
         title: doc.title,
         group: doc.group,
-        snippet: getSnippet(bodyText, query),
+        snippet: docSearchSnippet(bodyText, query),
         score: r.score,
       };
     });

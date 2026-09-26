@@ -73,6 +73,12 @@ refuses a destination that already holds objects: the job fails in its
 dialog) makes the destination an exact copy instead: destination objects that
 the source does not hold are deleted before the flip, and each delete is
 audited as `maintenance_migrate_mirror_delete`.
+### Fixed — Small drift in the admin UI, the docs and the logs
+
+- Docs search: a result no longer shows the changelog's "GENERATED FILE"
+  comment, and a search for an identifier in backticks (for example
+  `replication_target_only`) finds it and shows it in the snippet.
+
 ### Fixed — The Credentials page shows the bootstrap access key and removes it on request
 
 The page showed an empty access key field while a bootstrap key was
