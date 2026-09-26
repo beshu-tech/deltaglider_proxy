@@ -426,20 +426,8 @@ async fn apply_section(
     // `storage.backends[i].encryption.key` (matched by backend
     // name, not by list index — operators may reorder the list).
     let body_probe = BackendEncryptionKeyProbe::from_section(section, &body);
-    preserve_backend_encryption_secrets(
-        &mut new_cfg.backend_encryption,
-        &old_cfg.backend_encryption,
-        body_probe.for_singleton(),
-    );
-    for new_named in &mut new_cfg.backends {
-        if let Some(old_named) = old_cfg.backends.iter().find(|n| n.name == new_named.name) {
-            let probe = body_probe.for_named(&new_named.name);
-            preserve_backend_encryption_secrets(
-                &mut new_named.encryption,
-                &old_named.encryption,
-                probe,
-            );
-        }
+    if let Err(e) = preserve_all_backend_encryption(&mut new_cfg, &old_cfg, &body_probe) {
+        return reject(StatusCode::BAD_REQUEST, e);
     }
 
     // Webhook header values are masked to REDACTED_SENTINEL on GET; restore any
@@ -1099,6 +1087,9 @@ fn compute_section_diff(
 pub(crate) struct BackendKeyPresence {
     pub key_is_explicit_null: bool,
     pub legacy_key_is_explicit_null: bool,
+    /// The body carries a `legacy_key` string: the operator chose the
+    /// shim key, so the rotated-out primary is not promoted over it.
+    pub legacy_key_is_set: bool,
 }
 
 /// Inspects a section-PUT body and reports, per backend-encryption
@@ -1168,24 +1159,37 @@ fn probe_enc_body(enc: &serde_json::Value) -> BackendKeyPresence {
     BackendKeyPresence {
         key_is_explicit_null: obj.get("key").map(|v| v.is_null()).unwrap_or(false),
         legacy_key_is_explicit_null: obj.get("legacy_key").map(|v| v.is_null()).unwrap_or(false),
+        legacy_key_is_set: obj.get("legacy_key").is_some_and(|v| v.is_string()),
     }
 }
 
 /// Preserve encryption key material on a single backend entry
-/// across a section PUT.
+/// across a section PUT or a document apply.
 ///
 /// Semantics for each of `key` / `legacy_key`:
 ///   * body absent, new==None → restore from old (preserve).
 ///   * body null, new==None → leave None (explicit clear).
 ///   * new==Some → operator rotated; validate hex, keep as-is.
 ///
-/// No-op on variants that don't carry the field (e.g. SseS3 has no
-/// primary `key`).
+/// A proxy key that goes out of use (rotation to a new key, or a mode
+/// flip away from `aes256-gcm-proxy`) moves into the decrypt-only
+/// `legacy_key` slot, with the id the objects carry, unless the body
+/// sets `legacy_key` itself or nulls it. The objects written under
+/// that key stay readable, and the re-encrypt job can rewrite them.
+///
+/// Errors when the change would lose a key that objects can still
+/// need: a rotation that keeps the same key id (old objects would be
+/// decrypted with the new key), or a rotation while the one legacy
+/// slot already holds a different key.
+///
+/// `backend_name` feeds the key-id derivation (`"default"` for the
+/// singleton backend, as in the engine).
 pub(crate) fn preserve_backend_encryption_secrets(
+    backend_name: &str,
     new: &mut crate::config::BackendEncryptionConfig,
     old: &crate::config::BackendEncryptionConfig,
     probe: BackendKeyPresence,
-) {
+) -> Result<(), String> {
     use crate::config::BackendEncryptionConfig as E;
     // H8: validate hex during preservation. If the old config landed
     // in memory with malformed hex (e.g. a pre-existing pathological
@@ -1219,43 +1223,133 @@ pub(crate) fn preserve_backend_encryption_secrets(
         }
     }
 
-    // Mode-flip auto-promotion (correctness x-ray C3):
-    // When the operator changes mode AWAY from Aes256GcmProxy (the
-    // only mode with a primary key), auto-promote the old primary
-    // key + derived id into the new config's legacy_key slot IFF
-    // the operator didn't explicitly set legacy_key on the new
-    // config. This preserves historical-read capability — without
-    // this, a mode flip through the admin UI (which redacts the
-    // primary key on GET) silently orphans every historical object:
-    // the next read returns "object encrypted, no key configured".
-    //
-    // The operator can still OVERRIDE this by explicitly passing
-    // `legacy_key: null` in the body — that's the "discard old keys"
-    // escape hatch, encoded via `probe.legacy_key_is_explicit_null`.
-    let mode_changed_from_proxy =
-        matches!(old, E::Aes256GcmProxy { .. }) && !matches!(new, E::Aes256GcmProxy { .. });
-    if mode_changed_from_proxy && !probe.legacy_key_is_explicit_null {
-        // Only auto-populate if the new legacy_key slot is empty AND
-        // the old primary has a VALIDATED key (`old_primary_ok`). A
-        // redact-round-trip yields None → no-op; a pre-existing
-        // malformed hex yields None via the H8 validation → no-op.
-        if let (Some(old_primary), Some(new_legacy_slot)) = (&old_primary_ok, new.legacy_key_mut())
-        {
-            if new_legacy_slot.is_none() {
-                *new_legacy_slot = Some(old_primary.clone());
+    // Retirement of the old proxy key (correctness x-ray C3 for mode
+    // flips; explore finding 2 for rotations). The admin UI never sees
+    // the key (GET redacts it), so the server must keep it: without
+    // this every historical object reads as "encrypted with key id X,
+    // backend configured with key id Y".
+    if let Some(old_primary) = &old_primary_ok {
+        let old_kid = effective_proxy_key_id(backend_name, old).unwrap_or_default();
+        let retired = match &*new {
+            E::Aes256GcmProxy { key: Some(k), .. } => k != old_primary,
+            E::Aes256GcmProxy { key: None, .. } => false,
+            _ => true,
+        };
+        if retired {
+            if let Some(new_kid) = effective_proxy_key_id(backend_name, new) {
+                if new_kid == old_kid {
+                    return Err(format!(
+                        "backend '{backend_name}': the encryption key changes but the key id \
+                         stays '{old_kid}'. Objects written under the old key would be decrypted \
+                         with the new key and fail. Remove `key_id` (the id is then derived from \
+                         the key) or set a new one."
+                    ));
+                }
+            }
+            // A merge-patch keeps the OLD legacy value in `new`; only a
+            // different value (or the probe) means the body chose one.
+            let body_sets_legacy = probe.legacy_key_is_set
+                || (new.legacy_key().is_some() && new.legacy_key() != old.legacy_key());
+            if !probe.legacy_key_is_explicit_null && !body_sets_legacy {
+                if let Some(held) = old_legacy_ok.as_deref().filter(|l| *l != old_primary) {
+                    let held_kid = old.legacy_key_id().map(str::to_string).unwrap_or_else(|| {
+                        derive_hex_key_id(&format!("{backend_name}::legacy"), held)
+                            .unwrap_or_default()
+                    });
+                    return Err(format!(
+                        "backend '{backend_name}': the current key must become the legacy \
+                         (decrypt-only) key, but the legacy slot still holds key id \
+                         '{held_kid}', and objects can still need it. Re-encrypt the buckets \
+                         on this backend, then remove `legacy_key` / `legacy_key_id` and change \
+                         the key again. To drop the old legacy key on purpose, send \
+                         `legacy_key` explicitly."
+                    ));
+                }
+                if let Some(slot) = new.legacy_key_mut() {
+                    *slot = Some(old_primary.clone());
+                }
+                set_legacy_key_id(new, Some(old_kid));
+                return Ok(());
             }
         }
     }
 
     // Legacy shim key preservation — same-slot absent-in-body.
-    // Runs AFTER the auto-promotion so explicit operator intent
-    // (a fresh legacy_key in the body) always wins over the
-    // promoted value. Uses the H8-validated variable so malformed
-    // hex doesn't propagate.
+    // Explicit operator intent (a legacy_key in the body) always wins.
+    // Uses the H8-validated variable so malformed hex doesn't
+    // propagate. The id travels with the key: a key restored without
+    // its id would get a different derived id and match nothing.
     if let Some(new_legacy) = new.legacy_key_mut() {
         if new_legacy.is_none() && !probe.legacy_key_is_explicit_null {
-            *new_legacy = old_legacy_ok;
+            *new_legacy = old_legacy_ok.clone();
+            if old_legacy_ok.is_some() && new.legacy_key_id().is_none() {
+                set_legacy_key_id(new, old.legacy_key_id().map(str::to_string));
+            }
         }
+    }
+    Ok(())
+}
+
+/// [`preserve_backend_encryption_secrets`] over the singleton and every
+/// named backend (matched by name). Shared by the section PUT and the
+/// document apply so both write paths keep the same key rules.
+pub(crate) fn preserve_all_backend_encryption(
+    new_cfg: &mut crate::config::Config,
+    old_cfg: &crate::config::Config,
+    probe: &BackendEncryptionKeyProbe,
+) -> Result<(), String> {
+    preserve_backend_encryption_secrets(
+        "default",
+        &mut new_cfg.backend_encryption,
+        &old_cfg.backend_encryption,
+        probe.for_singleton(),
+    )?;
+    for new_named in &mut new_cfg.backends {
+        if let Some(old_named) = old_cfg.backends.iter().find(|n| n.name == new_named.name) {
+            preserve_backend_encryption_secrets(
+                &new_named.name,
+                &mut new_named.encryption,
+                &old_named.encryption,
+                probe.for_named(&new_named.name),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The id a proxy-AES backend stamps on the objects it writes: the
+/// explicit `key_id`, else derived from the backend name and the key
+/// (same rule as the engine wrapper). None for other modes or an
+/// unparseable key.
+fn effective_proxy_key_id(
+    backend_name: &str,
+    enc: &crate::config::BackendEncryptionConfig,
+) -> Option<String> {
+    match enc {
+        crate::config::BackendEncryptionConfig::Aes256GcmProxy {
+            key: Some(hex),
+            key_id,
+            ..
+        } => match key_id {
+            Some(explicit) => Some(explicit.clone()),
+            None => derive_hex_key_id(backend_name, hex),
+        },
+        _ => None,
+    }
+}
+
+fn derive_hex_key_id(name: &str, hex: &str) -> Option<String> {
+    let parsed = crate::storage::EncryptionKey::from_hex(hex).ok()?;
+    Some(crate::deltaglider::derive_key_id(name, &parsed.0))
+}
+
+fn set_legacy_key_id(enc: &mut crate::config::BackendEncryptionConfig, id: Option<String>) {
+    use crate::config::BackendEncryptionConfig as E;
+    match enc {
+        E::None { legacy_key_id, .. }
+        | E::Aes256GcmProxy { legacy_key_id, .. }
+        | E::SseKms { legacy_key_id, .. }
+        | E::SseS3 { legacy_key_id, .. } => *legacy_key_id = id,
     }
 }
 
@@ -1433,7 +1527,7 @@ mod tests {
         let old = proxy(Some(HEX32), None);
         let mut new = kms(None);
         let probe = BackendKeyPresence::default();
-        preserve_backend_encryption_secrets(&mut new, &old, probe);
+        preserve_backend_encryption_secrets("b", &mut new, &old, probe).unwrap();
         assert_eq!(
             new.legacy_key(),
             Some(HEX32),
@@ -1451,8 +1545,9 @@ mod tests {
         let probe = BackendKeyPresence {
             key_is_explicit_null: false,
             legacy_key_is_explicit_null: true,
+            legacy_key_is_set: false,
         };
-        preserve_backend_encryption_secrets(&mut new, &old, probe);
+        preserve_backend_encryption_secrets("b", &mut new, &old, probe).unwrap();
         assert_eq!(
             new.legacy_key(),
             None,
@@ -1468,7 +1563,7 @@ mod tests {
         let old = proxy(Some(HEX32), None);
         let mut new = kms(Some(HEX32_B));
         let probe = BackendKeyPresence::default();
-        preserve_backend_encryption_secrets(&mut new, &old, probe);
+        preserve_backend_encryption_secrets("b", &mut new, &old, probe).unwrap();
         assert_eq!(
             new.legacy_key(),
             Some(HEX32_B),
@@ -1487,7 +1582,7 @@ mod tests {
             legacy_key_id: None,
         };
         let probe = BackendKeyPresence::default();
-        preserve_backend_encryption_secrets(&mut new, &old, probe);
+        preserve_backend_encryption_secrets("b", &mut new, &old, probe).unwrap();
         assert_eq!(new.legacy_key(), Some(HEX32));
     }
 
@@ -1499,7 +1594,7 @@ mod tests {
         let old = proxy(Some(HEX32), Some(HEX32_B));
         let mut new = proxy(None, None); // redacted round-trip
         let probe = BackendKeyPresence::default();
-        preserve_backend_encryption_secrets(&mut new, &old, probe);
+        preserve_backend_encryption_secrets("b", &mut new, &old, probe).unwrap();
         assert_eq!(
             new.primary_key(),
             Some(HEX32),
@@ -1510,6 +1605,110 @@ mod tests {
             Some(HEX32_B),
             "same-mode preserves legacy_key"
         );
+    }
+
+    fn derived(name: &str, hex: &str) -> String {
+        derive_hex_key_id(name, hex).unwrap()
+    }
+
+    #[test]
+    fn rotation_keeps_the_old_key_as_legacy_with_its_stamped_id() {
+        // The UI rotate flow: body carries only the new key. Old objects
+        // carry the id derived from the OLD key; the shim must match it.
+        let old = proxy(Some(HEX32), None);
+        let mut new = proxy(Some(HEX32_B), None);
+        preserve_backend_encryption_secrets("b", &mut new, &old, BackendKeyPresence::default())
+            .unwrap();
+        assert_eq!(new.primary_key(), Some(HEX32_B));
+        assert_eq!(new.legacy_key(), Some(HEX32));
+        assert_eq!(new.legacy_key_id(), Some(derived("b", HEX32).as_str()));
+    }
+
+    #[test]
+    fn rotation_with_explicit_old_key_id_keeps_that_id() {
+        let old = E::Aes256GcmProxy {
+            key: Some(HEX32.into()),
+            key_id: Some("k-old".into()),
+            legacy_key: None,
+            legacy_key_id: None,
+        };
+        let mut new = proxy(Some(HEX32_B), None);
+        preserve_backend_encryption_secrets("b", &mut new, &old, BackendKeyPresence::default())
+            .unwrap();
+        assert_eq!(new.legacy_key_id(), Some("k-old"));
+    }
+
+    #[test]
+    fn rotation_that_keeps_the_key_id_is_refused() {
+        // Singleton merge-patch keeps an explicit key_id: the new key would
+        // be picked for objects stamped with the old key's id.
+        let old = E::Aes256GcmProxy {
+            key: Some(HEX32.into()),
+            key_id: Some("k1".into()),
+            legacy_key: None,
+            legacy_key_id: None,
+        };
+        let mut new = E::Aes256GcmProxy {
+            key: Some(HEX32_B.into()),
+            key_id: Some("k1".into()),
+            legacy_key: None,
+            legacy_key_id: None,
+        };
+        let err =
+            preserve_backend_encryption_secrets("b", &mut new, &old, BackendKeyPresence::default())
+                .unwrap_err();
+        assert!(err.contains("key id"), "{err}");
+    }
+
+    #[test]
+    fn rotation_refuses_to_overwrite_a_different_legacy_key() {
+        const HEX32_C: &str = "0303030303030303030303030303030303030303030303030303030303030303";
+        let old = proxy(Some(HEX32), Some(HEX32_C));
+        let mut new = proxy(Some(HEX32_B), Some(HEX32_C)); // merge-patch kept it
+        let err =
+            preserve_backend_encryption_secrets("b", &mut new, &old, BackendKeyPresence::default())
+                .unwrap_err();
+        assert!(err.contains("legacy"), "{err}");
+        // An explicit legacy_key: null is the operator's "drop it" choice.
+        let mut new = proxy(Some(HEX32_B), None);
+        let probe = BackendKeyPresence {
+            legacy_key_is_explicit_null: true,
+            ..Default::default()
+        };
+        preserve_backend_encryption_secrets("b", &mut new, &old, probe).unwrap();
+        assert_eq!(new.legacy_key(), None);
+    }
+
+    #[test]
+    fn mode_flip_promotion_carries_the_old_key_id() {
+        // Without the id, the engine derives `<name>::legacy` for the shim
+        // and it matches no object written under the old primary.
+        let old = proxy(Some(HEX32), None);
+        let mut new = E::None {
+            legacy_key: None,
+            legacy_key_id: None,
+        };
+        preserve_backend_encryption_secrets("b", &mut new, &old, BackendKeyPresence::default())
+            .unwrap();
+        assert_eq!(new.legacy_key_id(), Some(derived("b", HEX32).as_str()));
+    }
+
+    #[test]
+    fn unchanged_key_keeps_the_existing_legacy_pair() {
+        let old = E::Aes256GcmProxy {
+            key: Some(HEX32_B.into()),
+            key_id: None,
+            legacy_key: Some(HEX32.into()),
+            legacy_key_id: Some("k-old".into()),
+        };
+        // Named-list PUT: the whole encryption object is replaced, key and
+        // legacy_key_id absent.
+        let mut new = proxy(None, None);
+        preserve_backend_encryption_secrets("b", &mut new, &old, BackendKeyPresence::default())
+            .unwrap();
+        assert_eq!(new.primary_key(), Some(HEX32_B));
+        assert_eq!(new.legacy_key(), Some(HEX32));
+        assert_eq!(new.legacy_key_id(), Some("k-old"));
     }
 }
 

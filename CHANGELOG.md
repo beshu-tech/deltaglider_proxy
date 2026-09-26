@@ -73,6 +73,18 @@ refuses a destination that already holds objects: the job fails in its
 dialog) makes the destination an exact copy instead: destination objects that
 the source does not hold are deleted before the flip, and each delete is
 audited as `maintenance_migrate_mirror_delete`.
+### Fixed — Rotate key no longer makes existing objects unreadable
+
+The **Rotate key** button sent only the new key, because the admin UI never
+sees the current one. The server then dropped the current key, so every
+object written under it answered `500` and the re-encrypt job failed on every
+object. Now a config apply that changes a proxy-AES key (or moves a backend
+away from `aes256-gcm-proxy`) and does not set `legacy_key` keeps the previous
+key as `legacy_key`, together with the key id that the old objects carry. A
+mode change used to keep the key without its id, so the shim matched no
+object; it now keeps the id too. The apply is refused when the one legacy slot
+already holds a different key, or when the new key keeps the old `key_id`.
+Send `legacy_key: null` to drop the previous key on purpose.
 
 ### Changed — Declared buckets are created at boot on S3 backends too
 

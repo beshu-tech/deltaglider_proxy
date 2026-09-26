@@ -159,7 +159,7 @@ When `legacy_key` / `legacy_key_id` are set, reads check the object's `dg-encryp
 
 ## Limits
 
-- **No in-place key rotation.** Changing `key` on a backend makes objects written under the old key unreadable unless the old key is configured as `legacy_key`. The shim holds one legacy generation at a time. A Re-encrypt job (`POST /_/api/admin/jobs/reencrypt`, or Jobs → + New job → Re-encrypt buckets…) rewrites objects under the current configuration; it is durable, resumable across restarts, cancellable, and write-gates affected buckets (`503 SlowDown` on writes; reads unaffected).
+- **Key rotation keeps one previous key.** When an apply changes `key` (or moves a backend away from `aes256-gcm-proxy`) and does not set `legacy_key`, the proxy moves the previous key into `legacy_key`, and its effective id into `legacy_key_id`. An apply that sends `legacy_key: null` drops the previous key instead. The shim holds one legacy generation at a time, so the proxy refuses a key change while `legacy_key` holds a different key. It also refuses a key change that keeps the same `key_id`. A Re-encrypt job (`POST /_/api/admin/jobs/reencrypt`, or Jobs → + New job → Re-encrypt buckets…) rewrites objects under the current configuration; it is durable, resumable across restarts, cancellable, and write-gates affected buckets (`503 SlowDown` on writes; reads unaffected).
 - **Enabling is not retroactive.** Switching a backend's mode affects new writes only; existing objects keep their stored form and markers until rewritten.
 - **Key loss is data loss** in `aes256-gcm-proxy` mode. Keys are not escrowed; there is no recovery path.
 - **No per-bucket encryption.** Encryption is backend-scoped; a bucket inherits the encryption of the backend it routes to.

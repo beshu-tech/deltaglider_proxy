@@ -1,7 +1,7 @@
 /** src/backendEncryptionPayload.ts */
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
-import { buildEncryptionSectionBody } from '../backendEncryptionPayload';
+import { aesKeyPatch, buildEncryptionSectionBody } from '../backendEncryptionPayload';
 
 /** Mirror of the (unexported) `EncryptionPatch` in backendEncryptionPayload.ts. */
 interface EncryptionPatch {
@@ -153,4 +153,19 @@ test('force_path_style === false is a real value → must be KEPT', () => {
   eq(got, oracleBody('s3b', patch, backends), 'force_path_style false matches oracle');
   const list = got.backends as Record<string, unknown>[];
   assert.equal(list[0].force_path_style, false, 'force_path_style:false is preserved');
+});
+
+test('a proxy-AES key patch on a proxy-AES backend names the retired key id', () => {
+  // Explore finding 2: Rotate key sent only the new key, and the server
+  // dropped the old one. The UI cannot know the old key (GET redacts it),
+  // but it knows its id: send it as legacy_key_id so the intent is
+  // explicit, and clear key_id so the new key gets its own id.
+  assert.deepEqual(aesKeyPatch('NEW', { mode: 'aes256-gcm-proxy', key_id: 'old-id' }), {
+    mode: 'aes256-gcm-proxy',
+    key: 'NEW',
+    key_id: null,
+    legacy_key_id: 'old-id',
+  });
+  // Enabling from another mode: nothing to retire.
+  assert.deepEqual(aesKeyPatch('NEW', { mode: 'none' }), { mode: 'aes256-gcm-proxy', key: 'NEW' });
 });

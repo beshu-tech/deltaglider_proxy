@@ -1013,9 +1013,10 @@ pub enum BackendEncryptionConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         key_id: Option<String>,
         /// Decrypt-only shim: preserve the ability to READ objects
-        /// that were written with a previous key. Unused in `Aes256GcmProxy`
-        /// mode (use `key` to rotate); reserved for transitions TO
-        /// native modes.
+        /// that were written with a previous key (after a rotation, or
+        /// a transition to a native mode). A config apply that changes
+        /// `key` fills it with the retired key when the body leaves it
+        /// out (`preserve_backend_encryption_secrets`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         legacy_key: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

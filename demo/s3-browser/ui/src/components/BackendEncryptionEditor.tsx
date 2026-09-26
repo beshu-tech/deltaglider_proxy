@@ -29,6 +29,7 @@ import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
 import { generateAesKeyHex } from '../aesKeyGen';
 import { useCopyToClipboard } from '../useCopyToClipboard';
+import { aesKeyPatch } from '../backendEncryptionPayload';
 
 const { Text } = Typography;
 
@@ -44,7 +45,7 @@ const { Text } = Typography;
 export interface BackendEncryptionPatch {
   mode: BackendEncryptionMode;
   key?: string;
-  key_id?: string;
+  key_id?: string | null;
   kms_key_id?: string;
   bucket_key_enabled?: boolean;
   legacy_key?: string | null;
@@ -106,7 +107,7 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
       const key = generateAesKeyHex();
       setPendingKey(key);
       setStoredSafelyChecked(false);
-      setPending({ mode, key });
+      setPending(aesKeyPatch(key, current));
     } else if (mode === 'sse-kms') {
       setPendingKey(null);
       setStoredSafelyChecked(false);
@@ -329,7 +330,7 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
                   onClick={() => {
                     const k = generateAesKeyHex();
                     setPendingKey(k);
-                    setPending({ mode: 'aes256-gcm-proxy', key: k });
+                    setPending(aesKeyPatch(k, current));
                     setStoredSafelyChecked(false);
                   }}
                 >

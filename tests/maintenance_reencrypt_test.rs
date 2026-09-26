@@ -628,6 +628,71 @@ async fn test_reencrypt_key_rotation_a_to_b() {
     );
 }
 
+/// Explore finding 2: the admin UI "Rotate key" sends only the new key (it
+/// never sees the old one). The server must keep the old key as the
+/// decrypt-only shim, with the id the old objects carry, so they stay
+/// readable and the re-encrypt job can rewrite them.
+#[tokio::test]
+async fn test_rotation_without_legacy_in_body_keeps_old_objects_readable() {
+    let bucket = "maintuirot";
+    let server = TestServer::builder().bucket(bucket).build().await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+
+    // Enable the way the UI does: a key, no explicit key_id (derived id).
+    put_storage_encryption(
+        &admin,
+        &endpoint,
+        serde_json::json!({ "mode": "aes256-gcm-proxy", "key": KEY }),
+    )
+    .await;
+    let body = [PLAINTEXT_MARKER, b" old"].concat();
+    put_object(
+        &http,
+        &endpoint,
+        bucket,
+        "old.json",
+        body.clone(),
+        "text/plain",
+    )
+    .await;
+
+    put_storage_encryption(
+        &admin,
+        &endpoint,
+        serde_json::json!({ "mode": "aes256-gcm-proxy", "key": KEY_B }),
+    )
+    .await;
+    assert_eq!(
+        get_bytes(&http, &endpoint, bucket, "old.json").await,
+        body,
+        "object written under the old key must stay readable after rotation"
+    );
+
+    start_reencrypt(&admin, &endpoint, bucket).await;
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "succeeded", "rotation job: {job}");
+    assert_eq!(job["progress"]["failed"], 0, "rotation job: {job}");
+    assert_eq!(job["progress"]["processed"], 1, "rotation job: {job}");
+    assert_eq!(get_bytes(&http, &endpoint, bucket, "old.json").await, body);
+
+    // A second rotation while the shim still holds the first key is refused:
+    // the one legacy slot cannot hold two keys.
+    const KEY_C: &str = "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc1";
+    let resp = admin
+        .put(format!("{endpoint}/_/api/admin/config/section/storage"))
+        .json(&serde_json::json!({
+            "backend_encryption": { "mode": "aes256-gcm-proxy", "key": KEY_C }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("legacy"));
+}
+
 /// A rotation to B WITHOUT the legacy shim, run against a bucket that still has
 /// A-stamped objects: reading an un-rewritten A object must HARD-FAIL (never
 /// serve ciphertext) with the rotation-hint error — pins pick_decrypt_key.
@@ -643,11 +708,14 @@ async fn test_read_after_rotation_without_shim_hard_fails() {
     let body = [PLAINTEXT_MARKER, b" secret"].concat();
     put_object(&http, &endpoint, bucket, "a.json", body, "text/plain").await;
 
-    // Rotate to B with NO legacy shim, and DON'T re-encrypt — a.json stays A.
+    // Rotate to B and DISCARD A (explicit `legacy_key: null`; without it the
+    // server keeps A as the shim), and DON'T re-encrypt — a.json stays A.
     put_storage_encryption(
         &admin,
         &endpoint,
-        serde_json::json!({ "mode": "aes256-gcm-proxy", "key": KEY_B, "key_id": KEY_B_ID }),
+        serde_json::json!({
+            "mode": "aes256-gcm-proxy", "key": KEY_B, "key_id": KEY_B_ID, "legacy_key": null,
+        }),
     )
     .await;
 

@@ -28,7 +28,7 @@
 interface EncryptionPatch {
   mode: string;
   key?: string;
-  key_id?: string;
+  key_id?: string | null;
   kms_key_id?: string;
   bucket_key_enabled?: boolean;
   legacy_key?: string | null;
@@ -107,4 +107,22 @@ export function buildEncryptionSectionBody(
     return backendShape;
   });
   return { backends: list };
+}
+
+/**
+ * The patch for a new proxy-AES key. On a backend that already runs
+ * proxy-AES this is a rotation: the UI never sees the current key (GET
+ * redacts it), so it names the key it retires by id (`legacy_key_id`)
+ * and the server moves that key into the legacy slot. `key_id: null`
+ * drops an explicit id, so the new key gets its own derived id; an id
+ * shared by both keys would make old objects decrypt with the new key.
+ */
+export function aesKeyPatch(
+  key: string,
+  current: { mode: string; key_id?: string },
+): EncryptionPatch & { mode: 'aes256-gcm-proxy' } {
+  if (current.mode === 'aes256-gcm-proxy' && current.key_id) {
+    return { mode: 'aes256-gcm-proxy', key, key_id: null, legacy_key_id: current.key_id };
+  }
+  return { mode: 'aes256-gcm-proxy', key };
 }

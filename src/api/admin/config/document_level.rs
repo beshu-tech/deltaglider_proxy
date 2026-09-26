@@ -334,7 +334,20 @@ pub async fn validate_config_doc(
             // apply would reject (or vice versa for unchanged-invalid rules).
             // Validate the SAME view apply runs: runtime secrets preserved,
             // env overrides re-applied (a dry run must not differ from apply).
-            let mut side_warnings = preserve_runtime_secrets(&mut cfg, &current, &body.yaml);
+            let mut side_warnings = match preserve_runtime_secrets(&mut cfg, &current, &body.yaml) {
+                Ok(w) => w,
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(ConfigValidateResponse {
+                            existing_warnings: Vec::new(),
+                            ok: false,
+                            warnings: vec![],
+                            error: Some(e),
+                        }),
+                    );
+                }
+            };
             match super::reapply_env(&current, &mut cfg, true) {
                 Ok(w) => side_warnings.extend(w),
                 Err(e) => {
@@ -443,7 +456,7 @@ pub(super) fn preserve_runtime_secrets(
     incoming: &mut crate::config::Config,
     current: &crate::config::Config,
     raw_yaml: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
 
     // Per-backend AES encryption keys are masked to None on export
@@ -463,20 +476,7 @@ pub(super) fn preserve_runtime_secrets(
         super::SectionName::Storage,
         &storage_body,
     );
-    super::section_level::preserve_backend_encryption_secrets(
-        &mut incoming.backend_encryption,
-        &current.backend_encryption,
-        probe.for_singleton(),
-    );
-    for new_named in &mut incoming.backends {
-        if let Some(old_named) = current.backends.iter().find(|n| n.name == new_named.name) {
-            super::section_level::preserve_backend_encryption_secrets(
-                &mut new_named.encryption,
-                &old_named.encryption,
-                probe.for_named(&new_named.name),
-            );
-        }
-    }
+    super::section_level::preserve_all_backend_encryption(incoming, current, &probe)?;
 
     // Top-level infra secrets. The bootstrap hash is the only
     // top-level infra secret left after the per-backend encryption
@@ -511,7 +511,7 @@ pub(super) fn preserve_runtime_secrets(
     // secrets identically.
     super::preserve_event_delivery_secrets(&mut incoming.event_delivery, &current.event_delivery);
 
-    warnings
+    Ok(warnings)
 }
 
 /// `POST /api/admin/config/apply` — atomic full-document apply.
@@ -670,7 +670,24 @@ pub(crate) async fn apply_config_inner_with_env(
     // 3. Merge runtime secrets into the incoming doc. `preserve_runtime_secrets`
     //    emits its own warnings for credential transitions that would
     //    silently clear state — surface them to the caller.
-    let preserve_warnings = preserve_runtime_secrets(&mut incoming, &cfg, &body.yaml);
+    let preserve_warnings = match preserve_runtime_secrets(&mut incoming, &cfg, &body.yaml) {
+        Ok(w) => w,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                ConfigApplyResponse {
+                    current_version: None,
+                    existing_warnings: Vec::new(),
+                    applied: false,
+                    persisted: false,
+                    requires_restart: false,
+                    warnings: parse_warnings,
+                    error: Some(e),
+                    persisted_path: None,
+                },
+            );
+        }
+    };
 
     // 3b. Carry forward env-ref provenance from the running config. A doc
     //     applied via the CLI arrives pre-expanded (operator-side env), so
@@ -1318,7 +1335,7 @@ access:
             ..Default::default()
         };
         let yaml = "storage:\n  backend_encryption:\n    mode: aes256-gcm-proxy\n    key_id: k1\n";
-        preserve_runtime_secrets(&mut incoming, &current, yaml);
+        preserve_runtime_secrets(&mut incoming, &current, yaml).unwrap();
         match incoming.backend_encryption {
             E::Aes256GcmProxy { key, .. } => assert_eq!(
                 key,
@@ -1353,7 +1370,7 @@ access:
             ..Default::default()
         };
         let yaml = "storage:\n  backend_encryption:\n    mode: aes256-gcm-proxy\n    key: null\n";
-        preserve_runtime_secrets(&mut incoming, &current, yaml);
+        preserve_runtime_secrets(&mut incoming, &current, yaml).unwrap();
         match incoming.backend_encryption {
             E::Aes256GcmProxy { key, .. } => {
                 assert_eq!(key, None, "explicit null must NOT be preserved")

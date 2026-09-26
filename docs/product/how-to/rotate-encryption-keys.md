@@ -1,6 +1,6 @@
 # How to rotate or change encryption keys
 
-This guide shows you how to change a backend's encryption key or mode without losing access to historical objects. There is no in-place rotation: changing `key` alone makes old objects unreadable. Every safe path goes through either the `legacy_key` read shim or a data rewrite — background in [encryption at rest](../explanation/encryption-at-rest.md), shim semantics in the [encryption reference](../reference/encryption.md#the-legacy_key-shim).
+This guide shows you how to change a backend's encryption key or mode without losing access to historical objects. Every safe path goes through either the `legacy_key` read shim or a data rewrite. When you change `key` and do not set `legacy_key` yourself, the proxy moves the previous key into the `legacy_key` slot, together with the key id that the old objects carry, so that those objects stay readable — background in [encryption at rest](../explanation/encryption-at-rest.md), shim semantics in the [encryption reference](../reference/encryption.md#the-legacy_key-shim).
 
 ## Which recipe do you need?
 
@@ -25,7 +25,7 @@ This guide shows you how to change a backend's encryption key or mode without lo
      legacy_key_id: prod-2025-10      # the id stamped on old objects
    ```
 
-   Apply (hot-reload or restart). New writes now use the new key; reads check the new key id first and fall back to the legacy slot. The admin panel shows an info banner while a shim is active.
+   Apply (hot-reload or restart). The **Rotate key** button on the Backends page does this step for you: it sends only the new key, and the proxy moves the current key and its id into the legacy slot. New writes now use the new key; reads check the new key id first and fall back to the legacy slot. The admin panel shows an info banner while a shim is active.
 
 3. Run a **Re-encrypt job** to rewrite the historical objects under the new key (a rewritten object keeps its original creation time, so its `LastModified` does not change): **Settings → Jobs → + New job → Re-encrypt buckets…**, or:
 
@@ -41,7 +41,7 @@ This guide shows you how to change a backend's encryption key or mode without lo
 
 4. When every job shows `succeeded`, remove `legacy_key` + `legacy_key_id` and apply. The old key can now be destroyed.
 
-**Caveat:** the shim holds exactly ONE legacy generation. Don't rotate again while a shim is live — rotate to the final key, not through intermediaries.
+**Caveat:** the shim holds exactly ONE legacy generation. Don't rotate again while a shim is live — rotate to the final key, not through intermediaries. The proxy refuses a key change that would push a different key out of a live legacy slot, because objects can still need that key. It also refuses a key change that keeps the same `key_id`, because the proxy would then decrypt the old objects with the new key. To drop a legacy key on purpose, send `legacy_key: null` in the same apply.
 
 ## Recipe B: rotation via data migration (zero-shim)
 

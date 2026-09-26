@@ -1776,17 +1776,21 @@ advanced:
         super::preserve_named_backends_creds(new, old, &mut w);
         let probe = super::section_level::BackendKeyPresence::default();
         super::section_level::preserve_backend_encryption_secrets(
+            "default",
             &mut new.backend_encryption,
             &old.backend_encryption,
             probe,
-        );
+        )
+        .unwrap();
         for n in &mut new.backends {
             if let Some(o) = old.backends.iter().find(|o| o.name == n.name) {
                 super::section_level::preserve_backend_encryption_secrets(
+                    &n.name.clone(),
                     &mut n.encryption,
                     &o.encryption,
                     probe,
-                );
+                )
+                .unwrap();
             }
         }
     }
@@ -1838,7 +1842,7 @@ advanced:
         // running config).
         let yaml = run.to_canonical_yaml_with(&|_| None).unwrap();
         let mut e = Config::from_yaml_str(&yaml).unwrap();
-        super::document_level::preserve_runtime_secrets(&mut e, &run, &yaml);
+        super::document_level::preserve_runtime_secrets(&mut e, &run, &yaml).unwrap();
         assert_no_leak("document apply", &run, e, &env, &check);
 
         // Encryption mode flip away from proxy AES (singleton + named).
