@@ -103,7 +103,8 @@ bytes = "1"
 futures = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 multer = "3"
 tokio-util = { version = "0.7", features = ["io", "rt"] }
-tower-http = { version = "0.6", features = ["trace", "cors", "timeout"] }
+# compression-*: gzip/br for the embedded UI assets only (see demo.rs).
+tower-http = { version = "0.6", features = ["trace", "cors", "timeout", "compression-gzip", "compression-br"] }
 arc-swap = "1"
 urlencoding = "2"
 tempfile = "3"
@@ -123,9 +124,9 @@ serde_urlencoded = "0.7"
 regex-lite = "0.1"
 
 # Embedded demo UI
-# NOTE: `compression` would pull include-flate → zstd-sys (~66s of C
-# compile) just to gzip our static JS/CSS in the binary; the wire
-# format is already gzipped by the client/CDN, so the work is wasted.
+# NOTE: rust-embed's `compression` would pull include-flate → zstd-sys
+# (~66s of C compile). The wire compression of the UI assets is
+# tower-http's CompressionLayer on the static routes instead (demo.rs).
 rust-embed = { version = "8" }
 mime_guess = "2"
 

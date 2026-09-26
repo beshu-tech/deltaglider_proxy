@@ -24,8 +24,14 @@ export default defineConfig({
     //
     // manualChunks: split heavy vendor libs out of the main shell so
     // the file-browser entry only downloads what it needs on first
-    // paint. AntD, AWS SDK, markdown stack, and dnd-kit are all
-    // independently cacheable across page navigations.
+    // paint. AntD, AWS SDK, dnd-kit and forms are all independently
+    // cacheable across page navigations.
+    //
+    // NO manual chunk for the markdown stack: Rolldown's manual groups
+    // capture a module's dependencies too, so a `markdown` group took
+    // react/jsx-runtime with it, and the file-browser entry then had to
+    // modulepreload the whole 330 kB markdown chunk. Left alone, the stack
+    // lands in the lazy docs chunks, loaded only when docs open.
     //
     // Function form (not the object form) because Vite 8 ships Rolldown
     // as its bundler, and Rolldown's manualChunks only accepts a
@@ -42,12 +48,6 @@ export default defineConfig({
               '@aws-sdk/client-s3',
               '@aws-sdk/lib-storage',
               '@aws-sdk/s3-request-presigner',
-            ]],
-            ['markdown', [
-              'react-markdown',
-              'remark-gfm',
-              'rehype-highlight',
-              'rehype-slug',
             ]],
             ['dnd', ['@dnd-kit/core', '@dnd-kit/sortable', '@dnd-kit/utilities']],
             ['forms', ['react-hook-form', '@hookform/resolvers', 'zod']],

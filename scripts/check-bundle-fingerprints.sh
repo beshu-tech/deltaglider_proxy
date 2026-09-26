@@ -8,6 +8,7 @@
 #   2. a build timestamp literal (ISO 8601 with a trailing Z)
 #   3. product docs inlined at build time (the changelog names every release)
 #   4. source maps (the full UI source)
+#   5. (size) the markdown/docs stack loaded by index.html up front
 # The running version and build time reach the UI only through the
 # session-authenticated /_/api/whoami, and the docs through /_/api/docs.
 # Runs after `npm run build`: wired into the Dockerfile UI stage and CI.
@@ -61,8 +62,21 @@ done
 maps=$(find "$dist" -name '*.map' -print)
 [ -z "$maps" ] || report "source maps present: $(echo "$maps" | tr '\n' ' ')"
 
+# 5. (Size, not a fingerprint.) The file-browser entry must not load the
+#    markdown stack: index.html's entry script and modulepreloads must not
+#    contain the markdown parser (micromark). It belongs to the lazy docs
+#    chunks; a manual `markdown` chunk once dragged react/jsx-runtime in and
+#    made every page preload 330 kB for the docs.
+if [ -f "$dist/index.html" ]; then
+  for asset in $(grep -oE '(src|href)="/_/assets/[^"]+\.js"' "$dist/index.html" | sed -E 's#.*/_/assets/([^"]+)"#\1#'); do
+    if grep -q 'micromark' "$dist/assets/$asset"; then
+      report "index.html loads the markdown stack up front via assets/$asset (keep it in the lazy docs chunks)"
+    fi
+  done
+fi
+
 if [ "$fail" -ne 0 ]; then
-  echo "check-bundle-fingerprints: FAILED - the bundle identifies the build to anonymous callers" >&2
+  echo "check-bundle-fingerprints: FAILED - the bundle identifies the build to anonymous callers, or preloads the docs stack" >&2
   exit 1
 fi
-echo "check-bundle-fingerprints: OK (no version, build time, docs, or source maps in $dist)"
+echo "check-bundle-fingerprints: OK (no version, build time, docs, source maps or up-front docs stack in $dist)"

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — The admin UI loads compressed, and the file browser skips the docs stack
+
+The UI's HTML, JS and CSS went out uncompressed (several MB on a first
+load), and the file-browser page preloaded the 330 kB markdown stack that
+only the docs need. The UI routes (and `GET /_/api/docs`) now answer gzip or
+br when the browser accepts it; S3 responses are not touched. The markdown
+stack moved to the lazy docs chunks, and `check-bundle-fingerprints.sh`
+fails the build if `index.html` loads it up front again.
+
 ### Fixed — Bucket migration and re-encryption keep each object's time
 
 A migrated or re-encrypted object got the time of the copy as its

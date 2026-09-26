@@ -982,6 +982,55 @@ async fn test_unknown_ui_paths_are_404_not_spa_fallback() {
     );
 }
 
+/// Browser review #21: the UI's HTML and JS go out compressed when the
+/// browser accepts it (they were sent raw: several MB per first load).
+#[tokio::test]
+async fn test_ui_assets_are_compressed() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let http = reqwest::Client::new();
+    let get = |p: String, enc: &'static str| {
+        http.get(format!("{}{}", server.endpoint(), p))
+            .header(reqwest::header::ACCEPT_ENCODING, enc)
+            .send()
+    };
+    let shell = get("/_/browse".into(), "identity").await.unwrap();
+    let body = shell.text().await.unwrap();
+    if body == "Demo UI not built" {
+        eprintln!("skipping: demo UI not built");
+        return;
+    }
+    let chunk = body
+        .split("/_/assets/")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("index.html references an /_/assets/ chunk")
+        .to_string();
+    for (path, enc, want) in [
+        ("/_/browse".to_string(), "gzip", "gzip"),
+        (format!("/_/assets/{chunk}"), "br, gzip", "br"),
+        (format!("/_/assets/{chunk}"), "gzip", "gzip"),
+    ] {
+        let resp = get(path.clone(), enc).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            resp.headers()
+                .get(reqwest::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some(want),
+            "{path} with Accept-Encoding: {enc}"
+        );
+    }
+    // A client that accepts no encoding gets the raw bytes.
+    let raw = get(format!("/_/assets/{chunk}"), "identity").await.unwrap();
+    assert!(raw
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .is_none());
+}
+
 /// `DGP_METRICS_BEARER_TOKEN` turns the public scrape into a token-gated
 /// one: Prometheus presents the token, the admin dashboard presents its
 /// session, and anonymous callers get a 401 with no metric names to

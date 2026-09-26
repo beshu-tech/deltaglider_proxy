@@ -139,7 +139,14 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .route("/_/api/admin/session", get(admin::check_session))
         // Product docs + manifest, one payload. Not secret, but they name
         // every release — so a session, never anonymous.
-        .route("/_/api/docs", get(product_docs_bundle))
+        .route(
+            "/_/api/docs",
+            get(product_docs_bundle).layer(
+                tower_http::compression::CompressionLayer::new()
+                    .gzip(true)
+                    .br(true),
+            ),
+        )
         // Canned IAM policies: consumed by the user form only. The policy
         // set changes across releases, so it stays off the anonymous surface.
         .route("/_/api/admin/policies", get(admin::get_canned_policies))
@@ -518,7 +525,15 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // (and a scanner) that the resource exists. Registered routes win
         // over this catch-all, so real endpoints keep their own 405s.
         .route("/_/api/*rest", any(api_not_found))
-        .route("/_/*path", get(static_or_fallback));
+        .route("/_/*path", get(static_or_fallback))
+        // gzip / br for the SPA shell and its JS/CSS (several MB raw). Only
+        // these routes: S3 responses must stay byte-exact, and the admin
+        // API's SSE streams must not be buffered by an encoder.
+        .layer(
+            tower_http::compression::CompressionLayer::new()
+                .gzip(true)
+                .br(true),
+        );
 
     Router::new()
         .merge(session_light)
