@@ -17,6 +17,18 @@ fails and never looks complete. In Chrome and Edge, a file that the browser
 created for a download that then fails is deleted. A ZIP download now writes a
 `bulk_zip` audit entry, like a bulk copy, move, or delete.
 
+### Fixed — An edit of a named backend keeps its explicit `key_id`
+
+A section `PUT` replaces the whole `backends` list, and the proxy kept an
+absent `key` and `legacy_key` from the running config, but not an absent
+`key_id`. So an edit of a named proxy-AES backend that did not repeat
+`key_id` changed the backend's key id to a derived one. Objects written
+before the edit carry the explicit id, which then matched no configured
+key, so reads of them failed.
+Now one rule covers `key`, `key_id` and `legacy_key`: absent keeps the
+value, `null` clears it, and a value replaces it. An id is kept only with
+its own key, so a new key without a `key_id` still gets a derived id.
+
 ### Added — Clear the legacy key from the shim banner, when nothing needs it
 
 The decrypt-only shim banner told operators to clear `legacy_key` "once all

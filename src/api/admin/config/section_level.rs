@@ -1074,22 +1074,51 @@ fn compute_section_diff(
     serde_json::Value::Object(out)
 }
 
-/// What the operator said about each encryption key field for one
-/// backend. Derived from the raw PUT body's JSON shape so the
-/// merge-patch "absent vs null" distinction survives into the
-/// preservation pass.
-///
-/// Both flags are independent — a PATCH that sets `key: null` and
-/// leaves `legacy_key` absent clears the primary but preserves the
-/// old shim. Vice versa for restoring a shim without rotating the
-/// primary.
+/// How one field appears in the raw PUT body: absent, `null`, or a value.
+/// After merge-patch / serde, absent and `null` both read as `None`; this
+/// keeps them apart.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Presence {
+    #[default]
+    Absent,
+    Null,
+    Set,
+}
+
+impl Presence {
+    fn of(obj: &serde_json::Map<String, serde_json::Value>, field: &str) -> Self {
+        match obj.get(field) {
+            None => Self::Absent,
+            Some(serde_json::Value::Null) => Self::Null,
+            Some(_) => Self::Set,
+        }
+    }
+}
+
+/// THE merge rule for a kept encryption field (`key`, `key_id`,
+/// `legacy_key`): absent keeps the old value, an explicit `null` clears
+/// it, a value replaces it. Returns true when the old value was restored.
+pub(crate) fn merge_kept_field(
+    presence: Presence,
+    new: &mut Option<String>,
+    old: Option<&str>,
+) -> bool {
+    if presence == Presence::Absent && new.is_none() && old.is_some() {
+        *new = old.map(str::to_string);
+        return true;
+    }
+    false
+}
+
+/// What the operator said about each kept encryption field for one
+/// backend, from the raw PUT body. The fields are independent: a PATCH
+/// that sets `key: null` and leaves `legacy_key` absent clears the
+/// primary but keeps the old shim.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct BackendKeyPresence {
-    pub key_is_explicit_null: bool,
-    pub legacy_key_is_explicit_null: bool,
-    /// The body carries a `legacy_key` string: the operator chose the
-    /// shim key, so the rotated-out primary is not promoted over it.
-    pub legacy_key_is_set: bool,
+    pub key: Presence,
+    pub key_id: Presence,
+    pub legacy_key: Presence,
 }
 
 /// Inspects a section-PUT body and reports, per backend-encryption
@@ -1157,9 +1186,9 @@ fn probe_enc_body(enc: &serde_json::Value) -> BackendKeyPresence {
         None => return BackendKeyPresence::default(),
     };
     BackendKeyPresence {
-        key_is_explicit_null: obj.get("key").map(|v| v.is_null()).unwrap_or(false),
-        legacy_key_is_explicit_null: obj.get("legacy_key").map(|v| v.is_null()).unwrap_or(false),
-        legacy_key_is_set: obj.get("legacy_key").is_some_and(|v| v.is_string()),
+        key: Presence::of(obj, "key"),
+        key_id: Presence::of(obj, "key_id"),
+        legacy_key: Presence::of(obj, "legacy_key"),
     }
 }
 
@@ -1209,16 +1238,24 @@ pub(crate) fn preserve_backend_encryption_secrets(
         .filter(|k| crate::storage::EncryptionKey::from_hex(k).is_ok())
         .map(str::to_string);
 
-    // Primary key preservation — only relevant on Aes256GcmProxy.
-    // Same-mode, absent-in-body ⇒ preserve old primary.
+    // Primary key + key_id — only relevant on Aes256GcmProxy. The id is
+    // kept only with its own key: a new key without an id gets a derived
+    // one (keeping the old id would stamp two keys with one id).
     if let E::Aes256GcmProxy {
         key: ref mut new_key,
+        key_id: ref mut new_kid,
         ..
     } = new
     {
-        if new_key.is_none() && !probe.key_is_explicit_null {
-            if let Some(old_key) = &old_primary_ok {
-                *new_key = Some(old_key.clone());
+        merge_kept_field(probe.key, new_key, old_primary_ok.as_deref());
+        if let E::Aes256GcmProxy {
+            key: old_key,
+            key_id: old_kid,
+            ..
+        } = old
+        {
+            if new_key.is_some() && new_key == old_key {
+                merge_kept_field(probe.key_id, new_kid, old_kid.as_deref());
             }
         }
     }
@@ -1248,9 +1285,9 @@ pub(crate) fn preserve_backend_encryption_secrets(
             }
             // A merge-patch keeps the OLD legacy value in `new`; only a
             // different value (or the probe) means the body chose one.
-            let body_sets_legacy = probe.legacy_key_is_set
+            let body_sets_legacy = probe.legacy_key == Presence::Set
                 || (new.legacy_key().is_some() && new.legacy_key() != old.legacy_key());
-            if !probe.legacy_key_is_explicit_null && !body_sets_legacy {
+            if probe.legacy_key != Presence::Null && !body_sets_legacy {
                 if old_legacy_ok.as_deref().is_some_and(|l| l != old_primary) {
                     let held_kid = crate::deltaglider::effective_legacy_key_id(backend_name, old)
                         .unwrap_or_default();
@@ -1278,11 +1315,10 @@ pub(crate) fn preserve_backend_encryption_secrets(
     // propagate. The id travels with the key: a key restored without
     // its id would get a different derived id and match nothing.
     if let Some(new_legacy) = new.legacy_key_mut() {
-        if new_legacy.is_none() && !probe.legacy_key_is_explicit_null {
-            *new_legacy = old_legacy_ok.clone();
-            if old_legacy_ok.is_some() && new.legacy_key_id().is_none() {
-                set_legacy_key_id(new, old.legacy_key_id().map(str::to_string));
-            }
+        if merge_kept_field(probe.legacy_key, new_legacy, old_legacy_ok.as_deref())
+            && new.legacy_key_id().is_none()
+        {
+            set_legacy_key_id(new, old.legacy_key_id().map(str::to_string));
         }
     }
     Ok(())
@@ -1541,9 +1577,8 @@ mod tests {
         let old = proxy(Some(HEX32), None);
         let mut new = kms(None);
         let probe = BackendKeyPresence {
-            key_is_explicit_null: false,
-            legacy_key_is_explicit_null: true,
-            legacy_key_is_set: false,
+            legacy_key: Presence::Null,
+            ..Default::default()
         };
         preserve_backend_encryption_secrets("b", &mut new, &old, probe).unwrap();
         assert_eq!(
@@ -1610,6 +1645,122 @@ mod tests {
     }
 
     #[test]
+    fn merge_kept_field_truth_table() {
+        use Presence::*;
+        // (presence, new before, old) -> new after
+        type Case = (
+            Presence,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
+        let cases: [Case; 7] = [
+            (Absent, None, Some("old"), Some("old")),
+            (Absent, None, None, None),
+            (Absent, Some("merged"), Some("old"), Some("merged")),
+            (Null, None, Some("old"), None),
+            (Set, Some("new"), Some("old"), Some("new")),
+            (Set, Some("new"), None, Some("new")),
+            (Null, None, None, None),
+        ];
+        for (presence, before, old, after) in cases {
+            let mut v = before.map(str::to_string);
+            merge_kept_field(presence, &mut v, old);
+            assert_eq!(v.as_deref(), after, "{presence:?} {before:?} {old:?}");
+        }
+    }
+
+    #[test]
+    fn key_id_follows_the_rule_only_with_its_own_key() {
+        let old = E::Aes256GcmProxy {
+            key: Some(HEX32.into()),
+            key_id: Some("k-explicit".into()),
+            legacy_key: None,
+            legacy_key_id: None,
+        };
+        let kid = |e: &E| match e {
+            E::Aes256GcmProxy { key_id, .. } => key_id.clone(),
+            _ => None,
+        };
+        let run = |key: Option<&str>, key_id: Option<&str>, p: BackendKeyPresence| {
+            let mut new = E::Aes256GcmProxy {
+                key: key.map(str::to_string),
+                key_id: key_id.map(str::to_string),
+                legacy_key: None,
+                legacy_key_id: None,
+            };
+            preserve_backend_encryption_secrets("b", &mut new, &old, p).map(|_| new)
+        };
+        let p = |key_id| BackendKeyPresence {
+            key_id,
+            ..Default::default()
+        };
+        // Same key (absent in body): absent keeps, null clears, a value replaces.
+        assert_eq!(
+            kid(&run(None, None, p(Presence::Absent)).unwrap()).as_deref(),
+            Some("k-explicit")
+        );
+        assert_eq!(kid(&run(None, None, p(Presence::Null)).unwrap()), None);
+        assert_eq!(
+            kid(&run(None, Some("k-2"), p(Presence::Set)).unwrap()).as_deref(),
+            Some("k-2")
+        );
+        // Same key sent again: the id is kept too.
+        assert_eq!(
+            kid(&run(
+                Some(HEX32),
+                None,
+                BackendKeyPresence {
+                    key: Presence::Set,
+                    ..p(Presence::Absent)
+                }
+            )
+            .unwrap())
+            .as_deref(),
+            Some("k-explicit")
+        );
+        // A new key without an id: derived id, and the old id goes to the shim.
+        let rotated = run(
+            Some(HEX32_B),
+            None,
+            BackendKeyPresence {
+                key: Presence::Set,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(kid(&rotated), None);
+        assert_eq!(rotated.legacy_key_id(), Some("k-explicit"));
+    }
+
+    #[test]
+    fn absent_key_id_is_kept_with_an_unchanged_key() {
+        // A named-backend entry is replaced as a whole, so a body that omits
+        // `key_id` (the GET redacts `key`, and the UI builds the block from the
+        // patch) must not drop an explicit id: new writes would get a derived
+        // id, and objects stamped with the explicit id would match no key.
+        let old = E::Aes256GcmProxy {
+            key: Some(HEX32.into()),
+            key_id: Some("k-explicit".into()),
+            legacy_key: Some(HEX32_B.into()),
+            legacy_key_id: Some("k-old".into()),
+        };
+        let mut new = E::Aes256GcmProxy {
+            key: None,
+            key_id: None,
+            legacy_key: None,
+            legacy_key_id: None,
+        };
+        preserve_backend_encryption_secrets("b", &mut new, &old, BackendKeyPresence::default())
+            .unwrap();
+        assert_eq!(new.primary_key(), Some(HEX32));
+        assert!(
+            matches!(&new, E::Aes256GcmProxy { key_id: Some(k), .. } if k == "k-explicit"),
+            "{new:?}"
+        );
+    }
+
+    #[test]
     fn rotation_keeps_the_old_key_as_legacy_with_its_stamped_id() {
         // The UI rotate flow: body carries only the new key. Old objects
         // carry the id derived from the OLD key; the shim must match it.
@@ -1670,7 +1821,7 @@ mod tests {
         // An explicit legacy_key: null is the operator's "drop it" choice.
         let mut new = proxy(Some(HEX32_B), None);
         let probe = BackendKeyPresence {
-            legacy_key_is_explicit_null: true,
+            legacy_key: Presence::Null,
             ..Default::default()
         };
         preserve_backend_encryption_secrets("b", &mut new, &old, probe).unwrap();
