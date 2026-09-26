@@ -910,3 +910,167 @@ mod review3_tests {
         assert!(pool.try_acquire(4 * MIB).is_ok());
     }
 }
+
+/// Model test of the `Budget` state machine: random sequences of no-wait
+/// takes, waits, releases, cancels and polls, with the invariants checked
+/// after every step. `loom`/`shuttle` would need `Budget` built on their
+/// primitives instead of `parking_lot` + `tokio::sync::Notify`; every state
+/// change here happens under one mutex, so a sequential model over all
+/// interleavings of those critical sections covers the same ground.
+#[cfg(test)]
+mod budget_model_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Try(usize),
+        Wait(usize),
+        Release(usize),
+        Cancel(usize),
+    }
+
+    fn op(max: usize) -> impl Strategy<Value = Op> {
+        prop_oneof![
+            (0..=max + 2).prop_map(Op::Try),
+            (0..=max + 2).prop_map(Op::Wait),
+            any::<usize>().prop_map(Op::Release),
+            any::<usize>().prop_map(Op::Cancel),
+        ]
+    }
+
+    type Pending = Pin<Box<dyn Future<Output = BudgetPermit>>>;
+
+    struct Model {
+        budget: Arc<Budget>,
+        held: Vec<BudgetPermit>,
+        /// Queued waiters, oldest first: (id, need, future).
+        pending: Vec<(usize, usize, Pending)>,
+        next_id: usize,
+    }
+
+    impl Model {
+        fn used(&self) -> usize {
+            self.budget.state.lock().used
+        }
+
+        /// Poll every pending waiter, oldest first. FIFO: none completes
+        /// while an older one still waits (a zero-size wait needs nothing
+        /// and never queues).
+        fn poll_all(&mut self) {
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut still = Vec::new();
+            let mut older_waits = false;
+            for (id, need, mut fut) in std::mem::take(&mut self.pending) {
+                match fut.as_mut().poll(&mut cx) {
+                    Poll::Ready(permit) => {
+                        assert!(
+                            !older_waits || need == 0,
+                            "waiter {id} granted before an older one"
+                        );
+                        assert_eq!(permit.num_permits(), need.min(self.budget.max));
+                        self.held.push(permit);
+                    }
+                    Poll::Pending => {
+                        older_waits = true;
+                        still.push((id, need, fut));
+                    }
+                }
+            }
+            self.pending = still;
+        }
+
+        /// `used` is exactly what permits hold plus what waiters collected.
+        fn check(&self) {
+            let st = self.budget.state.lock();
+            let held: usize = self.held.iter().map(|p| p.num_permits()).sum();
+            let collected: usize = st
+                .queue
+                .iter()
+                .map(|w| w.collected.load(std::sync::atomic::Ordering::SeqCst))
+                .sum();
+            assert!(st.used <= self.budget.max, "used {} > max", st.used);
+            assert_eq!(st.used, held + collected, "budget accounting drifted");
+            assert_eq!(st.queue.len(), self.pending.len(), "queue mirrors waiters");
+        }
+    }
+
+    fn run(max: usize, ops: Vec<Op>) {
+        let mut m = Model {
+            budget: Budget::new(max),
+            held: Vec::new(),
+            pending: Vec::new(),
+            next_id: 0,
+        };
+        for op in ops {
+            match op {
+                Op::Try(n) => {
+                    let free = max - m.used();
+                    let got = m.budget.try_acquire(n);
+                    // A no-wait caller gets any budget free now, whatever
+                    // the queue holds.
+                    assert_eq!(
+                        got.is_some(),
+                        free >= n.min(max),
+                        "try {n} with {free} free"
+                    );
+                    m.held.extend(got);
+                }
+                Op::Wait(n) => {
+                    let before = m.used();
+                    let b = m.budget.clone();
+                    let fut: Pending = Box::pin(async move { b.acquire(n).await });
+                    m.pending.push((m.next_id, n, fut));
+                    m.next_id += 1;
+                    let queued = m.pending.len();
+                    m.poll_all();
+                    if m.pending.len() == queued {
+                        // It queued: it takes nothing that was free.
+                        assert_eq!(m.used(), before, "a new waiter took free budget");
+                    }
+                }
+                Op::Release(i) if !m.held.is_empty() => {
+                    let i = i % m.held.len();
+                    drop(m.held.swap_remove(i));
+                    m.poll_all();
+                }
+                Op::Cancel(i) if !m.pending.is_empty() => {
+                    let i = i % m.pending.len();
+                    drop(m.pending.remove(i));
+                    m.poll_all();
+                }
+                Op::Release(_) | Op::Cancel(_) => {}
+            }
+            m.check();
+        }
+        // No starvation: once holders release, every waiter completes.
+        for _ in 0..=m.pending.len() {
+            m.held.clear();
+            m.poll_all();
+            m.check();
+        }
+        assert!(
+            m.pending.is_empty(),
+            "a waiter starved: {} left",
+            m.pending.len()
+        );
+        // No leak: with every permit dropped the whole budget is free.
+        m.held.clear();
+        assert_eq!(m.used(), 0, "budget leaked");
+        assert!(m.budget.state.lock().queue.is_empty());
+    }
+
+    proptest! {
+        #[test]
+        fn budget_invariants_hold_for_any_schedule(
+            (max, ops) in (1usize..12).prop_flat_map(|max| {
+                (Just(max), proptest::collection::vec(op(max), 0..60))
+            })
+        ) {
+            run(max, ops);
+        }
+    }
+}
