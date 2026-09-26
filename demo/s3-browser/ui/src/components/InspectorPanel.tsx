@@ -685,7 +685,7 @@ export default function InspectorPanel({
                 )}
               </InspectorSection>
             ) : (
-              /* Compression disabled for this bucket — show clean, simple size info */
+              /* Compression off for the bucket, or a passthrough object — simple size info */
               <InspectorSection title="Storage">
                 <div style={{
                   background: BG_SIDEBAR, borderRadius: 10, padding: '16px', textAlign: 'center',
@@ -695,7 +695,9 @@ export default function InspectorPanel({
                     {formatBytes(object.size)}
                   </div>
                   <div style={{ fontSize: 11, color: TEXT_FAINT, fontFamily: 'var(--font-ui)', marginTop: 8 }}>
-                    Compression disabled for this bucket
+                    {isPassthroughObject && (bucketPolicy?.compressionEnabled ?? true)
+                      ? 'Stored as-is: delta compression does not apply to this file type'
+                      : 'Compression disabled for this bucket'}
                   </div>
                 </div>
               </InspectorSection>
