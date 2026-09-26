@@ -75,3 +75,29 @@ export async function probeBackend(
     context: `Test connection to ${name}`,
   });
 }
+
+/**
+ * `GET /backends/:name/legacy-key-usage`: how many objects and delta
+ * references still carry the legacy key id. Exact up to `limit` objects;
+ * past that the scan stops and `complete` is false.
+ */
+export interface LegacyKeyUsage {
+  backend: string;
+  legacy_key_id: string | null;
+  buckets: string[];
+  objects_scanned: number;
+  objects_under_legacy_key: number;
+  references_scanned: number;
+  references_under_legacy_key: number;
+  examples: string[];
+  errors: string[];
+  complete: boolean;
+  limit: number;
+  safe_to_clear: boolean;
+}
+
+export async function getLegacyKeyUsage(name: string): Promise<LegacyKeyUsage> {
+  return adminJson(`/api/admin/backends/${encodeURIComponent(name)}/legacy-key-usage`, {
+    context: `Check the legacy key of ${name}`,
+  });
+}

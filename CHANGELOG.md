@@ -17,6 +17,20 @@ fails and never looks complete. In Chrome and Edge, a file that the browser
 created for a download that then fails is deleted. A ZIP download now writes a
 `bulk_zip` audit entry, like a bulk copy, move, or delete.
 
+### Added — Clear the legacy key from the shim banner, when nothing needs it
+
+The decrypt-only shim banner told operators to clear `legacy_key` "once all
+legacy-stamped objects are gone", but nothing showed whether they were gone.
+A re-encrypt job that succeeded proves this for one bucket only, and only
+if it ran after the rotation. Now
+`GET /_/api/admin/backends/:name/legacy-key-usage` reads the metadata of
+every object and delta reference on the backend and counts the ones under
+the legacy key id. The count is exact up to a limit (10000 objects by
+default); a scan that stops at the limit says so. The banner shows the
+count, and its **Clear legacy key** button is enabled only when the scan
+is complete and finds nothing. The confirm dialog says that an object under
+the legacy key cannot be read after the clear.
+
 ### Added — The OIDC provider form sets the network policy
 
 An identity provider on a private address or behind a private CA needs

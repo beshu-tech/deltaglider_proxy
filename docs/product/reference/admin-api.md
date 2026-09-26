@@ -89,9 +89,12 @@ deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.e
 | `GET` | `/_/api/admin/backends` | List named backends |
 | `POST` | `/_/api/admin/backends` | Create; validates S3 creds upfront |
 | `DELETE` | `/_/api/admin/backends/:name` | Remove — refuses to delete the default or in-use backends |
+| `GET` | `/_/api/admin/backends/:name/legacy-key-usage?limit=N` | Count the objects and delta references that still carry the backend's legacy key id — see below |
 | `POST` | `/_/api/admin/test-s3` | Test an arbitrary S3 connection without persisting |
 | `GET` / `POST` | `/_/api/admin/buckets` | List bucket origins / create a bucket on a backend |
 | `POST` | `/_/api/admin/buckets/:bucket/migrate` | Move a bucket's data to another backend as a durable, write-gated job — see [Jobs](#jobs--one-surface-for-everything-background) |
+
+`GET /_/api/admin/backends/:name/legacy-key-usage` answers whether the backend's decrypt-only `legacy_key` is still needed. The proxy reads the metadata of every object (a `HEAD`) and of every delta reference in the buckets that route to the backend, and counts those stamped with the legacy key id. The count is exact, not sampled. The scan stops after `limit` objects (default 10000, maximum 1000000); it then returns `complete: false`, and the counts are only a lower bound. The response is `{backend, legacy_key_id, buckets, objects_scanned, objects_under_legacy_key, references_scanned, references_under_legacy_key, examples, errors, complete, limit, safe_to_clear}`. `safe_to_clear` is true only when the scan is complete, read every object without an error, and found no object and no delta reference under the legacy key id. `legacy_key_id` is `null` when the backend has no legacy key. `:name` is a named backend or `default` for the singleton backend; an unknown name returns `404`.
 
 ## IAM (gated by `iam_mode`)
 

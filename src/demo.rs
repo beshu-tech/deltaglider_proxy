@@ -237,6 +237,10 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             post(admin::probe_backend),
         )
         .route(
+            "/_/api/admin/backends/:name/legacy-key-usage",
+            get(admin::legacy_key_usage),
+        )
+        .route(
             "/_/api/admin/buckets",
             get(admin::list_bucket_origins).post(admin::create_bucket_on_backend),
         )

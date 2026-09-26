@@ -140,6 +140,18 @@ pub fn needs_rewrite(user_metadata: &HashMap<String, String>, desired: &DesiredE
     }
 }
 
+/// Is this object encrypted AND stamped with exactly `key_id`? The
+/// question "does anything still need the legacy key": an unstamped or
+/// plaintext object never decrypts with the legacy key (the wrapper picks
+/// the primary for an unstamped body).
+pub fn stamped_with_key_id(user_metadata: &HashMap<String, String>, key_id: &str) -> bool {
+    let encrypted = matches!(
+        user_metadata.get(ENCRYPTION_MARKER_KEY).map(String::as_str),
+        Some(ENCRYPTION_MARKER_VALUE) | Some(CHUNK_MARKER_VALUE)
+    );
+    encrypted && user_metadata.get(ENCRYPTION_KEY_ID_KEY).map(String::as_str) == Some(key_id)
+}
+
 // `strip_encryption_markers` lives in `storage::encrypting` (where the marker
 // consts do) — the single home shared by the re-encrypt job here AND the
 // delta-passthrough ship in `transfer`. Re-exported so `super::` callers in this
@@ -269,6 +281,31 @@ mod tests {
         let bogus = meta(&[("dg-encrypted", "something-else")]);
         assert!(!needs_rewrite(&bogus, &plain));
         assert!(needs_rewrite(&bogus, &proxy));
+    }
+
+    #[test]
+    fn stamped_with_key_id_truth_table() {
+        let old = meta(&[
+            ("dg-encrypted", "aes-256-gcm-v1"),
+            ("dg-encryption-key-id", "kid-old"),
+        ]);
+        assert!(stamped_with_key_id(&old, "kid-old"));
+        assert!(!stamped_with_key_id(&old, "kid-new"));
+        let chunked = meta(&[
+            ("dg-encrypted", "aes-256-gcm-chunked-v1"),
+            ("dg-encryption-key-id", "kid-old"),
+        ]);
+        assert!(stamped_with_key_id(&chunked, "kid-old"));
+        // A key id without the marker is not an encrypted body.
+        assert!(!stamped_with_key_id(
+            &meta(&[("dg-encryption-key-id", "kid-old")]),
+            "kid-old"
+        ));
+        assert!(!stamped_with_key_id(
+            &meta(&[("dg-encrypted", "aes-256-gcm-v1")]),
+            "kid-old"
+        ));
+        assert!(!stamped_with_key_id(&meta(&[]), "kid-old"));
     }
 
     #[test]

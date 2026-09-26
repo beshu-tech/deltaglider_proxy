@@ -24,12 +24,15 @@ import {
   CheckCircleOutlined,
   ReloadOutlined,
 } from '@ant-design/icons';
-import type { BackendEncryptionSummary, BackendEncryptionMode } from '../adminApi';
+import type { BackendEncryptionSummary, BackendEncryptionMode, LegacyKeyUsage } from '../adminApi';
 import { useColors } from '../ThemeContext';
 import { useCardStyles } from './shared-styles';
 import { generateAesKeyHex } from '../aesKeyGen';
 import { useCopyToClipboard } from '../useCopyToClipboard';
 import { aesKeyPatch } from '../backendEncryptionPayload';
+import { useLegacyKeyUsage } from '../queries/backends';
+import { confirmDialog } from '../confirmDialog';
+import { normalizeUiError } from '../errorHandling';
 
 const { Text } = Typography;
 
@@ -69,9 +72,15 @@ interface Props {
   onApply: (patch: BackendEncryptionPatch) => Promise<void>;
   /** An env variable sets this backend's key: show the mode, offer no edits. */
   readOnly?: boolean;
+  /**
+   * Drop the decrypt-only legacy key (`legacy_key: null`). Offered on the
+   * shim banner, enabled only when the server's scan finds nothing that
+   * still needs the key. Resolves on success.
+   */
+  onClearLegacy?: () => Promise<void>;
 }
 
-export default function BackendEncryptionEditor({ backendName, current, onApply, readOnly }: Props) {
+export default function BackendEncryptionEditor({ backendName, current, onApply, readOnly, onClearLegacy }: Props) {
   const colors = useColors();
   const { cardStyle, inputRadius } = useCardStyles();
 
@@ -240,20 +249,7 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
          transition state, not an error. Points the operator at the
          follow-up action (clear legacy_key when objects are gone). */}
       {current.shim_active && !pending && (
-        <Alert
-          type="info"
-          showIcon
-          style={{ marginTop: 8, borderRadius: 6, fontSize: 12 }}
-          title="Decrypt-only shim active"
-          description={
-            <span>
-              A legacy key is configured on this backend. Historical objects
-              stamped with that key still decrypt; new writes use the current
-              mode. Clear <code>legacy_key</code> once all legacy-stamped
-              objects have been re-written or deleted.
-            </span>
-          }
-        />
+        <LegacyShimBanner backendName={backendName} readOnly={readOnly} onClearLegacy={onClearLegacy} />
       )}
 
       {/* Per-mode edit surface. Renders only when `pending` is set. */}
@@ -420,5 +416,110 @@ export default function BackendEncryptionEditor({ backendName, current, onApply,
         </div>
       )}
     </div>
+  );
+}
+
+const plural = (n: number, one: string, many: string) => `${n.toLocaleString('en-US')} ${n === 1 ? one : many}`;
+
+/** One sentence on what the legacy-key scan found. */
+function usageSummary(u: LegacyKeyUsage): string {
+  const kid = u.legacy_key_id ?? '(unknown)';
+  const where = plural(u.buckets.length, 'bucket', 'buckets');
+  if (!u.complete) {
+    return `The check stopped after ${u.objects_scanned.toLocaleString('en-US')} objects, so it cannot prove that no object uses the legacy key id ${kid}. Run a re-encrypt job on every bucket of this backend, then check again with a higher limit through the admin API.`;
+  }
+  const objects = u.objects_under_legacy_key;
+  const refs = u.references_under_legacy_key;
+  if (objects > 0 || refs > 0) {
+    return `${plural(objects, 'object', 'objects')} and ${plural(refs, 'delta reference', 'delta references')} still use the legacy key id ${kid} (checked ${where}). Run a re-encrypt job on these buckets first.`;
+  }
+  if (u.errors.length > 0) {
+    return `The check could not read everything, so it cannot prove that no object uses the legacy key id ${kid}.`;
+  }
+  return `No object uses the legacy key id ${kid}. The check read ${plural(u.objects_scanned, 'object', 'objects')} and ${plural(u.references_scanned, 'delta reference', 'delta references')} in ${where}.`;
+}
+
+function LegacyShimBanner({
+  backendName,
+  readOnly,
+  onClearLegacy,
+}: {
+  backendName: string;
+  readOnly?: boolean;
+  onClearLegacy?: () => Promise<void>;
+}) {
+  const usage = useLegacyKeyUsage(backendName, true);
+  const [clearing, setClearing] = useState(false);
+  const u = usage.data;
+
+  const clear = async () => {
+    if (!onClearLegacy || !u) return;
+    const ok = await confirmDialog({
+      title: 'Clear the legacy key?',
+      content: (
+        <span>
+          The proxy removes <code>legacy_key</code> and <code>legacy_key_id</code> from backend{' '}
+          <code>{backendName}</code>. An object encrypted under the legacy key id{' '}
+          <code>{u.legacy_key_id}</code> cannot be read any more after this. The check found no such
+          object, but keep a copy of the old key until you are sure, for example until the backups made
+          before the rotation expire.
+        </span>
+      ),
+      okText: 'Clear',
+      danger: true,
+    });
+    if (!ok) return;
+    setClearing(true);
+    try {
+      await onClearLegacy();
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  return (
+    <Alert
+      type="info"
+      showIcon
+      style={{ marginTop: 8, borderRadius: 6, fontSize: 12 }}
+      title="Decrypt-only shim active"
+      description={
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <span>
+            A legacy key is configured on this backend. Objects written under that key still
+            decrypt; new writes use the current mode. Clear the legacy key once no object uses it.
+          </span>
+          {usage.isLoading && <span>Checking which objects still use the legacy key…</span>}
+          {usage.error && <span>{normalizeUiError(usage.error, 'The check failed')}</span>}
+          {u && <span>{usageSummary(u)}</span>}
+          {u && u.examples.length > 0 && (
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, overflowWrap: 'anywhere' }}>
+              For example: {u.examples.join(', ')}
+            </span>
+          )}
+          {u && u.errors.length > 0 && (
+            <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, overflowWrap: 'anywhere' }}>
+              Not readable: {u.errors.join('; ')}
+            </span>
+          )}
+          <Space wrap>
+            <Button size="small" onClick={() => void usage.refetch()} loading={usage.isFetching}>
+              Check again
+            </Button>
+            {onClearLegacy && !readOnly && (
+              <Button
+                size="small"
+                danger
+                disabled={!u?.safe_to_clear || usage.isFetching}
+                loading={clearing}
+                onClick={() => void clear()}
+              >
+                Clear legacy key
+              </Button>
+            )}
+          </Space>
+        </div>
+      }
+    />
   );
 }

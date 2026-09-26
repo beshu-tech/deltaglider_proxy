@@ -709,3 +709,252 @@ mod tests {
         );
     }
 }
+
+/// Objects the legacy-key scan HEADs when the request names no `limit`.
+const LEGACY_SCAN_DEFAULT_LIMIT: u64 = 10_000;
+/// Upper bound on `limit`: one request must stay inside the request timeout.
+const LEGACY_SCAN_MAX_LIMIT: u64 = 1_000_000;
+/// HEADs in flight at once during the scan.
+const LEGACY_SCAN_CONCURRENCY: usize = 16;
+/// Keys listed per page, and object keys reported as examples.
+const LEGACY_SCAN_PAGE: u32 = 1000;
+const LEGACY_SCAN_EXAMPLES: usize = 10;
+
+#[derive(Deserialize)]
+pub struct LegacyKeyUsageQuery {
+    pub limit: Option<u64>,
+}
+
+/// `GET /backends/:name/legacy-key-usage` — how many objects and delta
+/// references of this backend still carry the legacy key id. The count is
+/// EXACT (every object and reference is HEADed) until `limit` objects are
+/// scanned; then the scan stops and `complete` is false.
+#[derive(Serialize, Debug, Default, PartialEq)]
+pub struct LegacyKeyUsage {
+    pub backend: String,
+    /// The id the legacy key stamps (`None`: no legacy key configured).
+    pub legacy_key_id: Option<String>,
+    /// Buckets that route to this backend (all scanned when `complete`).
+    pub buckets: Vec<String>,
+    pub objects_scanned: u64,
+    pub objects_under_legacy_key: u64,
+    pub references_scanned: u64,
+    pub references_under_legacy_key: u64,
+    /// Up to 10 `bucket/key` names under the legacy key.
+    pub examples: Vec<String>,
+    /// Buckets or objects the scan could not read (capped at 10).
+    pub errors: Vec<String>,
+    pub complete: bool,
+    pub limit: u64,
+    pub safe_to_clear: bool,
+}
+
+impl LegacyKeyUsage {
+    /// Pure: clearing the legacy key cannot make an object unreadable only
+    /// when the scan saw everything, read everything, and found nothing
+    /// under the legacy key id.
+    pub fn safe_to_clear(&self) -> bool {
+        self.legacy_key_id.is_some()
+            && self.complete
+            && self.errors.is_empty()
+            && self.objects_under_legacy_key == 0
+            && self.references_under_legacy_key == 0
+    }
+
+    fn error(&mut self, e: String) {
+        if self.errors.len() < LEGACY_SCAN_EXAMPLES {
+            self.errors.push(e);
+        }
+    }
+}
+
+pub async fn legacy_key_usage(
+    State(state): State<Arc<AdminState>>,
+    Path(name): Path<String>,
+    crate::api::admin::extract::AdminQuery(q): crate::api::admin::extract::AdminQuery<
+        LegacyKeyUsageQuery,
+    >,
+) -> Result<Json<LegacyKeyUsage>, (StatusCode, String)> {
+    use futures::StreamExt;
+
+    let limit = q
+        .limit
+        .unwrap_or(LEGACY_SCAN_DEFAULT_LIMIT)
+        .clamp(1, LEGACY_SCAN_MAX_LIMIT);
+    let engine = state.s3_state.engine.load().clone();
+    let origins = engine.list_bucket_origins().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to list buckets: {e}"),
+        )
+    })?;
+    let mut usage = LegacyKeyUsage {
+        backend: name.clone(),
+        limit,
+        ..Default::default()
+    };
+    {
+        let cfg = state.config.read().await;
+        let enc = cfg
+            .backend_encryption_by_name(&name)
+            .ok_or((StatusCode::NOT_FOUND, format!("no backend named '{name}'")))?;
+        usage.legacy_key_id = crate::deltaglider::effective_legacy_key_id(&name, enc);
+        let registry = engine.bucket_policy_registry();
+        for b in &origins {
+            if registry.is_reserved(&b.name) {
+                continue;
+            }
+            if cfg
+                .effective_backend_for_bucket(&b.name)
+                .is_some_and(|(n, _)| n == name)
+            {
+                if let Some(e) = &b.unavailable {
+                    usage.error(format!("{}: {e}", b.name));
+                }
+                usage.buckets.push(b.name.clone());
+            }
+        }
+    }
+    let Some(kid) = usage.legacy_key_id.clone() else {
+        usage.complete = true;
+        return Ok(Json(usage));
+    };
+
+    'buckets: for bucket in usage.buckets.clone() {
+        // Delta references first: one legacy reference breaks every delta
+        // in its deltaspace, so they count even when the object budget ends.
+        match engine.storage().list_deltaspaces(&bucket).await {
+            Ok(prefixes) => {
+                for prefix in prefixes {
+                    let storage = engine.storage();
+                    match storage.has_reference(&bucket, &prefix).await {
+                        Ok(false) => continue,
+                        Ok(true) => {}
+                        Err(e) => {
+                            usage.error(format!("{bucket}/{prefix}/.dg/reference.bin: {e}"));
+                            continue;
+                        }
+                    }
+                    usage.references_scanned += 1;
+                    match storage.get_reference_metadata(&bucket, &prefix).await {
+                        Ok(m) => {
+                            if crate::maintenance::stamped_with_key_id(&m.user_metadata, &kid) {
+                                usage.references_under_legacy_key += 1;
+                            }
+                        }
+                        Err(e) => usage.error(format!("{bucket}/{prefix}/.dg/reference.bin: {e}")),
+                    }
+                }
+            }
+            Err(e) => usage.error(format!("{bucket}: cannot list delta references: {e}")),
+        }
+
+        let mut token: Option<String> = None;
+        loop {
+            let page = match engine
+                .list_objects(&bucket, "", None, LEGACY_SCAN_PAGE, token.as_deref(), false)
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    usage.error(format!("{bucket}: cannot list objects: {e}"));
+                    continue 'buckets;
+                }
+            };
+            let budget = (limit - usage.objects_scanned) as usize;
+            let keys: Vec<String> = page
+                .objects
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|k| !k.ends_with('/'))
+                .collect();
+            let over_budget = keys.len() > budget;
+            let heads: Vec<_> = futures::stream::iter(keys.into_iter().take(budget))
+                .map(|key| {
+                    let engine = engine.clone();
+                    let bucket = bucket.clone();
+                    async move {
+                        let r = engine.head(&bucket, &key).await;
+                        (key, r)
+                    }
+                })
+                .buffer_unordered(LEGACY_SCAN_CONCURRENCY)
+                .collect()
+                .await;
+            for (key, r) in heads {
+                usage.objects_scanned += 1;
+                match r {
+                    Ok(m) if crate::maintenance::stamped_with_key_id(&m.user_metadata, &kid) => {
+                        usage.objects_under_legacy_key += 1;
+                        if usage.examples.len() < LEGACY_SCAN_EXAMPLES {
+                            usage.examples.push(format!("{bucket}/{key}"));
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => usage.error(format!("{bucket}/{key}: {e}")),
+                }
+            }
+            if over_budget || (page.is_truncated && usage.objects_scanned >= limit) {
+                // Budget spent with objects left: the count is a lower bound.
+                usage.complete = false;
+                usage.safe_to_clear = false;
+                return Ok(Json(usage));
+            }
+            match (page.is_truncated, page.next_continuation_token) {
+                (true, Some(t)) => token = Some(t),
+                _ => break,
+            }
+        }
+    }
+    usage.complete = true;
+    usage.safe_to_clear = usage.safe_to_clear();
+    Ok(Json(usage))
+}
+
+#[cfg(test)]
+mod legacy_usage_tests {
+    use super::LegacyKeyUsage;
+
+    #[test]
+    fn safe_to_clear_needs_a_complete_clean_scan() {
+        let clean = LegacyKeyUsage {
+            legacy_key_id: Some("kid".into()),
+            complete: true,
+            ..Default::default()
+        };
+        assert!(clean.safe_to_clear());
+        let cases = [
+            LegacyKeyUsage {
+                legacy_key_id: None,
+                ..clean_copy(&clean)
+            },
+            LegacyKeyUsage {
+                complete: false,
+                ..clean_copy(&clean)
+            },
+            LegacyKeyUsage {
+                errors: vec!["releases: 503".into()],
+                ..clean_copy(&clean)
+            },
+            LegacyKeyUsage {
+                objects_under_legacy_key: 1,
+                ..clean_copy(&clean)
+            },
+            LegacyKeyUsage {
+                references_under_legacy_key: 1,
+                ..clean_copy(&clean)
+            },
+        ];
+        for c in cases {
+            assert!(!c.safe_to_clear(), "{c:?}");
+        }
+    }
+
+    fn clean_copy(u: &LegacyKeyUsage) -> LegacyKeyUsage {
+        LegacyKeyUsage {
+            legacy_key_id: u.legacy_key_id.clone(),
+            complete: u.complete,
+            ..Default::default()
+        }
+    }
+}

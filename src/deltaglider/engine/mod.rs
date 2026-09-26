@@ -1044,11 +1044,35 @@ fn resolve_legacy_shim(
     let parsed = crate::storage::EncryptionKey::from_hex(hex).map_err(|e| {
         StorageError::Encryption(format!("backend '{}' legacy_key: {}", backend_name, e))
     })?;
-    let kid = match enc.legacy_key_id() {
-        Some(explicit) => explicit.to_string(),
-        None => derive_key_id(&format!("{backend_name}::legacy"), &parsed.0),
-    };
+    let kid = legacy_key_id_for(backend_name, enc.legacy_key_id(), &parsed);
     Ok((Some(parsed), Some(kid)))
+}
+
+/// The id stamped on objects written under a backend's legacy key: the
+/// explicit `legacy_key_id`, else derived from `{backend_name}::legacy`.
+fn legacy_key_id_for(
+    backend_name: &str,
+    explicit: Option<&str>,
+    key: &crate::storage::EncryptionKey,
+) -> String {
+    match explicit {
+        Some(explicit) => explicit.to_string(),
+        None => derive_key_id(&format!("{backend_name}::legacy"), &key.0),
+    }
+}
+
+/// The legacy (decrypt-only) key id of a backend, as the wrapper resolves
+/// it; `None` when no legacy key is configured or it does not parse.
+pub(crate) fn effective_legacy_key_id(
+    backend_name: &str,
+    enc: &crate::config::BackendEncryptionConfig,
+) -> Option<String> {
+    let parsed = crate::storage::EncryptionKey::from_hex(enc.legacy_key()?).ok()?;
+    Some(legacy_key_id_for(
+        backend_name,
+        enc.legacy_key_id(),
+        &parsed,
+    ))
 }
 
 /// Pure integrity check for a freshly-loaded reference baseline.

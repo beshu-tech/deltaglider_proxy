@@ -41,6 +41,8 @@ This guide shows you how to change a backend's encryption key or mode without lo
 
 4. When every job shows `succeeded`, remove `legacy_key` + `legacy_key_id` and apply. The old key can now be destroyed.
 
+   In the admin UI, the shim banner on the backend does this step. The banner shows how many objects and delta references still carry the legacy key id, because the proxy checks the metadata of every object on the backend. The **Clear legacy key** button is enabled only when that check read every object and found none. The button asks for confirmation and then sends `legacy_key: null` and `legacy_key_id: null`. On a backend with more than 10000 objects, the check in the UI stops early and the button stays disabled; call `GET /_/api/admin/backends/:name/legacy-key-usage?limit=N` with a higher limit instead ([admin API](../reference/admin-api.md#backends)).
+
 **Caveat:** the shim holds exactly ONE legacy generation. Don't rotate again while a shim is live — rotate to the final key, not through intermediaries. The proxy refuses a key change that would push a different key out of a live legacy slot, because objects can still need that key. It also refuses a key change that keeps the same `key_id`, because the proxy would then decrypt the old objects with the new key. To drop a legacy key on purpose, send `legacy_key: null` in the same apply.
 
 ## Recipe B: rotation via data migration (zero-shim)

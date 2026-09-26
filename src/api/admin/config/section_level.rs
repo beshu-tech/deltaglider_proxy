@@ -1251,11 +1251,9 @@ pub(crate) fn preserve_backend_encryption_secrets(
             let body_sets_legacy = probe.legacy_key_is_set
                 || (new.legacy_key().is_some() && new.legacy_key() != old.legacy_key());
             if !probe.legacy_key_is_explicit_null && !body_sets_legacy {
-                if let Some(held) = old_legacy_ok.as_deref().filter(|l| *l != old_primary) {
-                    let held_kid = old.legacy_key_id().map(str::to_string).unwrap_or_else(|| {
-                        derive_hex_key_id(&format!("{backend_name}::legacy"), held)
-                            .unwrap_or_default()
-                    });
+                if old_legacy_ok.as_deref().is_some_and(|l| l != old_primary) {
+                    let held_kid = crate::deltaglider::effective_legacy_key_id(backend_name, old)
+                        .unwrap_or_default();
                     return Err(format!(
                         "backend '{backend_name}': the current key must become the legacy \
                          (decrypt-only) key, but the legacy slot still holds key id \

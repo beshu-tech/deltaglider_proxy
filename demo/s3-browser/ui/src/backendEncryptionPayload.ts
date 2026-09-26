@@ -92,3 +92,31 @@ export function aesKeyPatch(
   }
   return { mode: 'aes256-gcm-proxy', key };
 }
+
+/**
+ * The `storage` section-PUT payload that drops a backend's decrypt-only
+ * legacy key (`legacy_key: null`, `legacy_key_id: null`). Nothing else of
+ * the encryption block changes: the singleton is a merge-patch of the two
+ * fields; a named entry keeps its own block (mode, `key_id`, KMS id) and
+ * only the two fields are nulled. An absent `key` keeps the current key.
+ */
+export function buildClearLegacySectionBody(
+  backendName: string,
+  storage: StorageSectionBackends,
+): Record<string, unknown> {
+  const clear = { legacy_key: null, legacy_key_id: null };
+  const list = storage.backends ?? [];
+  if (list.length === 0 && backendName === 'default') {
+    return { backend_encryption: clear };
+  }
+  if (!list.some((b) => b.name === backendName)) {
+    throw new Error(`Backend "${backendName}" is not in the storage configuration. Reload the page.`);
+  }
+  return {
+    backends: list.map((b) =>
+      b.name === backendName
+        ? { ...b, encryption: { ...((b.encryption as Record<string, unknown> | undefined) ?? {}), ...clear } }
+        : b,
+    ),
+  };
+}

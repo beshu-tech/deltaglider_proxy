@@ -45,6 +45,9 @@ export const qk = {
     // buckets, so BackendsPanel's refresh() of the list also refetches origins.
     list: () => ['backends'] as const,
     origins: () => ['backends', 'origins'] as const,
+    // NOT under the `backends` prefix: every scan HEADs every object, so a
+    // list invalidation must not start one.
+    legacyKeyUsage: (name: string) => ['legacy-key-usage', name] as const,
   },
 
   // ── Diagnostics ─────────────────────────────────────────────────

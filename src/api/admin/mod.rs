@@ -50,8 +50,8 @@ pub use auth::{
     OpenBrowserConnectRequest, ResolveIamIdentityRequest, SessionResponse, WhoamiResponse,
 };
 pub use backends::{
-    create_backend, create_bucket_on_backend, delete_backend, list_backends, list_bucket_origins,
-    probe_backend,
+    create_backend, create_bucket_on_backend, delete_backend, legacy_key_usage, list_backends,
+    list_bucket_origins, probe_backend,
 };
 pub use backup::{export_backup, import_backup, MAX_IMPORT_BODY_BYTES};
 pub use bucket_scan::{

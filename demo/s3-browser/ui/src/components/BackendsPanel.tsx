@@ -16,7 +16,7 @@ import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
 import BackendEncryptionEditor, { type BackendEncryptionPatch } from './BackendEncryptionEditor';
-import { buildEncryptionSectionBody, type StorageSectionBackends } from '../backendEncryptionPayload';
+import { buildClearLegacySectionBody, buildEncryptionSectionBody, type StorageSectionBackends } from '../backendEncryptionPayload';
 import MaskedSecretInput from './MaskedSecretInput';
 import { normalizeUiError } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
@@ -354,6 +354,23 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
     }
   };
 
+  /** Drop a backend's decrypt-only legacy key (the shim banner's action). */
+  const handleClearLegacy = async (backendName: string): Promise<void> => {
+    try {
+      const { body: storage, version } = await getSectionVersioned<StorageSectionBackends>('storage');
+      const result = await putSection('storage', buildClearLegacySectionBody(backendName, storage), version);
+      if (!result.ok) {
+        setSaveResult({ ok: false, message: result.error || 'Failed to clear the legacy key' });
+        return;
+      }
+      setSaveResult({ ok: true, message: `Legacy key cleared on backend '${backendName}'` });
+      qc.removeQueries({ queryKey: qk.backends.legacyKeyUsage(backendName) });
+      await refresh();
+    } catch (e) {
+      setSaveResult({ ok: false, message: normalizeUiError(e, 'Failed to clear the legacy key') });
+    }
+  };
+
   const globalCompressionOn = (config?.max_delta_ratio ?? 0.75) > 0;
   // DGP_MAX_DELTA_RATIO controls the switch's field: show it read-only.
   const ratioEnv = findEnvOverride(config?.env_overrides, 'advanced.max_delta_ratio');
@@ -569,6 +586,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                 backendName={b.name}
                 current={b.encryption}
                 onApply={(patch) => handleEncryptionApply(b.name, patch)}
+                onClearLegacy={() => handleClearLegacy(b.name)}
                 readOnly={!!encryptionEnv(b)}
               />
             </div>

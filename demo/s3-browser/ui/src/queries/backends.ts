@@ -8,7 +8,7 @@
  * a write so the list and the cached config both refresh.
  */
 import { useQuery } from '@tanstack/react-query';
-import { getBackends, getBucketOrigins } from '../adminApi';
+import { getBackends, getBucketOrigins, getLegacyKeyUsage } from '../adminApi';
 import { qk } from './keys';
 
 /**
@@ -44,4 +44,18 @@ export function useBucketOrigins(opts?: { enabled?: boolean }) {
 export function useBucketNames(): string[] {
   const origins = useBucketOrigins();
   return (origins.data?.buckets ?? []).map((b) => b.name);
+}
+
+/**
+ * Objects and delta references that still carry a backend's legacy key id.
+ * Each fetch HEADs every object, so it runs only while the shim is active
+ * and never on an interval; the banner has a "Check again" button.
+ */
+export function useLegacyKeyUsage(name: string, enabled: boolean) {
+  return useQuery({
+    queryKey: qk.backends.legacyKeyUsage(name),
+    queryFn: () => getLegacyKeyUsage(name),
+    enabled,
+    staleTime: Infinity,
+  });
 }

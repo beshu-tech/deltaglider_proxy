@@ -1204,3 +1204,95 @@ async fn test_job_with_failures_is_not_succeeded() {
     assert_eq!(job["progress"]["processed"], 0, "job: {job}");
     assert_eq!(job["status"], "failed", "every object failed: {job}");
 }
+
+async fn legacy_key_usage(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    query: &str,
+) -> serde_json::Value {
+    let resp = admin
+        .get(format!(
+            "{endpoint}/_/api/admin/backends/default/legacy-key-usage{query}"
+        ))
+        .send()
+        .await
+        .expect("legacy-key-usage GET failed");
+    assert!(
+        resp.status().is_success(),
+        "legacy-key-usage: {}",
+        resp.status()
+    );
+    resp.json().await.expect("legacy-key-usage not JSON")
+}
+
+/// U3: the admin UI enables "Clear legacy key" only when nothing still
+/// needs the legacy key. The endpoint counts the objects AND the delta
+/// references stamped with the legacy key id; after a re-encrypt job the
+/// count is zero and `safe_to_clear` is true. A scan stopped by `limit`
+/// is never safe.
+#[tokio::test]
+async fn test_legacy_key_usage_counts_until_reencrypted() {
+    let bucket = "maintlegacy";
+    let server = TestServer::builder().bucket(bucket).build().await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+
+    // Before any legacy key: nothing to clear.
+    let none = legacy_key_usage(&admin, &endpoint, "").await;
+    assert!(none["legacy_key_id"].is_null(), "{none}");
+    assert_eq!(none["safe_to_clear"], false, "{none}");
+
+    enable_encryption(&admin, &endpoint).await;
+    seed_bucket(&http, &endpoint, bucket, 4).await;
+    put_storage_encryption(
+        &admin,
+        &endpoint,
+        serde_json::json!({
+            "mode": "aes256-gcm-proxy",
+            "key": KEY_B, "key_id": KEY_B_ID,
+            "legacy_key": KEY, "legacy_key_id": KEY_ID,
+        }),
+    )
+    .await;
+
+    let before = legacy_key_usage(&admin, &endpoint, "").await;
+    assert_eq!(before["legacy_key_id"], KEY_ID, "{before}");
+    assert_eq!(before["buckets"], serde_json::json!([bucket]), "{before}");
+    assert_eq!(before["complete"], true, "{before}");
+    // 4 JSON objects + 2 zips, all written under A; one delta reference.
+    assert_eq!(before["objects_scanned"], 6, "{before}");
+    assert_eq!(before["objects_under_legacy_key"], 6, "{before}");
+    assert_eq!(before["references_under_legacy_key"], 1, "{before}");
+    assert_eq!(before["safe_to_clear"], false, "{before}");
+
+    let capped = legacy_key_usage(&admin, &endpoint, "?limit=2").await;
+    assert_eq!(capped["complete"], false, "{capped}");
+    assert_eq!(capped["objects_scanned"], 2, "{capped}");
+    assert_eq!(capped["safe_to_clear"], false, "{capped}");
+
+    start_reencrypt(&admin, &endpoint, bucket).await;
+    wait_job_done(&admin, &endpoint, bucket).await;
+
+    let after = legacy_key_usage(&admin, &endpoint, "").await;
+    assert_eq!(after["objects_under_legacy_key"], 0, "{after}");
+    assert_eq!(after["references_under_legacy_key"], 0, "{after}");
+    assert_eq!(after["complete"], true, "{after}");
+    assert_eq!(after["safe_to_clear"], true, "{after}");
+
+    // The UI's clear: a merge-patch that nulls only the legacy fields keeps
+    // the mode and the current key, and the shim is gone.
+    put_storage_encryption(
+        &admin,
+        &endpoint,
+        serde_json::json!({ "legacy_key": null, "legacy_key_id": null }),
+    )
+    .await;
+    let cleared = legacy_key_usage(&admin, &endpoint, "").await;
+    assert!(cleared["legacy_key_id"].is_null(), "{cleared}");
+    assert_eq!(
+        get_bytes(&http, &endpoint, bucket, "plain-00.json").await,
+        [PLAINTEXT_MARKER, b" object 0"].concat(),
+        "objects read under the current key after the clear"
+    );
+}

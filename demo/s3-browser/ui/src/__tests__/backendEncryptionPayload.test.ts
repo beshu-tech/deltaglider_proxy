@@ -1,7 +1,7 @@
 /** src/backendEncryptionPayload.ts */
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
-import { aesKeyPatch, buildEncryptionSectionBody } from '../backendEncryptionPayload';
+import { aesKeyPatch, buildClearLegacySectionBody, buildEncryptionSectionBody } from '../backendEncryptionPayload';
 
 // One entry per backend variant, as the storage section GET returns it
 // (secrets redacted, so absent). Every field must survive an encryption
@@ -103,4 +103,29 @@ test('a proxy-AES key patch on a proxy-AES backend names the retired key id', ()
   });
   // Enabling from another mode: nothing to retire.
   assert.deepEqual(aesKeyPatch('NEW', { mode: 'none' }), { mode: 'aes256-gcm-proxy', key: 'NEW' });
+});
+
+test('clearing the legacy key on the singleton nulls only the legacy fields', () => {
+  assert.deepEqual(buildClearLegacySectionBody('default', {}), {
+    backend_encryption: { legacy_key: null, legacy_key_id: null },
+  });
+});
+
+test('clearing the legacy key on a named backend keeps its key_id and every sibling', () => {
+  const body = buildClearLegacySectionBody('local-enc', { backends: variants }) as {
+    backends: Array<Record<string, unknown>>;
+  };
+  assert.equal(body.backends.length, variants.length);
+  const target = body.backends.find((b) => b.name === 'local-enc');
+  assert.deepEqual(target, {
+    name: 'local-enc',
+    type: 'filesystem',
+    path: '/srv/enc',
+    // The explicit key_id stays: dropping it would change the id new objects carry.
+    encryption: { mode: 'aes256-gcm-proxy', key_id: 'k-2026', legacy_key: null, legacy_key_id: null },
+  });
+  for (const v of variants.filter((b) => b.name !== 'local-enc')) {
+    assert.deepEqual(body.backends.find((b) => b.name === v.name), v);
+  }
+  assert.throws(() => buildClearLegacySectionBody('gone', { backends: variants }), /Reload the page/);
 });

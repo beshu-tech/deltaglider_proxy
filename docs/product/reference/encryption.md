@@ -155,7 +155,7 @@ Truncation, reordering, and tampering of proxy-AES objects fail at GCM verificat
 
 ### The `legacy_key` shim
 
-When `legacy_key` / `legacy_key_id` are set, reads check the object's `dg-encryption-key-id` against `key_id` first, then against `legacy_key_id`; objects matching the legacy slot decrypt with `legacy_key`. Writes are unaffected — they go through the backend's current mode only (under a native mode, the proxy-AES path is skipped entirely via `WriteMode::PassThrough`). The shim holds exactly one legacy key generation, works under every mode including `none`, and the admin panel shows an info banner while one is active. The native → proxy-AES direction needs no shim: native objects carry `dg-encrypted-native`, so the proxy decrypt path does not fire.
+When `legacy_key` / `legacy_key_id` are set, reads check the object's `dg-encryption-key-id` against `key_id` first, then against `legacy_key_id`; objects matching the legacy slot decrypt with `legacy_key`. Writes are unaffected — they go through the backend's current mode only (under a native mode, the proxy-AES path is skipped entirely via `WriteMode::PassThrough`). The shim holds exactly one legacy key generation, works under every mode including `none`, and the admin panel shows an info banner while one is active. The banner counts the objects and delta references that still carry `legacy_key_id` (`GET /_/api/admin/backends/:name/legacy-key-usage`), and its **Clear legacy key** button is enabled only when that count is complete and zero. The native → proxy-AES direction needs no shim: native objects carry `dg-encrypted-native`, so the proxy decrypt path does not fire.
 
 ## Limits
 
