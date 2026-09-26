@@ -98,7 +98,7 @@ async fn ha_startup_replica_pulls_state_from_s3() {
     // the S3 PUT to land. 2s is a generous upper bound (MinIO local is
     // typically <50ms). The s3_client view is authoritative, so we
     // just HEAD the sync key until it appears.
-    let s3 = server_a.s3_client().await;
+    let s3 = common::minio_client().await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let head = s3
@@ -198,7 +198,7 @@ async fn ha_sync_now_propagates_post_startup_mutation() {
     assert_eq!(resp.status().as_u16(), 201);
 
     // Wait for A's trigger_config_sync to actually upload. 2s ceiling.
-    let s3 = server_a.s3_client().await;
+    let s3 = common::minio_client().await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         let head = s3
@@ -280,7 +280,7 @@ async fn ha_sync_now_is_noop_when_etag_unchanged() {
         .unwrap();
 
     // Wait for the upload.
-    let s3 = server_a.s3_client().await;
+    let s3 = common::minio_client().await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if s3
@@ -381,7 +381,7 @@ async fn ha_revocation_reaches_peer() {
     let sk = body["secret_access_key"].as_str().unwrap().to_string();
 
     // Wait for A's user-create upload to land before booting B.
-    let s3 = server_a.s3_client().await;
+    let s3 = common::minio_client().await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if s3
