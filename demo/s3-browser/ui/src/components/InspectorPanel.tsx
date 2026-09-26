@@ -342,6 +342,17 @@ export default function InspectorPanel({
 
   if (!object) return null;
 
+  // A double-click on a file row: the first click opens this drawer, so the
+  // second click lands on its mask (event.detail 2). Treat it as the row's
+  // double-click and open the preview instead of closing.
+  const handleDrawerClose = (e: { type: string; detail?: number }) => {
+    if (e.type === 'click' && (e.detail ?? 0) >= 2 && canReadObject && onPreview && getPreviewMode(object.key)) {
+      onPreview(object);
+      return;
+    }
+    onClose();
+  };
+
   const fileName = getFileName(object.key);
   const headers = headData?.headers ?? {};
   const storageType = headData?.storageType;
@@ -466,7 +477,7 @@ export default function InspectorPanel({
         placement="right"
         size={isMobile ? '100%' : 380}
         open={!!object}
-        onClose={onClose}
+        onClose={handleDrawerClose}
         closable={false}
         title={<span className="sr-only">Object inspector: {fileName}</span>}
         styles={{
