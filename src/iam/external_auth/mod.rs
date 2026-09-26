@@ -22,6 +22,29 @@ use crate::config_db::auth_providers::AuthProviderConfig;
 use self::oidc::OidcProvider;
 use self::types::{AuthorizationRequest, ExternalAuthError, PendingAuth};
 
+/// The one provider type the provider map loads.
+pub const SUPPORTED_PROVIDER_TYPE: &str = "oidc";
+
+/// Save-time check of a provider, for every entry point (admin API create
+/// and update, declarative apply): the type must be `oidc` (another type
+/// is skipped by [`ExternalAuthManager::rebuild`], so its sign-in would
+/// never work), then the OIDC settings must pass
+/// [`oidc::validate_provider_config`].
+pub fn validate_provider(
+    provider_type: &str,
+    issuer_url: Option<&str>,
+    extra_config: Option<&serde_json::Value>,
+    check_files: bool,
+) -> Result<(), String> {
+    if provider_type != SUPPORTED_PROVIDER_TYPE {
+        return Err(format!(
+            "provider_type '{provider_type}' is not supported: the only provider type is \
+             '{SUPPORTED_PROVIDER_TYPE}' (Google, Okta and Azure AD are OIDC issuers)"
+        ));
+    }
+    oidc::validate_provider_config(issuer_url, extra_config, check_files)
+}
+
 /// TTL for pending OAuth flows (5 minutes).
 const PENDING_AUTH_TTL: Duration = Duration::from_secs(300);
 

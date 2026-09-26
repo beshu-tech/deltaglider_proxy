@@ -73,6 +73,15 @@ names the one object that the caller may read, the bucket and prefix that
 the caller may list, or the public prefixes of the bucket. For a write, it
 says that nothing is granted.
 
+### Fixed — A provider type other than `oidc` is refused when you save it
+
+The admin API and a declarative apply accepted any `provider_type`, for
+example `google`. The proxy then skipped the provider, so its sign-in
+button never worked, and nothing said why. Now create and update answer
+`422`, and a declarative apply fails with no change to the database. The
+message names `oidc` as the only type. A provider of another type that a
+declarative config already holds still boots, with a warning in the log.
+
 ### Fixed — Declarative IAM audit entries name the admin client
 
 The audit entries that a declarative IAM apply writes

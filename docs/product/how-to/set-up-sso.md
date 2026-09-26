@@ -46,7 +46,7 @@ If you use any other OIDC provider: it works as long as it serves `.well-known/o
 
 Go to **Settings → Access → External authentication** → **+ Add provider**.
 
-The proxy has one provider type, `oidc`. Google, Okta, and Azure AD have no type of their own: each one is an OpenID Connect issuer, so you add it as an `oidc` provider with its issuer URL. The proxy reads the issuer's `.well-known/openid-configuration` document and takes the authorization, token, and key endpoints from it. The form sets the type to `oidc` for you. In the admin API and in declarative YAML, `provider_type` must be `oidc`, because the proxy skips a provider of any other type.
+The proxy has one provider type, `oidc`. Google, Okta, and Azure AD have no type of their own: each one is an OpenID Connect issuer, so you add it as an `oidc` provider with its issuer URL. The proxy reads the issuer's `.well-known/openid-configuration` document and takes the authorization, token, and key endpoints from it. The form sets the type to `oidc` for you. In the admin API and in declarative YAML, `provider_type` must be `oidc`. The proxy refuses a provider of any other type when you save it (`422` in the admin API, a refused apply in declarative mode), because it has no sign-in flow for another type.
 
 | Field | Value |
 |---|---|

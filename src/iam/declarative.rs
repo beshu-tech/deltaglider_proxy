@@ -599,18 +599,18 @@ pub fn preview_declarative_iam_at_boot(
     diff_iam(yaml, &current)
 }
 
-/// The OIDC providers that an attended apply would create or change and
-/// whose issuer URL the provider's network policy (`extra_config.allow_local`)
-/// refuses — the admin API's save-time check. Only NEW or CHANGED providers:
+/// The providers that an attended apply would create or change and that the
+/// admin API's save-time check refuses (a type other than `oidc`, or an
+/// issuer URL that the provider's network policy refuses). Only NEW or CHANGED providers:
 /// a provider the DB already holds unchanged (an upgrade) is never refused.
 /// The CA file is read at discovery, not here: this check is pure.
 pub fn refused_provider_changes(diff: &IamDiff) -> Vec<String> {
     diff.providers_to_create
         .iter()
         .chain(diff.providers_to_update.iter().map(|(_, p)| p))
-        .filter(|p| p.provider_type == "oidc")
         .filter_map(|p| {
-            crate::iam::external_auth::oidc::validate_provider_config(
+            crate::iam::external_auth::validate_provider(
+                &p.provider_type,
                 p.issuer_url.as_deref(),
                 p.extra_config.as_ref(),
                 false,
@@ -1869,6 +1869,29 @@ mod tests {
         assert!(refused_provider_changes(&diff).is_empty());
         // Unchanged (already in the DB): not part of the diff, never refused.
         assert!(refused_provider_changes(&IamDiff::default()).is_empty());
+    }
+
+    #[test]
+    fn a_provider_type_other_than_oidc_is_refused() {
+        let yaml = DeclarativeIam {
+            auth_providers: vec![DeclarativeAuthProvider {
+                name: "corp".into(),
+                provider_type: "google".into(),
+                enabled: true,
+                priority: 0,
+                display_name: None,
+                client_id: Some("c".into()),
+                client_secret: Some("s".into()),
+                issuer_url: Some("https://accounts.google.com".into()),
+                scopes: default_scopes(),
+                extra_config: None,
+            }],
+            ..Default::default()
+        };
+        let diff = diff_iam(&yaml, &empty_db()).unwrap();
+        let refused = refused_provider_changes(&diff);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("'oidc'"), "{refused:?}");
     }
 
     #[test]

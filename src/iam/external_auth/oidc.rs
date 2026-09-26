@@ -96,7 +96,9 @@ impl OidcNetPolicy {
 /// issuer URL passes that policy (the same check discovery runs), and a
 /// `ca_cert_path` holds at least one certificate. `check_files: false`
 /// skips the file read (the pure declarative validation).
-pub fn validate_provider_config(
+/// `pub(super)`: every entry point goes through
+/// [`super::validate_provider`], which checks the provider type first.
+pub(super) fn validate_provider_config(
     issuer_url: Option<&str>,
     extra_config: Option<&serde_json::Value>,
     check_files: bool,

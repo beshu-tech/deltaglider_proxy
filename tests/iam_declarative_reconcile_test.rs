@@ -1000,3 +1000,43 @@ async fn reconcile_audit_entries_carry_the_request_headers() {
         .clone();
     assert_eq!(entry["ua"], "reconcile-ua-probe/1.0", "{entry}");
 }
+
+/// A declarative provider of a type other than `oidc` fails the apply with a
+/// reason that names `oidc`, and the DB stays unchanged (the user in the
+/// same body is not created either).
+#[tokio::test]
+async fn reconcile_refuses_a_provider_type_other_than_oidc() {
+    let server = TestServer::builder()
+        .auth("BOOTKEY1", "BOOTSECRET1")
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+    let resp = admin
+        .put(format!("{endpoint}/_/api/admin/config/section/access"))
+        .json(&json!({
+            "iam_mode": "declarative",
+            "iam_users": [{
+                "name": "dana",
+                "access_key_id": "AKIADANA00001",
+                "secret_access_key": "dana-secret",
+                "enabled": true,
+                "permissions": []
+            }],
+            "auth_providers": [{
+                "name": "corp",
+                "provider_type": "azure",
+                "client_id": "c",
+                "client_secret": "s",
+                "issuer_url": "https://login.microsoftonline.com/t/v2.0"
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert!(status.is_client_error(), "{status}: {body}");
+    assert!(body.contains("'oidc'"), "{body}");
+    assert!(list_users(&admin, &endpoint).await.is_empty());
+}

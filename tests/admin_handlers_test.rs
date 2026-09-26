@@ -1530,3 +1530,62 @@ async fn event_outbox_list_filters_requeue_and_purge() {
     assert_eq!(after["total"], 0, "{after}");
     assert_audited(&admin, &ep, "event_outbox_purge_failed", "").await;
 }
+
+/// Only `oidc` exists. Another type was saved and then silently skipped by
+/// the provider map, so its sign-in button never worked. Create and update
+/// refuse it with 422 and name `oidc`; nothing is written.
+#[tokio::test]
+async fn a_provider_type_other_than_oidc_is_refused() {
+    let server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let base = json!({
+        "name": "corp", "provider_type": "google", "enabled": true,
+        "client_id": "c", "client_secret": "s",
+        "issuer_url": "https://accounts.google.com",
+    });
+    let (code, body) = json_of(
+        admin
+            .post(format!("{ep}/_/api/admin/ext-auth/providers"))
+            .json(&base)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.to_string().contains("'oidc'"), "{body}");
+    let (_, list) = json_of(
+        admin
+            .get(format!("{ep}/_/api/admin/ext-auth/providers"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(list.as_array().map(Vec::len), Some(0), "{list}");
+
+    let mut ok = base.clone();
+    ok["provider_type"] = json!("oidc");
+    let (code, p) = json_of(
+        admin
+            .post(format!("{ep}/_/api/admin/ext-auth/providers"))
+            .json(&ok)
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CREATED, "{p}");
+    let (code, body) = json_of(
+        admin
+            .put(format!("{ep}/_/api/admin/ext-auth/providers/{}", p["id"]))
+            .json(&json!({ "provider_type": "okta" }))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.to_string().contains("'oidc'"), "{body}");
+}

@@ -675,17 +675,14 @@ fn invalid_provider(msg: String) -> Response {
         .into_response()
 }
 
-/// Save-time check of an OIDC provider (issuer URL against the provider's
-/// network policy, `extra_config` types, the CA file). Other types skip.
+/// Save-time check of a provider (type, issuer URL against the provider's
+/// network policy, `extra_config` types, the CA file).
 fn check_provider(
     provider_type: &str,
     issuer_url: Option<&str>,
     extra_config: Option<&serde_json::Value>,
 ) -> Result<(), String> {
-    if provider_type != "oidc" {
-        return Ok(());
-    }
-    crate::iam::external_auth::oidc::validate_provider_config(issuer_url, extra_config, true)
+    crate::iam::external_auth::validate_provider(provider_type, issuer_url, extra_config, true)
 }
 
 /// GET /api/admin/ext-auth/providers — list all providers (secrets masked).
