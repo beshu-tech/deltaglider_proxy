@@ -565,6 +565,15 @@ impl SigV4Params {
             S3Error::InvalidArgument(format!("Invalid X-Amz-Expires: {}", expires)).into_response()
         })?;
 
+        // AWS accepts 1..=604800. A negative value is no URL, and a huge one
+        // overflowed the expiry arithmetic below (a pre-auth panic).
+        if expires_secs < 1 {
+            warn!("SigV4 presigned: X-Amz-Expires={expires_secs} is not positive");
+            return Err(S3Error::InvalidArgument(format!(
+                "X-Amz-Expires={expires_secs} must be at least 1 second"
+            ))
+            .into_response());
+        }
         if expires_secs > MAX_PRESIGNED_EXPIRY {
             warn!(
                 "SigV4 presigned: X-Amz-Expires={} exceeds 7-day maximum ({})",
@@ -590,7 +599,7 @@ impl SigV4Params {
         // Reject presigned URLs signed far in the future — prevents "permanent" URLs
         // by crafting X-Amz-Date in year 2099. Allow up to MAX_PRESIGNED_EXPIRY in the future.
         let future_limit = chrono::Duration::seconds(MAX_PRESIGNED_EXPIRY);
-        if request_utc > now + future_limit {
+        if request_utc > now.checked_add_signed(future_limit).unwrap_or(now) {
             warn!(
                 "SigV4 presigned: X-Amz-Date {} is too far in the future (limit: {} seconds ahead)",
                 amz_date, MAX_PRESIGNED_EXPIRY
@@ -598,7 +607,12 @@ impl SigV4Params {
             return Err(S3Error::RequestTimeTooSkewed.into_response());
         }
 
-        let expiry = request_utc + chrono::Duration::seconds(expires_secs);
+        // In range by the checks above; `checked_` so no date near chrono's
+        // limits can panic here.
+        let Some(expiry) = request_utc.checked_add_signed(chrono::Duration::seconds(expires_secs))
+        else {
+            return Err(S3Error::AccessDenied.into_response());
+        };
         if now > expiry {
             debug!("SigV4 presigned: URL expired (expired at {})", expiry);
             return Err(S3Error::AccessDenied.into_response());
@@ -1076,6 +1090,40 @@ fn parse_auth_header(header: &str) -> Option<ParsedAuthHeader> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    /// X-Amz-Expires is client text. A huge negative value made
+    /// `request_time + expires` overflow chrono and panic, pre-auth, on any
+    /// S3 request with a presigned query. AWS accepts 1..=604800 only.
+    /// Found by the `sigv4` fuzz target.
+    #[test]
+    fn presigned_expiry_outside_one_second_to_seven_days_is_refused() {
+        let date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        for expires in [
+            "-600110010600106",
+            "-9223372036854775808",
+            "0",
+            "-1",
+            "604801",
+        ] {
+            let uri = format!(
+                "/b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+                 &X-Amz-Credential=AK%2F20260101%2Fus-east-1%2Fs3%2Faws4_request\
+                 &X-Amz-Date={date}&X-Amz-Expires={expires}&X-Amz-SignedHeaders=host\
+                 &X-Amz-Signature=ab"
+            );
+            let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            assert!(
+                SigV4Params::from_query(&request).is_err(),
+                "X-Amz-Expires={expires} accepted"
+            );
+        }
+        let uri = format!(
+            "/b/k?X-Amz-Credential=AK%2F20260101%2Fus-east-1%2Fs3%2Faws4_request\
+             &X-Amz-Date={date}&X-Amz-Expires=1&X-Amz-Signature=ab"
+        );
+        let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        assert!(SigV4Params::from_query(&request).is_ok());
+    }
 
     /// Only an s3s-verified signature resets the limiter; a 403 before
     /// verification is a failure; an authz denial or other status teaches
