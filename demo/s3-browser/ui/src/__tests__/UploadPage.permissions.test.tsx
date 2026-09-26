@@ -13,6 +13,8 @@ const uploadObject = vi.hoisted(() => vi.fn());
 vi.mock('../s3client', () => ({
   getBucket: () => 'releases',
   listCommonPrefixes: async () => [],
+  listDirectObjects: async () => [],
+  headObject: async () => ({ headers: {}, storedSize: 10 }),
   uploadObject,
 }));
 
@@ -42,4 +44,27 @@ test('a read-only destination says so, offers the writable prefixes and blocks t
   await waitFor(() => expect(destInput()).toHaveValue('firmware/widget-3000/'));
   expect(screen.queryByText(/You cannot upload to/)).not.toBeInTheDocument();
   expect(screen.getByRole('button', { name: /Upload 1 file to firmware\/widget-3000\// })).toBeEnabled();
+});
+
+test('a file over max_object_size or the remaining quota is refused before upload', async () => {
+  const { json, mockFetch } = await import('../test/fetchMock');
+  const http = mockFetch();
+  http.on('GET', '/_/api/admin/config', json({ max_object_size: 100, bucket_policies: { releases: { quota_bytes: 1000 } } }));
+  http.on('GET', '/_/api/admin/usage/bucket/releases', json({ bucket: 'releases', stored_bytes: 950, logical_bytes: 950, object_count: 1, never_scanned: false }));
+  const user = userEvent.setup();
+  renderWithQuery(
+    <UploadPage
+      prefix="builds/"
+      checkLimits
+      initialFiles={[new File(['x'.repeat(200)], 'big.bin'), new File(['x'.repeat(60)], 'mid.bin'), new File(['x'.repeat(10)], 'ok.bin')]}
+      onBack={() => {}}
+      onDone={() => {}}
+    />,
+  );
+  expect(await screen.findByText(/big\.bin: 200 B is over the 100 B object size limit/)).toBeInTheDocument();
+  expect(await screen.findByText(/mid\.bin: 60 B does not fit in the bucket quota/)).toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: /Upload 1 file to builds\// }));
+  await waitFor(() => expect(uploadObject).toHaveBeenCalledTimes(1));
+  expect(uploadObject.mock.calls[0][0]).toBe('builds/ok.bin');
+  vi.unstubAllGlobals();
 });

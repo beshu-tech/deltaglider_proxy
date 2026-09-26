@@ -16,6 +16,8 @@ import { useColors } from '../ThemeContext';
 import UploadProgressList from './UploadProgressList';
 import { activateOnKey } from '../keyboard';
 import { keyPathError } from './destPrefix';
+import { precheckUpload } from '../uploadPrecheck';
+import { useUploadLimits } from '../queries/uploadLimits';
 
 const { Text, Title } = Typography;
 
@@ -33,6 +35,8 @@ interface Props {
   canWrite?: (prefix: string) => boolean;
   /** Folder roots this user can write to, offered when the destination is read-only. */
   writablePrefixes?: string[];
+  /** Admin session: read max_object_size and the bucket quota to refuse files before upload. */
+  checkLimits?: boolean;
 }
 
 /** Normalize a destination prefix: strip leading/trailing/duplicate slashes. */
@@ -45,7 +49,7 @@ const NO_PREFIXES: string[] = [];
 
 export default function UploadPage({
   prefix, onBack, onDone, initialFiles, onConsumeInitialFiles, onFinish,
-  canWrite = ALWAYS, writablePrefixes = NO_PREFIXES,
+  canWrite = ALWAYS, writablePrefixes = NO_PREFIXES, checkLimits = false,
 }: Props) {
   const {
     BG_BASE, BG_ELEVATED, BORDER, TEXT_PRIMARY,
@@ -97,14 +101,22 @@ export default function UploadPage({
 
   // A bad destination blocks the upload here, at the one place files enter
   // the queue; the message is shown under the destination input.
+  // Files the server would refuse (size, quota) never enter the queue: the
+  // page says why at once instead of after the bytes went out.
+  const limits = useUploadLimits(bucket, checkLimits);
+  const [refused, setRefused] = useState<{ file: File; reason: string }[]>([]);
   const addFilesIfValid = (files: FileList | File[]) => {
     if (destError) return;
-    addFiles(files);
+    const check = precheckUpload(Array.from(files), limits);
+    setRefused(check.refused);
+    if (check.accepted.length > 0) addFiles(check.accepted);
   };
 
+  const pendingCheck = precheckUpload(pendingFiles, limits);
   const commitPending = () => {
-    if (pendingFiles.length === 0 || destError) return;
-    addFiles(pendingFiles);
+    if (pendingCheck.accepted.length === 0 || destError) return;
+    addFiles(pendingCheck.accepted);
+    setRefused(pendingCheck.refused);
     setPendingFiles([]);
   };
 
@@ -296,6 +308,20 @@ export default function UploadPage({
         </Text>
       </div>
 
+      {/* Files refused before upload, and the staged files that would be. */}
+      {(pendingFiles.length > 0 ? pendingCheck.refused : refused).length > 0 && (
+        <div role="alert" style={{ marginBottom: 16, padding: 12, borderRadius: 10, border: `1px solid ${ACCENT_RED}`, fontFamily: 'var(--font-ui)' }}>
+          <Text strong style={{ display: 'block', color: ACCENT_RED, fontSize: 13, marginBottom: 4 }}>
+            {pendingFiles.length > 0 ? 'These files cannot be uploaded:' : 'Not uploaded:'}
+          </Text>
+          <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12, color: TEXT_SECONDARY }}>
+            {(pendingFiles.length > 0 ? pendingCheck.refused : refused).map((r) => (
+              <li key={`${r.file.name}:${r.file.size}`}>{r.file.name}: {r.reason}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {/* Pending dropped files — confirm the destination before they upload. */}
       {pendingFiles.length > 0 && (
         <div
@@ -320,10 +346,10 @@ export default function UploadPage({
               size="large"
               icon={<CloudUploadOutlined />}
               onClick={commitPending}
-              disabled={destError !== null}
+              disabled={destError !== null || pendingCheck.accepted.length === 0}
               style={{ borderRadius: 8, fontWeight: 600 }}
             >
-              Upload {pendingFiles.length} file{pendingFiles.length !== 1 ? 's' : ''} to {destLabel}
+              Upload {pendingCheck.accepted.length} file{pendingCheck.accepted.length !== 1 ? 's' : ''} to {destLabel}
             </Button>
             <Button
               size="large"

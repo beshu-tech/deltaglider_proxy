@@ -67,7 +67,6 @@ test('every env-controlled YAML path the server reports has a UI consumer', asyn
   assert.ok(serverPaths.size > 20, `parsed only ${serverPaths.size} paths from env_overrides.rs`);
   /** Paths with no GUI control at all: nothing to make read-only. */
   const NO_GUI_CONTROL = new Set([
-    'advanced.max_object_size',
     'advanced.max_passthrough_object_size',
     'advanced.config_sync_object_key',
     'storage.backend.force_path_style',

@@ -164,7 +164,7 @@ export const ADMIN_IA: Array<{ group: string; entries: SidebarEntry[] }> = [
         label: 'Buckets',
         icon: <CloudOutlined />,
         section: 'storage',
-        dirtyKeys: ['storage/buckets'],
+        dirtyKeys: ['storage/buckets', 'storage/buckets/limits'],
         applyKey: 'storage/buckets',
         description: 'Per-bucket settings: routing, public access, quotas, compression.',
       },

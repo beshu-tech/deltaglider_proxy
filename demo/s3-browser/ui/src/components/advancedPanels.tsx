@@ -81,6 +81,10 @@ const CACHES_INITIAL: Pick<
   blocking_threads: undefined,
 };
 
+const SIZE_LIMIT_INITIAL: Pick<AdvancedSectionBody, 'max_object_size'> = {
+  max_object_size: undefined,
+};
+
 const LOG_INITIAL: Pick<AdvancedSectionBody, 'log_level'> = {
   log_level: undefined,
 };
@@ -99,6 +103,7 @@ interface AdvancedSectionBody {
   blocking_threads?: number;
   log_level?: string;
   config_sync_bucket?: string;
+  max_object_size?: number;
   tls?: {
     enabled?: boolean;
     cert_path?: string | null;
@@ -450,6 +455,53 @@ export function CachesPanel({ onSessionExpired }: PanelProps) {
         </div>
       </div>
     </PanelShell>
+  );
+}
+
+// ───────────────────────────────────────────────────────────
+// ObjectSizeLimitCard  (advanced.max_object_size — on the Buckets page)
+// ───────────────────────────────────────────────────────────
+
+const MIB = 1024 * 1024;
+
+/** The largest object any bucket accepts. Global, but operators look for it
+ *  next to the per-bucket quota, so it renders on the Buckets page. */
+export function ObjectSizeLimitCard({ onSessionExpired }: PanelProps) {
+  const { cardStyle, inputRadius } = useCardStyles();
+  const subset = useAdvancedSubset(SIZE_LIMIT_INITIAL, onSessionExpired, 'storage/buckets/limits');
+  const { value, setValue } = subset;
+  const gate = loadGate(subset);
+  if (gate) return gate;
+  const mb = value.max_object_size != null ? Math.round(value.max_object_size / MIB) : undefined;
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <AdvancedApplyRail editor={subset} />
+      <div style={cardStyle}>
+        <SectionHeader
+          icon={<ControlOutlined />}
+          title="Object size limit"
+          description="The largest object that any bucket accepts. The proxy refuses a bigger upload, and the upload page refuses it before the upload starts."
+        />
+        <FormField
+          label="Maximum object size (MB)"
+          yamlPath="advanced.max_object_size"
+          helpText="Applies to every bucket. The YAML value is in bytes."
+          defaultPlaceholder="100"
+          examples={[100, 1024, 5120]}
+          onExampleClick={(v) => setValue({ ...value, max_object_size: Number(v) * MIB })}
+        >
+          <InputNumber
+            aria-label="Maximum object size (MB)"
+            value={mb}
+            onChange={(v) => setValue({ ...value, max_object_size: v != null ? v * MIB : undefined })}
+            min={1}
+            placeholder="100"
+            style={{ width: 180, ...inputRadius }}
+            suffix="MB"
+          />
+        </FormField>
+      </div>
+    </div>
   );
 }
 

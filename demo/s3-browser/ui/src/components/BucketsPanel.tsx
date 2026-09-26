@@ -37,6 +37,7 @@ import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import ApplyDialog from './ApplyDialog';
 import StickyDirtyBar from './StickyDirtyBar';
 import BucketCard from './BucketCard';
+import { ObjectSizeLimitCard } from './advancedPanels';
 import CreateBucketModal from './CreateBucketModal';
 import ReencryptProposalModal from './ReencryptProposalModal';
 import { useApplyHandler } from '../useDirtySection';
@@ -323,6 +324,8 @@ export default function BucketsPanel({ onSessionExpired }: Props) {
           </div>
         </div>
       </div>
+
+      <ObjectSizeLimitCard onSessionExpired={onSessionExpired} />
 
       <StickyDirtyBar
         visible={dirty}

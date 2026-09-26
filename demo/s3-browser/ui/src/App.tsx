@@ -507,6 +507,7 @@ export default function App() {
           prefix={uploadSeedPrefix ?? uploadPrefix}
           canWrite={canWriteUploadPrefix}
           writablePrefixes={writablePrefixes}
+          checkLimits={sessionCaps.canFetchFullAdminConfig}
           initialFiles={droppedFiles}
           onConsumeInitialFiles={() => setDroppedFiles([])}
           onBack={navigateToBrowse}
