@@ -30,7 +30,7 @@
  * [`getDirtySections`] — returns a snapshot Set derived from the
  * refcount map.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useReducer, useRef, useState } from 'react';
 
 /**
  * The key a panel registers its dirty/apply state under. This is DECOUPLED
@@ -237,6 +237,9 @@ export function useDirtySection<T>(
 ): UseDirtySectionResult<T> {
   const [value, setValueState] = useState<T>(initial);
   const snapshotRef = useRef<T>(initial);
+  // markApplied changes only the snapshot ref. Setting `value` to the same
+  // reference is a React bail-out (no render), so it needs its own re-render.
+  const [, forceRender] = useReducer((n: number) => n + 1, 0);
   // `value` referenced inside `markApplied` must come from a ref so
   // the callback identity doesn't change on every render (which
   // would cascade through `useCallback` consumers and cause infinite
@@ -279,7 +282,7 @@ export function useDirtySection<T>(
   const discard = useCallback(() => setValueState(snapshotRef.current), []);
   const markApplied = useCallback(() => {
     snapshotRef.current = valueRef.current;
-    setValueState(valueRef.current); // trigger isDirty recompute
+    forceRender(); // recompute isDirty
   }, []);
   const resetWith = useCallback((next: T) => {
     snapshotRef.current = next;
