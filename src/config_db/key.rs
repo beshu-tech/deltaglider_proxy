@@ -206,7 +206,8 @@ pub fn check_sync_needs_env_key(
 /// file, else a new key file) and the fallbacks. `env` is injected for tests.
 ///
 /// A key file that exists but is empty or unreadable is an error, never
-/// replaced: a new key would make the DB unreadable.
+/// replaced, when it is the primary key: a new key would make the DB
+/// unreadable. When `DGP_CONFIG_DB_KEY` is set, such a file is skipped.
 pub fn resolve_config_db_keys(
     db_path: &Path,
     legacy_bootstrap_hash: Option<&str>,
@@ -225,9 +226,16 @@ pub fn resolve_config_db_keys(
                 fallbacks: Vec::new(),
             };
             // A node that moves from the key file to the env key migrates.
+            // Here the file is only a fallback: an empty or unreadable one
+            // (a crash between create and write) never keyed the DB, so it
+            // must not block the env key. It stays on disk untouched.
             if key_file.exists() {
-                let file_key = read_key_file(&key_file)?;
-                keys = keys.with_fallback(FallbackKind::KeyFile, file_key.expose());
+                match read_key_file(&key_file) {
+                    Ok(file_key) => {
+                        keys = keys.with_fallback(FallbackKind::KeyFile, file_key.expose())
+                    }
+                    Err(e) => tracing::warn!("{e}; using {CONFIG_DB_KEY_ENV} without it"),
+                }
             }
             keys
         }
@@ -511,7 +519,6 @@ mod review3_tests {
     /// With `DGP_CONFIG_DB_KEY` set, the file is only a fallback (the DB was
     /// never under it), yet the boot refuses to start.
     #[test]
-    #[ignore = "review3: pending fix"]
     fn review3_an_empty_fallback_key_file_does_not_block_the_env_key() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("deltaglider_config.db");

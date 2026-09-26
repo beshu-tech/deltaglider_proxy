@@ -56,7 +56,7 @@ The encrypted config database (`deltaglider_config.db`, SQLCipher) holds IAM use
 Facts about the key:
 
 - **Back up the key with the database.** A copy of `deltaglider_config.db` is useless without its key. If you lose the key, the IAM data cannot be recovered.
-- **An empty or unreadable key file stops the start.** The proxy never replaces an existing key file, because a new key would make the database unreadable.
+- **An empty or unreadable key file stops the start** when the key file is the only key source. The proxy never replaces an existing key file, because a new key would make the database unreadable. When `DGP_CONFIG_DB_KEY` is set, the key file is only a fallback for the move from the file to the variable, so the proxy logs a warning, leaves the file alone, and starts with the variable.
 - **Upgrade from a release before the config DB key**: those releases encrypted the database with the bootstrap password hash. On the first start, the proxy opens the database with that hash and re-encrypts it with the new key. The re-encryption works on a copy, and the copy replaces the original only after it opens with the new key. If a step fails, the original database stays unchanged and the next start tries again.
 - **Move from the key file to `DGP_CONFIG_DB_KEY`**: set the variable and restart. The proxy opens the database with the key file and re-encrypts it with the variable's value.
 - **Rotate the key**: set `DGP_CONFIG_DB_KEY` to the new key and `DGP_CONFIG_DB_KEY_PREVIOUS` to the old one, then restart. The proxy opens the database with the previous key and re-encrypts it, and the sync merge base next to it, with the new key. The steps for one instance:
