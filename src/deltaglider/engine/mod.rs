@@ -1290,13 +1290,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// storage write needs for its own temp files (the encrypting wrapper's
     /// ciphertext). Waiting for budget under the lock is hold-and-wait: a
     /// streaming PUT that holds its body spool can wait for the same lock.
-    /// `None`: the backend needs no spool.
+    /// `held_mib`: spool budget the op holds already (its body spool, or its
+    /// relay parts); a holder never waits. `None`: no spool needed.
     pub(crate) async fn reserve_storage_spool(
         &self,
         bucket: &str,
         bytes: u64,
         parts: bool,
-        held: Option<&crate::deltaglider::spool::Spool>,
+        held_mib: usize,
     ) -> Result<Option<crate::deltaglider::spool::SpoolReservation>, EngineError> {
         let need = self
             .storage
@@ -1305,9 +1306,25 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         if need == 0 {
             return Ok(None);
         }
-        Self::with_spool_timeout(self.spool.reserve_beside(held, need))
+        Self::with_spool_timeout(self.spool.reserve_beside(held_mib, need))
             .await
             .map(Some)
+    }
+
+    /// The spool file for the buffered codec's source, taken WITHOUT waiting:
+    /// the buffered PUT encodes under the deltaspace lock. A full budget is a
+    /// retryable SlowDown.
+    pub(crate) fn codec_source_spool_now(
+        &self,
+        bytes: usize,
+    ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
+        self.spool.try_acquire(bytes as u64).map_err(|e| {
+            if e.kind() == crate::deltaglider::spool::CONTENDED {
+                EngineError::Overloaded(e.to_string())
+            } else {
+                EngineError::Storage(StorageError::from(e))
+            }
+        })
     }
 
     /// `spool_acquire` for an op that may already hold a spool (`held`).

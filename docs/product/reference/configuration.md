@@ -1031,7 +1031,7 @@ The list of `DGP_*` variables that the server reads. The unit test `every_dgp_li
 | `DGP_METRICS_BEARER_TOKEN` | unset | When set, `/_/metrics` answers only to `Authorization: Bearer <token>` (the Prometheus `authorization:` scrape setting) or to an admin session. Unset keeps the scrape endpoint public. See [Monitor with Prometheus](../how-to/monitor-with-prometheus.md) |
 | `DGP_USAGE_CACHE_TTL_SECS` | 300 | Lifetime of a cached prefix-usage scan result, in seconds |
 | `DGP_REFERENCE_SCAN_LIMIT` | built-in cap | Maximum number of reference baselines that the savings panel reads for one request |
-| `DGP_RELAY_FOREIGN_MIN_AGE_SECS` | 3600 | Minimum age, in seconds, before startup removes a multipart relay directory that another process left behind |
+| `DGP_RELAY_FOREIGN_MIN_AGE_SECS` | 3600 | Minimum age, in seconds, before startup removes a multipart relay directory that another process left behind. The relay directories are in `DGP_SPOOL_DIR`; startup also sweeps the relay directory of earlier releases in the system temp dir |
 
 ### Delta engine
 
@@ -1040,6 +1040,8 @@ The list of `DGP_*` variables that the server reads. The unit test `every_dgp_li
 | `DGP_MAX_DELTA_RATIO` | 0.75 | Keep delta only if `delta/original < ratio` |
 | `DGP_MAX_OBJECT_SIZE` | 104857600 | Max bytes eligible for delta (xdelta3 mem cap) |
 | `DGP_CACHE_MB` | 100 | Reference cache size in MB |
+| `DGP_SPOOL_DIR` | `<system temp>/dgp-spool` | Directory for every scratch file of the proxy: the delta codec's files, the multipart relay parts, and the temporary files of encrypted uploads |
+| `DGP_SPOOL_MAX_BYTES` | 17179869184 (16 GiB) | Byte budget for all the files in `DGP_SPOOL_DIR`. A request that needs spool space while it holds none waits for it (up to `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS`). A request that already holds spool space, or that holds a lock, does not wait: it fails with `503 SlowDown`, and S3 clients retry it |
 | `DGP_METADATA_CACHE_MB` | 50 | `FileMetadata` cache size in MB (0 to disable) |
 | `DGP_LIST_SIZE_CACHE_MB` | 32 | Listing-size cache in MB: the original size and ETag of stored deltas, for listings |
 | `DGP_CODEC_CONCURRENCY` | `num_cpus * 4` (min 16) | Max concurrent xdelta3 subprocesses |

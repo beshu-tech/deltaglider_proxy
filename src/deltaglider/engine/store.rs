@@ -309,18 +309,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // PERF: try_acquire instead of acquire — fail fast with 503 when all codec
         // slots are busy rather than queuing unbounded requests in memory (each
         // holding a full object body while waiting for a permit).
+        // The source file first (spool before codec slot, as on every path).
+        let source_file = self.codec_source_spool_now(reference.len())?;
         let _codec_permit = self.try_acquire_codec()?;
         // spawn_blocking: xdelta3 is CPU-bound; data must be owned ('static).
         let ref_clone = reference.clone();
         let data_owned = ctx.data.to_vec();
         let codec = self.codec.clone();
         let encode_start = Instant::now();
-        let delta = tokio::task::spawn_blocking(move || codec.encode(&ref_clone, &data_owned))
-            .await
-            .map_err(|e| {
-                tracing::error!("Delta encode task panicked: {}", e);
-                EngineError::Storage(StorageError::Other(format!("codec task panicked: {}", e)))
-            })??;
+        let delta = tokio::task::spawn_blocking(move || {
+            codec.encode_spooled(&source_file, &ref_clone, &data_owned)
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("Delta encode task panicked: {}", e);
+            EngineError::Storage(StorageError::Other(format!("codec task panicked: {}", e)))
+        })??;
         let encode_secs = encode_start.elapsed().as_secs_f64();
         drop(_codec_permit);
 
@@ -1285,8 +1289,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
         let sha256 = hex::encode(sha256_hasher.finalize());
         let md5 = hex::encode(md5_hasher.finalize());
+        // The relay parts hold spool budget (the multipart store reserves it
+        // per part), so this op is a holder and never waits.
+        let parts_mib = crate::deltaglider::spool::mib_ceil(total_size);
         let reserved = self
-            .reserve_storage_spool(bucket, total_size, true, None)
+            .reserve_storage_spool(bucket, total_size, true, parts_mib)
             .await?;
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
@@ -1401,7 +1408,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let sha256 = hex::encode(sha256_hasher.finalize());
         let md5 = hex::encode(md5_hasher.finalize());
         let reserved = self
-            .reserve_storage_spool(bucket, total_size, false, held)
+            .reserve_storage_spool(
+                bucket,
+                total_size,
+                false,
+                held.map_or(0, crate::deltaglider::spool::Spool::reserved_mib),
+            )
             .await?;
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
@@ -1692,10 +1704,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let (reference, _cache_hit) = self
             .get_reference_cached(bucket, deltaspace_id, &ref_meta.file_sha256)
             .await?;
+        let source_file = self.codec_source_spool_now(reference.len())?;
         let _codec_permit = self.codec_semaphore.acquire().await.map_err(|_| {
             EngineError::Storage(StorageError::Other("codec semaphore closed".into()))
         })?;
-        let delta = self.codec.encode(&reference, &reference)?;
+        let delta = self
+            .codec
+            .encode_spooled(&source_file, &reference, &reference)?;
         drop(_codec_permit);
 
         let delta_meta = FileMetadata::new_delta(
@@ -2364,48 +2379,88 @@ mod review2_tests {
         assert_eq!(got, v);
     }
 
-    /// A relayed multipart store holds no spool, so it may wait for budget,
-    /// but only BEFORE it takes the deltaspace lock: a PUT that holds its
-    /// body spool can wait for that lock.
+    /// The buffered codec's source file is a spool file. A buffered PUT
+    /// encodes under the deltaspace lock, so it never waits for budget (a
+    /// full budget is SlowDown at once); a GET holds nothing and waits.
     #[tokio::test]
-    async fn encrypted_relayed_store_waits_for_budget_outside_the_lock() {
+    async fn buffered_codec_source_is_a_spool_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let engine = Arc::new(encrypted_engine(&tmp, 4 * 1024 * 1024).await);
+        let backend = FilesystemBackend::new(tmp.path().join("data"))
+            .await
+            .unwrap();
+        backend.create_bucket("b").await.unwrap();
+        let mut engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None);
+        engine.spool = Arc::new(
+            crate::deltaglider::spool::SpoolDir::new(tmp.path().join("spool"), 4 * 1024 * 1024)
+                .unwrap(),
+        );
+        let engine = Arc::new(engine);
+        let v1: Vec<u8> = (0..300_000u32).map(|n| (n % 251) as u8).collect();
+        let mut v2 = v1.clone();
+        v2[1000] ^= 0xff;
+        engine
+            .store("b", "rel/a.zip", &v1, None, HashMap::new())
+            .await
+            .unwrap();
+
+        let full = engine.spool_acquire(4 * 1024 * 1024).await.unwrap();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.store("b", "rel/b.zip", &v2, None, HashMap::new()),
+        )
+        .await
+        .expect("a buffered PUT must not wait for spool budget under the lock");
+        assert!(matches!(r, Err(EngineError::Overloaded(_))), "got {r:?}");
+        drop(full);
+        engine
+            .store("b", "rel/b.zip", &v2, None, HashMap::new())
+            .await
+            .unwrap();
+
+        // GET: waits for the budget, then decodes.
+        let full = engine.spool_acquire(4 * 1024 * 1024).await.unwrap();
+        let e = engine.clone();
+        let get = tokio::spawn(async move { e.retrieve("b", "rel/b.zip").await });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!get.is_finished(), "the GET waits for spool budget");
+        drop(full);
+        let (got, _) = tokio::time::timeout(std::time::Duration::from_secs(10), get)
+            .await
+            .expect("the GET goes on once the budget is free")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, v2);
+    }
+
+    /// A relayed multipart store holds spool budget: its relay parts. So it
+    /// never waits for more (two completing uploads would each wait for the
+    /// other's parts); with the budget in use it is a SlowDown at once.
+    #[tokio::test]
+    async fn encrypted_relayed_store_never_waits_for_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = encrypted_engine(&tmp, 4 * 1024 * 1024).await;
         let part = tmp.path().join("part1");
         let v = vec![5u8; 1024 * 1024];
         tokio::fs::write(&part, &v).await.unwrap();
-        let full = engine.spool_acquire(4 * 1024 * 1024).await.unwrap();
-
-        let e = engine.clone();
-        let parts = vec![part.clone()];
-        let len = v.len() as u64;
-        let store = tokio::spawn(async move {
-            e.store_passthrough_relayed_parts_with_multipart_etag(
+        let store = || {
+            engine.store_passthrough_relayed_parts_with_multipart_etag(
                 "b",
                 "x/a.png",
-                &parts,
-                len,
+                std::slice::from_ref(&part),
+                v.len() as u64,
                 None,
                 HashMap::new(),
                 "\"0123456789abcdef0123456789abcdef-1\"".to_string(),
             )
+        };
+        let full = engine.spool_acquire(4 * 1024 * 1024).await.unwrap();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), store())
             .await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(!store.is_finished(), "the store waits for budget");
-        let guard = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            engine.acquire_prefix_lock("b", "x"),
-        )
-        .await
-        .expect("the store must not hold the deltaspace lock while it waits for budget");
-        drop(guard);
+            .expect("a relayed store must not wait for spool budget");
+        assert!(matches!(r, Err(EngineError::Overloaded(_))), "got {r:?}");
         drop(full);
-        tokio::time::timeout(std::time::Duration::from_secs(10), store)
-            .await
-            .expect("the store goes on once the budget is free")
-            .unwrap()
-            .unwrap();
+        store().await.unwrap();
         let (got, _) = engine.retrieve("b", "x/a.png").await.unwrap();
         assert_eq!(got, v);
     }

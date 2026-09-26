@@ -5,10 +5,10 @@
 //! Uses the xdelta3 CLI binary for both encoding and decoding to ensure
 //! compatibility with deltas created by the original DeltaGlider Python CLI.
 
+use crate::deltaglider::spool::{Spool, SpoolDir};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-use tempfile::NamedTempFile;
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
@@ -527,7 +527,8 @@ impl DeltaCodec {
     /// exits-0 on an unknown flag (the encode itself must succeed).
     fn probe_armor_flag() -> bool {
         use std::io::Write;
-        let Ok(src) = NamedTempFile::new() else {
+        // A spool file like every scratch file; the probe runs once at start.
+        let Ok(src) = SpoolDir::shared().and_then(|s| s.try_acquire(1)) else {
             return false;
         };
         // Source file content is irrelevant; just needs to exist + be seekable.
@@ -585,8 +586,32 @@ impl DeltaCodec {
     /// random-access (mmap) to it. This reduces disk I/O from 3 temp files + 6 I/O
     /// ops to 1 temp file + 2 I/O ops per encode. Do NOT "simplify" by writing
     /// target to a temp file — that was the old slow path.
-    #[instrument(skip(self, source, target))]
+    ///
+    /// The source goes to a file of the process-wide spool, taken without
+    /// waiting ([`crate::deltaglider::spool::CONTENDED`] when the budget is in
+    /// use). The engine uses [`Self::encode_spooled`] with its own spool.
     pub fn encode(&self, source: &[u8], target: &[u8]) -> Result<Vec<u8>, CodecError> {
+        self.encode_impl(None, source, target)
+    }
+
+    /// [`Self::encode`] with the source written to `source_file`, a spool
+    /// file the caller reserved for `source.len()` bytes.
+    pub fn encode_spooled(
+        &self,
+        source_file: &Spool,
+        source: &[u8],
+        target: &[u8],
+    ) -> Result<Vec<u8>, CodecError> {
+        self.encode_impl(Some(source_file), source, target)
+    }
+
+    #[instrument(skip(self, source_file, source, target))]
+    fn encode_impl(
+        &self,
+        source_file: Option<&Spool>,
+        source: &[u8],
+        target: &[u8],
+    ) -> Result<Vec<u8>, CodecError> {
         // Validate sizes — both source and target must fit within max_size.
         if source.len() > self.max_size {
             return Err(CodecError::TooLarge {
@@ -607,7 +632,7 @@ impl DeltaCodec {
             target.len()
         );
 
-        let output = self.run_xdelta3(Mode::Encode, source, target)?;
+        let output = self.run_xdelta3(Mode::Encode, source_file, source, target)?;
 
         debug!(
             "Delta encoded: {} bytes (ratio: {:.2}%)",
@@ -622,8 +647,29 @@ impl DeltaCodec {
     /// PERF: Same piped I/O strategy as encode() — see encode() doc comment.
     /// Source stays as a temp file (xdelta3 needs random access); delta is piped
     /// via stdin; reconstructed output comes from stdout.
-    #[instrument(skip(self, source, delta))]
+    /// The source file: as for [`Self::encode`].
     pub fn decode(&self, source: &[u8], delta: &[u8]) -> Result<Vec<u8>, CodecError> {
+        self.decode_impl(None, source, delta)
+    }
+
+    /// [`Self::decode`] with the source written to `source_file`, a spool
+    /// file the caller reserved for `source.len()` bytes.
+    pub fn decode_spooled(
+        &self,
+        source_file: &Spool,
+        source: &[u8],
+        delta: &[u8],
+    ) -> Result<Vec<u8>, CodecError> {
+        self.decode_impl(Some(source_file), source, delta)
+    }
+
+    #[instrument(skip(self, source_file, source, delta))]
+    fn decode_impl(
+        &self,
+        source_file: Option<&Spool>,
+        source: &[u8],
+        delta: &[u8],
+    ) -> Result<Vec<u8>, CodecError> {
         if source.len() > self.max_size {
             return Err(CodecError::TooLarge {
                 size: source.len(),
@@ -637,7 +683,7 @@ impl DeltaCodec {
             delta.len()
         );
 
-        let output = self.run_xdelta3(Mode::Decode, source, delta)?;
+        let output = self.run_xdelta3(Mode::Decode, source_file, source, delta)?;
 
         debug!("Delta decoded: {} bytes", output.len());
         Ok(output)
@@ -652,10 +698,29 @@ impl DeltaCodec {
     /// stdin; xdelta3 can only read source from a seekable file descriptor.
     /// The input (target for encode, delta for decode) is piped via stdin;
     /// output comes from stdout (`-c` flag).
-    fn run_xdelta3(&self, mode: Mode, source: &[u8], input: &[u8]) -> Result<Vec<u8>, CodecError> {
-        let mut source_file = NamedTempFile::new()?;
-        source_file.write_all(source)?;
-        source_file.flush()?;
+    ///
+    /// The source file is a spool file: the caller's, or one of the shared
+    /// spool taken without waiting.
+    fn run_xdelta3(
+        &self,
+        mode: Mode,
+        source_file: Option<&Spool>,
+        source: &[u8],
+        input: &[u8],
+    ) -> Result<Vec<u8>, CodecError> {
+        let own;
+        let source_file = match source_file {
+            Some(f) => f,
+            None => {
+                own = SpoolDir::shared()?.try_acquire(source.len() as u64)?;
+                &own
+            }
+        };
+        {
+            let mut f = std::fs::File::create(source_file.path())?;
+            f.write_all(source)?;
+            f.flush()?;
+        }
 
         let mut proc = self.spawn_xdelta3(mode, source_file.path())?;
         let (write_result, output, stderr_result) = pipe_stdin_stdout_stderr(
@@ -903,8 +968,8 @@ mod tests {
 
     /// Write `data` to a fresh temp file and return it (the seekable source the
     /// streaming codec entry points require).
-    fn source_tempfile(data: &[u8]) -> NamedTempFile {
-        let mut f = NamedTempFile::new().unwrap();
+    fn source_tempfile(data: &[u8]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(data).unwrap();
         f.flush().unwrap();
         f

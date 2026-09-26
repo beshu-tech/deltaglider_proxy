@@ -39,12 +39,18 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
+use crate::deltaglider::spool::{mib_ceil, SpoolDir, SpoolReservation, CONTENDED};
+
+/// Relay root, under the spool dir (it was under the system temp dir).
 const RELAY_ROOT_DIR: &str = "deltaglider-mpu-relay";
 
 /// Data for a single uploaded part
 enum PartPayload {
     InMemory(Bytes),
-    RelayedFile(PathBuf),
+    /// A relay file in the spool dir, and the spool budget it holds until
+    /// the part is dropped (overwrite, abort, complete, sweep). The
+    /// reservation is never read: it is held for its Drop.
+    RelayedFile(PathBuf, #[allow(dead_code)] SpoolReservation),
 }
 
 impl PartPayload {
@@ -57,7 +63,7 @@ impl PartPayload {
     fn load_bytes(&self, expected_md5: &[u8; 16]) -> Result<Bytes, S3Error> {
         match self {
             Self::InMemory(bytes) => Ok(bytes.clone()),
-            Self::RelayedFile(path) => {
+            Self::RelayedFile(path, _) => {
                 let bytes = fs::read(path).map(Bytes::from).map_err(|e| {
                     S3Error::InternalError(format!("Failed to read relayed part: {}", e))
                 })?;
@@ -335,6 +341,8 @@ pub struct MultipartStore {
     in_flight_bytes: std::sync::atomic::AtomicU64,
     max_total_multipart_bytes: u64,
     idle_ttl: Duration,
+    /// Relay part files live in this spool's dir and hold its budget.
+    spool: SpoolDir,
 }
 
 impl MultipartStore {
@@ -351,7 +359,14 @@ impl MultipartStore {
             in_flight_bytes: std::sync::atomic::AtomicU64::new(0),
             max_total_multipart_bytes,
             idle_ttl: Duration::hours(idle_ttl_hours),
+            spool: shared_spool(),
         }
+    }
+
+    /// Use `spool` for relay part files (default: the process-wide spool).
+    pub fn with_spool(mut self, spool: SpoolDir) -> Self {
+        self.spool = spool;
+        self
     }
 
     /// Test-only constructor with custom caps. Not part of the stable API.
@@ -369,6 +384,7 @@ impl MultipartStore {
             in_flight_bytes: std::sync::atomic::AtomicU64::new(0),
             max_total_multipart_bytes,
             idle_ttl,
+            spool: shared_spool(),
         }
     }
 
@@ -447,7 +463,7 @@ impl MultipartStore {
             state: MultipartState::Open,
             relay_strategy: if always_relay_passthrough {
                 RelayStrategy::Relayed {
-                    relay_dir: relay_dir_for_upload(&upload_id),
+                    relay_dir: self.relay_dir_for_upload(&upload_id),
                 }
             } else {
                 RelayStrategy::InMemory {
@@ -556,15 +572,16 @@ impl MultipartStore {
             RelayStrategy::Relayed { .. } => false,
         };
         if should_promote_to_relay {
-            Self::promote_upload_to_relay(upload)?;
+            self.promote_upload_to_relay(upload)?;
         }
 
         let payload = match &upload.relay_strategy {
             RelayStrategy::InMemory { .. } => PartPayload::InMemory(data),
             RelayStrategy::Relayed { relay_dir } => {
+                let budget = self.reserve_relay_part(upload, size)?;
                 let path = part_path(relay_dir, part_number);
                 write_part_file(&path, &data)?;
-                PartPayload::RelayedFile(path)
+                PartPayload::RelayedFile(path, budget)
             }
         };
 
@@ -1257,30 +1274,33 @@ impl MultipartStore {
             })
             .collect();
         let (mut dirs_removed, mut files_removed) =
-            cleanup_orphan_relay_entries_at(&relay_root_dir(), &active_relay_dirs, min_age);
+            cleanup_orphan_relay_entries_at(&self.relay_root_dir(), &active_relay_dirs, min_age);
 
         // Foreign per-process roots (crashed/finished proxies): reap only STALE
         // leftovers — a young dir may belong to a live sibling process's upload.
         let foreign_min_age = std::time::Duration::from_secs(
             crate::config::env_parse_with_default("DGP_RELAY_FOREIGN_MIN_AGE_SECS", 3600),
         );
-        let mine = relay_root_dir();
-        if let Ok(entries) = fs::read_dir(relay_parent_dir()) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path == mine || !path.is_dir() {
-                    continue;
-                }
-                let (fd, ff) = cleanup_orphan_relay_entries_at(
-                    &path,
-                    &HashSet::new(),
-                    min_age.max(foreign_min_age),
-                );
-                dirs_removed += fd;
-                files_removed += ff;
-                // Removes the pid dir only when empty; a live sibling keeps it.
-                let _ = fs::remove_dir(&path);
+        let mine = self.relay_root_dir();
+        let parents = [self.relay_parent_dir(), legacy_relay_parent_dir()];
+        for entry in parents
+            .iter()
+            .filter_map(|p| fs::read_dir(p).ok())
+            .flat_map(|entries| entries.flatten())
+        {
+            let path = entry.path();
+            if path == mine || !path.is_dir() {
+                continue;
             }
+            let (fd, ff) = cleanup_orphan_relay_entries_at(
+                &path,
+                &HashSet::new(),
+                min_age.max(foreign_min_age),
+            );
+            dirs_removed += fd;
+            files_removed += ff;
+            // Removes the pid dir only when empty; a live sibling keeps it.
+            let _ = fs::remove_dir(&path);
         }
         MultipartSweepReport {
             orphan_relay_dirs_removed: dirs_removed,
@@ -1294,37 +1314,80 @@ impl MultipartStore {
         self.uploads.read().len()
     }
 
-    fn promote_upload_to_relay(upload: &mut MultipartUpload) -> Result<(), S3Error> {
-        let relay_dir = relay_dir_for_upload(&upload.upload_id);
+    fn promote_upload_to_relay(&self, upload: &mut MultipartUpload) -> Result<(), S3Error> {
+        let relay_dir = self.relay_dir_for_upload(&upload.upload_id);
         fs::create_dir_all(&relay_dir).map_err(|e| {
             S3Error::InternalError(format!("Failed to create multipart relay directory: {}", e))
         })?;
-        for (part_number, part) in &mut upload.parts {
+        let in_memory: Vec<u32> = upload
+            .parts
+            .iter()
+            .filter(|(_, p)| matches!(p.payload, PartPayload::InMemory(_)))
+            .map(|(n, _)| *n)
+            .collect();
+        for part_number in in_memory {
+            let size = upload.parts[&part_number].size;
+            let budget = self.reserve_relay_part(upload, size)?;
+            let part = upload.parts.get_mut(&part_number).expect("collected above");
             if let PartPayload::InMemory(bytes) = &part.payload {
-                let path = part_path(&relay_dir, *part_number);
+                let path = part_path(&relay_dir, part_number);
                 write_part_file(&path, bytes)?;
-                part.payload = PartPayload::RelayedFile(path);
+                part.payload = PartPayload::RelayedFile(path, budget);
             }
         }
         upload.relay_strategy = RelayStrategy::Relayed { relay_dir };
         Ok(())
     }
+
+    /// Spool budget for one relay part of `size` bytes. Never waits: this
+    /// runs under the uploads lock, and an upload that holds relay parts is
+    /// a holder (the review2 rule). A full budget is a retryable SlowDown.
+    fn reserve_relay_part(
+        &self,
+        upload: &MultipartUpload,
+        size: u64,
+    ) -> Result<SpoolReservation, S3Error> {
+        let held: u64 = upload
+            .parts
+            .values()
+            .filter(|p| matches!(p.payload, PartPayload::RelayedFile(..)))
+            .map(|p| p.size)
+            .sum();
+        self.spool.try_reserve(size, mib_ceil(held)).map_err(|e| {
+            if e.kind() == CONTENDED {
+                S3Error::SlowDown(format!("spool budget in use by other requests: {e}"))
+            } else {
+                S3Error::InternalError(format!("spool reservation failed: {e}"))
+            }
+        })
+    }
+
+    /// Parent of all per-process relay roots on this host.
+    fn relay_parent_dir(&self) -> PathBuf {
+        self.spool.dir().join(RELAY_ROOT_DIR)
+    }
+
+    /// Per-PROCESS relay root. Sharing one root across processes let a booting
+    /// instance's age-zero startup sweep delete the LIVE relay parts of every
+    /// other proxy on the host (chaos-found: "Failed to persist relay part: No
+    /// such file").
+    fn relay_root_dir(&self) -> PathBuf {
+        self.relay_parent_dir().join(std::process::id().to_string())
+    }
+
+    fn relay_dir_for_upload(&self, upload_id: &str) -> PathBuf {
+        self.relay_root_dir().join(upload_id)
+    }
 }
 
-/// Parent of all per-process relay roots on this host.
-fn relay_parent_dir() -> PathBuf {
+/// The relay parent of releases before the relay moved into the spool. Only
+/// swept (its roots are crash debris or an older process's uploads).
+fn legacy_relay_parent_dir() -> PathBuf {
     std::env::temp_dir().join(RELAY_ROOT_DIR)
 }
 
-/// Per-PROCESS relay root. Sharing one root across processes let a booting
-/// instance's age-zero startup sweep delete the LIVE relay parts of every other
-/// proxy on the host (chaos-found: "Failed to persist relay part: No such file").
-fn relay_root_dir() -> PathBuf {
-    relay_parent_dir().join(std::process::id().to_string())
-}
-
-fn relay_dir_for_upload(upload_id: &str) -> PathBuf {
-    relay_root_dir().join(upload_id)
+fn shared_spool() -> SpoolDir {
+    SpoolDir::shared().unwrap_or_else(|e| panic!("failed to init spool dir: {e}"))
 }
 
 fn part_path(relay_dir: &Path, part_number: u32) -> PathBuf {
@@ -1360,7 +1423,7 @@ fn ordered_relay_part_paths(
             S3Error::InvalidPart(format!("Part {} has not been uploaded", part_number))
         })?;
         match &part.payload {
-            PartPayload::RelayedFile(path) => {
+            PartPayload::RelayedFile(path, _) => {
                 // Re-verify content vs the MD5 recorded at UploadPart before the
                 // engine streams these paths (the streamed path never re-hashes
                 // against the per-part digest). Closes the shared-host local-
@@ -2337,7 +2400,9 @@ mod tests {
         fs::write(&path, &good).unwrap();
         let expected: [u8; 16] = Md5::digest(&good).into();
 
-        let payload = PartPayload::RelayedFile(path.clone());
+        let spool =
+            crate::deltaglider::spool::SpoolDir::new(dir.path().join("spool"), 1 << 20).unwrap();
+        let payload = PartPayload::RelayedFile(path.clone(), spool.try_reserve(1, 0).unwrap());
         // Untouched → loads fine.
         assert_eq!(payload.load_bytes(&expected).unwrap(), good);
 
@@ -2380,8 +2445,8 @@ mod tests {
         ));
         let part1 = upload.parts.get(&1).unwrap();
         let part2 = upload.parts.get(&2).unwrap();
-        assert!(matches!(part1.payload, PartPayload::RelayedFile(_)));
-        assert!(matches!(part2.payload, PartPayload::RelayedFile(_)));
+        assert!(matches!(part1.payload, PartPayload::RelayedFile(..)));
+        assert!(matches!(part2.payload, PartPayload::RelayedFile(..)));
     }
 
     #[test]
@@ -2414,5 +2479,86 @@ mod tests {
                 panic!("expected relayed part payload for always-relay upload")
             }
         }
+    }
+
+    /// Relay part files are scratch files: they must live in the spool dir
+    /// (and count against its budget). They were under the system temp dir.
+    #[test]
+    fn relay_parts_live_in_the_spool_dir() {
+        let spool = crate::deltaglider::spool::SpoolDir::shared().unwrap();
+        let store = MultipartStore::new(10 * 1024);
+        let id = store
+            .create_with_relay_policy("b", "k", None, HashMap::new(), None, true)
+            .unwrap();
+        store
+            .upload_part(&id, "b", "k", 1, Bytes::from_static(b"hello"))
+            .unwrap();
+        let uploads = store.uploads.read();
+        let part = uploads.get(&id).unwrap().parts.get(&1).unwrap();
+        let PartPayload::RelayedFile(path, ..) = &part.payload else {
+            panic!("expected a relayed part");
+        };
+        assert!(
+            path.starts_with(spool.dir()),
+            "relay part {path:?} is outside the spool dir {:?}",
+            spool.dir()
+        );
+    }
+
+    fn small_spool(dir: &tempfile::TempDir, mib: u64) -> SpoolDir {
+        SpoolDir::new(dir.path().join("spool"), mib << 20).unwrap()
+    }
+
+    /// A relay part holds spool budget from UploadPart until the part is
+    /// dropped: overwrite, abort, or the end of the upload.
+    #[test]
+    fn relay_parts_hold_spool_budget_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = small_spool(&dir, 8);
+        let store = MultipartStore::new(64 << 20).with_spool(spool.clone());
+        let id = store
+            .create_with_relay_policy("b", "k", None, HashMap::new(), None, true)
+            .unwrap();
+        let mib = |n: usize| Bytes::from(vec![7u8; n << 20]);
+        store.upload_part(&id, "b", "k", 1, mib(2)).unwrap();
+        store.upload_part(&id, "b", "k", 2, mib(3)).unwrap();
+        assert_eq!(spool.free_mib(), 3);
+        // Overwrite: the old part's budget goes back.
+        store.upload_part(&id, "b", "k", 2, mib(1)).unwrap();
+        assert_eq!(spool.free_mib(), 5);
+        store.abort(&id, "b", "k").unwrap();
+        assert_eq!(spool.free_mib(), 8);
+
+        // Promotion reserves for the parts that were in memory.
+        let id = store
+            .create_with_relay_policy("b", "k", None, HashMap::new(), Some(3 << 20), false)
+            .unwrap();
+        store.upload_part(&id, "b", "k", 1, mib(2)).unwrap();
+        assert_eq!(spool.free_mib(), 8, "in-memory parts hold no spool");
+        store.upload_part(&id, "b", "k", 2, mib(2)).unwrap();
+        assert_eq!(spool.free_mib(), 4);
+        store.finish_upload(&id);
+        assert_eq!(spool.free_mib(), 8);
+    }
+
+    /// UploadPart never waits for spool budget (it runs under the uploads
+    /// lock, and the upload may hold parts): a full budget is SlowDown now.
+    #[test]
+    fn relay_part_with_the_budget_taken_is_slowdown_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = small_spool(&dir, 4);
+        let store = MultipartStore::new(64 << 20).with_spool(spool.clone());
+        let id = store
+            .create_with_relay_policy("b", "k", None, HashMap::new(), None, true)
+            .unwrap();
+        let other = spool.try_acquire(4 << 20).unwrap();
+        let err = store
+            .upload_part(&id, "b", "k", 1, Bytes::from(vec![1u8; 1 << 20]))
+            .unwrap_err();
+        assert!(matches!(err, S3Error::SlowDown(_)), "got {err:?}");
+        drop(other);
+        store
+            .upload_part(&id, "b", "k", 1, Bytes::from(vec![1u8; 1 << 20]))
+            .unwrap();
     }
 }

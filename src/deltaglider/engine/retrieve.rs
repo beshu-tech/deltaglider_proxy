@@ -662,6 +662,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     });
                 }
 
+                // The source file first (spool before codec slot, as on the
+                // streaming GET). A GET holds no spool and no lock here, so it
+                // may wait for budget, under the spool acquire timeout.
+                let source_file = self.spool_acquire(reference.len() as u64).await?;
                 // Wait up to 60s for a codec slot (GET should queue, not fail fast)
                 let _codec_permit = self
                     .acquire_codec_timeout(std::time::Duration::from_secs(60))
@@ -669,15 +673,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 let ref_clone = reference.clone();
                 let codec = self.codec.clone();
                 let decode_start = Instant::now();
-                let result = tokio::task::spawn_blocking(move || codec.decode(&ref_clone, &delta))
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("Delta decode task panicked: {}", e);
-                        EngineError::Storage(StorageError::Other(format!(
-                            "codec task panicked: {}",
-                            e
-                        )))
-                    })??;
+                let result = tokio::task::spawn_blocking(move || {
+                    codec.decode_spooled(&source_file, &ref_clone, &delta)
+                })
+                .await
+                .map_err(|e| {
+                    tracing::error!("Delta decode task panicked: {}", e);
+                    EngineError::Storage(StorageError::Other(format!("codec task panicked: {}", e)))
+                })??;
                 let decode_secs = decode_start.elapsed().as_secs_f64();
                 drop(_codec_permit);
                 self.with_metrics(|m| m.delta_decode_duration_seconds.observe(decode_secs));

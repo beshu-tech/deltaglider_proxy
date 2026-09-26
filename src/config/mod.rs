@@ -488,13 +488,13 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_SPOOL_DIR",
-        description: "Directory for spool files: streaming codec ops and encrypted-write temp files (default: <system temp>/dgp-spool)",
+        description: "Directory for every scratch file: codec files, multipart relay parts, encrypted-write temps (default: <system temp>/dgp-spool)",
         example: "/var/lib/deltaglider/spool",
         category: "Delta Engine",
     },
     EnvVarEntry {
         name: "DGP_SPOOL_MAX_BYTES",
-        description: "Byte budget for concurrent spool files, encrypted-write temps included; acquirers back-pressure when full (default: 16 GiB)",
+        description: "Byte budget for all spool files; a request that holds none waits, a holder gets 503 SlowDown (default: 16 GiB)",
         example: "17179869184",
         category: "Delta Engine",
     },

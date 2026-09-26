@@ -3986,7 +3986,7 @@ mod tests {
             .file_put_spool_bytes("b", 3 * MIB as u64, true)
             .await;
         assert!(need > 6 * MIB as u64, "joined + ciphertext, got {need}");
-        let reserved = sd.reserve_beside(None, need).await.unwrap();
+        let reserved = sd.reserve_beside(0, need).await.unwrap();
         let free_after_reserve = sd.free_mib();
         wrapper
             .put_passthrough_parts(

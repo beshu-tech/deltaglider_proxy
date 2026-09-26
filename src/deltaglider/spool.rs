@@ -13,8 +13,8 @@
 //! When the budget is exhausted, acquirers wait (back-pressure) rather than
 //! failing the underlying storage with ENOSPC.
 //!
-//! The encrypting storage wrapper's temp files (ciphertext, joined multipart
-//! parts) live here too: see `SpoolBudget`.
+//! Every scratch file of the proxy lives here: the codec files, the multipart
+//! relay parts and the encrypting wrapper's temps (see `SpoolBudget`).
 //!
 //! Configured via `DGP_SPOOL_DIR` (default = system temp dir) and
 //! `DGP_SPOOL_MAX_BYTES` (default 16 GiB).
@@ -169,26 +169,33 @@ impl SpoolDir {
     /// the space now or a [`CONTENDED`] error, and goes on without it. Two
     /// holders that wait can each wait for the budget the other holds
     /// (hold-and-wait), until the acquire timeout.
-    ///
-    /// `may_wait = false` makes a non-holder behave like a holder: used by
-    /// storage writes, which run under the caller's deltaspace lock.
     async fn reserve_within(
         &self,
         bytes: u64,
         held_mib: usize,
-        may_wait: bool,
     ) -> std::io::Result<OwnedSemaphorePermit> {
-        let max_mib = mib_ceil(self.max_bytes).max(1);
-        let want_mib = mib_ceil(bytes).max(1).min(max_mib.saturating_sub(held_mib));
-        let closed = || std::io::Error::other("spool budget semaphore closed");
-        if held_mib == 0 && may_wait {
+        if held_mib == 0 {
             return self
                 .budget
                 .clone()
-                .acquire_many_owned(want_mib as u32)
+                .acquire_many_owned(self.want_mib(bytes, 0) as u32)
                 .await
-                .map_err(|_| closed());
+                .map_err(|_| std::io::Error::other("spool budget semaphore closed"));
         }
+        self.try_permit(bytes, held_mib)
+    }
+
+    /// Clamped want: the op's total (with `held_mib`) stays within the budget.
+    fn want_mib(&self, bytes: u64, held_mib: usize) -> usize {
+        let max_mib = mib_ceil(self.max_bytes).max(1);
+        mib_ceil(bytes).max(1).min(max_mib.saturating_sub(held_mib))
+    }
+
+    /// The no-wait half of [`Self::reserve_within`]: the space now, or
+    /// [`CONTENDED`]. Sync, so a sync caller under a lock can use it.
+    fn try_permit(&self, bytes: u64, held_mib: usize) -> std::io::Result<OwnedSemaphorePermit> {
+        let want_mib = self.want_mib(bytes, held_mib);
+        let closed = || std::io::Error::other("spool budget semaphore closed");
         match self.budget.clone().try_acquire_many_owned(want_mib as u32) {
             Ok(permit) => Ok(permit),
             Err(tokio::sync::TryAcquireError::Closed) => Err(closed()),
@@ -210,7 +217,7 @@ impl SpoolDir {
     /// [`Self::acquire_pair_beside`], so the op never waits on itself.
     pub async fn acquire_beside(&self, held: Option<&Spool>, bytes: u64) -> std::io::Result<Spool> {
         let permit = self
-            .reserve_within(bytes, held.map_or(0, Spool::reserved_mib), true)
+            .reserve_within(bytes, held.map_or(0, Spool::reserved_mib))
             .await?;
         let file = NamedTempFile::new_in(&self.dir)?;
         Ok(Spool {
@@ -247,7 +254,7 @@ impl SpoolDir {
     ) -> std::io::Result<(Spool, Spool)> {
         let held_mib = held.map_or(0, Spool::reserved_mib);
         let permit = std::sync::Arc::new(
-            self.reserve_within(a_bytes.saturating_add(b_bytes), held_mib, true)
+            self.reserve_within(a_bytes.saturating_add(b_bytes), held_mib)
                 .await?,
         );
         let a = NamedTempFile::new_in(&self.dir)?;
@@ -269,18 +276,35 @@ impl SpoolDir {
     /// in a [`SpoolBudget`]; waiting for budget under that lock is
     /// hold-and-wait. Same rules as [`Self::acquire_beside`]: clamped, and
     /// an op that holds `held` does not wait ([`CONTENDED`]).
+    /// `held_mib`: the budget the op holds already ([`Spool::reserved_mib`],
+    /// [`mib_ceil`]).
     pub async fn reserve_beside(
         &self,
-        held: Option<&Spool>,
+        held_mib: usize,
         bytes: u64,
     ) -> std::io::Result<SpoolReservation> {
-        let permit = self
-            .reserve_within(bytes, held.map_or(0, Spool::reserved_mib), true)
-            .await?;
-        Ok(SpoolReservation {
+        let permit = self.reserve_within(bytes, held_mib).await?;
+        Ok(self.reservation(permit))
+    }
+
+    /// [`Self::reserve_beside`] that never waits, for a sync caller (the
+    /// multipart store, under its uploads lock). `held_mib` clamps as there.
+    pub fn try_reserve(&self, bytes: u64, held_mib: usize) -> std::io::Result<SpoolReservation> {
+        Ok(self.reservation(self.try_permit(bytes, held_mib)?))
+    }
+
+    /// A spool file for `bytes` now, or [`CONTENDED`]. Never waits: for a
+    /// caller that holds a lock (the buffered codec runs under the
+    /// deltaspace lock on PUT).
+    pub fn try_acquire(&self, bytes: u64) -> std::io::Result<Spool> {
+        self.reservation(self.try_permit(bytes, 0)?).file()
+    }
+
+    fn reservation(&self, permit: OwnedSemaphorePermit) -> SpoolReservation {
+        SpoolReservation {
             dir: self.dir.clone(),
             permit: Arc::new(permit),
-        })
+        }
     }
 }
 
@@ -344,8 +368,7 @@ impl<'a> SpoolBudget<'a> {
         }
         let permit = self
             .dir
-            .reserve_within(bytes, self.held.map_or(0, Spool::reserved_mib), false)
-            .await?;
+            .try_permit(bytes, self.held.map_or(0, Spool::reserved_mib))?;
         Ok(Spool {
             file: NamedTempFile::new_in(&self.dir.dir)?,
             _permit: SharedOrOwned::Owned(permit),
@@ -363,7 +386,7 @@ impl Spool {
 
     /// Budget this spool holds, in MiB (a pair's shared permit counts once
     /// per holder; callers pass one spool of a pair at most).
-    fn reserved_mib(&self) -> usize {
+    pub(crate) fn reserved_mib(&self) -> usize {
         match &self._permit {
             SharedOrOwned::Owned(p) => p.num_permits(),
             SharedOrOwned::Shared(p) => p.num_permits(),
@@ -372,7 +395,7 @@ impl Spool {
 }
 
 /// Bytes → MiB, rounded up. Budget accounting unit (keeps semaphore permits small).
-fn mib_ceil(bytes: u64) -> usize {
+pub(crate) fn mib_ceil(bytes: u64) -> usize {
     const MIB: u64 = 1024 * 1024;
     bytes.div_ceil(MIB) as usize
 }
@@ -550,5 +573,109 @@ mod tests {
             .expect("waiter proceeds once the whole pair drops")
             .unwrap()
             .unwrap();
+    }
+
+    /// Every scratch file of the proxy goes through the spool, so it is in
+    /// the spool dir and counts against the budget. A temp file made
+    /// anywhere else is outside both (the encrypting wrapper, the multipart
+    /// relay and the buffered codec all were). Non-test code outside this
+    /// module must not reach for the system temp dir.
+    #[test]
+    fn no_scratch_files_outside_the_spool() {
+        const BANNED: &[&str] = &[
+            "NamedTempFile::new()",
+            "env::temp_dir()",
+            "tempfile::tempfile(",
+            "tempfile::tempdir(",
+            "TempDir::new(",
+        ];
+        // (file, pattern, reason). Keep this short.
+        const ALLOWED: &[(&str, &str, &str)] = &[
+            (
+                "src/deltaglider/spool.rs",
+                "env::temp_dir()",
+                "the spool's own default directory",
+            ),
+            (
+                "src/multipart.rs",
+                "env::temp_dir()",
+                "sweeps the relay root of releases before the relay moved into the spool",
+            ),
+        ];
+        let mut offenders = Vec::new();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut stack = vec![root.join("src")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                if !name.ends_with(".rs") || name.ends_with("_tests.rs") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let text = std::fs::read_to_string(&path).unwrap();
+                for (n, line) in non_test_lines(&text) {
+                    let code = line.split("//").next().unwrap_or("");
+                    for pat in BANNED {
+                        let allowed = ALLOWED.iter().any(|(f, p, _)| *f == rel && p == pat);
+                        if code.contains(pat) && !allowed {
+                            offenders.push(format!("{rel}:{n}: {}", line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "scratch files outside the spool (use SpoolDir, or add an ALLOWED entry \
+             with a reason):\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Lines outside `#[cfg(test)] mod … { … }` blocks, with 1-based numbers.
+    fn non_test_lines(text: &str) -> Vec<(usize, &str)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let is_test_mod = lines[i].trim() == "#[cfg(test)]"
+                && lines
+                    .get(i + 1)
+                    .is_some_and(|l| l.trim_start().starts_with("mod ") && l.contains('{'));
+            if is_test_mod {
+                // Skip to the brace that closes the module.
+                let mut depth = 0i64;
+                let mut j = i + 1;
+                loop {
+                    let l = lines[j];
+                    depth += l.matches('{').count() as i64 - l.matches('}').count() as i64;
+                    j += 1;
+                    if depth <= 0 || j >= lines.len() {
+                        break;
+                    }
+                }
+                i = j;
+                continue;
+            }
+            out.push((i + 1, lines[i]));
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn non_test_lines_skips_test_modules() {
+        let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn b() { x() }\n}\nfn c() {}\n";
+        let kept: Vec<&str> = non_test_lines(src).into_iter().map(|(_, l)| l).collect();
+        assert_eq!(kept, ["fn a() {}", "fn c() {}"]);
     }
 }

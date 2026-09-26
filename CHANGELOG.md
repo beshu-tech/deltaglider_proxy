@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Fixed — multipart relay parts and delta codec files count against the spool budget
+
+Two more kinds of scratch file lived in the system temp dir, outside
+`DGP_SPOOL_MAX_BYTES`. The first kind is the relay parts of large multipart
+uploads, which stay on disk until the upload completes or is aborted. The
+second kind is the reference copy that the delta codec writes for each
+small-object encode and decode. Both now live in the spool directory
+(`DGP_SPOOL_DIR`) and count against the budget. The relay directory moves from
+`<system temp>/deltaglider-mpu-relay` to `<spool dir>/deltaglider-mpu-relay`.
+Uploads that are in progress during an upgrade are lost, as on any restart,
+and startup still sweeps the old directory. The rule is the same as for
+encrypted uploads. An `UploadPart`, a multipart completion and a small delta
+PUT already hold spool space or a lock, so they do not wait for more: when the
+budget is in use they fail with `503 SlowDown`, and S3 clients retry. A small
+delta GET holds nothing, so it waits for space up to
+`DGP_SPOOL_ACQUIRE_TIMEOUT_SECS`. Keep `DGP_SPOOL_MAX_BYTES` above the relay
+parts of the multipart uploads that you expect to be open at the same time.
+
 ### Fixed — encrypted uploads keep their temporary files inside the spool budget
 
 With proxy-AES encryption, a large upload or a multipart upload encrypts its

@@ -1448,14 +1448,22 @@ async fn test_startup_sweeps_orphan_relay_artifacts() {
     // Relay roots are per-process (a shared root let one booting proxy delete a
     // live sibling's relay parts). Crash leftovers live under a DEAD pid's root
     // and are reaped once STALE; the test shrinks the staleness bound to zero.
-    let relay_root = std::env::temp_dir()
+    // The relay root is in the spool dir; the old one (system temp dir) is
+    // still swept for leftovers of earlier releases.
+    let spool_dir = std::env::var("DGP_SPOOL_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("dgp-spool"));
+    let relay_root = spool_dir.join("deltaglider-mpu-relay").join("999999999"); // a pid no live process owns
+    let legacy_root = std::env::temp_dir()
         .join("deltaglider-mpu-relay")
-        .join("999999999"); // a pid no live process owns
+        .join("999999999");
     let orphan_dir = relay_root.join(format!("orphan-dir-{}", unique_prefix()));
     let orphan_file = relay_root.join(format!("orphan-file-{}.tmp", unique_prefix()));
+    let legacy_dir = legacy_root.join(format!("orphan-dir-{}", unique_prefix()));
     fs::create_dir_all(&orphan_dir).expect("create orphan relay dir");
     fs::write(orphan_dir.join("part-00001.bin"), b"orphan").expect("write orphan relay part");
     fs::write(&orphan_file, b"orphan").expect("write orphan relay file");
+    fs::create_dir_all(&legacy_dir).expect("create legacy orphan relay dir");
 
     let _server = TestServer::builder()
         .env("DGP_RELAY_FOREIGN_MIN_AGE_SECS", "0")
@@ -1463,7 +1471,7 @@ async fn test_startup_sweeps_orphan_relay_artifacts() {
         .await;
 
     for _ in 0..40 {
-        if !orphan_dir.exists() && !orphan_file.exists() {
+        if !orphan_dir.exists() && !orphan_file.exists() && !legacy_dir.exists() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1477,6 +1485,11 @@ async fn test_startup_sweeps_orphan_relay_artifacts() {
         !orphan_file.exists(),
         "startup sweep should remove orphan relay file {:?}",
         orphan_file
+    );
+    assert!(
+        !legacy_dir.exists(),
+        "startup sweep should remove the old relay root's orphan {:?}",
+        legacy_dir
     );
 }
 
