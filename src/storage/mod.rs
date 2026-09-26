@@ -34,6 +34,28 @@ pub use traits::{
     StorageError, UploadedPart,
 };
 
+tokio::task_local! {
+    /// See [`with_deferred_fsync`].
+    static DEFERRED_FSYNC: ();
+}
+
+/// Run `fut` with its OBJECT writes (delta and passthrough data files) made
+/// without the per-object fsync: a backend that defers records the file,
+/// and [`StorageBackend::flush_pending`] makes it durable. Reference writes
+/// and directory markers keep their fsync. A caller MUST flush before it
+/// records any progress that assumes the writes survive a crash. Only the
+/// bucket migration opts in (source test `only_migrate_defers_fsync`).
+/// A write outside this task (a `tokio::spawn`) is not in scope: it fsyncs.
+pub async fn with_deferred_fsync<F: std::future::Future>(fut: F) -> F::Output {
+    DEFERRED_FSYNC.scope((), fut).await
+}
+
+/// True inside [`with_deferred_fsync`]. Read it in the async context, not
+/// in a `spawn_blocking` closure (the task-local does not cross it).
+pub(crate) fn fsync_deferred() -> bool {
+    DEFERRED_FSYNC.try_with(|_| ()).is_ok()
+}
+
 /// ENOSPC raw error code on Linux and macOS.
 const ENOSPC: i32 = 28;
 
@@ -121,7 +143,9 @@ mod tests {
 
     /// Fencing lives in the S3 backend; a wrapper that does not forward the
     /// two fence methods falls to the trait default, and the fence silently
-    /// disappears below it. Every wrapper of a StorageBackend forwards them.
+    /// disappears below it. Every wrapper of a StorageBackend forwards them,
+    /// and `flush_pending` too (a wrapper that answers Ok without forwarding
+    /// would let a migrate persist a cursor past non-durable copies).
     #[test]
     fn every_wrapper_forwards_the_reference_fence() {
         for (name, src) in [
@@ -131,7 +155,11 @@ mod tests {
             ("s3.rs", include_str!("s3.rs")),
         ] {
             let impl_src = src.split("#[cfg(test)]").next().unwrap();
-            for method in ["fn reference_fence(", "fn write_reference_fenced("] {
+            for method in [
+                "fn reference_fence(",
+                "fn write_reference_fenced(",
+                "fn flush_pending(",
+            ] {
                 // traits.rs: the trait default AND the Box forward.
                 let want = if name.starts_with("traits") { 2 } else { 1 };
                 assert!(
@@ -140,5 +168,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Only the bucket migration writes without the per-object fsync: any
+    /// other caller of `with_deferred_fsync` would have to flush before it
+    /// records progress, and nothing checks that it does.
+    #[test]
+    fn only_migrate_defers_fsync() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        walk(&root.join("src"), &mut files);
+        let needle = ["with_deferred_", "fsync("].concat();
+        let mut users = Vec::new();
+        for f in files {
+            let rel = f
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&f).unwrap();
+            let impl_src = text.split("#[cfg(test)]").next().unwrap();
+            if impl_src.contains(needle.as_str()) {
+                users.push(rel);
+            }
+        }
+        users.sort();
+        assert_eq!(
+            users,
+            ["src/maintenance/migrate.rs"],
+            "a new caller of with_deferred_fsync"
+        );
     }
 }

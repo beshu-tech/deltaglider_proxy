@@ -220,6 +220,30 @@ pub fn real_bucket_name<'a>(
     }
 }
 
+/// Save progress only after the copies made so far are durable. The copy
+/// phase writes without the per-object fsync (`storage::with_deferred_fsync`),
+/// so a cursor saved first could point past a copy that a crash loses. A
+/// failed flush saves nothing and fails the phase (the source stays
+/// authoritative). Every `persist` in this file goes through here (source
+/// test `every_migrate_persist_is_a_checkpoint`).
+async fn checkpoint<F, P>(flush: F, save: P) -> Result<(), String>
+where
+    F: std::future::Future<Output = Result<(), crate::deltaglider::EngineError>>,
+    P: std::future::Future<Output = ()>,
+{
+    flush
+        .await
+        .map_err(|e| format!("could not make the copied objects durable: {e}"))?;
+    save.await;
+    Ok(())
+}
+
+/// Flush the deferred copy writes of the live engine (every backend).
+async fn flush_copies(state: &Arc<AppState>) -> Result<(), crate::deltaglider::EngineError> {
+    let engine = state.engine.load().clone();
+    engine.flush_pending().await
+}
+
 async fn copy_verdict_for(
     engine: &crate::deltaglider::DynEngine,
     source_bucket: &str,
@@ -579,7 +603,11 @@ async fn run_phases(
         // wait out any write admitted before it armed.
         drain_inflight_writes(state, bucket).await?;
         phase = "copy".to_string();
-        persist(db, job, &phase, None, done, skipped, failed, bytes, None).await;
+        checkpoint(
+            flush_copies(state),
+            persist(db, job, &phase, None, done, skipped, failed, bytes, None),
+        )
+        .await?;
     }
 
     // ── Phase: copy (resumable; ANY copy failure aborts pre-flip) ──
@@ -590,6 +618,11 @@ async fn run_phases(
         } else {
             None
         });
+        // A resumed copy re-copies its first page instead of trusting the
+        // target's metadata: the copies after the last checkpoint were not
+        // durable, and a crash can leave such a file with its metadata but
+        // without its data (the rename reached the disk, the data did not).
+        let mut recopy_page = job.phase == "copy";
         while pager.begin_page().is_some() {
             check_cancel(db, job.id).await?;
             // Re-assert the staging route: an admin config apply mid-job
@@ -619,7 +652,11 @@ async fn run_phases(
                         job.id
                     );
                     pager.restart_fresh();
-                    persist(db, job, "copy", None, done, skipped, failed, bytes, None).await;
+                    checkpoint(
+                        flush_copies(state),
+                        persist(db, job, "copy", None, done, skipped, failed, bytes, None),
+                    )
+                    .await?;
                     continue;
                 }
                 Err(e) => return Err(format!("list source failed: {e}")),
@@ -633,26 +670,30 @@ async fn run_phases(
                 if i > 0 && i % CANCEL_CHECK_EVERY == 0 {
                     // Resume token = this page's: HEAD-skip makes the redo
                     // of its first part idempotent.
-                    persist(
-                        db,
-                        job,
-                        "copy",
-                        None,
-                        done,
-                        skipped,
-                        failed,
-                        bytes,
-                        pager.token(),
+                    checkpoint(
+                        flush_copies(state),
+                        persist(
+                            db,
+                            job,
+                            "copy",
+                            None,
+                            done,
+                            skipped,
+                            failed,
+                            bytes,
+                            pager.token(),
+                        ),
                     )
-                    .await;
+                    .await?;
                     check_cancel(db, job.id).await?;
                 }
                 stop_if_shutting_down()?;
                 // Skip only a target copy that PROVABLY matches the source: a
                 // cancelled earlier attempt leaves copies that the source has
                 // since outgrown.
-                if copy_verdict_for(&engine, bucket, &params.transient_key, key).await
-                    == ContentVerdict::Same
+                if !recopy_page
+                    && copy_verdict_for(&engine, bucket, &params.transient_key, key).await
+                        == ContentVerdict::Same
                 {
                     skipped += 1;
                     continue;
@@ -671,7 +712,11 @@ async fn run_phases(
                     upload_concurrency: None,
                     keep_created_at: true,
                 };
-                match copy_object_with_retries(&engine, req).await {
+                // No per-object fsync: `checkpoint` flushes the copies
+                // before any progress that counts on them is saved.
+                match crate::storage::with_deferred_fsync(copy_object_with_retries(&engine, req))
+                    .await
+                {
                     Ok(outcome) => {
                         done += 1;
                         bytes += outcome.bytes_copied as i64;
@@ -679,26 +724,34 @@ async fn run_phases(
                     Err(e) => {
                         record_failure(db, job.id, key, &e.to_string()).await?;
                         failed += 1;
-                        persist(db, job, "copy", None, done, skipped, failed, bytes, None).await;
+                        checkpoint(
+                            flush_copies(state),
+                            persist(db, job, "copy", None, done, skipped, failed, bytes, None),
+                        )
+                        .await?;
                         return Err(format!(
                             "copy of '{key}' failed — source remains authoritative: {e}"
                         ));
                     }
                 }
             }
+            recopy_page = false;
             let more = pager.advance(page.is_truncated, page.next_continuation_token);
-            persist(
-                db,
-                job,
-                "copy",
-                None,
-                done,
-                skipped,
-                failed,
-                bytes,
-                pager.token(),
+            checkpoint(
+                flush_copies(state),
+                persist(
+                    db,
+                    job,
+                    "copy",
+                    None,
+                    done,
+                    skipped,
+                    failed,
+                    bytes,
+                    pager.token(),
+                ),
             )
-            .await;
+            .await?;
             heartbeat(db, job.id, instance_id).await?;
             if !more {
                 break;
@@ -715,7 +768,11 @@ async fn run_phases(
                 .to_string());
         }
         phase = "verify".to_string();
-        persist(db, job, &phase, None, done, skipped, failed, bytes, None).await;
+        checkpoint(
+            flush_copies(state),
+            persist(db, job, &phase, None, done, skipped, failed, bytes, None),
+        )
+        .await?;
     }
 
     // ── Phase: verify ──
@@ -739,7 +796,11 @@ async fn run_phases(
                         job.id
                     );
                     pager.restart_fresh();
-                    persist(db, job, "verify", None, done, skipped, failed, bytes, None).await;
+                    checkpoint(
+                        flush_copies(state),
+                        persist(db, job, "verify", None, done, skipped, failed, bytes, None),
+                    )
+                    .await?;
                     continue;
                 }
                 Err(e) => return Err(format!("verify list failed: {e}")),
@@ -768,18 +829,21 @@ async fn run_phases(
                 }
             }
             let more = pager.advance(page.is_truncated, page.next_continuation_token);
-            persist(
-                db,
-                job,
-                "verify",
-                None,
-                done,
-                skipped,
-                failed,
-                bytes,
-                pager.token(),
+            checkpoint(
+                flush_copies(state),
+                persist(
+                    db,
+                    job,
+                    "verify",
+                    None,
+                    done,
+                    skipped,
+                    failed,
+                    bytes,
+                    pager.token(),
+                ),
             )
-            .await;
+            .await?;
             heartbeat(db, job.id, instance_id).await?;
             if !more {
                 break;
@@ -795,7 +859,11 @@ async fn run_phases(
             prune_destination_extras(db, state, instance_id, job, params).await?;
         }
         phase = "flip".to_string();
-        persist(db, job, &phase, None, done, skipped, failed, bytes, None).await;
+        checkpoint(
+            flush_copies(state),
+            persist(db, job, &phase, None, done, skipped, failed, bytes, None),
+        )
+        .await?;
     }
 
     // ── Phase: flip (idempotent; NOT interruptible) ──
@@ -833,7 +901,11 @@ async fn run_phases(
             bucket, params.target_backend
         );
         phase = "cleanup".to_string();
-        persist(db, job, &phase, None, done, skipped, failed, bytes, None).await;
+        checkpoint(
+            flush_copies(state),
+            persist(db, job, &phase, None, done, skipped, failed, bytes, None),
+        )
+        .await?;
     }
 
     // ── Phase: cleanup (optional delete-source; never fails the job) ──
@@ -973,6 +1045,55 @@ async fn run_phases(
 
 #[cfg(test)]
 mod tests {
+    /// The checkpoint saves only after the flush, and never after a failed
+    /// flush: a saved cursor must not point past a copy that is not durable.
+    #[tokio::test]
+    async fn checkpoint_saves_only_after_a_successful_flush() {
+        let log = std::sync::Mutex::new(Vec::new());
+        let flush = |ok: bool| {
+            let log = &log;
+            async move {
+                log.lock().unwrap().push("flush");
+                if ok {
+                    Ok(())
+                } else {
+                    Err(crate::deltaglider::EngineError::Overloaded("disk".into()))
+                }
+            }
+        };
+        let save = || async {
+            log.lock().unwrap().push("save");
+        };
+        checkpoint(flush(true), save()).await.unwrap();
+        assert_eq!(*log.lock().unwrap(), ["flush", "save"]);
+        log.lock().unwrap().clear();
+        assert!(checkpoint(flush(false), save()).await.is_err());
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["flush"],
+            "no save after a failed flush"
+        );
+    }
+
+    /// Every progress save of the migrate phases waits for the flush of the
+    /// deferred copies.
+    #[test]
+    fn every_migrate_persist_is_a_checkpoint() {
+        let src: String = include_str!("migrate.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let saves = src.matches("persist(db").count();
+        let checkpoints = src
+            .matches("checkpoint(flush_copies(state),persist(db")
+            .count();
+        assert!(saves >= 10, "scan found the saves ({saves})");
+        assert_eq!(saves, checkpoints, "a persist that skips the flush");
+    }
+
     use super::*;
 
     #[test]

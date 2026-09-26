@@ -69,6 +69,107 @@ fn internal_temp_in(dir: &Path) -> std::io::Result<NamedTempFile> {
         .tempfile_in(dir)
 }
 
+/// Whether a write fsyncs its file before the rename (the default) or
+/// leaves that to [`StorageBackend::flush_pending`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Durability {
+    Sync,
+    Deferred,
+}
+
+impl Durability {
+    /// An object (delta / passthrough) write: deferred only inside
+    /// [`super::with_deferred_fsync`]. Reference writes and directory
+    /// markers use `Durability::Sync` directly.
+    fn for_object() -> Self {
+        if super::fsync_deferred() {
+            Durability::Deferred
+        } else {
+            Durability::Sync
+        }
+    }
+}
+
+/// Deferred writes not yet made durable. Process-wide, not per backend: an
+/// engine rebuild (config apply) replaces the backend between a write and
+/// its flush, and the flush must still cover the write. Bounded: a write
+/// that fills it flushes it.
+static PENDING_FSYNC: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+const PENDING_FSYNC_MAX: usize = 256;
+
+/// fsync every file in `paths`, up to `FSYNC_PARALLEL` at a time: fsyncs
+/// that run together share one journal commit (ext4, XFS), which makes a
+/// flush of 20 files about 6x cheaper than 20 fsyncs in a row. A file that
+/// is gone (deleted, or replaced by a later write, which fsyncs or defers
+/// on its own) is skipped. The paths that fail go back to the pending set.
+fn fsync_paths(paths: Vec<PathBuf>) -> Result<(), StorageError> {
+    const FSYNC_PARALLEL: usize = 32;
+    let mut first_err = None;
+    for batch in paths.chunks(FSYNC_PARALLEL) {
+        let results: Vec<std::io::Result<()>> = std::thread::scope(|s| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|path| {
+                    s.spawn(
+                        move || match std::fs::File::open(path).and_then(|f| f.sync_all()) {
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                            other => other,
+                        },
+                    )
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(std::io::Error::other("fsync thread panicked")))
+                })
+                .collect()
+        });
+        for (path, res) in batch.iter().zip(results) {
+            if let Err(e) = res {
+                PENDING_FSYNC.lock().push(path.clone());
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(io_to_storage_error(e)),
+        None => Ok(()),
+    }
+}
+
+/// Make the pending deferred writes durable (blocking).
+fn flush_pending_fsync() -> Result<(), StorageError> {
+    let paths = std::mem::take(&mut *PENDING_FSYNC.lock());
+    fsync_paths(paths)
+}
+
+/// The end of every atomic write: fsync (unless deferred), rename, and
+/// record a deferred file. Blocking.
+fn finish_write(
+    tmp: NamedTempFile,
+    target: &Path,
+    durability: Durability,
+) -> Result<(), StorageError> {
+    if durability == Durability::Sync {
+        tmp.as_file().sync_all().map_err(io_to_storage_error)?;
+    }
+    tmp.persist(target)
+        .map_err(|e| io_to_storage_error(e.error))?;
+    if durability == Durability::Deferred {
+        let full = {
+            let mut pending = PENDING_FSYNC.lock();
+            pending.push(target.to_path_buf());
+            pending.len() >= PENDING_FSYNC_MAX
+        };
+        if full {
+            flush_pending_fsync()?;
+        }
+    }
+    Ok(())
+}
+
 /// Atomically write data + metadata to a file using write-to-temp + xattr + fsync + rename.
 ///
 /// The xattr is written to the temp file BEFORE the rename, so a crash can never
@@ -77,6 +178,7 @@ async fn atomic_write_with_metadata(
     path: &Path,
     data: &[u8],
     metadata: Option<&FileMetadata>,
+    durability: Durability,
 ) -> Result<(), StorageError> {
     let parent = path
         .parent()
@@ -93,10 +195,7 @@ async fn atomic_write_with_metadata(
         if let Some(json) = &meta_json {
             xattr_meta::set_metadata_xattr(tmp.path(), json)?;
         }
-        tmp.as_file().sync_all().map_err(io_to_storage_error)?;
-        tmp.persist(&path)
-            .map_err(|e| io_to_storage_error(e.error))?;
-        Ok(())
+        finish_write(tmp, &path, durability)
     })
     .await
     .map_err(super::join_error)?
@@ -122,6 +221,7 @@ async fn atomic_copy_with_metadata(
     source_path: &Path,
     target_path: &Path,
     metadata: &FileMetadata,
+    durability: Durability,
 ) -> Result<(), StorageError> {
     let parent = target_path
         .parent()
@@ -136,10 +236,7 @@ async fn atomic_copy_with_metadata(
         let mut tmp = internal_temp_in(&parent).map_err(io_to_storage_error)?;
         std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
         xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
-        tmp.as_file().sync_all().map_err(io_to_storage_error)?;
-        tmp.persist(&target)
-            .map_err(|e| io_to_storage_error(e.error))?;
-        Ok(())
+        finish_write(tmp, &target, durability)
     })
     .await
     .map_err(super::join_error)?
@@ -726,9 +823,10 @@ impl FilesystemBackend {
         label: &str,
         prefix: &str,
         filename: &str,
+        durability: Durability,
     ) -> Result<(), StorageError> {
         self.ensure_dir(bucket, data_path).await?;
-        atomic_write_with_metadata(data_path, data, Some(metadata)).await?;
+        atomic_write_with_metadata(data_path, data, Some(metadata), durability).await?;
         debug!(
             "Wrote {} ({} bytes) for {}/{}",
             label,
@@ -808,6 +906,12 @@ impl FilesystemBackend {
 
 #[async_trait]
 impl StorageBackend for FilesystemBackend {
+    async fn flush_pending(&self) -> Result<(), StorageError> {
+        tokio::task::spawn_blocking(flush_pending_fsync)
+            .await
+            .map_err(super::join_error)?
+    }
+
     // === Bucket operations ===
 
     #[instrument(skip(self))]
@@ -955,6 +1059,7 @@ impl StorageBackend for FilesystemBackend {
             "reference",
             prefix,
             "reference.bin",
+            Durability::Sync,
         )
         .await
     }
@@ -975,7 +1080,7 @@ impl StorageBackend for FilesystemBackend {
         // Copy to a temp file + xattr + fsync + rename. Delete-then-copy lost
         // the baseline on a failed or short copy, and a hardlink shared the
         // inode (and so the xattr) with the caller's source file.
-        atomic_copy_with_metadata(source_path, &dest, metadata).await
+        atomic_copy_with_metadata(source_path, &dest, metadata, Durability::Sync).await
     }
 
     async fn put_reference_metadata(
@@ -1078,6 +1183,7 @@ impl StorageBackend for FilesystemBackend {
             "delta",
             prefix,
             filename,
+            Durability::for_object(),
         )
         .await
     }
@@ -1153,6 +1259,7 @@ impl StorageBackend for FilesystemBackend {
             "passthrough",
             prefix,
             filename,
+            Durability::for_object(),
         )
         .await
     }
@@ -1170,7 +1277,8 @@ impl StorageBackend for FilesystemBackend {
         self.require_bucket_exists(bucket).await?;
         let data_path = self.passthrough_path(bucket, prefix, filename)?;
         self.ensure_dir(bucket, &data_path).await?;
-        atomic_copy_with_metadata(source_path, &data_path, metadata).await?;
+        atomic_copy_with_metadata(source_path, &data_path, metadata, Durability::for_object())
+            .await?;
         debug!(
             "Copied passthrough file {:?} -> {:?} for {}/{}",
             source_path, data_path, prefix, filename
@@ -1198,6 +1306,7 @@ impl StorageBackend for FilesystemBackend {
         let target = data_path.clone();
         let parts: Vec<PathBuf> = part_paths.to_vec();
         let meta_json = serde_json::to_vec(metadata)?;
+        let durability = Durability::for_object();
 
         tokio::task::spawn_blocking(move || {
             let mut tmp = internal_temp_in(&parent).map_err(io_to_storage_error)?;
@@ -1206,10 +1315,7 @@ impl StorageBackend for FilesystemBackend {
                 std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
             }
             xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
-            tmp.as_file().sync_all().map_err(io_to_storage_error)?;
-            tmp.persist(&target)
-                .map_err(|e| io_to_storage_error(e.error))?;
-            Ok(())
+            finish_write(tmp, &target, durability)
         })
         .await
         .map_err(super::join_error)?
@@ -1277,6 +1383,7 @@ impl StorageBackend for FilesystemBackend {
         let chunks: Vec<Bytes> = chunks.to_vec();
         let num_chunks = chunks.len();
         let meta_json = serde_json::to_vec(metadata)?;
+        let durability = Durability::for_object();
 
         tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
             let mut tmp = internal_temp_in(&parent).map_err(io_to_storage_error)?;
@@ -1285,10 +1392,7 @@ impl StorageBackend for FilesystemBackend {
             }
             // Write xattr before rename — atomic metadata+data visibility.
             xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
-            tmp.as_file().sync_all().map_err(io_to_storage_error)?;
-            tmp.persist(&target)
-                .map_err(|e| io_to_storage_error(e.error))?;
-            Ok(())
+            finish_write(tmp, &target, durability)
         })
         .await
         .map_err(super::join_error)??;
@@ -1436,8 +1540,17 @@ impl StorageBackend for FilesystemBackend {
         let mut meta = FileMetadata::directory_marker(key);
         // The key's file name, as for every other object on this backend.
         meta.original_name = String::new();
-        self.put_object_file(bucket, &path, &[], &meta, "folder marker", &obj.prefix, "")
-            .await
+        self.put_object_file(
+            bucket,
+            &path,
+            &[],
+            &meta,
+            "folder marker",
+            &obj.prefix,
+            "",
+            Durability::Sync,
+        )
+        .await
     }
 
     async fn total_size(&self, bucket: Option<&str>) -> Result<u64, StorageError> {
@@ -2648,5 +2761,93 @@ mod tests {
         ] {
             assert!(!is_internal_temp_name(n), "{n}");
         }
+    }
+
+    fn pending_has(path: &Path) -> bool {
+        super::PENDING_FSYNC.lock().iter().any(|p| p == path)
+    }
+
+    /// Only an object write inside `with_deferred_fsync` defers its fsync;
+    /// the flush makes it durable and empties the set. A reference write
+    /// in the same scope, and any write outside it, fsync at once.
+    #[tokio::test]
+    async fn only_scoped_object_writes_defer_their_fsync() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        let meta = |n: &str| {
+            FileMetadata::new_passthrough(n.into(), "0".repeat(64), "0".repeat(32), 1, None)
+        };
+        let path = |n: &str| backend.passthrough_path("bucket", "d", n).unwrap();
+
+        backend
+            .put_passthrough("bucket", "d", "plain.bin", b"x", &meta("plain.bin"))
+            .await
+            .unwrap();
+        assert!(!pending_has(&path("plain.bin")), "outside the scope: fsync");
+
+        crate::storage::with_deferred_fsync(async {
+            backend
+                .put_passthrough("bucket", "d", "copy.bin", b"x", &meta("copy.bin"))
+                .await
+                .unwrap();
+            backend
+                .put_passthrough_chunked(
+                    "bucket",
+                    "d",
+                    "chunked.bin",
+                    &[Bytes::from_static(b"x")],
+                    &meta("chunked.bin"),
+                )
+                .await
+                .unwrap();
+            backend
+                .put_reference("bucket", "d", b"ref", &ref_meta(3))
+                .await
+                .unwrap();
+        })
+        .await;
+        assert!(pending_has(&path("copy.bin")));
+        assert!(pending_has(&path("chunked.bin")));
+        let reference = backend.reference_path("bucket", "d").unwrap();
+        assert!(
+            !pending_has(&reference),
+            "a reference write keeps its fsync"
+        );
+
+        backend.flush_pending().await.unwrap();
+        assert!(!pending_has(&path("copy.bin")));
+        assert!(!pending_has(&path("chunked.bin")));
+    }
+
+    /// The pending set stays bounded: the write that fills it flushes it.
+    #[tokio::test]
+    async fn the_pending_fsync_set_is_bounded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        crate::storage::with_deferred_fsync(async {
+            for i in 0..super::PENDING_FSYNC_MAX + 10 {
+                let name = format!("f{i}.bin");
+                let meta = FileMetadata::new_passthrough(
+                    name.clone(),
+                    "0".repeat(64),
+                    "0".repeat(32),
+                    1,
+                    None,
+                );
+                backend
+                    .put_passthrough("bucket", "d", &name, b"x", &meta)
+                    .await
+                    .unwrap();
+                assert!(super::PENDING_FSYNC.lock().len() < super::PENDING_FSYNC_MAX);
+            }
+        })
+        .await;
+        backend.flush_pending().await.unwrap();
     }
 }

@@ -2295,6 +2295,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     // === Bucket operations (delegate to storage) ===
 
     /// Create a real bucket on the storage backend.
+    /// Make durable every object write that the storage deferred
+    /// (`storage::with_deferred_fsync`).
+    pub async fn flush_pending(&self) -> Result<(), EngineError> {
+        Ok(self.storage.flush_pending().await?)
+    }
+
     pub async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {
         Ok(self.storage.create_bucket(bucket).await?)
     }
@@ -2823,6 +2829,9 @@ mod tests {
             _: &str,
             _: &str,
         ) -> Result<(), crate::storage::StorageError> {
+            Ok(())
+        }
+        async fn flush_pending(&self) -> Result<(), crate::storage::StorageError> {
             Ok(())
         }
         async fn put_delta(
@@ -4158,6 +4167,9 @@ mod reference_lock_hold_tests {
         }
         async fn has_reference(&self, b: &str, p: &str) -> Result<bool, StorageError> {
             self.inner.has_reference(b, p).await
+        }
+        async fn flush_pending(&self) -> Result<(), StorageError> {
+            self.inner.flush_pending().await
         }
         async fn delete_reference(&self, b: &str, p: &str) -> Result<(), StorageError> {
             self.inner.delete_reference(b, p).await?;

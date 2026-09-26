@@ -834,6 +834,16 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, delete_reference, prefix)
     }
 
+    /// Every backend, not the one a bucket routes to: a route can change
+    /// between the write and the flush (a config apply), the pending writes
+    /// cannot.
+    async fn flush_pending(&self) -> Result<(), StorageError> {
+        for backend in self.backends.values() {
+            backend.flush_pending().await?;
+        }
+        Ok(())
+    }
+
     async fn reference_fence(
         &self,
         bucket: &str,
@@ -1444,6 +1454,10 @@ mod tests {
         }
 
         async fn delete_reference(&self, _: &str, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn flush_pending(&self) -> Result<(), StorageError> {
             Ok(())
         }
 

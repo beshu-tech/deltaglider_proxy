@@ -926,3 +926,106 @@ async fn test_migrate_cancel_interrupted_by_shutdown_still_unwinds() {
     )
     .await;
 }
+
+/// A resumed copy does not trust a target file that a crash may have torn.
+/// The copy writes without the per-object fsync, so after a crash a file
+/// can keep its metadata and lose its data. The stand-in here: stop the
+/// proxy mid-copy, truncate every staged copy (the metadata xattr stays),
+/// and resume. Every object must still read back whole after the flip.
+#[tokio::test]
+async fn test_migrate_resume_recopies_possibly_torn_copies() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migtorn";
+    let mut server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    seed(&http, &endpoint, bucket, 400).await;
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(resp.status(), 202);
+    for _ in 0..1000 {
+        let job = newest_job(&admin, &endpoint).await;
+        if job["progress"]["processed"].as_i64().unwrap_or(0) >= 20 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    server.terminate();
+    let staged: Vec<String> = walkdir_files(&dir_b.path().join(bucket))
+        .into_iter()
+        .filter(|p| p.contains("obj-"))
+        .collect();
+    assert!(!staged.is_empty(), "the stop must land mid-copy");
+    assert!(staged.len() < 400, "the stop must land mid-copy");
+    for p in &staged {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+    }
+
+    server
+        .respawn_with_env(&[(
+            "DGP_BOOTSTRAP_PASSWORD_HASH",
+            common::TEST_BOOTSTRAP_PASSWORD_HASH,
+        )])
+        .await;
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "succeeded", "job: {job}");
+    assert_eq!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        Some("dst")
+    );
+    let http = server.http();
+    for i in 0..400 {
+        assert_eq!(
+            get_bytes(&http, &endpoint, bucket, &format!("obj-{i:03}.json")).await,
+            [MARKER, format!(" object {i}").as_bytes()].concat(),
+            "obj-{i:03}"
+        );
+    }
+}
+
+/// Manual bench (not in CI): wall time of a filesystem → filesystem migrate
+/// of `DGP_BENCH_N` (default 1000) small objects.
+/// `cargo test --test all -- --ignored migrate_job_test::bench_migrate_small_objects --nocapture`
+#[tokio::test]
+#[ignore]
+async fn bench_migrate_small_objects() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migbench";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    let n: usize = std::env::var("DGP_BENCH_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    seed(&http, &endpoint, bucket, n).await;
+    let admin = admin_http_client(&endpoint).await;
+    let t = std::time::Instant::now();
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(resp.status(), 202);
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let el = t.elapsed();
+    assert_eq!(newest_job(&admin, &endpoint).await["status"], "succeeded");
+    eprintln!(
+        "migrate bench: {n} objects in {el:?} = {:.2} ms/object",
+        el.as_secs_f64() * 1000.0 / n as f64
+    );
+}

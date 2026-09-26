@@ -1920,6 +1920,9 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     async fn delete_reference(&self, b: &str, p: &str) -> Result<(), StorageError> {
         self.inner.delete_reference(b, p).await
     }
+    async fn flush_pending(&self) -> Result<(), StorageError> {
+        self.inner.flush_pending().await
+    }
     async fn reference_fence(
         &self,
         b: &str,
@@ -2930,6 +2933,9 @@ mod tests {
         }
         async fn delete_reference(&self, _: &str, _: &str) -> Result<(), StorageError> {
             Err(cb_err())
+        }
+        async fn flush_pending(&self) -> Result<(), StorageError> {
+            Ok(())
         }
         async fn put_delta(
             &self,

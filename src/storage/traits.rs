@@ -317,6 +317,12 @@ pub trait StorageBackend: Send + Sync {
     /// Delete a reference file and its metadata
     async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError>;
 
+    /// Make durable every object write that this backend deferred (see
+    /// [`crate::storage::with_deferred_fsync`]). A backend whose writes are
+    /// durable when they return (S3) answers `Ok` at once. No default:
+    /// every wrapper MUST forward it.
+    async fn flush_pending(&self) -> Result<(), StorageError>;
+
     /// The fence for the reference as it is now: `ETag(..)` when it exists,
     /// `Absent` when it does not. Same error contract as `has_reference`.
     /// The default (backends that do not fence) reports existence only.
@@ -1041,6 +1047,9 @@ macro_rules! impl_storage_backend_for_box {
                 prefix: &str,
             ) -> Result<(), StorageError> {
                 (**self).delete_reference(bucket, prefix).await
+            }
+            async fn flush_pending(&self) -> Result<(), StorageError> {
+                (**self).flush_pending().await
             }
             async fn reference_fence(
                 &self,

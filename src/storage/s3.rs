@@ -2546,6 +2546,11 @@ impl StorageBackend for S3Backend {
         }
     }
 
+    /// A PUT is durable when S3 answers it: nothing is deferred.
+    async fn flush_pending(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     #[instrument(skip(self))]
     async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError> {
         let key = self.reference_key(prefix);

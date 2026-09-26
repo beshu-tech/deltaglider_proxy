@@ -2236,6 +2236,9 @@ mod multipart_abort_tests {
         async fn delete_reference(&self, _: &str, _: &str) -> Result<(), StorageError> {
             Err(nope())
         }
+        async fn flush_pending(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
         async fn get_delta(&self, _: &str, _: &str, _: &str) -> Result<Vec<u8>, StorageError> {
             Err(nope())
         }
@@ -2425,6 +2428,9 @@ mod multipart_abort_tests {
         }
         async fn delete_reference(&self, b: &str, p: &str) -> Result<(), StorageError> {
             self.0.delete_reference(b, p).await
+        }
+        async fn flush_pending(&self) -> Result<(), StorageError> {
+            self.0.flush_pending().await
         }
         async fn get_delta(&self, b: &str, p: &str, f: &str) -> Result<Vec<u8>, StorageError> {
             self.0.get_delta(b, p, f).await

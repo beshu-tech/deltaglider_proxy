@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed — A migrate to a filesystem backend is about twice as fast
+
+A migrate made every copy durable on its own before the next one (one
+fsync per object), which cost most of the time for small objects. Now the
+migrate makes its copies durable in one batch every 20 objects, before it
+saves its cursor, so a crash never loses a copy that the saved cursor
+counts. A resumed migrate copies its first page again. In a debug build,
+1000 small objects from a filesystem backend to another one took 5.2 ms
+each before and 2.9 ms each after. Every other write keeps its fsync.
+
 ### Changed — The bulk ZIP download streams, with no size limit
 
 `GET /_/api/admin/objects/zip` read every selected object into memory,
