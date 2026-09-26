@@ -604,7 +604,6 @@ async fn test_filtered_list_tokens_never_reveal_hidden_keys() {
 /// ignores Deny), so the handler never filters and the denied keys are
 /// listed. `iam-permissions.md` says the proxy skips the hidden keys.
 #[tokio::test]
-#[ignore = "review3: pending fix"]
 async fn review3_a_bucket_wide_allow_with_a_deny_carve_out_hides_the_denied_keys() {
     let h = ScopeHarness::setup().await;
     let admin = h.admin_client().await;

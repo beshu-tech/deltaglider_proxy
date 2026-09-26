@@ -138,11 +138,11 @@ A client can write any `X-Forwarded-For` value, so the proxy reads that header f
 
 When a user with prefix-scoped permissions (for example `{ "resources": ["db-archive/home/dana/*"] }`) issues a LIST with an empty prefix, or a prefix wider than the policy covers, the proxy admits the request and post-filters the result:
 
-- The proxy reads only the prefixes that the user's `Allow` rules can reach. It derives them from the resource patterns (the text before the first `*` or `?`) and, for a rule with a `StringLike` or `StringEquals` condition on `s3:prefix`, from the condition values. It then merges these listings in key order. The keys outside these prefixes cost nothing, so the cost of a listing follows what the user can see, not the size of the bucket.
-- Each returned key and CommonPrefix is checked against the user's policy; only keys with `read` or `list` permission are returned.
+- The proxy reads only the prefixes that the user's `Allow` rules with `read` or `list` can reach. A rule that grants only `write` or `delete` shows no key, so its prefix is not read. The proxy derives the prefixes from the resource patterns (the text before the first `*` or `?`) and, for a rule with a `StringLike` or `StringEquals` condition on `s3:prefix`, from the condition values. It then merges these listings in key order. The keys outside these prefixes cost nothing, so the cost of a listing follows what the user can see, not the size of the bucket.
+- Each returned key and CommonPrefix is checked against the user's policy; only keys with `read` or `list` permission are returned. A `Deny` on `list` for a key hides that key, even when an `Allow` on the whole bucket admits the listing.
 - Each page holds up to `max_keys` visible entries. The continuation token is the last visible entry of the page, never a key that the user cannot see.
 - A rule that the proxy cannot narrow to prefixes, such as an `Allow` on the whole bucket with `Deny` exceptions, makes the proxy list the requested prefix and skip the hidden keys. That scan reads at most 10,000 backend pages per request. When the scan finds no visible key within that limit, the request fails with `InvalidRequest`; list a narrower prefix instead.
-- Users whose policy covers the full requested scope receive the engine page unchanged, with no filtering cost.
+- Users whose policy covers the full requested scope with `read` or `list`, and who have no `Deny` rule that can match a key under the requested prefix, receive the engine page unchanged, with no filtering cost.
 
 ## Workflow-bypass prevention
 

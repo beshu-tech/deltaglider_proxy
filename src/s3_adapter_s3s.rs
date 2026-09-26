@@ -3656,7 +3656,6 @@ mod review3_tests {
     /// spends the page budget (one engine page of `max_keys + 1` keys per
     /// step), and the request fails before the readable prefix is reached.
     #[tokio::test]
-    #[ignore = "review3: pending fix"]
     async fn review3_a_write_only_grant_does_not_hide_the_readable_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let backend: Box<dyn crate::storage::StorageBackend> = Box::new(

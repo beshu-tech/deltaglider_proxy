@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Security — A `Deny` exception now hides keys from a LIST
+
+A user with an `Allow` on the whole bucket and a `Deny` on part of it (for
+example `Allow` `read`, `list` on `releases/*` and `Deny` on
+`releases/internal/*`) could list the denied keys. The proxy classed the
+listing as unrestricted, because it looked only at the `Allow` rules, so it
+did not filter the keys. A listing is now unrestricted only when no `Deny`
+rule can match a key under the requested prefix, and the per-key filter hides
+every key that a `Deny` on `list` matches. The same classification also
+ignored the actions of the `Allow` rules: a `write`-only grant on a large
+prefix made the proxy scan that prefix for visible keys, and the listing
+could fail before it reached the readable prefix. Only rules that grant
+`read` or `list` count now.
+
 ### Changed — One multipart upload can hold at most a quarter of the spool budget
 
 A multipart upload larger than 64 MiB keeps its parts in the spool directory

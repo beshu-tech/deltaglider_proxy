@@ -550,9 +550,10 @@ pub(crate) fn has_any_on_bucket(permissions: &[Permission], bucket: &str) -> boo
 /// - Returns `false` when only narrower Allows match (e.g. policy grants
 ///   `bucket/alice/*` but the request has no prefix or a wider one).
 ///
-/// Deny rules are IGNORED at this stage — this predicate is about
-/// "how broad is the Allow space," not "what's denied inside it."
-/// The per-key filter on the handler side still evaluates denies per key.
+/// Only an Allow that grants read or list counts: a write-only grant on
+/// the whole bucket shows no key. And an Unrestricted listing is never
+/// filtered, so a Deny that can hide a key under the requested prefix
+/// (any condition, any key pattern) keeps the request on the filtered path.
 pub(crate) fn has_unrestricted_allow_for_bucket_prefix(
     permissions: &[Permission],
     bucket: &str,
@@ -564,8 +565,15 @@ pub(crate) fn has_unrestricted_allow_for_bucket_prefix(
         format!("{}/{}", bucket, prefix)
     };
 
+    if permissions
+        .iter()
+        .any(|perm| deny_can_hide_keys_under(perm, bucket, prefix))
+    {
+        return false;
+    }
+
     for perm in permissions {
-        if perm.effect != "Allow" {
+        if perm.effect != "Allow" || !grants_discovery(perm) {
             continue;
         }
         if perm.conditions.is_some() {
@@ -600,6 +608,28 @@ pub(crate) fn has_unrestricted_allow_for_bucket_prefix(
         }
     }
     false
+}
+
+/// Does this statement's action set let a key show in a listing (read or
+/// list)? Write, delete and admin alone do not.
+fn grants_discovery(perm: &Permission) -> bool {
+    perm.actions.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "*" | "read" | "list" | "s3:GetObject" | "s3:ListBucket" | "s3:*"
+        )
+    })
+}
+
+/// Can this Deny statement hide some key of `bucket` under `prefix` from a
+/// listing? Conditions are not evaluated: a Deny that MAY fire counts.
+fn deny_can_hide_keys_under(perm: &Permission, bucket: &str, prefix: &str) -> bool {
+    perm.effect == "Deny"
+        && grants_discovery(perm)
+        && perm.resources.iter().any(|r| {
+            resource_key_prefix(r, bucket)
+                .is_some_and(|d| d.starts_with(prefix) || prefix.starts_with(d.as_str()))
+        })
 }
 
 fn can_list_prefix_with_context(
@@ -639,13 +669,7 @@ fn allow_references_common_prefix(
             // conditions are handled by can_list_prefix_with_context above.
             return false;
         }
-        let can_discover = perm.actions.iter().any(|a| {
-            matches!(
-                a.as_str(),
-                "*" | "read" | "list" | "s3:GetObject" | "s3:ListBucket" | "s3:*"
-            )
-        });
-        can_discover
+        grants_discovery(perm)
             && perm
                 .resources
                 .iter()
@@ -673,6 +697,12 @@ pub fn user_can_see_listed_key(
     key: &str,
     context: &Context,
 ) -> bool {
+    // The third disjunct evaluates the BUCKET ARN, which a Deny on a key
+    // pattern (`b/secret/*`) never matches: a Deny on listing this key
+    // must hide it whatever grants the listing.
+    if user.is_explicitly_denied(S3Action::List, bucket, key, context) {
+        return false;
+    }
     user.can_with_context(S3Action::Read, bucket, key, context)
         || user.can_with_context(S3Action::List, bucket, key, context)
         // Prefix-conditioned list grants (the `$anonymous` public-prefix user,
@@ -728,7 +758,13 @@ pub fn user_can_see_common_prefix(
 /// The result is sorted and minimal: no entry is a prefix of another.
 pub fn visible_key_prefixes(user: &super::AuthenticatedUser, bucket: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for perm in user.permissions.iter().filter(|p| p.effect == "Allow") {
+    // Only read/list grants show keys: a write-only prefix is no scan
+    // target (its scan found nothing and spent the page budget).
+    for perm in user
+        .permissions
+        .iter()
+        .filter(|p| p.effect == "Allow" && grants_discovery(p))
+    {
         let resource_prefixes: Vec<String> = perm
             .resources
             .iter()
@@ -1362,6 +1398,77 @@ mod tests {
     }
 
     // === has_unrestricted_allow_for_bucket_prefix — C1 security fix ===
+
+    fn p(effect: &str, actions: &[&str], resources: &[&str]) -> Permission {
+        Permission {
+            id: 0,
+            effect: effect.into(),
+            actions: actions.iter().map(|s| s.to_string()).collect(),
+            resources: resources.iter().map(|s| s.to_string()).collect(),
+            conditions: None,
+        }
+    }
+
+    /// Review3 #11: an Unrestricted listing is never filtered, so a Deny
+    /// that can hide a key under the requested prefix forces Filtered.
+    #[test]
+    fn a_deny_carve_out_is_not_unrestricted() {
+        let perms = vec![
+            p("Allow", &["read", "list"], &["carve", "carve/*"]),
+            p("Deny", &["read", "list"], &["carve/secret/*"]),
+        ];
+        assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "carve", ""));
+        assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "carve", "secret/x/"));
+        assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "carve", "sec"));
+        // The Deny cannot match a key under `pub/`.
+        assert!(has_unrestricted_allow_for_bucket_prefix(&perms, "carve", "pub/"));
+        // A Deny on another bucket, or on writes only, hides nothing here.
+        let perms = vec![
+            p("Allow", &["read", "list"], &["carve/*"]),
+            p("Deny", &["read"], &["other/*"]),
+            p("Deny", &["write", "delete"], &["carve/*"]),
+        ];
+        assert!(has_unrestricted_allow_for_bucket_prefix(&perms, "carve", ""));
+        let perms = vec![p("Allow", &["*"], &["*"]), p("Deny", &["*"], &["*"])];
+        assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "b", ""));
+    }
+
+    /// Review3 #11: the per-key filter hides a key a Deny on listing
+    /// matches, although the bucket-ARN list grant admits every key.
+    #[test]
+    fn a_deny_carve_out_hides_the_key_in_the_per_key_filter() {
+        let perms = vec![
+            p("Allow", &["read", "list"], &["carve", "carve/*"]),
+            p("Deny", &["read", "list"], &["carve/secret/*"]),
+        ];
+        let user = crate::iam::AuthenticatedUser {
+            name: "u".into(),
+            access_key_id: "AK".into(),
+            iam_policies: perms.iter().map(permission_to_iam_policy).collect(),
+            permissions: perms,
+        };
+        let ctx = Context::new();
+        assert!(user_can_see_listed_key(&user, "carve", "pub/a.txt", &ctx));
+        assert!(!user_can_see_listed_key(&user, "carve", "secret/b.txt", &ctx));
+    }
+
+    /// Review3 #10: a write-only grant shows no key, so it neither makes a
+    /// listing Unrestricted nor becomes a scan target.
+    #[test]
+    fn a_write_only_grant_is_neither_unrestricted_nor_visible() {
+        let perms = vec![
+            p("Allow", &["write"], &["b/*"]),
+            p("Allow", &["read", "list"], &["b/releases/*"]),
+        ];
+        assert!(!has_unrestricted_allow_for_bucket_prefix(&perms, "b", ""));
+        let user = crate::iam::AuthenticatedUser {
+            name: "u".into(),
+            access_key_id: "AK".into(),
+            iam_policies: perms.iter().map(permission_to_iam_policy).collect(),
+            permissions: perms,
+        };
+        assert_eq!(visible_key_prefixes(&user, "b"), vec!["releases/".to_string()]);
+    }
 
     #[test]
     fn test_unrestricted_wildcard_is_unrestricted() {
