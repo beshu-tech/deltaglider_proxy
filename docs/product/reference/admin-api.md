@@ -203,6 +203,8 @@ The archive uses these format choices:
 
 Before the proxy sends the response headers, it checks every key against the caller's permissions and opens the first readable object. When no selected object can be read, the request fails with an error status instead of an empty archive: `404` when every object is missing, `403` when access to any object was denied, `413` when an object is too large to read, `503` when the proxy or the backend sheds load, and `502` for other backend failures. After the headers are sent, an object that cannot be opened is left out and named in a `_deltaglider-skipped-files.txt` entry at the end of the archive. An object that fails after some of its bytes are sent, or that ends with fewer bytes than its size, stops the response before the archive's central directory. The client then sees a failed or incomplete download, and never an archive that looks complete but lacks bytes.
 
+When the download starts, the proxy writes a `bulk_zip` audit entry. Its target names the buckets, the number of selected keys, and the number of keys that the caller's permissions denied. The entry also records the client IP address and User-Agent, like the audit entries of a bulk copy, move, or delete.
+
 ## Jobs — one surface for everything background
 
 Replication rules, lifecycle rules, and one-off maintenance jobs (re-encrypt,

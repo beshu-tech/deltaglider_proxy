@@ -14,7 +14,8 @@ stored without compression and use ZIP64 records where a value needs them
 (an entry of 4 GiB or more). An object that fails after some of its bytes
 are sent stops the response before the central directory, so the download
 fails and never looks complete. In Chrome and Edge, a file that the browser
-created for a download that then fails is deleted.
+created for a download that then fails is deleted. A ZIP download now writes a
+`bulk_zip` audit entry, like a bulk copy, move, or delete.
 
 ### Fixed — A sanitised 500 logs its cause
 

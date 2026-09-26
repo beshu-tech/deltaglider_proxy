@@ -400,6 +400,56 @@ fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
+/// A ZIP download is audited like bulk copy/move/delete: action
+/// `bulk_zip`, the bucket, the key count and the IAM denials in the target,
+/// the actor's IP and User-Agent.
+#[tokio::test]
+async fn test_zip_download_is_audited() {
+    let server = TestServer::builder().build().await;
+    let http = server.http();
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let bucket = server.bucket().to_string();
+    common::put_object(&http, &ep, &bucket, "au/a.txt", b"a".to_vec(), "text/plain").await;
+    let resp = admin
+        .get(format!("{ep}/_/api/admin/objects/zip"))
+        .header("user-agent", "zip-audit-test/1.0")
+        .query(&[("keys", format!("{bucket}/au/a.txt,{bucket}/au/ghost.txt"))])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    resp.bytes().await.unwrap();
+    let audit: Value = admin
+        .get(format!("{ep}/_/api/admin/audit?limit=100"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = audit["entries"]
+        .as_array()
+        .or(audit.as_array())
+        .expect("audit rows");
+    let row = rows
+        .iter()
+        .find(|e| e["action"] == "bulk_zip")
+        .unwrap_or_else(|| panic!("no bulk_zip entry: {audit}"));
+    let target = row["target"].as_str().unwrap();
+    assert!(
+        target.contains(&bucket) && target.contains("keys=2") && target.contains("denied=0"),
+        "{row}"
+    );
+    assert_eq!(row["ua"], "zip-audit-test/1.0", "{row}");
+    assert!(
+        row["ip"]
+            .as_str()
+            .is_some_and(|ip| ip != "unknown" && !ip.is_empty()),
+        "{row}"
+    );
+}
+
 /// list_all expands a folder selection to the absolute key list.
 #[tokio::test]
 async fn test_list_all_expands_folder() {

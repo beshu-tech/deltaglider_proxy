@@ -930,6 +930,7 @@ fn zip_entry_names(items: &[(String, String)]) -> Vec<String> {
 pub async fn download_zip(
     Extension(session): Extension<BulkSession>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
+    headers: axum::http::HeaderMap,
     AdminQuery(q): AdminQuery<ZipQuery>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     let parsed: Vec<(String, String)> = q
@@ -1014,6 +1015,27 @@ pub async fn download_zip(
         "zip: streaming {} of {} selected files",
         entries.len(),
         parsed.len()
+    );
+    // Audited when the download starts: later per-file skips are in the
+    // archive's skip report, the IAM denials are known now.
+    let mut buckets: Vec<&str> = parsed.iter().map(|(b, _)| b.as_str()).collect();
+    buckets.dedup();
+    buckets.sort_unstable();
+    buckets.dedup();
+    let denied = failures
+        .iter()
+        .filter(|f| **f == ZipFailure::AccessDenied)
+        .count();
+    super::audit_log(
+        "bulk_zip",
+        actor.label(),
+        &format!(
+            "{} keys={} denied={}",
+            buckets.join(","),
+            parsed.len(),
+            denied
+        ),
+        &headers,
     );
     let requested = parsed.len();
     let open_engine = engine.clone();
