@@ -1508,3 +1508,35 @@ async fn stale_section_put_gets_409_with_the_current_version() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
+
+/// Lead review of #4: the config version survives a restart (it is keyed
+/// with a key derived from the config DB key, not a per-process one), so a
+/// tab left open across a restart gets no false conflict.
+#[tokio::test]
+async fn config_version_is_stable_across_restarts() {
+    let mut server = TestServer::builder()
+        .auth("ETAGBOOT", "ETAGBOOTSECRET")
+        .build()
+        .await;
+    let etag = |r: &reqwest::Response| {
+        r.headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .expect("ETag header")
+    };
+    let url = format!("{}/_/api/admin/config/section/advanced", server.endpoint());
+    let admin = admin_http_client(&server.endpoint()).await;
+    let before = etag(&admin.get(&url).send().await.unwrap());
+    let export_url = format!("{}/_/api/admin/config/export", server.endpoint());
+    let doc_before = etag(&admin.get(&export_url).send().await.unwrap());
+
+    server.respawn_with_env(&[]).await;
+
+    let admin = admin_http_client(&server.endpoint()).await;
+    assert_eq!(etag(&admin.get(&url).send().await.unwrap()), before);
+    assert_eq!(
+        etag(&admin.get(&export_url).send().await.unwrap()),
+        doc_before
+    );
+}

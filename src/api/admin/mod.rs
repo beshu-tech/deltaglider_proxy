@@ -60,12 +60,13 @@ pub use bucket_scan::{
 pub(crate) use config::apply_config_inner_with_env;
 pub use config::{
     apply_config_doc, apply_declarative_iam, change_password, config_defaults, export_config,
-    export_declarative_iam, get_config, get_section, put_section, recover_db, sync_now,
-    test_s3_connection, trace_config, trace_config_get, update_config, validate_config_doc,
-    validate_declarative_iam, validate_section, BackendInfoResponse, ConfigApplyResponse,
-    ConfigDocumentRequest, ConfigResponse, ConfigUpdateRequest, ConfigUpdateResponse,
-    ConfigValidateResponse, PasswordChangeRequest, PasswordChangeResponse, SectionApplyResponse,
-    SyncNowResponse, TestS3Request, TestS3Response, TraceRequest, TraceResolved, TraceResponse,
+    export_declarative_iam, get_config, get_section, install_config_version_key, put_section,
+    recover_db, sync_now, test_s3_connection, trace_config, trace_config_get, update_config,
+    validate_config_doc, validate_declarative_iam, validate_section, BackendInfoResponse,
+    ConfigApplyResponse, ConfigDocumentRequest, ConfigResponse, ConfigUpdateRequest,
+    ConfigUpdateResponse, ConfigValidateResponse, PasswordChangeRequest, PasswordChangeResponse,
+    SectionApplyResponse, SyncNowResponse, TestS3Request, TestS3Response, TraceRequest,
+    TraceResolved, TraceResponse,
 };
 pub use delta_efficiency::{
     classify_deltaspace, get_delta_efficiency, post_delta_efficiency_scan, verify_delta_efficiency,

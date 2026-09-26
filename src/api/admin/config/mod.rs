@@ -30,6 +30,7 @@ pub mod password;
 pub mod section_level;
 pub mod trace;
 mod version;
+pub use version::install_version_key as install_config_version_key;
 
 /// Names of the four sections the admin API understands. Canonical
 /// home for the enum + its string-wire spelling — any consumer that

@@ -711,6 +711,8 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     });
     let shared_config = config.clone().into_shared();
     let db_keys = resolve_config_db_keys_or_exit(&config, &admin_password_hash);
+    // Config versions (ETags) keyed from the DB key: stable across restarts.
+    deltaglider_proxy::api::admin::install_config_version_key(db_keys.primary.expose());
     let (config_db, config_db_mismatch) = init_config_db(&db_keys, &iam_state, &config);
 
     // Load the synced session-revocation snapshot so a revoke performed on any
