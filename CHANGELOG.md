@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed — The bootstrap access key id is visible, and its removal is explicit
+
+The Credentials page showed an empty access key id field, because every GET
+and export redacted it, and it said "to remove them, clear both fields".
+Clearing both fields with no IAM users turned S3 authentication off at
+runtime. Now the access key id (an identifier, not a secret) is shown; the
+secret stays redacted, and an unchanged key id with no secret keeps the
+secret on apply. `DELETE /_/api/admin/config/bootstrap-credentials` removes
+the pair; it and every other config change refuse to remove it while no IAM
+users exist. With IAM users, the pair becomes the fallback for an empty IAM
+DB instead of an ignored edit.
+
 ### Added — OIDC providers in private networks
 
 An identity provider on a private address or behind a private CA (an

@@ -790,11 +790,11 @@ async fn trace_get_matches_post_output() {
 
 #[tokio::test]
 async fn section_put_access_round_trip_preserves_redacted_creds() {
-    // Scenario: GET /section/access (redacts access_key_id and
-    // secret_access_key), operator edits something innocuous and PUTs
-    // the body back. The legacy SigV4 credential pair must still be
-    // live afterwards — the section API preserves redacted secrets
-    // the same way the document-level apply does.
+    // Scenario: GET /section/access (shows access_key_id, which is an
+    // identifier, and redacts secret_access_key), operator edits
+    // something innocuous and PUTs the body back. The legacy SigV4
+    // credential pair must still be live afterwards — the section API
+    // preserves the redacted secret while the key id is unchanged.
     let server = TestServer::builder()
         .auth("PRESERVKEY", "PRESERVSECRET")
         .build()
@@ -820,14 +820,13 @@ async fn section_put_access_round_trip_preserves_redacted_creds() {
         .await
         .unwrap();
     let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["access_key_id"], "PRESERVKEY",
+        "section GET must show the access key id, got: {body}"
+    );
     assert!(
-        body.get("access_key_id").is_none()
-            || body["access_key_id"].as_str().unwrap_or("").is_empty()
-            || body["access_key_id"]
-                .as_str()
-                .unwrap_or("")
-                .starts_with("redacted"),
-        "section GET must redact access_key_id, got: {body}"
+        !body.to_string().contains("PRESERVSECRET"),
+        "section GET must redact the secret, got: {body}"
     );
 
     // PUT the redacted body back verbatim. No-op from the operator's
@@ -1539,4 +1538,84 @@ async fn config_version_is_stable_across_restarts() {
         etag(&admin.get(&export_url).send().await.unwrap()),
         doc_before
     );
+}
+
+// ═══════════════════════════════════════════════════
+// Removing the bootstrap SigV4 pair
+// ═══════════════════════════════════════════════════
+
+#[tokio::test]
+async fn bootstrap_credentials_are_removed_explicitly_and_never_leave_auth_off() {
+    let server = TestServer::builder()
+        .auth("BOOTKEY", "BOOTSECRET")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let remove = || admin.delete(format!("{ep}/_/api/admin/config/bootstrap-credentials"));
+
+    // No IAM users: removing the pair would turn authentication off.
+    let r = remove().send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert!(body["error"].as_str().unwrap().contains("IAM"), "{body}");
+
+    // "Clear both fields" through the field-level PATCH is refused too.
+    let r = admin
+        .put(format!("{ep}/_/api/admin/config"))
+        .json(&serde_json::json!({ "access_key_id": "", "secret_access_key": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let cfg: serde_json::Value = admin
+        .get(format!("{ep}/_/api/admin/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        cfg["auth_enabled"], true,
+        "clearing both fields turned auth off"
+    );
+    let unsigned = reqwest::Client::new()
+        .get(format!("{ep}/{}/", server.bucket()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unsigned.status(), StatusCode::FORBIDDEN);
+
+    // With an IAM user the pair can go.
+    let r = admin
+        .post(format!("{ep}/_/api/admin/users"))
+        .json(&serde_json::json!({
+            "name": "ops",
+            "permissions": [{"effect": "Allow", "actions": ["*"], "resources": ["*"]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let r = remove().send().await.unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["removed"], true, "{body}");
+    assert!(body.to_string().contains("legacy-admin"), "{body}");
+    let access: serde_json::Value = admin
+        .get(format!("{ep}/_/api/admin/config/section/access"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(access.get("access_key_id").is_none(), "{access}");
+    let on_disk = std::fs::read_to_string(server.config_path()).unwrap();
+    assert!(!on_disk.contains("BOOTKEY"), "{on_disk}");
+
+    // Idempotent.
+    let body: serde_json::Value = remove().send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["removed"], false, "{body}");
 }

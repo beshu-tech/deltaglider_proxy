@@ -354,9 +354,10 @@ async fn test_config_export_returns_yaml_with_secrets_redacted() {
         !body.contains("EXPORTSECRETVALUE"),
         "SigV4 secret must be redacted from export, got: {body}"
     );
+    // The access key id is an identifier, not a secret: it stays visible.
     assert!(
-        !body.contains("EXPORTKEY"),
-        "SigV4 access key must be redacted from export, got: {body}"
+        body.contains("EXPORTKEY"),
+        "the SigV4 access key id should be in the export, got: {body}"
     );
 }
 
@@ -1119,11 +1120,12 @@ async fn test_apply_response_has_persisted_field() {
 }
 
 #[tokio::test]
-async fn test_apply_warns_on_asymmetric_sigv4_credentials() {
-    // The operator sets only access_key_id on the incoming YAML. We must
-    // NOT cross-wire the runtime secret_access_key with the new access_key_id
-    // — that would produce a plausibly-authenticated state that silently
-    // fails at signature verification. Warn instead.
+async fn test_apply_refuses_asymmetric_sigv4_credentials_without_iam_users() {
+    // The operator sets only a NEW access_key_id on the incoming YAML. We
+    // must NOT cross-wire the runtime secret_access_key with it — that would
+    // produce a plausibly-authenticated state that silently fails at
+    // signature verification. With no IAM users, the result has no pair at
+    // all, so the apply is refused (it used to turn S3 auth off).
     let server = TestServer::builder()
         .auth("ASYMK", "ASYMSECRET")
         .max_delta_ratio(0.5)
@@ -1162,18 +1164,22 @@ async fn test_apply_warns_on_asymmetric_sigv4_credentials() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["applied"], true);
-    let warnings = body["warnings"]
-        .as_array()
-        .expect("warnings must be an array");
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("asymmetric")),
-        "expected asymmetric-credentials warning, got {warnings:?}"
-    );
+    // Without IAM users the half pair would turn authentication off (the
+    // secret is not cross-wired, so no pair is left): the apply is refused
+    // and the running pair stays.
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("without authentication"), "{body}");
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(cfg["auth_enabled"], true);
+    assert_eq!(cfg["access_key_id"], "ASYMK");
 }
 
 #[tokio::test]

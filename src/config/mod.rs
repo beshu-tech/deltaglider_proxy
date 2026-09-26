@@ -3306,7 +3306,10 @@ impl Config {
                 clear_unless_ref(secret_access_key);
             }
         }
-        clear_unless_ref(&mut export.access_key_id);
+        // The bootstrap access key id is an identifier, not a secret: the
+        // Credentials page must show which pair is configured. The secret
+        // stays hidden; an unchanged id keeps it on apply
+        // (`preserve_sigv4_pair`).
         clear_unless_ref(&mut export.secret_access_key);
         // Webhook header values may carry bearer tokens. Mask the VALUE but keep
         // the KEY so the GUI shows which headers exist; the section-PUT preserve
@@ -4276,8 +4279,8 @@ backend:
 
         let redacted = cfg.redact_all_secrets();
         let yaml = serde_yaml::to_string(&redacted).unwrap();
-        // Top-level proxy creds
-        assert!(!yaml.contains("AKIASHOULDNOTAPPEAR"));
+        // Top-level proxy creds: the key id is an identifier and stays.
+        assert!(yaml.contains("AKIASHOULDNOTAPPEAR"));
         assert!(!yaml.contains("secret-should-not-appear"));
         // Bootstrap + encryption (primary + legacy on singleton, primary on named)
         assert!(!yaml.contains("$2b$"));

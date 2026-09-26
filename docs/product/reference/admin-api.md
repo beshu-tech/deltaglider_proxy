@@ -35,6 +35,9 @@ All three scopes route through the same `apply_config_transition` path, so hot-r
 |---|---|---|
 | `GET` | `/_/api/admin/config` | Runtime config as flat JSON |
 | `PUT` | `/_/api/admin/config` | Partial JSON update |
+| `DELETE` | `/_/api/admin/config/bootstrap-credentials` | Remove the bootstrap SigV4 pair from the config: `{removed, warnings}` |
+
+The bootstrap `access_key_id` is an identifier, not a secret, so every GET and export shows it; `secret_access_key` stays redacted. An unchanged `access_key_id` with no secret in a PUT or apply keeps the secret. A change that removes the bootstrap pair while no IAM users exist is refused, because the proxy would then run without authentication: `DELETE …/bootstrap-credentials` answers `409`, and the field-level PUT keeps the pair and returns a warning. The DELETE also answers `409` when `DGP_ACCESS_KEY_ID` or `DGP_SECRET_ACCESS_KEY` sets the pair. When the key id is also an IAM user (the first IAM user carries the pair over as `legacy-admin`), the warnings say so: that user still signs requests until you delete or disable it.
 
 ### Section-level
 
@@ -112,8 +115,10 @@ deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.e
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` / `POST` | `/_/api/admin/ext-auth/providers` | List / create |
+| `GET` / `POST` | `/_/api/admin/ext-auth/providers` | List / create (`422` with `{error}` when the issuer URL or `extra_config` is invalid) |
 | `PUT` / `DELETE` | `/_/api/admin/ext-auth/providers/:id` | Update / delete |
+
+No response carries a provider's `client_secret`: it reads `****`. An OIDC provider's `extra_config` takes `allow_local` and `ca_cert_path` for an identity provider in a private network (see [How to set up SSO](../how-to/set-up-sso.md#an-identity-provider-in-a-private-network)).
 | `POST` | `/_/api/admin/ext-auth/providers/:id/test` | Probe the `.well-known` endpoint |
 | `GET` / `POST` | `/_/api/admin/ext-auth/mappings` | List / create group mapping rules |
 | `PUT` / `DELETE` | `/_/api/admin/ext-auth/mappings/:id` | Update / delete |

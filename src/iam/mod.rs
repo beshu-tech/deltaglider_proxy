@@ -169,6 +169,16 @@ impl IamIndex {
         }
     }
 
+    /// The same index with another bootstrap fallback (the bootstrap pair
+    /// changed or was removed from the config while IAM mode is active).
+    pub fn with_bootstrap_fallback(&self, fallback: Option<AuthConfig>) -> Self {
+        Self {
+            users: self.users.clone(),
+            groups: self.groups.clone(),
+            bootstrap_fallback: fallback,
+        }
+    }
+
     /// Look up a user by access_key_id. O(1).
     pub fn get(&self, access_key_id: &str) -> Option<&IamUser> {
         self.users.get(access_key_id)

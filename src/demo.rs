@@ -222,6 +222,10 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // deployments that want immediate propagation instead of
         // waiting for the 5-minute poll tick.
         .route("/_/api/admin/config/sync-now", post(admin::sync_now))
+        .route(
+            "/_/api/admin/config/bootstrap-credentials",
+            axum::routing::delete(admin::remove_bootstrap_credentials),
+        )
         // Multi-backend management
         .route(
             "/_/api/admin/backends",

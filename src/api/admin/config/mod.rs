@@ -341,22 +341,46 @@ pub(crate) async fn apply_config_transition(
     if old_cfg.access_key_id != new_cfg.access_key_id
         || old_cfg.secret_access_key != new_cfg.secret_access_key
     {
+        let new_pair = match (&new_cfg.access_key_id, &new_cfg.secret_access_key) {
+            (Some(k), Some(s)) => Some(AuthConfig {
+                access_key_id: k.clone(),
+                secret_access_key: s.clone(),
+            }),
+            _ => None,
+        };
         let current_iam = state.iam_state.load();
-        if matches!(&**current_iam, IamState::Iam(_)) {
+        if let IamState::Iam(index) = &**current_iam {
+            // Per-user keys are authoritative; the pair is only the fallback
+            // for an empty IAM DB. Keep it in step with the config.
+            state.iam_state.store(Arc::new(IamState::Iam(
+                index.with_bootstrap_fallback(new_pair),
+            )));
             warnings.push(
-                "Legacy credentials changed but IAM mode is active — edit ignored. Manage users via the Users panel."
+                "IAM mode is active: the bootstrap SigV4 pair is only the fallback for an empty \
+                 IAM database. IAM users (including 'legacy-admin', which carries the old pair) \
+                 are unchanged; manage them in the Users panel."
                     .to_string(),
             );
         } else {
-            let new_state = if let (Some(ref k), Some(ref s)) =
-                (&new_cfg.access_key_id, &new_cfg.secret_access_key)
+            // Without IAM users, dropping the pair turns S3 authentication
+            // OFF at runtime (and the next boot refuses to start).
+            if new_pair.is_none()
+                && old_cfg.auth_enabled()
+                && !matches!(
+                    new_cfg.classify_auth_config(false),
+                    crate::config::AuthConfigOutcome::OpenAccess
+                )
             {
-                IamState::Legacy(AuthConfig {
-                    access_key_id: k.clone(),
-                    secret_access_key: s.clone(),
-                })
-            } else {
-                IamState::Disabled
+                return Err(
+                    "removing the bootstrap SigV4 pair would leave the proxy without \
+                     authentication: create an IAM admin user first, or set \
+                     `authentication: none` explicitly"
+                        .to_string(),
+                );
+            }
+            let new_state = match new_pair {
+                Some(pair) => IamState::Legacy(pair),
+                None => IamState::Disabled,
             };
             state.iam_state.store(Arc::new(new_state));
             tracing::info!(
@@ -777,6 +801,11 @@ pub(super) fn preserve_sigv4_pair(
             *new_sk = old_sk.clone();
         }
         (Some(_), Some(_)) => {}
+        // The key id is not a secret, so exports show it: an unchanged id
+        // with no secret is an untouched round-trip, not a rotation.
+        (Some(k), None) if old_akid.as_deref() == Some(k.as_str()) => {
+            *new_sk = old_sk.clone();
+        }
         (Some(_), None) => {
             warnings.push(format!(
                 "{} credentials are asymmetric in the applied YAML (access_key_id set, secret_access_key missing) — not cross-wiring the runtime secret; authentication will fail until both are supplied",
@@ -790,6 +819,121 @@ pub(super) fn preserve_sigv4_pair(
             ));
         }
     }
+}
+
+/// What `DELETE /api/admin/config/bootstrap-credentials` does.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BootstrapRemoval {
+    /// No pair in the config: nothing to do (idempotent).
+    NothingToRemove,
+    /// `DGP_ACCESS_KEY_ID` / `DGP_SECRET_ACCESS_KEY` set it: the env var
+    /// must go, the config edit would not stick.
+    EnvControlled,
+    /// No IAM users: removing the pair turns authentication off.
+    WouldDisableAuth,
+    Remove,
+}
+
+/// Pure decision for the remove-bootstrap-credentials endpoint.
+pub(crate) fn bootstrap_removal_decision(
+    has_pair: bool,
+    env_controlled: bool,
+    iam_active: bool,
+) -> BootstrapRemoval {
+    if !has_pair {
+        BootstrapRemoval::NothingToRemove
+    } else if env_controlled {
+        BootstrapRemoval::EnvControlled
+    } else if !iam_active {
+        BootstrapRemoval::WouldDisableAuth
+    } else {
+        BootstrapRemoval::Remove
+    }
+}
+
+/// `DELETE /api/admin/config/bootstrap-credentials` — remove the bootstrap
+/// SigV4 pair from the config: the explicit action the Credentials page
+/// offers (clearing both fields was ambiguous). Refused (409) while no IAM
+/// users exist, and when env vars set the pair.
+pub async fn remove_bootstrap_credentials(
+    State(state): State<Arc<AdminState>>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    let conflict = |msg: &str| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response()
+    };
+    let mut cfg = state.config.write().await;
+    let iam_active = matches!(&**state.iam_state.load(), IamState::Iam(_));
+    let env_controlled = ["DGP_ACCESS_KEY_ID", "DGP_SECRET_ACCESS_KEY"]
+        .iter()
+        .any(|v| std::env::var_os(v).is_some());
+    let has_pair = cfg.access_key_id.is_some() || cfg.secret_access_key.is_some();
+    match bootstrap_removal_decision(has_pair, env_controlled, iam_active) {
+        BootstrapRemoval::NothingToRemove => {
+            return Json(serde_json::json!({ "removed": false, "warnings": [] })).into_response()
+        }
+        BootstrapRemoval::EnvControlled => {
+            return conflict(
+                "the bootstrap SigV4 pair comes from DGP_ACCESS_KEY_ID / DGP_SECRET_ACCESS_KEY: \
+                 unset those environment variables and restart",
+            )
+        }
+        BootstrapRemoval::WouldDisableAuth => {
+            return conflict(
+                "no IAM users exist: removing the bootstrap SigV4 pair would leave the proxy \
+                 without authentication. Create an IAM admin user first",
+            )
+        }
+        BootstrapRemoval::Remove => {}
+    }
+    let old_cfg = cfg.clone();
+    let removed_key = cfg.access_key_id.take();
+    cfg.secret_access_key = None;
+    let mut warnings = match reapply_env(&old_cfg, &mut cfg, false) {
+        Ok(w) => w,
+        Err(e) => {
+            *cfg = old_cfg;
+            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        }
+    };
+    match apply_config_transition(&state, &old_cfg, &cfg).await {
+        Ok((w, _)) => warnings.extend(w),
+        Err(e) => {
+            *cfg = old_cfg;
+            return conflict(&e);
+        }
+    }
+    let path = active_config_path(&state);
+    if let Err(e) = cfg.persist_to_file(&path) {
+        warnings.push(format!("Failed to persist config to {path}: {e}"));
+    }
+    drop(cfg);
+    // The same key may live on as an IAM user (the first IAM user carries
+    // the pair over as 'legacy-admin'): say so, it still signs requests.
+    let still_iam_user = removed_key
+        .as_deref()
+        .and_then(|k| match &**state.iam_state.load() {
+            IamState::Iam(index) => index.get(k).map(|u| u.name.clone()),
+            _ => None,
+        });
+    if let Some(name) = still_iam_user {
+        warnings.push(format!(
+            "the removed access key id is also IAM user '{name}', which still signs S3 \
+             requests: delete or disable that user in the Users panel to revoke the key"
+        ));
+    }
+    super::audit_log(
+        "remove_bootstrap_credentials",
+        "",
+        "access_key_id",
+        &headers,
+    );
+    Json(serde_json::json!({ "removed": true, "warnings": warnings })).into_response()
 }
 
 /// Preserve unredacted `event_delivery.webhook_headers` values across a section
@@ -1760,6 +1904,34 @@ advanced:
             env.get("DGP_SECRET_ACCESS_KEY").map(String::as_str),
             "{label}"
         );
+    }
+
+    /// The export shows the key id and hides the secret. An unedited
+    /// round-trip (same key id, no secret) keeps the secret; a new key id
+    /// without its secret stays asymmetric.
+    #[test]
+    fn a_visible_unchanged_key_id_keeps_its_secret() {
+        let old_k = Some("AKBOOT".to_string());
+        let old_s = Some("boot-secret".to_string());
+        let (mut k, mut sec, mut w) = (old_k.clone(), None, Vec::new());
+        super::preserve_sigv4_pair(&mut k, &mut sec, &old_k, &old_s, "proxy-level", &mut w);
+        assert_eq!(sec, old_s);
+        assert!(w.is_empty(), "{w:?}");
+        let (mut k, mut sec, mut w) = (Some("AKNEW".to_string()), None, Vec::new());
+        super::preserve_sigv4_pair(&mut k, &mut sec, &old_k, &old_s, "proxy-level", &mut w);
+        assert_eq!(sec, None);
+        assert_eq!(w.len(), 1, "{w:?}");
+    }
+
+    #[test]
+    fn bootstrap_removal_truth_table() {
+        use super::BootstrapRemoval::*;
+        let d = super::bootstrap_removal_decision;
+        assert_eq!(d(false, false, false), NothingToRemove);
+        assert_eq!(d(false, true, true), NothingToRemove);
+        assert_eq!(d(true, true, true), EnvControlled);
+        assert_eq!(d(true, false, false), WouldDisableAuth);
+        assert_eq!(d(true, false, true), Remove);
     }
 
     fn preserve_all(new: &mut Config, old: &Config) {
