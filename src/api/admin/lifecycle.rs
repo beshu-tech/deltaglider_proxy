@@ -213,6 +213,26 @@ pub async fn run_now(
             ));
         }
     }
+    // The rule was read before the lease, and only the lease makes a rule
+    // delete refuse: a delete in between removed the rule (and purged its
+    // state) already. Read it again now that it cannot go.
+    let current = {
+        let cfg = state.config.read().await;
+        lifecycle::planner::claimed_rule_is_current(&rule, &cfg.lifecycle.rules)
+    };
+    if !current {
+        let _ = db_arc
+            .lock()
+            .await
+            .lifecycle_release_lease(&rule.name, &lease_owner);
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "rule '{}' changed or was deleted while run-now started; retry",
+                rule.name
+            ),
+        ));
+    }
 
     info!("Lifecycle run-now via admin API: rule='{}'", name);
     // Open the run-history row now, so the 202 carries the run id the UI and

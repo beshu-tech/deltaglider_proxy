@@ -123,6 +123,16 @@ pub fn lifecycle_config_errors(cfg: &LifecycleConfig) -> Vec<String> {
     errs
 }
 
+/// Pure: is the rule a run-now read BEFORE it took the rule's lease still
+/// the configured one (same name, same definition, exactly once)? The lease
+/// is what makes a rule delete refuse; a delete that ran between the read
+/// and the lease already removed the rule (and purged its state), so the
+/// run must not start from the stale read.
+pub fn claimed_rule_is_current(snapshot: &LifecycleRule, rules: &[LifecycleRule]) -> bool {
+    let mut same_name = rules.iter().filter(|r| r.name == snapshot.name);
+    matches!((same_name.next(), same_name.next()), (Some(r), None) if r == snapshot)
+}
+
 /// Names appearing on MORE than one rule (each reported once, first-seen order).
 /// Shared by [`lifecycle_config_errors`] and the scheduler's dup-skip defence.
 pub fn duplicate_rule_names<'a, I>(rules: I) -> Vec<String>
@@ -504,6 +514,29 @@ pub fn plan_retain_newest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claimed_rule_is_current_truth_table() {
+        let rule = |name: &str, prefix: &str| LifecycleRule {
+            name: name.into(),
+            enabled: true,
+            bucket: "b".into(),
+            prefix: prefix.into(),
+            action: Default::default(),
+            expire_after: Some("1d".into()),
+            include_globs: vec![],
+            exclude_globs: vec![],
+            batch_size: 100,
+        };
+        let snap = rule("r", "p/");
+        assert!(claimed_rule_is_current(&snap, &[rule("x", ""), rule("r", "p/")]));
+        // Deleted between the read and the lease.
+        assert!(!claimed_rule_is_current(&snap, &[rule("x", "")]));
+        // Redefined in between.
+        assert!(!claimed_rule_is_current(&snap, &[rule("r", "q/")]));
+        // Duplicated in between.
+        assert!(!claimed_rule_is_current(&snap, &[rule("r", "p/"), rule("r", "p/")]));
+    }
     use chrono::{Duration, TimeZone};
 
     fn meta_at(ts: i64) -> FileMetadata {
