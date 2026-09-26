@@ -2,7 +2,7 @@
 
 This guide shows you how to scrape DeltaGlider Proxy with Prometheus, build the Grafana panels that matter, and install the alert rules you actually want to be paged on. The full metrics catalog lives in the [metrics reference](../reference/metrics.md).
 
-Three always-on endpoints are exempt from SigV4 auth so monitoring systems can hit them without credentials: `GET /_/health` (status + cache/RSS gauges), `GET /_/stats` (aggregate storage stats, 10s server-side cache), and `GET /_/metrics` (Prometheus text format). The version is intentionally **not** in `/_/health` (anti-fingerprinting); the authenticated `GET /_/api/whoami` returns it.
+Two endpoints answer monitoring systems that have no S3 credentials: `GET /_/health` (status + cache/RSS gauges) and `GET /_/metrics` (Prometheus text format; when `DGP_METRICS_BEARER_TOKEN` is set, the scraper must send that token). `GET /_/stats` (aggregate storage stats, 10s server-side cache) is different: it reveals the size of every bucket, so it answers only an admin session and returns `401` to anyone else. The version is intentionally **not** in `/_/health` (anti-fingerprinting); the authenticated `GET /_/api/whoami` returns it.
 
 ## 1. Configure the scrape
 

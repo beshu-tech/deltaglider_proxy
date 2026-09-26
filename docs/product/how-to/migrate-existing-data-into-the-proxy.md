@@ -64,12 +64,14 @@ Use this when you want the version history itself stored as deltas. The proxy re
 
 3. Upload order matters for ratios: the first object in each prefix becomes the reference baseline, and later versions delta against it. `aws s3 sync` copies in key order, which for versioned names (`fw-2.3.0.tar`, `fw-2.4.0.tar`…) is usually also version order — good enough in practice.
 
-4. Spot-check the savings on the stats endpoint before cutting over:
+4. Spot-check the savings on the stats endpoint before cutting over. The endpoint reveals the size of every bucket, so it answers only an admin session (`401` otherwise). Sign in first to store the session cookie:
 
    ```bash
-   curl https://s3.acme.example/_/stats
+   curl -s -c /tmp/dgp.cookies -X POST https://s3.acme.example/_/api/admin/login \
+     -H 'Content-Type: application/json' -d '{"password": "<bootstrap-password>"}'
+   curl -s -b /tmp/dgp.cookies https://s3.acme.example/_/stats
    # per bucket, with the running counter:
-   curl https://s3.acme.example/_/stats?bucket=releases
+   curl -s -b /tmp/dgp.cookies 'https://s3.acme.example/_/stats?bucket=releases'
    ```
 
 ## Cut clients over

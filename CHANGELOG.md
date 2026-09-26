@@ -85,6 +85,8 @@ audited as `maintenance_migrate_mirror_delete`.
   the sidebar.
 - The re-encrypt proposal no longer says that rewritten objects get a new
   Last-Modified. The job keeps each object's Last-Modified and ETag.
+- The docs no longer call `/_/stats` unauthenticated. It answers only an
+  admin session (`401` otherwise); the examples now sign in first.
 
 ### Fixed — The Credentials page shows the bootstrap access key and removes it on request
 

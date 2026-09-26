@@ -99,7 +99,7 @@ Reads and lists keep working; every write is rejected.
    aws --endpoint-url https://s3.acme.example s3 cp probe.txt s3://db-archive/probe.txt
    ```
 
-4. The savings for each bucket show up on the dashboard at **Settings → Observability → Dashboard** (`/_/admin/dashboard`) and through the O(1) usage counter — `curl https://s3.acme.example/_/stats?bucket=db-archive` (or `GET /_/api/admin/usage/bucket/db-archive` for the full counter row). The counter is maintained inline on every write; if it ever drifts, reconcile with `POST /_/api/admin/usage/refresh?bucket=db-archive`.
+4. The savings for each bucket show up on the dashboard at **Settings → Observability → Dashboard** (`/_/admin/dashboard`) and through the O(1) usage counter — `curl -b /tmp/dgp.cookies 'https://s3.acme.example/_/stats?bucket=db-archive'` with an admin session cookie from `POST /_/api/admin/login` (or `GET /_/api/admin/usage/bucket/db-archive` for the full counter row). The counter is maintained inline on every write; if it ever drifts, reconcile with `POST /_/api/admin/usage/refresh?bucket=db-archive`.
 
 ## Related
 
