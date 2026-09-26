@@ -1368,7 +1368,8 @@ mod tests {
         const ALLOWED: [&str; 6] = [
             "rate_limiter.rs",
             "api/auth.rs",
-            "startup.rs",
+            // The form-POST interceptor keys the limiter bucket on a failure.
+            "api/s3_router.rs",
             "audit.rs",
             "api/admin/auth.rs",
             "api/admin/external_auth.rs",

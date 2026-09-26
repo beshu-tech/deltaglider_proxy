@@ -882,7 +882,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         );
 
     // --- S3 router ---
-    let app = build_s3_router(
+    let app = deltaglider_proxy::api::s3_router::build_s3_router(
         &state,
         &iam_state,
         &metrics,

@@ -9,9 +9,10 @@
 //! a request on which the two parsers disagreed: the policy checked one
 //! principal or resource, s3s served another.
 //!
-//! This module drives raw requests through the production middleware
-//! stack and a real s3s service (production auth + access hooks, a
-//! recording wrapper around the access hook, a no-op `S3` impl). For every
+//! This module drives raw requests through the production S3 router
+//! (`api::s3_router::build_s3_router_with`: every layer, both
+//! interceptors, the production s3s auth and config) with a recording
+//! wrapper around the production access hook and a no-op `S3` impl. For every
 //! request that reaches the access hook it asserts that both sides agree on
 //! the identity, the bucket, the key, the list prefix and the action. A
 //! request that either side refuses before that point is fine: it is never
@@ -205,17 +206,25 @@ fn iam_user(id: i64, name: &str, u: User) -> IamUser {
     }
 }
 
-/// The production S3 middleware order (`startup::build_s3_router`) minus
-/// the layers that do not parse the request target (metrics, trace,
-/// request-id, maintenance counter), with the s3s service at the bottom.
-fn router() -> Router {
+/// Both routers of one test: `prod` is the production S3 router
+/// (`s3_router::build_s3_router_with`, every layer and interceptor) over the
+/// recording hook and a no-op `S3`; `bare` is the s3s service alone, which
+/// tells what s3s would make of a request the production router serves
+/// without s3s (the form-POST interceptor).
+struct Harness {
+    prod: Router,
+    bare: Router,
+    _data: tempfile::TempDir,
+}
+
+async fn harness() -> Harness {
     use s3s::service::S3ServiceBuilder;
 
     let iam: crate::iam::SharedIamState = Arc::new(arc_swap::ArcSwap::from_pointee(IamState::Iam(
         IamIndex::from_users(vec![iam_user(1, "alice", ALICE), iam_user(2, "bob", BOB)]),
     )));
-    let mut buckets = std::collections::BTreeMap::new();
-    buckets.insert(
+    let mut config = crate::config::Config::default();
+    config.buckets.insert(
         PUBLIC_BUCKET.to_string(),
         crate::bucket_policy::BucketPolicyConfig {
             public_prefixes: vec![PUBLIC_PREFIX.to_string()],
@@ -224,35 +233,71 @@ fn router() -> Router {
     );
     let snapshot: crate::bucket_policy::SharedPublicPrefixSnapshot =
         Arc::new(arc_swap::ArcSwap::from_pointee(
-            crate::bucket_policy::PublicPrefixSnapshot::from_config(&buckets),
+            crate::bucket_policy::PublicPrefixSnapshot::from_config(&config.buckets),
         ));
-    let chain = crate::admission::build_shared_chain_from_parts(&buckets, &[]);
+    let chain = crate::admission::build_shared_chain_from_parts(&config.buckets, &[]);
+
+    let data = tempfile::tempdir().unwrap();
+    let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+        crate::storage::FilesystemBackend::new(data.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let engine =
+        crate::deltaglider::DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, None);
+    let metrics = Arc::new(crate::metrics::Metrics::new());
+    let state = Arc::new(crate::api::handlers::AppState {
+        engine: arc_swap::ArcSwap::from_pointee(engine),
+        multipart: Arc::new(crate::multipart::MultipartStore::new(
+            config.max_object_size,
+        )),
+        metrics: metrics.clone(),
+        usage_scanner: Arc::new(crate::usage_scanner::UsageScanner::new()),
+        bucket_usage: None,
+        reference_lock: None,
+        config_db: None,
+        maintenance_gate: Arc::new(crate::maintenance::gate::MaintenanceGate::new()),
+        maintenance_notify: Arc::new(tokio::sync::Notify::new()),
+        backend_capabilities: Default::default(),
+        backend_health: Default::default(),
+    });
+    let rate_limiter = crate::rate_limiter::RateLimiter::new(
+        100,
+        Duration::from_secs(300),
+        Duration::from_secs(600),
+    );
+    let replay_cache: crate::api::auth::ReplayCache = Default::default();
+    let shared_config: crate::config::SharedConfig =
+        Arc::new(tokio::sync::RwLock::new(config.clone()));
+    let prod = crate::api::s3_router::build_s3_router_with(
+        &state,
+        &iam,
+        &metrics,
+        &rate_limiter,
+        &replay_cache,
+        &config,
+        false,
+        &snapshot,
+        &chain,
+        &shared_config,
+        NopS3,
+        RecordingAccess,
+    );
 
     let mut builder = S3ServiceBuilder::new(NopS3);
-    builder.set_auth(DeltaGliderS3sAuth {
-        iam_state: iam.clone(),
-    });
+    builder.set_auth(DeltaGliderS3sAuth { iam_state: iam });
     builder.set_access(RecordingAccess);
     builder.set_config(crate::api::s3s_hooks::s3s_config());
     let service =
         axum::error_handling::HandleError::new(builder.build(), |e: s3s::HttpError| async move {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}"))
         });
-
-    Router::new()
-        .fallback_service(service)
-        .layer(axum::middleware::from_fn(
-            crate::iam::authorization_middleware,
-        ))
-        .layer(axum::middleware::from_fn(
-            crate::api::auth::sigv4_auth_middleware,
-        ))
-        .layer(axum::middleware::from_fn(
-            crate::admission::admission_middleware,
-        ))
-        .layer(axum::Extension(iam))
-        .layer(axum::Extension(snapshot))
-        .layer(axum::Extension(chain))
+    let bare = Router::new().fallback_service(service);
+    Harness {
+        prod,
+        bare,
+        _data: data,
+    }
 }
 
 // ── request construction ────────────────────────────────────────────────
@@ -626,27 +671,41 @@ fn violations(method: &Method, seen: &Seen) -> Vec<String> {
 #[derive(Debug)]
 struct Outcome {
     status: StatusCode,
+    /// What reached the s3s access hook of the production router.
     seen: Option<Seen>,
     /// Our form-POST predicate claimed the request (the router serves it
     /// with the form handler, never with s3s).
     form_bucket: Option<String>,
+    /// For a claimed form POST: what bare s3s makes of the same request.
+    s3s_form_view: Option<Seen>,
 }
 
-async fn run(router: &Router, raw: &RawRequest) -> Option<Outcome> {
+async fn send(router: &Router, raw: &RawRequest) -> Option<(StatusCode, Option<Seen>)> {
     let mut request = build(raw)?;
+    let slot = Slot::default();
+    request.extensions_mut().insert(slot.clone());
+    let response = router.clone().oneshot(request).await.unwrap();
+    let seen = slot.0.lock().unwrap().take();
+    Some((response.status(), seen))
+}
+
+async fn run(h: &Harness, raw: &RawRequest) -> Option<Outcome> {
+    let request = build(raw)?;
     let form_bucket = crate::api::handlers::form_post::form_post_bucket(
         request.method(),
         request.uri(),
         request.headers(),
     );
-    let slot = Slot::default();
-    request.extensions_mut().insert(slot.clone());
-    let response = router.clone().oneshot(request).await.unwrap();
-    let seen = slot.0.lock().unwrap().take();
+    let (status, seen) = send(&h.prod, raw).await?;
+    let s3s_form_view = match &form_bucket {
+        Some(_) => send(&h.bare, raw).await?.1,
+        None => None,
+    };
     Some(Outcome {
-        status: response.status(),
+        status,
         seen,
         form_bucket,
+        s3s_form_view,
     })
 }
 
@@ -663,7 +722,11 @@ fn form_violations(raw: &RawRequest, out: &Outcome) -> Vec<String> {
     if crate::security::validate_bucket_name(ours).is_err() {
         return v;
     }
-    match &out.seen {
+    // The production router serves it with the form handler: s3s never runs.
+    if let Some(seen) = &out.seen {
+        v.push(format!("form bucket {ours:?}, but s3s ran {}", seen.op));
+    }
+    match &out.s3s_form_view {
         Some(seen) if seen.op == "PostObject" => {
             if seen.s3s_path.get_bucket_name() != Some(ours.as_str()) {
                 v.push(format!(
@@ -689,10 +752,7 @@ fn form_violations(raw: &RawRequest, out: &Outcome) -> Vec<String> {
             "form bucket {ours:?}, but s3s resolved {}",
             seen.op
         )),
-        None => v.push(format!(
-            "form bucket {ours:?}, but s3s refused the request ({})",
-            out.status
-        )),
+        None => v.push(format!("form bucket {ours:?}, but s3s refuses the request")),
     }
     v
 }
@@ -1088,10 +1148,10 @@ fn table() -> Vec<(&'static str, RawRequest, Expect)> {
 
 #[tokio::test]
 async fn table_cases_honour_the_contract() {
-    let router = router();
+    let h = harness().await;
     let mut failures = Vec::new();
     for (name, raw, expect) in table() {
-        let out = run(&router, &raw)
+        let out = run(&h, &raw)
             .await
             .unwrap_or_else(|| panic!("{name}: the harness could not build the request"));
         let served = out.seen.as_ref().is_some_and(|s| s.hook_admitted);
@@ -1284,8 +1344,7 @@ proptest! {
     #[test]
     fn generated_requests_honour_the_contract(raw in raw_request()) {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let router = router();
-        let out = rt.block_on(run(&router, &raw));
+        let out = rt.block_on(async { run(&harness().await, &raw).await });
         prop_assume!(out.is_some());
         let out = out.unwrap();
         let mut v: Vec<String> = out
@@ -1305,7 +1364,7 @@ proptest! {
 async fn generated_requests_reach_the_hook() {
     use proptest::strategy::ValueTree;
     use proptest::test_runner::TestRunner;
-    let router = router();
+    let h = harness().await;
     let mut runner = TestRunner::deterministic();
     let strategy = raw_request();
     let (mut built, mut served) = (0, 0);
@@ -1313,7 +1372,7 @@ async fn generated_requests_reach_the_hook() {
     let mut failures = Vec::new();
     for _ in 0..400 {
         let raw = strategy.new_tree(&mut runner).unwrap().current();
-        let Some(out) = run(&router, &raw).await else {
+        let Some(out) = run(&h, &raw).await else {
             continue;
         };
         built += 1;
