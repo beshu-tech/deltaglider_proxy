@@ -9,6 +9,7 @@ import FullScreenHeader from './FullScreenHeader';
 import AdminSidebar from './AdminSidebar';
 import { ADMIN_IA } from './adminNavigation';
 import { findEntry } from '../adminNavTree';
+import ReloginModal from './ReloginModal';
 import CommandPalette, {
   FileTextOutlined as PaletteFileTextOutlined,
   ImportOutlined as PaletteImportOutlined,
@@ -433,6 +434,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
           window.location.reload();
         }}
       />
+      <ReloginModal />
       <RestoreBackupModal
         file={backup.restoreFile}
         onCancel={backup.cancelRestore}

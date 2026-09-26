@@ -42,6 +42,7 @@ import { qk } from './queries/keys';
 import { useApplyHandler, useDirtySection } from './useDirtySection';
 import { normalizeUiError } from './errorHandling';
 import { isSessionExpired } from './errorHandling';
+import { requestRelogin } from './sessionRelogin';
 
 interface UseSectionEditorOptions<Wire, Local = Wire> {
   section: SectionName;
@@ -207,14 +208,20 @@ export function useSectionEditor<Wire, Local = Wire>(
 
   const runApply = useCallback(async () => {
     const snapshot = buildPayload(value);
-    try {
-      const resp = await validateSection<Wire>(section, snapshot);
-      setApplyResponse(resp);
-      setPendingBody(snapshot);
-      setApplyOpen(true);
-    } catch (e) {
-      message.error(`Validate failed: ${normalizeUiError(e, 'unknown')}`);
-    }
+    // A session that expired mid-edit: sign in again in place, then validate
+    // the same snapshot once more (the edits never leave the page).
+    const validate = async (retried: boolean): Promise<void> => {
+      try {
+        const resp = await validateSection<Wire>(section, snapshot);
+        setApplyResponse(resp);
+        setPendingBody(snapshot);
+        setApplyOpen(true);
+      } catch (e) {
+        if (!retried && isSessionExpired(e) && (await requestRelogin())) return validate(true);
+        message.error(`Validate failed: ${normalizeUiError(e, 'unknown')}`);
+      }
+    };
+    await validate(false);
   }, [section, buildPayload, value]);
 
   const cancelApply = useCallback(() => {
@@ -226,7 +233,11 @@ export function useSectionEditor<Wire, Local = Wire>(
     if (!pendingBody) return false;
     setApplying(true);
     try {
-      const resp = await putSection<Wire>(section, pendingBody);
+      const resp = await putSection<Wire>(section, pendingBody).catch(async (e: unknown) => {
+        // Same in-place sign-in as validate; the PUT sends the same body again.
+        if (isSessionExpired(e) && (await requestRelogin())) return putSection<Wire>(section, pendingBody);
+        throw e;
+      });
       if (!resp.ok) {
         message.error(resp.error || 'Apply failed');
         return false;
