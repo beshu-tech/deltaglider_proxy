@@ -196,7 +196,11 @@ impl TestServer {
         std::fs::write(&config_path, &full_config).expect("Failed to write test config");
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
-        cmd.env("DGP_CONFIG", &config_path)
+        // cwd = the temp config dir: the proxy writes state files
+        // (`.deltaglider_bootstrap_hash`) relative to its cwd, and those
+        // must never land in the repo root (see `spawns_set_current_dir`).
+        cmd.current_dir(&config_dir)
+            .env("DGP_CONFIG", &config_path)
             .env("RUST_LOG", "deltaglider_proxy=warn")
             .env("DGP_DEBUG_HEADERS", "true")
             .env("DGP_TRUST_PROXY_HEADERS", "true")
@@ -401,7 +405,8 @@ impl TestServer {
         );
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
-        cmd.env("DGP_CONFIG", &self.config_path)
+        cmd.current_dir(self.config_path.parent().expect("config dir"))
+            .env("DGP_CONFIG", &self.config_path)
             .env("RUST_LOG", "deltaglider_proxy=warn")
             .env("DGP_DEBUG_HEADERS", "true")
             .env("DGP_TRUST_PROXY_HEADERS", "true")
@@ -1551,7 +1556,8 @@ impl TestServer {
         );
 
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
-        cmd.env("DGP_CONFIG", &self.config_path)
+        cmd.current_dir(self.config_path.parent().expect("config dir"))
+            .env("DGP_CONFIG", &self.config_path)
             .env("RUST_LOG", "deltaglider_proxy=warn")
             .env("DGP_DEBUG_HEADERS", "true")
             .env("DGP_TRUST_PROXY_HEADERS", "true")

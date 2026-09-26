@@ -63,6 +63,7 @@ async fn test_config_apply_happy_path() {
     std::fs::write(yaml_path.path(), modified).unwrap();
 
     let output = Command::new(BIN)
+        .current_dir(std::env::temp_dir())
         .args([
             "config",
             "apply",
@@ -100,6 +101,7 @@ async fn test_config_apply_missing_password_exits_7() {
     .unwrap();
 
     let output = Command::new(BIN)
+        .current_dir(std::env::temp_dir())
         .args(["config", "apply", yaml_path.path().to_str().unwrap()])
         // Explicitly clear the env var; rustc inherits the parent environment
         // so a shell export could otherwise leak in.
@@ -125,6 +127,7 @@ async fn test_config_apply_wrong_password_exits_7() {
     std::fs::write(yaml_path.path(), "listen_addr: \"127.0.0.1:9999\"\n").unwrap();
 
     let output = Command::new(BIN)
+        .current_dir(std::env::temp_dir())
         .args([
             "config",
             "apply",
@@ -147,6 +150,7 @@ async fn test_config_apply_empty_file_rejected_before_hitting_server() {
     std::fs::write(yaml_path.path(), "   \n\n   \n").unwrap();
 
     let output = Command::new(BIN)
+        .current_dir(std::env::temp_dir())
         .args(["config", "apply", yaml_path.path().to_str().unwrap()])
         .env("DGP_BOOTSTRAP_PASSWORD", TEST_PASSWORD)
         .output()
@@ -172,6 +176,7 @@ async fn test_admission_trace_smoke() {
         .await;
 
     let output = Command::new(BIN)
+        .current_dir(std::env::temp_dir())
         .args([
             "admission",
             "trace",
@@ -253,6 +258,7 @@ async fn test_admission_trace_matches_public_prefix_after_apply() {
     std::fs::write(yaml_path.path(), patched).unwrap();
 
     let apply = Command::new(BIN)
+        .current_dir(std::env::temp_dir())
         .args([
             "config",
             "apply",
@@ -273,6 +279,7 @@ async fn test_admission_trace_matches_public_prefix_after_apply() {
     // 3. Trace an anonymous GET on the public path. Must now be
     //    `allow-anonymous` with the synthesised block matched.
     let trace = Command::new(BIN)
+        .current_dir(std::env::temp_dir())
         .args([
             "admission",
             "trace",

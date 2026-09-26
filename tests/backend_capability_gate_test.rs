@@ -52,7 +52,7 @@ fn spawn_expect_exit_with_db_key(
     let config_path = dir.path().join("test.yaml");
     std::fs::write(&config_path, config).expect("write config");
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
-    cmd.env_remove("DGP_CONFIG_DB_KEY");
+    cmd.current_dir(dir.path()).env_remove("DGP_CONFIG_DB_KEY");
     if let Some(k) = db_key {
         cmd.env("DGP_CONFIG_DB_KEY", k);
     }

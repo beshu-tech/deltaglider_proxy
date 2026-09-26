@@ -148,6 +148,8 @@ mod s3_correctness_test;
 mod s3_integration_test;
 #[path = "savings_test.rs"]
 mod savings_test;
+#[path = "spawn_cwd_guard_test.rs"]
+mod spawn_cwd_guard_test;
 #[path = "storage_resilience_test.rs"]
 mod storage_resilience_test;
 #[path = "streaming_copy_test.rs"]

@@ -400,6 +400,7 @@ jobs:
             maintenance_reencrypt_test:: \
             migrate_job_test:: \
             mismatch_boot_test:: \
+            spawn_cwd_guard_test:: \
             quota_test:: \
             replication_target_only_test:: \
             replication_test:: \
