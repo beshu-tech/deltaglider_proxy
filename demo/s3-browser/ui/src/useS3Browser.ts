@@ -25,6 +25,9 @@ import type { S3Object } from './types';
 import { readStorage, writeStorage } from './safeStorage';
 
 const MAX_HEAD_CACHE_SIZE = 5000;
+// A stable default: `load` depends on writablePrefixes, so a fresh `[]` per
+// render re-ran the list effect on every render (an infinite update loop).
+const NO_PREFIXES: string[] = [];
 
 interface UseS3BrowserOptions {
   writablePrefixes?: string[];
@@ -48,7 +51,7 @@ interface UseS3BrowserOptions {
 
 export default function useS3Browser(options: UseS3BrowserOptions) {
   const {
-    writablePrefixes = [],
+    writablePrefixes = NO_PREFIXES,
     adminSession = false,
     bucket,
     prefix,
