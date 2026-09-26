@@ -791,20 +791,6 @@ where
     )
 }
 
-/// Pure classifier: does this stringified S3 SDK error represent a failed
-/// conditional-write precondition (HTTP 412)?
-///
-/// The conditional PUT in [`ConfigDbSync::upload`] relies on the backend
-/// rejecting the request with `412 Precondition Failed` when the `If-Match`
-/// / `If-None-Match` guard doesn't hold. AWS S3 and MinIO both surface this
-/// as `PreconditionFailed` / a 412 status. Feed it [`sdk_error_signal`]
-/// output (status+code only), never a raw debug string — see that helper.
-pub(crate) fn is_precondition_failed(err_str: &str) -> bool {
-    err_str.contains("PreconditionFailed")
-        || err_str.contains("Precondition Failed")
-        || err_str.contains("412")
-}
-
 /// Pure classifier: did the backend LOUDLY reject the conditional request as
 /// unimplemented (HTTP 501 / NotImplemented)? Backblaze B2 answers conditional
 /// writes this way — a DEFINITIVE "no CAS", unlike a transport error.
@@ -820,10 +806,12 @@ pub(crate) fn is_object_absent(err_str: &str) -> bool {
     err_str.contains("NoSuchKey") || err_str.contains("NotFound") || err_str.contains("404")
 }
 
-/// Pure classifier: map a stringified S3 PUT error to [`UploadError`] —
-/// CAS precondition failures become `Conflict`, everything else `Other`.
+/// Pure classifier: map a stringified S3 PUT error to [`UploadError`] — a
+/// lost conditional write (412, or AWS's 409 ConditionalRequestConflict,
+/// see [`crate::coordination::cas::conditional_write_lost`]) becomes
+/// `Conflict`, everything else `Other`.
 fn classify_upload_error(err_str: &str) -> UploadError {
-    if is_precondition_failed(err_str) {
+    if crate::coordination::cas::conditional_write_lost(err_str) {
         UploadError::Conflict
     } else {
         UploadError::Other(err_str.to_string())
@@ -1446,36 +1434,6 @@ mod tests {
     }
 
     #[test]
-    fn precondition_failed_detected_from_common_shapes() {
-        // S3-style service error display.
-        assert!(is_precondition_failed(
-            "service error: PreconditionFailed: At least one of the pre-conditions you specified did not hold"
-        ));
-        // MinIO / human-readable status text.
-        assert!(is_precondition_failed(
-            "unhandled error (Precondition Failed)"
-        ));
-        // Raw HTTP status code.
-        assert!(is_precondition_failed(
-            "dispatch failure: response status: 412"
-        ));
-    }
-
-    #[test]
-    fn non_precondition_errors_are_not_misclassified() {
-        assert!(!is_precondition_failed(
-            "dispatch failure: connection refused"
-        ));
-        assert!(!is_precondition_failed(
-            "NoSuchBucket: bucket does not exist"
-        ));
-        assert!(!is_precondition_failed(
-            "service error: AccessDenied (status 403)"
-        ));
-        assert!(!is_precondition_failed(""));
-    }
-
-    #[test]
     fn not_implemented_classification() {
         // B2-style loud rejections → DEFINITIVE non-CAS.
         assert!(is_not_implemented(
@@ -1513,5 +1471,15 @@ mod tests {
             UploadError::Conflict => panic!("transport error misclassified as conflict"),
         }
         assert!(matches!(classify_upload_error(""), UploadError::Other(_)));
+        // AWS answers two racing conditional writes with 409: the peer won,
+        // so it is a conflict to reconcile, not a failed upload.
+        assert!(matches!(
+            classify_upload_error("status=409 code=ConditionalRequestConflict"),
+            UploadError::Conflict
+        ));
+        assert!(matches!(
+            classify_upload_error("status=409 code=BucketNotEmpty"),
+            UploadError::Other(_)
+        ));
     }
 }

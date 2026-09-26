@@ -108,7 +108,11 @@ mod source_guards {
     /// the structured SDK signal, may match on these tokens.
     #[test]
     fn no_error_classification_on_display_text() {
-        const ALLOWED: [&str; 2] = ["src/config_db_sync.rs", "src/storage/s3.rs"];
+        const ALLOWED: [&str; 3] = [
+            "src/config_db_sync.rs",
+            "src/storage/s3.rs",
+            "src/coordination/cas.rs",
+        ];
         const TOKENS: [&str; 16] = [
             "NoSuchKey",
             "NoSuchBucket",
