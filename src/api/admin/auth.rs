@@ -290,7 +290,8 @@ pub struct OpenBrowserConnectRequest {
 
 /// Whether session cookies should include the `Secure` flag (HTTPS-only).
 /// Controlled by `DGP_SECURE_COOKIES`. When not set, auto-detects based
-/// on TLS-at-our-listener (`DGP_TLS_ENABLED=true`) OR a trusted
+/// on TLS at our listener (YAML `advanced.tls.enabled` or
+/// `DGP_TLS_ENABLED=true`, see [`crate::tls::listener_tls`]) OR a trusted
 /// `X-Forwarded-Proto: https` from the front proxy.
 /// Set `DGP_SECURE_COOKIES=true` to force Secure regardless of detection.
 fn secure_cookies() -> bool {
@@ -300,7 +301,7 @@ fn secure_cookies() -> bool {
 /// Same as [`secure_cookies`] but also consults the inbound request's
 /// `X-Forwarded-Proto` header (only when `DGP_TRUST_PROXY_HEADERS=true`).
 /// Use this on the response-issuing path so a TLS-terminated front
-/// proxy yields a `Secure` cookie even when DGP_TLS_ENABLED is unset.
+/// proxy yields a `Secure` cookie even when our listener is plain HTTP.
 pub(super) fn secure_cookies_with(headers: Option<&HeaderMap>) -> bool {
     // Tri-state: an explicit, *recognised* DGP_SECURE_COOKIES value wins
     // (true OR false); absent or unrecognised falls through to TLS /
@@ -314,7 +315,7 @@ pub(super) fn secure_cookies_with(headers: Option<&HeaderMap>) -> bool {
             _ => {}
         }
     }
-    if crate::config::env_bool("DGP_TLS_ENABLED", false) {
+    if crate::tls::listener_tls() {
         return true;
     }
     if crate::rate_limiter::trust_proxy_headers() {
@@ -1883,7 +1884,7 @@ mod tests {
             "trusted XFP=https must yield Secure cookie"
         );
 
-        // Case C: trust=true, no XFP → falls back to TLS_ENABLED → false.
+        // Case C: trust=true, no XFP → falls back to the listener's TLS → false.
         assert!(!secure_cookies_with(Some(&HeaderMap::new())));
 
         // Case D: explicit DGP_SECURE_COOKIES=true wins.

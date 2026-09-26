@@ -603,12 +603,12 @@ Set `DGP_REPLAY_WINDOW_SECS=0` to disable replay rejection entirely (the window 
 
 ### `secure_cookies`
 
-Require HTTPS for admin session cookies (`Secure` flag).
+Controls the `Secure` flag on admin session cookies. `true` always sets it and `false` never sets it. When the variable is unset, the proxy sets the flag when its own listener serves TLS (`advanced.tls.enabled: true` or `DGP_TLS_ENABLED=true`), or when `DGP_TRUST_PROXY_HEADERS=true` and the request carries `X-Forwarded-Proto: https`.
 
 | | |
 |---|---|
 | **Env var** | `DGP_SECURE_COOKIES` |
-| **Default** | `true` |
+| **Default** | unset (automatic, as described above) |
 | **Hot-reload** | No |
 
 ### Config advisories
@@ -1127,7 +1127,7 @@ Tuning knobs for the large-object streaming multipart copy path (replication + l
 | `DGP_CONFIG_ENV_ALLOWLIST` | — | Comma-separated names (a trailing `*` matches a prefix) that an admin apply, import, restore or section PUT may resolve as `${env:NAME}` from the server environment, in addition to the names that the boot config file uses. `DGP_BOOTSTRAP_*`, `DGP_*ENCRYPTION_KEY*` and `DGP_*SECRET*` never match |
 | `DGP_CLOCK_SKEW_SECONDS` | 900 | SigV4 clock skew tolerance |
 | `DGP_REPLAY_WINDOW_SECS` | clock skew (900) | SigV4 replay detection window for mutating requests (0 disables) |
-| `DGP_SECURE_COOKIES` | true | Require HTTPS for session cookies |
+| `DGP_SECURE_COOKIES` | auto | `Secure` flag on session cookies: `true` always, `false` never; unset = when the listener serves TLS or a trusted `X-Forwarded-Proto: https` arrives |
 | `DGP_RATE_LIMIT_MAX_ATTEMPTS` | 100 | Max auth failures before lockout |
 | `DGP_RATE_LIMIT_WINDOW_SECS` | 300 | Rate-limit rolling window |
 | `DGP_RATE_LIMIT_LOCKOUT_SECS` | 600 | Lockout duration |

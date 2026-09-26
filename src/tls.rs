@@ -22,6 +22,19 @@ pub fn install_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
+/// Whether this process serves HTTPS on its listener. Set once at startup
+/// (`startup::init_tls`); the session cookies take `Secure` from it, so
+/// TLS from the YAML (`advanced.tls.enabled`) counts, not only the env var.
+static LISTENER_TLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_listener_tls(on: bool) {
+    LISTENER_TLS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn listener_tls() -> bool {
+    LISTENER_TLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Build a [`RustlsConfig`] from the given [`TlsConfig`].
 ///
 /// When `cert_path` and `key_path` are both set, loads user-provided PEM files.

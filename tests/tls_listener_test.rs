@@ -42,8 +42,13 @@ async fn self_signed_listener_serves_https() {
         .expect("HTTPS health request");
     assert_eq!(health.status(), 200);
 
-    // A signed-in admin session works over TLS.
-    login_cookie(&client, &endpoint).await;
+    // The listener has TLS from the YAML only (no DGP_TLS_ENABLED), so the
+    // session cookie must still be Secure.
+    let cookie = login_cookie(&client, &endpoint).await;
+    assert!(
+        cookie.contains("; Secure"),
+        "session cookie over TLS lacks Secure: {cookie}"
+    );
 }
 
 #[tokio::test]
@@ -82,7 +87,8 @@ async fn user_pem_listener_serves_https_with_a_verified_certificate() {
         .expect("verified HTTPS health request");
     assert_eq!(health.status(), 200);
 
-    login_cookie(&client, &endpoint).await;
+    let cookie = login_cookie(&client, &endpoint).await;
+    assert!(cookie.contains("; Secure"), "cookie: {cookie}");
 
     // Plain HTTP to the TLS port gets no HTTP answer.
     let plain = format!("http://{}", endpoint.trim_start_matches("https://"));

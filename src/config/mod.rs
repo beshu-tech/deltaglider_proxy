@@ -572,7 +572,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_SECURE_COOKIES",
-        description: "Require HTTPS for admin session cookies (default: true)",
+        description: "Secure flag on admin session cookies: true always, false never (default: automatic — set when the listener serves TLS, from YAML or env, or a trusted X-Forwarded-Proto: https arrives)",
         example: "true",
         category: "Security",
     },

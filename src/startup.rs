@@ -1452,6 +1452,7 @@ pub async fn init_tls(
             .as_ref()
             .expect("tls_enabled() implies tls config is Some");
         let rc = deltaglider_proxy::tls::build_rustls_config(tls_cfg).await?;
+        deltaglider_proxy::tls::set_listener_tls(true);
         if tls_cfg.cert_path.is_some() {
             info!("  TLS: enabled (user-provided certificate)");
         } else {

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — Session cookies are `Secure` when TLS comes from the YAML file
+
+The `Secure` flag on admin session cookies followed only the
+`DGP_TLS_ENABLED` variable, so a listener with `advanced.tls.enabled: true`
+in the YAML file sent cookies without it. Now the flag follows the TLS state
+of the running listener. The docs no longer claim that `DGP_SECURE_COOKIES`
+defaults to `true`: unset means automatic.
+
 ### Fixed — TLS no longer panics on the first HTTPS request
 
 With `tls.enabled: true` the proxy panicked on the first HTTPS handshake

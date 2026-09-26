@@ -18,6 +18,8 @@ advanced:
 
 Or via env vars: `DGP_TLS_ENABLED=true`, `DGP_TLS_CERT=...`, `DGP_TLS_KEY=...`. If you omit both paths, the proxy generates a self-signed certificate on startup — fine for testing, not for clients that verify certificates.
 
+With TLS at the proxy, the admin session cookies carry the `Secure` flag automatically. This is true whether you enable TLS in the YAML file or with `DGP_TLS_ENABLED`.
+
 When the proxy faces the internet directly, keep `DGP_TRUST_PROXY_HEADERS=false` (the default). Otherwise clients can spoof `X-Forwarded-For` and bypass rate limiting.
 
 ## Option B: terminate TLS at a reverse proxy
@@ -72,7 +74,7 @@ Set two env vars on the proxy when a reverse proxy is in front:
 | Variable | Value | Why |
 |---|---|---|
 | `DGP_TRUST_PROXY_HEADERS` | `true` | Accept `X-Forwarded-For` / `X-Real-IP` for rate limiting and IAM IP conditions. Flip it **only** when a reverse proxy is genuinely in front — otherwise clients can spoof IPs. |
-| `DGP_SECURE_COOKIES` | `true` | Already the default. Keeps admin session cookies HTTPS-only. |
+| `DGP_SECURE_COOKIES` | `true` | The listener is plain HTTP behind the reverse proxy, so the proxy cannot see the TLS itself. It sets the `Secure` flag on its own only when a trusted `X-Forwarded-Proto: https` header arrives. Setting this variable to `true` makes the admin session cookies HTTPS-only for every request. |
 
 ## Raise the reverse-proxy read timeout — mandatory for large uploads
 
