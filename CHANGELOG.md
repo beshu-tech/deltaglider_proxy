@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added — Tokio schedule-latency histogram (opt-in build flag)
+
+A binary built with `RUSTFLAGS="--cfg tokio_unstable"` now exports
+`deltaglider_tokio_schedule_latency_range_total{range}`: the number of task
+wake-ups per wake-to-poll latency range. It shows ready tasks that wait for a
+worker, which the poll-time series cannot show. Tokio is now at 1.53, which
+added this histogram. A default build does not change. The metrics reference
+explains how to read the series and what a bad value looks like (#87).
 ### Fixed — Lock and lease expiry no longer depends on the node clocks
 
 The cross-instance reference lock and the replication leader lease stored an

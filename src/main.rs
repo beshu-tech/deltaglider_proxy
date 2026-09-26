@@ -406,6 +406,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         runtime_builder.enable_metrics_poll_time_histogram();
     }
+    // #87: the wake-to-poll latency histogram, exported as
+    // `deltaglider_tokio_schedule_latency_range_total`. Same cost shape as the
+    // poll-time one. Tokio ships it only on 64-bit targets.
+    #[cfg(all(tokio_unstable, target_pointer_width = "64"))]
+    {
+        runtime_builder.enable_metrics_schedule_latency_histogram();
+    }
     let runtime = runtime_builder.build()?;
 
     runtime.block_on(async_main(cli))

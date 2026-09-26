@@ -34,7 +34,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 # Web framework
 axum = "0.7"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -146,6 +146,13 @@ s3s = "0.14.0"
 # Recursive directory walker for `cli::cp -r` (local→s3 path). Also
 # used by tests that walk the filesystem backend tree.
 walkdir = "2"
+
+# #87: the schedule-latency histogram. Tokio refuses the `schedule-latency`
+# feature without `--cfg tokio_unstable` (compile_error!) and on 32-bit
+# targets, so the feature is switched on only where both hold. Cargo reads
+# the cfg from RUSTFLAGS, so the default build never sees it.
+[target.'cfg(all(tokio_unstable, target_pointer_width = "64"))'.dependencies]
+tokio = { version = "1.53", features = ["schedule-latency"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -159,7 +159,11 @@ No bucket names, no object keys in labels. No unbounded cardinality.
 
 ## Tokio runtime series (opt-in build flag)
 
-These series exist only when the binary is built with `RUSTFLAGS="--cfg tokio_unstable"`. A default build omits them entirely, and the operator pages should treat that as "not compiled in", not "all zeros".
+These series exist only when the binary is built with `RUSTFLAGS="--cfg tokio_unstable"`. A default build omits them entirely, and the operator pages should treat that as "not compiled in", not "all zeros". The same flag also switches on Tokio's `schedule-latency` crate feature, because `Cargo.toml` enables that feature only when the flag is set. You do not pass a Cargo feature yourself. Tokio supports the schedule-latency histogram only on 64-bit targets, so a 32-bit build omits that one series.
+
+```bash
+RUSTFLAGS="--cfg tokio_unstable" cargo build --release
+```
 
 | Series | Gauge | Meaning |
 |---|---|---|
@@ -168,9 +172,18 @@ These series exist only when the binary is built with `RUSTFLAGS="--cfg tokio_un
 | `deltaglider_tokio_blocking_queue_depth` | gauge | Tasks waiting for a `spawn_blocking` thread. Sustained depth means the blocking pool (size `DGP_BLOCKING_THREADS`) is saturated. |
 | `deltaglider_tokio_budget_forced_yields_total` | counter | Polls the scheduler force-yielded after exhausting their budget. Rapid growth points at a task hogging a worker in a tight loop. Use `rate()`/`increase()`. |
 | `deltaglider_tokio_poll_time_range_total{range}` | counter | Task polls per poll-duration range (label `range`, for example `10-100us`), summed across workers. Counts in the high ranges are the long polls the mean hides. Use `rate()`/`increase()`. |
+| `deltaglider_tokio_schedule_latency_range_total{range}` | counter | Task wake-ups per schedule-latency range, summed across workers. The schedule latency is the time from the moment a task becomes ready (a socket has data, a lock is free, a timer fires) to the moment a worker starts to poll it. The label `range` has the same shape as the poll-time series. Use `rate()`/`increase()`. |
 | `deltaglider_tokio_workers` | gauge | Worker thread count, for context when reading the per-worker series. |
 
 Reading guidance: start with `worker_mean_poll_seconds` — if it is high, request handling contains inline blocking work (the class of problem behind the bucket-usage and periodic-sweep fixes). The mean hides the tail, so confirm with `deltaglider_tokio_poll_time_range_total`: growth in the high `range` buckets is what a few long polls look like. If the mean is low and the tail is flat but latency is still poor, check the two queue depths for saturation, then the budget-yield counter for CPU-hogging loops.
+
+The schedule-latency series answers a different question from the poll-time series. Poll time measures how long a task runs once a worker picks it up. Schedule latency measures how long a ready task waits before a worker picks it up. Both histograms use Tokio's default buckets: ten linear ranges of 100 microseconds each, and the last range (from 900 microseconds up) is open-ended.
+
+On a healthy proxy, almost all wake-ups land in the first range (`0-100us`), and the last range stays nearly flat. A bad value looks like this: `rate()` of the last range grows under load, and its share of all wake-ups rises to a few percent or more. That means ready tasks wait a millisecond or more for a worker, so every request that passes through those tasks gets slower even though no single poll is long. Read it together with the other series:
+
+- A high schedule latency with a high poll-time tail means that long polls occupy the workers, and the other tasks queue behind them. Fix the long polls first.
+- A high schedule latency with a flat poll-time tail and a deep global queue means that the runtime has more ready work than workers. The proxy is CPU-saturated, or it has too few worker threads for the load.
+- A high schedule latency on its own, while the queues stay short, usually means that the host does not give the worker threads enough CPU time (CPU throttling from a container limit, or a noisy neighbour).
 
 ## What's NOT in `/_/metrics`
 

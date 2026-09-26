@@ -848,41 +848,40 @@ pub fn spawn_tokio_runtime_metrics_sampler(metrics: &Arc<Metrics>) {
 
     // Poll-time histogram: this is the series `enable_metrics_poll_time_histogram()`
     // in `main.rs` turns on, and it is what exposes the TAIL a mean hides.
-    // Bucket boundaries are runtime-configured, so build one child counter
-    // per range and label by range.
-    let poll_hist = if rt.poll_time_histogram_enabled() {
-        let n = rt.poll_time_histogram_num_buckets();
-        let ranges: Vec<String> = (0..n)
-            .map(|i| {
-                let r = rt.poll_time_histogram_bucket_range(i);
-                format!("{}-{}us", r.start.as_micros(), r.end.as_micros())
-            })
-            .collect();
-        let v = IntCounterVec::new(
-            Opts::new(
-                "deltaglider_tokio_poll_time_range_total",
-                "Task polls per duration range, summed across workers. \
-                 Counts in the high ranges are long polls.",
-            ),
-            &["range"],
+    let poll_hist = rt.poll_time_histogram_enabled().then(|| {
+        RangeCounters::register(
+            registry,
+            "deltaglider_tokio_poll_time_range_total",
+            "Task polls per duration range, summed across workers. \
+             Counts in the high ranges are long polls.",
+            rt.poll_time_histogram_num_buckets(),
+            |i| rt.poll_time_histogram_bucket_range(i),
         )
-        .unwrap();
-        // Pre-create the children so every range appears from the first
-        // scrape, including ranges that have seen no polls yet.
-        for r in &ranges {
-            v.with_label_values(&[r.as_str()]);
-        }
-        let _ = registry.register(Box::new(v.clone()));
-        Some((v, ranges))
-    } else {
-        None
-    };
+    });
+
+    // Schedule-latency histogram: the time from "task woken" to "task polled".
+    // Long polls show up above; this shows the OTHER stall — ready tasks that
+    // wait in a queue because every worker is busy. Needs tokio's
+    // `schedule-latency` feature, which Cargo.toml enables only under
+    // `--cfg tokio_unstable` on 64-bit targets.
+    #[cfg(target_pointer_width = "64")]
+    let sched_hist = rt.schedule_latency_histogram_enabled().then(|| {
+        RangeCounters::register(
+            registry,
+            "deltaglider_tokio_schedule_latency_range_total",
+            "Task wakeups per wake-to-poll latency range, summed across workers. \
+             Counts in the high ranges are ready tasks that waited for a worker.",
+            rt.schedule_latency_histogram_num_buckets(),
+            |i| rt.schedule_latency_histogram_bucket_range(i),
+        )
+    });
 
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         let mut prev_budget: u64 = 0;
-        let mut prev_buckets: Vec<u64> =
-            vec![0; poll_hist.as_ref().map(|(_, r)| r.len()).unwrap_or(0)];
+        let mut poll_hist = poll_hist;
+        #[cfg(target_pointer_width = "64")]
+        let mut sched_hist = sched_hist;
         loop {
             tick.tick().await;
             // Worst (not mean-of-means) worker: a single poisoned worker must
@@ -903,20 +902,76 @@ pub fn spawn_tokio_runtime_metrics_sampler(metrics: &Arc<Metrics>) {
                 budget_forced_yields_total.inc_by(cur_budget - prev_budget);
                 prev_budget = cur_budget;
             }
-            if let Some((hist, ranges)) = poll_hist.as_ref() {
-                for (i, range) in ranges.iter().enumerate() {
-                    let cur: u64 = (0..rt.num_workers())
-                        .map(|w| rt.poll_time_histogram_bucket_count(w, i))
-                        .sum();
-                    if cur >= prev_buckets[i] {
-                        hist.with_label_values(&[range.as_str()])
-                            .inc_by(cur - prev_buckets[i]);
-                        prev_buckets[i] = cur;
-                    }
-                }
+            let workers = rt.num_workers();
+            if let Some(h) = poll_hist.as_mut() {
+                h.sample(|b| {
+                    (0..workers)
+                        .map(|w| rt.poll_time_histogram_bucket_count(w, b))
+                        .sum()
+                });
+            }
+            #[cfg(target_pointer_width = "64")]
+            if let Some(h) = sched_hist.as_mut() {
+                h.sample(|b| {
+                    (0..workers)
+                        .map(|w| rt.schedule_latency_histogram_bucket_count(w, b))
+                        .sum()
+                });
             }
         }
     });
+}
+
+/// One tokio histogram exported as a counter per bucket range, labelled
+/// `range="<start>-<end>us"`. Tokio reports absolute per-bucket totals; the
+/// sampler adds the delta since the last tick, so Prometheus sees a real
+/// monotonic counter. Bucket boundaries are runtime-configured, so the
+/// labels are read from the runtime once, at registration.
+#[cfg(tokio_unstable)]
+struct RangeCounters {
+    vec: IntCounterVec,
+    ranges: Vec<String>,
+    prev: Vec<u64>,
+}
+
+#[cfg(tokio_unstable)]
+impl RangeCounters {
+    fn register(
+        registry: &Registry,
+        name: &str,
+        help: &str,
+        buckets: usize,
+        range: impl Fn(usize) -> std::ops::Range<std::time::Duration>,
+    ) -> Self {
+        let ranges: Vec<String> = (0..buckets)
+            .map(|i| {
+                let r = range(i);
+                format!("{}-{}us", r.start.as_micros(), r.end.as_micros())
+            })
+            .collect();
+        let vec = IntCounterVec::new(Opts::new(name, help), &["range"]).unwrap();
+        // Pre-create the children so every range appears from the first
+        // scrape, including ranges that have seen no events yet.
+        for r in &ranges {
+            vec.with_label_values(&[r.as_str()]);
+        }
+        let _ = registry.register(Box::new(vec.clone()));
+        let prev = vec![0; ranges.len()];
+        Self { vec, ranges, prev }
+    }
+
+    /// `total(bucket)` is the runtime's absolute count for that bucket.
+    fn sample(&mut self, total: impl Fn(usize) -> u64) {
+        for (i, range) in self.ranges.iter().enumerate() {
+            let cur = total(i);
+            if cur >= self.prev[i] {
+                self.vec
+                    .with_label_values(&[range.as_str()])
+                    .inc_by(cur - self.prev[i]);
+                self.prev[i] = cur;
+            }
+        }
+    }
 }
 
 /// Compiled-out stub so call sites never need their own cfg.
@@ -1001,12 +1056,14 @@ mod tests {
     #[cfg(tokio_unstable)]
     #[test]
     fn runtime_metrics_sampler_exports_series() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
             .worker_threads(2)
             .enable_all()
-            .enable_metrics_poll_time_histogram()
-            .build()
-            .unwrap();
+            .enable_metrics_poll_time_histogram();
+        #[cfg(target_pointer_width = "64")]
+        builder.enable_metrics_schedule_latency_histogram();
+        let rt = builder.build().unwrap();
         rt.block_on(async {
             let m = Arc::new(Metrics::new());
             spawn_tokio_runtime_metrics_sampler(&m);
@@ -1019,13 +1076,17 @@ mod tests {
                 .iter()
                 .map(|f| f.name().to_string())
                 .collect();
-            for expected in [
+            #[allow(unused_mut)]
+            let mut expected_names = vec![
                 "deltaglider_tokio_workers",
                 "deltaglider_tokio_global_queue_depth",
                 "deltaglider_tokio_blocking_queue_depth",
                 "deltaglider_tokio_budget_forced_yields_total",
                 "deltaglider_tokio_poll_time_range_total",
-            ] {
+            ];
+            #[cfg(target_pointer_width = "64")]
+            expected_names.push("deltaglider_tokio_schedule_latency_range_total");
+            for expected in expected_names {
                 assert!(
                     names.iter().any(|n| n == expected),
                     "sampler must export {expected}; got {names:?}"
@@ -1043,6 +1104,30 @@ mod tests {
                 .iter()
                 .any(|mm| mm.get_label().iter().any(|l| l.name() == "range"));
             assert!(has_range, "poll-time counter must be labelled by range");
+
+            // The schedule-latency counters must COUNT, not only exist: wake
+            // tasks, wait past the next 1s tick, and expect a non-zero sum.
+            #[cfg(target_pointer_width = "64")]
+            {
+                for _ in 0..200 {
+                    tokio::spawn(async { tokio::task::yield_now().await })
+                        .await
+                        .unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+                let sched = m
+                    .registry
+                    .gather()
+                    .into_iter()
+                    .find(|f| f.name() == "deltaglider_tokio_schedule_latency_range_total")
+                    .expect("schedule-latency family present");
+                let total: f64 = sched
+                    .get_metric()
+                    .iter()
+                    .map(|mm| mm.get_counter().get_value())
+                    .sum();
+                assert!(total > 0.0, "schedule-latency counters must advance");
+            }
         });
     }
 }
