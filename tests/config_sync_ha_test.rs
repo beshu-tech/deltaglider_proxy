@@ -626,13 +626,10 @@ async fn ha_replica_with_wrong_db_key_refuses_the_synced_db() {
 }
 
 /// S8 upgrade path: the sync object was written by a node on the release
-/// before S8, so it is keyed with the bootstrap password hash. A new node
-/// accepts it (legacy fallback), re-encrypts its copy with the DB key, and
-/// merges the IAM state.
-#[tokio::test]
-async fn ha_legacy_hash_keyed_sync_object_is_accepted() {
-    skip_unless_minio!();
-
+/// before S8, so it is keyed with the bootstrap password hash.
+/// Seed the sync object with a DB under the legacy bootstrap hash, boot a
+/// node on it, and return whether the node merged the seeded user.
+async fn boot_on_a_legacy_sync_object(accept_legacy: bool) -> bool {
     let sync_key = unique_config_sync_object_key();
     let user_name = unique_user_name("ha-legacy");
     let dir = tempfile::tempdir().unwrap();
@@ -656,14 +653,16 @@ async fn ha_legacy_hash_keyed_sync_object_is_accepted() {
         .await
         .expect("seed the legacy sync object");
 
-    let server = TestServer::builder()
+    let mut builder = TestServer::builder()
         .auth("HAKEY-L1", "HASECRET-L1-1234567890")
         .s3_endpoint(&minio_endpoint_url())
         .bucket(MINIO_BUCKET)
         .config_sync_bucket(MINIO_BUCKET)
-        .config_sync_object_key(&sync_key)
-        .build()
-        .await;
+        .config_sync_object_key(&sync_key);
+    if accept_legacy {
+        builder = builder.env("DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC", "true");
+    }
+    let server = builder.build().await;
     let users: Vec<serde_json::Value> = admin_http_client(&server.endpoint())
         .await
         .get(format!("{}/_/api/admin/users", server.endpoint()))
@@ -673,9 +672,27 @@ async fn ha_legacy_hash_keyed_sync_object_is_accepted() {
         .json()
         .await
         .unwrap();
+    users.iter().any(|u| u["name"] == user_name)
+}
+
+/// Rolling upgrade: with DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC=true, a copy that an
+/// old-release node wrote under the bootstrap hash merges.
+#[tokio::test]
+async fn ha_legacy_hash_keyed_sync_object_is_accepted_when_opted_in() {
+    skip_unless_minio!();
     assert!(
-        users.iter().any(|u| u["name"] == user_name),
-        "a legacy hash-keyed sync object must merge; got: {users:?}"
+        boot_on_a_legacy_sync_object(true).await,
+        "a legacy hash-keyed sync object must merge with the opt-in"
+    );
+}
+
+/// S8: the hash is not a secret, so by default it never opens a synced copy.
+#[tokio::test]
+async fn ha_legacy_hash_keyed_sync_object_is_refused_by_default() {
+    skip_unless_minio!();
+    assert!(
+        !boot_on_a_legacy_sync_object(false).await,
+        "a copy under the bootstrap hash must not merge without the opt-in"
     );
 }
 
