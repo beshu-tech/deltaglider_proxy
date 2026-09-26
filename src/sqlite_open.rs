@@ -8,8 +8,9 @@
 //! initialized" and fails `PRAGMA key` with "sqlcipher not initialized". The
 //! first connection of a process is where this bites: at boot, and in the
 //! test harness, where many threads open their first DB at once. Every open
-//! goes through [`open`] / [`open_in_memory`], which run the first
-//! initialization to its end exactly once before any connection opens.
+//! goes through [`open`], [`open_with_flags`] or [`open_in_memory`], which
+//! run the first initialization to its end exactly once before any
+//! connection opens.
 //! `sqlite_opens_go_through_the_init_gate` guards the call sites.
 
 use rusqlite::Connection;
@@ -28,6 +29,11 @@ fn initialized() {
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     initialized();
     Connection::open(path)
+}
+
+pub fn open_with_flags(path: &Path, flags: rusqlite::OpenFlags) -> rusqlite::Result<Connection> {
+    initialized();
+    Connection::open_with_flags(path, flags)
 }
 
 pub fn open_in_memory() -> rusqlite::Result<Connection> {

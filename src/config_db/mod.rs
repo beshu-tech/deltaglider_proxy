@@ -1147,7 +1147,7 @@ impl ConfigDb {
 /// `false`, so it is never taken for a wrong key.
 pub fn probe_key(path: &Path, key: &str) -> Result<bool, ConfigDbError> {
     use rusqlite::OpenFlags;
-    let conn = Connection::open_with_flags(
+    let conn = crate::sqlite_open::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
@@ -1224,7 +1224,7 @@ fn rekey_file_hooked(
     let result = (|| -> Result<(), ConfigDbError> {
         std::fs::copy(path, &tmp).map_err(ConfigDbError::Io)?;
         {
-            let conn = Connection::open(&tmp)?;
+            let conn = crate::sqlite_open::open(&tmp)?;
             conn.pragma_update(None, "key", old)?;
             conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
                 r.get::<_, i32>(0)
