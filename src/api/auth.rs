@@ -832,7 +832,14 @@ pub async fn sigv4_auth_middleware(
             .map(|s| s.load_full());
         if let Some(snapshot) = snapshot {
             let public_prefixes = snapshot.public_prefixes_for_bucket(&admit.bucket);
-            let anon_user = build_anonymous_user(&admit.bucket, public_prefixes);
+            let mut anon_user = build_anonymous_user(&admit.bucket, public_prefixes);
+            // An operator block grants exactly this read-class request.
+            if let Some(perm) = admit.grant.as_ref().and_then(|g| g.permission()) {
+                anon_user
+                    .iam_policies
+                    .push(crate::iam::permissions::permission_to_iam_policy(&perm));
+                anon_user.permissions.push(perm);
+            }
 
             info!(
                 "AUDIT | action=public_read | user=$anonymous | bucket={} | matched_block={} | ip={} | method={}",

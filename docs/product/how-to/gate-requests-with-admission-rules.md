@@ -30,6 +30,8 @@ admission:
 
 A request matches a rule only when it matches every condition of the rule. A rule with an empty `match: {}` matches every request. The [configuration reference](../reference/configuration.md#admission-chain) lists all conditions (`method`, `source_ip` or `source_ip_list` with CIDR networks, `bucket`, `path_glob`, `authenticated`) and all actions (`deny`, `allow-anonymous`, `continue`, and `reject` with a custom status and message).
 
+An `allow-anonymous` rule lets the matched request through without credentials only when that request is a read: a `GET` or `HEAD` of an object, or a listing with the requested prefix. The rule grants exactly that request and nothing wider. A write that matches an `allow-anonymous` rule is refused with `403`, because the proxy never grants a write to an anonymous caller.
+
 ## 2. Put the rules in order
 
 The proxy checks the rules from the top of the list to the bottom, and the **first rule that matches decides**. A request that matches rule 1 never reaches rule 2. For this reason, put narrow exceptions above broad rules. For example, an `allow-anonymous` rule for one path must be above a `deny` rule that would otherwise match the same requests.

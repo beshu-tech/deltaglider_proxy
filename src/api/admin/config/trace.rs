@@ -53,6 +53,10 @@ pub struct TraceResponse {
     /// Admission-layer decision. Phase 2.5+ will add sibling fields for
     /// identity, iam, parameters, and routing.
     pub admission: crate::admission::Decision,
+    /// What an `allow-anonymous` decision grants this request (the same
+    /// function the live path uses). `null` for any other decision, and
+    /// for a write: writes are never granted anonymously.
+    pub anonymous_grant: Option<crate::admission::AnonymousGrant>,
 }
 
 #[derive(Serialize)]
@@ -91,9 +95,11 @@ pub async fn trace_config(
     );
     // `RequestInfo` borrows from `owned`; confining it to a block
     // ends the borrow before we move out of `owned` below.
-    let decision = {
+    let (decision, anonymous_grant) = {
         let req_info = owned.as_ref();
-        crate::admission::evaluate(&chain, &req_info)
+        let decision = crate::admission::evaluate(&chain, &req_info);
+        let grant = crate::admission::anonymous_grant(&decision, &req_info);
+        (decision, grant)
     };
 
     // `TraceResolved` echoes the parsed inputs back so operators can
@@ -117,6 +123,7 @@ pub async fn trace_config(
                 authenticated: body.authenticated,
             },
             admission: decision,
+            anonymous_grant,
         }),
     )
 }

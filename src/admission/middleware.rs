@@ -44,6 +44,9 @@ use crate::metrics::{record_http_request_total, Metrics};
 pub struct AdmissionAllowAnonymous {
     pub bucket: String,
     pub matched_block: String,
+    /// What the decision grants this request ([`super::anonymous_grant`],
+    /// the function the trace reports too). `None` for a write.
+    pub grant: Option<super::AnonymousGrant>,
 }
 
 /// Middleware: evaluate the admission chain, annotate the request, forward.
@@ -71,12 +74,14 @@ pub async fn admission_middleware(mut request: Request<Body>, next: Next) -> Res
 
     let owned = extract_request_info(&request);
     let decision = super::evaluator::evaluate(&chain, &owned.as_ref());
+    let grant = super::anonymous_grant(&decision, &owned.as_ref());
 
     match decision {
         Decision::AllowAnonymous { matched } => {
             request.extensions_mut().insert(AdmissionAllowAnonymous {
                 bucket: owned.bucket.clone(),
                 matched_block: matched,
+                grant,
             });
         }
         Decision::Continue { .. } => {

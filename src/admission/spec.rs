@@ -337,7 +337,7 @@ impl AdmissionSpec {
             // operator authoring `name: public-prefix:releases` would
             // collide with the synthesized block for that bucket and
             // make audit logs / trace output ambiguous.
-            if block.name.starts_with("public-prefix:") {
+            if block.name.starts_with(super::PUBLIC_PREFIX_BLOCK_PREFIX) {
                 return Err(format!(
                     "admission block name `{}` is reserved — the `public-prefix:` prefix is \
                      used for blocks synthesized from `storage.buckets[*].public_prefixes`. \

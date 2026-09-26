@@ -948,3 +948,142 @@ admission:
         "the form POST to //{bucket} stored an object past the admission block"
     );
 }
+
+async fn trace_anon(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    method: &str,
+    path: &str,
+    query: &str,
+) -> serde_json::Value {
+    admin
+        .post(format!("{endpoint}/_/api/admin/config/trace"))
+        .json(&json!({ "method": method, "path": path, "query": query, "authenticated": false }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Explore #8: an operator `allow-anonymous` block on a bucket without
+/// public prefixes admitted the request, then authorization refused it
+/// (403) while the trace said `allow-anonymous`. Now the decision grants
+/// exactly that read-class request; a write is never granted; the trace
+/// reports the same grant.
+#[tokio::test]
+async fn test_operator_allow_anonymous_grants_the_matched_read() {
+    let server = TestServer::builder()
+        .auth("ANONOPK", "ANONOPS")
+        .bucket("releases")
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let http = server.http();
+    for key in ["builds/app.zip", "builds/app.tar.gz"] {
+        common::put_object(
+            &http,
+            &endpoint,
+            "releases",
+            key,
+            b"payload".to_vec(),
+            "application/octet-stream",
+        )
+        .await;
+    }
+    let admin = admin_http_client(&endpoint).await;
+    apply_admission_yaml(
+        &admin,
+        &endpoint,
+        r#"
+admission:
+  blocks:
+    - name: allow-public-zips
+      match:
+        method: [GET, HEAD]
+        bucket: releases
+        path_glob: "*.zip"
+      action: allow-anonymous
+    - name: allow-list-builds
+      match:
+        method: [GET]
+        bucket: releases
+        path_glob: "builds/"
+      action: allow-anonymous
+    - name: never-a-write
+      match:
+        method: [PUT, DELETE]
+        bucket: releases
+      action: allow-anonymous
+"#,
+    )
+    .await;
+
+    let anon = reqwest::Client::new();
+    // The matched read goes through, as the trace says.
+    let trace = trace_anon(&admin, &endpoint, "GET", "/releases/builds/app.zip", "").await;
+    assert_eq!(trace["admission"]["decision"], "allow-anonymous");
+    assert_eq!(trace["anonymous_grant"]["action"], "read", "{trace}");
+    let r = anon
+        .get(format!("{endpoint}/releases/builds/app.zip"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.bytes().await.unwrap().as_ref(), b"payload");
+    let r = anon
+        .head(format!("{endpoint}/releases/builds/app.zip"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+
+    // A key the block does not match stays private.
+    let r = anon
+        .get(format!("{endpoint}/releases/builds/app.tar.gz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+    // The matched LIST: exactly that prefix.
+    let trace = trace_anon(
+        &admin,
+        &endpoint,
+        "GET",
+        "/releases",
+        "list-type=2&prefix=builds/",
+    )
+    .await;
+    assert_eq!(trace["anonymous_grant"]["action"], "list", "{trace}");
+    let r = anon
+        .get(format!("{endpoint}/releases?list-type=2&prefix=builds/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let body = r.text().await.unwrap();
+    assert!(
+        body.contains("builds/app.zip") && body.contains("builds/app.tar.gz"),
+        "{body}"
+    );
+
+    // A write is never granted, even when an allow-anonymous block matches.
+    let trace = trace_anon(&admin, &endpoint, "PUT", "/releases/builds/evil.zip", "").await;
+    assert_eq!(trace["admission"]["decision"], "allow-anonymous");
+    assert!(trace["anonymous_grant"].is_null(), "{trace}");
+    let r = anon
+        .put(format!("{endpoint}/releases/builds/evil.zip"))
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    let r = anon
+        .delete(format!("{endpoint}/releases/builds/app.zip"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
+}

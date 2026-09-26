@@ -532,6 +532,8 @@ admission:
 
 `continue` is an explicit terminal that falls through to authentication — useful as the final block for diagnostic visibility in trace output.
 
+`allow-anonymous` lets the request that matched the block through without credentials, as the `$anonymous` principal. It grants exactly that one request, and only when the request is a read: a `GET` or `HEAD` of the matched object, or a listing of the matched bucket with the requested `prefix`. It never grants a write. A `PUT`, `POST` or `DELETE` that matches an `allow-anonymous` block continues without credentials and is refused with `403 AccessDenied`. In the example above, an unsigned `GET /releases/builds/app.zip` returns the object, and an unsigned `PUT` of the same key returns `403`. The trace (`POST /_/api/admin/config/trace`) shows the grant in its `anonymous_grant` field (`{"action": "read", ...}`, `{"action": "list", ...}`, `{"action": "public-prefixes", ...}` for a public-access rule, whose grant is the bucket's `public_prefixes`, or `null`), and the live request path uses the same function to decide.
+
 The `source_ip` and `source_ip_list` conditions match the address of the TCP connection. The proxy reads the client address from `X-Forwarded-For` only when the connection comes from a network that `DGP_TRUSTED_PROXY_CIDRS` lists. `DGP_TRUST_PROXY_HEADERS=true` alone is not enough, because without the list the proxy cannot tell a header that a reverse proxy wrote from a header that the client forged.
 
 ### Round-trip

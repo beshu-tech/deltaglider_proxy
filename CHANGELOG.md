@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed — An `allow-anonymous` request rule lets the matched read through
+
+An operator-authored `allow-anonymous` rule (for example, the documented
+`allow-public-zips` rule) marked the request as anonymous, but the
+`$anonymous` principal got its permissions only from the bucket's
+`public_prefixes`. On a bucket without public prefixes, authorization then
+refused the request with `403`, while the trace said `allow-anonymous`.
+Now the rule grants exactly the request that matched, when it is a read: a
+`GET` or `HEAD` of that object, or a listing of that bucket with that
+prefix. Writes are never granted. One function decides the grant for the
+live path and for the trace, which reports it as `anonymous_grant`.
+
 ### Fixed — A one-off job with failed objects no longer shows "succeeded"
 
 A re-encrypt or backfill job records a failed object and goes on to the

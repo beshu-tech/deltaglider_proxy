@@ -47,12 +47,18 @@ use crate::bucket_policy::PublicPrefixSnapshot;
 use serde::{Deserialize, Serialize};
 
 pub mod evaluator;
+pub mod grant;
 pub mod middleware;
 pub mod spec;
 
 pub use evaluator::{evaluate, RequestInfo};
+pub use grant::{anonymous_grant, AnonymousGrant};
 pub use middleware::{admission_middleware, AdmissionAllowAnonymous};
 pub use spec::{AdmissionBlockSpec, AdmissionSpec, MatchSpec};
+
+/// Name prefix of the blocks synthesised from bucket `public_prefixes`
+/// (reserved: operator block names cannot start with it).
+pub const PUBLIC_PREFIX_BLOCK_PREFIX: &str = "public-prefix:";
 
 /// Ordered list of admission blocks plus the snapshot needed to evaluate
 /// public-prefix matches. The order matters — the evaluator returns on the
@@ -272,7 +278,7 @@ impl AdmissionChain {
             .iter()
             .filter(|(_, policy)| !policy.public_prefixes.is_empty())
             .map(|(name, _)| AdmissionBlock {
-                name: format!("public-prefix:{}", name.to_ascii_lowercase()),
+                name: format!("{PUBLIC_PREFIX_BLOCK_PREFIX}{}", name.to_ascii_lowercase()),
                 match_: Match::PublicPrefixGrant {
                     bucket: name.to_ascii_lowercase(),
                 },
