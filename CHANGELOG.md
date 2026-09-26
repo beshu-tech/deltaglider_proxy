@@ -78,6 +78,9 @@ audited as `maintenance_migrate_mirror_delete`.
 - Docs search: a result no longer shows the changelog's "GENERATED FILE"
   comment, and a search for an identifier in backticks (for example
   `replication_target_only`) finds it and shows it in the snippet.
+- An unknown page under `/_/` (for example a mistyped `/_/setings`) shows a
+  404 page in the UI theme with a link home, not a bare "not found". Missing
+  files (assets, source maps) still get the plain 404.
 
 ### Fixed — The Credentials page shows the bootstrap access key and removes it on request
 

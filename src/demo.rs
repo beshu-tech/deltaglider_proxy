@@ -586,6 +586,17 @@ async fn static_or_fallback(Path(path): Path<String>) -> impl IntoResponse {
                 "not found",
             )
                 .into_response(),
+            // A page address a person typed or followed: the themed page,
+            // not a bare "not found" on a white background.
+            Fallback::NotFoundPage => (
+                StatusCode::NOT_FOUND,
+                [(header::CACHE_CONTROL, "no-store")],
+                Html(deltaglider_proxy::api::error_page::themed_error_html(
+                    "Page not found",
+                    &format!("There is no page at /_/{path}."),
+                )),
+            )
+                .into_response(),
         }
     }
 }
@@ -611,8 +622,11 @@ enum Fallback {
     /// The bare `/_/api` or `/_/api/` path (deeper API misses are caught by
     /// the `/_/api/*rest` route for every method): a JSON 404.
     ApiNotFound,
-    /// Anything else (a missing asset, a source map, a typo): plain 404.
+    /// A missing file (an asset, a source map): plain 404.
     NotFound,
+    /// A page address (no file extension, e.g. a typo of a view): the
+    /// themed HTML 404.
+    NotFoundPage,
 }
 
 /// First URL segments the SPA router owns — mirrors `SEGMENT_TO_VIEW` in
@@ -625,10 +639,13 @@ fn fallback_for(path: &str) -> Fallback {
         return Fallback::ApiNotFound;
     }
     let first = path.split('/').next().unwrap_or("");
+    let last = path.rsplit('/').next().unwrap_or("");
     if SPA_ROUTE_SEGMENTS.contains(&first) {
         Fallback::SpaIndex
-    } else {
+    } else if last.contains('.') {
         Fallback::NotFound
+    } else {
+        Fallback::NotFoundPage
     }
 }
 
@@ -729,15 +746,18 @@ mod tests {
     }
 
     #[test]
-    fn everything_else_is_404() {
-        for p in [
-            "assets/index-abc.js.map",
-            "nope",
-            "index.htm",
-            "browsex",
-            "apix/y",
-        ] {
+    fn missing_files_are_a_plain_404() {
+        for p in ["assets/index-abc.js.map", "index.htm", "favicon.png"] {
             assert_eq!(fallback_for(p), Fallback::NotFound, "{p}");
+        }
+    }
+
+    /// Explore finding 19: `/_/nope` answered a bare "not found" in the
+    /// browser's default style, outside the UI theme.
+    #[test]
+    fn unknown_page_addresses_get_the_themed_404() {
+        for p in ["nope", "browsex", "apix/y", "settings/users"] {
+            assert_eq!(fallback_for(p), Fallback::NotFoundPage, "{p}");
         }
     }
 }
