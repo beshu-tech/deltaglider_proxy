@@ -9,8 +9,8 @@ export const darkColors = {
   BORDER: '#1e2d45',
   TEXT_PRIMARY: '#e4e9f2',
   TEXT_SECONDARY: '#8b99b0',
-  TEXT_MUTED: '#8494ab',
-  TEXT_FAINT: '#5e7290',
+  TEXT_MUTED: '#9aa5b5',
+  TEXT_FAINT: '#88a0b8',
   ACCENT_BLUE: '#2dd4bf',     // teal as primary accent
   ACCENT_BLUE_LIGHT: '#5eead4',
   ACCENT_GREEN: '#34d399',
@@ -46,10 +46,10 @@ export const lightColors = {
   BORDER: '#d5dbe5',
   TEXT_PRIMARY: '#0c1629',
   TEXT_SECONDARY: '#475569',
-  TEXT_MUTED: '#64748b',
-  TEXT_FAINT: '#94a3b8',
-  ACCENT_BLUE: '#0d9488',     // darker teal for contrast on light
-  ACCENT_BLUE_LIGHT: '#0f766e',
+  TEXT_MUTED: '#55627a',
+  TEXT_FAINT: '#5f6c80',
+  ACCENT_BLUE: '#0f766e',     // darker teal: 4.5:1 on every light surface
+  ACCENT_BLUE_LIGHT: '#115e59',
   ACCENT_GREEN: '#059669',
   ACCENT_RED: '#e11d48',
   ACCENT_PURPLE: '#7c3aed',

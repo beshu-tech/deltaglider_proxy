@@ -67,7 +67,7 @@ body {
   --docs-code-inline-text: #5eead4;
   --docs-blockquote-bg: rgba(45, 212, 191, 0.04);
   --docs-table-stripe: rgba(11, 17, 32, 0.4);
-  --docs-toc-text: #8494ab;
+  --docs-toc-text: #9aa5b5;
   --docs-toc-active: #2dd4bf;
   --docs-link: #2dd4bf;
   --docs-heading: #e4e9f2;
@@ -93,7 +93,7 @@ body {
   --hljs-keyword: #a78bfa;
   --hljs-string: #34d399;
   --hljs-number: #fbbf24;
-  --hljs-comment: #5e7290;
+  --hljs-comment: #88a0b8;
   --hljs-builtin: #60a5fa;
   --hljs-attr: #fb7185;
   --hljs-title: #2dd4bf;
@@ -106,7 +106,7 @@ body {
   --scrollbar-thumb-hover: rgba(0, 0, 0, 0.2);
   --table-row-hover: rgba(13, 148, 136, 0.05);
   --table-row-selected: rgba(13, 148, 136, 0.10);
-  --focus-ring: #0d9488;
+  --focus-ring: #0f766e;
   --glass-bg: rgba(255, 255, 255, 0.7);
   --glass-border: rgba(0, 0, 0, 0.06);
   --surface-hover: rgba(0, 0, 0, 0.03);
@@ -137,17 +137,17 @@ body {
   --docs-code-inline-text: #0d7367;
   --docs-blockquote-bg: rgba(13, 148, 136, 0.04);
   --docs-table-stripe: rgba(0, 0, 0, 0.02);
-  --docs-toc-text: #64748b;
-  --docs-toc-active: #0d9488;
-  --docs-link: #0d9488;
+  --docs-toc-text: #55627a;
+  --docs-toc-active: #0f766e;
+  --docs-link: #0f766e;
   --docs-heading: #0c1629;
   --hljs-keyword: #7c3aed;
   --hljs-string: #059669;
   --hljs-number: #d97706;
-  --hljs-comment: #94a3b8;
+  --hljs-comment: #5f6c80;
   --hljs-builtin: #2563eb;
   --hljs-attr: #e11d48;
-  --hljs-title: #0d9488;
+  --hljs-title: #0f766e;
   /* Semantic status */
   --accent-success: #389e0d;
   --accent-warning: #d48806;
@@ -614,7 +614,7 @@ body {
 [data-theme="light"] .account-menu-avatar {
   background: rgba(255, 255, 255, 0.65);
   border: 1px solid rgba(13, 148, 136, 0.45);
-  color: #0d9488;
+  color: #0f766e;
 }
 
 .account-menu-name {
@@ -989,4 +989,9 @@ body {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* WCAG AA: AntD's dark preset purple tag text is 3.4:1 on its own tint. */
+[data-theme="dark"] .ant-tag-purple {
+  color: #c4b5fd;
 }
