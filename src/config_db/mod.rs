@@ -2197,6 +2197,27 @@ mod tests {
         assert!(!base2.exists());
     }
 
+    /// Rotation end to end: DB and sync-base under the previous key, the new
+    /// key primary, the previous key a fallback → both move to the new key.
+    #[test]
+    fn rotation_moves_the_db_and_base_to_the_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deltaglider_config.db");
+        let old = "old-config-db-key-0123456789abcdef0123456789";
+        let db = ConfigDb::open_or_create(&path, old).unwrap();
+        db.create_user("alice", "AKALICE1", "s", true, &[]).unwrap();
+        drop(db);
+        let base = crate::config_db_sync::sync_base_path(&path);
+        std::fs::copy(&path, &base).unwrap();
+        let keys =
+            ConfigDbKeys::primary_only(NEW_KEY).with_fallback(FallbackKind::PreviousKey, old);
+        let (db, how) = ConfigDb::open_with_keys(&path, &keys).unwrap();
+        assert_eq!(how, OpenedWith::Migrated(FallbackKind::PreviousKey));
+        assert_eq!(db.load_users().unwrap()[0].name, "alice");
+        assert!(probe_key(&path, NEW_KEY).unwrap());
+        assert!(probe_key(&base, NEW_KEY).unwrap());
+    }
+
     #[test]
     fn a_leftover_rekey_copy_is_replaced() {
         let dir = tempfile::tempdir().unwrap();

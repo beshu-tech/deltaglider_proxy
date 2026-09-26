@@ -59,6 +59,13 @@ Facts about the key:
 - **An empty or unreadable key file stops the start.** The proxy never replaces an existing key file, because a new key would make the database unreadable.
 - **Upgrade from a release before the config DB key**: those releases encrypted the database with the bootstrap password hash. On the first start, the proxy opens the database with that hash and re-encrypts it with the new key. The re-encryption works on a copy, and the copy replaces the original only after it opens with the new key. If a step fails, the original database stays unchanged and the next start tries again.
 - **Move from the key file to `DGP_CONFIG_DB_KEY`**: set the variable and restart. The proxy opens the database with the key file and re-encrypts it with the variable's value.
+- **Rotate the key**: set `DGP_CONFIG_DB_KEY` to the new key and `DGP_CONFIG_DB_KEY_PREVIOUS` to the old one, then restart. The proxy opens the database with the previous key and re-encrypts it, and the sync merge base next to it, with the new key. The steps for one instance:
+  1. Generate a new key, for example with `openssl rand -hex 32`.
+  2. Set `DGP_CONFIG_DB_KEY_PREVIOUS` to the current key: the old value of `DGP_CONFIG_DB_KEY`, or the content of `deltaglider_config.db.key` when the variable was unset.
+  3. Set `DGP_CONFIG_DB_KEY` to the new key, and restart.
+  4. Check the log line `re-encrypted with DGP_CONFIG_DB_KEY`. Then remove `DGP_CONFIG_DB_KEY_PREVIOUS`, restart, and store the new key with your database backups.
+
+  For several instances with a sync bucket, see [How to run multiple instances](../how-to/run-multiple-instances.md#rotate-the-config-db-key).
 - **A key that opens nothing**: when no key opens the database, the proxy keeps the database as `deltaglider_config.db.bak`, starts with an empty database, and locks the S3 API (`503`) until you restore the right key and restart. The admin GUI has a recovery wizard that tells you whether a candidate key opens the preserved database.
 - **The key is never printed** and never leaves the node: the synced copy in `config_sync_bucket` is encrypted with it.
 

@@ -440,6 +440,8 @@ The SQLCipher key of the IAM config DB (`deltaglider_config.db`). When the varia
 | **YAML** | none (env only, so that the key never lands in a config file or an export) |
 | **Default** | Key file next to the DB, generated on first start |
 
+To rotate the key, set `DGP_CONFIG_DB_KEY_PREVIOUS` to the old key and `DGP_CONFIG_DB_KEY` to the new one; see [Config database key](authentication.md#config-database-key).
+
 ### `DGP_BOOTSTRAP_PASSWORD`
 
 Plaintext bootstrap password for the `config apply` / `admission trace` admin CLI commands (they authenticate via this env var; argv is avoided because it leaks via `ps`). Not read by the server itself.
@@ -1086,6 +1088,7 @@ Tuning knobs for the large-object streaming multipart copy path (replication + l
 | `DGP_SECRET_ACCESS_KEY` | — | Proxy SigV4 secret key |
 | `DGP_BOOTSTRAP_PASSWORD_HASH` | auto | Bcrypt hash (legacy alias: `DGP_ADMIN_PASSWORD_HASH`) |
 | `DGP_CONFIG_DB_KEY` | key file | Encryption key of the IAM config DB, at least 32 characters; required and identical on every instance when `config_sync_bucket` is set |
+| `DGP_CONFIG_DB_KEY_PREVIOUS` | — | The previous config DB key during a key rotation; a DB or synced copy that opens only with it is re-encrypted with `DGP_CONFIG_DB_KEY`. Remove it after the rotation |
 | `DGP_BOOTSTRAP_PASSWORD` | — | Plaintext password for admin CLI only |
 
 ### Security

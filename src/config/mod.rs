@@ -297,6 +297,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         example: "<openssl rand -hex 32>",
         category: "Authentication",
     },
+    EnvVarEntry {
+        name: "DGP_CONFIG_DB_KEY_PREVIOUS",
+        description: "Previous DGP_CONFIG_DB_KEY during a key rotation: a config DB (or synced copy) that opens only with it is re-encrypted with DGP_CONFIG_DB_KEY at boot or sync. Remove it after the rotation",
+        example: "<the old DGP_CONFIG_DB_KEY>",
+        category: "Authentication",
+    },
     // ── TLS ─────────────────────────────────────────────────
     EnvVarEntry {
         name: "DGP_TLS_ENABLED",

@@ -30,6 +30,17 @@ DGP_CONFIG_DB_KEY=<that value> # on every instance
 
 An instance with a sync bucket but without `DGP_CONFIG_DB_KEY` refuses to start, because a per-node key file cannot open the other nodes' uploads. An instance whose key differs refuses to merge the synced DB and logs an error that names `DGP_CONFIG_DB_KEY`; it never overwrites the synced copy. Also share the bootstrap password hash (`DGP_BOOTSTRAP_PASSWORD_HASH`) if you want the same admin password on every instance; it no longer encrypts anything.
 
+### Rotate the config DB key
+
+The synced database, and the local database of every instance, move to the new key during one rolling restart:
+
+1. Generate a new key (`openssl rand -hex 32`).
+2. On every instance, set `DGP_CONFIG_DB_KEY_PREVIOUS` to the current key and `DGP_CONFIG_DB_KEY` to the new key.
+3. Restart the instances one at a time. Each instance re-encrypts its local database with the new key. Because its database changed key, it also uploads its database to the sync bucket at start, so the synced copy moves to the new key too. While the rollout runs, the instances that already run with the new key still read a synced copy under the previous key.
+4. When every instance runs with the new key, remove `DGP_CONFIG_DB_KEY_PREVIOUS` everywhere and restart again. An instance that later finds a synced copy under the old key logs an error that names `DGP_CONFIG_DB_KEY` and does not merge it.
+
+Instances that have not restarted yet cannot read uploads under the new key, so avoid IAM changes during step 3.
+
 **Upgrading a fleet from a release before the config DB key.** Those releases encrypted the DB with the bootstrap password hash. Set the same new `DGP_CONFIG_DB_KEY` on every instance and restart all of them. On the first start, each instance re-encrypts its local DB with the new key, and it still accepts a synced DB under the old hash. Until the last instance runs the new release, the old instances cannot read the uploads of the new ones, so avoid IAM changes during the rollout.
 
 ## 3. Decide where operators edit IAM

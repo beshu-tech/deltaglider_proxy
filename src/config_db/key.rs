@@ -11,7 +11,8 @@
 //!    first boot.
 //!
 //! Earlier releases keyed the DB with the bootstrap password hash. That hash,
-//! and a key file that an env key replaces, stay as FALLBACK keys: a DB that
+//! `DGP_CONFIG_DB_KEY_PREVIOUS` (rotation) and a key file that an env key
+//! replaces stay as FALLBACK keys: a DB that
 //! opens only with a fallback is re-encrypted with the primary key on boot
 //! (see [`super::ConfigDb::open_with_keys`]).
 
@@ -20,6 +21,11 @@ use zeroize::Zeroizing;
 
 /// The env var that sets the config DB key.
 pub const CONFIG_DB_KEY_ENV: &str = "DGP_CONFIG_DB_KEY";
+
+/// The key before a rotation: a DB (or synced copy) that opens only with it
+/// is re-encrypted with the current key. Remove it once every node and the
+/// synced copy use the new key.
+pub const PREVIOUS_CONFIG_DB_KEY_ENV: &str = "DGP_CONFIG_DB_KEY_PREVIOUS";
 
 /// Minimum length of a `DGP_CONFIG_DB_KEY` value. `openssl rand -hex 32`
 /// gives 64 characters.
@@ -48,6 +54,8 @@ impl DbKeySource {
 /// Why a fallback key is on the list (for log lines; never the key itself).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackKind {
+    /// `DGP_CONFIG_DB_KEY_PREVIOUS`, the key before a rotation.
+    PreviousKey,
     /// The key file, when `DGP_CONFIG_DB_KEY` replaces it.
     KeyFile,
     /// The bootstrap password hash (the key of earlier releases).
@@ -57,6 +65,7 @@ pub enum FallbackKind {
 impl FallbackKind {
     pub fn describe(self) -> &'static str {
         match self {
+            FallbackKind::PreviousKey => "DGP_CONFIG_DB_KEY_PREVIOUS",
             FallbackKind::KeyFile => "the key file",
             FallbackKind::LegacyBootstrapHash => "the bootstrap password hash (legacy key)",
         }
@@ -175,6 +184,9 @@ pub fn resolve_config_db_keys(
 ) -> Result<ConfigDbKeys, String> {
     let key_file = key_file_path(db_path);
     let env_key = classify_env_key(env(CONFIG_DB_KEY_ENV).as_deref())?;
+    let previous = env(PREVIOUS_CONFIG_DB_KEY_ENV)
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
     let mut keys = match env_key {
         Some(k) => {
             let mut keys = ConfigDbKeys {
@@ -200,6 +212,15 @@ pub fn resolve_config_db_keys(
             fallbacks: Vec::new(),
         },
     };
+    // The previous key goes first: it is the most likely one after a rotation.
+    if let Some(p) = previous {
+        let dup = p == keys.primary.expose();
+        if !dup {
+            keys.fallbacks.retain(|(_, k)| k.expose() != p);
+            keys.fallbacks
+                .insert(0, (FallbackKind::PreviousKey, DbSecret::new(p)));
+        }
+    }
     if let Some(h) = legacy_bootstrap_hash {
         keys = keys.with_fallback(FallbackKind::LegacyBootstrapHash, h);
     }
@@ -361,6 +382,33 @@ mod tests {
                 (FallbackKind::LegacyBootstrapHash, "$2b$hash".to_string()),
             ]
         );
+    }
+
+    /// Rotation: DGP_CONFIG_DB_KEY_PREVIOUS is the first fallback, so a DB
+    /// under the previous key migrates to the new one.
+    #[test]
+    fn previous_env_key_is_the_first_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("deltaglider_config.db");
+        let new_key = "n".repeat(40);
+        let old_key = "o".repeat(40);
+        let keys = resolve_config_db_keys(&db, Some("$2b$hash"), |n| match n {
+            CONFIG_DB_KEY_ENV => Some(new_key.clone()),
+            PREVIOUS_CONFIG_DB_KEY_ENV => Some(old_key.clone()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(keys.primary.expose(), new_key);
+        assert_eq!(keys.fallbacks[0].0, FallbackKind::PreviousKey);
+        assert_eq!(keys.fallbacks[0].1.expose(), old_key);
+        assert_eq!(keys.fallbacks[1].0, FallbackKind::LegacyBootstrapHash);
+        // Blank = unset; equal to the primary = no fallback.
+        let keys = resolve_config_db_keys(&db, None, |n| match n {
+            CONFIG_DB_KEY_ENV | PREVIOUS_CONFIG_DB_KEY_ENV => Some(new_key.clone()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(keys.fallbacks.is_empty());
     }
 
     #[test]

@@ -1082,7 +1082,25 @@ fn init_config_db_attempt(
 ) {
     let db_file = config_db_path();
     match deltaglider_proxy::config_db::ConfigDb::open_with_keys(&db_file, keys) {
-        Ok((db, _)) => {
+        Ok((db, opened)) => {
+            // A DB that moved to a new key (rotation, key-file → env, legacy
+            // hash): the synced copy is still under the old key. Upload once
+            // at the sync start, while the old key is still a fallback, so
+            // every node can later drop DGP_CONFIG_DB_KEY_PREVIOUS.
+            let has_sync = config
+                .config_sync_bucket
+                .as_deref()
+                .is_some_and(|b| !b.is_empty());
+            if has_sync
+                && matches!(
+                    opened,
+                    deltaglider_proxy::config_db::OpenedWith::Migrated(_)
+                )
+            {
+                if let Err(e) = deltaglider_proxy::config_db_sync::park_upload(&db_file) {
+                    warn!("Could not queue the re-encrypted config DB for upload: {e}");
+                }
+            }
             // Classify a lingering .db.bak BEFORE any boot-time mutation: a
             // node with an unresolved mismatch incident must stay locked.
             let bak_path = db_file.with_extension("db.bak");

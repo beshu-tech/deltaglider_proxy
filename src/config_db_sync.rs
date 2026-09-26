@@ -815,6 +815,17 @@ async fn write_sync_base(local_path: &std::path::Path, data: &[u8]) {
     }
 }
 
+/// Park an upload for the next boot's sync start (before any
+/// `ConfigDbSync` exists). The boot calls it after it re-encrypted the local
+/// DB with a new key: the synced copy is still under the old key, and it
+/// must move to the new one while the old key is still accepted as a
+/// fallback. No base ETag: the flush 412s, merges the remote copy, and
+/// uploads on top of it.
+pub fn park_upload(local_path: &std::path::Path) -> std::io::Result<()> {
+    let body = serde_json::to_vec(&PendingUpload { base_etag: None }).unwrap_or_default();
+    std::fs::write(pending_marker_path(local_path), body)
+}
+
 fn pending_marker_path(local_path: &std::path::Path) -> PathBuf {
     local_path.with_extension("db.sync-pending")
 }
@@ -1118,6 +1129,24 @@ mod tests {
     /// the change was based on: otherwise the next boot downloads the remote
     /// copy over the local change, and the change (already answered 200) is
     /// lost on every node.
+    #[tokio::test]
+    async fn a_boot_park_is_flushed_by_the_next_sync_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("deltaglider_config.db");
+        park_upload(&db_path).unwrap();
+        let sync = ConfigDbSync::new(
+            &dead_s3_backend(),
+            "sync".into(),
+            "k.db".into(),
+            db_path.clone(),
+            crate::config_db::ConfigDbKeys::primary_only("pw"),
+        )
+        .await
+        .unwrap();
+        assert!(sync.has_pending_upload());
+        assert_eq!(sync.last_etag.read().await.as_deref(), None);
+    }
+
     #[tokio::test]
     async fn parked_upload_survives_a_restart_with_its_base_etag() {
         let dir = tempfile::tempdir().unwrap();

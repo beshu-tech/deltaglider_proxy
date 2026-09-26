@@ -265,3 +265,41 @@ async fn wrong_db_key_boot_stays_locked_and_correct_key_promotes_backup() {
         .await
         .expect("boot 4: S3 PUT must succeed after recovery");
 }
+
+/// Key rotation: the new key in DGP_CONFIG_DB_KEY, the old one in
+/// DGP_CONFIG_DB_KEY_PREVIOUS. The DB migrates; after that the old key is
+/// no longer needed.
+#[tokio::test]
+async fn config_db_key_rotation_with_the_previous_key() {
+    let mut server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_CONFIG_DB_KEY", KEY_GOOD)
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    create_alice(&endpoint).await;
+
+    server
+        .respawn_with_env(&[
+            ("DGP_CONFIG_DB_KEY", KEY_WRONG),
+            ("DGP_CONFIG_DB_KEY_PREVIOUS", KEY_GOOD),
+        ])
+        .await;
+    let who = whoami(&endpoint).await;
+    assert_ne!(
+        who["config_db_mismatch"], true,
+        "rotation locked the DB: {who}"
+    );
+
+    // The previous key is gone; the DB opens with the new key alone.
+    server
+        .respawn_with_env(&[("DGP_CONFIG_DB_KEY", KEY_WRONG)])
+        .await;
+    let who = whoami(&endpoint).await;
+    assert_ne!(
+        who["config_db_mismatch"], true,
+        "the DB did not move to the new key: {who}"
+    );
+    let names = user_names(&admin_http_client(&endpoint).await, &endpoint).await;
+    assert!(names.iter().any(|n| n == "alice"), "got {names:?}");
+}

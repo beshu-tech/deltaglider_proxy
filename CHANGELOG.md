@@ -138,6 +138,12 @@ Upgrade steps:
 - **Helm:** set `auth.configDbKey` (or `DGP_CONFIG_DB_KEY` in
   `auth.existingSecret`) before you raise `replicaCount` with config sync.
 
+To rotate the key later, set `DGP_CONFIG_DB_KEY_PREVIOUS` to the old key and
+`DGP_CONFIG_DB_KEY` to the new one, and restart. A database, a sync merge
+base, or a synced copy that opens only with the previous key is re-encrypted
+with the new key; an instance whose database changed key uploads it once at
+start, so the synced copy moves to the new key too.
+
 The recovery wizard of a locked database now accepts a config DB key, or,
 for a database from an older release, the bootstrap password hash.
 
