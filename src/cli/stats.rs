@@ -666,18 +666,14 @@ mod tests {
     use chrono::Utc;
 
     fn meta(file_size: u64, info: StorageInfo) -> FileMetadata {
-        FileMetadata {
-            tool: "deltaglider/test".into(),
-            original_name: "x.bin".into(),
-            file_sha256: "0".into(),
-            md5: "0".into(),
+        FileMetadata::fallback(
+            "x.bin".into(),
             file_size,
-            multipart_etag: None,
-            created_at: Utc::now(),
-            content_type: None,
-            user_metadata: Default::default(),
-            storage_info: info,
-        }
+            "0".into(),
+            Utc::now(),
+            None,
+            info,
+        )
     }
 
     #[test]

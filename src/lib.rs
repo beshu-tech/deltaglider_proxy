@@ -228,6 +228,126 @@ mod source_guards {
         out
     }
 
+    /// Is `FileMetadata {` at `idx` a struct literal (not a type position
+    /// such as `-> FileMetadata {`, `impl FileMetadata {`)?
+    fn is_file_metadata_literal(line: &str, idx: usize) -> bool {
+        let before = line[..idx]
+            .trim_end_matches(|c: char| c.is_alphanumeric() || c == '_' || c == ':')
+            .trim_end();
+        !["->", "impl", "struct", "for", "enum"]
+            .iter()
+            .any(|t| before.ends_with(t))
+    }
+
+    /// Test fixtures come from the real write path or a recorded fixture,
+    /// never from a hand-built shape production does not emit: such
+    /// fixtures kept C1 (open-access only), D14 (schema gate) and D17
+    /// (backfill) green. So test code (src test modules and tests/) holds
+    /// no `FileMetadata { .. }` struct literal (use a `FileMetadata::new_*`
+    /// constructor or the engine), and integration tests do not hand-write
+    /// DG metadata onto stored objects (S3 user metadata, headers, xattrs).
+    ///
+    /// Allowed: a test whose subject IS a foreign or corrupt shape.
+    #[test]
+    fn test_fixtures_come_from_the_write_path() {
+        const ALLOWED: [(&str, &str); 3] = [
+            (
+                "tests/replication_test.rs",
+                "plants a foreign writer's partial dg-* metadata on purpose",
+            ),
+            (
+                "tests/cli_s3_purge_test.rs",
+                "dg-expires-at is written only by the Python toolchain",
+            ),
+            (
+                "tests/metadata_validation_test.rs",
+                "writes corrupt xattrs to test graceful degradation",
+            ),
+        ];
+        // Built at runtime so this file's own text is no hit.
+        let hand_written_meta = [
+            [".metadata(\"", "dg-"].concat(),
+            ["insert(\"", "dg-"].concat(),
+            [".header(\"x-amz-meta-", "dg-"].concat(),
+            ["insert(\"x-amz-meta-", "dg-"].concat(),
+            ["xattr::", "set("].concat(),
+        ];
+        let literal = ["FileMetadata", " {"].concat();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut src = Vec::new();
+        rust_files(&root.join("src"), &mut src);
+        let test_files = out_of_line_test_modules(&src);
+        let mut integration = Vec::new();
+        rust_files(&root.join("tests"), &mut integration);
+        assert!(!integration.is_empty(), "scan found tests/");
+        let mut offenders = Vec::new();
+        let mut allowed_hits = std::collections::BTreeSet::new();
+        for file in src.iter().chain(&integration) {
+            let rel = file
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel == "src/lib.rs" {
+                continue;
+            }
+            let is_integration = rel.starts_with("tests/");
+            let text = std::fs::read_to_string(file).unwrap();
+            let lines: Vec<(usize, &str)> = if is_integration || test_files.contains(file) {
+                text.lines().enumerate().map(|(i, l)| (i + 1, l)).collect()
+            } else {
+                test_module_lines(&text)
+            };
+            for (n, line) in lines {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let struct_literal = line
+                    .match_indices(literal.as_str())
+                    .any(|(i, _)| is_file_metadata_literal(line, i));
+                let meta_write =
+                    is_integration && hand_written_meta.iter().any(|x| line.contains(x.as_str()));
+                if !(struct_literal || meta_write) {
+                    continue;
+                }
+                if ALLOWED.iter().any(|(f, _)| *f == rel) {
+                    allowed_hits.insert(rel.clone());
+                } else {
+                    offenders.push(format!("{rel}:{n}: {}", line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a test builds a fixture shape by hand; store it through the proxy \
+             (or use a FileMetadata constructor), or add the file to ALLOWED \
+             with a reason:\n{}",
+            offenders.join("\n")
+        );
+        for (f, why) in ALLOWED {
+            assert!(
+                allowed_hits.contains(f),
+                "{f} ({why}) no longer hand-builds metadata: drop it from ALLOWED"
+            );
+        }
+    }
+
+    #[test]
+    fn file_metadata_literal_detection() {
+        let lit = |l: &str| {
+            let i = l.find("FileMetadata {").unwrap();
+            is_file_metadata_literal(l, i)
+        };
+        assert!(lit("        FileMetadata {"));
+        assert!(lit("    let m = crate::types::FileMetadata {"));
+        assert!(lit("        Ok(FileMetadata {"));
+        assert!(!lit("    fn meta() -> FileMetadata {"));
+        assert!(!lit("    fn meta() -> crate::types::FileMetadata {"));
+        assert!(!lit("impl FileMetadata {"));
+        assert!(!lit("pub struct FileMetadata {"));
+        assert!(!lit("impl Default for FileMetadata {"));
+    }
+
     /// Unit tests do not read the process environment. A test that reads it
     /// passes or fails (or skips itself) by what the runner exports: the
     /// nightly job used to set `DGP_BACKEND_ALLOW_LOCAL` for the whole job,
