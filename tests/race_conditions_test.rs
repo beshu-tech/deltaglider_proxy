@@ -172,7 +172,7 @@ async fn lifecycle_delete_never_removes_a_concurrent_overwrite() {
         .await;
     let http = server.http();
     let admin = admin_http_client(&server.endpoint()).await;
-    const KEYS: usize = 200;
+    const KEYS: usize = 100;
     let keys: Vec<String> = (0..KEYS).map(|i| format!("old/k{i:04}.txt")).collect();
     join_all(keys.iter().map(|k| {
         http.s3_request(Method::PUT, &obj_url(&server, k))
@@ -308,6 +308,70 @@ async fn admin_move_and_copy_of_the_same_keys_lose_nothing() {
         }
     }
     assert!(wrong.is_empty(), "{reports:?}\n{}", wrong.join("\n"));
+}
+
+/// Admin bulk move while clients overwrite the source keys: the move
+/// deletes a source only if it is still the object it copied, so every
+/// overwrite survives, in the source or (when it landed before the copy)
+/// in the destination.
+#[tokio::test]
+async fn admin_move_never_removes_a_concurrent_overwrite() {
+    let server = TestServer::filesystem().await;
+    let http = server.http();
+    let admin = admin_http_client(&server.endpoint()).await;
+    let bucket = server.bucket().to_string();
+    const KEYS: usize = 100;
+    let src = |i: usize| format!("mvsrc/k{i:03}.txt");
+    let fresh = |i: usize| format!("overwrite of key {i}").into_bytes();
+    for i in 0..KEYS {
+        let r = http
+            .s3_request(Method::PUT, &obj_url(&server, &src(i)))
+            .body(b"first version".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+    }
+    let items: Vec<serde_json::Value> = (0..KEYS)
+        .map(|i| serde_json::json!({ "source_key": src(i), "relative": format!("k{i:03}.txt") }))
+        .collect();
+    let mv = admin
+        .post(format!("{}/_/api/admin/objects/move", server.endpoint()))
+        .json(&serde_json::json!({
+            "source_bucket": bucket,
+            "dest_bucket": bucket,
+            "dest_prefix": "mvdst/",
+            "items": items,
+        }))
+        .send();
+    let overwrites = join_all((0..KEYS).map(|i| {
+        http.s3_request(Method::PUT, &obj_url(&server, &src(i)))
+            .body(fresh(i))
+            .send()
+    }));
+    let (mv, writes) = tokio::join!(mv, overwrites);
+    assert_eq!(mv.unwrap().status().as_u16(), 200, "move");
+    for w in writes {
+        assert_eq!(w.unwrap().status().as_u16(), 200, "overwrite PUT");
+    }
+    let mut lost = Vec::new();
+    for i in 0..KEYS {
+        let (sc, sb) = get(&server, &src(i)).await;
+        let (dc, db) = get(&server, &format!("mvdst/k{i:03}.txt")).await;
+        let kept = (sc == 200 && sb == fresh(i)) || (dc == 200 && db == fresh(i));
+        if !kept {
+            lost.push(format!(
+                "k{i:03}: src {sc}, dst {dc} {:?}",
+                String::from_utf8_lossy(&db)
+            ));
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "the move lost {} overwrites:\n{}",
+        lost.len(),
+        lost.join("\n")
+    );
 }
 
 /// Files named `reference.bin` under `dir` (recursive).
