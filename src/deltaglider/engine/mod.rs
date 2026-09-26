@@ -613,6 +613,47 @@ impl ReferenceLockGuard {
         let op = crate::storage::RefWrite::Delete;
         self.write_reference(storage, bucket, deltaspace, op).await
     }
+
+    /// A delta is valid only against the baseline it was encoded from. The
+    /// delta write cannot be conditional on reference.bin (another object),
+    /// so under a cross-instance hold re-read the reference fence AFTER the
+    /// write: a peer that replaced the baseline meanwhile makes our delta
+    /// undecodable, so remove it and fail retryably instead of a 200.
+    pub(crate) async fn put_delta<B: StorageBackend + ?Sized>(
+        &self,
+        storage: &B,
+        bucket: &str,
+        deltaspace: &str,
+        filename: &str,
+        data: &[u8],
+        meta: &FileMetadata,
+    ) -> Result<(), EngineError> {
+        self.ensure_held().await?;
+        storage
+            .put_delta(bucket, deltaspace, filename, data, meta)
+            .await?;
+        let Some(h) = &self.hold else {
+            return Ok(());
+        };
+        let expected = h.fence.lock().clone();
+        if expected == crate::storage::RefFence::Unfenced {
+            return Ok(());
+        }
+        let verdict = match storage.reference_fence(bucket, deltaspace).await {
+            Ok(now) if now == expected => return Ok(()),
+            Ok(_) => crate::storage::reference_fence_lost(bucket, deltaspace),
+            // Baseline unknown: the delta may be undecodable, so the same
+            // answer as a lost fence (the client retries under a fresh lock).
+            Err(e) => e,
+        };
+        if let Err(e) = storage.delete_delta(bucket, deltaspace, filename).await {
+            tracing::warn!(
+                "delta {bucket}/{deltaspace}/{filename} is not fenced to its baseline; \
+                 its removal failed: {e}"
+            );
+        }
+        Err(verdict.into())
+    }
 }
 
 impl Drop for ReferenceLockGuard {
@@ -1595,12 +1636,12 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<(), StorageError> {
         // Inside `with_dest_prefix_lock`: the delta is only valid against the
         // reference the held cross-instance lock protects.
-        if let Ok(held) = HELD_REFERENCE_LOCK.try_with(Arc::clone) {
-            held.ensure_held().await.map_err(engine_to_storage)?;
-        }
-        self.storage
-            .put_delta(bucket, prefix, filename, data, metadata)
-            .await?;
+        let held = HELD_REFERENCE_LOCK
+            .try_with(Arc::clone)
+            .unwrap_or_else(|_| Arc::new(ReferenceLockGuard::inert()));
+        held.put_delta(&*self.storage, bucket, prefix, filename, data, metadata)
+            .await
+            .map_err(engine_to_storage)?;
         // Mirror every engine store path: a delta write supersedes any stale
         // PASSTHROUGH variant of the same key — leaving it behind lets a
         // later delta delete resurrect old content. Cache must drop too.
@@ -3630,6 +3671,8 @@ mod reference_lock_hold_tests {
             "put_reference_from_file",
             "put_reference_metadata",
             "delete_reference",
+            // A delta depends on the baseline: fenced like a reference write.
+            "put_delta",
         ]
         .iter()
         .map(|m| format!("storage.{m}("))
@@ -3675,7 +3718,7 @@ mod reference_lock_hold_tests {
         }
         assert!(
             offenders.is_empty(),
-            "write reference.bin through ReferenceLockGuard: {offenders:?}"
+            "write reference.bin and deltas through ReferenceLockGuard: {offenders:?}"
         );
     }
     // ── review second pass (failing tests for findings) ──────────────────
@@ -4168,7 +4211,6 @@ mod reference_lock_hold_tests {
     /// against the old baseline) still lands and the PUT answers 200: the
     /// object is unreadable afterwards.
     #[tokio::test]
-    #[ignore = "review3: pending fix"]
     async fn review3_a_delta_against_a_replaced_baseline_is_not_acknowledged() {
         let lock = ScriptedLock::new(true, Duration::from_secs(60));
         let (_tmp, engine) = fencing_engine(lock).await;
@@ -4186,6 +4228,18 @@ mod reference_lock_hold_tests {
         let stored = engine
             .store("releases", "v1/b.zip", &b, None, HashMap::new())
             .await;
+        assert!(
+            matches!(stored, Err(EngineError::Storage(StorageError::Throttled(_)))),
+            "a delta against a replaced baseline must fail retryably, got {stored:?}"
+        );
+        assert!(
+            engine
+                .storage
+                .get_delta("releases", "v1", "b.zip")
+                .await
+                .is_err(),
+            "the unfenced delta must not stay behind"
+        );
         if stored.is_ok() {
             // Another node (no in-process reference cache) reads it back.
             let peer = DeltaGliderEngine::new_with_backend(

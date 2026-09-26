@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed — A delta written against a replaced baseline is no longer acknowledged
+
+With config sync on, the fence of the cross-instance reference lock covered
+only the writes of `reference.bin`. A PUT that encodes a delta against an
+existing baseline does not write `reference.bin`, so the fence did not check
+it. When the lock of that PUT lapsed and another instance replaced the
+baseline in the meantime, the delta still landed and the PUT answered 200.
+The object could not be read afterwards, because its delta did not match the
+new baseline. After it writes a delta, the proxy now reads the fence of
+`reference.bin` again. If the baseline changed, the proxy deletes the delta
+and fails the request with `503 SlowDown`, which S3 clients retry. Every
+delta write goes through this check, including replication and the legacy
+reference migration.
+
 ### Fixed — an SDK retry of a PUT or DELETE inside its signing second is served
 
 When a PUT succeeded but a load balancer lost its response, the SDK retried

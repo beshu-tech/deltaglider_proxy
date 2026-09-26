@@ -773,9 +773,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         metadata.multipart_etag = multipart_etag;
         let stored_size = delta.len() as u64;
         // The delta is only valid against the reference we locked.
-        xnode.ensure_held().await?;
-        self.storage
-            .put_delta(bucket, deltaspace_id, &obj_key.filename, &delta, &metadata)
+        xnode
+            .put_delta(
+                &*self.storage,
+                bucket,
+                deltaspace_id,
+                &obj_key.filename,
+                &delta,
+                &metadata,
+            )
             .await?;
         // Clean up any prior passthrough variant at this key.
         if let Err(e) = self
@@ -887,9 +893,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // Write delta first, then clean up old passthrough variant. The delta
         // is only valid against the reference we locked.
-        xnode.ensure_held().await?;
-        self.storage
+        xnode
             .put_delta(
+                &*self.storage,
                 ctx.bucket,
                 ctx.deltaspace_id,
                 &ctx.obj_key.filename,
@@ -1726,8 +1732,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // Write the delta BEFORE deleting the passthrough. If put_delta fails,
         // the passthrough still exists and the object remains accessible.
-        self.storage
-            .put_delta(bucket, deltaspace_id, filename, &delta, &delta_meta)
+        xnode
+            .put_delta(
+                &*self.storage,
+                bucket,
+                deltaspace_id,
+                filename,
+                &delta,
+                &delta_meta,
+            )
             .await?;
         self.delete_passthrough_idempotent(bucket, deltaspace_id, filename)
             .await?;
