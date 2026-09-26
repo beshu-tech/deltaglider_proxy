@@ -426,15 +426,12 @@ async fn cold_list_of_an_encrypted_backend_reports_plaintext_facts() {
     let facts = |raw: aws_sdk_s3::Client| async move {
         raw.list_objects_v2()
             .bucket(common::MINIO_BUCKET)
-            .prefix(".dg/facts/")
+            .prefix(format!(".dg/facts/{prefix}/"))
             .send()
             .await
             .unwrap()
             .contents()
-            .iter()
-            .filter_map(|o| o.key().map(str::to_string))
-            .filter(|k| k.contains(prefix.as_str()))
-            .count()
+            .len()
     };
     assert_eq!(facts(raw.clone()).await, 1);
     reader_client
@@ -444,7 +441,15 @@ async fn cold_list_of_an_encrypted_backend_reports_plaintext_facts() {
         .send()
         .await
         .unwrap();
-    assert_eq!(facts(raw).await, 0, "DELETE drops the listing facts");
+    // The cleanup runs in the background, after a short batching delay.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while facts(raw.clone()).await > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "DELETE drops the listing facts"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Review C3, lazy backfill: an object stored without listing facts (before
@@ -469,14 +474,13 @@ async fn a_head_backfills_missing_listing_facts() {
     let facts_keys = |raw: aws_sdk_s3::Client, prefix: String| async move {
         raw.list_objects_v2()
             .bucket(MINIO_BUCKET)
-            .prefix(".dg/facts/")
+            .prefix(format!(".dg/facts/{prefix}/v1.zip"))
             .send()
             .await
             .unwrap()
             .contents()
             .iter()
             .filter_map(|o| o.key().map(str::to_string))
-            .filter(|k| k.contains(&format!("{prefix}/v1.zip")))
             .collect::<Vec<_>>()
     };
     for k in facts_keys(raw.clone(), prefix.clone()).await {
