@@ -27,7 +27,7 @@ This guide shows you how to change a backend's encryption key or mode without lo
 
    Apply (hot-reload or restart). New writes now use the new key; reads check the new key id first and fall back to the legacy slot. The admin panel shows an info banner while a shim is active.
 
-3. Run a **Re-encrypt job** to rewrite the historical objects under the new key: **Settings → Jobs → + New job → Re-encrypt buckets…**, or:
+3. Run a **Re-encrypt job** to rewrite the historical objects under the new key (a rewritten object keeps its original creation time, so its `LastModified` does not change): **Settings → Jobs → + New job → Re-encrypt buckets…**, or:
 
    ```bash
    curl -b cookies -X POST https://s3.acme.example/_/api/admin/jobs/reencrypt \

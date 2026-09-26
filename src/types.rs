@@ -213,6 +213,21 @@ fn validate_key_path(value: &str, allow_slashes: bool) -> Result<(), KeyValidati
     Ok(())
 }
 
+tokio::task_local! {
+    /// See [`with_created_at`].
+    static PINNED_CREATED_AT: DateTime<Utc>;
+}
+
+/// Run `fut` with every new object it stores stamped `at` as its created-at
+/// (`dg-created-at`, served as LastModified), instead of the store time. A
+/// job that moves or rewrites an existing object (bucket migration,
+/// re-encryption) keeps the object's time this way, so listings, lifecycle
+/// ages and newer-wins stay correct. Only object (delta / passthrough)
+/// metadata is pinned; an internal `reference.bin` gets the real time.
+pub async fn with_created_at<F: std::future::Future>(at: DateTime<Utc>, fut: F) -> F::Output {
+    PINNED_CREATED_AT.scope(at, fut).await
+}
+
 /// Per-file metadata following DeltaGlider schema
 /// Stored as `user.dg.metadata` extended attributes on data file inodes
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -312,6 +327,14 @@ impl StorageInfo {
 }
 
 impl FileMetadata {
+    /// The created-at a NEW object's metadata gets: now, or the time pinned
+    /// by [`with_created_at`] for the running task.
+    fn object_created_at() -> DateTime<Utc> {
+        PINNED_CREATED_AT
+            .try_with(|at| *at)
+            .unwrap_or_else(|_| Utc::now())
+    }
+
     /// Create metadata for a new reference file
     pub fn new_reference(
         original_name: String,
@@ -358,7 +381,7 @@ impl FileMetadata {
             file_size,
             md5,
             multipart_etag: None,
-            created_at: Utc::now(),
+            created_at: Self::object_created_at(),
             content_type,
             user_metadata: HashMap::new(),
             storage_info: StorageInfo::Delta {
@@ -385,7 +408,7 @@ impl FileMetadata {
             file_size: size,
             md5,
             multipart_etag: None,
-            created_at: Utc::now(),
+            created_at: Self::object_created_at(),
             content_type,
             user_metadata: HashMap::new(),
             storage_info: StorageInfo::Passthrough,
@@ -654,6 +677,46 @@ pub fn dedup_keep_latest(items: Vec<(String, FileMetadata)>) -> Vec<(String, Fil
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn with_created_at_pins_object_metadata_only() {
+        let at = DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let (pt, delta, reference) = with_created_at(at, async {
+            (
+                FileMetadata::new_passthrough("a".into(), "s".into(), "m".into(), 1, None),
+                FileMetadata::new_delta(
+                    "b".into(),
+                    "s".into(),
+                    "m".into(),
+                    1,
+                    "r".into(),
+                    "rs".into(),
+                    1,
+                    None,
+                ),
+                FileMetadata::new_reference(
+                    "r".into(),
+                    "b".into(),
+                    "s".into(),
+                    "m".into(),
+                    1,
+                    None,
+                ),
+            )
+        })
+        .await;
+        assert_eq!(pt.created_at, at);
+        assert_eq!(delta.created_at, at);
+        assert_ne!(
+            reference.created_at, at,
+            "reference.bin keeps the real time"
+        );
+        // Outside the scope: now.
+        let now = FileMetadata::new_passthrough("a".into(), "s".into(), "m".into(), 1, None);
+        assert!(now.created_at > at);
+    }
 
     #[test]
     fn test_object_key_parse() {

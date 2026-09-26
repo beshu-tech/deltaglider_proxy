@@ -382,6 +382,7 @@ async fn run_phases(
                     strip_user_metadata_keys: &[],
                     operation: "migrate",
                     upload_concurrency: None,
+                    keep_created_at: true,
                 };
                 match copy_object_with_retries(&engine, req).await {
                     Ok(outcome) => {

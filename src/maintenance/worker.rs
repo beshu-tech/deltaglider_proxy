@@ -332,6 +332,7 @@ async fn execute_phases(
                     strip_user_metadata_keys: &[ENCRYPTION_MARKER_KEY, ENCRYPTION_KEY_ID_KEY],
                     operation: "maintenance-reencrypt",
                     upload_concurrency: None,
+                    keep_created_at: true,
                 };
                 match copy_object_with_retries(&engine, req).await {
                     Ok(outcome) => {

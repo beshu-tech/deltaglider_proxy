@@ -102,6 +102,9 @@ pub(crate) struct ObjectTransferRequest<'a> {
     /// falls back to the env-resolved `transfer_plan::upload_concurrency()`.
     /// Only the replication worker overrides it (from config).
     pub upload_concurrency: Option<usize>,
+    /// Keep the source's created-at on the destination (a move or rewrite
+    /// of the same object: migrate, re-encrypt) instead of the copy time.
+    pub keep_created_at: bool,
 }
 
 /// How one object was physically moved source→dest. Surfaced to the
@@ -160,7 +163,11 @@ pub(crate) async fn copy_object_with_retries(
 ) -> Result<ObjectTransferOutcome, Box<dyn std::error::Error + Send + Sync>> {
     let mut last_err: Option<String> = None;
     for attempt in 1..=DEFAULT_COPY_MAX_ATTEMPTS {
-        match copy_object_once(engine, request).await {
+        let attempt_result = match request.keep_created_at {
+            true => keep_source_created_at(engine, request).await,
+            false => copy_object_once(engine, request).await,
+        };
+        match attempt_result {
             Ok(outcome) => return Ok(outcome),
             Err(err) => {
                 let msg = err.to_string();
@@ -199,6 +206,22 @@ pub(crate) async fn copy_object_with_retries(
     Err(last_err
         .unwrap_or_else(|| "copy failed without error detail".to_string())
         .into())
+}
+
+/// [`copy_object_once`] with the destination stamped the source's
+/// created-at ([`crate::types::with_created_at`]).
+async fn keep_source_created_at(
+    engine: &Arc<DynEngine>,
+    request: ObjectTransferRequest<'_>,
+) -> Result<ObjectTransferOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    let at = engine
+        .head(request.source_bucket, request.source_key)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("source head failed: {}", e).into()
+        })?
+        .created_at;
+    crate::types::with_created_at(at, copy_object_once(engine, request)).await
 }
 
 async fn copy_object_once(
@@ -1515,6 +1538,7 @@ mod tests {
             strip_user_metadata_keys: &[],
             operation: "replication",
             upload_concurrency: None,
+            keep_created_at: false,
         };
         match spooled_copy(&engine, &request, &stale, stale.file_size).await {
             Err(e) => assert!(
@@ -1676,6 +1700,7 @@ mod tests {
             strip_user_metadata_keys: &[],
             operation: "replication",
             upload_concurrency: None,
+            keep_created_at: false,
         };
         let result = delta_passthrough_copy(&engine, request, &stale_head).await;
         match result {
@@ -2474,6 +2499,7 @@ mod multipart_abort_tests {
             strip_user_metadata_keys: &[],
             operation: "test",
             upload_concurrency: Some(2),
+            keep_created_at: false,
         }
     }
 

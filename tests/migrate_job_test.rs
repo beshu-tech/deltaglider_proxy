@@ -479,3 +479,73 @@ async fn test_migrate_recopies_a_stale_target_object() {
         "the flip serves the stale target copy"
     );
 }
+
+/// Browser review #8: a migrated object keeps its created-at. The copy used
+/// to stamp the migration time, so listings showed every object as new,
+/// lifecycle ages restarted, and newer-wins compared the wrong times.
+/// Covers a small (buffered) object and a delta-eligible one.
+#[tokio::test]
+async fn test_migrate_keeps_created_at() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migtime";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    let keys = ["notes.json", "app-1.0.0.zip", "app-1.0.1.zip"];
+    for key in keys {
+        let body = [MARKER, key.as_bytes(), &[7u8; 4096]].concat();
+        put_object(
+            &http,
+            &endpoint,
+            bucket,
+            key,
+            body,
+            "application/octet-stream",
+        )
+        .await;
+    }
+    let s3 = server.s3_client().await;
+    let mut before = Vec::new();
+    for key in keys {
+        let h = s3
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        before.push(h.last_modified().copied().unwrap());
+    }
+    // LastModified has one-second resolution: make the migration later.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(resp.status(), 202);
+    wait_job_done(&admin, &endpoint, bucket).await;
+    assert_eq!(newest_job(&admin, &endpoint).await["status"], "succeeded");
+    assert_eq!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        Some("dst")
+    );
+
+    for (key, was) in keys.iter().zip(before) {
+        let h = s3
+            .head_object()
+            .bucket(bucket)
+            .key(*key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            h.last_modified().copied().unwrap(),
+            was,
+            "{key}: the migrated copy must keep the original time"
+        );
+    }
+}

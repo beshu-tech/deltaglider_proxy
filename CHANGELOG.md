@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — Bucket migration and re-encryption keep each object's time
+
+A migrated or re-encrypted object got the time of the copy as its
+`dg-created-at` (served as `LastModified`). After a migration every object
+looked new, lifecycle ages started again, and newer-wins compared the copy
+times. Now both jobs stamp the destination with the source object's
+created-at, on every copy path (buffered, delta, spooled, streamed).
+`reference.bin` baselines keep the real time.
+
 ### Changed — Bulk copy, move, delete and ZIP work for users without admin rights
 
 The bulk actions in the file browser needed an administrator session, so a

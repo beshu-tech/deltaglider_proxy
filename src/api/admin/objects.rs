@@ -531,6 +531,7 @@ async fn copy_one(
             strip_user_metadata_keys: &[],
             operation: "admin bulk copy",
             upload_concurrency: None,
+            keep_created_at: false,
         },
     )
     .await

@@ -28,6 +28,8 @@ The response is `202 Accepted` with a `maintenance:<n>` job id. `delete_source` 
 
 The job stages the destination, copies every object through the engine, verifies, flips the bucket's routing to the new backend, and cleans up.
 
+Each copy keeps the object's original creation time, which S3 clients see as `LastModified`. So after the move, a listing shows the same dates as before, lifecycle rules count an object's age from its original upload, and a newer-wins comparison sees the real times.
+
 ## 2. Watch it run
 
 Open **Settings → Jobs**. The migration appears as a `maintenance:<n>` row with live progress (objects and bytes); the drawer shows its run and any per-object failures.
