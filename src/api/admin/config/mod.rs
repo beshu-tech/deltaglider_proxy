@@ -1923,6 +1923,63 @@ advanced:
         assert_eq!(w.len(), 1, "{w:?}");
     }
 
+    /// A backend key id shows in the redacted GET; an unedited round-trip
+    /// of that GET (key id, no secret) keeps every backend secret.
+    #[test]
+    fn a_redacted_backend_round_trip_keeps_backend_secrets() {
+        let mut run = Config {
+            backend: BackendConfig::S3 {
+                session_token: None,
+                endpoint: Some("https://s3.example".into()),
+                region: "eu-central-1".into(),
+                force_path_style: true,
+                access_key_id: Some("AKPRIMARY".into()),
+                secret_access_key: Some("primary-secret".into()),
+                allow_local: false,
+            },
+            ..Config::default()
+        };
+        run.backends.push(crate::config::NamedBackendConfig {
+            name: "hetzner-fsn1".into(),
+            backend: BackendConfig::S3 {
+                session_token: None,
+                endpoint: Some("https://fsn1.example".into()),
+                region: "eu-central-1".into(),
+                force_path_style: true,
+                access_key_id: Some("AKNAMED".into()),
+                secret_access_key: Some("named-secret".into()),
+                allow_local: false,
+            },
+            encryption: BackendEncryptionConfig::default(),
+        });
+        let redacted = run.redact_all_secrets();
+        let creds = |b: &BackendConfig| match b {
+            BackendConfig::S3 {
+                access_key_id,
+                secret_access_key,
+                ..
+            } => (access_key_id.clone(), secret_access_key.clone()),
+            _ => (None, None),
+        };
+        assert_eq!(creds(&redacted.backend), (Some("AKPRIMARY".into()), None));
+        assert_eq!(
+            creds(&redacted.backends[0].backend),
+            (Some("AKNAMED".into()), None)
+        );
+        let mut e = crate::config_sections::SectionedConfig::from_flat(&redacted)
+            .into_flat()
+            .unwrap();
+        let mut w = Vec::new();
+        super::preserve_primary_backend_creds(&mut e, &run, &mut w);
+        super::preserve_named_backends_creds(&mut e, &run, &mut w);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(creds(&e.backend), creds(&run.backend));
+        assert_eq!(
+            creds(&e.backends[0].backend),
+            creds(&run.backends[0].backend)
+        );
+    }
+
     #[test]
     fn bootstrap_removal_truth_table() {
         use super::BootstrapRemoval::*;

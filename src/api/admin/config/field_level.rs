@@ -202,6 +202,10 @@ pub struct BackendInfoResponse {
     pub region: Option<String>,
     pub force_path_style: Option<bool>,
     pub has_credentials: bool,
+    /// The S3 access key id: an identifier, not a secret, so the operator
+    /// sees which key the backend uses. The secret is never returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
     /// Per-backend encryption status. Step 6.
     pub encryption: BackendEncryptionSummary,
     /// `true` when this entry was synthesised from the legacy
@@ -240,6 +244,7 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 region: None,
                 force_path_style: None,
                 has_credentials: false,
+                access_key_id: None,
                 encryption,
                 is_synthesized: false,
                 capability: None,
@@ -259,6 +264,7 @@ impl From<&crate::config::NamedBackendConfig> for BackendInfoResponse {
                 region: Some(region.clone()),
                 force_path_style: Some(*force_path_style),
                 has_credentials: access_key_id.is_some(),
+                access_key_id: access_key_id.clone(),
                 encryption,
                 is_synthesized: false,
                 capability: None,

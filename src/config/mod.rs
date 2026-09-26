@@ -3286,30 +3286,26 @@ impl Config {
             c
         });
         let mut export = file_view.with_env_refs_reinserted().redact_for_export();
+        // An access key id (bootstrap pair and every S3 backend) is an
+        // identifier, not a secret: the operator must see which key is
+        // configured. The secret stays hidden; an unchanged id keeps it on
+        // apply (`preserve_sigv4_pair`).
         if let BackendConfig::S3 {
-            ref mut access_key_id,
             ref mut secret_access_key,
             ..
         } = export.backend
         {
-            clear_unless_ref(access_key_id);
             clear_unless_ref(secret_access_key);
         }
         for named in &mut export.backends {
             if let BackendConfig::S3 {
-                ref mut access_key_id,
                 ref mut secret_access_key,
                 ..
             } = named.backend
             {
-                clear_unless_ref(access_key_id);
                 clear_unless_ref(secret_access_key);
             }
         }
-        // The bootstrap access key id is an identifier, not a secret: the
-        // Credentials page must show which pair is configured. The secret
-        // stays hidden; an unchanged id keeps it on apply
-        // (`preserve_sigv4_pair`).
         clear_unless_ref(&mut export.secret_access_key);
         // Webhook header values may carry bearer tokens. Mask the VALUE but keep
         // the KEY so the GUI shows which headers exist; the section-PUT preserve
@@ -4293,11 +4289,11 @@ backend:
             !yaml.contains("NAMED-ENCRYPTION-KEY-SHOULD-REDACT"),
             "per-named-backend encryption keys must redact"
         );
-        // Primary backend creds
-        assert!(!yaml.contains("BACKEND-SECRET-ID"));
+        // Backend creds: the key id is an identifier and stays (the operator
+        // must see WHICH key a backend uses); the secret never shows.
+        assert!(yaml.contains("BACKEND-SECRET-ID"));
         assert!(!yaml.contains("BACKEND-SECRET-KEY"));
-        // Named backend creds
-        assert!(!yaml.contains("NAMED-SECRET-ID"));
+        assert!(yaml.contains("NAMED-SECRET-ID"));
         assert!(!yaml.contains("NAMED-SECRET-KEY"));
         // Non-secret fields survive: backend names, regions, non-secret key_ids.
         assert!(yaml.contains("hetzner"));

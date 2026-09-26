@@ -304,6 +304,8 @@ export interface BackendInfo {
   region: string | null;
   force_path_style: boolean | null;
   has_credentials: boolean;
+  /** S3 access key id (an identifier; the secret is never returned). */
+  access_key_id?: string;
   /**
    * Per-backend encryption status (Step 6/7 per-backend refactor).
    * Always present — the server synthesises a "default" entry for

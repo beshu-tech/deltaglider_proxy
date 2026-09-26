@@ -399,6 +399,8 @@ storage:
 
 Endpoint URLs must start with `http://` or `https://` (scheme-less values rejected at load time).
 
+The admin API shows the `access_key_id` of every S3 backend in `GET /api/admin/config/export`, in the storage section, and in `GET /api/admin/backends`, because an access key id is an identifier and not a secret. The `secret_access_key` is never shown. When a document or section that you apply carries the same `access_key_id` and no `secret_access_key`, the proxy keeps the current secret, so an unedited export applies without change. A different `access_key_id` without a secret is a rotation that is missing its secret: the proxy does not pair the new id with the old secret, and it returns a warning.
+
 ---
 
 ## Access — authentication

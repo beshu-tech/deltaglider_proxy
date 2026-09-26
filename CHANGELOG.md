@@ -73,6 +73,15 @@ names the one object that the caller may read, the bucket and prefix that
 the caller may list, or the public prefixes of the bucket. For a write, it
 says that nothing is granted.
 
+### Changed — The admin API shows backend access key ids
+
+The config export, the storage section, and the backend list hid the
+`access_key_id` of each S3 backend, so the operator could not see which
+key a backend uses. An access key id is not a secret, so these responses
+now show it; the Backends page shows it too. The secret stays hidden. An
+applied document with the same key id and no secret keeps the current
+secret, as it already does for the bootstrap pair.
+
 ### Fixed — A sanitised 500 logs its cause
 
 A request that failed with `500 InternalError` sends the client a generic

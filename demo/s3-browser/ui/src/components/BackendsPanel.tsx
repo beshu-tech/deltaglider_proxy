@@ -10,6 +10,7 @@ import { createBackend, deleteBackend, probeBackend, testS3Connection, updateAdm
 import { useAdminConfig } from '../queries/config';
 import { useBackends, useBucketOrigins } from '../queries/backends';
 import CreateBucketModal from './CreateBucketModal';
+import { backendSummary } from '../backendSummary';
 import ReencryptProposalModal, { type ReencryptTransition } from './ReencryptProposalModal';
 import { useColors } from '../ThemeContext';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
@@ -459,9 +460,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
                   )}
                   {b.health && <HealthBadge h={b.health} colors={colors} />}
                   <div style={{ fontSize: 12, color: colors.TEXT_MUTED, fontFamily: 'var(--font-mono)', overflowWrap: 'anywhere' }}>
-                    {b.backend_type === 'filesystem'
-                      ? `filesystem: ${b.path}`
-                      : `s3: ${b.endpoint || 'AWS'} (${b.region})`}
+                    {backendSummary(b)}
                   </div>
                   {b.is_synthesized && singletonEnv && (
                     <div data-testid="backend-env-note" style={{ fontSize: 12, color: colors.TEXT_MUTED, marginTop: 2 }}>

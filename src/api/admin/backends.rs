@@ -708,6 +708,29 @@ mod tests {
             matches!(ok, BackendConfig::Filesystem { ref path } if path == std::path::Path::new("/srv/dg"))
         );
     }
+
+    /// The list shows an S3 backend's key id (an identifier) and never its
+    /// secret.
+    #[test]
+    fn the_backend_list_shows_the_key_id_not_the_secret() {
+        let named = crate::config::NamedBackendConfig {
+            name: "hetzner-fsn1".into(),
+            backend: BackendConfig::S3 {
+                session_token: None,
+                endpoint: Some("https://fsn1.example".into()),
+                region: "eu-central-1".into(),
+                force_path_style: true,
+                access_key_id: Some("AKHETZNER".into()),
+                secret_access_key: Some("hetzner-secret".into()),
+                allow_local: false,
+            },
+            encryption: Default::default(),
+        };
+        let json = serde_json::to_string(&super::super::config::BackendInfoResponse::from(&named))
+            .unwrap();
+        assert!(json.contains(r#""access_key_id":"AKHETZNER""#), "{json}");
+        assert!(!json.contains("hetzner-secret"), "{json}");
+    }
 }
 
 /// Objects the legacy-key scan HEADs when the request names no `limit`.
