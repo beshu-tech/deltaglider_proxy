@@ -2,25 +2,21 @@
  * Pure storage-section PUT payload builder for per-backend encryption
  * changes (extracted from BackendsPanel.handleEncryptionApply).
  *
- * Lives in its own React/antd-free module so the unit test
- * can transpile-and-import it and assert the wire body byte-for-byte —
- * this is the one genuinely-pure decision point in BackendsPanel, and
- * the composed body is exactly what the admin API receives, so it must
- * never drift.
- *
- * Composes a `storage` section-PUT body that mutates ONLY the target
- * backend's `encryption` block and leaves every sibling backend + every
- * non-encryption field untouched. The server's RFC 7396 merge-patch
- * semantics guarantee siblings are preserved — we just need to send the
- * correct shape for the path we want to replace.
+ * Lives in its own React/antd-free module so the unit test can import it
+ * and assert the wire body exactly: the composed body is what the admin
+ * API receives.
  *
  * Path:
- *   * Singleton (synthetic "default" backend surfaced by the server when
- *     `backends` is empty) → `{ backend_encryption: <patch> }`.
- *   * Named entry (any other name) → `{ backends: [{name, type, ...,
- *     encryption}] }`. The server replaces `backends` as a whole array
- *     on a section PUT; for per-entry edits we send the FULL list with
- *     only the target entry's `encryption` swapped.
+ *   * Singleton (the storage section has no `backends` list; the server
+ *     surfaces the synthetic "default" backend) →
+ *     `{ backend_encryption: <patch> }`, merged by RFC 7396 onto the
+ *     running block.
+ *   * Named entry → `{ backends: [...] }`. A section PUT replaces the
+ *     `backends` array as a whole, so the list is the storage section's
+ *     OWN list (from its GET), every entry copied as-is, and only the
+ *     target's `encryption` swapped. A list rebuilt from the summary
+ *     `BackendInfo` dropped every field it does not carry (`allow_local`,
+ *     the siblings' `encryption`), and the server applied that loss.
  */
 
 /** Mirror of `BackendEncryptionPatch` in BackendEncryptionEditor, kept
@@ -35,24 +31,16 @@ interface EncryptionPatch {
   legacy_key_id?: string | null;
 }
 
-/** The subset of `BackendInfo` this builder reads. Matches the live
- *  `BackendInfo` shape (extra fields ignored) so callers pass it as-is. */
-interface BackendShapeSource {
-  name: string;
-  backend_type: string;
-  path?: string | null;
-  endpoint?: string | null;
-  region?: string | null;
-  force_path_style?: boolean | null;
+/** The part of the storage section GET body this builder reads. Each
+ *  entry is passed through untouched, so its fields are opaque here. */
+export interface StorageSectionBackends {
+  backends?: Array<Record<string, unknown>>;
 }
 
 /** Translate the per-mode patch into the wire `encryption` block.
  *
- *  null-clears for `legacy_key` pass through; absent fields rely on the
- *  server's three-state preservation to keep the previous value.
- *
- *  Internal helper — the only public surface is
- *  `buildEncryptionSectionBody`; this is exercised through it. */
+ *  null-clears pass through; absent fields rely on the server's
+ *  three-state preservation to keep the previous value. */
 function encryptionBody(patch: EncryptionPatch): Record<string, unknown> {
   const encBody: Record<string, unknown> = { mode: patch.mode };
   if (patch.key !== undefined) encBody.key = patch.key;
@@ -66,47 +54,25 @@ function encryptionBody(patch: EncryptionPatch): Record<string, unknown> {
 
 /**
  * Build the `storage` section-PUT payload for an encryption change on
- * `backendName`. Byte-identical to the body BackendsPanel composed
- * inline before the useSectionEditor migration.
+ * `backendName`, from the current storage section (its GET body).
+ * Throws when a named target is not in the section (a stale page).
  */
 export function buildEncryptionSectionBody(
   backendName: string,
   patch: EncryptionPatch,
-  backends: BackendShapeSource[],
+  storage: StorageSectionBackends,
 ): Record<string, unknown> {
   const encBody = encryptionBody(patch);
-
-  // The singleton ("default") path and the named-entries path have
-  // different shapes on disk.
-  if (backendName === 'default' && backends.length === 1 && backends[0].name === 'default') {
-    // Legacy singleton path — synthesise the singleton
-    // `backend_encryption` block. The server handles the preservation
-    // for us.
+  const list = storage.backends ?? [];
+  if (list.length === 0 && backendName === 'default') {
     return { backend_encryption: encBody };
   }
-
-  // Named-backend path: replace the whole list with the edited
-  // encryption entry. The server's `preserve_backend_secrets` keeps
-  // non-encryption fields intact (e.g. S3 creds); the
-  // `preserve_backend_encryption_secrets` walker preserves sibling
-  // fields inside the encryption block itself.
-  const list = backends.map((b) => {
-    const backendShape: Record<string, unknown> = {
-      name: b.name,
-      type: b.backend_type,
-    };
-    if (b.path) backendShape.path = b.path;
-    if (b.endpoint) backendShape.endpoint = b.endpoint;
-    if (b.region) backendShape.region = b.region;
-    if (b.force_path_style !== null && b.force_path_style !== undefined) {
-      backendShape.force_path_style = b.force_path_style;
-    }
-    if (b.name === backendName) {
-      backendShape.encryption = encBody;
-    }
-    return backendShape;
-  });
-  return { backends: list };
+  if (!list.some((b) => b.name === backendName)) {
+    throw new Error(`Backend "${backendName}" is not in the storage configuration. Reload the page.`);
+  }
+  return {
+    backends: list.map((b) => (b.name === backendName ? { ...b, encryption: encBody } : b)),
+  };
 }
 
 /**

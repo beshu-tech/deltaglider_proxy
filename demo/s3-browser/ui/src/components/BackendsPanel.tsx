@@ -6,7 +6,7 @@ import { qk } from '../queries/keys';
 import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin, message } from 'antd';
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
 import type { BackendHealthEntry, BackendInfo, CreateBackendRequest } from '../adminApi';
-import { createBackend, deleteBackend, probeBackend, testS3Connection, updateAdminConfig, putSection } from '../adminApi';
+import { createBackend, deleteBackend, probeBackend, testS3Connection, updateAdminConfig, putSection, getSectionVersioned } from '../adminApi';
 import { useAdminConfig } from '../queries/config';
 import { useBackends, useBucketOrigins } from '../queries/backends';
 import CreateBucketModal from './CreateBucketModal';
@@ -16,7 +16,7 @@ import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import SectionHeader from './SectionHeader';
 import FormField from './FormField';
 import BackendEncryptionEditor, { type BackendEncryptionPatch } from './BackendEncryptionEditor';
-import { buildEncryptionSectionBody } from '../backendEncryptionPayload';
+import { buildEncryptionSectionBody, type StorageSectionBackends } from '../backendEncryptionPayload';
 import MaskedSecretInput from './MaskedSecretInput';
 import { normalizeUiError } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
@@ -298,12 +298,6 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
     backendName: string,
     patch: BackendEncryptionPatch,
   ): Promise<void> => {
-    // Compose the section-PUT body via the pure builder (singleton vs
-    // named-list shape, encryption-block translation). Extracted to
-    // `backendEncryptionPayload.ts` so the wire shape is unit-tested
-    // byte-for-byte and can't silently drift.
-    const body = buildEncryptionSectionBody(backendName, patch, backends);
-
     // Tracks whether the try-block already set a precise result message this
     // run. Using a local (not the closed-over `saveResult` state, which is the
     // stale render snapshot) is what keeps the catch from either suppressing a
@@ -311,7 +305,13 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
     // clobbering the precise message just set with a generic one.
     let resultSet = false;
     try {
-      const result = await putSection('storage', body);
+      // The body starts from the storage section itself (fresh GET), not from
+      // the backend summaries: the PUT replaces the whole `backends` list, so
+      // anything missing from it is removed. If-Match refuses the PUT when
+      // another editor changed the section in between.
+      const { body: storage, version } = await getSectionVersioned<StorageSectionBackends>('storage');
+      const body = buildEncryptionSectionBody(backendName, patch, storage);
+      const result = await putSection('storage', body, version);
       if (!result.ok) {
         setSaveResult({
           ok: false,

@@ -73,6 +73,17 @@ refuses a destination that already holds objects: the job fails in its
 dialog) makes the destination an exact copy instead: destination objects that
 the source does not hold are deleted before the flip, and each delete is
 audited as `maintenance_migrate_mirror_delete`.
+### Fixed — An encryption change on the Backends page keeps the other backends intact
+
+The Backends page built the `backends` list for its section PUT from the
+backend summaries, which carry only a few fields. Because the PUT replaces the
+whole list, an encryption change on one backend removed `allow_local` and the
+`encryption` block from every other backend: an `http://` S3 backend was
+refused, and a proxy-AES sibling was switched to `mode: none`. The page now
+reads the storage section, copies every entry as it is, and changes only the
+target's `encryption`. The PUT carries `If-Match`, so a concurrent edit is
+refused instead of overwritten.
+
 ### Fixed — Rotate key no longer makes existing objects unreadable
 
 The **Rotate key** button sent only the new key, because the admin UI never
