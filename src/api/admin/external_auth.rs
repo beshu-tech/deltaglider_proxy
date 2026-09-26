@@ -850,8 +850,8 @@ pub async fn update_mapping(
     let db = db.lock().await;
 
     let rule = db.update_group_mapping_rule(id, &body).map_err(|e| {
-        tracing::error!("Failed to update mapping rule: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        tracing::warn!("Failed to update mapping rule: {}", e);
+        super::db_error_status(&e)
     })?;
     let target = rule_target(&db, &rule);
 
@@ -879,8 +879,8 @@ pub async fn delete_mapping(
         .unwrap_or_else(|| format!("rule {id}"));
 
     db.delete_group_mapping_rule(id).map_err(|e| {
-        tracing::error!("Failed to delete mapping rule: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        tracing::warn!("Failed to delete mapping rule: {}", e);
+        super::db_error_status(&e)
     })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;

@@ -264,14 +264,13 @@ pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
 ///     Ok(Json(providers))
 /// }
 /// ```
-pub(crate) async fn with_config_db<T, F, E>(
+pub(crate) async fn with_config_db<T, F>(
     state: &Arc<AdminState>,
     op_label: &str,
     f: F,
 ) -> Result<T, axum::http::StatusCode>
 where
-    F: FnOnce(&ConfigDb) -> Result<T, E>,
-    E: std::fmt::Display,
+    F: FnOnce(&ConfigDb) -> Result<T, crate::config_db::ConfigDbError>,
 {
     let db = state
         .config_db
@@ -279,9 +278,30 @@ where
         .ok_or(axum::http::StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
     f(&db).map_err(|e| {
-        tracing::error!("Failed to {op_label}: {e}");
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        let status = db_error_status(&e);
+        if status.is_server_error() {
+            tracing::error!("Failed to {op_label}: {e}");
+        } else {
+            tracing::warn!("Failed to {op_label}: {e}");
+        }
+        status
     })
+}
+
+/// Pure: the HTTP status of a config-DB error. A missing row is the
+/// caller's 404 and a UNIQUE violation its 409; only the rest is a 500.
+pub(crate) fn db_error_status(e: &crate::config_db::ConfigDbError) -> axum::http::StatusCode {
+    use crate::config_db::{classify_sqlite_error, ConfigDbError, SqliteErrorClass};
+    use axum::http::StatusCode;
+    match e {
+        ConfigDbError::NotFound(_) => StatusCode::NOT_FOUND,
+        ConfigDbError::Sqlite(se) => match classify_sqlite_error(se) {
+            SqliteErrorClass::NotFound => StatusCode::NOT_FOUND,
+            SqliteErrorClass::Conflict => StatusCode::CONFLICT,
+            SqliteErrorClass::Other => StatusCode::INTERNAL_SERVER_ERROR,
+        },
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 /// Admin audit log helper — delegates to `crate::audit::audit_log` with empty bucket/path.
@@ -387,5 +407,39 @@ mod tests {
         ];
 
         assert_eq!(next_copy_name("reader", existing), "reader (copy3)");
+    }
+}
+
+#[cfg(test)]
+mod db_error_status_tests {
+    use super::db_error_status;
+    use crate::config_db::ConfigDbError;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn db_error_status_truth_table() {
+        assert_eq!(
+            db_error_status(&ConfigDbError::NotFound("provider 9".into())),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            db_error_status(&ConfigDbError::Sqlite(rusqlite::Error::QueryReturnedNoRows)),
+            StatusCode::NOT_FOUND
+        );
+        let unique = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                extended_code: rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE,
+            },
+            Some("UNIQUE constraint failed: auth_providers.name".into()),
+        );
+        assert_eq!(
+            db_error_status(&ConfigDbError::Sqlite(unique)),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            db_error_status(&ConfigDbError::Other("broken".into())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
