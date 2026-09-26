@@ -157,6 +157,14 @@ pub fn is_reserved_principal_name(name: &str) -> bool {
     name.starts_with('$')
 }
 
+/// A blank user or group name names nothing: the GUI cannot select it, and
+/// `${iam:username}` would expand to "". The admin API refuses it on create
+/// and rename. (Declarative YAML and backup restore still accept one, so an
+/// existing deployment keeps booting.)
+pub fn is_blank_principal_name(name: &str) -> bool {
+    name.trim().is_empty()
+}
+
 /// `name` with every reserved prefix removed, so that
 /// `is_reserved_principal_name` is false for the result.
 pub fn strip_reserved_principal_prefix(name: &str) -> &str {
@@ -337,6 +345,9 @@ mod principal_tests {
         assert!(named(ANONYMOUS_USER_NAME, "").is_anonymous());
         assert!(!named(ANONYMOUS_USER_NAME, "AKREAL").is_anonymous());
         assert!(!named("alice", "").is_anonymous());
+        assert!(is_blank_principal_name(""));
+        assert!(is_blank_principal_name(" \t"));
+        assert!(!is_blank_principal_name("dana"));
         assert!(is_reserved_principal_name("$anonymous"));
         assert!(is_reserved_principal_name("$x"));
         assert!(!is_reserved_principal_name("dana$"));

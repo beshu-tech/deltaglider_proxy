@@ -70,6 +70,10 @@ pub async fn create_group(
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
 
+    if crate::iam::types::is_blank_principal_name(&body.name) {
+        tracing::warn!("Group name cannot be blank");
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let mut perms = body.permissions.clone();
     normalize_permissions(&mut perms);
     if let Err(msg) = validate_permissions(&perms) {
@@ -184,6 +188,19 @@ pub async fn update_group(
     let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
     let db = db.lock().await;
 
+    // Refuse a RENAME to a blank name; a row that already has one (created
+    // before names were checked) stays editable.
+    if let Some(name) = body.name.as_deref() {
+        if crate::iam::types::is_blank_principal_name(name) {
+            let current = db
+                .get_group_by_id(group_id)
+                .map_err(|_| StatusCode::NOT_FOUND)?;
+            if current.name != name {
+                tracing::warn!("Group name cannot be blank");
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
     let normalized_perms = body.permissions.as_ref().map(|p| {
         let mut perms = p.clone();
         normalize_permissions(&mut perms);

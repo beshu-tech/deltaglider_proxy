@@ -243,7 +243,11 @@ pub async fn create_user(
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    // Block reserved names
+    // Block reserved and blank names
+    if crate::iam::types::is_blank_principal_name(&body.name) {
+        tracing::warn!("User name cannot be blank");
+        return Err(StatusCode::BAD_REQUEST);
+    }
     if crate::iam::types::is_reserved_principal_name(&body.name) {
         tracing::warn!("User name cannot start with '$': {:?}", body.name);
         return Err(StatusCode::BAD_REQUEST);
@@ -361,12 +365,14 @@ pub async fn update_user(
     // OAuth user provisioned before names were checked) stays editable: the
     // GUI always sends the current name back.
     if let Some(name) = body.name.as_deref() {
-        if crate::iam::types::is_reserved_principal_name(name) {
+        if crate::iam::types::is_reserved_principal_name(name)
+            || crate::iam::types::is_blank_principal_name(name)
+        {
             let current = db
                 .get_user_by_id(user_id)
                 .map_err(|_| StatusCode::NOT_FOUND)?;
             if current.name != name {
-                tracing::warn!("User name cannot start with '$': {:?}", name);
+                tracing::warn!("User name cannot be blank or start with '$': {:?}", name);
                 return Err(StatusCode::BAD_REQUEST);
             }
         }

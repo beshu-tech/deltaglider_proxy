@@ -643,6 +643,8 @@ async fn groups_crud_members_clone_and_errors() {
     )
     .await;
     assert_eq!(code, StatusCode::BAD_REQUEST);
+    let (code, _) = json_of(put(gid, json!({ "name": " " })).await.unwrap()).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST, "a rename to a blank name");
     let (code, _) = json_of(put(999_999, json!({ "description": "x" })).await.unwrap()).await;
     assert_eq!(code, StatusCode::NOT_FOUND);
     let (_, other) = json_of(create(json!({ "name": "other" })).await.unwrap()).await;
@@ -827,6 +829,15 @@ async fn users_rotate_clone_delete_and_empty_name() {
     assert_eq!(s3_status(&server, &cak, &csk).await, 403);
     assert_eq!(del(cid).await.unwrap().status(), StatusCode::NOT_FOUND);
     assert_audited(&admin, &ep, "delete_user", "rot-user-copy").await;
+
+    let code = admin
+        .put(format!("{ep}/_/api/admin/users/{id}"))
+        .json(&json!({ "name": "" }))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(code, StatusCode::BAD_REQUEST, "a rename to a blank name");
 
     // Reserved and empty names.
     for name in ["$anonymous", ""] {
@@ -1078,7 +1089,16 @@ async fn form_post_policy_table() {
         json!({ "expiration": "2099-01-01T00:00:00.000Z", "conditions": c })
     };
     // (name, policy, extra form fields, key, file bytes, expected status, S3 code)
-    let cases: Vec<(&str, Value, Vec<(&str, &str)>, &str, usize, u16, &str)> = vec![
+    type Case<'a> = (
+        &'a str,
+        Value,
+        Vec<(&'a str, &'a str)>,
+        &'a str,
+        usize,
+        u16,
+        &'a str,
+    );
+    let cases: Vec<Case> = vec![
         (
             "ok",
             base(vec![json!(["content-length-range", 1, 100])]),
