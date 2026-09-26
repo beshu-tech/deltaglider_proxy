@@ -123,6 +123,6 @@ test('parentPrefix (keyboard "up a folder" navigation)', () => {
 test('cacheEntrySubtitle averages the used bytes over the entries', () => {
   assert.equal(cacheEntrySubtitle(2 * 1024 * 1024, 100 * 1024 * 1024, 1), '2.0 MB avg per entry');
   assert.equal(cacheEntrySubtitle(3 * 1024, 100 * 1024 * 1024, 2), '1.5 KB avg per entry');
-  assert.equal(cacheEntrySubtitle(0, 100 * 1024 * 1024, 0), 'No entries yet');
+  assert.equal(cacheEntrySubtitle(0, 100 * 1024 * 1024, 0), '0 B avg per entry');
   assert.equal(cacheEntrySubtitle(0, 0, 0), 'Cache disabled');
 });
