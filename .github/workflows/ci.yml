@@ -408,6 +408,7 @@ jobs:
             iam_list_scope_test:: \
             multipart_etag_test:: \
             multipart_complete_resilience_test:: \
+            prod_shape_matrix_test:: \
             public_prefix_list_test:: \
             public_prefix_test:: \
             folder_marker_test:: \

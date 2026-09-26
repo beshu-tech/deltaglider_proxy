@@ -128,6 +128,8 @@ mod multipart_etag_test;
 mod optimization_test;
 #[path = "parity_test.rs"]
 mod parity_test;
+#[path = "prod_shape_matrix_test.rs"]
+mod prod_shape_matrix_test;
 #[path = "public_prefix_list_test.rs"]
 mod public_prefix_list_test;
 #[path = "public_prefix_test.rs"]

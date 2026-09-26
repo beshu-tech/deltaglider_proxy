@@ -107,6 +107,10 @@ pub const TEST_BOOTSTRAP_PASSWORD_HASH: &str =
 /// replicas share one encrypted DB, so they need one key (the proxy refuses
 /// to start with a sync bucket and no env key). A test that wants a replica
 /// with another key sets `.env("DGP_CONFIG_DB_KEY", ...)`.
+/// Stands for `127.0.0.1:<leased port>` in a document passed to
+/// [`TestServer::from_config_document`].
+pub const LISTEN_ADDR_PLACEHOLDER: &str = "__DGP_TEST_LISTEN_ADDR__";
+
 pub const TEST_CONFIG_DB_KEY: &str = "test-config-db-key-0123456789abcdef0123456789abcdef";
 
 /// MinIO configuration constants
@@ -276,8 +280,15 @@ impl TestServer {
         let port_lease = lease_free_port();
         let port = port_lease.port();
 
-        // Build full config with listen_addr prepended (flat YAML shape).
-        let full_config = format!("listen_addr: \"127.0.0.1:{}\"\n{}", port, config_body);
+        // A whole document (e.g. the sectioned prod-shape fixture) names
+        // its listen address with the placeholder; the flat shape gets it
+        // prepended.
+        let listen = format!("127.0.0.1:{port}");
+        let full_config = if config_body.contains(LISTEN_ADDR_PLACEHOLDER) {
+            config_body.replace(LISTEN_ADDR_PLACEHOLDER, &listen)
+        } else {
+            format!("listen_addr: \"{listen}\"\n{config_body}")
+        };
 
         // Write config to a temp file inside a per-instance directory.
         // config_db_path() derives the DB path from the config file's parent,
@@ -319,6 +330,34 @@ impl TestServer {
         server.wait_ready().await;
         server.ensure_bucket().await;
         server
+    }
+
+    /// Spawn the proxy from a complete config document (any shape) instead
+    /// of the builder's generated flat one. The document must carry
+    /// [`LISTEN_ADDR_PLACEHOLDER`] where the listen address goes;
+    /// `data_dir` owns every filesystem backend path in it. `bucket` is
+    /// created through the S3 API, signed with `auth`.
+    pub async fn from_config_document(
+        document: &str,
+        data_dir: TempDir,
+        auth: (&str, &str),
+        bucket: &str,
+        extra_env: Vec<(String, String)>,
+    ) -> Self {
+        assert!(
+            document.contains(LISTEN_ADDR_PLACEHOLDER),
+            "the config document must name its listen address as {LISTEN_ADDR_PLACEHOLDER}"
+        );
+        Self::spawn_with_config(
+            document,
+            bucket,
+            Some(data_dir),
+            Some((auth.0.to_string(), auth.1.to_string())),
+            None,
+            extra_env,
+            false,
+        )
+        .await
     }
 
     // ── Instance methods ──
