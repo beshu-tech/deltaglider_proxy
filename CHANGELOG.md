@@ -17,6 +17,14 @@ fails and never looks complete. In Chrome and Edge, a file that the browser
 created for a download that then fails is deleted. A ZIP download now writes a
 `bulk_zip` audit entry, like a bulk copy, move, or delete.
 
+### Docs — The proxy-AES to SSE-KMS recipe uses the migrate job
+
+The key-rotation guide said to run a re-encrypt job after a switch from
+proxy-AES to SSE-KMS. The job refuses SSE backends, so the old objects
+were never rewritten. Recipe C now moves the buckets to a new SSE-KMS
+backend with the migrate job. It also says that on an in-place switch,
+**Clear legacy key** stays disabled until no object uses the legacy key.
+
 ### Fixed — An edit of a named backend keeps its explicit `key_id`
 
 A section `PUT` replaces the whole `backends` list, and the proxy kept an

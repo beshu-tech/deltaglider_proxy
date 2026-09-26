@@ -8,7 +8,7 @@ This guide shows you how to change a backend's encryption key or mode without lo
 |---|---|
 | Rotate a proxy-AES key, minimum disruption | **A** — shim, then re-encrypt job |
 | Rotate so the old key never stays in runtime | **B** — new backend + migrate job |
-| Move from proxy-AES to SSE-KMS / SSE-S3 | **C** — mode change with shim |
+| Move from proxy-AES to SSE-KMS / SSE-S3 | **C** — migrate job to a new SSE backend |
 | Stop encrypting a backend | **D** — `mode: none`, keep the shim |
 
 ## Recipe A: shim-assisted rotation
@@ -55,7 +55,20 @@ Use when the old key must not remain in runtime at all.
 
 ## Recipe C: migrate from proxy-AES to SSE-KMS
 
-Same shape as recipe A, with a mode change:
+The re-encrypt job cannot do this change. It refuses a bucket whose backend uses `sse-kms` or `sse-s3`, because AWS encrypts those objects and leaves no proxy marker that the job can check. So on a backend that you switch to SSE-KMS, the job never rewrites the old proxy-AES objects. Use a migrate job to a new SSE-KMS backend instead.
+
+1. Declare a new backend with SSE-KMS. Route no buckets to it yet:
+
+   ```yaml
+   encryption:
+     mode: sse-kms
+     kms_key_id: arn:aws:kms:eu-west-1:123456789012:key/new-kms
+   ```
+
+2. Move each bucket to the new backend with the migrate job: **Settings → Storage → Buckets → (bucket) → Migrate data…**, or `POST /_/api/admin/buckets/:bucket/migrate`. The migrate job reads every object through the old backend, which decrypts it with the proxy key. Then it writes the object through the new backend, where AWS encrypts it with the KMS key. Full procedure: [How to move a bucket to another backend](move-a-bucket-between-backends.md).
+3. When every bucket has moved, delete the old backend. The old proxy key is then no longer needed.
+
+You can also switch the existing backend in place, with the old key as the shim:
 
 ```yaml
 encryption:
@@ -65,7 +78,9 @@ encryption:
   legacy_key_id: prod-2025-10
 ```
 
-New writes go through SSE-KMS (the proxy-AES write path is skipped entirely); reads of old proxy-stamped objects decrypt via the shim. Run a re-encrypt job to rewrite them natively, then clear the legacy fields. The reverse direction (native → proxy-AES) needs no shim — native objects carry `dg-encrypted-native`, so the proxy decrypt path never fires on them.
+New writes then go through SSE-KMS, and reads of the old proxy-AES objects decrypt through the shim. But no job rewrites the old objects, so they keep the legacy key id until a client uploads them again or you delete them. The shim banner on the backend counts these objects. Its **Clear legacy key** button stays disabled until the count is zero, because an object under the legacy key id cannot be read after the clear. To reach zero, move the buckets with the migrate job as described above.
+
+The reverse direction (native → proxy-AES) needs no shim. Native objects carry `dg-encrypted-native`, so the proxy decrypt path never runs on them.
 
 ## Recipe D: decommission encryption safely
 
