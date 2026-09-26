@@ -244,6 +244,47 @@ async fn flush_copies(state: &Arc<AppState>) -> Result<(), crate::deltaglider::E
     engine.flush_pending().await
 }
 
+/// Which target copies a resumed copy phase must re-copy instead of trusting
+/// their metadata. The copies after the last checkpoint were not durable, and
+/// a crash can leave such a file with its metadata but without its data. They
+/// all lie in the page at the saved token, so the first resumed page is
+/// re-copied. A restart from page 0 (poisoned token) never reaches that page
+/// first, so it re-copies the whole phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecopyScope {
+    None,
+    FirstPage,
+    WholePhase,
+}
+
+impl RecopyScope {
+    fn on_resume(resumed_in_copy: bool) -> Self {
+        if resumed_in_copy {
+            Self::FirstPage
+        } else {
+            Self::None
+        }
+    }
+
+    fn on_restart_fresh(self) -> Self {
+        match self {
+            Self::None => Self::None,
+            _ => Self::WholePhase,
+        }
+    }
+
+    fn after_page(self) -> Self {
+        match self {
+            Self::FirstPage => Self::None,
+            s => s,
+        }
+    }
+
+    fn recopies(self) -> bool {
+        self != Self::None
+    }
+}
+
 async fn copy_verdict_for(
     engine: &crate::deltaglider::DynEngine,
     source_bucket: &str,
@@ -618,11 +659,7 @@ async fn run_phases(
         } else {
             None
         });
-        // A resumed copy re-copies its first page instead of trusting the
-        // target's metadata: the copies after the last checkpoint were not
-        // durable, and a crash can leave such a file with its metadata but
-        // without its data (the rename reached the disk, the data did not).
-        let mut recopy_page = job.phase == "copy";
+        let mut recopy = RecopyScope::on_resume(job.phase == "copy");
         while pager.begin_page().is_some() {
             check_cancel(db, job.id).await?;
             // Re-assert the staging route: an admin config apply mid-job
@@ -652,6 +689,7 @@ async fn run_phases(
                         job.id
                     );
                     pager.restart_fresh();
+                    recopy = recopy.on_restart_fresh();
                     checkpoint(
                         flush_copies(state),
                         persist(db, job, "copy", None, done, skipped, failed, bytes, None),
@@ -691,7 +729,7 @@ async fn run_phases(
                 // Skip only a target copy that PROVABLY matches the source: a
                 // cancelled earlier attempt leaves copies that the source has
                 // since outgrown.
-                if !recopy_page
+                if !recopy.recopies()
                     && copy_verdict_for(&engine, bucket, &params.transient_key, key).await
                         == ContentVerdict::Same
                 {
@@ -735,7 +773,7 @@ async fn run_phases(
                     }
                 }
             }
-            recopy_page = false;
+            recopy = recopy.after_page();
             let more = pager.advance(page.is_truncated, page.next_continuation_token);
             checkpoint(
                 flush_copies(state),
@@ -1045,6 +1083,26 @@ async fn run_phases(
 
 #[cfg(test)]
 mod tests {
+    use super::RecopyScope;
+
+    /// A resumed copy re-copies the page that can hold torn copies: the first
+    /// page after a resume, or every page after a restart from page 0.
+    #[test]
+    fn recopy_scope_covers_the_page_at_the_saved_token() {
+        let fresh = RecopyScope::on_resume(false);
+        assert!(!fresh.recopies());
+        assert!(!fresh.on_restart_fresh().recopies());
+
+        let resumed = RecopyScope::on_resume(true);
+        assert!(resumed.recopies());
+        assert!(!resumed.after_page().recopies());
+
+        let restarted = resumed.on_restart_fresh();
+        assert!(restarted.recopies());
+        assert!(restarted.after_page().recopies());
+        assert!(restarted.after_page().after_page().recopies());
+    }
+
     /// The checkpoint saves only after the flush, and never after a failed
     /// flush: a saved cursor must not point past a copy that is not durable.
     #[tokio::test]
