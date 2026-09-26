@@ -252,3 +252,39 @@ async fn test_complete_multipart_after_bucket_deletion_returns_nosuchbucket() {
         "C2 REGRESSION: bucket directory recreated by failed CompleteMultipartUpload"
     );
 }
+
+/// CreateBucket on a bucket the caller already owns answers the same on
+/// every backend: success (the us-east-1 answer, and what the filesystem
+/// backend gives). The S3 backend mapped the backend's 409
+/// BucketAlreadyOwnedByYou to a 500 InternalError, which SDKs retry.
+async fn create_existing_bucket_succeeds(server: &TestServer) {
+    let s3 = server.s3_client().await;
+    let bucket = common::unique_bucket("twice");
+    s3.create_bucket().bucket(&bucket).send().await.unwrap();
+    let again = s3.create_bucket().bucket(&bucket).send().await;
+    assert!(
+        again.is_ok(),
+        "second CreateBucket of an owned bucket: {:?}",
+        again
+            .err()
+            .and_then(|e| e.raw_response().map(|r| r.status().as_u16()))
+    );
+    s3.put_object()
+        .bucket(&bucket)
+        .key("k.txt")
+        .body(aws_sdk_s3::primitives::ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .expect("the bucket still works");
+}
+
+#[tokio::test]
+async fn test_create_existing_bucket_succeeds_on_filesystem() {
+    create_existing_bucket_succeeds(&TestServer::filesystem().await).await;
+}
+
+#[tokio::test]
+async fn test_create_existing_bucket_succeeds_on_s3() {
+    skip_unless_minio!();
+    create_existing_bucket_succeeds(&TestServer::s3().await).await;
+}
