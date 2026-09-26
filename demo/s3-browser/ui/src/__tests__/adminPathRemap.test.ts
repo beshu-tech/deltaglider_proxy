@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
-import { ADMIN_PATH_REMAP, resolveAdminPath } from '../adminPathRemap';
+import { ADMIN_PATH_REMAP, isUnknownAdminPath, nearestAdminPath, resolveAdminPath } from '../adminPathRemap';
 
 // The live IA's leaves — the membership test the app injects.
 const KNOWN = new Set([
@@ -83,4 +83,20 @@ test('slash trimming + empty + unknown → dashboard', () => {
   assert.equal(resolveAdminPath('/jobs/', isKnown), 'jobs');
   assert.equal(resolveAdminPath('', isKnown), 'dashboard');
   assert.equal(resolveAdminPath('totally/unknown', isKnown), 'dashboard');
+});
+
+// Browser-review item 20: an unknown admin deep link rendered the dashboard
+// under the wrong URL, with no word. It now gets a not-found view that links
+// the nearest real page.
+test('unknown paths are detected; the nearest page shares the longest prefix', () => {
+  assert.equal(isUnknownAdminPath('totally/unknown', isKnown), true);
+  assert.equal(isUnknownAdminPath('', isKnown), false);
+  assert.equal(isUnknownAdminPath('users', isKnown), false); // legacy remap
+  assert.equal(isUnknownAdminPath('setup', isKnown), false);
+  assert.equal(isUnknownAdminPath('access/users', isKnown), false);
+  const leaves = [...KNOWN];
+  assert.equal(nearestAdminPath('access/userz', leaves), 'access/users');
+  assert.equal(nearestAdminPath('storage/nope', leaves), 'storage/backends');
+  assert.equal(nearestAdminPath('jobs/42', leaves), 'jobs');
+  assert.equal(nearestAdminPath('zzz', leaves), 'dashboard');
 });

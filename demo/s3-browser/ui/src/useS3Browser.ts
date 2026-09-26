@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useLayoutEffect, useCallback, useRef, useMemo } from 'react';
 import { message } from 'antd';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from './queries/keys';
@@ -105,9 +105,11 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
   const isInitialLoad = useRef(true);
 
   // Keep the s3client's module-level active bucket in sync with the URL bucket
-  // (the AWS-SDK calls read it). Runs before the list-fetch effect on a bucket
-  // change so listObjects() targets the right bucket.
-  useEffect(() => {
+  // (the AWS-SDK calls read it). A LAYOUT effect: it runs before every passive
+  // effect, the children's included, so neither the list fetch nor a child's
+  // first request (the inspector's HEAD on a ?object= deep link) sees the
+  // previous bucket.
+  useLayoutEffect(() => {
     if (bucket && bucket !== getBucket()) {
       setBucket(bucket);
     }

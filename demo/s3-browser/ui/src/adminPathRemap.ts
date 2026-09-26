@@ -59,3 +59,40 @@ export function resolveAdminPath(raw: string, isKnownPath: (p: string) => boolea
   if (isKnownPath(path)) return path;
   return 'dashboard';
 }
+
+/** True for a non-empty path that is neither a live leaf nor a legacy alias. */
+export function isUnknownAdminPath(raw: string, isKnownPath: (p: string) => boolean): boolean {
+  const path = raw.replace(/^\/+/, '').replace(/\/+$/, '');
+  if (!path || path === 'setup' || ADMIN_PATH_REMAP[path]) return false;
+  return !isKnownPath(path);
+}
+
+/**
+ * The live leaf nearest to an unknown path: the one sharing the most leading
+ * segments, then the most leading characters of the first differing segment
+ * ("access/userz" → "access/users"). Nothing in common → the dashboard.
+ */
+export function nearestAdminPath(raw: string, leaves: string[]): string {
+  const segs = raw.replace(/^\/+/, '').replace(/\/+$/, '').split('/');
+  let best = 'dashboard';
+  let bestScore = 0;
+  for (const leaf of leaves) {
+    const ls = leaf.split('/');
+    let score = 0;
+    for (let i = 0; i < Math.min(ls.length, segs.length); i++) {
+      if (ls[i] === segs[i]) {
+        score += 1000;
+        continue;
+      }
+      let c = 0;
+      while (c < ls[i].length && c < segs[i].length && ls[i][c] === segs[i][c]) c++;
+      score += c;
+      break;
+    }
+    if (score > bestScore) {
+      best = leaf;
+      bestScore = score;
+    }
+  }
+  return best;
+}

@@ -10,6 +10,7 @@ import AdminSidebar from './AdminSidebar';
 import { ADMIN_IA } from './adminNavigation';
 import { findEntry } from '../adminNavTree';
 import ReloginModal from './ReloginModal';
+import AdminNotFound from './admin/AdminNotFound';
 import CommandPalette, {
   FileTextOutlined as PaletteFileTextOutlined,
   ImportOutlined as PaletteImportOutlined,
@@ -18,7 +19,7 @@ import CommandPalette, {
   QuestionCircleOutlined,
 } from './CommandPalette';
 import { useNavigation } from '../NavigationContext';
-import { resolveAdminPath as remapAdminPath } from '../adminPathRemap';
+import { isUnknownAdminPath, nearestAdminPath, resolveAdminPath as remapAdminPath } from '../adminPathRemap';
 import { buildViewUrl, parseAdminQuery } from '../urlState';
 import { useOverlayClose } from '../hooks/useOverlayClose';
 import { useBackupImportExport } from '../hooks/useBackupImportExport';
@@ -37,9 +38,11 @@ import RestoreBackupModal from './admin/RestoreBackupModal';
  * The exhaustive old→new table lives in `adminPathRemap.ts` (regression-
  * tested); membership in the live IA is the passthrough test.
  */
+const isLeaf = (p: string) => Boolean(findEntry(ADMIN_IA, p));
 function resolveAdminPath(subPath: string): string {
-  return remapAdminPath(subPath, (p) => Boolean(findEntry(ADMIN_IA, p)));
+  return remapAdminPath(subPath, isLeaf);
 }
+const ADMIN_LEAVES = ADMIN_IA.flatMap((g) => g.entries.flatMap((e) => [e.path, ...(e.children ?? []).map((c) => c.path)]));
 
 interface AdminPageProps {
   onBack: () => void;
@@ -82,6 +85,9 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
   // `backends`, etc.) are mapped to the new hierarchy.
   const rawSubPath = (subPath || '').replace(/^\/+/, '').replace(/\/+$/, '');
   const adminPath = resolveAdminPath(subPath || '');
+  // An unknown deep link: say so and link the nearest page, instead of the
+  // dashboard under a URL that names something else.
+  const unknownPath = isUnknownAdminPath(rawSubPath, isLeaf) ? rawSubPath : null;
   const activeSection = sectionForPath(adminPath);
   // The per-leaf dirty/apply key for ⌘S dispatch (panels register under this,
   // not the coarse section). `activeSection` is still used for the avatar
@@ -110,13 +116,13 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
     // the raw sub-path (legacy hit). Skip on the landing page
     // (empty sub-path -> diagnostics/dashboard) — that's a fresh
     // navigation, not a legacy bookmark.
-    if (rawSubPath && rawSubPath !== adminPath) {
+    if (rawSubPath && rawSubPath !== adminPath && !unknownPath) {
       // Preserve any query params (e.g. ?job=…&tab=…) that were present
       // on the legacy URL — the canonical path must not wipe them.
       const query = parseAdminQuery(search ?? window.location.search);
       navigate(buildViewUrl('admin', adminPath, Object.keys(query).length > 0 ? query : undefined), { replace: true });
     }
-  }, [rawSubPath, adminPath, navigate, search]);
+  }, [rawSubPath, adminPath, navigate, search, unknownPath]);
 
   const [authed, setAuthed] = useState(false);
   const [checkingSession, setCheckingSession] = useState(true);
@@ -524,7 +530,11 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
             overflow: 'auto',
           }}
         >
-          <AdminRouteContent path={adminPath} ctx={routeCtx} />
+          {unknownPath ? (
+            <AdminNotFound path={unknownPath} nearest={nearestAdminPath(unknownPath, ADMIN_LEAVES)} onNavigate={navigateAdmin} />
+          ) : (
+            <AdminRouteContent path={adminPath} ctx={routeCtx} />
+          )}
         </div>
       </div>
     </div>
