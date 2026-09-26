@@ -1120,7 +1120,15 @@ impl S3Backend {
                 Err(e) => {
                     match fenced_write_verdict(&fence, &crate::config_db_sync::sdk_error_signal(&e))
                     {
-                        FencedWriteVerdict::Lost => return Err(reference_fence_lost(bucket, key)),
+                        FencedWriteVerdict::Lost => {
+                            let md5 = hex::encode(<md5::Md5 as md5::Digest>::digest(data));
+                            let etag = self.own_write_or_lost(bucket, key, &md5).await?;
+                            let stored = data.len() as u64;
+                            self.remember_listed_facts(bucket, key, &etag, stored, metadata);
+                            self.persist_listing_facts(bucket, key, &etag, stored, metadata)
+                                .await;
+                            return Ok(Some(etag));
+                        }
                         // Retry at once without the condition (the last
                         // attempt reports the 501 instead of falling out of
                         // the loop).
@@ -1187,6 +1195,28 @@ impl S3Backend {
         )
         .await
         .map(|_| ())
+    }
+
+    /// A fenced PUT met a refused condition. When an earlier attempt of the
+    /// same PUT (ours, or an SDK-level retry) landed but its response was
+    /// lost, the retry meets our own write: the object then holds exactly
+    /// our bytes, and its ETag is their MD5. That is a success, not a lost
+    /// fence (a false SlowDown, and a rollback that deleted our own
+    /// baseline). Any other object is a peer's write: lost.
+    async fn own_write_or_lost(
+        &self,
+        bucket: &str,
+        key: &str,
+        body_md5_hex: &str,
+    ) -> Result<String, StorageError> {
+        let head = self.client.head_object().bucket(bucket).key(key).send().await;
+        match head.ok().and_then(|h| h.e_tag().map(str::to_string)) {
+            Some(etag) if etag_is_body_md5(&etag, body_md5_hex) => {
+                debug!("S3 PUT {bucket}/{key}: the refused retry met its own landed write");
+                Ok(etag)
+            }
+            _ => Err(reference_fence_lost(bucket, key)),
+        }
     }
 
     /// `put_object_file_with_metadata` with a write precondition; returns
@@ -1258,7 +1288,18 @@ impl S3Backend {
                 Err(e) => {
                     match fenced_write_verdict(&fence, &crate::config_db_sync::sdk_error_signal(&e))
                     {
-                        FencedWriteVerdict::Lost => return Err(reference_fence_lost(bucket, key)),
+                        FencedWriteVerdict::Lost => {
+                            let Some(md5) = md5_hex_of_file(source_path).await else {
+                                return Err(reference_fence_lost(bucket, key));
+                            };
+                            let etag = self.own_write_or_lost(bucket, key, &md5).await?;
+                            if let Some(size) = stored_size {
+                                self.remember_listed_facts(bucket, key, &etag, size, metadata);
+                                self.persist_listing_facts(bucket, key, &etag, size, metadata)
+                                    .await;
+                            }
+                            return Ok(Some(etag));
+                        }
                         // Retry at once without the condition (the last
                         // attempt reports the 501 instead of falling out of
                         // the loop).
@@ -3473,6 +3514,42 @@ enum FencedWriteVerdict {
     Other,
 }
 
+/// Pure: is `etag` (as S3 returns it) the MD5 of a single-PUT body? A
+/// multipart or SSE-KMS ETag never is, so those stay lost fences.
+fn etag_is_body_md5(etag: &str, body_md5_hex: &str) -> bool {
+    !body_md5_hex.is_empty() && etag.trim_matches('"').eq_ignore_ascii_case(body_md5_hex)
+}
+
+/// MD5 of a file, hex; `None` when it cannot be read.
+async fn md5_hex_of_file(path: &std::path::Path) -> Option<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        use md5::Digest;
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut h = md5::Md5::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = f.read(&mut buf).ok()?;
+            if n == 0 {
+                break;
+            }
+            h.update(&buf[..n]);
+        }
+        Some(hex::encode(h.finalize()))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// AWS answers a conditional write that races another one with `409
+/// ConditionalRequestConflict` ("retry"): another writer is changing the
+/// object, so the fence cannot hold. Plain 409s (BucketNotEmpty, …) are not.
+fn is_conditional_conflict(signal: &str) -> bool {
+    signal.contains("status=409") && signal.contains("code=ConditionalRequestConflict")
+}
+
 /// Pure: classify a failed write by its SDK signal (status + code).
 fn fenced_write_verdict(fence: &RefFence, signal: &str) -> FencedWriteVerdict {
     let conditional = match fence {
@@ -3482,7 +3559,9 @@ fn fenced_write_verdict(fence: &RefFence, signal: &str) -> FencedWriteVerdict {
     };
     if !conditional {
         FencedWriteVerdict::Other
-    } else if crate::config_db_sync::is_precondition_failed(signal) {
+    } else if crate::config_db_sync::is_precondition_failed(signal)
+        || is_conditional_conflict(signal)
+    {
         FencedWriteVerdict::Lost
     } else if crate::config_db_sync::is_not_implemented(signal) {
         FencedWriteVerdict::Unsupported
@@ -4741,12 +4820,202 @@ mod review3_tests {
     /// reads it as unrelated, and the PUT loop does not retry a 409, so the
     /// client gets a non-retryable error instead of SlowDown.
     #[test]
-    #[ignore = "review3: pending fix"]
+    fn etag_is_body_md5_truth_table() {
+        assert!(etag_is_body_md5("\"abcd\"", "abcd"));
+        assert!(etag_is_body_md5("ABCD", "abcd"));
+        assert!(!etag_is_body_md5("\"abcd-2\"", "abcd"));
+        assert!(!etag_is_body_md5("\"\"", ""));
+        assert!(!etag_is_body_md5("\"ffff\"", "abcd"));
+    }
+
+    #[test]
     fn review3_a_409_conditional_conflict_is_a_lost_fence() {
         let etag = RefFence::ETag("\"abc\"".into());
         assert_eq!(
             fenced_write_verdict(&etag, "status=409 code=ConditionalRequestConflict"),
             FencedWriteVerdict::Lost
+        );
+        assert_eq!(
+            fenced_write_verdict(&RefFence::Absent, "status=409 code=ConditionalRequestConflict"),
+            FencedWriteVerdict::Lost
+        );
+        assert_eq!(
+            fenced_write_verdict(&etag, "status=409 code=OperationAborted"),
+            FencedWriteVerdict::Other
+        );
+    }
+}
+
+/// A fenced PUT whose response is lost: the write landed, the retry meets
+/// its own write and gets 412.
+#[cfg(test)]
+mod lost_response_tests {
+    use super::*;
+    use axum::http::{HeaderMap, StatusCode};
+    use md5::Digest;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct Fake {
+        objects: parking_lot::Mutex<HashMap<String, String>>,
+        puts: AtomicUsize,
+    }
+
+    /// A minimal S3: PUT honours `If-None-Match: *` and `If-Match`, the
+    /// first PUT answers only after the client gave up, HEAD returns the
+    /// ETag.
+    async fn fake_s3() -> (String, Arc<Fake>) {
+        use axum::routing::put;
+        let fake = Arc::new(Fake::default());
+        let f = fake.clone();
+        let f2 = fake.clone();
+        let app = axum::Router::new().route(
+            "/:bucket/*key",
+            put(
+                move |axum::extract::Path((b, k)): axum::extract::Path<(String, String)>,
+                      headers: HeaderMap,
+                      body: axum::body::Bytes| {
+                    let f = f.clone();
+                    async move {
+                        let path = format!("{b}/{k}");
+                        let etag = format!("\"{}\"", hex::encode(md5::Md5::digest(&body)));
+                        {
+                            let mut objs = f.objects.lock();
+                            let cur = objs.get(&path).cloned();
+                            let refused = match (headers.get("if-none-match"), headers.get("if-match")) {
+                                (Some(_), _) => cur.is_some(),
+                                (_, Some(m)) => cur.as_deref() != m.to_str().ok(),
+                                _ => false,
+                            };
+                            if refused {
+                                return (
+                                    StatusCode::PRECONDITION_FAILED,
+                                    HeaderMap::new(),
+                                    "<Error><Code>PreconditionFailed</Code></Error>".to_string(),
+                                );
+                            }
+                            objs.insert(path, etag.clone());
+                        }
+                        if f.puts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            // The write landed; the response comes too late.
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        }
+                        let mut h = HeaderMap::new();
+                        h.insert("etag", etag.parse().unwrap());
+                        (StatusCode::OK, h, String::new())
+                    }
+                },
+            )
+            .head(
+                move |axum::extract::Path((b, k)): axum::extract::Path<(String, String)>| {
+                    let f = f2.clone();
+                    async move {
+                        let mut h = HeaderMap::new();
+                        match f.objects.lock().get(&format!("{b}/{k}")) {
+                            Some(e) => {
+                                h.insert("etag", e.parse().unwrap());
+                                h.insert("content-length", "0".parse().unwrap());
+                                (StatusCode::OK, h)
+                            }
+                            None => (StatusCode::NOT_FOUND, h),
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), fake)
+    }
+
+    fn backend(endpoint: &str) -> S3Backend {
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("a", "b", None, None, "t"))
+            .force_path_style(true)
+            .endpoint_url(endpoint)
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .timeout_config(
+                aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+                    .operation_attempt_timeout(std::time::Duration::from_millis(300))
+                    .build(),
+            )
+            .request_checksum_calculation(
+                aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired,
+            )
+            .build();
+        let client = Client::from_conf(conf);
+        S3Backend {
+            facts_cleanup: super::super::facts_cleanup::FactsCleanupQueue::start(client.clone()),
+            client,
+            native_encryption: NativeEncryptionConfig::None,
+            list_cache_scope: endpoint.to_string(),
+        }
+    }
+
+    fn meta(data: &[u8]) -> FileMetadata {
+        FileMetadata::new_reference(
+            "reference.bin".into(),
+            "v1/a.zip".into(),
+            hex::encode(sha2::Sha256::digest(data)),
+            hex::encode(md5::Md5::digest(data)),
+            data.len() as u64,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_fenced_put_whose_response_was_lost_is_not_a_lost_fence() {
+        let (ep, fake) = fake_s3().await;
+        let s3 = backend(&ep);
+        let data = b"the baseline".to_vec();
+        let got = s3
+            .write_reference_fenced(
+                "b",
+                "v1",
+                RefWrite::Put {
+                    data: &data,
+                    metadata: &meta(&data),
+                },
+                &RefFence::Absent,
+            )
+            .await;
+        assert!(fake.puts.load(Ordering::SeqCst) >= 1);
+        let want = format!("\"{}\"", hex::encode(md5::Md5::digest(&data)));
+        assert_eq!(
+            got.ok(),
+            Some(RefFence::ETag(want)),
+            "the reference is ours: the retry's 412 must not read as a lost fence"
+        );
+    }
+
+    /// A 412 against a PEER's write stays a lost fence.
+    #[tokio::test]
+    async fn a_peer_write_is_still_a_lost_fence() {
+        let (ep, fake) = fake_s3().await;
+        fake.puts.store(1, Ordering::SeqCst); // no slow first response
+        let s3 = backend(&ep);
+        fake.objects
+            .lock()
+            .insert(format!("b/{}", s3.reference_key("v1")), "\"peer\"".into());
+        let data = b"mine".to_vec();
+        let got = s3
+            .write_reference_fenced(
+                "b",
+                "v1",
+                RefWrite::Put {
+                    data: &data,
+                    metadata: &meta(&data),
+                },
+                &RefFence::Absent,
+            )
+            .await;
+        assert!(
+            matches!(got, Err(StorageError::Throttled(_))),
+            "a peer's reference must stay a lost fence, got {got:?}"
         );
     }
 }

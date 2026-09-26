@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed — Fewer false `503 SlowDown` answers from the fenced reference write
+
+With config sync on, the write of a delta prefix's `reference.bin` is
+conditional on the version that the writer saw. Two cases gave the wrong
+answer. First, when the response of that write was lost (a timeout), the
+proxy sent the write again. The second write found the first one and was
+refused, so the proxy answered `503 SlowDown` and removed the baseline that
+it had just written. Now the proxy reads the object after a refused write:
+when it holds exactly the bytes of this request, the write succeeds.
+Second, AWS answers two conditional writes that race with
+`409 ConditionalRequestConflict`. The proxy read that answer as an ordinary
+error that clients do not retry. Now it is a lost race, and the client gets
+`503 SlowDown` and retries.
+
 ### Security — A `Deny` exception now hides keys from a LIST
 
 A user with an `Allow` on the whole bucket and a `Deny` on part of it (for
