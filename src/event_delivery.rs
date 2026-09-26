@@ -93,20 +93,61 @@ pub trait EventDeliveryClient: Send + Sync + 'static {
 /// One place an event is delivered to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryTarget {
-    /// A raw or Slack Incoming Webhook URL.
-    Webhook(String),
+    /// A raw or Slack Incoming Webhook URL, at position `slot` of the
+    /// configured endpoints.
+    Webhook { url: String, slot: usize },
     /// A Slack channel (bot-token mode, `chat.postMessage`).
     SlackChannel(String),
 }
 
 impl DeliveryTarget {
-    /// The `event_deliveries.endpoint_id` of this target.
+    /// The `event_deliveries.endpoint_id` of this target. A webhook is the
+    /// configured endpoint at its position and origin, not its full URL: a
+    /// rotated token in the path or query is the same endpoint, and keeps
+    /// its delivered state (a retry does not post to it again). A removal
+    /// that moves another host into the position is a new endpoint.
     pub fn id(&self) -> String {
         match self {
-            DeliveryTarget::Webhook(url) => endpoint_id(url),
+            DeliveryTarget::Webhook { url, slot } => {
+                endpoint_id(&format!("webhook:{slot}:{}", url_origin(url)))
+            }
             DeliveryTarget::SlackChannel(c) => endpoint_id(&format!("slack-channel:{c}")),
         }
     }
+
+    /// The id rows written before the position-keyed id carry (the URL
+    /// hash): still honoured, so an upgrade does not re-post.
+    fn legacy_id(&self) -> Option<String> {
+        match self {
+            DeliveryTarget::Webhook { url, .. } => Some(endpoint_id(url)),
+            DeliveryTarget::SlackChannel(_) => None,
+        }
+    }
+}
+
+/// `scheme://host[:port]` of a URL (no path, query or credentials), or the
+/// trimmed input when it does not parse.
+fn url_origin(raw: &str) -> String {
+    match Url::parse(raw.trim()) {
+        Ok(u) => u.origin().ascii_serialization(),
+        Err(_) => raw.trim().to_string(),
+    }
+}
+
+/// The webhook endpoints as targets. The same URL listed twice is one
+/// endpoint (posted once).
+fn webhook_targets(config: &EventDeliveryConfig) -> Vec<DeliveryTarget> {
+    let mut seen = std::collections::HashSet::new();
+    config
+        .webhook_endpoints()
+        .into_iter()
+        .enumerate()
+        .filter(|(_, u)| seen.insert(endpoint_id(u)))
+        .map(|(slot, u)| DeliveryTarget::Webhook {
+            url: u.to_string(),
+            slot,
+        })
+        .collect()
 }
 
 /// Pure: the targets `event` goes to under `config`. `Ok(empty)` means consume
@@ -116,13 +157,7 @@ pub fn delivery_targets(
     config: &EventDeliveryConfig,
     event: &EventOutboxRecord,
 ) -> Result<Vec<DeliveryTarget>, String> {
-    let webhooks = || -> Vec<DeliveryTarget> {
-        config
-            .webhook_endpoints()
-            .into_iter()
-            .map(|u| DeliveryTarget::Webhook(u.to_string()))
-            .collect()
-    };
+    let webhooks = || webhook_targets(config);
     match config.format {
         EventDeliveryFormat::Raw => {
             let t = webhooks();
@@ -161,12 +196,14 @@ pub fn delivery_targets(
 /// An id missing from the map is an endpoint removed from the config.
 pub fn endpoint_labels(config: &EventDeliveryConfig) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
-    for (i, url) in config.webhook_endpoints().into_iter().enumerate() {
-        let target = DeliveryTarget::Webhook(url.to_string());
-        out.insert(
-            target.id(),
-            format!("webhook {}: {}", i + 1, redact_url_for_error(url)),
-        );
+    for target in webhook_targets(config) {
+        if let DeliveryTarget::Webhook { url, slot } = &target {
+            let label = format!("webhook {}: {}", slot + 1, redact_url_for_error(url));
+            if let Some(legacy) = target.legacy_id() {
+                out.insert(legacy, label.clone());
+            }
+            out.insert(target.id(), label);
+        }
     }
     let channels = config
         .slack_channel
@@ -346,10 +383,10 @@ impl EventDeliveryClient for HttpWebhookDeliveryClient {
             "event_delivery.request_timeout",
         );
         match (config.format, target) {
-            (EventDeliveryFormat::Raw, DeliveryTarget::Webhook(url)) => {
+            (EventDeliveryFormat::Raw, DeliveryTarget::Webhook { url, .. }) => {
                 self.post_raw(config, event, url, timeout).await
             }
-            (EventDeliveryFormat::Slack, DeliveryTarget::Webhook(url)) => {
+            (EventDeliveryFormat::Slack, DeliveryTarget::Webhook { url, .. }) => {
                 self.post_slack_webhook(config, event, url, timeout).await
             }
             (_, DeliveryTarget::SlackChannel(channel)) => {
@@ -719,7 +756,7 @@ async fn deliver_to_targets(
     let mut errors = Vec::new();
     for target in targets {
         let id = target.id();
-        if done.contains(&id) {
+        if done.contains(&id) || target.legacy_id().is_some_and(|l| done.contains(&l)) {
             continue;
         }
         let outcome = client.deliver_target(config, event, &target).await;
@@ -1110,7 +1147,7 @@ mod tests {
             target: &DeliveryTarget,
         ) -> Result<(), String> {
             let endpoint = match target {
-                DeliveryTarget::Webhook(u) => u.as_str(),
+                DeliveryTarget::Webhook { url, .. } => url.as_str(),
                 DeliveryTarget::SlackChannel(c) => c.as_str(),
             };
             self.posts.lock().unwrap().push(endpoint.to_string());
@@ -1154,10 +1191,18 @@ mod tests {
             ]
         );
         let deliveries = db.lock().await.event_deliveries_for(id).unwrap();
+        let slot = |url: &str| config.webhook_endpoints().iter().position(|u| *u == url);
+        let wid = |url: &str| {
+            DeliveryTarget::Webhook {
+                url: url.to_string(),
+                slot: slot(url).unwrap(),
+            }
+            .id()
+        };
         let status = |url: &str| {
             deliveries
                 .iter()
-                .find(|d| d.endpoint_id == endpoint_id(url))
+                .find(|d| d.endpoint_id == wid(url))
                 .map(|d| (d.status.clone(), d.attempts))
         };
         assert_eq!(
@@ -1180,11 +1225,57 @@ mod tests {
         assert_eq!(
             deliveries
                 .iter()
-                .find(|d| d.endpoint_id == endpoint_id("http://b.invalid/hook"))
+                .find(|d| d.endpoint_id == wid("http://b.invalid/hook"))
                 .unwrap()
                 .attempts,
             2
         );
+    }
+
+    /// An operator rotates the token in the URL of endpoint A (the same
+    /// configured endpoint) while an event waits for a retry of B. A had
+    /// the event already; the retry must post to B only. Keyed by the URL
+    /// hash, A's new URL looked like a new endpoint and got it again.
+    #[tokio::test]
+    async fn a_rotated_endpoint_url_keeps_its_delivered_state() {
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        db.lock().await.event_outbox_insert(&event("rot")).unwrap();
+        let client = EndpointClient {
+            fail_url: "http://b.invalid/hook",
+            fail_times: 1,
+            failed: AtomicUsize::new(0),
+            posts: Default::default(),
+        };
+        let mut config = EventDeliveryConfig {
+            webhook_url: Some("http://a.invalid/hook?token=old".into()),
+            webhook_urls: vec!["http://b.invalid/hook".into()],
+            ..cfg()
+        };
+        dispatch_once(&db, &client, &config, "w", 200).await;
+        client.posts.lock().unwrap().clear();
+        config.webhook_url = Some("http://a.invalid/hook?token=new".into());
+        dispatch_once(&db, &client, &config, "w", 205).await;
+        assert_eq!(*client.posts.lock().unwrap(), vec!["http://b.invalid/hook"]);
+    }
+
+    /// The same URL listed twice is one endpoint: one post.
+    #[tokio::test]
+    async fn a_url_listed_twice_gets_one_post() {
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        db.lock().await.event_outbox_insert(&event("dup")).unwrap();
+        let client = EndpointClient {
+            fail_url: "http://none.invalid/",
+            fail_times: 0,
+            failed: AtomicUsize::new(0),
+            posts: Default::default(),
+        };
+        let config = EventDeliveryConfig {
+            webhook_url: Some("http://a.invalid/hook".into()),
+            webhook_urls: vec!["http://a.invalid/hook".into()],
+            ..cfg()
+        };
+        dispatch_once(&db, &client, &config, "w", 200).await;
+        assert_eq!(*client.posts.lock().unwrap(), vec!["http://a.invalid/hook"]);
     }
 
     fn slack_event() -> NewEvent {
@@ -1329,9 +1420,10 @@ mod tests {
         );
         assert_eq!(
             delivery_targets(&slack, &rec(EventKind::ObjectCreated)),
-            Ok(vec![DeliveryTarget::Webhook(
-                "http://example.invalid/hook".into()
-            )])
+            Ok(vec![DeliveryTarget::Webhook {
+                url: "http://example.invalid/hook".into(),
+                slot: 0
+            }])
         );
         // Bot token without a channel is a config error; routed-but-unmatched is not.
         let bot = EventDeliveryConfig {
@@ -1347,7 +1439,11 @@ mod tests {
         // Channel and URL ids never collide.
         assert_ne!(
             DeliveryTarget::SlackChannel("x".into()).id(),
-            DeliveryTarget::Webhook("x".into()).id()
+            DeliveryTarget::Webhook {
+                url: "x".into(),
+                slot: 0
+            }
+            .id()
         );
     }
 

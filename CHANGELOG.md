@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — A webhook endpoint keeps its delivery state when its URL token is rotated
+
+The proxy records the delivery result of each webhook endpoint, and a retry
+posts only to the endpoints that failed. It knew an endpoint by the hash of
+its full URL. When an operator rotated a token in the path or query of an
+endpoint URL while an event waited for a retry, the endpoint looked new, and
+the retry posted the event to it a second time. Now the proxy knows an
+endpoint by its position in the list and by its scheme, host and port. The
+same URL listed twice is now one endpoint. Delivery rows written by earlier
+releases still count.
+
 ### Fixed — The listing-facts cleanup no longer removes a peer's new entry, and misses no deleted object
 
 On an S3 backend, deleting a delta or encrypted object queues the removal of
