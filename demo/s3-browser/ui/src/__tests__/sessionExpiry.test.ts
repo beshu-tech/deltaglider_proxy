@@ -143,7 +143,8 @@ test('loginAs: 403 means "not an admin"; a rate limit or a server error must sur
     assert.ok(!r.ok);
     assert.equal(r.status, status);
     assert.equal(api.isNotAdminDenial(r), false, `${status} is not a not-admin answer`);
-    assert.match(r.error, new RegExp(`\\(${status}\\)`));
+    // A lockout names itself (loginError.ts); other failures carry the status.
+    assert.match(r.error, status === 429 ? /Too many sign-in attempts/ : new RegExp(`\\(${status}\\)`));
   }
 });
 

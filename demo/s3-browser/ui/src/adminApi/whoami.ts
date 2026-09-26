@@ -1,6 +1,6 @@
 // === Whoami / Login-as ===
-import { ApiError, throwApiError } from '../errorHandling';
-import { adminFetch, loginFailureFromResponse, safeJson } from './core';
+import { ApiError } from '../errorHandling';
+import { adminFetch, loginFailureFromResponse, safeJson, signInRequest } from './core';
 import type { IamPermission } from './users';
 
 export interface ExternalProviderInfo {
@@ -65,13 +65,11 @@ export type LoginAsResult = { ok: true } | { ok: false; status: number; error: s
  */
 export async function loginAs(accessKeyId: string, secretAccessKey: string): Promise<LoginAsResult> {
   try {
-    const res = await adminFetch('/api/admin/login-as', 'POST', {
+    const locked = await signInRequest('/api/admin/login-as', {
       access_key_id: accessKeyId,
       secret_access_key: secretAccessKey,
-    });
-    if (res.status === 429) return { ok: false, status: 429, error: await loginFailureFromResponse(res) };
-    if (!res.ok) await throwApiError(res, 'Admin sign-in');
-    return { ok: true };
+    }, 'Admin sign-in');
+    return locked ?? { ok: true };
   } catch (e) {
     if (!(e instanceof ApiError)) throw e; // network failure: the caller shows it
     if (e.status === 403) {

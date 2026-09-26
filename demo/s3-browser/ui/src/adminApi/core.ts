@@ -115,6 +115,22 @@ export async function adminLogin(password: string): Promise<{ ok: boolean; error
   return { ok: false, error: await loginFailureFromResponse(res) };
 }
 
+/**
+ * A sign-in POST. A lockout (429) comes back as a result with the lockout
+ * sentence (the wait is in `Retry-After`, which an ApiError does not
+ * carry); any other failure throws the usual ApiError. Null = signed in.
+ */
+export async function signInRequest(
+  path: string,
+  body: unknown,
+  context: string,
+): Promise<{ ok: false; status: 429; error: string } | null> {
+  const res = await adminFetch(path, 'POST', body);
+  if (res.status === 429) return { ok: false, status: 429, error: await loginFailureFromResponse(res) };
+  if (!res.ok) await throwApiError(res, context);
+  return null;
+}
+
 /** The sign-in failure sentence for a non-2xx sign-in response. */
 export async function loginFailureFromResponse(res: Response): Promise<string> {
   const data = (await res.json().catch(() => ({}))) as { error?: unknown; retry_after_secs?: unknown };
