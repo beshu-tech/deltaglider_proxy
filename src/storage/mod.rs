@@ -30,7 +30,7 @@ pub use s3::{
 };
 pub use traits::{
     reference_fence_lost, BucketListing, BulkListing, DelegatedListResult, MultipartUpload,
-    RefFence, RefWrite, StorageBackend, StorageError, UploadedPart,
+    ObjectVariant, RefFence, RefWrite, StorageBackend, StorageError, UploadedPart,
 };
 
 /// ENOSPC raw error code on Linux and macOS.

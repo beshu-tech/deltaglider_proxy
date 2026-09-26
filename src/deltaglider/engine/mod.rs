@@ -2341,8 +2341,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Delete `key` only if `still_ours` accepts the object as read under
     /// the deltaspace lock. Every PUT holds that lock, so no overwrite can
     /// land between the check and the delete (a HEAD, then a delete by key,
-    /// removed an overwrite that landed in between). Single instance only: a
-    /// peer instance's PUT does not take this in-process lock.
+    /// removed an overwrite that landed in between). A peer INSTANCE's PUT
+    /// does not take this lock: where the backend has a conditional delete
+    /// (S3 `If-Match`), the delete is also pinned to the stored version the
+    /// check saw; elsewhere (filesystem, a backend answering 501) the
+    /// in-process lock is the only guard.
     #[instrument(skip(self, still_ours))]
     pub async fn delete_if(
         &self,
@@ -2480,9 +2483,49 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 None => Err(EngineError::NotFound(obj_key.full_key())),
             };
         };
-        if still_ours.is_some_and(|ours| !ours(&metadata)) {
-            return Ok(ConditionalDelete::Changed);
-        }
+        // A conditional delete also pins the stored version where the backend
+        // can (S3 If-Match): a peer INSTANCE's PUT does not take our
+        // in-process lock. The version is read BEFORE the check's read, so
+        // any overwrite after it fails the delete.
+        let mut pinned: Option<String> = None;
+        let metadata = match still_ours {
+            None => metadata,
+            Some(ours) => {
+                let variant = match metadata.storage_info {
+                    StorageInfo::Delta { .. } => crate::storage::ObjectVariant::Delta,
+                    _ => crate::storage::ObjectVariant::Passthrough,
+                };
+                let checked = match self
+                    .storage
+                    .variant_version(bucket, &deltaspace_id, &obj_key.filename, variant)
+                    .await
+                {
+                    Ok(None) => metadata,
+                    Ok(Some(version)) => {
+                        pinned = Some(version);
+                        match self
+                            .resolve_metadata(bucket, &deltaspace_id, &obj_key)
+                            .await?
+                        {
+                            Some(m)
+                                if std::mem::discriminant(&m.storage_info)
+                                    == std::mem::discriminant(&metadata.storage_info) =>
+                            {
+                                m
+                            }
+                            Some(_) => return Ok(ConditionalDelete::Changed),
+                            None => return Ok(ConditionalDelete::Gone),
+                        }
+                    }
+                    Err(StorageError::NotFound(_)) => return Ok(ConditionalDelete::Gone),
+                    Err(e) => return Err(e.into()),
+                };
+                if !ours(&checked) {
+                    return Ok(ConditionalDelete::Changed);
+                }
+                checked
+            }
+        };
 
         // Delete based on storage type — but ALSO clean up the OTHER variant.
         // A key can transiently have BOTH a passthrough and a delta sibling (e.g.
@@ -2493,9 +2536,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // non-resolved one is best-effort (NotFound is the normal case).
         match &metadata.storage_info {
             StorageInfo::Passthrough => {
-                self.storage
-                    .delete_passthrough(bucket, &deltaspace_id, &obj_key.filename)
-                    .await?;
+                if let Some(version) = &pinned {
+                    let v = crate::storage::ObjectVariant::Passthrough;
+                    if !self
+                        .storage
+                        .delete_variant_if(bucket, &deltaspace_id, &obj_key.filename, v, version)
+                        .await?
+                    {
+                        return Ok(ConditionalDelete::Changed);
+                    }
+                } else {
+                    self.storage
+                        .delete_passthrough(bucket, &deltaspace_id, &obj_key.filename)
+                        .await?;
+                }
                 self.delete_sibling_variant_best_effort(
                     bucket,
                     &deltaspace_id,
@@ -2505,9 +2559,20 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .await;
             }
             StorageInfo::Delta { .. } => {
-                self.storage
-                    .delete_delta(bucket, &deltaspace_id, &obj_key.filename)
-                    .await?;
+                if let Some(version) = &pinned {
+                    let v = crate::storage::ObjectVariant::Delta;
+                    if !self
+                        .storage
+                        .delete_variant_if(bucket, &deltaspace_id, &obj_key.filename, v, version)
+                        .await?
+                    {
+                        return Ok(ConditionalDelete::Changed);
+                    }
+                } else {
+                    self.storage
+                        .delete_delta(bucket, &deltaspace_id, &obj_key.filename)
+                        .await?;
+                }
                 self.delete_sibling_variant_best_effort(
                     bucket,
                     &deltaspace_id,

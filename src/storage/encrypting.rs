@@ -1994,6 +1994,26 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         // The inner backend drops the listing facts of the ciphertext.
         self.inner.delete_passthrough(b, p, f).await
     }
+    // The version is the stored ciphertext's: an overwrite changes it too.
+    async fn variant_version(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+        v: crate::storage::ObjectVariant,
+    ) -> Result<Option<String>, StorageError> {
+        self.inner.variant_version(b, p, f, v).await
+    }
+    async fn delete_variant_if(
+        &self,
+        b: &str,
+        p: &str,
+        f: &str,
+        v: crate::storage::ObjectVariant,
+        version: &str,
+    ) -> Result<bool, StorageError> {
+        self.inner.delete_variant_if(b, p, f, v, version).await
+    }
     async fn scan_deltaspace(&self, b: &str, p: &str) -> Result<Vec<FileMetadata>, StorageError> {
         self.inner.scan_deltaspace(b, p).await
     }

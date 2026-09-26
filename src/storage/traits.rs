@@ -44,6 +44,13 @@ pub enum RefFence {
     ETag(String),
 }
 
+/// Which stored variant of an object a conditional delete names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectVariant {
+    Delta,
+    Passthrough,
+}
+
 /// One fenced write to `reference.bin` (see
 /// [`StorageBackend::write_reference_fenced`]).
 #[derive(Debug, Clone, Copy)]
@@ -453,6 +460,39 @@ pub trait StorageBackend: Send + Sync {
         prefix: &str,
         filename: &str,
     ) -> Result<(), StorageError>;
+
+    /// The stored version (the backend's ETag) of one variant, for a later
+    /// [`Self::delete_variant_if`]. `Ok(None)`: this backend has no
+    /// conditional delete; the engine's in-process deltaspace lock is the
+    /// only guard (enough single-instance: every PUT takes it). A missing
+    /// object is `Err(NotFound)`.
+    async fn variant_version(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+        _filename: &str,
+        _variant: ObjectVariant,
+    ) -> Result<Option<String>, StorageError> {
+        Ok(None)
+    }
+
+    /// Delete one variant only while it is still `version` (from
+    /// [`Self::variant_version`]). `Ok(false)`: it changed or is gone, and
+    /// nothing is deleted. The default deletes unconditionally.
+    async fn delete_variant_if(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        variant: ObjectVariant,
+        _version: &str,
+    ) -> Result<bool, StorageError> {
+        match variant {
+            ObjectVariant::Delta => self.delete_delta(bucket, prefix, filename).await?,
+            ObjectVariant::Passthrough => self.delete_passthrough(bucket, prefix, filename).await?,
+        }
+        Ok(true)
+    }
 
     // === Streaming operations ===
 
@@ -1087,6 +1127,29 @@ macro_rules! impl_storage_backend_for_box {
                 filename: &str,
             ) -> Result<(), StorageError> {
                 (**self).delete_passthrough(bucket, prefix, filename).await
+            }
+            async fn variant_version(
+                &self,
+                bucket: &str,
+                prefix: &str,
+                filename: &str,
+                variant: ObjectVariant,
+            ) -> Result<Option<String>, StorageError> {
+                (**self)
+                    .variant_version(bucket, prefix, filename, variant)
+                    .await
+            }
+            async fn delete_variant_if(
+                &self,
+                bucket: &str,
+                prefix: &str,
+                filename: &str,
+                variant: ObjectVariant,
+                version: &str,
+            ) -> Result<bool, StorageError> {
+                (**self)
+                    .delete_variant_if(bucket, prefix, filename, variant, version)
+                    .await
             }
 
             async fn get_passthrough_stream(

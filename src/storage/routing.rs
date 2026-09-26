@@ -1007,6 +1007,35 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, delete_passthrough, prefix, filename)
     }
 
+    async fn variant_version(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        variant: crate::storage::ObjectVariant,
+    ) -> Result<Option<String>, StorageError> {
+        route_existing!(self, bucket, variant_version, prefix, filename, variant)
+    }
+
+    async fn delete_variant_if(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        variant: crate::storage::ObjectVariant,
+        version: &str,
+    ) -> Result<bool, StorageError> {
+        route_existing!(
+            self,
+            bucket,
+            delete_variant_if,
+            prefix,
+            filename,
+            variant,
+            version
+        )
+    }
+
     // === Streaming operations ===
 
     async fn get_passthrough_stream(

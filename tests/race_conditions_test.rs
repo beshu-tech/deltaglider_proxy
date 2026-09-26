@@ -439,10 +439,10 @@ async fn move_race(runner: &TestServer, writer: &TestServer) {
     let (mv, last) = overwrite_during(writer, &keys, 0, mv).await;
     assert_eq!(mv.unwrap().status().as_u16(), 200, "move");
     let mut lost = Vec::new();
-    for i in 0..KEYS {
+    for (i, want) in last.iter().enumerate() {
         let (sc, sb) = get(writer, &src(i)).await;
         let (dc, db) = get(writer, &format!("mvdst/k{i:03}.txt")).await;
-        let kept = (sc == 200 && sb == last[i]) || (dc == 200 && db == last[i]);
+        let kept = (sc == 200 && &sb == want) || (dc == 200 && &db == want);
         if !kept {
             lost.push(format!(
                 "k{i:03}: src {sc}, dst {dc} {:?}",

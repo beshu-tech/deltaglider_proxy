@@ -751,6 +751,18 @@ impl S3Backend {
         Self::prefixed_key(prefix, &format!("{}.delta", filename))
     }
 
+    fn variant_key(
+        &self,
+        prefix: &str,
+        filename: &str,
+        variant: crate::storage::ObjectVariant,
+    ) -> String {
+        match variant {
+            crate::storage::ObjectVariant::Delta => self.delta_key(prefix, filename),
+            crate::storage::ObjectVariant::Passthrough => self.passthrough_key(prefix, filename),
+        }
+    }
+
     /// Get the S3 key for a passthrough file (stored with original filename, no suffix)
     fn passthrough_key(&self, prefix: &str, filename: &str) -> String {
         Self::prefixed_key(prefix, filename)
@@ -2626,6 +2638,73 @@ impl StorageBackend for S3Backend {
         Ok(())
     }
 
+    async fn variant_version(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        variant: crate::storage::ObjectVariant,
+    ) -> Result<Option<String>, StorageError> {
+        let key = self.variant_key(prefix, filename, variant);
+        BACKEND_HEAD_REQUESTS.inc();
+        let head = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::HeadObject))?;
+        Ok(head.e_tag().map(str::to_string))
+    }
+
+    /// `DeleteObject` with `If-Match`. A 412/409 means a peer overwrote it:
+    /// nothing deleted. A backend that answers 501 to a conditional delete
+    /// gets a plain one (the in-process lock is then the only guard).
+    async fn delete_variant_if(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        variant: crate::storage::ObjectVariant,
+        version: &str,
+    ) -> Result<bool, StorageError> {
+        let key = self.variant_key(prefix, filename, variant);
+        let date = crate::coordination::server_clock::ServerDate::default();
+        let sent = self
+            .client
+            .delete_object()
+            .bucket(bucket)
+            .key(&key)
+            .if_match(version)
+            .customize()
+            .interceptor(date.clone())
+            .send()
+            .await;
+        match sent {
+            Ok(_) => {}
+            Err(e) => {
+                match conditional_delete_verdict(&crate::config_db_sync::sdk_error_signal(&e)) {
+                    ConditionalDeleteVerdict::Changed => return Ok(false),
+                    ConditionalDeleteVerdict::Unsupported => {
+                        let at = self.delete_s3_object_dated(bucket, &key).await?;
+                        self.facts_cleanup.enqueue(bucket, &key, at);
+                        return Ok(true);
+                    }
+                    ConditionalDeleteVerdict::Other => {
+                        return match Self::classify_s3_error(bucket, &e, S3Op::DeleteObject) {
+                            StorageError::NotFound(_) => Ok(false),
+                            other => Err(other),
+                        }
+                    }
+                }
+            }
+        }
+        self.facts_cleanup.enqueue(bucket, &key, date.get());
+        debug!("Deleted {key} in {bucket} if still {version}");
+        Ok(true)
+    }
+
     // === Streaming operations ===
 
     #[instrument(skip(self))]
@@ -3699,6 +3778,27 @@ fn apply_native_encryption_mpu(
         }
     }
     request
+}
+
+/// What a failed conditional `DeleteObject` means.
+#[derive(Debug, PartialEq, Eq)]
+enum ConditionalDeleteVerdict {
+    /// 412/409: the object is not the version we checked.
+    Changed,
+    /// 501: the backend has no conditional delete.
+    Unsupported,
+    Other,
+}
+
+/// Pure: classify a failed conditional delete from its error signal.
+fn conditional_delete_verdict(signal: &str) -> ConditionalDeleteVerdict {
+    if crate::coordination::cas::conditional_write_lost(signal) {
+        ConditionalDeleteVerdict::Changed
+    } else if crate::config_db_sync::is_not_implemented(signal) {
+        ConditionalDeleteVerdict::Unsupported
+    } else {
+        ConditionalDeleteVerdict::Other
+    }
 }
 
 /// Pure: a CreateBucket refused because the bucket exists. The caller's own
@@ -5268,5 +5368,182 @@ mod create_bucket_conflict_tests {
         ));
         assert!(classify_create_bucket_conflict("b", Some("AccessDenied")).is_none());
         assert!(classify_create_bucket_conflict("b", None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod conditional_delete_tests {
+    use super::*;
+    use crate::storage::ObjectVariant;
+    use axum::http::{HeaderMap, StatusCode};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn conditional_delete_verdict_truth_table() {
+        use ConditionalDeleteVerdict::*;
+        let v = conditional_delete_verdict;
+        assert_eq!(v("status=412 code=PreconditionFailed"), Changed);
+        assert_eq!(v("status=409 code=ConditionalRequestConflict"), Changed);
+        assert_eq!(v("status=501 code=NotImplemented"), Unsupported);
+        assert_eq!(v("status=404 code=NoSuchKey"), Other);
+        assert_eq!(v("status=500 code=InternalError"), Other);
+    }
+
+    /// Objects by path -> ETag. DELETE honours If-Match (or answers 501
+    /// to any conditional delete when `no_conditional`).
+    #[derive(Default)]
+    struct Fake {
+        objects: parking_lot::Mutex<HashMap<String, String>>,
+        no_conditional: std::sync::atomic::AtomicBool,
+    }
+
+    async fn fake() -> (String, Arc<Fake>) {
+        let fake = Arc::new(Fake::default());
+        let f = fake.clone();
+        let app = axum::Router::new().route(
+            "/:bucket/*key",
+            axum::routing::any(
+                move |method: axum::http::Method,
+                      axum::extract::Path((b, k)): axum::extract::Path<(String, String)>,
+                      headers: HeaderMap| {
+                    let f = f.clone();
+                    async move {
+                        let path = format!("{b}/{k}");
+                        let mut h = HeaderMap::new();
+                        let current = f.objects.lock().get(&path).cloned();
+                        if method == axum::http::Method::HEAD {
+                            return match current {
+                                Some(e) => {
+                                    h.insert("etag", e.parse().unwrap());
+                                    h.insert("content-length", "0".parse().unwrap());
+                                    (StatusCode::OK, h, String::new())
+                                }
+                                None => (StatusCode::NOT_FOUND, h, String::new()),
+                            };
+                        }
+                        let want = headers.get("if-match").and_then(|v| v.to_str().ok());
+                        if want.is_some()
+                            && f.no_conditional.load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            return (
+                                StatusCode::NOT_IMPLEMENTED,
+                                h,
+                                "<Error><Code>NotImplemented</Code></Error>".into(),
+                            );
+                        }
+                        if want.is_some_and(|w| current.as_deref() != Some(w)) {
+                            return (
+                                StatusCode::PRECONDITION_FAILED,
+                                h,
+                                "<Error><Code>PreconditionFailed</Code></Error>".into(),
+                            );
+                        }
+                        f.objects.lock().remove(&path);
+                        (StatusCode::NO_CONTENT, h, String::new())
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), fake)
+    }
+
+    fn backend(endpoint: &str) -> S3Backend {
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("a", "b", None, None, "t"))
+            .force_path_style(true)
+            .endpoint_url(endpoint)
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .build();
+        let client = Client::from_conf(conf);
+        S3Backend {
+            facts_cleanup: super::super::facts_cleanup::FactsCleanupQueue::start(client.clone()),
+            client,
+            native_encryption: NativeEncryptionConfig::None,
+            list_cache_scope: endpoint.to_string(),
+        }
+    }
+
+    /// A peer overwrite between the version read and the delete: the
+    /// delete sends If-Match, gets 412, and keeps the peer's object.
+    #[tokio::test]
+    async fn a_peer_overwrite_after_the_version_read_is_not_deleted() {
+        let (ep, fake) = fake().await;
+        let s3 = backend(&ep);
+        let path = "b/p/a.txt".to_string();
+        fake.objects.lock().insert(path.clone(), "\"v1\"".into());
+        let pt = ObjectVariant::Passthrough;
+        let v = s3.variant_version("b", "p", "a.txt", pt).await.unwrap();
+        assert_eq!(v.as_deref(), Some("\"v1\""));
+
+        fake.objects.lock().insert(path.clone(), "\"v2\"".into());
+        let deleted = s3
+            .delete_variant_if("b", "p", "a.txt", pt, v.as_deref().unwrap())
+            .await
+            .unwrap();
+        assert!(!deleted, "a changed object is not deleted");
+        assert!(
+            fake.objects.lock().contains_key(&path),
+            "the peer's object stays"
+        );
+
+        assert!(s3
+            .delete_variant_if("b", "p", "a.txt", pt, "\"v2\"")
+            .await
+            .unwrap());
+        assert!(
+            !fake.objects.lock().contains_key(&path),
+            "the checked version goes"
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_variant_uses_the_delta_key_and_absent_is_not_found() {
+        let (ep, fake) = fake().await;
+        let s3 = backend(&ep);
+        fake.objects
+            .lock()
+            .insert("b/p/a.zip.delta".into(), "\"d\"".into());
+        let d = ObjectVariant::Delta;
+        assert_eq!(
+            s3.variant_version("b", "p", "a.zip", d)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("\"d\"")
+        );
+        assert!(matches!(
+            s3.variant_version("b", "p", "a.zip", ObjectVariant::Passthrough)
+                .await,
+            Err(StorageError::NotFound(_))
+        ));
+        assert!(s3
+            .delete_variant_if("b", "p", "a.zip", d, "\"d\"")
+            .await
+            .unwrap());
+        assert!(fake.objects.lock().is_empty());
+    }
+
+    /// A backend without conditional delete (501) gets a plain delete.
+    #[tokio::test]
+    async fn no_conditional_delete_falls_back_to_a_plain_delete() {
+        let (ep, fake) = fake().await;
+        let s3 = backend(&ep);
+        fake.objects
+            .lock()
+            .insert("b/p/a.txt".into(), "\"v1\"".into());
+        fake.no_conditional
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let pt = ObjectVariant::Passthrough;
+        assert!(s3
+            .delete_variant_if("b", "p", "a.txt", pt, "\"v1\"")
+            .await
+            .unwrap());
+        assert!(fake.objects.lock().is_empty());
     }
 }
