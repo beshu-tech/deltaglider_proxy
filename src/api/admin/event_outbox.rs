@@ -133,7 +133,7 @@ pub async fn list(
             sort,
             order,
         })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(super::db_error_reply)?;
 
     let ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
     let mut deliveries = db

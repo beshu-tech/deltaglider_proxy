@@ -389,11 +389,16 @@ mod source_guards {
                 let Some(at) = line.find(".map_err(") else {
                     continue;
                 };
-                // The statement: back to the previous `;`, `{` or `}` line.
+                // The statement: back to the previous `;`, `{` or `}` line
+                // that is indented less than this one (a struct literal
+                // inside the call opens `{` at the call's own depth).
+                let indent = |l: &str| l.len() - l.trim_start().len();
+                let own = indent(line);
                 let mut start = i;
                 while start > 0 {
                     let prev = lines[start - 1].trim_end();
-                    if prev.ends_with(';') || prev.ends_with('{') || prev.ends_with('}') {
+                    let ends = prev.ends_with(';') || prev.ends_with('{') || prev.ends_with('}');
+                    if ends && (prev.ends_with(';') || indent(prev) < own) {
                         break;
                     }
                     start -= 1;
