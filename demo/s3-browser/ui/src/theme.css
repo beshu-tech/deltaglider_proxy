@@ -303,6 +303,14 @@ body {
   outline-offset: 2px;
 }
 
+/* Sortable table headers: the outside ring (2px offset) is clipped by the
+   table container and painted over by the next header cell, so draw it
+   inside the cell. */
+.ant-table-wrapper .ant-table-thead > tr > th.ant-table-column-has-sorters:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
 /* ───── Semantic button reset ───── */
 .btn-reset {
   all: unset;

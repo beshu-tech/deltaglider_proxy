@@ -91,6 +91,8 @@ audited as `maintenance_migrate_mirror_delete`.
   metadata…**. The job and its API are documented in the jobs reference.
 - A HEAD that finds no bucket or no object on an S3 backend (a routing or
   existence probe) logs at debug. It used to log a WARN "S3 error" line.
+- Sortable table headers (object browser, event outbox) show a focus ring in
+  both themes, and Space sorts as well as Enter.
 
 ### Fixed — The Credentials page shows the bootstrap access key and removes it on request
 

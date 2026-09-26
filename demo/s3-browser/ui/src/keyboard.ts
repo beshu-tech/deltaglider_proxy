@@ -80,3 +80,17 @@ export function activateOnKey(action: () => void) {
     action();
   };
 }
+
+/**
+ * `activateOnKey` for Space alone, for an element whose Enter a library
+ * already handles (AntD sortable table headers sort on Enter). `action`
+ * gets the element the handler sits on.
+ */
+export function activateOnSpace(action: (el: EventTarget) => void) {
+  return (e: Pick<KeyboardEvent, 'key' | 'target' | 'currentTarget' | 'preventDefault'>): void => {
+    if (e.target !== e.currentTarget || e.currentTarget === null) return;
+    if (e.key !== ' ') return;
+    e.preventDefault();
+    action(e.currentTarget);
+  };
+}

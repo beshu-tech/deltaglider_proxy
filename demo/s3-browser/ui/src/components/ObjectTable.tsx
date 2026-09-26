@@ -5,6 +5,7 @@ import { FolderOutlined, FileOutlined, LoadingOutlined, CalculatorOutlined, Clos
 import type { S3Object } from '../types';
 import { formatBytes, relativeTime } from '../utils';
 import type { ColumnsType, TableProps } from 'antd/es/table';
+import { withKeyboardSort } from '../tableSort';
 import type { GetRef } from 'antd';
 import { useColors } from '../ThemeContext';
 import type { FolderSizeState } from '../useComputeSize';
@@ -512,7 +513,7 @@ export default function ObjectTable({
         <Table<RowData>
           ref={tableRef}
           virtual
-          columns={columns}
+          columns={withKeyboardSort(columns)}
           dataSource={dataSource}
           onChange={handleTableChange}
           rowKey="key"

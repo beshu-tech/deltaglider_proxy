@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { withKeyboardSort } from '../tableSort';
 import { confirmDialog } from '../confirmDialog';
 import { useVisiblePolling } from '../useVisiblePolling';
 import { Alert, Button, Input, message, Select, Space, Switch, Table, Tag, Typography } from 'antd';
@@ -448,7 +449,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
           horizontally on mobile (clipped wrapper); card-stack would drop sort+pagination. */}
       <div style={{ border: `1px solid ${colors.BORDER}`, borderRadius: 8, overflow: 'hidden', background: colors.BG_CARD }}>
         <Table<EventOutboxRecord>
-          columns={columns}
+          columns={withKeyboardSort(columns)}
           dataSource={filtered}
           rowKey="id"
           loading={loading && !autoRefresh}
