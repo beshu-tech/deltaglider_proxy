@@ -1446,6 +1446,15 @@ fn init_config_db_attempt(
     }
 }
 
+/// `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC` (S8, transitional): may a synced copy
+/// open with the legacy bootstrap hash?
+fn accept_legacy_sync() -> bool {
+    deltaglider_proxy::config::env_bool(
+        deltaglider_proxy::config_db::key::ACCEPT_LEGACY_SYNC_ENV,
+        false,
+    )
+}
+
 /// The coordination bucket's backend (see [`Config::coordination_backend`]).
 /// Falls back to the singleton only for a sync bucket routed to an undefined
 /// backend, which `check_fatal` refuses before this runs.
@@ -1505,6 +1514,7 @@ pub async fn build_coordination_lease(
             }),
         config_db_path(),
         db_keys.clone(),
+        accept_legacy_sync(),
     )
     .await
     {
@@ -1773,6 +1783,7 @@ pub async fn init_config_sync(
         object_key,
         db_file,
         db_keys.clone(),
+        accept_legacy_sync(),
     )
     .await
     {
@@ -1784,6 +1795,14 @@ pub async fn init_config_sync(
     };
 
     info!("Config DB S3 sync: enabled (bucket={})", sync_bucket);
+    if accept_legacy_sync() {
+        warn!(
+            "{}=true: a synced config DB under the bootstrap password hash is accepted. \
+             Remove it when every instance runs this release — the hash is not a secret \
+             that should open the shared IAM database",
+            deltaglider_proxy::config_db::key::ACCEPT_LEGACY_SYNC_ENV
+        );
+    }
 
     // Boot gate: PROVE the coordination bucket enforces atomic conditional
     // writes before any HA feature (leases, single-writer locks) hinges on it.

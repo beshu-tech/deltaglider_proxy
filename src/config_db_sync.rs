@@ -117,6 +117,7 @@ impl ConfigDbSync {
         object_key: String,
         local_path: PathBuf,
         db_keys: crate::config_db::ConfigDbKeys,
+        accept_legacy_sync: bool,
     ) -> Result<Self, String> {
         let client = Self::build_client(backend_config).await?;
 
@@ -134,18 +135,9 @@ impl ConfigDbSync {
         }
 
         // S8: a synced copy opens only with a real key, never with the
-        // bootstrap hash, unless the operator opts in for a rolling upgrade.
-        let accept_legacy =
-            crate::config::env_bool(crate::config_db::key::ACCEPT_LEGACY_SYNC_ENV, false);
-        if accept_legacy {
-            warn!(
-                "{}=true: a synced config DB under the bootstrap password hash is accepted. \
-                 Remove it when every instance runs this release — the hash is not a secret \
-                 that should open the shared IAM database",
-                crate::config_db::key::ACCEPT_LEGACY_SYNC_ENV
-            );
-        }
-        let db_keys = db_keys.for_synced_copy(accept_legacy);
+        // bootstrap hash, unless the operator opts in for a rolling upgrade
+        // (DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC, read and logged by the boot).
+        let db_keys = db_keys.for_synced_copy(accept_legacy_sync);
 
         // A park from before a restart comes back with the ETag its change
         // was based on, so the flush can still CAS on top of it.
@@ -1282,6 +1274,7 @@ mod tests {
             "k.db".into(),
             db_path.clone(),
             keys,
+            false,
         )
         .await
         .unwrap();
@@ -1317,6 +1310,7 @@ mod tests {
             "k.db".into(),
             db_path.clone(),
             crate::config_db::ConfigDbKeys::primary_only("pw"),
+            false,
         )
         .await
         .unwrap();
@@ -1337,6 +1331,7 @@ mod tests {
             "k.db".into(),
             db_path.clone(),
             crate::config_db::ConfigDbKeys::primary_only("pw"),
+            false,
         )
         .await
         .unwrap();
@@ -1353,6 +1348,7 @@ mod tests {
             "k.db".into(),
             db_path.clone(),
             crate::config_db::ConfigDbKeys::primary_only("pw"),
+            false,
         )
         .await
         .unwrap();
@@ -1374,6 +1370,7 @@ mod tests {
             "k.db".into(),
             db_path,
             crate::config_db::ConfigDbKeys::primary_only("pw"),
+            false,
         )
         .await
         .unwrap();
