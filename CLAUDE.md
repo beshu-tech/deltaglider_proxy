@@ -215,15 +215,22 @@ single-instance planes below are addressed.
   **THREE-WAY merge by NAME** (D16, `config_db/iam_merge.rs`): the last synced
   DB is kept as the base (`<db>.sync-base`, written after every successful
   upload and every merge; download/merge/upload serialise on `upload_lock`
-  via `pull_and_merge`). A row changed on one side takes that side; a delete
-  (in base, absent on one side) propagates; only a row changed on BOTH sides
-  conflicts → newer `sync_mtime` wins (trigger-maintained, v26; a permission
-  change stamps its owner), delete beats edit, each conflict is an
-  `iam_sync_conflict` audit entry. Ids: remote id if the remote has the row,
+  via `pull_and_merge`). The merge is COLUMN-wise against the base: a column
+  changed on one side takes that side (a key rotation on A and an edit on B
+  both survive); only a column changed on BOTH sides conflicts → newer
+  `sync_mtime` wins (trigger-maintained, v26; `sync_mtime = 0` is "unknown",
+  not "oldest"; a permission change stamps its owner); a delete (in base,
+  absent on one side) propagates and beats an edit; each conflict is an
+  `iam_sync_conflict` audit entry. Renames are detected (same id +
+  `created_at` vs the base) and applied before the merge, so child rows follow.
+  Two same-name users created on both sides with different access keys stay
+  two users (the later-sorting one is renamed deterministically). Ids: remote id if the remote has the row,
   else local if free, else fresh; FKs resolve through names (external
   identities follow), and local user ids that change owner end their live
-  external sessions. No base (upgrade/first sync/unreadable) → remote wins
-  (the old table-replace). Mapping rules are keyed by `rule_uid` (v28: random
+  external sessions. No base (upgrade/first sync/unreadable) → union, no
+  deletes (never "remote wins"). A synced copy opens only with
+  `DGP_CONFIG_DB_KEY` or `DGP_CONFIG_DB_KEY_PREVIOUS` (the legacy
+  bootstrap-hash key only with `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC=true`). Mapping rules are keyed by `rule_uid` (v28: random
   on GUI insert via trigger, content-derived for the declarative reconcile and
   the v28 backfill so equal rules on two nodes share one uid; an edit keeps
   it). `session_revocations` stays a monotonic `MAX`
