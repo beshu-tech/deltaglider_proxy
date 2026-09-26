@@ -133,8 +133,13 @@ pub async fn run_begun_rule(
     maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
 ) -> Result<LifecycleRunOutcome, String> {
     let lease_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let heartbeat_handle =
-        spawn_lease_heartbeat(db.clone(), &rule.name, lease.clone(), lease_alive.clone());
+    let heartbeat = RunLeaseGuard {
+        heartbeat: spawn_lease_heartbeat(db.clone(), &rule.name, lease.clone(), lease_alive.clone()),
+        release: db
+            .clone()
+            .zip(lease.as_ref())
+            .map(|(db, l)| (db, rule.name.clone(), l.owner.clone())),
+    };
 
     let ctx = RunContext {
         run_id,
@@ -152,9 +157,8 @@ pub async fn run_begun_rule(
         maintenance_gate.clone(),
     )
     .await;
-    if let Some(handle) = heartbeat_handle {
-        handle.abort();
-    }
+    // Normal exit: stop renewing. The caller releases the lease it took.
+    heartbeat.finish();
 
     let mut outcome = match outcome_result {
         Ok(outcome) => outcome,
@@ -216,6 +220,40 @@ pub async fn run_begun_rule(
     }
 
     Ok(outcome)
+}
+
+/// The run's lease heartbeat, stopped on EVERY exit. A panic in the run (a
+/// spawned run-now) or a dropped run future skips the caller's release, and
+/// a detached heartbeat renewed that lease forever: run-now, the scheduler
+/// and rule delete were refused until a restart. So the drop also releases.
+struct RunLeaseGuard {
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+    /// (db, rule, owner) to release on an abnormal exit.
+    release: Option<(Arc<Mutex<ConfigDb>>, String, String)>,
+}
+
+impl RunLeaseGuard {
+    /// Normal exit: the caller releases the lease itself.
+    fn finish(mut self) {
+        self.release = None;
+    }
+}
+
+impl Drop for RunLeaseGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.heartbeat.take() {
+            h.abort();
+        }
+        let Some((db, rule, owner)) = self.release.take() else {
+            return;
+        };
+        // No runtime (shutdown): the lease lapses after its TTL.
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                let _ = db.lock().await.lifecycle_release_lease(&rule, &owner);
+            });
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1550,7 +1588,6 @@ mod review3_tests {
     /// forever: run-now, the scheduler and rule delete are refused until a
     /// restart. The future drop stands in for the unwind here.
     #[tokio::test]
-    #[ignore = "review3: pending fix"]
     async fn review3_an_aborted_run_does_not_keep_its_lease_alive() {
         let dir = tempfile::tempdir().unwrap();
         let backend: Box<dyn StorageBackend> = Box::new(
