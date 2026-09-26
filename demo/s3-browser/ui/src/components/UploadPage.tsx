@@ -29,6 +29,10 @@ interface Props {
   onConsumeInitialFiles?: () => void;
   /** "Big OK" when uploads finish: jump to the browser at the destination prefix. */
   onFinish?: (destinationPrefix: string) => void;
+  /** Can this user write under the prefix (`''` = bucket root)? Per prefix, not per bucket. */
+  canWrite?: (prefix: string) => boolean;
+  /** Folder roots this user can write to, offered when the destination is read-only. */
+  writablePrefixes?: string[];
 }
 
 /** Normalize a destination prefix: strip leading/trailing/duplicate slashes. */
@@ -36,7 +40,13 @@ function normalizeDestination(dest: string): string {
   return dest.replace(/^\/+/, '').replace(/\/+$/, '').replace(/\/{2,}/g, '/');
 }
 
-export default function UploadPage({ prefix, onBack, onDone, initialFiles, onConsumeInitialFiles, onFinish }: Props) {
+const ALWAYS = () => true;
+const NO_PREFIXES: string[] = [];
+
+export default function UploadPage({
+  prefix, onBack, onDone, initialFiles, onConsumeInitialFiles, onFinish,
+  canWrite = ALWAYS, writablePrefixes = NO_PREFIXES,
+}: Props) {
   const {
     BG_BASE, BG_ELEVATED, BORDER, TEXT_PRIMARY,
     TEXT_SECONDARY, TEXT_MUTED, ACCENT_BLUE, ACCENT_GREEN, ACCENT_RED, ACCENT_PURPLE, ACCENT_AMBER,
@@ -78,7 +88,11 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
   }, [initialFiles, onConsumeInitialFiles]);
 
   const normalizedDest = normalizeDestination(destination);
-  const destError = keyPathError(normalizedDest);
+  // The destination is never moved behind the user's back: a read-only one
+  // blocks the upload and the page offers the writable prefixes instead.
+  const pathError = keyPathError(normalizedDest);
+  const destReadOnly = !pathError && !canWrite(normalizedDest ? `${normalizedDest}/` : '');
+  const destError = pathError ?? (destReadOnly ? 'read-only' : null);
   const folderNameError = keyPathError(folderName.replace(/^\/+|\/+$/g, ''));
 
   // A bad destination blocks the upload here, at the one place files enter
@@ -254,10 +268,28 @@ export default function UploadPage({ prefix, onBack, onDone, initialFiles, onCon
             New folder
           </Button>
         </div>
-        {destError && (
+        {pathError && (
           <Text role="alert" style={{ display: 'block', marginTop: 8, fontSize: 12, color: ACCENT_RED, fontFamily: 'var(--font-ui)' }}>
-            {destError}
+            {pathError}
           </Text>
+        )}
+        {destReadOnly && (
+          <div role="alert" style={{ marginTop: 8, fontSize: 12, color: ACCENT_RED, fontFamily: 'var(--font-ui)' }}>
+            <div>
+              You cannot upload to {bucket}/{normalizedDest ? `${normalizedDest}/` : ''}: your account has no write
+              permission there.
+            </div>
+            {writablePrefixes.length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: 6, color: TEXT_SECONDARY }}>
+                <span>You can upload to:</span>
+                {writablePrefixes.map((p) => (
+                  <Button key={p} size="small" onClick={() => setDestination(p)} style={{ fontFamily: 'var(--font-mono)' }}>
+                    {p || '/ (bucket root)'}
+                  </Button>
+                ))}
+              </div>
+            )}
+          </div>
         )}
         <Text style={{ display: 'block', marginTop: 8, fontSize: 12, color: TEXT_MUTED, fontFamily: 'var(--font-ui)' }}>
           Edit the path above to change the destination folder. It is created if it doesn&rsquo;t exist.

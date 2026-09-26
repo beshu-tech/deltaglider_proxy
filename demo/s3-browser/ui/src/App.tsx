@@ -365,11 +365,14 @@ export default function App() {
   const canAdmin = identity?.mode === 'bootstrap' || identity?.mode === 'open' || identity?.user?.is_admin === true;
   const canCreateBucket = canUse(identity, 'admin');
   const canWriteActivePrefix = Boolean(activeBucket) && !bucketBusy && canUse(identity, 'write', activeBucket, s3.prefix);
-  const uploadFallbackPrefix = writablePrefixes[0] ?? null;
-  const uploadPrefix = canWriteActivePrefix
-    ? s3.prefix
-    : (uploadFallbackPrefix ?? s3.prefix);
-  const canUploadToActiveBucket = Boolean(activeBucket) && !bucketBusy && (canWriteActivePrefix || uploadFallbackPrefix !== null);
+  // The upload page opens at the folder the user is in, even a read-only one:
+  // it says so there and offers the writable prefixes (never a silent move).
+  const uploadPrefix = s3.prefix;
+  const canUploadToActiveBucket = Boolean(activeBucket) && !bucketBusy && (canWriteActivePrefix || writablePrefixes.length > 0);
+  const canWriteUploadPrefix = useCallback(
+    (p: string) => canUse(identity, 'write', activeBucket, p),
+    [identity, activeBucket],
+  );
   const selectedKeys = Array.from(s3.selectedKeys);
   const canReadSelected = Boolean(activeBucket) && selectedKeys.length > 0 && selectedKeys.every((selectedKey) =>
     selectedKey.startsWith('folder:')
@@ -502,6 +505,8 @@ export default function App() {
       return (
         <UploadPage
           prefix={uploadSeedPrefix ?? uploadPrefix}
+          canWrite={canWriteUploadPrefix}
+          writablePrefixes={writablePrefixes}
           initialFiles={droppedFiles}
           onConsumeInitialFiles={() => setDroppedFiles([])}
           onBack={navigateToBrowse}
