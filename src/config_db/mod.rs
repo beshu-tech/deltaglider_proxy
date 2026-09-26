@@ -203,6 +203,9 @@ impl ConfigDb {
                 } else {
                     OpenedWith::Created
                 };
+                // A crash after the DB moved to the primary key, but before
+                // its companions did, heals here.
+                heal_companions(local_path, keys);
                 return Ok((db, how));
             }
             Err(ConfigDbError::WrongPassphrase(msg)) => msg,
@@ -213,7 +216,7 @@ impl ConfigDb {
                 continue;
             }
             rekey_file_hooked(local_path, old.expose(), primary, before_swap)?;
-            rekey_companions(local_path, old.expose(), primary);
+            heal_companions(local_path, keys);
             warn!(
                 "Config DB {} opened with {}; it is now re-encrypted with {}",
                 local_path.display(),
@@ -1143,10 +1146,16 @@ impl ConfigDb {
 }
 
 /// True if `key` decrypts the existing DB file at `path`. Reads only: the
-/// file is never created or migrated. A busy or unreadable file is `Err`, not
+/// file is never created or migrated. An empty file holds no DB, so no key
+/// opens it. A busy or unreadable file is `Err`, not
 /// `false`, so it is never taken for a wrong key.
 pub fn probe_key(path: &Path, key: &str) -> Result<bool, ConfigDbError> {
     use rusqlite::OpenFlags;
+    // SQLite reads a zero-byte file as a fresh DB under ANY key, so without
+    // this every candidate would "open" an empty backup.
+    if std::fs::metadata(path).map_err(ConfigDbError::Io)?.len() == 0 {
+        return Ok(false);
+    }
     let conn = crate::sqlite_open::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -1163,26 +1172,50 @@ pub fn probe_key(path: &Path, key: &str) -> Result<bool, ConfigDbError> {
 }
 
 /// Files next to the DB that are encrypted with its key: the config sync's
-/// merge base (`config_db_sync::sync_base_path`).
-fn key_companions(db_path: &Path) -> Vec<PathBuf> {
-    vec![db_path.with_extension("db.sync-base")]
+/// merge base (`config_db_sync::sync_base_path`), and the `.db.bak` that a
+/// key-mismatch boot parks. `true` = the file may be removed when no key
+/// opens it (a missing merge base only makes the next merge a union; a
+/// parked `.db.bak` is recovery data and is never removed).
+fn key_companions(db_path: &Path) -> Vec<(PathBuf, bool)> {
+    vec![
+        (db_path.with_extension("db.sync-base"), true),
+        (db_path.with_extension("db.bak"), false),
+    ]
 }
 
-/// After the DB moved to a new key, move its companions too. A companion
-/// that does not re-encrypt is removed: a missing merge base only makes the
-/// next sync fall back to remote-wins, while a base under the old key would
-/// be unreadable.
-fn rekey_companions(db_path: &Path, old: &str, new: &str) {
-    for c in key_companions(db_path) {
-        if !c.exists() {
+/// Bring every companion of the DB to the primary key: a companion that
+/// opens only with a fallback key is re-encrypted. Runs on EVERY open, so a
+/// crash between the DB rekey and the companion rekey heals on the next boot
+/// instead of leaving the merge base unreadable for good.
+fn heal_companions(db_path: &Path, keys: &ConfigDbKeys) {
+    let primary = keys.primary.expose();
+    for (c, removable) in key_companions(db_path) {
+        if !c.exists() || probe_key(&c, primary).unwrap_or(true) {
             continue;
         }
-        if let Err(e) = rekey_file(&c, old, new) {
-            warn!(
-                "{} did not re-encrypt with the new config DB key ({e}); removing it",
+        let old = keys
+            .fallbacks
+            .iter()
+            .find(|(_, k)| probe_key(&c, k.expose()).unwrap_or(false));
+        let result = match old {
+            Some((_, k)) => rekey_file(&c, k.expose(), primary),
+            None => Err(ConfigDbError::WrongPassphrase(
+                "no config DB key opens it".to_string(),
+            )),
+        };
+        match result {
+            Ok(()) => info!("{} is now re-encrypted with the config DB key", c.display()),
+            Err(e) if removable => {
+                warn!(
+                    "{} did not re-encrypt with the config DB key ({e}); removing it",
+                    c.display()
+                );
+                let _ = std::fs::remove_file(&c);
+            }
+            Err(e) => warn!(
+                "{} did not re-encrypt with the config DB key ({e}); it stays as it is",
                 c.display()
-            );
-            let _ = std::fs::remove_file(&c);
+            ),
         }
     }
 }
@@ -2181,7 +2214,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = legacy_db(dir.path());
         let base = crate::config_db_sync::sync_base_path(&path);
-        assert_eq!(key_companions(&path), vec![base.clone()]);
+        assert_eq!(key_companions(&path)[0], (base.clone(), true));
         std::fs::copy(&path, &base).unwrap();
         ConfigDb::open_with_keys(&path, &keys()).unwrap();
         assert!(
@@ -2243,7 +2276,6 @@ mod review3_tests {
     /// again, so the base stays unreadable for good and every later 412
     /// reconcile runs base-less (remote wins, local unsynced edits lost).
     #[test]
-    #[ignore = "review3: pending fix"]
     fn review3_a_crash_before_the_companion_rekey_heals_on_the_next_open() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deltaglider_config.db");
@@ -2264,11 +2296,37 @@ mod review3_tests {
         );
     }
 
+    /// A parked `.db.bak` under a fallback key follows the DB to the primary
+    /// key; one that no key opens (the incident shape) is never touched.
+    #[test]
+    fn a_parked_backup_follows_the_key_and_an_unknown_one_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deltaglider_config.db");
+        let bak = path.with_extension("db.bak");
+        ConfigDb::open_or_create(&bak, HASH)
+            .unwrap()
+            .create_user("alice", "AKALICE1", "secret", true, &[])
+            .unwrap();
+        let keys = ConfigDbKeys::primary_only(NEW_KEY)
+            .with_fallback(key::FallbackKind::LegacyBootstrapHash, HASH);
+        drop(ConfigDb::open_with_keys(&path, &keys).unwrap());
+        assert!(probe_key(&bak, NEW_KEY).unwrap());
+
+        std::fs::remove_file(&bak).unwrap();
+        drop(ConfigDb::open_or_create(&bak, "a-foreign-key").unwrap());
+        let before = std::fs::read(&bak).unwrap();
+        drop(ConfigDb::open_with_keys(&path, &keys).unwrap());
+        assert_eq!(
+            std::fs::read(&bak).unwrap(),
+            before,
+            "never removed or changed"
+        );
+    }
+
     /// `recover-db` asks `probe_key` whether a candidate opens `.db.bak`. An
     /// empty (or junk-free zero-byte) file reads as a fresh DB under ANY key,
     /// so every candidate "matches" and the operator is told to use it.
     #[test]
-    #[ignore = "review3: pending fix"]
     fn review3_probe_key_does_not_accept_any_key_for_an_empty_file() {
         let dir = tempfile::tempdir().unwrap();
         let bak = dir.path().join("deltaglider_config.db.bak");
