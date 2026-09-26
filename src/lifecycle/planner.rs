@@ -529,13 +529,19 @@ mod tests {
             batch_size: 100,
         };
         let snap = rule("r", "p/");
-        assert!(claimed_rule_is_current(&snap, &[rule("x", ""), rule("r", "p/")]));
+        assert!(claimed_rule_is_current(
+            &snap,
+            &[rule("x", ""), rule("r", "p/")]
+        ));
         // Deleted between the read and the lease.
         assert!(!claimed_rule_is_current(&snap, &[rule("x", "")]));
         // Redefined in between.
         assert!(!claimed_rule_is_current(&snap, &[rule("r", "q/")]));
         // Duplicated in between.
-        assert!(!claimed_rule_is_current(&snap, &[rule("r", "p/"), rule("r", "p/")]));
+        assert!(!claimed_rule_is_current(
+            &snap,
+            &[rule("r", "p/"), rule("r", "p/")]
+        ));
     }
     use chrono::{Duration, TimeZone};
 

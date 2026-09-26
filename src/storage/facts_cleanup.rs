@@ -329,8 +329,15 @@ async fn gc_loop(client: Client) {
         for bucket in resp.buckets().iter().filter_map(|b| b.name()) {
             let from = cursors.remove(bucket);
             let now = chrono::Utc::now().timestamp();
-            if let Some(next) =
-                gc_bucket(&client, bucket, from, now, GC_FACTS_PAGES_PER_RUN, GC_GRACE_SECS).await
+            if let Some(next) = gc_bucket(
+                &client,
+                bucket,
+                from,
+                now,
+                GC_FACTS_PAGES_PER_RUN,
+                GC_GRACE_SECS,
+            )
+            .await
             {
                 cursors.insert(bucket.to_string(), next);
             }
@@ -379,7 +386,10 @@ pub(super) async fn gc_bucket(
             let doomed =
                 listing_facts::gc_doomed(&candidates, &live, through.as_deref(), now, grace_secs);
             if !doomed.is_empty() {
-                debug!("facts GC on {bucket}: {} entries of gone objects", doomed.len());
+                debug!(
+                    "facts GC on {bucket}: {} entries of gone objects",
+                    doomed.len()
+                );
                 delete_facts_keys(client, bucket, doomed).await;
             }
         }
@@ -478,7 +488,13 @@ mod tests {
         let conf = aws_sdk_s3::config::Builder::new()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new("us-east-1"))
-            .credentials_provider(Credentials::new("minioadmin", "minioadmin", None, None, "t"))
+            .credentials_provider(Credentials::new(
+                "minioadmin",
+                "minioadmin",
+                None,
+                None,
+                "t",
+            ))
             .force_path_style(true)
             .endpoint_url(ep)
             .build();

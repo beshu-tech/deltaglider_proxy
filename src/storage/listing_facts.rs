@@ -206,7 +206,10 @@ pub fn gc_doomed(
     };
     candidates
         .iter()
-        .filter(|c| c.modified.is_some_and(|m| now.saturating_sub(m) >= grace_secs))
+        .filter(|c| {
+            c.modified
+                .is_some_and(|m| now.saturating_sub(m) >= grace_secs)
+        })
         .filter_map(|c| Some((c, c.entry.as_ref()?)))
         .filter(|(_, e)| e.stored_key.as_str() <= through)
         .filter(|(_, e)| {
