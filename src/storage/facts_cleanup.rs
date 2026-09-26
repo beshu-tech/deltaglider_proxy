@@ -283,7 +283,9 @@ impl FactsCleanupQueue {
         let (tx, rx) = mpsc::unbounded_channel();
         let rewritten: Rewritten = Default::default();
         tokio::spawn(drain(client.clone(), rx, rewritten.clone()));
-        tokio::spawn(gc_loop(client));
+        if crate::config::env_bool(GC_ENV, true) {
+            tokio::spawn(gc_loop(client));
+        }
         Self { tx, rewritten }
     }
 
@@ -370,6 +372,8 @@ const GC_FACTS_PAGES_PER_RUN: usize = 20;
 const GC_VERIFY_PAGES: usize = 5;
 /// An entry younger than this is never collected (its PUT may be in flight).
 const GC_GRACE_SECS: i64 = 3600;
+/// `false` turns the garbage collection off (default on).
+pub(super) const GC_ENV: &str = "DGP_LISTING_FACTS_GC";
 
 /// Periodic garbage collection of facts entries whose object is gone
 /// (`listing_facts::gc_doomed`). Every node runs it; deletes are idempotent,

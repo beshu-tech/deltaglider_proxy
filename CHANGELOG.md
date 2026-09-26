@@ -20,7 +20,8 @@ a wrong answer, but they stayed in the bucket forever. Every six hours, each
 instance now reads a part of each bucket's facts namespace (20 pages, and it
 goes on from there the next time), checks the objects that the entries
 describe, and deletes the entries whose object is gone or was overwritten.
-An entry younger than one hour is never deleted.
+An entry younger than one hour is never deleted. Set
+`DGP_LISTING_FACTS_GC=false` to turn this off.
 
 ### Fixed — A filtered LIST reads at most one page budget per request
 
