@@ -6,12 +6,16 @@ export default defineConfig({
   testDir: './e2e',
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 1 : 0,
+  // No retries, CI included: a retry that passes hid flaky tests. A flake
+  // fails the run; the trace of the failed attempt is kept.
+  retries: 0,
   workers: 1,
   timeout: 30_000,
+  // CI uploads playwright-report/ on failure.
+  reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : 'list',
   use: {
     ...devices['Desktop Chrome'],
     baseURL,
-    trace: 'on-first-retry',
+    trace: 'retain-on-failure',
   },
 });

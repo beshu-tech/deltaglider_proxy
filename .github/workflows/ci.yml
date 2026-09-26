@@ -484,10 +484,28 @@ jobs:
         run: |
           cd demo/s3-browser/ui
           npx playwright install chromium --with-deps
-      - name: Smoke test /_/ shell + /_/health
+      - name: Smoke + full flow, open access
         env:
           DELTAGLIDER_PROXY_BIN: ${{ github.workspace }}/target/release/deltaglider_proxy
+          E2E_AUTH: open
         run: ./scripts/e2e-smoke.sh
+      # Same suite against bootstrap SigV4 auth: the UI signs in with the
+      # admin password instead of auto-connecting (full-flow-bootstrap.spec.ts).
+      - name: Smoke + full flow, bootstrap auth
+        if: ${{ !cancelled() }}
+        env:
+          DELTAGLIDER_PROXY_BIN: ${{ github.workspace }}/target/release/deltaglider_proxy
+          E2E_AUTH: bootstrap
+        run: ./scripts/e2e-smoke.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: e2e-smoke-playwright-report
+          path: |
+            demo/s3-browser/ui/playwright-report
+            demo/s3-browser/ui/test-results
+          if-no-files-found: ignore
+          retention-days: 7
 
   frontend-lint:
     name: Frontend Lint

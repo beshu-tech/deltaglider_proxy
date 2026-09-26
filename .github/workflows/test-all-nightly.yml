@@ -82,14 +82,14 @@ jobs:
         run: docker rm -f minio-nightly 2>/dev/null || true
 
   # ── Moved off the PR critical path (were `continue-on-error` on ci.yml,
-  #    i.e. non-gating). Coverage re-runs the whole --lib suite under
+  #    i.e. non-gating). A failure here now fails the nightly (and opens the
+  #    `nightly-failure` issue, see `report`). Coverage re-runs the whole --lib suite under
   #    instrumentation; supply-chain drift is a daily concern, not per-commit.
   #    Tools (cargo-llvm-cov, cargo-deny) are baked into the builder image. ──
   coverage:
     name: Unit Coverage (nightly)
     runs-on: ubuntu-latest
     timeout-minutes: 40
-    continue-on-error: true
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       options: --ulimit nofile=1048576:1048576
@@ -161,7 +161,6 @@ jobs:
     name: Supply-chain (audit + deny)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true
     container:
       image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
       credentials:
@@ -176,3 +175,82 @@ jobs:
       - name: cargo deny check
         run: cargo deny check
 
+
+  # ── QA regression pass (demo/s3-browser/ui/e2e/qa-regression.spec.ts):
+  #    drives the whole admin UI + browser against the RELEASE binary in
+  #    bootstrap-auth mode. Minutes long, so nightly only. ──
+  qa-e2e:
+    name: QA regression e2e (release binary, bootstrap auth)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/beshu-tech/deltaglider_proxy/builder:latest
+      options: --ulimit nofile=1048576:1048576
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      - name: Build demo UI (rust-embed) + Playwright deps
+        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - name: cargo build --release
+        run: scripts/ci-memwatch.sh cargo build --locked --release --bin deltaglider_proxy
+      - name: Install Playwright Chromium
+        run: cd demo/s3-browser/ui && npx playwright install chromium --with-deps
+      - name: QA regression spec
+        env:
+          DELTAGLIDER_PROXY_BIN: ${{ github.workspace }}/target/release/deltaglider_proxy
+          E2E_LOG_OUT: ${{ github.workspace }}/qa-proxy.log
+        run: ./scripts/qa-e2e.sh
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: qa-e2e-playwright-report
+          path: |
+            demo/s3-browser/ui/playwright-report
+            demo/s3-browser/ui/test-results
+            qa-proxy.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ── Failure visibility: one open `nightly-failure` issue while the nightly
+  #    is red (a comment per further red run, never a second issue), closed
+  #    by the next green run. Runs on main only; a cancelled run changes
+  #    nothing. ──
+  report:
+    name: Report nightly status
+    if: ${{ always() && github.ref == 'refs/heads/main' }}
+    needs: [test-all-default-features, coverage, tokio-unstable, supply-chain, qa-e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      FAILED: ${{ contains(needs.*.result, 'failure') }}
+      CANCELLED: ${{ contains(needs.*.result, 'cancelled') }}
+      RESULTS: ${{ join(needs.*.result, ', ') }}
+    steps:
+      - name: Open, comment on, or close the nightly-failure issue
+        shell: bash
+        run: |
+          set -euo pipefail
+          label=nightly-failure
+          open_issue="$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')"
+          if [[ "$FAILED" == "true" ]]; then
+            gh label create "$label" --color B60205 \
+              --description "The scheduled nightly workflow is failing" 2>/dev/null || true
+            msg="Nightly failed: $RUN_URL (job results: $RESULTS)"
+            if [[ -n "$open_issue" ]]; then
+              gh issue comment "$open_issue" --body "$msg"
+            else
+              gh issue create --label "$label" --title "Nightly workflow is failing" --body "$msg"
+            fi
+          elif [[ "$CANCELLED" == "true" ]]; then
+            echo "run cancelled: issue state unchanged"
+          elif [[ -n "$open_issue" ]]; then
+            gh issue close "$open_issue" --comment "Nightly green again: $RUN_URL"
+          fi

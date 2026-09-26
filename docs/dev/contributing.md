@@ -61,7 +61,7 @@ cd demo/s3-browser/ui && npm ci && npm run build && npm run lint:strict && npm r
 cargo test --locked --test all -- s3_integration_test::
 ```
 
-Embedded UI smoke (Playwright — same as `e2e-smoke` CI job): from repo root, `cargo build --release --bin deltaglider_proxy` with UI already built, then `cd demo/s3-browser/ui && npx playwright install chromium && cd ../../../.. && ./scripts/e2e-smoke.sh`.
+Embedded UI smoke (Playwright — same as `e2e-smoke` CI job): from repo root, `cargo build --release --bin deltaglider_proxy` with UI already built, then `cd demo/s3-browser/ui && npx playwright install chromium && cd ../../../.. && ./scripts/e2e-smoke.sh` (open access; `E2E_AUTH=bootstrap ./scripts/e2e-smoke.sh` runs the bootstrap-auth flow, as CI does too). The nightly QA pass over the whole admin UI: `./scripts/qa-e2e.sh`.
 
 ## Project Structure
 

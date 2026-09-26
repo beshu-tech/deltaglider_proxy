@@ -32,7 +32,9 @@ cargo test -- --nocapture                    # show println output
 # (needs MinIO on localhost:9000 — same as CI):
 cargo test --all --locked
 
-# Nightly CI also runs `test-all-nightly.yml` (`cargo test --all` default + s3s).
+# Nightly CI also runs `test-all-nightly.yml` (`cargo test --all` default + s3s, coverage,
+# supply-chain, tokio_unstable, the Playwright QA pass `scripts/qa-e2e.sh`). A red nightly
+# opens (or comments on) ONE `nightly-failure` issue; the next green run closes it.
 
 # Benchmarks (local/manual only — NOT in the CI merge gate, like coverage)
 cargo bench --bench codec    # criterion harness for delta encode/decode hot paths (needs xdelta3)
@@ -49,7 +51,7 @@ docker build -t deltaglider-proxy .
 
 Frontend tests are vitest (`npm run test:all` = `vitest run`, in the CI Frontend Lint job). Two projects: `unit` runs `src/**/*.test.ts` in Node; `dom` runs `src/**/*.test.tsx` in jsdom for hooks and components. Helpers in `src/test/`: `renderWithQuery` / `renderHookWithQuery` (no-retry QueryClient), `mockFetch` (route-table `fetch` stub; an unmatched request fails the test — mock HTTP there, not `adminApi`), and a setup file with AntD layout shims. AntD animations are off in tests because jsdom never ends them.
 
-CI merge gate: `verify-integration-test-registry` → `fmt` → `clippy -D warnings` → parallel test jobs (lib, curated integration + extended admin/IAM/replication, delta) → `e2e-smoke` → RustSec audit → Cargo deny → frontend (`lint:strict` zero-warning ESLint incl. the UI rules, tsc, knip, `npm run test:all` = vitest) → docs/schema → claude-review. See `ci.yml` for the exact `--test` lists.
+CI merge gate: `verify-integration-test-registry` → `fmt` → `clippy -D warnings` → parallel test jobs (lib, curated integration + extended admin/IAM/replication, delta) → `e2e-smoke` (open access AND bootstrap auth, Playwright `retries: 0`) → RustSec audit → Cargo deny → frontend (`lint:strict` zero-warning ESLint incl. the UI rules, tsc, knip, `npm run test:all` = vitest) → docs/schema → claude-review. See `ci.yml` for the exact `--test` lists.
 
 ## Architecture
 
@@ -367,7 +369,7 @@ Admin API at `/_/api/admin/*` (login, login-as, whoami, users CRUD, groups, conf
 
 ## Testing
 
-Tests in `tests/` use a `TestServer` harness (`tests/common/mod.rs`) that spawns a real proxy instance with a temp directory (filesystem backend) or MinIO (S3 backend). Port allocation uses an atomic counter starting at 19000. `wait_ready` checks `process.try_wait()` BEFORE the health probe so a stray proxy holding the test port fails loudly (`lsof -i :<port>`) instead of silently intercepting requests.
+Tests in `tests/` use a `TestServer` harness (`tests/common/mod.rs`) that spawns a real proxy instance with a temp directory (filesystem backend) or MinIO (S3 backend). **SigV4 auth is ON by default** (`TEST_ACCESS_KEY`/`TEST_SECRET_KEY`, which `server.s3_client()` signs with); a test that sends unsigned requests (raw reqwest, anonymous clients) opts out with `.open_access()` (`open_access_setup()` = server + unsigned client). **The child env is hermetic**: `proxy_command` strips every inherited `DGP_*` var and sets the two test relaxations per child (`DGP_BACKEND_ALLOW_LOCAL=true`, `DGP_REPLAY_WINDOW_SECS=0`) — never set them job-wide in CI; `.production_security_defaults()` keeps the production replay window and SSRF guard. **Ports are leased machine-wide** (`lease_free_port`: an `flock` on `<tmp>/dgp-test-ports/<port>.lock` held for the server's life), so concurrent `cargo test` processes never share a port. `wait_ready` checks `process.try_wait()` BEFORE the health probe so a stray proxy holding the test port fails loudly (`lsof -i :<port>`) instead of silently intercepting requests. Unit tests do not read the process env (source guard `test_modules_do_not_read_process_env` in `src/lib.rs`); inject an `EnvLookup` instead.
 
 S3 integration tests require MinIO running on localhost:9000 — the `pgsty/silo` build (maintained MinIO fork; `minio/minio` left Docker Hub), same `MINIO_*` env. CI starts it automatically; locally, `docker compose up -d` at the repo root creates it with the `deltaglider-test` bucket the harness head-buckets (`skip_unless_minio!()` silently skips every S3 test when that bucket is missing).
 

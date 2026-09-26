@@ -4,6 +4,9 @@ import { test, expect } from '@playwright/test';
 const TEST_BOOTSTRAP_PASSWORD = 'testpass';
 
 test.describe.configure({ timeout: 120_000 });
+// Open-mode flow (auto session, "Connect again"). The bootstrap-auth run
+// (E2E_AUTH=bootstrap) uses full-flow-bootstrap.spec.ts instead.
+test.skip(process.env.E2E_AUTH === 'bootstrap', 'open-auth flow');
 
 test('open auth: bucket, upload, list, admin login, sign out, reconnect, object still visible', async ({
   page,
