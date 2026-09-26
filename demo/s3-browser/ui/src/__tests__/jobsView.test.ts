@@ -29,6 +29,7 @@ import {
   ACTIVE_POLL_MS,
   IDLE_POLL_MS,
   kindTone,
+  lifecycleRunLabel,
   type JobRow,
 } from '../jobsView';
 import type { ConflictPolicy, FixAction, JobRunEntry } from '../adminApi';
@@ -491,4 +492,11 @@ test('kindTone', () => {
   assert.equal(kindTone('reencrypt'), 'gold');
   assert.equal(kindTone('migrate'), 'gold');
   assert.equal(kindTone('backfill-metadata'), 'gold');
+});
+
+test('lifecycleRunLabel names the verb and the count', () => {
+  assert.equal(lifecycleRunLabel(2, ['delete', 'delete']), 'Run: delete 2 objects');
+  assert.equal(lifecycleRunLabel(1, ['transition']), 'Run: transition 1 object');
+  assert.equal(lifecycleRunLabel(3, ['delete', 'transition']), 'Run: act on 3 objects');
+  assert.equal(lifecycleRunLabel(0, []), 'Run: nothing to do');
 });

@@ -223,6 +223,31 @@ export async function runJobAction(id: string, action: JobAction): Promise<unkno
   return safeJson(res);
 }
 
+/** One object a lifecycle rule would act on (mirrors `PreviewObject`). */
+export interface LifecycleCandidate {
+  bucket: string;
+  key: string;
+  action: 'delete' | 'transition' | string;
+  destination_bucket?: string;
+  destination_key?: string;
+  delete_source_after_success: boolean;
+  created_at: string;
+  size: number;
+}
+
+/** `POST /jobs/lifecycle:<rule>/preview` (mirrors `LifecycleRunOutcome`).
+ *  `candidates` is capped server-side; the counts are the full totals. */
+export interface LifecyclePreview {
+  objects_scanned: number;
+  objects_affected: number;
+  bytes_affected: number;
+  candidates: LifecycleCandidate[];
+}
+
+export async function previewLifecycleJob(id: string): Promise<LifecyclePreview> {
+  return (await runJobAction(id, 'preview')) as LifecyclePreview;
+}
+
 /** Queue re-encryption jobs for the given buckets. */
 export async function startReencrypt(buckets: string[]): Promise<{
   started: Array<{ bucket: string; job_id: number }>;

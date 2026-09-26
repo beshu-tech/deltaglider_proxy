@@ -62,6 +62,7 @@ import StickyDirtyBar from '../StickyDirtyBar';
 import ReencryptProposalModal from '../ReencryptProposalModal';
 import MigrateBucketModal from '../MigrateBucketModal';
 import JobDrawer from './JobDrawer';
+import LifecycleRunConfirm from './LifecycleRunConfirm';
 import {
   buildReplicationPayload,
   DEFAULT_REPLICATION,
@@ -292,6 +293,7 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
   const [reencryptOpen, setReencryptOpen] = useState(false);
   const [migrateOpen, setMigrateOpen] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const [confirmRun, setConfirmRun] = useState<JobRow | null>(null);
 
   // Sync URL → state: when the query string changes (Back/Forward / shared link),
   // update the local drawer state.
@@ -315,10 +317,10 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
   );
 
   const openDrawer = useCallback(
-    (jobId: string) => {
+    (jobId: string, tab = 'definition') => {
       setDrawerJobId(jobId);
-      setDrawerTab('definition');
-      const url = buildViewUrl('admin', 'jobs', { job: jobId });
+      setDrawerTab(tab);
+      const url = buildViewUrl('admin', 'jobs', tab === 'definition' ? { job: jobId } : { job: jobId, tab });
       navigate(url);
       markPushed();
     },
@@ -351,17 +353,23 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
     [drawerJobId, updateDrawerUrl],
   );
 
-  const runAction = async (row: JobRow, action: JobAction) => {
+  const runAction = async (row: JobRow, action: JobAction, confirmed = false) => {
+    // A lifecycle run deletes or moves objects: confirm with the preview list.
+    if (action === 'run-now' && row.kind === 'lifecycle' && !confirmed) {
+      setConfirmRun(row);
+      return;
+    }
+    // Preview is a view, not a toast: the drawer's Preview tab lists the keys.
+    if (action === 'preview') {
+      void qc.invalidateQueries({ queryKey: qk.jobs.preview(row.id) });
+      openDrawer(row.id, 'preview');
+      return;
+    }
     setActionBusy(`${row.id}:${action}`);
     try {
       const result = await runJobAction(row.id, action);
       if (action === 'run-now') {
         messageApi.success(runNowMessage(row.kind, result));
-      } else if (action === 'preview') {
-        const r = result as { objects_affected?: number; objects_scanned?: number };
-        messageApi.info(
-          `Preview: ${r?.objects_affected ?? 0} of ${r?.objects_scanned ?? 0} scanned objects would be affected`
-        );
       } else {
         messageApi.success(ACTION_META[action].done ?? `${ACTION_META[action].label} OK`);
       }
@@ -599,6 +607,14 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
         open={migrateOpen}
         bucket={null}
         onClose={() => setMigrateOpen(false)}
+      />
+      <LifecycleRunConfirm
+        row={confirmRun}
+        onCancel={() => setConfirmRun(null)}
+        onRun={(r) => {
+          setConfirmRun(null);
+          void runAction(r, 'run-now', true);
+        }}
       />
       <JobDrawer
         jobId={drawerJobId}

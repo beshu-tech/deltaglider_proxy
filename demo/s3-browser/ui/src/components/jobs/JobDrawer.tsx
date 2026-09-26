@@ -29,6 +29,7 @@ import OutcomeMeter from './OutcomeMeter';
 import ReplicationRuleFields from '../ReplicationRuleFields';
 import LifecycleRuleFields from '../LifecycleRuleFields';
 import VerifyTab from './VerifyTab';
+import LifecyclePreviewTab from './LifecyclePreviewTab';
 import { useBucketNames } from '../../queries/backends';
 
 const { Text } = Typography;
@@ -315,6 +316,7 @@ export default function JobDrawer({
     if (serverRow) {
       tabs.push('runs', 'failures');
       if (parsed?.subsystem === 'replication') tabs.push('verify');
+      if (parsed?.subsystem === 'lifecycle') tabs.push('preview');
     }
     return tabs;
   }, [serverRow, parsed]);
@@ -423,6 +425,10 @@ export default function JobDrawer({
                 { key: 'runs', label: 'Runs', children: runsTable },
                 { key: 'failures', label: 'Failures', children: failuresTable },
               ]
+            : []),
+          // Preview is lifecycle-only: what the SAVED rule would act on now.
+          ...(serverRow && parsed?.subsystem === 'lifecycle'
+            ? [{ key: 'preview', label: 'Preview', children: <LifecyclePreviewTab jobId={serverRow.id} /> }]
             : []),
           // Verify is replication-only and needs a server-known rule to audit.
           ...(serverRow && parsed?.subsystem === 'replication'

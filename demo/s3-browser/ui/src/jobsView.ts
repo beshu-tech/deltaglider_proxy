@@ -714,3 +714,14 @@ export function computeRate(
   const next = prevRate == null ? inst : alpha * inst + (1 - alpha) * prevRate;
   return Math.max(0, next);
 }
+
+/**
+ * The lifecycle run-now confirm button names what the run does and to how
+ * many objects: "Run: delete 2 objects". The verb comes from the preview's
+ * candidate sample (one kind of action → that verb, a mix → "act on").
+ */
+export function lifecycleRunLabel(affected: number, actions: string[]): string {
+  const kinds = new Set(actions);
+  const verb = kinds.size === 1 ? (kinds.has('delete') ? 'delete' : kinds.has('transition') ? 'transition' : 'act on') : 'act on';
+  return `Run: ${affected === 0 ? 'nothing to' : verb} ${affected === 0 ? 'do' : `${affected.toLocaleString()} object${affected === 1 ? '' : 's'}`}`;
+}

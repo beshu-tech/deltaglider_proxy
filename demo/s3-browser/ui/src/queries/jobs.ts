@@ -10,6 +10,7 @@ import {
   getJobRuns,
   getJobs,
   getVerifyStatus,
+  previewLifecycleJob,
   runJobAction,
   startVerifyParity,
 } from '../adminApi';
@@ -49,6 +50,21 @@ export function useJobFailures(id: string | null) {
     queryKey: qk.jobs.failures(id ?? ''),
     queryFn: () => getJobFailures(id as string),
     enabled: !!id,
+  });
+}
+
+/**
+ * What a lifecycle rule would do now (a dry run: POST, but no writes). Shared
+ * by the run-now confirmation and the drawer's Preview tab. No polling and no
+ * background refetch: each open of either view computes a fresh plan.
+ */
+export function useLifecyclePreview(id: string | null) {
+  return useQuery({
+    queryKey: qk.jobs.preview(id ?? ''),
+    queryFn: () => previewLifecycleJob(id as string),
+    enabled: !!id,
+    staleTime: 0,
+    refetchOnWindowFocus: false,
   });
 }
 
