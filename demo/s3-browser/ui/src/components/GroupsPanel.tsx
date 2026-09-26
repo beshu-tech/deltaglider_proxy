@@ -245,23 +245,6 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
             <Text strong title={group.name} style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
               {group.name}
             </Text>
-            {!readOnly && (
-              <>
-                <Button
-                  type="text"
-                  size="small"
-                  icon={<CopyOutlined />}
-                  title="Duplicate group"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    void handleClone(group);
-                  }}
-                  style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0 }}
-                  onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
-                  onMouseLeave={e => { e.currentTarget.style.opacity = '0.5'; }}
-                />
-              </>
-            )}
           </div>
           <div style={{ marginLeft: 22, marginTop: 2 }}>
             <Text type="secondary" style={{ fontSize: 11 }}>
@@ -271,6 +254,19 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
             </Text>
           </div>
         </>
+      )}
+      renderRowActions={readOnly ? undefined : group => (
+        <Button
+          type="text"
+          size="small"
+          icon={<CopyOutlined />}
+          title="Duplicate group"
+          aria-label={`Duplicate group ${group.name}`}
+          onClick={() => void handleClone(group)}
+          style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0 }}
+          onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
+          onMouseLeave={e => { e.currentTarget.style.opacity = '0.5'; }}
+        />
       )}
       detail={detail}
     />

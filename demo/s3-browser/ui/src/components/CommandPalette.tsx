@@ -17,6 +17,7 @@
  * ADMIN_IA) + a few shell actions.
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useRestoreFocus } from '../hooks/useRestoreFocus';
 import { Input, Modal, Typography } from 'antd';
 import {
   SearchOutlined,
@@ -141,6 +142,8 @@ export default function CommandPalette({
   onNavigateAdmin,
   extraActions,
 }: Props) {
+  // The palette unmounts on close: focus goes back to where ⌘K was pressed.
+  useRestoreFocus(open);
   const colors = useColors();
   const [query, setQuery] = useState('');
   const [cursor, setCursor] = useState(0);

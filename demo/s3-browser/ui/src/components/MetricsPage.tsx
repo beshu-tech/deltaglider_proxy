@@ -449,6 +449,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
               hint={cacheUtil > 0.9 ? 'Nearly full — consider raising cache_size_mb' : 'Reference baselines held in memory'}
             >
               <Progress
+                aria-label="Reference cache utilization"
                 percent={Math.round(cacheUtil * 100)}
                 size="small"
                 strokeColor={cacheUtil > 0.9 ? colors.ACCENT_RED : cacheUtil > 0.7 ? colors.ACCENT_AMBER : colors.ACCENT_GREEN}

@@ -64,7 +64,7 @@ test('run-now on a lifecycle rule confirms with the candidate list before it run
   const user = userEvent.setup();
   renderWithQuery(<JobsPanel />);
   await screen.findByText('expire-nightlies');
-  await user.click(within(jobRow()).getByRole('button', { name: 'Run now' }));
+  await user.click(within(jobRow()).getByRole('button', { name: 'Run now: expire-nightlies' }));
 
   const dialog = await screen.findByRole('dialog');
   expect(await within(dialog).findByText('nightly/app-0.9.tar')).toBeInTheDocument();
@@ -80,7 +80,7 @@ test('cancelling the confirmation never sends run-now', async () => {
   const user = userEvent.setup();
   renderWithQuery(<JobsPanel />);
   await screen.findByText('expire-nightlies');
-  await user.click(within(jobRow()).getByRole('button', { name: 'Run now' }));
+  await user.click(within(jobRow()).getByRole('button', { name: 'Run now: expire-nightlies' }));
   const dialog = await screen.findByRole('dialog');
   await within(dialog).findByText('nightly/app-0.9.tar');
   await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
@@ -92,7 +92,7 @@ test('preview shows the candidate list in the drawer, not a toast', async () => 
   const user = userEvent.setup();
   renderWithQuery(<JobsPanel />);
   await screen.findByText('expire-nightlies');
-  await user.click(within(jobRow()).getByRole('button', { name: 'Preview' }));
+  await user.click(within(jobRow()).getByRole('button', { name: 'Preview: expire-nightlies' }));
   const tab = await screen.findByRole('tab', { name: 'Preview', selected: true });
   expect(tab).toBeInTheDocument();
   expect(await screen.findByText('nightly/app-0.9.tar')).toBeInTheDocument();

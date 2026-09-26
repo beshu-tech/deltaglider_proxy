@@ -343,6 +343,7 @@ export default function BucketScanCard({ onRenderActions, scopeBucket }: Props) 
             : 'computing savings…'}
         </div>
         <Progress
+          aria-label="Scan progress"
           percent={Math.min(99, liveProgress.pages_done * 1.5)}
           showInfo={false}
           status="active"

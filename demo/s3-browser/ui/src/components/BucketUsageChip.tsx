@@ -110,16 +110,21 @@ export default function BucketUsageChip({
       <span style={{ fontVariantNumeric: 'tabular-nums' }}>
         {data.object_count.toLocaleString()} {noun(data.object_count, 'object')}
       </span>
-      <ReloadOutlined
-        spin={refresh.isPending}
+      <button
+        type="button"
         onClick={() => !refresh.isPending && refresh.mutate()}
+        disabled={refresh.isPending}
         title="Refresh (full scan)"
+        aria-label={`Refresh the size of bucket ${bucket} (full scan)`}
         style={{
+          display: 'inline-flex', padding: 0, border: 'none', background: 'none',
           cursor: refresh.isPending ? 'default' : 'pointer',
           color: c.ACCENT_BLUE,
           fontSize: 11,
         }}
-      />
+      >
+        <ReloadOutlined spin={refresh.isPending} aria-hidden="true" />
+      </button>
     </span>
   );
 }

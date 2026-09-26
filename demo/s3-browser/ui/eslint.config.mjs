@@ -94,6 +94,11 @@ const UI_RULES = {
         "JSXOpeningElement[name.name='Button']:has(JSXAttribute[name.name='danger']):has(JSXAttribute[name.name='icon'] JSXIdentifier[name='DeleteOutlined'])",
       message: 'Put destructive row actions in <RowActionsMenu> (⋯ with a confirmation), not a red trash button.',
     },
+    {
+      // axe aria-progressbar-name: a progress bar with no name reads as "progress bar, 40%".
+      selector: "JSXOpeningElement[name.name='Progress']:not(:has(JSXAttribute[name.name='aria-label']))",
+      message: 'Give <Progress> an aria-label that says what is progressing.',
+    },
     // AntD 6 deprecated props: each one floods the dev console with a warning.
     ...ANTD_DEPRECATED.map(([selector, message]) => ({ selector, message: `AntD 6 deprecation: ${message}` })),
   ],

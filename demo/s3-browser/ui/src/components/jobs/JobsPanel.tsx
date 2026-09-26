@@ -554,7 +554,8 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
                     loading={actionBusy === `${d.row.id}:${a}`}
                     disabled={blocked !== null}
                     title={blocked ?? title}
-                    aria-label={title}
+                    // Unique per row: every row has a "Run now".
+                    aria-label={`${title}: ${d.row.name}`}
                     onClick={() => void runAction(d.row, a)}
                   >
                     {/* Icon-only on the wide table (label in the tooltip); the

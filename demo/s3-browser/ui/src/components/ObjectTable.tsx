@@ -495,6 +495,7 @@ export default function ObjectTable({
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       {refreshing && (
         <Progress
+          aria-label="Refreshing the listing"
           percent={100}
           status="active"
           showInfo={false}

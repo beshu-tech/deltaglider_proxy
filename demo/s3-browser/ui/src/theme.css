@@ -992,6 +992,6 @@ body {
 }
 
 /* WCAG AA: AntD's dark preset purple tag text is 3.4:1 on its own tint. */
-[data-theme="dark"] .ant-tag-purple {
-  color: #c4b5fd;
+[data-theme="dark"] .ant-tag.ant-tag-purple {
+  color: #c4b5fd !important;
 }

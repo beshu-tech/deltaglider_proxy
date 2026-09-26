@@ -14,7 +14,6 @@ import { useFolderSuggestions } from '../useFolderSuggestions';
 import useUploadQueue from '../useUploadQueue';
 import { useColors } from '../ThemeContext';
 import UploadProgressList from './UploadProgressList';
-import { activateOnKey } from '../keyboard';
 import { keyPathError } from './destPrefix';
 import { precheckUpload } from '../uploadPrecheck';
 import { useUploadLimits } from '../queries/uploadLimits';
@@ -453,11 +452,9 @@ export default function UploadPage({
           files are staged or uploading it's noise; dropping more files
           anywhere on the page still works (listeners are on the page root). */}
       {pendingFiles.length === 0 && queue.length === 0 && (
+      // Not role="button": it holds the two real buttons (axe
+      // nested-interactive). A click anywhere is a mouse shortcut to them.
       <div
-        tabIndex={0}
-        role="button"
-        aria-label="Drop files here to upload, or press Enter to select files"
-        onKeyDown={activateOnKey(() => fileInputRef.current?.click())}
         style={{
           border: `2px dashed ${dragging ? ACCENT_BLUE : BORDER}`,
           borderRadius: 14,

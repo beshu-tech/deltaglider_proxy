@@ -350,6 +350,7 @@ export default function BucketCard({
       {maintenanceJob && (
         <div style={{ padding: '0 14px 10px', display: 'flex', alignItems: 'center', gap: 12 }}>
           <Progress
+            aria-label="Maintenance job progress"
             percent={maintenanceJob.percent ?? 100}
             status="active"
             showInfo={maintenanceJob.percent != null}

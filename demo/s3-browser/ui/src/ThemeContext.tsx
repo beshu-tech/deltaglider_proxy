@@ -50,10 +50,11 @@ export const lightColors = {
   TEXT_FAINT: '#5f6c80',
   ACCENT_BLUE: '#0f766e',     // darker teal: 4.5:1 on every light surface
   ACCENT_BLUE_LIGHT: '#115e59',
-  ACCENT_GREEN: '#059669',
-  ACCENT_RED: '#e11d48',
+  // Text-grade (4.5:1 on every light surface): accents are also text.
+  ACCENT_GREEN: '#047857',
+  ACCENT_RED: '#be123c',
   ACCENT_PURPLE: '#7c3aed',
-  ACCENT_AMBER: '#d97706',
+  ACCENT_AMBER: '#9a4a07',
   // ── Analytics "money shot" tokens (visual-craft pass) ──────────────
   HERO_NUM_GRADIENT: 'linear-gradient(150deg, #047857 0%, #059669 48%, #0d9488 100%)',
   BAR_KEPT: 'linear-gradient(180deg, #134e4a 0%, #0f766e 100%)',
@@ -68,9 +69,9 @@ export const lightColors = {
   STORAGE_TYPE_COLORS: {
     delta:     { bg: '#f3e8ff', border: '#c084fc', text: '#7c3aed' },
     reference: { bg: '#e0f2fe', border: '#38bdf8', text: '#0284c7' },
-    passthrough: { bg: '#d1fae5', border: '#34d399', text: '#059669' },
+    passthrough: { bg: '#d1fae5', border: '#34d399', text: '#047857' },
   } as Record<string, { bg: string; border: string; text: string }>,
-  STORAGE_TYPE_DEFAULT: { bg: '#d1fae5', border: '#34d399', text: '#059669' },
+  STORAGE_TYPE_DEFAULT: { bg: '#d1fae5', border: '#34d399', text: '#047857' },
 };
 
 export type ColorTokens = typeof darkColors;

@@ -41,7 +41,6 @@ import { pageTitle } from './pageTitle';
 import { headerForPath } from './components/adminNavigation';
 import { identitySummary } from './identitySummary';
 
-const { Content } = Layout;
 const { useBreakpoint } = Grid;
 
 /** Full-screen views hide the main sidebar and TopBar */
@@ -542,6 +541,7 @@ export default function App() {
                 {browserBannerText(bucketMaintenance)}
               </div>
               <Progress
+                aria-label="Bucket maintenance progress"
                 percent={activePercent(bucketMaintenance) ?? 100}
                 status="active"
                 showInfo={activePercent(bucketMaintenance) != null}
@@ -766,10 +766,13 @@ export default function App() {
           )}
 
           <main id="main-content" ref={mainRef} tabIndex={-1} style={{ outline: 'none', flex: 1, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
-            <Content style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, position: 'relative' }}>
+            {/* The one level-1 heading: names the view for assistive tech. */}
+            <h1 className="sr-only">{pageTitle(view, activeBucket, view === 'admin' ? headerForPath(subPath)?.title : undefined)}</h1>
+            {/* A plain div: AntD's Layout.Content is a second <main>. */}
+            <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, position: 'relative' }}>
               <FileBrowserSessionTip visible={view === 'browser' && sessionCaps.signedInForFilesOnly} userKey={currentAccessKey ?? who.name} />
               {renderContent()}
-            </Content>
+            </div>
           </main>
         </Layout>
       </Layout>

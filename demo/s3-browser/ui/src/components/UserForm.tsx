@@ -238,7 +238,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
 
       <div style={{ marginBottom: 16 }}>
         <FormLabel text="Name" />
-        <Input data-testid="user-name" aria-label="User name" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. ci-bot" disabled={readOnly} style={{ ...inputRadius }} />
+        <Input data-testid="user-name" aria-label="User name" autoFocus={!isEdit} value={name} onChange={e => setName(e.target.value)} placeholder="e.g. ci-bot" disabled={readOnly} style={{ ...inputRadius }} />
       </div>
 
       <div style={{ marginBottom: 16 }}>

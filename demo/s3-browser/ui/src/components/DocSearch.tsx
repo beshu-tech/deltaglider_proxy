@@ -124,10 +124,14 @@ export default function DocSearch({ docs, onSelect }: Props) {
         ref={inputRef as never}
         prefix={<SearchOutlined style={{ color: colors.TEXT_FAINT, fontSize: 12 }} />}
         suffix={isActive ? (
-          <CloseCircleFilled
-            style={{ color: colors.TEXT_FAINT, fontSize: 12, cursor: 'pointer' }}
+          <button
+            type="button"
+            aria-label="Clear the search"
             onClick={() => setQuery('')}
-          />
+            style={{ display: 'inline-flex', padding: 0, border: 'none', background: 'none', cursor: 'pointer' }}
+          >
+            <CloseCircleFilled aria-hidden="true" style={{ color: colors.TEXT_FAINT, fontSize: 12 }} />
+          </button>
         ) : (
           <span style={{ fontSize: 10, color: colors.TEXT_FAINT, fontFamily: 'var(--font-mono)' }}>
             {navigator.platform?.includes('Mac') ? '⌘K' : 'Ctrl+K'}

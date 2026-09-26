@@ -156,6 +156,7 @@ function LivePulse({
   const color = active ? colors.ACCENT_GREEN : colors.TEXT_MUTED;
   return (
     <span
+      role="img"
       aria-label={active ? `Live, refreshing every ${cadence}` : 'Paused'}
       style={{
         display: 'inline-block',

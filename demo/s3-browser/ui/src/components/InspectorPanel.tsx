@@ -5,6 +5,7 @@ import { deleteObject, getDownloadUrl, getPresignedUrl, getObjectUrl, headObject
 import { GlobalOutlined } from '@ant-design/icons';
 import { formatBytes, getFileName, downloadFromUrl } from '../utils';
 import { normalizeUiError } from '../errorHandling';
+import { useRestoreFocus } from '../hooks/useRestoreFocus';
 import { isBaselineObject, summarizeObjectSavings } from '../savings';
 import { bucketPolicyFor } from '../bucketPolicyLookup';
 import type { S3Object } from '../types';
@@ -237,6 +238,9 @@ export default function InspectorPanel({
     ACCENT_BLUE, ACCENT_GREEN, ACCENT_RED, STORAGE_TYPE_COLORS, STORAGE_TYPE_DEFAULT,
   } = useColors();
   const [messageApi, contextHolder] = message.useMessage();
+  // Escape / Back closes the drawer through the URL: give focus back to the
+  // row (or the main region) instead of <body>.
+  useRestoreFocus(!!object);
 
   const [headData, setHeadData] = useState<{ headers: Record<string, string>; storageType?: string; storedSize?: number } | null>(null);
   const [headLoading, setHeadLoading] = useState(false);

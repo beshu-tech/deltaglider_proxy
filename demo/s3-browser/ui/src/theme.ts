@@ -22,7 +22,7 @@ export const darkTheme = {
     colorTextLightSolid: '#0b1120',
     colorTextSecondary: '#8b93a1',
     colorTextTertiary: '#8b93a1',
-    colorTextPlaceholder: '#7d8795',
+    colorTextPlaceholder: '#858f9e',
     fontSize: 14,
     borderRadius: 8,
     fontFamilyCode: "'JetBrains Mono', 'Fira Code', monospace",

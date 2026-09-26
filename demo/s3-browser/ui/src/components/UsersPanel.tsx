@@ -259,23 +259,6 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
                   textTransform: 'uppercase', flexShrink: 0,
                 }}>SSO</span>
               )}
-              {!readOnly && (
-                <>
-                  <Button
-                    type="text"
-                    size="small"
-                    icon={<CopyOutlined />}
-                    title="Duplicate user with fresh credentials"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void handleClone(user);
-                    }}
-                    style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0, flexShrink: 0 }}
-                    onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
-                    onMouseLeave={e => { e.currentTarget.style.opacity = '0.5'; }}
-                  />
-                </>
-              )}
             </div>
             {/* Row 2: permission summary (hidden for SSO users with group-only access) */}
             {summary && (
@@ -291,6 +274,19 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
           </>
         );
       }}
+      renderRowActions={readOnly ? undefined : user => (
+        <Button
+          type="text"
+          size="small"
+          icon={<CopyOutlined />}
+          title="Duplicate user with fresh credentials"
+          aria-label={`Duplicate ${user.name} with fresh credentials`}
+          onClick={() => void handleClone(user)}
+          style={{ opacity: 0.5, padding: '2px 4px', minWidth: 0, flexShrink: 0 }}
+          onMouseEnter={e => { e.currentTarget.style.opacity = '1'; }}
+          onMouseLeave={e => { e.currentTarget.style.opacity = '0.5'; }}
+        />
+      )}
       detail={detail}
     />
   );

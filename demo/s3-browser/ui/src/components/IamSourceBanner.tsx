@@ -55,7 +55,7 @@ export default function IamSourceBanner({ iamMode, loadError, resource }: Props)
         {!loadError && (
           <code
             title="YAML key controlling where IAM state lives"
-            style={{ fontFamily: 'var(--font-mono)', fontSize: 11, opacity: 0.6, color: colors.TEXT_MUTED }}
+            style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: colors.TEXT_MUTED }}
           >
             access.iam_mode: {isDeclarative ? 'declarative' : 'gui'}
           </code>

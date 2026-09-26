@@ -35,6 +35,12 @@ interface MasterDetailPanelProps<T> {
   /** True when `item` is the selected row and the panel is not in create mode. */
   isSelected: (item: T) => boolean;
   renderRowBody: (item: T) => ReactNode;
+  /**
+   * Per-row buttons (Duplicate…). Rendered NEXT TO the row's own button, not
+   * inside it: a button inside role="button" is unreachable for assistive
+   * technology (axe nested-interactive).
+   */
+  renderRowActions?: (item: T) => ReactNode;
   onSelect: (item: T) => void;
   /** Vertical padding for each row — users use 12px, groups 10px. */
   rowPadding: string;
@@ -68,6 +74,7 @@ export default function MasterDetailPanel<T>({
   getId,
   isSelected,
   renderRowBody,
+  renderRowActions,
   onSelect,
   rowPadding,
   rowClassName,
@@ -152,18 +159,12 @@ export default function MasterDetailPanel<T>({
             {!loading && items.length === 0 && !error && listEmptyState}
             {items.map(item => {
               const selected = isSelected(item);
+              const actions = renderRowActions?.(item);
               return (
                 <div
                   key={getId(item)}
-                  role="button"
-                  tabIndex={0}
-                  aria-current={selected || undefined}
-                  onClick={() => onSelect(item)}
-                  onKeyDown={activateOnKey(() => onSelect(item))}
                   className={rowClassName}
                   style={{
-                    padding: rowPadding,
-                    cursor: 'pointer',
                     background: selected ? colors.ACCENT_BLUE + '18' : 'transparent',
                     borderLeft: selected ? `3px solid ${colors.ACCENT_BLUE}` : '3px solid transparent',
                     transition: 'all 0.15s ease',
@@ -172,7 +173,17 @@ export default function MasterDetailPanel<T>({
                   onMouseEnter={e => { if (!selected) e.currentTarget.style.background = colors.BORDER + '40'; }}
                   onMouseLeave={e => { if (!selected) e.currentTarget.style.background = 'transparent'; }}
                 >
-                  {renderRowBody(item)}
+                  <div
+                    role="button"
+                    tabIndex={0}
+                    aria-current={selected || undefined}
+                    onClick={() => onSelect(item)}
+                    onKeyDown={activateOnKey(() => onSelect(item))}
+                    style={{ padding: rowPadding, paddingRight: actions ? 40 : undefined, cursor: 'pointer' }}
+                  >
+                    {renderRowBody(item)}
+                  </div>
+                  {actions && <div style={{ position: 'absolute', top: 8, right: 8 }}>{actions}</div>}
                 </div>
               );
             })}
