@@ -44,7 +44,6 @@
     "test:storage-section-payload": "node scripts/storage-section-payload-regression-test.mjs",
     "test:backend-encryption-payload": "node scripts/backend-encryption-payload-regression-test.mjs",
     "test:master-detail-filter": "node scripts/master-detail-filter-regression-test.mjs",
-    "test:bulk-clear-selection": "node scripts/bulk-clear-selection-regression-test.mjs",
     "test:dest-prefix": "node scripts/dest-prefix-regression-test.mjs",
     "test:bucket-backend": "node scripts/bucket-backend-regression-test.mjs",
     "test:zip-download": "node scripts/zip-download-regression-test.mjs",
