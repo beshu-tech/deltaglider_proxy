@@ -5564,6 +5564,8 @@ mod conditional_delete_tests {
         let client = Client::from_conf(conf);
         S3Backend {
             facts_cleanup: super::super::facts_cleanup::FactsCleanupQueue::start(client.clone()),
+            bulk_client: client.clone(),
+            health_key: None,
             client,
             native_encryption: NativeEncryptionConfig::None,
             list_cache_scope: endpoint.to_string(),
