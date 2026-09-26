@@ -2654,6 +2654,44 @@ impl Config {
         }
     }
 
+    /// The startup banner's storage lines: EVERY backend with its type and
+    /// location, the default marked. (The banner used to print only the
+    /// legacy singleton, so a multi-backend proxy logged "Backend:
+    /// Filesystem" and nothing about its S3 backends.)
+    pub fn backend_banner_lines(&self) -> Vec<String> {
+        fn describe(b: &BackendConfig) -> String {
+            match b {
+                BackendConfig::Filesystem { path } => {
+                    format!("filesystem, path {}", path.display())
+                }
+                BackendConfig::S3 {
+                    endpoint, region, ..
+                } => match endpoint {
+                    Some(ep) => format!("s3, endpoint {ep}, region {region}"),
+                    None => format!("s3 (AWS), region {region}"),
+                },
+            }
+        }
+        if self.backends.is_empty() {
+            return vec![format!("  Backend: {}", describe(&self.backend))];
+        }
+        let default = self
+            .default_backend
+            .clone()
+            .unwrap_or_else(|| self.backends[0].name.clone());
+        let mut out = vec![format!("  Backends ({}):", self.backends.len())];
+        for nb in &self.backends {
+            let mark = if nb.name == default { " (default)" } else { "" };
+            out.push(format!(
+                "    - {}{}: {}",
+                nb.name,
+                mark,
+                describe(&nb.backend)
+            ));
+        }
+        out
+    }
+
     /// Returns true if TLS is enabled.
     pub fn tls_enabled(&self) -> bool {
         self.tls.as_ref().is_some_and(|t| t.enabled)
@@ -3610,6 +3648,25 @@ mod tests {
             authentication: auth.map(Into::into),
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn banner_names_every_backend() {
+        let yaml = "storage:\n  backends:\n    - name: hetzner-fsn1\n      type: s3\n      endpoint: https://fsn1.example.com\n      region: eu-central\n    - name: local-disk\n      type: filesystem\n      path: /var/lib/dgp\n  default_backend: local-disk\n";
+        let cfg = Config::from_yaml_str(yaml).expect("parse");
+        let lines = cfg.backend_banner_lines();
+        assert_eq!(lines[0], "  Backends (2):");
+        assert!(
+            lines[1].contains("hetzner-fsn1: s3, endpoint https://fsn1.example.com"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[2].contains("local-disk (default): filesystem, path /var/lib/dgp"),
+            "{lines:?}"
+        );
+        let single = Config::default().backend_banner_lines();
+        assert_eq!(single.len(), 1);
+        assert!(single[0].starts_with("  Backend: "), "{single:?}");
     }
 
     /// The fatal auth messages show the config the operator can paste: YAML

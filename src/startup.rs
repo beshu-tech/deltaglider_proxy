@@ -80,20 +80,8 @@ pub fn log_startup_banner(config: &Config) {
     warn_active_test_seams();
     info!("  Listen address: {}", config.listen_addr);
 
-    match &config.backend {
-        BackendConfig::Filesystem { path } => {
-            info!("  Backend: Filesystem");
-            info!("  Data directory: {:?}", path);
-        }
-        BackendConfig::S3 {
-            endpoint, region, ..
-        } => {
-            info!("  Backend: S3");
-            info!("  Region: {}", region);
-            if let Some(ep) = endpoint {
-                info!("  Endpoint: {}", ep);
-            }
-        }
+    for line in config.backend_banner_lines() {
+        info!("{line}");
     }
 
     info!("  Max delta ratio: {}", config.max_delta_ratio);
