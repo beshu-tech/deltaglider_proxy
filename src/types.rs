@@ -81,6 +81,11 @@ pub struct ObjectKey {
     pub filename: String,
 }
 
+/// The page that lists every reserved or normalised object key; every
+/// reserved-key refusal links it.
+pub const RESERVED_KEYS_DOC_URL: &str =
+    "https://deltaglider.com/docs/reference/s3-api-compatibility#reserved-and-normalised-keys";
+
 impl ObjectKey {
     /// Parse a full S3-style key into components
     pub fn parse(bucket: &str, key: &str) -> Self {
@@ -133,16 +138,23 @@ impl ObjectKey {
         if self.filename == "." || self.filename == ".." {
             return Err(KeyValidationError("Invalid object filename".to_string()));
         }
-        // Reject filenames that collide with DeltaGlider internal storage files
+        // Reject filenames that collide with DeltaGlider internal storage
+        // files. The message names the rule: the client cannot see why.
         if self.filename == "reference.bin" {
-            return Err(KeyValidationError(
-                "Object key 'reference.bin' is reserved for internal use".to_string(),
-            ));
+            return Err(KeyValidationError(format!(
+                "Object key '{}' is refused: the file name 'reference.bin' is reserved, \
+                 because the proxy stores the delta baseline of each prefix under it. \
+                 See {RESERVED_KEYS_DOC_URL}",
+                self.full_key()
+            )));
         }
         if self.filename.ends_with(".delta") {
-            return Err(KeyValidationError(
-                "Object keys ending in '.delta' are reserved for internal use".to_string(),
-            ));
+            return Err(KeyValidationError(format!(
+                "Object key '{}' is refused: file names that end in '.delta' are reserved, \
+                 because the proxy stores delta-encoded objects under that suffix. \
+                 See {RESERVED_KEYS_DOC_URL}",
+                self.full_key()
+            )));
         }
         Ok(())
     }
@@ -165,7 +177,9 @@ impl ObjectKey {
             .starts_with(crate::storage::listing_facts::FACTS_ROOT)
         {
             return Err(KeyValidationError(format!(
-                "Keys under '{}' are reserved for internal use",
+                "Object key '{}' is refused: keys under '{}' are reserved, because the S3 \
+                 backend keeps its listing facts there. See {RESERVED_KEYS_DOC_URL}",
+                self.full_key(),
                 crate::storage::listing_facts::FACTS_ROOT
             )));
         }
@@ -889,6 +903,32 @@ mod tests {
         assert!(ObjectKey::parse("b", "a/.dg/facts/x")
             .validate_ingest()
             .is_ok());
+    }
+
+    /// Explore #13: the refusal names the rule it applies and links the
+    /// page that lists every reserved or normalised key.
+    #[test]
+    fn reserved_key_refusals_name_the_rule() {
+        let e = ObjectKey::parse("b", "docs/reference.bin")
+            .validate_object()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("'docs/reference.bin'"), "{e}");
+        assert!(e.contains("delta baseline"), "{e}");
+        assert!(e.contains(RESERVED_KEYS_DOC_URL), "{e}");
+        let e = ObjectKey::parse("b", "backups/db.sql.delta")
+            .validate_object()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("'backups/db.sql.delta'"), "{e}");
+        assert!(e.contains("'.delta'"), "{e}");
+        assert!(e.contains(RESERVED_KEYS_DOC_URL), "{e}");
+        let e = ObjectKey::parse("b", ".dg/facts/x")
+            .validate_ingest()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("listing facts"), "{e}");
+        assert!(e.contains(RESERVED_KEYS_DOC_URL), "{e}");
     }
 
     #[test]

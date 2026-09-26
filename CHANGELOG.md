@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed — A refused reserved key says which rule refused it
+
+A `PUT` of a key such as `docs/reference.bin` or `backups/db.sql.delta` got
+"reserved for internal use" with no reason. Now the message names the key,
+the rule and the reason (the proxy stores the delta baseline and the
+delta-encoded objects under these names), and links the new "Reserved and
+normalised keys" section of the S3 API compatibility reference. That section
+also lists the keys that the proxy changes or refuses and that S3 stores
+unchanged: a leading `/` is removed, and empty (`//`) or `..` segments are
+refused.
+
 ### Changed — The `s3` CLI verbs refuse a DeltaGlider Proxy endpoint
 
 The `s3` verbs run their own delta engine and write the storage layout

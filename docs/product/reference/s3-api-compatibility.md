@@ -66,6 +66,23 @@ The proxy enforces access control through its own **IAM / ABAC** model (see [IAM
 | `GetObjectTagging` / `PutObjectTagging` / `DeleteObjectTagging` | 🚫 Not supported | `501` — object tagging is not supported. |
 | `GetBucketPolicy` / `PutBucketPolicy` / `DeleteBucketPolicy` | — Not implemented | Use IAM permissions and [admission rules](../how-to/gate-requests-with-admission-rules.md) instead. |
 
+## Reserved and normalised keys
+
+The proxy stores its own files next to your objects, so a few object keys are reserved. It also changes or refuses some key shapes that S3 stores unchanged. A refused key gets `400 InvalidArgument`, and the error message names the rule and links this section.
+
+| Key | What the proxy does | Why |
+|---|---|---|
+| A file name of `reference.bin`, in any prefix (for example `docs/reference.bin`) | Refuses the request. A prefix segment named `reference.bin/` is allowed. | The proxy stores the delta baseline of each prefix under this file name. |
+| A file name that ends in `.delta` (for example `backups/db.sql.delta`) | Refuses the request. | The proxy stores delta-encoded objects under this suffix. |
+| A key under `.dg/facts/` at the root of the bucket | Refuses a write. | The S3 backend keeps its listing facts under this prefix. |
+| A key that starts with `/` (for example `/leading.txt`) | Removes the leading slashes, so the object is stored and listed as `leading.txt`. | The proxy derives the storage path from the key. S3 stores the slash as part of the key. |
+| A key that contains an empty segment (`a//b`) | Refuses a write. A read or a delete of such a key works, so that an object that was stored before this rule can be removed. | An empty segment is almost always a path-join error in the client. |
+| A key that contains a `..` segment, or a file name of `.` or `..` | Refuses the request. | These segments would leave the object's prefix on a filesystem backend. |
+| A key that contains a NUL byte or a backslash (`\`) | Refuses the request. | These characters are not safe in a storage path. |
+| A key that ends in `/` (for example `photos/`) | Stores a zero-byte folder marker (see `PutObject` above). | S3 clients create these markers for empty folders. |
+
+A bucket name on the S3 API cannot contain `_`, as on S3. For this reason, the transient `__dgmigrate_*` routes of a migrate job and the `/_/` prefix of the admin API and the UI never collide with a client bucket.
+
 ## Not implemented
 
 The following families have no handler — `s3s` returns `NotImplemented`. Where a proxy-native equivalent exists, it is linked.
