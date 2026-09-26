@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — TLS no longer panics on the first HTTPS request
+
+With `tls.enabled: true` the proxy panicked on the first HTTPS handshake
+(self-signed) or at startup (user PEM): the dependencies enable two rustls
+crypto providers, and rustls refuses to pick one. Now the proxy installs
+aws-lc-rs as the process default before anything builds a TLS config. An
+integration test boots the listener in both modes and sends HTTPS requests.
+
 ### Changed — The admission chain holds at most 1000 blocks
 
 The proxy checks the admission blocks for every request, and the chain had

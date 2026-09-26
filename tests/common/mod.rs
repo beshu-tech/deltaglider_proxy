@@ -157,6 +157,8 @@ pub struct TestServer {
     extra_env: Vec<(String, String)>,
     /// See [`TestServerBuilder::production_security_defaults`].
     production_security: bool,
+    /// The listener speaks HTTPS (see [`TestServerBuilder::tls`]).
+    tls: bool,
 }
 
 /// The proxy child command every spawn path shares (first spawn and both
@@ -268,6 +270,7 @@ impl TestServer {
 
     /// Allocate a port, write a YAML config, spawn the proxy, wait for readiness,
     /// and create the test bucket. All factory methods delegate here.
+    #[allow(clippy::too_many_arguments)]
     async fn spawn_with_config(
         config_body: &str,
         bucket: &str,
@@ -276,6 +279,7 @@ impl TestServer {
         encryption_key: Option<String>,
         extra_env: Vec<(String, String)>,
         production_security: bool,
+        tls: bool,
     ) -> Self {
         let port_lease = lease_free_port();
         let port = port_lease.port();
@@ -326,9 +330,14 @@ impl TestServer {
             config_path,
             extra_env,
             production_security,
+            tls,
         };
         server.wait_ready().await;
-        server.ensure_bucket().await;
+        // The SDK client does not trust the test certificate; TLS tests
+        // make their own requests.
+        if !tls {
+            server.ensure_bucket().await;
+        }
         server
     }
 
@@ -356,6 +365,7 @@ impl TestServer {
             None,
             extra_env,
             false,
+            false,
         )
         .await
     }
@@ -366,9 +376,11 @@ impl TestServer {
         // Use the health endpoint instead of raw TCP connect — the HTTP server
         // may accept TCP connections before routes and middleware are fully
         // initialized, causing "connection refused" on the first real request.
-        let health_url = format!("http://127.0.0.1:{}/_/health", self.port);
+        let health_url = format!("{}/_/health", self.endpoint());
         let client = reqwest::Client::builder()
             .no_proxy()
+            // Readiness only: the TLS tests verify the certificate themselves.
+            .danger_accept_invalid_certs(self.tls)
             .timeout(Duration::from_secs(2))
             .build()
             .expect("health check client");
@@ -463,7 +475,8 @@ impl TestServer {
 
     /// Get the HTTP endpoint URL
     pub fn endpoint(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        let scheme = if self.tls { "https" } else { "http" };
+        format!("{scheme}://127.0.0.1:{}", self.port)
     }
 
     /// Get the bucket name
@@ -584,6 +597,17 @@ pub struct TestServerBuilder {
     extra_env: Vec<(String, String)>,
     /// See [`Self::production_security_defaults`].
     production_security: bool,
+    /// See [`Self::tls`].
+    tls: Option<TestTls>,
+}
+
+/// TLS mode of a test listener.
+#[derive(Clone)]
+pub enum TestTls {
+    /// `tls.enabled: true` with no files: the proxy generates a certificate.
+    SelfSigned,
+    /// A user-provided PEM certificate and key.
+    Pem { cert_path: String, key_path: String },
 }
 
 impl Default for TestServerBuilder {
@@ -605,6 +629,7 @@ impl Default for TestServerBuilder {
             extra_root_yaml: None,
             extra_env: Vec::new(),
             production_security: false,
+            tls: None,
         }
     }
 }
@@ -725,6 +750,14 @@ impl TestServerBuilder {
     /// full `iam_mode: declarative` + `iam_users:` block. The proxy reconciles
     /// declarative IAM at startup, so this exercises the cold-start IaC path
     /// (a fresh DB populated from YAML with no `config apply`).
+    /// Serve HTTPS (YAML `tls:` block). [`TestServer::endpoint`] then
+    /// returns an `https://` URL, and the builder does not create the
+    /// test bucket (the SDK client does not trust the test certificate).
+    pub fn tls(mut self, tls: TestTls) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
     pub fn extra_yaml_root(mut self, yaml: &str) -> Self {
         self.extra_root_yaml = Some(yaml.to_string());
         self
@@ -771,6 +804,7 @@ impl TestServerBuilder {
             self.encryption_key,
             extra_env,
             self.production_security,
+            self.tls.is_some(),
         )
         .await
     }
@@ -810,6 +844,16 @@ impl TestServerBuilder {
                 "config_sync_object_key: \"{}\"\n",
                 sync_key.replace('\\', "\\\\").replace('"', "\\\"")
             ));
+        }
+        match &self.tls {
+            None => {}
+            Some(TestTls::SelfSigned) => config.push_str("tls:\n  enabled: true\n"),
+            Some(TestTls::Pem {
+                cert_path,
+                key_path,
+            }) => config.push_str(&format!(
+                "tls:\n  enabled: true\n  cert_path: \"{cert_path}\"\n  key_path: \"{key_path}\"\n"
+            )),
         }
         if let Some((ref key_id, ref secret)) = self.auth_creds {
             config.push_str(&format!(

@@ -9,6 +9,19 @@
 use crate::config::TlsConfig;
 use axum_server::tls_rustls::RustlsConfig;
 
+/// Install aws-lc-rs as the process-default rustls crypto provider.
+///
+/// The dependency tree enables both `ring` (reqwest) and `aws-lc-rs` (the
+/// AWS SDK), so rustls cannot pick a default and panics on the first TLS
+/// config built without an explicit provider — the HTTPS listener did that
+/// on its first handshake. With a default installed, the listener and
+/// reqwest (which prefers the process default) use aws-lc-rs, the same
+/// provider the AWS SDK selects explicitly. Call it first thing in `main`.
+/// Idempotent: a provider that is already installed stays.
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 /// Build a [`RustlsConfig`] from the given [`TlsConfig`].
 ///
 /// When `cert_path` and `key_path` are both set, loads user-provided PEM files.
@@ -61,18 +74,18 @@ mod tests {
         assert!(build_rustls_config(&key_only).await.is_err());
     }
 
-    /// Both-omitted is the valid "auto self-signed" path.
-    /// We can't easily test the full TLS setup in unit tests (needs CryptoProvider),
-    /// but verify our validation logic doesn't reject it.
-    #[test]
-    fn both_omitted_passes_validation() {
+    /// Both-omitted is the valid "auto self-signed" path: with the process
+    /// provider installed, it builds a server config.
+    #[tokio::test]
+    async fn self_signed_config_builds_with_the_installed_provider() {
+        install_crypto_provider();
+        install_crypto_provider(); // idempotent
         let cfg = TlsConfig {
             enabled: true,
             cert_path: None,
             key_path: None,
         };
-        // Our validation check: cert_path.is_some() != key_path.is_some()
-        // Both None → false != false → false → no error from our check
-        assert_eq!(cfg.cert_path.is_some(), cfg.key_path.is_some());
+        build_rustls_config(&cfg).await.expect("self-signed config");
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 }

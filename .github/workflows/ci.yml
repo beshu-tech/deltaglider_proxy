@@ -351,6 +351,7 @@ jobs:
             s3_integration_test:: \
             status_endpoints_test:: \
             storage_resilience_test:: \
+            tls_listener_test:: \
             unmanaged_objects_test::
       - name: Integration tests (admin, IAM, replication, lifecycle, …)
         env:

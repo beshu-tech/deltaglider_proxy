@@ -166,5 +166,7 @@ mod status_endpoints_test;
 mod storage_resilience_test;
 #[path = "streaming_copy_test.rs"]
 mod streaming_copy_test;
+#[path = "tls_listener_test.rs"]
+mod tls_listener_test;
 #[path = "unmanaged_objects_test.rs"]
 mod unmanaged_objects_test;

@@ -34,6 +34,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 # Web framework
 axum = "0.7"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+# Direct only to install ONE process-default crypto provider (tls.rs): the tree
+# enables both `ring` and `aws-lc-rs`, and rustls then refuses to guess.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 tokio = { version = "1.53", features = ["full"] }
 
 # Serialization

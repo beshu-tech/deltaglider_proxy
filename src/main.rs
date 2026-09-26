@@ -213,6 +213,8 @@ enum AdmissionCommand {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything builds a TLS config (listener, OIDC, webhooks, CLI).
+    deltaglider_proxy::tls::install_crypto_provider();
     let cli = Cli::parse();
 
     // Subcommand dispatch (runs synchronously, exits before tokio runtime).
