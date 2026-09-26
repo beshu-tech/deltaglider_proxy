@@ -104,6 +104,7 @@ async fn head_last_modified(
 #[tokio::test]
 async fn backfill_stamps_canonical_metadata_and_preserves_served_time() {
     let server = TestServer::builder()
+        .open_access()
         .bucket("backfill-preserve")
         .build()
         .await;

@@ -22,7 +22,7 @@ use common::TestServer;
 /// NoSuchBucket, NOT create the bucket as a side effect.
 #[tokio::test]
 async fn test_put_object_to_nonexistent_bucket_returns_nosuchbucket() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let client = reqwest::Client::new();
 
     // The test server creates exactly one bucket ("deltaglider-test-<port>").
@@ -88,7 +88,7 @@ async fn test_put_object_to_nonexistent_bucket_does_not_create_directory() {
 /// POST?uploads targeting a non-existent bucket must fail fast.
 #[tokio::test]
 async fn test_create_multipart_upload_to_nonexistent_bucket_returns_nosuchbucket() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let client = reqwest::Client::new();
 
     let ghost = "missing-for-multipart";
@@ -109,7 +109,7 @@ async fn test_create_multipart_upload_to_nonexistent_bucket_returns_nosuchbucket
 /// return NoSuchBucket — the destination must not be implicitly created.
 #[tokio::test]
 async fn test_copy_to_nonexistent_destination_bucket_returns_nosuchbucket() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let client = reqwest::Client::new();
 
     // First PUT a source object into the real bucket.
@@ -157,7 +157,7 @@ async fn test_copy_to_nonexistent_destination_bucket_returns_nosuchbucket() {
 /// `ensure_bucket_exists` was omitted in some COPY arms.
 #[tokio::test]
 async fn test_copy_from_nonexistent_source_bucket_returns_nosuchbucket() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let client = reqwest::Client::new();
 
     // PUT into the real bucket — destination is fine.

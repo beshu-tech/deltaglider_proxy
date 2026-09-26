@@ -293,22 +293,11 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    env:
-      # Wave-1 security (commit 3ff9edc) rejects http:// + private-IP S3
-      # endpoints by default to close SSRF surface. The MinIO under test
-      # serves on http://localhost:9000, so we explicitly opt in here.
-      # The CLI's `engine_factory` auto-sets this when it detects a
-      # MinIO/dev endpoint; the proxy's `S3Backend::build_client` does
-      # NOT, because the proxy is the thing being hardened.
-      DGP_BACKEND_ALLOW_LOCAL: "true"
-      # Wave-3 security (commit 9f2e085) caches GET/HEAD SigV4
-      # signatures and rejects duplicates inside a 2s window — the
-      # default. Tests legitimately re-issue the same signed request
-      # within a second (assertion-style verifications) and the AWS
-      # SDK signs at one-second timestamp granularity, so two HEADs
-      # in the same second collide. Disable replay detection in CI
-      # only; production keeps the default.
-      DGP_REPLAY_WINDOW_SECS: "0"
+    # No job-wide DGP_* env: the TestServer harness sets
+    # DGP_BACKEND_ALLOW_LOCAL / DGP_REPLAY_WINDOW_SECS=0 per proxy child
+    # (`proxy_command` in tests/common/mod.rs) and strips every inherited
+    # DGP_* var, so CI and a local run see the same child env, and tests
+    # that opt into `production_security_defaults()` get the real defaults.
     steps:
       - name: Scrub stale workspace (drop .claude leftovers from prior runs)
         shell: bash
@@ -401,6 +390,7 @@ jobs:
             migrate_job_test:: \
             mismatch_boot_test:: \
             spawn_cwd_guard_test:: \
+            harness_port_test:: \
             quota_test:: \
             replication_target_only_test:: \
             replication_test:: \

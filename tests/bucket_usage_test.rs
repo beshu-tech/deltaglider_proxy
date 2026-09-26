@@ -52,7 +52,11 @@ fn sibling(base: &[u8], seed: u8) -> Vec<u8> {
 
 #[tokio::test]
 async fn counter_tracks_puts_and_deletes_without_scanning() {
-    let server = TestServer::builder().bucket("usage-basic").build().await;
+    let server = TestServer::builder()
+        .open_access()
+        .bucket("usage-basic")
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let admin = admin_http_client(&server.endpoint()).await;
     let bucket = server.bucket().to_string();
@@ -112,7 +116,11 @@ async fn counter_tracks_puts_and_deletes_without_scanning() {
 
 #[tokio::test]
 async fn deleting_last_object_reclaims_reference_bytes() {
-    let server = TestServer::builder().bucket("usage-reclaim").build().await;
+    let server = TestServer::builder()
+        .open_access()
+        .bucket("usage-reclaim")
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let admin = admin_http_client(&server.endpoint()).await;
     let bucket = server.bucket().to_string();
@@ -160,7 +168,11 @@ async fn deleting_last_object_reclaims_reference_bytes() {
 
 #[tokio::test]
 async fn refresh_reconciles_against_full_scan() {
-    let server = TestServer::builder().bucket("usage-refresh").build().await;
+    let server = TestServer::builder()
+        .open_access()
+        .bucket("usage-refresh")
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let admin = admin_http_client(&server.endpoint()).await;
     let bucket = server.bucket().to_string();
@@ -206,6 +218,7 @@ async fn refresh_reconciles_against_full_scan() {
 #[tokio::test]
 async fn overwriting_a_key_does_not_inflate_the_counter() {
     let server = TestServer::builder()
+        .open_access()
         .bucket("usage-overwrite")
         .build()
         .await;
@@ -273,7 +286,11 @@ async fn overwriting_a_key_does_not_inflate_the_counter() {
 /// just not compressed), so it's green everywhere but proves the delta path in CI.
 #[tokio::test]
 async fn delta_path_counter_and_reference_reclamation() {
-    let server = TestServer::builder().bucket("usage-delta").build().await;
+    let server = TestServer::builder()
+        .open_access()
+        .bucket("usage-delta")
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let admin = admin_http_client(&server.endpoint()).await;
     let bucket = server.bucket().to_string();

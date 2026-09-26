@@ -80,6 +80,8 @@ mod external_auth_test;
 mod folder_marker_test;
 #[path = "generation_pin_test.rs"]
 mod generation_pin_test;
+#[path = "harness_port_test.rs"]
+mod harness_port_test;
 #[path = "iam_authorization_test.rs"]
 mod iam_authorization_test;
 #[path = "iam_declarative_reconcile_test.rs"]

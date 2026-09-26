@@ -86,7 +86,7 @@ async fn http_list_keys(
 /// This would have caught the original_name bug immediately.
 #[tokio::test]
 async fn test_list_head_get_triangle_invariant() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let client = server.s3_client().await;
 
     // Upload a mix of passthrough and delta-eligible files
@@ -167,7 +167,7 @@ async fn test_list_head_get_triangle_invariant() {
 /// HEAD and GET must agree on content-length for every storage strategy.
 #[tokio::test]
 async fn test_head_get_content_length_consistency() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let client = server.s3_client().await;
     let http = reqwest::Client::new();
 
@@ -273,7 +273,7 @@ async fn test_content_roundtrip_sha256_match() {
 /// triangle invariant for files that bypass the proxy's PUT pipeline.
 #[tokio::test]
 async fn test_unmanaged_file_triangle_invariant() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
     let content = b"directly placed file content";
 
@@ -325,7 +325,7 @@ async fn test_unmanaged_file_triangle_invariant() {
 /// should cause GET to return 404, not stale cached data.
 #[tokio::test]
 async fn test_external_delete_returns_404() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
     let content = b"file that will be externally deleted";
 

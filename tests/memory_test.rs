@@ -135,7 +135,12 @@ async fn complete_multipart_upload(
 #[tokio::test]
 async fn test_multipart_memory_bounded() {
     // 50 MB max object size to allow our 30 MB upload
-    let server = TestServer::filesystem_with_max_object_size(50 * MB).await;
+    let server = TestServer::builder()
+        .open_access()
+        .max_object_size(50 * MB)
+        .open_access()
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let endpoint = server.endpoint();
     let bucket = server.bucket();

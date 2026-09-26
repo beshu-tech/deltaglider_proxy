@@ -79,11 +79,17 @@ async fn ensure_bucket(endpoint: &str) {
     let _ = client.create_bucket().bucket(TEST_BUCKET).send().await;
 }
 
-/// Start a proxy server pointed at the ephemeral MinIO, return (TestServer, endpoint)
+/// Start a proxy server pointed at the ephemeral MinIO, return (TestServer, endpoint).
+/// Open access: most tests here drive the proxy with unsigned reqwest.
 async fn proxy_server() -> TestServer {
     let endpoint = minio_endpoint();
     ensure_bucket(&endpoint).await;
-    TestServer::s3_with_endpoint(&endpoint, TEST_BUCKET).await
+    TestServer::builder()
+        .s3_endpoint(&endpoint)
+        .bucket(TEST_BUCKET)
+        .open_access()
+        .build()
+        .await
 }
 
 // ============================================================================
@@ -1450,9 +1456,9 @@ async fn test_startup_sweeps_orphan_relay_artifacts() {
     // and are reaped once STALE; the test shrinks the staleness bound to zero.
     // The relay root is in the spool dir; the old one (system temp dir) is
     // still swept for leftovers of earlier releases.
-    let spool_dir = std::env::var("DGP_SPOOL_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("dgp-spool"));
+    // The harness strips inherited DGP_* vars, so the proxy uses the
+    // default spool dir whatever the runner exports.
+    let spool_dir = std::env::temp_dir().join("dgp-spool");
     let relay_root = spool_dir.join("deltaglider-mpu-relay").join("999999999"); // a pid no live process owns
     let legacy_root = std::env::temp_dir()
         .join("deltaglider-mpu-relay")
@@ -2193,7 +2199,13 @@ async fn test_first_file_bad_delta_ratio_passthrough() {
     // exceeds the threshold and triggers the passthrough fallback
     let endpoint = minio_endpoint();
     ensure_bucket(&endpoint).await;
-    let server = TestServer::s3_with_endpoint_and_delta_ratio(&endpoint, TEST_BUCKET, 0.001).await;
+    let server = TestServer::builder()
+        .s3_endpoint(&endpoint)
+        .bucket(TEST_BUCKET)
+        .max_delta_ratio(0.001)
+        .open_access()
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
 

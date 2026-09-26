@@ -549,7 +549,13 @@ async fn list_objects_v1_raw(endpoint: &str, bucket: &str, qs: Option<&str>) -> 
 #[tokio::test]
 async fn test_v1_list_objects_empty_prefix() {
     skip_unless_minio!();
-    let server = TestServer::s3().await;
+    let server = TestServer::builder()
+        .open_access()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .open_access()
+        .build()
+        .await;
     let unique = format!(
         "v1-empty-{}",
         std::time::SystemTime::now()
@@ -590,7 +596,13 @@ async fn test_v1_list_objects_empty_prefix() {
 #[tokio::test]
 async fn test_v1_list_objects_nonexistent_bucket_returns_404() {
     skip_unless_minio!();
-    let server = TestServer::s3().await;
+    let server = TestServer::builder()
+        .open_access()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .open_access()
+        .build()
+        .await;
     let resp = list_objects_v1_raw(
         &server.endpoint(),
         "this-bucket-deliberately-does-not-exist-paranoid-test",
@@ -619,7 +631,13 @@ async fn test_v1_list_objects_nonexistent_bucket_returns_404() {
 #[tokio::test]
 async fn test_v1_list_objects_paginates_via_marker() {
     skip_unless_minio!();
-    let server = TestServer::s3().await;
+    let server = TestServer::builder()
+        .open_access()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .open_access()
+        .build()
+        .await;
     let s3 = server.s3_client().await;
     let prefix = format!(
         "v1-page-{}/",
@@ -706,7 +724,13 @@ async fn test_v1_list_objects_paginates_via_marker() {
 #[tokio::test]
 async fn test_v1_list_objects_max_keys_above_1000_is_clamped() {
     skip_unless_minio!();
-    let server = TestServer::s3().await;
+    let server = TestServer::builder()
+        .open_access()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .open_access()
+        .build()
+        .await;
     let resp =
         list_objects_v1_raw(&server.endpoint(), server.bucket(), Some("max-keys=5000")).await;
     assert_eq!(resp.status().as_u16(), 200);
@@ -725,7 +749,13 @@ async fn test_v1_list_objects_max_keys_above_1000_is_clamped() {
 #[tokio::test]
 async fn test_v1_list_objects_with_delimiter_produces_common_prefixes() {
     skip_unless_minio!();
-    let server = TestServer::s3().await;
+    let server = TestServer::builder()
+        .open_access()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .open_access()
+        .build()
+        .await;
     let s3 = server.s3_client().await;
     let prefix = format!(
         "v1-delim-{}/",

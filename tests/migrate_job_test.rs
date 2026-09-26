@@ -131,6 +131,7 @@ async fn test_migrate_full_cycle() {
     let dir_b = tempfile::TempDir::new().unwrap();
     let bucket = "migbkt";
     let server = TestServer::builder()
+        .open_access()
         .bucket(bucket)
         .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
         .build()
@@ -223,6 +224,7 @@ async fn test_migrate_delete_source() {
     let dir_b = tempfile::TempDir::new().unwrap();
     let bucket = "migdel";
     let server = TestServer::builder()
+        .open_access()
         .bucket(bucket)
         .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
         .build()
@@ -277,6 +279,7 @@ async fn test_migrate_validations() {
     let dir_b = tempfile::TempDir::new().unwrap();
     let bucket = "migval";
     let server = TestServer::builder()
+        .open_access()
         .bucket(bucket)
         .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
         .build()
@@ -307,6 +310,7 @@ async fn test_migrate_cancel_preflip_restores_source() {
     let dir_b = tempfile::TempDir::new().unwrap();
     let bucket = "migcan";
     let server = TestServer::builder()
+        .open_access()
         .bucket(bucket)
         .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
         .build()
@@ -380,6 +384,7 @@ async fn test_migrate_honours_bucket_alias() {
     let dir_b = tempfile::TempDir::new().unwrap();
     let bucket = "migalias";
     let server = TestServer::builder()
+        .open_access()
         .bucket(bucket)
         .bucket_policy(bucket, "backend: src\nalias: real-store")
         // An unrelated bucket whose REAL name equals the virtual name above.
@@ -442,6 +447,7 @@ async fn test_migrate_recopies_a_stale_target_object() {
     let dir_b = tempfile::TempDir::new().unwrap();
     let bucket = "migstale";
     let server = TestServer::builder()
+        .open_access()
         .bucket(bucket)
         .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
         .build()

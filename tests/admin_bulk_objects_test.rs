@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 /// keys land.
 #[tokio::test]
 async fn test_bulk_copy_preserves_relative_paths() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let admin = admin_http_client(&server.endpoint()).await;
     let bucket = server.bucket();
@@ -91,7 +91,7 @@ async fn test_bulk_copy_rejects_collisions() {
 /// Source bucket loses the items; destination gains them.
 #[tokio::test]
 async fn test_bulk_move_atomic_delete() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let admin = admin_http_client(&server.endpoint()).await;
     let bucket = server.bucket();
@@ -182,7 +182,7 @@ async fn test_bulk_delete_idempotent_on_missing() {
 /// with the right Content-Disposition.
 #[tokio::test]
 async fn test_zip_download_returns_archive() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let admin = admin_http_client(&server.endpoint()).await;
     let bucket = server.bucket();
@@ -238,7 +238,7 @@ async fn test_zip_download_returns_archive() {
 /// list_all expands a folder selection to the absolute key list.
 #[tokio::test]
 async fn test_list_all_expands_folder() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let admin = admin_http_client(&server.endpoint()).await;
     let bucket = server.bucket();
@@ -398,7 +398,7 @@ async fn test_admin_writes_refuse_cross_origin_browser_requests() {
 /// refused before anything is written.
 #[tokio::test]
 async fn test_move_into_own_subfolder_is_refused() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let admin = admin_http_client(&server.endpoint()).await;
     let ep = server.endpoint();
@@ -447,6 +447,7 @@ async fn test_move_into_own_subfolder_is_refused() {
 #[tokio::test]
 async fn test_bulk_ops_honour_quota_and_record_events_and_audit() {
     let server = TestServer::builder()
+        .open_access()
         .bucket_policy("frozen-bkt", "quota_bytes: 0")
         .build()
         .await;

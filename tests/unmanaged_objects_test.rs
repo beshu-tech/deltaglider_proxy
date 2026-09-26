@@ -22,7 +22,7 @@ fn write_unmanaged_file(data_dir: &Path, bucket: &str, prefix: &str, filename: &
 
 #[tokio::test]
 async fn test_head_unmanaged_object_returns_200() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend has data_dir");
     let content = b"hello unmanaged world";
 
@@ -42,7 +42,7 @@ async fn test_head_unmanaged_object_returns_200() {
 
 #[tokio::test]
 async fn test_get_unmanaged_object_returns_content() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend has data_dir");
     let content = b"unmanaged file content for GET";
 
@@ -71,7 +71,7 @@ async fn test_get_unmanaged_object_returns_content() {
 
 #[tokio::test]
 async fn test_list_includes_unmanaged_objects() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend has data_dir");
     let http = reqwest::Client::new();
 
@@ -124,7 +124,7 @@ async fn test_list_includes_unmanaged_objects() {
 
 #[tokio::test]
 async fn test_head_unmanaged_returns_passthrough_storage_type() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend has data_dir");
 
     write_unmanaged_file(
@@ -153,7 +153,7 @@ async fn test_head_unmanaged_returns_passthrough_storage_type() {
 
 #[tokio::test]
 async fn test_delete_unmanaged_object() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend has data_dir");
 
     write_unmanaged_file(
@@ -197,7 +197,7 @@ async fn test_delete_unmanaged_object() {
 
 #[tokio::test]
 async fn test_mixed_managed_and_unmanaged_listing_sizes() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend has data_dir");
     let http = reqwest::Client::new();
 
@@ -256,7 +256,7 @@ async fn test_mixed_managed_and_unmanaged_listing_sizes() {
 /// empty md5) while HEAD used get_passthrough_metadata with correct values.
 #[tokio::test]
 async fn test_head_and_get_metadata_consistency() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend has data_dir");
     let content = b"consistency check content with known size";
 
@@ -305,7 +305,7 @@ async fn test_head_and_get_metadata_consistency() {
 /// storage files (reference.bin, *.delta).
 #[tokio::test]
 async fn test_put_reserved_filename_reference_bin_rejected() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let client = reqwest::Client::new();
 
     let url = format!(
@@ -331,7 +331,7 @@ async fn test_put_reserved_filename_reference_bin_rejected() {
 
 #[tokio::test]
 async fn test_put_reserved_filename_dot_delta_rejected() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let client = reqwest::Client::new();
 
     let url = format!(
@@ -359,7 +359,7 @@ async fn test_put_reserved_filename_dot_delta_rejected() {
 /// source metadata reports file_size=0 (fallback metadata for unmanaged objects).
 #[tokio::test]
 async fn test_copy_unmanaged_object_succeeds() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend has data_dir");
     let content = b"copy me from unmanaged source";
 
@@ -406,7 +406,12 @@ async fn test_copy_unmanaged_object_succeeds() {
 /// max_object_size should be rejected after actual size check.
 #[tokio::test]
 async fn test_copy_unmanaged_object_too_large_rejected() {
-    let server = TestServer::filesystem_with_max_object_size(100).await;
+    let server = TestServer::builder()
+        .open_access()
+        .max_object_size(100)
+        .open_access()
+        .build()
+        .await;
     let data_dir = server.data_dir().expect("filesystem backend has data_dir");
 
     // Write a file larger than max_object_size directly (bypassing proxy)
@@ -448,7 +453,7 @@ async fn test_copy_unmanaged_object_too_large_rejected() {
 /// Regression for error discrimination: ENOENT must become 404, not 500.
 #[tokio::test]
 async fn test_deleted_unmanaged_object_returns_404_not_500() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend has data_dir");
 
     write_unmanaged_file(data_dir, server.bucket(), "ephemeral", "temp.bin", b"temp");
@@ -495,7 +500,7 @@ async fn test_deleted_unmanaged_object_returns_404_not_500() {
 /// This tests the full metadata preservation path through the engine.
 #[tokio::test]
 async fn test_user_metadata_round_trip() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let client = reqwest::Client::new();
     let url = format!(
         "{}/{}/meta-test/doc.txt",
@@ -556,7 +561,7 @@ async fn test_user_metadata_round_trip() {
 /// the exact original bytes (not corrupted by delta encode/decode).
 #[tokio::test]
 async fn test_delta_round_trip_byte_integrity() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let client = reqwest::Client::new();
 
     // Generate two similar binary files (delta-eligible: .zip extension)
@@ -707,7 +712,7 @@ async fn test_multipart_etag_format() {
 
 #[tokio::test]
 async fn test_get_nonexistent_still_returns_404() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let client = reqwest::Client::new();
 
     let url = format!(

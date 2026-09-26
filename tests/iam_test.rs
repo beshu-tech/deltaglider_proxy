@@ -16,7 +16,7 @@ use common::TestServer;
 /// Open access mode: no auth configured → all operations succeed without credentials.
 #[tokio::test]
 async fn test_open_access_no_auth_required() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let client = reqwest::Client::new();
 
     // PUT without any auth headers

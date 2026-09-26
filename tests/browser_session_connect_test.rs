@@ -127,7 +127,7 @@ async fn open_browser_connect_requires_open_auth_mode() {
 
 #[tokio::test]
 async fn open_browser_connect_sets_anonymous_creds_and_blocks_config() {
-    let server = TestServer::builder().build().await;
+    let server = TestServer::builder().open_access().build().await;
     let ep = server.endpoint();
     let c = reqwest::Client::builder()
         .cookie_store(true)

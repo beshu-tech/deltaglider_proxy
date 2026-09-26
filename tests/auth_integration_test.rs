@@ -633,14 +633,12 @@ async fn test_no_auth_header_rejected_when_auth_enabled() {
 /// should trigger replay detection.
 #[tokio::test]
 async fn test_replay_attack_detected() {
-    // Pin a replay window. CI sets
-    // `DGP_REPLAY_WINDOW_SECS=0` globally so the bulk-of-tests don't
-    // trip on duplicate signatures from assertion-style probes; this
-    // test specifically validates the wave-3 contract, so it needs the
-    // cache enabled.
+    // The harness disables replay detection by default (assertion-style
+    // probes repeat signatures); this test validates the wave-3 contract
+    // with the production default window.
     let server = TestServer::builder()
         .auth("testkey", "testsecret")
-        .env("DGP_REPLAY_WINDOW_SECS", "2")
+        .production_security_defaults()
         .build()
         .await;
 
@@ -682,11 +680,9 @@ async fn test_replay_attack_detected() {
 /// its signature is still inside the skew, must be rejected.
 #[tokio::test]
 async fn s23_mutation_replay_after_two_seconds_is_rejected_by_default() {
-    // CI exports DGP_REPLAY_WINDOW_SECS=0 for every test; a blank value
-    // parses as "unset" in the child, so the default applies.
     let server = TestServer::builder()
         .auth("testkey", "testsecret")
-        .env("DGP_REPLAY_WINDOW_SECS", "")
+        .production_security_defaults()
         .build()
         .await;
     let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -724,11 +720,10 @@ async fn s23_mutation_replay_after_two_seconds_is_rejected_by_default() {
 /// tolerance.
 #[tokio::test]
 async fn test_idempotent_get_replay_within_window_tolerated() {
-    // See test_replay_attack_detected: pin a window because CI sets the
-    // global to 0 for the other integration tests.
+    // Production replay defaults (the harness disables replay detection).
     let server = TestServer::builder()
         .auth("testkey", "testsecret")
-        .env("DGP_REPLAY_WINDOW_SECS", "2")
+        .production_security_defaults()
         .build()
         .await;
 
@@ -1555,11 +1550,9 @@ async fn test_group_creation_and_permission_inheritance() {
     // `.max_keys(1)` differentiates the canonical request from the earlier
     // "verify denied" `list_objects_v2()` call (line ~1063). Without it, both
     // requests sign to the same SigV4 signature and the second one would
-    // trip the GET replay cache when running locally with the default
-    // 2s window. CI sets DGP_REPLAY_WINDOW_SECS=0 globally so this
-    // workaround isn't strictly required there, but keeping it makes
-    // the test pass in either environment. The bucket starts empty, so
-    // max_keys=1 doesn't change the observable result.
+    // trip a replay cache. GET/HEAD no longer enter it and the harness
+    // disables replay detection, so this is belt and braces. The bucket
+    // starts empty, so max_keys=1 does not change the observable result.
     let result = s3
         .list_objects_v2()
         .bucket(server.bucket())
@@ -2948,4 +2941,199 @@ async fn review2_presigned_hits_do_not_reset_a_wrong_secret_loop() {
         503,
         "six wrong secrets from one IP must lock it, presigned hits in between or not"
     );
+}
+
+// ============================================================================
+// Production security defaults (replay window on, SSRF guard strict)
+// ============================================================================
+
+/// An SDK client for `server` with fast retries and one test interceptor.
+fn retrying_client(
+    server: &TestServer,
+    interceptor: impl aws_sdk_s3::config::Intercept + 'static,
+) -> aws_sdk_s3::Client {
+    let conf = aws_sdk_s3::Config::builder()
+        .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(aws_sdk_s3::config::Region::new("us-east-1"))
+        .endpoint_url(server.endpoint())
+        .credentials_provider(aws_credential_types::Credentials::new(
+            common::TEST_ACCESS_KEY,
+            common::TEST_SECRET_KEY,
+            None,
+            None,
+            "test",
+        ))
+        .force_path_style(true)
+        // A 10 ms backoff keeps the retry inside the first attempt's signing
+        // second, so both attempts carry the SAME signature.
+        .retry_config(
+            aws_sdk_s3::config::retry::RetryConfig::standard()
+                .with_max_attempts(3)
+                .with_initial_backoff(Duration::from_millis(10)),
+        )
+        .interceptor(interceptor)
+        .build();
+    aws_sdk_s3::Client::from_conf(conf)
+}
+
+async fn get_body(server: &TestServer, key: &str) -> Vec<u8> {
+    server
+        .s3_client()
+        .await
+        .get_object()
+        .bucket(server.bucket())
+        .key(key)
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes()
+        .to_vec()
+}
+
+/// Runs `before_retry` right before the SECOND attempt: the test clears the
+/// server-side fault that made the first attempt fail.
+struct OnRetry {
+    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    before_retry: Box<dyn Fn() + Send + Sync>,
+}
+
+impl std::fmt::Debug for OnRetry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnRetry")
+    }
+}
+
+impl aws_sdk_s3::config::Intercept for OnRetry {
+    fn name(&self) -> &'static str {
+        "OnRetry"
+    }
+
+    fn read_before_attempt(
+        &self,
+        _context: &aws_sdk_s3::config::interceptors::BeforeTransmitInterceptorContextRef<'_>,
+        _rc: &aws_sdk_s3::config::RuntimeComponents,
+        _cfg: &mut aws_sdk_s3::config::ConfigBag,
+    ) -> Result<(), aws_sdk_s3::error::BoxError> {
+        if self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            (self.before_retry)();
+        }
+        Ok(())
+    }
+}
+
+/// With the production replay window, an SDK retry after a server 5xx
+/// succeeds. The first PutObject fails in the storage backend (a regular
+/// file sits where the key's directory must go) and the proxy answers 500.
+/// A failed mutation gives its replay-cache slot back (`replay_slot_kept`),
+/// so the SDK's byte-identical retry is served, not refused as a replay.
+#[tokio::test]
+async fn production_defaults_sdk_retry_after_a_5xx_succeeds() {
+    let server = TestServer::builder()
+        .production_security_defaults()
+        .build()
+        .await;
+    let blocker = server
+        .data_dir()
+        .expect("filesystem backend")
+        .join(server.bucket())
+        .join("deltaspaces");
+    std::fs::create_dir_all(&blocker).unwrap();
+    let blocker = blocker.join("blocked");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let unblock = blocker.clone();
+    let client = retrying_client(
+        &server,
+        OnRetry {
+            attempts: attempts.clone(),
+            before_retry: Box::new(move || std::fs::remove_file(&unblock).unwrap()),
+        },
+    );
+
+    client
+        .put_object()
+        .bucket(server.bucket())
+        .key("blocked/obj.txt")
+        .body(ByteStream::from_static(b"retried payload"))
+        .send()
+        .await
+        .expect("the SDK retry after a 500 must succeed");
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one failed attempt, one retry"
+    );
+    assert_eq!(
+        get_body(&server, "blocked/obj.txt").await,
+        b"retried payload"
+    );
+}
+
+/// Turns the FIRST attempt's response into a 500 after the server stored the
+/// object: a gateway lost the response. The SDK retries on its own.
+#[derive(Debug, Default)]
+struct LoseFirstResponse {
+    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl aws_sdk_s3::config::Intercept for LoseFirstResponse {
+    fn name(&self) -> &'static str {
+        "LoseFirstResponse"
+    }
+
+    fn modify_before_deserialization(
+        &self,
+        context: &mut aws_sdk_s3::config::interceptors::BeforeDeserializationInterceptorContextMut<
+            '_,
+        >,
+        _rc: &aws_sdk_s3::config::RuntimeComponents,
+        _cfg: &mut aws_sdk_s3::config::ConfigBag,
+    ) -> Result<(), aws_sdk_s3::error::BoxError> {
+        if self
+            .attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            *context.response_mut().status_mut() = 500u16.try_into().expect("status");
+        }
+        Ok(())
+    }
+}
+
+/// Known gap: when a PUT SUCCEEDS but its response is lost (a load balancer
+/// 502/504), the SDK's retry inside the same signing second carries the same
+/// signature, and the replay cache refuses it with 400 "Request replay
+/// detected". The object is stored, but the client sees a failed upload.
+/// Real S3 accepts the retry. Changing this is a replay-policy decision.
+#[tokio::test]
+#[ignore = "known gap: a retry after a LOST 2xx response is refused as a replay"]
+async fn production_defaults_sdk_retry_after_a_lost_response_succeeds() {
+    let server = TestServer::builder()
+        .production_security_defaults()
+        .build()
+        .await;
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let client = retrying_client(
+        &server,
+        LoseFirstResponse {
+            attempts: attempts.clone(),
+        },
+    );
+    client
+        .put_object()
+        .bucket(server.bucket())
+        .key("lost.txt")
+        .body(ByteStream::from_static(b"stored once"))
+        .send()
+        .await
+        .expect("the SDK retry after a lost response must succeed");
+    assert_eq!(get_body(&server, "lost.txt").await, b"stored once");
 }

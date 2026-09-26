@@ -143,7 +143,7 @@ async fn streaming_unsigned_payload_trailer_roundtrips_byte_exact() {
     // This is the exact variant that corrupted production: AWS SDK v3's
     // default for flexible-checksum uploads. A bucket populated with
     // payloads framed this way must decode cleanly.
-    let server = TestServer::builder().build().await;
+    let server = TestServer::builder().open_access().build().await;
     let bucket = server.bucket().to_string();
 
     // Deterministic 4 KiB binary payload — every byte value cycled so
@@ -171,7 +171,7 @@ async fn streaming_unsigned_payload_trailer_roundtrips_byte_exact() {
 async fn streaming_unsigned_payload_trailer_without_trailer_line_roundtrips() {
     // Some SDKs emit the unsigned streaming content-sha256 value but
     // send no trailer line (just `0\r\n\r\n`). Must still decode.
-    let server = TestServer::builder().build().await;
+    let server = TestServer::builder().open_access().build().await;
     let bucket = server.bucket().to_string();
 
     let payload = b"hello-from-trailerless-upload".to_vec();
@@ -194,7 +194,7 @@ async fn streaming_unsigned_payload_trailer_without_trailer_line_roundtrips() {
 async fn streaming_legacy_signed_payload_roundtrips_byte_exact() {
     // Legacy pre-v3 SDK path. This worked before the fix too; covered
     // here to make sure the refactored decoder didn't regress it.
-    let server = TestServer::builder().build().await;
+    let server = TestServer::builder().open_access().build().await;
     let bucket = server.bucket().to_string();
 
     let payload: Vec<u8> = (0..2048u32).map(|i| (i & 0xff) as u8).collect();
@@ -217,7 +217,7 @@ async fn streaming_legacy_signed_payload_roundtrips_byte_exact() {
 async fn streaming_signed_payload_trailer_roundtrips_byte_exact() {
     // Signed + trailing checksum. Used by AWS SDKs configured for both
     // SigV4 per-chunk signing AND flexible checksums.
-    let server = TestServer::builder().build().await;
+    let server = TestServer::builder().open_access().build().await;
     let bucket = server.bucket().to_string();
 
     let payload: Vec<u8> = (0..1024u32).map(|i| (i & 0xff) as u8).collect();
@@ -246,7 +246,7 @@ async fn streaming_signed_payload_trailer_roundtrips_byte_exact() {
 /// body must equal the raw payload, byte for byte, length and content.
 #[tokio::test]
 async fn production_corruption_pattern_is_fixed() {
-    let server = TestServer::builder().build().await;
+    let server = TestServer::builder().open_access().build().await;
     let bucket = server.bucket().to_string();
 
     // Same payload size as the corrupted object. Fill with a

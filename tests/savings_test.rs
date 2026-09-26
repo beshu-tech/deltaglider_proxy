@@ -104,6 +104,7 @@ async fn upload_sibling_family(server: &TestServer, prefix: &str) -> Vec<u8> {
 #[tokio::test]
 async fn savings_endpoint_includes_reference_bytes_and_caps_below_99pct() {
     let server = TestServer::builder()
+        .open_access()
         .bucket("delta-savings-regression")
         .bootstrap_password(TEST_BOOTSTRAP_PASSWORD)
         .build()
@@ -210,6 +211,7 @@ async fn savings_endpoint_returns_null_pct_when_nothing_to_measure() {
 #[tokio::test]
 async fn dashboard_bucket_scan_reports_reference_bytes() {
     let server = TestServer::builder()
+        .open_access()
         .bucket("delta-savings-dashboard")
         .bootstrap_password(TEST_BOOTSTRAP_PASSWORD)
         .build()
@@ -314,6 +316,7 @@ async fn dashboard_bucket_scan_reports_reference_bytes() {
 async fn savings_endpoint_coalesces_concurrent_cold_misses() {
     use std::collections::HashSet;
     let server = TestServer::builder()
+        .open_access()
         .bucket("delta-savings-coalesce")
         .bootstrap_password(TEST_BOOTSTRAP_PASSWORD)
         .build()
@@ -380,6 +383,7 @@ async fn savings_endpoint_coalesces_concurrent_cold_misses() {
 #[tokio::test]
 async fn savings_endpoint_reports_truncated_when_over_reference_cap() {
     let server = TestServer::builder()
+        .open_access()
         .bucket("delta-savings-truncated")
         .bootstrap_password(TEST_BOOTSTRAP_PASSWORD)
         .env("DGP_REFERENCE_SCAN_LIMIT", "1")
@@ -425,6 +429,7 @@ async fn savings_endpoint_reports_truncated_when_over_reference_cap() {
 #[tokio::test]
 async fn savings_endpoint_reports_truncated_false_when_under_cap() {
     let server = TestServer::builder()
+        .open_access()
         .bucket("delta-savings-untruncated")
         .bootstrap_password(TEST_BOOTSTRAP_PASSWORD)
         .build()

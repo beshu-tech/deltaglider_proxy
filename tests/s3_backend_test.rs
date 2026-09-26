@@ -93,7 +93,13 @@ async fn test_s3_put_get_roundtrip() {
 #[tokio::test]
 async fn test_s3_delta_similar_files() {
     skip_unless_minio!();
-    let server = TestServer::s3().await;
+    let server = TestServer::builder()
+        .open_access()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .open_access()
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
 
@@ -285,7 +291,13 @@ async fn backend_heads(endpoint: &str) -> u64 {
 #[tokio::test]
 async fn list_reports_original_delta_sizes_without_backend_heads() {
     skip_unless_minio!();
-    let writer = TestServer::s3().await;
+    let writer = TestServer::builder()
+        .open_access()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .open_access()
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
 
@@ -347,7 +359,13 @@ async fn list_reports_original_delta_sizes_without_backend_heads() {
     assert_eq!(warm.e_tag(), head.e_tag());
 
     // Cold (a second proxy on the same bucket): original size, no HEAD.
-    let reader = TestServer::s3().await;
+    let reader = TestServer::builder()
+        .open_access()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .open_access()
+        .build()
+        .await;
     let reader_client = reader.s3_client().await;
     let before = backend_heads(&reader.endpoint()).await;
     let cold = list_v1(reader_client.clone(), reader.bucket().to_string()).await;
@@ -459,7 +477,13 @@ async fn cold_list_of_an_encrypted_backend_reports_plaintext_facts() {
 #[tokio::test]
 async fn a_head_backfills_missing_listing_facts() {
     skip_unless_minio!();
-    let writer = TestServer::s3().await;
+    let writer = TestServer::builder()
+        .open_access()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .open_access()
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let prefix = unique_prefix();
     let base = generate_binary(100_000, 21);
@@ -511,7 +535,13 @@ async fn a_head_backfills_missing_listing_facts() {
             size.parse::<usize>().unwrap()
         }
     };
-    let node = TestServer::s3().await;
+    let node = TestServer::builder()
+        .open_access()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .open_access()
+        .build()
+        .await;
     assert!(
         size_on(&node).await < variant.len(),
         "no facts: stored size"
@@ -530,7 +560,13 @@ async fn a_head_backfills_missing_listing_facts() {
         assert!(std::time::Instant::now() < deadline, "facts not backfilled");
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let other = TestServer::s3().await;
+    let other = TestServer::builder()
+        .open_access()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .open_access()
+        .build()
+        .await;
     assert_eq!(size_on(&other).await, variant.len());
 }
 
@@ -653,7 +689,13 @@ async fn batch_delete_drops_listing_facts_in_a_few_requests() {
 #[tokio::test]
 async fn test_s3_list_metadata_true_carries_user_metadata() {
     skip_unless_minio!();
-    let server = TestServer::s3().await;
+    let server = TestServer::builder()
+        .open_access()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(common::MINIO_BUCKET)
+        .open_access()
+        .build()
+        .await;
     let client = server.s3_client().await;
     let prefix = unique_prefix();
     client

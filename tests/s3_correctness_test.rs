@@ -99,7 +99,7 @@ async fn test_delete_bucket_succeeds_with_internal_residue_only() {
 
 #[tokio::test]
 async fn test_delete_bucket_error_reports_object_and_mpu_blockers() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let client = server.s3_client().await;
     let bucket = "h2-blockers-bucket";
 
@@ -284,7 +284,7 @@ async fn test_copy_source_if_none_match_star_rejects() {
 
 #[tokio::test]
 async fn test_invalid_metadata_directive_rejected() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
 
     // Seed source.
@@ -323,7 +323,7 @@ async fn test_invalid_metadata_directive_rejected() {
 
 #[tokio::test]
 async fn test_object_tagging_get_returns_501() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
 
     // Seed the object first so the handler reaches the tagging branch.
@@ -339,7 +339,7 @@ async fn test_object_tagging_get_returns_501() {
 
 #[tokio::test]
 async fn test_object_tagging_put_returns_501() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let put_url = format!("{}/{}/u.bin", server.endpoint(), server.bucket());
     http.put(&put_url).body(b"x".to_vec()).send().await.unwrap();
@@ -353,7 +353,7 @@ async fn test_object_tagging_put_returns_501() {
 
 #[tokio::test]
 async fn test_bucket_tagging_returns_501() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
 
     let url = format!("{}/{}?tagging", server.endpoint(), server.bucket());
@@ -452,7 +452,7 @@ async fn test_list_parts_honours_max_parts_and_marker() {
 
 #[tokio::test]
 async fn test_put_if_none_match_star_idempotent_create() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let url = format!("{}/{}/idempotent.txt", server.endpoint(), server.bucket());
 
@@ -487,7 +487,7 @@ async fn test_put_if_none_match_star_idempotent_create() {
 
 #[tokio::test]
 async fn test_put_if_match_compare_and_swap() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let url = format!("{}/{}/cas.txt", server.endpoint(), server.bucket());
 
@@ -536,7 +536,7 @@ async fn test_put_if_match_compare_and_swap() {
 
 #[tokio::test]
 async fn test_get_bucket_location_on_missing_bucket_returns_404() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let resp = http
         .get(format!("{}/ghost-bucket?location", server.endpoint()))
@@ -550,7 +550,7 @@ async fn test_get_bucket_location_on_missing_bucket_returns_404() {
 
 #[tokio::test]
 async fn test_get_bucket_versioning_on_missing_bucket_returns_404() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let resp = http
         .get(format!("{}/ghost-bucket?versioning", server.endpoint()))
@@ -562,7 +562,7 @@ async fn test_get_bucket_versioning_on_missing_bucket_returns_404() {
 
 #[tokio::test]
 async fn test_list_multipart_uploads_on_missing_bucket_returns_404() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let resp = http
         .get(format!("{}/ghost-bucket?uploads", server.endpoint()))
@@ -578,7 +578,7 @@ async fn test_list_multipart_uploads_on_missing_bucket_returns_404() {
 
 #[tokio::test]
 async fn test_tagging_on_missing_object_returns_404_not_501() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let url = format!(
         "{}/{}/does-not-exist?tagging",
@@ -595,7 +595,7 @@ async fn test_tagging_on_missing_object_returns_404_not_501() {
 
 #[tokio::test]
 async fn test_tagging_on_missing_bucket_returns_404_not_501() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let resp = http
         .get(format!("{}/ghost-bucket?tagging", server.endpoint()))
@@ -615,7 +615,7 @@ async fn test_tagging_on_missing_bucket_returns_404_not_501() {
 
 #[tokio::test]
 async fn test_zero_byte_managed_object_emits_content_length_zero() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let url = format!("{}/{}/empty.bin", server.endpoint(), server.bucket());
 
@@ -660,7 +660,7 @@ async fn test_zero_byte_managed_object_emits_content_length_zero() {
 
 #[tokio::test]
 async fn test_put_bucket_acl_returns_501_not_fake_200() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let resp = http
         .put(format!("{}/{}?acl", server.endpoint(), server.bucket()))
@@ -674,7 +674,7 @@ async fn test_put_bucket_acl_returns_501_not_fake_200() {
 
 #[tokio::test]
 async fn test_put_bucket_acl_on_missing_bucket_404_wins() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let resp = http
         .put(format!("{}/no-such-bucket?acl", server.endpoint()))
@@ -688,7 +688,7 @@ async fn test_put_bucket_acl_on_missing_bucket_404_wins() {
 
 #[tokio::test]
 async fn test_put_bucket_versioning_returns_501() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let resp = http
         .put(format!(
@@ -705,7 +705,7 @@ async fn test_put_bucket_versioning_returns_501() {
 
 #[tokio::test]
 async fn test_put_object_acl_returns_501() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     // Seed the object so we exercise the 501 path, not 404.
     http.put(format!("{}/{}/o.bin", server.endpoint(), server.bucket()))
@@ -729,7 +729,7 @@ async fn test_put_object_acl_returns_501() {
 
 #[tokio::test]
 async fn test_put_object_acl_on_missing_object_404_wins() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let resp = http
         .put(format!(
@@ -750,7 +750,7 @@ async fn test_put_object_acl_on_missing_object_404_wins() {
 
 #[tokio::test]
 async fn test_put_tagging_on_missing_object_returns_404() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let resp = http
         .put(format!(
@@ -769,7 +769,7 @@ async fn test_put_tagging_on_missing_object_returns_404() {
 
 #[tokio::test]
 async fn test_put_tagging_on_missing_bucket_returns_404() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let resp = http
         .put(format!("{}/ghost-bucket?tagging", server.endpoint()))
@@ -782,7 +782,7 @@ async fn test_put_tagging_on_missing_bucket_returns_404() {
 
 #[tokio::test]
 async fn test_delete_tagging_on_missing_object_returns_404() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     let resp = http
         .delete(format!(
@@ -798,7 +798,7 @@ async fn test_delete_tagging_on_missing_object_returns_404() {
 
 #[tokio::test]
 async fn test_delete_tagging_on_existing_object_returns_501() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     http.put(format!(
         "{}/{}/seed.bin",

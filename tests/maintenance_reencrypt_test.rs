@@ -231,7 +231,11 @@ async fn test_gate_state_hidden_from_unauthenticated_writers() {
 #[tokio::test]
 async fn test_reencrypt_full_cycle() {
     let bucket = "maintbkt";
-    let server = TestServer::builder().bucket(bucket).build().await;
+    let server = TestServer::builder()
+        .open_access()
+        .bucket(bucket)
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let endpoint = server.endpoint();
 
@@ -377,7 +381,11 @@ async fn test_reencrypt_full_cycle() {
 #[tokio::test]
 async fn test_decrypt_after_disable_strips_markers() {
     let bucket = "maintdec";
-    let server = TestServer::builder().bucket(bucket).build().await;
+    let server = TestServer::builder()
+        .open_access()
+        .bucket(bucket)
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let endpoint = server.endpoint();
     let admin = admin_http_client(&endpoint).await;
@@ -434,7 +442,11 @@ async fn test_decrypt_after_disable_strips_markers() {
 #[tokio::test]
 async fn test_reencrypt_validation_errors() {
     let bucket = "maintval";
-    let server = TestServer::builder().bucket(bucket).build().await;
+    let server = TestServer::builder()
+        .open_access()
+        .bucket(bucket)
+        .build()
+        .await;
     let endpoint = server.endpoint();
     let admin = admin_http_client(&endpoint).await;
 
@@ -469,7 +481,11 @@ async fn test_reencrypt_validation_errors() {
 #[tokio::test]
 async fn test_cancel_releases_gate() {
     let bucket = "maintcan";
-    let server = TestServer::builder().bucket(bucket).build().await;
+    let server = TestServer::builder()
+        .open_access()
+        .bucket(bucket)
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let endpoint = server.endpoint();
     let admin = admin_http_client(&endpoint).await;
@@ -529,7 +545,11 @@ const KEY_B_ID: &str = "maint-test-key-2";
 #[tokio::test]
 async fn test_reencrypt_key_rotation_a_to_b() {
     let bucket = "maintrot";
-    let server = TestServer::builder().bucket(bucket).build().await;
+    let server = TestServer::builder()
+        .open_access()
+        .bucket(bucket)
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let endpoint = server.endpoint();
     let admin = admin_http_client(&endpoint).await;
@@ -629,7 +649,11 @@ async fn test_reencrypt_key_rotation_a_to_b() {
 #[tokio::test]
 async fn test_read_after_rotation_without_shim_hard_fails() {
     let bucket = "maintnoshim";
-    let server = TestServer::builder().bucket(bucket).build().await;
+    let server = TestServer::builder()
+        .open_access()
+        .bucket(bucket)
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let endpoint = server.endpoint();
     let admin = admin_http_client(&endpoint).await;
@@ -667,7 +691,11 @@ async fn test_read_after_rotation_without_shim_hard_fails() {
 #[tokio::test]
 async fn test_reencrypt_resumes_after_restart() {
     let bucket = "maintresume";
-    let mut server = TestServer::builder().bucket(bucket).build().await;
+    let mut server = TestServer::builder()
+        .open_access()
+        .bucket(bucket)
+        .build()
+        .await;
     let http = reqwest::Client::new();
     let endpoint = server.endpoint();
     let admin = admin_http_client(&endpoint).await;

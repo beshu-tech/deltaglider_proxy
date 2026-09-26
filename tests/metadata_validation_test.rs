@@ -65,7 +65,7 @@ async fn head_status(client: &reqwest::Client, endpoint: &str, bucket: &str, key
 /// This test verifies the proxy doesn't crash on such files — it returns a clean error.
 #[tokio::test]
 async fn test_delta_suffix_file_rejected_cleanly() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
 
     write_file(
@@ -96,7 +96,7 @@ async fn test_delta_suffix_file_rejected_cleanly() {
 /// A regular file (no .delta suffix) without metadata should serve as passthrough.
 #[tokio::test]
 async fn test_regular_file_no_metadata_serves_as_passthrough() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
     let content = b"file without any DG metadata";
 
@@ -137,7 +137,7 @@ async fn test_regular_file_no_metadata_serves_as_passthrough() {
 /// reference.bin without metadata should be served as passthrough.
 #[tokio::test]
 async fn test_reference_file_no_metadata_still_accessible() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
     let ref_content = b"reference file data without DG metadata";
 
@@ -232,7 +232,7 @@ async fn test_delta_with_valid_metadata_reconstructs() {
 /// A file with invalid/garbage xattr metadata should not crash the proxy.
 #[tokio::test]
 async fn test_corrupt_xattr_metadata_graceful_fallback() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
     let content = b"file with garbage metadata";
 
@@ -285,7 +285,7 @@ async fn test_corrupt_xattr_metadata_graceful_fallback() {
 /// Metadata that's valid JSON but missing required fields should degrade gracefully.
 #[tokio::test]
 async fn test_partial_metadata_missing_fields_graceful() {
-    let server = TestServer::filesystem().await;
+    let server = TestServer::builder().open_access().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
     let content = b"file with partial metadata";
 

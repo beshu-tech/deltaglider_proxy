@@ -12,27 +12,79 @@ use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
 use rand::{Rng, SeedableRng};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
-/// Port counter to avoid conflicts between tests.
-/// Single port per server (UI served under /_/ on the same port).
-static PORT_COUNTER: AtomicU16 = AtomicU16::new(19000);
+/// First port the harness hands out, and how many it cycles through.
+const PORT_BASE: u32 = 19000;
+const PORT_SPAN: u32 = 40000;
 
-/// Next counter port that is free right now. The counter alone kept tests
-/// apart from each other but not from anything else on the machine: on a
-/// dev box with another project's container on :19025, whichever test drew
-/// that port died with AddrInUse. Probe-bind and skip taken ports.
-fn next_free_port() -> u16 {
-    loop {
-        let port = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
+/// Per-process cursor into the port range.
+static PORT_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// A port reserved for one [`TestServer`] across EVERY test process on the
+/// machine, for the server's whole life (respawns included).
+///
+/// A per-process counter plus a probe-bind was not enough: two concurrent
+/// `cargo test` processes (parallel CI jobs, several sessions on one dev
+/// box) both started at 19000, both saw a port free, and a test then talked
+/// to the OTHER process's proxy (AccessDenied on seed PUTs, another test's
+/// maintenance gate, "exited before becoming ready"). The reservation is an
+/// advisory lock (`flock`) on `<tmp>/dgp-test-ports/<port>.lock`: the kernel
+/// drops it when the holder exits, so a crashed run leaks nothing. The
+/// probe-bind still skips ports that non-harness processes hold.
+pub struct PortLease {
+    port: u16,
+    _lock: std::fs::File,
+}
+
+impl PortLease {
+    pub fn port(&self) -> u16 {
+        self.port
     }
 }
+
+/// Path of the lock file that reserves `port` (see [`PortLease`]).
+pub fn port_lock_path(port: u16) -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join("dgp-test-ports")
+        .join(format!("{port}.lock"))
+}
+
+/// Reserve the next port no harness process holds and nothing is bound to.
+pub fn lease_free_port() -> PortLease {
+    let dir = port_lock_path(0).parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&dir).expect("create port lock dir");
+    for _ in 0..PORT_SPAN {
+        let n = PORT_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let port = (PORT_BASE + n % PORT_SPAN) as u16;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(port_lock_path(port))
+            .expect("open port lock file");
+        // Held by another test process (or another lease in this one).
+        if lock.try_lock().is_err() {
+            continue;
+        }
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return PortLease { port, _lock: lock };
+        }
+    }
+    panic!(
+        "no free test port in {PORT_BASE}..{}",
+        PORT_BASE + PORT_SPAN
+    );
+}
+
+/// SigV4 credentials every [`TestServer`] gets unless the test calls
+/// [`TestServerBuilder::open_access`]. Auth is ON by default so the suite
+/// exercises the same auth pipeline as production; open access is opt-in.
+pub const TEST_ACCESS_KEY: &str = "test";
+pub const TEST_SECRET_KEY: &str = "test";
 
 /// Known bootstrap password used by all test servers.
 pub const TEST_BOOTSTRAP_PASSWORD: &str = "testpass";
@@ -83,6 +135,8 @@ pub const MINIO_SECRET_KEY: &str = "minioadmin";
 pub struct TestServer {
     process: Child,
     port: u16,
+    /// Keeps `port` reserved against other test processes until drop.
+    _port_lease: PortLease,
     _data_dir: Option<TempDir>,
     bucket: String,
     /// Auth credentials for the test server (None = open access).
@@ -94,6 +148,48 @@ pub struct TestServer {
     config_path: std::path::PathBuf,
     /// Extra environment variables used when respawning this server.
     extra_env: Vec<(String, String)>,
+    /// See [`TestServerBuilder::production_security_defaults`].
+    production_security: bool,
+}
+
+/// The proxy child command every spawn path shares (first spawn and both
+/// respawns), so the harness env is defined once.
+///
+/// Hermetic: every `DGP_*` variable of the parent process (a developer
+/// shell, a CI job `env:`) is removed, so a test sees the same child env
+/// locally and in CI. The two test-convenience relaxations are set here,
+/// per child, instead of job-wide in CI:
+/// - `DGP_BACKEND_ALLOW_LOCAL=true`: tests use http://127.0.0.1 MinIO and
+///   dead local endpoints, which the SSRF guard refuses by default.
+/// - `DGP_REPLAY_WINDOW_SECS=0`: the SDK signs at one-second granularity, so
+///   two identical assertion-style mutations in one second collide.
+///
+/// `production_security` leaves both at their production defaults.
+fn proxy_command(config_path: &std::path::Path, production_security: bool) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("DGP_") {
+            cmd.env_remove(key);
+        }
+    }
+    // cwd = the temp config dir: the proxy writes state files
+    // (`.deltaglider_bootstrap_hash`) relative to its cwd, and those
+    // must never land in the repo root (see `spawns_set_current_dir`).
+    cmd.current_dir(config_path.parent().expect("config dir"))
+        .env("DGP_CONFIG", config_path)
+        .env("RUST_LOG", "deltaglider_proxy=warn")
+        .env("DGP_DEBUG_HEADERS", "true")
+        .env("DGP_TRUST_PROXY_HEADERS", "true")
+        // Boot backend-health probe: OFF by default in the harness — many
+        // tests deliberately spawn against dead/absent endpoints and must
+        // not exit(1) or pay probe timeouts. Gate tests opt back in via
+        // .env("DGP_BOOT_BACKEND_PROBE", "enforce").
+        .env("DGP_BOOT_BACKEND_PROBE", "off");
+    if !production_security {
+        cmd.env("DGP_BACKEND_ALLOW_LOCAL", "true")
+            .env("DGP_REPLAY_WINDOW_SECS", "0");
+    }
+    cmd
 }
 
 impl TestServer {
@@ -172,8 +268,10 @@ impl TestServer {
         auth_creds: Option<(String, String)>,
         encryption_key: Option<String>,
         extra_env: Vec<(String, String)>,
+        production_security: bool,
     ) -> Self {
-        let port = next_free_port();
+        let port_lease = lease_free_port();
+        let port = port_lease.port();
 
         // Build full config with listen_addr prepended (flat YAML shape).
         let full_config = format!("listen_addr: \"127.0.0.1:{}\"\n{}", port, config_body);
@@ -195,34 +293,7 @@ impl TestServer {
         let config_path = config_dir.join("test.yaml");
         std::fs::write(&config_path, &full_config).expect("Failed to write test config");
 
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
-        // cwd = the temp config dir: the proxy writes state files
-        // (`.deltaglider_bootstrap_hash`) relative to its cwd, and those
-        // must never land in the repo root (see `spawns_set_current_dir`).
-        cmd.current_dir(&config_dir)
-            .env("DGP_CONFIG", &config_path)
-            .env("RUST_LOG", "deltaglider_proxy=warn")
-            .env("DGP_DEBUG_HEADERS", "true")
-            .env("DGP_TRUST_PROXY_HEADERS", "true")
-            // Env overrides file config; a developer shell exporting
-            // DGP_BOOTSTRAP_PASSWORD_HASH would otherwise break every
-            // test that logs in with [`TEST_BOOTSTRAP_PASSWORD`].
-            .env_remove("DGP_BOOTSTRAP_PASSWORD_HASH")
-            .env_remove("DGP_ADMIN_PASSWORD_HASH")
-            .env_remove("DGP_CONFIG_DB_KEY")
-            // Boot backend-health probe: OFF by default in the harness — many
-            // tests deliberately spawn against dead/absent endpoints and must
-            // not exit(1) or pay probe timeouts. Gate tests opt back in via
-            // .env("DGP_BOOT_BACKEND_PROBE", "enforce").
-            .env("DGP_BOOT_BACKEND_PROBE", "off")
-            // Local endpoints (http://127.0.0.1 MinIO, private IPs) are the norm
-            // for tests, and the proxy otherwise refuses them at startup with
-            // "URL scheme 'http' is not allowed". CI sets this for the whole job
-            // (ci.yml), so WITHOUT it here the same test passes in CI and dies
-            // locally with an opaque "exited before becoming ready" — the trap
-            // that made several tests carry their own copy of this line.
-            // Set before `extra_env` so a test can still override it.
-            .env("DGP_BACKEND_ALLOW_LOCAL", "true");
+        let mut cmd = proxy_command(&config_path, production_security);
         if let Some(ref key) = encryption_key {
             cmd.env("DGP_ENCRYPTION_KEY", key);
         }
@@ -234,11 +305,13 @@ impl TestServer {
         let mut server = Self {
             process,
             port,
+            _port_lease: port_lease,
             _data_dir: data_dir,
             bucket: bucket.to_string(),
             auth_creds,
             config_path,
             extra_env,
+            production_security,
         };
         server.wait_ready().await;
         server.ensure_bucket().await;
@@ -404,30 +477,9 @@ impl TestServer {
             self.port, self.port
         );
 
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
-        cmd.current_dir(self.config_path.parent().expect("config dir"))
-            .env("DGP_CONFIG", &self.config_path)
-            .env("RUST_LOG", "deltaglider_proxy=warn")
-            .env("DGP_DEBUG_HEADERS", "true")
-            .env("DGP_TRUST_PROXY_HEADERS", "true")
-            // Explicitly NOT setting DGP_ENCRYPTION_KEY.
-            .env_remove("DGP_ENCRYPTION_KEY")
-            .env_remove("DGP_BOOTSTRAP_PASSWORD_HASH")
-            .env_remove("DGP_ADMIN_PASSWORD_HASH")
-            .env_remove("DGP_CONFIG_DB_KEY")
-            // Boot backend-health probe: OFF by default in the harness — many
-            // tests deliberately spawn against dead/absent endpoints and must
-            // not exit(1) or pay probe timeouts. Gate tests opt back in via
-            // .env("DGP_BOOT_BACKEND_PROBE", "enforce").
-            .env("DGP_BOOT_BACKEND_PROBE", "off")
-            // Local endpoints (http://127.0.0.1 MinIO, private IPs) are the norm
-            // for tests, and the proxy otherwise refuses them at startup with
-            // "URL scheme 'http' is not allowed". CI sets this for the whole job
-            // (ci.yml), so WITHOUT it here the same test passes in CI and dies
-            // locally with an opaque "exited before becoming ready" — the trap
-            // that made several tests carry their own copy of this line.
-            // Set before `extra_env` so a test can still override it.
-            .env("DGP_BACKEND_ALLOW_LOCAL", "true");
+        // Explicitly NOT setting DGP_ENCRYPTION_KEY (`proxy_command` strips
+        // any inherited one).
+        let mut cmd = proxy_command(&self.config_path, self.production_security);
         for (key, value) in &self.extra_env {
             cmd.env(key, value);
         }
@@ -480,6 +532,8 @@ pub struct TestServerBuilder {
     extra_root_yaml: Option<String>,
     /// Extra process environment variables for this test proxy.
     extra_env: Vec<(String, String)>,
+    /// See [`Self::production_security_defaults`].
+    production_security: bool,
 }
 
 impl Default for TestServerBuilder {
@@ -490,7 +544,7 @@ impl Default for TestServerBuilder {
             max_object_size: None,
             codec_concurrency: None,
             s3_endpoint: None,
-            auth_creds: None,
+            auth_creds: Some((TEST_ACCESS_KEY.to_string(), TEST_SECRET_KEY.to_string())),
             bucket_policies: Vec::new(),
             encryption_key: None,
             native_sse_mode: None,
@@ -500,6 +554,7 @@ impl Default for TestServerBuilder {
             extra_storage_yaml: None,
             extra_root_yaml: None,
             extra_env: Vec::new(),
+            production_security: false,
         }
     }
 }
@@ -532,6 +587,24 @@ impl TestServerBuilder {
 
     pub fn auth(mut self, access_key_id: &str, secret_access_key: &str) -> Self {
         self.auth_creds = Some((access_key_id.to_string(), secret_access_key.to_string()));
+        self
+    }
+
+    /// No SigV4 credentials: the proxy runs with `authentication: none`.
+    /// Auth is on by default; call this only when the test needs unsigned
+    /// requests (raw reqwest, anonymous clients, open-access behaviour).
+    pub fn open_access(mut self) -> Self {
+        self.auth_creds = None;
+        self
+    }
+
+    /// Keep the production defaults for replay protection
+    /// (`DGP_REPLAY_WINDOW_SECS` unset = the clock-skew window) and for the
+    /// SSRF guard (`DGP_BACKEND_ALLOW_LOCAL` unset = http:// and private
+    /// endpoints refused). The harness relaxes both by default (see
+    /// `proxy_command`); a local MinIO backend cannot start in this mode.
+    pub fn production_security_defaults(mut self) -> Self {
+        self.production_security = true;
         self
     }
 
@@ -647,6 +720,7 @@ impl TestServerBuilder {
             auth,
             self.encryption_key,
             extra_env,
+            self.production_security,
         )
         .await
     }
@@ -1260,9 +1334,11 @@ pub async fn list_objects_raw(
 
 // === Quick-setup helpers (reduce test boilerplate) ===
 
-/// Quick setup: filesystem server + reqwest client
-pub async fn test_setup() -> (TestServer, reqwest::Client) {
-    let server = TestServer::filesystem().await;
+/// Quick setup: OPEN-ACCESS filesystem server + an unsigned reqwest client.
+/// The client sends no SigV4, so the server must run with
+/// `authentication: none`; the name keeps that visible at the call site.
+pub async fn open_access_setup() -> (TestServer, reqwest::Client) {
+    let server = TestServer::builder().open_access().build().await;
     let http = reqwest::Client::new();
     (server, http)
 }
@@ -1555,28 +1631,7 @@ impl TestServer {
             self.port, self.port
         );
 
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
-        cmd.current_dir(self.config_path.parent().expect("config dir"))
-            .env("DGP_CONFIG", &self.config_path)
-            .env("RUST_LOG", "deltaglider_proxy=warn")
-            .env("DGP_DEBUG_HEADERS", "true")
-            .env("DGP_TRUST_PROXY_HEADERS", "true")
-            .env_remove("DGP_BOOTSTRAP_PASSWORD_HASH")
-            .env_remove("DGP_ADMIN_PASSWORD_HASH")
-            .env_remove("DGP_CONFIG_DB_KEY")
-            // Boot backend-health probe: OFF by default in the harness — many
-            // tests deliberately spawn against dead/absent endpoints and must
-            // not exit(1) or pay probe timeouts. Gate tests opt back in via
-            // .env("DGP_BOOT_BACKEND_PROBE", "enforce").
-            .env("DGP_BOOT_BACKEND_PROBE", "off")
-            // Local endpoints (http://127.0.0.1 MinIO, private IPs) are the norm
-            // for tests, and the proxy otherwise refuses them at startup with
-            // "URL scheme 'http' is not allowed". CI sets this for the whole job
-            // (ci.yml), so WITHOUT it here the same test passes in CI and dies
-            // locally with an opaque "exited before becoming ready" — the trap
-            // that made several tests carry their own copy of this line.
-            // Set before `extra_env` so a test can still override it.
-            .env("DGP_BACKEND_ALLOW_LOCAL", "true");
+        let mut cmd = proxy_command(&self.config_path, self.production_security);
         for (key, value) in &self.extra_env {
             cmd.env(key, value);
         }

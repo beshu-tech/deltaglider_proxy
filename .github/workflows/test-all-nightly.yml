@@ -40,15 +40,9 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    env:
-      # See ci.yml `test-integration` for rationale: MinIO under test
-      # serves http://localhost:9000, which the wave-1 SSRF guard
-      # rejects unless this is set. DGP_REPLAY_WINDOW_SECS=0 disables
-      # the wave-3 GET/HEAD replay cache for tests that legitimately
-      # re-issue identical signed requests inside the default 2s
-      # window.
-      DGP_BACKEND_ALLOW_LOCAL: "true"
-      DGP_REPLAY_WINDOW_SECS: "0"
+    # No job-wide DGP_* env (see ci.yml `test-integration`): the harness
+    # sets the test relaxations per proxy child, and lib tests stay
+    # hermetic (source guard `test_modules_do_not_read_process_env`).
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
