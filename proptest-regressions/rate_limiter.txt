@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e2cf299bd854967a403016e20586cfb9c485104e03a9ef6e303d2109398297b2 # shrinks to real = (0, 0, 0, 1), forged = [], forged_lines = 0, proxy_mode = 2, inner_hops = [], real_ip_header = true
