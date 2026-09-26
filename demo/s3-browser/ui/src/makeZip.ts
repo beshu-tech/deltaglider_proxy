@@ -1,5 +1,5 @@
 // Pure ZIP byte-writer for the demo data generator. No DOM/React deps so it's
-// unit-testable from Node (see scripts/make-zip-regression-test.mjs).
+// unit-testable from Node (see src/__tests__/makeZip.test.ts).
 
 // CRC-32 (IEEE) — required by the ZIP format. Table built once.
 const CRC_TABLE = (() => {
@@ -12,7 +12,7 @@ const CRC_TABLE = (() => {
   return t;
 })();
 
-/** @public — exercised by scripts/make-zip-regression-test.mjs (dynamic import). */
+/** @public — exercised by src/__tests__/makeZip.test.ts. */
 export function crc32(bytes: Uint8Array): number {
   let c = 0xffffffff;
   for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
@@ -21,7 +21,7 @@ export function crc32(bytes: Uint8Array): number {
 
 // A REAL, openable ZIP, single STORED (uncompressed) entry — on purpose: a tiny
 // content change stays a tiny binary delta (DEFLATE would scramble it).
-/** @public — exercised by scripts/make-zip-regression-test.mjs (dynamic import). */
+/** @public — exercised by src/__tests__/makeZip.test.ts. */
 export function makeZip(entryName: string, content: string): Uint8Array {
   const enc = new TextEncoder();
   const name = enc.encode(entryName);

@@ -2,7 +2,7 @@
  * Pure payload + validation logic for BucketsPanel.
  *
  * Extracted to a React-free module (no antd / no hooks) so the Node
- * regression script can transpile-and-import it directly, and so the
+ * unit test can import it directly, and so the
  * fetch→dirty→validate→PUT pipeline can move onto the shared
  * `useSectionEditor` hook without duplicating the storage-section
  * apply machinery.

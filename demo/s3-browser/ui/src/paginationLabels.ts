@@ -1,7 +1,7 @@
 /**
  * Pure helpers for paginated-table labels. Kept in plain `.ts` (no
  * React imports) so they're trivially unit-testable from
- * `scripts/page-size-regression-test.mjs`.
+ * src/__tests__/pageSize.test.ts.
  */
 
 /**

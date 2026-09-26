@@ -1,7 +1,7 @@
 /**
  * Pure normalize + validation + payload logic for LifecyclePanel.
  *
- * React-free (no antd / no hooks) so the Node regression script can
+ * React-free (no antd / no hooks) so the unit test can
  * transpile-and-import it directly, and so the panel can move onto the
  * shared `useSectionEditor` storage-section apply pipeline.
  *

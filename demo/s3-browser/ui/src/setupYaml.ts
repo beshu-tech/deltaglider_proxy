@@ -1,6 +1,6 @@
 /**
  * Pure YAML emitter for the first-run setup wizard (SetupWizard.tsx).
- * Kept out of the component so a regression script can round-trip it.
+ * Kept out of the component so a unit test can round-trip it.
  */
 
 import type { EnvOverride } from './envOverrides';

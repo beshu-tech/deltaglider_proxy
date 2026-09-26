@@ -2,7 +2,7 @@
  * Pure storage-section PUT payload builder for per-backend encryption
  * changes (extracted from BackendsPanel.handleEncryptionApply).
  *
- * Lives in its own React/antd-free module so the Node regression script
+ * Lives in its own React/antd-free module so the unit test
  * can transpile-and-import it and assert the wire body byte-for-byte —
  * this is the one genuinely-pure decision point in BackendsPanel, and
  * the composed body is exactly what the admin API receives, so it must

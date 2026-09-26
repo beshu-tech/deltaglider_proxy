@@ -2,7 +2,7 @@
  * Pure merge-patch payload helper for the Advanced sub-panels.
  *
  * Extracted to its own module (no React / antd imports) so the Node
- * regression script can transpile-and-import it directly.
+ * unit test can import it directly.
  *
  * ## Why this exists
  *

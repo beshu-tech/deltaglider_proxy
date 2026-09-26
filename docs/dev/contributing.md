@@ -175,11 +175,13 @@ glob rows, routes, permissions, rules) key React lists by a stable id (a
 per-instance `nextId()` counter or the record's own id), and mutate rows by id
 (`rows.map(r => r.id === id ? {...} : r)`), never by index.
 
-**Pure helpers + Node regression tests.** Validation, payload-building, and
+**Pure helpers + unit tests.** Validation, payload-building, and
 normalization live in pure functions (e.g. `webhookDeliveryPayload.ts`'s
 `formFromWire` / `buildPayloadFromForm`), not inline in components, and get a
-`scripts/*-regression-test.mjs` Node test (registered in `package.json` + CI).
-Mirrors the Rust convention of pure decision-fns at seams (`classify_*`,
+vitest file in `src/__tests__/` (`*.test.ts` runs in Node; `*.test.tsx` runs in
+jsdom for hooks and components, with helpers in `src/test/`: mock HTTP with
+`mockFetch`, not by mocking `adminApi`). `npm run test:all` runs every file, in
+CI too. Mirrors the Rust convention of pure decision-fns at seams (`classify_*`,
 `validate_*`, `resolve_*`) with colocated unit tests.
 
 **Secret round-trip.** Secret fields (webhook headers, Slack bot token, SigV4)

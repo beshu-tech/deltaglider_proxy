@@ -1,6 +1,6 @@
 /**
  * Pure "Upload Session Statistics" aggregation for the upload page. React-
- * and SDK-free so scripts/upload-stats-regression-test.mjs can check it.
+ * and SDK-free so src/__tests__/uploadStats.test.ts can check it.
  */
 import { summarizeObjectSavings } from './savings';
 

@@ -1,8 +1,8 @@
 /**
  * Pure decision for the folder-size ("Compute Size") result poll in
  * `useComputeSize.ts`: after each poll, continue, finish, or stop with an
- * error. Kept React-free so a Node regression script can check the table
- * (scripts/usage-poll-regression-test.mjs).
+ * error. Kept React-free so a unit test can check the table
+ * (src/__tests__/usagePoll.test.ts).
  */
 import { ApiError, isSessionExpired, normalizeUiError } from './errorHandling';
 

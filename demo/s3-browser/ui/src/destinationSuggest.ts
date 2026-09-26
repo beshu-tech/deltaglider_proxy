@@ -4,7 +4,7 @@
  * The destination input holds a folder path like "tirso/sub". Suggestions come
  * from the bucket's REAL folders (S3 delimiter listing) one level at a time:
  * we list the folders under the path's parent and filter them by the segment
- * being typed. Kept React-free so a Node regression script can exercise the
+ * being typed. Kept React-free so a unit test can exercise the
  * splitting/filtering truth table (the async fetch lives in
  * useFolderSuggestions.ts).
  */

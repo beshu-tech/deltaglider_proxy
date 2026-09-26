@@ -2,7 +2,7 @@
  * Pure-ish credential generators for the IAM UserForm "generate random
  * key/secret" buttons. The randomness source is injectable so the format
  * invariants (prefix, length, alphabet) can be exercised deterministically in
- * the Node regression test without touching real entropy.
+ * the unit test without touching real entropy.
  */
 
 const ID_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';

@@ -14,7 +14,7 @@
  * proxy ships the manifest inside the same payload, so the UI has no
  * build-time knowledge of the docs at all.
  *
- * Unit-tested by scripts/docs-bundle-regression-test.mjs.
+ * Unit-tested by src/__tests__/docsBundle.test.ts.
  */
 
 export type DocGroup = string;

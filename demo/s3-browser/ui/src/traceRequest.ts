@@ -2,7 +2,7 @@
  * Pure payload builder for the admission-trace diagnostic (TracePanel).
  *
  * React-free so it can be unit-tested in Node (see
- * scripts/trace-request-regression-test.mjs). The wire contract is
+ * src/__tests__/traceRequest.test.ts). The wire contract is
  * load-bearing: `query` / `source_ip` are only emitted when non-empty
  * after trimming, matching what `POST /_/api/admin/config/trace`
  * expects. Keep this byte-identical to the prior inline builder.

@@ -3,7 +3,7 @@
  * `components/adminNavigation.tsx`). Kept JSX-free in its own module so
  * the navigation single-source-of-truth logic can be unit-tested with a
  * plain data tree (no icon imports, no JSX factory) — see
- * `scripts/admin-nav-tree-regression-test.mjs`.
+ * src/__tests__/adminNavTree.test.ts.
  *
  * Generic over the entry shape: callers in `adminNavigation.tsx` pass
  * the real `SidebarEntry` tree; the regression test feeds bare

@@ -1,6 +1,6 @@
 /**
  * The account-menu header: who is signed in and how. React-free so
- * scripts/identity-summary-regression-test.mjs can check it.
+ * src/__tests__/identitySummary.test.ts can check it.
  */
 import type { WhoamiResponse } from './adminApi';
 

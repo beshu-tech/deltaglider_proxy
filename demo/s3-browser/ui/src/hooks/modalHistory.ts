@@ -1,6 +1,6 @@
 /**
  * Pure history-entry helpers behind `useBackClosesModal` (useOverlayClose.ts).
- * They take a History-like object so scripts/modal-history-regression-test.mjs
+ * They take a History-like object so src/__tests__/modalHistory.test.ts
  * can drive them with a fake stack.
  */
 type HistoryLike = Pick<History, 'state' | 'pushState' | 'back'>;

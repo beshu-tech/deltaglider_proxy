@@ -528,8 +528,8 @@ jobs:
       # ── Blocking: Knip detects unused files, deps, and exports. ──
       - name: Knip (dead code / unused deps)
         run: cd demo/s3-browser/ui && npm run knip
-      # Every `test:*` script in package.json — no hand-kept list to drift.
-      - name: Node regression scripts
+      # vitest: every src/**/*.test.ts (Node) and *.test.tsx (jsdom) file.
+      - name: Unit and component tests (vitest)
         run: cd demo/s3-browser/ui && npm run test:all
       - name: npm audit
         run: cd demo/s3-browser/ui && npm audit --audit-level=high || true  # warn-only

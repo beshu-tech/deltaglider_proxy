@@ -2,7 +2,7 @@
  * Pure rule-name helper shared by the Lifecycle and Replication payload
  * modules' `emptyRule` factories.
  *
- * React-free (no antd / no hooks) so the Node regression script can
+ * React-free (no antd / no hooks) so the unit test can
  * transpile-and-import it directly. Both panels seed a new draft rule with
  * a `<base>-<n>` name and bump `n` until it does not collide with an
  * existing rule name — this collapses that loop into one tested helper.

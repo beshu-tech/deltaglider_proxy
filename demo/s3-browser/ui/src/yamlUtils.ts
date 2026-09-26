@@ -2,7 +2,7 @@
  * Pure helpers for reasoning about admin-API section YAML bodies.
  *
  * Extracted from CopySectionYamlButton so the logic can be unit-tested
- * without React (see scripts/yaml-utils-regression-test.mjs).
+ * without React (see src/__tests__/yamlUtils.test.ts).
  */
 
 /** Strip full-line # comments (API bodies are comment-free; avoids double-detection if we re-fetch). */

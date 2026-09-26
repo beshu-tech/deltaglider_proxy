@@ -1,6 +1,6 @@
 /**
  * The admin content pane as a route table: one entry per admin path (every
- * `ADMIN_IA` leaf plus the `setup` wizard; scripts/admin-page-regression-test
+ * `ADMIN_IA` leaf plus the `setup` wizard; src/__tests__/adminPage.test.ts
  * keeps the two in sync). AdminPage resolves the path and renders
  * `<AdminRouteContent>`; a panel's wiring lives here, next to its siblings,
  * instead of in a chain of `if (adminPath === …)` blocks.

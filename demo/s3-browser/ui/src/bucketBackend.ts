@@ -1,6 +1,6 @@
 /**
  * Backend chip rules for the browser (sidebar rows and breadcrumb).
- * React-free so scripts/bucket-backend-regression-test.mjs can check it.
+ * React-free so src/__tests__/bucketBackend.test.ts can check it.
  *
  * The chip shows the REAL backend name from the admin bucket-origins data.
  * It never guesses a provider from a name or an endpoint (the old regex made

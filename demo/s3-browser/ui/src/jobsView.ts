@@ -1,6 +1,6 @@
 /**
  * Pure view logic for the unified Jobs screen (React-free — transpiled
- * directly by the Node regression script).
+ * directly by the unit test).
  *
  * The backend's GET /api/admin/jobs returns ONE row shape for every
  * background operation (replication rules, lifecycle rules, one-off
@@ -107,7 +107,7 @@ export function jobWalkProgress(
   return { scanning, dirs_completed, dirs_pending };
 }
 
-export type StrategySegment = {
+type StrategySegment = {
   key: 'verbatim' | 'reconstructed' | 'straight';
   count: number;
   /** Layman label shown inline. */
@@ -589,7 +589,7 @@ export function stepPendingReverify(
 }
 
 // ── Outcome meter (the calm-by-default run-result visual) ─────────────────
-export type MeterState = 'in-sync' | 'copied' | 'errors' | 'mixed' | 'running' | 'idle';
+type MeterState = 'in-sync' | 'copied' | 'errors' | 'mixed' | 'running' | 'idle';
 
 export interface OutcomeMeterInput {
   scanned: number;

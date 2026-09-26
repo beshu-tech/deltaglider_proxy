@@ -2,7 +2,7 @@
  * Pure folder expansion for the browser's bulk actions (delete / copy / move / ZIP).
  *
  * React-free and fetch-free (the lister is injected) so a plain Node regression
- * script can exercise it — see scripts/bulk-selection-regression-test.mjs.
+ * script can exercise it — see src/__tests__/bulkSelection.test.ts.
  */
 
 /** Shape of `GET /api/admin/objects/list`: the server stops at 10,000 keys. */

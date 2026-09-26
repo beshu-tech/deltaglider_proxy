@@ -3,7 +3,7 @@ import type { View } from './urlState';
 const APP = 'DeltaGlider Proxy';
 
 /**
- * The browser-tab title for a view. Pure so the regression script can pin
+ * The browser-tab title for a view. Pure so the unit test can pin
  * it: the old inline table read the bucket once per view change, so a fresh
  * load (no bucket yet) showed "— DeltaGlider Proxy" and a bucket switch
  * never updated the tab.

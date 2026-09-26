@@ -2,7 +2,7 @@
 // Server-side enforcement messages (config refusals, 403s, check() warnings)
 // embed a https://deltaglider.com/docs/... URL; the GUI renders it clickable
 // and rewrites it to the in-app docs viewer so operators stay in the product.
-// Pure module — node-regression-tested (linkify-regression-test.mjs).
+// Pure module — unit-tested (src/__tests__/linkify.test.ts).
 
 export interface LinkSegment {
   kind: 'text' | 'link';
@@ -21,7 +21,7 @@ const DOCS_URL_RE = /^https:\/\/(?:www\.)?deltaglider\.com\/docs\/([A-Za-z0-9/_.
 
 /** deltaglider.com/docs/<path> → in-app docs route (`/_/docs/<id>`), using the
  *  one `pathToId` the docs bundle itself uses, so the two cannot disagree.
- *  @public — exercised by scripts/linkify-regression-test.mjs (dynamic import). */
+ *  @public — exercised by src/__tests__/linkify.test.ts. */
 export function docsUrlToInAppHref(url: string): string | null {
   const m = url.match(DOCS_URL_RE);
   if (!m) return null;

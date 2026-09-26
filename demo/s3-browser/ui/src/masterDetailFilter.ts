@@ -7,7 +7,7 @@
  * IMPORTANT: these are behaviour-preserving copies of the `permissionSummary`
  * functions and the `.filter(...)` predicates that previously lived inline in
  * UsersPanel.tsx and GroupsPanel.tsx. Do not change the truth tables without a
- * matching update to scripts/master-detail-filter-regression-test.mjs.
+ * matching update to src/__tests__/masterDetailFilter.test.ts.
  */
 
 interface PermissionRule {

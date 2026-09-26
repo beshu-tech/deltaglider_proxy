@@ -1,7 +1,7 @@
 /**
  * Pure status→UI mapping for bucket maintenance (re-encryption) jobs.
  *
- * React-free so the Node regression script can transpile-and-import it
+ * React-free so the unit test can import it
  * directly (same pattern as droppedFiles.ts / destinationSuggest.ts).
  *
  * The server's job view carries `percent` (0-99 while running, null

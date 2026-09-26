@@ -1,7 +1,7 @@
 /**
  * Pure validation helpers for `usePersistedPageSize`. Kept React-free
  * so they can be exercised from a plain Node regression test
- * (`scripts/page-size-regression-test.mjs`).
+ * (src/__tests__/pageSize.test.ts).
  */
 
 /**
