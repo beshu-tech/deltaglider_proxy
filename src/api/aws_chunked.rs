@@ -115,7 +115,9 @@ pub fn get_decoded_content_length(headers: &HeaderMap) -> Option<usize> {
 /// authorised. Chunk-level signature verification is a separate piece
 /// of work and is not implemented here (nor in the pre-fix code).
 pub fn decode_aws_chunked(body: &Bytes, expected_length: Option<usize>) -> Option<Bytes> {
-    let mut result = Vec::with_capacity(expected_length.unwrap_or(body.len()));
+    // The decoded payload is never longer than the framed body, whatever the
+    // client advertised in x-amz-decoded-content-length.
+    let mut result = Vec::with_capacity(expected_length.unwrap_or(body.len()).min(body.len()));
     let mut pos = 0;
 
     loop {
@@ -155,7 +157,8 @@ pub fn decode_aws_chunked(body: &Bytes, expected_length: Option<usize>) -> Optio
         // Read the chunk body. Bail if the declared size exceeds what
         // remains — truncation must surface as a decode failure, not a
         // silent partial store.
-        if pos + chunk_size > body.len() {
+        // `checked_add`: the size is client hex, up to usize::MAX.
+        let Some(chunk_end) = pos.checked_add(chunk_size).filter(|&e| e <= body.len()) else {
             warn!(
                 "aws_chunked: truncated chunk at pos={} (need {}, have {})",
                 pos,
@@ -163,9 +166,9 @@ pub fn decode_aws_chunked(body: &Bytes, expected_length: Option<usize>) -> Optio
                 body.len() - pos
             );
             return None;
-        }
-        result.extend_from_slice(&body[pos..pos + chunk_size]);
-        pos += chunk_size;
+        };
+        result.extend_from_slice(&body[pos..chunk_end]);
+        pos = chunk_end;
 
         // Every data chunk is followed by a CRLF. Tolerating a missing
         // CRLF here is the exact laxity that masked the bug in
@@ -239,6 +242,31 @@ fn find_crlf(data: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chunk size near `usize::MAX` overflowed `pos + chunk_size`: a panic
+    /// with overflow checks, a slice-index panic without them. The body is
+    /// client input (the adapter decodes chunked bodies s3s did not).
+    /// Found by the `aws_chunked` fuzz target.
+    #[test]
+    fn huge_chunk_size_is_refused_not_a_panic() {
+        for body in [
+            &b"ffffffffffffffff\r\nx"[..],
+            b"fffffffffffffffe\r\nhello\r\n0\r\n\r\n",
+            b"5\r\nhello\r\nffffffffffffffff\r\n",
+        ] {
+            let body = Bytes::copy_from_slice(body);
+            assert_eq!(decode_aws_chunked(&body, None), None);
+            assert_eq!(decode_aws_chunked(&body, Some(5)), None);
+        }
+    }
+
+    /// The advertised decoded length is client text too: it must not size an
+    /// allocation beyond the body it describes.
+    #[test]
+    fn advertised_length_does_not_size_the_buffer() {
+        let body = Bytes::from_static(b"5\r\nhello\r\n0\r\n\r\n");
+        assert_eq!(decode_aws_chunked(&body, Some(usize::MAX)), None);
+    }
 
     // ── is_aws_chunked ────────────────────────────────────────────────
 
