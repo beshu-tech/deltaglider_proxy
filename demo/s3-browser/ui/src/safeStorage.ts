@@ -1,6 +1,6 @@
 /**
  * The ONLY place that touches `localStorage` / `sessionStorage` directly
- * (enforced by scripts/ui-rules-guard.mjs). Browsers with site storage
+ * (enforced by the UI_RULES in eslint.config.mjs). Browsers with site storage
  * blocked throw `SecurityError` on property access, and a full quota
  * throws on write — a UI preference must never white-screen the app, so
  * every access degrades to "no stored value" instead.
