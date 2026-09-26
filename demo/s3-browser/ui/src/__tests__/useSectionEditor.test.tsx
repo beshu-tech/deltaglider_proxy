@@ -3,7 +3,8 @@
  * fetch → dirty → validate → ApplyDialog → PUT → markApplied, plus the
  * failure paths that must keep the operator's edits.
  */
-import { act, screen, waitFor } from '@testing-library/react';
+import { act, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { qk } from '../queries/keys';
 import { getDirtySections, requestApplyFirst } from '../useDirtySection';
@@ -249,7 +250,8 @@ describe('optimistic concurrency (browser review #4)', () => {
       ok = await result.current.confirmApply();
     });
     expect(ok).toBe(false);
-    expect((await screen.findAllByText(/changed in another tab or by another admin/)).length).toBeGreaterThan(0);
+    // The dialog renders outside the hook's tree: await it, then act inside it.
+    const dialog = await screen.findByRole('dialog', { name: /changed in another tab or by another admin/ });
     expect(result.current.isDirty).toBe(true);
     expect(result.current.value.cache_size_mb).toBe(256);
 
@@ -257,10 +259,7 @@ describe('optimistic concurrency (browser review #4)', () => {
     // validates again (the ApplyDialog then shows the diff from v2).
     http.on('GET', SECTION, withEtag({ cache_size_mb: 300 }, '"v2"'));
     http.on('PUT', SECTION, withEtag({ ok: true }, '"v3"'));
-    const review = await screen.findByText('Review my edits against the new version');
-    await act(async () => {
-      review.click();
-    });
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Review my edits against the new version' }));
     await waitFor(() => expect(result.current.applyOpen).toBe(true));
     expect(result.current.value.cache_size_mb).toBe(256);
     await act(async () => {
@@ -302,10 +301,8 @@ describe('optimistic concurrency (browser review #4)', () => {
       await result.current.confirmApply();
     });
     http.on('GET', SECTION, withEtag({ cache_size_mb: 300 }, '"v2"'));
-    const reload = await screen.findByText('Reload (discard my edits)');
-    await act(async () => {
-      reload.click();
-    });
+    const dialog = await screen.findByRole('dialog', { name: /changed in another tab/ });
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Reload (discard my edits)' }));
     await waitFor(() => expect(result.current.value.cache_size_mb).toBe(300));
     expect(result.current.isDirty).toBe(false);
   });
