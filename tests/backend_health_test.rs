@@ -258,3 +258,202 @@ backends:
         .await
         .expect("a bucket on the healthy named backend must still be served");
 }
+
+/// A fake S3 endpoint that answers every request with an empty
+/// ListAllMyBuckets result, until `hang` is set: then it reads requests and
+/// never answers (a hung backend, like a SIGSTOPped process).
+async fn fake_s3(hang: std::sync::Arc<std::sync::atomic::AtomicBool>) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let hang = hang.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => n,
+                    };
+                    buf.extend_from_slice(&chunk[..n]);
+                    // One request per header block; the fake ignores bodies.
+                    while let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        buf.drain(..end + 4);
+                        if hang.load(std::sync::atomic::Ordering::SeqCst) {
+                            std::future::pending::<()>().await;
+                        }
+                        let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                            <ListAllMyBucketsResult><Owner><ID>x</ID></Owner>\
+                            <Buckets></Buckets></ListAllMyBucketsResult>";
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/xml\r\n\
+                             content-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if sock.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+async fn ready(ep: &str) -> (u16, serde_json::Value) {
+    let resp = reqwest::get(format!("{ep}/_/ready")).await.unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap())
+}
+
+fn hung_backend_yaml(port: u16, disk: &std::path::Path) -> String {
+    format!(
+        r#"
+backends:
+  - name: local-disk
+    type: filesystem
+    path: {}
+  - name: hetzner-fsn1
+    type: s3
+    endpoint: "http://127.0.0.1:{port}"
+    region: us-east-1
+    access_key_id: x
+    secret_access_key: y
+    allow_local: true
+default_backend: local-disk
+buckets:
+  releases:
+    backend: hetzner-fsn1
+"#,
+        disk.display()
+    )
+}
+
+/// Browser review #5: a backend that HANGS (answers nothing) must not hang
+/// requests. The request times out after DGP_BACKEND_REQUEST_TIMEOUT_SECS
+/// with a 503 that names the backend; the timeout marks the backend
+/// unhealthy at once, so the next request gets the gate's fast 503; and
+/// `/_/ready` lists the backend as unreachable.
+#[tokio::test]
+async fn hung_backend_times_out_fast_and_is_marked_unhealthy() {
+    let hang = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let port = fake_s3(hang.clone()).await;
+    let disk = tempfile::tempdir().unwrap();
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(&hung_backend_yaml(port, disk.path()))
+        .env("DGP_BOOT_BACKEND_PROBE", "enforce")
+        // The loop must not be what finds the hang in this test.
+        .env("DGP_BACKEND_HEALTH_INTERVAL_SECS", "3600")
+        .env("DGP_BACKEND_REQUEST_TIMEOUT_SECS", "2")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let (_, body) = ready(&ep).await;
+    assert_eq!(body["backends"]["hetzner-fsn1"], "healthy", "{body}");
+
+    hang.store(true, std::sync::atomic::Ordering::SeqCst);
+    // No client retries: the test times the proxy, not the SDK's backoff.
+    let s3 = aws_sdk_s3::Client::from_conf(
+        server
+            .s3_client()
+            .await
+            .config()
+            .to_builder()
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .build(),
+    );
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    let t0 = std::time::Instant::now();
+    let err = s3
+        .head_object()
+        .bucket("releases")
+        .key("app-1.0.0.tar")
+        .send()
+        .await
+        .expect_err("a hung backend cannot answer");
+    let first = t0.elapsed();
+    assert!(
+        first < std::time::Duration::from_secs(15),
+        "the request must end near the 2s timeout, took {first:?}"
+    );
+    // HEAD has no body, so check the status; GET carries the message.
+    assert_eq!(
+        err.raw_response().map(|r| r.status().as_u16()),
+        Some(503),
+        "{err:?}"
+    );
+
+    let t1 = std::time::Instant::now();
+    let err = s3
+        .get_object()
+        .bucket("releases")
+        .key("app-1.0.0.tar")
+        .send()
+        .await
+        .expect_err("gated");
+    assert!(
+        t1.elapsed() < std::time::Duration::from_secs(1),
+        "after the timeout the gate answers at once, took {:?}",
+        t1.elapsed()
+    );
+    assert_eq!(err.meta().code(), Some("ServiceUnavailable"), "{err:?}");
+    assert!(
+        err.meta().message().unwrap_or("").contains("hetzner-fsn1"),
+        "{err:?}"
+    );
+
+    let (status, body) = ready(&ep).await;
+    assert_eq!(body["backends"]["hetzner-fsn1"], "unreachable", "{body}");
+    assert_eq!(body["backends"]["local-disk"], "healthy", "{body}");
+    assert_eq!(
+        status, 200,
+        "one healthy backend keeps the node ready: {body}"
+    );
+}
+
+/// The health loop probes HEALTHY backends too: a backend that hangs with no
+/// traffic turns unreachable, and it recovers on its own when it answers.
+#[tokio::test]
+async fn health_loop_finds_a_hang_and_the_recovery() {
+    let hang = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let port = fake_s3(hang.clone()).await;
+    let disk = tempfile::tempdir().unwrap();
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(&hung_backend_yaml(port, disk.path()))
+        .env("DGP_BOOT_BACKEND_PROBE", "enforce")
+        .env("DGP_BACKEND_HEALTH_INTERVAL_SECS", "1")
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let wait_for = |want: &'static str| {
+        let ep = ep.clone();
+        async move {
+            // A hung probe takes two 5s attempts before it reports.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+            loop {
+                let (_, body) = ready(&ep).await;
+                if body["backends"]["hetzner-fsn1"] == want {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "hetzner-fsn1 never became {want}: {body}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    };
+    wait_for("healthy").await;
+    hang.store(true, std::sync::atomic::Ordering::SeqCst);
+    wait_for("unreachable").await;
+    hang.store(false, std::sync::atomic::Ordering::SeqCst);
+    wait_for("healthy").await;
+}

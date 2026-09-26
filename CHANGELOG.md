@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed — A hung backend no longer hangs requests, and the proxy notices it
+
+The health probe re-checked only backends that were already unhealthy, so a
+backend that hung after boot stayed "Connected", and requests to it waited
+for minutes (a 60 s read timeout, three times). Now every backend is probed
+every 30 s (`DGP_BACKEND_HEALTH_INTERVAL_SECS`). A backend request without a
+large body has a 30 s deadline, retries included
+(`DGP_BACKEND_REQUEST_TIMEOUT_SECS`); when it passes, or the connection
+fails, the client gets `503 ServiceUnavailable` naming the backend (before:
+`500 InternalError`), and the backend is marked unhealthy at once, so the
+next requests get the gate's 503 without a wait. Uploads and server-side
+copies keep their old timeouts. `GET /_/ready` now lists each backend's live
+state in `backends`, and reports not-ready when every backend is down.
+
 ### Changed — A backup restore replaces users and groups (point-in-time)
 
 A restore of `iam.json` added the users and groups that the instance did not

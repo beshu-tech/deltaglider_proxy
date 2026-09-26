@@ -895,49 +895,33 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         &shared_config,
     );
 
-    // Backend-health re-probe loop: only UNHEALTHY backends are re-probed
-    // (healthy ones re-probe on definition change or manual Test connection),
-    // so a recovered backend self-heals within ~30s and its gated buckets
-    // reopen without a restart.
-    spawn_periodic(Duration::from_secs(30), {
-        let health = backend_health.clone();
-        let shared_config = shared_config.clone();
-        move || {
-            let health = health.clone();
+    // Backend-health loop: every backend is probed each interval, so a
+    // backend that hangs or goes down is gated within one interval, and a
+    // recovered one reopens without a restart. Requests that find a backend
+    // unavailable mark it at once (passive sink).
+    deltaglider_proxy::coordination::health::install_passive_sink(backend_health.clone());
+    if let Some(every) = deltaglider_proxy::coordination::health::health_probe_interval() {
+        spawn_periodic(every, {
+            let health = backend_health.clone();
             let shared_config = shared_config.clone();
-            tokio::spawn(async move {
-                let unhealthy = health.unhealthy_names();
-                if unhealthy.is_empty() {
+            let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            move || {
+                // A round with a hung backend can outlast the interval; never
+                // stack rounds.
+                if running.swap(true, std::sync::atomic::Ordering::AcqRel) {
                     return;
                 }
-                let targets = {
-                    let cfg = shared_config.read().await;
-                    deltaglider_proxy::coordination::health::probe_targets(&cfg)
-                };
-                // Hygiene FIRST: drop entries for backends no longer in the
-                // config (deleted backends, rejected-apply ghosts). A stale
-                // unhealthy entry would otherwise pin the gate's slow path
-                // forever and can never self-heal (it has no probe target).
-                let current: std::collections::BTreeSet<String> =
-                    targets.iter().map(|(n, _, _)| n.clone()).collect();
-                health.retain_backends(&current);
-                for (name, backend, fallback) in targets {
-                    if !unhealthy.contains(&name) {
-                        continue;
-                    }
-                    let verdict = deltaglider_proxy::coordination::health::probe_backend_health(
-                        &backend,
-                        fallback.as_deref(),
-                    )
-                    .await;
-                    if verdict.is_healthy() {
-                        tracing::info!("backend health: '{name}' RECOVERED — gated buckets reopen");
-                    }
-                    health.set(&name, &backend, verdict);
-                }
-            });
-        }
-    });
+                let health = health.clone();
+                let shared_config = shared_config.clone();
+                let running = running.clone();
+                tokio::spawn(async move {
+                    deltaglider_proxy::coordination::health::reprobe_all(&health, &shared_config)
+                        .await;
+                    running.store(false, std::sync::atomic::Ordering::Release);
+                });
+            }
+        });
+    }
 
     // --- External auth (OAuth/OIDC) ---
     let external_auth = {

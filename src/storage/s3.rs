@@ -474,7 +474,17 @@ impl NativeEncryptionConfig {
 }
 
 pub struct S3Backend {
+    /// Client for requests without a large body: every operation is capped
+    /// at [`backend_request_timeout`], so a hung backend fails fast.
     client: Client,
+    /// Client for uploads and server-side copies (PutObject, UploadPart,
+    /// CopyObject, CompleteMultipartUpload): their duration grows with the
+    /// object size, so only the per-attempt and read timeouts apply.
+    bulk_client: Client,
+    /// `(backend name, definition fingerprint)` for passive health marking
+    /// (`coordination::health::note_unavailable`). `None` for a backend that
+    /// the engine did not name (tests, CLI).
+    health_key: Option<(String, String)>,
     /// Per-backend native S3 server-side encryption mode. Applied to
     /// every `put_object`/`put_directory_marker` call.
     native_encryption: NativeEncryptionConfig,
@@ -495,10 +505,29 @@ impl S3Backend {
     const MAX_CONCURRENT_HEADS: usize = 10;
 }
 
+/// `DGP_BACKEND_REQUEST_TIMEOUT_SECS` (default 30; 0 turns it off): the
+/// deadline for one backend request without a large body, retries included.
+/// A hung backend then costs a request this long, not minutes.
+pub(crate) fn backend_request_timeout() -> Option<std::time::Duration> {
+    match crate::config::env_parse_with_default("DGP_BACKEND_REQUEST_TIMEOUT_SECS", 30u64) {
+        0 => None,
+        secs => Some(std::time::Duration::from_secs(secs)),
+    }
+}
+
 impl S3Backend {
     /// Build an S3 client from a BackendConfig without creating an S3Backend.
     /// Useful for one-off operations like testing connectivity.
     pub async fn build_client(config: &BackendConfig) -> Result<Client, StorageError> {
+        Self::build_client_with(config, None).await
+    }
+
+    /// [`Self::build_client`] with a whole-operation deadline (all retries
+    /// included) on top of the per-attempt timeouts.
+    async fn build_client_with(
+        config: &BackendConfig,
+        operation_timeout: Option<std::time::Duration>,
+    ) -> Result<Client, StorageError> {
         let (
             endpoint,
             region,
@@ -564,11 +593,14 @@ impl S3Backend {
         let attempt_timeout =
             crate::config::env_parse_with_default("DGP_S3_OPERATION_ATTEMPT_TIMEOUT_SECS", 300u64);
         let stall_grace = crate::config::env_parse_with_default("DGP_S3_STALL_GRACE_SECS", 20u64);
-        let timeout_config = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
+        let mut timeout_config = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
             .read_timeout(std::time::Duration::from_secs(read_timeout))
             .connect_timeout(std::time::Duration::from_secs(connect_timeout))
-            .operation_attempt_timeout(std::time::Duration::from_secs(attempt_timeout))
-            .build();
+            .operation_attempt_timeout(std::time::Duration::from_secs(attempt_timeout));
+        if let Some(t) = operation_timeout {
+            timeout_config = timeout_config.operation_timeout(t);
+        }
+        let timeout_config = timeout_config.build();
         let stalled_stream_protection =
             aws_sdk_s3::config::StalledStreamProtectionConfig::enabled()
                 .grace_period(std::time::Duration::from_secs(stall_grace))
@@ -609,7 +641,8 @@ impl S3Backend {
         config: &BackendConfig,
         native_encryption: NativeEncryptionConfig,
     ) -> Result<Self, StorageError> {
-        let client = Self::build_client(config).await?;
+        let client = Self::build_client_with(config, backend_request_timeout()).await?;
+        let bulk_client = Self::build_client(config).await?;
         debug!(
             "S3Backend initialized (multi-bucket mode, native encryption: {:?})",
             native_encryption
@@ -625,10 +658,54 @@ impl S3Backend {
         let facts_cleanup = super::facts_cleanup::FactsCleanupQueue::start(client.clone());
         Ok(Self {
             client,
+            bulk_client,
+            health_key: None,
             native_encryption,
             list_cache_scope,
             facts_cleanup,
         })
+    }
+
+    /// Name this backend for passive health marking: a request that finds
+    /// it unavailable marks it unhealthy at once (the request gate then
+    /// answers a fast 503), and error messages name it.
+    pub fn with_health_name(mut self, name: &str, config: &BackendConfig) -> Self {
+        self.health_key = Some((
+            name.to_string(),
+            crate::coordination::capability::fingerprint(config),
+        ));
+        self
+    }
+
+    /// [`Self::classify_s3_error`], plus the passive health signal: an
+    /// `Unavailable` result names the backend and marks it unhealthy.
+    fn classify(
+        &self,
+        bucket: &str,
+        e: &SdkError<impl std::fmt::Debug + ProvideErrorMetadata>,
+        op: S3Op,
+    ) -> StorageError {
+        self.observe(Self::classify_s3_error(bucket, e, op))
+    }
+
+    /// [`Self::classify_get_error`] plus the passive health signal.
+    fn classify_get(
+        &self,
+        bucket: &str,
+        key: &str,
+        e: &SdkError<aws_sdk_s3::operation::get_object::GetObjectError>,
+    ) -> StorageError {
+        self.observe(Self::classify_get_error(bucket, key, e))
+    }
+
+    fn observe(&self, err: StorageError) -> StorageError {
+        match (err, &self.health_key) {
+            (StorageError::Unavailable(msg), Some((name, fp))) => {
+                crate::coordination::health::note_unavailable(name, fp, &msg);
+                StorageError::Unavailable(format!("backend '{name}': {msg}"))
+            }
+            (err, _) => err,
+        }
     }
 
     /// Classify an S3 SDK error with full diagnostic context.
@@ -664,6 +741,11 @@ impl S3Backend {
             e,
         );
 
+        // No answer at all (timeout, refused/reset connection): the backend
+        // is unavailable, which is a 503 and a passive health signal.
+        if matches!(e, SdkError::TimeoutError(_) | SdkError::DispatchFailure(_)) {
+            return StorageError::Unavailable(format!("{op} on bucket '{bucket}': {e}"));
+        }
         // Classify by the structured error CODE only. The Debug text embeds
         // the error message, which names the key: a key `SlowDown-q3.pdf`
         // turned every error on it into a 503 forever.
@@ -825,7 +907,7 @@ impl S3Backend {
             .key(key)
             .send()
             .await
-            .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::HeadObject))?;
+            .map_err(|e| self.classify(bucket, &e, S3Op::HeadObject))?;
         let expect_etag = match fence {
             RefFence::ETag(e) if !e.is_empty() => Some(e.clone()),
             _ => None,
@@ -842,7 +924,7 @@ impl S3Backend {
         );
 
         let mut request = self
-            .client
+            .bulk_client
             .copy_object()
             .bucket(bucket)
             .copy_source(&copy_source)
@@ -904,11 +986,7 @@ impl S3Backend {
                     .await;
             }
             Err(e) => {
-                return Err(Self::classify_s3_error(
-                    bucket,
-                    &e,
-                    S3Op::Other("copy_object (metadata update)"),
-                ))
+                return Err(self.classify(bucket, &e, S3Op::Other("copy_object (metadata update)")))
             }
         };
         Ok(resp
@@ -1119,7 +1197,7 @@ impl S3Backend {
 
         for attempt in 0..=backoff_ms.len() {
             let mut request = self
-                .client
+                .bulk_client
                 .put_object()
                 .bucket(bucket)
                 .key(key)
@@ -1218,7 +1296,7 @@ impl S3Backend {
                         continue;
                     }
 
-                    return Err(Self::classify_s3_error(bucket, &e, S3Op::PutObject));
+                    return Err(self.classify(bucket, &e, S3Op::PutObject));
                 }
             }
         }
@@ -1310,7 +1388,7 @@ impl S3Backend {
                     StorageError::S3(format!("Failed to open source file stream: {}", e))
                 })?;
             let mut request = self
-                .client
+                .bulk_client
                 .put_object()
                 .bucket(bucket)
                 .key(key)
@@ -1382,7 +1460,7 @@ impl S3Backend {
                         .await;
                         continue;
                     }
-                    return Err(Self::classify_s3_error(bucket, &e, S3Op::PutObject));
+                    return Err(self.classify(bucket, &e, S3Op::PutObject));
                 }
             }
         }
@@ -1435,7 +1513,7 @@ impl S3Backend {
             .key(key)
             .send()
             .await
-            .map_err(|e| Self::classify_get_error(bucket, key, &e))?;
+            .map_err(|e| self.classify_get(bucket, key, &e))?;
 
         let data = response
             .body
@@ -1472,7 +1550,7 @@ impl S3Backend {
                         return StorageError::NotFound(key.to_string());
                     }
                 }
-                Self::classify_s3_error(bucket, &e, S3Op::HeadObject)
+                self.classify(bucket, &e, S3Op::HeadObject)
             })?;
 
         let headers: HashMap<String, String> = response
@@ -1606,7 +1684,7 @@ impl S3Backend {
             Ok(head) if head.e_tag() == Some(etag.as_str()) => {}
             Ok(_) => return Err(reference_fence_lost(bucket, key)),
             Err(e) => {
-                return match Self::classify_s3_error(bucket, &e, S3Op::HeadObject) {
+                return match self.classify(bucket, &e, S3Op::HeadObject) {
                     StorageError::NotFound(_) => Ok(()),
                     other => Err(other),
                 }
@@ -1626,9 +1704,7 @@ impl S3Backend {
                 match fenced_write_verdict(fence, &crate::config_db_sync::sdk_error_signal(&e)) {
                     FencedWriteVerdict::Lost => Err(reference_fence_lost(bucket, key)),
                     FencedWriteVerdict::Unsupported => self.delete_s3_object(bucket, key).await,
-                    FencedWriteVerdict::Other => {
-                        Err(Self::classify_s3_error(bucket, &e, S3Op::DeleteObject))
-                    }
+                    FencedWriteVerdict::Other => Err(self.classify(bucket, &e, S3Op::DeleteObject)),
                 }
             }
         }
@@ -1655,7 +1731,7 @@ impl S3Backend {
             .interceptor(date.clone())
             .send()
             .await
-            .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::DeleteObject))?;
+            .map_err(|e| self.classify(bucket, &e, S3Op::DeleteObject))?;
 
         debug!("S3 DELETE {}/{}", bucket, key);
         Ok(date.get())
@@ -1778,7 +1854,7 @@ impl S3Backend {
                     .send()
                     .await
                     .map(|r| r.contents().first().and_then(|o| o.key()).map(String::from))
-                    .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))
+                    .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))
             }
         };
         match first_key(None).await? {
@@ -1800,7 +1876,7 @@ impl S3Backend {
                 .set_continuation_token(token.take())
                 .send()
                 .await
-                .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))?;
+                .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))?;
             // One DeleteObjects per page, not a DELETE per facts object. A
             // key left behind makes DeleteBucket fail, as it must.
             let keys: Vec<String> = resp
@@ -1848,7 +1924,7 @@ impl S3Backend {
                 Err(e) => {
                     warn!(
                         "listing facts of {bucket} not read: {}",
-                        Self::classify_s3_error(bucket, &e, S3Op::ListObjects)
+                        self.classify(bucket, &e, S3Op::ListObjects)
                     );
                     break;
                 }
@@ -2184,7 +2260,7 @@ impl S3Backend {
             let response = request
                 .send()
                 .await
-                .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))?;
+                .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))?;
 
             let page_last = last_listed_key(response.contents.as_deref());
             if let Some(contents) = response.contents {
@@ -2219,7 +2295,7 @@ impl StorageBackend for S3Backend {
         if let Err(e) = result {
             return match classify_create_bucket_conflict(bucket, e.code()) {
                 Some(outcome) => outcome,
-                None => Err(Self::classify_s3_error(bucket, &e, S3Op::CreateBucket)),
+                None => Err(self.classify(bucket, &e, S3Op::CreateBucket)),
             };
         }
         debug!("Created S3 bucket: {}", bucket);
@@ -2235,7 +2311,7 @@ impl StorageBackend for S3Backend {
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::Other("delete_bucket")))?;
+            .map_err(|e| self.classify(bucket, &e, S3Op::Other("delete_bucket")))?;
         debug!("Deleted S3 bucket: {}", bucket);
         Ok(())
     }
@@ -2255,7 +2331,7 @@ impl StorageBackend for S3Backend {
             .await
             // classify (not a bare S3(...)) so a 503 throttle surfaces as
             // Throttled → SlowDown, not a retry-storm-inducing 500.
-            .map_err(|e| Self::classify_s3_error("", &e, S3Op::Other("list_buckets")))?;
+            .map_err(|e| self.classify("", &e, S3Op::Other("list_buckets")))?;
 
         let mut buckets: Vec<(String, DateTime<Utc>)> = response
             .buckets()
@@ -2287,7 +2363,7 @@ impl StorageBackend for S3Backend {
             // 5xx must NOT read as absent — routing uses this to place a bucket
             // on a backend; a transient error must not silently reroute writes
             // to the wrong (default) backend. (Same class as has_reference.)
-            Err(e) => match Self::classify_s3_error(bucket, &e, S3Op::HeadBucket) {
+            Err(e) => match self.classify(bucket, &e, S3Op::HeadBucket) {
                 StorageError::BucketNotFound(_) | StorageError::NotFound(_) => Ok(false),
                 other => Err(other),
             },
@@ -2383,7 +2459,7 @@ impl StorageBackend for S3Backend {
             .key(&key)
             .send()
             .await
-            .map_err(|e| Self::classify_get_error(bucket, &key, &e))?;
+            .map_err(|e| self.classify_get(bucket, &key, &e))?;
 
         let mut stream = Self::s3_body_to_stream(response.body);
         let mut file = tokio::fs::File::create(dest).await?;
@@ -2427,7 +2503,7 @@ impl StorageBackend for S3Backend {
             // A genuine object-level 404 → absent. Anything else (503 SlowDown,
             // timeout, 5xx, connection reset) must NOT read as absent — else a
             // write path overwrites a live reference.bin on a backend hiccup.
-            Err(e) => match Self::classify_s3_error(bucket, &e, S3Op::HeadObject) {
+            Err(e) => match self.classify(bucket, &e, S3Op::HeadObject) {
                 StorageError::NotFound(_) => Ok(false),
                 other => Err(other),
             },
@@ -2456,7 +2532,7 @@ impl StorageBackend for S3Backend {
         {
             Ok(head) => Ok(RefFence::ETag(head.e_tag().unwrap_or_default().to_string())),
             // Same contract as has_reference: only a real 404 is "absent".
-            Err(e) => match Self::classify_s3_error(bucket, &e, S3Op::HeadObject) {
+            Err(e) => match self.classify(bucket, &e, S3Op::HeadObject) {
                 StorageError::NotFound(_) => Ok(RefFence::Absent),
                 other => Err(other),
             },
@@ -2722,7 +2798,7 @@ impl StorageBackend for S3Backend {
             .key(&key)
             .send()
             .await
-            .map_err(|e| Self::classify_get_error(bucket, &key, &e))?;
+            .map_err(|e| self.classify_get(bucket, &key, &e))?;
 
         debug!("S3 GET stream {}/{}", bucket, key);
 
@@ -2748,7 +2824,7 @@ impl StorageBackend for S3Backend {
             .range(&range_header)
             .send()
             .await
-            .map_err(|e| Self::classify_get_error(bucket, &key, &e))?;
+            .map_err(|e| self.classify_get(bucket, &key, &e))?;
 
         let content_length = response.content_length.unwrap_or(0) as u64;
         debug!(
@@ -2809,7 +2885,7 @@ impl StorageBackend for S3Backend {
         let resp = request
             .send()
             .await
-            .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::CreateMpu))?;
+            .map_err(|e| self.classify(bucket, &e, S3Op::CreateMpu))?;
         let upload_id = resp.upload_id().ok_or_else(|| {
             StorageError::S3(format!(
                 "create_multipart_upload returned no upload id for {}/{}",
@@ -2838,7 +2914,7 @@ impl StorageBackend for S3Backend {
         for attempt in 0..=backoff_ms.len() {
             let body = ByteStream::from(data.clone());
             let result = self
-                .client
+                .bulk_client
                 .upload_part()
                 .bucket(&upload.bucket)
                 .key(&key)
@@ -2868,11 +2944,7 @@ impl StorageBackend for S3Backend {
                             .await;
                         continue;
                     }
-                    return Err(Self::classify_s3_error(
-                        &upload.bucket,
-                        &e,
-                        S3Op::UploadPart,
-                    ));
+                    return Err(self.classify(&upload.bucket, &e, S3Op::UploadPart));
                 }
             }
         }
@@ -2904,7 +2976,7 @@ impl StorageBackend for S3Backend {
             .set_parts(Some(completed_parts))
             .build();
         let resp = self
-            .client
+            .bulk_client
             .complete_multipart_upload()
             .bucket(&upload.bucket)
             .key(&key)
@@ -2912,7 +2984,7 @@ impl StorageBackend for S3Backend {
             .multipart_upload(completed)
             .send()
             .await
-            .map_err(|e| Self::classify_s3_error(&upload.bucket, &e, S3Op::CompleteMpu))?;
+            .map_err(|e| self.classify(&upload.bucket, &e, S3Op::CompleteMpu))?;
         // The S3 multipart ETag is `<md5-of-concatenated-part-md5s>-<n>`.
         let etag = resp
             .e_tag()
@@ -2936,7 +3008,7 @@ impl StorageBackend for S3Backend {
             .upload_id(&upload.upload_id)
             .send()
             .await
-            .map_err(|e| Self::classify_s3_error(&upload.bucket, &e, S3Op::AbortMpu))?;
+            .map_err(|e| self.classify(&upload.bucket, &e, S3Op::AbortMpu))?;
         Ok(())
     }
 
@@ -3269,7 +3341,7 @@ impl StorageBackend for S3Backend {
             let response = request
                 .send()
                 .await
-                .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))?;
+                .map_err(|e| self.classify(bucket, &e, S3Op::ListObjects))?;
             DELEGATED_LIST_UPSTREAM_PAGES.inc();
 
             // Collect CommonPrefixes, skipping ONLY the `.dg/` internal deltaspace
@@ -3361,7 +3433,7 @@ impl StorageBackend for S3Backend {
                         .max_keys(3)
                         .send()
                         .await
-                        .map_err(|e| Self::classify_s3_error(&bucket, &e, S3Op::ListObjects))?;
+                        .map_err(|e| self.classify(&bucket, &e, S3Op::ListObjects))?;
                     let hits: Vec<S3ListedObject> = found
                         .contents
                         .into_iter()
@@ -3446,7 +3518,7 @@ impl StorageBackend for S3Backend {
         request
             .send()
             .await
-            .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::PutObject))?;
+            .map_err(|e| self.classify(bucket, &e, S3Op::PutObject))?;
 
         debug!("Created directory marker: {}/{}", bucket, key);
         Ok(())
@@ -4371,6 +4443,33 @@ mod tests {
         SdkError::service_error(inner, http_response(status, Some("req-1")))
     }
 
+    /// Browser review #5: a backend that does not answer (timeout, refused
+    /// connection) is a 503 the gate can act on, not a 500 "S3 error".
+    #[test]
+    fn classify_timeout_and_dispatch_failure_as_unavailable() {
+        let timeout: SdkError<GetObjectError> = SdkError::timeout_error("operation timed out");
+        assert!(
+            matches!(
+                S3Backend::classify_s3_error("releases", &timeout, S3Op::HeadObject),
+                StorageError::Unavailable(_)
+            ),
+            "timeout must classify as Unavailable"
+        );
+        let dispatch: SdkError<GetObjectError> = SdkError::dispatch_failure(
+            aws_smithy_runtime_api::client::result::ConnectorError::io("connection refused".into()),
+        );
+        assert!(matches!(
+            S3Backend::classify_get_error("releases", "k", &dispatch),
+            StorageError::Unavailable(_)
+        ));
+        // A service answer (even a 500) is not "unavailable".
+        let answered = no_such_key_error(500);
+        assert!(!matches!(
+            S3Backend::classify_s3_error("releases", &answered, S3Op::Other("x")),
+            StorageError::Unavailable(_)
+        ));
+    }
+
     /// Classify GetObject NoSuchKey (S3's canonical "key doesn't exist")
     /// as `StorageError::NotFound(key)`. Without this mapping, callers
     /// would see a generic S3 error string and fail to map it to a 404
@@ -5224,6 +5323,8 @@ mod lost_response_tests {
         let client = Client::from_conf(conf);
         S3Backend {
             facts_cleanup: super::super::facts_cleanup::FactsCleanupQueue::start(client.clone()),
+            bulk_client: client.clone(),
+            health_key: None,
             client,
             native_encryption: NativeEncryptionConfig::None,
             list_cache_scope: endpoint.to_string(),

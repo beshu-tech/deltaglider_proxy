@@ -132,6 +132,18 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Replication",
     },
     EnvVarEntry {
+        name: "DGP_BACKEND_REQUEST_TIMEOUT_SECS",
+        description: "Deadline in seconds for one S3-backend request without a large body (HEAD, GET until the first byte, LIST, DELETE), retries included. A backend that does not answer in time gets a 503 naming it, and it is marked unhealthy until the next health probe succeeds. Uploads and server-side copies are not capped. 0 turns it off (default: 30)",
+        example: "30",
+        category: "Storage",
+    },
+    EnvVarEntry {
+        name: "DGP_BACKEND_HEALTH_INTERVAL_SECS",
+        description: "How often every storage backend is health-probed (seconds). An unhealthy backend's buckets answer 503 until a probe succeeds. 0 turns the probe loop off, and so does DGP_BOOT_BACKEND_PROBE=off (default: 30)",
+        example: "30",
+        category: "Storage",
+    },
+    EnvVarEntry {
         name: "DGP_S3_READ_TIMEOUT_SECS",
         description: "S3 client per-attempt read timeout (seconds)",
         example: "60",

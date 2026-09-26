@@ -195,6 +195,19 @@ pub struct ReadinessResponse {
     pub backend: &'static str,
     /// Config DB openability ("ready" | "locked" | "absent").
     pub config_db: &'static str,
+    /// Live health of each configured backend (name → `healthy` |
+    /// `unreachable` | `auth-rejected` | `erroring`), from the periodic
+    /// health probe and from requests that found a backend unavailable.
+    /// Empty when no probe ran (`DGP_BOOT_BACKEND_PROBE=off`).
+    pub backends: std::collections::BTreeMap<String, String>,
+}
+
+/// Pure: the node is not ready when every backend with a verdict is gated
+/// (no bucket can be served). One gated backend of several leaves the node
+/// ready: the other backends' buckets still work, and every node sees the
+/// same outage, so pulling nodes from rotation would not help.
+fn live_backends_ready(verdicts: &[crate::coordination::HealthVerdict]) -> bool {
+    verdicts.is_empty() || verdicts.iter().any(|v| !v.is_gating())
 }
 
 /// Unix seconds of the last CONFIRMED-good backend interaction (0 = never).
@@ -341,6 +354,20 @@ pub async fn readiness_check(
         },
         None => "absent",
     };
+    let live = state.backend_health.snapshot();
+    let verdicts: Vec<_> = live.values().map(|e| e.verdict.clone()).collect();
+    let backends = live
+        .into_iter()
+        .map(|(name, e)| {
+            let status = serde_json::to_value(&e.verdict)
+                .ok()
+                .and_then(|v| v["status"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            (name, status)
+        })
+        .collect();
+    let backends_ok = live_backends_ready(&verdicts);
+    let backend = if backends_ok { backend } else { "unreachable" };
     let ready = backend_verdict_is_ready(backend) && config_db != "locked";
     let code = if ready {
         StatusCode::OK
@@ -353,6 +380,7 @@ pub async fn readiness_check(
             status: if ready { "ready" } else { "not_ready" },
             backend,
             config_db,
+            backends,
         }),
     )
 }
@@ -360,6 +388,17 @@ pub async fn readiness_check(
 #[cfg(test)]
 mod readiness_tests {
     use super::*;
+
+    #[test]
+    fn live_backends_gate_readiness_only_when_all_are_gated() {
+        use crate::coordination::HealthVerdict as V;
+        let down = || V::Unreachable { detail: "x".into() };
+        assert!(live_backends_ready(&[]));
+        assert!(live_backends_ready(&[V::Healthy, down()]));
+        assert!(!live_backends_ready(&[down(), down()]));
+        // Erroring (reachable, 5xx) never gates.
+        assert!(live_backends_ready(&[V::Erroring { detail: "x".into() }]));
+    }
 
     const TTL: i64 = 300;
     const NOW: i64 = 10_000;

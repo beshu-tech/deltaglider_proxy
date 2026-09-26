@@ -2477,6 +2477,10 @@ fn engine_error_to_s3s(err: impl Into<crate::api::S3Error>) -> s3s::S3Error {
         // 503 SlowDown must reach the wire as SlowDown — AWS SDKs back off on
         // it; a catch-all 500 InternalError is treated as permanent instead.
         crate::api::S3Error::SlowDown(msg) => s3s::s3_error!(SlowDown, "{}", msg),
+        // A backend that did not answer: 503 (retryable), naming the backend.
+        crate::api::S3Error::ServiceUnavailable(msg) => {
+            s3s::s3_error!(ServiceUnavailable, "{}", msg)
+        }
         other => {
             // Catch-all → 500. The S3 wire error only carries the error *code*
             // (a category), so without this the actual cause (upstream S3
@@ -3263,6 +3267,13 @@ mod tests {
             engine_error_to_s3s(S3Error::PreconditionFailed).code(),
             &s3s::S3ErrorCode::PreconditionFailed
         );
+        // A backend that did not answer is a 503 the client retries, and the
+        // message names it.
+        let e = engine_error_to_s3s(crate::storage::StorageError::Unavailable(
+            "backend 'hetzner-fsn1': head_object timed out".into(),
+        ));
+        assert_eq!(e.code(), &s3s::S3ErrorCode::ServiceUnavailable);
+        assert!(e.message().unwrap_or("").contains("hetzner-fsn1"));
         // Catch-all: an unmapped engine error becomes a 500 InternalError
         // rather than leaking an unrelated code.
         assert_eq!(

@@ -248,9 +248,97 @@ impl BackendHealthCache {
             .filter(|v| !v.is_healthy())
     }
 
+    /// Passive marking: a request found the backend with definition
+    /// fingerprint `fp` unavailable. The entry turns Unreachable unless it
+    /// belongs to ANOTHER definition (an engine still running a replaced
+    /// definition must not paint the current one). The re-probe loop turns
+    /// it back to Healthy once the backend answers.
+    pub fn mark_unavailable(&self, backend: &str, fp: &str, detail: &str) {
+        let verdict = HealthVerdict::Unreachable {
+            detail: format!("a request failed: {detail}"),
+        };
+        let mut map = self.entries.write();
+        let changed = match map.get(backend) {
+            Some((old_fp, _)) if old_fp != fp => return,
+            Some((_, old)) => !old.verdict.is_gating(),
+            None => true,
+        };
+        if !changed {
+            return; // keep the first cause and its time
+        }
+        let entry = HealthEntry {
+            verdict,
+            probed_at: chrono::Utc::now().timestamp(),
+        };
+        map.insert(backend.to_string(), (fp.to_string(), entry));
+        drop(map);
+        tracing::warn!(
+            "backend health: '{backend}' did not answer a request ({detail}) — its buckets \
+             answer 503 until the next health probe succeeds"
+        );
+        bump_backend_health_version();
+    }
+
     /// Drop entries for backends no longer in the config (post-apply hygiene).
     pub fn retain_backends(&self, names: &std::collections::BTreeSet<String>) {
         self.entries.write().retain(|k, _| names.contains(k));
+    }
+}
+
+/// The process's health cache, for passive marking from the storage layer
+/// (an `S3Backend` has no handle on `AppState`). Installed once at startup.
+static PASSIVE_SINK: std::sync::OnceLock<Arc<BackendHealthCache>> = std::sync::OnceLock::new();
+
+/// Install the cache that [`note_unavailable`] writes to (startup, once).
+pub fn install_passive_sink(cache: Arc<BackendHealthCache>) {
+    let _ = PASSIVE_SINK.set(cache);
+}
+
+/// A request found backend `name` (definition fingerprint `fp`) unavailable.
+pub fn note_unavailable(name: &str, fp: &str, detail: &str) {
+    if let Some(cache) = PASSIVE_SINK.get() {
+        cache.mark_unavailable(name, fp, detail);
+    }
+}
+
+/// `DGP_BACKEND_HEALTH_INTERVAL_SECS` (default 30; 0 turns the loop off):
+/// how often every backend is health-probed. `DGP_BOOT_BACKEND_PROBE=off`
+/// ("skip probing entirely") turns it off too.
+pub fn health_probe_interval() -> Option<std::time::Duration> {
+    if boot_probe_mode() == BootProbeMode::Off {
+        return None;
+    }
+    match crate::config::env_parse_with_default("DGP_BACKEND_HEALTH_INTERVAL_SECS", 30u64) {
+        0 => None,
+        secs => Some(std::time::Duration::from_secs(secs)),
+    }
+}
+
+/// One round of the health loop: probe EVERY configured backend, at the
+/// same time, and record the verdicts. A healthy backend that hangs or goes
+/// down turns unhealthy within one interval, with no request needed; an
+/// unhealthy one recovers the same way.
+pub async fn reprobe_all(health: &BackendHealthCache, config: &crate::config::SharedConfig) {
+    let targets = probe_targets(&*config.read().await);
+    // Hygiene FIRST: drop entries for backends no longer in the config. A
+    // stale unhealthy entry would pin the gate's slow path forever.
+    let current: std::collections::BTreeSet<String> =
+        targets.iter().map(|(n, _, _)| n.clone()).collect();
+    health.retain_backends(&current);
+    let probes = targets
+        .into_iter()
+        .map(|(name, backend, fallback)| async move {
+            let verdict = probe_backend_health(&backend, fallback.as_deref()).await;
+            (name, backend, verdict)
+        });
+    for (name, backend, verdict) in futures::future::join_all(probes).await {
+        let was_unhealthy = health.unhealthy_verdict(&name).is_some();
+        if was_unhealthy && verdict.is_healthy() {
+            tracing::info!("backend health: '{name}' RECOVERED — gated buckets reopen");
+        } else if !was_unhealthy && !verdict.is_healthy() {
+            tracing::warn!("backend health: '{name}' is unhealthy: {}", verdict.cause());
+        }
+        health.set(&name, &backend, verdict);
     }
 }
 
@@ -520,8 +608,9 @@ pub fn health_gate_refusal(gate: &BackendHealthGate, path: &str) -> Option<S3Err
         S3Error::ServiceUnavailable(format!(
             "bucket '{bucket}' is on backend '{backend_name}', which is currently \
              unavailable: {}. Requests are blocked until the backend recovers \
-             (re-checked every 30s); see Storage → Backends for live status",
-            verdict.cause()
+             (re-checked every {}s); see Storage → Backends for live status",
+            verdict.cause(),
+            health_probe_interval().map_or(30, |d| d.as_secs())
         ))
     })
 }
@@ -614,6 +703,30 @@ mod tests {
             classify_probe_signal(false, Some(400), Some("MalformedXML")),
             Erroring
         );
+    }
+
+    #[test]
+    fn passive_marking_gates_only_the_same_definition() {
+        let cache = BackendHealthCache::default();
+        let cfg = BackendConfig::Filesystem {
+            path: "/tmp/dgp-passive".into(),
+        };
+        let fp = fingerprint(&cfg);
+        cache.set("hetzner-fsn1", &cfg, HealthVerdict::Healthy);
+        // Another definition's engine must not paint the current one.
+        cache.mark_unavailable("hetzner-fsn1", "other-fp", "timed out");
+        assert_eq!(
+            cache.get("hetzner-fsn1", &cfg),
+            Some(HealthVerdict::Healthy)
+        );
+        let v0 = current_backend_health_version();
+        cache.mark_unavailable("hetzner-fsn1", &fp, "timed out");
+        let v = cache.get("hetzner-fsn1", &cfg).unwrap();
+        assert!(v.is_gating(), "{v:?}");
+        assert!(current_backend_health_version() > v0);
+        // A probe that succeeds reopens it.
+        cache.set("hetzner-fsn1", &cfg, HealthVerdict::Healthy);
+        assert!(cache.unhealthy_verdict("hetzner-fsn1").is_none());
     }
 
     #[test]

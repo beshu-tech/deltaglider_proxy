@@ -253,6 +253,8 @@ Unauthenticated — needed for load-balancer probes and Prometheus:
 
 `/_/ready` probes the backend with a bounded, retried `ListBuckets` so a brief provider latency spike doesn't flip readiness to a paging `503`: it only reports not-ready if **every** attempt fails. Tune with `DGP_READY_TIMEOUT_SECS` (per-attempt, default 3) and `DGP_READY_RETRIES` (extra attempts, default 2) — raise the timeout for a storage provider with a long tail latency, raise retries to ride out short blips.
 
+The response also carries `backends`, a map from each backend name to its live health (`healthy`, `unreachable`, `auth-rejected` or `erroring`). The proxy keeps this map current with the periodic health probe (`DGP_BACKEND_HEALTH_INTERVAL_SECS`) and with requests that find a backend unavailable. When every backend in the map is `unreachable` or `auth-rejected`, the node reports `503 not_ready`, because it cannot serve any bucket. When only some backends are down, the node stays ready: the other backends' buckets still work, and every node sees the same outage.
+
 Session-protected (reveals per-bucket sizes):
 
 | Method | Path | Purpose |

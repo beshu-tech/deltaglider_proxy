@@ -1,6 +1,6 @@
 # How to diagnose a backend that isn't serving
 
-Follow this when a bucket answers `503 ServiceUnavailable`, the Backends panel shows a red health badge, or a boot log says a backend is UNHEALTHY. The proxy probes every configured backend's connectivity and credentials — at boot, on every config change to a backend, and continuously while one is down — so a broken backend always names itself and its cause.
+Follow this when a bucket answers `503 ServiceUnavailable`, the Backends panel shows a red health badge, or a boot log says a backend is UNHEALTHY. The proxy probes every configured backend's connectivity and credentials at boot, on every config change to a backend, and every 30 seconds after that (healthy backends too). A request that finds a backend unavailable also marks it unhealthy. So a broken backend always names itself and its cause.
 
 ## Read the verdict
 
@@ -23,7 +23,11 @@ Click **Test connection** on the backend card. This runs the probe **server-side
 
 - Every request to a bucket routed to it answers a fast `503 ServiceUnavailable` naming the backend and cause — no per-request timeouts, no misleading `404`s, and the file browser shows the fault instead of an empty bucket.
 - Buckets on healthy backends are unaffected.
-- The proxy re-probes the unhealthy backend every 30 seconds and logs the recovery.
+- The proxy probes every backend every 30 seconds (`DGP_BACKEND_HEALTH_INTERVAL_SECS`) and logs the recovery.
+
+## What happens when a backend hangs
+
+A backend can accept connections and then never answer, for example when its process is paused. The proxy does not wait for such a backend for minutes. Each backend request that carries no large body (HEAD, GET until the first byte, LIST, DELETE) has a deadline of 30 seconds, retries included (`DGP_BACKEND_REQUEST_TIMEOUT_SECS`). When the deadline passes, the client gets `503 ServiceUnavailable` with the backend's name, and the proxy marks the backend **Unreachable** at once. The next requests to the backend's buckets then get the 503 immediately, without a wait. The health probe also finds a hang on its own, because it probes healthy backends too. When the backend answers a probe again, its buckets reopen. `GET /_/ready` lists each backend's live state in its `backends` field.
 
 ## Boot behaviour
 

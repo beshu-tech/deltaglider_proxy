@@ -11,10 +11,18 @@ import { useQuery } from '@tanstack/react-query';
 import { getBackends, getBucketOrigins } from '../adminApi';
 import { qk } from './keys';
 
+/**
+ * The server re-probes every backend every 30 s and marks one unhealthy as
+ * soon as a request finds it unavailable, so the health badges refresh on
+ * their own while the page is open.
+ */
+export const BACKENDS_REFRESH_MS = 15_000;
+
 export function useBackends() {
   return useQuery({
     queryKey: qk.backends.list(),
     queryFn: getBackends,
+    refetchInterval: BACKENDS_REFRESH_MS,
   });
 }
 

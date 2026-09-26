@@ -256,6 +256,11 @@ impl From<crate::storage::StorageError> for S3Error {
             crate::storage::StorageError::Throttled(_) => S3Error::SlowDown(
                 "Backend signalled transient pressure; please retry with backoff.".to_string(),
             ),
+            // The message names the op and bucket (and the backend, when
+            // S3Backend knows it), never credentials or endpoint URLs.
+            crate::storage::StorageError::Unavailable(msg) => {
+                S3Error::ServiceUnavailable(format!("the storage backend did not answer: {msg}"))
+            }
             other => S3Error::InternalError(sanitise_for_client(&other)),
         }
     }

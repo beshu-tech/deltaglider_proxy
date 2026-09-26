@@ -130,6 +130,13 @@ pub enum StorageError {
     #[error("MetadataTooLarge: {0}")]
     MetadataTooLarge(String),
 
+    /// The backend did not answer: the request timed out, or the
+    /// connection failed. Maps to 503 ServiceUnavailable. The Display text
+    /// says "timed out or unreachable" on purpose: the string-based
+    /// transient classifiers (`transfer::is_transient_copy_error`) match it.
+    #[error("Backend unavailable (timed out or unreachable): {0}")]
+    Unavailable(String),
+
     #[error("Storage error: {0}")]
     Other(String),
 }
