@@ -284,7 +284,7 @@ pub async fn copy_objects(
     )?;
 
     let s3 = state.s3_state.clone();
-    let res = run_copy_loop(&s3, &req).await;
+    let (res, _) = run_copy_loop(&s3, &req).await;
     info!(
         "bulk copy: src={} dst={}/{} succeeded={} failed={}",
         req.source_bucket, req.dest_bucket, req.dest_prefix, res.succeeded, res.failed
@@ -301,8 +301,14 @@ pub async fn copy_objects(
     Ok(Json(res))
 }
 
-async fn run_copy_loop(s3: &Arc<AppState>, req: &CopyRequest) -> CopyResponse {
+/// Also returns, per item, the source object as it was copied (`None`: not
+/// copied), so a move deletes a source only while it is still that object.
+async fn run_copy_loop(
+    s3: &Arc<AppState>,
+    req: &CopyRequest,
+) -> (CopyResponse, Vec<Option<crate::types::FileMetadata>>) {
     let engine = s3.engine.load();
+    let mut copied = vec![None; req.items.len()];
     let mut succeeded = 0usize;
     let mut failed = 0usize;
     let mut failures: Vec<CopyFailure> = Vec::new();
@@ -344,7 +350,10 @@ async fn run_copy_loop(s3: &Arc<AppState>, req: &CopyRequest) -> CopyResponse {
         )
         .await;
         match result {
-            Ok(()) => succeeded += 1,
+            Ok(source) => {
+                succeeded += 1;
+                copied[idx] = Some(source);
+            }
             Err(e) => {
                 failed += 1;
                 if failures.len() < MAX_FAILURE_ENTRIES {
@@ -358,17 +367,21 @@ async fn run_copy_loop(s3: &Arc<AppState>, req: &CopyRequest) -> CopyResponse {
         }
     }
     drop(_write);
-    CopyResponse {
-        succeeded,
-        failed,
-        failures,
-    }
+    (
+        CopyResponse {
+            succeeded,
+            failed,
+            failures,
+        },
+        copied,
+    )
 }
 
 /// Copy one object the way a client write is handled: quota gate on the
 /// destination, the shared engine-routed transfer (streams or spools large
 /// objects instead of holding them in RAM; strips encryption markers; keeps
-/// multipart ETags), then an `ObjectCopied` outbox event.
+/// multipart ETags), then an `ObjectCopied` outbox event. Returns the
+/// source's metadata as read before the copy.
 async fn copy_one(
     s3: &Arc<AppState>,
     engine: &Arc<crate::deltaglider::DynEngine>,
@@ -376,7 +389,7 @@ async fn copy_one(
     src_key: &str,
     dst_bucket: &str,
     dst_key: &str,
-) -> Result<(), String> {
+) -> Result<crate::types::FileMetadata, String> {
     let head = engine
         .head(src_bucket, src_key)
         .await
@@ -410,7 +423,7 @@ async fn copy_one(
         }),
     )
     .await;
-    Ok(())
+    Ok(head)
 }
 
 /// Outbox append for an admin write, same shape as the S3 adapter's (source
@@ -486,7 +499,7 @@ pub async fn move_objects(
             })
             .collect(),
     };
-    let copy_result = run_copy_loop(&s3, &copy_req).await;
+    let (copy_result, copied) = run_copy_loop(&s3, &copy_req).await;
 
     // Atomicity rule: only delete sources if EVERY copy succeeded.
     // Pre-migration the client implemented this same rule client-side;
@@ -500,7 +513,7 @@ pub async fn move_objects(
         // RAII drain slot — released on drop even if the handler future is
         // cancelled mid-loop (H12).
         let _write = gate.begin_write(&req.source_bucket);
-        for it in &req.items {
+        for (it, source) in req.items.iter().zip(&copied) {
             if gate.is_busy(&req.source_bucket) {
                 // A maintenance job armed mid-loop: stop deleting sources.
                 // The copies succeeded; leftovers are benign (same contract
@@ -528,8 +541,17 @@ pub async fn move_objects(
                 skipped_self += 1;
                 continue;
             }
-            match engine.delete(&req.source_bucket, &it.source_key).await {
-                Ok(_) => {
+            let Some(source) = source else { continue };
+            // Delete the source only while it holds the bytes we copied: a
+            // client PUT since the copy is a new object, not ours to delete.
+            let still_copied = |current: &crate::types::FileMetadata| {
+                crate::deltaglider::DynEngine::same_generation(source, current)
+            };
+            match engine
+                .delete_if(&req.source_bucket, &it.source_key, &still_copied)
+                .await
+            {
+                Ok(crate::deltaglider::ConditionalDelete::Deleted(_)) => {
                     deleted += 1;
                     emit_event(
                         &s3,
@@ -540,6 +562,10 @@ pub async fn move_objects(
                     )
                     .await;
                 }
+                Ok(_) => debug!(
+                    "bulk move: source {}/{} changed or gone since its copy; left in place",
+                    req.source_bucket, it.source_key
+                ),
                 Err(e) => {
                     warn!(
                         "bulk move: delete source {}/{} failed: {}",

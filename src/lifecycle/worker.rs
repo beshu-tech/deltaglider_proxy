@@ -745,40 +745,32 @@ async fn run_or_preview_retain_newest(
                 size: c.size,
             },
         };
-        match recheck_before_delete(engine, &rule.bucket, &c.key, &snapshot).await {
-            DeleteCheck::Proceed => {}
-            DeleteCheck::Changed | DeleteCheck::Gone => {
-                out.objects_skipped += 1;
-                debug!(
-                    "lifecycle rule '{}': retain-newest skipping {:?} — changed or gone since collect",
-                    rule.name, c.key
-                );
-                continue;
-            }
-            DeleteCheck::HeadFailed(msg) => {
-                out.errors += 1;
-                push_failure(&mut out.failures, response_cap, c.key.clone(), msg.clone());
-                record_failure(&db, rule, ctx.as_ref(), &c.key, &msg).await?;
-                continue;
-            }
-        }
-
         let meta = metas.get(&c.key);
-        match engine.delete(&rule.bucket, &c.key).await {
-            Ok(_) => {
+        let failed = match delete_if_unchanged(engine, &rule.bucket, &c.key, &snapshot).await {
+            Ok(DeleteCheck::Proceed) => {
                 out.objects_affected += 1;
                 out.bytes_affected += c.size as i64;
                 if let Some(meta) = meta {
                     append_lifecycle_delete_event(db.as_ref(), rule, &c.key, meta, "retain-newest")
                         .await;
                 }
+                None
             }
-            Err(err) => {
-                out.errors += 1;
-                let msg = err.to_string();
-                push_failure(&mut out.failures, response_cap, c.key.clone(), msg.clone());
-                record_failure(&db, rule, ctx.as_ref(), &c.key, &msg).await?;
+            Ok(DeleteCheck::Changed | DeleteCheck::Gone) => {
+                out.objects_skipped += 1;
+                debug!(
+                    "lifecycle rule '{}': retain-newest skipping {:?} — changed or gone since collect",
+                    rule.name, c.key
+                );
+                None
             }
+            Ok(DeleteCheck::HeadFailed(msg)) => Some(msg),
+            Err(err) => Some(err.to_string()),
+        };
+        if let Some(msg) = failed {
+            out.errors += 1;
+            push_failure(&mut out.failures, response_cap, c.key.clone(), msg.clone());
+            record_failure(&db, rule, ctx.as_ref(), &c.key, &msg).await?;
         }
     }
 
@@ -920,17 +912,26 @@ fn same_generation(a: chrono::DateTime<Utc>, b: chrono::DateTime<Utc>) -> bool {
     trunc(a) == trunc(b)
 }
 
-/// Every lifecycle delete goes through this re-HEAD: the plan was made on a
-/// listing snapshot, and a delete by key would remove a newer overwrite.
-/// (A small window between this HEAD and the delete remains: the engine has
-/// no conditional delete.)
-async fn recheck_before_delete(
+/// Every lifecycle delete is conditional: the plan was made on a listing
+/// snapshot, and a delete by key would remove a newer overwrite. The engine
+/// checks the object under the deltaspace lock that every PUT holds, so no
+/// overwrite lands between the check and the delete (a HEAD, then a delete
+/// by key, lost one). `Ok(Proceed)`: checked and deleted.
+async fn delete_if_unchanged(
     engine: &DynEngine,
     bucket: &str,
     key: &str,
     snapshot: &Snapshot,
-) -> DeleteCheck {
-    classify_delete_check(snapshot, engine.head(bucket, key).await.as_ref())
+) -> Result<DeleteCheck, crate::deltaglider::EngineError> {
+    use crate::deltaglider::ConditionalDelete;
+    let still_ours = |current: &crate::types::FileMetadata| {
+        classify_delete_check(snapshot, Ok(current)) == DeleteCheck::Proceed
+    };
+    Ok(match engine.delete_if(bucket, key, &still_ours).await? {
+        ConditionalDelete::Deleted(_) => DeleteCheck::Proceed,
+        ConditionalDelete::Changed => DeleteCheck::Changed,
+        ConditionalDelete::Gone => DeleteCheck::Gone,
+    })
 }
 
 /// What `execute_action` did with one planned object.
@@ -952,12 +953,11 @@ async fn execute_action(
 ) -> Result<ActionOutcome, Box<dyn std::error::Error + Send + Sync>> {
     match action {
         PlannedLifecycleAction::Delete => {
-            match recheck_before_delete(engine, &rule.bucket, key, &Snapshot::of(meta)).await {
+            match delete_if_unchanged(engine, &rule.bucket, key, &Snapshot::of(meta)).await? {
                 DeleteCheck::Proceed => {}
                 DeleteCheck::Changed | DeleteCheck::Gone => return Ok(ActionOutcome::Skipped),
                 DeleteCheck::HeadFailed(msg) => return Err(msg.into()),
             }
-            engine.delete(&rule.bucket, key).await?;
             append_lifecycle_delete_event(db, rule, key, meta, "delete").await;
             Ok(ActionOutcome::Acted(meta.file_size))
         }
@@ -1007,9 +1007,8 @@ async fn execute_action(
             .await;
 
             if *delete_source_after_success {
-                match recheck_before_delete(engine, &rule.bucket, key, &Snapshot::of(meta)).await {
+                match delete_if_unchanged(engine, &rule.bucket, key, &Snapshot::of(meta)).await? {
                     DeleteCheck::Proceed => {
-                        engine.delete(&rule.bucket, key).await?;
                         append_lifecycle_delete_event(
                             db,
                             rule,

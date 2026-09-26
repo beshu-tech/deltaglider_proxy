@@ -788,7 +788,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Size must match; then the strongest hash both sides carry decides
     /// (sha256 > md5 > multipart_etag). Same size with NO shared hash is
     /// conservatively DIFFERENT — a pinned copy must never guess.
-    fn same_generation(expected: &FileMetadata, actual: &FileMetadata) -> bool {
+    pub(crate) fn same_generation(expected: &FileMetadata, actual: &FileMetadata) -> bool {
         if expected.file_size != actual.file_size {
             return false;
         }

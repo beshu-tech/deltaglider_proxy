@@ -227,6 +227,17 @@ pub struct ReferenceScan {
 /// type parameter `<S>`.
 pub const REFERENCE_SCAN_LIMIT: usize = 1000;
 
+/// What [`DeltaGliderEngine::delete_if`] did.
+#[derive(Debug)]
+pub enum ConditionalDelete {
+    /// The object passed the check and is deleted.
+    Deleted(Box<FileMetadata>),
+    /// The object failed the check (e.g. overwritten): nothing deleted.
+    Changed,
+    /// No such object: nothing deleted.
+    Gone,
+}
+
 /// Response from `retrieve_stream()` — either a streaming or buffered response.
 pub enum RetrieveResponse {
     /// Passthrough file streamed from backend (zero-copy, constant memory).
@@ -2320,8 +2331,36 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Delete an object
     #[instrument(skip(self))]
     pub async fn delete(&self, bucket: &str, key: &str) -> Result<FileMetadata, EngineError> {
-        self.delete_inner(bucket, key, /* reclaim_reference = */ true)
-            .await
+        Self::deleted(
+            key,
+            self.delete_inner(bucket, key, /* reclaim_reference = */ true, None)
+                .await?,
+        )
+    }
+
+    /// Delete `key` only if `still_ours` accepts the object as read under
+    /// the deltaspace lock. Every PUT holds that lock, so no overwrite can
+    /// land between the check and the delete (a HEAD, then a delete by key,
+    /// removed an overwrite that landed in between). Single instance only: a
+    /// peer instance's PUT does not take this in-process lock.
+    #[instrument(skip(self, still_ours))]
+    pub async fn delete_if(
+        &self,
+        bucket: &str,
+        key: &str,
+        still_ours: &(dyn Fn(&FileMetadata) -> bool + Send + Sync),
+    ) -> Result<ConditionalDelete, EngineError> {
+        self.delete_inner(bucket, key, true, Some(still_ours)).await
+    }
+
+    fn deleted(key: &str, outcome: ConditionalDelete) -> Result<FileMetadata, EngineError> {
+        match outcome {
+            ConditionalDelete::Deleted(meta) => Ok(*meta),
+            // Unconditional deletes report a missing object as NotFound.
+            ConditionalDelete::Changed | ConditionalDelete::Gone => {
+                Err(EngineError::NotFound(key.to_string()))
+            }
+        }
     }
 
     /// Delete one member of a prefix sweep, SKIPPING the per-object
@@ -2337,8 +2376,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         key: &str,
     ) -> Result<FileMetadata, EngineError> {
-        self.delete_inner(bucket, key, /* reclaim_reference = */ false)
-            .await
+        Self::deleted(
+            key,
+            self.delete_inner(bucket, key, /* reclaim_reference = */ false, None)
+                .await?,
+        )
     }
 
     /// Reclaim a deltaspace's `reference.bin` if no non-reference object remains.
@@ -2415,7 +2457,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         key: &str,
         reclaim_reference: bool,
-    ) -> Result<FileMetadata, EngineError> {
+        still_ours: Option<&(dyn Fn(&FileMetadata) -> bool + Send + Sync)>,
+    ) -> Result<ConditionalDelete, EngineError> {
         let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
 
         info!("Deleting {}/{}", bucket, key);
@@ -2428,10 +2471,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // tokio::sync::Mutex is not reentrant, so calling resolve_metadata_with_migration
         // here would deadlock. Legacy objects that haven't been migrated yet will appear
         // as NotFound; a prior GET/HEAD on the key will have triggered migration.
-        let metadata = self
+        let Some(metadata) = self
             .resolve_metadata(bucket, &deltaspace_id, &obj_key)
             .await?
-            .ok_or_else(|| EngineError::NotFound(obj_key.full_key()))?;
+        else {
+            return match still_ours {
+                Some(_) => Ok(ConditionalDelete::Gone),
+                None => Err(EngineError::NotFound(obj_key.full_key())),
+            };
+        };
+        if still_ours.is_some_and(|ours| !ours(&metadata)) {
+            return Ok(ConditionalDelete::Changed);
+        }
 
         // Delete based on storage type — but ALSO clean up the OTHER variant.
         // A key can transiently have BOTH a passthrough and a delta sibling (e.g.
@@ -2523,7 +2574,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.record_delete(bucket, &metadata, reclaimed_ref_bytes);
 
         debug!("Deleted {}/{}", bucket, key);
-        Ok(metadata)
+        Ok(ConditionalDelete::Deleted(Box::new(metadata)))
     }
 
     /// Get reference with caching. Returns `Bytes` for zero-copy sharing.
