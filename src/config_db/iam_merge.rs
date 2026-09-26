@@ -24,6 +24,15 @@
 //! write. A delete that was not yet synced comes back, but a create or an edit
 //! that was not yet synced is never lost.
 //!
+//! Before the merge, a user, group or provider renamed on one side (same id,
+//! same `created_at`, a new name) is renamed in the base and on the other
+//! side too, children included, so a concurrent edit of the row or of an
+//! identity or membership that names it is not lost. Two users that both
+//! sides created with one name and different access keys are two users: the
+//! one whose key sorts later gets `<name>-<first 6 key chars>`. A child row
+//! that loses its parent is dropped, and reported unless it is unchanged
+//! from the base (the cascade of a deliberate delete).
+//!
 //! Ids: a row takes the remote id when the remote has the row, else its local
 //! id when that id is still free, else a fresh one. Foreign keys are resolved
 //! through names, so `external_identities`, group members and mapping rules
@@ -545,7 +554,11 @@ fn merge_table(
 /// Pure: whether the local version of a row changed on both sides is the
 /// newer write (a tie goes to the remote copy).
 fn local_is_newer(l: &Entity, r: &Entity) -> bool {
-    l.mtime > r.mtime
+    local_mtime_is_newer(l.mtime, r.mtime)
+}
+
+fn local_mtime_is_newer(local: i64, remote: i64) -> bool {
+    local > remote
 }
 
 /// Pure: the three-way pick of one value, and whether it changed on both
@@ -648,6 +661,100 @@ fn rename_parent(snap: &mut Snapshot, parent: Parent, old: &str, new: &str) {
     }
 }
 
+/// Renames of `parent` rows on one side against the base: a base row whose
+/// id now carries a name the base does not know (same `created_at`, so the
+/// same row). Old name → (new name, mtime).
+fn renames(base: &Snapshot, side: &Snapshot, parent: Parent) -> BTreeMap<String, (String, i64)> {
+    let empty = BTreeMap::new();
+    let b = base.get(parent.table()).unwrap_or(&empty);
+    let s = side.get(parent.table()).unwrap_or(&empty);
+    let by_id: HashMap<i64, (&String, &Entity)> = s
+        .iter()
+        .filter_map(|(k, e)| e.id.map(|i| (i, (k, e))))
+        .collect();
+    let mut out = BTreeMap::new();
+    for (old, be) in b {
+        let Some((new, se)) = be.id.and_then(|i| by_id.get(&i)) else {
+            continue;
+        };
+        if *new != old
+            && !b.contains_key(*new)
+            && se.row.get("created_at") == be.row.get("created_at")
+        {
+            out.insert(old.clone(), ((*new).clone(), se.mtime));
+        }
+    }
+    out
+}
+
+/// A user, group or provider renamed on one side: apply the rename to the
+/// base and to the other side BEFORE the merge, so the rows match by name
+/// again. Then a concurrent edit of the row, or of a child row that names
+/// it (an identity login, a membership), merges instead of reading as
+/// "deleted on one side". Renamed differently on both sides: the newer
+/// rename wins (audited). A rename whose new name the other side already
+/// uses for another row is not applied (audited): the merge then sees a
+/// delete and a create.
+fn propagate_renames(
+    base: &mut Snapshot,
+    local: &mut Snapshot,
+    remote: &mut Snapshot,
+    conflicts: &mut Vec<MergeConflict>,
+) {
+    for parent in [Parent::Users, Parent::Groups, Parent::Providers] {
+        let (lr, rr) = (renames(base, local, parent), renames(base, remote, parent));
+        let olds: std::collections::BTreeSet<String> =
+            lr.keys().chain(rr.keys()).cloned().collect();
+        let free = |snap: &Snapshot, name: &str| {
+            !snap
+                .get(parent.table())
+                .is_some_and(|t| t.contains_key(name))
+        };
+        for old in olds {
+            let target = |new: &str| format!("{old} -> {new}");
+            match (lr.get(&old), rr.get(&old)) {
+                (Some((ln, _)), Some((rn, _))) if ln == rn => {
+                    rename_parent(base, parent, &old, ln);
+                }
+                (Some((ln, lm)), Some((rn, rm))) => {
+                    let (win, lose_side, lose_name) = if local_mtime_is_newer(*lm, *rm) {
+                        (ln, &mut *remote, rn)
+                    } else {
+                        (rn, &mut *local, ln)
+                    };
+                    if free(lose_side, win) {
+                        rename_parent(lose_side, parent, lose_name, win);
+                        rename_parent(base, parent, &old, win);
+                    }
+                    conflicts.push(MergeConflict {
+                        table: parent.table(),
+                        target: target(win),
+                        resolution: "renamed",
+                    });
+                }
+                (Some((new, _)), None) | (None, Some((new, _))) => {
+                    let other = if lr.contains_key(&old) {
+                        &mut *remote
+                    } else {
+                        &mut *local
+                    };
+                    if free(other, new) {
+                        rename_parent(other, parent, &old, new);
+                        rename_parent(base, parent, &old, new);
+                    } else {
+                        conflicts.push(MergeConflict {
+                            table: parent.table(),
+                            target: target(new),
+                            resolution: "rename-collision",
+                        });
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+    }
+}
+
 /// Pure: the name a user takes when another user holds its name:
 /// `<name>-<first 6 chars of its access key, lowercased>`, then `-2`, `-3`,
 /// ... past names in use. Every node derives the same name from the same key.
@@ -719,9 +826,10 @@ pub(crate) fn merge_snapshots(
 ) -> MergeOutcome {
     let empty = BTreeMap::new();
     let has_base = base.is_some();
-    let base = base.cloned().unwrap_or_default();
+    let mut base = base.cloned().unwrap_or_default();
     let (mut local, mut remote) = (local.clone(), remote.clone());
     let mut conflicts = Vec::new();
+    propagate_renames(&mut base, &mut local, &mut remote, &mut conflicts);
     split_same_name_users(&base, has_base, &mut local, &mut remote, &mut conflicts);
     let mut merged = Merged::new();
     for spec in SPECS {
@@ -778,15 +886,29 @@ pub(crate) fn merge_snapshots(
                 (p, names)
             })
             .collect();
+    // A dropped row that nobody changed follows a deliberate delete of its
+    // parent. A dropped row that one side created or changed is reported:
+    // the merge never loses a child row silently.
     for spec in SPECS.iter().filter(|s| !s.fks.is_empty()) {
-        if let Some(t) = merged.get_mut(spec.table) {
-            t.retain(|_, (e, _)| {
-                spec.fks.iter().all(|(col, parent)| match e.row.get(*col) {
-                    Some(Value::Text(n)) => present[parent].contains(n),
-                    _ => true,
-                })
+        let Some(t) = merged.get_mut(spec.table) else {
+            continue;
+        };
+        let base_t = base.get(spec.table);
+        t.retain(|key, (e, _)| {
+            let keep = spec.fks.iter().all(|(col, parent)| match e.row.get(*col) {
+                Some(Value::Text(n)) => present[parent].contains(n),
+                _ => true,
             });
-        }
+            let unchanged = base_t.and_then(|b| b.get(key)).is_some_and(|b| b.same(e));
+            if !keep && !unchanged {
+                conflicts.push(MergeConflict {
+                    table: spec.table,
+                    target: conflict_target(spec, e),
+                    resolution: "deleted",
+                });
+            }
+            keep
+        });
     }
     MergeOutcome {
         merged,
@@ -1804,7 +1926,6 @@ mod review3_tests {
     /// retain drops the binding with no conflict entry. The next login makes
     /// a fresh user without the old groups and permissions.
     #[test]
-    #[ignore = "review3: pending fix"]
     fn review3_a_rename_keeps_a_concurrently_updated_identity() {
         let t = trio(|db| {
             seed_okta(db);
@@ -1837,6 +1958,65 @@ mod review3_tests {
             "the identity binding is gone (conflicts reported: {:?})",
             report.conflicts
         );
+    }
+
+    /// The peer renames a user while this node adds it to a group and edits
+    /// its permissions: the membership and the edit follow the new name.
+    #[test]
+    fn a_peer_rename_carries_local_child_rows_and_edits() {
+        let t = trio(|db| {
+            db.create_user("bob", "AKBOB00000001", "s", true, &[])
+                .unwrap();
+            db.create_group("eng", "", &[]).unwrap();
+        });
+        let local = open(&t.local);
+        let g = local.load_groups().unwrap()[0].id;
+        let bob = user_id(&local, "bob");
+        local.add_user_to_group(g, bob).unwrap();
+        local
+            .update_user(bob, None, None, Some(&[perm("x/*")]))
+            .unwrap();
+        {
+            let remote = open(&t.remote);
+            remote
+                .update_user(user_id(&remote, "bob"), Some("robert"), None, None)
+                .unwrap();
+        }
+        let report = local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .unwrap();
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        assert_eq!(names(&local), vec!["robert"]);
+        let robert = local.get_user_by_id(user_id(&local, "robert")).unwrap();
+        assert_eq!(robert.permissions[0].resources, vec!["x/*"]);
+        assert_eq!(local.get_group_members(g).unwrap(), vec![robert.id]);
+        assert!(report.stale_user_ids.is_empty(), "the same user, same id");
+    }
+
+    /// Renamed differently on both sides: one user, the newer name, audited.
+    #[test]
+    fn two_renames_of_one_user_converge_on_the_newer() {
+        let t = trio(|db| {
+            db.create_user("bob", "AKBOB00000001", "s", true, &[])
+                .unwrap();
+        });
+        let local = open(&t.local);
+        local
+            .update_user(user_id(&local, "bob"), Some("bobby"), None, None)
+            .unwrap();
+        tick();
+        {
+            let remote = open(&t.remote);
+            remote
+                .update_user(user_id(&remote, "bob"), Some("robert"), None, None)
+                .unwrap();
+        }
+        let report = local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .unwrap();
+        assert_eq!(names(&local), vec!["robert"]);
+        assert_eq!(report.conflicts.len(), 1, "{:?}", report.conflicts);
+        assert_eq!(report.conflicts[0].resolution, "renamed");
     }
 
     /// No merge base (the first sync after the upgrade, or a base that a
