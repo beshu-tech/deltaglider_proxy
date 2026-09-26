@@ -345,6 +345,7 @@ async fn backends_create_probe_route_and_delete() {
     let (code, v) = json_of(
         admin
             .post(format!("{ep}/_/api/admin/backends/extra/probe"))
+            .header("user-agent", "probe-client/1.0")
             .send()
             .await
             .unwrap(),
@@ -354,6 +355,24 @@ async fn backends_create_probe_route_and_delete() {
     assert_eq!(v["status"], "healthy", "{v}");
     assert!(v["probed_at"].as_i64().unwrap() > 0);
     assert_audited(&admin, &ep, "backend_probe", "extra").await;
+    // The entry names the client that asked for the probe.
+    let ring: Value = admin
+        .get(format!("{ep}/_/api/admin/audit?limit=500"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let probe = ring["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "backend_probe")
+        .unwrap()
+        .clone();
+    assert_eq!(probe["ua"], "probe-client/1.0", "{probe}");
+    assert_eq!(probe["ip"], "127.0.0.1", "{probe}");
     let code = admin
         .post(format!("{ep}/_/api/admin/backends/ghost/probe"))
         .send()
