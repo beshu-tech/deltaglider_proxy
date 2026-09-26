@@ -70,10 +70,16 @@ describe('ok response', () => {
     expect(onCancel).toHaveBeenCalledTimes(1);
   });
 
-  test('an empty diff is a no-op apply that is still allowed', () => {
+  // Browser-review item 24: an Apply with nothing to apply is off.
+  test('an empty diff disables Apply', () => {
     renderDialog({ ok: true, diff: {} });
     expect(screen.getByText('Changes (0)')).toBeInTheDocument();
-    expect(screen.getByText(/this apply would be a no-op/)).toBeInTheDocument();
+    expect(screen.getByText(/nothing to apply/)).toBeInTheDocument();
+    expect(applyButton()).toBeDisabled();
+  });
+
+  test('a response without a diff keeps Apply on', () => {
+    renderDialog({ ok: true });
     expect(applyButton()).toBeEnabled();
   });
 
@@ -96,7 +102,7 @@ test('ok:false shows the validation error and disables Apply', async () => {
 test('new warnings show open; existing warnings fold into a closed <details>', () => {
   renderDialog({
     ok: true,
-    diff: {},
+    diff: { advanced: { cache_size_mb: { before: 100, after: 512 } } },
     warnings: ['bucket "releases" has no backend'],
     existing_warnings: ['old warning one', 'old warning two'],
   });

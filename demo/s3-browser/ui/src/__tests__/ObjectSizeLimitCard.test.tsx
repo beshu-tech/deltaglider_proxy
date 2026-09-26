@@ -16,7 +16,7 @@ beforeEach(() => {
   http = mockFetch();
   http.on('GET', SECTION, json({ max_object_size: 100 * 1024 * 1024 }));
   http.on('GET', '/_/api/admin/config', json({}));
-  http.on('POST', `${SECTION}/validate`, json({ ok: true, diff: {} }));
+  http.on('POST', `${SECTION}/validate`, json({ ok: true, diff: { advanced: { max_object_size: { before: 104857600, after: 262144000 } } } }));
   http.on('PUT', SECTION, json({ ok: true }));
 });
 afterEach(() => vi.unstubAllGlobals());

@@ -56,6 +56,8 @@ export default function ApplyDialog({
   const { ok, warnings = [], existing_warnings: existingWarnings = [], requires_restart, error, diff } = response;
   const sectionDiff = (diff && diff[section]) || {};
   const diffRows = Object.entries(sectionDiff);
+  // A diff that the server computed and found empty: nothing to apply.
+  const noChanges = diff != null && diffRows.length === 0;
 
   return (
     <Modal
@@ -79,7 +81,7 @@ export default function ApplyDialog({
             aria-label="Apply and persist changes"
             type="primary"
             onClick={onApply}
-            disabled={!ok || loading}
+            disabled={!ok || loading || noChanges}
             loading={loading}
             icon={<CheckCircleOutlined />}
           >
@@ -136,8 +138,7 @@ export default function ApplyDialog({
         </div>
       )}
 
-      {/* Diff — the star of the dialog. Empty diff = no-op apply, which
-          the UI still allows (matches field-level PATCH idempotency). */}
+      {/* Diff — the star of the dialog. An empty diff disables Apply. */}
       <div
         style={{
           background: BG_CARD,
@@ -160,7 +161,7 @@ export default function ApplyDialog({
           Changes ({diffRows.length})
         </div>
         {diffRows.length === 0 ? (
-          <Text type="secondary">No changes detected — this apply would be a no-op.</Text>
+          <Text type="secondary">No changes detected: there is nothing to apply.</Text>
         ) : (
           <div style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
             {diffRows.map(([path, change]) => (
