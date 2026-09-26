@@ -501,10 +501,11 @@ pub fn xff_trust_warning(trust: bool, trusted_cidrs_set: bool) -> Option<&'stati
 ///   `peer_ip` is inside a trusted network (a real reverse proxy). The XFF chain
 ///   is then walked **right-to-left**, returning the rightmost address that is
 ///   NOT itself a trusted hop — i.e. the real client the trusted proxy saw. This
-///   defeats a client that prepends a forged XFF entry. `X-Real-IP` is not
-///   read on this path (it has no chain to validate).
+///   defeats a client that prepends a forged XFF entry. `X-Real-IP` is read
+///   only when the trusted peer sent no XFF.
 /// - `trust == true` AND `trusted_cidrs` EMPTY: back-compat with the historical
-///   "first XFF element" behavior (operators who set trust but no CIDR list).
+///   "first XFF element" behavior (operators who set trust but no CIDR list),
+///   no `X-Real-IP`.
 ///   This path is spoofable — operators should set `DGP_TRUSTED_PROXY_CIDRS`.
 pub fn resolve_client_ip(
     headers: &axum::http::HeaderMap,
@@ -524,8 +525,9 @@ pub fn resolve_client_ip(
     };
 
     if trusted_cidrs.is_empty() {
-        // Legacy spoofable path: first XFF element, then X-Real-IP, then peer.
-        if let Some(ip) = first_xff(headers).or_else(|| header_ip(headers, "x-real-ip")) {
+        // Legacy spoofable path (rate-limit bucket only): first XFF element,
+        // then the peer. No X-Real-IP: the peer is not known to be a proxy.
+        if let Some(ip) = first_xff(headers) {
             return Some(normalize_ip(ip));
         }
         return peer_ip.map(normalize_ip);
@@ -537,9 +539,8 @@ pub fn resolve_client_ip(
             // Walk XFF right-to-left; the first (rightmost) entry that isn't a
             // trusted hop is the real client. If every entry is trusted, the
             // leftmost is (the address the outermost trusted proxy saw).
-            // X-Real-IP is never read here: it has no chain, so a proxy that
-            // passes the client's copy through cannot be told from one that
-            // wrote it. No XFF means the peer.
+            // X-Real-IP only when there is no XFF (XFF wins): the trusted
+            // proxy set it (nginx often sets only that). Else the peer.
             if let Some(xff) = xff_chain(headers) {
                 let mut leftmost = None;
                 for hop in xff.rsplit(',') {
@@ -557,6 +558,8 @@ pub fn resolve_client_ip(
                 if let Some(ip) = leftmost {
                     return Some(normalize_ip(ip));
                 }
+            } else if let Some(ip) = header_ip(headers, "x-real-ip") {
+                return Some(normalize_ip(ip));
             }
             Some(normalize_ip(p))
         }
@@ -978,7 +981,8 @@ mod tests {
                 resolve(&all_trusted, Some(proxy), true, &trusted),
                 Some(ip("10.0.0.7"))
             );
-            // trusted peer, no XFF → the peer, not X-Real-IP.
+            // trusted peer, no XFF → its X-Real-IP (nginx often sets only
+            // that), else the peer.
             assert_eq!(
                 resolve(
                     &hdrs(&[("x-real-ip", "198.51.100.2")]),
@@ -986,13 +990,43 @@ mod tests {
                     true,
                     &trusted
                 ),
+                Some(ip("198.51.100.2"))
+            );
+            assert_eq!(
+                resolve(
+                    &hdrs(&[("x-real-ip", "garbage")]),
+                    Some(proxy),
+                    true,
+                    &trusted
+                ),
                 Some(proxy)
+            );
+            // UNtrusted peer → X-Real-IP ignored.
+            let attacker = ip("203.0.113.50");
+            assert_eq!(
+                resolve(
+                    &hdrs(&[("x-real-ip", "198.51.100.2")]),
+                    Some(attacker),
+                    true,
+                    &trusted
+                ),
+                Some(attacker)
             );
         }
         // trust=true but NO trusted CIDRs → legacy first-XFF behavior (spoofable).
         assert_eq!(
             resolve_client_ip(&xff("203.0.113.9, 10.0.0.5"), Some(proxy), true, &[]),
             Some(ip("203.0.113.9"))
+        );
+        // ... which never reads X-Real-IP: the peer is not known to be a proxy.
+        assert_eq!(
+            resolve_client_ip(
+                &hdrs(&[("x-real-ip", "198.51.100.2")]),
+                Some(proxy),
+                true,
+                &[]
+            ),
+            Some(proxy)
         );
     }
 
@@ -1002,9 +1036,9 @@ mod tests {
         /// garbage), a trusted proxy then appends the address it saw, as a
         /// new line (HAProxy `option forwardfor`) or on the last line (nginx
         /// `$proxy_add_x_forwarded_for`), and more trusted hops may follow;
-        /// or it sets no XFF at all. The resolved client is the address the
-        /// first proxy saw (the peer when it names none), never a forged hop
-        /// and never the client-writable X-Real-IP.
+        /// or it sets only X-Real-IP. The resolved client is the address the
+        /// first proxy saw, never a forged hop, and never a client-written
+        /// X-Real-IP next to an XFF (XFF wins).
         #[test]
         fn xff_walk_returns_the_address_the_proxy_saw(
             real in (0u8..=255, 0u8..=255, 0u8..=255, 1u8..=254),
@@ -1019,7 +1053,8 @@ mod tests {
             ], 0..4),
             forged_lines in 0usize..3,
             // 0: the proxy appends a new XFF line, 1: it extends the last
-            // line, 2: it sets no XFF (and the client sent none).
+            // line, 2: it sets no XFF but sets X-Real-IP to the client
+            // (nginx `proxy_set_header X-Real-IP $remote_addr`).
             proxy_mode in 0u8..3,
             inner_hops in proptest::collection::vec(1u8..=254, 0..3),
             real_ip_header in proptest::arbitrary::any::<bool>(),
@@ -1036,8 +1071,7 @@ mod tests {
             };
             let mut lines = lines;
             let peer = Some(ip("10.0.0.1"));
-            // Without an XFF from the proxy, only the peer is known.
-            let expected = if proxy_mode == 2 { peer } else { Some(client) };
+            let expected = Some(client);
             match proxy_mode {
                 2 => lines.clear(),
                 1 if !lines.is_empty() => {
@@ -1058,8 +1092,11 @@ mod tests {
                     return Ok(());
                 }
             }
-            // The client's own X-Real-IP (a proxy may pass it through).
-            if real_ip_header {
+            if proxy_mode == 2 {
+                // The proxy's X-Real-IP replaces any the client sent.
+                h.insert("x-real-ip", client.to_string().parse().unwrap());
+            } else if real_ip_header {
+                // The client's own X-Real-IP, passed through: XFF wins.
                 h.insert("x-real-ip", "6.6.6.6".parse().unwrap());
             }
             proptest::prop_assert_eq!(resolve_trusted_client_ip(&h, peer, true, &trusted), expected);
@@ -1075,11 +1112,19 @@ mod tests {
             let attacker = IpAddr::V4(Ipv4Addr::new(a, b, c, d));
             let trusted = vec![cidr("10.0.0.0/8")];
             if trusted.iter().any(|n| n.contains(&attacker)) { return Ok(()); } // skip trusted
-            let h = hdrs(&[("x-forwarded-for", "1.2.3.4, 5.6.7.8"), ("x-real-ip", "9.9.9.9")]);
-            proptest::prop_assert_eq!(
-                resolve_client_ip(&h, Some(attacker), true, &trusted),
-                Some(normalize_ip(attacker))
-            );
+            for h in [
+                hdrs(&[("x-forwarded-for", "1.2.3.4, 5.6.7.8"), ("x-real-ip", "9.9.9.9")]),
+                hdrs(&[("x-real-ip", "9.9.9.9")]),
+            ] {
+                proptest::prop_assert_eq!(
+                    resolve_client_ip(&h, Some(attacker), true, &trusted),
+                    Some(normalize_ip(attacker))
+                );
+                proptest::prop_assert_eq!(
+                    resolve_trusted_client_ip(&h, Some(attacker), true, &trusted),
+                    Some(normalize_ip(attacker))
+                );
+            }
         }
     }
 
