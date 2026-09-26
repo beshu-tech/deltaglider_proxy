@@ -92,7 +92,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         key: &str,
     ) -> Result<StoreResult, EngineError> {
-        let (obj_key, deltaspace_id) = self.validated_key(bucket, key)?;
+        // The data PUT's ingest gate (reserved namespaces, `//`), minus its
+        // refusal of marker keys.
+        let obj_key = ObjectKey::parse(bucket, key);
+        obj_key
+            .validate_ingest()
+            .map_err(|e| EngineError::InvalidArgument(e.to_string()))?;
+        let deltaspace_id = obj_key.deltaspace_id();
         let prior_for_counter = self.prior_for_counter(bucket, key).await;
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
         self.storage

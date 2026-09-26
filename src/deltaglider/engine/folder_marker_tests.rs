@@ -143,7 +143,6 @@ async fn a_marker_key_with_a_body_is_refused() {
 /// zero-byte `PUT` writes into the reserved `.dg/facts/` namespace, which
 /// `validate_ingest` refuses for every data PUT.
 #[tokio::test]
-#[ignore = "review3: pending fix"]
 async fn review3_a_marker_put_passes_the_ingest_gate() {
     for (_dir, engine) in engines().await {
         for key in [".dg/facts/x/"] {
