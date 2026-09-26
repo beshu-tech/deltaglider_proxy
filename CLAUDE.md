@@ -21,7 +21,7 @@ npm run dev                    # dev server on :5173, proxies /api to :9001
 # Tests
 # Merge gate (see `.github/workflows/ci.yml`): `cargo test --lib`, curated
 # integration batches, delta/memory, frontend lint/tsc/knip, Node
-# regression scripts, E2E smoke — not a single `cargo test --all`.
+# vitest unit + component tests, E2E smoke — not a single `cargo test --all`.
 cargo test --lib --locked
 ./scripts/check-integration-tests-in-ci.sh   # every tests/*.rs appears in ci.yml
 cargo test --test all -- delta_test::        # one integration-test file (all live in tests/all.rs)
@@ -47,7 +47,9 @@ docker build -t deltaglider-proxy .
 
 **Prose style (docs/product + user-facing READMEs — user-mandated):** write plain, fully-formed English. Say "requests", never "calls", for HTTP/S3 traffic. Complete sentences with articles and prepositions — no telegraphic/compressed phrasing, no noun piles. Explain the mechanism behind every claim before its consequence (e.g. "no other pod knows that this upload exists" before "so the request fails with `NoSuchUpload`"). One idea per sentence. Terseness stays right for code comments and chat replies, but not for documentation.
 
-CI merge gate: `verify-integration-test-registry` → `fmt` → `clippy -D warnings` → parallel test jobs (lib, curated integration + extended admin/IAM/replication, delta) → `e2e-smoke` → RustSec audit → Cargo deny → frontend (`lint:strict` zero-warning ESLint incl. the UI rules, tsc, knip, `npm run test:all` = every `test:*` script) → docs/schema → claude-review. See `ci.yml` for the exact `--test` lists.
+Frontend tests are vitest (`npm run test:all` = `vitest run`, in the CI Frontend Lint job). Two projects: `unit` runs `src/**/*.test.ts` in Node; `dom` runs `src/**/*.test.tsx` in jsdom for hooks and components. Helpers in `src/test/`: `renderWithQuery` / `renderHookWithQuery` (no-retry QueryClient), `mockFetch` (route-table `fetch` stub; an unmatched request fails the test — mock HTTP there, not `adminApi`), and a setup file with AntD layout shims. AntD animations are off in tests because jsdom never ends them.
+
+CI merge gate: `verify-integration-test-registry` → `fmt` → `clippy -D warnings` → parallel test jobs (lib, curated integration + extended admin/IAM/replication, delta) → `e2e-smoke` → RustSec audit → Cargo deny → frontend (`lint:strict` zero-warning ESLint incl. the UI rules, tsc, knip, `npm run test:all` = vitest) → docs/schema → claude-review. See `ci.yml` for the exact `--test` lists.
 
 ## Architecture
 
