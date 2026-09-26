@@ -766,8 +766,9 @@ export default function App() {
           )}
 
           <main id="main-content" ref={mainRef} tabIndex={-1} style={{ outline: 'none', flex: 1, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
-            {/* The one level-1 heading: names the view for assistive tech. */}
-            <h1 className="sr-only">{pageTitle(view, activeBucket, view === 'admin' ? headerForPath(subPath)?.title : undefined)}</h1>
+            {/* The one level-1 heading: names the view for assistive tech
+                (the upload page renders its own visible h1). */}
+            {view !== 'upload' && <h1 className="sr-only">{pageTitle(view, activeBucket, view === 'admin' ? headerForPath(subPath)?.title : undefined)}</h1>}
             {/* A plain div: AntD's Layout.Content is a second <main>. */}
             <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, position: 'relative' }}>
               <FileBrowserSessionTip visible={view === 'browser' && sessionCaps.signedInForFilesOnly} userKey={currentAccessKey ?? who.name} />
