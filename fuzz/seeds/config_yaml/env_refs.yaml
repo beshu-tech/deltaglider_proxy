@@ -1,0 +1,7 @@
+access:
+  access_key_id: "${env:HOME}"
+  secret_access_key: "${env:SECRET}"
+storage:
+  buckets:
+    releases:
+      public_prefixes: ["builds/"]

@@ -1,0 +1,5 @@
+target/
+artifacts/
+coverage/
+# The working corpus libFuzzer grows; the checked-in seeds live in seeds/.
+corpus/

@@ -1,0 +1,2 @@
+AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abcdef
+/bucket/key.txt

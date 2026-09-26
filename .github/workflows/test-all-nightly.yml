@@ -243,6 +243,36 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # ── Fuzzing (fuzz/, libFuzzer): 5 minutes per target on the pinned STABLE
+  #    toolchain via scripts/fuzz.sh (cargo-fuzz's coverage flags with no
+  #    sanitizer: the targets are safe-Rust parsers whose bugs are panics, and
+  #    sanitizers would need nightly). A crash fails the job and uploads the
+  #    input. Plain runner, not the builder image: libFuzzer needs a C++
+  #    compiler. ──
+  fuzz:
+    name: Fuzz ${{ matrix.target }} (5 min)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUSTC_WRAPPER: ""
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aws_chunked, sigv4, config_yaml, admission_spec]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build demo UI (rust-embed)
+        run: cd demo/s3-browser/ui && npm ci && npm run build
+      - name: Fuzz
+        run: scripts/fuzz.sh ${{ matrix.target }} 300
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 30
+
   # ── Failure visibility: one open `nightly-failure` issue while the nightly
   #    is red (a comment per further red run, never a second issue), closed
   #    by the next green run. Runs on main only; a cancelled run changes
@@ -250,7 +280,7 @@ jobs:
   report:
     name: Report nightly status
     if: ${{ always() && github.ref == 'refs/heads/main' }}
-    needs: [test-all-default-features, coverage, tokio-unstable, supply-chain, qa-e2e]
+    needs: [test-all-default-features, coverage, tokio-unstable, supply-chain, qa-e2e, fuzz]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

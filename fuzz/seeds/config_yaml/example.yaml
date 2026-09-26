@@ -1,0 +1,199 @@
+# ─────────────────────────────────────────────────────────────────────
+# DeltaGlider Proxy — canonical YAML configuration (Phase 3+)
+# ─────────────────────────────────────────────────────────────────────
+# Copy this file to `deltaglider_proxy.yaml` and edit as needed.
+# Run `deltaglider_proxy config lint deltaglider_proxy.yaml` before
+# committing to CI.
+#
+# The layout is four optional top-level sections:
+#
+#   admission: ...   # pre-auth request gating (deny / reject / allow)
+#   access:    ...   # SigV4 credentials + iam_mode selector
+#   storage:   ...   # backend(s) + per-bucket overrides
+#   advanced:  ...   # listener, caches, TLS, log level, infra secrets
+#
+# Every section is optional — a bare `storage: { filesystem: /var/dgp }`
+# is a complete, runnable config.
+#
+# Canonical export (the admin API `/config/export`) always emits this
+# shape and omits default-valued sections.
+
+
+# ── storage — single-backend shorthand (T1 five-line deployment) ────
+#
+# `s3:` OR `filesystem:` triggers the respective backend. Companion
+# fields (region, access_key_id, secret_access_key, force_path_style)
+# apply only to `s3:`.
+storage:
+  filesystem: /var/lib/deltaglider
+  # s3: https://s3.amazonaws.com
+  # region: eu-central-1
+  # access_key_id: AKIA...
+  # secret_access_key: ...
+
+  # Per-bucket overrides. `public: true` is a shorthand for "the
+  # entire bucket is anonymously readable" (compiles to
+  # public_prefixes: [""] which the runtime already consumes).
+  # buckets:
+  #   docs-site:
+  #     public: true
+  #   releases:
+  #     public_prefixes: ["builds/", "stable/"]
+  #     quota_bytes: 10737418240   # 10 GiB
+  #     compression: true
+  #     max_delta_ratio: 0.5
+  #
+  #   # A cheap mirror on a backend WITHOUT conditional-write support
+  #   # (e.g. Backblaze B2): mark it replication_target_only so client
+  #   # writes 403 and replication stays the single writer — the property
+  #   # that makes a non-CAS backend safe under multi-instance. See
+  #   # https://deltaglider.com/docs/how-to/backend-capability-validation
+  #   releases-mirror:
+  #     backend: b2-archive
+  #     replication_target_only: true
+  #
+  # Lifecycle expiration. Disabled by default; preview first via
+  # POST /_/api/admin/jobs/lifecycle:<name>/preview (or the Jobs screen).
+  # lifecycle:
+  #   enabled: false
+  #   tick_interval: "1h"
+  #   max_failures_retained: 100
+  #   rules:
+  #     - name: expire-old-builds
+  #       enabled: false
+  #       bucket: releases
+  #       prefix: "builds/"
+  #       action: delete
+  #       expire_after: "30d"
+  #       include_globs: ["builds/**/*.zip"]
+  #       exclude_globs: [".deltaglider/**", "builds/golden/**"]
+  #
+  #     - name: archive-old-builds
+  #       enabled: false
+  #       bucket: releases
+  #       prefix: "builds/"
+  #       action:
+  #         type: transition
+  #         destination:
+  #           bucket: release-archive
+  #           prefix: "cold/builds/"
+  #         delete_source_after_success: false
+  #       expire_after: "90d"
+  #       include_globs: ["builds/**/*.zip"]
+  #       exclude_globs: [".deltaglider/**"]
+
+
+# ── access — SigV4 credentials + IAM source-of-truth mode ──────────
+#
+# access:
+#   # Legacy (Phase 2) single admin key pair. In Gui mode the
+#   # encrypted IAM DB is authoritative; this pair is still used
+#   # by the admin GUI login flow and by scripted CI tools.
+#   access_key_id: AKIA...
+#   secret_access_key: ...
+#
+#   # iam_mode: gui (default) — admin GUI/API writes the DB.
+#   # iam_mode: declarative  — YAML is authoritative; admin API
+#   #                          IAM mutation routes return 403.
+#   iam_mode: gui
+
+
+# ── admission — operator-authored pre-auth request gating ──────────
+#
+# Each block has a `name`, a `match` predicate, and an `action`.
+# Blocks fire in order; the first match wins. Operator blocks
+# evaluate BEFORE synthesised public-prefix blocks, so a deny for
+# a known-bad IP range short-circuits anonymous-allow for the same
+# request.
+#
+# admission:
+#   blocks:
+#     - name: deny-known-bad-ips
+#       match:
+#         source_ip_list:
+#           - "203.0.113.5"
+#           - "198.51.100.0/24"
+#       action: deny
+#
+#     - name: maintenance-mode
+#       match: {}                 # empty = fires on every request
+#       action:
+#         type: reject
+#         status: 503
+#         message: "We'll be right back — planned maintenance."
+#
+#     - name: allow-public-zips
+#       match:
+#         method: [GET, HEAD]
+#         bucket: releases
+#         path_glob: "*.zip"
+#       action: allow-anonymous
+
+
+# ── advanced — process-level tunables ──────────────────────────────
+#
+# advanced:
+#   listen_addr: "0.0.0.0:9000"
+#   log_level: "deltaglider_proxy=info"
+#   max_delta_ratio: 0.75           # default
+#   cache_size_mb: 2048             # production recommended ≥1 GiB
+#   metadata_cache_mb: 50
+#
+#   # TLS — both S3 and admin GUI served over HTTPS on the same port.
+#   # `enabled: true` is REQUIRED to serve HTTPS: supplying the paths alone
+#   # does not turn TLS on, so without it the server keeps serving plain HTTP.
+#   # tls:
+#   #   enabled: true
+#   #   cert_path: /etc/ssl/certs/deltaglider.crt
+#   #   key_path: /etc/ssl/private/deltaglider.key
+#
+#   # Durable event outbox delivery. Disabled by default; when enabled,
+#   # a background worker POSTs object mutation events to all webhooks.
+#   # S3 operations only append rows and never wait on the webhook.
+#   # event_delivery:
+#   #   enabled: true
+#   #   webhook_url: "https://events.example.com/deltaglider"
+#   #   webhook_urls:
+#   #     - "https://audit.example.com/deltaglider"
+#   #   webhook_headers:
+#   #     authorization: "Bearer redacted-token"
+#   #     x-dgp-env: "prod"
+#   #   tick_interval: "10s"
+#   #   batch_size: 50
+#   #   request_timeout: "5s"
+#   #   max_attempts: 8
+#   #   retry_base: "5s"
+#   #   retry_max: "5m"
+#   #   stale_claim_after: "60s"
+#   #   delivered_retention: "24h"
+#   #   delivered_max_rows: 10000
+#   #   prune_batch: 100
+#   #
+#   #   # Slack notifications (no OAuth — paste a credential; works on private
+#   #   # instances, outbound HTTPS only). Set format: slack, then EITHER point
+#   #   # webhook_url at an Incoming Webhook, OR set slack_bot_token + slack_channel.
+#   #   format: slack
+#   #   # Incoming Webhook mode (simplest, single channel):
+#   #   webhook_url: "https://hooks.slack.com/services/T000/B000/XXXX"
+#   #   slack_username: "DeltaGlider"
+#   #   slack_icon_emoji: ":package:"
+#   #   # Bot-token mode (multi-channel + @mentions) — set these INSTEAD of webhook_url:
+#   #   # slack_bot_token: "xoxb-..."   # needs chat:write + chat:write.public scopes
+#   #   # slack_channel: "C0123456"     # channel id or #name
+#   #   # What gets posted:
+#   #   slack_notify_kinds: ["ObjectCreated"]   # add ObjectDeleted, etc.
+#   #   slack_include_globs: ["builds/**"]      # empty = all user objects
+#   #   slack_exclude_globs: ["**/*.tmp"]
+#   #
+#   #   # Route different buckets/prefixes to different channels (bot-token mode
+#   #   # only — Incoming Webhook URLs are bound to one channel). An event posts
+#   #   # to EVERY route it matches. When slack_routes is set, slack_channel is
+#   #   # the fallback only for events that match no route.
+#   #   slack_routes:
+#   #     - name: "Releases → #ci"
+#   #       bucket: "releases"
+#   #       prefix_globs: ["builds/**"]   # empty = any key in the bucket
+#   #       channel: "C_CI"
+#   #     - name: "Audit → #security"
+#   #       bucket: "audit"
+#   #       channel: "C_SECURITY"

@@ -21,6 +21,8 @@ pub mod cors;
 pub mod deltaglider;
 pub mod event_delivery;
 pub mod event_outbox;
+#[doc(hidden)]
+pub mod fuzz_entry;
 pub mod iam;
 pub mod init;
 pub mod job_loop;

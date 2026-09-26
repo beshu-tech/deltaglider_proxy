@@ -1,0 +1,52 @@
+# Fuzz targets for untrusted-input parsers (cargo-fuzz layout, libFuzzer).
+# NOT part of the root package: `cargo build` / `cargo test` at the repo root
+# never build it. Run with `scripts/fuzz.sh <target> [seconds]` (stable
+# toolchain, no sanitizer) or `cargo +nightly fuzz run <target>`.
+[package]
+name = "deltaglider_proxy-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "BUSL-1.1"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+deltaglider_proxy = { path = ".." }
+
+# Its own workspace, so the root package never picks it up.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "aws_chunked"
+path = "fuzz_targets/aws_chunked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sigv4"
+path = "fuzz_targets/sigv4.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_yaml"
+path = "fuzz_targets/config_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "admission_spec"
+path = "fuzz_targets/admission_spec.rs"
+test = false
+doc = false
+bench = false

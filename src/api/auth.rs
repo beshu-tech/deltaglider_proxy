@@ -632,6 +632,19 @@ fn has_presigned_query_params(query: &str) -> bool {
     RequestTarget::parse("/", Some(query)).is_ok_and(|t| t.is_presigned_v4())
 }
 
+/// Fuzz entry (`fuzz_entry::sigv4`): the identity parse this middleware runs
+/// before s3s, `(access key, signature)`.
+#[doc(hidden)]
+pub fn fuzz_sigv4_identity(request: &Request<Body>) -> Option<(String, String)> {
+    let params = if has_presigned_query_params(request.uri().query().unwrap_or("")) {
+        SigV4Params::from_query(request)
+    } else {
+        SigV4Params::from_headers(request)
+    }
+    .ok()?;
+    Some((params.access_key, params.signature))
+}
+
 /// Axum middleware that verifies SigV4 signatures when auth is configured.
 ///
 /// Inserted as a layer around the router. If `auth` is `None` (no credentials
