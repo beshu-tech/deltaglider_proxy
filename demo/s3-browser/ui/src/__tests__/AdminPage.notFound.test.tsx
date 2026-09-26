@@ -29,6 +29,9 @@ test('an unknown admin path shows a not-found view with the nearest page', async
     </NavigationContext.Provider>,
   );
   expect(await screen.findByText('This settings page does not exist')).toBeInTheDocument();
+  // Explore finding 19: the sidebar still marked Dashboard as the current
+  // page (the unknown path resolves to it). No entry is current now.
+  expect(document.querySelector('[aria-current="page"]')).toBeNull();
   // The URL is left alone (no silent rewrite to the dashboard).
   expect(navigate).not.toHaveBeenCalled();
   await user.click(screen.getByRole('button', { name: 'Go to Users' }));

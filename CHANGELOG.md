@@ -81,6 +81,8 @@ audited as `maintenance_migrate_mirror_delete`.
 - An unknown page under `/_/` (for example a mistyped `/_/setings`) shows a
   404 page in the UI theme with a link home, not a bare "not found". Missing
   files (assets, source maps) still get the plain 404.
+- An unknown settings page no longer marks Dashboard as the current page in
+  the sidebar.
 
 ### Fixed — The Credentials page shows the bootstrap access key and removes it on request
 

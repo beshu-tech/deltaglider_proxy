@@ -89,6 +89,9 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
   // dashboard under a URL that names something else.
   const unknownPath = isUnknownAdminPath(rawSubPath, isLeaf) ? rawSubPath : null;
   const activeSection = sectionForPath(adminPath);
+  // The sidebar marks no entry while the not-found view shows: `adminPath`
+  // falls back to the dashboard, which is not the page on screen.
+  const sidebarPath = unknownPath ? '' : adminPath;
   // The per-leaf dirty/apply key for ⌘S dispatch (panels register under this,
   // not the coarse section). `activeSection` is still used for the avatar
   // menu's section-YAML target (which IS section-scoped).
@@ -495,7 +498,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
           >
             <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
               <div style={{ flex: 1, minHeight: 0 }}>
-                <AdminSidebar activePath={adminPath} onNavigate={navigateAdmin} />
+                <AdminSidebar activePath={sidebarPath} onNavigate={navigateAdmin} />
               </div>
             </div>
           </Drawer>
@@ -511,7 +514,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
           }}
         >
           <div style={{ flex: 1, minHeight: 0 }}>
-            <AdminSidebar activePath={adminPath} onNavigate={navigateAdmin} />
+            <AdminSidebar activePath={sidebarPath} onNavigate={navigateAdmin} />
           </div>
         </div>
 
