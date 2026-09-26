@@ -39,8 +39,10 @@ On an S3 backend, deleting a delta or encrypted object queues the removal of
 its listing-facts entries. When another instance wrote the same key again
 before the queue ran, the removal deleted the new entry too, so a LIST
 reported the stored size of the new object until a HEAD restored the entry.
-Now the removal deletes only the entries that the S3 server stored before
-the delete (by the `Date` of the delete response). The delete of a plain
+Now the removal deletes the entries that the S3 server stored before the
+delete (by the `Date` of the delete response). An entry stored in the same
+second or later is deleted only when it does not describe the object that is
+in the bucket now. The delete of a plain
 object also removes its entries now: an object from a multipart upload that
 the proxy assembled has one, and it stayed forever. When `DeleteBucket`
 removes the facts of an otherwise empty bucket, it now uses one batch
