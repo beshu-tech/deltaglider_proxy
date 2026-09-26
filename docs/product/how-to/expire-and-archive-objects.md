@@ -50,7 +50,7 @@ curl -b cookies -X POST \
   https://s3.acme.example/_/api/admin/jobs/lifecycle:expire-nightly-dumps/preview
 ```
 
-From the admin UI: the **Preview** button on the rule's row on the Jobs screen.
+From the admin UI: the **Preview** button on the rule's row on the Jobs screen. It opens the rule's drawer on the **Preview** tab, which lists the candidate keys with the total count and bytes. The list stays there until you close the drawer, and **Refresh preview** computes it again.
 
 ![Lifecycle preview](/_/screenshots/lifecycle-preview.jpg)
 
@@ -66,6 +66,8 @@ curl -b cookies -X POST \
 ```
 
 A `409` means the rule is disabled, paused, or already running.
+
+In the admin UI, **Run now** on a lifecycle rule does not start the run at once. The proxy first computes a preview, and a dialog shows the objects that the run would delete or move, with their count and total size. The run starts only when you press the button that names the count, for example **Run: delete 12 objects**. The run acts on the objects that match the rule when it starts, so the result can differ slightly from the preview.
 
 If you need to stop the rule temporarily (incident, audit freeze), pause it from the job row or `POST …/pause`. Paused rules are skipped by the scheduler and run-now alike, and the pause survives restarts; `…/resume` re-arms it.
 

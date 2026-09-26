@@ -70,6 +70,8 @@ storage:
 
 ## 5. Freeze a bucket
 
+**What the upload page does:** when you sign in to the admin UI, the upload page reads the bucket's quota, its usage counter and the object size limit (`advanced.max_object_size`, which you can edit under Storage → Buckets → Object size limit). A file that is bigger than the size limit, or that does not fit in the space the quota leaves, is refused on the page before any byte goes out, and the page says why. A files-only session cannot read these limits, so for such a session the proxy's own check is the only one.
+
 If you need a bucket read-only (for example during a manual migration), set the quota to zero:
 
 ```yaml

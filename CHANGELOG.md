@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### Fixed — Admin UI and object browser, from a browser review
+
+- **A new or duplicated user's secret is shown.** Create and Duplicate
+  select the new user, and the URL change cleared the one-time secret
+  before anyone saw it. The credentials now stay in a dialog, with copy
+  buttons, until the admin presses "I have copied it".
+- **Lifecycle Run now asks first.** It shows the preview (the keys, their
+  count and bytes) and runs only on the button that names the count.
+  Preview is a tab in the job drawer, not a toast.
+- **Upload.** The page opens at the current folder, even a read-only one:
+  it says "You cannot upload to …" and offers the writable prefixes
+  instead of moving the destination by itself. For admin sessions it
+  refuses a file over `max_object_size` or the remaining quota before the
+  upload starts. The Buckets page edits `max_object_size`.
+- **Download** streams through the browser from a short-lived presigned
+  URL, in one click, instead of holding the whole object in page memory.
+- **Numbers.** The analytics hero shows the saved share (never more than
+  100% smaller), and the cache "avg per entry" divides the used bytes.
+  A passthrough file says it is stored as-is, not that compression is off.
+- **Sessions.** A session that expires mid-edit asks to sign in again in a
+  dialog, keeps the edits and retries the step. A non-admin in Settings
+  reads that the account has no admin rights. The "files only" tip is
+  remembered per user and is one line on a phone.
+- **Navigation.** An unknown admin link shows a not-found page with the
+  nearest real page. A `?object=` link into another bucket sends its first
+  request to that bucket. Double-click on a file opens the preview.
+  The palette's Show YAML and Apply YAML open the YAML dialog.
+- **First run.** The empty browser links to the setup wizard, the wizard
+  keeps its apply warnings on screen, and the fatal no-authentication
+  message shows YAML. The startup banner names every backend.
+- **Accessibility.** Text and primary buttons reach 4.5:1 contrast in both
+  themes; one `<main>` and one `<h1>` per view; no button inside a button;
+  named progress bars and row buttons; clickable pills are buttons; every
+  confirmation is a dialog instead of `window.confirm`; focus returns to
+  where it was when an overlay closes.
+- **Polish.** Bucket-name inputs explain an invalid name instead of
+  rewriting it; the theme follows `prefers-color-scheme` until you pick
+  one; the Apply dialog disables Apply when there is nothing to apply;
+  the Credentials page no longer says the admin password encrypts the IAM
+  database. An admin UI apply still rewrites the config file in canonical
+  form; the configuration reference now says so.
+
 ### Fixed — Leases and locks read a racing conditional write as a lost race
 
 With config sync on, the replication lease, the reference lock and the backend
