@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed — The admission chain holds at most 1000 blocks
+
+The proxy checks the admission blocks for every request, and the chain had
+no size limit (a 20000-block config was accepted). Now a config with more
+than 1000 operator blocks is refused with an error that names the count and
+the limit, on load and on every admin apply.
+
 ### Changed — A refused reserved key says which rule refused it
 
 A `PUT` of a key such as `docs/reference.bin` or `backups/db.sql.delta` got

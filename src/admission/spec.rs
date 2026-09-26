@@ -297,6 +297,14 @@ impl AdmissionSpec {
     /// with precise file-position information via
     /// [`ConfigError::Parse`] rather than much later from the evaluator.
     pub fn validate(&self) -> Result<(), String> {
+        if self.blocks.len() > MAX_ADMISSION_BLOCKS {
+            return Err(format!(
+                "admission has {} blocks — the limit is {MAX_ADMISSION_BLOCKS}. Every \
+                 request walks the chain, so merge rules (one block can list many \
+                 networks in `source_ip_list`), or gate at a WAF in front of the proxy",
+                self.blocks.len()
+            ));
+        }
         let mut seen_names = std::collections::HashSet::new();
         for block in &self.blocks {
             // Restrict block-name charset. Block names appear in
@@ -359,6 +367,11 @@ impl AdmissionSpec {
         Ok(())
     }
 }
+
+/// Maximum blocks in the operator chain. The evaluator walks the chain
+/// for every request (first match wins), so an unbounded chain is a
+/// per-request cost knob, like an unbounded `source_ip_list`.
+pub const MAX_ADMISSION_BLOCKS: usize = 1000;
 
 /// Maximum entries allowed in a single `source_ip_list`. The
 /// evaluator does a linear scan per request, so an unbounded list is
@@ -591,6 +604,25 @@ action:
             err.contains("source_ip_list") && err.contains("4096"),
             "error must name the field + the cap, got: {err}"
         );
+    }
+
+    /// Explore #19: the chain had no size cap; the evaluator walks every
+    /// block for every request. 1000 is accepted, 1001 is refused with
+    /// the count and the cap.
+    #[test]
+    fn admission_spec_block_count_is_capped() {
+        let blocks = |n: usize| AdmissionSpec {
+            blocks: (0..n)
+                .map(|i| AdmissionBlockSpec {
+                    name: format!("b{i}"),
+                    match_: MatchSpec::default(),
+                    action: ActionSpec::Simple(SimpleAction::Deny),
+                })
+                .collect(),
+        };
+        assert!(blocks(MAX_ADMISSION_BLOCKS).validate().is_ok());
+        let err = blocks(MAX_ADMISSION_BLOCKS + 1).validate().unwrap_err();
+        assert!(err.contains("1001") && err.contains("1000"), "{err}");
     }
 
     #[test]
