@@ -716,6 +716,13 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Config versions (ETags) keyed from the DB key: stable across restarts.
     deltaglider_proxy::api::admin::install_config_version_key(db_keys.primary.expose());
     let (config_db, config_db_mismatch) = init_config_db(&db_keys, &iam_state, &config);
+    // After the DB: its IAM users (declarative ones are reconciled into it
+    // by now) are credentials. A DB this key cannot read may hold users too.
+    validate_auth_config(
+        &config,
+        config_db_mismatch
+            || matches!(**iam_state.load(), deltaglider_proxy::iam::IamState::Iam(_)),
+    );
 
     // Load the synced session-revocation snapshot so a revoke performed on any
     // instance (before this one started) is honored immediately.

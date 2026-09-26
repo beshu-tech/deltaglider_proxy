@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — IAM users count as credentials at boot
+
+A declarative config whose only credentials were `access.iam_users`, and a
+GUI-mode proxy whose config DB held IAM users but whose config had no
+bootstrap SigV4 pair, both refused to start with "No authentication
+configured". Now the startup check runs after the config DB is open and
+counts declarative `iam_users` and existing IAM DB users as configured
+credentials. The fatal help text names these options.
+
 ### Security — S3 clients cannot reach the coordination bucket
 
 The `config_sync_bucket` holds the synced IAM database, the replication

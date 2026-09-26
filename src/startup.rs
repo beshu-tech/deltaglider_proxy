@@ -110,8 +110,6 @@ pub fn log_startup_banner(config: &Config) {
             config.cache_size_mb
         );
     }
-
-    validate_auth_config(config);
 }
 
 /// Validate authentication configuration and refuse to start if unsafe.
@@ -153,9 +151,11 @@ fn warn_active_test_seams() {
     }
 }
 
-fn validate_auth_config(config: &Config) {
+/// Runs after the config DB is open: IAM users in the DB (or a DB this key
+/// cannot read, which may hold them) count as configured credentials.
+pub fn validate_auth_config(config: &Config, iam_db_has_users: bool) {
     use deltaglider_proxy::config::AuthConfigOutcome;
-    match config.classify_auth_config() {
+    match config.classify_auth_config(iam_db_has_users) {
         AuthConfigOutcome::CredentialsEnabled { redundant_none } => {
             info!(
                 "  Authentication: SigV4 ENABLED (access key: {})",
@@ -163,6 +163,12 @@ fn validate_auth_config(config: &Config) {
             );
             if redundant_none {
                 warn!("  Note: `authentication: none` is ignored because S3 credentials are configured");
+            }
+        }
+        AuthConfigOutcome::IamUsers { redundant_none } => {
+            info!("  Authentication: SigV4 ENABLED (IAM users, no bootstrap SigV4 pair)");
+            if redundant_none {
+                warn!("  Note: `authentication: none` is ignored because IAM users exist");
             }
         }
         AuthConfigOutcome::OpenAccess => {
@@ -812,7 +818,10 @@ fn init_config_db_attempt(
                     // DB users force IAM mode, overriding `authentication: none`
                     // — warn so the resulting AccessDenied isn't read as data loss.
                     use deltaglider_proxy::config::AuthConfigOutcome;
-                    if matches!(config.classify_auth_config(), AuthConfigOutcome::OpenAccess) {
+                    if matches!(
+                        config.classify_auth_config(false),
+                        AuthConfigOutcome::OpenAccess
+                    ) {
                         warn!(
                             "  Authentication: IAM mode is ACTIVE ({} user(s) in {}) — this \
                              OVERRIDES `authentication: none`. Open/anonymous browser \

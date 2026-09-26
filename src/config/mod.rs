@@ -1449,6 +1449,10 @@ pub enum AuthConfigOutcome {
     /// SigV4 credentials are configured → auth is ON. `redundant_none` is
     /// true if `authentication = "none"` was also set (ignored — worth a note).
     CredentialsEnabled { redundant_none: bool },
+    /// No bootstrap pair, but IAM users exist (declarative `iam_users`, or
+    /// users in the config DB) → auth is ON in IAM mode. `redundant_none`:
+    /// `authentication: none` was also set (overridden by the IAM users).
+    IamUsers { redundant_none: bool },
     /// No credentials, `authentication = "none"` → explicit open access.
     OpenAccess,
     /// No credentials, an unrecognised `authentication` value → FATAL.
@@ -1472,7 +1476,11 @@ impl AuthConfigOutcome {
                 "         access_key_id: \"...\"",
                 "         secret_access_key: \"...\"",
                 "",
-                "    2. Explicitly allow open access (development only):",
+                "    2. Declare IAM users (access.iam_users with iam_mode: declarative),",
+                "       or create IAM users in the admin GUI first: once users exist in the",
+                "       config DB, the bootstrap pair is optional.",
+                "",
+                "    3. Explicitly allow open access (development only):",
                 "       access:",
                 "         authentication: none",
                 "",
@@ -1490,7 +1498,7 @@ impl AuthConfigOutcome {
                 "      access_key_id: \"...\"",
                 "      secret_access_key: \"...\"",
             ]),
-            Self::CredentialsEnabled { .. } | Self::OpenAccess => None,
+            Self::CredentialsEnabled { .. } | Self::IamUsers { .. } | Self::OpenAccess => None,
         }
     }
 }
@@ -2713,8 +2721,13 @@ impl Config {
     /// owns the logging and the `process::exit` so this stays unit-testable
     /// without spawning a process or capturing stderr.
     ///
+    /// `iam_db_has_users`: the config DB holds IAM users (or cannot be read
+    /// with this key, so it may). Those users, like declarative `iam_users`,
+    /// are configured credentials: the proxy runs in IAM mode without a
+    /// bootstrap pair.
+    ///
     /// See [`AuthConfigOutcome`] for the meaning of each variant.
-    pub fn classify_auth_config(&self) -> AuthConfigOutcome {
+    pub fn classify_auth_config(&self, iam_db_has_users: bool) -> AuthConfigOutcome {
         // Normalize the authentication field: lowercase + trim whitespace.
         let auth_mode = self
             .authentication
@@ -2726,6 +2739,14 @@ impl Config {
             // Credentials are set — auth is on regardless of the field. A
             // stray `authentication = "none"` is ignored (but worth a note).
             return AuthConfigOutcome::CredentialsEnabled {
+                redundant_none: auth_mode == Some("none"),
+            };
+        }
+        let declarative_users =
+            matches!(self.iam_mode, crate::config_sections::IamMode::Declarative)
+                && !self.iam_users.is_empty();
+        if iam_db_has_users || declarative_users {
+            return AuthConfigOutcome::IamUsers {
                 redundant_none: auth_mode == Some("none"),
             };
         }
@@ -3786,14 +3807,14 @@ mod tests {
     #[test]
     fn classify_auth_config_credentials_enabled() {
         assert_eq!(
-            auth_cfg(Some("AK"), Some("SK"), None).classify_auth_config(),
+            auth_cfg(Some("AK"), Some("SK"), None).classify_auth_config(false),
             AuthConfigOutcome::CredentialsEnabled {
                 redundant_none: false
             }
         );
         // Credentials win even if authentication = "none" is also set.
         assert_eq!(
-            auth_cfg(Some("AK"), Some("SK"), Some("none")).classify_auth_config(),
+            auth_cfg(Some("AK"), Some("SK"), Some("none")).classify_auth_config(false),
             AuthConfigOutcome::CredentialsEnabled {
                 redundant_none: true
             }
@@ -3804,7 +3825,7 @@ mod tests {
     fn classify_auth_config_open_access() {
         // Case/whitespace-insensitive normalisation.
         assert_eq!(
-            auth_cfg(None, None, Some("  NONE  ")).classify_auth_config(),
+            auth_cfg(None, None, Some("  NONE  ")).classify_auth_config(false),
             AuthConfigOutcome::OpenAccess
         );
     }
@@ -3812,20 +3833,55 @@ mod tests {
     #[test]
     fn classify_auth_config_unrecognized_mode_is_fatal() {
         assert_eq!(
-            auth_cfg(None, None, Some("disabled")).classify_auth_config(),
+            auth_cfg(None, None, Some("disabled")).classify_auth_config(false),
             AuthConfigOutcome::UnrecognizedMode
         );
     }
 
     #[test]
+    fn classify_auth_config_iam_users_are_credentials() {
+        // Users in the config DB.
+        assert_eq!(
+            auth_cfg(None, None, None).classify_auth_config(true),
+            AuthConfigOutcome::IamUsers {
+                redundant_none: false
+            }
+        );
+        assert_eq!(
+            auth_cfg(None, None, Some("none")).classify_auth_config(true),
+            AuthConfigOutcome::IamUsers {
+                redundant_none: true
+            }
+        );
+        // Declarative iam_users count; the same list in gui mode does not
+        // (gui mode never reads it into the DB).
+        let yaml = "access:\n  iam_mode: declarative\n  iam_users:\n    - name: u\n      access_key_id: AKU\n      secret_access_key: secret-123\n";
+        let decl = Config::from_yaml_str(yaml).expect("parse");
+        assert_eq!(
+            decl.classify_auth_config(false),
+            AuthConfigOutcome::IamUsers {
+                redundant_none: false
+            }
+        );
+        let mut gui = decl.clone();
+        gui.iam_mode = crate::config_sections::IamMode::Gui;
+        assert_eq!(gui.classify_auth_config(false), AuthConfigOutcome::Missing);
+        // A bootstrap pair still reports as such.
+        assert!(matches!(
+            auth_cfg(Some("AK"), Some("SK"), None).classify_auth_config(true),
+            AuthConfigOutcome::CredentialsEnabled { .. }
+        ));
+    }
+
+    #[test]
     fn classify_auth_config_missing_is_fatal() {
         assert_eq!(
-            auth_cfg(None, None, None).classify_auth_config(),
+            auth_cfg(None, None, None).classify_auth_config(false),
             AuthConfigOutcome::Missing
         );
         // A single credential without its pair is NOT "enabled" → still Missing.
         assert_eq!(
-            auth_cfg(Some("AK"), None, None).classify_auth_config(),
+            auth_cfg(Some("AK"), None, None).classify_auth_config(false),
             AuthConfigOutcome::Missing
         );
     }
@@ -6045,7 +6101,7 @@ mod prod_shape_tests {
     fn parses_and_classifies_auth() {
         let cfg = parsed();
         assert!(matches!(
-            cfg.classify_auth_config(),
+            cfg.classify_auth_config(false),
             AuthConfigOutcome::CredentialsEnabled {
                 redundant_none: false
             }

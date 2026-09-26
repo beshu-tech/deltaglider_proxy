@@ -599,6 +599,8 @@ pub struct TestServerBuilder {
     production_security: bool,
     /// See [`Self::tls`].
     tls: Option<TestTls>,
+    /// See [`Self::client_credentials_only`].
+    omit_bootstrap_creds: bool,
 }
 
 /// TLS mode of a test listener.
@@ -630,6 +632,7 @@ impl Default for TestServerBuilder {
             extra_env: Vec::new(),
             production_security: false,
             tls: None,
+            omit_bootstrap_creds: false,
         }
     }
 }
@@ -670,6 +673,15 @@ impl TestServerBuilder {
     /// requests (raw reqwest, anonymous clients, open-access behaviour).
     pub fn open_access(mut self) -> Self {
         self.auth_creds = None;
+        self
+    }
+
+    /// The test's S3 clients sign with this pair, but the config carries
+    /// no bootstrap SigV4 pair and no `authentication` field: the pair must
+    /// come from IAM (e.g. declarative `iam_users`).
+    pub fn client_credentials_only(mut self, access_key_id: &str, secret_access_key: &str) -> Self {
+        self.auth_creds = Some((access_key_id.to_string(), secret_access_key.to_string()));
+        self.omit_bootstrap_creds = true;
         self
     }
 
@@ -855,7 +867,9 @@ impl TestServerBuilder {
                 "tls:\n  enabled: true\n  cert_path: \"{cert_path}\"\n  key_path: \"{key_path}\"\n"
             )),
         }
-        if let Some((ref key_id, ref secret)) = self.auth_creds {
+        if self.omit_bootstrap_creds {
+            // Neither a bootstrap pair nor `authentication: none`.
+        } else if let Some((ref key_id, ref secret)) = self.auth_creds {
             config.push_str(&format!(
                 "access_key_id: \"{}\"\nsecret_access_key: \"{}\"\n",
                 key_id, secret

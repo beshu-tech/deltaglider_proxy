@@ -3227,3 +3227,78 @@ async fn production_defaults_refuse_a_loopback_backend() {
         "the proxy connected to an SSRF-refused endpoint"
     );
 }
+
+// ============================================================================
+// Boot: IAM users count as configured credentials
+// ============================================================================
+
+/// A declarative config whose `iam_users` are the only credentials boots:
+/// the users are credentials. It used to exit "No authentication configured".
+#[tokio::test]
+async fn declarative_iam_users_without_a_bootstrap_pair_boot() {
+    let server = TestServer::builder()
+        .client_credentials_only("iac-boot-key", "iac-boot-secret-123")
+        .extra_yaml_root(
+            "iam_mode: declarative\n\
+             iam_users:\n\
+             \x20 - name: iac-boot\n\
+             \x20   access_key_id: iac-boot-key\n\
+             \x20   secret_access_key: iac-boot-secret-123\n\
+             \x20   enabled: true\n\
+             \x20   permissions:\n\
+             \x20     - effect: Allow\n\
+             \x20       actions: [\"*\"]\n\
+             \x20       resources: [\"*\"]\n",
+        )
+        .build()
+        .await;
+    let s3 = server.s3_client().await;
+    s3.put_object()
+        .bucket(server.bucket())
+        .key("boot.txt")
+        .body(ByteStream::from_static(b"ok"))
+        .send()
+        .await
+        .expect("the declarative user signs S3 requests");
+}
+
+/// GUI mode: once IAM users exist in the config DB, the bootstrap SigV4 pair
+/// can go from the config and the proxy still boots, in IAM mode.
+#[tokio::test]
+async fn iam_db_users_without_a_bootstrap_pair_boot() {
+    let mut server = TestServer::builder().build().await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let alice = create_user(
+        &admin,
+        &server,
+        "alice-boot",
+        vec![json!({"effect": "Allow", "actions": ["*"], "resources": ["*"]})],
+    )
+    .await;
+
+    server.kill();
+    let path = server.config_path().to_path_buf();
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    let without_pair: String = yaml
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with("access_key_id:") && !t.starts_with("secret_access_key:")
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_ne!(yaml, without_pair, "the config carried a bootstrap pair");
+    std::fs::write(&path, without_pair).unwrap();
+    server.respawn_with_env(&[]).await;
+
+    let s3 = server
+        .s3_client_with_creds(&alice.access_key_id, &alice.secret_access_key)
+        .await;
+    s3.put_object()
+        .bucket(server.bucket())
+        .key("boot.txt")
+        .body(ByteStream::from_static(b"ok"))
+        .send()
+        .await
+        .expect("the DB user signs S3 requests");
+}
