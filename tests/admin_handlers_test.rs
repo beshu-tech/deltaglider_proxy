@@ -1360,3 +1360,173 @@ async fn form_post_policy_table() {
     }
     assert!(wrong.is_empty(), "form POST table:\n{}", wrong.join("\n"));
 }
+
+// ── Event outbox ────────────────────────────────────────────────────────
+
+async fn outbox(admin: &reqwest::Client, ep: &str, query: &str) -> (StatusCode, Value) {
+    json_of(
+        admin
+            .get(format!("{ep}/_/api/admin/event-outbox?{query}"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await
+}
+
+/// Two webhook endpoints that fail at once (one refused by the SSRF guard,
+/// one unresolvable), one attempt each: every event ends `failed` with a
+/// per-endpoint view, is requeued, fails again, and is purged.
+#[tokio::test]
+async fn event_outbox_list_filters_requeue_and_purge() {
+    let server = TestServer::builder()
+        .extra_yaml_root(
+            "event_delivery:\n  enabled: true\n  webhook_urls:\n    - \"https://hooks.dgp-test.invalid/in?token=s3cr3t-token\"\n    - \"http://127.0.0.1:9/local\"\n  tick_interval: 1s\n  max_attempts: 1\n  retry_base: 1s\n",
+        )
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let http = server.http();
+    for k in ["ev/a.txt", "ev/b.txt", "ev/c.txt"] {
+        common::put_object(&http, &ep, server.bucket(), k, b"x".to_vec(), "text/plain").await;
+    }
+
+    let wait_failed = |want: i64| {
+        let admin = admin.clone();
+        let ep = ep.clone();
+        async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let (_, v) = outbox(&admin, &ep, "limit=100").await;
+                if v["counts"]["failed"].as_i64() == Some(want) {
+                    return v;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "rows never failed: {v}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    };
+    let v = wait_failed(3).await;
+    assert_eq!(v["delivery_enabled"], true);
+    assert_eq!(v["delivery_active"], true);
+    assert_eq!(v["total"], 3, "{v}");
+
+    // Filters, sort, pagination and the per-endpoint view.
+    let (code, page) = outbox(
+        &admin,
+        &ep,
+        "status=failed&sort=key&order=asc&limit=1&offset=1",
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{page}");
+    assert_eq!(page["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(page["total"], 3);
+    let row = &page["rows"][0];
+    assert_eq!(row["key"], "ev/b.txt", "sorted by key, second row: {row}");
+    assert_eq!(row["status"], "failed");
+    let deliveries = row["deliveries"].as_array().unwrap();
+    assert_eq!(deliveries.len(), 2, "one view per endpoint: {row}");
+    for d in deliveries {
+        assert_eq!(d["status"], "failed", "{d}");
+        assert!(d["attempts"].as_i64().unwrap() >= 1, "{d}");
+        assert!(!d["last_error"].as_str().unwrap_or("").is_empty(), "{d}");
+        let label = d["label"].as_str().unwrap_or("");
+        assert!(label.starts_with("webhook "), "{d}");
+        assert!(!label.contains("s3cr3t-token"), "labels are redacted: {d}");
+    }
+    let (_, delivered) = outbox(&admin, &ep, "status=delivered").await;
+    assert!(delivered["rows"].as_array().unwrap().is_empty());
+    for bad in ["status=bogus", "sort=bogus", "order=sideways"] {
+        let (code, v) = outbox(&admin, &ep, bad).await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+
+    // Requeue one: it becomes claimable and fails again (attempts grow).
+    let id = row["id"].as_i64().unwrap();
+    let attempts = row["attempts"].as_i64().unwrap();
+    let (code, v) = json_of(
+        admin
+            .post(format!("{ep}/_/api/admin/event-outbox/{id}/requeue"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["requeued"], 1);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (_, v) = outbox(&admin, &ep, "limit=100").await;
+        let r = v["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap()
+            .clone();
+        if r["status"] == "failed" && r["attempts"].as_i64().unwrap() > attempts {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "requeued row never retried: {r}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let (code, _) = json_of(
+        admin
+            .post(format!("{ep}/_/api/admin/event-outbox/999999/requeue"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        code,
+        StatusCode::CONFLICT,
+        "a missing row is not requeueable"
+    );
+
+    // Requeue many.
+    let many = |ids: Value| {
+        admin
+            .post(format!("{ep}/_/api/admin/event-outbox/requeue"))
+            .json(&json!({ "ids": ids }))
+            .send()
+    };
+    let (code, v) = json_of(many(json!([])).await.unwrap()).await;
+    assert_eq!((code, v["requeued"].as_i64()), (StatusCode::OK, Some(0)));
+    let too_many: Vec<i64> = (1..=501).collect();
+    let (code, _) = json_of(many(json!(too_many)).await.unwrap()).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    wait_failed(3).await;
+    let ids: Vec<i64> = outbox(&admin, &ep, "limit=100").await.1["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+    let (code, v) = json_of(many(json!(ids)).await.unwrap()).await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert!(v["requeued"].as_i64().unwrap() >= 1, "{v}");
+
+    // Purge: no replication rules, so failed rows are purgeable.
+    wait_failed(3).await;
+    let (code, v) = json_of(
+        admin
+            .post(format!("{ep}/_/api/admin/event-outbox/purge-failed"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    assert_eq!(v["purged"], 3, "{v}");
+    let (_, after) = outbox(&admin, &ep, "limit=100").await;
+    assert_eq!(after["total"], 0, "{after}");
+    assert_audited(&admin, &ep, "event_outbox_purge_failed", "").await;
+}

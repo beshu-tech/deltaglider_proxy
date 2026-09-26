@@ -349,6 +349,7 @@ jobs:
             s3_backend_test:: \
             s3_compat_test:: \
             s3_integration_test:: \
+            status_endpoints_test:: \
             storage_resilience_test:: \
             unmanaged_objects_test::
       - name: Integration tests (admin, IAM, replication, lifecycle, …)

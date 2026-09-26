@@ -160,6 +160,8 @@ mod s3_integration_test;
 mod savings_test;
 #[path = "spawn_cwd_guard_test.rs"]
 mod spawn_cwd_guard_test;
+#[path = "status_endpoints_test.rs"]
+mod status_endpoints_test;
 #[path = "storage_resilience_test.rs"]
 mod storage_resilience_test;
 #[path = "streaming_copy_test.rs"]
