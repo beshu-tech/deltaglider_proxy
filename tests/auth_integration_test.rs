@@ -652,6 +652,9 @@ async fn test_replay_attack_detected() {
         .unwrap();
 
     let status1 = resp1.status();
+    // A duplicate inside the signing second is an SDK retry and is served;
+    // one after it is a replay.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
 
     // Same exact request (same signature because same timestamp+path+key)
     let resp2 = build_signed_put(&server.endpoint(), &path, "testkey", "testsecret", &now)
@@ -3108,13 +3111,11 @@ impl aws_sdk_s3::config::Intercept for LoseFirstResponse {
     }
 }
 
-/// Known gap: when a PUT SUCCEEDS but its response is lost (a load balancer
-/// 502/504), the SDK's retry inside the same signing second carries the same
-/// signature, and the replay cache refuses it with 400 "Request replay
-/// detected". The object is stored, but the client sees a failed upload.
-/// Real S3 accepts the retry. Changing this is a replay-policy decision.
+/// A PUT succeeds but its response is lost (a load balancer 502/504). The
+/// SDK retries inside the same signing second, so the retry carries the
+/// same signature. It must be served (real S3 accepts it), not refused as a
+/// replay: the object is stored, and a refusal fails the client's upload.
 #[tokio::test]
-#[ignore = "known gap: a retry after a LOST 2xx response is refused as a replay"]
 async fn production_defaults_sdk_retry_after_a_lost_response_succeeds() {
     let server = TestServer::builder()
         .production_security_defaults()

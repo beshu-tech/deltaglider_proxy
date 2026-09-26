@@ -218,6 +218,20 @@ pub fn replay_tracked(method: &axum::http::Method) -> bool {
     !matches!(*method, Method::GET | Method::HEAD)
 }
 
+/// Pure: whether a duplicate signature seen `since_first` after its first
+/// copy is served as a retry instead of refused as a replay. Only PUT and
+/// DELETE, and only inside the signing second: SigV4 timestamps have
+/// one-second resolution, so an SDK that retries in the second it signed
+/// (after a lost response or a gateway 5xx) sends the same signature. A
+/// retry signed in a later second carries a new signature anyway. The
+/// second is measured on the server clock from the first copy, not from
+/// `x-amz-date`, so client clock skew cannot stretch it. PUT and DELETE
+/// repeat the same effect; other mutations (POST) stay strict.
+pub fn same_second_retry_served(method: &axum::http::Method, since_first: Duration) -> bool {
+    use axum::http::Method;
+    matches!(*method, Method::PUT | Method::DELETE) && since_first < Duration::from_secs(1)
+}
+
 /// Whether a request that claimed a replay-cache slot keeps it once its
 /// response is known: only on success (2xx/3xx). A failed mutation had no
 /// effect, so a byte-identical retry of it is not a replay.
@@ -899,11 +913,15 @@ pub async fn sigv4_auth_middleware(
             // Only RESET the timestamp once the window has expired — never on
             // a duplicate hit, so the window is measured from first-seen.
             let mut is_duplicate = false;
+            let mut is_retry = false;
             let claimed_at = Instant::now();
+            let method = request.method().clone();
             cache
                 .entry(sig.clone())
                 .and_modify(|first_seen: &mut Instant| {
-                    if first_seen.elapsed() < replay_window {
+                    if same_second_retry_served(&method, first_seen.elapsed()) {
+                        is_retry = true;
+                    } else if first_seen.elapsed() < replay_window {
                         is_duplicate = true;
                     } else {
                         // Window expired — reset so the slot can be reused.
@@ -926,7 +944,10 @@ pub async fn sigv4_auth_middleware(
                     S3Error::InvalidArgument("Request replay detected".to_string()).into_response(),
                 );
             }
-            replay_claim = Some((cache.clone(), sig.clone(), claimed_at));
+            // A served retry does not own the slot: the first copy does.
+            if !is_retry {
+                replay_claim = Some((cache.clone(), sig.clone(), claimed_at));
+            }
         }
     }
 
@@ -1281,6 +1302,27 @@ mod tests {
         );
         // Blank or invalid = unset.
         assert_eq!(secs(&env(&[("DGP_REPLAY_WINDOW_SECS", "")])), 900);
+    }
+
+    #[test]
+    fn same_second_retry_is_served_for_put_and_delete_only() {
+        use axum::http::Method;
+        let now = Duration::from_millis(0);
+        let in_second = Duration::from_millis(999);
+        let after = Duration::from_millis(1000);
+        for m in [Method::PUT, Method::DELETE] {
+            assert!(same_second_retry_served(&m, now), "{m}");
+            assert!(same_second_retry_served(&m, in_second), "{m}");
+            assert!(
+                !same_second_retry_served(&m, after),
+                "{m} replayed after the second"
+            );
+        }
+        // POST (CompleteMultipartUpload, DeleteObjects, form upload) and
+        // the rest stay strict: any duplicate is a replay.
+        for m in [Method::POST, Method::PATCH] {
+            assert!(!same_second_retry_served(&m, now), "{m}");
+        }
     }
 
     #[test]

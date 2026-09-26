@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Fixed — an SDK retry of a PUT or DELETE inside its signing second is served
+
+When a PUT succeeded but a load balancer lost its response, the SDK retried
+within the same second. SigV4 timestamps have 1-second granularity, so the
+retry carried the same signature, and the replay cache rejected it with
+`400 Request replay detected`: the object was stored, but the client saw a
+failed upload. A duplicate PUT or DELETE that arrives less than one second
+after the first copy, on the proxy's clock, is now served. A later duplicate
+is still rejected, and POST requests stay strict.
+
+### Fixed — an SSRF-refused backend endpoint is a 400
+
+Adding an S3 backend whose endpoint the SSRF guard refuses (an `http://` or
+loopback URL without `allow_local`) returned `500 Failed to rebuild engine`.
+It now returns 400 with the same message, and nothing changes.
+
 ### Fixed — multipart relay parts and delta codec files count against the spool budget
 
 Two more kinds of scratch file lived in the system temp dir, outside
