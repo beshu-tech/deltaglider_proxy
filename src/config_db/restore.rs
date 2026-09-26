@@ -51,6 +51,14 @@ pub struct BackupUser {
     pub enabled: bool,
     pub permissions: Vec<Permission>,
     pub group_ids: Vec<i64>,
+    /// `local`, or `external` for a user an OAuth login provisioned. Older
+    /// backups lack it: `local`.
+    #[serde(default = "local_auth_source")]
+    pub auth_source: String,
+}
+
+fn local_auth_source() -> String {
+    "local".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -288,14 +296,15 @@ fn restore_on(
         let name = first_free_user_name(&bu.name, |c| taken_names.contains(c));
         let id = keep_id(replace, bu.id, &user_ids_taken);
         conn.execute(
-            "INSERT INTO users (id, name, access_key_id, secret_access_key, enabled) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO users (id, name, access_key_id, secret_access_key, enabled, auth_source) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id,
                 name,
                 bu.access_key_id,
                 bu.secret_access_key,
-                bu.enabled as i32
+                bu.enabled as i32,
+                bu.auth_source
             ],
         )?;
         let uid = conn.last_insert_rowid();
@@ -477,6 +486,7 @@ mod tests {
             enabled: true,
             permissions: vec![perm()],
             group_ids: groups,
+            auth_source: "local".into(),
         }
     }
 
@@ -528,6 +538,31 @@ mod tests {
         assert_eq!(names(&db), ["ci-uploader", "dana"]);
         assert_eq!((r.users_deleted, r.users_skipped), (0, 1));
         assert!(r.stale_user_ids.is_empty());
+    }
+
+    /// Lead review of #3: an OAuth-provisioned user (auth_source
+    /// "external") stays external through a backup round trip, in both
+    /// modes; a backup without the field restores a local user.
+    #[test]
+    fn restore_keeps_auth_source() {
+        let backup: IamBackup = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "users": [
+                { "id": 4, "name": "dana", "access_key_id": "AKDANA", "secret_access_key": "s",
+                  "enabled": true, "permissions": [], "group_ids": [], "auth_source": "external" },
+                { "id": 5, "name": "ci-uploader", "access_key_id": "AKCI", "secret_access_key": "s",
+                  "enabled": true, "permissions": [], "group_ids": [] }
+            ],
+            "groups": []
+        }))
+        .unwrap();
+        for mode in [IamRestoreMode::Replace, IamRestoreMode::Merge] {
+            let (_d, db) = open();
+            db.restore_iam(&backup, mode, None).unwrap();
+            let src = |k: &str| db.get_user_by_access_key(k).unwrap().unwrap().auth_source;
+            assert_eq!(src("AKDANA"), "external", "{mode:?}");
+            assert_eq!(src("AKCI"), "local", "{mode:?}");
+        }
     }
 
     #[test]

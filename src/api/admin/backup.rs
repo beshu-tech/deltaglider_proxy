@@ -451,6 +451,7 @@ async fn build_iam_backup(state: &Arc<AdminState>) -> Result<IamBackup, StatusCo
                 enabled: u.enabled,
                 permissions: u.permissions,
                 group_ids: u.group_ids,
+                auth_source: u.auth_source,
             })
             .collect(),
         groups: groups
@@ -1927,6 +1928,7 @@ storage:
                 enabled: true,
                 permissions: vec![],
                 group_ids: vec![1],
+                auth_source: "local".into(),
             }],
             groups: vec![BackupGroup {
                 id: 1,
