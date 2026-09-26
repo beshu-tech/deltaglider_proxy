@@ -73,6 +73,14 @@ names the one object that the caller may read, the bucket and prefix that
 the caller may list, or the public prefixes of the bucket. For a write, it
 says that nothing is granted.
 
+### Fixed — A migrate cancel that a restart interrupts still cleans up
+
+When the proxy stopped (a rolling deploy, a crash) while a migrate job was
+`cancelling`, the next boot marked the job `cancelled` but did not run the
+cancel. The copies that the job wrote to the destination and its staging
+route stayed. Now the next boot runs the cancel: it deletes the staged
+copies and removes the route, as a cancel without a restart does.
+
 ### Fixed — `s3 purge` and the bucket-ACL verbs refuse a proxy endpoint
 
 The engine verbs (`ls`, `cp`, `rm`, …) stop with exit code `2` when

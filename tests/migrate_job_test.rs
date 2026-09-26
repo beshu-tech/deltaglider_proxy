@@ -820,3 +820,109 @@ async fn test_migrate_cancel_mid_copy_removes_its_staged_copies() {
     )
     .await;
 }
+
+/// A cancel that a shutdown interrupts must still unwind. SIGTERM while a
+/// migrate is `cancelling` hands the row back with its status kept and its
+/// lease released; the boot scan then settled it `cancelled` without the
+/// pre-flip unwind, which left the staging route and the staged copies on
+/// the destination. Now the next worker claims the row and runs the cancel.
+#[tokio::test]
+async fn test_migrate_cancel_interrupted_by_shutdown_still_unwinds() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migcansig";
+    let mut server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    seed(&http, &endpoint, bucket, 400).await;
+    let admin = admin_http_client(&endpoint).await;
+    let resp = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(resp.status(), 202);
+    let job_id = resp.json::<serde_json::Value>().await.unwrap()["job_id"]
+        .as_i64()
+        .unwrap();
+    for _ in 0..1000 {
+        let job = newest_job(&admin, &endpoint).await;
+        if job["progress"]["processed"].as_i64().unwrap_or(0) >= 20 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    server.terminate();
+
+    // The row as a SIGTERM during `cancelling` leaves it: the operator's
+    // cancel is recorded, the runner released its lease and stopped.
+    let dir = server.config_path().parent().unwrap().to_path_buf();
+    let key = std::fs::read_to_string(dir.join("deltaglider_config.db.key")).unwrap();
+    {
+        let db = deltaglider_proxy::config_db::ConfigDb::open_or_create(
+            &dir.join("deltaglider_config.db"),
+            key.trim(),
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let job = db
+            .maintenance_claim_next_job("stopped-runner", now, 60)
+            .unwrap()
+            .expect("the SIGTERM left the job resumable");
+        assert_eq!(job.id, job_id);
+        assert_eq!(job.phase, "copy", "SIGTERM must land in the copy");
+        db.maintenance_request_cancel(job_id).unwrap();
+        assert!(db
+            .maintenance_release_for_resume(job_id, "stopped-runner")
+            .unwrap());
+    }
+    assert!(
+        walkdir_files(&dir_b.path().join(bucket))
+            .iter()
+            .any(|p| p.contains("obj-")),
+        "precondition: staged copies exist on the destination"
+    );
+
+    server
+        .respawn_with_env(&[(
+            "DGP_BOOTSTRAP_PASSWORD_HASH",
+            common::TEST_BOOTSTRAP_PASSWORD_HASH,
+        )])
+        .await;
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+    wait_job_done(&admin, &endpoint, bucket).await;
+
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "cancelled", "job: {job}");
+    assert_ne!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        Some("dst")
+    );
+    assert!(
+        transient_keys(&admin, &endpoint).await.is_empty(),
+        "the staging route survived the cancel"
+    );
+    let left: Vec<String> = walkdir_files(&dir_b.path().join(bucket))
+        .into_iter()
+        .filter(|p| p.contains("obj-"))
+        .collect();
+    assert!(left.is_empty(), "staged copies left: {left:?}");
+    let http = server.http();
+    assert_eq!(
+        get_bytes(&http, &endpoint, bucket, "obj-399.json").await,
+        [MARKER, b" object 399"].concat()
+    );
+    put_object(
+        &http,
+        &endpoint,
+        bucket,
+        "after.json",
+        b"ok".to_vec(),
+        "application/json",
+    )
+    .await;
+}

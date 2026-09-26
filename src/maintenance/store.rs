@@ -274,7 +274,7 @@ impl ConfigDb {
             .conn
             .query_row(
                 "SELECT id FROM maintenance_jobs
-                 WHERE status = 'queued'
+                 WHERE (status = 'queued' OR (status = 'cancelling' AND kind = 'migrate'))
                    AND (leader_instance_id IS NULL
                         OR leader_expires_at IS NULL
                         OR leader_expires_at < ?)
@@ -303,12 +303,16 @@ impl ConfigDb {
             // rolls back on drop.
             return Ok(None);
         }
+        // An abandoned `cancelling` migrate keeps its status: the worker
+        // runs the cancel (its pre-flip unwind), see
+        // `maintenance_requeue_abandoned`.
         let updated = tx.execute(
             "UPDATE maintenance_jobs
-                SET status = 'running',
+                SET status = CASE status WHEN 'queued' THEN 'running' ELSE status END,
                     started_at = COALESCE(started_at, ?),
                     updated_at = ?
-              WHERE id = ? AND status = 'queued' AND leader_instance_id = ?",
+              WHERE id = ? AND leader_instance_id = ?
+                AND (status = 'queued' OR (status = 'cancelling' AND kind = 'migrate'))",
             params![now, now, id, instance_id],
         )?;
         if updated == 0 {
@@ -453,7 +457,8 @@ impl ConfigDb {
     /// release OUR lease so the next boot resumes it at once instead of
     /// after one lease TTL. A `running` row goes back to `queued` with phase
     /// and cursor preserved; a `cancelling` row keeps its status (the requeue
-    /// scan settles it `cancelled`). Returns whether a row changed.
+    /// scan settles it `cancelled`, or the next claim runs a migrate's
+    /// cancel). Returns whether a row changed.
     pub fn maintenance_release_for_resume(
         &self,
         job_id: i64,
@@ -525,16 +530,16 @@ impl ConfigDb {
     /// Reconciliation: jobs left `running` by a dead process go back to
     /// `queued` with phase + continuation token PRESERVED, so the worker
     /// resumes them; `cancelling` rows instead settle to `cancelled` (the
-    /// operator's cancel outranks resume). ONLY rows whose leader lease has lapsed
+    /// operator's cancel outranks resume), except a migrate: its cancel must
+    /// run the pre-flip unwind (remove the staged copies and the staging
+    /// route), so the row stays `cancelling` and the next claim runs the
+    /// cancel (`maintenance_claim_next_job`). ONLY rows whose leader lease has lapsed
     /// are touched: under multi-instance config sync the DB file (with
     /// `maintenance_jobs` rows in it) is copied between instances, and a
     /// peer's LIVE job must not be resurrected here — its heartbeats keep
     /// the lease fresh. A genuinely dead runner's row becomes claimable
     /// within one lease TTL because the worker loop calls this on every
     /// poll tick, not just at boot. Returns the number re-queued.
-    /// KNOWN LIMIT: a migrate job settled 'cancelled' here skips the live
-    /// worker's pre-flip unwind; its transient __dgmigrate_* route stays until
-    /// the next boot reconcile clears it (gated + hidden from listings = inert).
     pub fn maintenance_requeue_abandoned(&self) -> Result<usize, ConfigDbError> {
         let now = current_unix_seconds();
         // Operator cancel is authoritative: a dead runner's 'cancelling' row
@@ -546,7 +551,7 @@ impl ConfigDb {
                     leader_expires_at = NULL,
                     finished_at = ?,
                     updated_at = ?
-              WHERE status = 'cancelling'
+              WHERE status = 'cancelling' AND kind != 'migrate'
                 AND (leader_instance_id IS NULL
                      OR leader_expires_at IS NULL
                      OR leader_expires_at < ?)",
@@ -966,6 +971,38 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(db.maintenance_active_job_for_bucket("b").unwrap().is_none());
+    }
+
+    /// A migrate's cancel must run its pre-flip unwind, so an abandoned
+    /// `cancelling` migrate is not settled by the scan: the next claim takes
+    /// it, with its status kept, and the worker runs the cancel.
+    #[test]
+    fn an_abandoned_cancelling_migrate_is_claimed_to_run_its_cancel() {
+        let db = db();
+        let id = db
+            .maintenance_create_job("migrate", "b", "copy", None, "admin", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_claim_next_job("w", current_unix_seconds(), 60)
+            .unwrap()
+            .unwrap();
+        db.maintenance_request_cancel(id).unwrap();
+        assert!(db.maintenance_release_for_resume(id, "w").unwrap());
+        assert_eq!(db.maintenance_requeue_abandoned().unwrap(), 0);
+        assert_eq!(
+            db.maintenance_job_by_id(id).unwrap().unwrap().status,
+            "cancelling"
+        );
+        let claimed = db
+            .maintenance_claim_next_job("w2", current_unix_seconds(), 60)
+            .unwrap()
+            .expect("the cancel is resumable");
+        assert_eq!((claimed.id, claimed.status.as_str()), (id, "cancelling"));
+        // A live lease is never taken.
+        assert!(db
+            .maintenance_claim_next_job("w3", current_unix_seconds(), 60)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
