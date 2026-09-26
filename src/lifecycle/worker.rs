@@ -1038,6 +1038,7 @@ fn spawn_lease_heartbeat(
     let heartbeat_secs = lease.heartbeat_secs.max(1) as u64;
     Some(tokio::spawn(async move {
         let interval = std::time::Duration::from_secs(heartbeat_secs);
+        let mut last_ok = std::time::Instant::now();
         loop {
             tokio::time::sleep(interval).await;
             let renewed = {
@@ -1048,18 +1049,55 @@ fn spawn_lease_heartbeat(
                     super::current_unix_seconds(),
                     lease.ttl_secs,
                 )
-                .unwrap_or(false)
             };
-            if !renewed {
-                lease_alive.store(false, std::sync::atomic::Ordering::Release);
-                warn!(
-                    "Lifecycle lease heartbeat lost for rule '{}'; worker will stop before more work",
-                    rule_name
-                );
-                return;
+            match heartbeat_step(&renewed, last_ok.elapsed(), &lease) {
+                HeartbeatStep::Renewed => last_ok = std::time::Instant::now(),
+                HeartbeatStep::Retry => {
+                    if let Err(e) = &renewed {
+                        warn!("Lifecycle lease renew for rule '{rule_name}' failed ({e}); retrying");
+                    }
+                }
+                HeartbeatStep::Lost => {
+                    lease_alive.store(false, std::sync::atomic::Ordering::Release);
+                    warn!(
+                        "Lifecycle lease heartbeat lost for rule '{}'; worker will stop before more work",
+                        rule_name
+                    );
+                    return;
+                }
             }
         }
     }))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum HeartbeatStep {
+    Renewed,
+    Retry,
+    Lost,
+}
+
+/// One heartbeat's verdict. A refused renew is a lost lease. A DB error is
+/// not: the lease is still ours until its TTL, so retry while the next
+/// retry still lands before the expiry (`since_ok` = age of the last renew).
+fn heartbeat_step<E>(
+    renewed: &Result<bool, E>,
+    since_ok: std::time::Duration,
+    lease: &RunLease,
+) -> HeartbeatStep {
+    match renewed {
+        Ok(true) => HeartbeatStep::Renewed,
+        Ok(false) => HeartbeatStep::Lost,
+        Err(_) => {
+            let ttl = lease.ttl_secs.max(1) as u64;
+            let hb = lease.heartbeat_secs.max(1) as u64;
+            if since_ok.as_secs().saturating_add(hb) < ttl {
+                HeartbeatStep::Retry
+            } else {
+                HeartbeatStep::Lost
+            }
+        }
+    }
 }
 
 /// True when any bucket this rule WRITES to (source-for-deletes + transition
@@ -1132,14 +1170,20 @@ async fn renew_run_lease(
         if !ctx.lease_alive.load(std::sync::atomic::Ordering::Acquire) {
             false
         } else {
-            guard
-                .lifecycle_renew_lease(
-                    &rule.name,
-                    &lease.owner,
-                    super::current_unix_seconds(),
-                    lease.ttl_secs,
-                )
-                .map_err(|err| err.to_string())?
+            match guard.lifecycle_renew_lease(
+                &rule.name,
+                &lease.owner,
+                super::current_unix_seconds(),
+                lease.ttl_secs,
+            ) {
+                Ok(renewed) => renewed,
+                // Not a lost lease: the heartbeat retries it and marks the
+                // lease lost only when the TTL runs out.
+                Err(err) => {
+                    warn!("Lifecycle lease renew for rule '{}' failed ({err}); going on", rule.name);
+                    true
+                }
+            }
         }
     };
     if renewed {
@@ -1650,5 +1694,69 @@ mod review3_tests {
                 .unwrap(),
             "the lease of a run that is gone is still renewed"
         );
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_db_error_tests {
+    use super::*;
+
+    /// A DB error on one renew (a locked or busy DB) is not a lost lease:
+    /// the lease is still ours until its TTL. The heartbeat read the error
+    /// as "lost" and stopped the run.
+    #[tokio::test]
+    async fn a_db_error_on_one_renew_does_not_lose_the_lease() {
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("k").unwrap()));
+        let now = crate::lifecycle::current_unix_seconds();
+        {
+            let d = db.lock().await;
+            d.lifecycle_ensure_state("r", now).unwrap();
+            assert!(d.lifecycle_try_acquire_lease("r", "X", now, 30).unwrap());
+            // Every statement on the table fails until it is renamed back.
+            d.conn
+                .execute_batch("ALTER TABLE lifecycle_state RENAME TO lifecycle_state_off")
+                .unwrap();
+        }
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hb = spawn_lease_heartbeat(
+            Some(db.clone()),
+            "r",
+            Some(RunLease {
+                owner: "X".into(),
+                ttl_secs: 30,
+                heartbeat_secs: 1,
+            }),
+            alive.clone(),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        db.lock()
+            .await
+            .conn
+            .execute_batch("ALTER TABLE lifecycle_state_off RENAME TO lifecycle_state")
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        hb.abort();
+        assert!(
+            alive.load(std::sync::atomic::Ordering::Acquire),
+            "one failed renew marked a live lease lost"
+        );
+    }
+
+    #[test]
+    fn heartbeat_step_truth_table() {
+        let lease = RunLease {
+            owner: "X".into(),
+            ttl_secs: 300,
+            heartbeat_secs: 60,
+        };
+        let secs = std::time::Duration::from_secs;
+        let err: Result<bool, &str> = Err("busy");
+        assert_eq!(heartbeat_step(&Ok::<_, ()>(true), secs(999), &lease), HeartbeatStep::Renewed);
+        assert_eq!(heartbeat_step(&Ok::<_, ()>(false), secs(0), &lease), HeartbeatStep::Lost);
+        assert_eq!(heartbeat_step(&err, secs(60), &lease), HeartbeatStep::Retry);
+        assert_eq!(heartbeat_step(&err, secs(239), &lease), HeartbeatStep::Retry);
+        // The next retry would land at the expiry: lost now.
+        assert_eq!(heartbeat_step(&err, secs(240), &lease), HeartbeatStep::Lost);
     }
 }
