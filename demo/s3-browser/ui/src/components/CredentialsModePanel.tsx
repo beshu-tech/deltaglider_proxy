@@ -29,13 +29,16 @@
  * plumbing applies. Dirty state + ApplyDialog + AdminPage's
  * sidebar-dot coordination all free from `useDirtySection`.
  */
+import { useState } from 'react';
 import {
   Alert,
+  Button,
   Input,
   Modal,
   Radio,
   Typography,
 } from 'antd';
+import { useQueryClient } from '@tanstack/react-query';
 import {
   ExclamationCircleOutlined,
   KeyOutlined,
@@ -43,7 +46,10 @@ import {
   SafetyOutlined,
   TeamOutlined,
 } from '@ant-design/icons';
-import type { IamMode } from '../adminApi';
+import { removeBootstrapCredentials, type IamMode } from '../adminApi';
+import { ApiError, normalizeUiError } from '../errorHandling';
+import { confirmDialog } from '../confirmDialog';
+import { qk } from '../queries/keys';
 import { useColors } from '../ThemeContext';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import { useSectionEditor } from '../useSectionEditor';
@@ -77,6 +83,18 @@ const EMPTY_ACCESS: AccessSectionBody = {
 
 type AuthMode = 'auto' | 'none';
 
+/**
+ * The PUT body: an empty key field means "keep the current value" (the
+ * same rule as the blank secret), never "set it to the empty string".
+ * Removal is the explicit "Remove bootstrap credentials" action.
+ */
+function accessPayload(v: AccessSectionBody): AccessSectionBody {
+  const out = { ...v };
+  if (!out.access_key_id) delete out.access_key_id;
+  if (!out.secret_access_key) delete out.secret_access_key;
+  return out;
+}
+
 interface Props {
   onSessionExpired?: () => void;
 }
@@ -104,7 +122,11 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
     initial: EMPTY_ACCESS,
     onSessionExpired,
     noun: 'access',
+    toPayload: accessPayload,
   });
+  const qc = useQueryClient();
+  const [removing, setRemoving] = useState(false);
+  const [removeError, setRemoveError] = useState<string | null>(null);
 
   // The RUNNING auth state (env variables included), so the page never
   // implies auth is off while an env-provided key keeps SigV4 on.
@@ -173,7 +195,42 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
     }));
   };
 
-  const setAccessKey = (v: string) => setForm((prev) => ({ ...prev, access_key_id: v || undefined }));
+  // The section GET redacts the access key id; the running config carries
+  // it (it is not a secret). Show it, so an empty field never reads as
+  // "no bootstrap key". Typing the same id back is no change.
+  const runningKeyId = runtimeConfig?.access_key_id ?? undefined;
+  // An env variable wins over the file: removing the file's pair would not
+  // remove the key, so the action is not offered then.
+  const accessKeyEnv = useEnvOverride('access.access_key_id');
+  const accessKeyShown = form.access_key_id ?? runningKeyId ?? '';
+  const setAccessKey = (v: string) =>
+    setForm((prev) => ({ ...prev, access_key_id: v === runningKeyId ? undefined : v }));
+
+  const removeBootstrap = async () => {
+    const ok = await confirmDialog({
+      title: 'Remove the bootstrap credentials?',
+      content:
+        'S3 clients that sign with this access key are refused from now on. IAM users keep working. ' +
+        'The admin GUI password does not change.',
+      okText: 'Remove',
+      danger: true,
+    });
+    if (!ok) return;
+    setRemoving(true);
+    setRemoveError(null);
+    try {
+      await removeBootstrapCredentials();
+      await qc.invalidateQueries({ queryKey: qk.config() });
+    } catch (e) {
+      setRemoveError(
+        e instanceof ApiError && (e.status === 404 || e.status === 405)
+          ? 'This proxy cannot remove the bootstrap credentials from the GUI. Remove access.access_key_id and access.secret_access_key from the YAML config instead.'
+          : normalizeUiError(e, 'Could not remove the bootstrap credentials'),
+      );
+    } finally {
+      setRemoving(false);
+    }
+  };
   const setSecretKey = (v: string) => setForm((prev) => ({ ...prev, secret_access_key: v || undefined }));
 
   if (error) {
@@ -323,7 +380,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
             helpText="Clients use this key to sign S3 requests."
           >
             <Input
-              value={form.access_key_id ?? ''}
+              value={accessKeyShown}
               onChange={(e) => setAccessKey(e.target.value)}
               placeholder="AKIAIOSFODNN7EXAMPLE"
               style={{ ...inputRadius, fontFamily: 'var(--font-mono)', fontSize: 13 }}
@@ -333,7 +390,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
             label="Secret access key"
             yamlPath="access.secret_access_key"
             helpText={
-              form.access_key_id
+              accessKeyShown
                 ? 'Leave empty to keep the current secret unchanged. Paste a new value to rotate.'
                 : 'Shared secret paired with the access key.'
             }
@@ -344,7 +401,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
             <input
               type="text"
               autoComplete="username"
-              value={form.access_key_id ?? ''}
+              value={accessKeyShown}
               readOnly
               aria-hidden="true"
               tabIndex={-1}
@@ -361,8 +418,16 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
           </FormField>
           <Text type="secondary" style={{ fontSize: 12, marginTop: -4 }}>
             The current secret is never shown. To rotate the credentials,
-            set both fields. To remove them, clear both fields.
+            set both fields. An empty field keeps the current value.
           </Text>
+          {runningKeyId && !accessKeyEnv && (
+            <div>
+              <Button danger loading={removing} onClick={() => void removeBootstrap()}>
+                Remove bootstrap credentials
+              </Button>
+            </div>
+          )}
+          {removeError && <Alert type="error" showIcon title={removeError} style={{ borderRadius: 8 }} />}
         </div>
       </div>
 

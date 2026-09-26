@@ -343,6 +343,24 @@ export type BackendHealthEntry = {
 /** Throws `ApiError` on failure. Callers detect expiry with
  *  `useSessionExpiredOn(error, …)`; a failed load is NOT a config (never
  *  read a missing `iam_mode` as GUI mode). */
+/**
+ * Remove the bootstrap SigV4 pair (`access.access_key_id` +
+ * `access.secret_access_key`). An empty field in a section PUT means
+ * "keep" (the GET redacts the secret), so removal is its own request.
+ *
+ * Wire contract (explore item 11; the server route is owned by the core
+ * fix branch, which matches it):
+ *   DELETE /_/api/admin/config/bootstrap-credentials
+ *     200 {"ok": true}   the pair is removed, persisted, and SigV4 state rebuilt
+ *     4xx {"error": ...} refused, e.g. no other way to sign S3 requests is left
+ */
+export async function removeBootstrapCredentials(): Promise<void> {
+  await adminRequest('/api/admin/config/bootstrap-credentials', {
+    method: 'DELETE',
+    context: 'Remove bootstrap credentials',
+  });
+}
+
 export async function getAdminConfig(): Promise<AdminConfig> {
   return adminJson('/api/admin/config', { context: 'Config load' });
 }

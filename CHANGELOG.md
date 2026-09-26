@@ -73,6 +73,14 @@ refuses a destination that already holds objects: the job fails in its
 dialog) makes the destination an exact copy instead: destination objects that
 the source does not hold are deleted before the flip, and each delete is
 audited as `maintenance_migrate_mirror_delete`.
+### Fixed — The Credentials page shows the bootstrap access key and removes it on request
+
+The page showed an empty access key field while a bootstrap key was
+configured, and it said "to remove them, clear both fields", although an
+empty field keeps the current value. The field now shows the configured
+access key ID, and a **Remove bootstrap credentials** button removes the pair
+after a confirmation.
+
 ### Fixed — A locked-out sign-in says that it is locked, and for how long
 
 After too many failed sign-ins the proxy refuses every attempt from that
