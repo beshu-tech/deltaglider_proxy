@@ -95,7 +95,9 @@ pub async fn get_with_server_age(
         aws_sdk_s3::operation::get_object::GetObjectOutput,
         Option<i64>,
     ),
-    aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>,
+    // Boxed: the SDK error is large (clippy::result_large_err on the CI
+    // toolchain), and this is a cold path.
+    Box<aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::get_object::GetObjectError>>,
 > {
     let date = ServerDate::default();
     let out = client
@@ -105,7 +107,8 @@ pub async fn get_with_server_age(
         .customize()
         .interceptor(date.clone())
         .send()
-        .await?;
+        .await
+        .map_err(Box::new)?;
     let age = server_age(date.get(), out.last_modified().map(|t| t.secs()));
     Ok((out, age))
 }

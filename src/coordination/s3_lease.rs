@@ -214,7 +214,7 @@ impl S3Lease {
             }
             Err(e) => {
                 if crate::config_db_sync::is_object_absent(
-                    &crate::config_db_sync::sdk_error_signal(&e),
+                    &crate::config_db_sync::sdk_error_signal(&*e),
                 ) {
                     Ok(LeaseRead::Absent)
                 } else {
