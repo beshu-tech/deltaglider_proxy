@@ -359,6 +359,7 @@ jobs:
             admin_bulk_objects_test:: \
             browser_session_connect_test:: \
             admin_config_test:: \
+            admin_handlers_test:: \
             admin_login_as_test:: \
             admin_section_test:: \
             bucket_existence_test:: \

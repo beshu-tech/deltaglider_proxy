@@ -16,6 +16,8 @@ mod common;
 mod admin_bulk_objects_test;
 #[path = "admin_config_test.rs"]
 mod admin_config_test;
+#[path = "admin_handlers_test.rs"]
+mod admin_handlers_test;
 #[path = "admin_login_as_test.rs"]
 mod admin_login_as_test;
 #[path = "admin_section_test.rs"]
