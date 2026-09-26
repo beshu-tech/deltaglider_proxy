@@ -308,7 +308,7 @@ impl S3ReferenceLock {
         match put.send().await {
             Ok(_) => Ok(true),
             Err(e) => {
-                if crate::config_db_sync::is_precondition_failed(
+                if crate::coordination::cas::conditional_write_lost(
                     &crate::config_db_sync::sdk_error_signal(&e),
                 ) {
                     Ok(false) // a peer won the race — expected, not an error

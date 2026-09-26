@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — Leases and locks read a racing conditional write as a lost race
+
+With config sync on, the replication lease, the reference lock and the backend
+CAS probe make conditional writes to S3. AWS answers two conditional writes
+that race each other with `409 ConditionalRequestConflict`. These paths
+checked only for `412 PreconditionFailed`, so a 409 made a lease or lock step
+fail with an error instead of reporting that another instance won. One shared
+rule now reads both answers as a lost race, everywhere.
+
 ### Added — Garbage collection of listing-facts entries whose object is gone
 
 The removal of listing-facts entries after a delete is best effort: its

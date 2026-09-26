@@ -22,6 +22,7 @@
 //! the exact expiry instant is never simultaneously renewable and stealable.
 
 pub mod capability;
+pub mod cas;
 pub mod cas_probe;
 pub mod health;
 pub mod lease;

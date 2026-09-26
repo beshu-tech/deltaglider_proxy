@@ -877,7 +877,7 @@ impl S3Backend {
 
         let resp = request.send().await.map_err(|e| {
             if expect_etag.is_some()
-                && crate::config_db_sync::is_precondition_failed(
+                && crate::coordination::cas::conditional_write_lost(
                     &crate::config_db_sync::sdk_error_signal(&e),
                 )
             {
@@ -3571,13 +3571,6 @@ async fn md5_hex_of_file(path: &std::path::Path) -> Option<String> {
     .flatten()
 }
 
-/// AWS answers a conditional write that races another one with `409
-/// ConditionalRequestConflict` ("retry"): another writer is changing the
-/// object, so the fence cannot hold. Plain 409s (BucketNotEmpty, …) are not.
-fn is_conditional_conflict(signal: &str) -> bool {
-    signal.contains("status=409") && signal.contains("code=ConditionalRequestConflict")
-}
-
 /// Pure: classify a failed write by its SDK signal (status + code).
 fn fenced_write_verdict(fence: &RefFence, signal: &str) -> FencedWriteVerdict {
     let conditional = match fence {
@@ -3587,9 +3580,7 @@ fn fenced_write_verdict(fence: &RefFence, signal: &str) -> FencedWriteVerdict {
     };
     if !conditional {
         FencedWriteVerdict::Other
-    } else if crate::config_db_sync::is_precondition_failed(signal)
-        || is_conditional_conflict(signal)
-    {
+    } else if crate::coordination::cas::conditional_write_lost(signal) {
         FencedWriteVerdict::Lost
     } else if crate::config_db_sync::is_not_implemented(signal) {
         FencedWriteVerdict::Unsupported
