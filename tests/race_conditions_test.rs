@@ -164,21 +164,25 @@ async fn complete_multipart_race(server: &TestServer, key: &str) {
     );
 }
 
-const LIFECYCLE_RACE_YAML: &str = r#"
+fn lifecycle_race_yaml(bucket: &str) -> String {
+    format!(
+        r#"
 lifecycle:
   enabled: true
   tick_interval: "1h"
   rules:
     - name: expire-race
       enabled: true
-      bucket: bucket
+      bucket: {bucket}
       prefix: "old/"
       action: delete
       expire_after: "3s"
       batch_size: 1000
       include_globs: []
       exclude_globs: []
-"#;
+"#
+    )
+}
 
 /// Lifecycle age-delete while clients overwrite the expired keys: an
 /// overwrite is a new object the rule never judged (age 0), so after the
@@ -187,50 +191,105 @@ lifecycle:
 #[tokio::test]
 async fn lifecycle_delete_never_removes_a_concurrent_overwrite() {
     let server = TestServer::builder()
-        .extra_yaml_storage_section(LIFECYCLE_RACE_YAML)
+        .extra_yaml_storage_section(&lifecycle_race_yaml("bucket"))
         .build()
         .await;
-    let http = server.http();
-    let admin = admin_http_client(&server.endpoint()).await;
+    lifecycle_race(&server, &server, 1).await;
+}
+
+/// Two instances on one S3 bucket: lifecycle runs on `a`, clients
+/// overwrite through `b`, whose PUTs do not take `a`'s in-process lock.
+/// Only a conditional delete (If-Match) keeps the overwrites.
+#[tokio::test]
+async fn lifecycle_delete_never_removes_an_overwrite_from_another_instance() {
+    skip_unless_minio!();
+    let (a, b) = two_instances_on_one_bucket(Some(lifecycle_race_yaml)).await;
+    // The cross-instance window is small: without a conditional delete a
+    // round loses an overwrite about every other time.
+    lifecycle_race(&a, &b, 4).await;
+}
+
+/// Two proxies sharing one fresh MinIO bucket. `yaml` (given the bucket
+/// name) goes into the first one's storage section.
+async fn two_instances_on_one_bucket(yaml: Option<fn(&str) -> String>) -> (TestServer, TestServer) {
+    let bucket = common::unique_bucket("race-2i");
+    let spawn = |extra: Option<String>| {
+        let mut b = TestServer::builder()
+            .s3_endpoint(&common::minio_endpoint_url())
+            .bucket(&bucket);
+        if let Some(y) = extra {
+            b = b.extra_yaml_storage_section(&y);
+        }
+        b.build()
+    };
+    let a = spawn(yaml.map(|f| f(&bucket))).await;
+    let b = spawn(None).await;
+    (a, b)
+}
+
+/// Overwrite every key once, all at once, while `done` runs. Returns the
+/// new body of each key. (Overwriting round after round keeps every key
+/// fresh, so the rule plans nothing and the race never happens.)
+async fn overwrite_during<F: std::future::Future>(
+    writer: &TestServer,
+    keys: &[String],
+    round: usize,
+    done: F,
+) -> (F::Output, Vec<Vec<u8>>) {
+    let http = writer.http();
+    let bodies: Vec<Vec<u8>> = keys
+        .iter()
+        .map(|k| format!("round {round}: new generation of {k}").into_bytes())
+        .collect();
+    let writes = join_all(keys.iter().zip(&bodies).map(|(k, b)| {
+        http.s3_request(Method::PUT, &obj_url(writer, k))
+            .body(b.clone())
+            .send()
+    }));
+    let (out, ws) = tokio::join!(done, writes);
+    for w in ws {
+        assert_eq!(w.unwrap().status().as_u16(), 200, "overwrite PUT");
+    }
+    (out, bodies)
+}
+
+/// `rounds` times: let every key expire, then run the rule while a burst
+/// overwrites every key. After each round every key holds its new bytes.
+async fn lifecycle_race(runner: &TestServer, writer: &TestServer, rounds: usize) {
+    let http = writer.http();
+    let admin = admin_http_client(&runner.endpoint()).await;
     const KEYS: usize = 100;
     let keys: Vec<String> = (0..KEYS).map(|i| format!("old/k{i:04}.txt")).collect();
     join_all(keys.iter().map(|k| {
-        http.s3_request(Method::PUT, &obj_url(&server, k))
+        http.s3_request(Method::PUT, &obj_url(writer, k))
             .body(b"old generation".to_vec())
             .send()
     }))
     .await
     .into_iter()
     .for_each(|r| assert_eq!(r.unwrap().status().as_u16(), 200));
-    tokio::time::sleep(Duration::from_millis(3500)).await;
 
-    let run = async {
-        common::lifecycle_run_now_and_wait(&admin, &server.endpoint(), "expire-race").await
-    };
-    let overwrite = join_all(keys.iter().map(|k| {
-        http.s3_request(Method::PUT, &obj_url(&server, k))
-            .body(format!("new generation of {k}").into_bytes())
-            .send()
-    }));
-    let (run, writes) = tokio::join!(run, overwrite);
-    for w in writes {
-        assert_eq!(w.unwrap().status().as_u16(), 200, "overwrite PUT");
-    }
-    assert!(run["status"].as_str().is_some(), "run settled: {run}");
+    let ep = runner.endpoint();
+    for round in 0..rounds {
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        let run = common::lifecycle_run_now_and_wait(&admin, &ep, "expire-race");
+        let (run, last) = overwrite_during(writer, &keys, round, run).await;
+        assert!(run["status"].as_str().is_some(), "run settled: {run}");
 
-    let mut lost = Vec::new();
-    for k in &keys {
-        let (code, body) = get(&server, k).await;
-        if code != 200 || body != format!("new generation of {k}").into_bytes() {
-            lost.push(format!("{k}: {code} {:?}", String::from_utf8_lossy(&body)));
+        let mut lost = Vec::new();
+        for (k, want) in keys.iter().zip(&last) {
+            let (code, body) = get(writer, k).await;
+            if code != 200 || &body != want {
+                lost.push(format!("{k}: {code} {:?}", String::from_utf8_lossy(&body)));
+            }
         }
+        assert!(
+            lost.is_empty(),
+            "round {round}: lifecycle removed {} of {KEYS} overwrites (run {run}):\n{}",
+            lost.len(),
+            lost.join("\n")
+        );
     }
-    assert!(
-        lost.is_empty(),
-        "lifecycle removed {} of {KEYS} overwrites (run {run}):\n{}",
-        lost.len(),
-        lost.join("\n")
-    );
 }
 
 /// Admin bulk move and bulk copy (and a second move) of the same keys at
@@ -337,15 +396,27 @@ async fn admin_move_and_copy_of_the_same_keys_lose_nothing() {
 #[tokio::test]
 async fn admin_move_never_removes_a_concurrent_overwrite() {
     let server = TestServer::filesystem().await;
-    let http = server.http();
-    let admin = admin_http_client(&server.endpoint()).await;
-    let bucket = server.bucket().to_string();
+    move_race(&server, &server).await;
+}
+
+/// Two instances on one S3 bucket: the move runs on `a`, clients
+/// overwrite the sources through `b`.
+#[tokio::test]
+async fn admin_move_never_removes_an_overwrite_from_another_instance() {
+    skip_unless_minio!();
+    let (a, b) = two_instances_on_one_bucket(None).await;
+    move_race(&a, &b).await;
+}
+
+async fn move_race(runner: &TestServer, writer: &TestServer) {
+    let http = writer.http();
+    let admin = admin_http_client(&runner.endpoint()).await;
+    let bucket = runner.bucket().to_string();
     const KEYS: usize = 100;
     let src = |i: usize| format!("mvsrc/k{i:03}.txt");
-    let fresh = |i: usize| format!("overwrite of key {i}").into_bytes();
     for i in 0..KEYS {
         let r = http
-            .s3_request(Method::PUT, &obj_url(&server, &src(i)))
+            .s3_request(Method::PUT, &obj_url(writer, &src(i)))
             .body(b"first version".to_vec())
             .send()
             .await
@@ -356,7 +427,7 @@ async fn admin_move_never_removes_a_concurrent_overwrite() {
         .map(|i| serde_json::json!({ "source_key": src(i), "relative": format!("k{i:03}.txt") }))
         .collect();
     let mv = admin
-        .post(format!("{}/_/api/admin/objects/move", server.endpoint()))
+        .post(format!("{}/_/api/admin/objects/move", runner.endpoint()))
         .json(&serde_json::json!({
             "source_bucket": bucket,
             "dest_bucket": bucket,
@@ -364,21 +435,14 @@ async fn admin_move_never_removes_a_concurrent_overwrite() {
             "items": items,
         }))
         .send();
-    let overwrites = join_all((0..KEYS).map(|i| {
-        http.s3_request(Method::PUT, &obj_url(&server, &src(i)))
-            .body(fresh(i))
-            .send()
-    }));
-    let (mv, writes) = tokio::join!(mv, overwrites);
+    let keys: Vec<String> = (0..KEYS).map(src).collect();
+    let (mv, last) = overwrite_during(writer, &keys, 0, mv).await;
     assert_eq!(mv.unwrap().status().as_u16(), 200, "move");
-    for w in writes {
-        assert_eq!(w.unwrap().status().as_u16(), 200, "overwrite PUT");
-    }
     let mut lost = Vec::new();
     for i in 0..KEYS {
-        let (sc, sb) = get(&server, &src(i)).await;
-        let (dc, db) = get(&server, &format!("mvdst/k{i:03}.txt")).await;
-        let kept = (sc == 200 && sb == fresh(i)) || (dc == 200 && db == fresh(i));
+        let (sc, sb) = get(writer, &src(i)).await;
+        let (dc, db) = get(writer, &format!("mvdst/k{i:03}.txt")).await;
+        let kept = (sc == 200 && sb == last[i]) || (dc == 200 && db == last[i]);
         if !kept {
             lost.push(format!(
                 "k{i:03}: src {sc}, dst {dc} {:?}",
