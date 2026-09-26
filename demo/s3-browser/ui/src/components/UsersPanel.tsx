@@ -11,7 +11,7 @@ import { qk } from '../queries/keys';
 import { userPermissionSummary, filterItems } from '../masterDetailFilter';
 import MasterDetailPanel from './MasterDetailPanel';
 import UserForm from './UserForm';
-import CredentialsBanner from './CredentialsBanner';
+import CredentialsModal from './CredentialsModal';
 import IamSourceBanner from './IamSourceBanner';
 import { normalizeUiError } from '../errorHandling';
 import { useNavigation } from '../NavigationContext';
@@ -69,12 +69,12 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
   // URL → state: when the query string changes (direct load, Back/Forward),
   // re-select that user. Only acts when a ?user= param is present so local
   // state (e.g. the unsaved "creating" form) isn't clobbered by a param-less
-  // URL.
+  // URL. It must NOT clear `newCreds`: create and clone write ?user=<new id>,
+  // and the secret they return is shown only once.
   useEffect(() => {
     if (urlUserId == null) return;
     setSelectedId(urlUserId);
     setCreating(false);
-    setNewCreds(null);
   }, [urlUserId]);
 
   const cloneMutation = useCloneUser();
@@ -155,16 +155,13 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
 
   const detail = (
     <>
-      {/* Credentials banner after create */}
       {newCreds && (
-        <div style={{ padding: '16px 28px 0' }}>
-          <CredentialsBanner
-            accessKey={newCreds.ak}
-            secretKey={newCreds.sk}
-            message="User created — save these credentials"
-            onClose={() => setNewCreds(null)}
-          />
-        </div>
+        <CredentialsModal
+          accessKey={newCreds.ak}
+          secretKey={newCreds.sk}
+          title="User created: save these credentials"
+          onClose={() => setNewCreds(null)}
+        />
       )}
 
       {creating ? (

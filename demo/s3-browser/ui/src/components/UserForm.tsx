@@ -18,7 +18,7 @@ import {
   rowsToPermissions,
   type PermissionRow,
 } from './permissionRows';
-import CredentialsBanner from './CredentialsBanner';
+import CredentialsModal from './CredentialsModal';
 import { generateId, generateSecret } from '../credentialGeneration';
 import { normalizeUiError } from '../errorHandling';
 import { IAM_DIRTY_KEYS, useDirtyFlag, useFormBaseline } from '../useDirtyFlag';
@@ -220,14 +220,12 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
       </div>
 
       {savedCredentials && (
-        <div style={{ marginBottom: 20 }}>
-          <CredentialsBanner
-            accessKey={savedCredentials.ak}
-            secretKey={savedCredentials.sk}
-            message={isEdit ? 'Credentials updated' : 'User created'}
-            onClose={() => setSavedCredentials(null)}
-          />
-        </div>
+        <CredentialsModal
+          accessKey={savedCredentials.ak}
+          secretKey={savedCredentials.sk}
+          title="Credentials updated: save them now"
+          onClose={() => setSavedCredentials(null)}
+        />
       )}
 
       {error && <Alert type="error" title={error} showIcon closable={{ onClose: () => setError('') }} style={{ marginBottom: 16, borderRadius: 8 }} />}
