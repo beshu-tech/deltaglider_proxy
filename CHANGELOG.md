@@ -286,10 +286,27 @@ two instances edit the same rule, the merge keeps one rule (the more recent
 edit) instead of both versions. The upgrade derives the uid of an existing
 rule from its content, so equal rules on two instances get the same uid.
 
+When both sides change the same row, the merge compares it column by column
+with the base (the permissions count as one column), so a key rotation on one
+instance and a permission edit on the other both survive; only a column that
+both sides changed goes to the more recent change. A rename of a user, group,
+or provider is matched by the row's id and creation time, and it is applied
+to the other side before the merge, so a login or a membership change on the
+other instance still reaches the renamed row. Two users that two instances
+created with one name and different access keys (for example two people with
+one IdP display name) stay two users: the one whose access key sorts later is
+renamed to `<name>-<first 6 access key characters, lower case>`, on every
+instance alike. OAuth provisioning of a taken name uses the same suffix
+instead of `-2`. A failed commit of the merge rolls back.
+
 Upgrade: the schema moves to v26 and v28, which add a `sync_mtime` column to
-the IAM tables and a `rule_uid` column to the mapping rules. The first sync after the upgrade has no merge base, so the copy in the
-bucket wins, as before. Upgrade every instance before you expect merges: an
-instance refuses a peer database with a different schema version.
+the IAM tables and a `rule_uid` column to the mapping rules. The first sync
+after the upgrade has no merge base, so the merge keeps every row of both
+sides: a create or edit that was not synced yet survives, and a delete that
+was not synced yet comes back. An instance reads the schema version of a
+synced database before it migrates it: it refuses a newer one, and it merges
+an older one after it migrates a copy. The rows of an older copy have no
+change time, so a conflict with them goes to the copy in the bucket.
 
 ### Changed — The IAM database has its own encryption key (upgrade step for multi-instance)
 
