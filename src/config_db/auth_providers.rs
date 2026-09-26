@@ -514,9 +514,35 @@ impl ConfigDb {
         raw_claims: Option<&serde_json::Value>,
         email_verified: bool,
     ) -> Result<ExternalIdentity, ConfigDbError> {
+        let id = Self::insert_external_identity(
+            &self.conn,
+            user_id,
+            provider_id,
+            external_sub,
+            email,
+            display_name,
+            raw_claims,
+            email_verified,
+        )?;
+        self.get_external_identity(id)
+    }
+
+    /// The INSERT of [`Self::create_external_identity`] on `conn` (a caller's
+    /// transaction or the plain connection). Returns the new identity id.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_external_identity(
+        conn: &rusqlite::Connection,
+        user_id: i64,
+        provider_id: i64,
+        external_sub: &str,
+        email: Option<&str>,
+        display_name: Option<&str>,
+        raw_claims: Option<&serde_json::Value>,
+        email_verified: bool,
+    ) -> Result<i64, ConfigDbError> {
         let claims_json: Option<String> =
             raw_claims.map(|v| serde_json::to_string(v).unwrap_or_default());
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO external_identities (user_id, provider_id, external_sub, email, \
              display_name, last_login, raw_claims, email_verified) \
              VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'), ?6, ?7)",
@@ -530,8 +556,7 @@ impl ConfigDb {
                 email_verified as i64,
             ],
         )?;
-        let id = self.conn.last_insert_rowid();
-        self.get_external_identity(id)
+        Ok(conn.last_insert_rowid())
     }
 
     /// Update an external identity (on returning login).
@@ -612,6 +637,19 @@ impl ConfigDb {
         secret_access_key: &str,
     ) -> Result<crate::iam::IamUser, ConfigDbError> {
         let tx = self.conn.unchecked_transaction()?;
+        let user_id = Self::insert_external_user(&tx, name, access_key_id, secret_access_key)?;
+        tx.commit()?;
+        self.get_user_by_id(user_id)
+    }
+
+    /// The INSERT of [`Self::create_external_user`], inside the caller's
+    /// transaction. Returns the new user id.
+    fn insert_external_user(
+        tx: &rusqlite::Connection,
+        name: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+    ) -> Result<i64, ConfigDbError> {
         // The IdP controls `name` (many let the user edit it), and user names
         // are unique: a name in use gets a suffix instead of another user's
         // `${iam:username}` prefix. The suffix comes from the new access key,
@@ -631,9 +669,43 @@ impl ConfigDb {
              VALUES (?1, ?2, ?3, 1, 'external')",
             params![name, access_key_id, secret_access_key],
         )?;
-        let user_id = tx.last_insert_rowid();
+        Ok(tx.last_insert_rowid())
+    }
+
+    /// First OAuth login: create the external user AND its identity link as
+    /// one unit. A failed identity insert leaves no user behind (an orphan
+    /// user has no identity, so the next login would create another one).
+    #[allow(clippy::too_many_arguments)]
+    pub fn provision_external_user(
+        &self,
+        name: &str,
+        access_key_id: &str,
+        secret_access_key: &str,
+        provider_id: i64,
+        external_sub: &str,
+        email: Option<&str>,
+        display_name: Option<&str>,
+        raw_claims: Option<&serde_json::Value>,
+        email_verified: bool,
+    ) -> Result<(crate::iam::IamUser, ExternalIdentity), ConfigDbError> {
+        // A dropped `tx` (any `?` below) rolls both inserts back.
+        let tx = self.conn.unchecked_transaction()?;
+        let user_id = Self::insert_external_user(&tx, name, access_key_id, secret_access_key)?;
+        let ident_id = Self::insert_external_identity(
+            &tx,
+            user_id,
+            provider_id,
+            external_sub,
+            email,
+            display_name,
+            raw_claims,
+            email_verified,
+        )?;
         tx.commit()?;
-        self.get_user_by_id(user_id)
+        Ok((
+            self.get_user_by_id(user_id)?,
+            self.get_external_identity(ident_id)?,
+        ))
     }
 
     /// Set group memberships for a user, replacing all existing memberships.
@@ -884,6 +956,29 @@ mod tests {
         db.delete_user(user.id).unwrap();
         let identities = db.list_external_identities().unwrap();
         assert!(identities.is_empty());
+    }
+
+    /// A first login whose identity insert fails (here: the provider is
+    /// gone) must not leave a user without an identity behind.
+    #[test]
+    fn a_failed_identity_insert_leaves_no_orphan_user() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let r = db.provision_external_user(
+            "alice",
+            "AKALICE00001",
+            "s",
+            4242,
+            "sub-a",
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(r.is_err(), "the identity insert must fail");
+        assert!(
+            db.load_users().unwrap().is_empty(),
+            "an orphan user is left behind"
+        );
     }
 
     #[test]

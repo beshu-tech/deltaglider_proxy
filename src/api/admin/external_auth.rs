@@ -483,20 +483,20 @@ pub async fn oauth_callback(
             let ak = keygen::generate_access_key_id();
             let sk = keygen::generate_secret_access_key();
 
-            match db.create_external_user(display_name, &ak, &sk) {
-                Ok(user) => {
-                    // Create the external identity link
-                    if let Err(e) = db.create_external_identity(
-                        user.id,
-                        provider_config.id,
-                        &identity.subject,
-                        identity.email.as_deref(),
-                        identity.name.as_deref(),
-                        Some(&identity.raw_claims),
-                        identity.email_verified,
-                    ) {
-                        tracing::error!("Failed to create external identity: {}", e);
-                    }
+            // User and identity link in one transaction: a failed link
+            // must not leave a user that no login can ever find again.
+            match db.provision_external_user(
+                display_name,
+                &ak,
+                &sk,
+                provider_config.id,
+                &identity.subject,
+                identity.email.as_deref(),
+                identity.name.as_deref(),
+                Some(&identity.raw_claims),
+                identity.email_verified,
+            ) {
+                Ok((user, _)) => {
                     tracing::info!(
                         "Auto-provisioned external user '{}' (id={}) via '{}'",
                         user.name,
