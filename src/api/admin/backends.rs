@@ -101,6 +101,11 @@ fn build_backend_config(req: &CreateBackendRequest) -> Result<BackendConfig, Str
             {
                 return Err("S3 backend requires both access_key_id and secret_access_key".into());
             }
+            // The SSRF policy the engine applies at rebuild, checked here so
+            // a refused endpoint is the caller's error (400), not a 500.
+            if let Some(ep) = req.endpoint.as_deref() {
+                crate::storage::check_s3_endpoint(ep, false)?;
+            }
             Ok(BackendConfig::S3 {
                 session_token: None,
                 endpoint: req.endpoint.clone(),

@@ -3137,3 +3137,43 @@ async fn production_defaults_sdk_retry_after_a_lost_response_succeeds() {
         .expect("the SDK retry after a lost response must succeed");
     assert_eq!(get_body(&server, "lost.txt").await, b"stored once");
 }
+
+/// With the production SSRF default, a backend at a loopback http://
+/// endpoint is refused, and the proxy never connects to it.
+#[tokio::test]
+async fn production_defaults_refuse_a_loopback_backend() {
+    let server = TestServer::builder()
+        .production_security_defaults()
+        .build()
+        .await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .is_ok()
+    });
+    let admin = admin_http_client(&server.endpoint()).await;
+    let resp = admin
+        .post(format!("{}/_/api/admin/backends", server.endpoint()))
+        .json(&json!({
+            "name": "loopback",
+            "type": "s3",
+            "endpoint": format!("http://127.0.0.1:{port}"),
+            "access_key_id": "k",
+            "secret_access_key": "s",
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        status.is_client_error(),
+        "a loopback backend must be refused, got {status}: {body}"
+    );
+    assert!(
+        !accepted.await.unwrap(),
+        "the proxy connected to an SSRF-refused endpoint"
+    );
+}

@@ -247,6 +247,30 @@ fn resolve_created_at(meta_value: Option<String>, fallback: DateTime<Utc>) -> Da
         .unwrap_or(fallback)
 }
 
+/// The outbound-URL check of [`guard_s3_endpoint`], without a client: the
+/// admin API runs it on a new backend so a refused endpoint is a 400, not a
+/// failed engine rebuild (500). Returns the URL kind the resolver enforces.
+pub(crate) fn check_s3_endpoint(
+    ep: &str,
+    allow_local: bool,
+) -> Result<crate::security::UrlKind, String> {
+    let env_allow = crate::config::env_bool("DGP_BACKEND_ALLOW_LOCAL", false);
+    let kind = if allow_local || env_allow {
+        crate::security::UrlKind::BackendDev
+    } else {
+        crate::security::UrlKind::Backend
+    };
+    crate::security::validate_outbound_url(ep, kind).map_err(|e| {
+        format!(
+            "Refusing to use S3 endpoint {ep:?}: {e}. \
+             Set `allow_local: true` in the backend config (or \
+             DGP_BACKEND_ALLOW_LOCAL=true env) to permit http:// + \
+             private IPs for dev/CI."
+        )
+    })?;
+    Ok(kind)
+}
+
 /// The SDK's default HTTPS client (hyper 1 + rustls/aws-lc, env proxy
 /// config, SDK connector settings), with an SSRF-guarded DNS resolver.
 /// Mirrors `aws_smithy_runtime::client::http::default_https_client`.
@@ -270,20 +294,7 @@ pub(crate) fn guard_s3_endpoint(
     ep: &str,
     allow_local: bool,
 ) -> Result<aws_sdk_s3::config::Builder, String> {
-    let env_allow = crate::config::env_bool("DGP_BACKEND_ALLOW_LOCAL", false);
-    let kind = if allow_local || env_allow {
-        crate::security::UrlKind::BackendDev
-    } else {
-        crate::security::UrlKind::Backend
-    };
-    crate::security::validate_outbound_url(ep, kind).map_err(|e| {
-        format!(
-            "Refusing to use S3 endpoint {ep:?}: {e}. \
-             Set `allow_local: true` in the backend config (or \
-             DGP_BACKEND_ALLOW_LOCAL=true env) to permit http:// + \
-             private IPs for dev/CI."
-        )
-    })?;
+    let kind = check_s3_endpoint(ep, allow_local)?;
     let mut builder = builder.endpoint_url(ep);
     // The text check above cannot see DNS: a name whose record points at
     // IMDS (or rebinds there) passed. Private answers stay allowed: on-prem
