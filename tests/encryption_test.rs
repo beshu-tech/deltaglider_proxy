@@ -1056,15 +1056,14 @@ async fn a_key_id_mismatch_on_get_logs_its_cause() {
         .respawn_with_env(&[("DGP_ENCRYPTION_KEY", OTHER_KEY)])
         .await;
 
+    // One raw request: an SDK would retry the 500 and log it again.
     let get = server
-        .s3_client()
-        .await
-        .get_object()
-        .bucket(BUCKET)
-        .key("mismatch.bin")
+        .http()
+        .get(format!("{}/{BUCKET}/mismatch.bin", server.endpoint()))
         .send()
-        .await;
-    assert!(get.is_err(), "the GET must fail under the other key");
+        .await
+        .unwrap();
+    assert_eq!(get.status(), 500, "the GET must fail under the other key");
 
     let admin = common::admin_http_client(&server.endpoint()).await;
     let logs: serde_json::Value = admin
@@ -1083,6 +1082,11 @@ async fn a_key_id_mismatch_on_get_logs_its_cause() {
         text.contains("was encrypted with key id"),
         "no ERROR line names the key-id mismatch: {text}"
     );
+    // One request, one ERROR line: the cause. A second line that repeats
+    // only the sanitised client text is noise.
+    let errors = logs["entries"].as_array().expect("a log list");
+    assert_eq!(errors.len(), 1, "one ERROR line per 500: {text}");
+    assert!(errors[0].to_string().contains("was encrypted with key id"));
     assert!(
         !text.contains(TEST_KEY) && !text.contains(OTHER_KEY),
         "a key reached the log"

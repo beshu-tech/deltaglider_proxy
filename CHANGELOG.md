@@ -73,6 +73,13 @@ names the one object that the caller may read, the bucket and prefix that
 the caller may list, or the public prefixes of the bucket. For a write, it
 says that nothing is granted.
 
+### Fixed — A sanitised 500 is logged once
+
+A `500 InternalError` whose cause the proxy hides from the client logged
+two ERROR lines: the cause, and a second line that repeated only the
+client text "Internal server error. See server logs for details.". Now
+it logs one line, the cause.
+
 ### Fixed — A single sign-on lockout says how long it lasts
 
 A locked-out browser that started or finished a single sign-on flow got

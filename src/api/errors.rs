@@ -297,13 +297,25 @@ impl From<crate::storage::StorageError> for S3Error {
 /// The return value is deliberately generic. Operators read the real
 /// error in logs; clients see "Internal server error."
 pub fn sanitise_for_client(err: &dyn std::fmt::Display) -> String {
-    // Log the full detail exactly once per sanitisation. If the caller
-    // also logs, we'll have duplicate lines — acceptable for a rare
-    // error path. The default target (this module): the log filter is a
-    // list of crate targets (`deltaglider_proxy=…`), and an event under
-    // any other target is dropped, as the old `dgp::sanitised_error` was.
+    // Log the full detail exactly once per sanitisation; a caller that
+    // logs 500s skips an error whose cause this line already carries
+    // (`S3Error::cause_is_logged`). The default target (this module): the
+    // log filter is a list of crate targets (`deltaglider_proxy=…`), and an
+    // event under any other target is dropped, as the old
+    // `dgp::sanitised_error` was.
     tracing::error!("sanitised 500, cause: {}", err);
-    "Internal server error. See server logs for details.".to_string()
+    SANITISED_500.to_string()
+}
+
+/// The client text of a sanitised 500.
+const SANITISED_500: &str = "Internal server error. See server logs for details.";
+
+impl S3Error {
+    /// True for a 500 whose cause `sanitise_for_client` already logged: a
+    /// second log line would repeat only the generic client text.
+    pub fn cause_is_logged(&self) -> bool {
+        matches!(self, S3Error::InternalError(m) if m == SANITISED_500)
+    }
 }
 
 #[cfg(test)]

@@ -2490,7 +2490,9 @@ fn engine_error_to_s3s(err: impl Into<crate::api::S3Error>) -> s3s::S3Error {
             // timeout/throttle, a storage I/O failure, etc.) is lost and prod
             // 500s are undebuggable. Log the full Display (which includes the
             // underlying error chain) at ERROR before mapping.
-            tracing::error!(error = %other, code = other.code(), "mapping engine error to 500 InternalError");
+            if !other.cause_is_logged() {
+                tracing::error!(error = %other, code = other.code(), "mapping engine error to 500 InternalError");
+            }
             s3s::s3_error!(InternalError, "{}", other.code())
         }
     }
