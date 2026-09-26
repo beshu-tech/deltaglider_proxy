@@ -2203,12 +2203,13 @@ impl StorageBackend for S3Backend {
 
     #[instrument(skip(self))]
     async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError> {
-        self.client
-            .create_bucket()
-            .bucket(bucket)
-            .send()
-            .await
-            .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::CreateBucket))?;
+        let result = self.client.create_bucket().bucket(bucket).send().await;
+        if let Err(e) = result {
+            return match classify_create_bucket_conflict(bucket, e.code()) {
+                Some(outcome) => outcome,
+                None => Err(Self::classify_s3_error(bucket, &e, S3Op::CreateBucket)),
+            };
+        }
         debug!("Created S3 bucket: {}", bucket);
         Ok(())
     }
@@ -3700,6 +3701,21 @@ fn apply_native_encryption_mpu(
     request
 }
 
+/// Pure: a CreateBucket refused because the bucket exists. The caller's own
+/// bucket is a success (idempotent: the us-east-1 answer and what the
+/// filesystem backend gives), someone else's is `AlreadyExists` (409
+/// BucketAlreadyExists). `None`: not a conflict, classify as usual.
+fn classify_create_bucket_conflict(
+    bucket: &str,
+    code: Option<&str>,
+) -> Option<Result<(), StorageError>> {
+    match code {
+        Some("BucketAlreadyOwnedByYou") => Some(Ok(())),
+        Some("BucketAlreadyExists") => Some(Err(StorageError::AlreadyExists(bucket.to_string()))),
+        _ => None,
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Unit tests for error classification.
 //
@@ -3718,6 +3734,7 @@ fn apply_native_encryption_mpu(
 // in-tree via existing transitive dependencies, and constructing a
 // ServiceError for a classifier test is ~3 lines, not a mock server.
 // ────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod endpoint_guard_source_test {
     /// Every S3 client that gets a custom endpoint goes through
@@ -5232,5 +5249,24 @@ mod lost_response_tests {
             )
             .await;
         assert!(matches!(got, Err(StorageError::Throttled(_))), "{got:?}");
+    }
+}
+
+#[cfg(test)]
+mod create_bucket_conflict_tests {
+    use super::*;
+
+    #[test]
+    fn create_bucket_conflict_truth_table() {
+        assert!(matches!(
+            classify_create_bucket_conflict("b", Some("BucketAlreadyOwnedByYou")),
+            Some(Ok(()))
+        ));
+        assert!(matches!(
+            classify_create_bucket_conflict("b", Some("BucketAlreadyExists")),
+            Some(Err(StorageError::AlreadyExists(b))) if b == "b"
+        ));
+        assert!(classify_create_bucket_conflict("b", Some("AccessDenied")).is_none());
+        assert!(classify_create_bucket_conflict("b", None).is_none());
     }
 }
