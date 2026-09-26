@@ -210,7 +210,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
   }, [authed, activeApplyKeys]);
 
   // Memoised palette extra-actions. The underlying handlers
-  // (`setYamlModalMode`, `onShowShortcuts`, `navigateAdmin`, `onBack`)
+  // (`openYamlModal`, `onShowShortcuts`, `navigateAdmin`, `onBack`)
   // are stable, so the array only changes if those change. A fresh
   // array each render would invalidate the palette's useMemo chain
   // (commands → filtered) on every keystroke in the search input —
@@ -221,17 +221,17 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
         id: 'action:show-yaml',
         label: 'Show YAML',
         hint: 'View current config as canonical YAML (secrets redacted)',
-        keywords: 'show yaml view config copy',
+        keywords: 'show yaml view export download config copy',
         icon: <PaletteFileTextOutlined />,
-        onRun: () => setYamlModalMode('export'),
+        onRun: () => openYamlModal('export'),
       },
       {
         id: 'action:apply-yaml',
         label: 'Apply YAML',
         hint: 'Paste a YAML config document — validate, then apply',
-        keywords: 'apply yaml upload config paste',
+        keywords: 'apply yaml import upload config paste',
         icon: <PaletteImportOutlined />,
-        onRun: () => setYamlModalMode('import'),
+        onRun: () => openYamlModal('import'),
       },
       {
         id: 'action:setup-wizard',
@@ -259,7 +259,7 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
         onRun: () => onBack(),
       },
     ],
-    [navigateAdmin, onBack, onShowShortcuts]
+    [navigateAdmin, onBack, onShowShortcuts, openYamlModal]
   );
 
   // Check existing session on mount, or auto-login for IAM admins

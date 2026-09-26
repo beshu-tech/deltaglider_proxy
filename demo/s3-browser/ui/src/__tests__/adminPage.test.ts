@@ -31,3 +31,12 @@ test('ONE isZipFile', () => {
   assert.equal(isZipFile({ name: 'iam.json', type: 'application/json' }), false);
   assert.equal(isZipFile({ name: 'zip.json', type: '' }), false);
 });
+
+test('URL-synced modals open only through their open* helper', async () => {
+  // The YAML and IAM modals close whenever the URL lacks ?modal=…. A setter
+  // call with a mode (not null) outside the open* helper skips the URL push,
+  // so the modal closes at once: the palette's Show YAML did nothing.
+  const src = await readFile(new URL('../components/AdminPage.tsx', import.meta.url), 'utf8');
+  const opens = [...src.matchAll(/set(YamlModalMode|IamYamlMode)\((?!null\))/g)];
+  assert.equal(opens.length, 2, `expected only openYamlModal/openIamYamlModal to set a mode, got ${opens.length}`);
+});
