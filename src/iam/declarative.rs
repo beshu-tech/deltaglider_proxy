@@ -583,8 +583,52 @@ pub fn export_as_declarative_inner(
 /// both surfaces funnel through `diff_iam`, so the dry-run can't
 /// lie about what the live apply will actually do.
 pub fn preview_declarative_iam(db: &ConfigDb, yaml: &DeclarativeIam) -> Result<IamDiff, String> {
+    let diff = preview_declarative_iam_at_boot(db, yaml)?;
+    check_provider_changes(&diff)?;
+    Ok(diff)
+}
+
+/// [`preview_declarative_iam`] without [`check_provider_changes`]: the
+/// startup reconcile warns about a refused provider instead of refusing to
+/// start, so one broken SSO provider never takes the whole proxy down.
+pub fn preview_declarative_iam_at_boot(
+    db: &ConfigDb,
+    yaml: &DeclarativeIam,
+) -> Result<IamDiff, String> {
     let current = load_current_iam(db)?;
     diff_iam(yaml, &current)
+}
+
+/// The OIDC providers that an attended apply would create or change and
+/// whose issuer URL the provider's network policy (`extra_config.allow_local`)
+/// refuses — the admin API's save-time check. Only NEW or CHANGED providers:
+/// a provider the DB already holds unchanged (an upgrade) is never refused.
+/// The CA file is read at discovery, not here: this check is pure.
+pub fn refused_provider_changes(diff: &IamDiff) -> Vec<String> {
+    diff.providers_to_create
+        .iter()
+        .chain(diff.providers_to_update.iter().map(|(_, p)| p))
+        .filter(|p| p.provider_type == "oidc")
+        .filter_map(|p| {
+            crate::iam::external_auth::oidc::validate_provider_config(
+                p.issuer_url.as_deref(),
+                p.extra_config.as_ref(),
+                false,
+            )
+            .err()
+            .map(|e| format!("auth provider '{}': {e}", p.name))
+        })
+        .collect()
+}
+
+/// `Err` naming every [`refused_provider_changes`] entry.
+pub fn check_provider_changes(diff: &IamDiff) -> Result<(), String> {
+    let refused = refused_provider_changes(diff);
+    if refused.is_empty() {
+        Ok(())
+    } else {
+        Err(refused.join("; "))
+    }
 }
 
 /// Load the full `CurrentIam` snapshot from the DB, including the
@@ -696,20 +740,6 @@ fn validate(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<(), String> {
         yaml.users.iter().map(|u| &u.access_key_id),
         "iam_users.access_key_id",
     )?;
-
-    // OIDC providers: the issuer URL passes the provider's network policy
-    // (`extra_config.allow_local`), as on the admin API. The CA file is read
-    // at discovery, not here: this validation is pure.
-    for p in &yaml.auth_providers {
-        if p.provider_type == "oidc" {
-            crate::iam::external_auth::oidc::validate_provider_config(
-                p.issuer_url.as_deref(),
-                p.extra_config.as_ref(),
-                false,
-            )
-            .map_err(|e| format!("auth provider '{}': {e}", p.name))?;
-        }
-    }
 
     // Reserved-name blocks ($-prefixed are reserved for synthetic
     // principals like $anonymous and $bootstrap).
@@ -1436,6 +1466,20 @@ pub fn reconcile_declarative_iam(
 ) -> Result<ReconcileStats, String> {
     let current = load_current_iam(db)?;
     let diff = diff_iam(yaml, &current)?;
+    check_provider_changes(&diff)?;
+    db.apply_iam_reconcile(&diff, &current)
+        .map_err(|e| format!("apply reconcile: {e}"))
+}
+
+/// [`reconcile_declarative_iam`] for the unattended startup reconcile: a
+/// provider that [`check_provider_changes`] refuses is stored anyway (its
+/// discovery fails and logs, as before the check existed); the caller warns.
+pub fn reconcile_declarative_iam_at_boot(
+    db: &ConfigDb,
+    yaml: &DeclarativeIam,
+) -> Result<ReconcileStats, String> {
+    let current = load_current_iam(db)?;
+    let diff = diff_iam(yaml, &current)?;
     db.apply_iam_reconcile(&diff, &current)
         .map_err(|e| format!("apply reconcile: {e}"))
 }
@@ -1448,7 +1492,7 @@ pub fn reconcile_declarative_iam(
 /// runtime side effect (engine rebuild, snapshot publish) is committed (H8/H19).
 pub fn validate_declarative_iam(db: &ConfigDb, yaml: &DeclarativeIam) -> Result<(), String> {
     let current = load_current_iam(db)?;
-    diff_iam(yaml, &current).map(|_| ())
+    check_provider_changes(&diff_iam(yaml, &current)?)
 }
 
 // ───── Tests ───────────────────────────────────────────────────────────
@@ -1790,6 +1834,41 @@ mod tests {
         };
         let err = diff_iam(&yaml, &empty_db()).unwrap_err();
         assert!(err.contains("reserved"));
+    }
+
+    #[test]
+    fn only_new_or_changed_oidc_providers_are_refused() {
+        let prov = |issuer: &str, extra: Option<serde_json::Value>| DeclarativeAuthProvider {
+            name: "corp".into(),
+            provider_type: "oidc".into(),
+            enabled: true,
+            priority: 0,
+            display_name: None,
+            client_id: Some("c".into()),
+            client_secret: Some("s".into()),
+            issuer_url: Some(issuer.into()),
+            scopes: default_scopes(),
+            extra_config: extra,
+        };
+        let yaml = |p| DeclarativeIam {
+            auth_providers: vec![p],
+            ..Default::default()
+        };
+        // The pure diff accepts it: validation of the provider's URL is not
+        // a reason to refuse the whole IAM snapshot at boot.
+        let diff = diff_iam(&yaml(prov("http://127.0.0.1:9", None)), &empty_db()).unwrap();
+        let refused = refused_provider_changes(&diff);
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("allow_local"), "{refused:?}");
+        assert!(check_provider_changes(&diff).is_err());
+        let local = prov(
+            "http://127.0.0.1:9",
+            Some(serde_json::json!({"allow_local": true})),
+        );
+        let diff = diff_iam(&yaml(local), &empty_db()).unwrap();
+        assert!(refused_provider_changes(&diff).is_empty());
+        // Unchanged (already in the DB): not part of the diff, never refused.
+        assert!(refused_provider_changes(&IamDiff::default()).is_empty());
     }
 
     #[test]

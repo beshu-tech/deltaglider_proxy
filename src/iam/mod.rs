@@ -30,7 +30,8 @@ use tracing::warn;
 // Re-export everything at crate::iam level for backward compatibility
 pub use declarative::{
     diff_iam, duplicate_user_name, export_as_declarative, export_as_declarative_inner,
-    preview_declarative_iam, reconcile_declarative_iam, snapshot_from_access,
+    preview_declarative_iam, preview_declarative_iam_at_boot, reconcile_declarative_iam,
+    reconcile_declarative_iam_at_boot, refused_provider_changes, snapshot_from_access,
     validate_declarative_iam, CurrentIam, DeclarativeAuthProvider, DeclarativeExternalIdentity,
     DeclarativeGroup, DeclarativeIam, DeclarativeMappingRule, DeclarativeUser, IamDiff,
     MappingRulesAction, ReconcileStats,

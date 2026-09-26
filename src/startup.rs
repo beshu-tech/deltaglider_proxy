@@ -742,7 +742,8 @@ fn init_config_db_attempt(
                     &[],
                 );
                 // Preview the diff (no writes), then apply the pure policy.
-                let diff = match deltaglider_proxy::iam::preview_declarative_iam(&db, &yaml) {
+                let diff = match deltaglider_proxy::iam::preview_declarative_iam_at_boot(&db, &yaml)
+                {
                     Ok(d) => d,
                     Err(e) => {
                         error!(
@@ -783,7 +784,17 @@ fn init_config_db_attempt(
                         std::process::exit(1);
                     }
                     StartupReconcileAction::Reconcile => {
-                        match deltaglider_proxy::iam::reconcile_declarative_iam(&db, &yaml) {
+                        // A provider an attended apply would refuse boots
+                        // anyway: one broken SSO provider must not take the
+                        // S3 API down. Its discovery fails and logs.
+                        for refused in deltaglider_proxy::iam::refused_provider_changes(&diff) {
+                            warn!(
+                                "{refused}. Stored anyway at startup; sign-in with this \
+                                 provider will fail until the config is fixed"
+                            );
+                        }
+                        match deltaglider_proxy::iam::reconcile_declarative_iam_at_boot(&db, &yaml)
+                        {
                             Ok(stats) => info!(
                                 "Declarative IAM reconciled at startup: {} user(s), {} group(s) \
                                  ({} created, {} updated)",
