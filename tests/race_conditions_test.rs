@@ -39,15 +39,26 @@ async fn get(server: &TestServer, key: &str) -> (u16, Vec<u8>) {
 /// stored bytes are the winner's. Passthrough and delta-eligible keys.
 #[tokio::test]
 async fn conditional_put_if_none_match_has_exactly_one_winner() {
-    let server = TestServer::filesystem().await;
+    conditional_put_race(&TestServer::filesystem().await, "cond").await;
+}
+
+#[tokio::test]
+async fn conditional_put_if_none_match_has_exactly_one_winner_on_s3() {
+    skip_unless_minio!();
+    let prefix = common::unique_bucket("cond");
+    conditional_put_race(&TestServer::s3().await, &prefix).await;
+}
+
+async fn conditional_put_race(server: &TestServer, prefix: &str) {
     let http = server.http();
     let base = generate_binary(64 * 1024, 1);
-    for key in ["cond/one.bin", "cond-zip/one.zip"] {
+    for key in [format!("{prefix}/one.bin"), format!("{prefix}-zip/one.zip")] {
+        let key = key.as_str();
         let bodies: Vec<Vec<u8>> = (0..N)
             .map(|i| mutate_binary(&base, 0.01 + i as f64 * 0.001))
             .collect();
         let codes = join_all(bodies.iter().map(|b| {
-            http.s3_request(Method::PUT, &obj_url(&server, key))
+            http.s3_request(Method::PUT, &obj_url(server, key))
                 .header("If-None-Match", "*")
                 .body(b.clone())
                 .send()
@@ -62,7 +73,7 @@ async fn conditional_put_if_none_match_has_exactly_one_winner() {
             codes.iter().all(|c| matches!(c, 200 | 412 | 409)),
             "{key}: losers are refused, got {codes:?}"
         );
-        let (code, got) = get(&server, key).await;
+        let (code, got) = get(server, key).await;
         assert_eq!(code, 200);
         assert!(
             got == bodies[winners[0]],
@@ -75,10 +86,19 @@ async fn conditional_put_if_none_match_has_exactly_one_winner() {
 /// key at once: exactly one completes.
 #[tokio::test]
 async fn complete_multipart_if_none_match_has_exactly_one_winner() {
-    let server = TestServer::filesystem().await;
+    complete_multipart_race(&TestServer::filesystem().await, "cond-mp/one.bin").await;
+}
+
+#[tokio::test]
+async fn complete_multipart_if_none_match_has_exactly_one_winner_on_s3() {
+    skip_unless_minio!();
+    let key = format!("{}/one.bin", common::unique_bucket("cond-mp"));
+    complete_multipart_race(&TestServer::s3().await, &key).await;
+}
+
+async fn complete_multipart_race(server: &TestServer, key: &str) {
     let s3 = server.s3_client().await;
     let b = server.bucket();
-    let key = "cond-mp/one.bin";
     let mut uploads = Vec::new();
     for i in 0..N {
         let id = s3
@@ -137,7 +157,7 @@ async fn complete_multipart_if_none_match_has_exactly_one_winner() {
             );
         }
     }
-    let (_, got) = get(&server, key).await;
+    let (_, got) = get(server, key).await;
     assert_eq!(
         got, uploads[winners[0]].2,
         "the stored bytes are the winner's"
