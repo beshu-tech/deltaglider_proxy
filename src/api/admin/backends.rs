@@ -413,6 +413,7 @@ pub async fn create_bucket_on_backend(
 /// POST /api/admin/backends — add a new named backend.
 pub async fn create_backend(
     State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
     AdminJson(body): AdminJson<CreateBackendRequest>,
 ) -> impl IntoResponse {
     let name = body.name.trim().to_string();
@@ -539,6 +540,8 @@ pub async fn create_backend(
     if let Err(e) = cfg.persist_to_file(&persist_path) {
         tracing::warn!("Failed to persist config to {}: {}", persist_path, e);
     }
+    drop(cfg);
+    audit_log("backend_create", "admin", &name, &headers);
 
     (
         axum::http::StatusCode::CREATED,
@@ -554,6 +557,7 @@ pub async fn create_backend(
 pub async fn delete_backend(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let mut cfg = state.config.write().await;
 
@@ -662,6 +666,8 @@ pub async fn delete_backend(
     if let Err(e) = cfg.persist_to_file(&persist_path) {
         tracing::warn!("Failed to persist config to {}: {}", persist_path, e);
     }
+    drop(cfg);
+    audit_log("backend_delete", "admin", &name, &headers);
 
     (
         axum::http::StatusCode::OK,
