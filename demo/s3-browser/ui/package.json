@@ -19,7 +19,7 @@
     "test:all": "node scripts/run-regression-tests.mjs",
     "test:page-title": "node scripts/page-title-regression-test.mjs",
     "test:permissions": "node scripts/permissions-regression-test.mjs",
-  "test:docs-bundle": "node scripts/docs-bundle-regression-test.mjs",
+    "test:docs-bundle": "node scripts/docs-bundle-regression-test.mjs",
     "test:writable-prefixes": "node scripts/writable-prefixes-regression-test.mjs",
     "test:virtual-prefix-scan": "node scripts/virtual-prefix-scan-regression-test.mjs",
     "test:storage-path": "node scripts/storage-path-regression-test.mjs",
@@ -118,6 +118,10 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.56.0",
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/jest-dom": "7.0.1",
+    "@testing-library/react": "16.3.3",
+    "@testing-library/user-event": "14.6.7",
     "@types/node": "^26.0.0",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
@@ -126,9 +130,11 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.3",
     "globals": "^17.7.0",
+    "jsdom": "30.1.1",
     "knip": "^6.18.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.57.0",
-    "vite": "^8.1.0"
+    "vite": "^8.1.0",
+    "vitest": "5.0.2"
   }
 }

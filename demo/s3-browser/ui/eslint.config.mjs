@@ -184,6 +184,15 @@ export default tseslint.config(
     files: ['src/keyboard.ts'],
     rules: { 'no-restricted-syntax': 'off' },
   },
+  // Tests stub the raw storage and clipboard APIs the wrappers guard.
+  {
+    files: ['src/__tests__/**', 'src/test/**'],
+    rules: {
+      'no-restricted-properties': 'off',
+      'no-restricted-globals': 'off',
+      'react-refresh/only-export-components': 'off',
+    },
+  },
   {
     files: ['src/useCopyToClipboard.ts'],
     rules: { 'no-restricted-properties': 'off' },
