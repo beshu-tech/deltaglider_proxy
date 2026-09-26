@@ -1,5 +1,6 @@
 // Admin API client core: shared fetch glue + cross-cutting types.
 import { ApiError, isSessionExpired, normalizeUiError, throwApiError } from '../errorHandling';
+import { loginFailureMessage, retryAfterSeconds } from '../loginError';
 import type { EnvOverride } from '../envOverrides';
 import { BASE as APP_BASE } from '../urlState';
 import { requestRelogin } from '../sessionRelogin';
@@ -106,15 +107,22 @@ export async function adminJson<T>(path: string, opts: AdminRequestOptions = {})
   return safeJson<T>(await adminRequest(path, opts));
 }
 
+/** Password sign-in. On failure, `error` is the full sentence to show
+ *  (see `loginFailureMessage`: a 429 reads as a lockout with the wait). */
 export async function adminLogin(password: string): Promise<{ ok: boolean; error?: string }> {
   const res = await adminFetch('/api/admin/login', 'POST', { password });
   if (res.ok) return { ok: true };
-  try {
-    const data = await res.json();
-    return { ok: false, error: data.error || 'Login failed' };
-  } catch {
-    return { ok: false, error: 'Login failed' };
-  }
+  return { ok: false, error: await loginFailureFromResponse(res) };
+}
+
+/** The sign-in failure sentence for a non-2xx sign-in response. */
+export async function loginFailureFromResponse(res: Response): Promise<string> {
+  const data = (await res.json().catch(() => ({}))) as { error?: unknown; retry_after_secs?: unknown };
+  return loginFailureMessage({
+    status: res.status,
+    error: typeof data.error === 'string' ? data.error : undefined,
+    retryAfterSecs: retryAfterSeconds(res.headers.get('retry-after'), data),
+  });
 }
 
 export async function adminLogout(): Promise<void> {

@@ -169,7 +169,7 @@ export default function ConnectPage({ onConnect, showError }: Props) {
         }
         const adminResult = await adminLogin(adminPassword);
         if (!adminResult.ok) {
-          setError(`Login failed: ${adminResult.error || 'Invalid password'}`);
+          setError(adminResult.error || 'Login failed: wrong password.');
           setLoading(false);
           return;
         }

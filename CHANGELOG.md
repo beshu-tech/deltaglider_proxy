@@ -73,6 +73,16 @@ refuses a destination that already holds objects: the job fails in its
 dialog) makes the destination an exact copy instead: destination objects that
 the source does not hold are deleted before the flip, and each delete is
 audited as `maintenance_migrate_mirror_delete`.
+### Fixed — A locked-out sign-in says that it is locked, and for how long
+
+After too many failed sign-ins the proxy refuses every attempt from that
+address for a while, including one with the right password. The sign-in
+forms showed "Login failed: Login failed", so the operator kept retrying.
+Every sign-in form (admin password, IAM keys, re-login, browser session) now
+shows "Too many sign-in attempts. Try again in N min." and reads the wait
+from `Retry-After` (or `retry_after_secs` in the JSON body) when the server
+sends it. A wrong password shows "Login failed: wrong password." once.
+
 ### Fixed — The upload page keeps up with many small files
 
 Every upload progress event rebuilt the whole queue and re-rendered every
