@@ -1536,3 +1536,82 @@ mod tests {
         assert!(!retain_newest_may_delete(true, true), "both → abort");
     }
 }
+
+#[cfg(test)]
+mod review3_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::deltaglider::DeltaGliderEngine;
+    use crate::storage::{FilesystemBackend, StorageBackend};
+
+    /// The run's lease heartbeat is a detached task, aborted only on the
+    /// normal return. A run that unwinds (panic in the spawned run-now task)
+    /// or whose future is dropped leaves the heartbeat renewing the lease
+    /// forever: run-now, the scheduler and rule delete are refused until a
+    /// restart. The future drop stands in for the unwind here.
+    #[tokio::test]
+    #[ignore = "review3: pending fix"]
+    async fn review3_an_aborted_run_does_not_keep_its_lease_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<dyn StorageBackend> = Box::new(
+            FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine: Arc<DynEngine> = Arc::new(DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &Config::default(),
+            None,
+        ));
+        engine.create_bucket("b").await.unwrap();
+        for i in 0..50 {
+            engine
+                .store("b", &format!("k{i}.bin"), b"x", None, Default::default())
+                .await
+                .unwrap();
+        }
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("k").unwrap()));
+        let rule = crate::config_sections::LifecycleRule {
+            name: "r".to_string(),
+            enabled: true,
+            bucket: "b".to_string(),
+            prefix: String::new(),
+            action: Default::default(),
+            expire_after: Some("1d".to_string()),
+            include_globs: vec![],
+            exclude_globs: vec![],
+            batch_size: 100,
+        };
+        let now = crate::lifecycle::current_unix_seconds();
+        {
+            let d = db.lock().await;
+            d.lifecycle_ensure_state("r", now).unwrap();
+            assert!(d.lifecycle_try_acquire_lease("r", "X", now, 2).unwrap());
+        }
+        let run_id = begin_run(Some(&db), &rule, "run-now").await.unwrap();
+        let fut = run_begun_rule(
+            Some(db.clone()),
+            &engine,
+            &rule,
+            10,
+            run_id,
+            60,
+            Some(RunLease {
+                owner: "X".into(),
+                ttl_secs: 2,
+                heartbeat_secs: 1,
+            }),
+            None,
+        );
+        let _ = tokio::time::timeout(std::time::Duration::ZERO, fut).await;
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+        let now = crate::lifecycle::current_unix_seconds();
+        assert!(
+            db.lock()
+                .await
+                .lifecycle_try_acquire_lease("r", "Y", now, 2)
+                .unwrap(),
+            "the lease of a run that is gone is still renewed"
+        );
+    }
+}

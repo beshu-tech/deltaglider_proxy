@@ -679,3 +679,28 @@ mod tests {
         assert_eq!(kept, ["fn a() {}", "fn c() {}"]);
     }
 }
+
+#[cfg(test)]
+mod review3_tests {
+    use super::*;
+
+    /// A queued waiter takes the free permits (tokio's semaphore assigns them
+    /// to the queue head), so a no-wait request for 1 MiB of a budget with
+    /// 4 MiB free is refused: every buffered delta PUT and relayed part is
+    /// a SlowDown while one large GET waits.
+    #[tokio::test]
+    #[ignore = "review3: pending fix"]
+    async fn review3_a_queued_waiter_starves_every_no_wait_request() {
+        const MIB: u64 = 1024 * 1024;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = SpoolDir::new(tmp.path().to_path_buf(), 8 * MIB).unwrap();
+        let _held = pool.acquire(4 * MIB).await.unwrap();
+        let p2 = pool.clone();
+        let _waiter = tokio::spawn(async move { p2.acquire(6 * MIB).await.map(|_| ()) });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            pool.try_acquire(MIB).is_ok(),
+            "4 MiB of 8 are not in use, but a no-wait 1 MiB request is refused"
+        );
+    }
+}

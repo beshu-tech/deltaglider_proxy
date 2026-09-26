@@ -1421,3 +1421,28 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod review3_tests {
+    use super::*;
+
+    /// With the 900 s window, legit traffic above ~555 mutations/s keeps the
+    /// cache over the cap. The inline prune cuts to EXACTLY the cap, so the
+    /// next insert is over it again: every later mutation runs an O(500k)
+    /// retain + clone + select on the request path.
+    #[test]
+    #[ignore = "review3: pending fix"]
+    fn review3_hard_cap_prune_leaves_headroom() {
+        let cache: ReplayCache = Arc::new(DashMap::new());
+        for i in 0..101 {
+            cache.insert(format!("sig-{i}"), Instant::now());
+        }
+        prune_replay_cache(&cache, Duration::from_secs(900), 100);
+        cache.insert("next".into(), Instant::now());
+        assert!(
+            cache.len() <= 100,
+            "one insert after a prune is over the cap again ({}), so the next request prunes again",
+            cache.len()
+        );
+    }
+}

@@ -3895,6 +3895,9 @@ mod reference_lock_hold_tests {
         inner: FilesystemBackend,
         versions: parking_lot::Mutex<HashMap<String, u64>>,
         peer_race: AtomicBool,
+        /// review3: the peer's baseline lands right before our next DELTA
+        /// write (not a reference write) lands.
+        peer_race_on_delta: AtomicBool,
     }
 
     impl FencingFs {
@@ -4021,6 +4024,10 @@ mod reference_lock_hold_tests {
             d: &[u8],
             m: &Meta,
         ) -> Result<(), StorageError> {
+            if self.peer_race_on_delta.swap(false, Ordering::SeqCst) {
+                self.peer_race.store(true, Ordering::SeqCst);
+                self.maybe_peer_write(b, p).await;
+            }
             self.inner.put_delta(b, p, f, d, m).await
         }
         async fn get_delta_metadata(
@@ -4114,6 +4121,7 @@ mod reference_lock_hold_tests {
             inner,
             versions: parking_lot::Mutex::new(HashMap::new()),
             peer_race: AtomicBool::new(false),
+            peer_race_on_delta: AtomicBool::new(false),
         };
         let engine =
             DeltaGliderEngine::new_with_backend(Arc::new(backend), &Config::default(), None)
@@ -4152,6 +4160,46 @@ mod reference_lock_hold_tests {
             b"PEER",
             "the peer's reference.bin was overwritten"
         );
+    }
+
+    /// The fence covers reference.bin writes only. A delta PUT against an
+    /// existing reference writes no reference, so when the lock lapsed and a
+    /// peer re-created the baseline from other bytes, our delta (encoded
+    /// against the old baseline) still lands and the PUT answers 200: the
+    /// object is unreadable afterwards.
+    #[tokio::test]
+    #[ignore = "review3: pending fix"]
+    async fn review3_a_delta_against_a_replaced_baseline_is_not_acknowledged() {
+        let lock = ScriptedLock::new(true, Duration::from_secs(60));
+        let (_tmp, engine) = fencing_engine(lock).await;
+        let a = vec![7u8; 4096];
+        let mut b = a.clone();
+        b[100] = 9;
+        engine
+            .store("releases", "v1/a.zip", &a, None, HashMap::new())
+            .await
+            .expect("baseline PUT");
+        engine
+            .storage
+            .peer_race_on_delta
+            .store(true, Ordering::SeqCst);
+        let stored = engine
+            .store("releases", "v1/b.zip", &b, None, HashMap::new())
+            .await;
+        if stored.is_ok() {
+            // Another node (no in-process reference cache) reads it back.
+            let peer = DeltaGliderEngine::new_with_backend(
+                engine.storage.clone(),
+                &Config::default(),
+                None,
+            );
+            let got = peer.retrieve("releases", "v1/b.zip").await;
+            assert!(
+                got.as_ref().is_ok_and(|(data, _)| *data == b),
+                "the PUT answered 200 but the object does not read back: {:?}",
+                got.err()
+            );
+        }
     }
 
     /// Without a race the fenced baseline write goes through, and the second

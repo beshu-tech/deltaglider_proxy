@@ -1368,3 +1368,242 @@ mod tests {
         assert!(c1.is_empty() && c2.is_empty());
     }
 }
+
+#[cfg(test)]
+mod review3_tests {
+    use super::*;
+    use crate::iam::Permission;
+    use std::path::PathBuf;
+
+    const PASS: &str = "shared-key";
+
+    struct Trio {
+        _dir: tempfile::TempDir,
+        base: PathBuf,
+        local: PathBuf,
+        remote: PathBuf,
+    }
+
+    fn trio(seed: impl FnOnce(&ConfigDb)) -> Trio {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.db");
+        {
+            let db = ConfigDb::open_or_create(&base, PASS).unwrap();
+            seed(&db);
+        }
+        let local = dir.path().join("local.db");
+        let remote = dir.path().join("remote.db");
+        std::fs::copy(&base, &local).unwrap();
+        std::fs::copy(&base, &remote).unwrap();
+        Trio {
+            _dir: dir,
+            base,
+            local,
+            remote,
+        }
+    }
+
+    fn open(p: &Path) -> ConfigDb {
+        ConfigDb::open_or_create(p, PASS).unwrap()
+    }
+
+    fn user_id(db: &ConfigDb, name: &str) -> i64 {
+        db.load_users()
+            .unwrap()
+            .into_iter()
+            .find(|u| u.name == name)
+            .unwrap_or_else(|| panic!("user {name} missing"))
+            .id
+    }
+
+    fn names(db: &ConfigDb) -> Vec<String> {
+        let mut n: Vec<String> = db
+            .load_users()
+            .unwrap()
+            .into_iter()
+            .map(|u| u.name)
+            .collect();
+        n.sort();
+        n
+    }
+
+    fn perm(resource: &str) -> Permission {
+        Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: vec!["read".into()],
+            resources: vec![resource.into()],
+            conditions: None,
+        }
+    }
+
+    fn seed_okta(db: &ConfigDb) {
+        db.create_auth_provider(&super::super::auth_providers::CreateAuthProviderRequest {
+            name: "okta".into(),
+            provider_type: "oidc".into(),
+            enabled: true,
+            priority: 0,
+            display_name: None,
+            client_id: None,
+            client_secret: None,
+            issuer_url: None,
+            scopes: "openid".into(),
+            extra_config: None,
+        })
+        .unwrap();
+    }
+
+    fn tick() {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    /// Two different IdP people whose first login lands on two nodes inside
+    /// one poll window both get the user name "Alex". The merge keys users by
+    /// name, keeps one row, and binds BOTH identities to it: two people now
+    /// share one access key, one secret and one `${iam:username}` home.
+    #[test]
+    #[ignore = "review3: pending fix"]
+    fn review3_two_idp_people_with_one_display_name_stay_two_users() {
+        let t = trio(seed_okta);
+        let local = open(&t.local);
+        let p = local.get_auth_provider_by_name("okta").unwrap().unwrap().id;
+        let x = local
+            .create_external_user("Alex", "AKALEXX000001", "sx")
+            .unwrap();
+        local
+            .create_external_identity(x.id, p, "sub-x", None, None, None, true)
+            .unwrap();
+        {
+            let remote = open(&t.remote);
+            let y = remote
+                .create_external_user("Alex", "AKALEXY000001", "sy")
+                .unwrap();
+            remote
+                .create_external_identity(y.id, p, "sub-y", None, None, None, true)
+                .unwrap();
+        }
+        local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .unwrap();
+        let ix = local.find_external_identity(p, "sub-x").unwrap();
+        let iy = local.find_external_identity(p, "sub-y").unwrap();
+        if let (Some(ix), Some(iy)) = (ix, iy) {
+            assert_ne!(
+                ix.user_id, iy.user_id,
+                "two IdP subjects are bound to one IAM user after the merge"
+            );
+        }
+    }
+
+    /// A key rotation (the old key leaked) on node A and a later permission
+    /// edit of the same user on node B: row-level last-writer-wins keeps B's
+    /// whole row, so the LEAKED key and secret come back and work again.
+    #[test]
+    #[ignore = "review3: pending fix"]
+    fn review3_a_key_rotation_survives_a_later_edit_on_the_peer() {
+        let t = trio(|db| {
+            db.create_user("u1", "AKLEAKED00001", "leaked", true, &[perm("a/*")])
+                .unwrap();
+        });
+        let local = open(&t.local);
+        local
+            .rotate_keys(user_id(&local, "u1"), "AKROTATED0001", "fresh")
+            .unwrap();
+        tick();
+        {
+            let remote = open(&t.remote);
+            remote
+                .update_user(user_id(&remote, "u1"), None, None, Some(&[perm("z/*")]))
+                .unwrap();
+        }
+        local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .unwrap();
+        let u1 = local
+            .load_users()
+            .unwrap()
+            .into_iter()
+            .find(|u| u.name == "u1")
+            .unwrap();
+        assert_eq!(
+            u1.access_key_id, "AKROTATED0001",
+            "the leaked key is back after the merge"
+        );
+    }
+
+    /// A user rename on one node and a login (identity update) on the other:
+    /// the identity row names the OLD user, which the merge deletes, so the
+    /// retain drops the binding with no conflict entry. The next login makes
+    /// a fresh user without the old groups and permissions.
+    #[test]
+    #[ignore = "review3: pending fix"]
+    fn review3_a_rename_keeps_a_concurrently_updated_identity() {
+        let t = trio(|db| {
+            seed_okta(db);
+            let p = db.get_auth_provider_by_name("okta").unwrap().unwrap().id;
+            let bob = db
+                .create_external_user("bob", "AKBOB00000001", "s")
+                .unwrap();
+            db.create_external_identity(bob.id, p, "sub-b", None, None, None, true)
+                .unwrap();
+        });
+        let local = open(&t.local);
+        let p = local.get_auth_provider_by_name("okta").unwrap().unwrap().id;
+        local
+            .update_user(user_id(&local, "bob"), Some("robert"), None, None)
+            .unwrap();
+        tick();
+        {
+            let remote = open(&t.remote);
+            let ext = remote.find_external_identity(p, "sub-b").unwrap().unwrap();
+            remote
+                .update_external_identity(ext.id, Some("bob@corp"), None, None, true)
+                .unwrap();
+        }
+        let report = local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .unwrap();
+        let ext = local.find_external_identity(p, "sub-b").unwrap();
+        assert!(
+            ext.is_some_and(|e| e.user_id == user_id(&local, "robert")),
+            "the identity binding is gone (conflicts reported: {:?})",
+            report.conflicts
+        );
+    }
+
+    /// No merge base (the first sync after the upgrade, or a base that a
+    /// failed write/rekey removed): local stands in as the base, so every
+    /// local change that is not yet uploaded reads as "unchanged" and the
+    /// remote side wins. A 412 reconcile then drops the local create and
+    /// brings back the local delete, and the retry uploads that.
+    #[test]
+    #[ignore = "review3: pending fix"]
+    fn review3_without_a_base_local_unsynced_changes_survive() {
+        let t = trio(|db| {
+            db.create_user("u1", "AKU1000000001", "s1", true, &[])
+                .unwrap();
+            db.create_user("u2", "AKU2000000001", "s2", true, &[])
+                .unwrap();
+        });
+        std::fs::remove_file(&t.base).unwrap();
+        let local = open(&t.local);
+        local.delete_user(user_id(&local, "u1")).unwrap();
+        local
+            .create_user("l-new", "AKLNEW0000001", "s", true, &[])
+            .unwrap();
+        {
+            let remote = open(&t.remote);
+            remote
+                .create_user("r-new", "AKRNEW0000001", "s", true, &[])
+                .unwrap();
+        }
+        local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .unwrap();
+        assert!(
+            names(&local).contains(&"l-new".to_string()),
+            "the local create is lost: {:?}",
+            names(&local)
+        );
+    }
+}

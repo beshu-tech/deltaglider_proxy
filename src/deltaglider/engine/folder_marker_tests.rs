@@ -138,3 +138,23 @@ async fn a_marker_key_with_a_body_is_refused() {
         assert!(keys(&engine, "", None).await.is_empty());
     }
 }
+
+/// A marker PUT goes through `validated_key`, not the ingest gate, so a
+/// zero-byte `PUT` writes into the reserved `.dg/facts/` namespace, which
+/// `validate_ingest` refuses for every data PUT.
+#[tokio::test]
+#[ignore = "review3: pending fix"]
+async fn review3_a_marker_put_passes_the_ingest_gate() {
+    for (_dir, engine) in engines().await {
+        for key in [".dg/facts/x/"] {
+            let err = engine
+                .store("b", key, b"", None, Default::default())
+                .await
+                .err();
+            assert!(
+                matches!(err, Some(EngineError::InvalidArgument(_))),
+                "PUT {key} (empty body) must be refused like a data PUT, got {err:?}"
+            );
+        }
+    }
+}

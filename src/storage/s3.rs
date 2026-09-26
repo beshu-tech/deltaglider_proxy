@@ -4709,3 +4709,22 @@ mod tests {
         };
     }
 }
+
+#[cfg(test)]
+mod review3_tests {
+    use super::*;
+
+    /// AWS answers a conditional write that races another one with
+    /// `409 ConditionalRequestConflict` ("retry the request"). The fence
+    /// reads it as unrelated, and the PUT loop does not retry a 409, so the
+    /// client gets a non-retryable error instead of SlowDown.
+    #[test]
+    #[ignore = "review3: pending fix"]
+    fn review3_a_409_conditional_conflict_is_a_lost_fence() {
+        let etag = RefFence::ETag("\"abc\"".into());
+        assert_eq!(
+            fenced_write_verdict(&etag, "status=409 code=ConditionalRequestConflict"),
+            FencedWriteVerdict::Lost
+        );
+    }
+}

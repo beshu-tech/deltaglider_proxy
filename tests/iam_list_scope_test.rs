@@ -598,3 +598,50 @@ async fn test_filtered_list_tokens_never_reveal_hidden_keys() {
         "paging must still reach every visible key, past hidden ones"
     );
 }
+
+/// Review3: an Allow on the whole bucket with a Deny carve-out is classed
+/// `ListScope::Unrestricted` (`has_unrestricted_allow_for_bucket_prefix`
+/// ignores Deny), so the handler never filters and the denied keys are
+/// listed. `iam-permissions.md` says the proxy skips the hidden keys.
+#[tokio::test]
+#[ignore = "review3: pending fix"]
+async fn review3_a_bucket_wide_allow_with_a_deny_carve_out_hides_the_denied_keys() {
+    let h = ScopeHarness::setup().await;
+    let admin = h.admin_client().await;
+    let _ = admin.create_bucket().bucket("carve").send().await;
+    for key in &["pub/a.txt", "secret/b.txt"] {
+        admin
+            .put_object()
+            .bucket("carve")
+            .key(*key)
+            .body(ByteStream::from(b"d".to_vec()))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let (key, secret) = h
+        .create_user(
+            "carver",
+            vec![
+                json!({"effect": "Allow", "actions": ["read", "list"], "resources": ["carve", "carve/*"]}),
+                json!({"effect": "Deny", "actions": ["read", "list"], "resources": ["carve/secret/*"]}),
+            ],
+        )
+        .await;
+    let user = h.user_client(&key, &secret).await;
+    let keys: Vec<String> = user
+        .list_objects_v2()
+        .bucket("carve")
+        .send()
+        .await
+        .expect("list ok")
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_string))
+        .collect();
+    assert!(keys.contains(&"pub/a.txt".to_string()), "{keys:?}");
+    assert!(
+        !keys.iter().any(|k| k.starts_with("secret/")),
+        "denied keys listed: {keys:?}"
+    );
+}

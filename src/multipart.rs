@@ -2562,3 +2562,37 @@ mod tests {
             .unwrap();
     }
 }
+
+#[cfg(test)]
+mod review3_tests {
+    use super::*;
+
+    /// A relay part is clamped to what its upload does not hold yet: once an
+    /// upload holds the whole budget, every further part reserves 0 MiB and
+    /// is written anyway. The budget then pins every other request of the
+    /// node (up to the 24 h idle TTL for an abandoned upload) while the disk
+    /// use of this one upload grows without a bound.
+    #[test]
+    #[ignore = "review3: pending fix"]
+    fn review3_relay_parts_past_the_budget_are_not_written_for_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = SpoolDir::new(dir.path().join("spool"), 4 << 20).unwrap();
+        let store = MultipartStore::new(64 << 20).with_spool(spool.clone());
+        let id = store
+            .create_with_relay_policy("b", "k", None, HashMap::new(), None, true)
+            .unwrap();
+        let mib = |n: usize| Bytes::from(vec![7u8; n << 20]);
+        store.upload_part(&id, "b", "k", 1, mib(4)).unwrap();
+        assert_eq!(spool.free_mib(), 0);
+        let mut accepted = 0;
+        for n in 2..=4 {
+            if store.upload_part(&id, "b", "k", n, mib(4)).is_ok() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(
+            accepted, 0,
+            "{accepted} more 4 MiB parts were written to the spool dir with no budget (budget 4 MiB)"
+        );
+    }
+}

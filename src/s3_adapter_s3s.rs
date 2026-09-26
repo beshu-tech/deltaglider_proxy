@@ -3635,3 +3635,78 @@ mod review2_tests {
         assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
     }
 }
+
+#[cfg(test)]
+mod review3_tests {
+    use super::*;
+    use crate::iam::permissions::permission_to_iam_policy;
+
+    fn perm(actions: &[&str], resources: &[&str]) -> crate::iam::Permission {
+        crate::iam::Permission {
+            id: 0,
+            effect: "Allow".into(),
+            actions: actions.iter().map(|s| s.to_string()).collect(),
+            resources: resources.iter().map(|s| s.to_string()).collect(),
+            conditions: None,
+        }
+    }
+
+    /// `visible_key_prefixes` ignores actions: a WRITE-only grant on a big
+    /// upload prefix becomes a scan target. That scan finds no visible key,
+    /// spends the page budget (one engine page of `max_keys + 1` keys per
+    /// step), and the request fails before the readable prefix is reached.
+    #[tokio::test]
+    #[ignore = "review3: pending fix"]
+    async fn review3_a_write_only_grant_does_not_hide_the_readable_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+            crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine: crate::deltaglider::DynEngine =
+            crate::deltaglider::DeltaGliderEngine::new_with_backend(
+                Arc::new(backend),
+                &crate::config::Config::default(),
+                None,
+            );
+        engine.create_bucket("b").await.unwrap();
+        for i in 0..41 {
+            engine
+                .store(
+                    "b",
+                    &format!("incoming/{i:03}.png"),
+                    b"x",
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        engine
+            .store("b", "releases/a.png", b"x", None, Default::default())
+            .await
+            .unwrap();
+        let perms = vec![
+            perm(&["write"], &["b/incoming/*"]),
+            perm(&["read", "list"], &["b/releases/*"]),
+        ];
+        let user = AuthenticatedUser {
+            name: "u".into(),
+            access_key_id: "AK".into(),
+            iam_policies: perms.iter().map(permission_to_iam_policy).collect(),
+            permissions: perms,
+        };
+        let scope = ListScope::Filtered {
+            user: Box::new(user),
+            context: Box::new(policy_context_for_ip(None)),
+        };
+        let page = list_page_for_caller(&engine, "b", "", None, 1, None, false, Some(&scope))
+            .await
+            .expect("the listing must not fail on the write-only prefix");
+        assert_eq!(
+            page.objects.first().map(|(k, _)| k.as_str()),
+            Some("releases/a.png")
+        );
+    }
+}

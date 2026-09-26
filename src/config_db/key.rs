@@ -454,3 +454,24 @@ mod tests {
         assert_eq!(k.fallbacks.len(), 1);
     }
 }
+
+#[cfg(test)]
+mod review3_tests {
+    use super::*;
+
+    /// A crash between `create_new` and the write leaves an empty key file.
+    /// With `DGP_CONFIG_DB_KEY` set, the file is only a fallback (the DB was
+    /// never under it), yet the boot refuses to start.
+    #[test]
+    #[ignore = "review3: pending fix"]
+    fn review3_an_empty_fallback_key_file_does_not_block_the_env_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("deltaglider_config.db");
+        std::fs::write(key_file_path(&db), "").unwrap();
+        let env_key = "e".repeat(MIN_CONFIG_DB_KEY_LEN + 8);
+        let keys = resolve_config_db_keys(&db, Some("$2b$04$hash"), |n| {
+            (n == CONFIG_DB_KEY_ENV).then(|| env_key.clone())
+        });
+        assert!(keys.is_ok(), "boot refused: {:?}", keys.err());
+    }
+}

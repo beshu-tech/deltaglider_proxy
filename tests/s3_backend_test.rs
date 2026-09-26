@@ -682,3 +682,193 @@ async fn test_s3_list_metadata_true_carries_user_metadata() {
         "metadata=true LIST must carry the user's metadata: {body}"
     );
 }
+
+/// A fresh backend bucket for one review3 test (its own root namespace).
+async fn review3_bucket(tag: &str) -> String {
+    let bucket = format!("r3-{tag}-{}", PREFIX_COUNTER.fetch_add(1, Ordering::SeqCst))
+        .chars()
+        .take(40)
+        .collect::<String>()
+        .to_lowercase();
+    let raw = minio_client().await;
+    let _ = raw.create_bucket().bucket(&bucket).send().await;
+    bucket
+}
+
+/// Review3 C3: the facts live at the bucket ROOT under `.dg/facts/`, and
+/// `.` sorts before every digit and letter. A delimiter-less LIST from the
+/// root (aws s3 sync, rclone, replication/lifecycle walks) reads every facts
+/// object before the first user key: one upstream page per 1000 facts, for
+/// a one-key page. The facts below are what 2500 delta/encrypted PUTs leave.
+#[tokio::test]
+#[ignore = "review3: pending fix"]
+async fn review3_a_root_listing_does_not_walk_the_facts_namespace() {
+    skip_unless_minio!();
+    let bucket = review3_bucket("rootwalk").await;
+    let raw = minio_client().await;
+    for i in 0..2500 {
+        raw.put_object()
+            .bucket(&bucket)
+            .key(format!(".dg/facts/zz/o{i:05}.zip.delta!!1.abc.10.100.def"))
+            .body(ByteStream::from_static(b""))
+            .send()
+            .await
+            .unwrap();
+    }
+    raw.put_object()
+        .bucket(&bucket)
+        .key("zz/a.txt")
+        .body(ByteStream::from_static(b"x"))
+        .send()
+        .await
+        .unwrap();
+    let server = TestServer::builder()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(&bucket)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    let before = delegated_list_pages(&server.endpoint()).await;
+    let out = client
+        .list_objects_v2()
+        .bucket(&bucket)
+        .max_keys(1)
+        .send()
+        .await
+        .unwrap();
+    let pages = delegated_list_pages(&server.endpoint()).await - before;
+    assert_eq!(
+        out.contents().first().and_then(|o| o.key()),
+        Some("zz/a.txt")
+    );
+    assert!(
+        pages <= 2,
+        "a one-key root LIST read {pages} upstream pages (the whole facts namespace)"
+    );
+}
+
+/// Review3 C3: `.dg/facts/` is hidden only where its parent `.dg/` would be
+/// a CommonPrefix. A LIST of `.dg/` with a delimiter shows `.dg/facts/`.
+#[tokio::test]
+#[ignore = "review3: pending fix"]
+async fn review3_the_facts_namespace_is_not_listed() {
+    skip_unless_minio!();
+    let bucket = review3_bucket("hidden").await;
+    let raw = minio_client().await;
+    raw.put_object()
+        .bucket(&bucket)
+        .key(".dg/facts/zz/o.zip.delta!!1.abc.10.100.def")
+        .body(ByteStream::from_static(b""))
+        .send()
+        .await
+        .unwrap();
+    let server = TestServer::builder()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(&bucket)
+        .build()
+        .await;
+    let out = server
+        .s3_client()
+        .await
+        .list_objects_v2()
+        .bucket(&bucket)
+        .prefix(".dg/")
+        .delimiter("/")
+        .send()
+        .await
+        .unwrap();
+    let cps: Vec<&str> = out
+        .common_prefixes()
+        .iter()
+        .filter_map(|p| p.prefix())
+        .collect();
+    assert!(
+        cps.is_empty(),
+        "internal namespace listed to a client: {cps:?}"
+    );
+}
+
+/// Review3 C3: a plain (unencrypted) passthrough whose stored ETag is not
+/// its logical ETag (a proxy-assembled multipart upload: MD5 stored, `-N`
+/// logical) gets a facts object on PUT, but the raw `delete_passthrough`
+/// queues no cleanup: the entry stays forever.
+#[tokio::test]
+#[ignore = "review3: pending fix"]
+async fn review3_a_deleted_multipart_passthrough_leaves_no_facts() {
+    skip_unless_minio!();
+    let bucket = review3_bucket("mpufacts").await;
+    let server = TestServer::builder()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(&bucket)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    let key = "p/photo.jpg";
+    let mpu = client
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let id = mpu.upload_id().unwrap().to_string();
+    let mut parts = Vec::new();
+    for (n, body) in [(1, vec![1u8; 5 << 20]), (2, vec![2u8; 1024])] {
+        let up = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&id)
+            .part_number(n)
+            .body(ByteStream::from(body))
+            .send()
+            .await
+            .unwrap();
+        parts.push(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(n)
+                .e_tag(up.e_tag().unwrap())
+                .build(),
+        );
+    }
+    client
+        .complete_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&id)
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .set_parts(Some(parts))
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let raw = minio_client().await;
+    let facts = || async {
+        raw.list_objects_v2()
+            .bucket(&bucket)
+            .prefix(".dg/facts/")
+            .send()
+            .await
+            .unwrap()
+            .contents()
+            .iter()
+            .filter_map(|o| o.key().map(str::to_string))
+            .collect::<Vec<_>>()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut left = facts().await;
+    while !left.is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        left = facts().await;
+    }
+    assert!(left.is_empty(), "facts of a deleted object stay: {left:?}");
+}

@@ -2227,3 +2227,53 @@ mod tests {
         assert_eq!(db.load_users().unwrap().len(), 1);
     }
 }
+
+#[cfg(test)]
+mod review3_tests {
+    use super::*;
+
+    const HASH: &str = "$2b$04$legacyhashlegacyhashlegacyhashlegacyhash";
+    const NEW_KEY: &str = "new-config-db-key-0123456789abcdef0123456789";
+
+    /// Kill between the DB rename and `rekey_companions`: the DB is under the
+    /// new key, the merge base still under the legacy hash. The next boot
+    /// opens the DB with the primary key and never looks at the companion
+    /// again, so the base stays unreadable for good and every later 412
+    /// reconcile runs base-less (remote wins, local unsynced edits lost).
+    #[test]
+    #[ignore = "review3: pending fix"]
+    fn review3_a_crash_before_the_companion_rekey_heals_on_the_next_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deltaglider_config.db");
+        ConfigDb::open_or_create(&path, HASH)
+            .unwrap()
+            .create_user("alice", "AKALICE1", "secret", true, &[])
+            .unwrap();
+        let base = crate::config_db_sync::sync_base_path(&path);
+        drop(ConfigDb::open_or_create(&base, HASH).unwrap());
+        // The crash: the DB moved, its companion did not.
+        rekey_file(&path, HASH, NEW_KEY).unwrap();
+        let keys = ConfigDbKeys::primary_only(NEW_KEY)
+            .with_fallback(key::FallbackKind::LegacyBootstrapHash, HASH);
+        let (_db, _how) = ConfigDb::open_with_keys(&path, &keys).unwrap();
+        assert!(
+            probe_key(&base, NEW_KEY).unwrap(),
+            "the merge base is still under the old key after the next boot"
+        );
+    }
+
+    /// `recover-db` asks `probe_key` whether a candidate opens `.db.bak`. An
+    /// empty (or junk-free zero-byte) file reads as a fresh DB under ANY key,
+    /// so every candidate "matches" and the operator is told to use it.
+    #[test]
+    #[ignore = "review3: pending fix"]
+    fn review3_probe_key_does_not_accept_any_key_for_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bak = dir.path().join("deltaglider_config.db.bak");
+        std::fs::write(&bak, b"").unwrap();
+        assert!(
+            !probe_key(&bak, "any-candidate-at-all").unwrap(),
+            "an empty backup matches every candidate key"
+        );
+    }
+}
