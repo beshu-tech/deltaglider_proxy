@@ -2507,6 +2507,48 @@ mod tests {
     }
 
     proptest::proptest! {
+        /// A Deny that covers listing a key hides it, whatever Allow grants
+        /// the listing; and the derived scan prefixes still hold every key
+        /// that stays visible (the soundness property below, with Denies).
+        #[test]
+        fn a_key_under_a_list_deny_is_never_listed(
+            key in "[ab/.]{1,6}",
+            allows in proptest::collection::vec("[ab/]{0,3}", 1..3),
+            denies in proptest::collection::vec(("[ab/]{0,3}", 0u8..3, proptest::arbitrary::any::<bool>()), 1..3),
+        ) {
+            let mut perms: Vec<Permission> = allows
+                .iter()
+                .map(|lit| allow(&[&format!("b/{lit}*"), "b"], None))
+                .collect();
+            for (lit, actions, wildcard) in &denies {
+                let actions: Vec<String> = match actions {
+                    0 => vec!["list".into()],
+                    1 => vec!["read".into(), "list".into()],
+                    _ => vec!["*".into()],
+                };
+                let resource = if *wildcard { format!("b/{lit}*") } else { format!("b/{lit}") };
+                perms.push(Permission {
+                    id: 0,
+                    effect: "Deny".into(),
+                    actions,
+                    resources: vec![resource],
+                    conditions: None,
+                });
+            }
+            let user = make_user_with_permissions("u", perms);
+            let visible = user_can_see_listed_key(&user, "b", &key, &Context::new());
+            for (lit, _, wildcard) in &denies {
+                let covered = if *wildcard { key.starts_with(lit.as_str()) } else { key == *lit };
+                if covered {
+                    proptest::prop_assert!(!visible, "{key} listed despite a Deny on b/{lit}");
+                }
+            }
+            if visible {
+                let prefixes = visible_key_prefixes(&user, "b");
+                proptest::prop_assert!(prefixes.iter().any(|p| key.starts_with(p.as_str())));
+            }
+        }
+
         /// Soundness: every key the LIST filter lets through lies under one
         /// of the derived prefixes. A miss would hide a visible key.
         #[test]

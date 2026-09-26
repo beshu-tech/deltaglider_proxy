@@ -684,3 +684,67 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod glob_proptests {
+    use super::*;
+    use crate::admission::spec::{
+        ActionSpec, AdmissionBlockSpec, AdmissionSpec, MatchSpec, SimpleAction,
+    };
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
+
+    fn deny_block(glob: &str) -> AdmissionBlockSpec {
+        AdmissionBlockSpec {
+            name: "g".into(),
+            match_: MatchSpec {
+                path_glob: Some(glob.into()),
+                bucket: Some("b".into()),
+                ..Default::default()
+            },
+            action: ActionSpec::Simple(SimpleAction::Deny),
+        }
+    }
+
+    fn denied(glob: &str, key: Option<&str>, list_prefix: Option<&str>) -> bool {
+        let chain = AdmissionChain::from_config_parts(&BTreeMap::new(), &[deny_block(glob)]);
+        let req = RequestInfo {
+            method: "GET",
+            bucket: "b",
+            key,
+            list_prefix,
+            authenticated: true,
+            source_ip: None,
+        };
+        matches!(evaluate(&chain, &req), Decision::Deny { .. })
+    }
+
+    proptest! {
+        /// Arbitrary operator globs: validation and chain build never panic,
+        /// and they agree (a glob the loader accepts is one the chain keeps).
+        #[test]
+        fn any_glob_validates_and_compiles_consistently(glob in ".{0,24}", key in ".{0,24}") {
+            let spec = AdmissionSpec { blocks: vec![deny_block(&glob)] };
+            let valid = spec.validate().is_ok();
+            let compiles = globset::Glob::new(&glob).is_ok();
+            prop_assert_eq!(valid, compiles, "validate and compile disagree on {:?}", glob);
+            let _ = denied(&glob, Some(&key), None);
+        }
+
+        /// `lit*` fires exactly on keys (and LIST prefixes) that start with
+        /// `lit`, `*` crossing `/`: a Deny on `secret/*` covers
+        /// `secret/a/b`. A literal glob fires on that one key only.
+        #[test]
+        fn prefix_glob_matches_exactly_the_keys_under_it(
+            lit in "[a-z0-9/._-]{0,8}",
+            key in "[a-z0-9/._-]{0,12}",
+        ) {
+            let glob = format!("{lit}*");
+            prop_assert_eq!(denied(&glob, Some(&key), None), key.starts_with(&lit), "{} vs {}", glob, key);
+            prop_assert_eq!(denied(&glob, None, Some(&key)), key.starts_with(&lit));
+            if !lit.is_empty() {
+                prop_assert_eq!(denied(&lit, Some(&key), None), key == lit);
+            }
+        }
+    }
+}

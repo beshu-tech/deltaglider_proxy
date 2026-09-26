@@ -959,6 +959,26 @@ mod rewrite_key_proptests {
             );
         }
 
+        /// INJECTIVE for any prefix pair, raw prefix spelling and key text:
+        /// two distinct keys under the source never share a destination
+        /// (a shared one means one replica overwrites or deletes the other).
+        #[test]
+        fn rewrite_is_injective_for_any_prefixes(
+            src in "[a/]{0,4}",
+            dst in "[b/]{0,4}",
+            a in "[a-c/. %\u{e9}]{0,10}",
+            b in "[a-c/. %\u{e9}]{0,10}",
+        ) {
+            prop_assume!(a != b);
+            let under = normalize_prefix(&src);
+            let (ka, kb) = (format!("{under}{a}"), format!("{under}{b}"));
+            let ra = rewrite_key(&src, &dst, &ka).unwrap();
+            let rb = rewrite_key(&src, &dst, &kb).unwrap();
+            prop_assert_ne!(&ra, &rb, "{} and {} both map to {}", ka, kb, ra);
+            // And the destination lies under the destination prefix.
+            prop_assert!(ra.starts_with(&normalize_prefix(&dst)));
+        }
+
         /// normalize_prefix is idempotent — a fixpoint.
         #[test]
         fn normalize_prefix_idempotent(s in "[a-z/]{0,30}") {

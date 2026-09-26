@@ -981,6 +981,34 @@ mod key_path_proptests {
             }
         }
 
+        /// `parse` then `full_key` gives the key back, minus the leading
+        /// slashes the engine drops (`/b//k` is served as `k`).
+        #[test]
+        fn parse_round_trips_the_key(key in "[a-z/.\u{e9}]{0,24}") {
+            let k = ObjectKey::parse("b", &key);
+            prop_assert_eq!(k.full_key(), key.trim_start_matches('/'));
+        }
+
+        /// The ingest gate is the read gate plus more, and what it admits is
+        /// a key the filesystem and S3 backends store under one name: no
+        /// `//`, no `..`, no NUL or backslash, not empty.
+        #[test]
+        fn ingest_accepted_keys_are_canonical(key in prop_oneof![
+            ".{0,40}",
+            "[a/.\\\\\u{0}]{0,12}",
+        ]) {
+            let k = ObjectKey::parse("b", &key);
+            if k.validate_ingest().is_ok() {
+                prop_assert!(k.validate_object().is_ok());
+                let full = k.full_key();
+                prop_assert!(!full.is_empty());
+                prop_assert!(!full.contains("//"), "{full:?}");
+                prop_assert!(!full.split('/').any(|s| s == ".."));
+                prop_assert!(!full.contains('\0') && !full.contains('\\'));
+                prop_assert!(!full.starts_with('/'));
+            }
+        }
+
         /// A traversal attempt (`..` as a full segment) is always rejected as a
         /// prefix — the security-relevant property.
         #[test]

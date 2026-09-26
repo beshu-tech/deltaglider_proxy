@@ -981,6 +981,65 @@ mod tests {
     }
 
     proptest::proptest! {
+        /// The XFF walk against a real proxy chain: the client writes any
+        /// XFF lines and X-Real-IP it likes (IPs, trusted-looking hops,
+        /// garbage), a trusted proxy then appends the address it saw, as a
+        /// new line (HAProxy `option forwardfor`) or on the last line (nginx
+        /// `$proxy_add_x_forwarded_for`), and more trusted hops may follow.
+        /// The resolved client is the address the first proxy saw, never a
+        /// forged hop.
+        #[test]
+        fn xff_walk_returns_the_address_the_proxy_saw(
+            real in (0u8..=255, 0u8..=255, 0u8..=255, 1u8..=254),
+            forged in proptest::collection::vec(proptest::prop_oneof![
+                proptest::strategy::Just("10.0.0.7".to_string()),
+                proptest::strategy::Just("1.2.3.4".to_string()),
+                proptest::strategy::Just("unknown".to_string()),
+                proptest::strategy::Just("1.2.3.4:80".to_string()),
+                proptest::strategy::Just(" ".to_string()),
+                proptest::strategy::Just("::ffff:10.0.0.9".to_string()),
+                "[0-9a-f:., ]{0,12}",
+            ], 0..4),
+            forged_lines in 0usize..3,
+            new_line in proptest::arbitrary::any::<bool>(),
+            inner_hops in proptest::collection::vec(1u8..=254, 0..3),
+            real_ip_header in proptest::arbitrary::any::<bool>(),
+        ) {
+            let client = IpAddr::V4(Ipv4Addr::new(real.0, real.1, real.2, real.3));
+            let trusted = vec![cidr("10.0.0.0/8")];
+            proptest::prop_assume!(!trusted[0].contains(&client));
+            let mut h = axum::http::HeaderMap::new();
+            let per_line = forged.len().div_ceil(forged_lines.max(1));
+            let lines: Vec<String> = if forged_lines == 0 {
+                Vec::new()
+            } else {
+                forged.chunks(per_line.max(1)).map(|c| c.join(",")).collect()
+            };
+            let mut lines = lines;
+            if new_line || lines.is_empty() {
+                lines.push(client.to_string());
+            } else {
+                let last = lines.pop().unwrap();
+                lines.push(format!("{last}, {client}"));
+            }
+            for hop in &inner_hops {
+                lines.push(format!("10.1.0.{hop}"));
+            }
+            for line in &lines {
+                if let Ok(v) = axum::http::HeaderValue::from_str(line) {
+                    h.append("x-forwarded-for", v);
+                } else {
+                    return Ok(());
+                }
+            }
+            if real_ip_header {
+                h.insert("x-real-ip", "6.6.6.6".parse().unwrap());
+            }
+            let peer = Some(ip("10.0.0.1"));
+            proptest::prop_assert_eq!(resolve_trusted_client_ip(&h, peer, true, &trusted), Some(client));
+            proptest::prop_assert_eq!(resolve_client_ip(&h, peer, true, &trusted), Some(client));
+        }
+
         #[test]
         fn resolve_client_ip_untrusted_peer_never_honors_headers(
             a in 0u8..=255, b in 0u8..=255, c in 0u8..=255, d in 0u8..=255,

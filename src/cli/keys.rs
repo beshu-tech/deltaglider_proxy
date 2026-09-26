@@ -214,6 +214,32 @@ mod proptests {
             }
         }
 
+        /// Prefix-as-directory: a key selected under `dir_prefix(p)` lies in
+        /// the directory `p`, never in a sibling that only shares the text
+        /// (`releases` must not select `releases-old/x`).
+        #[test]
+        fn dir_prefix_never_selects_a_sibling(
+            prefix in "[a-z-]{1,6}/?",
+            key in "[a-z/-]{0,16}",
+        ) {
+            let d = dir_prefix(&prefix);
+            if rel_under(&key, &d).is_some() {
+                let base = prefix.trim_end_matches('/');
+                prop_assert!(key.starts_with(&format!("{base}/")), "{key} selected by {prefix}");
+            }
+        }
+
+        /// Whatever the relative key, a result joined onto the root never
+        /// has more components than the key has segments (nothing expands).
+        #[test]
+        fn accepted_path_has_one_component_per_segment(key in any::<String>()) {
+            let root = PathBuf::from("/tmp/dest");
+            if let Ok(p) = local_path_for_key(&root, &key) {
+                let rest = p.strip_prefix(&root).unwrap();
+                prop_assert_eq!(rest.components().count(), key.split('/').count());
+            }
+        }
+
         #[test]
         fn rel_under_result_rejoins_to_the_key(
             prefix in "[a-z/]{0,8}",

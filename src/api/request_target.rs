@@ -264,6 +264,27 @@ mod proptests {
             }
         }
 
+        /// Round trip: a key encoded the way SDKs encode it (each segment
+        /// percent-encoded, `/` kept) or fully encoded (`/` as `%2F`) decodes
+        /// back to the key, minus the leading slashes the engine drops. Query
+        /// values round-trip through form encoding.
+        #[test]
+        fn encoded_key_and_query_round_trip(
+            key in "[a-z0-9/ +%.~\u{e9}\u{4e2d}-]{0,24}",
+            value in "[a-z0-9/ +%&=.\u{e9}-]{0,16}",
+            full in any::<bool>(),
+        ) {
+            let encoded_key = if full {
+                urlencoding::encode(&key).into_owned()
+            } else {
+                key.split('/').map(|s| urlencoding::encode(s).into_owned()).collect::<Vec<_>>().join("/")
+            };
+            let query = format!("prefix={}", urlencoding::encode(&value));
+            let t = RequestTarget::parse(&format!("/bucket/{encoded_key}"), Some(&query)).unwrap();
+            prop_assert_eq!(t.bucket_and_key(), ("bucket", key.trim_start_matches('/')));
+            prop_assert_eq!(t.query_value("prefix"), Some(value.as_str()));
+        }
+
         /// Percent escapes of arbitrary bytes, mixed with multi-byte text.
         #[test]
         fn parse_never_panics_on_escapes(parts in proptest::collection::vec(
