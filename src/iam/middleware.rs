@@ -72,16 +72,19 @@ pub fn authz_target<'a>(
 ) -> AuthzTarget<'a> {
     let mut action = classify_action(method, &target.path);
     let (bucket, key) = target.bucket_and_key();
-    // POST /{bucket}?delete is a batch DELETE, not a write.
-    let is_delete = *method == axum::http::Method::POST && target.has_query("delete");
-    if is_delete {
+    // POST /{bucket}?delete is a batch DELETE, not a write. Only on a bucket
+    // path: s3s ignores `delete` on an object path, where the POST is a
+    // write (CompleteMultipartUpload, CreateMultipartUpload).
+    let batch_delete =
+        *method == axum::http::Method::POST && target.has_query("delete") && key.is_empty();
+    if batch_delete {
         action = S3Action::Delete;
     }
     AuthzTarget {
         action,
         bucket,
         key,
-        batch_delete: is_delete && key.is_empty(),
+        batch_delete,
     }
 }
 
@@ -331,6 +334,25 @@ pub async fn authorization_middleware(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// s3s routes `?delete` to DeleteObjects only on a BUCKET path. On an
+    /// object path it ignores the parameter: `POST /b/k?uploadId=u&delete`
+    /// is CompleteMultipartUpload, a write. Classifying it as a delete let a
+    /// delete-only user complete (write) an upload. Found by the
+    /// middleware-vs-s3s contract test.
+    #[test]
+    fn delete_query_on_an_object_path_stays_a_write() {
+        use crate::api::request_target::RequestTarget;
+        let at = |path: &str, query: &str| {
+            let t = RequestTarget::parse(path, Some(query)).unwrap();
+            let a = authz_target(&axum::http::Method::POST, &t);
+            (a.action, a.batch_delete)
+        };
+        assert_eq!(at("/b/k", "delete&uploadId=u1"), (S3Action::Write, false));
+        assert_eq!(at("/b/k", "uploads&delete"), (S3Action::Write, false));
+        assert_eq!(at("/b", "delete"), (S3Action::Delete, true));
+        assert_eq!(at("/b", "%64elete"), (S3Action::Delete, true));
+    }
 
     #[test]
     fn test_classify_action_unknown_method_requires_admin() {
