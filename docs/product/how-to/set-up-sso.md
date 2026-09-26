@@ -22,6 +22,7 @@ If you use Google (Cloud Console):
 2. Application type: **Web application**.
 3. Authorized redirect URIs: add the callback URL above.
 4. Save, then copy the **Client ID** and **Client Secret**.
+5. The issuer URL is `https://accounts.google.com`.
 
 If you use Okta:
 
@@ -29,6 +30,7 @@ If you use Okta:
 2. Sign-in redirect URIs: the callback URL above.
 3. Assignments: pick the Okta groups that should be allowed to log in.
 4. Copy the **Client ID** and **Client Secret**.
+5. The issuer URL is the URL of your Okta authorization server. For the default custom server it is `https://<your-org>.okta.com/oauth2/default`; for the org server it is `https://<your-org>.okta.com`.
 
 If you use Azure AD / Entra:
 
@@ -36,6 +38,7 @@ If you use Azure AD / Entra:
 2. Certificates & secrets → New client secret. Copy the value immediately — Azure hides it on the next page load.
 3. API permissions → Microsoft Graph → `openid`, `profile`, `email`; add `GroupMember.Read.All` if you'll map on AD groups.
 4. Copy the **Application (client) ID** and the secret value.
+5. The issuer URL is `https://login.microsoftonline.com/<tenant-id>/v2.0`, where `<tenant-id>` is the **Directory (tenant) ID** on the app's overview page.
 
 If you use any other OIDC provider: it works as long as it serves `.well-known/openid-configuration`. Collect the issuer URL, client ID, client secret, and scopes (at minimum `openid email`; add `profile` and `groups` if you map on them).
 
@@ -43,12 +46,13 @@ If you use any other OIDC provider: it works as long as it serves `.well-known/o
 
 Go to **Settings → Access → External authentication** → **+ Add provider**.
 
+The proxy has one provider type, `oidc`. Google, Okta, and Azure AD have no type of their own: each one is an OpenID Connect issuer, so you add it as an `oidc` provider with its issuer URL. The proxy reads the issuer's `.well-known/openid-configuration` document and takes the authorization, token, and key endpoints from it. The form sets the type to `oidc` for you. In the admin API and in declarative YAML, `provider_type` must be `oidc`, because the proxy skips a provider of any other type.
+
 | Field | Value |
 |---|---|
 | Name | lower-case ASCII id — appears in the sign-in button (`Sign in with okta`) |
 | Display name | human-readable label shown on the login page |
-| Provider type | `google` / `okta` / `azure` / `oidc` |
-| Issuer URL | required for `oidc`; pre-filled for named providers |
+| Issuer URL | the issuer URL from step 1 |
 | Client ID / Client secret | from step 1 |
 | Scopes | `openid email profile` minimum; add `groups` per your provider |
 | Enabled | ✓ |
