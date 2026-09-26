@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed — Declared buckets are created at boot on S3 backends too
+
+A bucket declared under `storage.buckets` was created at boot only on a
+filesystem backend; on an S3 backend its first write failed with
+`NoSuchBucket`. Now the proxy creates a missing declared bucket on either
+kind of backend (on S3: `HeadBucket`, then `CreateBucket` only when it is
+missing; a failure only warns). `DGP_BOOT_CREATE_DECLARED_BUCKETS=false`
+turns this off.
+
 ### Fixed — The admin UI loads compressed, and the file browser skips the docs stack
 
 The UI's HTML, JS and CSS went out uncompressed (several MB on a first

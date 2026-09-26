@@ -2302,6 +2302,20 @@ impl StorageBackend for S3Backend {
         Ok(())
     }
 
+    /// A bucket declared in config is created at boot when the backend
+    /// does not have it, as on the filesystem backend: its first write
+    /// must not fail with NoSuchBucket. HEAD first, so a present bucket
+    /// costs one request and a key without CreateBucket rights only warns
+    /// when the bucket is really missing.
+    async fn ensure_declared_bucket(&self, bucket: &str) -> Result<(), StorageError> {
+        if self.head_bucket(bucket).await? {
+            return Ok(());
+        }
+        self.create_bucket(bucket).await?;
+        tracing::info!("created declared bucket '{bucket}' on its S3 backend");
+        Ok(())
+    }
+
     #[instrument(skip(self))]
     async fn delete_bucket(&self, bucket: &str) -> Result<(), StorageError> {
         // Listing facts are internal: they must not keep an empty bucket.
@@ -5648,5 +5662,75 @@ mod conditional_delete_tests {
             .await
             .unwrap());
         assert!(fake.objects.lock().is_empty());
+    }
+}
+
+/// Browser review #24: a bucket declared in config and routed to an S3
+/// backend is created at boot, like a filesystem one (it used to be created
+/// only on filesystem backends, so its first write failed on S3).
+#[cfg(test)]
+mod declared_bucket_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    async fn fake() -> (
+        String,
+        Arc<parking_lot::Mutex<Vec<String>>>,
+        Arc<AtomicUsize>,
+    ) {
+        use axum::http::StatusCode;
+        use axum::routing::put;
+        let buckets = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let creates = Arc::new(AtomicUsize::new(0));
+        let (b1, b2, c) = (buckets.clone(), buckets.clone(), creates.clone());
+        // Path-style bucket requests carry a trailing slash.
+        let app = axum::Router::new().route(
+            "/:bucket/",
+            put(move |axum::extract::Path(b): axum::extract::Path<String>| {
+                let (b1, c) = (b1.clone(), c.clone());
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    b1.lock().push(b);
+                    StatusCode::OK
+                }
+            })
+            .head(move |axum::extract::Path(b): axum::extract::Path<String>| {
+                let b2 = b2.clone();
+                async move {
+                    if b2.lock().contains(&b) {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::NOT_FOUND
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), buckets, creates)
+    }
+
+    #[tokio::test]
+    async fn a_declared_bucket_is_created_once() {
+        let (ep, buckets, creates) = fake().await;
+        let cfg = BackendConfig::S3 {
+            session_token: None,
+            endpoint: Some(ep),
+            region: "us-east-1".into(),
+            force_path_style: true,
+            access_key_id: Some("a".into()),
+            secret_access_key: Some("b".into()),
+            allow_local: true,
+        };
+        let s3 = S3Backend::new(&cfg, NativeEncryptionConfig::None)
+            .await
+            .unwrap();
+        s3.ensure_declared_bucket("releases").await.unwrap();
+        assert_eq!(*buckets.lock(), ["releases"]);
+        // Present now: no second CreateBucket.
+        s3.ensure_declared_bucket("releases").await.unwrap();
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
     }
 }

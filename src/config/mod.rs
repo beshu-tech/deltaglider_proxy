@@ -138,6 +138,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Storage",
     },
     EnvVarEntry {
+        name: "DGP_BOOT_CREATE_DECLARED_BUCKETS",
+        description: "At boot, create every bucket declared under storage.buckets that its backend does not have: a directory on a filesystem backend, a CreateBucket on an S3 backend (after a HeadBucket). false turns this off for every backend (default: true)",
+        example: "false",
+        category: "Storage",
+    },
+    EnvVarEntry {
         name: "DGP_BACKEND_HEALTH_INTERVAL_SECS",
         description: "How often every storage backend is health-probed (seconds). An unhealthy backend's buckets answer 503 until a probe succeeds. 0 turns the probe loop off, and so does DGP_BOOT_BACKEND_PROBE=off (default: 30)",
         example: "30",

@@ -155,13 +155,14 @@ pub trait StorageBackend: Send + Sync {
     /// Create a new bucket
     async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError>;
 
-    /// Ensure a bucket DECLARED in config exists, if this backend can create it
-    /// implicitly and safely. Filesystem backends `mkdir` the bucket dir (a
-    /// declared bucket routed to local disk should just work on first write —
-    /// #63); every other backend no-ops (never auto-create a real remote S3
-    /// bucket at boot, and never create a bucket implicitly on the WRITE path —
-    /// that's a deliberate refusal, see `filesystem::require_bucket_exists`).
-    /// Called once at startup for each `storage.buckets` entry; idempotent.
+    /// Ensure a bucket DECLARED in config exists. Filesystem backends `mkdir`
+    /// the bucket dir (#63); S3 backends create a missing bucket (browser
+    /// review #24: both kinds of backend behave the same, so a declared
+    /// bucket works on its first write). A bucket is never created implicitly
+    /// on the WRITE path — that's a deliberate refusal, see
+    /// `filesystem::require_bucket_exists`. Called once at startup for each
+    /// `storage.buckets` entry unless `DGP_BOOT_CREATE_DECLARED_BUCKETS=false`;
+    /// idempotent. The default no-op is for wrappers and test doubles.
     async fn ensure_declared_bucket(&self, _bucket: &str) -> Result<(), StorageError> {
         Ok(())
     }

@@ -538,13 +538,26 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .await?
         .with_bucket_usage(bucket_usage.clone())
         .with_reference_lock(reference_lock.clone());
-    // #63: create dirs for buckets DECLARED in storage.buckets that route to a
-    // filesystem backend, so their first write doesn't 404. Only declared intent
-    // (no write-path auto-create, no remote S3 side effects — other backends
-    // no-op via the trait default). Idempotent; a failure is logged, not fatal.
-    for bucket in config.buckets.keys() {
-        if let Err(e) = engine.storage().ensure_declared_bucket(bucket).await {
-            tracing::warn!("could not pre-create declared bucket '{}': {}", bucket, e);
+    // #63 + browser review #24: create the buckets DECLARED in storage.buckets
+    // on their backend (a filesystem dir, or an S3 CreateBucket when missing),
+    // so their first write doesn't 404. Only declared intent — never on the
+    // write path. Idempotent; a failure is logged, not fatal.
+    // DGP_BOOT_CREATE_DECLARED_BUCKETS=false turns it off for every backend.
+    // All at once: a slow or dead backend costs one request timeout, not one
+    // per declared bucket.
+    if deltaglider_proxy::config::env_bool("DGP_BOOT_CREATE_DECLARED_BUCKETS", true) {
+        let storage = engine.storage();
+        let results = futures::future::join_all(
+            config
+                .buckets
+                .keys()
+                .map(|b| async move { (b, storage.ensure_declared_bucket(b).await) }),
+        )
+        .await;
+        for (bucket, result) in results {
+            if let Err(e) = result {
+                tracing::warn!("could not pre-create declared bucket '{}': {}", bucket, e);
+            }
         }
     }
     if engine.is_cli_available() {

@@ -55,7 +55,7 @@ From the admin UI: **Settings → Storage → Buckets** — each bucket is a row
 
 ![Per-bucket storage form](/_/screenshots/config-storage-form.jpg)
 
-A bucket **declared** under `storage.buckets` that routes to a **filesystem** backend is created automatically at startup, so its first write just works — no `CreateBucket` step. For an **S3** backend the proxy never auto-creates a remote bucket (that would be a surprising remote side effect): create it through the proxy after applying the route — `aws s3 mb s3://downloads --endpoint-url https://s3.acme.example` — and the proxy creates it on the backend the route points at. If a client creates a bucket that has no `storage.buckets` entry at all, it lands on `default_backend`.
+A bucket **declared** under `storage.buckets` is created at startup on the backend that its route points at, so its first write works without a `CreateBucket` step. On a **filesystem** backend the proxy creates the bucket's directory. On an **S3** backend the proxy first sends a `HeadBucket`, and it sends a `CreateBucket` only when the backend does not have the bucket. When the backend's key may not create buckets, the proxy logs a warning and starts anyway; create the bucket yourself then, for example through the proxy with `aws s3 mb s3://downloads --endpoint-url https://s3.acme.example`. Set `DGP_BOOT_CREATE_DECLARED_BUCKETS=false` to turn the startup creation off for every backend. A route that you add at runtime (with an apply) does not create the bucket until the next start. If a client creates a bucket that has no `storage.buckets` entry at all, it lands on `default_backend`.
 
 ## 3. Alias an upstream bucket name
 
