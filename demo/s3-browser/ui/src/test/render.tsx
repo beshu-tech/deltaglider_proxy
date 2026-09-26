@@ -1,6 +1,7 @@
 // Shared render helpers for component tests.
 import type { ReactElement, ReactNode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ConfigProvider, type ThemeConfig } from 'antd';
 import { render, renderHook, type RenderOptions } from '@testing-library/react';
 
 /** A QueryClient that never retries and never caches between tests. */
@@ -13,9 +14,16 @@ export function testQueryClient(): QueryClient {
   });
 }
 
+/** AntD theme without motion: jsdom never ends an animation. */
+export const NO_MOTION: ThemeConfig = { token: { motion: false } };
+
 function wrapperFor(client: QueryClient) {
   return function Wrapper({ children }: { children: ReactNode }) {
-    return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+    return (
+      <QueryClientProvider client={client}>
+        <ConfigProvider theme={NO_MOTION}>{children}</ConfigProvider>
+      </QueryClientProvider>
+    );
   };
 }
 

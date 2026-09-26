@@ -48,10 +48,10 @@ describe('delete', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
     expect(onDelete).not.toHaveBeenCalled();
 
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+
     await user.click(screen.getByRole('button', { name: 'Delete 2 selected items' }));
-    // The first dialog may still be animating out: act on the newest one.
-    const dialogs = await screen.findAllByRole('dialog');
-    const again = dialogs[dialogs.length - 1];
+    const again = await screen.findByRole('dialog');
     await user.click(within(again).getByRole('button', { name: 'Delete' }));
     await waitFor(() => expect(onDelete).toHaveBeenCalledTimes(1));
   });

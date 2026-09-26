@@ -1,22 +1,39 @@
 // jsdom lacks the layout APIs AntD 6 calls on mount; stub them so components
 // render. The stubs report "no match / no size", which is what a test wants.
 import '@testing-library/jest-dom/vitest';
-import { cleanup } from '@testing-library/react';
-import { Modal, message, notification } from 'antd';
-import { afterEach, vi } from 'vitest';
+import { act, cleanup } from '@testing-library/react';
+import { ConfigProvider, Modal, message, notification } from 'antd';
+import { createElement } from 'react';
+import { NO_MOTION } from './render';
+import { afterAll, afterEach, vi } from 'vitest';
 
-afterEach(() => {
+// jsdom never fires animation/transition end, so AntD motion would leave
+// closed dialogs mounted and fire timers after the test. Static
+// Modal.confirm / message render outside the tree: give them the same theme.
+ConfigProvider.config({
+  holderRender: (children) => createElement(ConfigProvider, { theme: NO_MOTION }, children),
+});
+
+afterEach(async () => {
   cleanup();
   // Static Modal.confirm / message / notification render outside the test's
-  // root, so cleanup() does not reach them: drop them before the next test.
-  Modal.destroyAll();
-  message.destroy();
-  notification.destroy();
-  // destroyAll() only starts the close animation; drop the leftover
-  // confirm containers so the next test sees one dialog.
-  for (const el of document.body.querySelectorAll(':scope > div')) {
-    if (el.querySelector('.ant-modal-root, .ant-modal-wrap')) el.remove();
-  }
+  // root, so cleanup() does not reach them. Close them inside act() and let
+  // React finish: work left on the scheduler would run after jsdom is torn
+  // down ("window is not defined").
+  await act(async () => {
+    Modal.destroyAll();
+    message.destroy();
+    notification.destroy();
+    await new Promise((r) => setTimeout(r, 0));
+  });
+});
+
+// A loaded machine can still hold scheduled React work (AntD motion timers,
+// late promise settles) when the last test ends; drain it before jsdom goes.
+afterAll(async () => {
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 100));
+  });
 });
 
 if (!window.matchMedia) {
