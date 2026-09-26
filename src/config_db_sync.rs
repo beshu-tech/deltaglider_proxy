@@ -67,9 +67,9 @@ pub struct ConfigDbSync {
     object_key: String,
     local_path: PathBuf,
     last_etag: Arc<RwLock<Option<String>>>,
-    /// The config DB keys, used to validate downloaded DBs. A download under
-    /// a fallback key (a peer on the release before S8) is re-encrypted with
-    /// the primary key before the merge.
+    /// The keys that may open a downloaded copy ([`ConfigDbKeys::for_synced_copy`]).
+    /// A download under a fallback key is re-encrypted with the primary key
+    /// before the merge.
     db_keys: crate::config_db::ConfigDbKeys,
     /// Set when an upload exhausted its retries; the periodic poll flushes it.
     needs_upload: AtomicBool,
@@ -110,6 +110,20 @@ impl ConfigDbSync {
                 }
             }
         }
+
+        // S8: a synced copy opens only with a real key, never with the
+        // bootstrap hash, unless the operator opts in for a rolling upgrade.
+        let accept_legacy =
+            crate::config::env_bool(crate::config_db::key::ACCEPT_LEGACY_SYNC_ENV, false);
+        if accept_legacy {
+            warn!(
+                "{}=true: a synced config DB under the bootstrap password hash is accepted. \
+                 Remove it when every instance runs this release — the hash is not a secret \
+                 that should open the shared IAM database",
+                crate::config_db::key::ACCEPT_LEGACY_SYNC_ENV
+            );
+        }
+        let db_keys = db_keys.for_synced_copy(accept_legacy);
 
         // A park from before a restart comes back with the ETag its change
         // was based on, so the flush can still CAS on top of it.
@@ -323,9 +337,10 @@ impl ConfigDbSync {
 
         // Validate that the downloaded DB opens with our config DB key. A DB
         // under another key must NOT reach the merge — it would be unreadable.
-        // A DB under a fallback key (the bootstrap hash of a peer that runs the
-        // release before S8) is re-encrypted with our key here, so the merge
-        // below attaches it with the primary key.
+        // A DB under an accepted fallback key (DGP_CONFIG_DB_KEY_PREVIOUS, or
+        // the bootstrap hash with DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC) is
+        // re-encrypted with our key here, so the merge attaches it with the
+        // primary key.
         match ConfigDb::open_with_keys(&tmp_path, &self.db_keys) {
             Ok(_) => {
                 debug!("Downloaded config DB passed key validation");
@@ -1122,6 +1137,42 @@ mod tests {
             allow_local: true,
             session_token: None,
         }
+    }
+
+    /// S8: the bootstrap hash sits in configs and backups, so it must not
+    /// open a copy from the shared bucket: with it, anyone who can write to
+    /// the bucket and knows the hash plants an IAM DB on every node. The
+    /// boot fallback list still has it (local DB migration); the sync does not.
+    #[tokio::test]
+    async fn a_synced_copy_under_the_legacy_hash_is_refused_by_default() {
+        const HASH: &str = "$2b$04$legacyhashlegacyhashlegacyhashlegacyhash";
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("deltaglider_config.db");
+        let keys = crate::config_db::ConfigDbKeys::primary_only(&"k".repeat(40))
+            .with_fallback(crate::config_db::FallbackKind::LegacyBootstrapHash, HASH);
+        let sync = ConfigDbSync::new(
+            &dead_s3_backend(),
+            "sync".into(),
+            "k.db".into(),
+            db_path.clone(),
+            keys,
+        )
+        .await
+        .unwrap();
+        // A planted copy: encrypted with the hash, carrying an admin user.
+        let planted = dir.path().join("planted.db");
+        ConfigDb::open_or_create(&planted, HASH)
+            .unwrap()
+            .create_user("intruder", "AKINTRUDER01", "s", true, &[])
+            .unwrap();
+        let opened = ConfigDb::open_with_keys(&planted, &sync.db_keys);
+        assert!(
+            matches!(
+                opened,
+                Err(crate::config_db::ConfigDbError::WrongPassphrase(_))
+            ),
+            "the sync accepted a copy under the bootstrap hash"
+        );
     }
 
     /// D16: an upload that exhausts its retries (S3 down) is parked for the

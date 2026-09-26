@@ -41,7 +41,7 @@ The synced database, and the local database of every instance, move to the new k
 
 Instances that have not restarted yet cannot read uploads under the new key, so avoid IAM changes during step 3.
 
-**Upgrading a fleet from a release before the config DB key.** Those releases encrypted the DB with the bootstrap password hash. Set the same new `DGP_CONFIG_DB_KEY` on every instance and restart all of them. On the first start, each instance re-encrypts its local DB with the new key, and it still accepts a synced DB under the old hash. Until the last instance runs the new release, the old instances cannot read the uploads of the new ones, so avoid IAM changes during the rollout.
+**Upgrading a fleet from a release before the config DB key.** Those releases encrypted the DB with the bootstrap password hash. Set the same new `DGP_CONFIG_DB_KEY` on every instance and restart all of them. Also set `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC=true` on every instance for the rollout. On the first start, each instance re-encrypts its local DB with the new key. The variable lets it also accept a synced DB under the old hash. Without the variable, an instance refuses such a synced DB, because the hash is in configuration files and backups, so it cannot protect a database that other instances trust. Remove the variable and restart when the rollout is complete. Until the last instance runs the new release, the old instances cannot read the uploads of the new ones, so avoid IAM changes during the rollout.
 
 ## 3. Decide where operators edit IAM
 

@@ -27,6 +27,14 @@ pub const CONFIG_DB_KEY_ENV: &str = "DGP_CONFIG_DB_KEY";
 /// synced copy use the new key.
 pub const PREVIOUS_CONFIG_DB_KEY_ENV: &str = "DGP_CONFIG_DB_KEY_PREVIOUS";
 
+/// Transitional switch for a rolling upgrade from a release before the
+/// config DB key: when `true`, a SYNCED copy that opens only with the legacy
+/// bootstrap hash is accepted (and re-encrypted). Off by default, because the
+/// hash is not a secret of the same class as the key (it sits in configs and
+/// backups): with it, anyone who can write to the sync bucket and knows the
+/// hash could plant an IAM database on every node.
+pub const ACCEPT_LEGACY_SYNC_ENV: &str = "DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC";
+
 /// Minimum length of a `DGP_CONFIG_DB_KEY` value. `openssl rand -hex 32`
 /// gives 64 characters.
 pub const MIN_CONFIG_DB_KEY_LEN: usize = 32;
@@ -113,6 +121,28 @@ impl ConfigDbKeys {
             primary: DbSecret::new(key),
             source: DbKeySource::Env,
             fallbacks: Vec::new(),
+        }
+    }
+
+    /// The keys that may open a copy downloaded from the sync bucket: the
+    /// primary key and `DGP_CONFIG_DB_KEY_PREVIOUS`. The key file is per node
+    /// and never keys a shared copy. The legacy bootstrap hash counts only
+    /// with `accept_legacy` ([`ACCEPT_LEGACY_SYNC_ENV`]).
+    pub fn for_synced_copy(&self, accept_legacy: bool) -> Self {
+        let fallbacks = self
+            .fallbacks
+            .iter()
+            .filter(|(kind, _)| match kind {
+                FallbackKind::PreviousKey => true,
+                FallbackKind::KeyFile => false,
+                FallbackKind::LegacyBootstrapHash => accept_legacy,
+            })
+            .cloned()
+            .collect();
+        Self {
+            primary: self.primary.clone(),
+            source: self.source.clone(),
+            fallbacks,
         }
     }
 
@@ -442,6 +472,24 @@ mod tests {
     fn debug_never_shows_the_key() {
         let keys = ConfigDbKeys::primary_only("super-secret-value");
         assert!(!format!("{keys:?}").contains("super-secret-value"));
+    }
+
+    #[test]
+    fn a_synced_copy_opens_only_with_the_key_and_the_previous_key() {
+        let keys = ConfigDbKeys::primary_only("primary")
+            .with_fallback(FallbackKind::PreviousKey, "previous")
+            .with_fallback(FallbackKind::KeyFile, "file")
+            .with_fallback(FallbackKind::LegacyBootstrapHash, "hash");
+        let kinds = |k: ConfigDbKeys| k.fallbacks.iter().map(|(k, _)| *k).collect::<Vec<_>>();
+        assert_eq!(
+            kinds(keys.for_synced_copy(false)),
+            vec![FallbackKind::PreviousKey]
+        );
+        assert_eq!(
+            kinds(keys.for_synced_copy(true)),
+            vec![FallbackKind::PreviousKey, FallbackKind::LegacyBootstrapHash]
+        );
+        assert_eq!(keys.for_synced_copy(false).primary.expose(), "primary");
     }
 
     #[test]

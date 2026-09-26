@@ -318,8 +318,13 @@ Upgrade steps:
   instance before you start this release. An instance with a sync bucket and
   without the variable refuses to start. Upgrade all instances together and
   make no IAM changes during the rollout: instances on the old release cannot
-  read uploads under the new key. This release still accepts a synced
-  database that an old instance wrote under the hash. An instance whose key
+  read uploads under the new key. For the rollout, also set
+  `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC=true` on every instance, so that the new
+  release accepts a synced database that an old instance wrote under the hash,
+  and remove it when the rollout is complete. Without it, a synced database
+  that opens only with the hash is refused: the hash is in configuration files
+  and backups, so anyone who can write to the bucket and knows the hash could
+  plant an IAM database. An instance whose key
   differs refuses the synced database with an error that names
   `DGP_CONFIG_DB_KEY`, and never overwrites the synced copy.
 - **Kubernetes operator:** with `bootstrapPassword.autoGenerate`, the operator

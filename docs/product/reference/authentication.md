@@ -67,6 +67,7 @@ Facts about the key:
 
   For several instances with a sync bucket, see [How to run multiple instances](../how-to/run-multiple-instances.md#rotate-the-config-db-key).
 - **A key that opens nothing**: when no key opens the database, the proxy keeps the database as `deltaglider_config.db.bak`, starts with an empty database, and locks the S3 API (`503`) until you restore the right key and restart. The admin GUI has a recovery wizard that tells you whether a candidate key opens the preserved database.
+- **A synced copy opens only with a real key.** A database that an instance downloads from `config_sync_bucket` must open with `DGP_CONFIG_DB_KEY` or `DGP_CONFIG_DB_KEY_PREVIOUS`. The bootstrap password hash opens a synced copy only when `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC=true`, which is meant for the rolling upgrade from a release before the config DB key. The hash is in configuration files and backups, so it must not open a database that the instances trust.
 - **The key is never printed** and never leaves the node: the synced copy in `config_sync_bucket` is encrypted with it.
 
 ## SigV4 verification

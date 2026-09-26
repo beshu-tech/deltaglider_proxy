@@ -303,6 +303,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         example: "<the old DGP_CONFIG_DB_KEY>",
         category: "Authentication",
     },
+    EnvVarEntry {
+        name: "DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC",
+        description: "Transitional, for a rolling upgrade from a release before DGP_CONFIG_DB_KEY: accept a synced config DB that opens only with the bootstrap password hash (default false). Remove it when every instance runs this release",
+        example: "true",
+        category: "Authentication",
+    },
     // ── TLS ─────────────────────────────────────────────────
     EnvVarEntry {
         name: "DGP_TLS_ENABLED",
