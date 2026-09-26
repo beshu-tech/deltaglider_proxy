@@ -228,6 +228,69 @@ pub fn facts_for<'a>(
     found.cloned()
 }
 
+/// After a PUT wrote the facts entry `mine`, the entries of the same stored
+/// key that the cleanup may delete: those the backend stored EARLIER than
+/// `mine` (by the backend's own `LastModified`, so node clocks do not
+/// matter). A newer entry comes from a later write on another node and must
+/// survive; an equal time cannot be ordered and survives too (harmless: it
+/// matches only its own stored object). Without `mine` in the listing,
+/// nothing is deleted.
+pub fn stale_after_write<T: Ord + Copy>(listed: &[(String, Option<T>)], mine: &str) -> Vec<String> {
+    let Some(Some(mine_at)) = listed.iter().find(|(k, _)| k == mine).map(|(_, t)| *t) else {
+        return Vec::new();
+    };
+    listed
+        .iter()
+        .filter(|(k, t)| k != mine && t.is_some_and(|t| t < mine_at))
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// How a batch cleanup finds the facts entries of deleted stored keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanupRead {
+    /// Few keys: one prefix LIST per key.
+    PerKey(Vec<String>),
+    /// Many keys in one directory: one range scan of that directory, at most
+    /// `pages` pages; the keys the scan does not reach fall back to
+    /// `PerKey`.
+    Range {
+        scan: FactsScan,
+        keys: Vec<String>,
+        pages: usize,
+    },
+}
+
+/// Keys at or below this count in one directory read per key.
+const PER_KEY_MAX: usize = 2;
+
+/// Pure: group deleted stored keys by directory and pick the cheapest read
+/// for each group. A batch of `n` keys in one directory costs about
+/// `n / 1000 + 1` LIST requests instead of `n`.
+pub fn plan_cleanup(stored_keys: impl IntoIterator<Item = String>) -> Vec<CleanupRead> {
+    let mut by_dir: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        Default::default();
+    for k in stored_keys {
+        by_dir.entry(dir_of(&k).to_string()).or_default().insert(k);
+    }
+    by_dir
+        .into_values()
+        .map(|keys| {
+            let keys: Vec<String> = keys.into_iter().collect();
+            if keys.len() <= PER_KEY_MAX {
+                return CleanupRead::PerKey(keys);
+            }
+            let scan = plan_facts_scan(keys.iter().map(String::as_str))
+                .expect("a non-empty group has a scan");
+            CleanupRead::Range {
+                pages: keys.len() / 1000 + 2,
+                scan,
+                keys,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +388,60 @@ mod tests {
             (".dg/facts/", Some("/"))
         );
         assert!(plan_facts_scan([]).is_none());
+    }
+
+    #[test]
+    fn a_cleanup_deletes_only_entries_older_than_the_write() {
+        let l = |k: &str, t: Option<u32>| (k.to_string(), t);
+        let listed = [
+            l("old", Some(1)),
+            l("mine", Some(5)),
+            l("newer", Some(9)),
+            l("same", Some(5)),
+            l("unknown", None),
+        ];
+        assert_eq!(stale_after_write(&listed, "mine"), vec!["old".to_string()]);
+        // The newer node's own cleanup removes both older entries.
+        assert_eq!(
+            stale_after_write(&listed, "newer"),
+            vec!["old".to_string(), "mine".to_string(), "same".to_string()]
+        );
+        assert!(stale_after_write(&listed, "absent").is_empty());
+        assert!(stale_after_write(&[l("mine", None), l("old", Some(1))], "mine").is_empty());
+    }
+
+    /// Two nodes overwrite the same key; each cleanup runs after both
+    /// writes. Whatever the order of the cleanups, the last write survives.
+    #[test]
+    fn the_last_writer_survives_both_cleanups() {
+        let listed = vec![("a".to_string(), Some(1u32)), ("b".to_string(), Some(2))];
+        let mut left: Vec<&str> = vec!["a", "b"];
+        for mine in ["a", "b"] {
+            let stale = stale_after_write(&listed, mine);
+            left.retain(|k| !stale.iter().any(|s| s == k));
+        }
+        assert_eq!(left, vec!["b"]);
+    }
+
+    #[test]
+    fn a_batch_cleanup_scans_each_directory_once() {
+        let many: Vec<String> = (0..1000).map(|i| format!("d/{i:04}.zip.delta")).collect();
+        let mut keys = many.clone();
+        keys.push("e/x.delta".into());
+        keys.push("d/sub/y.delta".into());
+        let plan = plan_cleanup(keys);
+        assert_eq!(plan.len(), 3);
+        match &plan[0] {
+            CleanupRead::Range { scan, keys, pages } => {
+                assert_eq!(scan.prefix, ".dg/facts/d/");
+                assert_eq!(scan.delimiter, Some("/"));
+                assert_eq!(keys.len(), 1000);
+                assert_eq!(*pages, 3);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(plan[1], CleanupRead::PerKey(vec!["d/sub/y.delta".into()]));
+        assert_eq!(plan[2], CleanupRead::PerKey(vec!["e/x.delta".into()]));
     }
 
     proptest::proptest! {

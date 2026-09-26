@@ -530,6 +530,117 @@ async fn a_head_backfills_missing_listing_facts() {
     assert_eq!(size_on(&other).await, variant.len());
 }
 
+async fn facts_requests(endpoint: &str, kind: &str) -> u64 {
+    scrape_counter(
+        endpoint,
+        &format!("deltaglider_listing_facts_requests_total{{kind=\"{kind}\"}}"),
+    )
+    .await
+}
+
+/// Review C3 follow-up: a 1000-key DeleteObjects drops the listing facts of
+/// all its objects with a few requests (one range scan of the directory and
+/// one batched delete), not one facts LIST per key.
+#[tokio::test]
+async fn batch_delete_drops_listing_facts_in_a_few_requests() {
+    skip_unless_minio!();
+    const N: usize = 1000;
+    let server = TestServer::builder()
+        .s3_endpoint(&common::minio_endpoint_url())
+        .bucket(MINIO_BUCKET)
+        .encryption_key("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    let prefix = unique_prefix();
+    let keys: Vec<String> = (0..N).map(|i| format!("{prefix}/obj-{i:04}.bin")).collect();
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(32));
+    let puts: Vec<_> = keys
+        .iter()
+        .map(|k| {
+            let (c, k, b, sem) = (
+                client.clone(),
+                k.clone(),
+                server.bucket().to_string(),
+                sem.clone(),
+            );
+            tokio::spawn(async move {
+                let _p = sem.acquire().await.unwrap();
+                c.put_object()
+                    .bucket(b)
+                    .key(k)
+                    .body(ByteStream::from_static(b"payload"))
+                    .send()
+                    .await
+                    .unwrap();
+            })
+        })
+        .collect();
+    for p in puts {
+        p.await.unwrap();
+    }
+    let raw = minio_client().await;
+    let facts_left = |raw: aws_sdk_s3::Client, prefix: String| async move {
+        let mut n = 0;
+        let mut token = None;
+        loop {
+            let r = raw
+                .list_objects_v2()
+                .bucket(MINIO_BUCKET)
+                .prefix(format!(".dg/facts/{prefix}/"))
+                .set_continuation_token(token)
+                .send()
+                .await
+                .unwrap();
+            n += r.contents().len();
+            token = r.next_continuation_token().map(String::from);
+            if token.is_none() {
+                return n;
+            }
+        }
+    };
+    assert_eq!(facts_left(raw.clone(), prefix.clone()).await, N);
+
+    let (lists, deletes) = (
+        facts_requests(&server.endpoint(), "list").await,
+        facts_requests(&server.endpoint(), "delete").await,
+    );
+    let ids: Vec<aws_sdk_s3::types::ObjectIdentifier> = keys
+        .iter()
+        .map(|k| {
+            aws_sdk_s3::types::ObjectIdentifier::builder()
+                .key(k)
+                .build()
+                .unwrap()
+        })
+        .collect();
+    let out = client
+        .delete_objects()
+        .bucket(server.bucket())
+        .delete(
+            aws_sdk_s3::types::Delete::builder()
+                .set_objects(Some(ids))
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(out.errors().is_empty(), "{:?}", out.errors());
+    // The cleanup runs in the background, after a short batching delay.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while facts_left(raw.clone(), prefix.clone()).await > 0 {
+        assert!(std::time::Instant::now() < deadline, "facts not cleaned up");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let lists = facts_requests(&server.endpoint(), "list").await - lists;
+    let deletes = facts_requests(&server.endpoint(), "delete").await - deletes;
+    // One LIST per key (1000) before. A slow backend can split the batch
+    // into a few flushes, each one range scan and one batched delete.
+    assert!(lists <= 20, "{lists} facts LISTs for a {N}-key batch");
+    assert!(deletes <= 20, "{deletes} facts deletes for a {N}-key batch");
+}
+
 /// Review C9: `metadata=true` must reach the engine. The adapter always
 /// listed in lite mode, so on an S3 backend (whose LIST carries no user
 /// metadata) the `<UserMetadata>` extension came back without the user's

@@ -109,7 +109,7 @@ deltaglider_cache_miss_rate_ratio > 0.5     # cache thrashing
 | `deltaglider_backend_head_requests_total` | Counter | — | Object metadata (HEAD) requests that the proxy sends to S3 |
 | `deltaglider_delegated_list_upstream_pages_total` | Counter | — | Backend listing pages that client listings read |
 | `deltaglider_delegated_list_probe_requests_total` | Counter | — | Exact-key probes that client listings send to complete a page |
-| `deltaglider_listing_facts_requests_total` | Counter | `kind` | Requests for the listing facts index on S3 (`.dg/facts/`): `list` (a listing page reads the original sizes of its objects, or a cleanup finds old entries), `put` (an upload or a lazy backfill writes an entry), `delete` (a cleanup drops an entry of an overwritten or deleted object) |
+| `deltaglider_listing_facts_requests_total` | Counter | `kind` | Requests for the listing facts index on S3 (`.dg/facts/`): `list` (a listing page reads the original sizes of its objects, or a cleanup finds old entries), `put` (an upload or a lazy backfill writes an entry), `delete` (a cleanup drops the entries of overwritten or deleted objects; one batched `DeleteObjects` request counts once) |
 
 A client listing of an S3-backed bucket costs one `list` request per page when the page holds deltas or ciphertext that this proxy did not write or read since it started. A `list` rate far above the client listing rate means that the index holds many old entries.
 

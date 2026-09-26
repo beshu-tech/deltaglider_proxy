@@ -236,9 +236,14 @@ bucket. Its key holds the stored object's key, ETag, and size, and the
 original size and ETag. A listing page reads these index objects with one more
 listing request and reports the original size and ETag, on every proxy
 instance and after a restart. An index object applies only to the stored
-object with exactly that key, ETag, and size, so a stale one is ignored. A
-delete of the object removes its index object, and an overwrite removes the
-old one. Listings never show `.dg/facts/`, and an upload to a key under
+object with exactly that key, ETag, and size, so a stale one is ignored. An
+overwrite removes the index objects that the backend stored before the new
+one, so when two proxy instances overwrite the same key at the same time, the
+index object of the later write stays. A delete removes the object's index
+objects in the background: the proxy collects the deletes for a moment, reads
+the index range of each folder once, and removes the entries with batched
+`DeleteObjects` requests. A delete of 1000 objects then costs a few requests,
+not 1000. Listings never show `.dg/facts/`, and an upload to a key under
 `.dg/facts/` gets `400 InvalidArgument`. A tool that lists the backend bucket
 directly (not through the proxy) sees these zero-byte objects; a delete of an
 empty bucket through the proxy removes them first.

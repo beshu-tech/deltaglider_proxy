@@ -3,6 +3,7 @@
 //! Storage backend abstraction
 
 pub mod encrypting;
+mod facts_cleanup;
 mod filesystem;
 pub mod list_size_cache;
 pub mod listing_facts;

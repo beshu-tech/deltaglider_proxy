@@ -465,6 +465,8 @@ pub struct S3Backend {
     /// Scope of this backend's entries in the listing-size cache: the
     /// endpoint that holds the buckets (see `list_size_cache`).
     list_cache_scope: String,
+    /// Batched removal of deleted objects' listing facts.
+    facts_cleanup: super::facts_cleanup::FactsCleanupQueue,
 }
 
 impl S3Backend {
@@ -604,10 +606,12 @@ impl S3Backend {
             BackendConfig::S3 { region, .. } => format!("aws:{region}"),
             _ => String::new(),
         };
+        let facts_cleanup = super::facts_cleanup::FactsCleanupQueue::start(client.clone());
         Ok(Self {
             client,
             native_encryption,
             list_cache_scope,
+            facts_cleanup,
         })
     }
 
@@ -1586,8 +1590,10 @@ impl S3Backend {
             warn!("listing facts for {bucket}/{key} not written: {e}");
             return;
         }
-        // The key's older entries describe objects that no longer exist.
-        drop_listing_facts(&self.client, bucket, key, Some(&facts_key)).await;
+        // Entries stored before this one describe objects that no longer
+        // exist; a newer one (a concurrent overwrite elsewhere) stays.
+        self.facts_cleanup.note_rewrite(bucket, key);
+        super::facts_cleanup::cleanup_after_write(&self.client, bucket, key, &facts_key).await;
     }
 
     /// Lazy backfill: a HEAD learned the facts of a stored object that a LIST
@@ -2402,7 +2408,7 @@ impl StorageBackend for S3Backend {
     ) -> Result<(), StorageError> {
         let key = self.delta_key(prefix, filename);
         self.delete_s3_object(bucket, &key).await?;
-        drop_listing_facts(&self.client, bucket, &key, None).await;
+        self.facts_cleanup.enqueue(bucket, &key);
         debug!("Deleted delta for {}/{}/{}", bucket, prefix, filename);
         Ok(())
     }
@@ -2994,13 +3000,8 @@ impl StorageBackend for S3Backend {
     }
 
     async fn forget_passthrough_listing_facts(&self, bucket: &str, prefix: &str, filename: &str) {
-        drop_listing_facts(
-            &self.client,
-            bucket,
-            &self.passthrough_key(prefix, filename),
-            None,
-        )
-        .await;
+        self.facts_cleanup
+            .enqueue(bucket, &self.passthrough_key(prefix, filename));
     }
 
     /// Optimised listing that delegates delimiter collapsing to upstream S3.
@@ -3236,10 +3237,6 @@ impl StorageBackend for S3Backend {
     }
 }
 
-/// Did an S3 backend deny access to an object? An object-level 403 has no
-/// `StorageError` variant of its own: `S3Backend::classify_s3_error` keeps it
-/// as `S3("<op> failed (status=403): …")`. This helper lives next to that
-/// format so that callers never match on error text themselves.
 /// PUT one zero-byte facts object (native SSE headers as for any object: a
 /// bucket policy may require them).
 async fn put_facts_object(
@@ -3266,37 +3263,10 @@ async fn put_facts_object(
     Ok(())
 }
 
-/// Delete the facts entries of the stored object `stored_key`, except
-/// `keep`. Best effort (a leftover entry never matches a later object), so
-/// errors are only logged.
-async fn drop_listing_facts(client: &Client, bucket: &str, stored_key: &str, keep: Option<&str>) {
-    let prefix = format!("{}!!", listing_facts::stored_prefix(stored_key));
-    LISTING_FACTS_REQUESTS.with_label_values(&["list"]).inc();
-    let listed = match client
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(&prefix)
-        .max_keys(100)
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            debug!("listing facts cleanup for {bucket}/{stored_key} skipped: {e:?}");
-            return;
-        }
-    };
-    for key in listed.contents().iter().filter_map(|o| o.key()) {
-        if Some(key) == keep {
-            continue;
-        }
-        LISTING_FACTS_REQUESTS.with_label_values(&["delete"]).inc();
-        if let Err(e) = client.delete_object().bucket(bucket).key(key).send().await {
-            debug!("stale listing facts {bucket}/{key} not deleted: {e:?}");
-        }
-    }
-}
-
+/// Did an S3 backend deny access to an object? An object-level 403 has no
+/// `StorageError` variant of its own: `S3Backend::classify_s3_error` keeps it
+/// as `S3("<op> failed (status=403): …")`. This helper lives next to that
+/// format so that callers never match on error text themselves.
 pub fn is_backend_access_denied(e: &StorageError) -> bool {
     matches!(e, StorageError::S3(msg) if msg.contains("(status=403)"))
 }
