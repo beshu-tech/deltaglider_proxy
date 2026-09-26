@@ -868,6 +868,7 @@ impl S3Backend {
             }
         }
 
+        let wanted_meta = plan.metadata.clone();
         for (k, v) in plan.metadata {
             request = request.metadata(k, v);
         }
@@ -875,20 +876,58 @@ impl S3Backend {
             request = request.copy_source_if_match(e);
         }
 
-        let resp = request.send().await.map_err(|e| {
-            if expect_etag.is_some()
-                && crate::coordination::cas::conditional_write_lost(
-                    &crate::config_db_sync::sdk_error_signal(&e),
-                )
+        let resp = match request.send().await {
+            Ok(resp) => resp,
+            Err(e)
+                if expect_etag.is_some()
+                    && crate::coordination::cas::conditional_write_lost(
+                        &crate::config_db_sync::sdk_error_signal(&e),
+                    ) =>
             {
-                return reference_fence_lost(bucket, key);
+                // An SDK retry of a copy whose response was lost meets our
+                // own copy (a new ETag on SSE-KMS and similar): ours when
+                // the object carries exactly the metadata we wrote.
+                return self
+                    .own_metadata_write_or_lost(bucket, key, &wanted_meta)
+                    .await;
             }
-            Self::classify_s3_error(bucket, &e, S3Op::Other("copy_object (metadata update)"))
-        })?;
+            Err(e) => {
+                return Err(Self::classify_s3_error(
+                    bucket,
+                    &e,
+                    S3Op::Other("copy_object (metadata update)"),
+                ))
+            }
+        };
         Ok(resp
             .copy_object_result()
             .and_then(|r| r.e_tag())
             .map(str::to_string))
+    }
+
+    /// See [`Self::own_write_or_lost`]; for a metadata-only rewrite the
+    /// proof is the object's user metadata, which a peer's write changes.
+    async fn own_metadata_write_or_lost(
+        &self,
+        bucket: &str,
+        key: &str,
+        wanted: &HashMap<String, String>,
+    ) -> Result<Option<String>, StorageError> {
+        BACKEND_HEAD_REQUESTS.inc();
+        let head = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        match head {
+            Ok(h) if user_metadata_equal(h.metadata(), wanted) => {
+                debug!("S3 metadata rewrite {bucket}/{key}: the refused retry met its own copy");
+                Ok(h.e_tag().map(str::to_string))
+            }
+            _ => Err(reference_fence_lost(bucket, key)),
+        }
     }
 
     /// Convert S3 metadata headers to FileMetadata
@@ -3542,6 +3581,22 @@ enum FencedWriteVerdict {
     Other,
 }
 
+/// Pure: does an object's user metadata (as a HEAD returns it; S3
+/// lowercases the keys) equal what a write sent? Empty values count as
+/// absent on both sides.
+fn user_metadata_equal(
+    got: Option<&HashMap<String, String>>,
+    wanted: &HashMap<String, String>,
+) -> bool {
+    let norm = |m: &HashMap<String, String>| -> std::collections::BTreeMap<String, String> {
+        m.iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
+            .collect()
+    };
+    !wanted.is_empty() && norm(got.unwrap_or(&HashMap::new())) == norm(wanted)
+}
+
 /// Pure: is `etag` (as S3 returns it) the MD5 of a single-PUT body? A
 /// multipart or SSE-KMS ETag never is, so those stay lost fences.
 fn etag_is_body_md5(etag: &str, body_md5_hex: &str) -> bool {
@@ -4839,6 +4894,29 @@ mod review3_tests {
     /// reads it as unrelated, and the PUT loop does not retry a 409, so the
     /// client gets a non-retryable error instead of SlowDown.
     #[test]
+    fn user_metadata_equal_truth_table() {
+        let m = |kv: &[(&str, &str)]| -> HashMap<String, String> {
+            kv.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let want = m(&[("dg-note", "reference"), ("Dg-Sha", "x")]);
+        assert!(user_metadata_equal(
+            Some(&m(&[("dg-note", "reference"), ("dg-sha", "x")])),
+            &want
+        ));
+        assert!(!user_metadata_equal(
+            Some(&m(&[("dg-note", "peer")])),
+            &want
+        ));
+        assert!(!user_metadata_equal(None, &want));
+        assert!(
+            !user_metadata_equal(Some(&m(&[])), &m(&[])),
+            "nothing to prove"
+        );
+    }
+
+    #[test]
     fn etag_is_body_md5_truth_table() {
         assert!(etag_is_body_md5("\"abcd\"", "abcd"));
         assert!(etag_is_body_md5("ABCD", "abcd"));
@@ -4881,6 +4959,8 @@ mod lost_response_tests {
     #[derive(Default)]
     struct Fake {
         objects: parking_lot::Mutex<HashMap<String, String>>,
+        /// `x-amz-meta-*` of each object (set by a REPLACE self-copy).
+        meta: parking_lot::Mutex<HashMap<String, Vec<(String, String)>>>,
         puts: AtomicUsize,
     }
 
@@ -4901,6 +4981,48 @@ mod lost_response_tests {
                     let f = f.clone();
                     async move {
                         let path = format!("{b}/{k}");
+                        if headers.contains_key("x-amz-copy-source") {
+                            // REPLACE self-copy: a new ETag (as with SSE-KMS),
+                            // the request's metadata.
+                            let refused = {
+                                let objs = f.objects.lock();
+                                let want = headers
+                                    .get("x-amz-copy-source-if-match")
+                                    .and_then(|v| v.to_str().ok());
+                                want.is_some_and(|w| objs.get(&path).map(String::as_str) != Some(w))
+                            };
+                            if refused {
+                                return (
+                                    StatusCode::PRECONDITION_FAILED,
+                                    HeaderMap::new(),
+                                    "<Error><Code>PreconditionFailed</Code></Error>".to_string(),
+                                );
+                            }
+                            let n = f.puts.fetch_add(1, Ordering::SeqCst);
+                            let etag = format!("\"copy-{n}\"");
+                            f.objects.lock().insert(path.clone(), etag.clone());
+                            let meta: Vec<(String, String)> = headers
+                                .iter()
+                                .filter_map(|(k, v)| {
+                                    Some((
+                                        k.as_str().strip_prefix("x-amz-meta-")?.to_string(),
+                                        v.to_str().ok()?.to_string(),
+                                    ))
+                                })
+                                .collect();
+                            f.meta.lock().insert(path, meta);
+                            if n == 0 {
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            }
+                            return (
+                                StatusCode::OK,
+                                HeaderMap::new(),
+                                format!(
+                                    "<CopyObjectResult><ETag>{}</ETag></CopyObjectResult>",
+                                    etag.replace('"', "&quot;")
+                                ),
+                            );
+                        }
                         let etag = format!("\"{}\"", hex::encode(md5::Md5::digest(&body)));
                         {
                             let mut objs = f.objects.lock();
@@ -4935,7 +5057,15 @@ mod lost_response_tests {
                     let f = f2.clone();
                     async move {
                         let mut h = HeaderMap::new();
-                        match f.objects.lock().get(&format!("{b}/{k}")) {
+                        let path = format!("{b}/{k}");
+                        for (mk, mv) in f.meta.lock().get(&path).into_iter().flatten() {
+                            h.insert(
+                                axum::http::HeaderName::try_from(format!("x-amz-meta-{mk}"))
+                                    .unwrap(),
+                                mv.parse().unwrap(),
+                            );
+                        }
+                        match f.objects.lock().get(&path) {
                             Some(e) => {
                                 h.insert("etag", e.parse().unwrap());
                                 h.insert("content-length", "0".parse().unwrap());
@@ -4954,13 +5084,17 @@ mod lost_response_tests {
     }
 
     fn backend(endpoint: &str) -> S3Backend {
+        backend_with(endpoint, aws_sdk_s3::config::retry::RetryConfig::disabled())
+    }
+
+    fn backend_with(endpoint: &str, retry: aws_sdk_s3::config::retry::RetryConfig) -> S3Backend {
         let conf = aws_sdk_s3::config::Builder::new()
             .behavior_version(BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
             .credentials_provider(Credentials::new("a", "b", None, None, "t"))
             .force_path_style(true)
             .endpoint_url(endpoint)
-            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .retry_config(retry)
             .timeout_config(
                 aws_sdk_s3::config::timeout::TimeoutConfig::builder()
                     .operation_attempt_timeout(std::time::Duration::from_millis(300))
@@ -5040,5 +5174,63 @@ mod lost_response_tests {
             matches!(got, Err(StorageError::Throttled(_))),
             "a peer's reference must stay a lost fence, got {got:?}"
         );
+    }
+
+    /// The metadata-only rewrite of reference.bin is a REPLACE self-copy
+    /// with `x-amz-copy-source-if-match`. When its response is lost, the
+    /// SDK retries; the first copy changed the ETag (SSE-KMS, or any
+    /// backend that re-stamps it), so the retry is refused with 412.
+    #[tokio::test]
+    async fn a_fenced_metadata_rewrite_whose_response_was_lost_is_ours() {
+        let (ep, fake) = fake_s3().await;
+        let s3 = backend_with(
+            &ep,
+            aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(3),
+        );
+        let key = s3.reference_key("v1");
+        fake.objects
+            .lock()
+            .insert(format!("b/{key}"), "\"v1\"".into());
+        let data = b"baseline".to_vec();
+        let got = s3
+            .write_reference_fenced(
+                "b",
+                "v1",
+                RefWrite::Metadata {
+                    metadata: &meta(&data),
+                },
+                &RefFence::ETag("\"v1\"".into()),
+            )
+            .await;
+        assert_eq!(
+            got.ok(),
+            Some(RefFence::ETag("\"copy-0\"".into())),
+            "our own landed copy must not read as a lost fence"
+        );
+    }
+
+    /// A peer's metadata rewrite in between stays a lost fence.
+    #[tokio::test]
+    async fn a_peer_metadata_rewrite_is_still_a_lost_fence() {
+        let (ep, fake) = fake_s3().await;
+        let s3 = backend(&ep);
+        let key = s3.reference_key("v1");
+        let path = format!("b/{key}");
+        fake.objects.lock().insert(path.clone(), "\"peer\"".into());
+        fake.meta
+            .lock()
+            .insert(path, vec![("dg-note".into(), "peer".into())]);
+        let data = b"baseline".to_vec();
+        let got = s3
+            .write_reference_fenced(
+                "b",
+                "v1",
+                RefWrite::Metadata {
+                    metadata: &meta(&data),
+                },
+                &RefFence::ETag("\"v1\"".into()),
+            )
+            .await;
+        assert!(matches!(got, Err(StorageError::Throttled(_))), "{got:?}");
     }
 }
