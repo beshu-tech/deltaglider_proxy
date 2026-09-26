@@ -3302,3 +3302,69 @@ async fn iam_db_users_without_a_bootstrap_pair_boot() {
         .await
         .expect("the DB user signs S3 requests");
 }
+
+// ============================================================================
+// Lockout responses name the lockout
+// ============================================================================
+
+/// Every lockout answers 429 with `Retry-After` and a JSON body that names
+/// the lockout, so a client can say "try again in N min" instead of a bare
+/// "Login failed". The correct password is refused while the lockout lasts.
+#[tokio::test]
+async fn lockout_answers_429_with_retry_after_and_a_reason() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_RATE_LIMIT_MAX_ATTEMPTS", "3")
+        .env("DGP_RATE_LIMIT_LOCKOUT_SECS", "600")
+        .build()
+        .await;
+    let url = format!("{}/_/api/admin/login", server.endpoint());
+    let http = reqwest::Client::new();
+    for i in 0..3 {
+        let r = http
+            .post(&url)
+            .json(&json!({ "password": format!("wrong-{i}") }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    }
+    for (label, password) in [
+        ("wrong", "wrong-4"),
+        ("correct", common::TEST_BOOTSTRAP_PASSWORD),
+    ] {
+        let r = http
+            .post(&url)
+            .json(&json!({ "password": password }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS, "{label}");
+        let retry: u64 = r
+            .headers()
+            .get("retry-after")
+            .unwrap_or_else(|| panic!("{label}: no Retry-After"))
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((500..=600).contains(&retry), "{label}: Retry-After {retry}");
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["error"], "too_many_attempts", "{label}: {body}");
+        assert_eq!(body["retry_after_secs"].as_u64(), Some(retry), "{body}");
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("10 min"),
+            "{label}: {body}"
+        );
+    }
+
+    // Other credential surfaces share the response: login-as.
+    let r = http
+        .post(format!("{}/_/api/admin/login-as", server.endpoint()))
+        .json(&json!({ "access_key_id": "x", "secret_access_key": "y" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(r.headers().get("retry-after").is_some());
+}

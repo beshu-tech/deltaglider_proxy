@@ -212,7 +212,7 @@ pub async fn require_metrics_access(
         .await
         {
             Ok(g) => g,
-            Err(_blocked) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+            Err(blocked) => return blocked.into_response(),
         };
         if bearer_matches(&headers, token) {
             guard.record_success();
@@ -286,6 +286,34 @@ pub struct OpenBrowserConnectRequest {
     region: Option<String>,
     #[serde(default)]
     bucket: String,
+}
+
+/// Error of a credential handler: a plain status, or a lockout (429 with
+/// `Retry-After` and a JSON reason, see [`crate::rate_limiter::Blocked`]).
+pub enum AuthReject {
+    Status(StatusCode),
+    Blocked(crate::rate_limiter::Blocked),
+}
+
+impl From<StatusCode> for AuthReject {
+    fn from(s: StatusCode) -> Self {
+        Self::Status(s)
+    }
+}
+
+impl From<crate::rate_limiter::Blocked> for AuthReject {
+    fn from(b: crate::rate_limiter::Blocked) -> Self {
+        Self::Blocked(b)
+    }
+}
+
+impl IntoResponse for AuthReject {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Status(s) => s.into_response(),
+            Self::Blocked(b) => b.into_response(),
+        }
+    }
 }
 
 /// Whether session cookies should include the `Secure` flag (HTTPS-only).
@@ -521,14 +549,7 @@ pub async fn login(
     .await
     {
         Ok(g) => g,
-        Err(_blocked) => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                HeaderMap::new(),
-                Json(LoginResponse { ok: false }),
-            )
-                .into_response();
-        }
+        Err(blocked) => return blocked.into_response(),
     };
 
     let hash = state.password_hash.read().clone();
@@ -717,15 +738,14 @@ pub async fn resolve_iam_identity(
     connect_info: Option<ConnectInfo<SocketAddr>>,
     req_headers: HeaderMap,
     AdminJson(body): AdminJson<ResolveIamIdentityRequest>,
-) -> Result<Json<WhoamiResponse>, StatusCode> {
+) -> Result<Json<WhoamiResponse>, AuthReject> {
     let guard = crate::rate_limiter::RateLimitGuard::enter(
         &state.rate_limiter,
         &req_headers,
         connect_info.as_ref().map(|ci| ci.0.ip()),
         "resolve_iam_identity",
     )
-    .await
-    .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    .await?;
 
     let iam_state = state.iam_state.load();
     let Some(user) = (match &**iam_state {
@@ -733,12 +753,12 @@ pub async fn resolve_iam_identity(
         _ => None,
     }) else {
         guard.record_failure();
-        return Err(StatusCode::FORBIDDEN);
+        return Err(StatusCode::FORBIDDEN.into());
     };
 
     if !iam_user_secret_valid(&user, &body.secret_access_key) {
         guard.record_failure();
-        return Err(StatusCode::FORBIDDEN);
+        return Err(StatusCode::FORBIDDEN.into());
     }
 
     guard.record_success();
@@ -861,7 +881,7 @@ pub async fn login_as(
     connect_info: Option<ConnectInfo<SocketAddr>>,
     req_headers: HeaderMap,
     AdminJson(body): AdminJson<LoginAsRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, AuthReject> {
     // Per-IP + per-account brute-force gate. Without the per-account
     // bucket, a botnet rotating IPs could target a specific admin's
     // access_key_id without any rate limit. The account dimension is
@@ -873,8 +893,7 @@ pub async fn login_as(
         &body.access_key_id,
         "login_as",
     )
-    .await
-    .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    .await?;
 
     let iam_state = state.iam_state.load();
     let user = match &**iam_state {
@@ -892,7 +911,7 @@ pub async fn login_as(
                 body.access_key_id
             );
             audit_log("login_failed", "", &body.access_key_id, &req_headers);
-            return Err(StatusCode::FORBIDDEN);
+            return Err(StatusCode::FORBIDDEN.into());
         }
     };
 
@@ -904,7 +923,7 @@ pub async fn login_as(
             body.access_key_id
         );
         audit_log("login_failed", "", &body.access_key_id, &req_headers);
-        return Err(StatusCode::FORBIDDEN);
+        return Err(StatusCode::FORBIDDEN.into());
     }
 
     // The same rule that mints the OAuth session kind and gates every admin
@@ -913,7 +932,7 @@ pub async fn login_as(
         access_key_id: body.access_key_id.clone(),
     };
     if !session_principal_is_admin(&auth_method, &iam_state) {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(StatusCode::FORBIDDEN.into());
     }
 
     // Successful login — reset rate limiter
@@ -965,15 +984,14 @@ pub async fn browser_session_connect(
     connect_info: Option<ConnectInfo<SocketAddr>>,
     req_headers: HeaderMap,
     AdminJson(body): AdminJson<BrowserSessionConnectRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, AuthReject> {
     let guard = crate::rate_limiter::RateLimitGuard::enter(
         &state.rate_limiter,
         &req_headers,
         connect_info.as_ref().map(|ci| ci.0.ip()),
         "browser_session_connect",
     )
-    .await
-    .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    .await?;
 
     let iam_state = state.iam_state.load();
     let access_key_id = body.access_key_id.trim();
@@ -988,7 +1006,7 @@ pub async fn browser_session_connect(
             "non_iam_mode",
             &req_headers,
         );
-        return Err(StatusCode::FORBIDDEN);
+        return Err(StatusCode::FORBIDDEN.into());
     };
 
     let Some(user) = index.get(access_key_id) else {
@@ -999,7 +1017,7 @@ pub async fn browser_session_connect(
             access_key_id
         );
         audit_log("login_failed", "", access_key_id, &req_headers);
-        return Err(StatusCode::FORBIDDEN);
+        return Err(StatusCode::FORBIDDEN.into());
     };
 
     if !iam_user_secret_valid(user, secret_access_key) {
@@ -1010,7 +1028,7 @@ pub async fn browser_session_connect(
             access_key_id
         );
         audit_log("login_failed", "", access_key_id, &req_headers);
-        return Err(StatusCode::FORBIDDEN);
+        return Err(StatusCode::FORBIDDEN.into());
     }
 
     guard.record_success();
@@ -1077,15 +1095,14 @@ pub async fn open_browser_connect(
     connect_info: Option<ConnectInfo<SocketAddr>>,
     req_headers: HeaderMap,
     AdminJson(body): AdminJson<OpenBrowserConnectRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, AuthReject> {
     let guard = crate::rate_limiter::RateLimitGuard::enter(
         &state.rate_limiter,
         &req_headers,
         connect_info.as_ref().map(|ci| ci.0.ip()),
         "open_browser_connect",
     )
-    .await
-    .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    .await?;
 
     let iam_state = state.iam_state.load();
     if !matches!(&**iam_state, IamState::Disabled) {
@@ -1096,7 +1113,7 @@ pub async fn open_browser_connect(
             "auth_required",
             &req_headers,
         );
-        return Err(StatusCode::FORBIDDEN);
+        return Err(StatusCode::FORBIDDEN.into());
     }
 
     guard.record_success();

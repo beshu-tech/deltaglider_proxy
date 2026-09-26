@@ -12,7 +12,12 @@ Per-IP brute-force protection for SigV4 authentication and admin login endpoints
 | Rolling window | 300 s (5 min) | `DGP_RATE_LIMIT_WINDOW_SECS` |
 | Lockout duration | 600 s (10 min) | `DGP_RATE_LIMIT_LOCKOUT_SECS` |
 
-After a lockout expires, the failure counter resets and the IP can authenticate again. Lockout responses are `429 SlowDown`.
+After a lockout expires, the failure counter resets and the IP can authenticate again.
+
+A locked-out request gets a response that names the lockout and says how long it lasts. The correct password is refused too while the lockout lasts.
+
+- The admin API sign-in endpoints (`/_/api/admin/login`, `login-as`, the browser-session endpoints, `recover-db`, and a `/_/metrics` bearer token) answer `429 Too Many Requests` with a `Retry-After` header in seconds and the JSON body `{"ok": false, "error": "too_many_attempts", "message": "Too many failed sign-in attempts. Try again in 10 min.", "retry_after_secs": 600}`.
+- The S3 API answers `503 SlowDown`, because S3 clients know that code, with the same `Retry-After` header and the wait in the error message.
 
 ### Progressive delay
 

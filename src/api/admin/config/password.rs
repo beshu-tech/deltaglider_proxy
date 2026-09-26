@@ -232,16 +232,7 @@ pub async fn recover_db(
     .await
     {
         Ok(g) => g,
-        Err(_) => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(RecoverDbResponse {
-                    error: Some("Too many attempts — try again later".into()),
-                    ..Default::default()
-                }),
-            )
-                .into_response();
-        }
+        Err(blocked) => return blocked.into_response(),
     };
 
     let candidates = recovery_candidates(&body.candidate_password);

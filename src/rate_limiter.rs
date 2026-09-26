@@ -142,22 +142,23 @@ impl RateLimiter {
     /// Check if an IP is currently rate-limited.
     /// Returns `true` if the request should be BLOCKED.
     pub fn is_limited(&self, ip: &IpAddr) -> bool {
-        let entry = match self.entries.get(ip) {
-            Some(e) => e,
-            None => return false,
-        };
+        self.lockout_remaining(ip).is_some()
+    }
 
-        let now = Instant::now();
+    /// How long the IP stays locked out; `None` when it is not locked out.
+    /// An expired lockout is cleaned up or reset on the next failure.
+    pub fn lockout_remaining(&self, ip: &IpAddr) -> Option<Duration> {
+        let entry = self.entries.get(ip)?;
+        remaining(entry.lockout_start?, self.lockout, Instant::now())
+    }
 
-        // Check lockout
-        if let Some(lockout_start) = entry.lockout_start {
-            if now.duration_since(lockout_start) < self.lockout {
-                return true; // Still locked out
-            }
-            // Lockout expired — will be cleaned up or reset on next record_failure
+    /// Per-account variant of [`Self::lockout_remaining`].
+    pub fn account_lockout_remaining(&self, subject: &str) -> Option<Duration> {
+        if subject.is_empty() {
+            return None;
         }
-
-        false
+        let entry = self.account_entries.get(subject)?;
+        remaining(entry.lockout_start?, self.account_lockout, Instant::now())
     }
 
     /// Get the progressive delay for an IP based on failure count.
@@ -231,19 +232,7 @@ impl RateLimiter {
     /// username) currently locked out? Empty subject → not limited
     /// (caller didn't supply a subject dimension).
     pub fn is_limited_account(&self, subject: &str) -> bool {
-        if subject.is_empty() {
-            return false;
-        }
-        let Some(entry) = self.account_entries.get(subject) else {
-            return false;
-        };
-        let now = Instant::now();
-        if let Some(lockout_start) = entry.lockout_start {
-            if now.duration_since(lockout_start) < self.account_lockout {
-                return true;
-            }
-        }
-        false
+        self.account_lockout_remaining(subject).is_some()
     }
 
     /// Per-account variant: record a failed attempt for this subject.
@@ -659,12 +648,56 @@ pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
 /// The `ip` and `failure_count` fields are diagnostic — they're
 /// populated for `Debug` output / future telemetry but no caller
 /// destructures them today, so `dead_code` is allowed explicitly.
-/// Callers should treat any `Err(_)` from the guard as "blocked".
+/// Callers should treat any `Err(_)` from the guard as "blocked". Its
+/// [`IntoResponse`](axum::response::IntoResponse) is THE lockout answer of
+/// every credential surface: 429, `Retry-After`, and a JSON body that names
+/// the lockout.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub struct Blocked {
     pub(crate) ip: IpAddr,
     pub(crate) failure_count: u32,
+    /// Time left in the lockout.
+    pub(crate) retry_after: Duration,
+}
+
+/// Pure: time left in a lockout that started at `start` and lasts `len`.
+fn remaining(start: Instant, len: Duration, now: Instant) -> Option<Duration> {
+    let elapsed = now.saturating_duration_since(start);
+    (elapsed < len).then(|| len - elapsed)
+}
+
+/// Pure: `Retry-After` seconds (rounded up, at least 1) and the message.
+pub(crate) fn lockout_message(retry_after: Duration) -> (u64, String) {
+    let secs = retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0);
+    let secs = secs.max(1);
+    let when = if secs < 60 {
+        format!("{secs} s")
+    } else {
+        format!("{} min", secs.div_ceil(60))
+    };
+    (
+        secs,
+        format!("Too many failed sign-in attempts. Try again in {when}."),
+    )
+}
+
+impl axum::response::IntoResponse for Blocked {
+    fn into_response(self) -> axum::response::Response {
+        let (secs, message) = lockout_message(self.retry_after);
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, secs.to_string())],
+            axum::Json(serde_json::json!({
+                // `ok` keeps the login response shape.
+                "ok": false,
+                "error": "too_many_attempts",
+                "message": message,
+                "retry_after_secs": secs,
+            })),
+        )
+            .into_response()
+    }
 }
 
 /// RAII-style wrapper that ties a rate-limited operation to the
@@ -713,7 +746,7 @@ impl<'a> RateLimitGuard<'a> {
         let unspecified = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
         let ip = extract_client_ip_with_peer(headers, peer_ip).unwrap_or(unspecified);
         let trusted_ip = extract_trusted_client_ip(headers, peer_ip).unwrap_or(unspecified);
-        if rl.is_limited(&ip) {
+        if let Some(retry_after) = rl.lockout_remaining(&ip) {
             let failure_count = rl.failure_count(&ip);
             tracing::warn!(
                 "SECURITY | event={}_brute_force_blocked | scope=ip | ip={} | attempts={}",
@@ -721,16 +754,20 @@ impl<'a> RateLimitGuard<'a> {
                 ip,
                 failure_count
             );
-            return Err(Blocked { ip, failure_count });
+            return Err(Blocked {
+                ip,
+                failure_count,
+                retry_after,
+            });
         }
-        if !subject.is_empty()
-            && rl.is_limited_account(subject)
-            && rl.account_lock_applies(
+        let account_left = rl.account_lockout_remaining(subject);
+        if let Some(retry_after) = account_left.filter(|_| {
+            rl.account_lock_applies(
                 subject,
                 &trusted_ip,
                 is_direct_local_request(headers, peer_ip),
             )
-        {
+        }) {
             tracing::warn!(
                 "SECURITY | event={}_brute_force_blocked | scope=account | subject={} | ip={}",
                 event_prefix,
@@ -740,6 +777,7 @@ impl<'a> RateLimitGuard<'a> {
             return Err(Blocked {
                 ip,
                 failure_count: 0,
+                retry_after,
             });
         }
         let delay = rl.progressive_delay(&ip);
@@ -813,6 +851,38 @@ fn sanitize_for_log(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lockout_message_rounds_up_and_names_the_wait() {
+        assert_eq!(lockout_message(Duration::from_secs(600)).0, 600);
+        assert!(lockout_message(Duration::from_secs(600))
+            .1
+            .contains("10 min"));
+        assert!(lockout_message(Duration::from_secs(61)).1.contains("2 min"));
+        assert!(lockout_message(Duration::from_secs(30)).1.contains("30 s"));
+        assert_eq!(lockout_message(Duration::from_millis(1)).0, 1);
+        assert_eq!(lockout_message(Duration::from_millis(1500)).0, 2);
+        assert_eq!(lockout_message(Duration::ZERO).0, 1);
+    }
+
+    #[test]
+    fn lockout_remaining_counts_down() {
+        let t0 = Instant::now();
+        let len = Duration::from_secs(10);
+        assert_eq!(remaining(t0, len, t0), Some(len));
+        assert_eq!(
+            remaining(t0, len, t0 + Duration::from_secs(4)),
+            Some(Duration::from_secs(6))
+        );
+        assert_eq!(remaining(t0, len, t0 + len), None);
+        let rl = RateLimiter::new(2, Duration::from_secs(60), Duration::from_secs(600));
+        let ip: IpAddr = "10.0.0.9".parse().unwrap();
+        assert!(rl.lockout_remaining(&ip).is_none());
+        rl.record_failure(&ip);
+        rl.record_failure(&ip);
+        let left = rl.lockout_remaining(&ip).expect("locked");
+        assert!(left > Duration::from_secs(590) && left <= Duration::from_secs(600));
+    }
+
     use super::*;
     use std::net::Ipv4Addr;
 

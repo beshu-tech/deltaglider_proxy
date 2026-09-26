@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — A lockout says that it is a lockout, and for how long
+
+A locked-out sign-in got a bare `429` (or `{"ok": false}`), so the UI showed
+"Login failed: Login failed", even for the correct password. Now every
+admin sign-in surface answers `429` with `Retry-After` and
+`{"error": "too_many_attempts", "message": "… Try again in N min.",
+"retry_after_secs": N}`; the S3 API keeps `503 SlowDown` and adds
+`Retry-After` and the wait to the message.
+
 ### Changed — The bootstrap access key id is visible, and its removal is explicit
 
 The Credentials page showed an empty access key id field, because every GET

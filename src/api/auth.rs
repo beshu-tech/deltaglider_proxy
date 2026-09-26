@@ -770,16 +770,24 @@ pub async fn sigv4_auth_middleware(
 
     // Check rate limit before processing auth
     if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
-        if rl.is_limited(ip) {
+        if let Some(left) = rl.lockout_remaining(ip) {
             let count = rl.failure_count(ip);
             warn!(
                 "SECURITY | event=brute_force_blocked | ip={} | bucket_key={} | trust_proxy={} | attempts={} | action=blocked",
                 ip, ip, crate::rate_limiter::trust_proxy_headers(), count
             );
-            return Err(
-                S3Error::SlowDown("Rate limited due to repeated auth failures".into())
-                    .into_response(),
-            );
+            // S3 clients understand SlowDown; the message and Retry-After
+            // say how long the lockout lasts.
+            let (secs, message) = crate::rate_limiter::lockout_message(left);
+            let mut resp = S3Error::SlowDown(format!(
+                "Rate limited due to repeated auth failures. {message}"
+            ))
+            .into_response();
+            if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, v);
+            }
+            return Err(resp);
         }
         // Progressive delay: slow down responses proportional to failure count.
         // Makes brute force expensive even before lockout threshold.
