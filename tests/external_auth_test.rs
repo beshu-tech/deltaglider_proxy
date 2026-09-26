@@ -765,3 +765,30 @@ async fn test_oauth_callback_provider_error() {
         "Should show the provider's error"
     );
 }
+
+/// The OAuth callback is reachable without a session. It logged the first 10
+/// BYTES of `code` and `state`, and a byte slice inside a multi-byte
+/// character panics: the handler died and the client saw a dropped
+/// connection. Any query value must get an HTTP answer.
+#[tokio::test]
+async fn oauth_callback_answers_a_multibyte_code_and_state() {
+    // The excerpt is built only when info is on; the default level is debug.
+    let server = TestServer::builder()
+        .auth("test_key", "test_secret")
+        .env("RUST_LOG", "deltaglider_proxy=info")
+        .build()
+        .await;
+    // "a" + five "é": byte 10 is inside the fifth "é".
+    let multibyte = "a%C3%A9%C3%A9%C3%A9%C3%A9%C3%A9";
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/_/api/admin/oauth/callback?code={multibyte}&state={multibyte}",
+            server.endpoint()
+        ))
+        .send()
+        .await;
+    assert!(
+        resp.is_ok(),
+        "the callback dropped the connection instead of answering: {resp:?}"
+    );
+}

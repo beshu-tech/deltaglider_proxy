@@ -101,6 +101,38 @@ mod source_guards {
         );
     }
 
+    /// A log excerpt of a string is cut with `security::str_prefix`, never
+    /// with a byte-index slice ending at `s.len().min(n)`: an index inside a
+    /// multi-byte char panics, and the OAuth callback died on a client-sent
+    /// `code` that way.
+    #[test]
+    fn no_byte_index_string_excerpts() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_files(&root.join("src"), &mut files);
+        // Built at runtime so this test's own source is no hit.
+        let needle = [".len()", ".min("].concat();
+        // Byte buffers, not strings: slicing them anywhere is fine.
+        const BYTES: [&str; 1] = ["hex::encode(&st.buf[.."];
+        let mut offenders = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                if line.contains("[..")
+                    && line.contains(needle.as_str())
+                    && !BYTES.iter().any(|b| line.contains(b))
+                {
+                    offenders.push(format!("{}:{}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "use security::str_prefix for string excerpts:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// Errors are classified on their type, status, or code, never on their
     /// Display text. `SdkError`'s Display is only "service error" (so a 404
     /// check on it never matches), and a typed engine error's text drifts

@@ -846,15 +846,10 @@ fn truncate_error(error: &str) -> String {
     if error.len() <= MAX_ERROR_LEN {
         return error.to_string();
     }
-    // Slice on a CHAR boundary: a naive `&error[..1000]` panics when byte 1000
-    // lands mid-UTF-8-char (e.g. a backend error carrying multi-byte text),
-    // which would kill the delivery dispatcher permanently. Walk back to the
-    // nearest boundary at or below the cap.
-    let mut end = MAX_ERROR_LEN;
-    while end > 0 && !error.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}...", &error[..end])
+    // On a CHAR boundary: a naive `&error[..1000]` panics when byte 1000
+    // lands mid-UTF-8-char (a backend error carrying multi-byte text), which
+    // would kill the delivery dispatcher permanently.
+    format!("{}...", crate::security::str_prefix(error, MAX_ERROR_LEN))
 }
 
 pub fn known_status(status: &str) -> bool {

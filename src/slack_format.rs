@@ -183,7 +183,7 @@ pub fn slack_message(event: &EventOutboxRecord, _cfg: &EventDeliveryConfig) -> V
         context_bits.push(format!("storage: {s}"));
     }
     if let Some(e) = &etag {
-        let short = if e.len() > 12 { &e[..12] } else { e.as_str() };
+        let short = crate::security::str_prefix(e, 12);
         context_bits.push(format!("etag: {short}"));
     }
     context_bits.push(format!("at: {}", iso8601(event.occurred_at)));

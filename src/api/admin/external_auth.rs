@@ -273,12 +273,12 @@ pub async fn oauth_callback(
         params
             .code
             .as_deref()
-            .map(|c| &c[..c.len().min(10)])
+            .map(|c| crate::security::str_prefix(c, 10))
             .unwrap_or("none"),
         params
             .state
             .as_deref()
-            .map(|s| &s[..s.len().min(10)])
+            .map(|s| crate::security::str_prefix(s, 10))
             .unwrap_or("none"),
         params.error,
     );

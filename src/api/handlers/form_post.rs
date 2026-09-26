@@ -685,8 +685,8 @@ fn authenticate_form_post(
         tracing::warn!(
             "form-POST DENY | reason=signature_mismatch | bucket={bucket} key={} access_key={access_key} scope_date={scope_date} computed_prefix={} client_prefix={}",
             parsed.resolved_key,
-            &computed_signature[..computed_signature.len().min(8)],
-            &signature[..signature.len().min(8)]
+            crate::security::str_prefix(&computed_signature, 8),
+            crate::security::str_prefix(&signature, 8)
         );
         return Err(S3Error::SignatureDoesNotMatch);
     }

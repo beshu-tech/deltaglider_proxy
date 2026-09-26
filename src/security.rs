@@ -239,6 +239,18 @@ impl std::fmt::Display for BucketNameError {
     }
 }
 
+/// The longest prefix of `s` of at most `max_bytes` bytes that ends on a
+/// char boundary: THE way to cut an excerpt of client text for a log line.
+/// `&s[..n]` panics when byte `n` falls inside a multi-byte character, and a
+/// panic in a handler drops the client's connection.
+pub fn str_prefix(s: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Canonical S3 bucket-name validator. The CLI URL parser
 /// (`cli/s3_url.rs`) collapses to `validate_bucket_name(name).is_ok()`;
 /// the live S3 request path delegates bucket-name syntax to the upstream
@@ -577,6 +589,27 @@ impl aws_smithy_runtime_api::client::dns::ResolveDns for SdkSsrfGuardedResolver 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn str_prefix_cuts_on_a_char_boundary() {
+        assert_eq!(str_prefix("abcdef", 3), "abc");
+        assert_eq!(str_prefix("ab", 10), "ab");
+        // Byte 2 is inside the first "é" (bytes 1..3).
+        assert_eq!(str_prefix("a\u{e9}\u{e9}", 2), "a");
+        assert_eq!(str_prefix("\u{4e2d}", 1), "");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn str_prefix_is_a_bounded_prefix(s in ".{0,16}", n in 0usize..40) {
+            let p = str_prefix(&s, n);
+            proptest::prop_assert!(p.len() <= n && s.starts_with(p));
+            // Maximal: the next char would pass the bound.
+            if let Some(c) = s[p.len()..].chars().next() {
+                proptest::prop_assert!(p.len() + c.len_utf8() > n);
+            }
+        }
+    }
+
     use super::*;
 
     #[test]

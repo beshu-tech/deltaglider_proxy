@@ -949,7 +949,7 @@ pub async fn sigv4_auth_middleware(
                     "SigV4: replay detected — {} {} sig={}… (duplicate within {:?})",
                     request.method(),
                     request.uri().path(),
-                    &params.signature[..params.signature.len().min(12)],
+                    crate::security::str_prefix(&params.signature, 12),
                     replay_window
                 );
                 // Distinct from a credential failure: observability only, no lockout.
