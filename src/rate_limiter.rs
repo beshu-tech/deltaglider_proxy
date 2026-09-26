@@ -700,6 +700,25 @@ impl axum::response::IntoResponse for Blocked {
     }
 }
 
+impl Blocked {
+    /// The lockout answer for a page that a browser navigates to (OAuth
+    /// authorize and callback): the same 429 and `Retry-After`, with the
+    /// themed HTML page that names the wait instead of JSON.
+    pub fn into_html_response(self) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let (secs, message) = lockout_message(self.retry_after);
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, secs.to_string())],
+            axum::response::Html(crate::api::error_page::themed_error_html(
+                "Too Many Requests",
+                &message,
+            )),
+        )
+            .into_response()
+    }
+}
+
 /// RAII-style wrapper that ties a rate-limited operation to the
 /// `(RateLimiter, IpAddr, event_prefix)` triple it needs. The guard
 /// itself does not enforce cleanup at drop — callers must explicitly

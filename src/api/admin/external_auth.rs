@@ -187,13 +187,7 @@ pub async fn oauth_authorize(
     .await
     {
         Ok(g) => g,
-        Err(_) => {
-            return error_page(
-                "Too Many Requests",
-                "Too many authentication attempts. Please wait and try again.",
-            )
-            .into_response();
-        }
+        Err(blocked) => return blocked.into_html_response(),
     };
 
     // Build redirect URI from the request's Host header
@@ -299,13 +293,7 @@ pub async fn oauth_callback(
     .await
     {
         Ok(g) => g,
-        Err(_) => {
-            return error_page(
-                "Too Many Requests",
-                "Too many authentication attempts. Please wait and try again.",
-            )
-            .into_response();
-        }
+        Err(blocked) => return blocked.into_html_response(),
     };
 
     // Check for provider error response

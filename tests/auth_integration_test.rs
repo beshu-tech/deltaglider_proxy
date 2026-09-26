@@ -3367,4 +3367,28 @@ async fn lockout_answers_429_with_retry_after_and_a_reason() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(r.headers().get("retry-after").is_some());
+
+    // The OAuth callback is a browser navigation: the same 429 and
+    // Retry-After, with the themed HTML page that names the wait.
+    let r = http
+        .get(format!(
+            "{}/_/api/admin/oauth/callback?code=c&state=s",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry: u64 = r.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((500..=600).contains(&retry), "Retry-After {retry}");
+    assert!(r.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    let page = r.text().await.unwrap();
+    assert!(page.contains("Try again in 10 min"), "{page}");
 }

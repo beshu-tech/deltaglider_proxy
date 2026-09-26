@@ -17,6 +17,7 @@ After a lockout expires, the failure counter resets and the IP can authenticate 
 A locked-out request gets a response that names the lockout and says how long it lasts. The correct password is refused too while the lockout lasts.
 
 - The admin API sign-in endpoints (`/_/api/admin/login`, `login-as`, the browser-session endpoints, `recover-db`, and a `/_/metrics` bearer token) answer `429 Too Many Requests` with a `Retry-After` header in seconds and the JSON body `{"ok": false, "error": "too_many_attempts", "message": "Too many failed sign-in attempts. Try again in 10 min.", "retry_after_secs": 600}`.
+- The single sign-on pages (`/_/api/admin/oauth/authorize/<provider>` and `/_/api/admin/oauth/callback`) are pages that the browser opens, not API requests. So they answer `429 Too Many Requests` with the same `Retry-After` header and an HTML error page that says how long to wait.
 - The S3 API answers `503 SlowDown`, because S3 clients know that code, with the same `Retry-After` header and the wait in the error message.
 
 ### Progressive delay

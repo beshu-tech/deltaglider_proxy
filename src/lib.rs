@@ -576,6 +576,39 @@ mod source_guards {
     ///
     /// Allowed: files whose tests test env handling itself, serialised on a
     /// lock, plus two reads that are not config.
+    /// A lockout answer names the wait (`Blocked`: 429, `Retry-After`, the
+    /// reason). A guard site that drops it with `Err(_)` sends a bare page.
+    #[test]
+    fn a_rate_limit_guard_site_keeps_the_lockout_answer() {
+        let needle = ["RateLimitGuard::", "enter"].concat();
+        let dropped = ["Err(", "_)"].concat();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_files(&root.join("src"), &mut files);
+        let (mut sites, mut offenders) = (0, Vec::new());
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains(needle.as_str()) || line.trim_start().starts_with("//") {
+                    continue;
+                }
+                sites += 1;
+                let window = &lines[i..(i + 15).min(lines.len())];
+                if window.iter().any(|l| l.contains(dropped.as_str())) {
+                    offenders.push(format!("{}:{}", file.display(), i + 1));
+                }
+            }
+        }
+        assert!(sites >= 8, "scan found the guard sites ({sites})");
+        assert!(
+            offenders.is_empty(),
+            "answer a lockout with the Blocked value (into_response / \
+             into_html_response), not a hand-written page:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     #[test]
     fn test_modules_do_not_read_process_env() {
         const ALLOWED: [(&str, &str); 7] = [

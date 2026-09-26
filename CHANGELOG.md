@@ -73,6 +73,13 @@ names the one object that the caller may read, the bucket and prefix that
 the caller may list, or the public prefixes of the bucket. For a write, it
 says that nothing is granted.
 
+### Fixed — A single sign-on lockout says how long it lasts
+
+A locked-out browser that started or finished a single sign-on flow got
+`200` and a page that said only "Please wait and try again". Now the
+authorize and callback pages answer `429` with `Retry-After` and the
+themed error page names the wait, for example "Try again in 10 min.".
+
 ### Changed — The admin API shows backend access key ids
 
 The config export, the storage section, and the backend list hid the
