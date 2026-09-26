@@ -767,7 +767,7 @@ export default function App() {
 
           <main id="main-content" ref={mainRef} tabIndex={-1} style={{ outline: 'none', flex: 1, overflow: 'auto', display: 'flex', flexDirection: 'column' }}>
             <Content style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, position: 'relative' }}>
-              <FileBrowserSessionTip visible={view === 'browser' && sessionCaps.signedInForFilesOnly} />
+              <FileBrowserSessionTip visible={view === 'browser' && sessionCaps.signedInForFilesOnly} userKey={currentAccessKey ?? who.name} />
               {renderContent()}
             </Content>
           </main>

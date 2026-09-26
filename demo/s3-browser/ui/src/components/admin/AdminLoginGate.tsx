@@ -17,7 +17,9 @@ export function AdminAccessDenied({ onBack }: { onBack: () => void }) {
         <LockOutlined style={{ fontSize: 32, color: colors.ACCENT_RED, marginBottom: 12 }} />
         <div><Text strong style={{ fontSize: 18, fontFamily: 'var(--font-ui)' }}>Access Denied</Text></div>
         <Text type="secondary" style={{ fontSize: 13, display: 'block', marginTop: 8, marginBottom: 24 }}>
-          Your account does not have admin permissions. Contact an administrator to grant you the &quot;admin&quot; action.
+          Your account has no admin rights, so Settings is not available to it. The file browser still works with
+          your account&apos;s permissions. To change settings, ask an administrator to grant your account the
+          &quot;admin&quot; action.
         </Text>
         <Button type="primary" onClick={onBack} style={{ borderRadius: 10 }}>Back to Browser</Button>
       </div>

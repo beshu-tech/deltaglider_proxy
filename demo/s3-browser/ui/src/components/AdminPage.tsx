@@ -289,6 +289,13 @@ export default function AdminPage({ onBack, onSessionExpired, subPath, search, a
           setCheckingSession(false);
           return;
         }
+        // An IAM user who is not an admin: the bootstrap password is not
+        // theirs to know, so say what is true instead of asking for it.
+        if (info.mode === 'iam' && info.user && !info.user.is_admin) {
+          setAccessDenied(true);
+          setCheckingSession(false);
+          return;
+        }
         // Valid browser S3 session but no admin GUI cookie yet — still allow bootstrap / OAuth
         // login here (open-access and access-key connects both land here).
         setS3BrowserSessionOnly(true);
