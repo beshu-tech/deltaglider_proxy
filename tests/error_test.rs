@@ -17,8 +17,8 @@ use common::TestServer;
 
 #[tokio::test]
 async fn test_nosuchbucket_xml_response() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
 
     // HEAD on a bucket that has no objects and was never created → NoSuchBucket
     let url = format!("{}/nonexistent-bucket", server.endpoint());
@@ -40,8 +40,8 @@ async fn test_nosuchbucket_xml_response() {
 
 #[tokio::test]
 async fn test_malformed_xml_delete_request() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
 
     let url = format!("{}/{}?delete", server.endpoint(), server.bucket());
     let resp = client
@@ -63,8 +63,8 @@ async fn test_malformed_xml_delete_request() {
 
 #[tokio::test]
 async fn test_multipart_create_upload() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
 
     let url = format!("{}/{}/test.zip?uploads", server.endpoint(), server.bucket());
     let resp = client.post(&url).send().await.unwrap();
@@ -80,8 +80,8 @@ async fn test_multipart_create_upload() {
 
 #[tokio::test]
 async fn test_error_content_type_is_xml() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
 
     // GET nonexistent key
     let url = format!("{}/{}/missing.txt", server.endpoint(), server.bucket());
@@ -109,8 +109,8 @@ async fn test_entitytoolarge_response() {
     // request to a nonexistent bucket (which triggers a different error).
     // The EntityTooLarge path is covered by the engine unit test.
     // Here we just verify the error XML format for the paths we CAN trigger.
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
 
     // HEAD nonexistent bucket → 404 NoSuchBucket with XML
     let url = format!("{}/fakebucket", server.endpoint());

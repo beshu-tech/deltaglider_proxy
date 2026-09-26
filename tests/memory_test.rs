@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 const MB: u64 = 1024 * 1024;
 
 /// GET /_/health and extract `peak_rss_bytes` from JSON response
-async fn get_peak_rss(client: &reqwest::Client, endpoint: &str) -> u64 {
+async fn get_peak_rss(client: &crate::common::S3Http, endpoint: &str) -> u64 {
     let url = format!("{}/_/health", endpoint);
     let resp = client.get(&url).send().await.expect("GET /health failed");
     assert!(
@@ -36,7 +36,7 @@ async fn get_peak_rss(client: &reqwest::Client, endpoint: &str) -> u64 {
 
 /// Initiate a multipart upload, return upload_id
 async fn create_multipart_upload(
-    client: &reqwest::Client,
+    client: &crate::common::S3Http,
     endpoint: &str,
     bucket: &str,
     key: &str,
@@ -64,7 +64,7 @@ async fn create_multipart_upload(
 
 /// Upload a part, return ETag
 async fn upload_part(
-    client: &reqwest::Client,
+    client: &crate::common::S3Http,
     endpoint: &str,
     bucket: &str,
     key: &str,
@@ -98,7 +98,7 @@ async fn upload_part(
 
 /// Complete a multipart upload
 async fn complete_multipart_upload(
-    client: &reqwest::Client,
+    client: &crate::common::S3Http,
     endpoint: &str,
     bucket: &str,
     key: &str,
@@ -135,13 +135,8 @@ async fn complete_multipart_upload(
 #[tokio::test]
 async fn test_multipart_memory_bounded() {
     // 50 MB max object size to allow our 30 MB upload
-    let server = TestServer::builder()
-        .open_access()
-        .max_object_size(50 * MB)
-        .open_access()
-        .build()
-        .await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().max_object_size(50 * MB).build().await;
+    let http = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
     let key = "memory-test/large.bin"; // .bin is non-delta-eligible

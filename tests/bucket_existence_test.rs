@@ -22,8 +22,8 @@ use common::TestServer;
 /// NoSuchBucket, NOT create the bucket as a side effect.
 #[tokio::test]
 async fn test_put_object_to_nonexistent_bucket_returns_nosuchbucket() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
 
     // The test server creates exactly one bucket ("deltaglider-test-<port>").
     // Use a guaranteed-absent name.
@@ -88,8 +88,8 @@ async fn test_put_object_to_nonexistent_bucket_does_not_create_directory() {
 /// POST?uploads targeting a non-existent bucket must fail fast.
 #[tokio::test]
 async fn test_create_multipart_upload_to_nonexistent_bucket_returns_nosuchbucket() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
 
     let ghost = "missing-for-multipart";
     let url = format!("{}/{}/file.zip?uploads", server.endpoint(), ghost);
@@ -109,8 +109,8 @@ async fn test_create_multipart_upload_to_nonexistent_bucket_returns_nosuchbucket
 /// return NoSuchBucket — the destination must not be implicitly created.
 #[tokio::test]
 async fn test_copy_to_nonexistent_destination_bucket_returns_nosuchbucket() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
 
     // First PUT a source object into the real bucket.
     let src_url = format!("{}/{}/source.bin", server.endpoint(), server.bucket());
@@ -157,8 +157,8 @@ async fn test_copy_to_nonexistent_destination_bucket_returns_nosuchbucket() {
 /// `ensure_bucket_exists` was omitted in some COPY arms.
 #[tokio::test]
 async fn test_copy_from_nonexistent_source_bucket_returns_nosuchbucket() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
 
     // PUT into the real bucket — destination is fine.
     let dst_url = format!("{}/{}/dst.bin", server.endpoint(), server.bucket());

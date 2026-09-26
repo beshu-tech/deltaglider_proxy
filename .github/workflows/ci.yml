@@ -391,6 +391,7 @@ jobs:
             mismatch_boot_test:: \
             spawn_cwd_guard_test:: \
             harness_port_test:: \
+            harness_signed_http_test:: \
             quota_test:: \
             replication_target_only_test:: \
             replication_test:: \

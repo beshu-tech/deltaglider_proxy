@@ -126,7 +126,7 @@ async fn delete_of_a_prefix_key_deletes_only_the_marker_on_encrypted_s3() {
 /// No marker: `DELETE photos/` deletes nothing and succeeds, like S3.
 #[tokio::test]
 async fn delete_of_a_prefix_key_without_a_marker_deletes_nothing() {
-    let server = TestServer::builder().open_access().build().await;
+    let server = TestServer::builder().build().await;
     let client = server.s3_client().await;
     let bucket = server.bucket();
     client
@@ -137,7 +137,8 @@ async fn delete_of_a_prefix_key_without_a_marker_deletes_nothing() {
         .send()
         .await
         .unwrap();
-    let resp = reqwest::Client::new()
+    let resp = server
+        .http()
         .delete(format!("{}/{}/docs/", server.endpoint(), bucket))
         .send()
         .await

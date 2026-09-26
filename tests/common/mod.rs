@@ -7,6 +7,9 @@
 
 #![allow(dead_code)]
 
+mod signed_http;
+pub use signed_http::{S3Http, S3Requests};
+
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
@@ -393,6 +396,15 @@ impl TestServer {
             None => ("test", "test"),
         };
         self.s3_client_with_creds(key, secret).await
+    }
+
+    /// Raw-HTTP client for hand-built S3 requests: signs with this server's
+    /// credentials (unsigned when the server has open access).
+    pub fn http(&self) -> S3Http {
+        match &self.auth_creds {
+            Some((k, s)) => S3Http::signed(k, s),
+            None => S3Http::unsigned(),
+        }
     }
 
     /// Create an S3 client with specific credentials.
@@ -870,7 +882,10 @@ pub async fn admin_http_client_with_password(endpoint: &str, password: &str) -> 
     client
 }
 
-// === Shared HTTP helpers (reqwest) ===
+// === Shared HTTP helpers (raw S3 requests) ===
+//
+// Each takes `&impl S3Requests`: `server.http()` (signed when auth is on) or
+// a plain reqwest client (unsigned, open-access servers only).
 
 /// Build an S3 object URL from endpoint, bucket, and key.
 fn object_url(endpoint: &str, bucket: &str, key: &str) -> String {
@@ -879,7 +894,7 @@ fn object_url(endpoint: &str, bucket: &str, key: &str) -> String {
 
 /// PUT an object via reqwest and return the response.
 pub async fn put_object(
-    client: &reqwest::Client,
+    client: &impl S3Requests,
     endpoint: &str,
     bucket: &str,
     key: &str,
@@ -888,7 +903,7 @@ pub async fn put_object(
 ) -> reqwest::Response {
     let url = object_url(endpoint, bucket, key);
     let resp = client
-        .put(&url)
+        .s3_request(reqwest::Method::PUT, &url)
         .header("content-type", content_type)
         .body(data)
         .send()
@@ -904,7 +919,7 @@ pub async fn put_object(
 
 /// PUT an object and return the x-amz-storage-type header value.
 pub async fn put_and_get_storage_type(
-    client: &reqwest::Client,
+    client: &impl S3Requests,
     endpoint: &str,
     bucket: &str,
     key: &str,
@@ -921,13 +936,17 @@ pub async fn put_and_get_storage_type(
 
 /// GET an object and return the body bytes.
 pub async fn get_bytes(
-    client: &reqwest::Client,
+    client: &impl S3Requests,
     endpoint: &str,
     bucket: &str,
     key: &str,
 ) -> Vec<u8> {
     let url = object_url(endpoint, bucket, key);
-    let resp = client.get(&url).send().await.expect("GET failed");
+    let resp = client
+        .s3_request(reqwest::Method::GET, &url)
+        .send()
+        .await
+        .expect("GET failed");
     assert!(
         resp.status().is_success(),
         "GET {} failed: {}",
@@ -939,13 +958,17 @@ pub async fn get_bytes(
 
 /// HEAD an object and return response headers.
 pub async fn head_headers(
-    client: &reqwest::Client,
+    client: &impl S3Requests,
     endpoint: &str,
     bucket: &str,
     key: &str,
 ) -> reqwest::header::HeaderMap {
     let url = object_url(endpoint, bucket, key);
-    let resp = client.head(&url).send().await.expect("HEAD failed");
+    let resp = client
+        .s3_request(reqwest::Method::HEAD, &url)
+        .send()
+        .await
+        .expect("HEAD failed");
     assert!(
         resp.status().is_success(),
         "HEAD {} failed: {}",
@@ -956,9 +979,13 @@ pub async fn head_headers(
 }
 
 /// DELETE an object via reqwest (tolerates 204 and 404).
-pub async fn delete_object(client: &reqwest::Client, endpoint: &str, bucket: &str, key: &str) {
+pub async fn delete_object(client: &impl S3Requests, endpoint: &str, bucket: &str, key: &str) {
     let url = object_url(endpoint, bucket, key);
-    let resp = client.delete(&url).send().await.expect("DELETE failed");
+    let resp = client
+        .s3_request(reqwest::Method::DELETE, &url)
+        .send()
+        .await
+        .expect("DELETE failed");
     assert!(
         resp.status().is_success()
             || resp.status().as_u16() == 204
@@ -1317,13 +1344,17 @@ pub async fn wait_for_ext_auth_rebuild(client: &reqwest::Client, endpoint: &str,
 
 /// Make a raw ListObjectsV2 request and return the XML body.
 pub async fn list_objects_raw(
-    client: &reqwest::Client,
+    client: &impl S3Requests,
     endpoint: &str,
     bucket: &str,
     params: &str,
 ) -> String {
     let url = format!("{}/{}?list-type=2&{}", endpoint, bucket, params);
-    let resp = client.get(&url).send().await.unwrap();
+    let resp = client
+        .s3_request(reqwest::Method::GET, &url)
+        .send()
+        .await
+        .unwrap();
     assert!(
         resp.status().is_success(),
         "ListObjects failed: {}",
@@ -1343,9 +1374,17 @@ pub async fn open_access_setup() -> (TestServer, reqwest::Client) {
     (server, http)
 }
 
+/// Quick setup: filesystem server (auth on) + a client that signs with its
+/// credentials.
+pub async fn signed_setup() -> (TestServer, S3Http) {
+    let server = TestServer::filesystem().await;
+    let http = server.http();
+    (server, http)
+}
+
 /// Upload a simple test file, return its bytes
 pub async fn upload_test_data(
-    http: &reqwest::Client,
+    http: &impl S3Requests,
     endpoint: &str,
     bucket: &str,
     key: &str,

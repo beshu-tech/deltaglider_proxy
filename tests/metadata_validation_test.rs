@@ -36,7 +36,7 @@ fn write_file_with_xattr(
 
 /// HTTP GET, return (status, body, headers).
 async fn get_with_headers(
-    client: &reqwest::Client,
+    client: &crate::common::S3Http,
     endpoint: &str,
     bucket: &str,
     key: &str,
@@ -50,7 +50,12 @@ async fn get_with_headers(
 }
 
 /// HTTP HEAD, return (status, headers).
-async fn head_status(client: &reqwest::Client, endpoint: &str, bucket: &str, key: &str) -> u16 {
+async fn head_status(
+    client: &crate::common::S3Http,
+    endpoint: &str,
+    bucket: &str,
+    key: &str,
+) -> u16 {
     let url = format!("{}/{}/{}", endpoint, bucket, key);
     let resp = client.head(&url).send().await.expect("HEAD failed");
     resp.status().as_u16()
@@ -65,7 +70,7 @@ async fn head_status(client: &reqwest::Client, endpoint: &str, bucket: &str, key
 /// This test verifies the proxy doesn't crash on such files — it returns a clean error.
 #[tokio::test]
 async fn test_delta_suffix_file_rejected_cleanly() {
-    let server = TestServer::builder().open_access().build().await;
+    let server = TestServer::builder().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
 
     write_file(
@@ -76,7 +81,7 @@ async fn test_delta_suffix_file_rejected_cleanly() {
         b"raw delta data",
     );
 
-    let http = reqwest::Client::new();
+    let http = server.http();
 
     // .delta suffix is blocked by validate_object — returns 400, not 500
     let status = head_status(
@@ -96,13 +101,13 @@ async fn test_delta_suffix_file_rejected_cleanly() {
 /// A regular file (no .delta suffix) without metadata should serve as passthrough.
 #[tokio::test]
 async fn test_regular_file_no_metadata_serves_as_passthrough() {
-    let server = TestServer::builder().open_access().build().await;
+    let server = TestServer::builder().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
     let content = b"file without any DG metadata";
 
     write_file(data_dir, server.bucket(), "nometa", "report.txt", content);
 
-    let http = reqwest::Client::new();
+    let http = server.http();
 
     let status = head_status(
         &http,
@@ -137,7 +142,7 @@ async fn test_regular_file_no_metadata_serves_as_passthrough() {
 /// reference.bin without metadata should be served as passthrough.
 #[tokio::test]
 async fn test_reference_file_no_metadata_still_accessible() {
-    let server = TestServer::builder().open_access().build().await;
+    let server = TestServer::builder().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
     let ref_content = b"reference file data without DG metadata";
 
@@ -150,7 +155,7 @@ async fn test_reference_file_no_metadata_still_accessible() {
         ref_content,
     );
 
-    let http = reqwest::Client::new();
+    let http = server.http();
 
     // reference.bin should be filtered from LIST (internal artifact)
     // But direct HEAD/GET should work as passthrough
@@ -232,7 +237,7 @@ async fn test_delta_with_valid_metadata_reconstructs() {
 /// A file with invalid/garbage xattr metadata should not crash the proxy.
 #[tokio::test]
 async fn test_corrupt_xattr_metadata_graceful_fallback() {
-    let server = TestServer::builder().open_access().build().await;
+    let server = TestServer::builder().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
     let content = b"file with garbage metadata";
 
@@ -246,7 +251,7 @@ async fn test_corrupt_xattr_metadata_graceful_fallback() {
         "this is not valid JSON {{{",
     );
 
-    let http = reqwest::Client::new();
+    let http = server.http();
 
     // Corrupt metadata may cause deserialization failure — the proxy should
     // either fallback to passthrough (200) or return a clean error (404/500).
@@ -285,7 +290,7 @@ async fn test_corrupt_xattr_metadata_graceful_fallback() {
 /// Metadata that's valid JSON but missing required fields should degrade gracefully.
 #[tokio::test]
 async fn test_partial_metadata_missing_fields_graceful() {
-    let server = TestServer::builder().open_access().build().await;
+    let server = TestServer::builder().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
     let content = b"file with partial metadata";
 
@@ -306,7 +311,7 @@ async fn test_partial_metadata_missing_fields_graceful() {
         &partial_meta,
     );
 
-    let http = reqwest::Client::new();
+    let http = server.http();
 
     // Should not crash — fallback to passthrough or return an error code
     let status = head_status(

@@ -17,11 +17,13 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn test_large_delta_roundtrip_1mb() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .unwrap();
+    let server = TestServer::builder().build().await;
+    let http = server.http().with_client(
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap(),
+    );
 
     let base = generate_binary(1_000_000, 42);
     let variant = mutate_binary(&base, 0.05);
@@ -56,8 +58,8 @@ async fn test_large_delta_roundtrip_1mb() {
 
 #[tokio::test]
 async fn test_twenty_versions_all_correct() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     let base = generate_binary(50_000, 100);
     put_object(
@@ -111,8 +113,8 @@ async fn test_twenty_versions_all_correct() {
 
 #[tokio::test]
 async fn test_concurrent_delta_puts_same_prefix() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Upload a reference first
     let base = generate_binary(50_000, 42);
@@ -171,13 +173,8 @@ async fn test_concurrent_delta_puts_same_prefix() {
 async fn test_concurrent_delta_puts_different_prefixes() {
     // Use high codec concurrency — this test spawns 20 concurrent delta PUTs
     // and would exhaust the default (CPU-count) permits on small CI runners.
-    let server = TestServer::builder()
-        .open_access()
-        .codec_concurrency(20)
-        .open_access()
-        .build()
-        .await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().codec_concurrency(20).build().await;
+    let http = server.http();
 
     let mut handles = Vec::new();
     let mut all_expected: Vec<(String, Vec<u8>)> = Vec::new();
@@ -230,13 +227,8 @@ async fn test_concurrent_gets_same_delta() {
     // Use high codec concurrency — this test validates concurrent delta
     // reconstruction correctness, not backpressure. With the default
     // (CPU-count) permits on a 2-core CI runner, most GETs would get 503.
-    let server = TestServer::builder()
-        .open_access()
-        .codec_concurrency(20)
-        .open_access()
-        .build()
-        .await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().codec_concurrency(20).build().await;
+    let http = server.http();
 
     let base = generate_binary(50_000, 42);
     let variant = mutate_binary(&base, 0.02);
@@ -282,8 +274,8 @@ async fn test_concurrent_gets_same_delta() {
 
 #[tokio::test]
 async fn test_cache_coherence_put_then_get() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     let base = generate_binary(50_000, 42);
     let variant = mutate_binary(&base, 0.01);
@@ -325,8 +317,8 @@ async fn test_cache_coherence_put_then_get() {
 
 #[tokio::test]
 async fn test_cache_invalidation_after_delete() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // First generation
     let base1 = generate_binary(50_000, 42);
@@ -388,8 +380,8 @@ async fn test_cache_invalidation_after_delete() {
 
 #[tokio::test]
 async fn test_delete_all_recreate_same_prefix() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // First generation: 3 files
     let base1 = generate_binary(30_000, 1);
@@ -479,8 +471,8 @@ async fn test_delete_all_recreate_same_prefix() {
 
 #[tokio::test]
 async fn test_multi_delete_large_xml_body() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Upload 50 objects (use .txt for passthrough — faster, no delta encoding needed)
     let mut keys = Vec::new();
@@ -545,8 +537,8 @@ async fn test_multi_delete_large_xml_body() {
 
 #[tokio::test]
 async fn test_response_headers_numeric_correctness() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     let sizes: Vec<usize> = vec![1, 999, 1000, 999_999, 1_048_576];
 
@@ -607,11 +599,13 @@ async fn test_response_headers_numeric_correctness() {
 
 #[tokio::test]
 async fn test_large_passthrough_roundtrip() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .unwrap();
+    let server = TestServer::builder().build().await;
+    let http = server.http().with_client(
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap(),
+    );
 
     let size = 5 * 1024 * 1024; // 5MB
     let data = generate_binary(size, 42);
@@ -658,17 +652,14 @@ async fn test_large_passthrough_roundtrip() {
 
 #[tokio::test]
 async fn test_codec_concurrency_one() {
-    let server = TestServer::builder()
-        .open_access()
-        .codec_concurrency(1)
-        .open_access()
-        .build()
-        .await;
-    let http = reqwest::Client::builder()
-        // 180s: 5 serial xdelta3 encodes with concurrency=1 can take >60s on slow CI runners
-        .timeout(Duration::from_secs(180))
-        .build()
-        .unwrap();
+    let server = TestServer::builder().codec_concurrency(1).build().await;
+    let http = server.http().with_client(
+        reqwest::Client::builder()
+            // 180s: 5 serial xdelta3 encodes with concurrency=1 can take >60s on slow CI runners
+            .timeout(Duration::from_secs(180))
+            .build()
+            .unwrap(),
+    );
 
     let base = generate_binary(50_000, 42);
     put_object(
@@ -743,16 +734,13 @@ async fn test_codec_concurrency_one() {
 /// later operations.
 #[tokio::test]
 async fn test_orphan_reference_rolled_back_on_encode_overload() {
-    let server = TestServer::builder()
-        .open_access()
-        .codec_concurrency(1)
-        .open_access()
-        .build()
-        .await;
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .unwrap();
+    let server = TestServer::builder().codec_concurrency(1).build().await;
+    let http = server.http().with_client(
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .unwrap(),
+    );
 
     // Burst 8 concurrent PUTs to a fresh deltaspace. With
     // codec_concurrency=1, only one acquires the codec; the rest race
@@ -834,8 +822,8 @@ async fn test_orphan_reference_rolled_back_on_encode_overload() {
 
 #[tokio::test]
 async fn test_special_characters_in_keys() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     let keys_and_data: Vec<(&str, Vec<u8>)> = vec![
         ("special/file-with-dashes.txt", b"dashes data".to_vec()),
@@ -897,8 +885,8 @@ async fn test_special_characters_in_keys() {
 
 #[tokio::test]
 async fn test_hundred_prefixes_cache_thrash() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Upload 1 file to each of 100 different prefixes
     let mut first_prefix_data = Vec::new();
@@ -937,8 +925,8 @@ async fn test_hundred_prefixes_cache_thrash() {
 
 #[tokio::test]
 async fn test_zero_byte_object() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // PUT zero-byte .txt (passthrough)
     put_object(
@@ -982,8 +970,8 @@ async fn test_zero_byte_object() {
 /// silent data-integrity bug.
 #[tokio::test]
 async fn test_cache_invalidation_on_overwrite_returns_fresh_size() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Passthrough payload — a PDF won't run through the delta codec, so
     // the LIST/HEAD size we observe is the raw object size and not
@@ -1075,8 +1063,8 @@ async fn test_cache_invalidation_on_overwrite_returns_fresh_size() {
 /// this test guards.
 #[tokio::test]
 async fn test_cache_invalidation_on_batch_delete() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Seed 5 passthrough objects.
     for i in 0..5 {

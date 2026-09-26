@@ -14,8 +14,8 @@ use common::{
 
 #[tokio::test]
 async fn test_similar_files_stored_as_delta() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     let base = generate_binary(100_000, 42);
     let variant = mutate_binary(&base, 0.01);
@@ -55,11 +55,10 @@ async fn test_similar_files_stored_as_delta() {
 #[tokio::test]
 async fn test_delta_get_via_spooled_path_is_byte_exact() {
     let server = TestServer::builder()
-        .open_access()
         .env("DGP_SPOOL_THRESHOLD_BYTES", "1") // every delta GET spools
         .build()
         .await;
-    let http = reqwest::Client::new();
+    let http = server.http();
 
     let base = generate_binary(200_000, 7);
     let variant = mutate_binary(&base, 0.02);
@@ -114,11 +113,10 @@ async fn test_delta_get_via_spooled_path_is_byte_exact() {
 #[tokio::test]
 async fn test_delta_range_via_spooled_seek() {
     let server = TestServer::builder()
-        .open_access()
         .env("DGP_SPOOL_THRESHOLD_BYTES", "1")
         .build()
         .await;
-    let http = reqwest::Client::new();
+    let http = server.http();
 
     let base = generate_binary(300_000, 11);
     let variant = mutate_binary(&base, 0.02);
@@ -172,11 +170,10 @@ async fn test_delta_range_via_spooled_seek() {
 #[tokio::test]
 async fn test_streaming_spool_store_put() {
     let server = TestServer::builder()
-        .open_access()
         .env("DGP_SPOOL_THRESHOLD_BYTES", "1")
         .build()
         .await;
-    let http = reqwest::Client::new();
+    let http = server.http();
 
     // base → first member (passthrough or reference)
     let base = generate_binary(250_000, 23);
@@ -249,11 +246,10 @@ async fn test_streaming_spool_store_put() {
 #[tokio::test]
 async fn test_streaming_baseline_ratio_loss_does_not_orphan_sibling() {
     let server = TestServer::builder()
-        .open_access()
         .env("DGP_SPOOL_THRESHOLD_BYTES", "1")
         .build()
         .await;
-    let http = reqwest::Client::new();
+    let http = server.http();
 
     // First member: a delta-eligible .zip that becomes the baseline. (A normal
     // first member self-deltas tiny and "wins" — to exercise the ratio-loss
@@ -297,8 +293,8 @@ async fn test_streaming_baseline_ratio_loss_does_not_orphan_sibling() {
 
 #[tokio::test]
 async fn test_three_versions_all_retrievable() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     let base = generate_binary(100_000, 42);
     let v1 = mutate_binary(&base, 0.01);
@@ -348,8 +344,8 @@ async fn test_three_versions_all_retrievable() {
 
 #[tokio::test]
 async fn test_xdelta_does_not_recompress_magic_compressed_payloads() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     let mut base = b"\xFD7zXZ\x00".to_vec();
     base.extend((0..512_000).map(|i| (i % 251) as u8));
@@ -395,8 +391,8 @@ async fn test_xdelta_does_not_recompress_magic_compressed_payloads() {
 
 #[tokio::test]
 async fn test_txt_file_stored_passthrough() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     let st = put_and_get_storage_type(
         &http,
@@ -416,8 +412,8 @@ async fn test_txt_file_stored_passthrough() {
 
 #[tokio::test]
 async fn test_mixed_types_same_prefix() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     let zip_data = generate_binary(50_000, 100);
 
@@ -449,8 +445,8 @@ async fn test_mixed_types_same_prefix() {
 
 #[tokio::test]
 async fn test_delete_last_delta_cleans_reference() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     let data = generate_binary(50_000, 200);
     put_and_get_storage_type(
@@ -527,8 +523,8 @@ async fn test_delete_last_delta_cleans_reference() {
 /// batch is what triggers the reference removal — verify it does.
 #[tokio::test]
 async fn test_batch_delete_cleans_reference_on_last_delta() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Two siblings under the same deltaspace.
     let base = generate_binary(50_000, 1234);
@@ -603,8 +599,8 @@ async fn test_batch_delete_cleans_reference_on_last_delta() {
 /// empty, no orphan `reference.bin` remains.
 #[tokio::test]
 async fn test_batch_delete_of_a_folder_cleans_reference() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     let base = generate_binary(50_000, 9000);
     let v1 = mutate_binary(&base, 0.01);
@@ -673,8 +669,8 @@ async fn test_batch_delete_of_a_folder_cleans_reference() {
 
 #[tokio::test]
 async fn test_delete_one_of_many_deltas() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     let base = generate_binary(50_000, 400);
     let v1 = mutate_binary(&base, 0.01);
@@ -723,8 +719,8 @@ async fn test_delete_one_of_many_deltas() {
 /// kept (other delta siblings might need it); only this single file
 /// is stored passthrough.
 async fn test_dissimilar_files_fall_back_to_passthrough() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // First file creates reference
     let base = generate_binary(50_000, 500);
@@ -769,8 +765,8 @@ async fn test_dissimilar_files_fall_back_to_passthrough() {
 
 #[tokio::test]
 async fn test_first_zip_creates_reference() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     let data = generate_binary(50_000, 600);
     let st = put_and_get_storage_type(
@@ -797,8 +793,8 @@ async fn test_first_zip_creates_reference() {
 
 #[tokio::test]
 async fn test_list_objects_reports_original_sizes() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Upload a base zip (reference)
     let base = generate_binary(1024, 42);
@@ -877,8 +873,8 @@ async fn test_list_objects_reports_original_sizes() {
 
 #[tokio::test]
 async fn test_list_objects_delimiter_common_prefixes() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Upload objects under different sub-prefixes
     for key in &[
@@ -928,8 +924,8 @@ async fn test_list_objects_delimiter_common_prefixes() {
 
 #[tokio::test]
 async fn test_list_objects_pagination() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Upload 4 files
     for i in 1..=4 {
@@ -1014,13 +1010,8 @@ async fn test_list_objects_pagination() {
 async fn test_first_file_bad_delta_ratio_passthrough() {
     // Use a very low max_delta_ratio so the identity delta (first file against itself)
     // exceeds the threshold and triggers the passthrough fallback
-    let server = TestServer::builder()
-        .open_access()
-        .max_delta_ratio(0.001)
-        .open_access()
-        .build()
-        .await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().max_delta_ratio(0.001).build().await;
+    let http = server.http();
 
     let data = generate_binary(1024, 99999);
 
@@ -1061,8 +1052,8 @@ async fn test_first_file_bad_delta_ratio_passthrough() {
 /// of the reconstructed content (not the raw delta bytes).
 #[tokio::test]
 async fn test_range_request_on_delta_file() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Upload base + variant to create a delta
     let base = generate_binary(100_000, 42);

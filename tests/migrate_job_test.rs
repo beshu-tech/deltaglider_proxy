@@ -31,7 +31,7 @@ fn two_backend_yaml(dir_a: &std::path::Path, dir_b: &std::path::Path) -> String 
     )
 }
 
-async fn seed(http: &reqwest::Client, endpoint: &str, bucket: &str, n: usize) {
+async fn seed(http: &impl crate::common::S3Requests, endpoint: &str, bucket: &str, n: usize) {
     for i in 0..n {
         let body = [MARKER, format!(" object {i}").as_bytes()].concat();
         put_object(
@@ -131,12 +131,11 @@ async fn test_migrate_full_cycle() {
     let dir_b = tempfile::TempDir::new().unwrap();
     let bucket = "migbkt";
     let server = TestServer::builder()
-        .open_access()
         .bucket(bucket)
         .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
         .build()
         .await;
-    let http = reqwest::Client::new();
+    let http = server.http();
     let endpoint = server.endpoint();
 
     seed(&http, &endpoint, bucket, 30).await;
@@ -224,12 +223,11 @@ async fn test_migrate_delete_source() {
     let dir_b = tempfile::TempDir::new().unwrap();
     let bucket = "migdel";
     let server = TestServer::builder()
-        .open_access()
         .bucket(bucket)
         .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
         .build()
         .await;
-    let http = reqwest::Client::new();
+    let http = server.http();
     let endpoint = server.endpoint();
     seed(&http, &endpoint, bucket, 10).await;
 
@@ -279,12 +277,11 @@ async fn test_migrate_validations() {
     let dir_b = tempfile::TempDir::new().unwrap();
     let bucket = "migval";
     let server = TestServer::builder()
-        .open_access()
         .bucket(bucket)
         .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
         .build()
         .await;
-    let http = reqwest::Client::new();
+    let http = server.http();
     let endpoint = server.endpoint();
     let admin = admin_http_client(&endpoint).await;
 
@@ -310,12 +307,11 @@ async fn test_migrate_cancel_preflip_restores_source() {
     let dir_b = tempfile::TempDir::new().unwrap();
     let bucket = "migcan";
     let server = TestServer::builder()
-        .open_access()
         .bucket(bucket)
         .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
         .build()
         .await;
-    let http = reqwest::Client::new();
+    let http = server.http();
     let endpoint = server.endpoint();
     seed(&http, &endpoint, bucket, 150).await;
 
@@ -384,7 +380,6 @@ async fn test_migrate_honours_bucket_alias() {
     let dir_b = tempfile::TempDir::new().unwrap();
     let bucket = "migalias";
     let server = TestServer::builder()
-        .open_access()
         .bucket(bucket)
         .bucket_policy(bucket, "backend: src\nalias: real-store")
         // An unrelated bucket whose REAL name equals the virtual name above.
@@ -392,7 +387,7 @@ async fn test_migrate_honours_bucket_alias() {
         .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
         .build()
         .await;
-    let http = reqwest::Client::new();
+    let http = server.http();
     let endpoint = server.endpoint();
     for b in [bucket, "decoy"] {
         http.put(format!("{endpoint}/{b}")).send().await.unwrap();
@@ -447,12 +442,11 @@ async fn test_migrate_recopies_a_stale_target_object() {
     let dir_b = tempfile::TempDir::new().unwrap();
     let bucket = "migstale";
     let server = TestServer::builder()
-        .open_access()
         .bucket(bucket)
         .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
         .build()
         .await;
-    let http = reqwest::Client::new();
+    let http = server.http();
     let endpoint = server.endpoint();
     let fresh = [MARKER, b" fresh".as_slice()].concat();
     put_object(

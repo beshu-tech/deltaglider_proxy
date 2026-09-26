@@ -82,6 +82,8 @@ mod folder_marker_test;
 mod generation_pin_test;
 #[path = "harness_port_test.rs"]
 mod harness_port_test;
+#[path = "harness_signed_http_test.rs"]
+mod harness_signed_http_test;
 #[path = "iam_authorization_test.rs"]
 mod iam_authorization_test;
 #[path = "iam_declarative_reconcile_test.rs"]

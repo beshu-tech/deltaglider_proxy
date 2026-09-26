@@ -222,8 +222,8 @@ async fn test_parallel_puts_different_prefixes() {
 /// This matches S3, where a retried identical Complete is not an error.
 #[tokio::test]
 async fn test_concurrent_complete_same_upload_id_converges() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -346,15 +346,15 @@ async fn test_concurrent_complete_same_upload_id_converges() {
 /// the bytes it uploaded — not the bytes the sibling uploaded.
 #[tokio::test]
 async fn test_concurrent_multipart_different_upload_ids_same_key_isolated() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
     let key = "shared-key.bin";
 
     // Initiate two uploads.
     async fn init_upload(
-        http: &reqwest::Client,
+        http: &crate::common::S3Http,
         endpoint: &str,
         bucket: &str,
         key: &str,
@@ -383,7 +383,7 @@ async fn test_concurrent_multipart_different_upload_ids_same_key_isolated() {
     let payload_b = vec![0xBBu8; 5000];
 
     async fn upload_part(
-        http: &reqwest::Client,
+        http: &crate::common::S3Http,
         endpoint: &str,
         bucket: &str,
         key: &str,

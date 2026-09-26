@@ -180,6 +180,10 @@ criterion = "0.5"
 # HMAC-SHA1 for crafting SigV2 requests in auth regression tests. Already in
 # the lockfile through rustls; hmac 0.12 cannot pair with the sha1 0.11 in tree.
 ring = "0.17"
+# SigV4 for hand-built raw S3 requests in integration tests
+# (tests/common/signed_http.rs). Already in the lockfile through aws-sdk-s3.
+aws-sigv4 = "1"
+http = "1"
 
 [[bench]]
 name = "codec"

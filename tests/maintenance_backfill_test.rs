@@ -104,12 +104,11 @@ async fn head_last_modified(
 #[tokio::test]
 async fn backfill_stamps_canonical_metadata_and_preserves_served_time() {
     let server = TestServer::builder()
-        .open_access()
         .bucket("backfill-preserve")
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
-    let http = reqwest::Client::new();
+    let http = server.http();
     let client = server.s3_client().await;
 
     // One canonical object via the proxy (must be SKIPPED, not rewritten)

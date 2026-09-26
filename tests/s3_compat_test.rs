@@ -12,8 +12,8 @@ use crate::common;
 
 use base64::Engine;
 use common::{
-    admin_http_client, generate_binary, mutate_binary, open_access_setup, put_and_get_storage_type,
-    put_object, upload_test_data, TestServer,
+    admin_http_client, generate_binary, mutate_binary, put_and_get_storage_type, put_object,
+    signed_setup, upload_test_data, TestServer,
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -24,8 +24,8 @@ use sha2::Sha256;
 
 #[tokio::test]
 async fn test_success_response_has_request_id() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -61,8 +61,8 @@ async fn test_success_response_has_request_id() {
 
 #[tokio::test]
 async fn test_error_response_has_unique_request_id() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -93,8 +93,8 @@ async fn test_error_response_has_unique_request_id() {
 
 #[tokio::test]
 async fn test_request_ids_are_unique_across_requests() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -139,8 +139,8 @@ async fn test_request_ids_are_unique_across_requests() {
 
 #[tokio::test]
 async fn test_head_has_accept_ranges_bytes() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -174,8 +174,8 @@ async fn test_head_has_accept_ranges_bytes() {
 
 #[tokio::test]
 async fn test_put_with_correct_content_md5() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -202,8 +202,8 @@ async fn test_put_with_correct_content_md5() {
 
 #[tokio::test]
 async fn test_put_with_wrong_content_md5_returns_bad_digest() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -235,8 +235,8 @@ async fn test_put_with_wrong_content_md5_returns_bad_digest() {
 
 #[tokio::test]
 async fn test_put_without_content_md5_succeeds() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -259,8 +259,8 @@ async fn test_put_without_content_md5_succeeds() {
 
 #[tokio::test]
 async fn test_copy_default_copies_metadata() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -298,8 +298,8 @@ async fn test_copy_default_copies_metadata() {
 
 #[tokio::test]
 async fn test_copy_replace_uses_request_metadata() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -347,8 +347,8 @@ async fn test_copy_replace_uses_request_metadata() {
 
 #[tokio::test]
 async fn test_copy_replace_content_type() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -387,8 +387,8 @@ async fn test_copy_replace_content_type() {
 
 #[tokio::test]
 async fn test_copy_to_self_with_replace() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -434,7 +434,7 @@ async fn test_copy_to_self_with_replace() {
 
 #[tokio::test]
 async fn test_get_if_match_matching_etag() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     put_object(
         &http,
         &server.endpoint(),
@@ -469,7 +469,7 @@ async fn test_get_if_match_matching_etag() {
 
 #[tokio::test]
 async fn test_get_if_match_non_matching() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     put_object(
         &http,
         &server.endpoint(),
@@ -499,7 +499,7 @@ async fn test_get_if_match_non_matching() {
 
 #[tokio::test]
 async fn test_get_if_none_match_matching() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     put_object(
         &http,
         &server.endpoint(),
@@ -538,7 +538,7 @@ async fn test_get_if_none_match_matching() {
 
 #[tokio::test]
 async fn test_get_if_none_match_non_matching() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     put_object(
         &http,
         &server.endpoint(),
@@ -564,7 +564,7 @@ async fn test_get_if_none_match_non_matching() {
 
 #[tokio::test]
 async fn test_get_if_modified_since_not_modified() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     put_object(
         &http,
         &server.endpoint(),
@@ -590,7 +590,7 @@ async fn test_get_if_modified_since_not_modified() {
 
 #[tokio::test]
 async fn test_get_if_modified_since_modified() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     put_object(
         &http,
         &server.endpoint(),
@@ -620,7 +620,7 @@ async fn test_get_if_modified_since_modified() {
 
 #[tokio::test]
 async fn test_head_if_none_match() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     put_object(
         &http,
         &server.endpoint(),
@@ -667,7 +667,7 @@ async fn test_head_if_none_match() {
 
 #[tokio::test]
 async fn test_conditional_precedence_order() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -715,7 +715,7 @@ async fn test_conditional_precedence_order() {
 
 #[tokio::test]
 async fn test_get_range_first_100_bytes() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let data = upload_test_data(
         &http,
         &server.endpoint(),
@@ -757,7 +757,7 @@ async fn test_get_range_first_100_bytes() {
 
 #[tokio::test]
 async fn test_get_range_last_100_bytes() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let data = upload_test_data(
         &http,
         &server.endpoint(),
@@ -786,7 +786,7 @@ async fn test_get_range_last_100_bytes() {
 
 #[tokio::test]
 async fn test_get_range_middle_slice() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let data = upload_test_data(
         &http,
         &server.endpoint(),
@@ -824,7 +824,7 @@ async fn test_get_range_middle_slice() {
 
 #[tokio::test]
 async fn test_get_range_suffix() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let data = upload_test_data(
         &http,
         &server.endpoint(),
@@ -862,7 +862,7 @@ async fn test_get_range_suffix() {
 
 #[tokio::test]
 async fn test_get_range_open_end() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let data = upload_test_data(
         &http,
         &server.endpoint(),
@@ -900,7 +900,7 @@ async fn test_get_range_open_end() {
 
 #[tokio::test]
 async fn test_get_range_full_file() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let data = upload_test_data(
         &http,
         &server.endpoint(),
@@ -929,7 +929,7 @@ async fn test_get_range_full_file() {
 
 #[tokio::test]
 async fn test_get_range_invalid_returns_416() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     upload_test_data(
         &http,
         &server.endpoint(),
@@ -958,7 +958,7 @@ async fn test_get_range_invalid_returns_416() {
 
 #[tokio::test]
 async fn test_get_range_beyond_file_size() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let data = upload_test_data(
         &http,
         &server.endpoint(),
@@ -999,7 +999,7 @@ async fn test_get_range_beyond_file_size() {
 
 #[tokio::test]
 async fn test_get_range_on_passthrough_file() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let data = generate_binary(500, 50);
     put_object(
         &http,
@@ -1034,7 +1034,7 @@ async fn test_get_range_on_passthrough_file() {
 
 #[tokio::test]
 async fn test_get_range_on_delta_file() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -1085,10 +1085,10 @@ async fn test_get_range_on_delta_file() {
 }
 
 /// Set up a delta-compressed file for Range testing. Returns (server, http_client, original_data).
-async fn setup_delta_range_test() -> (TestServer, reqwest::Client, Vec<u8>) {
+async fn setup_delta_range_test() -> (TestServer, crate::common::S3Http, Vec<u8>) {
     // Open access: the returned client is unsigned reqwest.
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Upload base zip (becomes reference)
     let base = generate_binary(10_000, 42);
@@ -1455,7 +1455,7 @@ async fn test_range_delta_sequential_requests() {
 
 #[tokio::test]
 async fn test_get_object_acl_returns_full_control() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let url = format!("{}/{}/acl-test.txt", server.endpoint(), server.bucket());
     http.put(&url).body("hello").send().await.unwrap();
 
@@ -1494,7 +1494,7 @@ async fn test_get_object_acl_returns_full_control() {
 
 #[tokio::test]
 async fn test_get_bucket_acl_returns_full_control() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let url = format!("{}/{}?acl", server.endpoint(), server.bucket());
     let resp = http.get(&url).send().await.unwrap();
     assert_eq!(resp.status(), 200);
@@ -1524,8 +1524,8 @@ async fn test_get_bucket_acl_returns_full_control() {
 
 #[tokio::test]
 async fn test_get_with_response_content_type() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Upload an object
     let url = format!(
@@ -1557,8 +1557,8 @@ async fn test_get_with_response_content_type() {
 
 #[tokio::test]
 async fn test_get_with_response_content_disposition() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Upload an object
     let url = format!(
@@ -1590,8 +1590,8 @@ async fn test_get_with_response_content_disposition() {
 
 #[tokio::test]
 async fn test_presigned_url_with_response_overrides() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Upload an object
     let url = format!(
@@ -1675,8 +1675,8 @@ async fn test_presigned_url_with_response_overrides() {
 
 #[tokio::test]
 async fn test_list_buckets_creation_date_not_now() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
 
     // Create a bucket
     let bucket_name = "date-test-bucket";
@@ -1732,8 +1732,8 @@ async fn test_list_buckets_creation_date_not_now() {
 
 #[tokio::test]
 async fn test_list_v2_metadata_true_returns_user_metadata() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -1791,8 +1791,8 @@ async fn test_list_v2_metadata_true_returns_user_metadata() {
 
 #[tokio::test]
 async fn test_list_v2_metadata_false_no_user_metadata() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -1824,8 +1824,8 @@ async fn test_list_v2_metadata_false_no_user_metadata() {
 
 #[tokio::test]
 async fn test_list_v2_metadata_true_dg_metadata() {
-    let server = TestServer::builder().open_access().build().await;
-    let client = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let client = server.http();
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -1885,7 +1885,7 @@ async fn test_list_v2_metadata_true_dg_metadata() {
 
 #[tokio::test]
 async fn test_conditional_on_nonexistent_object_returns_404() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
 
     let resp = http
         .get(format!(
@@ -1907,7 +1907,7 @@ async fn test_conditional_on_nonexistent_object_returns_404() {
 
 #[tokio::test]
 async fn test_get_if_match_wildcard() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     put_object(
         &http,
         &server.endpoint(),
@@ -1938,7 +1938,7 @@ async fn test_get_if_match_wildcard() {
 
 #[tokio::test]
 async fn test_get_range_on_zero_byte_file() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     put_object(
         &http,
         &server.endpoint(),
@@ -1969,7 +1969,7 @@ async fn test_get_range_on_zero_byte_file() {
 
 #[tokio::test]
 async fn test_head_conditional_if_none_match() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     put_object(
         &http,
         &server.endpoint(),
@@ -2036,7 +2036,7 @@ async fn test_head_conditional_if_none_match() {
 
 #[tokio::test]
 async fn test_get_acl_nonexistent_object_returns_404() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
 
     let resp = http
         .get(format!(
@@ -2057,7 +2057,7 @@ async fn test_get_acl_nonexistent_object_returns_404() {
 
 #[tokio::test]
 async fn test_get_acl_nonexistent_bucket_returns_404() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
 
     let resp = http
         .get(format!("{}/nonexistent-bucket-xyz?acl", server.endpoint()))
@@ -2078,7 +2078,7 @@ async fn test_get_acl_nonexistent_bucket_returns_404() {
 
 #[tokio::test]
 async fn test_upload_part_copy() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -2183,7 +2183,7 @@ async fn test_upload_part_copy() {
 
 #[tokio::test]
 async fn test_upload_part_copy_with_range() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -3545,7 +3545,7 @@ async fn test_form_post_success_response_has_etag_header() {
 
 #[tokio::test]
 async fn test_scan_prefix_usage() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -3631,7 +3631,7 @@ async fn test_scan_prefix_usage() {
 
 #[tokio::test]
 async fn test_usage_cache_returns_result() {
-    let (server, http) = open_access_setup().await;
+    let (server, http) = signed_setup().await;
     let endpoint = server.endpoint();
     let bucket = server.bucket();
 
@@ -3750,7 +3750,7 @@ async fn test_list_v2_honours_start_after() {
 /// came back as a space and `%` sequences were mangled.
 #[tokio::test]
 async fn test_list_encoding_type_url_encodes_keys() {
-    let server = TestServer::builder().open_access().build().await;
+    let server = TestServer::builder().build().await;
     let s3 = server.s3_client().await;
     let bucket = server.bucket();
     let key = "enc dir/a+b c%41.txt";
@@ -3761,7 +3761,7 @@ async fn test_list_encoding_type_url_encodes_keys() {
         .send()
         .await
         .unwrap();
-    let http = reqwest::Client::new();
+    let http = server.http();
     for list in ["list-type=2&", ""] {
         let body = http
             .get(format!(
@@ -3804,8 +3804,8 @@ async fn test_list_encoding_type_url_encodes_keys() {
 /// to pass it to storage: 500 on S3, "disk full" from xattrs on filesystem.
 #[tokio::test]
 async fn test_oversized_user_metadata_is_400() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
     let url = format!("{}/{}/meta-big.txt", server.endpoint(), server.bucket());
     let resp = http
         .put(&url)
@@ -3836,16 +3836,17 @@ async fn test_oversized_user_metadata_is_400() {
 /// key used to all pass the check and all write (4/4 succeeded).
 #[tokio::test]
 async fn test_concurrent_if_none_match_star_admits_one_writer() {
-    let server = TestServer::builder().open_access().build().await;
+    let server = TestServer::builder().build().await;
     let url = format!("{}/{}/race/once.bin", server.endpoint(), server.bucket());
     let body = generate_binary(4 * 1024 * 1024, 42);
+    let http = server.http();
     let handles: Vec<_> = (0..4)
         .map(|_| {
             let url = url.clone();
             let body = body.clone();
+            let http = http.clone();
             tokio::spawn(async move {
-                reqwest::Client::new()
-                    .put(&url)
+                http.put(&url)
                     .header("if-none-match", "*")
                     .body(body)
                     .send()
@@ -3950,8 +3951,8 @@ async fn review2_complete_multipart_honours_if_none_match_star() {
 /// limit and the PUT fails with a 5xx.
 #[tokio::test]
 async fn review2_user_metadata_at_limit_with_quotes_stores() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
     let url = format!("{}/{}/meta-quotes.txt", server.endpoint(), server.bucket());
     let resp = http
         .put(&url)
@@ -3973,8 +3974,8 @@ async fn review2_user_metadata_at_limit_with_quotes_stores() {
 /// (only NUL and `\` are refused) then makes the XML ill-formed.
 #[tokio::test]
 async fn review2_list_v2_next_token_stays_valid_xml() {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
+    let server = TestServer::builder().build().await;
+    let http = server.http();
     for k in ["ctl/a%01b.txt", "ctl/c.txt"] {
         let r = http
             .put(format!("{}/{}/{k}", server.endpoint(), server.bucket()))
@@ -4008,7 +4009,7 @@ async fn review2_list_v2_next_token_stays_valid_xml() {
 /// long keys exceed that, so the client gets a broken listing.
 #[tokio::test]
 async fn review2_large_metadata_listing_is_not_truncated_to_empty() {
-    let server = TestServer::builder().open_access().build().await;
+    let server = TestServer::builder().build().await;
     let s3 = server.s3_client().await;
     let b = server.bucket();
     let dir = format!(
@@ -4039,7 +4040,8 @@ async fn review2_large_metadata_listing_is_not_truncated_to_empty() {
         use futures::StreamExt;
         while puts.next().await.is_some() {}
     }
-    let resp = reqwest::Client::new()
+    let resp = server
+        .http()
         .get(format!(
             "{}/{}?list-type=2&metadata=true",
             server.endpoint(),

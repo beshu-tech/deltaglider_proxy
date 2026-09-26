@@ -28,7 +28,7 @@ fn write_raw_file(data_dir: &Path, bucket: &str, prefix: &str, filename: &str, d
 
 /// GET an object via HTTP client, return (status, body_bytes).
 async fn http_get(
-    client: &reqwest::Client,
+    client: &crate::common::S3Http,
     endpoint: &str,
     bucket: &str,
     key: &str,
@@ -42,7 +42,7 @@ async fn http_get(
 
 /// HEAD an object, return (status, content_length).
 async fn http_head(
-    client: &reqwest::Client,
+    client: &crate::common::S3Http,
     endpoint: &str,
     bucket: &str,
     key: &str,
@@ -61,7 +61,7 @@ async fn http_head(
 
 /// LIST a prefix, return list of keys.
 async fn http_list_keys(
-    client: &reqwest::Client,
+    client: &crate::common::S3Http,
     endpoint: &str,
     bucket: &str,
     prefix: &str,
@@ -86,7 +86,7 @@ async fn http_list_keys(
 /// This would have caught the original_name bug immediately.
 #[tokio::test]
 async fn test_list_head_get_triangle_invariant() {
-    let server = TestServer::builder().open_access().build().await;
+    let server = TestServer::builder().build().await;
     let client = server.s3_client().await;
 
     // Upload a mix of passthrough and delta-eligible files
@@ -130,7 +130,7 @@ async fn test_list_head_get_triangle_invariant() {
     );
 
     // For every listed key: HEAD and GET must succeed
-    let http = reqwest::Client::new();
+    let http = server.http();
     for key in &listed_keys {
         let (head_status, head_cl) =
             http_head(&http, &server.endpoint(), server.bucket(), key).await;
@@ -167,9 +167,9 @@ async fn test_list_head_get_triangle_invariant() {
 /// HEAD and GET must agree on content-length for every storage strategy.
 #[tokio::test]
 async fn test_head_get_content_length_consistency() {
-    let server = TestServer::builder().open_access().build().await;
+    let server = TestServer::builder().build().await;
     let client = server.s3_client().await;
-    let http = reqwest::Client::new();
+    let http = server.http();
 
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("consist/text.txt", b"passthrough content".to_vec()),
@@ -273,14 +273,14 @@ async fn test_content_roundtrip_sha256_match() {
 /// triangle invariant for files that bypass the proxy's PUT pipeline.
 #[tokio::test]
 async fn test_unmanaged_file_triangle_invariant() {
-    let server = TestServer::builder().open_access().build().await;
+    let server = TestServer::builder().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
     let content = b"directly placed file content";
 
     // Write a plain file (no .delta suffix, no metadata)
     write_raw_file(data_dir, server.bucket(), "direct", "report.txt", content);
 
-    let http = reqwest::Client::new();
+    let http = server.http();
 
     // LIST should show it
     let keys = http_list_keys(&http, &server.endpoint(), server.bucket(), "direct/").await;
@@ -325,13 +325,13 @@ async fn test_unmanaged_file_triangle_invariant() {
 /// should cause GET to return 404, not stale cached data.
 #[tokio::test]
 async fn test_external_delete_returns_404() {
-    let server = TestServer::builder().open_access().build().await;
+    let server = TestServer::builder().build().await;
     let data_dir = server.data_dir().expect("filesystem backend");
     let content = b"file that will be externally deleted";
 
     write_raw_file(data_dir, server.bucket(), "ephemeral", "temp.txt", content);
 
-    let http = reqwest::Client::new();
+    let http = server.http();
 
     // HEAD to populate metadata cache
     let (status, _) = http_head(
