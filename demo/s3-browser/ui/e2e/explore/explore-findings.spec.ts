@@ -305,18 +305,27 @@ test('the upload page sends 300 tiny files in under a minute', async ({ page }) 
 
 // ── S3 transparency: keys ───────────────────────────────────────────────
 
-test('keys that look like internal names round-trip like on S3', async () => {
+test('reserved and normalised keys behave as documented, and a refusal names the rule', async () => {
+  // Lead decision #13: the proxy keeps its reserved names (it stores its
+  // own files under them) and documents them; the refusal names the rule.
   const bucket = `explore-keys-${RUN}`;
   const c = s3();
   await c.send(new CreateBucketCommand({ Bucket: bucket }));
-  // S3 stores all of these. The proxy refuses the first two with
-  // "reserved for internal use" and strips the leading slash of the third.
   for (const key of ['docs/reference.bin', 'backups/db.sql.delta']) {
-    expect(await httpStatus(c.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: 'x' }))), key).toBe(200);
+    let err: { $metadata?: { httpStatusCode?: number }; message?: string } | null = null;
+    try {
+      await c.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: 'x' }));
+    } catch (e) {
+      err = e as typeof err;
+    }
+    expect(err?.$metadata?.httpStatusCode, key).toBe(400);
+    expect(err?.message, key).toContain(`'${key}' is refused`);
+    expect(err?.message, key).toContain('s3-api-compatibility#reserved-and-normalised-keys');
   }
+  // Documented normalisation: the leading slash is removed.
   await c.send(new PutObjectCommand({ Bucket: bucket, Key: '/leading.txt', Body: 'x' }));
   const keys = ((await c.send(new ListObjectsV2Command({ Bucket: bucket }))).Contents ?? []).map((o) => o.Key);
-  expect(keys).toContain('/leading.txt');
+  expect(keys).toContain('leading.txt');
 });
 
 test('a 250-character file name is stored, or refused with a 4xx, never a 500', async () => {
