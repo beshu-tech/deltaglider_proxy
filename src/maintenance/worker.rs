@@ -193,7 +193,12 @@ async fn run_job(
     }
 
     let (status, last_error) = match &outcome {
-        Ok(()) => ("completed", None),
+        Ok(()) => {
+            // Per-object failures do not stop a job; they decide its status.
+            let row = db.lock().await.maintenance_job_by_id(job.id).ok().flatten();
+            row.map(|j| super::settle_status(j.objects_done, j.objects_skipped, j.objects_failed))
+                .unwrap_or(("completed", None))
+        }
         Err(e) if e == CANCELLED => ("cancelled", None),
         Err(e) => ("failed", Some(e.clone())),
     };

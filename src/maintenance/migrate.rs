@@ -948,8 +948,15 @@ async fn run_phases(
             None
         };
         if let Some(note) = note {
+            // The migration itself succeeded; failed source deletes still
+            // make it `completed_with_errors`, never plain `completed`.
+            let status = if delete_failures > 0 {
+                "completed_with_errors"
+            } else {
+                "completed"
+            };
             let db = db.lock().await;
-            let _ = db.maintenance_finish(job.id, "completed", Some(&note));
+            let _ = db.maintenance_finish(job.id, status, Some(&note));
             return Ok(());
         }
     }

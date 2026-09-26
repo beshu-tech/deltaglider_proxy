@@ -146,12 +146,28 @@ pub fn needs_rewrite(user_metadata: &HashMap<String, String>, desired: &DesiredE
 // module are unaffected.
 pub(crate) use crate::storage::encrypting::strip_encryption_markers;
 
+/// Pure: the terminal status of a job that ran to its end. A job with
+/// per-object failures is never plain `completed`: `completed_with_errors`
+/// when some objects went through, `failed` when none did. Returns the
+/// status and a summary for `last_error`.
+pub fn settle_status(done: i64, skipped: i64, failed: i64) -> (&'static str, Option<String>) {
+    if failed <= 0 {
+        return ("completed", None);
+    }
+    let summary = format!("{failed} object(s) failed — see the job's Failures tab");
+    if done <= 0 && skipped <= 0 {
+        ("failed", Some(summary))
+    } else {
+        ("completed_with_errors", Some(summary))
+    }
+}
+
 /// Display percent for a job ROW: 100 once completed, otherwise
 /// [`progress_percent`]. The one home for the rule both admin views
 /// (jobs.rs + the session-light bucket status) share.
 pub fn display_percent(job: &store::MaintenanceJob) -> Option<u8> {
     match job.status.as_str() {
-        "completed" => Some(100),
+        "completed" | "completed_with_errors" => Some(100),
         _ => progress_percent(
             &job.phase,
             job.objects_total,
@@ -266,6 +282,17 @@ mod tests {
         assert!(!m.contains_key("dg-encrypted"));
         assert!(!m.contains_key("dg-encryption-key-id"));
         assert_eq!(m.get("custom").map(String::as_str), Some("keep-me"));
+    }
+
+    #[test]
+    fn settle_status_never_calls_a_job_with_failures_completed() {
+        assert_eq!(settle_status(10, 5, 0), ("completed", None));
+        assert_eq!(settle_status(0, 0, 0), ("completed", None));
+        let (s, e) = settle_status(10, 0, 2);
+        assert_eq!(s, "completed_with_errors");
+        assert!(e.unwrap().starts_with("2 object(s) failed"));
+        assert_eq!(settle_status(0, 3, 1).0, "completed_with_errors");
+        assert_eq!(settle_status(0, 0, 4).0, "failed", "all objects failed");
     }
 
     #[test]

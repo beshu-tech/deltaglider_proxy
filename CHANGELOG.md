@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — A one-off job with failed objects no longer shows "succeeded"
+
+A re-encrypt or backfill job records a failed object and goes on to the
+next one. At the end the job settled as `completed` (shown as `succeeded`)
+even when every object failed. Now such a job settles as
+`completed_with_errors` when some objects went through, and as `failed`
+when none did; `last_error` names the failure count. A migrate whose
+source cleanup fails to delete some objects is also `completed_with_errors`.
+On the Jobs screen the row shows "N failed", which opens the Failures tab.
+
 ### Fixed — A migrate cancel stops within 20 objects and removes its copies
 
 A migrate job checked for a cancel only once per 1000-object page, so a

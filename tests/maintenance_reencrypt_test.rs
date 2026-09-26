@@ -924,3 +924,104 @@ async fn test_signed_form_post_to_busy_bucket_is_gated() {
     assert_eq!(status, 503, "a signed form POST must be gated: {body}");
     assert!(body.contains("SlowDown"), "{body}");
 }
+
+/// Flip one byte in the middle of every on-disk file named `name`.
+fn corrupt_files_named(root: &std::path::Path, name: &str) -> usize {
+    let mut n = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.file_name().is_some_and(|f| f == name) {
+                let mut bytes = std::fs::read(&p).unwrap();
+                let mid = bytes.len() / 2;
+                bytes[mid] ^= 0xff;
+                std::fs::write(&p, bytes).unwrap();
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Explore #6: a job whose objects fail used to settle `succeeded`. Now a
+/// job with failures is `completed_with_errors` when some objects went
+/// through, and `failed` when none did; the row carries the count.
+#[tokio::test]
+async fn test_job_with_failures_is_not_succeeded() {
+    let (mixed, broken) = ("maintmixed", "maintbroken");
+    let server = TestServer::builder().bucket(mixed).build().await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+    http.put(format!("{endpoint}/{broken}"))
+        .send()
+        .await
+        .unwrap();
+
+    enable_encryption(&admin, &endpoint).await;
+    let body = [PLAINTEXT_MARKER, b" secret"].concat();
+    put_object(
+        &http,
+        &endpoint,
+        mixed,
+        "good.json",
+        body.clone(),
+        "application/json",
+    )
+    .await;
+    put_object(
+        &http,
+        &endpoint,
+        mixed,
+        "bad.json",
+        body.clone(),
+        "application/json",
+    )
+    .await;
+    put_object(
+        &http,
+        &endpoint,
+        broken,
+        "bad.json",
+        body,
+        "application/json",
+    )
+    .await;
+    // Corrupt the ciphertext: the rewrite cannot decrypt these objects.
+    let data_dir = server.data_dir().unwrap();
+    assert_eq!(corrupt_files_named(data_dir, "bad.json"), 2);
+
+    put_storage_encryption(
+        &admin,
+        &endpoint,
+        serde_json::json!({
+            "mode": "aes256-gcm-proxy",
+            "key": KEY_B, "key_id": KEY_B_ID,
+            "legacy_key": KEY, "legacy_key_id": KEY_ID,
+        }),
+    )
+    .await;
+
+    start_reencrypt(&admin, &endpoint, mixed).await;
+    wait_job_done(&admin, &endpoint, mixed).await;
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["progress"]["failed"], 1, "job: {job}");
+    assert_eq!(job["progress"]["processed"], 1, "job: {job}");
+    assert_eq!(job["status"], "completed_with_errors", "job: {job}");
+    assert!(
+        job["last_error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("1 object(s) failed"),
+        "job: {job}"
+    );
+
+    start_reencrypt(&admin, &endpoint, broken).await;
+    wait_job_done(&admin, &endpoint, broken).await;
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["progress"]["processed"], 0, "job: {job}");
+    assert_eq!(job["status"], "failed", "every object failed: {job}");
+}

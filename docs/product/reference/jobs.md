@@ -4,7 +4,7 @@ One API surface and one admin screen for everything that runs in the background:
 
 ## The model
 
-Three subsystems, one surface. Every job appears as a row in `GET /_/api/admin/jobs` and on the Settings **Jobs** screen with the same normalized shape: kind, scope (bucket/prefix/target), status (`idle` / `queued` / `running` / `cancelling` / `succeeded` / `failed` / `cancelled`), progress, and last run. Job ids are namespaced:
+Three subsystems, one surface. Every job appears as a row in `GET /_/api/admin/jobs` and on the Settings **Jobs** screen with the same normalized shape: kind, scope (bucket/prefix/target), status (`idle` / `queued` / `running` / `cancelling` / `succeeded` / `completed_with_errors` / `failed` / `cancelled`), progress, and last run. A one-off job that runs to its end with one or more failed objects is never `succeeded`: it is `completed_with_errors` when some objects went through, and `failed` when none did. Its row shows the failure count, which opens the job's Failures tab. Job ids are namespaced:
 
 | Kind | Id | Defined by | Actions |
 |---|---|---|---|

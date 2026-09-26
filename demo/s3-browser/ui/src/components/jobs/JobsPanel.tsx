@@ -496,6 +496,23 @@ export default function JobsPanel({ onSessionExpired, search }: Props) {
                 {jobStatusLabel(d.row)}
               </Tag>
             )}
+            {!live && d.row.progress.failed > 0 && (
+              <Button
+                type="link"
+                size="small"
+                danger
+                style={{ padding: '0 4px', height: 'auto', fontSize: 12 }}
+                aria-label={`${d.row.progress.failed} failed — show failures: ${d.row.name}`}
+                title="Show the failed objects"
+                onClick={(e) => {
+                  // The row click opens the Definition tab; this opens Failures.
+                  e.stopPropagation();
+                  openDrawer(d.row.id, 'failures');
+                }}
+              >
+                {d.row.progress.failed} failed
+              </Button>
+            )}
             {!live && d.row.last_error && (
               <Text type="danger" style={{ display: 'block', fontSize: 11, marginTop: 2 }} ellipsis title={d.row.last_error}>
                 {d.row.last_error}
