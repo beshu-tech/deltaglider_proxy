@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — A filtered LIST reads at most one page budget per request
+
+For a user whose policy covers several prefixes, the proxy lists each prefix
+that the policy can see and skips the keys that the user cannot see. The limit
+of 10,000 backend pages applied to each prefix, not to the request. So a
+policy with many prefixes that hold many hidden keys could make one LIST read
+many times that limit. The limit now applies to the whole request, including
+the checks that decide which folders to show.
+
 ### Fixed — A webhook endpoint keeps its delivery state when its URL token is rotated
 
 The proxy records the delivery result of each webhook endpoint, and a retry

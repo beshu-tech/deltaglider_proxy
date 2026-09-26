@@ -1735,8 +1735,18 @@ async fn list_page_for_caller(
     let mut objects = Vec::new();
     let mut prefixes = std::collections::BTreeSet::new();
     let mut more = false;
+    // ONE engine-page budget for the whole request, shared by every target
+    // (scans and roll-up probes): per target, N visible prefixes read N
+    // budgets for one LIST.
+    let mut budget = FILTERED_LIST_MAX_ENGINE_PAGES;
     for target in targets {
         if objects.len() + prefixes.len() >= want {
+            break;
+        }
+        if budget == 0 {
+            // Stopped before this target: the listing goes on after the
+            // last visible entry.
+            more = true;
             break;
         }
         match target {
@@ -1750,6 +1760,11 @@ async fn list_page_for_caller(
                     continue;
                 }
                 for probe in probes {
+                    if budget == 0 {
+                        more = true;
+                        break;
+                    }
+                    budget -= 1;
                     let page = engine
                         .list_objects(bucket, &probe, delimiter, 1, None, false)
                         .await
@@ -1763,7 +1778,8 @@ async fn list_page_for_caller(
             ListTarget::Scan(scan_prefix) => {
                 let need = want - objects.len() - prefixes.len();
                 let mut scan_cursor = cursor.map(str::to_string);
-                for _ in 0..FILTERED_LIST_MAX_ENGINE_PAGES {
+                while budget > 0 {
+                    budget -= 1;
                     let page = engine
                         .list_objects(
                             bucket,
@@ -3633,6 +3649,37 @@ mod review2_tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+    }
+
+    /// The page budget is one per REQUEST, not one per visible prefix: a
+    /// scan of hidden keys that ends inside the budget left the next prefix
+    /// a whole new budget, so a policy with N prefixes read N budgets of
+    /// engine pages for one LIST. Here `a/` spends the whole budget on
+    /// hidden keys, so `b/` must not be read.
+    #[tokio::test]
+    async fn review3_one_page_budget_per_request() {
+        // `max_keys=1` reads two entries per engine page.
+        let mut keys: Vec<String> = (0..2 * FILTERED_LIST_MAX_ENGINE_PAGES)
+            .map(|i| format!("a/{i:03}.png"))
+            .collect();
+        keys.push("b/v.png".into());
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let (_dir, engine) = fs_engine(&refs).await;
+        let read = |effect: &str, res: &str| crate::iam::Permission {
+            actions: vec!["read".into()],
+            ..rule(effect, &[res])
+        };
+        let scope = scoped(vec![
+            read("Allow", "b/a/*"),
+            read("Allow", "b/b/*"),
+            read("Deny", "b/a/*"),
+        ]);
+        let got = list_page_for_caller(&engine, "b", "", None, 1, None, false, Some(&scope)).await;
+        assert!(
+            got.is_err(),
+            "the request read past its page budget: {:?}",
+            got.map(|p| p.objects.into_iter().map(|(k, _)| k).collect::<Vec<_>>())
+        );
     }
 }
 
