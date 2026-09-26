@@ -106,23 +106,75 @@ pub(super) async fn cleanup_after_write(
     }
 }
 
+/// The stored object at a deleted key when the flush runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveNow {
+    /// Not read (no entry needs it, or the HEAD failed): keep what is unsure.
+    Unknown,
+    Gone,
+    /// Written again (by any node): `(stored ETag, stored size)`.
+    Is(String, u64),
+}
+
 /// The entries to delete for one deleted stored key. A key that was written
 /// again after its delete was queued keeps its newest entry. With the
-/// server time of the delete (`deleted_at`, the `Date` of its response),
-/// only entries the server stored BEFORE that second go: an entry of a
-/// peer's write after the delete (another node, so no local rewrite mark)
-/// stays. An entry of the same second stays too; it is garbage at worst.
-fn doomed(entries: &[Listed], rewritten: bool, deleted_at: Option<i64>) -> Vec<String> {
+/// server time of the delete (`deleted_at`, the `Date` of its response), an
+/// entry the server stored BEFORE that second goes. An entry of that second
+/// or later may be a peer's write after the delete (another node, so no
+/// local rewrite mark): it goes only when it does not describe the object
+/// that is there now (`live`).
+fn doomed(
+    entries: &[Listed],
+    rewritten: bool,
+    deleted_at: Option<i64>,
+    live: &LiveNow,
+) -> Vec<String> {
     let newest = entries.iter().filter_map(|(_, t)| *t).max();
     entries
         .iter()
         .filter(|(_, t)| !(rewritten && t.is_some() && *t == newest))
-        .filter(|(_, t)| match (deleted_at, t) {
-            (Some(at), Some((secs, _))) => *secs < at,
+        .filter(|(k, t)| match (deleted_at, t) {
+            (Some(at), Some((secs, _))) if *secs >= at => match live {
+                LiveNow::Unknown => false,
+                LiveNow::Gone => true,
+                LiveNow::Is(etag, size) => listing_facts::parse_facts_key(k).is_none_or(|e| {
+                    e.stored_etag != etag.trim_matches('"') || e.stored_size != *size
+                }),
+            },
             _ => true,
         })
         .map(|(k, _)| k.clone())
         .collect()
+}
+
+/// Does any entry of this key need the live object to decide?
+fn needs_live(entries: &[Listed], deleted_at: Option<i64>) -> bool {
+    deleted_at.is_some_and(|at| entries.iter().any(|(_, t)| t.is_some_and(|(s, _)| s >= at)))
+}
+
+/// HEAD the stored key once.
+async fn live_now(client: &Client, bucket: &str, stored_key: &str) -> LiveNow {
+    super::s3::BACKEND_HEAD_REQUESTS.inc();
+    match client
+        .head_object()
+        .bucket(bucket)
+        .key(stored_key)
+        .send()
+        .await
+    {
+        Ok(h) => LiveNow::Is(
+            h.e_tag().unwrap_or_default().to_string(),
+            h.content_length().unwrap_or(0).max(0) as u64,
+        ),
+        Err(e)
+            if crate::config_db_sync::is_object_absent(
+                &crate::config_db_sync::sdk_error_signal(&e),
+            ) =>
+        {
+            LiveNow::Gone
+        }
+        Err(_) => LiveNow::Unknown,
+    }
 }
 
 /// One flush: the facts of every queued stored key of one bucket.
@@ -193,7 +245,12 @@ async fn flush_bucket(
     let mut delete = Vec::new();
     for (k, entries) in by_key {
         let at = deleted.get(&k).copied().flatten();
-        delete.extend(doomed(&entries, rewritten.contains(&k), at));
+        let live = if needs_live(&entries, at) {
+            live_now(client, bucket, &k).await
+        } else {
+            LiveNow::Unknown
+        };
+        delete.extend(doomed(&entries, rewritten.contains(&k), at, &live));
     }
     if !delete.is_empty() {
         delete_facts_keys(client, bucket, delete).await;
@@ -461,8 +518,9 @@ mod tests {
     fn a_rewritten_key_keeps_its_newest_entry() {
         let e = |k: &str, t: i64| (k.to_string(), Some((t, 0)));
         let entries = vec![e("a", 1), e("b", 3), e("c", 2)];
-        assert_eq!(doomed(&entries, false, None), vec!["a", "b", "c"]);
-        assert_eq!(doomed(&entries, true, None), vec!["a", "c"]);
+        let unknown = LiveNow::Unknown;
+        assert_eq!(doomed(&entries, false, None, &unknown), vec!["a", "b", "c"]);
+        assert_eq!(doomed(&entries, true, None, &unknown), vec!["a", "c"]);
     }
 
     /// C3: node A deletes a key and queues its cleanup; node B writes the
@@ -473,6 +531,33 @@ mod tests {
     fn a_peer_write_after_the_delete_keeps_its_entry() {
         let e = |k: &str, t: i64| (k.to_string(), Some((t, 0)));
         let entries = vec![e("old", 1), e("peer-new", 5)];
-        assert_eq!(doomed(&entries, false, Some(3)), vec!["old"]);
+        assert_eq!(
+            doomed(&entries, false, Some(3), &LiveNow::Unknown),
+            vec!["old"]
+        );
+        assert!(needs_live(&entries, Some(3)));
+        assert!(!needs_live(&entries, Some(6)));
+    }
+
+    /// An entry of the delete's second (or later) goes when the object is
+    /// gone, or when it does not describe the object that is there now.
+    #[test]
+    fn a_recent_entry_is_judged_by_the_live_object() {
+        let logical = super::super::list_size_cache::LogicalFacts {
+            size: 40,
+            etag: "abc".into(),
+        };
+        let mine = listing_facts::facts_key("d/k.delta", "e1", 4, &logical).unwrap();
+        let peer = listing_facts::facts_key("d/k.delta", "e2", 5, &logical).unwrap();
+        let entries = vec![(mine.clone(), Some((3, 0))), (peer.clone(), Some((3, 0)))];
+        assert_eq!(
+            doomed(&entries, false, Some(3), &LiveNow::Gone),
+            vec![mine.clone(), peer.clone()]
+        );
+        assert_eq!(
+            doomed(&entries, false, Some(3), &LiveNow::Is("\"e2\"".into(), 5)),
+            vec![mine]
+        );
+        assert!(doomed(&entries, false, Some(3), &LiveNow::Unknown).is_empty());
     }
 }
