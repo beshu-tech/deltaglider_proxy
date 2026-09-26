@@ -200,7 +200,7 @@ maintenance one-offs are DB-born. See [replication.md](replication.md) and
 | `POST` | `/_/api/admin/jobs/:id/preview` | Lifecycle only — dry-run candidate keys. Read-only: no deletes, no history rows. |
 | `POST` | `/_/api/admin/jobs/:id/cancel` | Maintenance only — cancel a queued or running one-off. A pre-flip migrate cancel unwinds cleanly. |
 | `POST` | `/_/api/admin/jobs/reencrypt` | `{"buckets": [...]}` (max 100) → one durable re-encrypt job per bucket: `{started: [{bucket, job_id}], errors: [...]}`. |
-| `POST` | `/_/api/admin/buckets/:bucket/migrate` | `{"target_backend": "...", "delete_source": false}` → `202 Accepted` + `{job_id, id: "maintenance:<n>", bucket, from_backend, to_backend}`. |
+| `POST` | `/_/api/admin/buckets/:bucket/migrate` | `{"target_backend": "...", "delete_source": false, "target": "empty"}` → `202 Accepted` + `{job_id, id: "maintenance:<n>", bucket, from_backend, to_backend, target}`. `target: "empty"` (default) makes the job fail when the destination bucket already holds objects; `target: "mirror"` deletes the destination objects that the source does not hold. |
 | `GET` | `/_/api/admin/jobs/bucket/:bucket` | The bucket's active maintenance job, if any — status/phase/counts only, no config detail. Session-light: browser-lift sessions can read it (powers the busy banner in the object browser). |
 
 Actions outside a kind's capability matrix return `405` with the supported

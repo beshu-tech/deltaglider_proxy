@@ -66,6 +66,31 @@ use super::worker::{
 pub const TRANSIENT_PREFIX: &str = "__dgmigrate_";
 const PAGE_SIZE: u32 = 1000;
 
+/// What the migrate does with objects that already sit in the destination
+/// bucket.
+///
+/// `Empty` (default): the destination must hold no objects. A destination
+/// with objects is usually the safety copy of an earlier move; copying on
+/// top of it brings back every object deleted at the source since then.
+/// `Mirror`: the destination becomes an exact copy of the source — objects
+/// absent at the source are deleted before the flip (audited).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MigrateTarget {
+    #[default]
+    Empty,
+    Mirror,
+}
+
+impl MigrateTarget {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Mirror => "mirror",
+        }
+    }
+}
+
 /// Kind-specific parameters carried in `maintenance_jobs.params` (JSON).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrateParams {
@@ -73,6 +98,44 @@ pub struct MigrateParams {
     pub delete_source: bool,
     pub transient_key: String,
     pub from_backend: String,
+    /// Absent in rows written before the option existed → `Empty`.
+    #[serde(default)]
+    pub target: MigrateTarget,
+}
+
+/// Pages the stage phase lists to count the destination (the count in the
+/// refusal is "at least N" past this).
+const DEST_COUNT_MAX_PAGES: usize = 10;
+
+/// Pure: may a migrate in `mode` start on a destination that holds
+/// `existing` objects (`more` = the count stopped at the page cap)?
+pub fn destination_check(
+    mode: MigrateTarget,
+    existing: u64,
+    more: bool,
+    dest_bucket: &str,
+    target_backend: &str,
+) -> Result<(), String> {
+    if mode == MigrateTarget::Mirror || existing == 0 {
+        return Ok(());
+    }
+    Err(format!(
+        "destination bucket '{dest_bucket}' on backend '{target_backend}' already holds \
+         {}{existing} object(s). A migrate copies on top of them, so objects deleted at the \
+         source since that copy was made come back. Empty the destination first, or start \
+         the migrate with \"target\": \"mirror\" to make the destination an exact copy of \
+         the source (objects absent at the source are deleted).",
+        if more { "at least " } else { "" }
+    ))
+}
+
+/// Pure: the `dg-migration` provenance value. It carries the job id, so a
+/// pre-flip cancel removes exactly the copies THIS job made.
+pub fn provenance_value(params: &MigrateParams, job_id: i64) -> String {
+    format!(
+        "{}->{}#job{job_id}",
+        params.from_backend, params.target_backend
+    )
 }
 
 pub fn parse_params(json: &str) -> Result<MigrateParams, String> {
@@ -225,6 +288,105 @@ async fn remove_routes(mutator: &ConfigMutator, keys: &[String], context: &str) 
     }
 }
 
+/// Count the objects in `bucket` (a route), up to [`DEST_COUNT_MAX_PAGES`]
+/// pages. Returns `(count, more)`.
+async fn count_objects(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+) -> Result<(u64, bool), String> {
+    let mut count = 0u64;
+    let mut token: Option<String> = None;
+    for _ in 0..DEST_COUNT_MAX_PAGES {
+        let page = engine
+            .list_objects(bucket, "", None, PAGE_SIZE, token.as_deref(), false)
+            .await
+            .map_err(|e| format!("list destination failed: {e}"))?;
+        count += page
+            .objects
+            .iter()
+            .filter(|(k, _)| !k.ends_with('/'))
+            .count() as u64;
+        match page.next_continuation_token {
+            Some(t) if page.is_truncated => token = Some(t),
+            _ => return Ok((count, false)),
+        }
+    }
+    Ok((count, true))
+}
+
+/// `target: mirror`: delete every destination object that the source does
+/// not hold, before the flip (the gate still freezes the source). Each
+/// delete is audited. Any source HEAD error other than not-found stops the
+/// job: an object is deleted only when the source provably lacks it.
+async fn prune_destination_extras(
+    db: &Arc<Mutex<ConfigDb>>,
+    state: &Arc<AppState>,
+    instance_id: &str,
+    job: &MaintenanceJob,
+    params: &MigrateParams,
+) -> Result<(), String> {
+    let bucket = &job.bucket;
+    let mut pager = Pager::resuming(None);
+    let mut pruned = 0u64;
+    while pager.begin_page().is_some() {
+        check_cancel(db, job.id).await?;
+        let engine = state.engine.load().clone();
+        let page = engine
+            .list_objects(
+                &params.transient_key,
+                "",
+                None,
+                PAGE_SIZE,
+                pager.token(),
+                false,
+            )
+            .await
+            .map_err(|e| format!("mirror: list destination failed: {e}"))?;
+        for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
+            match engine.head(bucket, key).await {
+                Ok(_) => continue,
+                Err(e) if e.is_not_found() => {}
+                Err(e) => {
+                    return Err(format!(
+                        "mirror: could not check '{key}' at the source ({e}) — nothing deleted \
+                         for it; source remains authoritative"
+                    ))
+                }
+            }
+            engine
+                .delete(&params.transient_key, key)
+                .await
+                .map_err(|e| format!("mirror: delete of destination extra '{key}' failed: {e}"))?;
+            pruned += 1;
+            crate::audit::audit_log(
+                "maintenance_migrate_mirror_delete",
+                job.triggered_by.as_deref().unwrap_or("system"),
+                &format!("job:{}", job.id),
+                &axum::http::HeaderMap::new(),
+                bucket,
+                key,
+            );
+        }
+        let more = pager.advance(page.is_truncated, page.next_continuation_token);
+        heartbeat(db, job.id, instance_id).await?;
+        if !more {
+            break;
+        }
+    }
+    if pager.truncated_by_page_budget() {
+        return Err(
+            "mirror: destination listing stopped at the page budget — refusing to \
+             flip over an incompletely mirrored destination"
+                .to_string(),
+        );
+    }
+    info!(
+        "migrate: job #{} mirror deleted {pruned} destination object(s) absent at the source",
+        job.id
+    );
+    Ok(())
+}
+
 /// Run one migrate job to completion (or error). The caller settles the
 /// job row and clears the gate; THIS function unwinds the transient
 /// route on any PRE-FLIP termination (cancel or failure).
@@ -280,7 +442,7 @@ async fn run_phases(
     let mut skipped = job.objects_skipped;
     let mut failed = job.objects_failed;
     let mut bytes = job.bytes_done;
-    let provenance_value = format!("{}->{}", params.from_backend, params.target_backend);
+    let provenance_value = provenance_value(params, job.id);
 
     // ── Phase: stage ──
     if phase == "stage" {
@@ -311,6 +473,11 @@ async fn run_phases(
                 return Err(format!("create bucket on target failed: {e}"));
             }
         }
+        // Stage runs before any copy, so every object seen here predates
+        // this job.
+        let (existing, more) = count_objects(&engine, &params.transient_key).await?;
+        let dest = real_bucket_name(&mutator.read().await.buckets, bucket).to_string();
+        destination_check(params.target, existing, more, &dest, &params.target_backend)?;
         // The gate has been rejecting NEW source writes since job creation;
         // wait out any write admitted before it armed.
         drain_inflight_writes(state, bucket).await?;
@@ -495,6 +662,9 @@ async fn run_phases(
                  pending — refusing to flip over an incompletely verified \
                  listing; job left resumable in phase 'verify'"
                 .to_string());
+        }
+        if params.target == MigrateTarget::Mirror {
+            prune_destination_extras(db, state, instance_id, job, params).await?;
         }
         phase = "flip".to_string();
         persist(db, job, &phase, None, done, skipped, failed, bytes, None).await;
@@ -701,11 +871,45 @@ mod tests {
             delete_source: true,
             transient_key: "__dgmigrate_b_0".into(),
             from_backend: "local".into(),
+            target: MigrateTarget::Mirror,
         };
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(parse_params(&json).unwrap(), p);
+        // Rows written before the option existed read as `Empty`.
+        let old = r#"{"target_backend":"hz","delete_source":false,"transient_key":"t","from_backend":"l"}"#;
+        assert_eq!(parse_params(old).unwrap().target, MigrateTarget::Empty);
         assert!(parse_params("nope").is_err());
         assert!(parse_params("{}").is_err(), "missing fields rejected");
+    }
+
+    #[test]
+    fn destination_check_refuses_a_non_empty_destination_by_default() {
+        use MigrateTarget::*;
+        assert!(destination_check(Empty, 0, false, "b", "hz").is_ok());
+        assert!(destination_check(Mirror, 0, false, "b", "hz").is_ok());
+        assert!(destination_check(Mirror, 5, true, "b", "hz").is_ok());
+        let e = destination_check(Empty, 3, false, "b", "hz").unwrap_err();
+        assert!(e.contains("already holds 3 object(s)"), "{e}");
+        assert!(e.contains("'b' on backend 'hz'"), "{e}");
+        assert!(
+            e.contains("\"target\": \"mirror\""),
+            "names the option: {e}"
+        );
+        let e = destination_check(Empty, 10_000, true, "b", "hz").unwrap_err();
+        assert!(e.contains("at least 10000"), "{e}");
+    }
+
+    #[test]
+    fn provenance_is_job_unique() {
+        let p = MigrateParams {
+            target_backend: "hz".into(),
+            delete_source: false,
+            transient_key: "t".into(),
+            from_backend: "local".into(),
+            target: MigrateTarget::Empty,
+        };
+        assert_eq!(provenance_value(&p, 7), "local->hz#job7");
+        assert_ne!(provenance_value(&p, 7), provenance_value(&p, 8));
     }
 
     #[test]

@@ -31,6 +31,7 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
   const [pickedBucket, setPickedBucket] = useState<string | undefined>(undefined);
   const [target, setTarget] = useState<string | undefined>(undefined);
   const [deleteSource, setDeleteSource] = useState(false);
+  const [mirror, setMirror] = useState(false);
   const [starting, setStarting] = useState(false);
   const [messageApi, contextHolder] = message.useMessage();
 
@@ -49,13 +50,14 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
     setPickedBucket(undefined);
     setTarget(undefined);
     setDeleteSource(false);
+    setMirror(false);
   };
 
   const handleStart = async () => {
     if (!effectiveBucket || !target) return;
     setStarting(true);
     try {
-      await createMigrateJob(effectiveBucket, target, deleteSource);
+      await createMigrateJob(effectiveBucket, target, deleteSource, mirror ? 'mirror' : 'empty');
       messageApi.success(
         `Migration of ${effectiveBucket} → ${target} started — track progress on the Jobs page`
       );
@@ -142,6 +144,28 @@ export default function MigrateBucketModal({ open, bucket, onClose, onStarted }:
           <Text type="secondary">(default keeps them as a safety copy)</Text>
         </Text>
       </Checkbox>
+      <Text type="secondary" style={{ fontSize: 12, display: 'block', margin: '8px 0 4px 24px' }}>
+        If the destination bucket already holds objects, the job refuses to start: an old safety
+        copy there would bring back objects that were deleted since.
+      </Text>
+      <Checkbox checked={mirror} onChange={(e) => setMirror(e.target.checked)}>
+        <Text style={{ fontSize: 13 }}>Make the destination an exact mirror of the source</Text>
+      </Checkbox>
+      {mirror && (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginTop: 8, borderRadius: 8 }}
+          title="Destination objects can be deleted"
+          description={
+            <span style={{ fontSize: 12 }}>
+              Objects in the destination bucket that the source does not hold{' '}
+              <strong>are deleted before the switch-over</strong>. Each delete is written to the
+              audit log.
+            </span>
+          }
+        />
+      )}
     </Modal>
   );
 }

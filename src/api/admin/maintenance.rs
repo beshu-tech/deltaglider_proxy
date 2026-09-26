@@ -22,7 +22,7 @@
 
 use super::AdminState;
 use crate::api::admin::extract::AdminJson;
-use crate::maintenance::migrate::{parse_params, pick_transient_key, MigrateParams};
+use crate::maintenance::migrate::{parse_params, pick_transient_key, MigrateParams, MigrateTarget};
 use crate::maintenance::store::{current_unix_seconds, CancelOutcome, MaintenanceJob};
 use crate::maintenance::{display_percent, resolve_desired};
 use axum::extract::{Path, State};
@@ -315,6 +315,10 @@ pub struct MigrateBucketRequest {
     /// path leaves the source copy for the operator to remove later.
     #[serde(default)]
     pub delete_source: bool,
+    /// `empty` (default): refuse a destination that already holds objects.
+    /// `mirror`: make the destination an exact copy (extras deleted).
+    #[serde(default)]
+    pub target: MigrateTarget,
 }
 
 /// POST /_/api/admin/buckets/:bucket/migrate — create a durable migrate
@@ -387,6 +391,7 @@ pub async fn start_migrate(
             delete_source: body.delete_source,
             transient_key: pick_transient_key(&bucket_key, &|k| cfg.buckets.contains_key(k)),
             from_backend,
+            target: body.target,
         }
     };
 
@@ -445,7 +450,11 @@ pub async fn start_migrate(
     super::audit_log(
         "maintenance_migrate_requested",
         "admin",
-        &format!("{bucket}->{}", params.target_backend),
+        &format!(
+            "{bucket}->{} (target: {})",
+            params.target_backend,
+            params.target.as_str()
+        ),
         &headers,
     );
 
@@ -457,6 +466,7 @@ pub async fn start_migrate(
             "bucket": bucket,
             "from_backend": params.from_backend,
             "to_backend": params.target_backend,
+            "target": params.target.as_str(),
         })),
     ))
 }

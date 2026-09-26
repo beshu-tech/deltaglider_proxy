@@ -278,6 +278,7 @@ fn maintenance_job_view(j: &MaintenanceJob) -> JobView {
                     "target_backend": mp.target_backend,
                     "from_backend": mp.from_backend,
                     "delete_source": mp.delete_source,
+                    "target": mp.target.as_str(),
                 }),
             ),
             Err(_) => (None, serde_json::json!({})),

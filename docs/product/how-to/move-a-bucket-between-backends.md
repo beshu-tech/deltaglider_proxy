@@ -8,6 +8,7 @@ This guide shows you how to relocate a bucket's data from one backend to another
 - **Writes get `503 SlowDown`** while the job runs. AWS SDKs back off and retry automatically, so well-behaved clients just slow down; anything that treats 503 as fatal should be paused. The gate lifts the moment the bucket flips to the new backend — before any optional source cleanup.
 - The target backend must already be declared in `storage.backends` (see [How to route a bucket to a different backend](route-a-bucket-to-a-backend.md)).
 - The copy goes through the engine, so encryption and delta compression stay transparent — each side applies its own configuration. You can move between backends with different encryption modes or keys.
+- **The destination bucket must be empty.** A destination that already holds objects is usually the safety copy of an earlier move. The job copies on top of that copy, so every object that was deleted since the earlier move would come back. For this reason the job refuses to start on a non-empty destination: it fails in its `stage` phase, before it copies anything, and its error names the number of objects that it found. You then have two choices. You can empty the destination bucket, or you can start the job with `"target": "mirror"` (see below).
 
 ## 1. Start the job
 
@@ -25,6 +26,15 @@ curl -b cookies -X POST \
 ```
 
 The response is `202 Accepted` with a `maintenance:<n>` job id. `delete_source` defaults to `false` — the safe path leaves the source copy in place for you to remove after verifying.
+
+To move the bucket back onto a backend that still holds the old safety copy, add `"target": "mirror"`. In mirror mode the job makes the destination an exact copy of the source: after the verify phase and before the flip, it deletes every destination object that the source does not hold. Each of these deletes is written to the audit log as `maintenance_migrate_mirror_delete`. In the admin UI, this is the "Make the destination an exact mirror of the source" checkbox.
+
+```bash
+curl -b cookies -X POST \
+  https://s3.acme.example/_/api/admin/buckets/db-archive/migrate \
+  -H 'Content-Type: application/json' \
+  -d '{"target_backend": "local-disk", "target": "mirror"}'
+```
 
 The job stages the destination, copies every object through the engine, verifies, flips the bucket's routing to the new backend, and cleans up.
 

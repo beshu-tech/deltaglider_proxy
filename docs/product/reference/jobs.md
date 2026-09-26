@@ -25,7 +25,7 @@ Rules are recurring and YAML-authored; maintenance jobs are one-offs born in the
 | `GET` | `/_/api/admin/jobs/:id/failures?limit=N` | Recent per-object failures |
 | `POST` | `/_/api/admin/jobs/:id/pause` / `resume` / `run-now` / `preview` / `cancel` / `verify` / `kill` / `delete` | Per-kind actions; `405` outside the matrix |
 | `POST` | `/_/api/admin/jobs/reencrypt` | Create re-encrypt jobs: `{"buckets": [...]}` (max 100), one job per bucket |
-| `POST` | `/_/api/admin/buckets/:bucket/migrate` | Create a migrate job: `{"target_backend", "delete_source"}` → `202` + `maintenance:<n>` |
+| `POST` | `/_/api/admin/buckets/:bucket/migrate` | Create a migrate job: `{"target_backend", "delete_source", "target"}` → `202` + `maintenance:<n>`. `target` is `empty` (default: the job fails in `stage` when the destination holds objects) or `mirror` (destination objects absent at the source are deleted before the flip, audited) |
 | `GET` | `/_/api/admin/jobs/bucket/:bucket` | Busy state for one bucket; readable by non-admin browser sessions |
 
 All routes except the last are session-gated admin routes.

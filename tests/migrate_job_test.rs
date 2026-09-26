@@ -10,7 +10,9 @@
 
 use crate::common;
 
-use common::{admin_http_client, get_bytes, put_object, TestServer};
+use common::{
+    admin_http_client, delete_object, get_bytes, list_objects_raw, put_object, TestServer,
+};
 
 const MARKER: &[u8] = b"MIGRATE_TEST_MARKER_0123456789";
 
@@ -56,6 +58,20 @@ async fn start_migrate(
     admin
         .post(format!("{endpoint}/_/api/admin/buckets/{bucket}/migrate"))
         .json(&serde_json::json!({ "target_backend": target, "delete_source": delete_source }))
+        .send()
+        .await
+        .expect("migrate POST failed")
+}
+
+async fn start_migrate_body(
+    admin: &reqwest::Client,
+    endpoint: &str,
+    bucket: &str,
+    body: serde_json::Value,
+) -> reqwest::Response {
+    admin
+        .post(format!("{endpoint}/_/api/admin/buckets/{bucket}/migrate"))
+        .json(&body)
         .send()
         .await
         .expect("migrate POST failed")
@@ -468,7 +484,14 @@ async fn test_migrate_recopies_a_stale_target_object() {
     .unwrap();
 
     let admin = admin_http_client(&endpoint).await;
-    let resp = start_migrate(&admin, &endpoint, bucket, "dst", true).await;
+    // A non-empty destination needs `target: mirror` (the default refuses).
+    let resp = start_migrate_body(
+        &admin,
+        &endpoint,
+        bucket,
+        serde_json::json!({ "target_backend": "dst", "delete_source": true, "target": "mirror" }),
+    )
+    .await;
     assert_eq!(resp.status(), 202);
     wait_job_done(&admin, &endpoint, bucket).await;
     let job = newest_job(&admin, &endpoint).await;
@@ -548,4 +571,160 @@ async fn test_migrate_keeps_created_at() {
             "{key}: the migrated copy must keep the original time"
         );
     }
+}
+
+async fn listed_keys(
+    http: &impl crate::common::S3Requests,
+    endpoint: &str,
+    bucket: &str,
+) -> String {
+    list_objects_raw(http, endpoint, bucket, "").await
+}
+
+/// Explore #5: A → B keeps a safety copy on A. An object deleted on B and a
+/// migrate back to A used to bring the deleted object back from that copy.
+/// The default now refuses a destination that holds objects, and names the
+/// count and the `mirror` option.
+#[tokio::test]
+async fn test_migrate_back_refuses_a_destination_with_an_old_copy() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migback";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    for key in ["keep.json", "gone.json"] {
+        put_object(
+            &http,
+            &endpoint,
+            bucket,
+            key,
+            MARKER.to_vec(),
+            "application/json",
+        )
+        .await;
+    }
+    let admin = admin_http_client(&endpoint).await;
+    assert_eq!(
+        start_migrate(&admin, &endpoint, bucket, "dst", false)
+            .await
+            .status(),
+        202
+    );
+    wait_job_done(&admin, &endpoint, bucket).await;
+    assert_eq!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        Some("dst")
+    );
+    delete_object(&http, &endpoint, bucket, "gone.json").await;
+
+    assert_eq!(
+        start_migrate(&admin, &endpoint, bucket, "src", false)
+            .await
+            .status(),
+        202
+    );
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "failed", "job: {job}");
+    let err = job["last_error"].as_str().unwrap_or_default();
+    assert!(err.contains("already holds 2 object(s)"), "{err}");
+    assert!(err.contains("mirror"), "{err}");
+    assert_eq!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        Some("dst"),
+        "a refused migrate leaves the bucket where it is"
+    );
+    assert!(transient_keys(&admin, &endpoint).await.is_empty());
+    let list = listed_keys(&http, &endpoint, bucket).await;
+    assert!(
+        !list.contains("gone.json"),
+        "deleted object came back: {list}"
+    );
+    assert!(list.contains("keep.json"), "{list}");
+    // The source copy on src is untouched by the refusal.
+    assert!(!walkdir_files(&dir_a.path().join(bucket)).is_empty());
+}
+
+/// Explore #5: `target: mirror` makes the destination an exact copy — an
+/// object that exists only on the destination is deleted before the flip.
+#[tokio::test]
+async fn test_migrate_mirror_deletes_destination_extras() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migmirror";
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    for key in ["keep.json", "gone.json"] {
+        put_object(
+            &http,
+            &endpoint,
+            bucket,
+            key,
+            MARKER.to_vec(),
+            "application/json",
+        )
+        .await;
+    }
+    let admin = admin_http_client(&endpoint).await;
+    assert_eq!(
+        start_migrate(&admin, &endpoint, bucket, "dst", false)
+            .await
+            .status(),
+        202
+    );
+    wait_job_done(&admin, &endpoint, bucket).await;
+    delete_object(&http, &endpoint, bucket, "gone.json").await;
+
+    let resp = start_migrate_body(
+        &admin,
+        &endpoint,
+        bucket,
+        serde_json::json!({ "target_backend": "src", "target": "mirror" }),
+    )
+    .await;
+    assert_eq!(resp.status(), 202);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["target"],
+        "mirror"
+    );
+    wait_job_done(&admin, &endpoint, bucket).await;
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(job["status"], "succeeded", "job: {job}");
+    assert_eq!(job["detail"]["target"], "mirror", "job: {job}");
+    assert_eq!(
+        bucket_backend(&admin, &endpoint, bucket).await.as_deref(),
+        Some("src")
+    );
+    let list = listed_keys(&http, &endpoint, bucket).await;
+    assert!(
+        !list.contains("gone.json"),
+        "mirror kept a deleted object: {list}"
+    );
+    assert!(list.contains("keep.json"), "{list}");
+
+    // The delete is audited.
+    let audit: serde_json::Value = admin
+        .get(format!("{endpoint}/_/api/admin/audit?limit=200"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        audit
+            .to_string()
+            .contains("maintenance_migrate_mirror_delete"),
+        "no audit entry: {audit}"
+    );
 }

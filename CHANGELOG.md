@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Fixed — Moving a bucket back no longer brings deleted objects back
+
+A migrate job copied the source on top of whatever the destination bucket
+already held. After a move from A to B that kept the safety copy on A, an
+object deleted on B came back when the bucket moved back to A. Now a migrate
+refuses a destination that already holds objects: the job fails in its
+`stage` phase, before any copy, and the error names the object count. The new
+`"target": "mirror"` option (the "exact mirror" checkbox in the migrate
+dialog) makes the destination an exact copy instead: destination objects that
+the source does not hold are deleted before the flip, and each delete is
+audited as `maintenance_migrate_mirror_delete`.
+
 ### Changed — Declared buckets are created at boot on S3 backends too
 
 A bucket declared under `storage.buckets` was created at boot only on a

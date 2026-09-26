@@ -260,15 +260,20 @@ export async function startReencrypt(buckets: string[]): Promise<{
   });
 }
 
+/** What the migrate does with objects already in the destination bucket:
+ *  `empty` refuses a non-empty destination; `mirror` deletes the extras. */
+export type MigrateTargetMode = 'empty' | 'mirror';
+
 /** Create a durable migrate job; returns 202 with the job id. */
 export async function createMigrateJob(
   bucket: string,
   targetBackend: string,
-  deleteSource: boolean
+  deleteSource: boolean,
+  target: MigrateTargetMode = 'empty'
 ): Promise<{ job_id: number; id: string; bucket: string; from_backend: string; to_backend: string }> {
   return adminJson(`/api/admin/buckets/${encodeURIComponent(bucket)}/migrate`, {
     method: 'POST',
-    body: { target_backend: targetBackend, delete_source: deleteSource },
+    body: { target_backend: targetBackend, delete_source: deleteSource, target },
     context: `Migrate ${bucket}`,
   });
 }
