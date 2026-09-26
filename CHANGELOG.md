@@ -337,8 +337,10 @@ Upgrade steps:
 To rotate the key later, set `DGP_CONFIG_DB_KEY_PREVIOUS` to the old key and
 `DGP_CONFIG_DB_KEY` to the new one, and restart. A database, a sync merge
 base, or a synced copy that opens only with the previous key is re-encrypted
-with the new key; an instance whose database changed key uploads it once at
-start, so the synced copy moves to the new key too.
+with the new key. The synced copy follows: an instance uploads its database
+once when the database changed key at start, after a recovery promotion or
+`--set-bootstrap-password` re-encrypted it, and when it merged a synced copy
+that opened only with the previous key.
 
 A full backup restore no longer refuses a backup whose bootstrap password
 hash differs from the running instance's: the hash no longer protects the

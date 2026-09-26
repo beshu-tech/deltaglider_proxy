@@ -925,9 +925,9 @@ fn classify_lingering_bak(
 }
 
 /// Probe `.db.bak` with the config DB keys (primary, then fallbacks):
-/// `Some(user_count)` when one opens it, `None` when none does. A junk/empty
-/// file opens under ANY key (SQLCipher treats it as fresh) — the user count is
-/// what distinguishes a real parked IAM DB from junk, so promotion requires
+/// `Some(user_count)` when one opens it, `None` when none does. A zero-byte
+/// file is `Some(0)` (junk, not an incident) — the user count is what
+/// distinguishes a real parked IAM DB from junk, so promotion requires
 /// `Some(n) with n > 0`. Read-only apart from schema migration: a bak that
 /// opens with a fallback is re-encrypted only when it is promoted.
 fn probe_bak_users(
@@ -935,6 +935,11 @@ fn probe_bak_users(
     keys: &deltaglider_proxy::config_db::ConfigDbKeys,
 ) -> Option<usize> {
     use deltaglider_proxy::config_db::{probe_key, ConfigDb};
+    // A zero-byte file holds no DB under any key: junk with no users, not an
+    // undecryptable incident DB (which would lock the node as Sticky).
+    if std::fs::metadata(bak_path).is_ok_and(|m| m.len() == 0) {
+        return Some(0);
+    }
     std::iter::once(&keys.primary)
         .chain(keys.fallbacks.iter().map(|(_, k)| k))
         .find(|k| probe_key(bak_path, k.expose()).unwrap_or(false))
@@ -951,6 +956,7 @@ fn promote_backup_db(
     db_file: &std::path::Path,
     bak_path: &std::path::Path,
     keys: &deltaglider_proxy::config_db::ConfigDbKeys,
+    has_sync: bool,
 ) -> Result<deltaglider_proxy::config_db::ConfigDb, String> {
     let discarded = db_file.with_extension("db.discarded");
     std::fs::rename(db_file, &discarded).map_err(|e| {
@@ -969,7 +975,7 @@ fn promote_backup_db(
             db_file.display()
         ));
     }
-    let (db, _) = deltaglider_proxy::config_db::ConfigDb::open_with_keys(db_file, keys)
+    let (db, _) = deltaglider_proxy::config_db_sync::open_live_db(db_file, keys, has_sync)
         .map_err(|e| format!("reopen promoted {}: {e}", db_file.display()))?;
     info!(
         "config-db mismatch incident resolved: promoted backup {} over the live DB \
@@ -985,7 +991,7 @@ fn promote_backup_db(
 /// config DB key now. Without this, the new hash would leave no key that
 /// opens the DB. No DB, or a DB already on the config DB key: no-op.
 pub fn migrate_legacy_config_db_key() -> Result<(), String> {
-    use deltaglider_proxy::config_db::{key, ConfigDb, OpenedWith};
+    use deltaglider_proxy::config_db::{key, OpenedWith};
     let db_path = config_db_path();
     if !db_path.exists() {
         return Ok(());
@@ -1003,7 +1009,9 @@ pub fn migrate_legacy_config_db_key() -> Result<(), String> {
         .map(|raw| Config::decode_hash(raw.trim()));
     let keys =
         key::resolve_config_db_keys(&db_path, current_hash.as_deref(), |n| std::env::var(n).ok())?;
-    match ConfigDb::open_with_keys(&db_path, &keys) {
+    // The CLI does not know whether the config has a sync bucket, so it
+    // always parks the upload: without a sync bucket the marker is inert.
+    match deltaglider_proxy::config_db_sync::open_live_db(&db_path, &keys, true) {
         Ok((_, OpenedWith::Migrated(kind))) => {
             eprintln!(
                 "Config DB {} re-encrypted: it opened with {}, now with {}.",
@@ -1084,26 +1092,14 @@ fn init_config_db_attempt(
     bool,
 ) {
     let db_file = config_db_path();
-    match deltaglider_proxy::config_db::ConfigDb::open_with_keys(&db_file, keys) {
-        Ok((db, opened)) => {
-            // A DB that moved to a new key (rotation, key-file → env, legacy
-            // hash): the synced copy is still under the old key. Upload once
-            // at the sync start, while the old key is still a fallback, so
-            // every node can later drop DGP_CONFIG_DB_KEY_PREVIOUS.
-            let has_sync = config
-                .config_sync_bucket
-                .as_deref()
-                .is_some_and(|b| !b.is_empty());
-            if has_sync
-                && matches!(
-                    opened,
-                    deltaglider_proxy::config_db::OpenedWith::Migrated(_)
-                )
-            {
-                if let Err(e) = deltaglider_proxy::config_db_sync::park_upload(&db_file) {
-                    warn!("Could not queue the re-encrypted config DB for upload: {e}");
-                }
-            }
+    // A DB that moves to a new key (rotation, key-file → env, legacy hash)
+    // parks one upload, so the synced copy follows (see `open_live_db`).
+    let has_sync = config
+        .config_sync_bucket
+        .as_deref()
+        .is_some_and(|b| !b.trim().is_empty());
+    match deltaglider_proxy::config_db_sync::open_live_db(&db_file, keys, has_sync) {
+        Ok((db, _opened)) => {
             // Classify a lingering .db.bak BEFORE any boot-time mutation: a
             // node with an unresolved mismatch incident must stay locked.
             let bak_path = db_file.with_extension("db.bak");
@@ -1134,7 +1130,7 @@ fn init_config_db_attempt(
                 // as `.db.discarded`.
                 BakDisposition::Promote if allow_promote => {
                     drop(db);
-                    return match promote_backup_db(&db_file, &bak_path, keys) {
+                    return match promote_backup_db(&db_file, &bak_path, keys, has_sync) {
                         Ok(db) => {
                             drop(db);
                             init_config_db_attempt(keys, iam_state, config, false)
@@ -1365,7 +1361,7 @@ fn init_config_db_attempt(
                 && bak_path.exists()
                 && probe_bak_users(&bak_path, keys).is_some_and(|n| n > 0)
             {
-                match promote_backup_db(&db_file, &bak_path, keys) {
+                match promote_backup_db(&db_file, &bak_path, keys, has_sync) {
                     Ok(db) => {
                         drop(db);
                         return init_config_db_attempt(keys, iam_state, config, false);
@@ -1841,6 +1837,25 @@ pub async fn init_config_sync(
             warn!("Config DB S3 sync: startup download failed: {}", e);
         }
     }
+    // A synced copy under an old key (rotation, legacy hash) merged above and
+    // queued its re-upload: do it now, not at the first poll tick, so the
+    // bucket leaves the old key while the peers still accept it.
+    if sync.take_needs_upload() {
+        match deltaglider_proxy::config_db_sync::upload_with_reconcile(
+            &sync,
+            config_db,
+            db_keys.primary.expose(),
+            iam_state,
+            external_auth,
+            Some(sessions),
+            "startup re-encrypt",
+        )
+        .await
+        {
+            Ok(()) => info!("Config DB S3 sync: synced copy re-encrypted with the config DB key"),
+            Err(e) => warn!("Config DB S3 sync: re-encrypt upload failed (stays parked): {e}"),
+        }
+    }
 
     Some(sync)
 }
@@ -2071,7 +2086,7 @@ mod tests {
                 .unwrap(),
         );
         let keys = deltaglider_proxy::config_db::ConfigDbKeys::primary_only("$2b$04$good");
-        drop(promote_backup_db(&db_file, &bak, &keys).expect("promote must succeed"));
+        drop(promote_backup_db(&db_file, &bak, &keys, false).expect("promote must succeed"));
         assert!(db_file.exists(), "live DB must exist after promote");
         assert!(!bak.exists(), ".db.bak must be consumed by promote");
         assert!(
@@ -2119,8 +2134,30 @@ mod tests {
         let keys = ConfigDbKeys::primary_only(primary)
             .with_fallback(FallbackKind::LegacyBootstrapHash, "$2b$04$legacy");
         assert_eq!(probe_bak_users(&bak, &keys), Some(1));
-        drop(promote_backup_db(&db_file, &bak, &keys).unwrap());
+        drop(promote_backup_db(&db_file, &bak, &keys, false).unwrap());
         assert!(probe_key(&db_file, primary).unwrap());
+    }
+
+    /// A promoted backup that opened only with a fallback key is re-encrypted,
+    /// so the synced copy (still under the old key) must be re-uploaded.
+    #[test]
+    fn a_promoted_legacy_backup_parks_the_sync_upload() {
+        use deltaglider_proxy::config_db::{ConfigDb, ConfigDbKeys, FallbackKind};
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("deltaglider_config.db");
+        let bak = db_file.with_extension("db.bak");
+        let db = ConfigDb::open_or_create(&bak, "$2b$04$legacy").unwrap();
+        db.create_user("alice", "AKALICE1", "s", true, &[]).unwrap();
+        drop(db);
+        let primary = "primary-key-0123456789abcdef0123456789";
+        drop(ConfigDb::open_or_create(&db_file, primary).unwrap());
+        let keys = ConfigDbKeys::primary_only(primary)
+            .with_fallback(FallbackKind::LegacyBootstrapHash, "$2b$04$legacy");
+        drop(promote_backup_db(&db_file, &bak, &keys, true).unwrap());
+        assert!(
+            db_file.with_extension("db.sync-pending").exists(),
+            "the re-encrypted DB is not queued for upload"
+        );
     }
 
     // ── startup_declarative_action policy (IaC cold-start guards) ──────────

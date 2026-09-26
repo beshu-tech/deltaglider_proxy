@@ -36,7 +36,7 @@ The synced database, and the local database of every instance, move to the new k
 
 1. Generate a new key (`openssl rand -hex 32`).
 2. On every instance, set `DGP_CONFIG_DB_KEY_PREVIOUS` to the current key and `DGP_CONFIG_DB_KEY` to the new key.
-3. Restart the instances one at a time. Each instance re-encrypts its local database with the new key. Because its database changed key, it also uploads its database to the sync bucket at start, so the synced copy moves to the new key too. While the rollout runs, the instances that already run with the new key still read a synced copy under the previous key.
+3. Restart the instances one at a time. Each instance re-encrypts its local database with the new key. Because its database changed key, it also uploads its database to the sync bucket at start, so the synced copy moves to the new key too. An instance that downloads a synced copy that opens only with the previous key also uploads its merged database under the new key. While the rollout runs, the instances that already run with the new key still read a synced copy under the previous key.
 4. When every instance runs with the new key, remove `DGP_CONFIG_DB_KEY_PREVIOUS` everywhere and restart again. An instance that later finds a synced copy under the old key logs an error that names `DGP_CONFIG_DB_KEY` and does not merge it.
 
 Instances that have not restarted yet cannot read uploads under the new key, so avoid IAM changes during step 3.

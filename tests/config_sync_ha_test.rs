@@ -663,6 +663,37 @@ async fn boot_on_a_legacy_sync_object(accept_legacy: bool) -> bool {
         builder = builder.env("DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC", "true");
     }
     let server = builder.build().await;
+    if accept_legacy {
+        // The merged copy was under a fallback key: the boot re-uploads it
+        // under the config DB key, so the bucket leaves the hash.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let body = common::minio_client()
+                .await
+                .get_object()
+                .bucket(MINIO_BUCKET)
+                .key(&sync_key)
+                .send()
+                .await
+                .unwrap()
+                .body
+                .collect()
+                .await
+                .unwrap()
+                .into_bytes();
+            std::fs::write(&legacy, &body).unwrap();
+            if deltaglider_proxy::config_db::probe_key(&legacy, common::TEST_CONFIG_DB_KEY)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the synced copy stays under the legacy hash"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
     let users: Vec<serde_json::Value> = admin_http_client(&server.endpoint())
         .await
         .get(format!("{}/_/api/admin/users", server.endpoint()))

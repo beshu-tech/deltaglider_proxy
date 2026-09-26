@@ -1190,7 +1190,9 @@ fn key_companions(db_path: &Path) -> Vec<(PathBuf, bool)> {
 fn heal_companions(db_path: &Path, keys: &ConfigDbKeys) {
     let primary = keys.primary.expose();
     for (c, removable) in key_companions(db_path) {
-        if !c.exists() || probe_key(&c, primary).unwrap_or(true) {
+        // A zero-byte file holds no DB: nothing to re-encrypt.
+        let empty = std::fs::metadata(&c).map_or(true, |m| m.len() == 0);
+        if empty || probe_key(&c, primary).unwrap_or(true) {
             continue;
         }
         let old = keys

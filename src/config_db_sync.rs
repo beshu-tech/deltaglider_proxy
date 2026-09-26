@@ -37,6 +37,10 @@ pub const DEFAULT_CONFIG_SYNC_OBJECT_KEY: &str = ".deltaglider/config.db";
 pub struct DownloadedDb {
     pub temp_path: std::path::PathBuf,
     pub etag: Option<String>,
+    /// The copy opened only with a fallback key and was re-encrypted for the
+    /// merge: the synced object is still under the old key, so it must be
+    /// uploaded again (under the primary key) after the merge.
+    pub migrated: bool,
 }
 
 /// Why an upload failed: a CAS conflict (peer wrote concurrently — reconcile
@@ -341,9 +345,10 @@ impl ConfigDbSync {
         // the bootstrap hash with DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC) is
         // re-encrypted with our key here, so the merge attaches it with the
         // primary key.
-        match ConfigDb::open_with_keys(&tmp_path, &self.db_keys) {
-            Ok(_) => {
+        let migrated = match ConfigDb::open_with_keys(&tmp_path, &self.db_keys) {
+            Ok((_, opened)) => {
                 debug!("Downloaded config DB passed key validation");
+                matches!(opened, crate::config_db::OpenedWith::Migrated(_))
             }
             Err(e) => {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
@@ -376,7 +381,7 @@ impl ConfigDbSync {
                     }
                 };
             }
-        }
+        };
 
         // B3: do NOT rename over the live DB (that wholesale-clobbers per-node
         // coordination tables) and do NOT advance the ETag yet. The caller merges
@@ -392,6 +397,7 @@ impl ConfigDbSync {
         Ok(Some(DownloadedDb {
             temp_path: tmp_path,
             etag: remote_etag,
+            migrated,
         }))
     }
 
@@ -831,14 +837,31 @@ async fn write_sync_base(local_path: &std::path::Path, data: &[u8]) {
 }
 
 /// Park an upload for the next boot's sync start (before any
-/// `ConfigDbSync` exists). The boot calls it after it re-encrypted the local
-/// DB with a new key: the synced copy is still under the old key, and it
-/// must move to the new one while the old key is still accepted as a
-/// fallback. No base ETag: the flush 412s, merges the remote copy, and
-/// uploads on top of it.
+/// `ConfigDbSync` exists). No base ETag: the flush 412s, merges the remote
+/// copy, and uploads on top of it.
 pub fn park_upload(local_path: &std::path::Path) -> std::io::Result<()> {
     let body = serde_json::to_vec(&PendingUpload { base_etag: None }).unwrap_or_default();
     std::fs::write(pending_marker_path(local_path), body)
+}
+
+/// Open the LIVE config DB with the config DB keys. EVERY path that opens it
+/// (boot, recovery promotion, `--set-bootstrap-password`) goes through here:
+/// when the DB moved to the primary key, the synced copy is still under the
+/// old key, so one upload is parked for the sync start, while the old key is
+/// still a fallback on the other nodes. `sync_enabled = false` parks nothing
+/// (no sync bucket).
+pub fn open_live_db(
+    path: &std::path::Path,
+    keys: &crate::config_db::ConfigDbKeys,
+    sync_enabled: bool,
+) -> Result<(ConfigDb, crate::config_db::OpenedWith), crate::config_db::ConfigDbError> {
+    let (db, opened) = ConfigDb::open_with_keys(path, keys)?;
+    if sync_enabled && matches!(opened, crate::config_db::OpenedWith::Migrated(_)) {
+        if let Err(e) = park_upload(path) {
+            warn!("Could not queue the re-encrypted config DB for upload: {e}");
+        }
+    }
+    Ok((db, opened))
 }
 
 fn pending_marker_path(local_path: &std::path::Path) -> PathBuf {
@@ -978,6 +1001,12 @@ async fn pull_locked(
     // Commit the ETag only on a successful merge so a failure retries.
     if applied {
         sync.commit_downloaded_etag(dl.etag).await;
+        // The synced object is under a fallback key (a rotation's previous
+        // key, or the legacy hash): queue an upload so it moves to the
+        // primary key while the old key is still accepted.
+        if dl.migrated {
+            sync.mark_needs_upload().await;
+        }
     }
     Ok(Some(applied))
 }
@@ -1137,6 +1166,31 @@ mod tests {
             allow_local: true,
             session_token: None,
         }
+    }
+
+    /// Every migration of the live DB queues the upload that moves the synced
+    /// copy to the new key (only with a sync bucket).
+    #[test]
+    fn a_live_db_that_moves_key_parks_one_upload() {
+        const HASH: &str = "$2b$04$legacyhashlegacyhashlegacyhashlegacyhash";
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("deltaglider_config.db");
+        let keys = crate::config_db::ConfigDbKeys::primary_only(&"k".repeat(40))
+            .with_fallback(crate::config_db::FallbackKind::LegacyBootstrapHash, HASH);
+        drop(ConfigDb::open_or_create(&db_path, HASH).unwrap());
+        let marker = pending_marker_path(&db_path);
+        drop(open_live_db(&db_path, &keys, true).unwrap());
+        assert!(marker.exists(), "the migrated DB must be queued for upload");
+        std::fs::remove_file(&marker).unwrap();
+        drop(open_live_db(&db_path, &keys, true).unwrap());
+        assert!(!marker.exists(), "a DB already on the key queues nothing");
+        let other = dir.path().join("single.db");
+        drop(ConfigDb::open_or_create(&other, HASH).unwrap());
+        drop(open_live_db(&other, &keys, false).unwrap());
+        assert!(
+            !pending_marker_path(&other).exists(),
+            "no sync bucket, no park"
+        );
     }
 
     /// S8: the bootstrap hash sits in configs and backups, so it must not
