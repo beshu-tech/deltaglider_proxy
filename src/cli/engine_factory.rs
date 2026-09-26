@@ -148,8 +148,18 @@ async fn build_engine(opts: CliEngineOpts) -> Result<DynEngine, BuildError> {
 /// Build a raw SDK client for the verbs that talk to S3 directly
 /// (`purge`, `bucket-acl`). The one place that turns resolved
 /// credentials into a client, so the session token cannot be dropped
-/// at a call site.
+/// at a call site. Refuses a DeltaGlider Proxy endpoint, as
+/// [`build_cli_engine`] does.
 pub async fn build_raw_s3_client(
+    creds: &ResolvedCreds,
+    endpoint: Option<String>,
+    force_path_style: bool,
+) -> Result<aws_sdk_s3::Client, BuildError> {
+    refuse_proxy_endpoint(endpoint.as_deref()).await?;
+    Ok(raw_client(creds, endpoint, force_path_style).await?)
+}
+
+async fn raw_client(
     creds: &ResolvedCreds,
     endpoint: Option<String>,
     force_path_style: bool,
@@ -343,9 +353,8 @@ mod tests {
 
     async fn raw_head(creds: &ResolvedCreds) -> String {
         capture_head(|endpoint| async move {
-            let client = build_raw_s3_client(creds, Some(endpoint), true)
-                .await
-                .unwrap();
+            // `raw_client`: the probe would take the one-shot socket.
+            let client = raw_client(creds, Some(endpoint), true).await.unwrap();
             let _ = client.list_buckets().send().await;
         })
         .await

@@ -73,6 +73,14 @@ names the one object that the caller may read, the bucket and prefix that
 the caller may list, or the public prefixes of the bucket. For a write, it
 says that nothing is granted.
 
+### Fixed — `s3 purge` and the bucket-ACL verbs refuse a proxy endpoint
+
+The engine verbs (`ls`, `cp`, `rm`, …) stop with exit code `2` when
+`--endpoint-url` is a DeltaGlider Proxy, but `s3 purge`,
+`s3 get-bucket-acl`, and `s3 put-bucket-acl` sent their requests to the
+proxy anyway. Now they send the same `GET /_/health` probe first and stop
+with the same message and exit code.
+
 ### Fixed — A sanitised 500 is logged once
 
 A `500 InternalError` whose cause the proxy hides from the client logged

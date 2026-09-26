@@ -317,6 +317,10 @@ async fn test_s3_verbs_refuse_a_deltaglider_proxy_endpoint() {
     for args in [
         vec!["s3", "cp", file.to_str().unwrap(), "s3://releases/app.zip"],
         vec!["s3", "ls", "s3://releases/"],
+        // The raw-SDK verbs take the same probe and message.
+        vec!["s3", "purge", "releases", "--dry-run"],
+        vec!["s3", "get-bucket-acl", "s3://releases"],
+        vec!["s3", "put-bucket-acl", "s3://releases", "--acl", "private"],
     ] {
         let out = Command::new(BIN)
             .args(&args)

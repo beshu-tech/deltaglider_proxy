@@ -321,7 +321,7 @@ async fn build_client(args: &PurgeArgs) -> Result<aws_sdk_s3::Client, i32> {
         .await
         .map_err(|e| {
             eprintln!("error: failed to initialise S3 client: {e}");
-            cli_exit::EXIT_HTTP
+            e.exit_code()
         })
 }
 

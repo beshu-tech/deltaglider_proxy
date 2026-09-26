@@ -334,7 +334,7 @@ async fn build_client(
         .await
         .map_err(|e| {
             eprintln!("error: failed to initialise S3 client: {e}");
-            cli_exit::EXIT_HTTP
+            e.exit_code()
         })
 }
 
