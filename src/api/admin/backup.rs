@@ -1598,7 +1598,7 @@ async fn import_backup_iam(
         .restore_iam(&backup, mode, bootstrap_key.as_deref())
         .map_err(|e| {
             tracing::warn!("IAM restore rolled back: {e}");
-            StatusCode::UNPROCESSABLE_ENTITY
+            super::db_error_status(&e)
         })?;
 
     // Rebuild IAM index + external auth manager
