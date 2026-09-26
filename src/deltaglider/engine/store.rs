@@ -3,6 +3,7 @@
 //! Store pipeline — delta encoding, passthrough, and baseline management.
 
 use super::*;
+use crate::deltaglider::spool::SpoolBudget;
 use crate::storage::{MultipartUpload, StorageBackend, UploadedPart};
 use md5::{Digest, Md5};
 use sha2::Sha256;
@@ -443,6 +444,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                     bucket,
                     key,
                     body.path(),
+                    Some(body),
                     size,
                     content_type.clone(),
                     user_metadata.clone(),
@@ -713,6 +715,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 bucket,
                 key,
                 body.path(),
+                Some(body),
                 size,
                 content_type,
                 user_metadata,
@@ -1282,6 +1285,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
         let sha256 = hex::encode(sha256_hasher.finalize());
         let md5 = hex::encode(md5_hasher.finalize());
+        let reserved = self
+            .reserve_storage_spool(bucket, total_size, true, None)
+            .await?;
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
         let mut metadata = FileMetadata::new_passthrough(
@@ -1301,6 +1307,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 &obj_key.filename,
                 part_paths,
                 &metadata,
+                SpoolBudget::new(&self.spool, None, reserved.as_ref()),
             )
             .await?;
         if let Err(e) = self
@@ -1341,6 +1348,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 bucket,
                 key,
                 source_path,
+                None,
                 total_size,
                 content_type,
                 user_metadata,
@@ -1357,6 +1365,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         bucket: &str,
         key: &str,
         source_path: &Path,
+        held: Option<&crate::deltaglider::spool::Spool>,
         total_size: u64,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
@@ -1391,6 +1400,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
         let sha256 = hex::encode(sha256_hasher.finalize());
         let md5 = hex::encode(md5_hasher.finalize());
+        let reserved = self
+            .reserve_storage_spool(bucket, total_size, false, held)
+            .await?;
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
 
         let mut metadata = FileMetadata::new_passthrough(
@@ -1410,6 +1422,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 &obj_key.filename,
                 source_path,
                 &metadata,
+                SpoolBudget::new(&self.spool, held, reserved.as_ref()),
             )
             .await?;
         if let Err(e) = self
@@ -2265,6 +2278,136 @@ mod review2_tests {
         .expect("two streaming PUTs deadlocked on each other's body spool");
         ra.unwrap();
         rb.unwrap();
+    }
+
+    /// An engine over an encrypting filesystem backend with a small spool.
+    async fn encrypted_engine(
+        tmp: &tempfile::TempDir,
+        spool_bytes: u64,
+    ) -> DeltaGliderEngine<crate::storage::EncryptingBackend<FilesystemBackend>> {
+        let backend = FilesystemBackend::new(tmp.path().join("data"))
+            .await
+            .unwrap();
+        backend.create_bucket("b").await.unwrap();
+        let cfg = Arc::new(arc_swap::ArcSwap::new(Arc::new(
+            crate::storage::EncryptionConfig {
+                key: Some(crate::storage::EncryptionKey::from_hex(&"ab".repeat(32)).unwrap()),
+                key_id: Some("kid".into()),
+                ..Default::default()
+            },
+        )));
+        let wrapper = crate::storage::EncryptingBackend::new(backend, cfg);
+        let mut engine =
+            DeltaGliderEngine::new_with_backend(Arc::new(wrapper), &Config::default(), None);
+        engine.spool = Arc::new(
+            crate::deltaglider::spool::SpoolDir::new(tmp.path().join("spool"), spool_bytes)
+                .unwrap(),
+        );
+        engine
+    }
+
+    /// Two streaming passthrough PUTs to an encrypting backend: each holds
+    /// its body spool, and the encrypt needs as much again. Neither may wait
+    /// for the other's body (hold-and-wait): each stores, or fails at once
+    /// with a retryable SlowDown.
+    #[tokio::test]
+    async fn encrypted_streaming_puts_do_not_deadlock_on_each_others_body_spool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = encrypted_engine(&tmp, 4 * 1024 * 1024).await;
+        let v = vec![3u8; 1_500_000];
+        let body_a = engine.spool_acquire(v.len() as u64).await.unwrap();
+        let body_b = engine.spool_acquire(v.len() as u64).await.unwrap();
+        tokio::fs::write(body_a.path(), &v).await.unwrap();
+        tokio::fs::write(body_b.path(), &v).await.unwrap();
+        {
+            let put = |key: &'static str, body| {
+                engine.store_spooled_delta(
+                    "b",
+                    key,
+                    body,
+                    v.len() as u64,
+                    None,
+                    HashMap::new(),
+                    None,
+                )
+            };
+            let (ra, rb) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                futures::future::join(put("x/a.png", &body_a), put("y/b.png", &body_b)),
+            )
+            .await
+            .expect("two encrypted streaming PUTs deadlocked on each other's body spool");
+            for r in [ra, rb] {
+                match r {
+                    Ok(_) | Err(EngineError::Overloaded(_)) => {}
+                    Err(e) => panic!("unexpected error: {e:?}"),
+                }
+            }
+        }
+        // With room for both, both store and read back.
+        drop((body_a, body_b));
+        let body = engine.spool_acquire(v.len() as u64).await.unwrap();
+        tokio::fs::write(body.path(), &v).await.unwrap();
+        engine
+            .store_spooled_delta(
+                "b",
+                "x/a.png",
+                &body,
+                v.len() as u64,
+                None,
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let (got, _) = engine.retrieve("b", "x/a.png").await.unwrap();
+        assert_eq!(got, v);
+    }
+
+    /// A relayed multipart store holds no spool, so it may wait for budget,
+    /// but only BEFORE it takes the deltaspace lock: a PUT that holds its
+    /// body spool can wait for that lock.
+    #[tokio::test]
+    async fn encrypted_relayed_store_waits_for_budget_outside_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(encrypted_engine(&tmp, 4 * 1024 * 1024).await);
+        let part = tmp.path().join("part1");
+        let v = vec![5u8; 1024 * 1024];
+        tokio::fs::write(&part, &v).await.unwrap();
+        let full = engine.spool_acquire(4 * 1024 * 1024).await.unwrap();
+
+        let e = engine.clone();
+        let parts = vec![part.clone()];
+        let len = v.len() as u64;
+        let store = tokio::spawn(async move {
+            e.store_passthrough_relayed_parts_with_multipart_etag(
+                "b",
+                "x/a.png",
+                &parts,
+                len,
+                None,
+                HashMap::new(),
+                "\"0123456789abcdef0123456789abcdef-1\"".to_string(),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!store.is_finished(), "the store waits for budget");
+        let guard = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            engine.acquire_prefix_lock("b", "x"),
+        )
+        .await
+        .expect("the store must not hold the deltaspace lock while it waits for budget");
+        drop(guard);
+        drop(full);
+        tokio::time::timeout(std::time::Duration::from_secs(10), store)
+            .await
+            .expect("the store goes on once the budget is free")
+            .unwrap()
+            .unwrap();
+        let (got, _) = engine.retrieve("b", "x/a.png").await.unwrap();
+        assert_eq!(got, v);
     }
 
     /// Review-2 (144b303b): the deltaspace lock is keyed by the VIRTUAL

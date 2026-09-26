@@ -1286,6 +1286,30 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         Self::with_spool_timeout(self.spool.acquire_pair(a, b)).await
     }
 
+    /// Reserve, BEFORE the deltaspace lock, the spool that a file-streaming
+    /// storage write needs for its own temp files (the encrypting wrapper's
+    /// ciphertext). Waiting for budget under the lock is hold-and-wait: a
+    /// streaming PUT that holds its body spool can wait for the same lock.
+    /// `None`: the backend needs no spool.
+    pub(crate) async fn reserve_storage_spool(
+        &self,
+        bucket: &str,
+        bytes: u64,
+        parts: bool,
+        held: Option<&crate::deltaglider::spool::Spool>,
+    ) -> Result<Option<crate::deltaglider::spool::SpoolReservation>, EngineError> {
+        let need = self
+            .storage
+            .file_put_spool_bytes(bucket, bytes, parts)
+            .await;
+        if need == 0 {
+            return Ok(None);
+        }
+        Self::with_spool_timeout(self.spool.reserve_beside(held, need))
+            .await
+            .map(Some)
+    }
+
     /// `spool_acquire` for an op that may already hold a spool (`held`).
     pub(crate) async fn spool_acquire_beside(
         &self,

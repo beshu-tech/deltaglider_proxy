@@ -2,6 +2,7 @@
 
 //! Storage backend trait definitions
 
+use crate::deltaglider::spool::SpoolBudget;
 use crate::storage::list_size_cache::ListedSize;
 use crate::types::FileMetadata;
 use async_trait::async_trait;
@@ -390,6 +391,10 @@ pub trait StorageBackend: Send + Sync {
 
     /// Store a passthrough file from an on-disk source path.
     /// Default implementation reads the full file and delegates to `put_passthrough`.
+    ///
+    /// `spool` is where the write puts any temp file of its own (the
+    /// encrypting wrapper's ciphertext). It never waits for budget: the
+    /// caller reserves up front with [`Self::file_put_spool_bytes`].
     async fn put_passthrough_file(
         &self,
         bucket: &str,
@@ -397,6 +402,7 @@ pub trait StorageBackend: Send + Sync {
         filename: &str,
         source_path: &Path,
         metadata: &FileMetadata,
+        _spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
         let data = tokio::fs::read(source_path).await?;
         self.put_passthrough(bucket, prefix, filename, &data, metadata)
@@ -405,6 +411,7 @@ pub trait StorageBackend: Send + Sync {
 
     /// Store a passthrough file from ordered relay part paths.
     /// Default implementation materializes an intermediate file in-memory.
+    /// `spool`: as for [`Self::put_passthrough_file`].
     async fn put_passthrough_parts(
         &self,
         bucket: &str,
@@ -412,6 +419,7 @@ pub trait StorageBackend: Send + Sync {
         filename: &str,
         part_paths: &[PathBuf],
         metadata: &FileMetadata,
+        _spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
         let mut assembled = Vec::new();
         for path in part_paths {
@@ -420,6 +428,14 @@ pub trait StorageBackend: Send + Sync {
         }
         self.put_passthrough(bucket, prefix, filename, &assembled, metadata)
             .await
+    }
+
+    /// Spool bytes that `put_passthrough_file` (`parts = false`) or
+    /// `put_passthrough_parts` (`parts = true`) needs for its own temp files
+    /// when it stores `bytes` into `bucket`. The engine reserves this much
+    /// before it takes the deltaspace lock. Default: none.
+    async fn file_put_spool_bytes(&self, _bucket: &str, _bytes: u64, _parts: bool) -> u64 {
+        0
     }
 
     /// Get passthrough file metadata
@@ -923,10 +939,16 @@ macro_rules! impl_storage_backend_for_box {
                 filename: &str,
                 part_paths: &[std::path::PathBuf],
                 metadata: &FileMetadata,
+                spool: SpoolBudget<'_>,
             ) -> Result<(), StorageError> {
                 (**self)
-                    .put_passthrough_parts(bucket, prefix, filename, part_paths, metadata)
+                    .put_passthrough_parts(bucket, prefix, filename, part_paths, metadata, spool)
                     .await
+            }
+            // MUST forward: the default (0) makes the engine reserve nothing,
+            // and the encrypting wrapper then fails the write under contention.
+            async fn file_put_spool_bytes(&self, bucket: &str, bytes: u64, parts: bool) -> u64 {
+                (**self).file_put_spool_bytes(bucket, bytes, parts).await
             }
             async fn put_reference_metadata(
                 &self,
@@ -1053,9 +1075,10 @@ macro_rules! impl_storage_backend_for_box {
                 filename: &str,
                 source_path: &Path,
                 metadata: &FileMetadata,
+                spool: SpoolBudget<'_>,
             ) -> Result<(), StorageError> {
                 (**self)
-                    .put_passthrough_file(bucket, prefix, filename, source_path, metadata)
+                    .put_passthrough_file(bucket, prefix, filename, source_path, metadata, spool)
                     .await
             }
             async fn get_passthrough_metadata(

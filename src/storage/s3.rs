@@ -2437,7 +2437,7 @@ impl StorageBackend for S3Backend {
         Ok(())
     }
 
-    #[instrument(skip(self, metadata))]
+    #[instrument(skip(self, metadata, _spool))]
     async fn put_passthrough_file(
         &self,
         bucket: &str,
@@ -2445,6 +2445,7 @@ impl StorageBackend for S3Backend {
         filename: &str,
         source_path: &std::path::Path,
         metadata: &FileMetadata,
+        _spool: crate::deltaglider::spool::SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
         let key = self.passthrough_key(prefix, filename);
         self.put_object_file_with_metadata(bucket, &key, source_path, metadata)

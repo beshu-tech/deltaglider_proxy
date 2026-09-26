@@ -1157,7 +1157,7 @@ impl StorageBackend for FilesystemBackend {
         .await
     }
 
-    #[instrument(skip(self, metadata))]
+    #[instrument(skip(self, metadata, _spool))]
     async fn put_passthrough_file(
         &self,
         bucket: &str,
@@ -1165,6 +1165,7 @@ impl StorageBackend for FilesystemBackend {
         filename: &str,
         source_path: &Path,
         metadata: &FileMetadata,
+        _spool: crate::deltaglider::spool::SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         let data_path = self.passthrough_path(bucket, prefix, filename)?;
@@ -1177,7 +1178,7 @@ impl StorageBackend for FilesystemBackend {
         Ok(())
     }
 
-    #[instrument(skip(self, part_paths, metadata))]
+    #[instrument(skip(self, part_paths, metadata, _spool))]
     async fn put_passthrough_parts(
         &self,
         bucket: &str,
@@ -1185,6 +1186,7 @@ impl StorageBackend for FilesystemBackend {
         filename: &str,
         part_paths: &[PathBuf],
         metadata: &FileMetadata,
+        _spool: crate::deltaglider::spool::SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         let data_path = self.passthrough_path(bucket, prefix, filename)?;

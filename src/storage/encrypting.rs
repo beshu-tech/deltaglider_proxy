@@ -55,6 +55,7 @@ use super::traits::{
     BulkListing, DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend,
     StorageError, UploadedPart,
 };
+use crate::deltaglider::spool::SpoolBudget;
 use crate::types::FileMetadata;
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -130,6 +131,24 @@ const CHUNK_FRAME_LEN_FIELD: usize = 4;
 const CHUNK_HEADER_LEN: usize = 4 /*magic*/ + 12 /*base_iv*/;
 /// Wire size of every non-final chunk (length-prefix + ciphertext + tag).
 pub const CHUNK_FRAME_WIRE_LEN: usize = CHUNK_FRAME_LEN_FIELD + CHUNK_PLAINTEXT_SIZE + GCM_TAG_LEN;
+
+/// Upper bound of the chunked wire size of `plaintext` bytes: the header,
+/// the bytes, and a length field + tag per frame (one frame more than the
+/// full windows, for the final one). Sizes the spool reservation.
+fn chunked_wire_len_bound(plaintext: u64) -> u64 {
+    let frames = plaintext / CHUNK_PLAINTEXT_SIZE as u64 + 1;
+    CHUNK_HEADER_LEN as u64 + plaintext + frames * (CHUNK_FRAME_LEN_FIELD + GCM_TAG_LEN) as u64
+}
+
+/// A spool refusal is back-pressure: `Throttled` reaches the client as a
+/// retryable 503 SlowDown.
+fn spool_error(e: std::io::Error) -> StorageError {
+    if e.kind() == crate::deltaglider::spool::CONTENDED {
+        StorageError::Throttled(e.to_string())
+    } else {
+        io_to_storage_error(e)
+    }
+}
 /// Cap on the length-prefix to foil DOS-via-crafted-length allocations.
 /// A legitimate chunk can never exceed 64 KiB + tag + a tiny buffer.
 /// Enforced by the streaming chunk decoders
@@ -983,6 +1002,78 @@ impl<B: StorageBackend> EncryptingBackend<B> {
     /// native-SSE transitions: the inner backend encrypts natively). One
     /// `ArcSwap` load, so a concurrent hot-reload cannot pair one config's
     /// key with another config's key_id. Every write path goes through here.
+    /// Encrypt `source_path` into the spool file `ct` (chunked wire format,
+    /// 64 KiB windows, on a blocking thread), then store `ct` through the
+    /// inner backend.
+    #[allow(clippy::too_many_arguments)]
+    async fn encrypt_file_and_put(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        filename: &str,
+        source_path: &std::path::Path,
+        ct: &crate::deltaglider::spool::Spool,
+        (key, key_id): (EncryptionKey, Option<String>),
+        metadata: &FileMetadata,
+        spool: SpoolBudget<'_>,
+    ) -> Result<(), StorageError> {
+        let src = source_path.to_path_buf();
+        let dest = ct.path().to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+            use std::io::{Read, Write};
+            let mut input = std::fs::File::open(&src).map_err(io_to_storage_error)?;
+            let mut out = std::fs::File::create(&dest).map_err(io_to_storage_error)?;
+            let (mut framer, header) = ChunkFramer::with_random_iv();
+            out.write_all(&header).map_err(io_to_storage_error)?;
+
+            // Read the source in 64 KiB windows; ChunkFramer owns the
+            // is_final/index framing so this path just feeds windows and
+            // writes the frames it hands back.
+            let mut buf = vec![0u8; CHUNK_PLAINTEXT_SIZE];
+            loop {
+                // Fill a full window (short read only at EOF).
+                let mut filled = 0usize;
+                while filled < CHUNK_PLAINTEXT_SIZE {
+                    let n = input
+                        .read(&mut buf[filled..])
+                        .map_err(io_to_storage_error)?;
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                }
+                if filled == 0 {
+                    break; // EOF, no more windows
+                }
+                if let Some(frame) = framer.push_window(&key, buf[..filled].to_vec())? {
+                    out.write_all(&frame).map_err(io_to_storage_error)?;
+                }
+                if filled < CHUNK_PLAINTEXT_SIZE {
+                    break; // short read = EOF
+                }
+            }
+            // The final frame (or an empty final frame for a zero-byte object).
+            out.write_all(&framer.finish(&key)?)
+                .map_err(io_to_storage_error)?;
+            out.flush().map_err(io_to_storage_error)
+        })
+        .await
+        .map_err(|e| StorageError::Other(format!("encrypt-to-file task join: {e}")))??;
+
+        let mut meta = without_markers(metadata);
+        mark_chunked_encrypted(&mut meta, key_id.as_deref());
+        self.inner
+            .put_passthrough_file(
+                bucket,
+                prefix,
+                filename,
+                ct.path(),
+                &meta,
+                spool.holding(ct),
+            )
+            .await
+    }
+
     fn write_key(&self) -> Option<(EncryptionKey, Option<String>)> {
         let cfg = self.config.load();
         if cfg.write_mode == WriteMode::PassThrough {
@@ -1196,12 +1287,13 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     }
 
     /// BOUNDED-MEMORY file store: encrypt the source file in 64 KiB windows
-    /// into the chunked wire format, streamed to a temp file (peak ≈ one window
-    /// + one frame, ~130 KiB — never the whole object), then hand THAT file to
-    /// the inner backend (which streams it to disk/S3). This is the re-encrypt /
-    /// large-passthrough path; the trait default `tokio::fs::read`s the whole
-    /// file and single-shot-encrypts (100 MiB-capped, O(object) RAM).
-    /// PassThrough / no-key → delegate to inner (no encryption, still streamed).
+    /// into the chunked wire format, streamed to a spool file (peak ≈ one
+    /// window + one frame, ~130 KiB — never the whole object), then hand THAT
+    /// file to the inner backend (which streams it to disk/S3). This is the
+    /// re-encrypt / large-passthrough path; the trait default
+    /// `tokio::fs::read`s the whole file and single-shot-encrypts (100
+    /// MiB-capped, O(object) RAM). The ciphertext file is in the spool dir
+    /// and holds spool budget. PassThrough / no-key → delegate to inner.
     async fn put_passthrough_file(
         &self,
         bucket: &str,
@@ -1209,6 +1301,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         filename: &str,
         source_path: &std::path::Path,
         metadata: &FileMetadata,
+        spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
         let Some((key, key_id)) = self.write_key() else {
             return self
@@ -1219,70 +1312,37 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                     filename,
                     source_path,
                     &without_markers(metadata),
+                    spool,
                 )
                 .await;
         };
-
-        let src = source_path.to_path_buf();
-        // Encrypt source → chunked temp file on a blocking thread (file I/O +
-        // AES). Returns the temp file so its lifetime spans the inner PUT.
-        let tmp = tokio::task::spawn_blocking(
-            move || -> Result<tempfile::NamedTempFile, StorageError> {
-                use std::io::{Read, Write};
-                let mut input = std::fs::File::open(&src).map_err(io_to_storage_error)?;
-                let mut tmp = tempfile::NamedTempFile::new().map_err(io_to_storage_error)?;
-                let (mut framer, header) = ChunkFramer::with_random_iv();
-                tmp.write_all(&header).map_err(io_to_storage_error)?;
-
-                // Read the source in 64 KiB windows; ChunkFramer owns the
-                // is_final/index framing so this path just feeds windows and
-                // writes the frames it hands back.
-                let mut buf = vec![0u8; CHUNK_PLAINTEXT_SIZE];
-                loop {
-                    // Fill a full window (short read only at EOF).
-                    let mut filled = 0usize;
-                    while filled < CHUNK_PLAINTEXT_SIZE {
-                        let n = input
-                            .read(&mut buf[filled..])
-                            .map_err(io_to_storage_error)?;
-                        if n == 0 {
-                            break;
-                        }
-                        filled += n;
-                    }
-                    if filled == 0 {
-                        break; // EOF, no more windows
-                    }
-                    if let Some(frame) = framer.push_window(&key, buf[..filled].to_vec())? {
-                        tmp.write_all(&frame).map_err(io_to_storage_error)?;
-                    }
-                    if filled < CHUNK_PLAINTEXT_SIZE {
-                        break; // short read = EOF
-                    }
-                }
-                // The final frame (or an empty final frame for a zero-byte object).
-                tmp.write_all(&framer.finish(&key)?)
-                    .map_err(io_to_storage_error)?;
-                tmp.flush().map_err(io_to_storage_error)?;
-                Ok(tmp)
-            },
+        let plain_len = tokio::fs::metadata(source_path)
+            .await
+            .map_err(io_to_storage_error)?
+            .len();
+        let ct = spool
+            .file(chunked_wire_len_bound(plain_len))
+            .await
+            .map_err(spool_error)?;
+        self.encrypt_file_and_put(
+            bucket,
+            prefix,
+            filename,
+            source_path,
+            &ct,
+            (key, key_id),
+            metadata,
+            spool,
         )
         .await
-        .map_err(|e| StorageError::Other(format!("encrypt-to-file task join: {e}")))??;
-
-        let mut meta = without_markers(metadata);
-        mark_chunked_encrypted(&mut meta, key_id.as_deref());
-        self.inner
-            .put_passthrough_file(bucket, prefix, filename, tmp.path(), &meta)
-            .await
     }
 
     /// BOUNDED-MEMORY relayed-parts store: concatenate the ordered part files
-    /// into ONE temp plaintext file (streamed, `std::io::copy` — never a whole
-    /// `Vec`), then hand it to the streaming `put_passthrough_file` above so the
-    /// encrypt is windowed. The trait default assembles every part into one
-    /// in-RAM `Vec` (O(object)); with the raised passthrough ceiling that OOMs a
-    /// multi-GiB encrypted multipart upload. PassThrough / no-key → delegate.
+    /// into ONE spool file (streamed, `std::io::copy` — never a whole `Vec`),
+    /// then encrypt it windowed like `put_passthrough_file`. The trait default
+    /// assembles every part into one in-RAM `Vec` (O(object)); with the raised
+    /// passthrough ceiling that OOMs a multi-GiB encrypted multipart upload.
+    /// PassThrough / no-key → delegate.
     async fn put_passthrough_parts(
         &self,
         bucket: &str,
@@ -1290,8 +1350,9 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         filename: &str,
         part_paths: &[std::path::PathBuf],
         metadata: &FileMetadata,
+        spool: SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
-        if self.write_key().is_none() {
+        let Some(write_key) = self.write_key() else {
             return self
                 .inner
                 .put_passthrough_parts(
@@ -1300,26 +1361,55 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                     filename,
                     part_paths,
                     &without_markers(metadata),
+                    spool,
                 )
                 .await;
+        };
+        let mut plain_len = 0u64;
+        for p in part_paths {
+            plain_len += tokio::fs::metadata(p)
+                .await
+                .map_err(io_to_storage_error)?
+                .len();
         }
+        let joined = spool.file(plain_len).await.map_err(spool_error)?;
+        let ct = spool
+            .file(chunked_wire_len_bound(plain_len))
+            .await
+            .map_err(spool_error)?;
         let parts = part_paths.to_vec();
-        let joined = tokio::task::spawn_blocking(
-            move || -> Result<tempfile::NamedTempFile, StorageError> {
-                let mut tmp = tempfile::NamedTempFile::new().map_err(io_to_storage_error)?;
-                for p in &parts {
-                    let mut f = std::fs::File::open(p).map_err(io_to_storage_error)?;
-                    std::io::copy(&mut f, tmp.as_file_mut()).map_err(io_to_storage_error)?;
-                }
-                std::io::Write::flush(&mut tmp).map_err(io_to_storage_error)?;
-                Ok(tmp)
-            },
-        )
+        let joined_path = joined.path().to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
+            let mut out = std::fs::File::create(&joined_path).map_err(io_to_storage_error)?;
+            for p in &parts {
+                let mut f = std::fs::File::open(p).map_err(io_to_storage_error)?;
+                std::io::copy(&mut f, &mut out).map_err(io_to_storage_error)?;
+            }
+            std::io::Write::flush(&mut out).map_err(io_to_storage_error)
+        })
         .await
         .map_err(|e| StorageError::Other(format!("relay-join task: {e}")))??;
-        // Delegate to the windowed encrypt-to-file path (bounded).
-        self.put_passthrough_file(bucket, prefix, filename, joined.path(), metadata)
-            .await
+        self.encrypt_file_and_put(
+            bucket,
+            prefix,
+            filename,
+            joined.path(),
+            &ct,
+            write_key,
+            metadata,
+            spool,
+        )
+        .await
+    }
+
+    async fn file_put_spool_bytes(&self, bucket: &str, bytes: u64, parts: bool) -> u64 {
+        if self.write_key().is_none() {
+            return self.inner.file_put_spool_bytes(bucket, bytes, parts).await;
+        }
+        // The ciphertext file, plus the joined plaintext for parts.
+        let wire = chunked_wire_len_bound(bytes);
+        let joined = if parts { bytes } else { 0 };
+        wire + joined + self.inner.file_put_spool_bytes(bucket, wire, false).await
     }
 
     // put_passthrough_chunked: re-slices incoming chunks into 64 KiB
@@ -2077,6 +2167,7 @@ mod tests {
             })));
             let wrapper = EncryptingBackend::new(fs, cfg);
             wrapper.create_bucket("b").await.unwrap();
+            let sd = test_spool(&dir);
 
             let plaintext: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
             let mut src = tempfile::NamedTempFile::new().unwrap();
@@ -2090,9 +2181,19 @@ mod tests {
                 crate::types::StorageInfo::Passthrough,
             );
             wrapper
-                .put_passthrough_file("b", "p", "o.bin", src.path(), &meta)
+                .put_passthrough_file("b", "p", "o.bin", src.path(), &meta, unheld(&sd))
                 .await
                 .unwrap_or_else(|e| panic!("size {size}: put failed: {e:?}"));
+            let wire = wrapper
+                .inner
+                .get_passthrough("b", "p", "o.bin")
+                .await
+                .unwrap();
+            assert!(
+                wire.len() as u64 <= chunked_wire_len_bound(size as u64),
+                "size {size}: wire {} over the reservation bound",
+                wire.len()
+            );
 
             let got = wrapper.get_passthrough("b", "p", "o.bin").await.unwrap();
             assert_eq!(got, plaintext, "size {size}: roundtrip mismatch");
@@ -2121,7 +2222,7 @@ mod tests {
             let part_paths: Vec<std::path::PathBuf> =
                 part_files.iter().map(|f| f.path().to_path_buf()).collect();
             wrapper
-                .put_passthrough_parts("b", "p", "parts.bin", &part_paths, &meta)
+                .put_passthrough_parts("b", "p", "parts.bin", &part_paths, &meta, unheld(&sd))
                 .await
                 .unwrap_or_else(|e| panic!("size {size}: parts put failed: {e:?}"));
             let got_parts = wrapper
@@ -2662,6 +2763,10 @@ mod tests {
         ranges_requested: Mutex<Vec<(u64, u64)>>,
         /// Make metadata READS fail (a transient backend error).
         fail_meta_reads: std::sync::atomic::AtomicBool,
+        /// Spool whose free budget `put_passthrough_file` records.
+        probe_spool: Option<crate::deltaglider::spool::SpoolDir>,
+        /// (source path, free spool MiB) per `put_passthrough_file` call.
+        file_puts: Mutex<Vec<(std::path::PathBuf, usize)>>,
     }
 
     impl CountingBackend {
@@ -2671,6 +2776,8 @@ mod tests {
                 metadata: Mutex::new(None),
                 ranges_requested: Mutex::new(Vec::new()),
                 fail_meta_reads: Default::default(),
+                probe_spool: None,
+                file_puts: Mutex::new(Vec::new()),
             }
         }
 
@@ -2740,6 +2847,23 @@ mod tests {
             m: &FileMetadata,
         ) -> Result<(), StorageError> {
             *self.metadata.lock().unwrap() = Some(m.clone());
+            Ok(())
+        }
+
+        async fn put_passthrough_file(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            source_path: &std::path::Path,
+            _: &FileMetadata,
+            _: SpoolBudget<'_>,
+        ) -> Result<(), StorageError> {
+            let free = self.probe_spool.as_ref().map_or(0, |s| s.free_mib());
+            self.file_puts
+                .lock()
+                .unwrap()
+                .push((source_path.to_path_buf(), free));
             Ok(())
         }
 
@@ -3716,7 +3840,7 @@ mod tests {
                 .await
                 .unwrap();
             wrapper
-                .put_passthrough_file("b", "p", "c", &src, &meta)
+                .put_passthrough_file("b", "p", "c", &src, &meta, unheld(&test_spool(&tmp)))
                 .await
                 .unwrap();
             wrapper
@@ -3724,7 +3848,14 @@ mod tests {
                 .await
                 .unwrap();
             wrapper
-                .put_passthrough_parts("b", "p", "e", std::slice::from_ref(&src), &meta)
+                .put_passthrough_parts(
+                    "b",
+                    "p",
+                    "e",
+                    std::slice::from_ref(&src),
+                    &meta,
+                    unheld(&test_spool(&tmp)),
+                )
                 .await
                 .unwrap();
             wrapper
@@ -3771,5 +3902,195 @@ mod tests {
                 "{mode_name}: metadata rewrite"
             );
         }
+    }
+
+    fn keyed_cfg() -> Arc<ArcSwap<EncryptionConfig>> {
+        Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key: Some(test_key()),
+            key_id: Some("kid-1".to_string()),
+            ..Default::default()
+        })))
+    }
+
+    fn test_spool(dir: &tempfile::TempDir) -> crate::deltaglider::spool::SpoolDir {
+        crate::deltaglider::spool::SpoolDir::new(dir.path().join("spool"), 64 * 1024 * 1024)
+            .unwrap()
+    }
+
+    fn unheld(sd: &crate::deltaglider::spool::SpoolDir) -> SpoolBudget<'_> {
+        SpoolBudget::new(sd, None, None)
+    }
+
+    fn probe_wrapper(
+        sd: &crate::deltaglider::spool::SpoolDir,
+    ) -> EncryptingBackend<CountingBackend> {
+        let mut inner = CountingBackend::new();
+        inner.probe_spool = Some(sd.clone());
+        EncryptingBackend::new(inner, keyed_cfg())
+    }
+
+    fn meta_of(len: usize) -> FileMetadata {
+        FileMetadata::new_passthrough("o".into(), "0".repeat(64), "0".repeat(32), len as u64, None)
+    }
+
+    const MIB: usize = 1024 * 1024;
+
+    /// The ciphertext temp file of an encrypted file PUT must live in the
+    /// spool dir and hold spool budget while the inner backend reads it.
+    /// It was a `NamedTempFile::new()` in the system temp dir, outside the
+    /// budget, so N large encrypted PUTs could fill the disk.
+    #[tokio::test]
+    async fn encrypted_file_put_temp_is_inside_the_spool_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = test_spool(&dir);
+        let wrapper = probe_wrapper(&sd);
+        let body = vec![7u8; 3 * MIB];
+        let src = dir.path().join("src");
+        std::fs::write(&src, &body).unwrap();
+
+        wrapper
+            .put_passthrough_file("b", "p", "o", &src, &meta_of(body.len()), unheld(&sd))
+            .await
+            .unwrap();
+        let puts = wrapper.inner.file_puts.lock().unwrap().clone();
+        assert_eq!(puts.len(), 1);
+        assert_eq!(
+            puts[0].0.parent(),
+            Some(sd.dir()),
+            "ciphertext temp must be in the spool dir"
+        );
+        assert!(
+            puts[0].1 <= 64 - 4,
+            "ciphertext temp must hold its budget (3 MiB body -> 4 MiB), free {} MiB",
+            puts[0].1
+        );
+        assert_eq!(sd.free_mib(), 64, "budget released after the write");
+    }
+
+    /// Same for relayed parts: the joined plaintext AND the ciphertext.
+    #[tokio::test]
+    async fn encrypted_parts_put_temps_are_inside_the_spool_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = test_spool(&dir);
+        let wrapper = probe_wrapper(&sd);
+        let parts: Vec<std::path::PathBuf> = (0..3)
+            .map(|i| {
+                let p = dir.path().join(format!("part{i}"));
+                std::fs::write(&p, vec![i as u8; MIB]).unwrap();
+                p
+            })
+            .collect();
+
+        // With the engine's up-front reservation: both files share it.
+        let need = wrapper
+            .file_put_spool_bytes("b", 3 * MIB as u64, true)
+            .await;
+        assert!(need > 6 * MIB as u64, "joined + ciphertext, got {need}");
+        let reserved = sd.reserve_beside(None, need).await.unwrap();
+        let free_after_reserve = sd.free_mib();
+        wrapper
+            .put_passthrough_parts(
+                "b",
+                "p",
+                "o",
+                &parts,
+                &meta_of(3 * MIB),
+                SpoolBudget::new(&sd, None, Some(&reserved)),
+            )
+            .await
+            .unwrap();
+        let puts = wrapper.inner.file_puts.lock().unwrap().clone();
+        assert_eq!(puts[0].0.parent(), Some(sd.dir()));
+        assert_eq!(
+            puts[0].1, free_after_reserve,
+            "the files use the reservation, not more budget"
+        );
+        drop(reserved);
+        assert_eq!(sd.free_mib(), 64);
+
+        // Without a reservation: the wrapper takes free budget now.
+        wrapper
+            .put_passthrough_parts("b", "p", "o", &parts, &meta_of(3 * MIB), unheld(&sd))
+            .await
+            .unwrap();
+        let puts = wrapper.inner.file_puts.lock().unwrap().clone();
+        assert!(
+            puts[1].1 <= 64 - 7,
+            "joined 3 + ciphertext 4 MiB, free {}",
+            puts[1].1
+        );
+        assert_eq!(sd.free_mib(), 64);
+    }
+
+    /// The review2 rule: a storage write never waits for spool budget. It
+    /// runs under the engine's deltaspace lock, and other ops hold budget
+    /// while they wait for that lock. With the budget taken, the write fails
+    /// retryably (503 SlowDown) at once.
+    #[tokio::test]
+    async fn encrypted_file_put_never_waits_for_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let sd = crate::deltaglider::spool::SpoolDir::new(dir.path().join("spool"), 4 * MIB as u64)
+            .unwrap();
+        let wrapper = probe_wrapper(&sd);
+        let src = dir.path().join("src");
+        std::fs::write(&src, vec![1u8; 2 * MIB]).unwrap();
+
+        // Another op holds the whole budget.
+        let other = sd.acquire(4 * MIB as u64).await.unwrap();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wrapper.put_passthrough_file("b", "p", "o", &src, &meta_of(2 * MIB), unheld(&sd)),
+        )
+        .await
+        .expect("a storage write must not wait for spool budget");
+        assert!(matches!(r, Err(StorageError::Throttled(_))), "got {r:?}");
+        drop(other);
+
+        // Two holders, each with half the budget, write at the same time:
+        // neither waits for the other's half.
+        let a = sd.acquire(2 * MIB as u64).await.unwrap();
+        let b = sd.acquire(2 * MIB as u64).await.unwrap();
+        let (ra, rb) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures::future::join(
+                wrapper.put_passthrough_file(
+                    "b",
+                    "p",
+                    "a",
+                    &src,
+                    &meta_of(2 * MIB),
+                    SpoolBudget::new(&sd, Some(&a), None),
+                ),
+                wrapper.put_passthrough_file(
+                    "b",
+                    "p",
+                    "b",
+                    &src,
+                    &meta_of(2 * MIB),
+                    SpoolBudget::new(&sd, Some(&b), None),
+                ),
+            ),
+        )
+        .await
+        .expect("two holders deadlocked on each other's budget");
+        for r in [ra, rb] {
+            assert!(matches!(r, Err(StorageError::Throttled(_))), "got {r:?}");
+        }
+        drop((a, b));
+        assert_eq!(sd.free_mib(), 4);
+    }
+
+    #[tokio::test]
+    async fn file_put_spool_bytes_is_zero_without_a_write_key() {
+        let plain = EncryptingBackend::new(
+            CountingBackend::new(),
+            Arc::new(ArcSwap::new(Arc::new(EncryptionConfig::default()))),
+        );
+        assert_eq!(plain.file_put_spool_bytes("b", 1 << 30, true).await, 0);
+        let keyed = EncryptingBackend::new(CountingBackend::new(), keyed_cfg());
+        assert_eq!(
+            keyed.file_put_spool_bytes("b", 0, false).await,
+            chunked_wire_len_bound(0)
+        );
     }
 }

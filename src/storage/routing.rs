@@ -933,6 +933,7 @@ impl StorageBackend for RoutingBackend {
         filename: &str,
         source_path: &std::path::Path,
         metadata: &FileMetadata,
+        spool: crate::deltaglider::spool::SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
         route_existing!(
             self,
@@ -941,7 +942,8 @@ impl StorageBackend for RoutingBackend {
             prefix,
             filename,
             source_path,
-            metadata
+            metadata,
+            spool
         )
     }
 
@@ -952,6 +954,7 @@ impl StorageBackend for RoutingBackend {
         filename: &str,
         part_paths: &[std::path::PathBuf],
         metadata: &FileMetadata,
+        spool: crate::deltaglider::spool::SpoolBudget<'_>,
     ) -> Result<(), StorageError> {
         route_existing!(
             self,
@@ -960,8 +963,13 @@ impl StorageBackend for RoutingBackend {
             prefix,
             filename,
             part_paths,
-            metadata
+            metadata,
+            spool
         )
+    }
+
+    async fn file_put_spool_bytes(&self, bucket: &str, bytes: u64, parts: bool) -> u64 {
+        route_existing!(self, bucket, file_put_spool_bytes, bytes, parts)
     }
 
     async fn get_passthrough_metadata(

@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed — encrypted uploads keep their temporary files inside the spool budget
+
+With proxy-AES encryption, a large upload or a multipart upload encrypts its
+body into a temporary file before it goes to the backend. That file was in the
+system temp directory and did not count against `DGP_SPOOL_MAX_BYTES`, so many
+large encrypted uploads at the same time could fill the disk. For a multipart
+upload the proxy also joined the parts into a second temporary file outside the
+budget. Both files now live in the spool directory (`DGP_SPOOL_DIR`) and count
+against the budget. The proxy reserves the space before it locks the
+deltaspace, and an upload that already holds spool space never waits for more.
+When the budget is in use, the upload fails with `503 SlowDown`, which S3
+clients retry. Size `DGP_SPOOL_MAX_BYTES` for about twice the total size of the encrypted
+uploads that run at the same time.
+
 ### Added — Tokio schedule-latency histogram (opt-in build flag)
 
 A binary built with `RUSTFLAGS="--cfg tokio_unstable"` now exports
@@ -10,6 +24,7 @@ wake-ups per wake-to-poll latency range. It shows ready tasks that wait for a
 worker, which the poll-time series cannot show. Tokio is now at 1.53, which
 added this histogram. A default build does not change. The metrics reference
 explains how to read the series and what a bad value looks like (#87).
+
 ### Fixed — Lock and lease expiry no longer depends on the node clocks
 
 The cross-instance reference lock and the replication leader lease stored an

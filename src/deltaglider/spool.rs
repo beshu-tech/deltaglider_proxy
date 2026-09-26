@@ -13,6 +13,9 @@
 //! When the budget is exhausted, acquirers wait (back-pressure) rather than
 //! failing the underlying storage with ENOSPC.
 //!
+//! The encrypting storage wrapper's temp files (ciphertext, joined multipart
+//! parts) live here too: see `SpoolBudget`.
+//!
 //! Configured via `DGP_SPOOL_DIR` (default = system temp dir) and
 //! `DGP_SPOOL_MAX_BYTES` (default 16 GiB).
 
@@ -108,6 +111,17 @@ impl SpoolDir {
         self.max_bytes
     }
 
+    /// The directory the spool files live in.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Budget not reserved right now, in MiB.
+    #[cfg(test)]
+    pub(crate) fn free_mib(&self) -> usize {
+        self.budget.available_permits()
+    }
+
     /// Delete STALE spool files orphaned by a hard crash before `NamedTempFile`'s
     /// Drop could run. AGE-based (older than `STALE`), not delete-everything: the
     /// spool dir may be shared by another live DGP instance (or parallel tests),
@@ -155,15 +169,19 @@ impl SpoolDir {
     /// the space now or a [`CONTENDED`] error, and goes on without it. Two
     /// holders that wait can each wait for the budget the other holds
     /// (hold-and-wait), until the acquire timeout.
+    ///
+    /// `may_wait = false` makes a non-holder behave like a holder: used by
+    /// storage writes, which run under the caller's deltaspace lock.
     async fn reserve_within(
         &self,
         bytes: u64,
         held_mib: usize,
+        may_wait: bool,
     ) -> std::io::Result<OwnedSemaphorePermit> {
         let max_mib = mib_ceil(self.max_bytes).max(1);
         let want_mib = mib_ceil(bytes).max(1).min(max_mib.saturating_sub(held_mib));
         let closed = || std::io::Error::other("spool budget semaphore closed");
-        if held_mib == 0 {
+        if held_mib == 0 && may_wait {
             return self
                 .budget
                 .clone()
@@ -176,7 +194,7 @@ impl SpoolDir {
             Err(tokio::sync::TryAcquireError::Closed) => Err(closed()),
             Err(tokio::sync::TryAcquireError::NoPermits) => Err(std::io::Error::new(
                 CONTENDED,
-                "spool budget contended: an op that holds a spool does not wait for more",
+                "spool budget contended: an op that holds a spool, or a storage write, does not wait for more",
             )),
         }
     }
@@ -192,7 +210,7 @@ impl SpoolDir {
     /// [`Self::acquire_pair_beside`], so the op never waits on itself.
     pub async fn acquire_beside(&self, held: Option<&Spool>, bytes: u64) -> std::io::Result<Spool> {
         let permit = self
-            .reserve_within(bytes, held.map_or(0, Spool::reserved_mib))
+            .reserve_within(bytes, held.map_or(0, Spool::reserved_mib), true)
             .await?;
         let file = NamedTempFile::new_in(&self.dir)?;
         Ok(Spool {
@@ -229,7 +247,7 @@ impl SpoolDir {
     ) -> std::io::Result<(Spool, Spool)> {
         let held_mib = held.map_or(0, Spool::reserved_mib);
         let permit = std::sync::Arc::new(
-            self.reserve_within(a_bytes.saturating_add(b_bytes), held_mib)
+            self.reserve_within(a_bytes.saturating_add(b_bytes), held_mib, true)
                 .await?,
         );
         let a = NamedTempFile::new_in(&self.dir)?;
@@ -244,6 +262,94 @@ impl SpoolDir {
                 _permit: SharedOrOwned::Shared(permit),
             },
         ))
+    }
+
+    /// Reserve `bytes` for the temp files of a storage write, with no file
+    /// yet. The caller takes it BEFORE its deltaspace lock and hands it down
+    /// in a [`SpoolBudget`]; waiting for budget under that lock is
+    /// hold-and-wait. Same rules as [`Self::acquire_beside`]: clamped, and
+    /// an op that holds `held` does not wait ([`CONTENDED`]).
+    pub async fn reserve_beside(
+        &self,
+        held: Option<&Spool>,
+        bytes: u64,
+    ) -> std::io::Result<SpoolReservation> {
+        let permit = self
+            .reserve_within(bytes, held.map_or(0, Spool::reserved_mib), true)
+            .await?;
+        Ok(SpoolReservation {
+            dir: self.dir.clone(),
+            permit: Arc::new(permit),
+        })
+    }
+}
+
+/// Budget reserved for a storage write's temp files. Each file made from
+/// it shares the one permit; the budget is released when the reservation
+/// and every file made from it drop.
+pub struct SpoolReservation {
+    dir: PathBuf,
+    permit: Arc<OwnedSemaphorePermit>,
+}
+
+impl SpoolReservation {
+    fn file(&self) -> std::io::Result<Spool> {
+        Ok(Spool {
+            file: NamedTempFile::new_in(&self.dir)?,
+            _permit: SharedOrOwned::Shared(self.permit.clone()),
+        })
+    }
+}
+
+/// The spool a file-streaming storage write (`put_passthrough_file`,
+/// `put_passthrough_parts`) uses for its own temp files: the encrypting
+/// wrapper's ciphertext and joined parts. It names the spool the caller
+/// holds and the reservation the caller took before its lock, so the
+/// write NEVER waits for budget: it uses the reservation, or takes free
+/// budget now, or fails with [`CONTENDED`].
+#[derive(Clone, Copy)]
+pub struct SpoolBudget<'a> {
+    dir: &'a SpoolDir,
+    held: Option<&'a Spool>,
+    reserved: Option<&'a SpoolReservation>,
+}
+
+impl<'a> SpoolBudget<'a> {
+    pub fn new(
+        dir: &'a SpoolDir,
+        held: Option<&'a Spool>,
+        reserved: Option<&'a SpoolReservation>,
+    ) -> Self {
+        Self {
+            dir,
+            held,
+            reserved,
+        }
+    }
+
+    /// The same spool for a nested write that also holds `spool`. The
+    /// reservation is not passed on: it is sized for this write only.
+    pub fn holding(&self, spool: &'a Spool) -> Self {
+        Self {
+            dir: self.dir,
+            held: Some(spool),
+            reserved: None,
+        }
+    }
+
+    /// A temp file for `bytes` in the spool dir. Never waits.
+    pub async fn file(&self, bytes: u64) -> std::io::Result<Spool> {
+        if let Some(r) = self.reserved {
+            return r.file();
+        }
+        let permit = self
+            .dir
+            .reserve_within(bytes, self.held.map_or(0, Spool::reserved_mib), false)
+            .await?;
+        Ok(Spool {
+            file: NamedTempFile::new_in(&self.dir.dir)?,
+            _permit: SharedOrOwned::Owned(permit),
+        })
     }
 }
 
