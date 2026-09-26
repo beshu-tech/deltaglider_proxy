@@ -11,6 +11,13 @@ export function formatBytes(bytes: number): string {
   return `${sign}${(abs / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
 }
 
+/** Dashboard "Cache entries" subtitle: the USED bytes over the entry count. */
+export function cacheEntrySubtitle(usedBytes: number, maxBytes: number, entries: number): string {
+  if (maxBytes <= 0) return 'Cache disabled';
+  if (entries <= 0) return 'No entries yet';
+  return `${formatBytes(usedBytes / entries)} avg per entry`;
+}
+
 /** Extract the display name from a full S3 key given the current prefix */
 export function displayName(key: string, prefix: string): string {
   return key.startsWith(prefix) ? key.slice(prefix.length) : key;

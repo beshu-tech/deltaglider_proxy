@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
-import { clamp, formatDuration, relativeTime, formatBytes, getFileName, pluralize, noun, parentPrefix, isAbsolutePath } from '../utils';
+import { clamp, formatDuration, relativeTime, formatBytes, getFileName, pluralize, noun, parentPrefix, isAbsolutePath, cacheEntrySubtitle } from '../utils';
 
 test('isAbsolutePath (backend data directory, issue #92 comment item 3)', () => {
   assert.equal(isAbsolutePath('/var/lib/deltaglider'), true);
@@ -116,4 +116,13 @@ test('parentPrefix (keyboard "up a folder" navigation)', () => {
   // normally end in "/", but a stray non-slashed prefix must not throw)
   assert.equal(parentPrefix('a/b'), 'a/', 'no trailing slash still climbs one');
   assert.equal(parentPrefix('single'), '', 'single segment, no slash → root');
+});
+
+// Browser-review item 15: the average divided the cache SIZE (the max), so a
+// 100 MB cache with one 2 MB baseline read "100 MB avg per entry".
+test('cacheEntrySubtitle averages the used bytes over the entries', () => {
+  assert.equal(cacheEntrySubtitle(2 * 1024 * 1024, 100 * 1024 * 1024, 1), '2.0 MB avg per entry');
+  assert.equal(cacheEntrySubtitle(3 * 1024, 100 * 1024 * 1024, 2), '1.5 KB avg per entry');
+  assert.equal(cacheEntrySubtitle(0, 100 * 1024 * 1024, 0), 'No entries yet');
+  assert.equal(cacheEntrySubtitle(0, 0, 0), 'Cache disabled');
 });

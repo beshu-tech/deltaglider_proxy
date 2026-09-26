@@ -19,7 +19,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Typography, Spin, Progress } from 'antd';
 import { useColors } from '../ThemeContext';
-import { formatBytes } from '../utils';
+import { cacheEntrySubtitle, formatBytes } from '../utils';
 import { cacheMissSeverity, serverErrorSeverity } from '../statusTone';
 import { useVisiblePolling } from '../useVisiblePolling';
 import AnalyticsSection from './AnalyticsSection';
@@ -477,7 +477,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
           </Panel>
           <Panel
             title="Cache entries"
-            subtitle={cacheMax > 0 ? `${formatBytes(cacheMax / Math.max(cacheEntries, 1))} avg per entry` : 'Cache disabled'}
+            subtitle={cacheEntrySubtitle(cacheUsed, cacheMax, cacheEntries)}
             colSpan={4}
           >
             <StatValue value={fmtNum(cacheEntries)} hint="Active reference baselines" />
