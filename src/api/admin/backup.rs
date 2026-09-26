@@ -1499,7 +1499,7 @@ async fn apply_secrets(
     // would cause every subsequent S3 op to use stale credentials
     // until restart.
     if let Err(e) =
-        crate::api::admin::config::apply_config_transition(state, &old_cfg, &new_cfg).await
+        crate::api::admin::config::apply_config_transition(state, &old_cfg, &new_cfg, headers).await
     {
         tracing::error!("Full-backup import: apply_config_transition failed: {}", e);
         return Err(BackupSecretApplyError::new(

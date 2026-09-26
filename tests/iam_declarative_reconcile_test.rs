@@ -955,3 +955,48 @@ async fn declarative_mode_blocks_admin_api_iam_mutations() {
         "403-blocked mutation must leave DB untouched"
     );
 }
+
+/// The reconcile's audit entries name the admin request's client (its user
+/// agent), like every other admin mutation. They used an empty header map.
+#[tokio::test]
+async fn reconcile_audit_entries_carry_the_request_headers() {
+    let server = TestServer::builder()
+        .auth("BOOTKEY1", "BOOTSECRET1")
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+    let resp = admin
+        .put(format!("{endpoint}/_/api/admin/config/section/access"))
+        .header("user-agent", "reconcile-ua-probe/1.0")
+        .json(&json!({
+            "iam_mode": "declarative",
+            "iam_users": [{
+                "name": "dana",
+                "access_key_id": "AKIADANA00001",
+                "secret_access_key": "dana-secret",
+                "enabled": true,
+                "permissions": []
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{}", resp.status());
+    let audit: serde_json::Value = admin
+        .get(format!("{endpoint}/_/api/admin/audit?limit=100"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entry = audit["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "iam_reconcile_user_create" && e["target"] == "dana")
+        .unwrap_or_else(|| panic!("no reconcile entry: {audit}"))
+        .clone();
+    assert_eq!(entry["ua"], "reconcile-ua-probe/1.0", "{entry}");
+}

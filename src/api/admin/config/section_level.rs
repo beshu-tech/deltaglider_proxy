@@ -666,32 +666,39 @@ async fn apply_section(
     // PersistAndApply: run the full transition (engine rebuild + log
     // reload + IAM swap + snapshot rebuilds). On failure we return
     // UNPROCESSABLE_ENTITY — caller fixes and re-applies.
-    let (transition_warnings, transition_restart) =
-        match apply_config_transition(&state, &old_cfg, &new_cfg).await {
-            Ok(pair) => pair,
-            Err(e) => {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(SectionApplyResponse {
-                        ok: false,
-                        existing_warnings,
-                        warnings: removed_warnings
-                            .into_iter()
-                            .chain(warnings_from_check)
-                            .collect(),
-                        requires_restart: false,
-                        persisted_path: None,
-                        error: Some(format!(
-                            "Failed to apply section '{}' (no state changed): {}",
-                            section.as_str(),
-                            e
-                        )),
-                        diff: Some(diff),
-                    }),
-                )
-                    .into_response();
-            }
-        };
+    let (transition_warnings, transition_restart) = match apply_config_transition(
+        &state,
+        &old_cfg,
+        &new_cfg,
+        // Only the dry run has no headers, and it never gets here.
+        headers.as_ref().unwrap_or(&HeaderMap::default()),
+    )
+    .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(SectionApplyResponse {
+                    ok: false,
+                    existing_warnings,
+                    warnings: removed_warnings
+                        .into_iter()
+                        .chain(warnings_from_check)
+                        .collect(),
+                    requires_restart: false,
+                    persisted_path: None,
+                    error: Some(format!(
+                        "Failed to apply section '{}' (no state changed): {}",
+                        section.as_str(),
+                        e
+                    )),
+                    diff: Some(diff),
+                }),
+            )
+                .into_response();
+        }
+    };
 
     // Transition's `requires_restart` is authoritative for the PUT
     // response (it's the same value the field-level PATCH and

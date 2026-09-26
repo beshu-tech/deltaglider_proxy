@@ -73,6 +73,14 @@ names the one object that the caller may read, the bucket and prefix that
 the caller may list, or the public prefixes of the bucket. For a write, it
 says that nothing is granted.
 
+### Fixed — Declarative IAM audit entries name the admin client
+
+The audit entries that a declarative IAM apply writes
+(`iam_reconcile_user_create` and the others) had an empty user agent, and
+their IP fell back to the socket address, because the reconcile did not
+get the admin request's headers. Now they carry the request's user agent
+and forwarded IP, like every other admin change.
+
 ### Fixed — Replicas and archived objects keep their creation time
 
 A replication copy and a lifecycle transition copy got the time of the

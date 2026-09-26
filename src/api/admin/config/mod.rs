@@ -247,6 +247,7 @@ pub(crate) async fn apply_config_transition(
     state: &Arc<AdminState>,
     old_cfg: &crate::config::Config,
     new_cfg: &crate::config::Config,
+    headers: &axum::http::HeaderMap,
 ) -> Result<(Vec<String>, bool), String> {
     let mut warnings = Vec::new();
     let mut requires_restart = false;
@@ -511,10 +512,10 @@ pub(crate) async fn apply_config_transition(
 
             // Emit one audit entry per mutation via the `audit_entries()`
             // helper (hygiene #1: replaces a 10-block copy-paste loop).
-            let empty = axum::http::HeaderMap::new();
+            // The request's headers name the admin client (IP, UA).
             for (action, names) in stats.audit_entries() {
                 for name in names {
-                    super::audit_log(action, "declarative", name, &empty);
+                    super::audit_log(action, "declarative", name, headers);
                 }
             }
             if stats.mapping_rules_replaced > 0 {
@@ -522,7 +523,7 @@ pub(crate) async fn apply_config_transition(
                     "iam_reconcile_mapping_rules_replaced",
                     "declarative",
                     &format!("{} rules", stats.mapping_rules_replaced),
-                    &empty,
+                    headers,
                 );
             }
 
@@ -901,7 +902,7 @@ pub async fn remove_bootstrap_credentials(
             return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
         }
     };
-    match apply_config_transition(&state, &old_cfg, &cfg).await {
+    match apply_config_transition(&state, &old_cfg, &cfg, &headers).await {
         Ok((w, _)) => warnings.extend(w),
         Err(e) => {
             *cfg = old_cfg;

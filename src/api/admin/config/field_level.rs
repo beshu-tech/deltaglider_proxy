@@ -750,7 +750,7 @@ pub async fn update_config(
         }
     }
 
-    match apply_config_transition(&state, &old_cfg, &cfg).await {
+    match apply_config_transition(&state, &old_cfg, &cfg, &headers).await {
         Ok((transition_warnings, requires_restart)) => {
             warnings.extend(transition_warnings);
 

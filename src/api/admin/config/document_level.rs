@@ -767,7 +767,7 @@ pub(crate) async fn apply_config_inner_with_env(
     //    transition truth.
     let old_cfg = cfg.clone();
     let (transition_warnings, requires_restart) =
-        match apply_config_transition(state, &old_cfg, &incoming).await {
+        match apply_config_transition(state, &old_cfg, &incoming, headers).await {
             Ok(r) => r,
             Err(e) => {
                 return (

@@ -271,10 +271,7 @@ mod source_guards {
     /// scope (they live outside src/api and the adapter).
     #[test]
     fn request_audits_carry_the_request_headers() {
-        const ALLOWED: [(&str, &str); 1] = [(
-            "src/api/admin/config/mod.rs",
-            "declarative reconcile entries from apply_config_transition, which takes no headers",
-        )];
+        const ALLOWED: [(&str, &str); 0] = [];
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files = vec![root.join("src/s3_adapter_s3s.rs")];
         rust_files(&root.join("src/api"), &mut files);
