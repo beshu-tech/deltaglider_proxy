@@ -1106,6 +1106,26 @@ fn unchanged(merged: &Merged, plan: &IdPlan, local: &Snapshot) -> bool {
     })
 }
 
+/// Run `f` inside `BEGIN IMMEDIATE` and commit. On any error, `f`'s or the
+/// COMMIT's, the transaction is rolled back: a COMMIT can fail (a deferred
+/// constraint, I/O, a full disk), and a transaction left open would swallow
+/// every later write on this connection until the process dies.
+fn immediate_tx<T>(
+    conn: &Connection,
+    f: impl FnOnce(&Connection) -> Result<T, ConfigDbError>,
+) -> Result<T, ConfigDbError> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = f(conn).and_then(|v| {
+        conn.execute_batch("COMMIT;")?;
+        Ok(v)
+    });
+    // After a failed COMMIT, SQLite may keep the transaction open.
+    if result.is_err() && !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    result
+}
+
 impl ConfigDb {
     /// Three-way merge of the IAM tables of the peer DB at `remote_path` into
     /// this DB, against the last synced DB at `base_path` (see the module doc).
@@ -1131,8 +1151,7 @@ impl ConfigDb {
             let remote = read_snapshot(&self.conn, "remote")?;
             let base = base_path.and_then(|p| self.read_base(p, passphrase));
 
-            self.conn.execute_batch("BEGIN IMMEDIATE;")?;
-            let tx = (|| -> Result<MergeReport, ConfigDbError> {
+            immediate_tx(&self.conn, |_| {
                 let local = read_snapshot(&self.conn, "main")?;
                 let out = merge_snapshots(base.as_ref(), &local, &remote);
                 let mut report = MergeReport {
@@ -1157,17 +1176,7 @@ impl ConfigDb {
                     [],
                 )?;
                 Ok(report)
-            })();
-            match tx {
-                Ok(report) => {
-                    self.conn.execute_batch("COMMIT;")?;
-                    Ok(report)
-                }
-                Err(e) => {
-                    let _ = self.conn.execute_batch("ROLLBACK;");
-                    Err(e)
-                }
-            }
+            })
         })();
         let _ = self.conn.execute_batch("DETACH DATABASE remote;");
         result
@@ -1541,6 +1550,66 @@ mod tests {
             .unwrap();
         assert!(!report.changed);
         assert!(report.stale_user_ids.is_empty());
+    }
+
+    /// A COMMIT that fails (here: a deferred foreign key) must not leave the
+    /// transaction open, or every later write joins it and is never saved.
+    #[test]
+    fn a_failed_commit_rolls_back() {
+        let db = ConfigDb::in_memory(PASS).unwrap();
+        let r = immediate_tx(&db.conn, |c| {
+            c.execute_batch(
+                "PRAGMA defer_foreign_keys = ON;
+                 INSERT INTO permissions (user_id, actions, resources)
+                 VALUES (4242, '[]', '[]');",
+            )?;
+            Ok(())
+        });
+        assert!(r.is_err(), "the COMMIT must fail on the dangling row");
+        assert!(db.conn.is_autocommit(), "the transaction is still open");
+        let n: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM permissions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// Guard: a hand-written BEGIN in production code goes through
+    /// `immediate_tx` (rusqlite's `Transaction` rolls back on drop by itself).
+    #[test]
+    fn hand_written_transactions_go_through_immediate_tx() {
+        fn scan(dir: &Path, hits: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    scan(&p, hits);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let full = std::fs::read_to_string(&p).unwrap();
+                    // Production code only: tests may hold locks on purpose.
+                    let text = full.split("#[cfg(test)]").next().unwrap_or("");
+                    let n = text.matches(concat!("\"BEGIN", " ")).count()
+                        + text.matches(concat!("\"BEGIN", ";")).count();
+                    if n > 0 {
+                        hits.push(format!("{}: {n}", p.display()));
+                    }
+                }
+            }
+        }
+        let mut hits = Vec::new();
+        scan(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut hits,
+        );
+        assert_eq!(
+            hits,
+            vec![format!(
+                "{}: 1",
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/config_db/iam_merge.rs")
+                    .display()
+            )],
+            "a BEGIN outside immediate_tx"
+        );
     }
 
     #[test]
