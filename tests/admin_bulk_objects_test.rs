@@ -235,6 +235,171 @@ async fn test_zip_download_returns_archive() {
     assert!(s_str.contains("z2.txt"));
 }
 
+/// Read every entry of a ZIP body: (name, content), in archive order.
+fn unzip(body: &[u8]) -> Vec<(String, Vec<u8>)> {
+    use std::io::Read;
+    let mut z = zip::ZipArchive::new(std::io::Cursor::new(body)).expect("a complete ZIP");
+    (0..z.len())
+        .map(|i| {
+            let mut f = z.by_index(i).unwrap();
+            let mut data = Vec::new();
+            // read_to_end checks each entry's CRC-32.
+            f.read_to_end(&mut data).unwrap();
+            (f.name().to_string(), data)
+        })
+        .collect()
+}
+
+/// U4: the ZIP streams (no Content-Length: the proxy does not build the
+/// archive first) and holds the exact bytes of a delta-reconstructed
+/// object, decoded through the spooled streaming path, and of a 24 MiB
+/// passthrough object. A missing key lands in the skip report.
+#[tokio::test]
+async fn test_zip_streams_delta_and_large_objects() {
+    let server = TestServer::builder()
+        // Every delta GET decodes to a spool file, the path of large deltas.
+        .env("DGP_SPOOL_THRESHOLD_BYTES", "1")
+        .build()
+        .await;
+    let http = server.http();
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let bucket = server.bucket().to_string();
+
+    let base = common::generate_binary(200_000, 7);
+    let variant = common::mutate_binary(&base, 0.01);
+    let big = common::big_passthrough_body(24 * 1024 * 1024);
+    common::put_and_get_storage_type(
+        &http,
+        &ep,
+        &bucket,
+        "rel/v1.zip",
+        base.clone(),
+        "application/zip",
+    )
+    .await;
+    let st = common::put_and_get_storage_type(
+        &http,
+        &ep,
+        &bucket,
+        "rel/v2.zip",
+        variant.clone(),
+        "application/zip",
+    )
+    .await;
+    assert_eq!(st, "delta", "the fixture needs a delta-stored object");
+    common::put_object(
+        &http,
+        &ep,
+        &bucket,
+        "rel/media/clip.mp4",
+        big.clone(),
+        "video/mp4",
+    )
+    .await;
+
+    let keys = [
+        "rel/v1.zip",
+        "rel/v2.zip",
+        "rel/ghost.bin",
+        "rel/media/clip.mp4",
+    ]
+    .map(|k| format!("{bucket}/{k}"))
+    .join(",");
+    let resp = admin
+        .get(format!("{ep}/_/api/admin/objects/zip"))
+        .query(&[("keys", keys)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    assert!(
+        resp.headers().get("content-length").is_none(),
+        "a streamed ZIP has no Content-Length: {:?}",
+        resp.headers()
+    );
+    let body = resp.bytes().await.unwrap();
+    let entries = unzip(&body);
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "v1.zip",
+            "v2.zip",
+            "media/clip.mp4",
+            "_deltaglider-skipped-files.txt"
+        ]
+    );
+    assert!(entries[0].1 == base, "reference object differs");
+    assert!(
+        entries[1].1 == variant,
+        "delta-reconstructed object differs"
+    );
+    assert!(entries[2].1 == big, "large passthrough object differs");
+    let report = String::from_utf8(entries[3].1.clone()).unwrap();
+    assert!(report.contains("rel/ghost.bin"), "{report}");
+}
+
+/// U4: an object that fails after its bytes started (here: its file on
+/// disk is shorter than its metadata says) aborts the download. The client
+/// sees a failed transfer, never a well-formed archive that lacks bytes.
+#[tokio::test]
+async fn test_zip_aborts_when_an_object_fails_mid_stream() {
+    let server = TestServer::builder().build().await;
+    let http = server.http();
+    let admin = admin_http_client(&server.endpoint()).await;
+    let ep = server.endpoint();
+    let bucket = server.bucket().to_string();
+    common::put_object(
+        &http,
+        &ep,
+        &bucket,
+        "m/a.mp4",
+        b"first".to_vec(),
+        "video/mp4",
+    )
+    .await;
+    let clip = common::big_passthrough_body(1024 * 1024);
+    common::put_object(&http, &ep, &bucket, "m/clip.mp4", clip, "video/mp4").await;
+    // Truncate the stored file in place; its xattr metadata keeps the size.
+    let stored = walkdir(server.data_dir().expect("filesystem data dir"))
+        .into_iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "clip.mp4"))
+        .expect("stored clip.mp4");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&stored)
+        .unwrap()
+        .set_len(1000)
+        .unwrap();
+
+    let resp = admin
+        .get(format!("{ep}/_/api/admin/objects/zip"))
+        .query(&[("keys", format!("{bucket}/m/a.mp4,{bucket}/m/clip.mp4"))])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.bytes().await;
+    assert!(body.is_err(), "the download must fail, got a complete body");
+}
+
+fn walkdir(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                todo.push(p);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 /// list_all expands a folder selection to the absolute key list.
 #[tokio::test]
 async fn test_list_all_expands_folder() {
@@ -676,6 +841,15 @@ async fn browser_session_bulk_ops_are_authorized_per_key() {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
+    // The denied key's bytes are not in the archive; the report names it.
+    let entries = unzip(&resp.bytes().await.unwrap());
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["dana/a.txt", "_deltaglider-skipped-files.txt"]);
+    let report = String::from_utf8(entries[1].1.clone()).unwrap();
+    assert!(
+        report.contains("shared/c.txt") && report.contains("AccessDenied"),
+        "{report}"
+    );
 
     // List: dana's folder expands; another folder lists as empty (the S3
     // LIST rule: admitted, and filtered to the keys the user can see).

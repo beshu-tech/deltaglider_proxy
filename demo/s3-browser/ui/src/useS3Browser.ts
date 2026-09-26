@@ -18,8 +18,7 @@ import { useOverlayClose } from './hooks/useOverlayClose';
 import useSelection from './useSelection';
 import { virtualWritableChildren } from './permissions';
 import { expandSelection } from './bulkSelection';
-import { ZIP_MAX_BYTES, downloadZip as saveZip, zipPreflightError } from './zipDownload';
-import { formatBytes } from './utils';
+import { downloadZip as saveZip, zipPreflightError } from './zipDownload';
 // Bulk actions → admin objects API; App gates them on `sessionCaps.canUseBulkActions`
 // (the server authorizes each key for a files-only session).
 import type { S3Object } from './types';
@@ -485,7 +484,7 @@ export default function useS3Browser(options: UseS3BrowserOptions) {
     if (outcome === 'saved') message.success(`Saved ${filename}`);
     if (outcome === 'started') {
       message.info(
-        `The ZIP download started. If it fails, your browser's download list shows it. One ZIP can hold at most ${formatBytes(ZIP_MAX_BYTES)}.`,
+        "The ZIP download started. If it fails, your browser's download list shows it.",
         8,
       );
     }

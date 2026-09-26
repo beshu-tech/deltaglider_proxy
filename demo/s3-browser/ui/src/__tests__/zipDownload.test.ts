@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { test } from 'vitest';
-import { zipPreflightError, ZIP_MAX_BYTES, downloadZip, type ZipDownloadDeps } from '../zipDownload';
+import { zipPreflightError, downloadZip, type ZipDownloadDeps } from '../zipDownload';
 import { ApiError, isSessionExpired } from '../errorHandling';
 
 // The limits mirror the server constants in src/api/admin/objects.rs.
@@ -22,8 +22,9 @@ test('mirrored constants match src/zipDownload.ts and src/api/admin/objects.rs',
     rust,
     new RegExp(`const MAX_BULK_OBJECTS: usize = ${ZIP_MAX_KEYS.toLocaleString('en-US').replace(/,/g, '_')};`),
   );
-  assert.equal(ZIP_MAX_BYTES, 500 * 1024 * 1024);
-  assert.match(rust, /const MAX_ZIP_BYTES: u64 = 500 \* 1024 \* 1024;/);
+  // The server streams the ZIP: no archive size cap on either side.
+  assert.doesNotMatch(rust, /MAX_ZIP_BYTES/);
+  assert.doesNotMatch(src, /ZIP_MAX_BYTES/);
 });
 
 test('zipPreflightError', () => {
@@ -63,11 +64,29 @@ function fakes(status: number, body = '', sizeBefore = 0): Fakes {
   return { calls, deps };
 }
 
-test('413: the empty file is deleted', async () => {
-  const { calls, deps } = fakes(413);
-  await assert.rejects(downloadZip('/zip', 'a.zip', deps), /more than 500\.0 MB, the limit for one ZIP/);
+test('413 (a file too large to read): the empty file is deleted, the server message shows', async () => {
+  const { calls, deps } = fakes(413, JSON.stringify({ error: 'object too large' }));
+  await assert.rejects(downloadZip('/zip', 'a.zip', deps), /object too large/);
   assert.equal(calls.removed, 1, '413: the empty file is deleted');
   assert.equal(calls.wrote, 0);
+});
+
+// U4: the server streams the archive and aborts the response when a file
+// fails after its bytes started. The transfer must fail visibly, and a new
+// file must not stay behind half-written.
+test('a transfer that breaks mid-stream: the new file is deleted, the error passes through', async () => {
+  for (const sizeBefore of [0, 4096]) {
+    const { calls, deps } = fakes(200, '', sizeBefore);
+    deps.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('PK\x03\x04 partial'));
+        c.error(new TypeError('network error'));
+      },
+    }), { status: 200 })) as typeof fetch;
+    await assert.rejects(downloadZip('/zip', 'a.zip', deps), /network error/);
+    assert.equal(calls.wrote, 1);
+    assert.equal(calls.removed, sizeBefore === 0 ? 1 : 0, `sizeBefore=${sizeBefore}`);
+  }
 });
 
 test('404: the empty file is deleted, ApiError carries the server message', async () => {

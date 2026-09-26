@@ -12,7 +12,7 @@
 //! - Network drops mid-loop left orphaned half-copies on `move`.
 //! - No cancellation, no progress, no atomicity.
 //! - Bulk zip downloaded each object via SDK GET, assembled in
-//!   browser memory (capped at 500 MB by `useS3Browser`).
+//!   browser memory.
 //!
 //! This module moves the orchestration into the proxy where the
 //! engine is already running. Endpoints live under `/_/api/admin/objects/*`
@@ -23,15 +23,14 @@
 //! — the same `can_with_context` check, with `aws:SourceIp`, that the S3
 //! API runs — and a denied key is reported per key ([`BulkActor`]).
 //!
-//! Future iterations can stream zip output and add server-side
-//! progress reporting; for v1 we match the existing client semantics
-//! 1:1 so the migration is risk-free.
+//! The zip streams: each object goes through the engine's streaming
+//! retrieve into a STORED/ZIP64 archive ([`crate::zip_stream`]), so server
+//! memory does not grow with the selection or the object size.
 
 use crate::api::admin::extract::{AdminJson, AdminQuery};
 use crate::api::handlers::AppState;
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -135,7 +134,6 @@ pub struct ZipQuery {
 
 const MAX_BULK_OBJECTS: usize = 10_000;
 const MAX_FAILURE_ENTRIES: usize = 100;
-const MAX_ZIP_BYTES: u64 = 500 * 1024 * 1024;
 
 fn dest_key(dest_prefix: &str, relative: &str) -> String {
     if dest_prefix.is_empty() {
@@ -882,10 +880,11 @@ pub async fn bulk_delete(
 // GET /_/api/admin/objects/zip?keys=bucket/key1,bucket/key2,...
 // ---------------------------------------------------------------------------
 //
-// In-memory zip assembly mirrors the previous client-side
-// implementation (capped at 500 MB total uncompressed). Streaming the
-// zip is a future improvement — for now we match the v1 contract so
-// the migration is a drop-in replacement.
+// The archive streams. The first readable entry opens BEFORE the answer, so
+// a request where no file can be read still gets an error status. A later
+// file that cannot be opened goes into the skip report inside the archive;
+// a file that fails after its bytes started aborts the download (see
+// `crate::zip_stream`). No size cap: memory is bounded by the stream.
 
 /// ZIP entry names for `(bucket, key)` pairs: each key's path below the
 /// deepest folder shared by the whole selection, so a zipped folder keeps its
@@ -968,96 +967,121 @@ pub async fn download_zip(
     }
 
     let actor = BulkActor::for_session(&state, &session)?;
-    let engine = state.s3_state.engine.load();
+    let engine = state.s3_state.engine.load_full();
     let names = zip_entry_names(&parsed);
-    let mut bytes_total: u64 = 0;
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::with_capacity(parsed.len());
     let mut skipped: Vec<(String, String)> = Vec::new();
     let mut failures: Vec<ZipFailure> = Vec::new();
-    for ((bucket, key), zip_name) in parsed.iter().zip(names) {
+    // Authorize every key first, against one IAM snapshot.
+    let mut entries: std::collections::VecDeque<crate::zip_stream::Entry<(String, String)>> =
+        std::collections::VecDeque::with_capacity(parsed.len());
+    for ((bucket, key), name) in parsed.iter().zip(names) {
+        let label = format!("{bucket}/{key}");
         if let Err(denied) = actor.check(S3Action::Read, bucket, key) {
             failures.push(ZipFailure::AccessDenied);
-            skipped.push((format!("{bucket}/{key}"), denied));
+            skipped.push((label, denied));
             continue;
         }
-        match engine.retrieve(bucket, key).await {
-            Ok((data, _meta)) => {
-                bytes_total += data.len() as u64;
-                if bytes_total > MAX_ZIP_BYTES {
-                    return Err((
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        format!("ZIP would exceed {} bytes; pick fewer files", MAX_ZIP_BYTES),
-                    ));
-                }
-                entries.push((zip_name, data));
+        entries.push_back(crate::zip_stream::Entry {
+            name,
+            label,
+            key: (bucket.clone(), key.clone()),
+            opened: None,
+        });
+    }
+    // Open the first readable entry before answering.
+    while let Some(mut first) = entries.pop_front() {
+        match open_zip_entry(&engine, &first.key.0, &first.key.1).await {
+            Ok(src) => {
+                first.opened = Some(src);
+                entries.push_front(first);
+                break;
             }
             Err(e) => {
-                debug!("zip: skipping {}/{}: {}", bucket, key, e);
+                debug!("zip: skipping {}: {}", first.label, e);
                 failures.push(zip_failure_kind(&e));
-                skipped.push((format!("{bucket}/{key}"), e.to_string()));
+                skipped.push((first.label, e.to_string()));
             }
         }
     }
-    match zip_skip_report(parsed.len(), &skipped) {
-        Err(msg) => return Err((zip_all_failed_status(&failures), msg)),
-        Ok(Some(report)) => {
-            let taken: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
-            entries.push((zip_skip_report_name(&taken), report.into_bytes()));
-        }
-        Ok(None) => {}
+    if entries.is_empty() {
+        let msg = zip_skip_report(parsed.len(), &skipped)
+            .err()
+            .unwrap_or_else(|| "no file to put in the ZIP".to_string());
+        return Err((zip_all_failed_status(&failures), msg));
     }
 
-    // Build an uncompressed zip via the existing `zip` crate. We emit
-    // STORED entries (no compression) because the bodies are typically
-    // already-compressed binaries; deflate buys little and costs CPU.
-    let mut buf = std::io::Cursor::new(Vec::with_capacity((bytes_total + 4096) as usize));
-    {
-        use zip::write::SimpleFileOptions;
-        use zip::ZipWriter;
-        let mut zw = ZipWriter::new(&mut buf);
-        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-        for (name, data) in &entries {
-            if let Err(e) = std::io::Write::write_all(
-                &mut {
-                    let started = zw.start_file(name, opts);
-                    if let Err(e) = started {
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("zip start_file: {}", e),
-                        ));
-                    }
-                    &mut zw
-                },
-                data,
-            ) {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("zip write: {}", e),
-                ));
+    info!(
+        "zip: streaming {} of {} selected files",
+        entries.len(),
+        parsed.len()
+    );
+    let requested = parsed.len();
+    let open_engine = engine.clone();
+    let stream = crate::zip_stream::stream_archive(
+        crate::zip_stream::Limits::ZIP,
+        entries.into(),
+        skipped,
+        move |(bucket, key): &(String, String)| {
+            let engine = open_engine.clone();
+            let (bucket, key) = (bucket.clone(), key.clone());
+            async move {
+                open_zip_entry(&engine, &bucket, &key)
+                    .await
+                    .map_err(|e| e.to_string())
             }
-        }
-        if let Err(e) = zw.finish() {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("zip finish: {}", e),
-            ));
-        }
-    }
-    let body = buf.into_inner();
+        },
+        move |written: &[String], skipped: &[(String, String)]| {
+            let report = zip_skip_report(requested, skipped).ok().flatten()?;
+            let taken: Vec<&str> = written.iter().map(String::as_str).collect();
+            Some((zip_skip_report_name(&taken), report.into_bytes()))
+        },
+    );
 
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let filename = format!("deltaglider-{}.zip", date);
-    let headers = [
-        ("Content-Type", "application/zip"),
-        // String literal won't outlive the response, but the format!
-        // result is owned; assemble inline below.
-    ];
-    let cd = format!("attachment; filename=\"{}\"", filename);
-
-    let mut resp = (StatusCode::OK, headers, body).into_response();
-    resp.headers_mut()
-        .insert("Content-Disposition", cd.parse().unwrap());
+    let cd = format!("attachment; filename=\"deltaglider-{date}.zip\"");
+    let mut resp = axum::response::Response::new(axum::body::Body::from_stream(stream));
+    let h = resp.headers_mut();
+    h.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/zip"),
+    );
+    h.insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        axum::http::HeaderValue::from_str(&cd).expect("ASCII date"),
+    );
+    h.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
     Ok(resp)
+}
+
+/// Open one object for the ZIP through the engine's streaming retrieve, the
+/// path an S3 GET takes: a passthrough object streams from the backend, a
+/// large delta decodes to a spool file first (integrity checked before the
+/// first byte), a small delta is already in memory.
+async fn open_zip_entry(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+    key: &str,
+) -> Result<crate::zip_stream::EntrySource, crate::deltaglider::EngineError> {
+    use crate::deltaglider::RetrieveResponse;
+    use futures::{StreamExt, TryStreamExt};
+    let (body, metadata) = match engine.retrieve_stream(bucket, key).await? {
+        RetrieveResponse::Streamed {
+            stream, metadata, ..
+        } => (stream.map_err(std::io::Error::other).boxed(), metadata),
+        RetrieveResponse::Buffered { data, metadata, .. } => {
+            (crate::zip_stream::in_memory_body(data), metadata)
+        }
+    };
+    Ok(crate::zip_stream::EntrySource {
+        // The size an S3 GET announces as Content-Length; the writer fails
+        // the entry when the body does not match it.
+        size: metadata.file_size,
+        modified: metadata.created_at,
+        body,
+    })
 }
 
 /// Archive entry that lists the files a partial ZIP could not include.

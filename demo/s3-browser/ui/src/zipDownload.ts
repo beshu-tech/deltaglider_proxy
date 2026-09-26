@@ -1,9 +1,9 @@
 /**
  * Bulk ZIP download (`GET /_/api/admin/objects/zip?keys=…`).
  *
- * The old flow clicked an `<a download>` link. A failed request (the 413 above
- * the 500 MB cap, a 400, a 5xx) then only cancelled the download: the page
- * showed nothing. The design here:
+ * The old flow clicked an `<a download>` link. A failed request (a 400, a
+ * 403, a 5xx) then only cancelled the download: the page showed nothing.
+ * The design here:
  *
  *  1. Preflight what the browser knows for free: the key count and the URL
  *     length. The server rejects more than 10,000 keys, and a request line
@@ -13,20 +13,20 @@
  *     error with the server's message. A 2xx body is piped straight into the
  *     file: it streams to disk and is never held in memory.
  *  3. Elsewhere (Firefox, Safari) keep the streaming `<a download>` link and
- *     say where a failure shows up. Buffering up to 500 MB in memory only to
+ *     say where a failure shows up. Buffering the archive in memory only to
  *     read the status is not worth it.
  *
- * The server builds the whole archive before it sends the first byte, so a
- * fetch that waits for the status costs nothing extra.
+ * The server streams the archive and has no size cap. It opens the first
+ * file before it answers, so a selection where no file can be read still
+ * gets an error status. A file that fails after its bytes started aborts
+ * the response: the transfer fails (and the picked file is discarded), it
+ * never ends as a ZIP that looks complete.
  */
 import { fetchWithRelogin } from './adminApi/core';
 import { throwApiError } from './errorHandling';
-import { formatBytes } from './utils';
 
 /** Mirrors `MAX_BULK_OBJECTS` in src/api/admin/objects.rs. */
 const ZIP_MAX_KEYS = 10_000;
-/** Mirrors `MAX_ZIP_BYTES` in src/api/admin/objects.rs. */
-export const ZIP_MAX_BYTES = 500 * 1024 * 1024;
 /** The HTTP stack refuses request targets of 64 KiB and more; keep a margin. */
 const ZIP_MAX_URL_LENGTH = 60_000;
 
@@ -127,12 +127,6 @@ export async function downloadZip(
     await discard();
     throw e;
   }
-  if (res.status === 413) {
-    await discard();
-    throw new Error(
-      `The selected files add up to more than ${formatBytes(ZIP_MAX_BYTES)}, the limit for one ZIP. Select fewer files.`,
-    );
-  }
   if (!res.ok) {
     await discard();
     await throwApiError(res, 'ZIP download');
@@ -144,7 +138,12 @@ export async function downloadZip(
   const writable = await handle.createWritable();
   // pipeTo closes the writable on success and aborts it when the connection
   // breaks: an aborted writable discards what it wrote and leaves the file's
-  // previous content.
-  await res.body.pipeTo(writable);
+  // previous content. A file that was new is deleted, like above.
+  try {
+    await res.body.pipeTo(writable);
+  } catch (e) {
+    await discard();
+    throw e;
+  }
   return 'saved';
 }

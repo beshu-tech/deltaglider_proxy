@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Changed — The bulk ZIP download streams, with no size limit
+
+`GET /_/api/admin/objects/zip` read every selected object into memory,
+built the whole archive, and only then sent it. Because of this, one ZIP
+was limited to 500 MB, and the proxy held up to 1 GB for each download.
+Now the proxy streams the archive while it reads each object through the
+same streaming path as an S3 `GET`, so server memory stays small for any
+object and any selection size. The 500 MB limit is removed. Entries are
+stored without compression and use ZIP64 records where a value needs them
+(an entry of 4 GiB or more). An object that fails after some of its bytes
+are sent stops the response before the central directory, so the download
+fails and never looks complete. In Chrome and Edge, a file that the browser
+created for a download that then fails is deleted.
+
 ### Fixed — A sanitised 500 logs its cause
 
 A request that failed with `500 InternalError` sends the client a generic

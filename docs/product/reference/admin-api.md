@@ -186,6 +186,23 @@ Server-side helpers behind the embedded S3 browser's bulk actions.
 
 These endpoints accept an admin GUI session and also the browser session of a user without admin rights (the session that an access-key sign-in in the file browser creates). For an admin session, the session is the authorization boundary. For a user without admin rights, the proxy checks every key against that user's own IAM permissions before it touches the key, with the same rules as the S3 API, including `aws:SourceIp` conditions. A copy needs `read` on the source key and `write` on the destination key; a move needs `delete` on the source key too; a delete needs `delete`; a ZIP needs `read`. A key that the user may not use is not touched: the response lists it under `failures` with an `AccessDenied` error, and the other keys are processed. A ZIP leaves such a key out and names it in the skip report inside the archive; when no selected key may be read, the ZIP answers `403`. A folder listing (`objects/list`) returns only the keys that the user can see, like an S3 `LIST`. Because a move deletes its sources only when every copy succeeded, one denied key keeps all the sources of that move in place. In open mode (`authentication: none`) an open browser session may use the endpoints without checks, like the S3 API in open mode.
 
+### `GET /_/api/admin/objects/zip`
+
+| Parameter | Value |
+|---|---|
+| `keys` | A comma-separated list of `bucket/key` entries, at most 10,000. The request line must stay below 64 KiB. |
+
+The response is `200` with `Content-Type: application/zip` and `Content-Disposition: attachment; filename="deltaglider-<date>.zip"`. The proxy streams the archive while it reads the objects, so the response has no `Content-Length` header and no size limit. Each object is read through the same path as an S3 `GET`, so a delta-stored object is reconstructed before its bytes enter the archive. The proxy does not hold a whole object or the whole archive in memory.
+
+The archive uses these format choices:
+
+- Every entry is stored without compression (method `STORE`). Most objects that the proxy holds are already compressed, so compression would cost CPU time and save little space.
+- Every entry has a data descriptor, because the proxy computes the CRC-32 of an entry while its bytes pass through.
+- An entry of 4 GiB or more, an entry that starts after the first 4 GiB, and an archive with 65,535 entries or more use ZIP64 records. Tools without ZIP64 support cannot open such an archive; Info-ZIP `unzip` 6 and Python's `zipfile` read it.
+- Entry names are the keys below the deepest folder that all selected keys share. When the keys come from more than one bucket, each name starts with its bucket.
+
+Before the proxy sends the response headers, it checks every key against the caller's permissions and opens the first readable object. When no selected object can be read, the request fails with an error status instead of an empty archive: `404` when every object is missing, `403` when access to any object was denied, `413` when an object is too large to read, `503` when the proxy or the backend sheds load, and `502` for other backend failures. After the headers are sent, an object that cannot be opened is left out and named in a `_deltaglider-skipped-files.txt` entry at the end of the archive. An object that fails after some of its bytes are sent, or that ends with fewer bytes than its size, stops the response before the archive's central directory. The client then sees a failed or incomplete download, and never an archive that looks complete but lacks bytes.
+
 ## Jobs — one surface for everything background
 
 Replication rules, lifecycle rules, and one-off maintenance jobs (re-encrypt,

@@ -1220,6 +1220,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "crc32fast",
  "criterion",
  "dashmap",
  "futures",

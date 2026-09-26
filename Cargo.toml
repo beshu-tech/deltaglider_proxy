@@ -24,6 +24,10 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# The ZIP64 unit test CRCs 4 GiB twice; unoptimised that takes 20 s.
+[profile.dev.package.crc32fast]
+opt-level = 3
+
 # `tokio_unstable` is passed via RUSTFLAGS (nightly workflow + opt-in builds)
 # to unlock tokio's RuntimeMetrics API — the #87 runtime sampler. Declared
 # here so `unexpected_cfgs` doesn't warn on every build.
@@ -105,6 +109,7 @@ moka = { version = "0.12", features = ["sync", "future"] }
 bytes = "1"
 futures = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 multer = "3"
+crc32fast = "1"
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 # compression-*: gzip/br for the embedded UI assets only (see demo.rs).
 tower-http = { version = "0.6", features = ["trace", "cors", "timeout", "compression-gzip", "compression-br"] }

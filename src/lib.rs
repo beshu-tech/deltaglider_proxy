@@ -46,6 +46,7 @@ pub(crate) mod transfer;
 pub mod transfer_plan;
 pub mod types;
 pub mod usage_scanner;
+pub mod zip_stream;
 
 /// Source guards: rules that a unit test cannot express per call site.
 #[cfg(test)]
