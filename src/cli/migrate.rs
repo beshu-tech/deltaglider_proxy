@@ -422,7 +422,7 @@ async fn build_engines_from_args(
     };
     let dst_engine = Arc::new(build_cli_engine(dst_opts).await.map_err(|e| {
         eprintln!("error: failed to initialise destination S3 client: {e}");
-        cli_exit::EXIT_HTTP
+        e.exit_code()
     })?);
 
     let src_engine = match args.source_endpoint_url.as_deref() {
@@ -441,7 +441,7 @@ async fn build_engines_from_args(
             };
             Arc::new(build_cli_engine(src_opts).await.map_err(|e| {
                 eprintln!("error: failed to initialise source S3 client: {e}");
-                cli_exit::EXIT_HTTP
+                e.exit_code()
             })?)
         }
     };

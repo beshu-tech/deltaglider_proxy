@@ -46,10 +46,74 @@ pub struct CliEngineOpts {
 pub enum BuildError {
     #[error("engine init failed: {0}")]
     Engine(#[from] StorageError),
+    #[error(
+        "{0} is a DeltaGlider Proxy. The s3 verbs write and read the delta storage \
+         layout themselves, so they must talk to the storage backend behind the proxy \
+         (its S3 endpoint), not to the proxy. To use the proxy, use any plain S3 client \
+         (for example `aws s3 --endpoint-url {0}`)."
+    )]
+    ProxyEndpoint(String),
 }
 
-/// Build a one-shot engine pointed at the supplied S3 endpoint.
+impl BuildError {
+    /// Exit code: a proxy endpoint is a usage error, the rest are HTTP.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Engine(_) => crate::cli::config::EXIT_HTTP,
+            Self::ProxyEndpoint(_) => crate::cli::config::EXIT_USAGE,
+        }
+    }
+}
+
+/// Pure: does this `GET /_/health` answer come from a DeltaGlider Proxy?
+/// Its liveness JSON carries `status` plus the reference-cache fields; a
+/// plain S3 endpoint answers `/_/health` with an S3 error (`_` is not a
+/// valid bucket name).
+pub fn is_deltaglider_health(status: u16, body: &[u8]) -> bool {
+    if status != 200 {
+        return false;
+    }
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    v.get("status").is_some_and(|s| s.is_string())
+        && v.get("cache_max_bytes").is_some()
+        && v.get("peak_rss_bytes").is_some()
+}
+
+/// Refuse an endpoint that is a DeltaGlider Proxy. One unauthenticated
+/// `GET /_/health` (no credentials sent); any probe failure means "not a
+/// proxy" and the verb goes on.
+async fn refuse_proxy_endpoint(endpoint: Option<&str>) -> Result<(), BuildError> {
+    let Some(endpoint) = endpoint else {
+        return Ok(());
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    else {
+        return Ok(());
+    };
+    let url = format!("{}/_/health", endpoint.trim_end_matches('/'));
+    let Ok(resp) = client.get(&url).send().await else {
+        return Ok(());
+    };
+    let status = resp.status().as_u16();
+    let body = resp.bytes().await.unwrap_or_default();
+    if is_deltaglider_health(status, &body) {
+        return Err(BuildError::ProxyEndpoint(endpoint.to_string()));
+    }
+    Ok(())
+}
+
+/// Build a one-shot engine pointed at the supplied S3 endpoint. Refuses
+/// a DeltaGlider Proxy endpoint (see [`BuildError::ProxyEndpoint`]).
 pub async fn build_cli_engine(opts: CliEngineOpts) -> Result<DynEngine, BuildError> {
+    refuse_proxy_endpoint(opts.endpoint.as_deref()).await?;
+    build_engine(opts).await
+}
+
+async fn build_engine(opts: CliEngineOpts) -> Result<DynEngine, BuildError> {
     // `allow_local` flows through the typed `BackendConfig::S3` field
     // instead of via the `DGP_BACKEND_ALLOW_LOCAL` env var. The legacy
     // env path still works for backward compat (handled inside
@@ -158,6 +222,61 @@ mod tests {
     /// build the engine here (no MinIO assumed) — just verify the
     /// overrides land.
     #[test]
+    fn deltaglider_health_is_recognised() {
+        let dg = br#"{"status":"healthy","backend":"live","peak_rss_bytes":1,"cache_size_bytes":0,"cache_max_bytes":10,"cache_entries":0,"cache_utilization_pct":0.0}"#;
+        assert!(is_deltaglider_health(200, dg));
+        assert!(!is_deltaglider_health(503, dg));
+        assert!(!is_deltaglider_health(
+            400,
+            b"<Error><Code>InvalidBucketName</Code></Error>"
+        ));
+        assert!(!is_deltaglider_health(200, br#"{"status":"ok"}"#));
+        assert!(!is_deltaglider_health(200, b"not json"));
+    }
+
+    /// One-shot HTTP server answering every request with `status` + `body`.
+    async fn answering(status: &'static str, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        endpoint
+    }
+
+    #[tokio::test]
+    async fn a_proxy_endpoint_is_refused_and_a_plain_one_is_not() {
+        let proxy = answering(
+            "200 OK",
+            r#"{"status":"healthy","backend":"live","peak_rss_bytes":1,"cache_size_bytes":0,"cache_max_bytes":10,"cache_entries":0,"cache_utilization_pct":0.0}"#,
+        )
+        .await;
+        let err = refuse_proxy_endpoint(Some(&proxy)).await.unwrap_err();
+        assert_eq!(err.exit_code(), crate::cli::config::EXIT_USAGE);
+        assert!(err.to_string().contains("is a DeltaGlider Proxy"), "{err}");
+        let plain = answering(
+            "400 Bad Request",
+            "<Error><Code>InvalidBucketName</Code></Error>",
+        )
+        .await;
+        assert!(refuse_proxy_endpoint(Some(&plain)).await.is_ok());
+        // Unreachable endpoint: the probe is no verdict, the verb goes on.
+        assert!(refuse_proxy_endpoint(Some("http://127.0.0.1:1"))
+            .await
+            .is_ok());
+        assert!(refuse_proxy_endpoint(None).await.is_ok());
+    }
+
+    #[test]
     fn cli_opts_override_default_backend() {
         let backend = BackendConfig::S3 {
             session_token: None,
@@ -251,7 +370,8 @@ mod tests {
     #[tokio::test]
     async fn engine_sends_the_session_token() {
         let head = capture_head(|endpoint| async move {
-            let engine = build_cli_engine(CliEngineOpts {
+            // `build_engine`: the probe would take the one-shot socket.
+            let engine = build_engine(CliEngineOpts {
                 endpoint: Some(endpoint),
                 region: "us-east-1".into(),
                 force_path_style: true,

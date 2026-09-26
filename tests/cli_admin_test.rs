@@ -299,3 +299,39 @@ async fn test_admission_trace_matches_public_prefix_after_apply() {
     assert_eq!(body["admission"]["decision"], "allow-anonymous");
     assert_eq!(body["admission"]["matched"], "public-prefix:dogfood-bucket");
 }
+
+/// Explore #15: the `s3` verbs write the delta layout themselves, so
+/// pointed at the proxy they fail with the proxy's "reserved for internal
+/// use" 400 (or double-encode). The CLI now probes the endpoint and says
+/// that it is a DeltaGlider Proxy, before it sends any object request.
+#[tokio::test]
+async fn test_s3_verbs_refuse_a_deltaglider_proxy_endpoint() {
+    let server = TestServer::builder()
+        .auth("CLIPROXYK", "CLIPROXYS")
+        .bucket("releases")
+        .build()
+        .await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let file = dir.path().join("app.zip");
+    std::fs::write(&file, b"payload").unwrap();
+    for args in [
+        vec!["s3", "cp", file.to_str().unwrap(), "s3://releases/app.zip"],
+        vec!["s3", "ls", "s3://releases/"],
+    ] {
+        let out = Command::new(BIN)
+            .args(&args)
+            .args(["--endpoint-url", &server.endpoint()])
+            .env("AWS_ACCESS_KEY_ID", "CLIPROXYK")
+            .env("AWS_SECRET_ACCESS_KEY", "CLIPROXYS")
+            .env("AWS_REGION", "us-east-1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("is a DeltaGlider Proxy"),
+            "{args:?}: {stderr}"
+        );
+        assert!(stderr.contains("storage backend"), "{args:?}: {stderr}");
+    }
+}

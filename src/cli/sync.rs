@@ -686,7 +686,7 @@ async fn build_engine_from_args(args: &SyncArgs) -> Result<DynEngine, i32> {
     };
     build_cli_engine(opts).await.map_err(|e| {
         eprintln!("error: failed to initialise S3 client: {e}");
-        cli_exit::EXIT_HTTP
+        e.exit_code()
     })
 }
 

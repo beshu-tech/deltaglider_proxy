@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed — The `s3` CLI verbs refuse a DeltaGlider Proxy endpoint
+
+The `s3` verbs run their own delta engine and write the storage layout
+themselves, so they must talk to the storage backend. Pointed at the proxy,
+they failed with an unclear `400` on the internal key names. Now each engine
+verb (`ls`, `cp`, `rm`, `sync`, `stats`, `verify`, `migrate`) first sends one
+unauthenticated `GET /_/health` to `--endpoint-url`. When the endpoint is a
+DeltaGlider Proxy, the verb stops with exit code `2` and says to use the
+backend's endpoint, or a plain S3 client for the proxy.
+
 ### Fixed — An `allow-anonymous` request rule lets the matched read through
 
 An operator-authored `allow-anonymous` rule (for example, the documented

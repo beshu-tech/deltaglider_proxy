@@ -108,7 +108,7 @@ pub async fn run(args: LsArgs) -> i32 {
         Ok(e) => e,
         Err(e) => {
             eprintln!("error: failed to initialise S3 client: {e}");
-            return cli_exit::EXIT_HTTP;
+            return e.exit_code();
         }
     };
 
