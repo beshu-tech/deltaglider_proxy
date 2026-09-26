@@ -40,7 +40,7 @@ import {
 import { traceAdmission } from '../adminApi';
 import { isSessionExpired, normalizeUiError } from '../errorHandling';
 import { useCopyToClipboard } from '../useCopyToClipboard';
-import { buildTraceBody } from '../traceRequest';
+import { buildTraceBody, describeAnonymousGrant, type AnonymousGrant } from '../traceRequest';
 import { useColors } from '../ThemeContext';
 import { useCardStyles, contentColumn, CONTENT_FORM } from './shared-styles';
 import { METHODS } from '../schemas/admissionSchema';
@@ -70,6 +70,8 @@ interface TraceDecision {
 interface TraceResponse {
   resolved: TraceResolved;
   admission: TraceDecision;
+  /** What an allow-anonymous decision grants; `null` otherwise and for writes. */
+  anonymous_grant?: AnonymousGrant | null;
 }
 
 interface Props {
@@ -222,6 +224,16 @@ export default function TracePanel({ onSessionExpired }: Props) {
             description="How the request rules decided your request."
           />
           <DecisionSummary result={result} />
+          {result.admission.decision === 'allow-anonymous' && (
+            <div style={{ marginTop: 16, borderTop: `1px solid ${colors.BORDER}`, paddingTop: 14 }}>
+              <Text style={subHeaderStyle(colors.TEXT_MUTED)}>Anonymous access</Text>
+              <Alert
+                type={result.anonymous_grant ? 'success' : 'warning'}
+                showIcon
+                title={describeAnonymousGrant(result.anonymous_grant)}
+              />
+            </div>
+          )}
           <div style={{ marginTop: 16, borderTop: `1px solid ${colors.BORDER}`, paddingTop: 14 }}>
             <Text style={subHeaderStyle(colors.TEXT_MUTED)}>Reason path</Text>
             <ReasonPath result={result} />
@@ -256,7 +268,9 @@ export default function TracePanel({ onSessionExpired }: Props) {
             <Paragraph type="secondary" style={{ fontSize: 13, marginBottom: 0 }}>
               The test uses the same request rules as real traffic,
               but sends nothing to the backends. <b>Decision</b> is
-              what happens to the request. <b>Reason path</b> shows
+              what happens to the request. <b>Anonymous access</b>{' '}
+              shows what an allow-anonymous rule lets a caller without
+              credentials do. <b>Reason path</b> shows
               which rule matched and which condition decided it.{' '}
               <b>Resolved request</b> shows how the path splits into
               bucket and object key, which helps when you debug a
@@ -372,7 +386,9 @@ function ReasonPath({ result }: { result: TraceResponse }) {
   // Line 3: terminal action.
   const actionLine =
     admission.decision === 'allow-anonymous'
-      ? 'action: allow-anonymous (skips SigV4 check)'
+      ? result.anonymous_grant
+        ? 'action: allow-anonymous (skips SigV4 check)'
+        : 'action: allow-anonymous (write: no grant, 403 AccessDenied)'
       : admission.decision === 'deny'
         ? 'action: deny (403 Forbidden, S3-style)'
         : admission.decision === 'reject'

@@ -44,6 +44,8 @@ curl -b cookies "https://s3.acme.example/_/api/admin/config/trace?method=PUT&pat
 
 The trace output is a decision plus the path that produced it: the decision tag (allow / allow-anonymous / deny / reject), the **matched rule** by name, and the resolved request as the evaluator saw it. The first matching rule decides, so the named rule is the complete answer — nothing after it was consulted.
 
+When the decision is `allow-anonymous`, the output also says what the rule lets a caller without credentials do. The API returns this in the `anonymous_grant` field, and the admin UI shows it in an **Anonymous access** box. The rule grants only reads: a `GET` or `HEAD` of the matched object, a listing of the matched bucket with the requested prefix, or, for a public-access rule, the public prefixes of the bucket. A write is never granted. So a `PUT` that matches an `allow-anonymous` rule shows no grant, and the box says that the request continues without credentials and is refused with `403 AccessDenied`.
+
 Worked example — `downloads` has a public prefix:
 
 ```yaml

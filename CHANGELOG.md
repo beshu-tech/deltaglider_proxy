@@ -17,6 +17,16 @@ fails and never looks complete. In Chrome and Edge, a file that the browser
 created for a download that then fails is deleted. A ZIP download now writes a
 `bulk_zip` audit entry, like a bulk copy, move, or delete.
 
+### Added — The rule tester shows what an anonymous caller may do
+
+The trace response carries `anonymous_grant`, but the admin UI showed only
+the decision. So `allow-anonymous` on a `PUT` looked like an allowed upload,
+although the proxy refuses it with `403`. Now the **Request rule tester**
+shows an **Anonymous access** box for every `allow-anonymous` decision. It
+names the one object that the caller may read, the bucket and prefix that
+the caller may list, or the public prefixes of the bucket. For a write, it
+says that nothing is granted.
+
 ### Fixed — A sanitised 500 logs its cause
 
 A request that failed with `500 InternalError` sends the client a generic
