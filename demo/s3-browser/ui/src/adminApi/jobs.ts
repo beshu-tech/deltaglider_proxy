@@ -224,7 +224,7 @@ export async function runJobAction(id: string, action: JobAction): Promise<unkno
 }
 
 /** One object a lifecycle rule would act on (mirrors `PreviewObject`). */
-export interface LifecycleCandidate {
+interface LifecycleCandidate {
   bucket: string;
   key: string;
   action: 'delete' | 'transition' | string;

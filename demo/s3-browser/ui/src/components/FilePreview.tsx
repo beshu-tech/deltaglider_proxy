@@ -2,8 +2,8 @@ import { useState, useEffect } from 'react';
 import { Modal, Spin, Alert, Button, Typography } from 'antd';
 import { DownloadOutlined } from '@ant-design/icons';
 import type { S3Object } from '../types';
-import { downloadObject, getPresignedUrl } from '../s3client';
-import { formatBytes, getFileName, downloadBlobAsFile } from '../utils';
+import { downloadObject, getDownloadUrl, getPresignedUrl } from '../s3client';
+import { formatBytes, getFileName, downloadFromUrl } from '../utils';
 import { useColors } from '../ThemeContext';
 import { getPreviewMode } from './filePreviewMode';
 import { normalizeUiError } from '../errorHandling';
@@ -77,11 +77,11 @@ export default function FilePreview({ open, object, onClose }: FilePreviewProps)
     // keep exhaustive-deps happy and to make the effect's read set self-evident.
   }, [open, object, mode, tooLarge]);
 
+  // Native, streamed download (see InspectorPanel): no page-memory Blob.
   const handleDownload = async () => {
     if (!object) return;
     try {
-      const blob = await downloadObject(object.key);
-      downloadBlobAsFile(blob, filename);
+      downloadFromUrl(await getDownloadUrl(object.key, filename), filename);
     } catch {
       setError('Download failed');
     }

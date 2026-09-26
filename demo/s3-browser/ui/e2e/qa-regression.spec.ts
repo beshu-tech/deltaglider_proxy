@@ -243,12 +243,10 @@ test('1. bootstrap login, create bucket, upload, inspect, preview, download, del
   await page.keyboard.press('Escape');
   await expect(preview).toBeHidden();
 
-  // Download and check the bytes.
-  await page.getByRole('button', { name: /^download Download$/ }).click();
-  await expect(page.getByText('File ready')).toBeVisible({ timeout: 30_000 });
+  // Download (one click: the browser streams a presigned URL) and check the bytes.
   const [dl] = await Promise.all([
-    page.waitForEvent('download'),
-    page.getByRole('button', { name: /Save file/ }).click(),
+    page.waitForEvent('download', { timeout: 30_000 }),
+    page.getByRole('button', { name: /^download Download$/ }).click(),
   ]);
   expect(dl.suggestedFilename()).toBe('notes.txt');
   const path = await dl.path();

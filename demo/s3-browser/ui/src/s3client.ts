@@ -498,6 +498,22 @@ export async function getPresignedUrl(key: string, expiresInSeconds = 7 * 24 * 3
   }
 }
 
+/**
+ * A short-lived presigned GET that makes the browser SAVE the object under
+ * `filename` (response-content-disposition). The browser's own downloader
+ * streams it to disk: no Blob in page memory, whatever the object size.
+ */
+export async function getDownloadUrl(key: string, filename: string, expiresInSeconds = 300): Promise<string> {
+  const ascii = filename.replace(/[^\x20-\x7e]|["\\]/g, '_');
+  const disposition = `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+  try {
+    const command = new GetObjectCommand({ Bucket: activeBucket, Key: key, ResponseContentDisposition: disposition });
+    return await getSignedUrl(getClient(), command, { expiresIn: expiresInSeconds });
+  } catch (err) {
+    throw normalizeS3Error(err, `Create download URL for ${key}`);
+  }
+}
+
 export function getObjectUrl(key: string): string {
   return `${getEndpoint()}/${activeBucket}/${encodeURIComponent(key)}`;
 }

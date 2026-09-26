@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Drawer, Button, Modal, message, Tag, Skeleton, Input, Spin } from 'antd';
 import { DownloadOutlined, DeleteOutlined, LinkOutlined, FileOutlined, CloseOutlined, CheckCircleFilled, CopyOutlined, LoadingOutlined, EyeOutlined } from '@ant-design/icons';
-import { deleteObject, downloadObject, getPresignedUrl, getObjectUrl, headObject, getBucket } from '../s3client';
+import { deleteObject, getDownloadUrl, getPresignedUrl, getObjectUrl, headObject, getBucket } from '../s3client';
 import { GlobalOutlined } from '@ant-design/icons';
-import { formatBytes, getFileName, downloadBlobAsFile } from '../utils';
+import { formatBytes, getFileName, downloadFromUrl } from '../utils';
+import { normalizeUiError } from '../errorHandling';
 import { isBaselineObject, summarizeObjectSavings } from '../savings';
 import { bucketPolicyFor } from '../bucketPolicyLookup';
 import type { S3Object } from '../types';
@@ -243,11 +244,9 @@ export default function InspectorPanel({
 
   // Modal state for download / share operations (must be declared before early return)
   const [modalState, setModalState] = useState<
-    | { mode: 'download'; phase: 'loading' | 'ready' | 'error'; error?: string }
     | { mode: 'share'; phase: 'loading' | 'ready' | 'error'; url?: string; error?: string }
     | null
   >(null);
-  const blobRef = useRef<{ blob: Blob; name: string } | null>(null);
   const [shareDuration, setShareDuration] = useState<number | null>(null);
   const [showInternalMeta, setShowInternalMeta] = useState(false);
   const { copy: copyToClipboard } = useCopyToClipboard();
@@ -328,7 +327,6 @@ export default function InspectorPanel({
 
   const closeModal = useCallback(() => {
     setModalState(null);
-    blobRef.current = null;
   }, []);
 
   // Clear any in-flight / completed download or share modal when the selected
@@ -414,27 +412,19 @@ export default function InspectorPanel({
     }
   };
 
+  // The browser's own downloader streams the object to disk from a presigned
+  // URL (a delta is reconstructed by the proxy as it streams). No page-memory
+  // Blob and no second "Save file" click.
   const handleDownload = async () => {
     const reqKey = object.key;
-    const reqName = fileName;
-    setModalState({ mode: 'download', phase: 'loading' });
-    blobRef.current = null;
     try {
-      const blob = await downloadObject(reqKey);
-      // Stale-commit guard: drop the result if the selection changed mid-flight.
+      const url = await getDownloadUrl(reqKey, fileName);
       if (latestKeyRef.current !== reqKey) return;
-      blobRef.current = { blob, name: reqName };
-      setModalState({ mode: 'download', phase: 'ready' });
+      downloadFromUrl(url, fileName);
     } catch (e) {
       if (latestKeyRef.current !== reqKey) return;
-      setModalState({ mode: 'download', phase: 'error', error: String(e) });
+      messageApi.error(`Download failed: ${normalizeUiError(e, 'unknown error')}`);
     }
-  };
-
-  const triggerBlobDownload = () => {
-    if (!blobRef.current) return;
-    downloadBlobAsFile(blobRef.current.blob, blobRef.current.name);
-    closeModal();
   };
 
   const handleCopyLink = async (expiresInSeconds?: number) => {
@@ -797,71 +787,6 @@ export default function InspectorPanel({
         mask={{ closable: modalState?.phase !== 'loading' }}
         styles={{ body: { padding: '32px 24px', textAlign: 'center' } }}
       >
-        {modalState?.mode === 'download' && (
-          <>
-            {modalState.phase === 'loading' && (
-              <div style={MODAL_CENTER_STACK}>
-                <LoadingSpinner size={40} color={ACCENT_GREEN} />
-                <div>
-                  <div style={{ fontSize: 16, fontWeight: 600, color: TEXT_PRIMARY, marginBottom: 6, fontFamily: "var(--font-ui)" }}>
-                    Reconstructing file…
-                  </div>
-                  <div style={{ fontSize: 13, color: TEXT_MUTED, lineHeight: 1.5, fontFamily: "var(--font-ui)" }}>
-                    The proxy is assembling the original file from its
-                    delta-compressed storage. This may take a moment for
-                    large files.
-                  </div>
-                  <div style={{ fontSize: 12, color: TEXT_FAINT, marginTop: 8, fontFamily: "var(--font-mono)" }}>
-                    {fileName} · {formatBytes(object.size)}
-                  </div>
-                </div>
-              </div>
-            )}
-            {modalState.phase === 'ready' && (
-              <div style={MODAL_CENTER_STACK}>
-                <CheckCircleFilled style={{ fontSize: 40, color: ACCENT_GREEN }} />
-                <div>
-                  <div style={{ fontSize: 16, fontWeight: 600, color: TEXT_PRIMARY, marginBottom: 6, fontFamily: "var(--font-ui)" }}>
-                    File ready
-                  </div>
-                  <div style={{ fontSize: 12, color: TEXT_FAINT, fontFamily: "var(--font-mono)" }}>
-                    {fileName} · {formatBytes(object.size)}
-                  </div>
-                </div>
-                <Button
-                  type="primary"
-                  size="large"
-                  icon={<DownloadOutlined />}
-                  onClick={triggerBlobDownload}
-                  style={{
-                    background: ACCENT_GREEN,
-                    borderColor: ACCENT_GREEN,
-                    fontWeight: 600,
-                    borderRadius: 10,
-                    fontFamily: "var(--font-ui)",
-                    minWidth: 180,
-                  }}
-                >
-                  Save file
-                </Button>
-              </div>
-            )}
-            {modalState.phase === 'error' && (
-              <div style={MODAL_CENTER_STACK}>
-                <DeleteOutlined style={{ fontSize: 40, color: ACCENT_RED }} />
-                <div>
-                  <div style={{ fontSize: 16, fontWeight: 600, color: ACCENT_RED, marginBottom: 6, fontFamily: "var(--font-ui)" }}>
-                    Download failed
-                  </div>
-                  <div style={{ fontSize: 13, color: TEXT_MUTED, fontFamily: "var(--font-ui)" }}>
-                    {modalState.error || 'An unexpected error occurred'}
-                  </div>
-                </div>
-              </div>
-            )}
-          </>
-        )}
-
         {modalState?.mode === 'share' && (
           <>
             {modalState.phase === 'loading' && (

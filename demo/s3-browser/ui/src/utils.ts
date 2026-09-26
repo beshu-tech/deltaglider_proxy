@@ -28,16 +28,15 @@ export function getFileName(key: string): string {
   return key.split('/').pop() || key;
 }
 
-/** Trigger a browser download of `blob` as `filename` via a transient object URL. */
-export function downloadBlobAsFile(blob: Blob, filename: string): void {
-  const url = URL.createObjectURL(blob);
+/** Hand `url` to the browser's own downloader (streams to disk; no Blob). */
+export function downloadFromUrl(url: string, filename: string): void {
   const a = document.createElement('a');
   a.href = url;
   a.download = filename;
+  a.rel = 'noopener';
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 /** "1 item" / "3 items" — count-aware pluralisation. */
