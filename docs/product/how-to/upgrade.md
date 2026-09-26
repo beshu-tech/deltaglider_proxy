@@ -208,7 +208,7 @@ With `DGP_ENCRYPTION_KEY` in the environment unchanged.
 
 **If you had no encryption configured pre-0.9:** nothing to do. Your backends default to `encryption: none`.
 
-**If you want to move from proxy-AES to SSE-KMS as part of the upgrade:** do the upgrade first (keep your existing key), then configure the decrypt-only shim to migrate. See [Encryption reference](../reference/encryption.md).
+**If you want to move from proxy-AES to SSE-KMS as part of the upgrade:** do the upgrade first and keep your existing key. Then move each bucket to a new SSE-KMS backend with the migrate job, because the re-encrypt job does not write to SSE backends. The steps are in [Recipe C: migrate from proxy-AES to SSE-KMS](rotate-encryption-keys.md#recipe-c-migrate-from-proxy-aes-to-sse-kms).
 
 ## Verify
 
