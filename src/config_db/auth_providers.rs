@@ -530,7 +530,7 @@ impl ConfigDb {
     /// The INSERT of [`Self::create_external_identity`] on `conn` (a caller's
     /// transaction or the plain connection). Returns the new identity id.
     #[allow(clippy::too_many_arguments)]
-    fn insert_external_identity(
+    pub(super) fn insert_external_identity(
         conn: &rusqlite::Connection,
         user_id: i64,
         provider_id: i64,

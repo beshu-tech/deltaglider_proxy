@@ -34,6 +34,7 @@ mod groups;
 pub(crate) mod iam_merge;
 pub(crate) mod job_store;
 pub mod key;
+pub mod restore;
 mod users;
 pub(crate) use users::first_free_user_name;
 

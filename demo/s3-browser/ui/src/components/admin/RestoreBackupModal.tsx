@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Alert, Button, Modal, Radio, Space, Typography } from 'antd';
-import type { ImportBackupMode } from '../../adminApi';
+import type { ImportBackupMode, ImportIamMode } from '../../adminApi';
 import { useIamMode } from '../../queries/config';
 
 const { Text } = Typography;
@@ -9,7 +9,7 @@ interface Props {
   /** The picked zip; the modal is open while it is set. */
   file: File | null;
   onCancel: () => void;
-  onRestore: (file: File, mode: ImportBackupMode) => void;
+  onRestore: (file: File, mode: ImportBackupMode, iam: ImportIamMode) => void;
 }
 
 /** Every restore mode, in the order shown; `iam` marks modes that write IAM. */
@@ -40,6 +40,20 @@ const MODES: { mode: ImportBackupMode; label: string; help: string; iam: boolean
   },
 ];
 
+/** How an IAM-writing restore treats the users and groups that exist now. */
+const IAM_MODES: { iam: ImportIamMode; label: string; help: string }[] = [
+  {
+    iam: 'replace',
+    label: 'Replace (point in time)',
+    help: 'After the restore, users, groups and OIDC providers are exactly those in the backup. Entries that the backup does not hold are deleted, and entries that it holds are overwritten.',
+  },
+  {
+    iam: 'merge',
+    label: 'Merge (keep existing)',
+    help: 'Entries that the backup does not hold are kept. Entries that exist now are not overwritten; only missing ones are added.',
+  },
+];
+
 /**
  * Restore-mode chooser for a Full Backup zip: one list of choices, each with
  * its own description, and a single Restore button. (It used to be five
@@ -59,6 +73,9 @@ export default function RestoreBackupModal({ file, onCancel, onRestore }: Props)
   const [pick, setPick] = useState<{ file: File | null; mode: ImportBackupMode } | null>(null);
   const mode =
     pick && pick.file === file && modes.some((m) => m.mode === pick.mode) ? pick.mode : modes[0].mode;
+  const [iamPick, setIamPick] = useState<{ file: File | null; iam: ImportIamMode } | null>(null);
+  const iam: ImportIamMode = iamPick && iamPick.file === file ? iamPick.iam : 'replace';
+  const writesIam = MODES.find((m) => m.mode === mode)?.iam ?? false;
 
   return (
     <Modal
@@ -72,8 +89,8 @@ export default function RestoreBackupModal({ file, onCancel, onRestore }: Props)
         <Button
           key="restore"
           type="primary"
-          danger={mode === 'full'}
-          onClick={() => file && onRestore(file, mode)}
+          danger={mode === 'full' || (writesIam && iam === 'replace')}
+          onClick={() => file && onRestore(file, mode, iam)}
         >
           Restore
         </Button>,
@@ -114,6 +131,29 @@ export default function RestoreBackupModal({ file, onCancel, onRestore }: Props)
             ))}
           </Space>
         </Radio.Group>
+        {writesIam && (
+          <>
+            <Text strong>Users, groups and OIDC providers that exist now</Text>
+            <Radio.Group
+              value={iam}
+              onChange={(e) => setIamPick({ file, iam: e.target.value })}
+              style={{ width: '100%' }}
+              aria-label="Users, groups and OIDC providers that exist now"
+            >
+              <Space orientation="vertical" size={10} style={{ width: '100%' }}>
+                {IAM_MODES.map((m) => (
+                  <Radio key={m.iam} value={m.iam}>
+                    <Text strong>{m.label}</Text>
+                    <br />
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      {m.help}
+                    </Text>
+                  </Radio>
+                ))}
+              </Space>
+            </Radio.Group>
+          </>
+        )}
       </Space>
     </Modal>
   );

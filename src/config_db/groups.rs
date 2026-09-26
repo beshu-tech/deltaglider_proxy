@@ -20,7 +20,7 @@ impl ConfigDb {
     }
 
     /// Insert permission rows for a group.
-    fn insert_group_permissions(
+    pub(super) fn insert_group_permissions(
         conn: &Connection,
         group_id: i64,
         permissions: &[Permission],

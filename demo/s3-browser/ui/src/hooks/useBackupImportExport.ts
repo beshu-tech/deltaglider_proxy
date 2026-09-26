@@ -6,7 +6,13 @@
  */
 import { useCallback, useState } from 'react';
 import { Modal, message } from 'antd';
-import { exportBackup, importBackup, ImportBackupError, type ImportBackupMode } from '../adminApi';
+import {
+  exportBackup,
+  importBackup,
+  ImportBackupError,
+  type ImportBackupMode,
+  type ImportIamMode,
+} from '../adminApi';
 import { isZipFile } from '../components/admin/backupFile';
 import { normalizeUiError } from '../errorHandling';
 
@@ -28,17 +34,18 @@ export function useBackupImportExport() {
     }
   }, []);
 
-  const runBackupImport = useCallback(async (file: File, mode: ImportBackupMode) => {
+  const runBackupImport = useCallback(
+    async (file: File, mode: ImportBackupMode, iam: ImportIamMode = 'replace') => {
     try {
       const result = isZipFile(file)
-        ? await importBackup(file, mode)
-        : await importBackup(JSON.parse(await file.text()), 'iam-only');
+        ? await importBackup(file, mode, iam)
+        : await importBackup(JSON.parse(await file.text()), 'iam-only', iam);
       const ext = result.external_identities_created ?? 0;
       // The page reloads to pick up the restored state; a toast followed by
       // an immediate reload was never seen, so the outcome waits for an OK.
       Modal.success({
         title: 'Backup restored',
-        content: `${result.users_created} users, ${result.groups_created} groups and ${ext} OIDC identities imported (${result.users_skipped} skipped). The page reloads to show the restored state.`,
+        content: `${result.users_created} users, ${result.groups_created} groups and ${ext} OIDC identities imported (${result.users_skipped} skipped); ${result.users_deleted ?? 0} users and ${result.groups_deleted ?? 0} groups that the backup does not hold were deleted. The page reloads to show the restored state.`,
         okText: 'Reload',
         onOk: () => window.location.reload(),
       });
@@ -57,7 +64,9 @@ export function useBackupImportExport() {
     } finally {
       setRestoreFile(null);
     }
-  }, []);
+    },
+    []
+  );
 
   const importFullBackup = useCallback(() => {
     const input = document.createElement('input');

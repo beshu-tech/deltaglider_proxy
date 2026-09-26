@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Changed — A backup restore replaces users and groups (point-in-time)
+
+A restore of `iam.json` added the users and groups that the instance did not
+have, and it kept everything else. A user that someone created or changed
+after the backup survived the restore, so a restore was not a return to the
+backup's state. Now a restore replaces the users, groups, OIDC providers,
+mapping rules and external identities with the backup's, in one database
+transaction: a failure part-way leaves the database as it was. Add
+`iam=merge` to `POST /_/api/admin/backup` (or pick "Merge" in the restore
+dialog) to get the old behaviour. The result reports `users_deleted` and
+`groups_deleted`.
+
 ### Fixed — Admin UI and object browser, from a browser review
 
 - **A new or duplicated user's secret is shown.** Create and Duplicate

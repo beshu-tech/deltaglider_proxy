@@ -26,7 +26,9 @@ export async function exportBackup(): Promise<{ blob: Blob; filename: string }> 
 interface ImportBackupResult {
   users_created: number;
   users_skipped: number;
+  users_deleted?: number;
   groups_created: number;
+  groups_deleted?: number;
   groups_skipped: number;
   memberships_created: number;
   external_identities_created?: number;
@@ -34,6 +36,13 @@ interface ImportBackupResult {
 }
 
 export type ImportBackupMode = 'full' | 'preserve-bootstrap' | 'iam-only' | 'config-only';
+
+/**
+ * How a restore treats users, groups and OIDC providers that exist now:
+ * `replace` (point-in-time: what the backup lacks is deleted) or `merge`
+ * (what the backup lacks is kept; existing entries are not overwritten).
+ */
+export type ImportIamMode = 'replace' | 'merge';
 
 interface ImportBackupErrorBody {
   error?: string;
@@ -83,12 +92,13 @@ async function parseImportBackupError(res: Response): Promise<ImportBackupError>
  */
 export async function importBackup(
   data: Blob | File | Record<string, unknown>,
-  mode: ImportBackupMode = 'full'
+  mode: ImportBackupMode = 'full',
+  iam: ImportIamMode = 'replace'
 ): Promise<ImportBackupResult> {
   const isBlob = data instanceof Blob;
   const body = isBlob ? data : JSON.stringify(data);
   const contentType = isBlob ? 'application/zip' : 'application/json';
-  const qs = new URLSearchParams({ mode });
+  const qs = new URLSearchParams({ mode, iam });
   const res = await adminFetch(`/api/admin/backup?${qs.toString()}`, 'POST', undefined, {
     raw: body,
     contentType,
