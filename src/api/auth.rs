@@ -91,6 +91,50 @@ fn classify_auth_gate(locked: bool, iam_state: &IamState) -> AuthGateDecision<'_
     }
 }
 
+/// What the replay check did with one signature.
+#[derive(Debug, PartialEq, Eq)]
+enum ReplayClaim {
+    /// The check is off (`DGP_REPLAY_WINDOW_SECS=0`): nothing stored.
+    Off,
+    /// Seen within the window: a replay.
+    Duplicate,
+    /// A same-second SDK retry of a PUT/DELETE (`same_second_retry_served`):
+    /// served, and the slot stays with the first copy.
+    Retry,
+    /// Stored at this instant (a failed request gives it back).
+    Claimed(Instant),
+}
+
+/// Check-and-insert one signature: one DashMap `entry()` call, atomic under
+/// the per-key shard lock, so two concurrent duplicates cannot both pass.
+/// The timestamp is reset only once the window expired, never on a
+/// duplicate hit, so the window is measured from first-seen.
+fn claim_replay_slot(
+    cache: &ReplayCache,
+    sig: &str,
+    method: &axum::http::Method,
+    replay_window: Duration,
+) -> ReplayClaim {
+    if replay_window.is_zero() {
+        return ReplayClaim::Off;
+    }
+    let mut verdict = None;
+    let claimed_at = Instant::now();
+    cache
+        .entry(sig.to_string())
+        .and_modify(|first_seen: &mut Instant| {
+            if same_second_retry_served(method, first_seen.elapsed()) {
+                verdict = Some(ReplayClaim::Retry);
+            } else if first_seen.elapsed() < replay_window {
+                verdict = Some(ReplayClaim::Duplicate);
+            } else {
+                *first_seen = claimed_at;
+            }
+        })
+        .or_insert(claimed_at);
+    verdict.unwrap_or(ReplayClaim::Claimed(claimed_at))
+}
+
 fn prune_replay_cache(cache: &ReplayCache, replay_window: Duration, max_entries: usize) {
     // Pass 1: cheap TTL cleanup.
     cache.retain(|_, instant| instant.elapsed() < replay_window);
@@ -98,6 +142,10 @@ fn prune_replay_cache(cache: &ReplayCache, replay_window: Duration, max_entries:
     if len_after_ttl <= max_entries {
         return;
     }
+    // Down to a low-water mark, not to the cap: pruned to exactly the cap,
+    // the next insert is over it again, and under a steady load every later
+    // mutation ran this O(cache) prune on the request path.
+    let max_entries = max_entries - max_entries / 10;
 
     // Pass 2: hard-cap oldest signatures first. We only need to identify the
     // `to_remove` oldest entries, not fully order the cache — quickselect
@@ -909,28 +957,9 @@ pub async fn sigv4_auth_middleware(
             }
 
             let sig = &params.signature;
+            let claim = claim_replay_slot(cache, sig, request.method(), replay_window);
 
-            // Only RESET the timestamp once the window has expired — never on
-            // a duplicate hit, so the window is measured from first-seen.
-            let mut is_duplicate = false;
-            let mut is_retry = false;
-            let claimed_at = Instant::now();
-            let method = request.method().clone();
-            cache
-                .entry(sig.clone())
-                .and_modify(|first_seen: &mut Instant| {
-                    if same_second_retry_served(&method, first_seen.elapsed()) {
-                        is_retry = true;
-                    } else if first_seen.elapsed() < replay_window {
-                        is_duplicate = true;
-                    } else {
-                        // Window expired — reset so the slot can be reused.
-                        *first_seen = claimed_at;
-                    }
-                })
-                .or_insert(claimed_at);
-
-            if is_duplicate {
+            if claim == ReplayClaim::Duplicate {
                 warn!(
                     "SigV4: replay detected — {} {} sig={}… (duplicate within {:?})",
                     request.method(),
@@ -944,8 +973,8 @@ pub async fn sigv4_auth_middleware(
                     S3Error::InvalidArgument("Request replay detected".to_string()).into_response(),
                 );
             }
-            // A served retry does not own the slot: the first copy does.
-            if !is_retry {
+            // A served retry (`Retry`) does not own the slot: the first copy does.
+            if let ReplayClaim::Claimed(claimed_at) = claim {
                 replay_claim = Some((cache.clone(), sig.clone(), claimed_at));
             }
         }
@@ -1473,7 +1502,6 @@ mod review3_tests {
     /// next insert is over it again: every later mutation runs an O(500k)
     /// retain + clone + select on the request path.
     #[test]
-    #[ignore = "review3: pending fix"]
     fn review3_hard_cap_prune_leaves_headroom() {
         let cache: ReplayCache = Arc::new(DashMap::new());
         for i in 0..101 {
@@ -1486,5 +1514,26 @@ mod review3_tests {
             "one insert after a prune is over the cap again ({}), so the next request prunes again",
             cache.len()
         );
+    }
+
+    /// S23: `DGP_REPLAY_WINDOW_SECS=0` is the off switch, but every
+    /// mutation still stored its signature: the cache filled up to the cap
+    /// and the inline prune ran on the request path, for a check that never
+    /// fires.
+    #[test]
+    fn review3_a_zero_window_stores_nothing() {
+        let cache: ReplayCache = Arc::new(DashMap::new());
+        for i in 0..3 {
+            assert_ne!(
+                claim_replay_slot(
+                    &cache,
+                    &format!("sig-{i}"),
+                    &axum::http::Method::PUT,
+                    Duration::ZERO
+                ),
+                ReplayClaim::Duplicate
+            );
+        }
+        assert_eq!(cache.len(), 0, "the off switch must store no signature");
     }
 }

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Fixed — The replay cache costs nothing when it is off, and less under load
+
+With `DGP_REPLAY_WINDOW_SECS=0` the replay check is off, but the proxy still
+stored the signature of every mutating request, up to 500,000 entries. When
+the cache is full, the proxy removes the oldest entries before the next
+request. It removed them only down to the cap, so under a steady load every
+following request repeated that removal. Now the check stores nothing when it
+is off, the removal goes down to 90 % of the cap, and the periodic cleanup
+keeps entries only for the replay window.
+
 ### Fixed — Fewer false `503 SlowDown` answers from the fenced reference write
 
 With config sync on, the write of a delta prefix's `reference.bin` is

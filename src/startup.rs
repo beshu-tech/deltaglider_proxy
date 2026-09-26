@@ -269,10 +269,13 @@ fn backend_type_label(config: &Config) -> &'static str {
 /// Create the replay-attack detection cache and spawn its periodic cleanup.
 pub fn init_replay_cache() -> deltaglider_proxy::api::auth::ReplayCache {
     let replay_cache: deltaglider_proxy::api::auth::ReplayCache = Arc::new(dashmap::DashMap::new());
-    // The TTL sweep. The live window is DGP_REPLAY_WINDOW_SECS (default: the
-    // skew); a signature older than the skew fails verification anyway, so
-    // the skew is the longest retention that can matter.
-    let replay_window_secs = u64::from(deltaglider_proxy::api::auth::clock_skew_secs());
+    // The TTL sweep drops what the check no longer reads: entries older
+    // than the window (DGP_REPLAY_WINDOW_SECS, default the skew). A window
+    // longer than the skew is capped at it: an older signature fails
+    // verification anyway.
+    let replay_window_secs = deltaglider_proxy::api::auth::replay_window()
+        .as_secs()
+        .min(u64::from(deltaglider_proxy::api::auth::clock_skew_secs()));
     // #86: the retain is an O(live-signatures) walk — up to 500k shards under
     // load (MAX_REPLAY_ENTRIES) — so it runs on the blocking pool.
     spawn_periodic_blocking(Duration::from_secs(60), {
