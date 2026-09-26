@@ -118,3 +118,42 @@ async fn test_entitytoolarge_response() {
     // HEAD responses don't have bodies in HTTP, so just verify status
     assert_eq!(resp.status().as_u16(), 404);
 }
+
+/// A key whose file name is too long for the filesystem backend (255 bytes
+/// per segment, `.delta` included) is a client error: 400 KeyTooLongError,
+/// which SDKs do not retry. It used to be a 500, retried four times.
+#[tokio::test]
+async fn a_too_long_file_name_is_400_key_too_long() {
+    let server = TestServer::filesystem().await;
+    let http = server.http();
+    for key in [
+        // Delta-eligible: the stored name gains `.delta` and passes 255.
+        format!("{}.zip", "g".repeat(250)),
+        // Passthrough, one segment over the limit.
+        format!("dir/{}.jpg", "h".repeat(260)),
+    ] {
+        let url = format!("{}/{}/{}", server.endpoint(), server.bucket(), key);
+        let r = http
+            .put(&url)
+            .body(b"0123456789".repeat(100))
+            .send()
+            .await
+            .unwrap();
+        let status = r.status();
+        let body = r.text().await.unwrap();
+        assert_eq!(status, 400, "{key}: {body}");
+        assert!(
+            body.contains("<Code>KeyTooLongError</Code>"),
+            "{key}: {body}"
+        );
+    }
+    // A long key that fits still works.
+    let ok = format!(
+        "{}/{}/{}.zip",
+        server.endpoint(),
+        server.bucket(),
+        "k".repeat(200)
+    );
+    let r = http.put(&ok).body(b"fits".to_vec()).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+}

@@ -770,6 +770,12 @@ impl S3Backend {
         if code == "NoSuchBucket" {
             return StorageError::BucketNotFound(bucket.to_string());
         }
+        // The backend refuses the key's length: a client error, not a 500.
+        if code == "KeyTooLongError" {
+            return StorageError::KeyTooLong(format!(
+                "{op}: the storage backend refused the key as too long"
+            ));
+        }
         // NoSuchKey (object-level 404) → NotFound, not a 500. This generic
         // classifier runs for ops without a typed error variant (e.g.
         // CopyObject, where the *source* key may have been deleted by a

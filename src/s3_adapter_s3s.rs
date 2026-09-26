@@ -2449,6 +2449,7 @@ fn engine_error_to_s3s(err: impl Into<crate::api::S3Error>) -> s3s::S3Error {
             s3s::s3_error!(EntityTooLarge, "{}", msg)
         }
         crate::api::S3Error::InvalidArgument(msg) => s3s::s3_error!(InvalidArgument, "{}", msg),
+        crate::api::S3Error::KeyTooLong(msg) => s3s::s3_error!(KeyTooLongError, "{}", msg),
         crate::api::S3Error::InvalidRequest(msg) => s3s::s3_error!(InvalidRequest, "{}", msg),
         crate::api::S3Error::NoSuchUpload(id) => {
             // Multipart upload state is in-memory and PER-INSTANCE. Behind a

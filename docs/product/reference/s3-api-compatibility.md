@@ -22,6 +22,17 @@ Status legend:
 | `DeleteObject` | ✅ Full | Deletes one key. A key that ends in `/` deletes only the folder marker with that name, never the keys under it, as on S3. To delete a folder, list its keys and delete them with `DeleteObjects` (the object browser and `aws s3 rm --recursive` do this). A missing key is treated as success (S3 semantics). |
 | `DeleteObjects` | ✅ Full | Batch delete up to 1000 keys; `Quiet` flag and per-key error reporting honoured. |
 
+### Maximum key length
+
+The longest key that the proxy stores depends on the backend of the bucket:
+
+| Backend | Limit | Why |
+|---|---|---|
+| S3 | 1024 bytes for the whole key | The S3 limit. A backend that refuses the key answers `KeyTooLongError`, and the proxy passes that on. |
+| Filesystem | 255 bytes for each part of the key between `/` characters | Each part becomes a directory or file name, and file systems such as ext4 and XFS limit one name to 255 bytes. A delta-compressed object is stored with a `.delta` suffix, so its last part has 249 bytes. |
+
+A key over the limit gets `400 KeyTooLongError`. SDKs do not retry a 400.
+
 ## List operations
 
 | Operation | Status | Notes |

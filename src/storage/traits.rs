@@ -124,6 +124,12 @@ pub enum StorageError {
     #[error("Invalid key: {0}")]
     InvalidKey(String),
 
+    /// The key is longer than this backend can store (the filesystem limits
+    /// one path segment to 255 bytes, `.delta` included; S3 limits a key to
+    /// 1024 bytes). Maps to 400 KeyTooLongError, which clients do not retry.
+    #[error("KeyTooLong: {0}")]
+    KeyTooLong(String),
+
     /// The object's metadata is larger than this backend can store (the
     /// filesystem keeps it in one xattr, and JSON escaping can double user
     /// metadata that is within the S3 limit). Maps to 400 MetadataTooLarge.
@@ -139,6 +145,13 @@ pub enum StorageError {
 
     #[error("Storage error: {0}")]
     Other(String),
+}
+
+/// Pure: whether an I/O error says that a file name or path is too long
+/// (`ENAMETOOLONG`). The filesystem backend's keys become path segments, so
+/// this is a client error, never a 500.
+pub fn io_error_is_name_too_long(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ENAMETOOLONG) || e.kind() == std::io::ErrorKind::InvalidFilename
 }
 
 /// Abstract storage backend for S3-like object storage

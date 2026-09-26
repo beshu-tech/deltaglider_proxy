@@ -46,6 +46,9 @@ pub enum S3Error {
     #[error("InvalidArgument: {0}")]
     InvalidArgument(String),
 
+    #[error("KeyTooLongError: {0}")]
+    KeyTooLong(String),
+
     #[error("InvalidRequest: {0}")]
     InvalidRequest(String),
 
@@ -118,6 +121,7 @@ impl S3Error {
             S3Error::EntityTooLarge { .. } | S3Error::EntityTooLargeReason(_) => "EntityTooLarge",
             S3Error::InternalError(_) => "InternalError",
             S3Error::InvalidArgument(_) => "InvalidArgument",
+            S3Error::KeyTooLong(_) => "KeyTooLongError",
             S3Error::InvalidRequest(_) => "InvalidRequest",
             S3Error::MalformedXML => "MalformedXML",
             S3Error::NoSuchUpload(_) => "NoSuchUpload",
@@ -151,6 +155,7 @@ impl S3Error {
             }
             S3Error::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             S3Error::InvalidArgument(_) => StatusCode::BAD_REQUEST,
+            S3Error::KeyTooLong(_) => StatusCode::BAD_REQUEST,
             S3Error::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             S3Error::MalformedXML => StatusCode::BAD_REQUEST,
             S3Error::NoSuchUpload(_) => StatusCode::NOT_FOUND,
@@ -231,11 +236,22 @@ impl IntoResponse for S3Error {
     }
 }
 
+/// The client message for a key the filesystem backend cannot store.
+pub(crate) const KEY_TOO_LONG_FS: &str = "Your key is too long for this storage backend: the \
+     filesystem backend stores each '/'-separated part of a key as a file name of at most \
+     255 bytes, including a '.delta' suffix on delta-compressed objects";
+
 impl From<crate::storage::StorageError> for S3Error {
     fn from(err: crate::storage::StorageError) -> Self {
         match err {
             crate::storage::StorageError::NotFound(key) => S3Error::NoSuchKey(key),
             crate::storage::StorageError::InvalidKey(msg) => S3Error::InvalidArgument(msg),
+            crate::storage::StorageError::KeyTooLong(msg) => S3Error::KeyTooLong(msg),
+            crate::storage::StorageError::Io(e)
+                if crate::storage::io_error_is_name_too_long(&e) =>
+            {
+                S3Error::KeyTooLong(KEY_TOO_LONG_FS.to_string())
+            }
             crate::storage::StorageError::MetadataTooLarge(msg) => {
                 S3Error::InvalidArgument(format!("MetadataTooLarge: {msg}"))
             }

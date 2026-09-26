@@ -29,8 +29,9 @@ pub use s3::{
     DELEGATED_LIST_PROBE_REQUESTS, DELEGATED_LIST_UPSTREAM_PAGES, LISTING_FACTS_REQUESTS,
 };
 pub use traits::{
-    reference_fence_lost, BucketListing, BulkListing, DelegatedListResult, MultipartUpload,
-    ObjectVariant, RefFence, RefWrite, StorageBackend, StorageError, UploadedPart,
+    io_error_is_name_too_long, reference_fence_lost, BucketListing, BulkListing,
+    DelegatedListResult, MultipartUpload, ObjectVariant, RefFence, RefWrite, StorageBackend,
+    StorageError, UploadedPart,
 };
 
 /// ENOSPC raw error code on Linux and macOS.
@@ -42,6 +43,8 @@ pub(crate) fn io_to_storage_error(e: std::io::Error) -> StorageError {
         StorageError::DiskFull
     } else if e.kind() == std::io::ErrorKind::NotFound {
         StorageError::NotFound(e.to_string())
+    } else if io_error_is_name_too_long(&e) {
+        StorageError::KeyTooLong(crate::api::errors::KEY_TOO_LONG_FS.to_string())
     } else {
         StorageError::Io(e)
     }
@@ -55,6 +58,22 @@ pub(crate) fn join_error(e: tokio::task::JoinError) -> StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_too_long_is_a_key_error_on_every_path() {
+        let e = std::io::Error::from_raw_os_error(libc::ENAMETOOLONG);
+        assert!(io_error_is_name_too_long(&e));
+        assert!(matches!(
+            io_to_storage_error(e),
+            StorageError::KeyTooLong(_)
+        ));
+        // The #[from] Io path (a `?` on a raw io::Error) maps the same.
+        let s3: crate::api::S3Error =
+            StorageError::Io(std::io::Error::from_raw_os_error(libc::ENAMETOOLONG)).into();
+        assert_eq!(s3.code(), "KeyTooLongError");
+        assert_eq!(s3.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(!io_error_is_name_too_long(&std::io::Error::other("x")));
+    }
 
     #[test]
     fn test_io_to_storage_error_not_found() {

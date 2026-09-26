@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed — A key too long for the backend is a 400, not a 500
+
+A key with a part longer than the filesystem's 255-byte name limit (for
+example a 250-character `.zip` name, which gains `.delta`) failed with
+`500 InternalError`, and SDKs retried it four times. Now it gets
+`400 KeyTooLongError`; an S3 backend's own `KeyTooLongError` is passed on
+the same way. `s3-api-compatibility.md` lists the limit per backend.
+
 ### Fixed — A lockout says that it is a lockout, and for how long
 
 A locked-out sign-in got a bare `429` (or `{"ok": false}`), so the UI showed
