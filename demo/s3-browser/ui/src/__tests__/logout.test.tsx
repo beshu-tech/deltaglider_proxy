@@ -7,7 +7,7 @@
  * S3 data calls go through the AWS SDK, so those s3client functions are
  * stubbed; session, identity and logout requests are real fetches.
  */
-import { screen, waitFor } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { json, mockFetch } from '../test/fetchMock';
@@ -49,7 +49,6 @@ beforeEach(() => {
   http.on('GET', '/_/api/admin/session', json({ valid: true, admin_gui: false }));
   http.on('GET', '/_/api/whoami', json({ mode: 'open', user: null }));
   http.on('POST', LOGOUT, new Response(null, { status: 204 }));
-  vi.spyOn(window, 'confirm').mockReturnValue(true);
 });
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -67,6 +66,8 @@ test('sign-out clears the server credentials, then logs out, then sends no sessi
 
   await user.click(trigger);
   await user.click(await screen.findByRole('menuitem', { name: 'Sign out' }));
+  // The confirmation is a dialog (confirmDialog), not window.confirm.
+  await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Sign out' }));
   await waitFor(() => expect(http.callsTo('POST', LOGOUT)).toHaveLength(1));
 
   const clearAt = http.calls.findIndex((c) => c.method === 'DELETE' && c.path === CREDS);

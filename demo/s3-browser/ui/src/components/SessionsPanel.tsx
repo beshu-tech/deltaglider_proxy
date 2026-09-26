@@ -7,6 +7,7 @@
  * are in-memory, so a proxy restart still clears everything.
  */
 import { useCallback, useEffect, useState } from 'react';
+import { confirmDialog } from '../confirmDialog';
 import { Typography, Button, Tag, Table, Space, message, Input } from 'antd';
 import { ReloadOutlined, LogoutOutlined } from '@ant-design/icons';
 import { listSessions, revokeSession, revokeUserSessions, type SessionSummary } from '../adminApi';
@@ -54,7 +55,12 @@ export default function SessionsPanel({ onSessionExpired }: { onSessionExpired?:
   const revokeUser = async () => {
     const key = revokeKey.trim();
     if (!key) return;
-    if (!window.confirm(`Force-logout ALL sessions of identity "${key}" — on every instance. If this is YOUR OWN identity you will be logged out too. Use this after rotating a compromised key.`)) return;
+    if (!(await confirmDialog({
+      title: `Sign out every session of "${key}"?`,
+      content: 'This ends the sessions on every instance. If this is your own identity, you are signed out too. Use it after you rotate a compromised key.',
+      okText: 'Sign out all sessions',
+      danger: true,
+    }))) return;
     try {
       setBusy('user');
       const res = await revokeUserSessions(key);

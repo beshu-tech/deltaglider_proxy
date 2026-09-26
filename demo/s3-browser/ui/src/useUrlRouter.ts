@@ -1,3 +1,4 @@
+import { confirmDialog } from './confirmDialog';
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { getDirtySections } from './useDirtySection';
 import {
@@ -49,13 +50,17 @@ function currentUrl(): string {
  * redirect, and browser Back/Forward. NOT covered: full page loads (reload,
  * OAuth redirects, `<a href>`), which `beforeunload` already guards.
  */
-function confirmLeave(fromUrl: string, toUrl: string): boolean {
+function confirmLeave(fromUrl: string, toUrl: string): Promise<boolean> | true {
   if (!isAdminPageLeave(fromUrl, toUrl)) return true;
   const dirty = [...getDirtySections()];
   if (dirty.length === 0) return true;
-  return window.confirm(
-    `You have unsaved changes (${dirty.join(', ')}). Leave this page and discard them?`
-  );
+  return confirmDialog({
+    title: 'Leave this page and discard your changes?',
+    content: `You have unsaved changes (${dirty.join(', ')}).`,
+    okText: 'Leave and discard',
+    cancelText: 'Stay',
+    danger: true,
+  });
 }
 
 interface UrlRouter extends UrlLocation {
@@ -110,27 +115,40 @@ export function useUrlRouter(): UrlRouter {
     if (currentUrl() === fullPath) {
       return;
     }
-    if (!confirmLeave(currentUrl(), fullPath)) return;
-    if (opts?.replace) {
-      window.history.replaceState(null, '', fullPath);
-    } else {
-      window.history.pushState(null, '', fullPath);
-    }
-    committedUrl.current = currentUrl();
-    setLocation(readLocation());
+    const go = () => {
+      if (opts?.replace) {
+        window.history.replaceState(null, '', fullPath);
+      } else {
+        window.history.pushState(null, '', fullPath);
+      }
+      committedUrl.current = currentUrl();
+      setLocation(readLocation());
+    };
+    const ok = confirmLeave(currentUrl(), fullPath);
+    if (ok === true) go();
+    else void ok.then((yes) => { if (yes) go(); });
   }, []);
 
   useEffect(() => {
     const onPopState = () => {
-      if (!confirmLeave(committedUrl.current, currentUrl())) {
-        // Cancelled: the browser already moved. Put the page's URL back (a
-        // new entry; the direction of the Back/Forward press is unknown) and
-        // keep rendering the page, so the panel and its edits stay mounted.
-        window.history.pushState(null, '', committedUrl.current);
+      const target = currentUrl();
+      const ok = confirmLeave(committedUrl.current, target);
+      if (ok === true) {
+        committedUrl.current = target;
+        setLocation(readLocation());
         return;
       }
-      committedUrl.current = currentUrl();
-      setLocation(readLocation());
+      // The browser already moved. Put the page's URL back at once (a new
+      // entry; the direction of the Back/Forward press is unknown) and keep
+      // rendering the page, so the panel and its edits stay mounted while
+      // the dialog asks. On "Leave", go to where the press was going.
+      window.history.pushState(null, '', committedUrl.current);
+      void ok.then((yes) => {
+        if (!yes) return;
+        window.history.pushState(null, '', target);
+        committedUrl.current = target;
+        setLocation(readLocation());
+      });
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);

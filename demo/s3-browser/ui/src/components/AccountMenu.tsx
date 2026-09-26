@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react';
+import { confirmDialog } from '../confirmDialog';
 import {
   BookOutlined,
   CopyOutlined,
@@ -156,8 +157,8 @@ export default function AccountMenu({
     : 'Section YAML';
   const settingsHelp = 'Just your settings — does not include users/groups or full backup bundles.';
   const iamHelp = 'Full IAM (users, groups, providers, rules). Export includes LIVE secrets — handle like a password file.';
-  const confirmLogout = () => {
-    if (window.confirm('Sign out? This will clear your credentials and return to the login screen.')) {
+  const confirmLogout = async () => {
+    if (await confirmDialog({ title: 'Sign out?', content: 'This clears your credentials and returns to the sign-in screen.', okText: 'Sign out' })) {
       onLogout?.();
     }
   };

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Input, Switch, Button, Alert, Space, Divider, Typography, Tag } from 'antd';
+import { Input, Switch, Button, Alert, Space, Divider, Typography } from 'antd';
 import { ThunderboltOutlined, CheckCircleFilled, MinusCircleFilled, CrownFilled } from '@ant-design/icons';
 import type { IamUser, CreateUserRequest, UpdateUserRequest } from '../adminApi';
 import { useCreateUser, useUpdateUser, useDeleteUser, useRotateUserKeys } from '../queries/users';
@@ -19,6 +19,8 @@ import {
   type PermissionRow,
 } from './permissionRows';
 import CredentialsModal from './CredentialsModal';
+import PillButton from './PillButton';
+import { confirmDialog } from '../confirmDialog';
 import { generateId, generateSecret } from '../credentialGeneration';
 import { normalizeUiError } from '../errorHandling';
 import { IAM_DIRTY_KEYS, useDirtyFlag, useFormBaseline } from '../useDirtyFlag';
@@ -173,7 +175,11 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
   // One entry point for the Save button and ⌘S: key changes need a confirm
   // because the new secret is shown only once.
   const submit = async () => {
-    if (hasKeyChanges && !window.confirm('Update credentials? The new secret will be shown once — make sure to save it.')) return;
+    if (hasKeyChanges && !(await confirmDialog({
+      title: 'Update the credentials?',
+      content: 'The new secret is shown only once. Be ready to save it.',
+      okText: 'Update credentials',
+    }))) return;
     await handleSave();
   };
   useApplyHandler(IAM_DIRTY_KEYS.users, () => { if (!saving) void submit(); }, isDirty && !readOnly);
@@ -283,18 +289,17 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
             permissions: perms.map(p => ({ id: 0, effect: p.effect, actions: p.actions, resources: p.resources.map(s => s.trim()).filter(Boolean) })),
           }))).map(policy => {
             return (
-                <Tag
+                <PillButton
                   key={policy.name}
-                  color="blue"
-                  style={{ cursor: 'pointer', borderRadius: 10, fontSize: 12, padding: '2px 10px', margin: 0, userSelect: 'none' }}
-                  onClick={() => {
+                  title={policy.description || `Replace the permissions with the "${policy.name}" preset`}
+                  onClick={async () => {
                     const hasExisting = permissions.some(r => r.actions.length > 0 || r.resources.some(res => res.trim() !== ''));
-                    if (hasExisting && !window.confirm('Replace existing permissions?')) return;
+                    if (hasExisting && !(await confirmDialog({ title: `Replace the permissions with "${policy.name}"?`, okText: 'Replace' }))) return;
                     setPermissions(permissionsToRows(policy.permissions));
                   }}
                 >
                   {policy.name}
-                </Tag>
+                </PillButton>
               );
             })}
         </div>
@@ -334,7 +339,7 @@ export default function UserForm({ user, readOnly = false, onSaved, onDeleted, o
           <div>
             {isEdit && (
               <Button danger loading={deleting} disabled={deleting} onClick={async () => {
-                if (!window.confirm(`Delete "${user?.name}"? This cannot be undone.`)) return;
+                if (!(await confirmDialog({ title: `Delete "${user?.name}"?`, content: 'This cannot be undone.', okText: 'Delete', danger: true }))) return;
                 await handleDelete();
               }}>Delete User</Button>
             )}

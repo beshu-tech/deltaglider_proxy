@@ -23,6 +23,7 @@ import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { IAM_DIRTY_KEYS, confirmDiscardEdits, useDirtyFlag, useFormBaseline } from '../useDirtyFlag';
 import { useApplyHandler } from '../useDirtySection';
 import { useCopyToClipboard } from '../useCopyToClipboard';
+import { confirmDialog } from '../confirmDialog';
 
 const { Text } = Typography;
 
@@ -216,8 +217,8 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
         {/* Left: provider list — stacks above the detail when the row wraps. */}
         <div style={{ width: 220, flexShrink: 0, flexGrow: 1, maxWidth: '100%' }}>
           {!readOnly && (
-            <Button icon={<PlusOutlined />} block size="small" onClick={() => {
-              if (!confirmDiscardEdits(IAM_DIRTY_KEYS.providers)) return;
+            <Button icon={<PlusOutlined />} block size="small" onClick={async () => {
+              if (!(await confirmDiscardEdits(IAM_DIRTY_KEYS.providers))) return;
               setCreating(true); setSelectedProviderId(null);
             }} style={{ marginBottom: 8 }}>
               Add provider
@@ -226,9 +227,9 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
           {providers.map(p => (
             <div
               key={p.id}
-              onClick={() => {
+              onClick={async () => {
                 if (p.id === selectedProviderId && !creating) return;
-                if (!confirmDiscardEdits(IAM_DIRTY_KEYS.providers)) return;
+                if (!(await confirmDiscardEdits(IAM_DIRTY_KEYS.providers))) return;
                 setSelectedProviderId(p.id); setCreating(false);
               }}
               style={{
@@ -541,7 +542,12 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
 
   const handleDelete = async () => {
     if (!provider) return;
-    if (!window.confirm('Delete this provider? External users linked to it will no longer be able to log in via this provider.')) return;
+    if (!(await confirmDialog({
+      title: 'Delete this provider?',
+      content: 'External users linked to it can no longer sign in through this provider.',
+      okText: 'Delete',
+      danger: true,
+    }))) return;
     try {
       await deleteMutation.mutateAsync(provider.id);
       message.success('Provider deleted');

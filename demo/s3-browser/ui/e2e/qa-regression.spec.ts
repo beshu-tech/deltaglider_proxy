@@ -546,8 +546,8 @@ test('5. IAM: create prefix-scoped user and a group, delete the last user → bo
   for (const name of [`qa-scoped-${RUN}`, 'legacy-admin']) {
     await page.getByText(name, { exact: true }).first().click();
     await expect(page.getByRole('textbox', { name: 'User name' })).toHaveValue(name);
-    page.once('dialog', (d) => d.accept());
     await page.getByRole('button', { name: 'Delete User' }).click();
+    await page.getByRole('dialog').filter({ hasText: `Delete "${name}"?` }).getByRole('button', { name: 'Delete' }).click();
     await expect(page.getByText(name, { exact: true })).toHaveCount(0, { timeout: 30_000 });
   }
   await expect(page.getByText('No users yet')).toBeVisible({ timeout: 30_000 });
@@ -741,9 +741,9 @@ test('8. cross-origin admin POST refused; HTML served sandboxed; anonymous conte
 test('9. sign out, sign back in, data and settings persist', async () => {
   await ensureSignedIn();
   await openBucket(BUCKET);
-  page.once('dialog', (d) => d.accept());
   await page.getByRole('button', { name: /Account menu/ }).click();
   await page.getByRole('menuitem', { name: 'Sign out' }).click();
+  await page.getByRole('dialog').filter({ hasText: 'Sign out?' }).getByRole('button', { name: 'Sign out' }).click();
   await expect(page.getByPlaceholder('Admin password')).toBeVisible({ timeout: 30_000 });
   // The session is gone on the server, not only in the page.
   watch.expectFailure(401, /\/_\/api\/admin\/users$/, 'GET');

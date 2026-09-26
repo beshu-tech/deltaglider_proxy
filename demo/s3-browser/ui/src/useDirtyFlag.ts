@@ -7,6 +7,7 @@
  * sidebar dot, the `● ` tab-title prefix and the beforeunload prompt exactly
  * like the section editors do.
  */
+import { confirmDialog } from './confirmDialog';
 import { useEffect, useState } from 'react';
 import { getDirtySections, useDirtySection } from './useDirtySection';
 
@@ -33,9 +34,15 @@ export function useFormBaseline<T>(current: T): { isDirty: boolean; markClean: (
  * Ask before an in-panel action (row switch, "New", duplicate) throws away the
  * unsaved edits registered under `key`. True = go ahead.
  */
-export function confirmDiscardEdits(key: string): boolean {
+export async function confirmDiscardEdits(key: string): Promise<boolean> {
   if (!getDirtySections().has(key)) return true;
-  return window.confirm('You have unsaved changes. Discard them?');
+  return confirmDialog({
+    title: 'Discard your unsaved changes?',
+    content: 'You have unsaved changes on this form. They are lost if you continue.',
+    okText: 'Discard changes',
+    cancelText: 'Keep editing',
+    danger: true,
+  });
 }
 
 /**

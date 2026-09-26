@@ -101,11 +101,13 @@ const UI_RULES = {
     'error',
     { name: 'localStorage', message: 'Use readStorage/writeStorage from src/safeStorage.ts.' },
     { name: 'sessionStorage', message: 'Use readStorage/writeStorage(..., "session") from src/safeStorage.ts.' },
+    { name: 'confirm', message: 'Use confirmDialog from src/confirmDialog.ts.' },
   ],
   'no-restricted-properties': [
     'error',
     { object: 'window', property: 'localStorage', message: 'Use src/safeStorage.ts.' },
     { object: 'window', property: 'sessionStorage', message: 'Use src/safeStorage.ts.' },
+    { object: 'window', property: 'confirm', message: 'Use confirmDialog from src/confirmDialog.ts: window.confirm blocks the page and ignores the theme.' },
     {
       object: 'navigator',
       property: 'clipboard',

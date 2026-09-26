@@ -19,6 +19,7 @@ import { buildViewUrl, parseAdminQuery } from '../urlState';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { IAM_DIRTY_KEYS, confirmDiscardEdits, useDirtyFlag, useFormBaseline } from '../useDirtyFlag';
 import { useApplyHandler } from '../useDirtySection';
+import { confirmDialog } from '../confirmDialog';
 
 const { Text, Title } = Typography;
 
@@ -110,16 +111,16 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
     [navigate],
   );
 
-  const handleSelect = (group: IamGroup) => {
+  const handleSelect = async (group: IamGroup) => {
     if (group.id === selectedId && !creating) return;
-    if (!confirmDiscardEdits(IAM_DIRTY_KEYS.groups)) return;
+    if (!(await confirmDiscardEdits(IAM_DIRTY_KEYS.groups))) return;
     setCreating(false);
     setSelectedId(group.id);
     writeSelectionUrl(group.id);
   };
 
-  const handleCreate = () => {
-    if (!confirmDiscardEdits(IAM_DIRTY_KEYS.groups)) return;
+  const handleCreate = async () => {
+    if (!(await confirmDiscardEdits(IAM_DIRTY_KEYS.groups))) return;
     setSelectedId(null);
     setCreating(true);
     writeSelectionUrl(null);
@@ -153,9 +154,13 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
 
   const handleClone = async (group: IamGroup) => {
     // The clone becomes the selection, which unmounts the open form.
-    if (!confirmDiscardEdits(IAM_DIRTY_KEYS.groups)) return;
+    if (!(await confirmDiscardEdits(IAM_DIRTY_KEYS.groups))) return;
     const copyMembers = group.member_ids.length > 0
-      ? window.confirm(`Copy ${group.member_ids.length} member${group.member_ids.length !== 1 ? 's' : ''} into the duplicated group?`)
+      ? await confirmDialog({
+          title: `Copy ${group.member_ids.length} member${group.member_ids.length !== 1 ? 's' : ''} into the duplicated group?`,
+          okText: 'Copy members',
+          cancelText: 'No members',
+        })
       : false;
     onSavingChange?.(true);
     try {
@@ -176,7 +181,7 @@ export default function GroupsPanel({ onSessionExpired, onSavingChange, initialG
       group={null}
       users={users}
       onSaved={handleSaved}
-      onCancel={() => { if (confirmDiscardEdits(IAM_DIRTY_KEYS.groups)) setCreating(false); }}
+      onCancel={() => { void confirmDiscardEdits(IAM_DIRTY_KEYS.groups).then((ok) => { if (ok) setCreating(false); }); }}
       onSavingChange={onSavingChange}
     />
   ) : selectedGroup ? (
@@ -486,7 +491,7 @@ function GroupForm({ group, users, readOnly = false, onSaved, onDeleted, onCance
           <div>
             {isEdit && (
               <Button danger loading={deleting} disabled={deleting} onClick={async () => {
-                if (!window.confirm(`Delete group "${group?.name}"? This cannot be undone.`)) return;
+                if (!(await confirmDialog({ title: `Delete group "${group?.name}"?`, content: 'This cannot be undone.', okText: 'Delete', danger: true }))) return;
                 await handleDelete();
               }}>Delete Group</Button>
             )}

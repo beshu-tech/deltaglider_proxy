@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { confirmDialog } from '../confirmDialog';
 import { useVisiblePolling } from '../useVisiblePolling';
 import { Alert, Button, Input, message, Select, Space, Switch, Table, Tag, Typography } from 'antd';
 import {
@@ -320,7 +321,12 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
   };
 
   const purgeFailed = async () => {
-    if (!window.confirm(`Permanently delete all ${counts.failed} failed event(s)? They have exhausted retries; requeue would only re-fail them against a still-broken target.`)) {
+    if (!(await confirmDialog({
+      title: `Permanently delete all ${counts.failed} failed event(s)?`,
+      content: 'They have exhausted their retries. A requeue would only fail again against a target that is still broken.',
+      okText: 'Delete',
+      danger: true,
+    }))) {
       return;
     }
     try {

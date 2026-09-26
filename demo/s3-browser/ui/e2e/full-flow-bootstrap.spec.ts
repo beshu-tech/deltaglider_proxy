@@ -57,9 +57,9 @@ test('bootstrap auth: sign in, bucket, upload, list, admin, sign out, sign in, o
 
   // ── Sign out, sign back in, the object is still there ────────────
   await page.goto(`/_/browse/${bucketName}/`);
-  page.once('dialog', (d) => d.accept());
   await page.getByRole('button', { name: /Account menu/i }).click();
   await page.getByRole('menuitem', { name: 'Sign out' }).click();
+  await page.getByRole('dialog').filter({ hasText: 'Sign out?' }).getByRole('button', { name: 'Sign out' }).click();
   await signIn(page);
   await page.goto(`/_/browse/${bucketName}/`);
   await expect(page.getByText(uploadName)).toBeVisible({ timeout: 30_000 });

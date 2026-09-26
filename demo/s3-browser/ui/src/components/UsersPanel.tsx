@@ -93,17 +93,17 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
     [navigate],
   );
 
-  const handleSelect = (user: IamUser) => {
+  const handleSelect = async (user: IamUser) => {
     if (user.id === selectedId && !creating) return;
-    if (!confirmDiscardEdits(IAM_DIRTY_KEYS.users)) return;
+    if (!(await confirmDiscardEdits(IAM_DIRTY_KEYS.users))) return;
     setCreating(false);
     setSelectedId(user.id);
     setNewCreds(null);
     writeSelectionUrl(user.id);
   };
 
-  const handleCreate = () => {
-    if (!confirmDiscardEdits(IAM_DIRTY_KEYS.users)) return;
+  const handleCreate = async () => {
+    if (!(await confirmDiscardEdits(IAM_DIRTY_KEYS.users))) return;
     setSelectedId(null);
     setCreating(true);
     setNewCreds(null);
@@ -128,7 +128,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
 
   const handleClone = async (user: IamUser) => {
     // The clone becomes the selection, which unmounts the open form.
-    if (!confirmDiscardEdits(IAM_DIRTY_KEYS.users)) return;
+    if (!(await confirmDiscardEdits(IAM_DIRTY_KEYS.users))) return;
     onSavingChange?.(true);
     setNewCreds(null);
     try {
@@ -170,7 +170,7 @@ export default function UsersPanel({ onSessionExpired, onSavingChange, onNavigat
           user={null}
           onSaved={handleSaved}
           onCreated={handleCreated}
-          onCancel={() => { if (confirmDiscardEdits(IAM_DIRTY_KEYS.users)) setCreating(false); }}
+          onCancel={() => { void confirmDiscardEdits(IAM_DIRTY_KEYS.users).then((ok) => { if (ok) setCreating(false); }); }}
           onSavingChange={onSavingChange}
           onNavigateToGroup={onNavigateToGroup}
         />

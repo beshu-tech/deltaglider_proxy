@@ -2,6 +2,7 @@ import { Typography, Divider, Tag } from 'antd';
 import type { IamUser, IamGroup } from '../adminApi';
 import { rowsToPermissions, type PermissionRow } from './permissionRows';
 import { useColors } from '../ThemeContext';
+import PillButton from './PillButton';
 
 const { Text } = Typography;
 
@@ -34,20 +35,21 @@ export default function PermissionSummarySection({ user, permissions, userGroups
         <div style={{ marginBottom: 16 }}>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
             {memberGroups.map(g => (
-              <Tag
-                key={g.id}
-                color="blue"
-                style={{
-                  borderRadius: 8, fontSize: 12, padding: '3px 12px', margin: 0,
-                  cursor: onNavigateToGroup ? 'pointer' : undefined,
-                }}
-                onClick={() => onNavigateToGroup?.(g.id)}
-              >
-                {g.name}
-                <span style={{ marginLeft: 4, opacity: 0.6, fontSize: 10 }}>
-                  {g.permissions.length} rule{g.permissions.length !== 1 ? 's' : ''} · {g.member_ids.length} member{g.member_ids.length !== 1 ? 's' : ''}
-                </span>
-              </Tag>
+              onNavigateToGroup ? (
+                <PillButton key={g.id} onClick={() => onNavigateToGroup(g.id)} title={`Open group ${g.name}`}>
+                  {g.name}
+                  <span style={{ marginLeft: 4, fontSize: 10 }}>
+                    {g.permissions.length} rule{g.permissions.length !== 1 ? 's' : ''} · {g.member_ids.length} member{g.member_ids.length !== 1 ? 's' : ''}
+                  </span>
+                </PillButton>
+              ) : (
+                <Tag key={g.id} color="blue" style={{ borderRadius: 8, fontSize: 12, padding: '3px 12px', margin: 0 }}>
+                  {g.name}
+                  <span style={{ marginLeft: 4, fontSize: 10 }}>
+                    {g.permissions.length} rule{g.permissions.length !== 1 ? 's' : ''} · {g.member_ids.length} member{g.member_ids.length !== 1 ? 's' : ''}
+                  </span>
+                </Tag>
+              )
             ))}
           </div>
         </div>
@@ -62,15 +64,21 @@ export default function PermissionSummarySection({ user, permissions, userGroups
         if (g.permissions.length === 0) return null;
         return (
           <div key={g.id} style={{ marginBottom: 12 }}>
-            <div style={{
-              display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6,
-              cursor: onNavigateToGroup ? 'pointer' : undefined,
-            }} onClick={() => onNavigateToGroup?.(g.id)}>
+            <button
+              type="button"
+              disabled={!onNavigateToGroup}
+              onClick={() => onNavigateToGroup?.(g.id)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6, padding: 0,
+                background: 'none', border: 'none', font: 'inherit',
+                cursor: onNavigateToGroup ? 'pointer' : 'default',
+              }}
+            >
               <Text style={{ fontSize: 11, fontWeight: 700, color: colors.ACCENT_BLUE, textTransform: 'uppercase', letterSpacing: 0.5 }}>
                 From {g.name}
               </Text>
-              <span style={{ fontSize: 10, color: colors.TEXT_MUTED }}>↗</span>
-            </div>
+              <span aria-hidden="true" style={{ fontSize: 10, color: colors.TEXT_MUTED }}>↗</span>
+            </button>
             {g.permissions.map((perm, i) => {
               const isDeny = perm.effect === 'Deny';
               return (

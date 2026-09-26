@@ -61,9 +61,9 @@ test('open auth: bucket, upload, list, admin login, sign out, reconnect, object 
   await expect(page.getByRole('button', { name: 'Create bucket' })).toBeVisible({ timeout: 30_000 });
 
   // ── Sign out (open mode → reconnect gate) ─────────────────────────
-  page.once('dialog', (d) => d.accept());
   await page.getByRole('button', { name: /Account menu/i }).click();
   await page.getByRole('menuitem', { name: 'Sign out' }).click();
+  await page.getByRole('dialog').filter({ hasText: 'Sign out?' }).getByRole('button', { name: 'Sign out' }).click();
 
   await expect(page.getByRole('button', { name: 'Connect again' })).toBeVisible({ timeout: 30_000 });
   await page.getByRole('button', { name: 'Connect again' }).click();
