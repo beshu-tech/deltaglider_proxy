@@ -231,6 +231,9 @@ pub fn endpoint_id(endpoint: &str) -> String {
 #[derive(Clone)]
 pub struct HttpWebhookDeliveryClient {
     client: reqwest::Client,
+    /// The same client for `event_delivery.allow_local: true`: its resolver
+    /// allows private addresses (metadata stays refused).
+    local_client: reqwest::Client,
     /// When true, skip the per-URL SSRF `validate_outbound_url` check. ONLY set
     /// by tests that deliver to a local mock server; the production constructor
     /// (`Default`) leaves it false so private/metadata targets are rejected.
@@ -243,18 +246,21 @@ impl Default for HttpWebhookDeliveryClient {
         // SSRF surface, and a redirect could bounce a request that passed
         // validate_outbound_url onto a private/metadata address. Pair with the
         // per-URL validate_outbound_url(_, UrlKind::Webhook) checks below.
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            // Close the DNS-rebinding gap: a webhook hostname that resolves to a
-            // metadata/private address fails closed at connect time (the
-            // literal-IP validate_outbound_url check can't see DNS).
-            .dns_resolver(std::sync::Arc::new(
-                crate::security::SsrfGuardedResolver::new(crate::security::UrlKind::Webhook),
-            ))
-            .build()
-            .unwrap_or_default();
+        // Close the DNS-rebinding gap: a webhook hostname that resolves to a
+        // metadata/private address fails closed at connect time (the
+        // literal-IP validate_outbound_url check can't see DNS).
+        let build = |kind| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(std::sync::Arc::new(
+                    crate::security::SsrfGuardedResolver::new(kind),
+                ))
+                .build()
+                .unwrap_or_default()
+        };
         Self {
-            client,
+            client: build(UrlKind::Webhook),
+            local_client: build(UrlKind::BackendDev),
             skip_ssrf_check: false,
         }
     }
@@ -264,12 +270,31 @@ impl HttpWebhookDeliveryClient {
     /// Validate an operator-supplied delivery URL unless SSRF checks are
     /// disabled (tests only). Centralises the guard so both the raw-webhook and
     /// slack-incoming-webhook paths apply it identically.
-    fn check_ssrf(&self, endpoint: &str, what: &str) -> Result<(), String> {
+    /// A refusal is permanent: the URL is the same on every retry.
+    fn check_ssrf(
+        &self,
+        config: &EventDeliveryConfig,
+        endpoint: &str,
+        what: &str,
+    ) -> Result<(), String> {
         if self.skip_ssrf_check {
             return Ok(());
         }
-        validate_outbound_url(endpoint, UrlKind::Webhook)
-            .map_err(|e| format!("{what} rejected: {e}"))
+        validate_outbound_url(endpoint, config.webhook_url_kind()).map_err(|e| {
+            permanent(format!(
+                "{what} rejected: {e}. Set event_delivery.allow_local: true to allow \
+                 http:// and private addresses"
+            ))
+        })
+    }
+
+    /// The HTTP client for `config`'s URL policy.
+    fn http(&self, config: &EventDeliveryConfig) -> &reqwest::Client {
+        if config.allow_local {
+            &self.local_client
+        } else {
+            &self.client
+        }
     }
 
     /// Test-only: like `default()` but skips the SSRF guard so tests can deliver
@@ -331,6 +356,13 @@ fn redact_urls_in_text(text: &str) -> String {
             .find(is_url_end)
             .map(|i| sep + 3 + i)
             .unwrap_or(rest.len());
+        if end == sep + 3 {
+            // "https://" with nothing after it is advice text ("use
+            // https://"), not a URL that can hold a secret: copy it through.
+            out.push_str(&rest[..end]);
+            rest = &rest[end..];
+            continue;
+        }
         // A trailing ':' / ',' / ';' / '.' is punctuation, not URL.
         let url_end = scheme_start
             + rest[scheme_start..end]
@@ -342,6 +374,69 @@ fn redact_urls_in_text(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Prefix of a delivery error that no retry can fix (an SSRF refusal, an
+/// invalid URL or header, a config fault). A row whose every failed target
+/// failed this way is dead-lettered at once instead of retried.
+const PERMANENT: &str = "[permanent] ";
+
+fn permanent(msg: String) -> String {
+    format!("{PERMANENT}{msg}")
+}
+
+/// Pure: does every part of a (`"; "`-joined) delivery error say permanent?
+pub(crate) fn is_permanent_error(error: &str) -> bool {
+    !error.is_empty() && error.split("; ").all(|e| e.starts_with(PERMANENT))
+}
+
+/// The newest delivery outcome on this node (success, or the error), for the
+/// admin "Failing" status. In memory: a restart shows "Active" until the next
+/// delivery says otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastOutcome {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub at: i64,
+}
+
+static LAST_OUTCOME: parking_lot::Mutex<Option<LastOutcome>> = parking_lot::Mutex::new(None);
+
+pub fn last_outcome() -> Option<LastOutcome> {
+    LAST_OUTCOME.lock().clone()
+}
+
+fn record_outcome(error: Option<&str>, at: i64) {
+    *LAST_OUTCOME.lock() = Some(LastOutcome {
+        ok: error.is_none(),
+        error: error.map(str::to_string),
+        at,
+    });
+}
+
+/// What the admin GUI shows for event delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeliveryState {
+    Disabled,
+    /// Enabled, but no webhook URL or bot token: nothing is sent.
+    NoEndpoint,
+    Active,
+    /// Active, but the newest delivery failed.
+    Failing,
+}
+
+/// Pure: the delivery state for `config` and the newest outcome.
+pub fn delivery_state(config: &EventDeliveryConfig, last: Option<&LastOutcome>) -> DeliveryState {
+    if !config.enabled {
+        DeliveryState::Disabled
+    } else if !config.is_active() {
+        DeliveryState::NoEndpoint
+    } else if last.is_some_and(|o| !o.ok) {
+        DeliveryState::Failing
+    } else {
+        DeliveryState::Active
+    }
 }
 
 /// The one shape every delivery error takes before it is persisted.
@@ -413,18 +508,19 @@ impl HttpWebhookDeliveryClient {
         };
         // SSRF guard: reject private/loopback/metadata targets before any
         // outbound request (the client also refuses to follow redirects).
-        self.check_ssrf(endpoint, "webhook endpoint")?;
-        let url = Url::parse(endpoint).map_err(|e| format!("invalid webhook endpoint: {e}"))?;
+        self.check_ssrf(config, endpoint, "webhook endpoint")?;
+        let url = Url::parse(endpoint)
+            .map_err(|e| permanent(format!("invalid webhook endpoint: {e}")))?;
         let mut request = self
-            .client
+            .http(config)
             .post(url)
             .timeout(timeout)
             .header("user-agent", "deltaglider-proxy-event-outbox");
         for (name, value) in &config.webhook_headers {
             let name = HeaderName::from_bytes(name.as_bytes())
-                .map_err(|e| format!("invalid webhook header name {name:?}: {e}"))?;
+                .map_err(|e| permanent(format!("invalid webhook header name {name:?}: {e}")))?;
             let value = HeaderValue::from_str(value)
-                .map_err(|e| format!("invalid webhook header value for {name}: {e}"))?;
+                .map_err(|e| permanent(format!("invalid webhook header value for {name}: {e}")))?;
             request = request.header(name, value);
         }
         let response = request
@@ -502,10 +598,11 @@ impl HttpWebhookDeliveryClient {
                 map.insert("icon_emoji".to_string(), Value::String(i.to_string()));
             }
         }
-        self.check_ssrf(endpoint, "slack webhook URL")?;
-        let url = Url::parse(endpoint).map_err(|e| format!("invalid slack webhook URL: {e}"))?;
+        self.check_ssrf(config, endpoint, "slack webhook URL")?;
+        let url = Url::parse(endpoint)
+            .map_err(|e| permanent(format!("invalid slack webhook URL: {e}")))?;
         let response = self
-            .client
+            .http(config)
             .post(url)
             .timeout(timeout)
             .json(&body)
@@ -652,6 +749,7 @@ pub async fn dispatch_once(
         let db = db.lock().await;
         match outcome {
             Ok(()) => {
+                record_outcome(None, now);
                 if let Err(err) = db.event_outbox_mark_delivered(event.id, current_unix_seconds()) {
                     warn!(
                         "Event outbox mark delivered failed for {}: {}",
@@ -660,9 +758,16 @@ pub async fn dispatch_once(
                 }
             }
             Err(err) => {
-                let next_attempt_at = next_attempt_after(config, event.attempts, now);
+                let stored = persistable_error(&err);
+                record_outcome(Some(&stored), now);
+                // A permanent error fails the row now: a retry cannot fix it.
+                let next_attempt_at = if is_permanent_error(&err) {
+                    None
+                } else {
+                    next_attempt_after(config, event.attempts, now)
+                };
                 if let Err(mark_err) =
-                    db.event_outbox_mark_failed(event.id, &persistable_error(&err), next_attempt_at)
+                    db.event_outbox_mark_failed(event.id, &stored, next_attempt_at)
                 {
                     warn!(
                         "Event outbox mark failed failed for {}: {}",
@@ -744,7 +849,9 @@ async fn deliver_to_targets(
     config: &EventDeliveryConfig,
     event: &EventOutboxRecord,
 ) -> Result<(), String> {
-    let targets = delivery_targets(config, event)?;
+    // A config fault (no endpoint, a bad glob, no channel) fails every retry
+    // the same way until the config changes.
+    let targets = delivery_targets(config, event).map_err(permanent)?;
     if targets.is_empty() {
         return Ok(()); // filtered out or routed nowhere: consumed
     }
@@ -1440,6 +1547,93 @@ mod tests {
             }
             .id()
         );
+    }
+
+    /// Browser review #9: the redaction pass mangled our own advice text
+    /// "(use https://)" into "(use <invalid-url>)".
+    #[test]
+    fn redaction_keeps_a_bare_scheme_in_error_text() {
+        let msg = "webhook endpoint rejected: URL scheme 'http' is not allowed (use https://)";
+        assert_eq!(persistable_error(msg), msg);
+        // A real URL next to it is still redacted.
+        assert_eq!(
+            persistable_error("http://127.0.0.1:5056/deltaglider: refused (use https://)"),
+            "http://127.0.0.1:5056/<redacted>: refused (use https://)"
+        );
+    }
+
+    /// `allow_local: true` lets a webhook reach http:// and private
+    /// addresses (as for backends); metadata stays refused.
+    #[test]
+    fn allow_local_opens_private_webhooks_but_never_metadata() {
+        let client = HttpWebhookDeliveryClient::default();
+        let mut c = cfg();
+        assert!(client
+            .check_ssrf(&c, "http://127.0.0.1:5056/hook", "webhook endpoint")
+            .is_err());
+        c.allow_local = true;
+        client
+            .check_ssrf(&c, "http://127.0.0.1:5056/hook", "webhook endpoint")
+            .expect("allow_local opens loopback");
+        client
+            .check_ssrf(&c, "http://10.0.0.5/hook", "webhook endpoint")
+            .expect("allow_local opens private space");
+        assert!(client
+            .check_ssrf(&c, "http://169.254.169.254/latest", "webhook endpoint")
+            .is_err());
+    }
+
+    /// An SSRF refusal cannot succeed on a retry: the row fails at once
+    /// instead of retrying max_attempts times.
+    #[tokio::test]
+    async fn ssrf_refusal_dead_letters_at_once() {
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test-pass").unwrap()));
+        let id = db.lock().await.event_outbox_insert(&event("ssrf")).unwrap();
+        let mut config = cfg();
+        config.max_attempts = 8;
+        config.webhook_url = Some("http://127.0.0.1:5056/deltaglider".to_string());
+        let client = HttpWebhookDeliveryClient::default();
+        dispatch_once(&db, &client, &config, "test-worker", 200).await;
+        let row = db
+            .lock()
+            .await
+            .event_outbox_recent(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap();
+        assert_eq!(row.status, STATUS_FAILED, "{row:?}");
+        assert_eq!(row.next_attempt_at, None);
+        assert_eq!(row.attempts, 1);
+        assert!(
+            row.last_error
+                .as_deref()
+                .unwrap_or("")
+                .contains("allow_local"),
+            "the error says how to opt in: {row:?}"
+        );
+    }
+
+    #[test]
+    fn delivery_state_truth_table() {
+        let mut c = cfg();
+        let failed = LastOutcome {
+            ok: false,
+            error: Some("x".into()),
+            at: 1,
+        };
+        let ok = LastOutcome {
+            ok: true,
+            error: None,
+            at: 1,
+        };
+        assert_eq!(delivery_state(&c, Some(&failed)), DeliveryState::Failing);
+        assert_eq!(delivery_state(&c, Some(&ok)), DeliveryState::Active);
+        assert_eq!(delivery_state(&c, None), DeliveryState::Active);
+        c.webhook_url = None;
+        assert_eq!(delivery_state(&c, Some(&failed)), DeliveryState::NoEndpoint);
+        c.enabled = false;
+        assert_eq!(delivery_state(&c, Some(&failed)), DeliveryState::Disabled);
     }
 
     #[tokio::test]

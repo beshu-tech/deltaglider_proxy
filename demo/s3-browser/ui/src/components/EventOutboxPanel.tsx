@@ -13,10 +13,13 @@ import type { ColumnsType, TablePaginationConfig } from 'antd/es/table';
 import type { SorterResult } from 'antd/es/table/interface';
 import { useColors } from '../ThemeContext';
 import {
+  DELIVERY_STATE,
+  deliveryStateOf,
   fetchEventOutbox,
   requeueEventOutbox,
   requeueEventOutboxMany,
   purgeFailedEventOutbox,
+  type DeliveryState,
   type EndpointDelivery,
   type EventOutboxRecord,
   type EventOutboxStatus,
@@ -73,8 +76,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
   const [rows, setRows] = useState<EventOutboxRecord[]>([]);
   const [counts, setCounts] = useState({ pending: 0, in_progress: 0, delivered: 0, failed: 0 });
   const [total, setTotal] = useState(0);
-  const [deliveryEnabled, setDeliveryEnabled] = useState(false);
-  const [deliveryActive, setDeliveryActive] = useState(false);
+  const [deliveryState, setDeliveryState] = useState<DeliveryState>('disabled');
   const [filter, setFilter] = useState('');
   const [status, setStatus] = useState<StatusFilter>('all');
   const [page, setPage] = useState(1);
@@ -99,8 +101,7 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
       setRows(res.rows);
       setCounts(res.counts);
       setTotal(res.total);
-      setDeliveryEnabled(res.delivery_enabled);
-      setDeliveryActive(res.delivery_active);
+      setDeliveryState(deliveryStateOf(res));
       setError(null);
     } catch (e) {
       if (gen !== fetchGen.current) return;
@@ -363,10 +364,10 @@ export default function EventOutboxPanel({ onSessionExpired }: Props) {
           <DatabaseOutlined style={{ color: colors.ACCENT_BLUE }} />
           <Text strong>Object change events</Text>
           <Tag
-            color={deliveryActive ? 'success' : deliveryEnabled ? 'warning' : 'default'}
+            color={DELIVERY_STATE[deliveryState].color}
             title="Delivery runs in the background. Pending rows stay queued; failed rows can be requeued."
           >
-            delivery {deliveryActive ? 'active' : deliveryEnabled ? 'waiting' : 'off'}
+            delivery {DELIVERY_STATE[deliveryState].label.toLowerCase()}
           </Tag>
         </Space>
         <Text type="secondary" style={{ fontSize: 12 }} title="Events are stored safely until they're delivered. Delivered events are eventually cleaned up; pending and failed events are kept so they can still be retried.">

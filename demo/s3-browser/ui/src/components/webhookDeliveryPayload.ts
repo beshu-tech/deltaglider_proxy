@@ -79,6 +79,7 @@ interface EventDeliveryConfig {
   delivered_retention: string;
   delivered_max_rows: number;
   prune_batch: number;
+  allow_local: boolean;
   // Slack
   format: EventDeliveryFormat;
   /** Equals the sentinel while an untouched bot token is masked; '' = unset. */
@@ -107,6 +108,7 @@ const DEFAULT_EVENT_DELIVERY: EventDeliveryConfig = {
   delivered_retention: '24h',
   delivered_max_rows: 10000,
   prune_batch: 100,
+  allow_local: false,
   format: 'raw',
   slack_bot_token: '',
   slack_channel: '',
@@ -134,6 +136,7 @@ export interface EventDeliveryWire {
   delivered_retention?: string;
   delivered_max_rows?: number;
   prune_batch?: number;
+  allow_local?: boolean;
   format?: EventDeliveryFormat;
   slack_bot_token?: string | null;
   slack_channel?: string | null;
@@ -181,6 +184,7 @@ function normalizeEventDelivery(
     delivered_retention: ed.delivered_retention ?? d.delivered_retention,
     delivered_max_rows: ed.delivered_max_rows ?? d.delivered_max_rows,
     prune_batch: ed.prune_batch ?? d.prune_batch,
+    allow_local: ed.allow_local ?? d.allow_local,
     format: ed.format === 'slack' ? 'slack' : 'raw',
     // A null/absent token → unset (''); the sentinel survives as "masked".
     slack_bot_token: ed.slack_bot_token ?? '',
@@ -248,6 +252,10 @@ function buildEventDeliveryPayload(
   const urls = local.webhook_urls.map((u) => u.trim()).filter((u) => u.length > 0);
   for (const u of urls) {
     if (!URL_RE.test(u)) errors.push(`Endpoint "${u}" is not a valid http(s) URL.`);
+    else if (!local.allow_local && /^http:\/\//i.test(u)) {
+      // The server refuses it on apply (SSRF policy); say how to opt in.
+      errors.push(`Endpoint "${u}" uses http://. Use https://, or turn on Allow local receivers.`);
+    }
   }
 
   const isSlack = local.format === 'slack';
@@ -380,6 +388,7 @@ function buildEventDeliveryPayload(
       delivered_retention: local.delivered_retention.trim(),
       delivered_max_rows: local.delivered_max_rows,
       prune_batch: local.prune_batch,
+      allow_local: local.allow_local,
       // Slack — always emitted so the merge-patch reflects the editor's intent.
       format: local.format,
       slack_bot_token: slackBotToken,
@@ -474,6 +483,8 @@ export interface WebhookFormState {
   delivered_retention: string;
   delivered_max_rows: number;
   prune_batch: number;
+  /** Allow http:// and private-address webhook URLs (`event_delivery.allow_local`). */
+  allow_local: boolean;
   // ── Slack ──
   /** `raw` (existing JSON envelope) or `slack` (Block Kit message). */
   format: EventDeliveryFormat;
@@ -531,6 +542,7 @@ export function formFromWire(
     delivered_retention: cfg.delivered_retention,
     delivered_max_rows: cfg.delivered_max_rows,
     prune_batch: cfg.prune_batch,
+    allow_local: cfg.allow_local,
     format: cfg.format,
     // Bot mode iff a token (real or masked) is present at load.
     slackPreferBotMode: cfg.slack_bot_token.trim().length > 0,
@@ -590,6 +602,7 @@ export function buildPayloadFromForm(form: WebhookFormState): ValidationResult {
     delivered_retention: form.delivered_retention,
     delivered_max_rows: form.delivered_max_rows,
     prune_batch: form.prune_batch,
+    allow_local: form.allow_local,
     format: form.format,
     slack_bot_token: slackBotToken,
     slack_channel: form.slackChannel,

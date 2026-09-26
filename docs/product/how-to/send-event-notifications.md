@@ -16,6 +16,8 @@ advanced:
 
 Add fan-out endpoints with `webhook_urls: [...]` — every endpoint receives every event, and a row counts as delivered only when **all** endpoints return 2xx. The proxy records the result of each endpoint separately. When one endpoint fails, the proxy still posts to the other endpoints, and a retry posts only to the endpoints that have not yet returned 2xx, so the healthy endpoints do not receive the event twice. The proxy knows an endpoint by its position in the list and by its scheme, host and port. So when you rotate a token in the path or query of an endpoint URL, the endpoint keeps its state, and a retry does not post the event to it again. The same URL listed twice is one endpoint. Each POST body is the `{schema, event}` JSON envelope; full payload schema and tuning knobs (`tick_interval`, `batch_size`, `max_attempts`, retention) are in the [reference](../reference/event-outbox.md#yaml-grammar).
 
+The URLs must use `https://`, and they must not point at a private, loopback or cloud-metadata address. The proxy refuses a config apply that adds such a URL, because every delivery to it would fail. When the receiver runs on the same host or in the same private network, set `allow_local: true` in `event_delivery` (in the admin UI, turn on **Allow local receivers**). The proxy then allows `http://` and private addresses for the webhook URLs, but it still refuses cloud-metadata addresses.
+
 From the admin UI: **Settings → Integrations → Event delivery**.
 
 ![Event delivery settings](/_/screenshots/events-webhook.jpg)
@@ -94,6 +96,8 @@ curl -b cookies -X POST https://s3.acme.example/_/api/admin/event-outbox/123/req
 curl -b cookies -X POST https://s3.acme.example/_/api/admin/event-outbox/requeue \
   -H 'Content-Type: application/json' -d '{"ids": [123, 124]}'
 ```
+
+A row whose error cannot go away on a retry fails at once, after one attempt: for example, when the outbound-URL policy refuses the URL, or when a header value is invalid. Its error text starts with `[permanent]`. The Event delivery page shows the delivery state **Failing**, with the last error, when the newest delivery attempt failed.
 
 Requeue doesn't create a new event — it flips `failed` back to `pending`, keeps the attempt history, and makes the row due immediately. The Event log page does the same with a button.
 

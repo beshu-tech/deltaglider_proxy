@@ -158,6 +158,9 @@ storage:
 #   #   webhook_headers:
 #   #     authorization: "Bearer redacted-token"
 #   #     x-dgp-env: "prod"
+#   #   # true: allow http:// and private/loopback webhook URLs (a receiver
+#   #   # on this host or network). Cloud-metadata addresses stay refused.
+#   #   allow_local: false
 #   #   tick_interval: "10s"
 #   #   batch_size: 50
 #   #   request_timeout: "5s"

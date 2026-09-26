@@ -53,7 +53,29 @@ interface EventOutboxResponse {
   order: string;
   delivery_enabled: boolean;
   delivery_active: boolean;
+  /** `failing` = active, but the newest delivery failed. */
+  delivery_state?: DeliveryState;
+  last_delivery_error?: string | null;
 }
+
+export type DeliveryState = 'disabled' | 'no-endpoint' | 'active' | 'failing';
+
+/** The delivery state of a response (an older server sends only the flags). */
+export function deliveryStateOf(
+  r: Pick<EventOutboxResponse, 'delivery_enabled' | 'delivery_active' | 'delivery_state'>,
+): DeliveryState {
+  if (r.delivery_state) return r.delivery_state;
+  if (r.delivery_active) return 'active';
+  return r.delivery_enabled ? 'no-endpoint' : 'disabled';
+}
+
+/** Tag label + colour per delivery state, shared by the delivery panels. */
+export const DELIVERY_STATE: Record<DeliveryState, { label: string; color: string }> = {
+  disabled: { label: 'Disabled', color: 'default' },
+  'no-endpoint': { label: 'Enabled (no endpoint)', color: 'orange' },
+  active: { label: 'Active', color: 'green' },
+  failing: { label: 'Failing', color: 'red' },
+};
 
 interface EventOutboxRequeueResponse {
   requeued: number;

@@ -1375,3 +1375,53 @@ async fn section_put_never_persists_env_values_into_the_yaml_file() {
     assert!(!export.contains("env-secret-must-not-leak"), "{export}");
     assert!(!export.contains("ENVKEY"), "{export}");
 }
+
+/// Browser review #9: an apply that adds a webhook URL the SSRF policy
+/// refuses is itself refused (it would only fail every delivery), unless
+/// `allow_local: true` opts in to http:// and private addresses.
+#[tokio::test]
+async fn apply_refuses_a_local_webhook_unless_allow_local() {
+    let server = TestServer::builder()
+        .auth("WHLOCAL1", "WHLOCALSECRET1")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let url = format!("{}/_/api/admin/config/section/advanced", server.endpoint());
+
+    let resp = admin
+        .put(&url)
+        .json(&json!({
+            "event_delivery": {
+                "enabled": true,
+                "webhook_urls": ["http://127.0.0.1:5056/deltaglider"]
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert!(status.is_client_error(), "must refuse: {status} {body}");
+    assert!(body.contains("allow_local"), "says how to opt in: {body}");
+
+    let resp = admin
+        .put(&url)
+        .json(&json!({
+            "event_delivery": {
+                "enabled": true,
+                "allow_local": true,
+                "webhook_urls": ["http://127.0.0.1:5056/deltaglider"]
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "{}",
+        resp.text().await.unwrap()
+    );
+    let body: serde_json::Value = admin.get(&url).send().await.unwrap().json().await.unwrap();
+    assert_eq!(body["event_delivery"]["allow_local"], true, "{body}");
+}

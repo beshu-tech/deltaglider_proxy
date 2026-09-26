@@ -784,6 +784,13 @@ pub struct EventDeliveryConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub webhook_headers: BTreeMap<String, String>,
 
+    /// Allow webhook URLs on `http://` and on private or loopback addresses
+    /// (a receiver on the same host or network), like a backend's
+    /// `allow_local`. Cloud-metadata addresses stay refused. Off by default:
+    /// without it, such a URL is refused when the config is applied.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_local: bool,
+
     /// Dispatcher wake interval. Defaults to `10s`.
     #[serde(default = "default_event_delivery_tick")]
     pub tick_interval: String,
@@ -937,6 +944,62 @@ impl EventDeliveryConfig {
                 .unwrap_or(false)
     }
 
+    /// The outbound-URL policy for this config's webhook URLs:
+    /// `allow_local` gets the backend-dev policy (http:// and private
+    /// addresses allowed, metadata refused), else the strict webhook policy.
+    pub fn webhook_url_kind(&self) -> crate::security::UrlKind {
+        if self.allow_local {
+            crate::security::UrlKind::BackendDev
+        } else {
+            crate::security::UrlKind::Webhook
+        }
+    }
+
+    /// Every configured webhook URL that the SSRF policy refuses, as
+    /// `(yaml path, url, reason)`. The dispatcher refuses them at delivery
+    /// time; an apply that adds one is refused (see `apply_config_transition`).
+    pub fn refused_webhook_urls(&self) -> Vec<(&'static str, String, String)> {
+        self.webhook_url
+            .as_deref()
+            .map(|u| ("event_delivery.webhook_url", u))
+            .into_iter()
+            .chain(
+                self.webhook_urls
+                    .iter()
+                    .map(|u| ("event_delivery.webhook_urls", u.as_str())),
+            )
+            .map(|(label, u)| (label, u.trim()))
+            .filter(|(_, u)| !u.is_empty())
+            .filter_map(|(label, u)| {
+                crate::security::validate_outbound_url(u, self.webhook_url_kind())
+                    .err()
+                    .map(|e| (label, u.to_string(), e.to_string()))
+            })
+            .collect()
+    }
+
+    /// Pure: the refused webhook URLs that `self` ADDS over `old` (a URL
+    /// that `old` holds and refuses too is a pre-existing one: it only gets a
+    /// warning, so an unrelated apply is not blocked by it).
+    pub fn newly_refused_webhook_urls(&self, old: &Self) -> Vec<String> {
+        let before: std::collections::HashSet<String> = old
+            .refused_webhook_urls()
+            .into_iter()
+            .map(|(_, u, _)| u)
+            .collect();
+        self.refused_webhook_urls()
+            .into_iter()
+            .filter(|(_, u, _)| !before.contains(u))
+            .map(|(label, u, e)| {
+                format!(
+                    "{label} {u:?} is refused by the outbound-URL policy: {e}. Set \
+                     event_delivery.allow_local: true for a receiver on http:// or a \
+                     private address (cloud-metadata addresses are never allowed)"
+                )
+            })
+            .collect()
+    }
+
     pub fn webhook_endpoints(&self) -> Vec<&str> {
         self.webhook_url
             .as_deref()
@@ -955,6 +1018,7 @@ impl Default for EventDeliveryConfig {
             webhook_url: None,
             webhook_urls: Vec::new(),
             webhook_headers: BTreeMap::new(),
+            allow_local: false,
             tick_interval: default_event_delivery_tick(),
             batch_size: default_event_delivery_batch_size(),
             request_timeout: default_event_delivery_timeout(),
@@ -2088,31 +2152,14 @@ pub fn validate_event_delivery(cfg: &EventDeliveryConfig) -> Vec<String> {
         );
     }
 
-    for (label, url) in cfg
-        .webhook_url
-        .as_deref()
-        .map(|url| ("event_delivery.webhook_url", url))
-        .into_iter()
-        .chain(
-            cfg.webhook_urls
-                .iter()
-                .map(|url| ("event_delivery.webhook_urls", url.as_str())),
-        )
-    {
-        if url.trim().is_empty() {
-            continue;
-        }
-        // The SAME policy the dispatcher enforces at delivery time (https
-        // only, no loopback/private/metadata hosts). This used to accept any
-        // http(s) URL, so an http:// endpoint applied cleanly and then every
-        // event failed and retried with "scheme 'http' is not allowed".
-        if let Err(e) =
-            crate::security::validate_outbound_url(url, crate::security::UrlKind::Webhook)
-        {
-            warnings.push(format!(
-                "{label} {url:?} will be refused when events are delivered: {e}"
-            ));
-        }
+    // The SAME policy the dispatcher enforces at delivery time. An apply that
+    // ADDS such a URL is refused; one already in the config (an older
+    // version accepted it) is only warned about, so the proxy still boots.
+    for (label, url, e) in cfg.refused_webhook_urls() {
+        warnings.push(format!(
+            "{label} {url:?} will be refused when events are delivered: {e}. \
+             Set event_delivery.allow_local: true for a receiver on http:// or a private address"
+        ));
     }
 
     for (name, value) in &cfg.webhook_headers {
@@ -2296,6 +2343,35 @@ pub(crate) fn detect_replication_cycles(rules: &[ReplicationRule]) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_added_refused_webhook_urls_block_an_apply() {
+        let local = |allow_local| EventDeliveryConfig {
+            enabled: true,
+            webhook_urls: vec!["http://127.0.0.1:5056/hook".into()],
+            allow_local,
+            ..Default::default()
+        };
+        let empty = EventDeliveryConfig::default();
+        assert_eq!(local(false).newly_refused_webhook_urls(&empty).len(), 1);
+        assert!(local(true).newly_refused_webhook_urls(&empty).is_empty());
+        // Already there before: warned about, not refused.
+        assert!(local(false)
+            .newly_refused_webhook_urls(&local(false))
+            .is_empty());
+        // Turning allow_local off makes it newly refused.
+        assert_eq!(
+            local(false).newly_refused_webhook_urls(&local(true)).len(),
+            1
+        );
+        // Metadata is refused even with allow_local.
+        let imds = EventDeliveryConfig {
+            webhook_url: Some("http://169.254.169.254/x".into()),
+            allow_local: true,
+            ..Default::default()
+        };
+        assert_eq!(imds.newly_refused_webhook_urls(&empty).len(), 1);
+    }
 
     /// Validation must agree with the delivery-time URL policy: an http:// or
     /// loopback webhook applied cleanly and then failed every event.

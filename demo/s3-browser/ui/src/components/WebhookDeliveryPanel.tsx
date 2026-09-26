@@ -34,7 +34,7 @@ import {
 } from 'antd';
 import { ApiOutlined, DeleteOutlined } from '@ant-design/icons';
 import type { SectionApplyResponse } from '../adminApi';
-import { fetchEventOutbox } from '../adminApi';
+import { DELIVERY_STATE, deliveryStateOf, fetchEventOutbox, type DeliveryState } from '../adminApi';
 import { useCardStyles, contentColumn, CONTENT_WIDE } from './shared-styles';
 import { LoadingState } from './StatePlaceholders';
 import { useColors } from '../ThemeContext';
@@ -79,6 +79,7 @@ const EMPTY_FORM: WebhookFormState = {
   delivered_retention: '24h',
   delivered_max_rows: 10000,
   prune_batch: 100,
+  allow_local: false,
   format: 'raw',
   slackPreferBotMode: false,
   slackBotToken: '',
@@ -194,8 +195,8 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
   const [outbox, setOutbox] = useState<{
     pending: number;
     failed: number;
-    enabled: boolean;
-    active: boolean;
+    state: DeliveryState;
+    lastError: string | null;
   } | null>(null);
   useEffect(() => {
     let alive = true;
@@ -205,8 +206,8 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
         setOutbox({
           pending: r.counts.pending,
           failed: r.counts.failed,
-          enabled: r.delivery_enabled,
-          active: r.delivery_active,
+          state: deliveryStateOf(r),
+          lastError: r.last_delivery_error ?? null,
         });
       })
       .catch(() => {});
@@ -278,15 +279,13 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
 
       {outbox && (
         <Alert
-          type={outbox.active ? 'success' : 'info'}
+          type={outbox.state === 'failing' ? 'error' : outbox.state === 'active' ? 'success' : 'info'}
           showIcon
           title={
             <Space size="middle" wrap>
               <span>
                 Delivery:{' '}
-                <Tag color={outbox.active ? 'green' : outbox.enabled ? 'orange' : 'default'}>
-                  {outbox.active ? 'Active' : outbox.enabled ? 'Enabled (no endpoint)' : 'Disabled'}
-                </Tag>
+                <Tag color={DELIVERY_STATE[outbox.state].color}>{DELIVERY_STATE[outbox.state].label}</Tag>
               </span>
               <span>{outbox.pending} pending</span>
               <span>{outbox.failed} failed</span>
@@ -299,6 +298,11 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
                 View event log →
               </Button>
             </Space>
+          }
+          description={
+            outbox.state === 'failing' && outbox.lastError ? (
+              <Text style={{ fontSize: 12 }}>Last error: {outbox.lastError}</Text>
+            ) : undefined
           }
         />
       )}
@@ -447,7 +451,7 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
               <FormField
                 label="Endpoints"
                 yamlPath="advanced.event_delivery.webhook_urls"
-                helpText="HTTP(S) URLs that receive the payload. An event is marked delivered only after every endpoint returns 2xx."
+                helpText="HTTPS URLs that receive the payload. An event is marked delivered only after every endpoint returns 2xx. A URL on http:// or on a private or loopback address needs Allow local receivers."
               >
                 <RowListEditor<WebhookUrlRow>
                   items={form.urlRows}
@@ -474,6 +478,18 @@ export default function WebhookDeliveryPanel({ onSessionExpired }: Props) {
                       />
                     </Space.Compact>
                   )}
+                />
+              </FormField>
+
+              <FormField
+                label="Allow local receivers"
+                yamlPath="advanced.event_delivery.allow_local"
+                helpText="Lets endpoints use http:// and private or loopback addresses (a receiver on this host or network), like a backend's allow_local. Cloud-metadata addresses stay refused. Without it, such a URL is refused when you apply."
+              >
+                <Switch
+                  aria-label="Allow local receivers"
+                  checked={form.allow_local}
+                  onChange={(v) => setField({ allow_local: v })}
                 />
               </FormField>
 

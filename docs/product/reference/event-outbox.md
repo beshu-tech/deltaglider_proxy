@@ -14,6 +14,8 @@ Durable object events are written to the encrypted config DB after successful S3
 - Delivery is at-least-once. Webhook receivers must be idempotent, typically by deduplicating on `event.id`.
 - Multiple webhooks are fan-out, not independent subscriptions. If one endpoint fails, the row is retried and endpoints that already accepted the event may see it again.
 - Failed attempts use exponential backoff. After `max_attempts`, the row becomes permanently `failed` until an operator requeues it.
+- A permanent error does not retry. When every failed target of a row failed because of the configuration (the outbound-URL policy refuses the URL, the URL or a header is invalid, or no target is configured), the row becomes `failed` after its first attempt, because a retry would fail the same way. The error text of such a row starts with `[permanent]`.
+- Webhook URLs must use `https://` and must not point at a private, loopback or cloud-metadata address. Set `allow_local: true` to allow `http://` and private or loopback addresses, for example for a receiver on the same host or network. Cloud-metadata addresses are refused even then. A config apply that adds a URL that the policy refuses is itself refused, with an error that names the URL. A refused URL that the config already held before the apply (an older version accepted it) only produces a warning, so the proxy still starts.
 - Requeue does not create a new event. It changes only `failed` rows back to `pending`, clears claim/error fields, preserves `attempts` as delivery history, and makes the row due immediately.
 - Stale `in_progress` claims are reclaimable so a crashed dispatcher does not wedge rows forever.
 - Delivered rows are pruned by the dispatcher after `delivered_retention` and capped by `delivered_max_rows`. Pending, in-progress, and failed rows are not deleted by retention pruning because they still need operator or dispatcher action.
@@ -31,6 +33,7 @@ advanced:
     webhook_headers:
       authorization: "Bearer redacted-token"
       x-dgp-env: "prod"
+    allow_local: false          # true: allow http:// and private addresses
     tick_interval: "10s"
     batch_size: 50
     request_timeout: "5s"
@@ -111,6 +114,6 @@ All routes are session-gated.
 | `POST` | `/_/api/admin/event-outbox/:id/requeue` | Requeue one `failed` row. Returns `409` if the row is not currently failed. |
 | `POST` | `/_/api/admin/event-outbox/requeue` | Requeue failed rows by id: `{ "ids": [123, 124] }`. Non-failed ids are ignored. |
 
-`limit` defaults to 50 and is clamped to 500. Sort fields are `id`, `occurred_at`, `created_at`, `next_attempt_at`, `delivered_at`, `attempts`, `status`, `kind`, `bucket`, and `key`; `order` is `asc` or `desc`. The list response carries `rows`, per-status `counts`, `total`, the echoed paging/sort parameters, and the `delivery_enabled` / `delivery_active` flags.
+`limit` defaults to 50 and is clamped to 500. Sort fields are `id`, `occurred_at`, `created_at`, `next_attempt_at`, `delivered_at`, `attempts`, `status`, `kind`, `bucket`, and `key`; `order` is `asc` or `desc`. The list response carries `rows`, per-status `counts`, `total`, the echoed paging/sort parameters, and the `delivery_enabled` / `delivery_active` flags. `delivery_state` is `disabled`, `no-endpoint`, `active` or `failing`. It is `failing` when delivery is active but the newest delivery attempt on this instance failed, and then `last_delivery_error` holds that attempt's error (with URLs redacted). The instance keeps this state in memory, so after a restart it shows `active` until the next attempt.
 
 Each row also carries `deliveries`: the per-target delivery state from the `event_deliveries` table. Each entry has `endpoint_id`, `label`, `status` (`delivered` or `failed`), `attempts`, `last_error`, and `updated_at`. The `label` is the redacted webhook URL with its position in the config (for example `webhook 2: https://hooks.slack.com/<redacted>`) or the Slack channel (`slack channel #ops`). The label is `null` when the endpoint is no longer in the config. The list is empty until the dispatcher attempts a target, and it stays empty for a Slack event that the notify filters drop. The Event log page shows the same data: the status cell counts the endpoints that accepted the event, and you can expand a row to see each endpoint.

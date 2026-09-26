@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Fixed — Webhook delivery: local receivers, fast dead letters, a Failing state
+
+A webhook URL on `http://` or on a private address applied with only a
+warning, and then every event retried eight times and failed. Now:
+
+- `event_delivery.allow_local: true` allows `http://` and private or
+  loopback addresses for the webhook URLs (cloud metadata stays refused),
+  like a backend's `allow_local`. The admin UI has an **Allow local
+  receivers** switch.
+- A config apply that adds a URL that the policy refuses is refused. A URL
+  that the config already held only warns, so an upgrade still boots.
+- An error that no retry can fix (a refused or invalid URL, an invalid
+  header, no target) fails the row after one attempt. Its error starts with
+  `[permanent]`.
+- The event-outbox API returns `delivery_state` (`failing` when the newest
+  delivery failed) and `last_delivery_error`; the admin UI shows **Failing**
+  instead of **Active**.
+- The redaction of URLs in error text no longer turns the advice "(use
+  https://)" into "(use <invalid-url>)".
+
 ### Fixed — A hung backend no longer hangs requests, and the proxy notices it
 
 The health probe re-checked only backends that were already unhealthy, so a

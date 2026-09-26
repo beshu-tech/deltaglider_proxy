@@ -254,7 +254,14 @@ pub(crate) async fn apply_config_transition(
     //     un-runnable — a misrouted bucket silently falls to the default
     //     backend and 404s (the beshu-b2 incident). Boot enforces the same
     //     invariant; an apply must not smuggle one past it.
-    let fatal = new_cfg.check_fatal();
+    let mut fatal = new_cfg.check_fatal();
+    // A webhook URL that every delivery would refuse: refuse the apply that
+    // adds it, instead of failing (and retrying) every event later.
+    fatal.extend(
+        new_cfg
+            .event_delivery
+            .newly_refused_webhook_urls(&old_cfg.event_delivery),
+    );
     if !fatal.is_empty() {
         return Err(format!("config refused: {}", fatal.join("; ")));
     }

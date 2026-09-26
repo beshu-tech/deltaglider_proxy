@@ -427,3 +427,17 @@ test('resolveSlackChannelsPreview: no match + no fallback → no channel', () =>
   const r = resolveSlackChannelsPreview(routes, '', 'scratch', 'x');
   assert.ok(r.matches.length === 0 && !r.fellBackToChannel, 'no match, no fallback → posted nowhere');
 });
+
+test('allow_local round-trips, and an http:// endpoint needs it', () => {
+  const wire: EventDeliveryWire = { enabled: true, webhook_urls: ['http://127.0.0.1:5056/deltaglider'] };
+  const refused = buildFromWire(wire);
+  assert.equal(refused.ok, false, 'http:// without allow_local is refused before apply');
+  assert.ok(
+    !refused.ok && refused.errors.some((e) => e.includes('Allow local receivers')),
+    'the error names the switch',
+  );
+  const allowed = buildFromWire({ ...wire, allow_local: true });
+  assert.equal(ed(allowed).allow_local, true);
+  const off = buildFromWire({ ...wire, webhook_urls: ['https://hooks.example.com/in'] });
+  assert.equal(ed(off).allow_local, false);
+});

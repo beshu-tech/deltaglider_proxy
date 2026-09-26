@@ -57,6 +57,11 @@ pub struct EventOutboxResponse {
     pub order: String,
     pub delivery_enabled: bool,
     pub delivery_active: bool,
+    /// `disabled` | `no-endpoint` | `active` | `failing` (active, but the
+    /// newest delivery on this node failed).
+    pub delivery_state: crate::event_delivery::DeliveryState,
+    /// The newest delivery error on this node while `failing` (URLs redacted).
+    pub last_delivery_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +115,7 @@ pub async fn list(
     })?;
 
     let delivery = { state.config.read().await.event_delivery.clone() };
+    let last = crate::event_delivery::last_outcome();
     let db = state
         .config_db
         .as_ref()
@@ -172,6 +178,8 @@ pub async fn list(
         order: order_raw,
         delivery_enabled: delivery.enabled,
         delivery_active: delivery.is_active(),
+        delivery_state: crate::event_delivery::delivery_state(&delivery, last.as_ref()),
+        last_delivery_error: last.filter(|o| !o.ok).and_then(|o| o.error),
     }))
 }
 

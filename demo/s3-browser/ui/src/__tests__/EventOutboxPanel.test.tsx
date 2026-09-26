@@ -93,6 +93,24 @@ test('first load asks for page 1, newest first, all statuses', async () => {
   expect(screen.getByText('delivery active')).toBeInTheDocument();
 });
 
+test('a failing delivery says Failing, not active', async () => {
+  http.on(
+    'GET',
+    LIST,
+    json({
+      rows: [record(1)],
+      counts: { pending: 0, in_progress: 0, delivered: 0, failed: 1 },
+      total: 1,
+      delivery_enabled: true,
+      delivery_active: true,
+      delivery_state: 'failing',
+      last_delivery_error: 'webhook endpoint rejected',
+    }),
+  );
+  renderWithQuery(<EventOutboxPanel />);
+  expect(await screen.findByText('delivery failing')).toBeInTheDocument();
+});
+
 describe('per-endpoint delivery', () => {
   const partial = record(7, {
     status: 'failed',
