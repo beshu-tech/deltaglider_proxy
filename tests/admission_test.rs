@@ -877,3 +877,74 @@ admission:
         "a forged X-Forwarded-For escaped a source_ip deny block"
     );
 }
+
+/// A browser form POST names its bucket in the path. For admission (and for
+/// s3s) `//bucket` has an EMPTY bucket, so a block on `bucket` does not fire.
+/// The router must then not serve it as an upload into `bucket`: that upload
+/// skipped every admission block on the bucket. Found by the
+/// middleware-vs-s3s contract test (`api::s3s_contract_tests`).
+#[tokio::test]
+async fn form_post_to_an_empty_leading_segment_does_not_skip_admission() {
+    let server = TestServer::builder().open_access().build().await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let bucket = server.bucket().to_string();
+    apply_admission_yaml(
+        &admin,
+        &server.endpoint(),
+        &format!(
+            r#"
+admission:
+  blocks:
+    - name: freeze-uploads
+      match:
+        bucket: {bucket}
+        method: [POST]
+      action: deny
+"#
+        ),
+    )
+    .await;
+    let form = |key: &str| {
+        reqwest::multipart::Form::new()
+            .text("key", key.to_string())
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(b"payload".to_vec())
+                    .file_name("f.txt")
+                    .mime_str("text/plain")
+                    .unwrap(),
+            )
+    };
+    let http = reqwest::Client::new();
+
+    // Control: the plain form POST meets the block.
+    let resp = http
+        .post(format!("{}/{bucket}", server.endpoint()))
+        .multipart(form("plain.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let resp = http
+        .post(format!("{}//{bucket}", server.endpoint()))
+        .multipart(form("escaped.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !resp.status().is_success(),
+        "a form POST to //{bucket} must not be served, got {}",
+        resp.status()
+    );
+    let resp = http
+        .get(format!("{}/{bucket}/escaped.txt", server.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "the form POST to //{bucket} stored an object past the admission block"
+    );
+}

@@ -503,41 +503,17 @@ pub fn build_s3_router(
     ) -> axum::response::Response {
         use axum::response::IntoResponse;
         use deltaglider_proxy::api::handlers::form_post::{
-            handle_form_post_upload, is_multipart_form_upload,
+            form_post_bucket, handle_form_post_upload,
         };
 
-        // Pass-through guard 1: only POST is in scope.
-        if request.method() != axum::http::Method::POST {
+        // THE form-POST predicate, shared with the SigV4 deferral: `POST
+        // /<bucket>`, multipart/form-data, no query, no Authorization,
+        // bucket decoded as s3s and admission decode it. Every other POST
+        // (`?delete`, CreateMultipartUpload, `//bucket`) goes to s3s.
+        let Some(bucket) = form_post_bucket(request.method(), request.uri(), request.headers())
+        else {
             return next.run(request).await;
-        }
-
-        // Pass-through guard 2: must be multipart/form-data. The
-        // s3s `?delete` batch is POST + XML, CreateMultipartUpload is
-        // POST + JSON-ish — both must fall through.
-        if !is_multipart_form_upload(request.headers()) {
-            return next.run(request).await;
-        }
-
-        // Pass-through guard 3: no query string. This MUST match
-        // `is_form_post_policy_candidate` in api/auth.rs (which refuses to
-        // defer form-POST auth when a query is present) — otherwise a SIGNED
-        // multipart POST carrying a query string would pass the SigV4
-        // middleware as a normal signed request and then be mis-intercepted
-        // here as a form upload. Keeping the two predicates identical means the
-        // intercept set and the auth-deferral set are provably the same.
-        if request.uri().query().is_some() {
-            return next.run(request).await;
-        }
-
-        // Pass-through guard 4: path shape `/:bucket` (single segment,
-        // no key suffix). Anything else (`/`, `/bucket/key`) is not a
-        // browser form-POST upload.
-        let raw_path = request.uri().path().trim_start_matches('/');
-        let trimmed = raw_path.trim_end_matches('/');
-        if trimmed.is_empty() || trimmed.contains('/') {
-            return next.run(request).await;
-        }
-        let bucket = trimmed.to_string();
+        };
 
         // Pull iam_state from extensions (inserted as a layer below).
         let iam_state = request

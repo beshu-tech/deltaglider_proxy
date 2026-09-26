@@ -60,6 +60,14 @@ impl RequestTarget {
         (bucket, key.trim_start_matches('/'))
     }
 
+    /// The bucket, when s3s parses the path as bucket-level (`/b` or `/b/`,
+    /// decoded). `/b//` is an object request for s3s (key `/`), so `None`.
+    pub fn bucket_only(&self) -> Option<&str> {
+        let rest = self.path.strip_prefix('/')?;
+        let (bucket, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        (!bucket.is_empty() && tail.is_empty()).then_some(bucket)
+    }
+
     /// The bucket segment, or `None` for the service root (`/`).
     pub fn bucket(&self) -> Option<&str> {
         let (bucket, _) = self.bucket_and_key();
@@ -135,6 +143,24 @@ mod tests {
     }
 
     #[test]
+    fn bucket_only_matches_the_s3s_bucket_path() {
+        let only = |p: &str| {
+            RequestTarget::parse(p, None)
+                .unwrap()
+                .bucket_only()
+                .map(str::to_string)
+        };
+        assert_eq!(only("/b").as_deref(), Some("b"));
+        assert_eq!(only("/b/").as_deref(), Some("b"));
+        assert_eq!(only("/pro%64").as_deref(), Some("prod"));
+        assert_eq!(only("//b"), None);
+        assert_eq!(only("/b//"), None);
+        assert_eq!(only("/b%2F"), Some("b".to_string()));
+        assert_eq!(only("/b%2Fk"), None);
+        assert_eq!(only("/"), None);
+    }
+
+    #[test]
     fn query_keys_and_values_decode_like_s3s() {
         let t =
             RequestTarget::parse("/b", Some("list-type=2&%70refix=secret+x%2Fy&delete")).unwrap();
@@ -195,6 +221,8 @@ mod tests {
         let auth_only = [decode, query_split];
         for (file, needles) in [
             ("api/auth.rs", &auth_only[..]),
+            // Splits form fields and credential scopes on `/`, not paths.
+            ("api/handlers/form_post.rs", &auth_only[..]),
             ("iam/middleware.rs", &all[..]),
             ("admission/middleware.rs", &all[..]),
             ("maintenance/gate.rs", &all[..]),

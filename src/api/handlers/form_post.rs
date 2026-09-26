@@ -76,6 +76,34 @@ pub fn is_multipart_form_upload(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
+/// THE form-POST predicate: the bucket of a browser form upload that the
+/// router serves with the form handler instead of s3s, or `None`. Shape:
+/// `POST /{bucket}` (or `/{bucket}/`), `multipart/form-data`, no query, no
+/// `Authorization` header. The SigV4 middleware defers exactly these
+/// requests to the handler's policy check, and the router intercepts exactly
+/// these, so the two sets cannot drift.
+///
+/// The path is decoded like s3s decodes it (`RequestTarget`), so admission,
+/// the deferral and the handler name ONE bucket: `/pro%64` is `prod`, and
+/// `//prod` (empty bucket for admission and s3s) is no form upload at all.
+/// A raw-path split served `//prod` as an upload into `prod` that no
+/// admission block on `prod` saw.
+pub fn form_post_bucket(
+    method: &axum::http::Method,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+) -> Option<String> {
+    if method != axum::http::Method::POST
+        || !is_multipart_form_upload(headers)
+        || uri.query().is_some()
+        || headers.contains_key(axum::http::header::AUTHORIZATION)
+    {
+        return None;
+    }
+    let target = crate::api::request_target::RequestTarget::from_uri(uri).ok()?;
+    target.bucket_only().map(str::to_string)
+}
+
 fn derive_v4_signing_key(secret_access_key: &str, date: &str, region: &str) -> [u8; 32] {
     let k_date = hmac_sha256(
         format!("AWS4{}", secret_access_key).as_bytes(),
