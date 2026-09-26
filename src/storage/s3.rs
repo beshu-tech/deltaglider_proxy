@@ -271,9 +271,6 @@ pub(crate) fn check_s3_endpoint(
     Ok(kind)
 }
 
-/// The SDK's default HTTPS client (hyper 1 + rustls/aws-lc, env proxy
-/// config, SDK connector settings), with an SSRF-guarded DNS resolver.
-/// Mirrors `aws_smithy_runtime::client::http::default_https_client`.
 /// Point `builder` at the operator-supplied endpoint `ep`, SSRF-guarded:
 /// THE one place an S3 client gets a custom endpoint (engine backends,
 /// config sync, S3 leases, the reference lock, health and capability
@@ -310,6 +307,9 @@ pub(crate) fn guard_s3_endpoint(
     Ok(builder)
 }
 
+/// The SDK's default HTTPS client (hyper 1 + rustls/aws-lc, env proxy
+/// config, SDK connector settings), with an SSRF-guarded DNS resolver.
+/// Mirrors `aws_smithy_runtime::client::http::default_https_client`.
 fn ssrf_guarded_http_client(
     resolver: crate::security::SdkSsrfGuardedResolver,
 ) -> aws_smithy_runtime_api::client::http::SharedHttpClient {
