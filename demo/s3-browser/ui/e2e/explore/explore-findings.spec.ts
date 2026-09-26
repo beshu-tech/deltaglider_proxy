@@ -312,12 +312,10 @@ test('reserved and normalised keys behave as documented, and a refusal names the
   const c = s3();
   await c.send(new CreateBucketCommand({ Bucket: bucket }));
   for (const key of ['docs/reference.bin', 'backups/db.sql.delta']) {
-    let err: { $metadata?: { httpStatusCode?: number }; message?: string } | null = null;
-    try {
-      await c.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: 'x' }));
-    } catch (e) {
-      err = e as typeof err;
-    }
+    type S3Err = { $metadata?: { httpStatusCode?: number }; message?: string };
+    const err: S3Err | null = await c
+      .send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: 'x' }))
+      .then(() => null, (e: unknown) => e as S3Err);
     expect(err?.$metadata?.httpStatusCode, key).toBe(400);
     expect(err?.message, key).toContain(`'${key}' is refused`);
     expect(err?.message, key).toContain('s3-api-compatibility#reserved-and-normalised-keys');
