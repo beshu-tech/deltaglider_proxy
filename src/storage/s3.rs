@@ -4482,12 +4482,7 @@ mod tests {
         }
     }
 
-    /// Module-level lock for tests that toggle `DGP_BACKEND_ALLOW_LOCAL`,
-    /// to keep parallel `cargo test` workers from racing each other.
-    /// Held across `.await` because the env-var window must include the
-    /// async `build_client` call; the lock is uncontended in production
-    /// code, so the "MutexGuard across await" lint doesn't apply.
-    static SSRF_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::storage::SSRF_ENV_LOCK;
 
     /// Adversarial: operator-supplied `s3_endpoint` pointing at IMDS
     /// or other private targets must be rejected by `build_client`.

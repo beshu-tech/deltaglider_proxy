@@ -2515,9 +2515,10 @@ mod review2_tests {
         let cfg = crate::config::Config::from_yaml_str(&yaml).unwrap();
         let secrets = harvest_config_secrets(&cfg).unwrap();
         let exported = cfg.redact_all_secrets().to_canonical_yaml().unwrap();
-        std::env::set_var("DGP_BACKEND_D13_DR_PROBE_ENCRYPTION_KEY", K);
-        let r = hydrate_restore_doc(&exported, Some(&secrets), &crate::config::process_env);
-        std::env::remove_var("DGP_BACKEND_D13_DR_PROBE_ENCRYPTION_KEY");
+        // The DR host's env, injected (the process env is shared by every test).
+        let dr_env =
+            |n: &str| (n == "DGP_BACKEND_D13_DR_PROBE_ENCRYPTION_KEY").then(|| K.to_string());
+        let r = hydrate_restore_doc(&exported, Some(&secrets), &dr_env);
         assert!(r.is_ok(), "{r:?}");
         // The file holds the ref, never the key; the apply pass resolves it.
         let (yaml, refs) = r.unwrap();

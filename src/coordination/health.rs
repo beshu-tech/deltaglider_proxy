@@ -754,19 +754,35 @@ storage:
 mod review2_tests {
     use super::*;
 
+    /// Puts `DGP_BACKEND_ALLOW_LOCAL` back on drop (also on a failed assert).
+    struct RestoreEnv(Option<std::ffi::OsString>);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            if let Some(v) = self.0.take() {
+                // SAFETY: still under SSRF_ENV_LOCK (dropped after this guard).
+                unsafe { std::env::set_var("DGP_BACKEND_ALLOW_LOCAL", v) };
+            }
+        }
+    }
+
     /// Review-2 (S18 incomplete): the pre-commit health probe (and every
     /// client built by `ConfigDbSync::build_client`: config sync, S3 leases,
     /// the reference lock, the capability probe) never runs the outbound-URL
     /// check or the SSRF resolver. The engine refuses the endpoint; the
     /// probe still sends a signed request to it.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn review2_probe_never_contacts_an_endpoint_the_backend_validator_refuses() {
         // The env override lets every builder accept a local endpoint, so the
-        // premise (the engine refuses it) cannot hold. The nightly job sets it.
-        if crate::config::env_bool("DGP_BACKEND_ALLOW_LOCAL", false) {
-            eprintln!("skipped: DGP_BACKEND_ALLOW_LOCAL is set");
-            return;
-        }
+        // premise (the engine refuses it) needs it unset, whatever the runner
+        // exports. The lock serialises this with the other SSRF env tests.
+        let _g = crate::storage::SSRF_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("DGP_BACKEND_ALLOW_LOCAL");
+        // SAFETY: the SSRF env tests are serialised on SSRF_ENV_LOCK.
+        unsafe { std::env::remove_var("DGP_BACKEND_ALLOW_LOCAL") };
+        let _restore = RestoreEnv(prev);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accepted = tokio::spawn(async move {

@@ -9,6 +9,13 @@ pub mod list_size_cache;
 pub mod listing_facts;
 pub(crate) mod routing;
 mod s3;
+
+/// Lock for tests that toggle `DGP_BACKEND_ALLOW_LOCAL` (the SSRF guard's
+/// legacy env override), so parallel test threads do not race on it.
+/// Held across `.await`: the env window must include the async
+/// `build_client` call.
+#[cfg(test)]
+pub(crate) static SSRF_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 mod traits;
 #[cfg(unix)]
 pub(crate) mod xattr_meta;

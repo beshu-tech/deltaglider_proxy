@@ -156,4 +156,172 @@ mod source_guards {
             offenders.join("\n")
         );
     }
+
+    /// Lines of every `#[cfg(test)] mod NAME { ... }` body in `text`, with
+    /// their 1-based line numbers. Brace counting is per line: good enough
+    /// for rustfmt-formatted sources (the scan covers all of `src/`).
+    fn test_module_lines(text: &str) -> Vec<(usize, &str)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].trim() != "#[cfg(test)]" {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].trim_start().starts_with("#[") {
+                j += 1;
+            }
+            let head = lines.get(j).map(|l| l.trim_start()).unwrap_or("");
+            let head = head.strip_prefix("pub(crate) ").unwrap_or(head);
+            if !(head.starts_with("mod ") && head.ends_with('{')) {
+                i = j;
+                continue;
+            }
+            let mut depth: i64 = 0;
+            let mut k = j;
+            while k < lines.len() {
+                depth += lines[k].matches('{').count() as i64;
+                depth -= lines[k].matches('}').count() as i64;
+                out.push((k + 1, lines[k]));
+                if depth <= 0 && k > j {
+                    break;
+                }
+                k += 1;
+            }
+            i = k + 1;
+        }
+        out
+    }
+
+    /// Files declared as `#[cfg(test)] mod NAME;` (test module in its own file).
+    fn out_of_line_test_modules(files: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(file).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for w in lines.windows(2) {
+                let decl = w[1].trim();
+                if w[0].trim() != "#[cfg(test)]"
+                    || !decl.starts_with("mod ")
+                    || !decl.ends_with(';')
+                {
+                    continue;
+                }
+                let name = &decl["mod ".len()..decl.len() - 1];
+                let dir = if file
+                    .file_name()
+                    .is_some_and(|n| n == "mod.rs" || n == "lib.rs")
+                {
+                    file.parent().unwrap().to_path_buf()
+                } else {
+                    file.with_extension("")
+                };
+                out.push(dir.join(format!("{name}.rs")));
+            }
+        }
+        out
+    }
+
+    /// Unit tests do not read the process environment. A test that reads it
+    /// passes or fails (or skips itself) by what the runner exports: the
+    /// nightly job used to set `DGP_BACKEND_ALLOW_LOCAL` for the whole job,
+    /// and a lib test skipped itself there. Inject the env instead (the
+    /// `*_from(env: EnvLookup)` pattern, e.g. `replay_window_from`).
+    ///
+    /// Allowed: files whose tests test env handling itself, serialised on a
+    /// lock, plus two reads that are not config.
+    #[test]
+    fn test_modules_do_not_read_process_env() {
+        const ALLOWED: [(&str, &str); 7] = [
+            (
+                "src/api/admin/auth.rs",
+                "cookie-flag env parsing, under LOCK",
+            ),
+            (
+                "src/storage/s3.rs",
+                "the SSRF env override, under SSRF_ENV_LOCK",
+            ),
+            (
+                "src/coordination/health.rs",
+                "unsets the SSRF override, under SSRF_ENV_LOCK",
+            ),
+            (
+                "src/cli/aws_creds.rs",
+                "the AWS env credential chain, under ENV_LOCK",
+            ),
+            (
+                "src/config/mod.rs",
+                "${env:} expansion, under ENV_GUARD_LOCK",
+            ),
+            (
+                "src/sqlite_open.rs",
+                "child-process marker of a re-exec race test",
+            ),
+            (
+                "src/api/admin/config/document_level.rs",
+                "reads HOME to prove it is NOT expanded",
+            ),
+        ];
+        // Built at runtime so this file's own text is no hit.
+        let needles = [
+            ["env::", "var("].concat(),
+            ["env::", "var_os("].concat(),
+            ["env::", "vars("].concat(),
+            ["env_", "bool("].concat(),
+            ["env_", "parse("].concat(),
+            ["env_", "parse_with_default("].concat(),
+            ["config::", "process_env"].concat(),
+        ];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_files(&root.join("src"), &mut files);
+        let test_files = out_of_line_test_modules(&files);
+        assert!(
+            !test_files.is_empty(),
+            "scan found the out-of-line test modules"
+        );
+        let mut offenders = Vec::new();
+        let mut allowed_hits = std::collections::BTreeSet::new();
+        for file in files {
+            let rel = file
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&file).unwrap();
+            // A `#[cfg(test)] mod x;` file is test code throughout.
+            let lines: Vec<(usize, &str)> = if test_files.contains(&file) {
+                text.lines().enumerate().map(|(i, l)| (i + 1, l)).collect()
+            } else {
+                test_module_lines(&text)
+            };
+            for (n, line) in lines {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if needles.iter().any(|x| line.contains(x.as_str())) {
+                    if ALLOWED.iter().any(|(f, _)| *f == rel) {
+                        allowed_hits.insert(rel.clone());
+                    } else {
+                        offenders.push(format!("{rel}:{n}: {}", line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "unit tests read the process env; inject an EnvLookup instead, or \
+             add the file to ALLOWED with a reason and a lock:\n{}",
+            offenders.join("\n")
+        );
+        // A stale allow-list entry hides the next offender in that file.
+        for (f, why) in ALLOWED {
+            assert!(
+                allowed_hits.contains(f),
+                "{f} ({why}) no longer reads env: drop it from ALLOWED"
+            );
+        }
+    }
 }
