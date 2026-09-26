@@ -1045,8 +1045,8 @@ pub async fn reopen_and_rebuild_iam(
     };
     if !report.base_used {
         info!(
-            "Config DB S3 sync ({context}): no merge base yet — the remote IAM copy won \
-             (first sync or upgrade)"
+            "Config DB S3 sync ({context}): no merge base yet — merged as a union, so a \
+             delete that was not synced yet comes back (first sync or upgrade)"
         );
     }
     for c in &report.conflicts {

@@ -14,8 +14,11 @@
 //!   concurrent edit, because bringing back a deleted identity is the unsafe
 //!   outcome. Every conflict is reported so the caller can audit it.
 //!
-//! Without a base (first sync, upgrade, unreadable base file) the local copy
-//! stands in as the base, so the remote copy wins — the pre-merge behaviour.
+//! Without a base (first sync, upgrade, unreadable base file) nothing can be
+//! told apart from "deleted", so the merge is a UNION: every row of either
+//! side is kept, and a row on both sides that differs goes to the newer
+//! write. A delete that was not yet synced comes back, but a create or an edit
+//! that was not yet synced is never lost.
 //!
 //! Ids: a row takes the remote id when the remote has the row, else its local
 //! id when that id is still free, else a fresh one. Foreign keys are resolved
@@ -314,7 +317,7 @@ pub struct MergeReport {
     /// Local user ids that no longer name the same user after the merge
     /// (deleted, or moved to another id). Live sessions bound to them must end.
     pub stale_user_ids: Vec<i64>,
-    /// False when no usable base existed (the remote copy won).
+    /// False when no usable base existed (the merge was a union).
     pub base_used: bool,
     /// False when the merge result equals the local IAM (nothing written).
     pub changed: bool,
@@ -614,7 +617,8 @@ fn split_same_name_users(
     }
 }
 
-/// Pure three-way merge of every IAM table. `base = None` → local is the base.
+/// Pure three-way merge of every IAM table. `base = None` → an empty base,
+/// so the merge is a union (no deletes).
 pub(crate) fn merge_snapshots(
     base: Option<&Snapshot>,
     local: &Snapshot,
@@ -622,7 +626,7 @@ pub(crate) fn merge_snapshots(
 ) -> MergeOutcome {
     let empty = BTreeMap::new();
     let has_base = base.is_some();
-    let base = base.unwrap_or(local).clone();
+    let base = base.cloned().unwrap_or_default();
     let (mut local, mut remote) = (local.clone(), remote.clone());
     let mut conflicts = Vec::new();
     split_same_name_users(&base, has_base, &mut local, &mut remote, &mut conflicts);
@@ -975,7 +979,7 @@ impl ConfigDb {
     }
 
     /// The merge base, or `None` when it is missing or unusable (the merge
-    /// then lets the remote copy win). Opening it first migrates a base left
+    /// is then a union). Opening it first migrates a base left
     /// by an older binary to the current schema.
     fn read_base(&self, path: &Path, passphrase: &str) -> Option<Snapshot> {
         if !path.exists() {
@@ -983,13 +987,13 @@ impl ConfigDb {
         }
         if let Err(e) = ConfigDb::open_or_create(path, passphrase) {
             warn!(
-                "Config DB sync: merge base {} is unusable ({e}); the remote copy wins",
+                "Config DB sync: merge base {} is unusable ({e}); the merge is a union",
                 path.display()
             );
             return None;
         }
         if let Err(e) = self.attach("syncbase", path, passphrase) {
-            warn!("Config DB sync: cannot attach merge base: {e}; the remote copy wins");
+            warn!("Config DB sync: cannot attach merge base: {e}; the merge is a union");
             return None;
         }
         let snap = read_snapshot(&self.conn, "syncbase");
@@ -997,7 +1001,7 @@ impl ConfigDb {
         match snap {
             Ok(s) => Some(s),
             Err(e) => {
-                warn!("Config DB sync: cannot read merge base: {e}; the remote copy wins");
+                warn!("Config DB sync: cannot read merge base: {e}; the merge is a union");
                 None
             }
         }
@@ -1291,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn without_a_base_the_remote_copy_wins() {
+    fn without_a_base_the_merge_is_a_union() {
         let t = trio(seed_three);
         let local = open(&t.local);
         local
@@ -1303,7 +1307,8 @@ mod tests {
         }
         let report = local.merge_iam_from(&t.remote, None, PASS).unwrap();
         assert!(!report.base_used);
-        assert_eq!(names(&local), vec!["u1", "u2"]);
+        // The local create survives; the unsynced remote delete comes back.
+        assert_eq!(names(&local), vec!["l-new", "u1", "u2", "u3"]);
         // An unreadable base behaves the same.
         std::fs::write(&t.base, b"not a database").unwrap();
         let report = local
@@ -1742,7 +1747,6 @@ mod review3_tests {
     /// remote side wins. A 412 reconcile then drops the local create and
     /// brings back the local delete, and the retry uploads that.
     #[test]
-    #[ignore = "review3: pending fix"]
     fn review3_without_a_base_local_unsynced_changes_survive() {
         let t = trio(|db| {
             db.create_user("u1", "AKU1000000001", "s1", true, &[])

@@ -1789,8 +1789,8 @@ mod tests {
     }
 
     #[test]
-    fn merge_iam_from_replaces_iam_but_preserves_coordination() {
-        // B3: a sync download must replace IAM tables from the peer while
+    fn merge_iam_from_merges_iam_but_preserves_coordination() {
+        // B3: a sync download must merge IAM tables from the peer while
         // leaving this node's coordination tables (here: a listener cursor)
         // intact — the bug the old fs::rename caused.
         let dir = tempfile::tempdir().unwrap();
@@ -1820,17 +1820,19 @@ mod tests {
         // Merge peer's IAM into local.
         local.merge_iam_from(&peer_path, None, pass).unwrap();
 
-        // IAM replaced: local-only gone, peer-user present.
-        let names: Vec<String> = local
+        // IAM merged (no base: a union): the peer's user arrives, the local
+        // one stays.
+        let mut names: Vec<String> = local
             .load_users()
             .unwrap()
             .into_iter()
             .map(|u| u.name)
             .collect();
+        names.sort();
         assert_eq!(
             names,
-            vec!["peer-user"],
-            "IAM must be replaced by the peer's"
+            vec!["local-only", "peer-user"],
+            "IAM must be merged from the peer's"
         );
 
         // Coordination preserved: local's cursor (4242) survived, NOT clobbered
