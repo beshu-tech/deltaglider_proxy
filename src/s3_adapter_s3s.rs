@@ -2429,6 +2429,9 @@ fn engine_error_to_s3s(err: impl Into<crate::api::S3Error>) -> s3s::S3Error {
         crate::api::S3Error::BucketAlreadyExists(_) => s3s::s3_error!(BucketAlreadyExists),
         crate::api::S3Error::BucketNotEmpty(_) => s3s::s3_error!(BucketNotEmpty),
         crate::api::S3Error::EntityTooLarge { .. } => s3s::s3_error!(EntityTooLarge),
+        crate::api::S3Error::EntityTooLargeReason(msg) => {
+            s3s::s3_error!(EntityTooLarge, "{}", msg)
+        }
         crate::api::S3Error::InvalidArgument(msg) => s3s::s3_error!(InvalidArgument, "{}", msg),
         crate::api::S3Error::InvalidRequest(msg) => s3s::s3_error!(InvalidRequest, "{}", msg),
         crate::api::S3Error::NoSuchUpload(id) => {

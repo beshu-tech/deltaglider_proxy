@@ -505,6 +505,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Delta Engine",
     },
     EnvVarEntry {
+        name: "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES",
+        description: "Max spool bytes one relayed multipart upload may hold (default: half of DGP_SPOOL_MAX_BYTES; 0 = no per-upload cap)",
+        example: "8589934592",
+        category: "Delta Engine",
+    },
+    EnvVarEntry {
         name: "DGP_SPOOL_THRESHOLD_BYTES",
         description: "Delta GETs larger than this reconstruct to a spool file + stream (default: max_object_size)",
         example: "104857600",

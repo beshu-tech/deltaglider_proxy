@@ -86,19 +86,20 @@ prefix made the proxy scan that prefix for visible keys, and the listing
 could fail before it reached the readable prefix. Only rules that grant
 `read` or `list` count now.
 
-### Changed — One multipart upload can hold at most a quarter of the spool budget
+### Changed — One multipart upload can hold at most half of the spool budget (`DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`)
 
 A multipart upload larger than 64 MiB keeps its parts in the spool directory
 until it completes. A part used to reserve only the budget that its upload did
 not hold yet. So when one upload held the whole budget, each further part
 reserved nothing and the proxy wrote it anyway. The disk use of that upload had
 no limit, and every other request that needed spool space failed until the
-upload completed or expired. Now one upload can hold at most a quarter of
-`DGP_SPOOL_MAX_BYTES` (4 GiB with the default of 16 GiB). A part that would
-take the upload past that share fails with `400 EntityTooLarge`. To upload
-larger objects in multipart, raise `DGP_SPOOL_MAX_BYTES` to at least four
-times the object size. A part that finds no free budget fails with
-`503 SlowDown`, as before.
+upload completed or expired. Now one upload can hold at most
+`DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES` of spool space. The default is half of
+`DGP_SPOOL_MAX_BYTES` (8 GiB with the default of 16 GiB), and `0` removes the
+per-upload limit. A part that would take the upload past the limit fails with
+`413 EntityTooLarge`, and the message names the variable and the limit. The
+limit applies to every client multipart upload larger than 64 MiB. A part that
+finds no free budget fails with `503 SlowDown`, as before.
 
 ### Fixed — Listings skip the internal listing-facts namespace
 

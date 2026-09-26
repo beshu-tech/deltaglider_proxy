@@ -36,6 +36,10 @@ pub enum S3Error {
     #[error("EntityTooLarge: Your proposed upload exceeds the maximum allowed size.")]
     EntityTooLarge { size: u64, max: u64 },
 
+    /// `EntityTooLarge` whose message names the limit (and how to raise it).
+    #[error("EntityTooLarge: {0}")]
+    EntityTooLargeReason(String),
+
     #[error("InternalError: {0}")]
     InternalError(String),
 
@@ -111,7 +115,7 @@ impl S3Error {
             S3Error::NoSuchBucket(_) => "NoSuchBucket",
             S3Error::BucketNotEmpty(_) => "BucketNotEmpty",
             S3Error::BucketAlreadyExists(_) => "BucketAlreadyExists",
-            S3Error::EntityTooLarge { .. } => "EntityTooLarge",
+            S3Error::EntityTooLarge { .. } | S3Error::EntityTooLargeReason(_) => "EntityTooLarge",
             S3Error::InternalError(_) => "InternalError",
             S3Error::InvalidArgument(_) => "InvalidArgument",
             S3Error::InvalidRequest(_) => "InvalidRequest",
@@ -142,7 +146,9 @@ impl S3Error {
             S3Error::NoSuchBucket(_) => StatusCode::NOT_FOUND,
             S3Error::BucketNotEmpty(_) => StatusCode::CONFLICT,
             S3Error::BucketAlreadyExists(_) => StatusCode::CONFLICT,
-            S3Error::EntityTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            S3Error::EntityTooLarge { .. } | S3Error::EntityTooLargeReason(_) => {
+                StatusCode::PAYLOAD_TOO_LARGE
+            }
             S3Error::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             S3Error::InvalidArgument(_) => StatusCode::BAD_REQUEST,
             S3Error::InvalidRequest(_) => StatusCode::BAD_REQUEST,

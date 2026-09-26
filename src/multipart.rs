@@ -44,14 +44,20 @@ use crate::deltaglider::spool::{mib_ceil, SpoolDir, SpoolReservation, CONTENDED}
 /// Relay root, under the spool dir (it was under the system temp dir).
 const RELAY_ROOT_DIR: &str = "deltaglider-mpu-relay";
 
-/// A relayed multipart upload holds at most 1/`RELAY_UPLOAD_SHARE` of the
-/// spool budget (`DGP_SPOOL_MAX_BYTES`), so one upload never pins the
-/// budget of every other request. A part past that fails `EntityTooLarge`.
-pub const RELAY_UPLOAD_SHARE: u64 = 4;
+/// Env var: the relay bytes one multipart upload may hold in the spool.
+pub const RELAY_UPLOAD_MAX_ENV: &str = "DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES";
 
-/// The relay bytes one upload may hold, for a spool of `spool_max_bytes`.
-pub fn relay_upload_cap(spool_max_bytes: u64) -> u64 {
-    (spool_max_bytes / RELAY_UPLOAD_SHARE).max(1024 * 1024)
+/// Pure: the relay bytes one upload may hold, for a spool of
+/// `spool_max_bytes` and the configured `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`
+/// (`None` = unset). Default: half of the spool, so one upload never pins
+/// the budget of every other request. `0` = no per-upload cap (only the
+/// global budget). `None` in the result means no cap.
+pub fn relay_upload_cap(spool_max_bytes: u64, configured: Option<u64>) -> Option<u64> {
+    match configured {
+        Some(0) => None,
+        Some(n) => Some(n),
+        None => Some((spool_max_bytes / 2).max(1024 * 1024)),
+    }
 }
 
 /// Data for a single uploaded part
@@ -353,6 +359,8 @@ pub struct MultipartStore {
     idle_ttl: Duration,
     /// Relay part files live in this spool's dir and hold its budget.
     spool: SpoolDir,
+    /// `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES` as read at construction.
+    relay_upload_max: Option<u64>,
 }
 
 impl MultipartStore {
@@ -370,12 +378,19 @@ impl MultipartStore {
             max_total_multipart_bytes,
             idle_ttl: Duration::hours(idle_ttl_hours),
             spool: shared_spool(),
+            relay_upload_max: crate::config::env_parse(RELAY_UPLOAD_MAX_ENV),
         }
     }
 
     /// Use `spool` for relay part files (default: the process-wide spool).
     pub fn with_spool(mut self, spool: SpoolDir) -> Self {
         self.spool = spool;
+        self
+    }
+
+    /// Override `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES` (`Some(0)` = no cap).
+    pub fn with_relay_upload_max(mut self, configured: Option<u64>) -> Self {
+        self.relay_upload_max = configured;
         self
     }
 
@@ -395,6 +410,7 @@ impl MultipartStore {
             max_total_multipart_bytes,
             idle_ttl,
             spool: shared_spool(),
+            relay_upload_max: None,
         }
     }
 
@@ -1353,7 +1369,7 @@ impl MultipartStore {
     /// runs under the uploads lock, and an upload that holds relay parts is
     /// a holder (the review2 rule). A full budget is a retryable SlowDown.
     ///
-    /// One upload holds at most 1/[`RELAY_UPLOAD_SHARE`] of the budget. The
+    /// One upload holds at most [`relay_upload_cap`] of the budget. The
     /// reservation used to be clamped to what the upload did not hold yet,
     /// so once an upload held the whole budget every further part reserved
     /// 0 MiB and was written anyway: the disk use of one upload grew without
@@ -1372,12 +1388,15 @@ impl MultipartStore {
             })
             .map(|(_, p)| p.size)
             .sum();
-        let cap = relay_upload_cap(self.spool.max_bytes());
-        if held.saturating_add(size) > cap {
-            return Err(S3Error::EntityTooLarge {
-                size: held.saturating_add(size),
-                max: cap,
-            });
+        let want = held.saturating_add(size);
+        if let Some(cap) = relay_upload_cap(self.spool.max_bytes(), self.relay_upload_max) {
+            if want > cap {
+                return Err(S3Error::EntityTooLargeReason(format!(
+                    "this multipart upload would hold {want} bytes of relay parts in the spool; \
+                     one upload may hold at most {cap} bytes ({RELAY_UPLOAD_MAX_ENV}, default \
+                     half of DGP_SPOOL_MAX_BYTES; 0 = no per-upload cap)"
+                )));
+            }
         }
         let reservation = self.spool.try_reserve(size, mib_ceil(held)).map_err(|e| {
             if e.kind() == CONTENDED {
@@ -2547,8 +2566,10 @@ mod tests {
     #[test]
     fn relay_parts_hold_spool_budget_until_dropped() {
         let dir = tempfile::tempdir().unwrap();
-        let spool = small_spool(&dir, 32); // one upload may hold 8 MiB
-        let store = MultipartStore::new(64 << 20).with_spool(spool.clone());
+        let spool = small_spool(&dir, 32);
+        let store = MultipartStore::new(64 << 20)
+            .with_spool(spool.clone())
+            .with_relay_upload_max(Some(8 << 20));
         let id = store
             .create_with_relay_policy("b", "k", None, HashMap::new(), None, true)
             .unwrap();
@@ -2610,7 +2631,9 @@ mod review3_tests {
         let dir = tempfile::tempdir().unwrap();
         // 16 MiB budget: one upload may hold 4 MiB of it.
         let spool = SpoolDir::new(dir.path().join("spool"), 16 << 20).unwrap();
-        let store = MultipartStore::new(64 << 20).with_spool(spool.clone());
+        let store = MultipartStore::new(64 << 20)
+            .with_spool(spool.clone())
+            .with_relay_upload_max(Some(4 << 20));
         let id = store
             .create_with_relay_policy("b", "k", None, HashMap::new(), None, true)
             .unwrap();
@@ -2621,7 +2644,14 @@ mod review3_tests {
         for n in 2..=4 {
             match store.upload_part(&id, "b", "k", n, mib(4)) {
                 Ok(_) => accepted += 1,
-                Err(e) => assert!(matches!(e, S3Error::EntityTooLarge { .. }), "{e:?}"),
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert_eq!(e.code(), "EntityTooLarge", "{e:?}");
+                    assert!(
+                        msg.contains(RELAY_UPLOAD_MAX_ENV) && msg.contains("4194304"),
+                        "the message names the variable and the limit: {msg}"
+                    );
+                }
             }
         }
         assert_eq!(
@@ -2631,5 +2661,32 @@ mod review3_tests {
         assert_eq!(spool.free_mib(), 12, "a refused part reserves nothing");
         // Re-uploading part 1 replaces it: within the share.
         store.upload_part(&id, "b", "k", 1, mib(4)).unwrap();
+    }
+
+    #[test]
+    fn relay_upload_cap_truth_table() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(relay_upload_cap(16 * MIB, None), Some(8 * MIB));
+        assert_eq!(relay_upload_cap(MIB, None), Some(MIB), "never below 1 MiB");
+        assert_eq!(relay_upload_cap(16 * MIB, Some(0)), None);
+        assert_eq!(relay_upload_cap(16 * MIB, Some(3 * MIB)), Some(3 * MIB));
+    }
+
+    /// `0` = no per-upload cap: the upload may use the whole budget, and a
+    /// part past the budget is a SlowDown (never written for free).
+    #[test]
+    fn no_per_upload_cap_leaves_only_the_global_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = SpoolDir::new(dir.path().join("spool"), 8 << 20).unwrap();
+        let store = MultipartStore::new(64 << 20)
+            .with_spool(spool.clone())
+            .with_relay_upload_max(Some(0));
+        let id = store
+            .create_with_relay_policy("b", "k", None, HashMap::new(), None, true)
+            .unwrap();
+        let mib = |n: usize| Bytes::from(vec![7u8; n << 20]);
+        store.upload_part(&id, "b", "k", 1, mib(8)).unwrap();
+        let err = store.upload_part(&id, "b", "k", 2, mib(1)).unwrap_err();
+        assert!(matches!(err, S3Error::SlowDown(_)), "{err:?}");
     }
 }
