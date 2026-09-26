@@ -348,17 +348,18 @@ export type BackendHealthEntry = {
  * `access.secret_access_key`). An empty field in a section PUT means
  * "keep" (the GET redacts the secret), so removal is its own request.
  *
- * Wire contract (explore item 11; the server route is owned by the core
- * fix branch, which matches it):
+ * Wire contract (`remove_bootstrap_credentials` in src/api/admin/config/mod.rs):
  *   DELETE /_/api/admin/config/bootstrap-credentials
- *     200 {"ok": true}   the pair is removed, persisted, and SigV4 state rebuilt
- *     4xx {"error": ...} refused, e.g. no other way to sign S3 requests is left
+ *     200 {"removed": bool, "warnings": [...]}  removed (or nothing to remove);
+ *         a warning names an IAM user that still holds the same key
+ *     409 {"error": ...}  refused: no IAM users yet, or env variables set the pair
  */
-export async function removeBootstrapCredentials(): Promise<void> {
-  await adminRequest('/api/admin/config/bootstrap-credentials', {
-    method: 'DELETE',
-    context: 'Remove bootstrap credentials',
-  });
+export async function removeBootstrapCredentials(): Promise<{ removed: boolean; warnings: string[] }> {
+  const res = await adminJson<{ removed?: boolean; warnings?: string[] }>(
+    '/api/admin/config/bootstrap-credentials',
+    { method: 'DELETE', context: 'Remove bootstrap credentials' },
+  );
+  return { removed: res.removed ?? false, warnings: res.warnings ?? [] };
 }
 
 export async function getAdminConfig(): Promise<AdminConfig> {

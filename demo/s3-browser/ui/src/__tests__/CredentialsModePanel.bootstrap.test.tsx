@@ -26,12 +26,31 @@ test('the access key field shows the configured bootstrap access key id', async 
   expect(screen.queryByText(/clear both fields/)).toBeNull();
 });
 
+test('a refusal (409: no IAM users yet) shows the server reason', async () => {
+  http.on(
+    'DELETE',
+    '/_/api/admin/config/bootstrap-credentials',
+    json({ error: 'no IAM users exist: removing the bootstrap SigV4 pair would leave the proxy without authentication' }, 409),
+  );
+  const user = userEvent.setup();
+  renderWithQuery(<CredentialsModePanel />);
+  await user.click(await screen.findByRole('button', { name: 'Remove bootstrap credentials' }));
+  await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Remove' }));
+  expect(await screen.findByText(/no IAM users exist/)).toBeInTheDocument();
+});
+
 test('"Remove bootstrap credentials" asks, then calls the removal endpoint', async () => {
-  http.on('DELETE', '/_/api/admin/config/bootstrap-credentials', json({ ok: true }));
+  http.on(
+    'DELETE',
+    '/_/api/admin/config/bootstrap-credentials',
+    json({ removed: true, warnings: ["the removed access key id is also IAM user 'legacy-admin'"] }),
+  );
   const user = userEvent.setup();
   renderWithQuery(<CredentialsModePanel />);
   await user.click(await screen.findByRole('button', { name: 'Remove bootstrap credentials' }));
   const dialog = await screen.findByRole('dialog');
   await user.click(within(dialog).getByRole('button', { name: 'Remove' }));
   await waitFor(() => expect(http.callsTo('DELETE', '/_/api/admin/config/bootstrap-credentials')).toHaveLength(1));
+  // The server's warning (the same key still signs as an IAM user) is shown.
+  expect(await screen.findByText(/also IAM user 'legacy-admin'/)).toBeInTheDocument();
 });

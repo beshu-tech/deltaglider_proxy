@@ -127,6 +127,7 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
   const qc = useQueryClient();
   const [removing, setRemoving] = useState(false);
   const [removeError, setRemoveError] = useState<string | null>(null);
+  const [removeWarnings, setRemoveWarnings] = useState<string[]>([]);
 
   // The RUNNING auth state (env variables included), so the page never
   // implies auth is off while an env-provided key keeps SigV4 on.
@@ -218,8 +219,10 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
     if (!ok) return;
     setRemoving(true);
     setRemoveError(null);
+    setRemoveWarnings([]);
     try {
-      await removeBootstrapCredentials();
+      const { warnings } = await removeBootstrapCredentials();
+      setRemoveWarnings(warnings);
       await qc.invalidateQueries({ queryKey: qk.config() });
     } catch (e) {
       setRemoveError(
@@ -428,6 +431,9 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
             </div>
           )}
           {removeError && <Alert type="error" showIcon title={removeError} style={{ borderRadius: 8 }} />}
+          {removeWarnings.map((w) => (
+            <Alert key={w} type="warning" showIcon title={w} style={{ borderRadius: 8 }} />
+          ))}
         </div>
       </div>
 

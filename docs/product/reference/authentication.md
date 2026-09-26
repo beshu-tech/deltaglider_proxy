@@ -13,7 +13,7 @@ Reference for the proxy's authentication modes, the bootstrap password, SigV4 ve
 
 The proxy refuses to start without authentication credentials unless `authentication: none` is set explicitly. Bootstrap and IAM coexist: the request's access key is tried against both the bootstrap pair and the IAM table. When the first IAM user is created, the bootstrap credentials are carried over as a `legacy-admin` user.
 
-The **Credentials** page (Settings → Access) shows the configured bootstrap access key ID, because an access key ID is not a secret. The secret is never shown. An empty field on that page keeps the current value, so clearing the fields does not remove the pair. To remove the pair, use **Remove bootstrap credentials** on the same page (`DELETE /_/api/admin/config/bootstrap-credentials`), or delete both keys from the YAML config. When `DGP_ACCESS_KEY_ID` sets the key, the page does not offer the removal, because the environment variable would keep the key in place.
+The **Credentials** page (Settings → Access) shows the configured bootstrap access key ID, because an access key ID is not a secret. The secret is never shown. An empty field on that page keeps the current value, so clearing the fields does not remove the pair. To remove the pair, use **Remove bootstrap credentials** on the same page (`DELETE /_/api/admin/config/bootstrap-credentials`), or delete both keys from the YAML config. The proxy refuses the removal (`409`) while no IAM user exists, because the proxy would then have no credentials to check S3 requests against. When `DGP_ACCESS_KEY_ID` sets the key, the page does not offer the removal, because the environment variable would keep the key in place.
 
 ```yaml
 # validate
