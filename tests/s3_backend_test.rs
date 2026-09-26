@@ -743,7 +743,6 @@ async fn review3_bucket(tag: &str) -> String {
 /// object before the first user key: one upstream page per 1000 facts, for
 /// a one-key page. The facts below are what 2500 delta/encrypted PUTs leave.
 #[tokio::test]
-#[ignore = "review3: pending fix"]
 async fn review3_a_root_listing_does_not_walk_the_facts_namespace() {
     skip_unless_minio!();
     let bucket = review3_bucket("rootwalk").await;
@@ -792,7 +791,6 @@ async fn review3_a_root_listing_does_not_walk_the_facts_namespace() {
 /// Review3 C3: `.dg/facts/` is hidden only where its parent `.dg/` would be
 /// a CommonPrefix. A LIST of `.dg/` with a delimiter shows `.dg/facts/`.
 #[tokio::test]
-#[ignore = "review3: pending fix"]
 async fn review3_the_facts_namespace_is_not_listed() {
     skip_unless_minio!();
     let bucket = review3_bucket("hidden").await;

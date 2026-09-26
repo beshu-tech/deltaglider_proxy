@@ -53,6 +53,24 @@ pub fn is_facts_key(key: &str) -> bool {
     key.starts_with(FACTS_ROOT)
 }
 
+/// A start-after past every facts key (`0` follows `/`).
+pub const PAST_FACTS: &str = ".dg/facts0";
+
+/// Where the next upstream page of a listing starts when the page it just
+/// read (truncated) ends at `last_key`. `.` sorts before digits and letters,
+/// so the facts come first in a listing from the root: one upstream page per
+/// 1000 facts before the first user key. A page that ends inside the
+/// namespace jumps past it instead of following the continuation token.
+pub fn skip_past_facts(last_key: &str) -> Option<&'static str> {
+    is_facts_key(last_key).then_some(PAST_FACTS)
+}
+
+/// Is a CommonPrefix of a listing inside the facts namespace (or a partial
+/// path to it, like `.dg/fac` with delimiter `t`)? Never shown to a client.
+pub fn is_internal_common_prefix(p: &str) -> bool {
+    p.starts_with(FACTS_ROOT) || (p.len() > ".dg/".len() && FACTS_ROOT.starts_with(p))
+}
+
 /// Order-preserving, prefix-free encoding of a stored key (see module doc).
 fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
@@ -481,6 +499,37 @@ mod tests {
                     proptest::prop_assert!(!fk[scan.prefix.len()..].contains(d));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_page_that_ends_in_the_facts_jumps_past_them() {
+        let last = facts_key(
+            "zz/o.zip.delta",
+            "abc",
+            10,
+            &LogicalFacts {
+                size: 100,
+                etag: "def".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(skip_past_facts(&last), Some(PAST_FACTS));
+        assert!(PAST_FACTS > last.as_str());
+        // The jump skips no key outside the facts: the root reference and
+        // every user key sort after it.
+        assert!(PAST_FACTS < ".dg/reference.bin" && PAST_FACTS < "zz/a.txt");
+        assert_eq!(skip_past_facts(".dg/reference.bin"), None);
+        assert_eq!(skip_past_facts("a.txt"), None);
+    }
+
+    #[test]
+    fn facts_common_prefixes_are_internal() {
+        for p in [".dg/facts/", ".dg/facts/zz/", ".dg/fac", ".dg/facts"] {
+            assert!(is_internal_common_prefix(p), "{p}");
+        }
+        for p in [".dg/", ".d", "", "a/.dg/facts/x/", ".well-known/", ".dgx/"] {
+            assert!(!is_internal_common_prefix(p), "{p}");
         }
     }
 }

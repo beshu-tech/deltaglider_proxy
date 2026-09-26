@@ -375,6 +375,11 @@ impl S3Op {
     }
 }
 
+/// The last key of one upstream LIST page, before any filtering.
+fn last_listed_key(contents: Option<&[aws_sdk_s3::types::Object]>) -> Option<String> {
+    contents?.last()?.key.clone()
+}
+
 /// Lightweight object info from ListObjectsV2 (no HEAD requests needed)
 struct S3ListedObject {
     key: String,
@@ -2048,10 +2053,14 @@ impl S3Backend {
         let mut results = Vec::new();
         let mut continuation_token: Option<String> = None;
 
+        let mut skip_to: Option<&'static str> = None;
+
         loop {
             let mut request = self.client.list_objects_v2().bucket(bucket).prefix(prefix);
 
-            if let Some(token) = continuation_token {
+            if let Some(past) = skip_to.take() {
+                request = request.start_after(past);
+            } else if let Some(token) = continuation_token {
                 request = request.continuation_token(token);
             }
 
@@ -2060,6 +2069,7 @@ impl S3Backend {
                 .await
                 .map_err(|e| Self::classify_s3_error(bucket, &e, S3Op::ListObjects))?;
 
+            let page_last = last_listed_key(response.contents.as_deref());
             if let Some(contents) = response.contents {
                 results.extend(
                     contents
@@ -2070,6 +2080,7 @@ impl S3Backend {
 
             if response.is_truncated.unwrap_or(false) {
                 continuation_token = response.next_continuation_token;
+                skip_to = page_last.as_deref().and_then(listing_facts::skip_past_facts);
             } else {
                 break;
             }
@@ -3042,6 +3053,7 @@ impl StorageBackend for S3Backend {
         // Set when the loop stops early at the anchor. The bounded set of raw
         // keys that can still sort above it is confirmed after the loop.
         let mut settled_anchor: Option<String> = None;
+        let mut skip_to: Option<&'static str> = None;
 
         // When the engine gives us a continuation_token it's a *user-visible* key.
         // We use start_after to skip past it on upstream S3.
@@ -3056,12 +3068,14 @@ impl StorageBackend for S3Backend {
                 .set_delimiter(delimiter.map(String::from));
 
             // On the first page use start_after; on subsequent pages use
-            // the upstream continuation token.
+            // the upstream continuation token (or jump past the facts).
             if first_page {
                 if let Some(ref sa) = start_after {
                     request = request.start_after(sa);
                 }
                 first_page = false;
+            } else if let Some(past) = skip_to.take() {
+                request = request.start_after(past);
             } else if let Some(ref token) = upstream_token {
                 request = request.continuation_token(token);
             }
@@ -3080,7 +3094,7 @@ impl StorageBackend for S3Backend {
                 for cp in cps {
                     if let Some(p) = cp.prefix {
                         let last_seg = p.trim_end_matches('/').rsplit('/').next().unwrap_or("");
-                        if last_seg == ".dg" {
+                        if last_seg == ".dg" || listing_facts::is_internal_common_prefix(&p) {
                             continue;
                         }
                         all_common_prefixes.insert(p);
@@ -3089,6 +3103,7 @@ impl StorageBackend for S3Backend {
             }
 
             // Collect direct objects at this level
+            let page_last = last_listed_key(response.contents.as_deref());
             if let Some(contents) = response.contents {
                 raw_objects.extend(
                     contents
@@ -3099,6 +3114,7 @@ impl StorageBackend for S3Backend {
 
             if response.is_truncated.unwrap_or(false) {
                 upstream_token = response.next_continuation_token;
+                skip_to = page_last.as_deref().and_then(listing_facts::skip_past_facts);
             } else {
                 break;
             }

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — Listings skip the internal listing-facts namespace
+
+On an S3 backend the proxy keeps one small object per delta or encrypted
+object under `.dg/facts/` at the root of the bucket. A dot sorts before
+digits and letters, so a listing without a delimiter from the root (for
+example `aws s3 sync`, rclone, or a replication walk) read every facts object
+before the first user key: one backend request per 1000 facts. A listing of
+the prefix `.dg/` with a delimiter also showed `.dg/facts/` as a folder. Now a
+listing jumps past the facts namespace when a backend page ends inside it,
+and a listing never shows a folder inside it.
+
 ### Fixed — A large request that waits for spool space no longer blocks small requests
 
 The spool budget was a semaphore that gives free space to the request at the
