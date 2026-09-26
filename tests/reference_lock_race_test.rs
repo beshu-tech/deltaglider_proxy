@@ -19,27 +19,47 @@ use crate::common;
 use common::{minio_available, minio_client, MINIO_BUCKET};
 use deltaglider_proxy::coordination::reference_lock::lock_object_key;
 use deltaglider_proxy::coordination::{ReferenceLock, S3ReferenceLock};
+use std::time::Duration;
+
+/// Lock TTL for these tests. Expiry is judged by the SERVER clock (the lock
+/// object's Last-Modified against the GET's Date, 1 s resolution), so time
+/// cannot be simulated through `now`: the tests wait real time instead.
+const TTL: i64 = 2;
+/// Long enough that the server age is over `TTL` whatever the rounding.
+const PAST_TTL: Duration = Duration::from_millis(3_500);
 
 /// A fresh lock object key for an isolated (bucket, deltaspace) each test.
 fn unique_key() -> String {
     lock_object_key("race-bucket", &format!("prefix/{}", uuid::Uuid::new_v4()))
 }
 
-/// Build an `S3ReferenceLock` over MinIO with a given durable node id. The
-/// coordination bucket is the shared MinIO test bucket.
+/// Build an `S3ReferenceLock` over MinIO with a given durable node id and the
+/// short test TTL. The coordination bucket is the shared MinIO test bucket.
 async fn lock_for(node_id: &str) -> S3ReferenceLock {
     S3ReferenceLock::new(
         minio_client().await,
         MINIO_BUCKET.to_string(),
         node_id.to_string(),
     )
+    .with_tunables(TTL, 30)
 }
 
-/// Best-effort teardown: steal with a far-future clock (any live lock is expired
-/// relative to it), then release, so a test never leaves a lock object behind.
-async fn cleanup(lock: &S3ReferenceLock, key: &str) {
-    let _ = lock.try_acquire(key, "cleanup", 9_999_999_999).await;
-    let _ = lock.release(key, "cleanup").await;
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// Best-effort teardown: delete the lock object.
+async fn cleanup(key: &str) {
+    let _ = minio_client()
+        .await
+        .delete_object()
+        .bucket(MINIO_BUCKET)
+        .key(key)
+        .send()
+        .await;
 }
 
 #[tokio::test]
@@ -52,16 +72,16 @@ async fn reference_lock_mutual_exclusion_lifecycle() {
     let node_a = lock_for("nodeA").await;
     let node_b = lock_for("nodeB").await;
 
-    // A acquires the free deltaspace lock (create-if-absent). TTL default (120).
+    // A acquires the free deltaspace lock (create-if-absent).
     assert!(
-        node_a.try_acquire(&key, "ref-a1", 1000).await.unwrap(),
+        node_a.try_acquire(&key, "ref-a1", now()).await.unwrap(),
         "A should acquire the free deltaspace lock"
     );
 
-    // While A holds it (now 1050 < expires 1120), B is EXCLUDED — this is the
-    // guarantee that stops a second node from creating a rival reference.bin.
+    // While A holds it, B is EXCLUDED — this is the guarantee that stops a
+    // second node from creating a rival reference.bin.
     assert!(
-        !node_b.try_acquire(&key, "ref-b1", 1050).await.unwrap(),
+        !node_b.try_acquire(&key, "ref-b1", now()).await.unwrap(),
         "B must be blocked while A holds the deltaspace lock"
     );
 
@@ -70,12 +90,12 @@ async fn reference_lock_mutual_exclusion_lifecycle() {
 
     // Now B can acquire the freed lock.
     assert!(
-        node_b.try_acquire(&key, "ref-b1", 1060).await.unwrap(),
+        node_b.try_acquire(&key, "ref-b1", now()).await.unwrap(),
         "after A releases, B acquires the deltaspace lock"
     );
 
     node_b.release(&key, "ref-b1").await.unwrap();
-    cleanup(&node_a, &key).await;
+    cleanup(&key).await;
 }
 
 #[tokio::test]
@@ -95,7 +115,7 @@ async fn reference_lock_concurrent_acquire_exactly_one_wins() {
         let k = key.clone();
         handles.push(tokio::spawn(async move {
             let lock = lock_for(&format!("node{i}")).await;
-            lock.try_acquire(&k, &format!("ref{i}"), 1000)
+            lock.try_acquire(&k, &format!("ref{i}"), now())
                 .await
                 .unwrap_or(false)
         }));
@@ -111,8 +131,7 @@ async fn reference_lock_concurrent_acquire_exactly_one_wins() {
         "exactly one concurrent acquirer must win the deltaspace lock, got {wins}"
     );
 
-    let cleaner = lock_for("cleanup").await;
-    cleanup(&cleaner, &key).await;
+    cleanup(&key).await;
 }
 
 #[tokio::test]
@@ -122,28 +141,51 @@ async fn reference_lock_steals_after_ttl_expiry() {
         return;
     }
     // Crash backstop: a holder that dies mid-critical-section never releases, so
-    // its lock must become stealable once the TTL lapses — otherwise a crashed
-    // node would wedge the deltaspace forever. Default TTL 120: acquire at 1000
-    // (expires 1120), a peer at 1050 is blocked, a peer past 1120 steals.
+    // its lock must become stealable once the TTL lapses on the server clock —
+    // otherwise a crashed node would wedge the deltaspace forever.
     let key = unique_key();
     let dead = lock_for("dead-node").await;
     let peer = lock_for("peer-node").await;
 
     assert!(
-        dead.try_acquire(&key, "ref-dead", 1000).await.unwrap(),
+        dead.try_acquire(&key, "ref-dead", now()).await.unwrap(),
         "the (soon-dead) holder acquires"
     );
     assert!(
-        !peer.try_acquire(&key, "ref-peer", 1050).await.unwrap(),
+        !peer.try_acquire(&key, "ref-peer", now()).await.unwrap(),
         "peer blocked while the lock is still live"
     );
+    tokio::time::sleep(PAST_TTL).await;
     assert!(
-        peer.try_acquire(&key, "ref-peer", 1200).await.unwrap(),
+        peer.try_acquire(&key, "ref-peer", now()).await.unwrap(),
         "peer steals the lapsed lock after the TTL crash-backstop expires"
     );
 
     peer.release(&key, "ref-peer").await.unwrap();
-    cleanup(&dead, &key).await;
+    cleanup(&key).await;
+}
+
+/// The peer's clock does not matter: a peer that believes it is far in the
+/// future (the old "steal with a far-future clock") must still be blocked by
+/// a lock that the server says was written a moment ago.
+#[tokio::test]
+async fn reference_lock_expiry_ignores_the_peer_clock() {
+    if !minio_available().await {
+        eprintln!("Skipping reference_lock_expiry_ignores_the_peer_clock: MinIO not available");
+        return;
+    }
+    let key = unique_key();
+    let a = lock_for("nodeA").await;
+    let b = lock_for("nodeB").await;
+    assert!(a.try_acquire(&key, "ref-a", now()).await.unwrap());
+    assert!(
+        !b.try_acquire(&key, "ref-b", now() + 1_000_000)
+            .await
+            .unwrap(),
+        "a peer clock far ahead must not steal a live lock"
+    );
+    a.release(&key, "ref-a").await.unwrap();
+    cleanup(&key).await;
 }
 
 #[tokio::test]
@@ -158,21 +200,22 @@ async fn reference_lock_live_lock_blocks_the_same_node_id() {
     let key = unique_key();
     let before = lock_for("nodeC").await;
     assert!(
-        before.try_acquire(&key, "ref-c-old", 1000).await.unwrap(),
+        before.try_acquire(&key, "ref-c-old", now()).await.unwrap(),
         "node C acquires (still live)"
     );
     let twin = lock_for("nodeC").await; // same node id, fresh owner token
     assert!(
-        !twin.try_acquire(&key, "ref-c-new", 1050).await.unwrap(),
+        !twin.try_acquire(&key, "ref-c-new", now()).await.unwrap(),
         "a live lock blocks the same node id"
     );
+    tokio::time::sleep(PAST_TTL).await;
     assert!(
-        twin.try_acquire(&key, "ref-c-new", 1200).await.unwrap(),
+        twin.try_acquire(&key, "ref-c-new", now()).await.unwrap(),
         "after the TTL the lock frees"
     );
 
     twin.release(&key, "ref-c-new").await.unwrap();
-    cleanup(&before, &key).await;
+    cleanup(&key).await;
 }
 
 #[tokio::test]
@@ -184,16 +227,18 @@ async fn reference_lock_renew_extends_and_detects_a_steal() {
     let key = unique_key();
     let a = lock_for("nodeA").await;
     let b = lock_for("nodeB").await;
-    assert!(a.try_acquire(&key, "ref-a", 1000).await.unwrap()); // expires 1120
-                                                                // Renew at 1100 → expires 1220: B is still blocked at 1150.
-    assert!(a.renew(&key, "ref-a", 1100).await.unwrap());
-    assert!(!b.try_acquire(&key, "ref-b", 1150).await.unwrap());
-    // B steals after the renewed expiry; A's next renew reports the loss.
-    assert!(b.try_acquire(&key, "ref-b", 1300).await.unwrap());
-    assert!(!a.renew(&key, "ref-a", 1301).await.unwrap());
+    assert!(a.try_acquire(&key, "ref-a", now()).await.unwrap());
+    // A renew inside the TTL moves Last-Modified on: B is still blocked.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(a.renew(&key, "ref-a", now()).await.unwrap());
+    assert!(!b.try_acquire(&key, "ref-b", now()).await.unwrap());
+    // B steals after the renewed lock lapses; A's next renew reports the loss.
+    tokio::time::sleep(PAST_TTL).await;
+    assert!(b.try_acquire(&key, "ref-b", now()).await.unwrap());
+    assert!(!a.renew(&key, "ref-a", now()).await.unwrap());
 
     b.release(&key, "ref-b").await.unwrap();
-    cleanup(&a, &key).await;
+    cleanup(&key).await;
 }
 
 #[tokio::test]
@@ -216,11 +261,11 @@ async fn reference_lock_replaces_a_corrupt_body() {
         .unwrap();
     let a = lock_for("nodeA").await;
     assert!(
-        a.try_acquire(&key, "ref-a", 1000).await.unwrap(),
+        a.try_acquire(&key, "ref-a", now()).await.unwrap(),
         "a corrupt lock object must be replaced"
     );
     a.release(&key, "ref-a").await.unwrap();
-    cleanup(&a, &key).await;
+    cleanup(&key).await;
 }
 
 #[tokio::test]
@@ -236,18 +281,19 @@ async fn reference_lock_release_is_owner_scoped() {
     let a = lock_for("nodeA").await;
     let b = lock_for("nodeB").await;
 
-    assert!(a.try_acquire(&key, "ref-a", 1000).await.unwrap());
+    assert!(a.try_acquire(&key, "ref-a", now()).await.unwrap());
     // B steals after expiry (A "crashed").
-    assert!(b.try_acquire(&key, "ref-b", 1200).await.unwrap());
+    tokio::time::sleep(PAST_TTL).await;
+    assert!(b.try_acquire(&key, "ref-b", now()).await.unwrap());
     // A's late release (wrong owner) must be a no-op — B still holds it.
     a.release(&key, "ref-a").await.unwrap();
     assert!(
-        !a.try_acquire(&key, "ref-a2", 1250).await.unwrap(),
+        !a.try_acquire(&key, "ref-a2", now()).await.unwrap(),
         "B's live lock must survive A's stale owner-mismatched release"
     );
 
     b.release(&key, "ref-b").await.unwrap();
-    cleanup(&a, &key).await;
+    cleanup(&key).await;
 }
 
 /// Fencing (the reference write is conditional on what the lock saw), against

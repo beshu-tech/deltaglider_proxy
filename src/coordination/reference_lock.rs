@@ -45,12 +45,12 @@
 //!
 //! ## Clock skew
 //!
-//! `expires_at` is the writer's wall clock; a peer compares it with its own.
-//! The holder trusts its hold for at most `ttl / 2` after its last confirmed
-//! renew (a monotonic clock), and renews every `ttl / 4`. So a peer steals a
-//! live-held lock only when its clock runs more than `ttl / 2` (60s at the
-//! default TTL) ahead of the holder's: the supported skew bound. NTP-synced
-//! nodes are far inside it.
+//! A peer judges expiry by the S3 server's clock: the lock object's
+//! `Last-Modified` against the `Date` of the GET (see `server_clock`), so
+//! node clocks do not matter. The holder trusts its hold for at most
+//! `ttl / 2` after its last confirmed renew (a monotonic clock), and renews
+//! every `ttl / 4`. A body from the previous release (no `ttl_secs`) is
+//! still judged by its writer-clock `expires_at`.
 //!
 //! ## Fencing
 //!
@@ -88,7 +88,13 @@ pub struct RefLock {
     pub owner: String,
     pub node_id: String,
     pub epoch: u64,
+    /// The writer's clock + TTL. Kept for readers on the previous release;
+    /// this release judges expiry by the server clock (`ttl_secs`).
     pub expires_at: i64,
+    /// The TTL the writer granted. With it, expiry is `server age > ttl`
+    /// (see `server_clock`). Absent in a body from the previous release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<i64>,
 }
 
 /// What a read of the lock key found.
@@ -232,16 +238,13 @@ impl S3ReferenceLock {
         self
     }
 
-    async fn read_lock(&self, key: &str) -> Result<Observed, String> {
-        match self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(out) => {
+    /// Read the lock. `now` is the caller's clock: the returned lock's
+    /// `expires_at` is re-based onto it from the server-clock age (see
+    /// `server_clock::effective_expires_at`), so the planners compare like
+    /// with like.
+    async fn read_lock(&self, key: &str, now: i64) -> Result<Observed, String> {
+        match super::server_clock::get_with_server_age(&self.client, &self.bucket, key).await {
+            Ok((out, age)) => {
                 let etag = out.e_tag().map(str::to_string).unwrap_or_default();
                 let bytes = out
                     .body
@@ -250,7 +253,15 @@ impl S3ReferenceLock {
                     .map_err(|e| format!("lock body read: {e}"))?
                     .into_bytes();
                 Ok(match serde_json::from_slice::<RefLock>(&bytes) {
-                    Ok(lock) => Observed::Held { lock, etag },
+                    Ok(mut lock) => {
+                        lock.expires_at = super::server_clock::effective_expires_at(
+                            lock.expires_at,
+                            lock.ttl_secs,
+                            age,
+                            now,
+                        );
+                        Observed::Held { lock, etag }
+                    }
                     Err(_) => Observed::Corrupt { etag },
                 })
             }
@@ -272,6 +283,7 @@ impl S3ReferenceLock {
             node_id: self.node_id.clone(),
             epoch,
             expires_at,
+            ttl_secs: Some(self.ttl_secs.max(1)),
         };
         ByteStream::from(serde_json::to_vec(&lock).unwrap_or_default())
     }
@@ -311,7 +323,7 @@ impl S3ReferenceLock {
 #[async_trait]
 impl ReferenceLock for S3ReferenceLock {
     async fn try_acquire(&self, key: &str, owner: &str, now: i64) -> Result<bool, String> {
-        let current = self.read_lock(key).await?;
+        let current = self.read_lock(key, now).await?;
         let expires_at = now.saturating_add(self.ttl_secs.max(1));
         match plan_lock_acquire(&current, now) {
             LockAction::Blocked => Ok(false),
@@ -331,7 +343,8 @@ impl ReferenceLock for S3ReferenceLock {
     }
 
     async fn release(&self, key: &str, owner: &str) -> Result<(), String> {
-        if let Observed::Held { lock, etag } = self.read_lock(key).await? {
+        let now = crate::event_outbox::current_unix_seconds();
+        if let Observed::Held { lock, etag } = self.read_lock(key, now).await? {
             if lock.owner == owner {
                 let _ = self
                     .client
@@ -347,7 +360,7 @@ impl ReferenceLock for S3ReferenceLock {
     }
 
     async fn renew(&self, key: &str, owner: &str, now: i64) -> Result<bool, String> {
-        let current = self.read_lock(key).await?;
+        let current = self.read_lock(key, now).await?;
         match plan_lock_renew(&current, now, owner) {
             RenewLockAction::Lost => Ok(false),
             // A 412 here means the object moved under us: lost.
@@ -406,7 +419,34 @@ mod tests {
             node_id: node.into(),
             epoch,
             expires_at: expires,
+            ttl_secs: None,
         }
+    }
+
+    /// The body stays readable both ways for one release: the previous
+    /// release's struct (no `ttl_secs`) reads a new body, and a body without
+    /// `ttl_secs` reads here.
+    #[test]
+    fn lock_body_is_compatible_with_the_previous_release() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct PrevRefLock {
+            owner: String,
+            node_id: String,
+            epoch: u64,
+            expires_at: i64,
+        }
+        let new = RefLock {
+            ttl_secs: Some(120),
+            ..obj("o", "n", 1, 99)
+        };
+        let json = serde_json::to_vec(&new).unwrap();
+        let prev: PrevRefLock = serde_json::from_slice(&json).unwrap();
+        assert_eq!(prev.expires_at, 99);
+        let old: RefLock =
+            serde_json::from_slice(br#"{"owner":"o","node_id":"n","epoch":1,"expires_at":99}"#)
+                .unwrap();
+        assert_eq!(old.ttl_secs, None);
     }
 
     fn held(l: RefLock) -> Observed {
@@ -504,6 +544,58 @@ mod tests {
             plan_lock_renew(&Observed::Corrupt { etag: "x".into() }, 100, "me"),
             RenewLockAction::Lost
         );
+    }
+
+    /// Expiry is judged by the S3 server's clock. The holder's clock runs
+    /// 620 s behind, so its `expires_at` (its own now + 120 s) is already
+    /// in the past on the peer's clock; the server says the lock was
+    /// written 10 s ago. The peer must not steal it.
+    #[tokio::test]
+    async fn a_lock_written_by_a_slow_clock_is_live_by_server_time() {
+        let now = crate::event_outbox::current_unix_seconds();
+        let body = serde_json::json!({
+            "owner": "holder", "node_id": "nodeB", "epoch": 3,
+            "expires_at": now - 620 + 120, "ttl_secs": 120
+        });
+        let canned = crate::coordination::test_s3::Canned {
+            body: serde_json::to_vec(&body).unwrap(),
+            date: now,
+            last_modified: now - 10,
+            seen: Default::default(),
+        };
+        let lock = S3ReferenceLock::new(
+            crate::coordination::test_s3::client(&canned),
+            "coord".into(),
+            "nodeA".into(),
+        );
+        let got = lock.try_acquire("k", "peer", now).await.unwrap();
+        assert!(!got, "a live lock (server age 10 s < ttl 120 s) was stolen");
+        assert_eq!(canned.puts(), 0);
+    }
+
+    /// And the other way round: the holder's clock runs ahead, so its
+    /// `expires_at` looks far in the future, but the server says the lock
+    /// was last renewed 500 s ago (TTL 120): it is dead, so a peer takes it.
+    #[tokio::test]
+    async fn a_lock_written_by_a_fast_clock_expires_by_server_time() {
+        let now = crate::event_outbox::current_unix_seconds();
+        let body = serde_json::json!({
+            "owner": "holder", "node_id": "nodeB", "epoch": 3,
+            "expires_at": now + 10_000, "ttl_secs": 120
+        });
+        let canned = crate::coordination::test_s3::Canned {
+            body: serde_json::to_vec(&body).unwrap(),
+            date: now,
+            last_modified: now - 500,
+            seen: Default::default(),
+        };
+        let lock = S3ReferenceLock::new(
+            crate::coordination::test_s3::client(&canned),
+            "coord".into(),
+            "nodeA".into(),
+        );
+        assert!(lock.try_acquire("k", "peer", now).await.unwrap());
+        assert_eq!(canned.puts(), 1);
     }
 
     #[test]

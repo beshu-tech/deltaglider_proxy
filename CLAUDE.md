@@ -278,7 +278,12 @@ single-instance planes below are addressed.
   holder renews it every TTL/4 (heartbeat) and `ReferenceLockGuard::ensure_held`
   runs before every reference/delta commit, so a holder that lost it stops
   before it writes. A live lock is never stolen, not even by the same node id
-  (HOSTNAME twins, engine rebuilds). Supported clock skew between nodes: TTL/2.
+  (HOSTNAME twins, engine rebuilds). Expiry (this lock AND `S3Lease`) is judged
+  by the S3 SERVER clock — the object's `Last-Modified` vs the GET response
+  `Date` (`src/coordination/server_clock.rs`, body field `ttl_secs`) — so node
+  clock skew does not matter; `expires_at` is still written for the previous
+  release's readers, and a body without `ttl_secs` is judged by it. MinIO tests
+  therefore wait real time (TTL 2 s), a simulated `now` no longer expires a lock.
   Every engine write of reference.bin goes through a guard method (source test
   `reference_writes_go_through_the_guard`), incl. delete-reclaim, sweep-reclaim,
   legacy-reference migration and the replication fast-path seed

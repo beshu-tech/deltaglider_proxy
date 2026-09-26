@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — Lock and lease expiry no longer depends on the node clocks
+
+The cross-instance reference lock and the replication leader lease stored an
+expiry time on the writer's clock, and other instances compared it with their
+own clocks. An instance whose clock ran ahead could take a lock that was
+still held, and one whose clock ran behind waited on a dead lock. Expiry is
+now judged by the S3 server's clock: the lock object's `Last-Modified`
+against the `Date` of the response that reads it. The lock body keeps its
+old fields and gains `ttl_secs`, so an instance on the previous release still
+reads it; a body written by such an instance is judged as before.
+
 ### Fixed — A writer that lost the reference lock can no longer overwrite a peer's baseline
 
 With config sync on, a PUT holds a cross-instance lock while it writes a delta

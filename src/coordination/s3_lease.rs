@@ -14,10 +14,10 @@
 //! the pure [`plan_acquire`] / [`plan_renew`] kernels so the full edge-case truth
 //! table is unit-testable without a live backend; the async methods do the I/O.
 //!
-//! Clock skew: `expires_at` is the writer's wall clock and a peer compares it
-//! with its own. A peer whose clock runs ahead by more than (TTL − the
-//! holder's renew interval) steals a live lease. At the replication defaults
-//! (300s TTL) that bound is minutes; NTP-synced nodes are far inside it.
+//! Clock skew: expiry is judged by the S3 server's clock (the lease object's
+//! `Last-Modified` against the GET's `Date`, see `server_clock`), so node
+//! clocks do not matter. A body from the previous release (no `ttl_secs`) is
+//! still judged by its writer-clock `expires_at`.
 
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
@@ -41,6 +41,11 @@ pub struct Lease {
     /// empty, which never equals a live process's id.
     #[serde(default)]
     pub boot_id: String,
+    /// The TTL the writer granted: expiry is `server age > ttl` (see
+    /// `server_clock`). Absent in a body from the previous release, which is
+    /// judged by `expires_at` (still written, for that release's readers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<i64>,
 }
 
 /// Bounded retries for a renew PUT against a transient coordination-bucket blip,
@@ -181,17 +186,12 @@ impl S3Lease {
         format!("_dgp/leases/{}/{}.json", subsystem.slug(), rule)
     }
 
-    /// Read the lease object + its ETag.
-    async fn read_lease(&self, key: &str) -> Result<LeaseRead, String> {
-        match self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            Ok(out) => {
+    /// Read the lease object + its ETag. The lease's `expires_at` comes back
+    /// re-based onto the caller's clock `now` from the server-clock age
+    /// (`server_clock::effective_expires_at`).
+    async fn read_lease(&self, key: &str, now: i64) -> Result<LeaseRead, String> {
+        match super::server_clock::get_with_server_age(&self.client, &self.bucket, key).await {
+            Ok((out, age)) => {
                 let etag = out.e_tag().map(str::to_string).unwrap_or_default();
                 let bytes = out
                     .body
@@ -200,7 +200,15 @@ impl S3Lease {
                     .map_err(|e| format!("lease body read: {e}"))?
                     .into_bytes();
                 Ok(match serde_json::from_slice::<Lease>(&bytes) {
-                    Ok(lease) => LeaseRead::Valid { lease, etag },
+                    Ok(mut lease) => {
+                        lease.expires_at = super::server_clock::effective_expires_at(
+                            lease.expires_at,
+                            lease.ttl_secs,
+                            age,
+                            now,
+                        );
+                        LeaseRead::Valid { lease, etag }
+                    }
                     Err(_) => LeaseRead::Corrupt { etag },
                 })
             }
@@ -216,13 +224,14 @@ impl S3Lease {
         }
     }
 
-    fn body_for(&self, owner: &str, epoch: u64, expires_at: i64) -> ByteStream {
+    fn body_for(&self, owner: &str, epoch: u64, expires_at: i64, ttl_secs: i64) -> ByteStream {
         let lease = Lease {
             owner: owner.to_string(),
             node_id: self.node_id.clone(),
             epoch,
             expires_at,
             boot_id: self.boot_id.clone(),
+            ttl_secs: Some(ttl_secs.max(1)),
         };
         ByteStream::from(serde_json::to_vec(&lease).unwrap_or_default())
     }
@@ -274,18 +283,18 @@ impl CoordinationLease for S3Lease {
         ttl_secs: i64,
     ) -> Result<bool, String> {
         let key = Self::object_key(subsystem, rule);
-        let current = self.read_lease(&key).await?;
+        let current = self.read_lease(&key, now).await?;
         let expires_at = now.saturating_add(ttl_secs.max(1));
         match plan_acquire_read(&current, now, &self.node_id, &self.boot_id) {
             AcquireAction::Blocked => Ok(false),
             AcquireAction::Create => {
-                self.put_lease(&key, self.body_for(owner, 1, expires_at), None)
+                self.put_lease(&key, self.body_for(owner, 1, expires_at, ttl_secs), None)
                     .await
             }
             AcquireAction::Steal { etag, next_epoch } => {
                 self.put_lease(
                     &key,
-                    self.body_for(owner, next_epoch, expires_at),
+                    self.body_for(owner, next_epoch, expires_at, ttl_secs),
                     Some(&etag),
                 )
                 .await
@@ -319,7 +328,7 @@ impl CoordinationLease for S3Lease {
             let elapsed_secs = started.elapsed().as_secs() as i64;
             let effective_now = now.saturating_add(elapsed_secs);
             let expires_at = effective_now.saturating_add(ttl_secs.max(1));
-            let current = match self.read_lease(&key).await {
+            let current = match self.read_lease(&key, effective_now).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_err = Some(e);
@@ -330,7 +339,11 @@ impl CoordinationLease for S3Lease {
                 RenewAction::Lost => return Ok(false),
                 RenewAction::Renew { etag, epoch } => {
                     match self
-                        .put_lease(&key, self.body_for(owner, epoch, expires_at), Some(&etag))
+                        .put_lease(
+                            &key,
+                            self.body_for(owner, epoch, expires_at, ttl_secs),
+                            Some(&etag),
+                        )
                         .await
                     {
                         Ok(true) => return Ok(true),
@@ -361,7 +374,8 @@ impl CoordinationLease for S3Lease {
         let key = Self::object_key(subsystem, rule);
         // Owner-scoped release: only delete the object if WE still own it, so a
         // release can't clobber a lease a peer legitimately stole.
-        if let LeaseRead::Valid { lease, etag } = self.read_lease(&key).await? {
+        let now = crate::event_outbox::current_unix_seconds();
+        if let LeaseRead::Valid { lease, etag } = self.read_lease(&key, now).await? {
             if lease.owner == owner {
                 let _ = self
                     .client
@@ -386,7 +400,7 @@ impl CoordinationLease for S3Lease {
         // Held = the lease object exists AND hasn't lapsed. A transient read
         // error is surfaced (the caller treats an Err conservatively).
         Ok(self
-            .read_lease(&key)
+            .read_lease(&key, now)
             .await?
             .valid()
             .is_some_and(|(lease, _etag)| lease.expires_at >= now))
@@ -404,7 +418,63 @@ mod tests {
             epoch,
             expires_at: expires,
             boot_id: "boot-old".into(),
+            ttl_secs: None,
         }
+    }
+
+    fn canned_lease(body: serde_json::Value, age: i64) -> crate::coordination::test_s3::Canned {
+        let now = crate::event_outbox::current_unix_seconds();
+        crate::coordination::test_s3::Canned {
+            body: serde_json::to_vec(&body).unwrap(),
+            date: now,
+            last_modified: now - age,
+            seen: Default::default(),
+        }
+    }
+
+    /// Expiry by the server clock: a leader whose clock runs 1000 s behind
+    /// renewed 20 s ago (TTL 300). Its lease is live; a peer must not steal.
+    #[tokio::test]
+    async fn a_lease_from_a_slow_clock_is_live_by_server_time() {
+        let now = crate::event_outbox::current_unix_seconds();
+        let canned = canned_lease(
+            serde_json::json!({"owner": "leader", "node_id": "nodeB", "epoch": 2,
+                "expires_at": now - 1000 + 300, "ttl_secs": 300}),
+            20,
+        );
+        let l = S3Lease::new(
+            crate::coordination::test_s3::client(&canned),
+            "coord".into(),
+            "nodeA".into(),
+        );
+        let got = l
+            .try_acquire(LeaseSubsystem::Replication, "r", "peer", now, 300)
+            .await
+            .unwrap();
+        assert!(!got, "a live lease was stolen");
+        assert_eq!(canned.puts(), 0);
+    }
+
+    /// A dead leader with a clock far ahead: the server says 400 s since
+    /// its last renew (TTL 300), so the lease is free for a peer.
+    #[tokio::test]
+    async fn a_lease_from_a_fast_clock_expires_by_server_time() {
+        let now = crate::event_outbox::current_unix_seconds();
+        let canned = canned_lease(
+            serde_json::json!({"owner": "leader", "node_id": "nodeB", "epoch": 2,
+                "expires_at": now + 50_000, "ttl_secs": 300}),
+            400,
+        );
+        let l = S3Lease::new(
+            crate::coordination::test_s3::client(&canned),
+            "coord".into(),
+            "nodeA".into(),
+        );
+        assert!(l
+            .try_acquire(LeaseSubsystem::Replication, "r", "peer", now, 300)
+            .await
+            .unwrap());
+        assert_eq!(canned.puts(), 1);
     }
 
     #[test]

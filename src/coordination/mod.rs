@@ -27,6 +27,7 @@ pub mod health;
 pub mod lease;
 pub mod reference_lock;
 pub mod s3_lease;
+pub mod server_clock;
 
 pub use capability::{BackendCapabilityCache, CapabilityVerdict, VerifiedVia};
 pub use health::{BackendHealthCache, HealthVerdict};
@@ -71,4 +72,93 @@ pub fn durable_node_id(dir: &std::path::Path) -> String {
     // non-durable-this-boot) id rather than block startup.
     let _ = std::fs::write(&path, &generated);
     generated
+}
+
+#[cfg(test)]
+mod test_s3 {
+    //! Test-only S3 client over a canned connector: a GET answers with a fixed
+    //! body, `Date` and `Last-Modified`; every other request answers 200. The
+    //! lock and lease tests use it to drive the real read path, including the
+    //! response headers that a mock of the trait cannot show.
+
+    use aws_sdk_s3::config::{BehaviorVersion, Region};
+    use aws_smithy_runtime_api::client::http::{
+        HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
+    use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+    use aws_smithy_types::body::SdkBody;
+    use std::sync::{Arc, Mutex};
+
+    /// HTTP date (IMF-fixdate) for a unix time.
+    pub fn http_date(unix: i64) -> String {
+        chrono::DateTime::from_timestamp(unix, 0)
+            .unwrap()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string()
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Canned {
+        pub body: Vec<u8>,
+        pub date: i64,
+        pub last_modified: i64,
+        /// Methods of the requests seen, in order.
+        pub seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Canned {
+        pub fn puts(&self) -> usize {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| *m == "PUT")
+                .count()
+        }
+    }
+
+    impl HttpConnector for Canned {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let method = request.method().to_string();
+            self.seen.lock().unwrap().push(method.clone());
+            let mut resp = if method == "GET" {
+                let mut r =
+                    HttpResponse::new(200.try_into().unwrap(), SdkBody::from(self.body.clone()));
+                r.headers_mut()
+                    .insert("last-modified", http_date(self.last_modified));
+                r.headers_mut().insert("content-type", "application/json");
+                r
+            } else {
+                HttpResponse::new(200.try_into().unwrap(), SdkBody::empty())
+            };
+            resp.headers_mut().insert("date", http_date(self.date));
+            resp.headers_mut().insert("etag", "\"e1\"");
+            HttpConnectorFuture::ready(Ok(resp))
+        }
+    }
+
+    impl HttpClient for Canned {
+        fn http_connector(
+            &self,
+            _: &HttpConnectorSettings,
+            _: &RuntimeComponents,
+        ) -> SharedHttpConnector {
+            SharedHttpConnector::new(self.clone())
+        }
+    }
+
+    pub fn client(canned: &Canned) -> aws_sdk_s3::Client {
+        let conf = aws_sdk_s3::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(aws_credential_types::Credentials::new(
+                "k", "s", None, None, "test",
+            ))
+            .endpoint_url("http://127.0.0.1:1")
+            .force_path_style(true)
+            .http_client(canned.clone())
+            .build();
+        aws_sdk_s3::Client::from_conf(conf)
+    }
 }

@@ -21,6 +21,19 @@ fn unique_rule() -> String {
 
 const SUB: LeaseSubsystem = LeaseSubsystem::Replication;
 
+/// Lease TTL for the expiry steps. Expiry is judged by the SERVER clock (the
+/// lease object's Last-Modified against the GET's Date, 1 s resolution), so
+/// the tests wait real time instead of passing a simulated `now`.
+const TTL: i64 = 2;
+const PAST_TTL: std::time::Duration = std::time::Duration::from_millis(3_500);
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
 /// Build an S3Lease over MinIO with a given durable node id.
 async fn lease_for(node_id: &str) -> S3Lease {
     S3Lease::new(
@@ -28,6 +41,17 @@ async fn lease_for(node_id: &str) -> S3Lease {
         MINIO_BUCKET.to_string(),
         node_id.to_string(),
     )
+}
+
+async fn delete_lease(rule: &str) {
+    let key = format!("_dgp/leases/{}/{}.json", SUB.slug(), rule);
+    let _ = minio_client()
+        .await
+        .delete_object()
+        .bucket(MINIO_BUCKET)
+        .key(&key)
+        .send()
+        .await;
 }
 
 #[tokio::test]
@@ -40,35 +64,41 @@ async fn s3_lease_full_failover_lifecycle() {
     let node_a = lease_for("nodeA").await;
     let node_b = lease_for("nodeB").await;
 
-    // 1. Node A acquires a free lease (create-if-absent). Owner "task-a1", TTL 60.
+    // 1. Node A acquires a free lease (create-if-absent).
     assert!(
         node_a
-            .try_acquire(SUB, &rule, "task-a1", 1000, 60)
+            .try_acquire(SUB, &rule, "task-a1", now(), TTL)
             .await
             .unwrap(),
         "A should acquire a free lease"
     );
 
-    // 2. E2/E3: Node B cannot steal a LIVE lease (expires_at 1060 > now 1030).
+    // 2. E2/E3: Node B cannot steal a LIVE lease — not even with a clock far
+    //    ahead: the server clock judges expiry.
     assert!(
         !node_b
-            .try_acquire(SUB, &rule, "task-b1", 1030, 60)
+            .try_acquire(SUB, &rule, "task-b1", now() + 1_000_000, TTL)
             .await
             .unwrap(),
         "B must be blocked while A's lease is live"
     );
 
-    // 3. A renews while live (now 1030, expires 1060 → new 1090).
+    // 3. A renews while live.
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
     assert!(
-        node_a.renew(SUB, &rule, "task-a1", 1030, 60).await.unwrap(),
+        node_a
+            .renew(SUB, &rule, "task-a1", now(), TTL)
+            .await
+            .unwrap(),
         "A should renew its live lease"
     );
 
-    // 4. E1: A "dies" (stops renewing). Once its lease lapses (now > 1090), B
-    //    steals it → automatic failover.
+    // 4. E1: A "dies" (stops renewing). Once its lease lapses, B steals it →
+    //    automatic failover.
+    tokio::time::sleep(PAST_TTL).await;
     assert!(
         node_b
-            .try_acquire(SUB, &rule, "task-b1", 1091, 60)
+            .try_acquire(SUB, &rule, "task-b1", now(), 60)
             .await
             .unwrap(),
         "B should steal the lapsed lease (failover)"
@@ -76,13 +106,19 @@ async fn s3_lease_full_failover_lifecycle() {
 
     // 5. The old owner A can no longer renew (it was stolen) — E3b.
     assert!(
-        !node_a.renew(SUB, &rule, "task-a1", 1091, 60).await.unwrap(),
+        !node_a
+            .renew(SUB, &rule, "task-a1", now(), 60)
+            .await
+            .unwrap(),
         "A must NOT renew a lease B has stolen"
     );
 
     // 6. B now holds it and renews normally.
     assert!(
-        node_b.renew(SUB, &rule, "task-b1", 1100, 60).await.unwrap(),
+        node_b
+            .renew(SUB, &rule, "task-b1", now(), 60)
+            .await
+            .unwrap(),
         "B should renew the lease it stole"
     );
 
@@ -90,7 +126,7 @@ async fn s3_lease_full_failover_lifecycle() {
     node_b.release(SUB, &rule, "task-b1").await.unwrap();
     assert!(
         node_a
-            .try_acquire(SUB, &rule, "task-a2", 1200, 60)
+            .try_acquire(SUB, &rule, "task-a2", now(), 60)
             .await
             .unwrap(),
         "after release the lease is free to re-acquire"
@@ -112,18 +148,18 @@ async fn s3_lease_self_reclaim_after_restart() {
     let before_restart = lease_for("nodeC").await;
     assert!(
         before_restart
-            .try_acquire(SUB, &rule, "task-c-old", 1000, 300)
+            .try_acquire(SUB, &rule, "task-c-old", now(), 300)
             .await
             .unwrap(),
         "node C acquires (long TTL, still live after 'restart')"
     );
 
     // Same node_id, fresh task owner (a new process) — the lease is still LIVE
-    // (expires 1300) but ours, so we reclaim it now rather than blocking.
+    // but ours, so we reclaim it now rather than blocking.
     let after_restart = lease_for("nodeC").await;
     assert!(
         after_restart
-            .try_acquire(SUB, &rule, "task-c-new", 1050, 300)
+            .try_acquire(SUB, &rule, "task-c-new", now(), 300)
             .await
             .unwrap(),
         "same node reclaims its own live lease (E7)"
@@ -132,7 +168,7 @@ async fn s3_lease_self_reclaim_after_restart() {
     let other = lease_for("nodeD").await;
     assert!(
         !other
-            .try_acquire(SUB, &rule, "task-d", 1060, 300)
+            .try_acquire(SUB, &rule, "task-d", now(), 300)
             .await
             .unwrap(),
         "a different node is still blocked while the lease is live"
@@ -159,7 +195,7 @@ async fn s3_lease_concurrent_acquire_exactly_one_wins() {
         handles.push(tokio::spawn(async move {
             let lease = lease_for(&format!("node{i}")).await;
             lease
-                .try_acquire(SUB, &r, &format!("task{i}"), 1000, 60)
+                .try_acquire(SUB, &r, &format!("task{i}"), now(), 60)
                 .await
                 .unwrap_or(false)
         }));
@@ -175,12 +211,7 @@ async fn s3_lease_concurrent_acquire_exactly_one_wins() {
         "exactly one concurrent acquirer must win, got {wins}"
     );
 
-    // cleanup — steal it expired and release.
-    let cleanup = lease_for("cleanup").await;
-    let _ = cleanup
-        .try_acquire(SUB, &rule, "cleanup", 9_999_999_999, 1)
-        .await;
-    let _ = cleanup.release(SUB, &rule, "cleanup").await;
+    delete_lease(&rule).await;
 }
 
 #[tokio::test]
@@ -207,7 +238,7 @@ async fn s3_lease_replaces_a_corrupt_body() {
     let node_a = lease_for("nodeA").await;
     assert!(
         node_a
-            .try_acquire(SUB, &rule, "task-a1", 1000, 60)
+            .try_acquire(SUB, &rule, "task-a1", now(), 60)
             .await
             .unwrap(),
         "a corrupt lease object must be replaced"
