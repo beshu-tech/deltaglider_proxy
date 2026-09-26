@@ -21,7 +21,7 @@ use crate::common;
 use bytes::Bytes;
 use common::{
     generate_binary, get_bytes, head_headers, list_objects_raw, minio_endpoint_url, mutate_binary,
-    put_and_get_storage_type, TestServer, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
+    put_and_get_storage_type, S3Requests, TestServer, MINIO_ACCESS_KEY, MINIO_SECRET_KEY,
 };
 use deltaglider_proxy::multipart::MultipartStore;
 use sha2::{Digest, Sha256};
@@ -922,14 +922,14 @@ async fn test_full_lifecycle_with_delete() {
 
 /// Helper: initiate a multipart upload via raw HTTP, return upload_id
 async fn create_multipart_upload(
-    client: &reqwest::Client,
+    client: &impl S3Requests,
     endpoint: &str,
     bucket: &str,
     key: &str,
 ) -> String {
     let url = format!("{}/{}/{}?uploads", endpoint, bucket, key);
     let resp = client
-        .post(&url)
+        .s3_request(reqwest::Method::POST, &url)
         .header("content-type", "application/octet-stream")
         .send()
         .await
@@ -951,7 +951,7 @@ async fn create_multipart_upload(
 
 /// Helper: upload a part via raw HTTP, return ETag
 async fn upload_part(
-    client: &reqwest::Client,
+    client: &impl S3Requests,
     endpoint: &str,
     bucket: &str,
     key: &str,
@@ -964,7 +964,7 @@ async fn upload_part(
         endpoint, bucket, key, part_number, upload_id
     );
     let resp = client
-        .put(&url)
+        .s3_request(reqwest::Method::PUT, &url)
         .body(data)
         .send()
         .await
@@ -985,7 +985,7 @@ async fn upload_part(
 
 /// Helper: complete a multipart upload via raw HTTP
 async fn complete_multipart_upload(
-    client: &reqwest::Client,
+    client: &impl S3Requests,
     endpoint: &str,
     bucket: &str,
     key: &str,
@@ -1003,7 +1003,7 @@ async fn complete_multipart_upload(
     xml.push_str("</CompleteMultipartUpload>");
 
     client
-        .post(&url)
+        .s3_request(reqwest::Method::POST, &url)
         .header("content-type", "application/xml")
         .body(xml)
         .send()
@@ -1381,7 +1381,7 @@ async fn test_multipart_large_zip_forces_passthrough_on_s3_backend() {
         .env("DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES", "1024")
         .build()
         .await;
-    let http = reqwest::Client::new();
+    let http = server.http();
     let prefix = unique_prefix();
 
     // Seed a baseline so the .zip key family is delta-eligible.
