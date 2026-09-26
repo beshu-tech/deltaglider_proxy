@@ -20,6 +20,7 @@
  * a policy row whose bucket doesn't exist ("not found" chip; name editable
  * for pre-provisioning drafts).
  */
+import { bucketNameError } from '../bucketName';
 import { useState } from 'react';
 import { CAPABILITY_DOC_URL, docsUrlToInAppHref } from '../linkifyDocUrl';
 import { Button, Collapse, Input, InputNumber, Modal, Progress, Radio, Select, Typography } from 'antd';
@@ -311,11 +312,16 @@ export default function BucketCard({
           <span onClick={(e) => e.stopPropagation()} style={{ flex: 1, minWidth: 160 }}>
             <SimpleAutoComplete
               value={name}
-              onChange={(v) => onDraftNameChange(v.toLowerCase().replace(/[^a-z0-9.-]/g, ''))}
+              onChange={(v) => onDraftNameChange(v)}
               options={availableBuckets}
               placeholder="Bucket name"
               style={{ width: '100%' }}
             />
+            {bucketNameError(name) && (
+              <Text role="alert" type="danger" style={{ display: 'block', fontSize: 11, marginTop: 2 }}>
+                {bucketNameError(name)}
+              </Text>
+            )}
           </span>
         ) : (
           <Text

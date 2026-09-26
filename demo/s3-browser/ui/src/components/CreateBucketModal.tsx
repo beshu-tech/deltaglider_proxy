@@ -20,6 +20,7 @@ import { createBucket } from '../s3client';
 import { getBackends } from '../adminApi';
 import type { BackendInfo } from '../adminApi';
 import { normalizeUiError } from '../errorHandling';
+import { bucketNameError } from '../bucketName';
 
 const { Text } = Typography;
 
@@ -81,6 +82,7 @@ export default function CreateBucketModal({
   }, [open, canAdmin, presetBackend]);
 
   const showPicker = canAdmin && backends.length > 1;
+  const nameError = bucketNameError(name.trim());
 
   const handleCreate = async () => {
     const trimmed = name.trim();
@@ -112,7 +114,7 @@ export default function CreateBucketModal({
         okText="Create"
         onOk={handleCreate}
         confirmLoading={creating}
-        okButtonProps={{ disabled: !name.trim() || (showPicker && !selectedBackend) }}
+        okButtonProps={{ disabled: !name.trim() || nameError !== null || (showPicker && !selectedBackend) }}
         onCancel={() => {
           if (creating) return;
           setName('');
@@ -127,14 +129,18 @@ export default function CreateBucketModal({
           placeholder="Bucket name"
           aria-label="Bucket name"
           value={name}
-          // Normalize to a valid S3 bucket name as you type: lowercase, and only
-          // [a-z0-9.-]. S3 backends reject uppercase ("InvalidBucketName"), and a
-          // filesystem backend would accept it inconsistently — so we keep the
-          // name portable across backends. Mirrors BucketCard's name field.
-          onChange={(e) => setName(e.target.value.toLowerCase().replace(/[^a-z0-9.-]/g, ''))}
-          onPressEnter={handleCreate}
+          // Keep what the user typed and say what is wrong: a silent rewrite
+          // ("My_Bucket" → "mybucket") creates a bucket nobody asked for.
+          onChange={(e) => setName(e.target.value)}
+          onPressEnter={() => { if (!nameError) void handleCreate(); }}
+          status={nameError ? 'error' : undefined}
           style={{ fontFamily: 'var(--font-mono)' }}
         />
+        {nameError && (
+          <Text role="alert" type="danger" style={{ display: 'block', marginTop: 6, fontSize: 12 }}>
+            {nameError}
+          </Text>
+        )}
         {showPicker && (
           <div style={{ marginTop: 12 }} data-testid="bucket-backend-select">
             <Select
