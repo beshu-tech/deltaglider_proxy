@@ -103,3 +103,4 @@ deltaglider-demo-90s-music.mp4
 
 # llvm-cov profiles (scripts/coverage.sh)
 *.profraw
+*.profdata
