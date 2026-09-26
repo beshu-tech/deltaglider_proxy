@@ -9,10 +9,14 @@
 //! - a row changed on one side only takes that side's version;
 //! - a row deleted on one side (present in the base, absent on that side) and
 //!   unchanged on the other is deleted;
-//! - a row changed differently on both sides is a CONFLICT: the newer
-//!   `sync_mtime` wins (a tie goes to the remote), and a delete beats a
-//!   concurrent edit, because bringing back a deleted identity is the unsafe
-//!   outcome. Every conflict is reported so the caller can audit it.
+//! - a row changed differently on both sides merges COLUMN BY COLUMN against
+//!   the base (the permission rows count as one column): a key rotation on
+//!   one side and a permission edit on the other both survive. Only a column
+//!   changed on both sides is a CONFLICT: the newer `sync_mtime` wins (a tie
+//!   goes to the remote);
+//! - a delete beats a concurrent edit, because bringing back a deleted
+//!   identity is the unsafe outcome. Every conflict is reported so the caller
+//!   can audit it.
 //!
 //! Without a base (first sync, upgrade, unreadable base file) nothing can be
 //! told apart from "deleted", so the merge is a UNION: every row of either
@@ -490,9 +494,34 @@ fn merge_table(
             l.map(|e| (e, Side::Local))
         } else {
             // Changed on both sides.
-            let (resolution, pick) = match (l, r) {
-                (Some(l), Some(r)) if l.mtime > r.mtime => ("local", Some((l, Side::Local))),
-                (Some(_), Some(r)) => ("remote", Some((r, Side::Remote))),
+            let side = |l: &Entity, r: &Entity| {
+                if local_is_newer(l, r) {
+                    ("local", Side::Local)
+                } else {
+                    ("remote", Side::Remote)
+                }
+            };
+            let (resolution, pick) = match (b, l, r) {
+                // One row edited on both nodes: merge it column by column, so
+                // a key rotation on one node and a permission edit on the
+                // other both survive. Only a column changed on both sides
+                // goes to the newer write.
+                (Some(b), Some(l), Some(r)) => {
+                    let (resolution, side) = side(l, r);
+                    let (e, conflict) = merge_columns(b, l, r, side);
+                    if !conflict {
+                        out.insert(key.clone(), (e, side));
+                        continue;
+                    }
+                    (resolution, Some((e, side)))
+                }
+                // Created on both sides with different content: no base to
+                // merge against, so the newer row wins as a whole.
+                (None, Some(l), Some(r)) => {
+                    let (resolution, side) = side(l, r);
+                    let e = if side == Side::Local { l } else { r };
+                    (resolution, Some((e.clone(), side)))
+                }
                 _ => ("deleted", None),
             };
             let named = l.or(r).expect("a conflict has at least one side");
@@ -501,13 +530,77 @@ fn merge_table(
                 target: conflict_target(spec, named),
                 resolution,
             });
-            pick
+            if let Some(p) = pick {
+                out.insert(key.clone(), p);
+            }
+            continue;
         };
         if let Some((e, side)) = pick {
             out.insert(key.clone(), (e.clone(), side));
         }
     }
     out
+}
+
+/// Pure: whether the local version of a row changed on both sides is the
+/// newer write (a tie goes to the remote copy).
+fn local_is_newer(l: &Entity, r: &Entity) -> bool {
+    l.mtime > r.mtime
+}
+
+/// Pure: the three-way pick of one value, and whether it changed on both
+/// sides (then `w`, the winner's value, is taken).
+fn pick3<'a, T: PartialEq>(
+    b: Option<&'a T>,
+    l: Option<&'a T>,
+    r: Option<&'a T>,
+    w: Option<&'a T>,
+) -> (Option<&'a T>, bool) {
+    if l == r || r == b {
+        (l, false)
+    } else if l == b {
+        (r, false)
+    } else {
+        (w, true)
+    }
+}
+
+/// Pure: column-wise three-way merge of a row that both sides changed. A
+/// column changed on one side takes that side's value; a column changed on
+/// both sides takes the `winner`'s. The owned permission rows count as one
+/// column. Returns the row and whether any column changed on both sides.
+fn merge_columns(b: &Entity, l: &Entity, r: &Entity, winner: Side) -> (Entity, bool) {
+    let w = if winner == Side::Local { l } else { r };
+    let mut conflict = false;
+    let mut row = Row::new();
+    let cols: std::collections::BTreeSet<&String> = l.row.keys().chain(r.row.keys()).collect();
+    for c in cols {
+        let v = if NOT_COMPARED.contains(&c.as_str()) {
+            w.row.get(c)
+        } else {
+            let (v, both) = pick3(b.row.get(c), l.row.get(c), r.row.get(c), w.row.get(c));
+            conflict |= both;
+            v
+        };
+        if let Some(v) = v {
+            row.insert(c.clone(), v.clone());
+        }
+    }
+    let (children, both) = pick3(
+        Some(&b.children),
+        Some(&l.children),
+        Some(&r.children),
+        Some(&w.children),
+    );
+    conflict |= both;
+    let children = children.cloned().unwrap_or_default();
+    let merged = Entity {
+        id: w.id,
+        mtime: l.mtime.max(r.mtime),
+        row,
+        children,
+    };
+    (merged, conflict)
 }
 
 type Merged = BTreeMap<&'static str, BTreeMap<String, (Entity, Side)>>;
@@ -1669,7 +1762,6 @@ mod review3_tests {
     /// edit of the same user on node B: row-level last-writer-wins keeps B's
     /// whole row, so the LEAKED key and secret come back and work again.
     #[test]
-    #[ignore = "review3: pending fix"]
     fn review3_a_key_rotation_survives_a_later_edit_on_the_peer() {
         let t = trio(|db| {
             db.create_user("u1", "AKLEAKED00001", "leaked", true, &[perm("a/*")])
@@ -1698,6 +1790,12 @@ mod review3_tests {
         assert_eq!(
             u1.access_key_id, "AKROTATED0001",
             "the leaked key is back after the merge"
+        );
+        assert_eq!(u1.secret_access_key, "fresh");
+        assert_eq!(
+            u1.permissions[0].resources,
+            vec!["z/*"],
+            "the peer edit survives"
         );
     }
 
