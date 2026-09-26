@@ -299,14 +299,47 @@ impl From<crate::storage::StorageError> for S3Error {
 pub fn sanitise_for_client(err: &dyn std::fmt::Display) -> String {
     // Log the full detail exactly once per sanitisation. If the caller
     // also logs, we'll have duplicate lines — acceptable for a rare
-    // error path.
-    tracing::error!(target: "dgp::sanitised_error", "{}", err);
+    // error path. The default target (this module): the log filter is a
+    // list of crate targets (`deltaglider_proxy=…`), and an event under
+    // any other target is dropped, as the old `dgp::sanitised_error` was.
+    tracing::error!("sanitised 500, cause: {}", err);
     "Internal server error. See server logs for details.".to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Source guard: a `tracing` target outside `deltaglider_proxy::` is
+    /// dropped by the default filter (`deltaglider_proxy=debug,…`, plus the
+    /// audit directive), so the event never reaches a log.
+    #[test]
+    fn no_log_event_uses_a_target_outside_the_crate() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            &mut files,
+        );
+        let pattern = ["target", ": \"dgp::"].concat();
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            assert!(
+                !text.contains(&pattern),
+                "{}: a log target outside the crate",
+                f.display()
+            );
+        }
+    }
 
     /// Regression: EntityTooLarge must return 413, not 400.
     /// S3 clients rely on the status code to distinguish size errors from bad requests.

@@ -1043,3 +1043,48 @@ async fn test_section_put_key_rotation_surfaces_fingerprint_diff() {
         "new key bytes leaked in diff: {raw}"
     );
 }
+
+/// A GET that cannot decrypt because the object's key id does not match the
+/// backend's key logs the precise cause at ERROR (never the key). The
+/// sanitised 500 used to log it under a target outside the log filter, so
+/// the operator saw only "Internal server error".
+#[tokio::test]
+async fn a_key_id_mismatch_on_get_logs_its_cause() {
+    let mut server = encrypted_builder().build().await;
+    put_object(&server, "mismatch.bin", b"written under TEST_KEY").await;
+    server
+        .respawn_with_env(&[("DGP_ENCRYPTION_KEY", OTHER_KEY)])
+        .await;
+
+    let get = server
+        .s3_client()
+        .await
+        .get_object()
+        .bucket(BUCKET)
+        .key("mismatch.bin")
+        .send()
+        .await;
+    assert!(get.is_err(), "the GET must fail under the other key");
+
+    let admin = common::admin_http_client(&server.endpoint()).await;
+    let logs: serde_json::Value = admin
+        .get(format!(
+            "{}/_/api/admin/logs?level=error&limit=200",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let text = logs.to_string();
+    assert!(
+        text.contains("was encrypted with key id"),
+        "no ERROR line names the key-id mismatch: {text}"
+    );
+    assert!(
+        !text.contains(TEST_KEY) && !text.contains(OTHER_KEY),
+        "a key reached the log"
+    );
+}

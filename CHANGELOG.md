@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — A sanitised 500 logs its cause
+
+A request that failed with `500 InternalError` sends the client a generic
+message, and the proxy meant to log the real cause at ERROR. It logged it
+under the target `dgp::sanitised_error`, which the default log filter
+(`deltaglider_proxy=…`) drops. So a GET that could not decrypt because the
+object's key id does not match the backend's key left only "Internal
+server error" in the log. Now the cause, for example "object was encrypted
+with key id 'A', but this backend is configured with key id 'B'", is
+logged at ERROR under the crate's own target. Keys are never logged.
+
 ### Fixed — A key too long for the backend is a 400, not a 500
 
 A key with a part longer than the filesystem's 255-byte name limit (for
