@@ -37,22 +37,25 @@ export default function PasswordChangeCard() {
 
         <div style={{ fontSize: 13, color: TEXT_MUTED, lineHeight: 1.6 }}>
           <Text style={{ color: TEXT_MUTED, fontSize: 13 }}>
-            The admin password is a single infrastructure secret that serves three purposes:
+            The admin password does two things:
           </Text>
           <ul style={{ margin: '8px 0', paddingLeft: 20 }}>
-            <li><strong>Encrypts the user database</strong> — all user credentials are stored encrypted, locked with this password.</li>
-            <li><strong>Signs admin session cookies</strong> — authenticates your browser session for this settings panel.</li>
-            <li><strong>Gates admin access</strong> — before IAM users exist, this password is required to access settings.</li>
+            <li><strong>Signs admin session cookies</strong>: it authenticates your browser session for this settings panel.</li>
+            <li><strong>Gates admin access</strong>: before IAM users exist, you need this password to open settings.</li>
           </ul>
+          <Text style={{ color: TEXT_MUTED, fontSize: 13 }}>
+            It does not encrypt the IAM database. The database has its own key: <code>DGP_CONFIG_DB_KEY</code>, or the key
+            file <code>deltaglider_config.db.key</code> next to the database.
+          </Text>
         </div>
 
         <Alert
           type="warning"
           icon={<WarningOutlined />}
           showIcon
-          title="Changing this password re-encrypts the IAM database"
+          title="Changing this password signs you and every other admin out"
           description={
-            <CodeTokenText text="All active admin sessions will be invalidated. IAM users and their credentials are preserved. If you forget this password, use the CLI flag --set-bootstrap-password to reset it (warning: this wipes the IAM database)." />
+            <CodeTokenText text="All active admin sessions end. IAM users and their credentials stay as they are. If you forget this password, reset it with the CLI flag --set-bootstrap-password. The reset keeps the IAM database." />
           }
           style={{ borderRadius: 8 }}
         />

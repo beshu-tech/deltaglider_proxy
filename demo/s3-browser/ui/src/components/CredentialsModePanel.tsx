@@ -374,8 +374,8 @@ export default function CredentialsModePanel({ onSessionExpired }: Props) {
       <div style={{ marginTop: 4 }}>
         <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>
           <b>Note:</b> The admin GUI password is SEPARATE from the S3
-          SigV4 credentials above. It unlocks this GUI and encrypts
-          the IAM database.
+          SigV4 credentials above. It unlocks this GUI. It does not
+          encrypt the IAM database, which has its own key.
         </Text>
         <PasswordChangeCard />
       </div>

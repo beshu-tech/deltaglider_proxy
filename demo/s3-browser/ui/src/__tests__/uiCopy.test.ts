@@ -63,6 +63,12 @@ const RULES: { name: string; test: (line: string) => boolean }[] = [
     name: 'request-rule vocabulary',
     test: (l) => /operator-authored|\bsynthesi[sz]ed\b|\badmission (block|chain)s?\b/i.test(l) || hasBareRuleTester(l),
   },
+  {
+    // The config DB has its own key (DGP_CONFIG_DB_KEY or the key file); the
+    // admin password encrypts nothing, and resetting it keeps the IAM DB.
+    name: 'admin password encrypts the database (it does not)',
+    test: (l) => /\b(re-)?encrypts (the )?(IAM|user|config) (database|DB)\b|\bwipes the IAM database\b/i.test(l),
+  },
 ];
 
 test('no UI copy violations in src/**/*.tsx', async () => {
