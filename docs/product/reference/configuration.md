@@ -64,6 +64,19 @@ The flat (pre-Phase-3) shape — root-level `listen_addr:`, `backend:`, etc. —
 
 The same document is editable from the admin UI. The form keeps section ownership visible and surfaces each field's YAML path on hover; environment-driven fields note their `DGP_*` variable inline in the help text.
 
+### What happens to the file when the admin UI saves
+
+When you apply a change in the admin UI, the proxy writes the whole configuration file again. It does not edit the file in place. The proxy serializes its running configuration into the canonical form and replaces the file with the result, in one atomic rename. As a consequence, the saved file differs from a file that you wrote by hand in these ways:
+
+- Your comments and your blank lines are not kept, because the running configuration does not hold them.
+- The keys appear in the canonical order, and the file uses the four-section layout even when you wrote the flat layout.
+- A field that equals its default value is left out of the file.
+- A shorthand such as `public_prefixes: [""]` can come back as `public: true`.
+
+Some values do survive the rewrite. A `${env:NAME}` reference that the file held stays a reference, so a secret that came from the environment does not end up in the file. An encryption key that you wrote into the YAML stays in the YAML.
+
+If you manage the file in Git, keep your commented copy in the repository and treat the file on the server as generated output. To see the layout that the proxy writes, with its secrets redacted, request `GET /api/admin/config/export`.
+
 ![Access configuration form](/_/screenshots/config-access-form.jpg)
 
 ![Storage backend configuration form](/_/screenshots/config-storage-form.jpg)
