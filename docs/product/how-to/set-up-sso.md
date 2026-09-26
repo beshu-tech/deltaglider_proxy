@@ -67,6 +67,8 @@ If your identity provider (for example Keycloak or Dex) runs on a private addres
 | `allow_local` | `true` | The issuer, and the endpoints that its discovery document names, may use `http://` and private addresses. This is the same opt-in as `allow_local` on backends and on event delivery. Cloud-metadata addresses stay refused. |
 | `ca_cert_path` | path to a PEM file | The certificates in the file are added to the trust roots for this provider. The proxy checks at save time that the file holds at least one certificate. |
 
+In the admin UI, the provider form sets them in its **Network** fields: the **Allow http:// and private addresses** switch sets `allow_local`, and the **CA certificate file** field sets `ca_cert_path`. The form keeps the other keys of `extra_config` when you save. If the proxy refuses the provider with `422`, the form shows the reason under the fields, and the provider stays as it was.
+
 In the admin API, the provider body carries them as `"extra_config": {"allow_local": true, "ca_cert_path": "/etc/deltaglider/idp-ca.pem"}`. In declarative YAML they go under the provider entry:
 
 ```yaml

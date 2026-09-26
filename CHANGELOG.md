@@ -17,6 +17,18 @@ fails and never looks complete. In Chrome and Edge, a file that the browser
 created for a download that then fails is deleted. A ZIP download now writes a
 `bulk_zip` audit entry, like a bulk copy, move, or delete.
 
+### Added — The OIDC provider form sets the network policy
+
+An identity provider on a private address or behind a private CA needs
+`extra_config.allow_local` and `extra_config.ca_cert_path`, but the admin
+UI had no fields for them, so only the API or YAML could set them. Now the
+provider form has an **Allow http:// and private addresses** switch, with
+the warning that the proxy then reaches internal addresses, and a
+**CA certificate file** field. A save keeps the other `extra_config` keys.
+When the proxy refuses the provider with `422` (for example, an issuer URL
+on a private address without `allow_local`), the form shows the reason
+inline instead of in a short-lived toast.
+
 ### Added — The rule tester shows what an anonymous caller may do
 
 The trace response carries `anonymous_grant`, but the admin UI showed only

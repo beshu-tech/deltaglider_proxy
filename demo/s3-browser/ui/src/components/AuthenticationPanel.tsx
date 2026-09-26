@@ -18,7 +18,7 @@ import MappingRuleRow from './MappingRuleRow';
 import MaskedSecretInput from './MaskedSecretInput';
 import { useQueryClient } from '@tanstack/react-query';
 import { qk } from '../queries/keys';
-import { normalizeUiError } from '../errorHandling';
+import { ApiError, normalizeUiError } from '../errorHandling';
 import { useSessionExpiredOn } from '../hooks/useSessionExpiredOn';
 import { IAM_DIRTY_KEYS, confirmDiscardEdits, useDirtyFlag, useFormBaseline } from '../useDirtyFlag';
 import { useApplyHandler } from '../useDirtySection';
@@ -490,6 +490,15 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
   const [formClientSecret, setFormClientSecret] = useState('');
   const [formScopes, setFormScopes] = useState(() => provider?.scopes ?? 'openid email profile');
   const [formEnabled, setFormEnabled] = useState(() => provider?.enabled ?? true);
+  // Network policy (extra_config.allow_local / ca_cert_path), read by the
+  // server at save time and on every discovery request.
+  const [formAllowLocal, setFormAllowLocal] = useState(() => provider?.extra_config?.allow_local === true);
+  const [formCaCertPath, setFormCaCertPath] = useState(() => {
+    const v = provider?.extra_config?.ca_cert_path;
+    return typeof v === 'string' ? v : '';
+  });
+  // The server's save-time refusal (422), shown in the form, not as a toast.
+  const [saveRefusal, setSaveRefusal] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [testResult, setTestResult] = useState<ProviderTestResult | null>(null);
   const [testing, setTesting] = useState(false);
@@ -497,12 +506,15 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
 
   const { isDirty, markClean } = useFormBaseline({
     formName, formDisplayName, formIssuerUrl, formClientId, formClientSecret, formScopes, formEnabled,
+    formAllowLocal, formCaCertPath,
   });
   useDirtyFlag(IAM_DIRTY_KEYS.providers, isDirty && !readOnly);
   const canSave = Boolean(formName && formClientId && formIssuerUrl);
 
   const handleSave = async () => {
     setSaving(true);
+    setSaveRefusal(null);
+    const extraConfig = withNetworkPolicy(provider?.extra_config, formAllowLocal, formCaCertPath);
     try {
       if (!isEdit) {
         await createMutation.mutateAsync({
@@ -514,6 +526,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
           client_secret: formClientSecret || undefined,
           issuer_url: formIssuerUrl || undefined,
           scopes: formScopes,
+          extra_config: extraConfig,
         });
         message.success('Provider created');
       } else {
@@ -524,6 +537,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
           client_id: formClientId || undefined,
           issuer_url: formIssuerUrl || undefined,
           scopes: formScopes,
+          extra_config: extraConfig,
         };
         if (formClientSecret) patch.client_secret = formClientSecret;
         await updateMutation.mutateAsync({ id: provider.id, patch });
@@ -532,7 +546,8 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
       markClean();
       onSaved();
     } catch (e) {
-      message.error(normalizeUiError(e, 'Save failed'));
+      if (e instanceof ApiError && e.status === 422 && e.detail) setSaveRefusal(e.detail);
+      else message.error(normalizeUiError(e, 'Save failed'));
     } finally {
       setSaving(false);
     }
@@ -604,6 +619,49 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
         />
       </div>
 
+      {/* Network policy */}
+      <div style={label}>Network</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
+        <Switch
+          checked={formAllowLocal}
+          onChange={setFormAllowLocal}
+          size="small"
+          disabled={readOnly}
+          aria-label="Allow http:// and private addresses"
+        />
+        <Text style={{ fontSize: 13 }}>Allow http:// and private addresses</Text>
+      </div>
+      <div style={{ fontSize: 12, color: colors.TEXT_MUTED, marginBottom: 12, lineHeight: 1.5 }}>
+        Turn this on only for an identity provider on your own network. The proxy then sends
+        requests to any address that the issuer and its discovery document name, so a wrong
+        issuer URL can reach internal services. Cloud metadata addresses stay refused.
+      </div>
+      <label htmlFor={`ca-cert-${provider?.id ?? 'new'}`} style={{ ...label, display: 'block' }}>
+        CA certificate file
+      </label>
+      <Input
+        id={`ca-cert-${provider?.id ?? 'new'}`}
+        value={formCaCertPath}
+        onChange={e => setFormCaCertPath(e.target.value)}
+        placeholder="/etc/deltaglider/idp-ca.pem"
+        disabled={readOnly}
+        style={{ marginBottom: 4 }}
+      />
+      <div style={{ fontSize: 12, color: colors.TEXT_MUTED, marginBottom: 16, lineHeight: 1.5 }}>
+        Optional. A PEM file on the proxy host, for an identity provider whose certificate a private
+        CA signs. The proxy trusts it in addition to the public roots.
+      </div>
+
+      {saveRefusal && (
+        <Alert
+          type="error"
+          showIcon
+          title="The provider was not saved"
+          description={saveRefusal}
+          style={{ marginBottom: 12, borderRadius: 8 }}
+        />
+      )}
+
       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <Switch checked={formEnabled} onChange={setFormEnabled} size="small" disabled={readOnly} />
@@ -646,4 +704,22 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
       </div>
     </div>
   );
+}
+
+/**
+ * `extra_config` with the form's network policy on top of the stored keys.
+ * An off switch and an empty path remove their key, so the stored config
+ * stays minimal (and matches a YAML declaration that omits them).
+ */
+function withNetworkPolicy(
+  base: Record<string, unknown> | undefined,
+  allowLocal: boolean,
+  caCertPath: string,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = { ...(base ?? {}) };
+  delete next.allow_local;
+  delete next.ca_cert_path;
+  if (allowLocal) next.allow_local = true;
+  if (caCertPath.trim()) next.ca_cert_path = caCertPath.trim();
+  return next;
 }
