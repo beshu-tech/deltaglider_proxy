@@ -453,6 +453,11 @@ fn compute_tainted_fields(runtime: &crate::config::Config) -> Vec<String> {
 /// GET /api/admin/config — return sanitized config (no secrets).
 pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoResponse {
     let cfg = state.config.read().await;
+    // The document's version, for a PATCH's `If-Match`.
+    let etag = [(
+        axum::http::header::ETAG,
+        super::version::etag(&super::version::config_version(&cfg, None)),
+    )];
 
     let (
         backend_type,
@@ -516,62 +521,65 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         cfg.backends.iter().map(BackendInfoResponse::from).collect()
     };
 
-    Json(ConfigResponse {
-        listen_addr: cfg.listen_addr.to_string(),
-        backend_type: backend_type.to_string(),
-        backend_path,
-        backend_endpoint,
-        backend_region,
-        backend_force_path_style,
-        // Compression
-        max_delta_ratio: cfg.max_delta_ratio,
-        max_object_size: cfg.max_object_size,
-        cache_size_mb: cfg.cache_size_mb,
-        metadata_cache_mb: cfg.metadata_cache_mb,
-        codec_concurrency: cfg.codec_concurrency.unwrap_or_else(|| (cpus * 4).max(16)),
-        codec_timeout_secs: env_u64("DGP_CODEC_TIMEOUT_SECS", 60),
-        // Limits
-        request_timeout_secs: env_u64("DGP_REQUEST_TIMEOUT_SECS", 300),
-        max_concurrent_requests: env_usize("DGP_MAX_CONCURRENT_REQUESTS", 1024),
-        max_multipart_uploads: env_usize("DGP_MAX_MULTIPART_UPLOADS", 1000),
-        // Auth
-        auth_enabled: cfg.auth_enabled(),
-        access_key_id: cfg.access_key_id.clone(),
-        // Security
-        clock_skew_seconds: u64::from(crate::api::auth::clock_skew_secs()),
-        replay_window_secs: crate::api::auth::replay_window().as_secs(),
-        rate_limit_max_attempts: env_u64("DGP_RATE_LIMIT_MAX_ATTEMPTS", 100) as u32,
-        rate_limit_window_secs: env_u64("DGP_RATE_LIMIT_WINDOW_SECS", 300),
-        rate_limit_lockout_secs: env_u64("DGP_RATE_LIMIT_LOCKOUT_SECS", 600),
-        session_ttl_hours: env_u64("DGP_SESSION_TTL_HOURS", 4),
-        trust_proxy_headers: env_bool("DGP_TRUST_PROXY_HEADERS", false),
-        secure_cookies: env_bool("DGP_SECURE_COOKIES", true),
-        debug_headers: env_bool("DGP_DEBUG_HEADERS", false),
-        // Sync
-        config_sync_bucket: cfg.config_sync_bucket.clone(),
-        bucket_policies: cfg.buckets.clone(),
-        // Logging
-        log_level,
-        backend_has_credentials,
-        backends: backends_info,
-        default_backend: cfg.default_backend.clone(),
-        // Admission chain (Phase 3b.2) — forwarded verbatim so the UI
-        // can render an editor. Collapse the `[""]` sentinel on the
-        // bucket-policy side is handled elsewhere; admission blocks
-        // are operator-authored and round-trip without transformation.
-        admission_blocks: cfg.admission_blocks.clone(),
-        // IAM source-of-truth selector (Phase 3c.1). Included so the
-        // UI can drive the `iam_mode: declarative` banner + toggle.
-        iam_mode: cfg.iam_mode,
-        tainted_fields,
-        env_overrides: crate::config::env_overrides::process_env_overrides(&cfg),
-        // Encryption status is now per-backend. Each `BackendInfoResponse`
-        // in `backends` carries an `encryption: BackendEncryptionSummary`
-        // non-secret summary. The former top-level `encryption_enabled`
-        // boolean was removed in v0.9 alongside the per-backend
-        // refactor — the UI drives the BackendsPanel and BucketsPanel
-        // badges from the per-entry summaries instead.
-    })
+    (
+        etag,
+        Json(ConfigResponse {
+            listen_addr: cfg.listen_addr.to_string(),
+            backend_type: backend_type.to_string(),
+            backend_path,
+            backend_endpoint,
+            backend_region,
+            backend_force_path_style,
+            // Compression
+            max_delta_ratio: cfg.max_delta_ratio,
+            max_object_size: cfg.max_object_size,
+            cache_size_mb: cfg.cache_size_mb,
+            metadata_cache_mb: cfg.metadata_cache_mb,
+            codec_concurrency: cfg.codec_concurrency.unwrap_or_else(|| (cpus * 4).max(16)),
+            codec_timeout_secs: env_u64("DGP_CODEC_TIMEOUT_SECS", 60),
+            // Limits
+            request_timeout_secs: env_u64("DGP_REQUEST_TIMEOUT_SECS", 300),
+            max_concurrent_requests: env_usize("DGP_MAX_CONCURRENT_REQUESTS", 1024),
+            max_multipart_uploads: env_usize("DGP_MAX_MULTIPART_UPLOADS", 1000),
+            // Auth
+            auth_enabled: cfg.auth_enabled(),
+            access_key_id: cfg.access_key_id.clone(),
+            // Security
+            clock_skew_seconds: u64::from(crate::api::auth::clock_skew_secs()),
+            replay_window_secs: crate::api::auth::replay_window().as_secs(),
+            rate_limit_max_attempts: env_u64("DGP_RATE_LIMIT_MAX_ATTEMPTS", 100) as u32,
+            rate_limit_window_secs: env_u64("DGP_RATE_LIMIT_WINDOW_SECS", 300),
+            rate_limit_lockout_secs: env_u64("DGP_RATE_LIMIT_LOCKOUT_SECS", 600),
+            session_ttl_hours: env_u64("DGP_SESSION_TTL_HOURS", 4),
+            trust_proxy_headers: env_bool("DGP_TRUST_PROXY_HEADERS", false),
+            secure_cookies: env_bool("DGP_SECURE_COOKIES", true),
+            debug_headers: env_bool("DGP_DEBUG_HEADERS", false),
+            // Sync
+            config_sync_bucket: cfg.config_sync_bucket.clone(),
+            bucket_policies: cfg.buckets.clone(),
+            // Logging
+            log_level,
+            backend_has_credentials,
+            backends: backends_info,
+            default_backend: cfg.default_backend.clone(),
+            // Admission chain (Phase 3b.2) — forwarded verbatim so the UI
+            // can render an editor. Collapse the `[""]` sentinel on the
+            // bucket-policy side is handled elsewhere; admission blocks
+            // are operator-authored and round-trip without transformation.
+            admission_blocks: cfg.admission_blocks.clone(),
+            // IAM source-of-truth selector (Phase 3c.1). Included so the
+            // UI can drive the `iam_mode: declarative` banner + toggle.
+            iam_mode: cfg.iam_mode,
+            tainted_fields,
+            env_overrides: crate::config::env_overrides::process_env_overrides(&cfg),
+            // Encryption status is now per-backend. Each `BackendInfoResponse`
+            // in `backends` carries an `encryption: BackendEncryptionSummary`
+            // non-secret summary. The former top-level `encryption_enabled`
+            // boolean was removed in v0.9 alongside the per-backend
+            // refactor — the UI drives the BackendsPanel and BucketsPanel
+            // badges from the per-entry summaries instead.
+        }),
+    )
 }
 
 /// PUT /api/admin/config — update configuration via field-level patch.
@@ -592,9 +600,15 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
 ///   matching the admin-GUI's legacy expectations.
 pub async fn update_config(
     State(state): State<Arc<AdminState>>,
+    headers: axum::http::HeaderMap,
     AdminJson(body): AdminJson<ConfigUpdateRequest>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let mut cfg = state.config.write().await;
+    // Optimistic concurrency, against the whole document's version.
+    let current = super::version::config_version(&cfg, None);
+    if super::version::if_match_conflicts(&headers, &current) {
+        return super::version::conflict(&current, "config");
+    }
     let mut warnings = Vec::new();
     let old_cfg = cfg.clone();
 
@@ -725,7 +739,8 @@ pub async fn update_config(
                 success: true,
                 warnings,
                 requires_restart: false,
-            });
+            })
+            .into_response();
         }
     }
 
@@ -749,6 +764,7 @@ pub async fn update_config(
                 warnings,
                 requires_restart,
             })
+            .into_response()
         }
         Err(engine_err) => {
             // Roll back the in-memory mutation so the next read sees the
@@ -765,6 +781,7 @@ pub async fn update_config(
                 warnings,
                 requires_restart: false,
             })
+            .into_response()
         }
     }
 }

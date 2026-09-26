@@ -29,6 +29,7 @@ pub mod field_level;
 pub mod password;
 pub mod section_level;
 pub mod trace;
+mod version;
 
 /// Names of the four sections the admin API understands. Canonical
 /// home for the enum + its string-wire spelling — any consumer that

@@ -14,6 +14,10 @@
  *     keeps editing under the dialog
  *   * Unwrap `session-expired` 401s via `onSessionExpired`
  *   * `useApplyHandler` for ⌘S → same action as clicking Apply
+ *   * Optimistic concurrency: the version (ETag) of the loaded section goes
+ *     out as `If-Match`; a 409 (another tab or admin changed the section)
+ *     opens a conflict dialog — reload, or review my edits against the new
+ *     version in the ApplyDialog diff — and never loses the edits silently
  *
  * Keeping three copies in sync was the failure mode — the §F5 fix
  * already had to land three times. This hook is the single place
@@ -33,11 +37,17 @@
  * `pick` is the optional filter. Provide it for subset editing;
  * leave it off for whole-section editing.
  */
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { message } from 'antd';
+import { createElement, useCallback, useEffect, useRef, useState } from 'react';
+import { Button, Modal, Space, Typography, message } from 'antd';
 import { useQueryClient } from '@tanstack/react-query';
 import type { SectionApplyResponse, SectionName } from './adminApi';
-import { getSection, putSection, validateSection } from './adminApi';
+import {
+  ConfigConflictError,
+  getSectionVersioned,
+  putSection,
+  validateSection,
+} from './adminApi';
+import { onSectionVersionAdvanced, sectionVersionAdvanced } from './sectionVersionBus';
 import { qk } from './queries/keys';
 import { useApplyHandler, useDirtySection } from './useDirtySection';
 import { normalizeUiError } from './errorHandling';
@@ -163,11 +173,21 @@ export function useSectionEditor<Wire, Local = Wire>(
   const [applyResponse, setApplyResponse] = useState<SectionApplyResponse | null>(null);
   const [pendingBody, setPendingBody] = useState<Wire | null>(null);
   const [applying, setApplying] = useState(false);
+  // The version (ETag) of the section this editor's value is based on.
+  const versionRef = useRef<string | null>(null);
+  useEffect(
+    () =>
+      onSectionVersionAdvanced(section, (from, to) => {
+        if (versionRef.current === from) versionRef.current = to;
+      }),
+    [section]
+  );
 
   const refresh = useCallback(async () => {
     try {
       setLoading(true);
-      const body = await getSection<Wire>(section);
+      const { body, version } = await getSectionVersioned<Wire>(section);
+      versionRef.current = version;
       const currentPick = pickRef.current;
       if (currentPick) {
         // Caller converts wire → local outright (subset OR shape-change).
@@ -224,14 +244,67 @@ export function useSectionEditor<Wire, Local = Wire>(
     setPendingBody(null);
   }, []);
 
+  const runApplyRef = useRef(runApply);
+  useEffect(() => {
+    runApplyRef.current = runApply;
+  });
+
+  // Another tab or admin changed the section: keep the edits, and let the
+  // operator reload or review them against the new version (the review
+  // re-runs validate, so the ApplyDialog shows the diff from the new state).
+  const openConflict = useCallback(() => {
+    const dialog = Modal.confirm({
+      title: 'This section changed in another tab or by another admin',
+      content: createElement(
+        Space,
+        { orientation: 'vertical', size: 8 },
+        createElement(
+          Typography.Text,
+          null,
+          'Your edits are not applied, and they are still here. Review them against the new version (the next dialog shows what your apply changes now), or reload the section and lose your edits.'
+        ),
+        createElement(
+          Button,
+          {
+            danger: true,
+            onClick: () => {
+              dialog.destroy();
+              void refresh();
+            },
+          },
+          'Reload (discard my edits)'
+        )
+      ),
+      okText: 'Review my edits against the new version',
+      cancelText: 'Keep editing',
+      onOk: async () => {
+        try {
+          versionRef.current = (await getSectionVersioned<Wire>(section)).version;
+        } catch (e) {
+          message.error(`Reload failed: ${normalizeUiError(e, 'unknown')}`);
+          return;
+        }
+        await runApplyRef.current();
+      },
+    });
+  }, [section, refresh]);
+
   const confirmApply = useCallback(async (): Promise<boolean> => {
     if (!pendingBody) return false;
     setApplying(true);
     try {
-      const resp = await putSection<Wire>(section, pendingBody);
+      // A 409 (stale version) goes to the conflict dialog below; a 401 is
+      // handled (sign in again + retry) inside the admin fetch layer.
+      const sent = versionRef.current;
+      const resp = await putSection<Wire>(section, pendingBody, sent);
       if (!resp.ok) {
         message.error(resp.error || 'Apply failed');
         return false;
+      }
+      if (sent && resp.version) {
+        // Sibling editors of this section in this tab follow our own edit.
+        sectionVersionAdvanced(section, sent, resp.version);
+        versionRef.current = resp.version;
       }
       message.success(
         resp.persisted_path ? `Applied + persisted to ${resp.persisted_path}` : 'Applied'
@@ -247,6 +320,12 @@ export function useSectionEditor<Wire, Local = Wire>(
       void refresh();
       return true;
     } catch (e) {
+      if (e instanceof ConfigConflictError) {
+        setApplyOpen(false);
+        setPendingBody(null);
+        openConflict();
+        return false;
+      }
       // Apply failed (network/server error). Close the dialog but do NOT
       // refresh() — refreshing would overwrite the user's still-dirty form
       // with server truth, silently discarding the edits they were trying to
@@ -259,7 +338,7 @@ export function useSectionEditor<Wire, Local = Wire>(
     } finally {
       setApplying(false);
     }
-  }, [section, pendingBody, markApplied, refresh, queryClient]);
+  }, [section, pendingBody, markApplied, refresh, queryClient, openConflict]);
 
   // ⌘S wiring: when dirty, ⌘S opens the validate → ApplyDialog sequence.
   // Registered under dirtyKey so ⌘S reaches the active panel, not all

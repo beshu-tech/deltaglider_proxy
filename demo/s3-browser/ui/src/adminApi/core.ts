@@ -59,15 +59,18 @@ export async function adminFetch(
   method = 'GET',
   body?: unknown,
   rawBody?: RawBody,
+  extraHeaders?: Record<string, string>,
 ): Promise<Response> {
   const opts: RequestInit = { method, credentials: 'include' };
+  const headers: Record<string, string> = { ...extraHeaders };
   if (rawBody) {
-    opts.headers = { 'Content-Type': rawBody.contentType };
+    headers['Content-Type'] = rawBody.contentType;
     opts.body = rawBody.raw;
   } else if (body !== undefined) {
-    opts.headers = { 'Content-Type': 'application/json' };
+    headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
+  if (Object.keys(headers).length > 0) opts.headers = headers;
   return fetchWithRelogin(`${BASE}${path}`, opts);
 }
 
@@ -567,6 +570,33 @@ export async function getSectionYaml(section: SectionName): Promise<string> {
 }
 
 /**
+ * A section GET plus its version (the `ETag`), for a later `putSection`
+ * with `If-Match` (optimistic concurrency).
+ */
+export async function getSectionVersioned<T = unknown>(
+  section: SectionName
+): Promise<{ body: T; version: string | null }> {
+  const res = await adminRequest(`/api/admin/config/section/${section}`, {
+    context: `Section fetch (${section})`,
+  });
+  return { body: await safeJson<T>(res), version: res.headers.get('etag') };
+}
+
+/**
+ * A section PUT refused because the section changed after this editor
+ * loaded it (another tab or admin). `currentVersion` is the server's
+ * version now.
+ */
+export class ConfigConflictError extends Error {
+  readonly currentVersion: string | null;
+  constructor(message: string, currentVersion: string | null) {
+    super(message);
+    this.name = 'ConfigConflictError';
+    this.currentVersion = currentVersion;
+  }
+}
+
+/**
  * Apply a section body. On success: the section slice is swapped
  * in-memory, side effects (engine rebuild, log reload, IAM state,
  * snapshot rebuilds) fire, and the on-disk config file is
@@ -574,9 +604,21 @@ export async function getSectionYaml(section: SectionName): Promise<string> {
  */
 export async function putSection<T = unknown>(
   section: SectionName,
-  body: T
-): Promise<SectionApplyResponse> {
-  return adminJson(`/api/admin/config/section/${section}`, { method: 'PUT', body });
+  body: T,
+  ifMatch?: string | null
+): Promise<SectionApplyResponse & { version?: string | null }> {
+  const path = `/api/admin/config/section/${section}`;
+  const res = await adminFetch(path, 'PUT', body, undefined, ifMatch ? { 'If-Match': ifMatch } : undefined);
+  if (res.status === 409) {
+    const data = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new ConfigConflictError(
+      data.error ?? `The ${section} section changed after you loaded it.`,
+      res.headers.get('etag'),
+    );
+  }
+  if (!res.ok) await throwApiError(res, defaultContext(path));
+  const resp = await safeJson<SectionApplyResponse>(res);
+  return { ...resp, version: res.headers.get('etag') };
 }
 
 /**

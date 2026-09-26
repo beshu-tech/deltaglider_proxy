@@ -48,6 +48,8 @@ All three scopes route through the same `apply_config_transition` path, so hot-r
 
 **Merge-patch semantics:** keys missing from the body are preserved; `null` deletes; objects merge recursively. Secrets round-trip (GET → edit → PUT never clears credentials).
 
+**Optimistic concurrency.** The section GET returns the version of that section in an `ETag` header. Send it back in an `If-Match` header on the section PUT. When the section changed after you read it (another browser tab, another admin, or a GitOps apply), the PUT does not apply, and the proxy answers `409 Conflict` with `{ok: false, error: "config_conflict: …", current_version}` and the current version in `ETag`. A successful PUT returns the section's new version in `ETag`. A PUT without `If-Match` is not checked, so scripts keep working. The version of one section does not change when another section changes. `GET /_/api/admin/config/export` and `GET /_/api/admin/config` return the version of the whole document (or of the one section, with `?section=`), and `POST /_/api/admin/config/apply` and `PUT /_/api/admin/config` check `If-Match` against the whole document in the same way. A version is a keyed hash of the running config: it changes with every change, from any source, and it reveals nothing about secrets. A restart changes every version, so a client then reads the config once more. The admin GUI sends `If-Match` on every section apply; on a `409` it keeps your edits and offers to reload the section or to review your edits against the new version.
+
 ### Document-level (GitOps)
 
 | Method | Path | Body | Purpose |

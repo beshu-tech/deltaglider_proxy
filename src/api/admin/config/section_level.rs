@@ -150,12 +150,13 @@ pub async fn get_section(
 
     let cfg = state.config.read().await;
     let redacted = cfg.redact_all_secrets();
+    let version = super::version::config_version(&cfg, Some(section));
     let sectioned = SectionedConfig::from_flat(&redacted);
     drop(cfg);
 
     let yaml_format = query.format.as_deref() == Some("yaml");
 
-    match section {
+    let mut resp = match section {
         SectionName::Admission => emit_section(
             section,
             sectioned.admission.unwrap_or_default(),
@@ -164,7 +165,11 @@ pub async fn get_section(
         SectionName::Access => emit_section(section, sectioned.access, yaml_format),
         SectionName::Storage => emit_section(section, sectioned.storage, yaml_format),
         SectionName::Advanced => emit_section(section, sectioned.advanced, yaml_format),
-    }
+    };
+    // The version a PUT sends back in `If-Match` (optimistic concurrency).
+    resp.headers_mut()
+        .insert(axum::http::header::ETAG, super::version::etag(&version));
+    resp
 }
 
 /// Serialize one section in the requested format. Factored out so
@@ -293,6 +298,19 @@ async fn apply_section(
     // can't sneak between our compare and swap.
     let mut cfg = state.config.write().await;
     let old_cfg = cfg.clone();
+
+    // Optimistic concurrency: a PUT based on an older version of this
+    // section (another tab or admin changed it since) is refused. Checked
+    // under the write lock, so no write can land between check and swap.
+    if matches!(mode, ApplyMode::PersistAndApply) {
+        let current = super::version::config_version(&old_cfg, Some(section));
+        if headers
+            .as_ref()
+            .is_some_and(|h| super::version::if_match_conflicts(h, &current))
+        {
+            return super::version::conflict(&current, &format!("'{}' section", section.as_str()));
+        }
+    }
 
     // Project current config → sectioned shape → replace one slice →
     // collapse back. The replacement does NOT touch secrets on the
@@ -701,6 +719,7 @@ async fn apply_section(
 
     // Swap the config in memory and persist.
     *cfg = new_cfg;
+    let new_version = super::version::config_version(&cfg, Some(section));
 
     let persist_path = active_config_path(&state);
     // The `persisted: bool` is folded into `status` + `persist_warning`
@@ -738,7 +757,7 @@ async fn apply_section(
         .chain(persist_warning)
         .collect();
 
-    (
+    let mut resp = (
         status,
         Json(SectionApplyResponse {
             ok: true,
@@ -750,7 +769,10 @@ async fn apply_section(
             diff: Some(diff),
         }),
     )
-        .into_response()
+        .into_response();
+    resp.headers_mut()
+        .insert(axum::http::header::ETAG, super::version::etag(&new_version));
+    resp
 }
 
 /// Apply a JSON-Merge-Patch (RFC 7396) body on top of one section of

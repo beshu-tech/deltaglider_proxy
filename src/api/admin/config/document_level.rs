@@ -81,6 +81,9 @@ pub struct ConfigApplyResponse {
     pub existing_warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// On a `409` (stale `If-Match`): the document's current version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<String>,
     /// Path the config was written to. `None` when persist failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persisted_path: Option<String>,
@@ -114,14 +117,25 @@ pub async fn export_config(
 ) -> impl IntoResponse {
     let cfg = state.config.read().await;
     let redacted = cfg.redact_all_secrets();
+    // The version an apply sends back in `If-Match`: of the whole document,
+    // or of the one exported section.
+    let version =
+        super::version::config_version(&cfg, query.section.as_deref().and_then(SectionName::parse));
     drop(cfg);
+    let etag = (axum::http::header::ETAG, super::version::etag(&version));
 
     let Some(section_name) = query.section.as_deref() else {
         // Full document path — unchanged from the pre-Wave-1 behavior.
         return match redacted.to_canonical_yaml() {
             Ok(yaml) => (
                 StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/yaml")],
+                [
+                    (
+                        axum::http::header::CONTENT_TYPE,
+                        axum::http::HeaderValue::from_static("application/yaml"),
+                    ),
+                    etag,
+                ],
                 yaml,
             )
                 .into_response(),
@@ -165,7 +179,13 @@ pub async fn export_config(
     match serde_yaml::to_string(&serde_yaml::Value::Mapping(map)) {
         Ok(s) => (
             StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/yaml")],
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/yaml"),
+                ),
+                etag,
+            ],
             s,
         )
             .into_response(),
@@ -515,7 +535,14 @@ pub async fn apply_config_doc(
     // mutation path (backup restore) can call it directly and read the TYPED
     // result instead of re-parsing this handler's own HTTP response body.
     let (status, resp) = apply_config_inner(&state, &headers, body).await;
-    (status, Json(resp))
+    // The document's version after the apply (or the current one on a 409),
+    // for the client's next `If-Match`.
+    let version = super::version::config_version(&*state.config.read().await, None);
+    (
+        status,
+        [(axum::http::header::ETAG, super::version::etag(&version))],
+        Json(resp),
+    )
 }
 
 /// The full config-apply pipeline as a typed call (no HTTP extractors):
@@ -549,6 +576,7 @@ pub(crate) async fn apply_config_inner_with_env(
             return (
                 StatusCode::BAD_REQUEST,
                 ConfigApplyResponse {
+                    current_version: None,
                     existing_warnings: Vec::new(),
                     applied: false,
                     persisted: false,
@@ -565,6 +593,29 @@ pub(crate) async fn apply_config_inner_with_env(
     //    Serializes admin mutations so a concurrent PATCH via `update_config`
     //    cannot race our read-for-compare and our write-to-swap.
     let mut cfg = state.config.write().await;
+
+    // 2a. Optimistic concurrency: an apply based on an older version of the
+    //     document (another tab, admin or GitOps apply changed it) is refused.
+    let current = super::version::config_version(&cfg, None);
+    if super::version::if_match_conflicts(headers, &current) {
+        return (
+            StatusCode::CONFLICT,
+            ConfigApplyResponse {
+                current_version: Some(current),
+                existing_warnings: Vec::new(),
+                applied: false,
+                persisted: false,
+                requires_restart: false,
+                warnings: Vec::new(),
+                error: Some(
+                    "config_conflict: the config changed after you loaded it (another tab, \
+                     another admin, or a GitOps apply). Export it again and re-apply your edits."
+                        .to_string(),
+                ),
+                persisted_path: None,
+            },
+        );
+    }
 
     // 2b. Lifecycle gate (changed-only): fatal only when this doc actually EDITS
     //     an invalid lifecycle; an unchanged pre-existing bad rule downgrades to
@@ -584,6 +635,7 @@ pub(crate) async fn apply_config_inner_with_env(
                 return (
                     StatusCode::BAD_REQUEST,
                     ConfigApplyResponse {
+                        current_version: None,
                         existing_warnings: Vec::new(),
                         applied: false,
                         persisted: false,
@@ -603,6 +655,7 @@ pub(crate) async fn apply_config_inner_with_env(
         return (
             StatusCode::BAD_REQUEST,
             ConfigApplyResponse {
+                current_version: None,
                 existing_warnings: Vec::new(),
                 applied: false,
                 persisted: false,
@@ -644,6 +697,7 @@ pub(crate) async fn apply_config_inner_with_env(
         return (
             StatusCode::FORBIDDEN,
             ConfigApplyResponse {
+                current_version: None,
                 existing_warnings: Vec::new(),
                 applied: false,
                 persisted: false,
@@ -666,6 +720,7 @@ pub(crate) async fn apply_config_inner_with_env(
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ConfigApplyResponse {
+                    current_version: None,
                     existing_warnings: Vec::new(),
                     applied: false,
                     persisted: false,
@@ -701,6 +756,7 @@ pub(crate) async fn apply_config_inner_with_env(
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     ConfigApplyResponse {
+                        current_version: None,
                         existing_warnings: Vec::new(),
                         applied: false,
                         persisted: false,
@@ -762,6 +818,7 @@ pub(crate) async fn apply_config_inner_with_env(
     (
         status,
         ConfigApplyResponse {
+            current_version: None,
             existing_warnings,
             applied: true,
             persisted,

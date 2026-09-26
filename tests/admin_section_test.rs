@@ -1425,3 +1425,86 @@ async fn apply_refuses_a_local_webhook_unless_allow_local() {
     let body: serde_json::Value = admin.get(&url).send().await.unwrap().json().await.unwrap();
     assert_eq!(body["event_delivery"]["allow_local"], true, "{body}");
 }
+
+/// Browser review #4: two tabs editing one section. The section GET gives
+/// an ETag; a PUT with a stale If-Match gets 409 and the current version,
+/// instead of overwriting the other tab's edit. No If-Match: not checked.
+#[tokio::test]
+async fn stale_section_put_gets_409_with_the_current_version() {
+    let server = TestServer::builder()
+        .auth("ETAG1", "ETAGSECRET1")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let url = format!("{}/_/api/admin/config/section/advanced", server.endpoint());
+    let etag_of = |r: &reqwest::Response| {
+        r.headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .expect("ETag header")
+    };
+
+    // Both tabs load the section.
+    let tab = etag_of(&admin.get(&url).send().await.unwrap());
+
+    // Tab A applies.
+    let resp = admin
+        .put(&url)
+        .header("if-match", &tab)
+        .json(&json!({ "max_delta_ratio": 0.42 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let after_a = etag_of(&resp);
+    assert_ne!(after_a, tab, "the version moves");
+
+    // Tab B applies on the version it loaded: refused.
+    let resp = admin
+        .put(&url)
+        .header("if-match", &tab)
+        .json(&json!({ "max_delta_ratio": 0.33 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        format!("\"{}\"", body["current_version"].as_str().unwrap()),
+        after_a,
+        "{body}"
+    );
+    let now: serde_json::Value = admin.get(&url).send().await.unwrap().json().await.unwrap();
+    assert_eq!(now["max_delta_ratio"], 0.42, "tab A's edit survives");
+
+    // Another section's version did not move with tab A's edit.
+    let storage = format!("{}/_/api/admin/config/section/storage", server.endpoint());
+    let s1 = etag_of(&admin.get(&storage).send().await.unwrap());
+    let s2 = etag_of(&admin.get(&storage).send().await.unwrap());
+    assert_eq!(s1, s2);
+
+    // The whole-document apply checks the export's version the same way.
+    let export = admin
+        .get(format!("{}/_/api/admin/config/export", server.endpoint()))
+        .send()
+        .await
+        .unwrap();
+    let doc_etag = etag_of(&export);
+    let yaml = export.text().await.unwrap();
+    let resp = admin
+        .put(&url)
+        .json(&json!({ "max_delta_ratio": 0.5 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "no If-Match: not checked");
+    let resp = admin
+        .post(format!("{}/_/api/admin/config/apply", server.endpoint()))
+        .header("if-match", &doc_etag)
+        .json(&json!({ "yaml": yaml }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}

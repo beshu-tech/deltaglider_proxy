@@ -6,6 +6,8 @@ export interface RecordedRequest {
   method: string;
   path: string;
   body: unknown;
+  /** Request headers, names lower-cased. */
+  headers: Record<string, string>;
 }
 
 type Reply = Response | (() => Response | Promise<Response>);
@@ -30,7 +32,11 @@ export function mockFetch() {
         /* raw text body */
       }
     }
-    const req = { method, path, body };
+    const headers: Record<string, string> = {};
+    new Headers(init.headers).forEach((v, k) => {
+      headers[k] = v;
+    });
+    const req = { method, path, body, headers };
     calls.push(req);
     // Newest route first, so a test can override a default.
     for (let i = routes.length - 1; i >= 0; i--) {

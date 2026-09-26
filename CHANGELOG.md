@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed — Two tabs editing one config section no longer overwrite each other
+
+The config endpoints were last-writer-wins: a second browser tab applied its
+stale copy of a section over the first tab's edit, with no warning. Now the
+section GET, `GET /config` and the export return a version in `ETag`; the
+section PUT, `PUT /config` and `POST /config/apply` accept `If-Match`, and a
+stale one gets `409 Conflict` with the current version. The admin GUI sends
+`If-Match` on every section apply, and on a conflict it keeps the edits and
+offers to reload or to review them against the new version. A write without
+`If-Match` is not checked.
+
 ### Fixed — Webhook delivery: local receivers, fast dead letters, a Failing state
 
 A webhook URL on `http://` or on a private address applied with only a

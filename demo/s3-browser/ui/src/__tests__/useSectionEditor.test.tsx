@@ -213,3 +213,100 @@ describe('dirty → validate → apply', () => {
     expect(http.callsTo('POST', `${SECTION}/validate`)).toHaveLength(1);
   });
 });
+
+describe('optimistic concurrency (browser review #4)', () => {
+  function withEtag(body: unknown, etag: string, status = 200): Response {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { 'content-type': 'application/json', etag },
+    });
+  }
+
+  test('the PUT carries the loaded version as If-Match', async () => {
+    http.on('GET', SECTION, withEtag({ cache_size_mb: 100 }, '"v1"'));
+    http.on('POST', `${SECTION}/validate`, json({ ok: true }));
+    http.on('PUT', SECTION, withEtag({ ok: true }, '"v2"'));
+    const { result } = mountEditor();
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    act(() => result.current.setValue((v) => ({ ...v, cache_size_mb: 256 })));
+    await act(() => result.current.runApply());
+    await act(async () => {
+      await result.current.confirmApply();
+    });
+    expect(http.callsTo('PUT', SECTION)[0].headers['if-match']).toBe('"v1"');
+  });
+
+  test('a 409 keeps the edits and offers reload or review', async () => {
+    http.on('GET', SECTION, withEtag({ cache_size_mb: 100 }, '"v1"'));
+    http.on('POST', `${SECTION}/validate`, json({ ok: true }));
+    http.on('PUT', SECTION, withEtag({ ok: false, error: 'config_conflict' }, '"v2"', 409));
+    const { result } = mountEditor();
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    act(() => result.current.setValue((v) => ({ ...v, cache_size_mb: 256 })));
+    await act(() => result.current.runApply());
+    let ok = true;
+    await act(async () => {
+      ok = await result.current.confirmApply();
+    });
+    expect(ok).toBe(false);
+    expect((await screen.findAllByText(/changed in another tab or by another admin/)).length).toBeGreaterThan(0);
+    expect(result.current.isDirty).toBe(true);
+    expect(result.current.value.cache_size_mb).toBe(256);
+
+    // Review: the editor takes the new version, keeps the edits, and
+    // validates again (the ApplyDialog then shows the diff from v2).
+    http.on('GET', SECTION, withEtag({ cache_size_mb: 300 }, '"v2"'));
+    http.on('PUT', SECTION, withEtag({ ok: true }, '"v3"'));
+    const review = await screen.findByText('Review my edits against the new version');
+    await act(async () => {
+      review.click();
+    });
+    await waitFor(() => expect(result.current.applyOpen).toBe(true));
+    expect(result.current.value.cache_size_mb).toBe(256);
+    await act(async () => {
+      await result.current.confirmApply();
+    });
+    expect(http.callsTo('PUT', SECTION)[1].headers['if-match']).toBe('"v2"');
+  });
+
+  test('a sibling editor of the section follows this tab\'s own apply', async () => {
+    http.on('GET', SECTION, withEtag({ cache_size_mb: 100 }, '"v1"'));
+    http.on('POST', `${SECTION}/validate`, json({ ok: true }));
+    http.on('PUT', SECTION, withEtag({ ok: true }, '"v2"'));
+    const a = mountEditor();
+    const b = mountEditor({ dirtyKey: 'advanced/logging' });
+    await waitFor(() => expect(a.result.current.loading || b.result.current.loading).toBe(false));
+    act(() => a.result.current.setValue((v) => ({ ...v, cache_size_mb: 256 })));
+    await act(() => a.result.current.runApply());
+    await act(async () => {
+      await a.result.current.confirmApply();
+    });
+    act(() => b.result.current.setValue((v) => ({ ...v, log_level: 'debug' })));
+    await act(() => b.result.current.runApply());
+    await act(async () => {
+      await b.result.current.confirmApply();
+    });
+    const puts = http.callsTo('PUT', SECTION);
+    expect(puts[puts.length - 1].headers['if-match']).toBe('"v2"');
+  });
+
+  test('reload discards the edits', async () => {
+    http.on('GET', SECTION, withEtag({ cache_size_mb: 100 }, '"v1"'));
+    http.on('POST', `${SECTION}/validate`, json({ ok: true }));
+    http.on('PUT', SECTION, withEtag({ ok: false }, '"v2"', 409));
+    const { result } = mountEditor();
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    act(() => result.current.setValue((v) => ({ ...v, cache_size_mb: 256 })));
+    await act(() => result.current.runApply());
+    await act(async () => {
+      await result.current.confirmApply();
+    });
+    http.on('GET', SECTION, withEtag({ cache_size_mb: 300 }, '"v2"'));
+    const reload = await screen.findByText('Reload (discard my edits)');
+    await act(async () => {
+      reload.click();
+    });
+    await waitFor(() => expect(result.current.value.cache_size_mb).toBe(300));
+    expect(result.current.isDirty).toBe(false);
+  });
+});
