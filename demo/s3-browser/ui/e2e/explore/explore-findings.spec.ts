@@ -303,6 +303,30 @@ test('the upload page sends 300 tiny files in under a minute', async ({ page }) 
   await expect(page.getByText('Upload complete')).toBeVisible({ timeout: 60_000 });
 });
 
+test('the upload page sends 1000 tiny files with a bounded heap', async ({ page }) => {
+  const bucket = `explore-bulk1k-${RUN}`;
+  await s3().send(new CreateBucketCommand({ Bucket: bucket }));
+  await signIn(page);
+  await page.goto(`/_/browse/${bucket}/`);
+  await page.getByRole('button', { name: 'Upload Files' }).first().click();
+  const files = Array.from({ length: 1000 }, (_, i) => ({
+    name: `k-${String(i).padStart(4, '0')}.txt`,
+    mimeType: 'text/plain',
+    buffer: Buffer.from(`file ${i}`),
+  }));
+  const t0 = Date.now();
+  await page.locator('input[type=file]').first().setInputFiles(files);
+  await expect(page.getByText('Upload complete')).toBeVisible({ timeout: 180_000 });
+  const secs = (Date.now() - t0) / 1000;
+  // Only the rows in view are in the DOM (the list is virtualised).
+  expect(await page.getByRole('listitem').count()).toBeLessThan(60);
+  const heap = await page.evaluate(
+    () => (performance as Performance & { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ?? 0,
+  );
+  console.log(`1000 files in ${secs.toFixed(1)} s, JS heap ${(heap / 1e6).toFixed(0)} MB`);
+  expect(heap, 'JS heap after 1000 uploads').toBeLessThan(300e6);
+});
+
 // ── S3 transparency: keys ───────────────────────────────────────────────
 
 test('reserved and normalised keys behave as documented, and a refusal names the rule', async () => {

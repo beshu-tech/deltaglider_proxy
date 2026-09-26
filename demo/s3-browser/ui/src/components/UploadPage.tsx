@@ -614,21 +614,19 @@ export default function UploadPage({
             </Space>
           </div>
 
-          {/* Cap the visible list at ~6 rows; the rest scrolls. */}
-          <div style={{ maxHeight: 520, overflowY: 'auto', borderRadius: 10 }}>
-            <UploadProgressList
-              queue={queue}
-              borderColor={BORDER}
-              textPrimary={TEXT_PRIMARY}
-              textMuted={TEXT_MUTED}
-              accentBlue={ACCENT_BLUE}
-              accentGreen={ACCENT_GREEN}
-              accentRed={ACCENT_RED}
-              finalizingColor={ACCENT_AMBER}
-              onCancelUpload={cancelUpload}
-              onRetryUpload={retryUpload}
-            />
-          </div>
+          {/* The list scrolls past ~6 rows and renders only the rows in view. */}
+          <UploadProgressList
+            queue={queue}
+            borderColor={BORDER}
+            textPrimary={TEXT_PRIMARY}
+            textMuted={TEXT_MUTED}
+            accentBlue={ACCENT_BLUE}
+            accentGreen={ACCENT_GREEN}
+            accentRed={ACCENT_RED}
+            finalizingColor={ACCENT_AMBER}
+            onCancelUpload={cancelUpload}
+            onRetryUpload={retryUpload}
+          />
         </div>
       )}
     </div>

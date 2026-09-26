@@ -73,6 +73,16 @@ refuses a destination that already holds objects: the job fails in its
 dialog) makes the destination an exact copy instead: destination objects that
 the source does not hold are deleted before the flip, and each delete is
 audited as `maintenance_migrate_mirror_delete`.
+### Fixed — The upload page keeps up with many small files
+
+Every upload progress event rebuilt the whole queue and re-rendered every
+row, so the cost of a batch grew with the square of its size: 300 small
+files took about nine minutes. Progress now goes to a keyed store and
+reaches the page at most once every 50 ms, the next file starts as soon as
+the previous one ends (not after a render), and the queue list renders only
+the rows in view. 1000 small files upload at the speed of the server, with a
+bounded page memory.
+
 ### Fixed — An encryption change on the Backends page keeps the other backends intact
 
 The Backends page built the `backends` list for its section PUT from the
