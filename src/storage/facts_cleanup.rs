@@ -225,7 +225,8 @@ impl FactsCleanupQueue {
     pub(super) fn start(client: Client) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let rewritten: Rewritten = Default::default();
-        tokio::spawn(drain(client, rx, rewritten.clone()));
+        tokio::spawn(drain(client.clone(), rx, rewritten.clone()));
+        tokio::spawn(gc_loop(client));
         Self { tx, rewritten }
     }
 
@@ -304,6 +305,144 @@ async fn drain(client: Client, mut rx: mpsc::UnboundedReceiver<Queued>, rewritte
     }
 }
 
+/// How often the garbage collection runs, and how much of each bucket's
+/// facts namespace one run reads (it resumes there next time).
+const GC_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+const GC_FACTS_PAGES_PER_RUN: usize = 20;
+/// Object-listing pages that may verify one facts page.
+const GC_VERIFY_PAGES: usize = 5;
+/// An entry younger than this is never collected (its PUT may be in flight).
+const GC_GRACE_SECS: i64 = 3600;
+
+/// Periodic garbage collection of facts entries whose object is gone
+/// (`listing_facts::gc_doomed`). Every node runs it; deletes are idempotent,
+/// and the grace keeps a fresh entry of any node.
+async fn gc_loop(client: Client) {
+    let mut cursors: HashMap<String, String> = HashMap::new();
+    let mut tick = tokio::time::interval(GC_INTERVAL);
+    tick.tick().await; // not at boot
+    loop {
+        tick.tick().await;
+        let Ok(resp) = client.list_buckets().send().await else {
+            continue;
+        };
+        for bucket in resp.buckets().iter().filter_map(|b| b.name()) {
+            let from = cursors.remove(bucket);
+            let now = chrono::Utc::now().timestamp();
+            if let Some(next) =
+                gc_bucket(&client, bucket, from, now, GC_FACTS_PAGES_PER_RUN, GC_GRACE_SECS).await
+            {
+                cursors.insert(bucket.to_string(), next);
+            }
+        }
+    }
+}
+
+/// One GC pass over at most `pages` facts pages of `bucket`, from `from`
+/// (a facts key). Returns where the next pass resumes, `None` at the end.
+pub(super) async fn gc_bucket(
+    client: &Client,
+    bucket: &str,
+    from: Option<String>,
+    now: i64,
+    pages: usize,
+    grace_secs: i64,
+) -> Option<String> {
+    let mut cursor = from;
+    for _ in 0..pages {
+        LISTING_FACTS_REQUESTS.with_label_values(&["list"]).inc();
+        let resp = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(listing_facts::FACTS_ROOT)
+            .set_start_after(cursor.clone())
+            .send()
+            .await
+            .ok()?;
+        let candidates: Vec<listing_facts::GcCandidate> = resp
+            .contents()
+            .iter()
+            .filter_map(listed_of)
+            .map(|(key, t)| listing_facts::GcCandidate {
+                entry: listing_facts::parse_facts_key(&key),
+                modified: t.map(|(secs, _)| secs),
+                key,
+            })
+            .collect();
+        let last_key = candidates.last()?.key.clone();
+        let stored: Vec<&str> = candidates
+            .iter()
+            .filter_map(|c| c.entry.as_ref().map(|e| e.stored_key.as_str()))
+            .collect();
+        if let (Some(first), Some(last)) = (stored.iter().min(), stored.iter().max()) {
+            let (live, through) = live_objects(client, bucket, first, last).await;
+            let doomed =
+                listing_facts::gc_doomed(&candidates, &live, through.as_deref(), now, grace_secs);
+            if !doomed.is_empty() {
+                debug!("facts GC on {bucket}: {} entries of gone objects", doomed.len());
+                delete_facts_keys(client, bucket, doomed).await;
+            }
+        }
+        if !resp.is_truncated().unwrap_or(false) {
+            return None;
+        }
+        cursor = Some(last_key);
+    }
+    cursor
+}
+
+/// The stored objects from `first` to `last` (key -> (ETag, size)), and
+/// the key the listing is complete through (`None`: nothing verified).
+async fn live_objects(
+    client: &Client,
+    bucket: &str,
+    first: &str,
+    last: &str,
+) -> (HashMap<String, (String, u64)>, Option<String>) {
+    let mut live = HashMap::new();
+    let mut token: Option<String> = None;
+    let mut read_through: Option<String> = None;
+    let mut start_after = listing_facts::start_before(first);
+    for _ in 0..GC_VERIFY_PAGES {
+        let mut request = client.list_objects_v2().bucket(bucket);
+        request = match token.take() {
+            Some(t) => request.continuation_token(t),
+            None => request.start_after(&start_after),
+        };
+        let Ok(resp) = request.send().await else {
+            return (live, None);
+        };
+        for o in resp.contents() {
+            let Some(k) = o.key() else { continue };
+            if k > last {
+                return (live, Some(last.to_string()));
+            }
+            live.insert(
+                k.to_string(),
+                (
+                    o.e_tag().unwrap_or_default().to_string(),
+                    o.size().unwrap_or(0).max(0) as u64,
+                ),
+            );
+            read_through = Some(k.to_string());
+        }
+        match resp.next_continuation_token() {
+            Some(t) if resp.is_truncated().unwrap_or(false) => {
+                // A page that ends in the facts namespace jumps past it.
+                let page_last = resp.contents().last().and_then(|o| o.key());
+                match page_last.and_then(listing_facts::skip_past_facts) {
+                    Some(past) => start_after = past.to_string(),
+                    None => token = Some(t.to_string()),
+                }
+            }
+            // The bucket ends here: everything up to `last` is read.
+            _ => return (live, Some(last.to_string())),
+        }
+    }
+    // Page budget spent below `last`: only what was read is verified.
+    (live, read_through)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +464,68 @@ mod tests {
         let e = |k: &str, t: i64| (k.to_string(), Some((t, 0)));
         let entries = vec![e("old", 1), e("peer-new", 5)];
         assert_eq!(doomed(&entries, false, Some(3)), vec!["old"]);
+    }
+
+    /// Against a real S3 (`MINIO_ENDPOINT`, e.g. MinIO or moto); skipped
+    /// without one. The entry of a gone object goes, the live one stays.
+    #[tokio::test]
+    async fn gc_removes_the_facts_of_gone_objects() {
+        let Ok(ep) = std::env::var("MINIO_ENDPOINT") else {
+            eprintln!("MINIO_ENDPOINT unset, skipping");
+            return;
+        };
+        use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("minioadmin", "minioadmin", None, None, "t"))
+            .force_path_style(true)
+            .endpoint_url(ep)
+            .build();
+        let client = Client::from_conf(conf);
+        let bucket = format!("gc-{}", uuid::Uuid::new_v4().simple());
+        if client.create_bucket().bucket(&bucket).send().await.is_err() {
+            eprintln!("S3 at MINIO_ENDPOINT unreachable, skipping");
+            return;
+        }
+        let put = |k: String, body: &'static [u8]| {
+            let c = client.clone();
+            let b = bucket.clone();
+            async move {
+                c.put_object()
+                    .bucket(b)
+                    .key(k)
+                    .body(body.to_vec().into())
+                    .send()
+                    .await
+                    .unwrap()
+                    .e_tag()
+                    .unwrap()
+                    .to_string()
+            }
+        };
+        let etag = put("d/live.delta".into(), b"live").await;
+        let logical = super::super::list_size_cache::LogicalFacts {
+            size: 40,
+            etag: "abc".into(),
+        };
+        let live_facts = listing_facts::facts_key("d/live.delta", &etag, 4, &logical).unwrap();
+        let gone_facts = listing_facts::facts_key("d/gone.delta", "e1", 4, &logical).unwrap();
+        put(live_facts.clone(), b"").await;
+        put(gone_facts, b"").await;
+        let far = chrono::Utc::now().timestamp() + 10_000;
+        assert_eq!(gc_bucket(&client, &bucket, None, far, 5, 60).await, None);
+        let left: Vec<String> = client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .prefix(listing_facts::FACTS_ROOT)
+            .send()
+            .await
+            .unwrap()
+            .contents()
+            .iter()
+            .filter_map(|o| o.key().map(str::to_string))
+            .collect();
+        assert_eq!(left, vec![live_facts]);
     }
 }

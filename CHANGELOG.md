@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added — Garbage collection of listing-facts entries whose object is gone
+
+The removal of listing-facts entries after a delete is best effort: its
+queue is in memory, so a crash loses it, and an entry that the server stored
+in the same second as the delete is kept on purpose. Such entries never give
+a wrong answer, but they stayed in the bucket forever. Every six hours, each
+instance now reads a part of each bucket's facts namespace (20 pages, and it
+goes on from there the next time), checks the objects that the entries
+describe, and deletes the entries whose object is gone or was overwritten.
+An entry younger than one hour is never deleted.
+
 ### Fixed — A filtered LIST reads at most one page budget per request
 
 For a user whose policy covers several prefixes, the proxy lists each prefix

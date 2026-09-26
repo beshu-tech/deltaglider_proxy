@@ -175,6 +175,57 @@ pub fn parse_facts_key(key: &str) -> Option<FactsEntry> {
     })
 }
 
+/// One facts object the garbage collection read: its key, its parsed form
+/// (`None`: not in this release's format) and its server `LastModified`.
+#[derive(Debug, Clone)]
+pub struct GcCandidate {
+    pub key: String,
+    pub entry: Option<FactsEntry>,
+    pub modified: Option<i64>,
+}
+
+/// Pure: the facts objects of one GC page to delete. An entry goes when the
+/// stored object it describes (that key, stored ETag and size) is not in
+/// `live`, the listing of the stored keys, which is complete up to and with
+/// `verified_through`. The delete cleanup is best effort (an in-memory
+/// queue, lost on a crash; a same-second entry is kept on purpose), so
+/// without this such entries stayed forever.
+///
+/// Kept: an entry younger than `grace_secs` (its PUT, or a rewrite on
+/// another node, may be in flight), an entry past the verified range, and
+/// anything not in this format (a newer release's entries).
+pub fn gc_doomed(
+    candidates: &[GcCandidate],
+    live: &std::collections::HashMap<String, (String, u64)>,
+    verified_through: Option<&str>,
+    now: i64,
+    grace_secs: i64,
+) -> Vec<String> {
+    let Some(through) = verified_through else {
+        return Vec::new();
+    };
+    candidates
+        .iter()
+        .filter(|c| c.modified.is_some_and(|m| now.saturating_sub(m) >= grace_secs))
+        .filter_map(|c| Some((c, c.entry.as_ref()?)))
+        .filter(|(_, e)| e.stored_key.as_str() <= through)
+        .filter(|(_, e)| {
+            live.get(&e.stored_key)
+                .is_none_or(|(etag, size)| bare(etag) != e.stored_etag || *size != e.stored_size)
+        })
+        .map(|(c, _)| c.key.clone())
+        .collect()
+}
+
+/// A start-after that lists `key` itself and what follows (S3 returns the
+/// keys strictly after it): `key` without its last character. Keys between
+/// the two cost a little more listing, never a missed key.
+pub fn start_before(key: &str) -> String {
+    let mut s = key.to_string();
+    s.pop();
+    s
+}
+
 /// The one LIST (in pages) that returns the facts of a set of stored keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FactsScan {
@@ -531,5 +582,53 @@ mod tests {
         for p in [".dg/", ".d", "", "a/.dg/facts/x/", ".well-known/", ".dgx/"] {
             assert!(!is_internal_common_prefix(p), "{p}");
         }
+    }
+
+    #[test]
+    fn gc_deletes_only_old_verified_entries_of_gone_objects() {
+        let facts = |k: &str, etag: &str, size: u64| {
+            facts_key(
+                k,
+                etag,
+                size,
+                &LogicalFacts {
+                    size: size * 10,
+                    etag: "logical".into(),
+                },
+            )
+            .unwrap()
+        };
+        let cand = |key: String, modified: i64| GcCandidate {
+            entry: parse_facts_key(&key),
+            key,
+            modified: Some(modified),
+        };
+        let gone = facts("d/gone.delta", "e1", 1);
+        let live_ok = facts("d/live.delta", "e2", 2);
+        let stale = facts("d/over.delta", "old", 3);
+        let fresh = facts("d/fresh.delta", "e4", 4);
+        let far = facts("z/far.delta", "e5", 5);
+        let cands = vec![
+            cand(gone.clone(), 0),
+            cand(live_ok.clone(), 0),
+            cand(stale.clone(), 0),
+            cand(fresh.clone(), 99),
+            cand(far.clone(), 0),
+            GcCandidate {
+                key: ".dg/facts/d/x!!2.future".into(),
+                entry: None,
+                modified: Some(0),
+            },
+        ];
+        let live: std::collections::HashMap<String, (String, u64)> = [
+            ("d/live.delta".to_string(), ("\"e2\"".to_string(), 2)),
+            ("d/over.delta".to_string(), ("\"new\"".to_string(), 3)),
+        ]
+        .into_iter()
+        .collect();
+        let doomed = gc_doomed(&cands, &live, Some("d/zzz"), 100, 10);
+        assert_eq!(doomed, vec![gone, stale]);
+        assert!(gc_doomed(&cands, &live, None, 100, 10).is_empty());
+        assert_eq!(start_before("d/a.delta"), "d/a.delt");
     }
 }
