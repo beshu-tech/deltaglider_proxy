@@ -168,6 +168,36 @@ impl SavingsTotals {
     pub fn user_visible_count(&self) -> u64 {
         self.delta_count.saturating_add(self.passthrough_count)
     }
+
+    /// Fold another scope's totals into this one.
+    ///
+    /// For callers that accumulate per-bucket (or per-prefix) and then want
+    /// a proxy-wide figure without a second pass over every object. Summing
+    /// the fields is only valid because the scopes are disjoint — merging
+    /// two totals that both counted the same `reference.bin` double-counts
+    /// it, and the derived percentage silently drifts. The caller owns
+    /// disjointness, exactly as it already owns "which objects are in
+    /// scope" for [`Self::accumulate`].
+    ///
+    /// Every field saturates, matching `accumulate`: a total that has
+    /// already saturated is wrong, but wrapping to near-zero would turn a
+    /// wrong-but-huge number into a plausible-looking small one.
+    pub fn merge(&mut self, other: &SavingsTotals) {
+        self.original_bytes = self.original_bytes.saturating_add(other.original_bytes);
+        self.stored_bytes = self.stored_bytes.saturating_add(other.stored_bytes);
+        self.reference_bytes = self.reference_bytes.saturating_add(other.reference_bytes);
+        self.delta_stored_bytes = self
+            .delta_stored_bytes
+            .saturating_add(other.delta_stored_bytes);
+        self.passthrough_bytes = self
+            .passthrough_bytes
+            .saturating_add(other.passthrough_bytes);
+        self.reference_count = self.reference_count.saturating_add(other.reference_count);
+        self.delta_count = self.delta_count.saturating_add(other.delta_count);
+        self.passthrough_count = self
+            .passthrough_count
+            .saturating_add(other.passthrough_count);
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +390,61 @@ mod tests {
         // 1.0 — diagnostic surfaces aren't user-facing, so the truth
         // is what they want.
         assert_eq!(t.compression_ratio(), Some(1.0));
+    }
+
+    #[test]
+    fn merge_of_disjoint_scopes_equals_one_pass_over_both() {
+        // The property that makes `merge` worth having: accumulating two
+        // buckets separately then merging must equal scanning both into one
+        // accumulator. If these ever diverge, a per-bucket caller and a
+        // proxy-wide caller disagree about the same data.
+        let objs_a = [reference(10_000), delta(10_000, 500), delta(10_000, 250)];
+        let objs_b = [reference(4_000), delta(4_000, 100), passthrough(7_777)];
+
+        let mut one_pass = SavingsTotals::default();
+        for m in objs_a.iter().chain(objs_b.iter()) {
+            one_pass.accumulate(m);
+        }
+
+        let mut a = SavingsTotals::default();
+        for m in &objs_a {
+            a.accumulate(m);
+        }
+        let mut b = SavingsTotals::default();
+        for m in &objs_b {
+            b.accumulate(m);
+        }
+        a.merge(&b);
+
+        assert_eq!(a, one_pass);
+        assert_eq!(a.savings_percentage(), one_pass.savings_percentage());
+        assert_eq!(a.saved_bytes(), one_pass.saved_bytes());
+    }
+
+    #[test]
+    fn merge_with_default_is_identity() {
+        let mut t = SavingsTotals::default();
+        t.accumulate(&reference(1_000));
+        t.accumulate(&delta(5_000, 50));
+        let before = t;
+
+        t.merge(&SavingsTotals::default());
+        assert_eq!(t, before, "merging an empty scope must change nothing");
+    }
+
+    /// Pin: merge saturates rather than wrapping. A wrapped total would
+    /// present as a small, believable number — far worse than a clamped one.
+    #[test]
+    fn merge_saturates_instead_of_wrapping() {
+        let mut a = SavingsTotals::default();
+        a.accumulate(&passthrough(u64::MAX));
+        let mut b = SavingsTotals::default();
+        b.accumulate(&passthrough(u64::MAX));
+
+        a.merge(&b);
+        assert_eq!(a.original_bytes, u64::MAX);
+        assert_eq!(a.stored_bytes, u64::MAX);
+        assert_eq!(a.passthrough_count, 2);
     }
 
     /// Regression: `user_visible_count` must NEVER include reference
