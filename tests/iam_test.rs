@@ -16,6 +16,7 @@ use common::TestServer;
 /// Open access mode: no auth configured → all operations succeed without credentials.
 #[tokio::test]
 async fn test_open_access_no_auth_required() {
+    // By design: this test IS the `authentication: none` contract.
     let server = TestServer::builder().open_access().build().await;
     let client = reqwest::Client::new();
 

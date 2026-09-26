@@ -127,6 +127,7 @@ async fn open_browser_connect_requires_open_auth_mode() {
 
 #[tokio::test]
 async fn open_browser_connect_sets_anonymous_creds_and_blocks_config() {
+    // By design: `open-browser-connect` exists only when authentication is none.
     let server = TestServer::builder().open_access().build().await;
     let ep = server.endpoint();
     let c = reqwest::Client::builder()
