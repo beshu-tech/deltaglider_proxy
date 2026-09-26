@@ -37,6 +37,7 @@ pub mod replication;
 pub mod s3_adapter_s3s;
 pub mod security;
 pub mod session;
+pub mod shutdown;
 pub mod slack_format;
 pub mod sqlite_open;
 pub mod storage;

@@ -1557,6 +1557,9 @@ pub async fn shutdown_signal() {
             warn!("Received SIGTERM, initiating graceful shutdown...");
         }
     }
+    // BEFORE the drain and the runtime teardown: background jobs must see it
+    // before any teardown-caused error reaches them.
+    deltaglider_proxy::shutdown::begin();
 }
 
 // ─────────────────────────────────────────────────────────────────────

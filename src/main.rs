@@ -848,12 +848,13 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let mut maintenance_worker = None;
     if !config_db_mismatch {
         if let Some(db) = config_db.as_ref() {
-            deltaglider_proxy::maintenance::worker::spawn_worker(
+            maintenance_worker = Some(deltaglider_proxy::maintenance::worker::spawn_worker(
                 config_mutator.clone(),
                 db.clone(),
-            );
+            ));
         }
         // Job-plane leader lease: S3-CAS (cross-node failover) when a validated
         // coordination bucket is configured, else node-local. Built ONCE, before
@@ -1087,6 +1088,18 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    }
+
+    // Let a running maintenance job reach its stop point and hand its row
+    // back (resumable at once on the next boot). Bounded: one object copy
+    // can outlast it, and then the job's lease lapses as after a crash.
+    if let Some(worker) = maintenance_worker {
+        if tokio::time::timeout(Duration::from_secs(10), worker)
+            .await
+            .is_err()
+        {
+            tracing::warn!("maintenance worker did not stop within 10s; its job resumes after the lease lapses");
+        }
     }
 
     // #85: drain any un-flushed bucket-usage deltas. The periodic task runs

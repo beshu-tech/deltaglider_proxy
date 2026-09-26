@@ -63,9 +63,14 @@ pub fn spawn_worker(
             tokio::select! {
                 _ = state.maintenance_notify.notified() => {}
                 _ = tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)) => {}
+                _ = crate::shutdown::started() => {}
             }
             // Drain every claimable job before sleeping again.
             loop {
+                if crate::shutdown::is_shutting_down() {
+                    info!("Maintenance worker stopped: the process shuts down");
+                    return;
+                }
                 let claimed = {
                     let db = db.lock().await;
                     // Re-queue abandoned rows first (lease-aware): a job
@@ -175,7 +180,31 @@ async fn run_job(
     };
     drop(keeper);
 
-    if outcome.as_ref().err().is_some_and(|e| e == LEASE_LOST) {
+    let action = after_run(&outcome, crate::shutdown::is_shutting_down());
+    if action == AfterRun::ReleaseForResume {
+        // A graceful shutdown (SIGTERM on every rolling deploy) stopped the
+        // job, or made its work fail. Neither says anything about the data:
+        // never settle. Hand the row back with its cursor, so the next boot
+        // resumes it at once instead of after one lease TTL.
+        let released = db
+            .lock()
+            .await
+            .maintenance_release_for_resume(job.id, instance_id);
+        warn!(
+            "maintenance: job #{} on '{}' stopped by shutdown ({}) — left resumable \
+             (released: {:?})",
+            job.id,
+            bucket,
+            outcome.as_ref().err().map(String::as_str).unwrap_or(""),
+            released
+        );
+        for k in &gated {
+            state.maintenance_gate.clear(k);
+        }
+        return;
+    }
+
+    if action == AfterRun::LeaveToLeaseHolder {
         // Do NOT settle the row: losing the lease means it lapsed (the
         // requeue scan will hand it to the next claimer with its cursor
         // intact) or another instance already claimed it — settling here
@@ -308,17 +337,18 @@ async fn execute_phases(
             };
 
             for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
+                stop_if_shutting_down()?;
                 let meta = match engine.head(bucket, key).await {
                     Ok(m) => m,
                     Err(e) => {
-                        failed += 1;
                         record_failure(
                             db,
                             job.id,
                             key,
                             &format!("could not read object metadata: {e}"),
                         )
-                        .await;
+                        .await?;
+                        failed += 1;
                         continue;
                     }
                 };
@@ -345,8 +375,8 @@ async fn execute_phases(
                         bytes += outcome.bytes_copied as i64;
                     }
                     Err(e) => {
+                        record_failure(db, job.id, key, &e.to_string()).await?;
                         failed += 1;
-                        record_failure(db, job.id, key, &e.to_string()).await;
                     }
                 }
             }
@@ -399,8 +429,8 @@ async fn execute_phases(
             match rewrite_reference_if_needed(&engine, bucket, &prefix, &desired).await {
                 Ok(()) => {}
                 Err(e) => {
+                    record_failure(db, job.id, &format!("{prefix}/.dg/reference.bin"), &e).await?;
                     failed += 1;
-                    record_failure(db, job.id, &format!("{prefix}/.dg/reference.bin"), &e).await;
                 }
             }
             heartbeat(db, job.id, instance_id).await?;
@@ -552,6 +582,44 @@ pub(crate) const CANCELLED: &str = "__cancelled__";
 /// left UNTOUCHED (no settle, no unwind) — it belongs to whoever holds
 /// the lease now, or to the requeue scan once it lapses.
 pub(crate) const LEASE_LOST: &str = "__lease_lost__";
+/// Sentinel for "the process shuts down". Like [`LEASE_LOST`], the row is
+/// not settled; the worker hands it back for the next boot to resume.
+pub(crate) const SHUTTING_DOWN: &str = "__shutting_down__";
+
+/// Stop point for phase loops: `Err(SHUTTING_DOWN)` once shutdown starts.
+pub(crate) fn stop_if_shutting_down() -> Result<(), String> {
+    if crate::shutdown::is_shutting_down() {
+        Err(SHUTTING_DOWN.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// What the worker does with a finished phase run.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AfterRun {
+    /// Settle the row (succeeded / completed_with_errors / failed / cancelled).
+    Settle,
+    /// The lease lapsed or moved: leave the row to whoever holds it now.
+    LeaveToLeaseHolder,
+    /// Shutdown: never settle, never unwind; hand the row back to resume.
+    ReleaseForResume,
+}
+
+/// The decision for [`AfterRun`]. Any error while the process shuts down
+/// counts as the shutdown: the runtime teardown makes healthy work fail
+/// (a refused `spawn_blocking`), and settling on it leaves a half-done
+/// bucket marked finished. An operator cancel stays a cancel.
+pub(crate) fn after_run(outcome: &Result<(), String>, shutting_down: bool) -> AfterRun {
+    match outcome {
+        Ok(()) => AfterRun::Settle,
+        Err(e) if e == LEASE_LOST => AfterRun::LeaveToLeaseHolder,
+        Err(e) if e == SHUTTING_DOWN => AfterRun::ReleaseForResume,
+        Err(e) if e == CANCELLED => AfterRun::Settle,
+        Err(_) if shutting_down => AfterRun::ReleaseForResume,
+        Err(_) => AfterRun::Settle,
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn persist(
@@ -651,7 +719,17 @@ pub(crate) async fn heartbeat(
     }
 }
 
-pub(crate) async fn record_failure(db: &Arc<Mutex<ConfigDb>>, job_id: i64, key: &str, error: &str) {
+/// Record a per-object failure. Refuses with `Err(SHUTTING_DOWN)` once the
+/// process shuts down: a failure then is most likely the runtime teardown,
+/// not the object, and counting it would settle a healthy job with errors.
+/// Callers propagate the Err so the phase stops before its page persists.
+pub(crate) async fn record_failure(
+    db: &Arc<Mutex<ConfigDb>>,
+    job_id: i64,
+    key: &str,
+    error: &str,
+) -> Result<(), String> {
+    stop_if_shutting_down()?;
     let db = db.lock().await;
     if let Err(e) = db.maintenance_record_failure(job_id, key, error, MAX_FAILURES_RETAINED) {
         warn!(
@@ -659,6 +737,7 @@ pub(crate) async fn record_failure(db: &Arc<Mutex<ConfigDb>>, job_id: i64, key: 
             job_id, e
         );
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -732,6 +811,31 @@ mod tests {
             0,
             "the keeper stopped at a DB error and the lease lapsed"
         );
+    }
+
+    #[test]
+    fn after_run_never_settles_on_a_shutdown() {
+        use AfterRun::*;
+        let err = |e: &str| Err(e.to_string());
+        let cases: [(Result<(), String>, bool, AfterRun); 10] = [
+            (Ok(()), false, Settle),
+            (Ok(()), true, Settle),
+            (err("object list failed: x"), false, Settle),
+            (err("object list failed: x"), true, ReleaseForResume),
+            (err(SHUTTING_DOWN), false, ReleaseForResume),
+            (err(SHUTTING_DOWN), true, ReleaseForResume),
+            (err(LEASE_LOST), false, LeaveToLeaseHolder),
+            (err(LEASE_LOST), true, LeaveToLeaseHolder),
+            (err(CANCELLED), false, Settle),
+            (err(CANCELLED), true, Settle),
+        ];
+        for (outcome, shutting_down, want) in cases {
+            assert_eq!(
+                after_run(&outcome, shutting_down),
+                want,
+                "{outcome:?} shutting_down={shutting_down}"
+            );
+        }
     }
 
     #[test]

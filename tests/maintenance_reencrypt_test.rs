@@ -819,6 +819,102 @@ async fn test_reencrypt_resumes_after_restart() {
     }
 }
 
+/// How many of the seeded `plain-NNN.json` files still hold plaintext on disk.
+fn plaintext_count(data_dir: &std::path::Path, bucket: &str, n: usize) -> usize {
+    (0..n)
+        .filter(|i| {
+            let p = data_dir
+                .join(bucket)
+                .join("deltaspaces")
+                .join(format!("plain-{i:03}.json"));
+            std::fs::read(p).is_ok_and(|b| {
+                b.windows(PLAINTEXT_MARKER.len())
+                    .any(|w| w == PLAINTEXT_MARKER)
+            })
+        })
+        .count()
+}
+
+/// A GRACEFUL stop (SIGTERM — what Kubernetes sends on every rolling deploy)
+/// in the middle of a re-encrypt page must leave the job resumable: the next
+/// boot finishes it, and it settles `succeeded` with no failures. Before, the
+/// runtime teardown could make every remaining copy fail, and the worker
+/// settled the job `completed_with_errors` with part of the bucket still
+/// plaintext (nightly coverage run, where every stop is a SIGTERM). The
+/// worker now stops at an object boundary and hands the row back, so the
+/// resume also starts at once, not after the 60 s lease TTL of a crash.
+#[tokio::test]
+async fn test_reencrypt_resumes_after_graceful_shutdown() {
+    let bucket = "maintsigterm";
+    let mut server = TestServer::builder().bucket(bucket).build().await;
+    let http = server.http();
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+
+    // One page (< PAGE_SIZE), large enough that the SIGTERM lands mid-page.
+    const N: usize = 300;
+    for i in 0..N {
+        let body = [PLAINTEXT_MARKER, format!(" obj {i}").as_bytes()].concat();
+        put_object(
+            &http,
+            &endpoint,
+            bucket,
+            &format!("plain-{i:03}.json"),
+            body,
+            "application/json",
+        )
+        .await;
+    }
+    enable_encryption(&admin, &endpoint).await;
+    start_reencrypt(&admin, &endpoint, bucket).await;
+
+    // Wait until the rewrite is visibly mid-page on disk, then SIGTERM.
+    let data_dir = server.data_dir().unwrap().to_path_buf();
+    let mut left = N;
+    for _ in 0..2000 {
+        left = plaintext_count(&data_dir, bucket, N);
+        if left < N {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        left > 0 && left < N,
+        "SIGTERM must land mid-job ({left} of {N} still plaintext)"
+    );
+    server.terminate();
+    let left_at_stop = plaintext_count(&data_dir, bucket, N);
+
+    server
+        .respawn_with_env(&[(
+            "DGP_BOOTSTRAP_PASSWORD_HASH",
+            common::TEST_BOOTSTRAP_PASSWORD_HASH,
+        )])
+        .await;
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+    let after_boot = newest_job(&admin, &endpoint).await;
+    // 30 s: well inside LEASE_TTL_SECS (60 s). Only a released lease lets
+    // the job resume this soon.
+    wait_job_done_within(&admin, &endpoint, bucket, 300).await;
+
+    let job = newest_job(&admin, &endpoint).await;
+    assert_eq!(
+        plaintext_count(&data_dir, bucket, N),
+        0,
+        "the job must resume and finish ({left_at_stop} plaintext at stop); \
+         row after boot: {after_boot}; final row: {job}"
+    );
+    assert_eq!(job["status"], "succeeded", "job: {job}");
+    assert_eq!(job["progress"]["failed"], 0, "job: {job}");
+    for i in [0usize, N / 2, N - 1] {
+        assert_eq!(
+            get_bytes(&http, &endpoint, bucket, &format!("plain-{i:03}.json")).await,
+            [PLAINTEXT_MARKER, format!(" obj {i}").as_bytes()].concat(),
+        );
+    }
+}
+
 // ── review second pass (failing tests for findings) ──────────────────────
 
 async fn review2_busy_bucket(bucket: &str) -> (TestServer, reqwest::Client) {

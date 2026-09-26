@@ -449,6 +449,30 @@ impl ConfigDb {
         Ok(())
     }
 
+    /// Hand back a job this instance stops because the process shuts down:
+    /// release OUR lease so the next boot resumes it at once instead of
+    /// after one lease TTL. A `running` row goes back to `queued` with phase
+    /// and cursor preserved; a `cancelling` row keeps its status (the requeue
+    /// scan settles it `cancelled`). Returns whether a row changed.
+    pub fn maintenance_release_for_resume(
+        &self,
+        job_id: i64,
+        instance_id: &str,
+    ) -> Result<bool, ConfigDbError> {
+        let now = current_unix_seconds();
+        let n = self.conn.execute(
+            "UPDATE maintenance_jobs
+                SET status = CASE status WHEN 'running' THEN 'queued' ELSE status END,
+                    leader_instance_id = NULL, leader_expires_at = NULL,
+                    updated_at = ?
+              WHERE id = ?
+                AND status IN ('running','cancelling')
+                AND leader_instance_id = ?",
+            params![now, job_id, instance_id],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Record a per-object failure, ring-bounded to `max_retained` rows
     /// per job (oldest evicted first).
     pub fn maintenance_record_failure(
@@ -869,6 +893,53 @@ mod tests {
             .unwrap();
         assert_eq!(claimed.id, id);
         assert_eq!(claimed.started_at, Some(wall));
+    }
+
+    #[test]
+    fn release_for_resume_requeues_our_running_job_with_its_cursor() {
+        let db = db();
+        let id = db
+            .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_claim_next_job("w", current_unix_seconds(), 60)
+            .unwrap()
+            .unwrap();
+        db.maintenance_update_progress(id, "objects", Some(50), 20, 5, 0, 999, Some("page-3"))
+            .unwrap();
+        // Another instance's release must not touch our row.
+        assert!(!db.maintenance_release_for_resume(id, "other").unwrap());
+        assert!(db.maintenance_release_for_resume(id, "w").unwrap());
+        let job = db.maintenance_active_job_for_bucket("b").unwrap().unwrap();
+        assert_eq!(job.status, "queued");
+        assert_eq!(job.phase, "objects");
+        assert_eq!(job.continuation_token.as_deref(), Some("page-3"));
+        // Claimable at once: no wait for the lease to lapse.
+        let claimed = db
+            .maintenance_claim_next_job("w2", current_unix_seconds(), 60)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.id, id);
+    }
+
+    #[test]
+    fn release_for_resume_keeps_a_cancel_and_ignores_terminal_rows() {
+        let db = db();
+        let id = db
+            .maintenance_create_job("reencrypt", "b", "counting", None, "admin", 1)
+            .unwrap()
+            .unwrap();
+        db.maintenance_claim_next_job("w", current_unix_seconds(), 60)
+            .unwrap()
+            .unwrap();
+        db.maintenance_request_cancel(id).unwrap();
+        assert!(db.maintenance_release_for_resume(id, "w").unwrap());
+        // The operator's cancel outranks resume: the scan settles it.
+        assert_eq!(db.maintenance_requeue_abandoned().unwrap(), 0);
+        let job = db.maintenance_job_by_id(id).unwrap().unwrap();
+        assert_eq!(job.status, "cancelled");
+        // Terminal rows are immutable.
+        assert!(!db.maintenance_release_for_resume(id, "w").unwrap());
     }
 
     #[test]

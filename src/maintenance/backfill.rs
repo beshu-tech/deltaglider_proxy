@@ -155,7 +155,7 @@ pub(crate) async fn execute_backfill_phases(
 ) -> Result<(), String> {
     use super::worker::{
         check_cancel, counting_phase, drain_inflight_writes, heartbeat, persist, record_failure,
-        PAGE_SIZE,
+        stop_if_shutting_down, PAGE_SIZE,
     };
     use crate::job_loop::Pager;
 
@@ -223,17 +223,18 @@ pub(crate) async fn execute_backfill_phases(
             };
 
             for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
+                stop_if_shutting_down()?;
                 let meta = match engine.head(bucket, key).await {
                     Ok(m) => m,
                     Err(e) => {
-                        failed += 1;
                         record_failure(
                             db,
                             job.id,
                             key,
                             &format!("could not read object metadata: {e}"),
                         )
-                        .await;
+                        .await?;
+                        failed += 1;
                         continue;
                     }
                 };
@@ -246,8 +247,8 @@ pub(crate) async fn execute_backfill_phases(
                     match hash_object_content(engine.as_ref(), bucket, key).await {
                         Ok(h) => h,
                         Err(e) => {
+                            record_failure(db, job.id, key, &e).await?;
                             failed += 1;
-                            record_failure(db, job.id, key, &e).await;
                             continue;
                         }
                     };
@@ -265,8 +266,8 @@ pub(crate) async fn execute_backfill_phases(
                     .put_passthrough_metadata(bucket, prefix, filename, &new_meta)
                     .await
                 {
+                    record_failure(db, job.id, key, &format!("metadata write failed: {e}")).await?;
                     failed += 1;
-                    record_failure(db, job.id, key, &format!("metadata write failed: {e}")).await;
                     continue;
                 }
                 // The 10-minute metadata cache would otherwise keep serving

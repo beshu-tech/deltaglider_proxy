@@ -122,7 +122,9 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                             writes; `check_verified_request` 503-SlowDowns writes to busy buckets (and runs the backend-health
                             gate) AFTER signature verification — s3s access hook + form-POST handler; reads pass; in-flight write drain; admin bulk copy/move/delete loops participate via
                             write_started/finished + per-item is_busy), worker.rs (sequential runner, kind dispatch; heartbeat returns
-                            Err(LEASE_LOST) on refused renewal → phase stops, row NOT settled), migrate.rs (kind=migrate: stage→copy→verify→
+                            Err(LEASE_LOST) on refused renewal → phase stops, row NOT settled; graceful shutdown
+                            (SIGTERM → `shutdown::begin()`) = Err(SHUTTING_DOWN): record_failure refuses, `after_run` never
+                            settles/unwinds any Err while shutting down, row released to `queued` for an instant resume), migrate.rs (kind=migrate: stage→copy→verify→
                             flip→cleanup, transient __dgmigrate_* routes — gated from creation, filtered out of all bucket listings, cleared at
                             flip; pre-flip cancel unwind; cleanup re-checks routed_to_target PER SWEEP; cancel-in-cleanup settles completed with
                             a note), backfill.rs (kind=backfill-metadata: stamp canonical DG metadata onto foreign/pre-proxy passthrough objects

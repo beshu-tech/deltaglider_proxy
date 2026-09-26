@@ -954,17 +954,28 @@ impl Drop for TestServer {
 /// shutdown and a normal exit, and SIGKILL only after 10 s.
 fn stop_child(child: &mut Child) {
     if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-        // SAFETY: plain kill(2) on our own child's pid.
-        unsafe {
-            libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        sigterm_then_wait(child);
+        return;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// SIGTERM, wait up to 10 s for the graceful exit, then SIGKILL.
+fn sigterm_then_wait(child: &mut Child) {
+    if let Ok(Some(_)) = child.try_wait() {
+        return;
+    }
+    // SAFETY: plain kill(2) on our own child's pid.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(_)) = child.try_wait() {
+            return;
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if let Ok(Some(_)) = child.try_wait() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        std::thread::sleep(Duration::from_millis(20));
     }
     let _ = child.kill();
     let _ = child.wait();
@@ -1761,6 +1772,14 @@ impl TestServer {
     /// on-disk state here, then calls `respawn_with_env`.
     pub fn kill(&mut self) {
         stop_child(&mut self.process);
+    }
+
+    /// Stop the proxy the way Kubernetes does on a rolling deploy: SIGTERM,
+    /// then wait for the graceful exit (SIGKILL only after 10 s). Unlike
+    /// [`Self::kill`], this sends SIGTERM in every run, not only under
+    /// coverage. Follow with `respawn_with_env`.
+    pub fn terminate(&mut self) {
+        sigterm_then_wait(&mut self.process);
     }
 
     pub async fn respawn_with_env(&mut self, extra: &[(&str, &str)]) {

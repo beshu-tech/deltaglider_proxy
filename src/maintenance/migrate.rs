@@ -63,7 +63,8 @@ use crate::transfer::{
 
 use super::store::MaintenanceJob;
 use super::worker::{
-    check_cancel, drain_inflight_writes, heartbeat, persist, record_failure, LEASE_LOST,
+    after_run, check_cancel, drain_inflight_writes, heartbeat, persist, record_failure,
+    stop_if_shutting_down, AfterRun,
 };
 
 pub const TRANSIENT_PREFIX: &str = "__dgmigrate_";
@@ -414,7 +415,9 @@ async fn remove_staged_copies(
 ) {
     let fail = |e: String| async move {
         tracing::warn!("migrate: job #{} staged-copy cleanup: {e}", job.id);
-        record_failure(db, job.id, "", &format!("staged-copy cleanup: {e}")).await;
+        // Best effort: during a shutdown the record is refused, and the
+        // unwind does not run then anyway (see execute_migrate_phases).
+        let _ = record_failure(db, job.id, "", &format!("staged-copy cleanup: {e}")).await;
     };
     // A config apply can wipe the staging route; without it the deletes
     // would hit the default backend.
@@ -485,11 +488,13 @@ pub async fn execute_migrate_phases(
     let params = parse_params(job.params.as_deref().ok_or("migrate job has no params")?)?;
     let result = run_phases(mutator, db, state, instance_id, job, &params).await;
 
-    let lease_lost = result.as_ref().err().is_some_and(|e| e == LEASE_LOST);
-    if result.is_err() && !lease_lost {
-        // (Lease loss is NOT an unwind: the job continues under the next
-        // claimer, which needs the staging route — and re-asserts it per
-        // page anyway.)
+    // Only an outcome the worker SETTLES unwinds. Lease loss is NOT an
+    // unwind: the job continues under the next claimer, which needs the
+    // staging route (and re-asserts it per page anyway). A shutdown is not
+    // one either: the next boot resumes the copy, so deleting the staged
+    // copies would throw that work away and fail a healthy migration.
+    let settles = after_run(&result, crate::shutdown::is_shutting_down()) == AfterRun::Settle;
+    if result.is_err() && settles {
         // Determine the phase we died in (re-read — phases persist it).
         let phase = {
             let db = db.lock().await;
@@ -642,6 +647,7 @@ async fn run_phases(
                     .await;
                     check_cancel(db, job.id).await?;
                 }
+                stop_if_shutting_down()?;
                 // Skip only a target copy that PROVABLY matches the source: a
                 // cancelled earlier attempt leaves copies that the source has
                 // since outgrown.
@@ -671,8 +677,8 @@ async fn run_phases(
                         bytes += outcome.bytes_copied as i64;
                     }
                     Err(e) => {
+                        record_failure(db, job.id, key, &e.to_string()).await?;
                         failed += 1;
-                        record_failure(db, job.id, key, &e.to_string()).await;
                         persist(db, job, "copy", None, done, skipped, failed, bytes, None).await;
                         return Err(format!(
                             "copy of '{key}' failed — source remains authoritative: {e}"
@@ -886,19 +892,20 @@ async fn run_phases(
             {
                 Ok(p) => p,
                 Err(e) => {
+                    record_failure(db, job.id, "", &format!("cleanup list failed: {e}")).await?;
                     delete_failures += 1;
-                    record_failure(db, job.id, "", &format!("cleanup list failed: {e}")).await;
                     break 'cleanup;
                 }
             };
             let mut deleted_this_sweep = 0u32;
             for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
+                stop_if_shutting_down()?;
                 match engine.delete(&cleanup_key, key).await {
                     Ok(_) => deleted_this_sweep += 1,
                     Err(e) => {
-                        delete_failures += 1;
                         record_failure(db, job.id, key, &format!("source delete failed: {e}"))
-                            .await;
+                            .await?;
+                        delete_failures += 1;
                     }
                 }
             }
