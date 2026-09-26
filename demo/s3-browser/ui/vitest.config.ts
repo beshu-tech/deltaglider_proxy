@@ -20,6 +20,9 @@ export default mergeConfig(
             environment: 'jsdom',
             include: ['src/**/*.test.tsx'],
             setupFiles: ['src/test/setup.ts'],
+            // Full AntD panels take seconds to mount in jsdom; the 5 s
+            // default times out on a loaded machine or a 4-vCPU runner.
+            testTimeout: 15_000,
           },
         },
       ],
