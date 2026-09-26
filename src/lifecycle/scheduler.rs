@@ -255,4 +255,260 @@ mod tests {
         };
         assert_eq!(scheduler_tick(&cfg), DEFAULT_TICK);
     }
+
+    // ── The scheduler loop over a real engine (filesystem) + config DB ──
+
+    struct Env {
+        state: Arc<AppState>,
+        db: Arc<Mutex<ConfigDb>>,
+        _data: tempfile::TempDir,
+    }
+
+    async fn env() -> Env {
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::default();
+        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+            crate::storage::FilesystemBackend::new(data.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &config,
+            None,
+        );
+        let state = Arc::new(AppState {
+            engine: arc_swap::ArcSwap::from_pointee(engine),
+            multipart: Arc::new(crate::multipart::MultipartStore::new(
+                config.max_object_size,
+            )),
+            metrics: Arc::new(crate::metrics::Metrics::new()),
+            usage_scanner: Arc::new(crate::usage_scanner::UsageScanner::new()),
+            bucket_usage: None,
+            reference_lock: None,
+            config_db: None,
+            maintenance_gate: Arc::new(crate::maintenance::gate::MaintenanceGate::new()),
+            maintenance_notify: Arc::new(tokio::sync::Notify::new()),
+            backend_capabilities: Default::default(),
+            backend_health: Default::default(),
+        });
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("test").unwrap()));
+        Env {
+            state,
+            db,
+            _data: data,
+        }
+    }
+
+    /// A lifecycle section with one rule per `(name, bucket)`, each deleting
+    /// everything under `old/` older than 1 ms.
+    fn lifecycle(rules: &[(&str, &str)]) -> LifecycleConfig {
+        let mut yaml = String::from("enabled: true\ntick_interval: 1h\nrules:\n");
+        for (name, bucket) in rules {
+            yaml.push_str(&format!(
+                "  - name: {name}\n    enabled: true\n    bucket: {bucket}\n    prefix: old/\n    \
+                 action: delete\n    expire_after: 1ms\n"
+            ));
+        }
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    async fn seed(env: &Env, bucket: &str) {
+        let engine = env.state.engine.load();
+        engine.create_bucket(bucket).await.unwrap();
+        engine
+            .store(bucket, "old/a.txt", b"expired", None, Default::default())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    async fn exists(env: &Env, bucket: &str) -> bool {
+        env.state
+            .engine
+            .load()
+            .head(bucket, "old/a.txt")
+            .await
+            .is_ok()
+    }
+
+    async fn run(env: &Env, cfg: &LifecycleConfig) {
+        run_due_rules(cfg, Some(env.db.clone()), &env.state, "sched-test").await;
+    }
+
+    /// A due rule runs, releases its lease, and is not due again until one
+    /// tick later.
+    #[tokio::test]
+    async fn a_due_rule_runs_then_waits_one_tick() {
+        let env = env().await;
+        seed(&env, "sched-due").await;
+        let cfg = lifecycle(&[("sched-due-rule", "sched-due")]);
+        run(&env, &cfg).await;
+        assert!(
+            !exists(&env, "sched-due").await,
+            "the expired object is deleted"
+        );
+        let db = env.db.lock().await;
+        let st = db.lifecycle_load_state("sched-due-rule").unwrap().unwrap();
+        assert_eq!(st.last_status, "succeeded", "{st:?}");
+        let now = crate::lifecycle::current_unix_seconds();
+        assert!(
+            st.next_due_at >= now + 3600 - 5,
+            "the next run is one tick away: {st:?}"
+        );
+        assert!(
+            db.lifecycle_try_acquire_lease("sched-due-rule", "other", now, 60)
+                .unwrap(),
+            "the scheduler released its lease"
+        );
+        db.lifecycle_release_lease("sched-due-rule", "other")
+            .unwrap();
+        drop(db);
+
+        // Not due: a new expired object stays.
+        seed(&env, "sched-due").await;
+        run(&env, &cfg).await;
+        assert!(
+            exists(&env, "sched-due").await,
+            "a rule that is not due does not run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paused_rule_is_skipped() {
+        let env = env().await;
+        seed(&env, "sched-paused").await;
+        {
+            let db = env.db.lock().await;
+            let now = crate::lifecycle::current_unix_seconds();
+            db.lifecycle_ensure_state("sched-paused-rule", now).unwrap();
+            db.lifecycle_set_paused("sched-paused-rule", true).unwrap();
+        }
+        run(&env, &lifecycle(&[("sched-paused-rule", "sched-paused")])).await;
+        assert!(
+            exists(&env, "sched-paused").await,
+            "a paused rule deletes nothing"
+        );
+    }
+
+    /// A rule whose bucket a maintenance job gates is deferred, and its
+    /// lease is released so run-now is not blocked for a TTL.
+    #[tokio::test]
+    async fn a_maintenance_gated_bucket_defers_the_rule_and_frees_the_lease() {
+        let env = env().await;
+        seed(&env, "sched-gated").await;
+        env.state.maintenance_gate.set_busy("sched-gated");
+        let cfg = lifecycle(&[("sched-gated-rule", "sched-gated")]);
+        run(&env, &cfg).await;
+        assert!(
+            exists(&env, "sched-gated").await,
+            "deferred: nothing deleted"
+        );
+        {
+            let db = env.db.lock().await;
+            let now = crate::lifecycle::current_unix_seconds();
+            assert!(
+                db.lifecycle_try_acquire_lease("sched-gated-rule", "other", now, 60)
+                    .unwrap(),
+                "the deferred rule's lease is free"
+            );
+            db.lifecycle_release_lease("sched-gated-rule", "other")
+                .unwrap();
+            let st = db
+                .lifecycle_load_state("sched-gated-rule")
+                .unwrap()
+                .unwrap();
+            assert!(
+                st.last_run_at.is_none_or(|t| t == 0),
+                "no run recorded: {st:?}"
+            );
+        }
+        env.state.maintenance_gate.clear("sched-gated");
+        run(&env, &cfg).await;
+        assert!(
+            !exists(&env, "sched-gated").await,
+            "runs once the gate clears"
+        );
+    }
+
+    /// Another holder's live lease: the scheduler skips the rule.
+    #[tokio::test]
+    async fn a_rule_leased_elsewhere_is_skipped() {
+        let env = env().await;
+        seed(&env, "sched-leased").await;
+        {
+            let db = env.db.lock().await;
+            let now = crate::lifecycle::current_unix_seconds();
+            db.lifecycle_ensure_state("sched-leased-rule", now).unwrap();
+            assert!(db
+                .lifecycle_try_acquire_lease("sched-leased-rule", "peer", now, 300)
+                .unwrap());
+        }
+        run(&env, &lifecycle(&[("sched-leased-rule", "sched-leased")])).await;
+        assert!(exists(&env, "sched-leased").await);
+    }
+
+    /// Duplicate names and a rule that can never run are skipped; a valid
+    /// rule next to them still runs.
+    #[tokio::test]
+    async fn duplicate_and_invalid_rules_are_skipped() {
+        let env = env().await;
+        seed(&env, "sched-dup").await;
+        seed(&env, "sched-bad").await;
+        seed(&env, "sched-ok").await;
+        let mut cfg = lifecycle(&[
+            ("sched-dup-rule", "sched-dup"),
+            ("sched-dup-rule", "sched-dup"),
+            ("sched-bad-rule", "sched-bad"),
+            ("sched-ok-rule", "sched-ok"),
+        ]);
+        cfg.rules[2].expire_after = None;
+        run(&env, &cfg).await;
+        assert!(exists(&env, "sched-dup").await, "duplicated names: skipped");
+        assert!(exists(&env, "sched-bad").await, "no expire_after: skipped");
+        assert!(!exists(&env, "sched-ok").await, "the valid rule runs");
+    }
+
+    /// Without a config DB the in-process guard picks one runner: a rule
+    /// already running here is skipped.
+    #[tokio::test]
+    async fn without_a_db_the_process_guard_serialises_a_rule() {
+        let env = env().await;
+        seed(&env, "sched-nodb").await;
+        let cfg = lifecycle(&[("sched-nodb-rule", "sched-nodb")]);
+        let held = crate::lifecycle::try_acquire_rule("sched-nodb-rule").unwrap();
+        run_due_rules(&cfg, None, &env.state, "sched-test").await;
+        assert!(exists(&env, "sched-nodb").await, "busy here: skipped");
+        drop(held);
+        run_due_rules(&cfg, None, &env.state, "sched-test").await;
+        assert!(!exists(&env, "sched-nodb").await, "free: runs");
+    }
+
+    /// The spawned loop sleeps one tick, then runs due rules; with lifecycle
+    /// disabled it runs nothing. Virtual time: the minimum tick is 60 s.
+    #[tokio::test(start_paused = true)]
+    async fn the_spawned_scheduler_runs_rules_each_tick_while_enabled() {
+        let env = env().await;
+        seed(&env, "sched-loop").await;
+        let mut disabled = lifecycle(&[("sched-loop-rule", "sched-loop")]);
+        disabled.enabled = false;
+        let config = crate::config::Config {
+            lifecycle: disabled,
+            ..Default::default()
+        };
+        let shared: crate::config::SharedConfig = Arc::new(tokio::sync::RwLock::new(config));
+        let task = spawn_scheduler(shared.clone(), Some(env.db.clone()), env.state.clone());
+        tokio::time::sleep(Duration::from_secs(3601)).await;
+        assert!(exists(&env, "sched-loop").await, "disabled: no run");
+        shared.write().await.lifecycle.enabled = true;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while exists(&env, "sched-loop").await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the next tick runs the rule"
+            );
+            tokio::time::sleep(Duration::from_secs(600)).await;
+        }
+        task.abort();
+    }
 }
