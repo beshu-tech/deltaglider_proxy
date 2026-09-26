@@ -315,6 +315,8 @@ const SPECS: &[Spec] = &[
 pub(crate) type Snapshot = BTreeMap<&'static str, BTreeMap<String, Entity>>;
 
 /// A row changed on both sides (or deleted on one, changed on the other).
+/// `resolution` is "local", "remote", "deleted", "renamed",
+/// "rename-collision" or "disabled" (lost its access key to another user).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MergeConflict {
     pub table: &'static str,
@@ -759,6 +761,15 @@ fn propagate_renames(
     }
 }
 
+/// Pure: the access key a user gets when it lost its key to another user
+/// in the merge. Deterministic, so every node converges on one value; it
+/// can never collide with a generated key (those are `AK` + 18 chars).
+pub(crate) fn duplicate_key_stand_in(name: &str, access_key_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(format!("{name}\u{1f}{access_key_id}").as_bytes());
+    format!("DISABLED-DUPLICATE-{}", &hex::encode(h)[..16])
+}
+
 /// Pure: the name a user takes when another user holds its name:
 /// `<name>-<first 8 hex chars of sha256(access key)>`, then `-2`, `-3`,
 /// ... past names in use. Every node derives the same name from the same key.
@@ -849,17 +860,22 @@ pub(crate) fn merge_snapshots(
         merged.insert(spec.table, t);
     }
 
-    // Two users renamed on two nodes can end up with one access key: keep the
-    // newer row (the key is unique, and one identity must own it).
+    // Two users renamed or re-keyed on two nodes can end up with one access
+    // key. The key is unique and one identity must own it: the newer row
+    // keeps it. The older row is DISABLED with a stand-in key, never deleted,
+    // so its name, secret, permissions and memberships survive for an admin
+    // to re-key (a delete here would silently lose a user).
     if let Some(users) = merged.get_mut("users") {
         let mut owner: HashMap<String, (String, i64)> = HashMap::new();
-        let mut drop = Vec::new();
+        let mut losers: Vec<(String, String)> = Vec::new();
         for (name, (e, _)) in users.iter() {
             let ak = text(e.row.get("access_key_id"));
             match owner.get(&ak) {
-                Some((_, mtime)) if *mtime >= e.mtime => drop.push(name.clone()),
+                Some((kept, mtime)) if *mtime >= e.mtime => {
+                    losers.push((name.clone(), kept.clone()))
+                }
                 Some((other, _)) => {
-                    drop.push(other.clone());
+                    losers.push((other.clone(), name.clone()));
                     owner.insert(ak, (name.clone(), e.mtime));
                 }
                 None => {
@@ -867,12 +883,20 @@ pub(crate) fn merge_snapshots(
                 }
             }
         }
-        for name in drop {
-            users.remove(&name);
+        for (loser, winner) in losers {
+            let Some((e, _)) = users.get_mut(&loser) else {
+                continue;
+            };
+            let ak = text(e.row.get("access_key_id"));
+            e.row.insert(
+                "access_key_id".into(),
+                Value::Text(duplicate_key_stand_in(&loser, &ak)),
+            );
+            e.row.insert("enabled".into(), Value::Integer(0));
             conflicts.push(MergeConflict {
                 table: "users",
-                target: name,
-                resolution: "deleted",
+                target: format!("{loser} (disabled; its access key stays with {winner})"),
+                resolution: "disabled",
             });
         }
     }
@@ -2071,6 +2095,52 @@ mod review3_tests {
             "the identity binding is gone (conflicts reported: {:?})",
             report.conflicts
         );
+    }
+
+    /// Two nodes give one access key to two users (two rotations to one
+    /// imported key): the key is unique, so one row must give it up. That row
+    /// is disabled, never deleted: its name, permissions and memberships stay.
+    #[test]
+    fn a_duplicate_access_key_disables_the_older_user_and_keeps_it() {
+        let t = trio(|db| {
+            db.create_user("u1", "AKU1000000001", "s1", true, &[perm("a/*")])
+                .unwrap();
+            db.create_user("u2", "AKU2000000001", "s2", true, &[])
+                .unwrap();
+        });
+        let local = open(&t.local);
+        local
+            .rotate_keys(user_id(&local, "u1"), "AKSHARED00001", "x1")
+            .unwrap();
+        tick();
+        {
+            let remote = open(&t.remote);
+            remote
+                .rotate_keys(user_id(&remote, "u2"), "AKSHARED00001", "x2")
+                .unwrap();
+        }
+        let report = local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .unwrap();
+        assert_eq!(names(&local), vec!["u1", "u2"], "a user was deleted");
+        let users = local.load_users().unwrap();
+        let u1 = users.iter().find(|u| u.name == "u1").unwrap();
+        let u2 = users.iter().find(|u| u.name == "u2").unwrap();
+        assert!(u2.enabled && u2.access_key_id == "AKSHARED00001");
+        assert!(!u1.enabled, "the older holder of the key must be disabled");
+        assert_ne!(u1.access_key_id, "AKSHARED00001");
+        assert_eq!(u1.permissions[0].resources, vec!["a/*"]);
+        assert!(
+            report
+                .conflicts
+                .iter()
+                .any(|c| c.target.contains("u1") && c.target.contains("u2")),
+            "{:?}",
+            report.conflicts
+        );
+        // Every node derives the same stand-in key.
+        let stand_in = u1.access_key_id.clone();
+        assert_eq!(stand_in, duplicate_key_stand_in("u1", "AKSHARED00001"));
     }
 
     /// The peer renames a user while this node adds it to a group and edits

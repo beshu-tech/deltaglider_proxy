@@ -308,9 +308,15 @@ to the other side before the merge, so a login or a membership change on the
 other instance still reaches the renamed row. Two users that two instances
 created with one name and different access keys (for example two people with
 one IdP display name) stay two users: the one whose access key sorts later is
-renamed to `<name>-<first 6 access key characters, lower case>`, on every
-instance alike. OAuth provisioning of a taken name uses the same suffix
-instead of `-2`. A failed commit of the merge rolls back.
+renamed to `<name>-<tag>`, where the tag is the first 8 hex characters of
+the SHA-256 hash of its access key id, on every instance alike. OAuth provisioning of a taken name uses the same suffix
+instead of `-2`. When the merge would give one access key to two users (for
+example two rotations to one imported key), it no longer deletes one of them:
+the more recent user keeps the key, and the other one is disabled with a
+stand-in key (`DISABLED-DUPLICATE-...`) and keeps its name, secret,
+permissions and memberships, so that an admin can give it a new key. An
+`iam_sync_conflict` audit entry names both users. A failed commit of the
+merge rolls back.
 
 Upgrade: the schema moves to v26 and v28, which add a `sync_mtime` column to
 the IAM tables and a `rule_uid` column to the mapping rules. The first sync
