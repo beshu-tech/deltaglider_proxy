@@ -169,6 +169,9 @@ async fn test_hot_apply_rejects_routing_client_writable_bucket_to_noncas_backend
         .extra_yaml_root(&b2sim_yaml(local.path()))
         .env("DGP_TEST_FORCE_NONCAS_BACKEND", "b2sim")
         .env("DGP_BACKEND_ALLOW_LOCAL", "true")
+        // Enabling config_sync_bucket needs the shared DB key (S8), else the
+        // apply is refused before the capability gate this test targets.
+        .env("DGP_CONFIG_DB_KEY", common::TEST_CONFIG_DB_KEY)
         .build()
         .await;
     let admin = admin_http_client(&server.endpoint()).await;
