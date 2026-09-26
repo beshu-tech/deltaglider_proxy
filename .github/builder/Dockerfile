@@ -36,13 +36,13 @@ RUN curl -fsSL https://deb.nodesource.com/setup_26.x | bash - \
   && apt-get install -y --no-install-recommends nodejs \
   && rm -rf /var/lib/apt/lists/*
 
-# ── Rust stable via rustup (minimal profile — no docs) ─────────────
+# ── Rust via rustup, pinned (keep in step with rust-toolchain.toml) ──
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH="/usr/local/cargo/bin:${PATH}"
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain stable --profile minimal \
+    | sh -s -- -y --default-toolchain 1.98.0 --profile minimal \
   && rustup component add rustfmt clippy \
   && rm -rf "$RUSTUP_HOME"/toolchains/*/share/doc \
   && rm -rf "$RUSTUP_HOME"/toolchains/*/share/man
