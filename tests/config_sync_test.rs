@@ -95,3 +95,67 @@ async fn test_config_db_backup_export_import() {
         "Imported group should exist on second server"
     );
 }
+
+/// S8 follow-up: the bootstrap hash no longer encrypts the config DB, so a
+/// full restore of a backup from an instance with ANOTHER admin password is
+/// not refused any more: it adopts the backup's password.
+#[tokio::test]
+async fn full_restore_adopts_a_different_bootstrap_password() {
+    let src_password = "source-instance-password-1";
+    let source = TestServer::builder()
+        .auth("BKSRC", "BKSRCSECRET")
+        .bootstrap_password(src_password)
+        .build()
+        .await;
+    let src_admin = common::admin_http_client_with_password(&source.endpoint(), src_password).await;
+    let zip = src_admin
+        .get(format!("{}/_/api/admin/backup", source.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+
+    let target = TestServer::builder()
+        .auth("BKDST", "BKDSTSECRET")
+        .build()
+        .await;
+    let resp = admin_http_client(&target.endpoint())
+        .await
+        .post(format!("{}/_/api/admin/backup", target.endpoint()))
+        .header("content-type", "application/zip")
+        .body(zip.to_vec())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(
+        status.as_u16(),
+        200,
+        "a different bootstrap hash must not block: {body}"
+    );
+
+    // The target's admin password is now the source's.
+    let login = |pw: &'static str| {
+        let ep = target.endpoint();
+        async move {
+            reqwest::Client::new()
+                .post(format!("{ep}/_/api/admin/login"))
+                .json(&json!({ "password": pw }))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert!(
+        login(src_password).await.is_success(),
+        "the backup's password must work"
+    );
+    assert!(
+        !login(common::TEST_BOOTSTRAP_PASSWORD).await.is_success(),
+        "the old password must stop working"
+    );
+}

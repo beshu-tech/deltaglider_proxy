@@ -50,6 +50,8 @@ curl -b cookies -X POST \
 
 The import is atomic: all four parts are unpacked and sha256-verified before any state changes. `external_identities` are remapped through the imported user and provider IDs, so OAuth users keep working. A legacy JSON-only body is still accepted for IAM-only restores from pre-v0.8.4 scripts.
 
+A full restore (the default mode, and `mode=config-only`) also restores the admin password: when the zip's `secrets.json` carries a bootstrap password hash that differs from the running instance's, the instance adopts it, and the backup's admin password works from then on. The hash does not encrypt anything, so this is safe. There is one exception: when `DGP_BOOTSTRAP_PASSWORD_HASH` is set, it sets the hash at every start, so the restore keeps the running password and logs a warning. Use `mode=preserve-bootstrap` to restore everything except the admin password, or `mode=iam-only` to keep this instance's admin password and storage configuration.
+
 The zip carries the IAM state as plain JSON (`iam.json`), so a restore onto a **fresh instance** does not need the old instance's config DB key: the fresh instance writes the imported users into its own database, under its own key. The zip's `secrets.json` holds the bootstrap password hash only when the config file held it; a hash that came from the environment is not in the backup.
 
 ## Snapshot the DB file

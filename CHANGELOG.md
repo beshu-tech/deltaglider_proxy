@@ -144,6 +144,12 @@ base, or a synced copy that opens only with the previous key is re-encrypted
 with the new key; an instance whose database changed key uploads it once at
 start, so the synced copy moves to the new key too.
 
+A full backup restore no longer refuses a backup whose bootstrap password
+hash differs from the running instance's: the hash no longer protects the
+database, so the restore adopts the backup's admin password. When
+`DGP_BOOTSTRAP_PASSWORD_HASH` is set, the running password stays, because
+that variable sets it at every start.
+
 The recovery wizard of a locked database now accepts a config DB key, or,
 for a database from an older release, the bootstrap password hash.
 

@@ -46,10 +46,21 @@ fn password_err(status: StatusCode, msg: impl Into<String>) -> axum::response::R
 
 /// D15: the env var that pins the bootstrap hash, if one is set. That hash
 /// wins at every boot, so a GUI change would be lost at the next start.
-fn env_pinned_hash_var(env: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+pub(crate) fn env_pinned_hash_var(env: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
     ["DGP_BOOTSTRAP_PASSWORD_HASH", "DGP_ADMIN_PASSWORD_HASH"]
         .into_iter()
         .find(|n| env(n).is_some_and(|v| !v.trim().is_empty()))
+}
+
+/// Make `hash` the bootstrap hash: the state file first (the next boot
+/// reads it), then the in-memory login verifier and the config. Shared by
+/// the password change and the backup restore.
+pub(crate) async fn install_bootstrap_hash(state: &AdminState, hash: &str) -> std::io::Result<()> {
+    let state_file = std::path::Path::new(".deltaglider_bootstrap_hash");
+    crate::config::write_bootstrap_hash_file(state_file, hash)?;
+    *state.password_hash.write() = hash.to_string();
+    state.config.write().await.bootstrap_password_hash = Some(hash.to_string());
+    Ok(())
 }
 
 /// PUT /api/admin/password — change bootstrap password.
@@ -106,8 +117,7 @@ pub async fn change_password(
         }
     };
 
-    let state_file = std::path::Path::new(".deltaglider_bootstrap_hash");
-    if let Err(e) = crate::config::write_bootstrap_hash_file(state_file, &new_hash) {
+    if let Err(e) = install_bootstrap_hash(&state, &new_hash).await {
         tracing::error!("Failed to persist new admin hash to disk: {}", e);
         return password_err(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -116,15 +126,6 @@ pub async fn change_password(
                 e
             ),
         );
-    }
-
-    // File written successfully — now update in-memory state
-    *state.password_hash.write() = new_hash.clone();
-
-    // Also update config
-    {
-        let mut cfg = state.config.write().await;
-        cfg.bootstrap_password_hash = Some(new_hash);
     }
 
     audit_log("change_password", "bootstrap", "", &headers);

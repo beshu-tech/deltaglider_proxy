@@ -105,10 +105,6 @@ impl BackupSecretApplyError {
             detail: sanitize_error_detail(detail.into()),
         }
     }
-
-    fn conflict(detail: impl Into<String>) -> Self {
-        Self::new(StatusCode::CONFLICT, detail)
-    }
 }
 
 /// Query params for `POST /_/api/admin/backup`.
@@ -120,10 +116,10 @@ pub struct ImportQuery {
 
 /// Explicit restore scope for zip imports.
 ///
-/// `full` remains the default and still means "restore config + secrets + IAM,
-/// including bootstrap password hash when compatible". `preserve-bootstrap`
-/// is the prod-to-local/test path: restore everything except the local admin
-/// password / SQLCipher key material.
+/// `full` remains the default and means "restore config + secrets + IAM,
+/// including the bootstrap password hash" (adopted unless an env var pins
+/// it). `preserve-bootstrap` is the prod-to-local/test path: restore
+/// everything except the local admin password.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 enum ImportMode {
@@ -1105,21 +1101,33 @@ fn hydrate_restore_doc(
     Ok((yaml, refs))
 }
 
-fn backup_secret_conflict_detail(current: &Config, secrets: &BackupSecrets) -> Option<String> {
-    let new_hash = secrets.bootstrap_password_hash.as_ref()?;
-    let existing = current.bootstrap_password_hash.as_ref()?;
-    if existing == new_hash {
-        return None;
-    }
+/// What a full/config-only restore does with the backup's bootstrap hash.
+#[derive(Debug, PartialEq, Eq)]
+enum BootstrapRestore {
+    /// No hash in the backup, or the same hash: nothing to do.
+    Keep,
+    /// Adopt the backup's hash (the admin password of the source instance).
+    /// Since S8 the hash no longer encrypts the config DB, so a different
+    /// hash is safe to restore.
+    Adopt(String),
+    /// A `DGP_BOOTSTRAP_PASSWORD_HASH` env var sets the hash at every start,
+    /// so the restored hash would be lost on restart: keep the running one
+    /// (env wins, like every env-controlled field) and say so.
+    EnvPinned(&'static str),
+}
 
-    Some(
-        "secrets.json bootstrap_password_hash differs from the running instance; \
-         full/config-only restore does not replace the admin password. Use restore \
-         mode 'iam-only' to import IAM/admin data while preserving this instance's \
-         admin password and storage config, or change the local admin password to \
-         the backup's one before attempting a full restore."
-            .to_string(),
-    )
+/// Pure restore decision for the bootstrap hash.
+fn plan_bootstrap_restore(
+    current: Option<&str>,
+    backup: Option<&str>,
+    env_pinned: Option<&'static str>,
+) -> BootstrapRestore {
+    match backup {
+        None => BootstrapRestore::Keep,
+        Some(b) if Some(b) == current => BootstrapRestore::Keep,
+        Some(_) if env_pinned.is_some() => BootstrapRestore::EnvPinned(env_pinned.unwrap()),
+        Some(b) => BootstrapRestore::Adopt(b.to_string()),
+    }
 }
 
 /// Unpack a Full Backup zip and apply all four parts atomically.
@@ -1318,25 +1326,6 @@ async fn import_zip_full_backup(
         "Full-backup import: backup parts parsed"
     );
 
-    // Refuse known secret conflicts before applying config.yaml. The previous
-    // ordering applied config first and then failed on a bootstrap hash mismatch,
-    // leaving a local/dev instance pointed at prod storage even though the import
-    // returned 409.
-    if mode.restores_bootstrap() {
-        if let Some(secrets) = secrets.as_ref() {
-            let cfg = state.config.read().await;
-            if let Some(detail) = backup_secret_conflict_detail(&cfg, secrets) {
-                drop(cfg);
-                return Err(import_fail(
-                    StatusCode::CONFLICT,
-                    "validate_secrets",
-                    "secrets.json",
-                    detail,
-                ));
-            }
-        }
-    }
-
     if mode.restores_config() {
         if let Some(yaml_str) = yaml_str {
             // Skip application if the YAML is empty/whitespace-only.
@@ -1501,11 +1490,10 @@ async fn import_zip_full_backup(
 ///
 /// X-ray fixes (HIGH #2, HIGH #3, MED #2):
 ///
-/// * **bootstrap_password_hash**: refused when the running instance
-///   already has a *different* hash — a restore must not swap the admin
-///   password under a running session store (change it via
-///   `PUT /api/admin/password`). Initial seeding (no existing hash, or
-///   identical hash) is permitted.
+/// * **bootstrap_password_hash**: adopted when it differs (S8: it is only
+///   the admin password, not the config DB key), written to the state file
+///   and swapped into the login verifier; kept when an env var pins it
+///   (`plan_bootstrap_restore`).
 /// * **Engine rebuild**: after mutating storage creds under the write
 ///   lock, call `apply_config_transition` so the S3 client picks up
 ///   the new credentials on the next request. Without this, the
@@ -1526,20 +1514,28 @@ async fn apply_secrets(
     let mut cfg = state.config.write().await;
     let old_cfg = cfg.clone();
 
-    // Guardrail: refuse hash rotation on a running instance. The only
-    // supported path to change the bootstrap password is
-    // PUT /api/admin/password, which verifies the current password.
-    // Initial seeding (hash match, or no existing hash)
-    // is fine — that covers first-restore into a fresh instance.
-    if restore_bootstrap_hash {
-        if let Some(detail) = backup_secret_conflict_detail(&old_cfg, secrets) {
-            tracing::error!("Full-backup import: {}", detail);
-            return Err(BackupSecretApplyError::conflict(detail));
-        }
+    // The bootstrap hash is only the admin password now (S8: it does not
+    // encrypt the config DB), so a restore adopts a different one, unless an
+    // env var pins it.
+    let hash_plan = if restore_bootstrap_hash {
+        plan_bootstrap_restore(
+            old_cfg.bootstrap_password_hash.as_deref(),
+            secrets.bootstrap_password_hash.as_deref(),
+            super::config::password::env_pinned_hash_var(|n| std::env::var(n).ok()),
+        )
+    } else {
+        BootstrapRestore::Keep
+    };
+    if let BootstrapRestore::EnvPinned(var) = &hash_plan {
+        tracing::warn!(
+            "Full-backup import: {var} is set, so the admin password of the backup is not \
+             restored (the env var sets it at every start)"
+        );
     }
 
     let mut new_cfg = old_cfg.clone();
-    hydrate_config_secrets(&mut new_cfg, secrets, restore_bootstrap_hash);
+    // The hash is installed separately below (state file + login verifier).
+    hydrate_config_secrets(&mut new_cfg, secrets, false);
     // Env wins consistently: the restored secrets reach the file, but an
     // env-controlled field keeps its env value at runtime.
     if let Err(e) = crate::api::admin::config::reapply_env(&old_cfg, &mut new_cfg, false) {
@@ -1581,6 +1577,22 @@ async fn apply_secrets(
         ));
     }
     drop(cfg); // before the config-DB lock below
+
+    if let BootstrapRestore::Adopt(hash) = &hash_plan {
+        if let Err(e) = super::config::password::install_bootstrap_hash(state, hash).await {
+            tracing::error!("Full-backup import: bootstrap hash not restored: {e}");
+            return Err(BackupSecretApplyError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("config restored, but the admin password could not be written: {e}"),
+            ));
+        }
+        super::audit_log(
+            "restore_bootstrap_password",
+            "admin",
+            "bootstrap",
+            &axum::http::HeaderMap::new(),
+        );
+    }
 
     // OAuth client_secret per provider, by name (robust to id
     // reshuffles across restores). Requires the provider row to
@@ -2259,38 +2271,30 @@ storage:
     }
 
     #[test]
-    fn backup_secret_conflict_names_bootstrap_hash_without_leaking_values() {
-        let current = Config {
-            bootstrap_password_hash: Some("$2b$12$current-local-hash".into()),
-            ..Config::default()
-        };
-        let secrets = BackupSecrets {
-            bootstrap_password_hash: Some("$2b$12$backup-prod-hash".into()),
-            ..BackupSecrets::default()
-        };
-
-        let detail = backup_secret_conflict_detail(&current, &secrets)
-            .expect("different bootstrap hash must be a conflict");
-        assert!(detail.contains("bootstrap_password_hash"));
-        assert!(detail.contains("iam-only"));
-        assert!(!detail.contains("current-local-hash"));
-        assert!(!detail.contains("backup-prod-hash"));
-    }
-
-    #[test]
-    fn backup_secret_conflict_allows_matching_or_missing_bootstrap_hash() {
-        let current = Config {
-            bootstrap_password_hash: Some("$2b$12$same-hash".into()),
-            ..Config::default()
-        };
-        let matching = BackupSecrets {
-            bootstrap_password_hash: Some("$2b$12$same-hash".into()),
-            ..BackupSecrets::default()
-        };
-        assert!(backup_secret_conflict_detail(&current, &matching).is_none());
-
-        let missing = BackupSecrets::default();
-        assert!(backup_secret_conflict_detail(&current, &missing).is_none());
+    fn bootstrap_restore_truth_table() {
+        use BootstrapRestore::*;
+        let f = plan_bootstrap_restore;
+        assert_eq!(f(Some("$2b$a"), None, None), Keep);
+        assert_eq!(f(Some("$2b$a"), Some("$2b$a"), None), Keep);
+        assert_eq!(f(Some("$2b$a"), Some("$2b$b"), None), Adopt("$2b$b".into()));
+        assert_eq!(f(None, Some("$2b$b"), None), Adopt("$2b$b".into()));
+        assert_eq!(
+            f(
+                Some("$2b$a"),
+                Some("$2b$b"),
+                Some("DGP_BOOTSTRAP_PASSWORD_HASH")
+            ),
+            EnvPinned("DGP_BOOTSTRAP_PASSWORD_HASH")
+        );
+        // The same hash under a pinned env is no conflict at all.
+        assert_eq!(
+            f(
+                Some("$2b$a"),
+                Some("$2b$a"),
+                Some("DGP_BOOTSTRAP_PASSWORD_HASH")
+            ),
+            Keep
+        );
     }
 
     #[test]
