@@ -7,9 +7,10 @@
  *     "You uploaded 1.4 TB. You're storing 96 GB."
  *
  * Layout: two zones over a full-width proof.
- *   - LEFT — the magnitude as a percentage ("270% smaller") at billboard size in gradient
- *     ink. Unbounded and visceral where the old % hero was capped and
- *     flat. The % survives as a green pill underneath.
+ *   - LEFT — the saved share as a percentage ("63.0% smaller on disk") at
+ *     billboard size in gradient ink, and the saved bytes as a green pill.
+ *     It is the saved share of the original bytes, so it never passes 100%
+ *     (the ratio × 100 lead, "270% smaller", was arithmetic nonsense).
  *   - RIGHT — the before/after proof: a dashed ghost bar ("without
  *     DeltaGlider", always full width) above the real bar ("with"),
  *     where the dense teal KEPT slice is dwarfed by the luminous green
@@ -107,25 +108,18 @@ function HeroInner({
   const hasData = totalOriginal > 0;
 
   // ─── Motion values ────────────────────────────────────────────────
-  const ratioMV = useMotionValue(1);
+  const percentMV = useMotionValue(0);
   const dollarMV = useMotionValue(0);
   const savedWidthMV = useMotionValue(0); // 0..100 — width of the SAVED field
 
-  const compressionRatio = totalStored > 0 ? totalOriginal / totalStored : 0;
-  const useRatioLead = compressionRatio >= 1.05;
-  const targetRatio = Math.max(1, compressionRatio);
   const targetPercent = clamp(savingsPercent, 0, 100);
   const targetSavedWidth = clamp(savingsPercent, 0, 100);
   const targetDollars = Math.max(0, monthlySavings);
 
-  // GOLDEN RULE: magnitudes are expressed as percentages, never as "N×".
-  // The lead figure is the multiplier × 100 — "2.7× smaller" renders as
-  // "270% smaller".
-  const ratioDisplay = useTransform(ratioMV, v =>
-    Math.round(v * 100).toLocaleString(),
-  );
+  // Magnitudes are percentages, never "N×". The lead is the saved share of
+  // the original bytes: the same number as every other savings surface.
   const dollarDisplay = useTransform(dollarMV, v => v.toFixed(2));
-  const percentLead = useTransform(ratioMV, () => targetPercent.toFixed(1));
+  const percentLead = useTransform(percentMV, v => v.toFixed(1));
   const keptWidth = useTransform(savedWidthMV, v => `max(${100 - v}%, 3px)`);
   const savedWidth = useTransform(savedWidthMV, v => `${v}%`);
   const seamLeft = useTransform(savedWidthMV, v => `calc(${100 - v}% - 1px)`);
@@ -141,20 +135,20 @@ function HeroInner({
     const skipAnim = prefersReduced || alreadyPlayed || liveScanning;
 
     if (skipAnim) {
-      ratioMV.set(targetRatio);
+      percentMV.set(targetPercent);
       dollarMV.set(targetDollars);
       savedWidthMV.set(targetSavedWidth);
       setSettled(true);
       return;
     }
 
-    ratioMV.set(1);
+    percentMV.set(0);
     dollarMV.set(0);
     savedWidthMV.set(0);
     setSettled(false);
 
     const opts = { duration: ANIMATION_MS / 1000, ease: EASE };
-    const ctrl1 = animate(ratioMV, targetRatio, opts);
+    const ctrl1 = animate(percentMV, targetPercent, opts);
     const ctrl2 = animate(dollarMV, targetDollars, opts);
     const ctrl3 = animate(savedWidthMV, targetSavedWidth, opts);
 
@@ -170,7 +164,7 @@ function HeroInner({
       window.clearTimeout(settleTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasData, targetRatio, targetDollars, targetSavedWidth, liveScanning]);
+  }, [hasData, targetPercent, targetDollars, targetSavedWidth, liveScanning]);
 
   // ─── Cost popover ────────────────────────────────────────────────
   const [showCostConfig, setShowCostConfig] = useState(false);
@@ -211,9 +205,7 @@ function HeroInner({
   // tracked with a ResizeObserver; the pure math lives in
   // heroNumberSize.ts. Hoisted above the early return (rules of hooks),
   // like the keptWidth/savedWidth transforms above.
-  const leadString = useRatioLead
-    ? Math.round(targetRatio * 100).toLocaleString()
-    : targetPercent.toFixed(1);
+  const leadString = targetPercent.toFixed(1);
   const [leftCol, setLeftCol] = useState<HTMLDivElement | null>(null);
   const [leftColWidth, setLeftColWidth] = useState(0);
   useEffect(() => {
@@ -311,11 +303,7 @@ function HeroInner({
         </div>
         <m.div
           aria-live="polite"
-          aria-label={
-            useRatioLead
-              ? `${Math.round(targetRatio * 100)} percent smaller`
-              : `${targetPercent.toFixed(1)} percent storage saved`
-          }
+          aria-label={`${targetPercent.toFixed(1)} percent smaller on disk`}
           animate={settled ? { scale: [1, 1.015, 1] } : undefined}
           transition={{ duration: 0.32, ease: 'easeOut' }}
           style={{
@@ -336,24 +324,13 @@ function HeroInner({
             animation: 'dgNumSheen 8s ease-in-out infinite',
           }}
         >
-          {useRatioLead ? (
-            <>
-              <m.span>{ratioDisplay}</m.span>
-              <span style={{ fontSize: '0.42em', fontWeight: 800, marginLeft: 2 }}>%</span>
-            </>
-          ) : (
-            <>
-              <m.span>{percentLead}</m.span>
-              <span style={{ fontSize: '0.38em', fontWeight: 800, marginLeft: 4 }}>%</span>
-            </>
-          )}
+          <m.span>{percentLead}</m.span>
+          <span style={{ fontSize: '0.38em', fontWeight: 800, marginLeft: 4 }}>%</span>
         </m.div>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
-          {useRatioLead && (
-            <div style={{ fontSize: 14, fontWeight: 600, color: colors.TEXT_SECONDARY }}>
-              smaller on disk
-            </div>
-          )}
+          <div style={{ fontSize: 14, fontWeight: 600, color: colors.TEXT_SECONDARY }}>
+            smaller on disk
+          </div>
           <div
             style={{
               padding: '4px 14px',
@@ -366,7 +343,7 @@ function HeroInner({
               border: `1px solid ${colors.ACCENT_GREEN}3a`,
             }}
           >
-            {targetPercent.toFixed(1)}% saved
+            {formatBytes(savedBytes)} saved
           </div>
         </div>
       </div>
