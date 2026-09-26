@@ -66,6 +66,8 @@ mod concurrency_test;
 mod config_sync_ha_test;
 #[path = "config_sync_test.rs"]
 mod config_sync_test;
+#[path = "coordination_bucket_reserved_test.rs"]
+mod coordination_bucket_reserved_test;
 #[path = "coordination_lease_test.rs"]
 mod coordination_lease_test;
 #[path = "delta_passthrough_test.rs"]

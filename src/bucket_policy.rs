@@ -220,9 +220,42 @@ pub struct BucketPolicyRegistry {
     /// probe in `resolve_existing_named` — onto the protected mirror's storage,
     /// so it must be blocked even though no policy is keyed under that name.
     replication_target_real_names: std::collections::HashSet<String>,
+    /// Lowercased `config_sync_bucket`: reserved for the proxy's own sync
+    /// client (synced IAM DB, leases, locks). See [`Self::reserved_bucket_reason`].
+    reserved_bucket: Option<String>,
 }
 
 impl BucketPolicyRegistry {
+    /// Reserve the coordination bucket (`config_sync_bucket`). Builder;
+    /// `None` or empty reserves nothing.
+    pub fn with_reserved_bucket(mut self, bucket: Option<&str>) -> Self {
+        self.reserved_bucket = bucket
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(str::to_ascii_lowercase);
+        self
+    }
+
+    /// Whether `bucket` is the reserved coordination bucket.
+    pub fn is_reserved(&self, bucket: &str) -> bool {
+        self.reserved_bucket
+            .as_deref()
+            .is_some_and(|r| r.eq_ignore_ascii_case(bucket))
+    }
+
+    /// Why a client request to `bucket` is refused, for every identity
+    /// (admins included): an object written there could replace the synced
+    /// IAM database or a lease on every peer. `None` = not reserved.
+    pub fn reserved_bucket_reason(&self, bucket: &str) -> Option<String> {
+        self.is_reserved(bucket).then(|| {
+            format!(
+                "Bucket '{bucket}' is the coordination bucket (config_sync_bucket): it is \
+                 reserved for the proxy's own config sync, leases and locks, and no client \
+                 may read or write it"
+            )
+        })
+    }
+
     /// Create a registry from per-bucket configs and global defaults.
     ///
     /// Accepts any `IntoIterator` over `(bucket_name, policy)` so both
@@ -340,6 +373,7 @@ impl BucketPolicyRegistry {
             })
             .collect();
         Self {
+            reserved_bucket: None,
             policies,
             default_compression: true,
             default_max_delta_ratio,
@@ -643,6 +677,22 @@ mod tests {
         let (backend, real) = registry.resolve_backend("dev-data");
         assert_eq!(backend, Some("local"));
         assert_eq!(real, "dev-data");
+    }
+
+    #[test]
+    fn the_coordination_bucket_is_reserved_case_insensitively() {
+        let none = BucketPolicyRegistry::new(HashMap::new(), 0.75);
+        assert!(!none.is_reserved("dgp-sync"));
+        let empty = BucketPolicyRegistry::new(HashMap::new(), 0.75).with_reserved_bucket(Some(" "));
+        assert!(!empty.is_reserved(""));
+        let reg =
+            BucketPolicyRegistry::new(HashMap::new(), 0.75).with_reserved_bucket(Some("DGP-Sync"));
+        assert!(reg.is_reserved("dgp-sync"));
+        assert!(reg.is_reserved("DGP-SYNC"));
+        assert!(!reg.is_reserved("dgp-sync2"));
+        let reason = reg.reserved_bucket_reason("dgp-sync").unwrap();
+        assert!(reason.contains("config_sync_bucket"), "{reason}");
+        assert!(reg.reserved_bucket_reason("releases").is_none());
     }
 
     // ── replication_target_only write gate (incl. the alias hole) ──

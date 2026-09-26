@@ -347,6 +347,25 @@ fn reject_if_under_maintenance(
     Ok(())
 }
 
+/// 403 for the coordination bucket (`config_sync_bucket`): reserved for the
+/// proxy's own sync client, for every identity. Admin bulk ops bypass the S3
+/// gate, so they check explicitly.
+fn reject_if_reserved(
+    state: &std::sync::Arc<crate::api::admin::AdminState>,
+    bucket: &str,
+) -> Result<(), (StatusCode, String)> {
+    match state
+        .s3_state
+        .engine
+        .load()
+        .bucket_policy_registry()
+        .reserved_bucket_reason(bucket)
+    {
+        Some(reason) => Err((StatusCode::FORBIDDEN, reason)),
+        None => Ok(()),
+    }
+}
+
 /// 403 when the bucket is `replication_target_only` — admin bulk ops are
 /// client writes too (same seam as the S3 gate, adapted to admin errors).
 fn reject_if_replication_target_only(
@@ -363,6 +382,8 @@ pub async fn copy_objects(
     headers: axum::http::HeaderMap,
     AdminJson(req): AdminJson<CopyRequest>,
 ) -> Result<Json<CopyResponse>, (StatusCode, String)> {
+    reject_if_reserved(&state, &req.source_bucket)?;
+    reject_if_reserved(&state, &req.dest_bucket)?;
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
     reject_if_replication_target_only(&state, &req.dest_bucket)?;
     if req.items.is_empty() {
@@ -584,6 +605,8 @@ pub async fn move_objects(
     headers: axum::http::HeaderMap,
     AdminJson(req): AdminJson<MoveRequest>,
 ) -> Result<Json<MoveResponse>, (StatusCode, String)> {
+    reject_if_reserved(&state, &req.source_bucket)?;
+    reject_if_reserved(&state, &req.dest_bucket)?;
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
     reject_if_under_maintenance(&state, &req.source_bucket)?;
     // Move = store into dest + delete from source: both are client writes.
@@ -753,6 +776,7 @@ pub async fn bulk_delete(
     headers: axum::http::HeaderMap,
     AdminJson(req): AdminJson<DeleteRequest>,
 ) -> Result<Json<DeleteResponse>, (StatusCode, String)> {
+    reject_if_reserved(&state, &req.bucket)?;
     reject_if_under_maintenance(&state, &req.bucket)?;
     reject_if_replication_target_only(&state, &req.bucket)?;
     if req.keys.is_empty() {
@@ -930,6 +954,7 @@ pub async fn download_zip(
         super::path_guard::check_bucket(b)
             .and_then(|()| super::path_guard::check_object_path(k))
             .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        reject_if_reserved(&state, b)?;
     }
     if parsed.len() > MAX_BULK_OBJECTS {
         return Err((
@@ -1165,6 +1190,7 @@ pub async fn list_all(
         ));
     }
 
+    reject_if_reserved(&state, &q.bucket)?;
     let actor = BulkActor::for_session(&state, &session)?;
     if !actor.may_list(&q.bucket, &q.prefix) {
         return Err((

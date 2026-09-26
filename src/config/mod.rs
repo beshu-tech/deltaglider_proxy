@@ -2636,6 +2636,70 @@ impl Config {
                 }
             }
         }
+        errors.extend(self.coordination_bucket_exposures());
+        errors
+    }
+
+    /// Ways the config would make the coordination bucket
+    /// (`config_sync_bucket`) reachable as client data: public read, an
+    /// alias from or onto it, or a replication/lifecycle rule that reads or
+    /// writes it. A `backend:` route alone is fine: it only says which
+    /// backend hosts the bucket (see [`Self::coordination_backend`]).
+    fn coordination_bucket_exposures(&self) -> Vec<String> {
+        let Some(sync) = self
+            .config_sync_bucket
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+        else {
+            return Vec::new();
+        };
+        let is_sync = |b: &str| b.trim().eq_ignore_ascii_case(sync);
+        let mut errors = Vec::new();
+        let why = "it is reserved for the proxy's config sync, leases and locks";
+        for (bucket, policy) in &self.buckets {
+            let alias_hits = policy.alias.as_deref().is_some_and(is_sync);
+            if is_sync(bucket) {
+                if policy.public == Some(true) || !policy.public_prefixes.is_empty() {
+                    errors.push(format!(
+                        "bucket '{bucket}' is the coordination bucket (config_sync_bucket) and \
+                         cannot be public: {why}"
+                    ));
+                }
+                if policy.alias.as_deref().is_some_and(|a| !is_sync(a)) {
+                    errors.push(format!(
+                        "bucket '{bucket}' is the coordination bucket (config_sync_bucket) and \
+                         cannot have an alias: {why}"
+                    ));
+                }
+            } else if alias_hits {
+                errors.push(format!(
+                    "bucket '{bucket}' has alias '{sync}', the coordination bucket \
+                     (config_sync_bucket): {why}"
+                ));
+            }
+        }
+        for rule in &self.replication.rules {
+            if is_sync(&rule.source.bucket) || is_sync(&rule.destination.bucket) {
+                errors.push(format!(
+                    "replication rule '{}' uses the coordination bucket '{sync}' \
+                     (config_sync_bucket): {why}",
+                    rule.name
+                ));
+            }
+        }
+        for rule in &self.lifecycle.rules {
+            if crate::lifecycle::planner::rule_write_buckets(rule)
+                .into_iter()
+                .any(is_sync)
+            {
+                errors.push(format!(
+                    "lifecycle rule '{}' uses the coordination bucket '{sync}' \
+                     (config_sync_bucket): {why}",
+                    rule.name
+                ));
+            }
+        }
         errors
     }
 
@@ -4305,6 +4369,39 @@ encryption_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
             cfg.backend_encryption,
             BackendEncryptionConfig::None { .. }
         ));
+    }
+
+    #[test]
+    fn check_fatal_refuses_a_client_facing_coordination_bucket() {
+        let fatal = |buckets: &str| {
+            let mut cfg =
+                Config::from_yaml_str(&format!("storage:\n  buckets:\n{buckets}")).expect("parses");
+            cfg.config_sync_bucket = Some("dgp-sync".into());
+            cfg.check_fatal()
+        };
+        // A backend route only says where the bucket lives: allowed.
+        assert!(fatal("    dgp-sync: {}\n").is_empty());
+        let public = fatal("    DGP-sync: { public: true }\n");
+        assert!(
+            public.iter().any(|e| e.contains("cannot be public")),
+            "{public:?}"
+        );
+        let prefixes = fatal("    dgp-sync: { public_prefixes: [\"a/\"] }\n");
+        assert!(!prefixes.is_empty());
+        let aliased = fatal("    innocent: { alias: dgp-sync }\n");
+        assert!(
+            aliased.iter().any(|e| e.contains("innocent")),
+            "{aliased:?}"
+        );
+        let alias_away = fatal("    dgp-sync: { alias: elsewhere }\n");
+        assert!(
+            alias_away.iter().any(|e| e.contains("alias")),
+            "{alias_away:?}"
+        );
+        // Without config_sync_bucket nothing is reserved.
+        let cfg = Config::from_yaml_str("storage:\n  buckets:\n    dgp-sync: { public: true }\n")
+            .unwrap();
+        assert!(cfg.check_fatal().is_empty());
     }
 
     #[test]

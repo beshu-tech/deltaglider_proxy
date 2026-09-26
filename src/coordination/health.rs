@@ -564,6 +564,20 @@ pub struct BackendHealthGate {
     pub app: Arc<crate::api::handlers::AppState>,
 }
 
+/// The reserved-bucket gate: every verified S3 request to the coordination
+/// bucket (`config_sync_bucket`) gets 403, whatever the identity. Runs with
+/// the other post-verification gates (`check_verified_request`), so the
+/// s3s access hook and the form-POST handler share it.
+pub fn reserved_bucket_refusal(gate: &BackendHealthGate, path: &str) -> Option<S3Error> {
+    let bucket = crate::maintenance::gate::bucket_from_path(path)?;
+    gate.app
+        .engine
+        .load()
+        .bucket_policy_registry()
+        .reserved_bucket_reason(&bucket)
+        .map(S3Error::AccessDeniedReason)
+}
+
 /// The S3 request gate: a request to a bucket whose backend is UNHEALTHY
 /// gets a fast honest 503 naming the backend and cause, for all verbs (a
 /// read against a dead backend fails anyway; this replaces the per-request

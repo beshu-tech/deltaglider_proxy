@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Security — S3 clients cannot reach the coordination bucket
+
+The `config_sync_bucket` holds the synced IAM database, the replication
+leases and the reference locks, but any client with write access to it
+through the proxy could replace them (for example, put back an old IAM
+copy that re-enables a disabled key on every instance). Now the proxy
+refuses every S3 request to that bucket with `403`, for every identity,
+hides it from ListBuckets and the admin bucket list, and refuses it in the
+admin bulk endpoints. A config that makes it public, aliases onto it, or
+uses it in a replication or lifecycle rule is refused. As a second line of
+defence, the sync refuses a downloaded copy with rows older than the last
+synced copy.
+
 ### Fixed — Session cookies are `Secure` when TLS comes from the YAML file
 
 The `Secure` flag on admin session cookies followed only the

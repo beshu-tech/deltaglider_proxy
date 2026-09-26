@@ -554,6 +554,39 @@ fn merge_table(
     out
 }
 
+/// How much older than the merge base a peer row may be before it counts as
+/// a rollback. `sync_mtime` is each writer's wall clock, so a small skew
+/// between nodes is normal; five minutes is far past NTP-level skew.
+const ROLLBACK_TOLERANCE_MS: i64 = 5 * 60 * 1000;
+
+/// Pure: whether a peer row with `remote` mtime, which differs from the
+/// merge base's row with `base` mtime, is older than the base. Every upload
+/// descends from the bucket's last copy, so row ages never go back; an older
+/// row is a copy put back from the past. `0` is an unknown age: never a
+/// rollback.
+fn is_rollback(remote: i64, base: i64) -> bool {
+    remote > 0 && base > 0 && remote.saturating_add(ROLLBACK_TOLERANCE_MS) < base
+}
+
+/// Pure: the rows (`table/target`) that the peer copy holds in a version
+/// older than the merge base (see [`is_rollback`]).
+pub(crate) fn rollback_rows(base: &Snapshot, remote: &Snapshot) -> Vec<String> {
+    let mut out = Vec::new();
+    for spec in SPECS {
+        let (Some(b), Some(r)) = (base.get(spec.table), remote.get(spec.table)) else {
+            continue;
+        };
+        for (key, re) in r {
+            if let Some(be) = b.get(key) {
+                if !re.same(be) && is_rollback(re.mtime, be.mtime) {
+                    out.push(format!("{}/{}", spec.table, conflict_target(spec, re)));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Pure: whether the local version of a row changed on both sides is the
 /// newer write (a tie goes to the remote copy).
 fn local_is_newer(l: &Entity, r: &Entity) -> bool {
@@ -1181,6 +1214,16 @@ impl ConfigDb {
             }
             let remote = read_snapshot(&self.conn, "remote")?;
             let base = base_path.and_then(|p| self.read_base(p, passphrase));
+            if let Some(b) = &base {
+                let old = rollback_rows(b, &remote);
+                if !old.is_empty() {
+                    return Err(ConfigDbError::Other(format!(
+                        "peer config DB holds rows older than the last synced copy ({}): \
+                         refusing it as a rollback (a copy put back into the sync bucket?)",
+                        old.join(", ")
+                    )));
+                }
+            }
 
             immediate_tx(&self.conn, |_| {
                 let local = read_snapshot(&self.conn, "main")?;
@@ -1581,6 +1624,43 @@ mod tests {
             .unwrap();
         assert!(!report.changed);
         assert!(report.stale_user_ids.is_empty());
+    }
+
+    /// A peer copy whose version of a row is OLDER than the merge base's is
+    /// a rollback (for example an old copy put back into the sync bucket):
+    /// taken as "changed on the remote only", it would re-enable a disabled
+    /// key. The merge refuses the whole copy and changes nothing.
+    #[test]
+    fn a_copy_older_than_the_merge_base_is_refused() {
+        let t = trio(seed_three);
+        // The copy in the bucket is the seed (u1 enabled). Since then u1 was
+        // disabled here and synced, an hour later: base and local agree.
+        for p in [&t.base, &t.local] {
+            open(p)
+                .conn
+                .execute(
+                    "UPDATE users SET enabled = 0, sync_mtime = sync_mtime + 3600000 \
+                     WHERE name = 'u1'",
+                    [],
+                )
+                .unwrap();
+        }
+        let local = open(&t.local);
+        let err = local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .expect_err("a rollback copy must be refused");
+        assert!(err.to_string().contains("users/u1"), "{err}");
+        let u1 = local.get_user_by_id(user_id(&local, "u1")).unwrap();
+        assert!(!u1.enabled, "the refused copy re-enabled u1");
+        // The pure rule: within the clock tolerance, or with an unknown age,
+        // a row is not a rollback.
+        assert!(is_rollback(
+            1_000_000,
+            1_000_000 + ROLLBACK_TOLERANCE_MS + 1
+        ));
+        assert!(!is_rollback(1_000_000, 1_000_000 + ROLLBACK_TOLERANCE_MS));
+        assert!(!is_rollback(0, 5_000_000));
+        assert!(!is_rollback(5_000_000, 0));
     }
 
     /// `sync_mtime = 0` is a row from a copy without the column (an older

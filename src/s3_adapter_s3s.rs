@@ -438,13 +438,15 @@ impl s3s::S3 for DeltaGliderS3Service {
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListBucketsOutput>> {
         let auth_user = req.extensions.get::<AuthenticatedUser>().cloned();
         let input = req.input;
-        let mut buckets = self
-            .state
-            .engine
-            .load()
+        let engine = self.state.engine.load();
+        let mut buckets = engine
             .list_buckets_with_dates()
             .await
             .map_err(engine_error_to_s3s)?;
+        // The coordination bucket is not a client bucket (see
+        // `reserved_bucket_refusal`).
+        let registry = engine.bucket_policy_registry();
+        buckets.retain(|(name, _)| !registry.is_reserved(name));
         if let Some(user) = auth_user {
             buckets.retain(|(name, _)| user.can_see_bucket(name));
         }

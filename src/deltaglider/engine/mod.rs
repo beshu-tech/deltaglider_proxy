@@ -1162,7 +1162,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             bucket_policies: crate::bucket_policy::BucketPolicyRegistry::new(
                 config.buckets.clone(),
                 config.max_delta_ratio,
-            ),
+            )
+            .with_reserved_bucket(config.config_sync_bucket.as_deref()),
             bucket_usage: None,
             spool: Arc::new(
                 crate::deltaglider::spool::SpoolDir::shared()

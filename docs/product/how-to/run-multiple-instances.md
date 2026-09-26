@@ -19,6 +19,8 @@ DGP_CONFIG_SYNC_BUCKET=dgp-iam-sync
 
 After every IAM mutation, the mutating instance uploads the encrypted DB to the bucket. The other instances poll every 5 minutes and download when the ETag changes.
 
+Use a bucket that holds nothing else. The proxy reserves it: S3 clients cannot read, write, or list it through the proxy, and it does not appear in bucket lists.
+
 ## 2. Give every instance the same config DB key
 
 The synced DB is encrypted with the config DB key, so every instance needs the same one. Generate a key once and set it on every instance:

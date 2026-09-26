@@ -677,6 +677,10 @@ Every instance that shares the bucket must set `DGP_CONFIG_DB_KEY` to the same v
 
 Sync uses the same S3 credentials as the storage backend (`DGP_BE_AWS_*`) and only works when the storage backend is S3 (not filesystem). On every IAM mutation, the DB is uploaded to `s3://<bucket>/.deltaglider/config.db`; readers poll the S3 ETag every 5 minutes and download on change.
 
+The sync bucket is reserved for the proxy itself. The proxy refuses every S3 request to it with `403 AccessDenied`, for every identity including administrators, because an object that a client writes there could replace the synced IAM database or a lease on every instance. For the same reason, ListBuckets and the admin bucket list do not show it, and the admin bulk endpoints refuse it. A configuration that makes it public, gives it an alias, aliases another bucket onto it, or uses it in a replication or lifecycle rule is refused. A `backend:` route for it is allowed, because that only says which backend hosts it.
+
+A downloaded copy that holds a row in a version more than five minutes older than the copy this instance last synced is refused as a rollback, and the instance logs the rows. Every upload starts from the latest synced copy, so a legitimate copy never goes back in time.
+
 The sync poller starts once at boot — enabling or changing `config_sync_bucket` at runtime is persisted but does **not** take effect until restart (the apply response flags this with a `requires_restart` warning).
 
 ---

@@ -379,6 +379,7 @@ jobs:
             backend_health_test:: \
             config_sync_ha_test:: \
             config_sync_test:: \
+            coordination_bucket_reserved_test:: \
             coordination_lease_test:: \
             race_conditions_test:: \
             reference_lock_race_test:: \

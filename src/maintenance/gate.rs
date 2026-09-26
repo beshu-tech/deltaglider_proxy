@@ -230,6 +230,11 @@ pub fn check_verified_request(
     method: &Method,
     path: &str,
 ) -> Result<(), crate::api::errors::S3Error> {
+    if let Some(gate) = extensions.get::<crate::coordination::health::BackendHealthGate>() {
+        if let Some(refusal) = crate::coordination::health::reserved_bucket_refusal(gate, path) {
+            return Err(refusal);
+        }
+    }
     if let Some(gate) = extensions.get::<Arc<MaintenanceGate>>() {
         if let Some(refusal) = write_gate_refusal(gate, method, path) {
             return Err(refusal);

@@ -225,21 +225,19 @@ pub async fn list_bucket_origins(
         .iter()
         .map(|backend| (backend.name.as_str(), backend))
         .collect();
-    let bucket_list = state
-        .s3_state
-        .engine
-        .load()
-        .list_bucket_origins()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to list bucket origins: {e}"),
-            )
-        })?;
+    let engine = state.s3_state.engine.load();
+    let bucket_list = engine.list_bucket_origins().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to list bucket origins: {e}"),
+        )
+    })?;
 
+    // The coordination bucket is not a client bucket.
+    let registry = engine.bucket_policy_registry();
     let buckets = bucket_list
         .into_iter()
+        .filter(|bucket| !registry.is_reserved(&bucket.name))
         .map(|bucket| {
             let backend_name = bucket
                 .backend_name
@@ -281,6 +279,15 @@ pub async fn create_bucket_on_backend(
             StatusCode::BAD_REQUEST,
             "Bucket name cannot be empty".into(),
         ));
+    }
+    if let Some(reason) = state
+        .s3_state
+        .engine
+        .load()
+        .bucket_policy_registry()
+        .reserved_bucket_reason(&bucket)
+    {
+        return Err((StatusCode::FORBIDDEN, reason));
     }
     let backend_name = body.backend_name.trim().to_string();
     if backend_name.is_empty() {
