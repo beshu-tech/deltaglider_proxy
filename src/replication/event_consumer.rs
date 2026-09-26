@@ -1050,7 +1050,7 @@ async fn apply_action(
                         strip_user_metadata_keys: &[],
                         operation: "replication-event",
                         upload_concurrency: None,
-                        keep_created_at: false,
+                        keep_created_at: true,
                     };
                     let outcome = copy_object_with_retries(engine, transfer).await?;
                     // Emit ReplicationObjectCopied so the chain is observable

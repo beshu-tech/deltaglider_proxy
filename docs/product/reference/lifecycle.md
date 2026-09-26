@@ -42,7 +42,7 @@ Rule names use `[A-Za-z0-9_.-]{1,64}` and must be unique.
           delete_source_after_success: false
 ```
 
-`delete_source_after_success: false` makes transition an archive/copy; `true` gives move semantics. Transition is copy-first: lifecycle copies, verifies the destination HEAD when possible, and deletes the source only after the copy succeeds.
+`delete_source_after_success: false` makes transition an archive/copy; `true` gives move semantics. Transition is copy-first: lifecycle copies, verifies the destination HEAD when possible, and deletes the source only after the copy succeeds. The copy keeps the creation time of the source object, so the archived object shows its original `LastModified`, and a lifecycle rule on the archive bucket counts the object's age from its creation, not from the transition.
 
 ### Count-based retention: `retain-newest`
 

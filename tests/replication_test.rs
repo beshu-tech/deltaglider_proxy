@@ -2872,3 +2872,106 @@ async fn test_replication_kill_mid_walk_resumes_across_dirs() {
         .len();
     assert_eq!(total, 60, "full convergence after kill + resume");
 }
+
+const KEEP_TIME_RULES_YAML: &str = "
+replication:
+  enabled: true
+  tick_interval: \"5s\"
+  rules:
+    - name: repl-a-to-b
+      enabled: true
+      source:
+        bucket: repl-src
+        prefix: \"\"
+      destination:
+        bucket: repl-dst
+        prefix: \"\"
+      interval: \"1h\"
+      batch_size: 100
+    - name: ev-a-to-b
+      enabled: true
+      source:
+        bucket: ev-src
+        prefix: \"\"
+      destination:
+        bucket: ev-dst
+        prefix: \"\"
+      interval: \"24h\"
+      batch_size: 100
+";
+
+/// Key → LastModified from a listing (millisecond precision, unlike HEAD).
+async fn listed_times(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+) -> std::collections::BTreeMap<String, aws_sdk_s3::primitives::DateTime> {
+    let out = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("list");
+    out.contents()
+        .iter()
+        .map(|o| (o.key().unwrap().to_string(), *o.last_modified().unwrap()))
+        .collect()
+}
+
+/// A replica keeps the source object's created-at, on the reconcile path
+/// and on the event-driven path. With the copy time instead, every replica
+/// looks newer than its source, and destination-side ages start at the copy.
+#[tokio::test]
+async fn test_replication_keeps_source_created_at() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(KEEP_TIME_RULES_YAML)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for b in ["repl-src", "repl-dst", "ev-src", "ev-dst"] {
+        client.create_bucket().bucket(b).send().await.ok();
+    }
+    // A delta-eligible pair and a passthrough object: every copy path.
+    for (key, body) in [
+        ("app-1.0.0.zip", vec![7u8; 8192]),
+        ("app-1.0.1.zip", [vec![7u8; 8000], vec![9u8; 192]].concat()),
+        ("notes.txt", b"plain".to_vec()),
+    ] {
+        client
+            .put_object()
+            .bucket("repl-src")
+            .key(key)
+            .body(ByteStream::from(body))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let src = listed_times(&client, "repl-src").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let run = wait_for_latest_run(&admin, &server.endpoint(), "repl-a-to-b").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
+    assert_eq!(
+        listed_times(&client, "repl-dst").await,
+        src,
+        "reconcile copy"
+    );
+
+    let http = reqwest::Client::new();
+    let endpoint = server.endpoint();
+    let before = common::get_replication_event_version(&http, &endpoint).await;
+    client
+        .put_object()
+        .bucket("ev-src")
+        .key("evt/obj.txt")
+        .body(ByteStream::from(b"event-driven".to_vec()))
+        .send()
+        .await
+        .expect("put source object");
+    common::wait_for_replication_event(&http, &endpoint, before).await;
+    assert_eq!(
+        listed_times(&client, "ev-dst").await,
+        listed_times(&client, "ev-src").await,
+        "event-driven copy"
+    );
+}

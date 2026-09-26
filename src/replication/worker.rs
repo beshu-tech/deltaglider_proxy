@@ -1264,7 +1264,7 @@ async fn copy_one_object(
         strip_user_metadata_keys: &[],
         operation: "replication",
         upload_concurrency: Some(upload_concurrency),
-        keep_created_at: false,
+        keep_created_at: true,
     };
     // Bound the copy: a stalled object fails fast instead of hanging until
     // lease lapse. `Elapsed` routes into the Err arm below.

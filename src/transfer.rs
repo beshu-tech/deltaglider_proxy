@@ -102,8 +102,12 @@ pub(crate) struct ObjectTransferRequest<'a> {
     /// falls back to the env-resolved `transfer_plan::upload_concurrency()`.
     /// Only the replication worker overrides it (from config).
     pub upload_concurrency: Option<usize>,
-    /// Keep the source's created-at on the destination (a move or rewrite
-    /// of the same object: migrate, re-encrypt) instead of the copy time.
+    /// Keep the source's created-at on the destination instead of the copy
+    /// time. True for every copy that stands for the same object: migrate,
+    /// re-encrypt, replication (a replica must not look newer than its
+    /// source, or newer-wins and destination ages go wrong) and lifecycle
+    /// transition (the archived object keeps its age). False only for the
+    /// admin bulk copy, which makes a new object, as S3 CopyObject does.
     pub keep_created_at: bool,
 }
 

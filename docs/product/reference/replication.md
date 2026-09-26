@@ -67,6 +67,8 @@ Rule-name grammar: `[A-Za-z0-9_.-]{1,64}`. The name is also the primary key in t
 | `content-diff` | Keep the destination an exact mirror: copy only when the bytes differ (size differs, or both sides carry a logical SHA-256 and those differ). Byte-identical objects are skipped, so a recurring rule converges. |
 | `skip-if-dest-exists` | Never copy when destination exists (seed-once semantics). |
 
+A replica keeps the creation time of its source object, so its `LastModified` is the source's `LastModified` and not the time of the copy. This matters for `newer-wins`, because the policy compares these times. If a replica carried the copy time, it would look newer than its source, and a rule in the opposite direction would copy it back. It also matters for a lifecycle rule on the destination bucket, because that rule counts an object's age from its creation time. To read the creation time, the copy sends one extra metadata request to the source for each object that it copies.
+
 ## Delete replication
 
 When `replicate_deletes: true`, the destination is a **faithful mirror** of the source: any destination object that is not present at source is deleted — regardless of who wrote it. This applies on both the scheduled reconcile and the event-driven path.

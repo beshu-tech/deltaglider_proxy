@@ -73,6 +73,16 @@ names the one object that the caller may read, the bucket and prefix that
 the caller may list, or the public prefixes of the bucket. For a write, it
 says that nothing is granted.
 
+### Fixed — Replicas and archived objects keep their creation time
+
+A replication copy and a lifecycle transition copy got the time of the
+copy as their `LastModified`. So a replica looked newer than its source
+(`newer-wins` compares these times, and a rule in the opposite direction
+copied it back), and a lifecycle rule on the destination counted ages
+from the copy. Now both copies keep the source object's creation time,
+as a bucket migration and a re-encryption already do. The admin bulk
+copy still makes a new object with a new time, as S3 `CopyObject` does.
+
 ### Fixed — A migrate cancel that a restart interrupts still cleans up
 
 When the proxy stopped (a rolling deploy, a crash) while a migrate job was

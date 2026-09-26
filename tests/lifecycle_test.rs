@@ -288,6 +288,48 @@ async fn test_lifecycle_transition_copies_expired_object_and_preserves_source() 
         .expect("source should be preserved when delete_source_after_success=false");
 }
 
+/// A transition copy keeps the source object's created-at, so the archive
+/// shows the original time and ages on it count from the object's creation.
+#[tokio::test]
+async fn test_lifecycle_transition_keeps_source_created_at() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .extra_yaml_storage_section(LIFECYCLE_TRANSITION_KEEP_SOURCE_YAML)
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    for bucket in ["life-src", "life-archive"] {
+        client.create_bucket().bucket(bucket).send().await.ok();
+    }
+    client
+        .put_object()
+        .bucket("life-src")
+        .key("old/app.zip")
+        .body(ByteStream::from(b"archive me".to_vec()))
+        .send()
+        .await
+        .expect("seed transition source");
+    // A listing carries milliseconds; HEAD has one-second resolution.
+    let listed = |bucket: &'static str| {
+        let client = client.clone();
+        async move {
+            let out = client
+                .list_objects_v2()
+                .bucket(bucket)
+                .send()
+                .await
+                .unwrap();
+            *out.contents()[0].last_modified().unwrap()
+        }
+    };
+    let created = listed("life-src").await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let run = lifecycle_run_now_and_wait(&admin, &server.endpoint(), "archive-old").await;
+    assert_eq!(run["status"].as_str(), Some("succeeded"), "{run}");
+    assert_eq!(listed("life-archive").await, created);
+}
+
 #[tokio::test]
 async fn test_lifecycle_transition_delete_source_after_success() {
     let server = TestServer::builder()
