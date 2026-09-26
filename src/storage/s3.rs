@@ -344,6 +344,16 @@ enum S3Op {
     Other(&'static str),
 }
 
+/// Pure: is this S3 error the ordinary "not there" answer of a HEAD probe?
+/// HeadBucket 404 (403 on providers that hide bucket existence) and
+/// HeadObject 404. The caller logs those at debug, not warn.
+fn s3_error_is_expected_absence(op: &S3Op, status: Option<u16>) -> bool {
+    matches!(
+        (op, status),
+        (S3Op::HeadBucket, Some(404 | 403)) | (S3Op::HeadObject, Some(404))
+    )
+}
+
 impl std::fmt::Display for S3Op {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -729,17 +739,23 @@ impl S3Backend {
             (None, "-".to_string())
         };
 
-        // Log full context for production debugging
-        warn!(
-            "S3 error: op={} bucket={} status={} request_id={} error={:?}",
-            op,
-            bucket,
-            status
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            request_id,
-            e,
-        );
+        // Log full context for production debugging. A HEAD that answers
+        // "absent" is a normal probe result (routing, existence checks), so
+        // it logs at debug; everything else is a warning.
+        let status_text = status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        if s3_error_is_expected_absence(&op, status) {
+            debug!(
+                "S3 absent: op={} bucket={} status={} request_id={}",
+                op, bucket, status_text, request_id,
+            );
+        } else {
+            warn!(
+                "S3 error: op={} bucket={} status={} request_id={} error={:?}",
+                op, bucket, status_text, request_id, e,
+            );
+        }
 
         // No answer at all (timeout, refused/reset connection): the backend
         // is unavailable, which is a 503 and a passive health signal.
@@ -4503,6 +4519,20 @@ mod tests {
     /// `NotFound`, not the catch-all `S3(...)` → HTTP 500. This is the
     /// concurrent-source-delete race: copy a reference that a parallel
     /// request just deleted → must surface 404, not 500.
+    /// Explore finding 19: every HeadBucket 404 (a routing probe for a
+    /// bucket that is not on this backend) logged a WARN "S3 error" line.
+    #[test]
+    fn expected_absent_answers_are_not_warnings() {
+        assert!(s3_error_is_expected_absence(&S3Op::HeadBucket, Some(404)));
+        assert!(s3_error_is_expected_absence(&S3Op::HeadBucket, Some(403)));
+        assert!(s3_error_is_expected_absence(&S3Op::HeadObject, Some(404)));
+        assert!(!s3_error_is_expected_absence(&S3Op::HeadObject, Some(403)));
+        assert!(!s3_error_is_expected_absence(&S3Op::HeadBucket, Some(500)));
+        assert!(!s3_error_is_expected_absence(&S3Op::HeadBucket, None));
+        assert!(!s3_error_is_expected_absence(&S3Op::ListObjects, Some(404)));
+        assert!(!s3_error_is_expected_absence(&S3Op::GetObject, Some(404)));
+    }
+
     #[test]
     fn classify_s3_error_maps_object_level_404_to_not_found() {
         let err = no_such_key_error(404); // 404 + NoSuchKey body

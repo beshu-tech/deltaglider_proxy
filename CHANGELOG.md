@@ -89,6 +89,8 @@ audited as `maintenance_migrate_mirror_delete`.
   admin session (`401` otherwise); the examples now sign in first.
 - The Jobs screen can start the metadata-backfill job: **New job → Backfill
   metadata…**. The job and its API are documented in the jobs reference.
+- A HEAD that finds no bucket or no object on an S3 backend (a routing or
+  existence probe) logs at debug. It used to log a WARN "S3 error" line.
 
 ### Fixed — The Credentials page shows the bootstrap access key and removes it on request
 
