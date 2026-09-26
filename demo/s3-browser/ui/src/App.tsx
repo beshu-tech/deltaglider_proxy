@@ -655,10 +655,20 @@ export default function App() {
                   </Button>
                 </Space>
               )}
-              {hasNoBuckets && canCreateBucket && (
-                <Button type="link" onClick={requestCreateBucket} style={{ paddingInline: 0 }}>
-                  Create a bucket
-                </Button>
+              {hasNoBuckets && (canCreateBucket || canAdmin) && (
+                <Space size={16} wrap style={{ justifyContent: 'center' }}>
+                  {canCreateBucket && (
+                    <Button type="link" onClick={requestCreateBucket} style={{ paddingInline: 0 }}>
+                      Create a bucket
+                    </Button>
+                  )}
+                  {/* A fresh proxy: the wizard sets backend, admin and a bucket in one go. */}
+                  {canAdmin && (
+                    <Button type="link" onClick={() => navigate(buildViewUrl('admin', 'setup'))} style={{ paddingInline: 0 }}>
+                      Run the setup wizard
+                    </Button>
+                  )}
+                </Space>
               )}
               {isRootBucketEmpty && canUploadToActiveBucket && (
                 <Space orientation="vertical" size={4} align="center">

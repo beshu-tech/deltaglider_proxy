@@ -1438,6 +1438,44 @@ pub enum AuthConfigOutcome {
     Missing,
 }
 
+impl AuthConfigOutcome {
+    /// The lines the startup prints after "FATAL: …" for a fatal outcome:
+    /// the YAML the operator can add. `None` for the outcomes that start.
+    pub fn fatal_help(&self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::Missing => Some(&[
+                "  The proxy refuses to start without explicit authentication configuration.",
+                "  This prevents accidental exposure of S3 data.",
+                "",
+                "  Options:",
+                "    1. Set S3 credentials (recommended):",
+                "       access:",
+                "         access_key_id: \"...\"",
+                "         secret_access_key: \"...\"",
+                "",
+                "    2. Explicitly allow open access (development only):",
+                "       access:",
+                "         authentication: none",
+                "",
+                "  Environment variables:",
+                "    DGP_ACCESS_KEY_ID + DGP_SECRET_ACCESS_KEY, or DGP_AUTHENTICATION=none",
+            ]),
+            Self::UnrecognizedMode => Some(&[
+                "  Accepted values:",
+                "    access:",
+                "      authentication: none   # open access (development only)",
+                "    (omit the field to auto-detect from credentials)",
+                "",
+                "  Or set S3 credentials instead:",
+                "    access:",
+                "      access_key_id: \"...\"",
+                "      secret_access_key: \"...\"",
+            ]),
+            Self::CredentialsEnabled { .. } | Self::OpenAccess => None,
+        }
+    }
+}
+
 /// Classification of a parsed YAML document's top-level shape.
 ///
 /// The [`ConfigShape::Mixed`] variant is a hard error: silently picking
@@ -3571,6 +3609,37 @@ mod tests {
             secret_access_key: sk.map(Into::into),
             authentication: auth.map(Into::into),
             ..Config::default()
+        }
+    }
+
+    /// The fatal auth messages show the config the operator can paste: YAML
+    /// (the only config format), not the TOML `key = "value"` of old.
+    #[test]
+    fn fatal_auth_help_is_yaml() {
+        for outcome in [
+            AuthConfigOutcome::Missing,
+            AuthConfigOutcome::UnrecognizedMode,
+        ] {
+            let help = outcome.fatal_help().expect("fatal outcome has help");
+            let text = help.join("\n");
+            assert!(text.contains("access:"), "{text}");
+            assert!(text.contains("authentication: none"), "{text}");
+            assert!(!text.contains(" = "), "TOML syntax in: {text}");
+        }
+        assert!(AuthConfigOutcome::OpenAccess.fatal_help().is_none());
+        // The class: no startup message spells a config key in TOML syntax.
+        let startup = include_str!("../startup.rs");
+        for (i, line) in startup.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            assert!(
+                !line.contains("authentication = \\\"") && !line.contains("access_key_id = \\\""),
+                "src/startup.rs:{}: TOML syntax in a message: {}",
+                i + 1,
+                t
+            );
         }
     }
 

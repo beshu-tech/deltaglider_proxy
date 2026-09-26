@@ -174,11 +174,11 @@ fn validate_auth_config(config: &Config) {
                 config.access_key_id.as_deref().unwrap_or("")
             );
             if redundant_none {
-                warn!("  Note: authentication = \"none\" is ignored because S3 credentials are configured");
+                warn!("  Note: `authentication: none` is ignored because S3 credentials are configured");
             }
         }
         AuthConfigOutcome::OpenAccess => {
-            warn!("  Authentication: DISABLED (authentication = \"none\")");
+            warn!("  Authentication: DISABLED (`authentication: none`)");
             warn!("  ╔══════════════════════════════════════════════════════════════════╗");
             warn!("  ║  WARNING: All S3 data is accessible without credentials.        ║");
             warn!("  ║  Set access_key_id + secret_access_key for production use.      ║");
@@ -190,31 +190,20 @@ fn validate_auth_config(config: &Config) {
                 config.authentication.as_deref().unwrap_or("")
             );
             error!("");
-            error!("  Accepted values:");
-            error!("    authentication = \"none\"    — open access (development only)");
-            error!("    (omit field)               — auto-detect from credentials");
-            error!("");
-            error!("  Or set S3 credentials instead:");
-            error!("    access_key_id = \"...\"");
-            error!("    secret_access_key = \"...\"");
+            for line in AuthConfigOutcome::UnrecognizedMode
+                .fatal_help()
+                .unwrap_or_default()
+            {
+                error!("{line}");
+            }
             std::process::exit(1);
         }
         AuthConfigOutcome::Missing => {
             error!("FATAL: No authentication configured.");
             error!("");
-            error!("  The proxy refuses to start without explicit authentication configuration.");
-            error!("  This prevents accidental exposure of S3 data.");
-            error!("");
-            error!("  Options:");
-            error!("    1. Set S3 credentials (recommended):");
-            error!("       access_key_id = \"...\"");
-            error!("       secret_access_key = \"...\"");
-            error!("");
-            error!("    2. Explicitly allow open access (development only):");
-            error!("       authentication = \"none\"");
-            error!("");
-            error!("  Environment variables:");
-            error!("    DGP_ACCESS_KEY_ID + DGP_SECRET_ACCESS_KEY, or DGP_AUTHENTICATION=none");
+            for line in AuthConfigOutcome::Missing.fatal_help().unwrap_or_default() {
+                error!("{line}");
+            }
             std::process::exit(1);
         }
     }
@@ -838,7 +827,7 @@ fn init_config_db_attempt(
                     if matches!(config.classify_auth_config(), AuthConfigOutcome::OpenAccess) {
                         warn!(
                             "  Authentication: IAM mode is ACTIVE ({} user(s) in {}) — this \
-                             OVERRIDES `authentication = \"none\"`. Open/anonymous browser \
+                             OVERRIDES `authentication: none`. Open/anonymous browser \
                              access will get AccessDenied; log in as an IAM user, or delete \
                              {} to use open access.",
                             users.len(),

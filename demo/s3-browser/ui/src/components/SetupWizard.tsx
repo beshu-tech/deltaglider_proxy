@@ -202,6 +202,8 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<TestS3Response | null>(null);
   const [applying, setApplying] = useState(false);
+  // Warnings from a successful apply stay on screen until the admin continues.
+  const [appliedWarnings, setAppliedWarnings] = useState<string[] | null>(null);
 
   // Any edit to an S3 connection field invalidates a prior "Connected ✓" —
   // otherwise canAdvance (step 1) would let the operator proceed past an
@@ -270,10 +272,10 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
         return;
       }
       if (resp.warnings && resp.warnings.length > 0) {
-        message.warning(`Applied with ${resp.warnings.length} warning(s)`);
-      } else {
-        message.success('Setup complete!');
+        setAppliedWarnings(resp.warnings);
+        return;
       }
+      message.success('Setup complete!');
       onComplete();
     } catch (e) {
       message.error(
@@ -443,6 +445,22 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
 
       <div style={{ minHeight: 320 }}>{screen}</div>
 
+      {appliedWarnings && (
+        <Alert
+          type="warning"
+          showIcon
+          title={`The configuration is applied, with ${appliedWarnings.length} warning${appliedWarnings.length === 1 ? '' : 's'}`}
+          description={
+            <>
+              <ul style={{ margin: '4px 0 12px', paddingLeft: 18 }}>
+                {appliedWarnings.map((w) => <li key={w}>{w}</li>)}
+              </ul>
+              <Button type="primary" onClick={onComplete}>Continue</Button>
+            </>
+          }
+        />
+      )}
+
       {/* Nav */}
       <div
         style={{
@@ -478,6 +496,7 @@ export default function SetupWizard({ onComplete, onCancel, search }: Props) {
             icon={<CheckCircleOutlined />}
             onClick={apply}
             loading={applying}
+            disabled={appliedWarnings !== null}
           >
             Save and start
           </Button>
