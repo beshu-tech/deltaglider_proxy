@@ -1137,6 +1137,20 @@ impl ConfigDb {
         Ok(rows)
     }
 
+    /// Rows of IAM state: users, groups, auth providers, mapping rules. Zero
+    /// only for a DB that holds no IAM at all (the fresh DB that a key
+    /// mismatch boot creates), so recovery can tell it from a working one.
+    pub fn iam_row_count(&self) -> Result<usize, ConfigDbError> {
+        let n: i64 = self.conn.query_row(
+            "SELECT (SELECT count(*) FROM users) + (SELECT count(*) FROM groups)
+                  + (SELECT count(*) FROM auth_providers)
+                  + (SELECT count(*) FROM group_mapping_rules)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     /// Re-encrypt the open database in place with a new key.
     pub fn rekey(&self, new_passphrase: &str) -> Result<(), ConfigDbError> {
         self.conn.pragma_update(None, "rekey", new_passphrase)?;

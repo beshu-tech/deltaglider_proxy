@@ -884,7 +884,8 @@ fn should_preserve_as_backup(db_exists: bool, bak_exists: bool) -> bool {
 /// What to do about a lingering `.db.bak` when the live config DB OPENED fine.
 /// A lingering backup means an earlier mismatch incident MAY be unresolved.
 /// An Ok-open node promotes only a POPULATED backup over an EMPTY live DB
-/// (the recovery shape); a populated live DB is never swapped out.
+/// (the recovery shape: no users, groups, providers or mapping rules); a
+/// live DB with any IAM state is never swapped out.
 #[derive(Debug, PartialEq, Eq)]
 enum BakDisposition {
     /// No `.db.bak` on disk — the normal healthy boot.
@@ -907,9 +908,9 @@ enum BakDisposition {
 fn classify_lingering_bak(
     bak_exists: bool,
     bak_users: Option<usize>,
-    live_user_count: usize,
+    live_iam_rows: usize,
 ) -> BakDisposition {
-    match (bak_exists, bak_users, live_user_count) {
+    match (bak_exists, bak_users, live_iam_rows) {
         (false, _, _) => BakDisposition::NoBak,
         // Undecryptable bak + EMPTY live DB = the boot-2 incident shape.
         (true, None, 0) => BakDisposition::Sticky,
@@ -922,6 +923,23 @@ fn classify_lingering_bak(
         (true, Some(n), 0) if n > 0 => BakDisposition::Promote,
         (true, Some(_), _) => BakDisposition::AmbiguousWarn,
     }
+}
+
+/// Classify a lingering `.db.bak` next to the live DB that opened.
+fn bak_disposition(
+    bak_path: &std::path::Path,
+    keys: &deltaglider_proxy::config_db::ConfigDbKeys,
+    live: &deltaglider_proxy::config_db::ConfigDb,
+) -> BakDisposition {
+    if !bak_path.exists() {
+        return BakDisposition::NoBak;
+    }
+    let bak_users = probe_bak_users(bak_path, keys);
+    // Any IAM row counts, not only users: a live DB with an OIDC provider or
+    // groups (before the first login) is not the incident-empty DB. On a
+    // load error err on the side of "populated".
+    let live_rows = live.iam_row_count().unwrap_or(usize::MAX);
+    classify_lingering_bak(true, bak_users, live_rows)
 }
 
 /// Probe `.db.bak` with the config DB keys (primary, then fallbacks):
@@ -1103,15 +1121,7 @@ fn init_config_db_attempt(
             // Classify a lingering .db.bak BEFORE any boot-time mutation: a
             // node with an unresolved mismatch incident must stay locked.
             let bak_path = db_file.with_extension("db.bak");
-            let disposition = if bak_path.exists() {
-                let bak_users = probe_bak_users(&bak_path, keys);
-                // On a load error err on the side of "has users" — a populated
-                // live DB must never be treated as the incident-empty DB.
-                let live_user_count = db.load_users().map(|u| u.len()).unwrap_or(usize::MAX);
-                classify_lingering_bak(true, bak_users, live_user_count)
-            } else {
-                BakDisposition::NoBak
-            };
+            let disposition = bak_disposition(&bak_path, keys, &db);
             match disposition {
                 BakDisposition::NoBak => {}
                 BakDisposition::Sticky => {
@@ -2136,6 +2146,37 @@ mod tests {
         assert_eq!(probe_bak_users(&bak, &keys), Some(1));
         drop(promote_backup_db(&db_file, &bak, &keys, false).unwrap());
         assert!(probe_key(&db_file, primary).unwrap());
+    }
+
+    /// A live DB that holds IAM state other than users (an OIDC provider, a
+    /// group, a mapping rule: a setup before the first login) is not the
+    /// empty incident DB: a stale backup with users must not replace it.
+    #[test]
+    fn a_stale_backup_never_replaces_a_live_db_with_iam_state() {
+        use deltaglider_proxy::config_db::{ConfigDb, ConfigDbKeys};
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("deltaglider_config.db");
+        let bak = db_file.with_extension("db.bak");
+        let key = "primary-key-0123456789abcdef0123456789";
+        let old = ConfigDb::open_or_create(&bak, key).unwrap();
+        old.create_user("stale", "AKSTALE1", "s", true, &[])
+            .unwrap();
+        drop(old);
+        let live = ConfigDb::open_or_create(&db_file, key).unwrap();
+        live.create_group("eng", "", &[]).unwrap();
+        let keys = ConfigDbKeys::primary_only(key);
+        assert_eq!(
+            bak_disposition(&bak, &keys, &live),
+            BakDisposition::AmbiguousWarn,
+            "a stale backup would replace a live DB that holds IAM state"
+        );
+        // The incident shape (nothing in the live DB) still promotes.
+        let empty = dir.path().join("empty.db");
+        let empty_db = ConfigDb::open_or_create(&empty, key).unwrap();
+        assert_eq!(
+            bak_disposition(&bak, &keys, &empty_db),
+            BakDisposition::Promote
+        );
     }
 
     /// A promoted backup that opened only with a fallback key is re-encrypted,
