@@ -12,8 +12,9 @@
 //! - a row changed differently on both sides merges COLUMN BY COLUMN against
 //!   the base (the permission rows count as one column): a key rotation on
 //!   one side and a permission edit on the other both survive. Only a column
-//!   changed on both sides is a CONFLICT: the newer `sync_mtime` wins (a tie
-//!   goes to the remote);
+//!   changed on both sides is a CONFLICT: the newer `sync_mtime` wins (a tie,
+//!   or an unknown `sync_mtime = 0` from an older-schema copy, goes to the
+//!   remote);
 //! - a delete beats a concurrent edit, because bringing back a deleted
 //!   identity is the unsafe outcome. Every conflict is reported so the caller
 //!   can audit it.
@@ -557,8 +558,11 @@ fn local_is_newer(l: &Entity, r: &Entity) -> bool {
     local_mtime_is_newer(l.mtime, r.mtime)
 }
 
+/// `0` is UNKNOWN, not "oldest": a copy from before the `sync_mtime` column
+/// (an older schema, migrated with the default) carries no age, so the tie
+/// rule (remote) applies instead of letting the known side win by default.
 fn local_mtime_is_newer(local: i64, remote: i64) -> bool {
-    local > remote
+    local > 0 && remote > 0 && local > remote
 }
 
 /// Pure: the three-way pick of one value, and whether it changed on both
@@ -1550,6 +1554,43 @@ mod tests {
             .unwrap();
         assert!(!report.changed);
         assert!(report.stale_user_ids.is_empty());
+    }
+
+    /// `sync_mtime = 0` is a row from a copy without the column (an older
+    /// schema, migrated with the default): its age is unknown, not "oldest",
+    /// so a local edit does not win by default — the tie rule applies.
+    #[test]
+    fn a_zero_mtime_is_unknown_not_oldest() {
+        let t = trio(seed_three);
+        let local = open(&t.local);
+        local
+            .update_user(user_id(&local, "u1"), None, None, Some(&[perm("local/*")]))
+            .unwrap();
+        {
+            let remote = open(&t.remote);
+            remote
+                .update_user(
+                    user_id(&remote, "u1"),
+                    None,
+                    None,
+                    Some(&[perm("remote/*")]),
+                )
+                .unwrap();
+            remote
+                .conn
+                .execute("UPDATE users SET sync_mtime = 0", [])
+                .unwrap();
+        }
+        let report = local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .unwrap();
+        let u1 = local.get_user_by_id(user_id(&local, "u1")).unwrap();
+        assert_eq!(u1.permissions[0].resources, vec!["remote/*"]);
+        assert_eq!(report.conflicts[0].resolution, "remote");
+        // The pure rule, both ways round.
+        assert!(!local_mtime_is_newer(5, 0));
+        assert!(!local_mtime_is_newer(0, 5));
+        assert!(local_mtime_is_newer(6, 5));
     }
 
     /// A COMMIT that fails (here: a deferred foreign key) must not leave the
