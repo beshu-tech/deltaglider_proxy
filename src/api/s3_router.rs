@@ -20,15 +20,10 @@ use crate::iam::{authorization_middleware, SharedIamState};
 use crate::metrics::Metrics;
 use crate::rate_limiter::RateLimiter;
 
-/// Whether the request is an `?acl` subresource request.
+/// Whether the request is an `?acl` subresource request, with the query
+/// decoded as s3s decodes it (`%61cl` is `acl`).
 fn is_acl_request(uri: &axum::http::Uri) -> bool {
-    uri.query()
-        .map(|query| {
-            query
-                .split('&')
-                .any(|part| part == "acl" || part.starts_with("acl="))
-        })
-        .unwrap_or(false)
+    crate::api::request_target::RequestTarget::from_uri(uri).is_ok_and(|t| t.has_query("acl"))
 }
 
 /// Build the S3-compatible router with all routes and middleware layers.
@@ -414,4 +409,20 @@ where
             crate::cors::cors_layer_for(permissive)
         })
         .with_state(state.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_acl_request;
+
+    #[test]
+    fn acl_query_is_decoded_like_s3s() {
+        let acl = |q: &str| is_acl_request(&format!("/b/k?{q}").parse().unwrap());
+        assert!(acl("acl"));
+        assert!(acl("acl="));
+        assert!(acl("%61cl"));
+        assert!(acl("versionId=v&acl"));
+        assert!(!acl("aclx"));
+        assert!(!acl("x=acl"));
+    }
 }

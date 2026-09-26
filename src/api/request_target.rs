@@ -224,6 +224,7 @@ mod tests {
             // Splits form fields and credential scopes on `/`, not paths.
             ("api/handlers/form_post.rs", &auth_only[..]),
             ("iam/middleware.rs", &all[..]),
+            ("api/s3_router.rs", &all[..]),
             ("admission/middleware.rs", &all[..]),
             ("maintenance/gate.rs", &all[..]),
             ("coordination/health.rs", &all[..]),
