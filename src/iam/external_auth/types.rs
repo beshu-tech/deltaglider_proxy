@@ -95,6 +95,24 @@ pub enum ExternalAuthError {
 
 impl From<reqwest::Error> for ExternalAuthError {
     fn from(e: reqwest::Error) -> Self {
-        Self::HttpError(e.to_string())
+        Self::HttpError(error_chain(&e))
     }
+}
+
+/// An error and every `source()` below it, joined with ": ". reqwest's own
+/// Display stops at "error sending request for url (...)"; the cause (DNS,
+/// refused connection, the TLS verdict such as `UnknownIssuer`) is in the
+/// source chain, and an operator needs it.
+pub fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut cur = e.source();
+    while let Some(src) = cur {
+        let s = src.to_string();
+        if !out.contains(&s) {
+            out.push_str(": ");
+            out.push_str(&s);
+        }
+        cur = src.source();
+    }
+    out
 }

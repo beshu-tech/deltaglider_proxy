@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added — OIDC providers in private networks
+
+An identity provider on a private address or behind a private CA (an
+in-house Keycloak or Dex) could not be used: discovery refused the address,
+and the proxy trusted only public roots. Now a provider's `extra_config`
+takes `allow_local: true` (http:// and private addresses allowed, cloud
+metadata never, as for backends and webhooks) and `ca_cert_path` (a PEM
+bundle added to the trust roots). The admin API and the declarative
+reconciler check the issuer URL against that policy at save time (422 with
+the reason), and the admin API checks the CA file. Create and update
+responses no longer echo `client_secret`. Discovery and token errors keep
+their cause (for example `UnknownIssuer`). `set-up-sso.md` no longer
+suggests `curl` as a check of what the proxy can reach.
+
 ### Fixed — IAM users count as credentials at boot
 
 A declarative config whose only credentials were `access.iam_users`, and a

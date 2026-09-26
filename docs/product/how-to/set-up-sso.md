@@ -54,7 +54,36 @@ Go to **Settings → Access → External authentication** → **+ Add provider**
 | Enabled | ✓ |
 | Priority | lower number = shown first on the login page |
 
-Save, then use the provider row's **Test** action: the proxy fetches the issuer's `.well-known/openid-configuration` and reports DNS, TLS, or connectivity problems before any human tries to log in.
+Save, then use the provider row's **Test** action: the proxy fetches the issuer's `.well-known/openid-configuration` and reports DNS, TLS, or connectivity problems before any human tries to log in. The error names the underlying cause, for example `invalid peer certificate: UnknownIssuer` for a certificate from a CA that the proxy does not trust.
+
+The proxy checks the issuer URL when you save the provider. By default the issuer must use `https://` and a public address, because the proxy refuses requests to private, loopback, and cloud-metadata addresses. A provider that breaks this rule is refused with `422` and a message that names the rule. The client secret is never returned in a response: the API shows `****` in its place.
+
+### An identity provider in a private network
+
+If your identity provider (for example Keycloak or Dex) runs on a private address, or uses a certificate from a private CA, set two keys in the provider's `extra_config`:
+
+| Key | Value | Effect |
+|---|---|---|
+| `allow_local` | `true` | The issuer, and the endpoints that its discovery document names, may use `http://` and private addresses. This is the same opt-in as `allow_local` on backends and on event delivery. Cloud-metadata addresses stay refused. |
+| `ca_cert_path` | path to a PEM file | The certificates in the file are added to the trust roots for this provider. The proxy checks at save time that the file holds at least one certificate. |
+
+In the admin API, the provider body carries them as `"extra_config": {"allow_local": true, "ca_cert_path": "/etc/deltaglider/idp-ca.pem"}`. In declarative YAML they go under the provider entry:
+
+```yaml
+access:
+  auth_providers:
+    - name: corp-keycloak
+      provider_type: oidc
+      client_id: deltaglider
+      client_secret: "${env:DGP_KEYCLOAK_SECRET}"
+      issuer_url: "https://keycloak.corp.internal/realms/acme"
+      scopes: "openid email profile"
+      extra_config:
+        allow_local: true
+        ca_cert_path: /etc/deltaglider/idp-ca.pem
+```
+
+The proxy does not use the operating system's certificate store for identity providers. It trusts the public web roots that are built into it, plus the file in `ca_cert_path`.
 
 ## 3. Map IdP groups to IAM groups
 
@@ -95,7 +124,7 @@ Three failure modes are provider-side, not proxy-side:
 
 1. **`invalid_redirect_uri` at the provider.** The registered URI doesn't byte-for-byte match `https://s3.acme.example/_/api/admin/oauth/callback` — watch trailing slashes and `http` vs `https`. If a reverse proxy fronts DeltaGlider, also confirm it forwards the same `Host` header the user sees. The proxy builds the callback URL from the `Host` header. It uses `X-Forwarded-Host` and `X-Forwarded-Proto` only when `DGP_TRUST_PROXY_HEADERS=true`, because otherwise any client could choose the host that receives the authorization code.
 2. **Azure `groups` claim missing.** Azure AD omits groups by default; in the app registration go to Token configuration → Add groups claim, then retry the flow.
-3. **"Token exchange failed" in the audit log.** The proxy couldn't reach the provider's token endpoint. From the proxy container, run `curl -v https://<issuer>/.well-known/openid-configuration` — if that fails, fix DNS/network/TLS first; it isn't an OAuth problem.
+3. **"Token exchange failed" in the audit log, or a failed Test.** The proxy couldn't reach the provider. Read the error first: it names the cause (DNS, a refused connection, a refused private address, or a TLS error such as `UnknownIssuer`). A `curl` from the proxy container is not a reliable check. `curl` trusts the operating system's certificate store and connects to private addresses, but the proxy does neither unless you set `ca_cert_path` and `allow_local` (see [An identity provider in a private network](#an-identity-provider-in-a-private-network)). So `curl` can succeed while the proxy fails. If `curl` fails too, fix DNS, the network, or the certificate first; it isn't an OAuth problem.
 
 If login succeeds but the user has no permissions, no mapping rule matched — check with the Preview tool, and verify the auto-created user row in **Settings → Access → Users**. If you rotate the client secret at the provider, update it in the provider form; it takes effect on save, no restart.
 

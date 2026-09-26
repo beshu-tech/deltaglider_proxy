@@ -128,6 +128,8 @@ mod mismatch_boot_test;
 mod multipart_complete_resilience_test;
 #[path = "multipart_etag_test.rs"]
 mod multipart_etag_test;
+#[path = "oidc_login_test.rs"]
+mod oidc_login_test;
 #[path = "optimization_test.rs"]
 mod optimization_test;
 #[path = "parity_test.rs"]

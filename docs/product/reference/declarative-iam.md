@@ -64,6 +64,8 @@ access:
       client_secret: "replace-with-secret-before-apply"
       issuer_url: "https://accounts.google.com"
       scopes: "openid email profile"
+      # Optional, for an identity provider in a private network:
+      # extra_config: { allow_local: true, ca_cert_path: /etc/deltaglider/idp-ca.pem }
 
   group_mapping_rules:
     - provider: google-corp     # by NAME (null/absent = all providers)
@@ -89,7 +91,7 @@ Per entity type (users, groups, providers, mapping rules), by NAME:
 
 Mapping rules are wipe-and-rebuild (no stable per-row identity beyond the tuple of fields; replacing is identical in observable effect).
 
-**Validation is separate from side effects.** Every YAML-only error (duplicate names, duplicate access keys, unknown group refs, invalid permissions, `$`-prefixed reserved names) surfaces before any DB write. A single error means zero state change.
+**Validation is separate from side effects.** Every YAML-only error (duplicate names, duplicate access keys, unknown group refs, invalid permissions, `$`-prefixed reserved names, an OIDC `issuer_url` that the provider's `extra_config.allow_local` setting does not permit) surfaces before any DB write. A single error means zero state change.
 
 **Permission templates.** `resources` and string condition values may contain `${iam:username}` and `${iam:access_key_id}` (the `iam:` prefix is required — it distinguishes these request-time identity substitutions from `${env:NAME}` load-time config expansion). The reconciler stores those templates literally in the DB; runtime IAM index rebuild expands them per user after group permissions are merged. Identity values are inserted as they are, and a value that contains `/`, `*`, `?`, `$`, `{`, `}` or `%` is refused at expansion (that user then gets no permissions), so user names and access keys cannot inject a path level or a wildcard. Unknown `${...}` variables (including a bare, unprefixed `${username}`) fail validation before any reconcile write.
 

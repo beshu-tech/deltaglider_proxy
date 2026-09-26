@@ -16,8 +16,108 @@ use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 use super::types::{
-    AuthorizationRequest, ExternalAuthError, ExternalIdentityInfo, PendingAuth, ProviderTestResult,
+    error_chain, AuthorizationRequest, ExternalAuthError, ExternalIdentityInfo, PendingAuth,
+    ProviderTestResult,
 };
+
+/// The network policy of one provider, from its `extra_config`:
+///
+/// - `allow_local: true` — the issuer (and the endpoints its discovery
+///   document names) may use `http://` and private addresses, the same opt-in
+///   as backends and webhooks. Cloud-metadata addresses stay refused.
+/// - `ca_cert_path: "/path/ca.pem"` — a PEM bundle added to the trust roots,
+///   for an IdP behind a private CA.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OidcNetPolicy {
+    pub allow_local: bool,
+    pub ca_cert_path: Option<String>,
+}
+
+impl OidcNetPolicy {
+    /// Read the policy from `extra_config`. Wrong types are errors, so a
+    /// quoted `"true"` never silently means "off".
+    pub fn from_extra_config(extra: Option<&serde_json::Value>) -> Result<Self, String> {
+        let Some(extra) = extra.filter(|v| !v.is_null()) else {
+            return Ok(Self::default());
+        };
+        let allow_local = match extra.get("allow_local") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(other) => {
+                return Err(format!(
+                    "extra_config.allow_local must be true or false, got {other}"
+                ))
+            }
+        };
+        let ca_cert_path = match extra.get("ca_cert_path") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(p)) if p.trim().is_empty() => None,
+            Some(serde_json::Value::String(p)) => Some(p.trim().to_string()),
+            Some(other) => {
+                return Err(format!(
+                    "extra_config.ca_cert_path must be a file path, got {other}"
+                ))
+            }
+        };
+        Ok(Self {
+            allow_local,
+            ca_cert_path,
+        })
+    }
+
+    /// The outbound-URL policy: `allow_local` gets the backend-dev policy.
+    pub fn url_kind(&self) -> UrlKind {
+        if self.allow_local {
+            UrlKind::BackendDev
+        } else {
+            UrlKind::Oidc
+        }
+    }
+
+    /// The certificates of `ca_cert_path`, or none.
+    pub fn load_ca_certs(&self) -> Result<Vec<reqwest::Certificate>, String> {
+        let Some(path) = &self.ca_cert_path else {
+            return Ok(Vec::new());
+        };
+        let pem = std::fs::read(path)
+            .map_err(|e| format!("extra_config.ca_cert_path '{path}': cannot read: {e}"))?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem)
+            .map_err(|e| format!("extra_config.ca_cert_path '{path}': {}", error_chain(&e)))?;
+        if certs.is_empty() {
+            return Err(format!(
+                "extra_config.ca_cert_path '{path}': no PEM certificate in the file"
+            ));
+        }
+        Ok(certs)
+    }
+}
+
+/// Save-time check of an OIDC provider: the network policy parses, the
+/// issuer URL passes that policy (the same check discovery runs), and a
+/// `ca_cert_path` holds at least one certificate. `check_files: false`
+/// skips the file read (the pure declarative validation).
+pub fn validate_provider_config(
+    issuer_url: Option<&str>,
+    extra_config: Option<&serde_json::Value>,
+    check_files: bool,
+) -> Result<(), String> {
+    let policy = OidcNetPolicy::from_extra_config(extra_config)?;
+    if let Some(url) = issuer_url.filter(|u| !u.trim().is_empty()) {
+        validate_outbound_url(url, policy.url_kind()).map_err(|e| {
+            let hint = if policy.allow_local {
+                ""
+            } else {
+                ". For an identity provider on http:// or a private address, set \
+                 extra_config.allow_local: true"
+            };
+            format!("issuer_url '{url}': {e}{hint}")
+        })?;
+    }
+    if check_files {
+        policy.load_ca_certs()?;
+    }
+    Ok(())
+}
 
 /// Cached OIDC discovery document.
 struct CachedDiscovery {
@@ -35,6 +135,11 @@ pub struct OidcProvider {
     pub scopes: String,
     pub extra_config: serde_json::Value,
     http: reqwest::Client,
+    /// Outbound-URL policy from `extra_config.allow_local`.
+    url_kind: UrlKind,
+    /// Why the HTTP client could not take the configured policy (a bad
+    /// `extra_config` or CA file). Every request then fails with it.
+    config_error: Option<String>,
     cache: RwLock<Option<CachedDiscovery>>,
 }
 
@@ -95,22 +200,45 @@ impl OidcProvider {
         scopes: String,
         extra_config: serde_json::Value,
     ) -> Self {
+        let (policy, mut config_error) = match OidcNetPolicy::from_extra_config(Some(&extra_config))
+        {
+            Ok(p) => (p, None),
+            Err(e) => (OidcNetPolicy::default(), Some(e)),
+        };
+        let url_kind = policy.url_kind();
         // Disable redirects: the OIDC discovery + JWKS targets are
         // operator-supplied; a redirect from a legit-looking host to
         // 169.254.169.254 is the SSRF pivot we want to block. Callers
-        // also enforce `validate_outbound_url(UrlKind::Oidc)` before
-        // even reaching the client.
-        let http = reqwest::Client::builder()
+        // also enforce `validate_outbound_url` before even reaching the
+        // client.
+        let mut builder = reqwest::Client::builder()
+            // rustls, as in production, whatever TLS backend the build
+            // unifies to (tests enable native-tls through dev-deps).
+            .use_rustls_tls()
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             // Close the DNS-rebinding gap: reject hostnames resolving to
             // metadata/private addresses at connect time (the literal-IP
-            // validate_outbound_url check can't see DNS).
+            // validate_outbound_url check can't see DNS). `allow_local`
+            // admits private addresses; metadata stays refused.
             .dns_resolver(std::sync::Arc::new(
-                crate::security::SsrfGuardedResolver::new(crate::security::UrlKind::Oidc),
-            ))
-            .build()
-            .unwrap_or_default();
+                crate::security::SsrfGuardedResolver::new(url_kind),
+            ));
+        match policy.load_ca_certs() {
+            Ok(certs) => {
+                for c in certs {
+                    builder = builder.add_root_certificate(c);
+                }
+            }
+            Err(e) => config_error = config_error.or(Some(e)),
+        }
+        let http = match builder.build() {
+            Ok(c) => c,
+            Err(e) => {
+                config_error = config_error.or(Some(format!("HTTP client: {}", error_chain(&e))));
+                reqwest::Client::default()
+            }
+        };
         Self {
             name,
             client_id,
@@ -119,7 +247,17 @@ impl OidcProvider {
             scopes,
             extra_config,
             http,
+            url_kind,
+            config_error,
             cache: RwLock::new(None),
+        }
+    }
+
+    /// Fails with the construction error, if any (see `config_error`).
+    fn check_config(&self) -> Result<(), ExternalAuthError> {
+        match &self.config_error {
+            Some(e) => Err(ExternalAuthError::ConfigError(e.clone())),
+            None => Ok(()),
         }
     }
 
@@ -207,7 +345,14 @@ impl OidcProvider {
             params.push(("code_verifier", verifier.clone()));
         }
 
-        let resp = self.http.post(&token_endpoint).form(&params).send().await?;
+        self.check_config()?;
+        let resp = self
+            .http
+            .post(&token_endpoint)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| ExternalAuthError::TokenExchangeFailed(error_chain(&e)))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -221,7 +366,7 @@ impl OidcProvider {
         let token_resp: TokenResponse = resp
             .json()
             .await
-            .map_err(|e| ExternalAuthError::TokenExchangeFailed(e.to_string()))?;
+            .map_err(|e| ExternalAuthError::TokenExchangeFailed(error_chain(&e)))?;
 
         let id_token_str = token_resp.id_token.ok_or_else(|| {
             ExternalAuthError::TokenExchangeFailed("No id_token in response".into())
@@ -303,7 +448,8 @@ impl OidcProvider {
     }
 
     async fn fetch_discovery(&self) -> Result<OidcDiscovery, ExternalAuthError> {
-        validate_outbound_url(&self.issuer_url, UrlKind::Oidc)
+        self.check_config()?;
+        validate_outbound_url(&self.issuer_url, self.url_kind)
             .map_err(|e| ExternalAuthError::ConfigError(format!("issuer_url: {e}")))?;
         let url = format!(
             "{}/.well-known/openid-configuration",
@@ -314,7 +460,7 @@ impl OidcProvider {
             .get(&url)
             .send()
             .await
-            .map_err(|e| ExternalAuthError::DiscoveryFailed(e.to_string()))?;
+            .map_err(|e| ExternalAuthError::DiscoveryFailed(error_chain(&e)))?;
 
         if !resp.status().is_success() {
             return Err(ExternalAuthError::DiscoveryFailed(format!(
@@ -327,7 +473,7 @@ impl OidcProvider {
         let doc: OidcDiscovery = resp
             .json()
             .await
-            .map_err(|e| ExternalAuthError::DiscoveryFailed(e.to_string()))?;
+            .map_err(|e| ExternalAuthError::DiscoveryFailed(error_chain(&e)))?;
 
         // RFC 8414 §3.3: the issuer in the discovery document MUST
         // match the URL the operator configured — otherwise a hostile
@@ -343,11 +489,11 @@ impl OidcProvider {
         // the IdP), so re-validate them. A discovery endpoint that
         // returns `token_endpoint: http://169.254.169.254/token` is
         // the exact pivot we're blocking.
-        validate_outbound_url(&doc.token_endpoint, UrlKind::Oidc)
+        validate_outbound_url(&doc.token_endpoint, self.url_kind)
             .map_err(|e| ExternalAuthError::DiscoveryFailed(format!("token_endpoint: {e}")))?;
-        validate_outbound_url(&doc.jwks_uri, UrlKind::Oidc)
+        validate_outbound_url(&doc.jwks_uri, self.url_kind)
             .map_err(|e| ExternalAuthError::DiscoveryFailed(format!("jwks_uri: {e}")))?;
-        validate_outbound_url(&doc.authorization_endpoint, UrlKind::Oidc).map_err(|e| {
+        validate_outbound_url(&doc.authorization_endpoint, self.url_kind).map_err(|e| {
             ExternalAuthError::DiscoveryFailed(format!("authorization_endpoint: {e}"))
         })?;
 
@@ -360,18 +506,18 @@ impl OidcProvider {
     ) -> Result<jsonwebtoken::jwk::JwkSet, ExternalAuthError> {
         // Re-validate even though `fetch_discovery` already did — a
         // future caller might pass a JWKS URI from elsewhere.
-        validate_outbound_url(jwks_uri, UrlKind::Oidc)
+        validate_outbound_url(jwks_uri, self.url_kind)
             .map_err(|e| ExternalAuthError::DiscoveryFailed(format!("jwks_uri: {e}")))?;
         let resp = self
             .http
             .get(jwks_uri)
             .send()
             .await
-            .map_err(|e| ExternalAuthError::DiscoveryFailed(e.to_string()))?;
+            .map_err(|e| ExternalAuthError::DiscoveryFailed(error_chain(&e)))?;
 
         resp.json()
             .await
-            .map_err(|e| ExternalAuthError::DiscoveryFailed(e.to_string()))
+            .map_err(|e| ExternalAuthError::DiscoveryFailed(error_chain(&e)))
     }
 
     fn validate_id_token(
@@ -609,6 +755,101 @@ mod tests {
             "https://idp.example.com",
             "https://idp.example.com/tenant"
         ));
+    }
+
+    #[test]
+    fn net_policy_reads_extra_config_strictly() {
+        use serde_json::json;
+        assert_eq!(
+            OidcNetPolicy::from_extra_config(None).unwrap(),
+            OidcNetPolicy::default()
+        );
+        let p = OidcNetPolicy::from_extra_config(Some(&json!({
+            "allow_local": true, "ca_cert_path": " /etc/ca.pem ", "allowed_domains": ["x"]
+        })))
+        .unwrap();
+        assert!(p.allow_local);
+        assert_eq!(p.ca_cert_path.as_deref(), Some("/etc/ca.pem"));
+        assert_eq!(p.url_kind(), UrlKind::BackendDev);
+        assert!(OidcNetPolicy::from_extra_config(Some(&json!({"allow_local": "true"}))).is_err());
+        assert!(OidcNetPolicy::from_extra_config(Some(&json!({"ca_cert_path": 5}))).is_err());
+    }
+
+    #[test]
+    fn provider_validation_applies_the_allow_local_policy() {
+        use serde_json::json;
+        let local = json!({"allow_local": true});
+        // Private and http:// issuers need allow_local.
+        for url in [
+            "https://10.0.0.5",
+            "http://idp.corp.example",
+            "https://127.0.0.1:8443",
+        ] {
+            let err = validate_provider_config(Some(url), None, false).unwrap_err();
+            assert!(err.contains("allow_local"), "{url}: {err}");
+            validate_provider_config(Some(url), Some(&local), false)
+                .unwrap_or_else(|e| panic!("{url} with allow_local: {e}"));
+        }
+        // Metadata never.
+        assert!(
+            validate_provider_config(Some("http://169.254.169.254"), Some(&local), false).is_err()
+        );
+        validate_provider_config(Some("https://accounts.google.com"), None, false).unwrap();
+        // A CA file that is missing, or holds no certificate, is refused.
+        let missing = json!({"ca_cert_path": "/nonexistent/ca.pem"});
+        assert!(validate_provider_config(None, Some(&missing), true).is_err());
+        assert!(validate_provider_config(None, Some(&missing), false).is_ok());
+        let dir = tempfile::tempdir().unwrap();
+        let junk = dir.path().join("junk.pem");
+        std::fs::write(&junk, "not a certificate").unwrap();
+        let cfg = json!({"ca_cert_path": junk.display().to_string()});
+        assert!(validate_provider_config(None, Some(&cfg), true).is_err());
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["idp.test".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let good = dir.path().join("ca.pem");
+        std::fs::write(&good, cert.pem()).unwrap();
+        let cfg = json!({"ca_cert_path": good.display().to_string()});
+        validate_provider_config(None, Some(&cfg), true).unwrap();
+    }
+
+    #[test]
+    fn a_bad_extra_config_fails_every_request_with_its_cause() {
+        let p = OidcProvider::new(
+            "p".into(),
+            "c".into(),
+            "s".into(),
+            "https://idp.example".into(),
+            "openid".into(),
+            serde_json::json!({"ca_cert_path": "/nonexistent/ca.pem"}),
+        );
+        let err = p.check_config().unwrap_err().to_string();
+        assert!(err.contains("/nonexistent/ca.pem"), "{err}");
+    }
+
+    #[test]
+    fn error_chain_keeps_the_cause() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error sending request")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let e = Outer(std::io::Error::other(
+            "invalid peer certificate: UnknownIssuer",
+        ));
+        assert_eq!(
+            error_chain(&e),
+            "error sending request: invalid peer certificate: UnknownIssuer"
+        );
     }
 
     #[test]

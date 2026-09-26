@@ -670,20 +670,43 @@ pub async fn oauth_callback(
 
 // ── Provider CRUD (protected endpoints) ──
 
+/// Hide a provider's client secret in an API response. Every response that
+/// carries a provider goes through this: list, create and update.
+fn mask_client_secret(p: &mut crate::config_db::auth_providers::AuthProviderConfig) {
+    if p.client_secret.is_some() {
+        p.client_secret = Some("****".to_string());
+    }
+}
+
+/// 422 with a JSON body naming the problem.
+fn invalid_provider(msg: String) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "error": msg })),
+    )
+        .into_response()
+}
+
+/// Save-time check of an OIDC provider (issuer URL against the provider's
+/// network policy, `extra_config` types, the CA file). Other types skip.
+fn check_provider(
+    provider_type: &str,
+    issuer_url: Option<&str>,
+    extra_config: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    if provider_type != "oidc" {
+        return Ok(());
+    }
+    crate::iam::external_auth::oidc::validate_provider_config(issuer_url, extra_config, true)
+}
+
 /// GET /api/admin/ext-auth/providers — list all providers (secrets masked).
 pub async fn list_providers(
     State(state): State<Arc<AdminState>>,
 ) -> Result<impl IntoResponse, StatusCode> {
     let mut providers =
         super::with_config_db(&state, "load auth providers", |db| db.load_auth_providers()).await?;
-
-    // Mask client secrets
-    for p in &mut providers {
-        if p.client_secret.is_some() {
-            p.client_secret = Some("****".to_string());
-        }
-    }
-
+    providers.iter_mut().for_each(mask_client_secret);
     Ok(Json(providers))
 }
 
@@ -692,17 +715,31 @@ pub async fn create_provider(
     State(state): State<Arc<AdminState>>,
     req_headers: HeaderMap,
     AdminJson(body): AdminJson<CreateAuthProviderRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let provider = super::with_config_db(&state, "create auth provider", |db| {
+) -> Response {
+    if let Err(e) = check_provider(
+        &body.provider_type,
+        body.issuer_url.as_deref(),
+        body.extra_config.as_ref(),
+    ) {
+        return invalid_provider(e);
+    }
+    let mut provider = match super::with_config_db(&state, "create auth provider", |db| {
         db.create_auth_provider(&body)
     })
-    .await?;
+    .await
+    {
+        Ok(p) => p,
+        Err(status) => return status.into_response(),
+    };
 
     audit_log("create_auth_provider", "", &body.name, &req_headers);
-    rebuild_external_auth(&state).await?;
+    if let Err(status) = rebuild_external_auth(&state).await {
+        return status.into_response();
+    }
     trigger_config_sync(&state);
 
-    Ok((StatusCode::CREATED, Json(provider)))
+    mask_client_secret(&mut provider);
+    (StatusCode::CREATED, Json(provider)).into_response()
 }
 
 /// PUT /api/admin/ext-auth/providers/:id — update a provider.
@@ -711,17 +748,41 @@ pub async fn update_provider(
     Path(id): Path<i64>,
     req_headers: HeaderMap,
     AdminJson(body): AdminJson<UpdateAuthProviderRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let updated = super::with_config_db(&state, "update auth provider", |db| {
+) -> Response {
+    // Validate the provider as it will be after the update.
+    let current =
+        match super::with_config_db(&state, "load auth provider", |db| db.get_auth_provider(id))
+            .await
+        {
+            Ok(p) => p,
+            Err(status) => return status.into_response(),
+        };
+    if let Err(e) = check_provider(
+        body.provider_type
+            .as_deref()
+            .unwrap_or(&current.provider_type),
+        body.issuer_url.as_deref().or(current.issuer_url.as_deref()),
+        body.extra_config.as_ref().or(current.extra_config.as_ref()),
+    ) {
+        return invalid_provider(e);
+    }
+    let mut updated = match super::with_config_db(&state, "update auth provider", |db| {
         db.update_auth_provider(id, &body)
     })
-    .await?;
+    .await
+    {
+        Ok(p) => p,
+        Err(status) => return status.into_response(),
+    };
 
     audit_log("update_auth_provider", "", &updated.name, &req_headers);
-    rebuild_external_auth(&state).await?;
+    if let Err(status) = rebuild_external_auth(&state).await {
+        return status.into_response();
+    }
     trigger_config_sync(&state);
 
-    Ok(Json(updated))
+    mask_client_secret(&mut updated);
+    Json(updated).into_response()
 }
 
 /// DELETE /api/admin/ext-auth/providers/:id — delete a provider.

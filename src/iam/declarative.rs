@@ -697,6 +697,20 @@ fn validate(yaml: &DeclarativeIam, db: &CurrentIam) -> Result<(), String> {
         "iam_users.access_key_id",
     )?;
 
+    // OIDC providers: the issuer URL passes the provider's network policy
+    // (`extra_config.allow_local`), as on the admin API. The CA file is read
+    // at discovery, not here: this validation is pure.
+    for p in &yaml.auth_providers {
+        if p.provider_type == "oidc" {
+            crate::iam::external_auth::oidc::validate_provider_config(
+                p.issuer_url.as_deref(),
+                p.extra_config.as_ref(),
+                false,
+            )
+            .map_err(|e| format!("auth provider '{}': {e}", p.name))?;
+        }
+    }
+
     // Reserved-name blocks ($-prefixed are reserved for synthetic
     // principals like $anonymous and $bootstrap).
     for u in &yaml.users {
