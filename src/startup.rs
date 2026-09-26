@@ -386,97 +386,9 @@ pub fn build_s3_router(
     shared_config: &deltaglider_proxy::config::SharedConfig,
 ) -> Router {
     use axum::error_handling::HandleError;
-    use deltaglider_proxy::iam::IamState;
+    use deltaglider_proxy::api::s3s_hooks::{DeltaGliderS3sAuth, VerifiedIdentityS3sAccess};
     use deltaglider_proxy::s3_adapter_s3s::DeltaGliderS3Service;
-    use s3s::access::{S3Access, S3AccessContext};
-    use s3s::auth::{S3Auth, SecretKey};
     use s3s::service::S3ServiceBuilder;
-
-    #[derive(Clone)]
-    struct DeltaGliderS3sAuth {
-        iam_state: SharedIamState,
-    }
-
-    #[async_trait::async_trait]
-    impl S3Auth for DeltaGliderS3sAuth {
-        async fn get_secret_key(&self, access_key: &str) -> s3s::S3Result<SecretKey> {
-            match self.iam_state.load().as_ref() {
-                IamState::Disabled => {
-                    // The legacy Axum path ignores signatures in open-dev mode.
-                    // In open mode, accept the common "same access key + secret"
-                    // dummy pattern used by SDK clients (test/test, anonymous/
-                    // anonymous). This lets s3s decode signed/chunked SDK
-                    // requests without making local-dev users discover a magic
-                    // hardcoded secret.
-                    Ok(SecretKey::from(access_key.to_string()))
-                }
-                IamState::Legacy(auth) if access_key == auth.access_key_id => {
-                    Ok(SecretKey::from(auth.secret_access_key.clone()))
-                }
-                IamState::Iam(index) => index
-                    .get(access_key)
-                    .filter(|user| user.enabled)
-                    .map(|user| SecretKey::from(user.secret_access_key.clone()))
-                    .ok_or_else(|| s3s::s3_error!(InvalidAccessKeyId)),
-                _ => Err(s3s::s3_error!(InvalidAccessKeyId)),
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    struct VerifiedIdentityS3sAccess;
-
-    #[async_trait::async_trait]
-    impl S3Access for VerifiedIdentityS3sAccess {
-        async fn check(&self, cx: &mut S3AccessContext<'_>) -> s3s::S3Result<()> {
-            // IAM/admission authorization is enforced by the outer Axum
-            // middleware chain, against the identity the SigV4 middleware
-            // resolved. This hook binds that identity to the key s3s verified
-            // (see `resolved_identity_is_verified`). It also replaces s3s'
-            // default "auth provider implies anonymous deny", which would
-            // reject already-admitted public/open-mode requests.
-            let verified = cx.credentials().map(|c| c.access_key.clone());
-            let resolved = cx
-                .extensions_mut()
-                .get::<deltaglider_proxy::iam::AuthenticatedUser>();
-            if deltaglider_proxy::api::auth::resolved_identity_is_verified(
-                resolved,
-                verified.as_deref(),
-            ) {
-                // Only a real verified credential counts as an auth success
-                // for the brute-force limiter; anonymous/open requests don't.
-                if verified.is_some() {
-                    if let Some(outcome) = cx
-                        .extensions_mut()
-                        .get::<deltaglider_proxy::api::auth::AuthOutcome>()
-                    {
-                        outcome.mark_verified();
-                    }
-                }
-                // The maintenance + backend-health gates run HERE, after s3s
-                // verified the signature: their 503 names a busy bucket or a
-                // backend's state, which a forged signature must not learn.
-                let (method, path) = (cx.method().clone(), cx.uri().path().to_owned());
-                deltaglider_proxy::maintenance::gate::check_verified_request(
-                    cx.extensions_mut(),
-                    &method,
-                    &path,
-                )
-                .map_err(|e| {
-                    let code = s3s::S3ErrorCode::from_bytes(e.code().as_bytes())
-                        .unwrap_or(s3s::S3ErrorCode::ServiceUnavailable);
-                    s3s::S3Error::with_message(code, e.to_string())
-                })
-            } else {
-                tracing::warn!(
-                    "SECURITY | event=identity_mismatch | resolved={} | verified={}",
-                    resolved.map(|u| u.access_key_id.as_str()).unwrap_or(""),
-                    verified.as_deref().unwrap_or("<none>")
-                );
-                Err(s3s::s3_error!(AccessDenied))
-            }
-        }
-    }
 
     async fn handle_s3s_http_error(err: s3s::HttpError) -> axum::response::Response {
         error!(?err, "s3s HTTP-level failure");
@@ -571,12 +483,7 @@ pub fn build_s3_router(
         iam_state: iam_state.clone(),
     });
     builder.set_access(VerifiedIdentityS3sAccess);
-    // Pass the documented skew tolerance to s3s; it used its own default.
-    let mut s3s_config = s3s::config::S3Config::default();
-    s3s_config.presigned_url_max_skew_time_secs = deltaglider_proxy::api::auth::clock_skew_secs();
-    builder.set_config(Arc::new(s3s::config::StaticConfigProvider::new(Arc::new(
-        s3s_config,
-    ))));
+    builder.set_config(deltaglider_proxy::api::s3s_hooks::s3s_config());
     let s3_service = HandleError::new(builder.build(), handle_s3s_http_error);
 
     // Form-POST upload interceptor (`POST /<bucket>` with

@@ -8,6 +8,7 @@ pub(crate) mod aws_chunked;
 pub(crate) mod errors;
 pub mod handlers;
 pub mod request_target;
+pub mod s3s_hooks;
 
 pub use errors::S3Error;
 

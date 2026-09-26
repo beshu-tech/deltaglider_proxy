@@ -53,6 +53,38 @@ fn classify_action(method: &axum::http::Method, path: &str) -> S3Action {
     }
 }
 
+/// The action and resource the authorization middleware checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthzTarget<'a> {
+    pub action: S3Action,
+    pub bucket: &'a str,
+    pub key: &'a str,
+    /// `POST /{bucket}?delete`: the keys are in the body; the adapter
+    /// checks each one.
+    pub batch_delete: bool,
+}
+
+/// THE mapping from a decoded request to what IAM authorizes. Pure, so the
+/// middleware-vs-s3s contract test checks the exact decision input.
+pub fn authz_target<'a>(
+    method: &axum::http::Method,
+    target: &'a crate::api::request_target::RequestTarget,
+) -> AuthzTarget<'a> {
+    let mut action = classify_action(method, &target.path);
+    let (bucket, key) = target.bucket_and_key();
+    // POST /{bucket}?delete is a batch DELETE, not a write.
+    let is_delete = *method == axum::http::Method::POST && target.has_query("delete");
+    if is_delete {
+        action = S3Action::Delete;
+    }
+    AuthzTarget {
+        action,
+        bucket,
+        key,
+        batch_delete: is_delete && key.is_empty(),
+    }
+}
+
 /// Axum middleware that checks IAM permissions after SigV4 authentication.
 ///
 /// If an `AuthenticatedUser` is present in request extensions (inserted by
@@ -94,19 +126,12 @@ pub async fn authorization_middleware(
         }
     };
     let path = target.path.as_str();
-
-    // Determine the S3 action
-    let mut action = classify_action(&method, path);
-
-    let (bucket, key) = target.bucket_and_key();
-
-    // POST /{bucket}?delete is a batch DELETE, not a write. Its keys are in
-    // the body; the adapter checks each one.
-    let is_batch_delete =
-        method == axum::http::Method::POST && target.has_query("delete") && key.is_empty();
-    if method == axum::http::Method::POST && target.has_query("delete") {
-        action = S3Action::Delete;
-    }
+    let AuthzTarget {
+        action,
+        bucket,
+        key,
+        batch_delete: is_batch_delete,
+    } = authz_target(&method, &target);
 
     // ListBuckets (GET /) is filtered at the handler level, not denied outright.
     // This lets IAM users see only the buckets they have permissions on. Only
