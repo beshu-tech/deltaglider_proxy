@@ -753,7 +753,7 @@ pub async fn test_provider(
     let db = db.lock().await;
     let provider_config = db.get_auth_provider(id).map_err(|e| {
         tracing::error!("Failed to load auth provider {}: {}", id, e);
-        StatusCode::NOT_FOUND
+        super::db_error_status(&e)
     })?;
     drop(db);
 
@@ -809,7 +809,7 @@ pub async fn create_mapping(
 
     let rule = db.create_group_mapping_rule(&body).map_err(|e| {
         tracing::error!("Failed to create mapping rule: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        super::db_error_status(&e)
     })?;
     let target = rule_target(&db, &rule);
 
@@ -912,7 +912,7 @@ pub async fn preview_mapping(
 
     let rules = db.load_group_mapping_rules().map_err(|e| {
         tracing::error!("Failed to load mapping rules: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        super::db_error_status(&e)
     })?;
 
     let group_ids = mapping::preview_email_mappings(&rules, &body.email);
@@ -1097,7 +1097,7 @@ async fn rebuild_external_auth(state: &Arc<AdminState>) -> Result<(), StatusCode
         let db = config_db.lock().await;
         let providers = db.load_auth_providers().map_err(|e| {
             tracing::error!("rebuild_external_auth: load_auth_providers failed: {e}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            super::db_error_status(&e)
         })?;
         ext_auth.rebuild(&providers);
         drop(db);

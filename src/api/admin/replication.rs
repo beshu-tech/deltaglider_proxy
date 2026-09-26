@@ -368,7 +368,7 @@ pub async fn verify(
     let acquired = {
         let db = db_arc.lock().await;
         db.parity_try_acquire_lease(&rule.name, &owner, now, PARITY_LEASE_TTL_SECS)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(super::db_error_reply)?
     };
     if !acquired {
         // Someone else holds the lease → a scan IS in flight. Report 'running'
@@ -624,7 +624,7 @@ pub async fn pause(
         .await;
     let _ = db.replication_ensure_state(&name, replication::current_unix_seconds());
     db.replication_set_paused(&name, true)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
+        .map_err(super::db_error_reply)?;
     crate::audit::audit_log("replication_pause", "admin", &name, headers, "", "");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -651,7 +651,7 @@ pub async fn resume(
     let now = replication::current_unix_seconds();
     let _ = db.replication_ensure_state(&name, now);
     db.replication_resume(&name, now)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
+        .map_err(super::db_error_reply)?;
     crate::audit::audit_log("replication_resume", "admin", &name, headers, "", "");
     Ok(StatusCode::NO_CONTENT)
 }

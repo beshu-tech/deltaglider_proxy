@@ -684,6 +684,17 @@ async fn groups_crud_members_clone_and_errors() {
             .send()
     };
     assert_eq!(add(bob_id).await.unwrap().status(), StatusCode::OK);
+    // A member or group that does not exist is the caller's 404 (the
+    // DB's FOREIGN KEY check), not a 400 or a 500.
+    assert_eq!(add(999_999).await.unwrap().status(), StatusCode::NOT_FOUND);
+    let code = admin
+        .post(format!("{ep}/_/api/admin/groups/999999/members"))
+        .json(&json!({ "user_id": bob_id }))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(code, StatusCode::NOT_FOUND, "a member of a missing group");
     assert_audited(&admin, &ep, "add_member", "g-bob").await;
     let groups: Value = admin
         .get(format!("{ep}/_/api/admin/groups"))
@@ -838,6 +849,32 @@ async fn users_rotate_clone_delete_and_empty_name() {
         .unwrap()
         .status();
     assert_eq!(code, StatusCode::BAD_REQUEST, "a rename to a blank name");
+
+    // A name another user has is a 409 on create, clone and rename.
+    let code = admin
+        .post(format!("{ep}/_/api/admin/users"))
+        .json(&json!({ "name": "rot-user", "permissions": [] }))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(code, StatusCode::CONFLICT, "a duplicate user name");
+    let code = admin
+        .post(format!("{ep}/_/api/admin/users/{id}/clone"))
+        .json(&json!({ "name": "rot-user" }))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(code, StatusCode::CONFLICT, "a clone onto a taken name");
+    let code = admin
+        .put(format!("{ep}/_/api/admin/users/999999"))
+        .json(&json!({ "name": "nobody" }))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(code, StatusCode::NOT_FOUND, "update of a missing user");
 
     // Reserved and empty names.
     for name in ["$anonymous", ""] {

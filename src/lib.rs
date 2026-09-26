@@ -262,6 +262,97 @@ mod source_guards {
         out
     }
 
+    /// Admin handlers map a config-DB error to its status through
+    /// `api::admin::db_error_status` (missing row 404, UNIQUE violation 409,
+    /// the rest 500), never through a hand-picked code: `delete_user`
+    /// answered 404 for any error, `update_provider` 500 for a missing row.
+    /// A DB call is a `.map_err(` whose statement calls `db.<method>(`.
+    #[test]
+    fn admin_db_errors_map_through_db_error_status() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_files(&root.join("src/api/admin"), &mut files);
+        let is_db_call = |text: &str| {
+            text.match_indices("db.").any(|(i, _)| {
+                let before = text[..i].chars().next_back();
+                let ident_start = !before.is_some_and(|c| c.is_alphanumeric() || c == '_');
+                let rest = &text[i + 3..];
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                ident_start && !name.is_empty() && rest[name.len()..].starts_with('(')
+            })
+        };
+        let mut offenders = Vec::new();
+        for file in files {
+            let rel = file
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&file).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            let tests_from = test_module_lines(&text).first().map(|(n, _)| *n);
+            for (i, line) in lines.iter().enumerate() {
+                if tests_from.is_some_and(|t| i + 1 >= t) {
+                    break;
+                }
+                let Some(at) = line.find(".map_err(") else {
+                    continue;
+                };
+                // The statement: back to the previous `;`, `{` or `}` line.
+                let mut start = i;
+                while start > 0 {
+                    let prev = lines[start - 1].trim_end();
+                    if prev.ends_with(';') || prev.ends_with('{') || prev.ends_with('}') {
+                        break;
+                    }
+                    start -= 1;
+                }
+                let head: String = lines[start..i]
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(&line[..at]))
+                    .collect::<Vec<_>>()
+                    .concat()
+                    .split_whitespace()
+                    .collect();
+                if !is_db_call(&head) {
+                    continue;
+                }
+                // The closure: until its parentheses balance.
+                let mut depth = 0i64;
+                let mut body = String::new();
+                'scan: for l in &lines[i..] {
+                    let from = if body.is_empty() { at } else { 0 };
+                    for c in l[from..].chars() {
+                        body.push(c);
+                        match c {
+                            '(' => depth += 1,
+                            ')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    break 'scan;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    body.push('\n');
+                }
+                if body.contains("StatusCode::") && !body.contains("db_error_status") {
+                    offenders.push(format!("{rel}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "map config-DB errors with super::db_error_status(&e), not a fixed code:\n{}",
+            offenders.join("\n")
+        );
+    }
+
     /// Is `FileMetadata {` at `idx` a struct literal (not a type position
     /// such as `-> FileMetadata {`, `impl FileMetadata {`)?
     fn is_file_metadata_literal(line: &str, idx: usize) -> bool {

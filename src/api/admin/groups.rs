@@ -56,7 +56,7 @@ pub async fn list_groups(
     let db = db.lock().await;
     let groups = db.load_groups().map_err(|e| {
         tracing::error!("Failed to load groups: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        super::db_error_status(&e)
     })?;
     Ok(Json(groups))
 }
@@ -85,7 +85,7 @@ pub async fn create_group(
         .create_group(&body.name, &body.description, &perms)
         .map_err(|e| {
             tracing::warn!("Failed to create group '{}': {}", body.name, e);
-            StatusCode::CONFLICT
+            super::db_error_status(&e)
         })?;
 
     // Add members if provided in the creation request.
@@ -117,7 +117,7 @@ pub async fn create_group(
     let group = if !body.member_ids.is_empty() {
         db.get_group_by_id(group.id).map_err(|e| {
             tracing::error!("Failed to reload group after adding members: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            super::db_error_status(&e)
         })?
     } else {
         group
@@ -143,7 +143,7 @@ pub async fn clone_group(
     let body = body.map(|Json(body)| body);
     let source = db.get_group_by_id(group_id).map_err(|e| {
         tracing::warn!("Failed to load source group {} for clone: {}", group_id, e);
-        StatusCode::NOT_FOUND
+        super::db_error_status(&e)
     })?;
 
     let name = body
@@ -162,7 +162,7 @@ pub async fn clone_group(
 
     let group = db.clone_group(group_id, &name, copy_members).map_err(|e| {
         tracing::warn!("Failed to clone group {} as '{}': {}", group_id, name, e);
-        StatusCode::CONFLICT
+        super::db_error_status(&e)
     })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
@@ -194,7 +194,7 @@ pub async fn update_group(
         if crate::iam::types::is_blank_principal_name(name) {
             let current = db
                 .get_group_by_id(group_id)
-                .map_err(|_| StatusCode::NOT_FOUND)?;
+                .map_err(|e| super::db_error_status(&e))?;
             if current.name != name {
                 tracing::warn!("Group name cannot be blank");
                 return Err(StatusCode::BAD_REQUEST);
@@ -223,7 +223,7 @@ pub async fn update_group(
         .map_err(|e| {
             tracing::warn!("Failed to update group {}: {}", group_id, e);
             // A rename to a name another group has → 409.
-            super::db_write_status(&e, StatusCode::NOT_FOUND)
+            super::db_error_status(&e)
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
@@ -246,7 +246,7 @@ pub async fn delete_group(
 
     db.delete_group(group_id).map_err(|e| {
         tracing::warn!("Failed to delete group {}: {}", group_id, e);
-        StatusCode::NOT_FOUND
+        super::db_error_status(&e)
     })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
@@ -274,7 +274,7 @@ pub async fn add_group_member(
             group_id,
             e
         );
-        StatusCode::BAD_REQUEST
+        super::db_error_status(&e)
     })?;
     let target = format!(
         "user {} to group {}",
@@ -306,7 +306,7 @@ pub async fn remove_group_member(
             group_id,
             e
         );
-        StatusCode::BAD_REQUEST
+        super::db_error_status(&e)
     })?;
     let target = format!(
         "user {} from group {}",

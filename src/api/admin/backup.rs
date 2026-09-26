@@ -464,12 +464,12 @@ async fn build_iam_backup(state: &Arc<AdminState>) -> Result<IamBackup, StatusCo
 
     let users = db.load_users().map_err(|e| {
         tracing::error!("Failed to load users for backup: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        super::db_error_status(&e)
     })?;
 
     let groups = db.load_groups().map_err(|e| {
         tracing::error!("Failed to load groups for backup: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        super::db_error_status(&e)
     })?;
 
     let auth_providers = db.load_auth_providers().unwrap_or_default();

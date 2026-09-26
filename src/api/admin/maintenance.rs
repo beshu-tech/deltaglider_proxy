@@ -419,7 +419,7 @@ pub async fn start_migrate(
             "admin",
             current_unix_seconds(),
         )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(super::db_error_reply)?
     };
     let Some(job_id) = created else {
         return Err((
@@ -475,10 +475,10 @@ pub async fn cancel_job(
         let db = db.lock().await;
         let job = db
             .maintenance_job_by_id(id)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(super::db_error_reply)?;
         let outcome = db
             .maintenance_request_cancel(id)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(super::db_error_reply)?;
         (outcome, job)
     };
     match outcome {

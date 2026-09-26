@@ -91,7 +91,7 @@ async fn set_paused(
         .await;
     let _ = db.lifecycle_ensure_state(name, lifecycle::current_unix_seconds());
     db.lifecycle_set_paused(name, paused)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
+        .map_err(super::db_error_reply)?;
     crate::audit::audit_log(audit_action, "admin", name, headers, "", "");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -184,12 +184,12 @@ pub async fn run_now(
     {
         let db = db_arc.lock().await;
         db.lifecycle_ensure_state(&rule.name, now)
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+            .map_err(super::db_error_reply)?;
         // Paused beats run-now (same contract as replication): the operator
         // paused the rule for a reason; an explicit run must not sidestep it.
         let paused = db
             .lifecycle_load_state(&rule.name)
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+            .map_err(super::db_error_reply)?
             .map(|st| st.paused)
             .unwrap_or(false);
         if paused {
@@ -205,7 +205,7 @@ pub async fn run_now(
                 now,
                 lifecycle::scheduler::lease_ttl_secs(),
             )
-            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+            .map_err(super::db_error_reply)?;
         if !acquired {
             return Err((
                 StatusCode::CONFLICT,

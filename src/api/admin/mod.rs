@@ -289,12 +289,20 @@ where
 }
 
 /// Pure: the HTTP status of a config-DB error. A missing row is the
-/// caller's 404 and a UNIQUE violation its 409; only the rest is a 500.
+/// caller's 404 (also a FOREIGN KEY failure: the request names a user or
+/// group that does not exist), a UNIQUE violation its 409; only the rest
+/// is a 500. Every admin handler maps DB errors through it (source guard
+/// `admin_db_errors_map_through_db_error_status`).
 pub(crate) fn db_error_status(e: &crate::config_db::ConfigDbError) -> axum::http::StatusCode {
     use crate::config_db::{classify_sqlite_error, ConfigDbError, SqliteErrorClass};
     use axum::http::StatusCode;
     match e {
         ConfigDbError::NotFound(_) => StatusCode::NOT_FOUND,
+        ConfigDbError::Sqlite(rusqlite::Error::SqliteFailure(f, _))
+            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY =>
+        {
+            StatusCode::NOT_FOUND
+        }
         ConfigDbError::Sqlite(se) => match classify_sqlite_error(se) {
             SqliteErrorClass::NotFound => StatusCode::NOT_FOUND,
             SqliteErrorClass::Conflict => StatusCode::CONFLICT,
@@ -302,6 +310,14 @@ pub(crate) fn db_error_status(e: &crate::config_db::ConfigDbError) -> axum::http
         },
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+/// [`db_error_status`] with the error text, for handlers that answer
+/// `(StatusCode, String)`.
+pub(crate) fn db_error_reply(
+    e: crate::config_db::ConfigDbError,
+) -> (axum::http::StatusCode, String) {
+    (db_error_status(&e), e.to_string())
 }
 
 /// Admin audit log helper — delegates to `crate::audit::audit_log` with empty bucket/path.
@@ -321,23 +337,6 @@ pub(crate) fn named_target(name: Option<&str>, id: i64) -> String {
     match name {
         Some(n) => format!("{n} (id {id})"),
         None => format!("id {id}"),
-    }
-}
-
-/// Status for a failed config-DB write: 409 when a UNIQUE constraint
-/// refused it (a user or group name in use), else `otherwise`.
-pub(crate) fn db_write_status(
-    e: &crate::config_db::ConfigDbError,
-    otherwise: axum::http::StatusCode,
-) -> axum::http::StatusCode {
-    match e {
-        crate::config_db::ConfigDbError::Sqlite(se)
-            if crate::config_db::classify_sqlite_error(se)
-                == crate::config_db::SqliteErrorClass::Conflict =>
-        {
-            axum::http::StatusCode::CONFLICT
-        }
-        _ => otherwise,
     }
 }
 
@@ -436,6 +435,17 @@ mod db_error_status_tests {
         assert_eq!(
             db_error_status(&ConfigDbError::Sqlite(unique)),
             StatusCode::CONFLICT
+        );
+        let fk = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                extended_code: rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+            },
+            Some("FOREIGN KEY constraint failed".into()),
+        );
+        assert_eq!(
+            db_error_status(&ConfigDbError::Sqlite(fk)),
+            StatusCode::NOT_FOUND
         );
         assert_eq!(
             db_error_status(&ConfigDbError::Other("broken".into())),

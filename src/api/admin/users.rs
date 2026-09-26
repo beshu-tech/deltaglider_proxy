@@ -95,7 +95,7 @@ fn rebuild_iam_index_inner(
 ) -> Result<(), StatusCode> {
     let mut users = db.load_users().map_err(|e| {
         tracing::error!("Failed to load users from config DB: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        super::db_error_status(&e)
     })?;
     if users.is_empty() {
         let state = IamIndex::build_iam_state(users, Vec::new(), &iam_state.load());
@@ -154,7 +154,7 @@ fn rebuild_iam_index_inner(
 
     let groups = db.load_groups().map_err(|e| {
         tracing::error!("Failed to load groups from config DB: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        super::db_error_status(&e)
     })?;
 
     let count = users.len();
@@ -213,7 +213,7 @@ pub async fn list_users(
     let db = db.lock().await;
     let users = db.load_users().map_err(|e| {
         tracing::error!("Failed to load users: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        super::db_error_status(&e)
     })?;
     Ok(Json(users.iter().map(mask_user).collect()))
 }
@@ -270,7 +270,7 @@ pub async fn create_user(
         )
         .map_err(|e| {
             tracing::warn!("Failed to create user '{}': {}", body.name, e);
-            StatusCode::CONFLICT
+            super::db_error_status(&e)
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
@@ -294,7 +294,7 @@ pub async fn clone_user(
     let body = body.map(|Json(body)| body);
     let source = db.get_user_by_id(user_id).map_err(|e| {
         tracing::warn!("Failed to load source user {} for clone: {}", user_id, e);
-        StatusCode::NOT_FOUND
+        super::db_error_status(&e)
     })?;
 
     let name = body
@@ -330,7 +330,7 @@ pub async fn clone_user(
         )
         .map_err(|e| {
             tracing::warn!("Failed to clone user {} as '{}': {}", user_id, name, e);
-            StatusCode::CONFLICT
+            super::db_error_status(&e)
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
@@ -370,7 +370,7 @@ pub async fn update_user(
         {
             let current = db
                 .get_user_by_id(user_id)
-                .map_err(|_| StatusCode::NOT_FOUND)?;
+                .map_err(|e| super::db_error_status(&e))?;
             if current.name != name {
                 tracing::warn!("User name cannot be blank or start with '$': {:?}", name);
                 return Err(StatusCode::BAD_REQUEST);
@@ -400,7 +400,7 @@ pub async fn update_user(
         .map_err(|e| {
             tracing::warn!("Failed to update user {}: {}", user_id, e);
             // A rename to a name another user has (names are unique) → 409.
-            super::db_write_status(&e, StatusCode::NOT_FOUND)
+            super::db_error_status(&e)
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
@@ -434,7 +434,7 @@ pub async fn delete_user(
 
     db.delete_user(user_id).map_err(|e| {
         tracing::warn!("Failed to delete user {}: {}", user_id, e);
-        StatusCode::NOT_FOUND
+        super::db_error_status(&e)
     })?;
 
     // Check if this was the last user before rebuilding
@@ -527,7 +527,7 @@ pub async fn rotate_user_keys(
         .rotate_keys(user_id, &new_access_key, &new_secret_key)
         .map_err(|e| {
             tracing::warn!("Failed to rotate keys for user {}: {}", user_id, e);
-            StatusCode::NOT_FOUND
+            super::db_error_status(&e)
         })?;
 
     // Rebuild AFTER capturing the result — the old-key revocation below must

@@ -124,7 +124,7 @@ pub async fn list(
 
     let counts = db
         .event_outbox_status_counts()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(super::db_error_reply)?;
     let page = db
         .event_outbox_list(DbEventOutboxListQuery {
             status: status.as_deref(),
@@ -138,7 +138,7 @@ pub async fn list(
     let ids: Vec<i64> = page.rows.iter().map(|r| r.id).collect();
     let mut deliveries = db
         .event_deliveries_for_many(&ids)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(super::db_error_reply)?;
     let labels = crate::event_delivery::endpoint_labels(&delivery);
     let rows = page
         .rows
@@ -195,7 +195,7 @@ pub async fn requeue_one(
     // back to pending and makes it immediately claimable by the dispatcher.
     let requeued = db
         .event_outbox_requeue_failed(id, current_unix_seconds())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(super::db_error_reply)?;
 
     if !requeued {
         return Err((
@@ -235,7 +235,7 @@ pub async fn requeue_many(
 
     let requeued = db
         .event_outbox_requeue_failed_many(&req.ids, current_unix_seconds())
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(super::db_error_reply)?;
 
     Ok(Json(RequeueEventOutboxResponse { requeued }))
 }
@@ -286,7 +286,7 @@ pub async fn purge_failed(
 
     let above = db
         .event_outbox_failed_above_floor(min_keep_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(super::db_error_reply)?;
     if above > 0 {
         return Err((
             StatusCode::CONFLICT,
@@ -300,7 +300,7 @@ pub async fn purge_failed(
 
     let purged = db
         .event_outbox_purge_failed(min_keep_id)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(super::db_error_reply)?;
 
     crate::audit::audit_log("event_outbox_purge_failed", "admin", "", &headers, "", "");
     Ok(Json(PurgeFailedResponse { purged }))
