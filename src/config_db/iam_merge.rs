@@ -30,7 +30,7 @@
 //! side too, children included, so a concurrent edit of the row or of an
 //! identity or membership that names it is not lost. Two users that both
 //! sides created with one name and different access keys are two users: the
-//! one whose key sorts later gets `<name>-<first 6 key chars>`. A child row
+//! one whose key sorts later gets `<name>-<first 8 hex of sha256(key)>`. A child row
 //! that loses its parent is dropped, and reported unless it is unchanged
 //! from the base (the cascade of a deliberate delete).
 //!
@@ -760,18 +760,17 @@ fn propagate_renames(
 }
 
 /// Pure: the name a user takes when another user holds its name:
-/// `<name>-<first 6 chars of its access key, lowercased>`, then `-2`, `-3`,
+/// `<name>-<first 8 hex chars of sha256(access key)>`, then `-2`, `-3`,
 /// ... past names in use. Every node derives the same name from the same key.
 pub(crate) fn access_key_suffixed_name(
     name: &str,
     access_key_id: &str,
     taken: impl Fn(&str) -> bool,
 ) -> String {
-    let tag: String = access_key_id
-        .chars()
-        .take(6)
-        .collect::<String>()
-        .to_lowercase();
+    use sha2::{Digest, Sha256};
+    // A hash, not the key's first characters: generated keys all start with
+    // the constant "AK", so a prefix carries almost no entropy.
+    let tag = &hex::encode(Sha256::digest(access_key_id.as_bytes()))[..8];
     super::users::first_free_user_name(&format!("{name}-{tag}"), taken)
 }
 
@@ -1969,9 +1968,9 @@ mod review3_tests {
             );
         }
         // The later access key takes the suffixed name, on every node.
-        assert_eq!(names(&local), vec!["Alex", "Alex-akalex"]);
+        assert_eq!(names(&local), vec!["Alex", "Alex-ad0917ea"]);
         let iy = local.find_external_identity(p, "sub-y").unwrap().unwrap();
-        assert_eq!(user_id(&local, "Alex-akalex"), iy.user_id);
+        assert_eq!(user_id(&local, "Alex-ad0917ea"), iy.user_id);
     }
 
     /// The split is symmetric: the node on the other side picks the same names.
@@ -1990,7 +1989,7 @@ mod review3_tests {
         let r = read_snapshot(&remote.conn, "main").unwrap();
         let keys = |o: MergeOutcome| o.merged["users"].keys().cloned().collect::<Vec<_>>();
         let a = keys(merge_snapshots(Some(&b), &l, &r));
-        assert_eq!(a, vec!["Alex", "Alex-akbbbb"]);
+        assert_eq!(a, vec!["Alex", "Alex-45b33b94"]);
         assert_eq!(a, keys(merge_snapshots(Some(&b), &r, &l)));
     }
 

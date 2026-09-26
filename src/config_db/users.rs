@@ -310,11 +310,15 @@ mod unique_name_tests {
         db.create_user("dana", "AKLOCAL", "s", true, &[]).unwrap();
         let first = db.create_external_user("dana", "AKEXT1", "s").unwrap();
         let second = db.create_external_user("dana", "AKEXT2", "s").unwrap();
-        assert_eq!(first.name, "dana-akext1");
-        assert_eq!(second.name, "dana-akext2");
-        // Same key prefix: the counter still makes the name unique.
-        let third = db.create_external_user("dana", "AKEXT1ZZ", "s").unwrap();
-        assert_eq!(third.name, "dana-akext1-2");
+        // The suffix is the first 8 hex chars of sha256(access key id).
+        assert_eq!(first.name, "dana-83ce2e52");
+        assert_eq!(second.name, "dana-50ccb215");
+        // A suffixed name already in use: the counter still makes it unique.
+        db.create_user("ops", "AKOPS", "s", true, &[]).unwrap();
+        db.create_user("ops-95f05dc1", "AKOPSLOCAL", "s", true, &[])
+            .unwrap();
+        let third = db.create_external_user("ops", "AKOPSEXT", "s").unwrap();
+        assert_eq!(third.name, "ops-95f05dc1-2");
         // An admin create or rename to a taken name is refused by the index.
         assert!(db.create_user("dana", "AKOTHER", "s", true, &[]).is_err());
         assert!(db.update_user(first.id, Some("dana"), None, None).is_err());
