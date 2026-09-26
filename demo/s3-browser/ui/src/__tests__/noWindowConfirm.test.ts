@@ -25,3 +25,25 @@ test('no window.confirm anywhere in src', async () => {
   expect(hits).toEqual([]);
 });
 
+
+// Lead follow-up to item 18: an expired session is handled in ONE place,
+// fetchWithRelogin (adminApi/core.ts). No other module calls the global
+// fetch (it would skip the sign-in prompt), and no module outside the
+// session plumbing tests for a 401 by itself.
+test('only adminApi/core.ts calls fetch; nobody else checks for 401', async () => {
+  const root = new URL('../', import.meta.url).pathname;
+  const RAW_FETCH = /(^|[^\w.])fetch\s*\(/;
+  const OWN_401 = /\bstatus\s*[!=]==?\s*401\b|\b401\s*[!=]==?\s*\w*\.?status\b/;
+  const SESSION_PLUMBING = ['src/adminApi/core.ts', 'src/errorHandling.ts'];
+  const hits: string[] = [];
+  for (const f of await sources(root)) {
+    const rel = f.replace(root, 'src/');
+    (await readFile(f, 'utf8')).split('\n').forEach((l, i) => {
+      const t = l.trim();
+      if (t.startsWith('//') || t.startsWith('*')) return;
+      if (RAW_FETCH.test(l) && rel !== 'src/adminApi/core.ts') hits.push(`${rel}:${i + 1} raw fetch`);
+      if (OWN_401.test(l) && !SESSION_PLUMBING.includes(rel)) hits.push(`${rel}:${i + 1} own 401 check`);
+    });
+  }
+  expect(hits).toEqual([]);
+});

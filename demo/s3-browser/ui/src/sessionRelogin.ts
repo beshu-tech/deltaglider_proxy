@@ -9,6 +9,8 @@ type Handler = () => Promise<boolean>;
 
 let handler: Handler | null = null;
 let pending: Promise<boolean> | null = null;
+/** The admin cancelled the last prompt: background reads stop asking. */
+let declined = false;
 
 /** The modal registers itself; returns the unregister function. */
 export function registerReloginHandler(fn: Handler): () => void {
@@ -18,13 +20,24 @@ export function registerReloginHandler(fn: Handler): () => void {
   };
 }
 
-/** One prompt for any number of concurrent 401s. */
-export function requestRelogin(): Promise<boolean> {
+/**
+ * One prompt for any number of concurrent 401s. `background` requests (a GET:
+ * polls, list reloads) do not ask again after the admin cancelled a prompt,
+ * so a 5-second poll cannot reopen the dialog forever; an action the admin
+ * starts (any other method) always asks. A successful sign-in re-arms both.
+ */
+export function requestRelogin(opts: { background?: boolean } = {}): Promise<boolean> {
   if (!handler) return Promise.resolve(false);
+  if (opts.background && declined && !pending) return Promise.resolve(false);
   if (!pending) {
-    pending = handler().finally(() => {
-      pending = null;
-    });
+    pending = handler()
+      .then((ok) => {
+        declined = !ok;
+        return ok;
+      })
+      .finally(() => {
+        pending = null;
+      });
   }
   return pending;
 }

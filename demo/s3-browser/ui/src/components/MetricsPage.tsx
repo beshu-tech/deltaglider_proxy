@@ -20,6 +20,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Typography, Spin, Progress } from 'antd';
 import { useColors } from '../ThemeContext';
 import { cacheEntrySubtitle, formatBytes } from '../utils';
+import { fetchWithRelogin } from '../adminApi/core';
 import { cacheMissSeverity, serverErrorSeverity } from '../statusTone';
 import { useVisiblePolling } from '../useVisiblePolling';
 import AnalyticsSection from './AnalyticsSection';
@@ -200,7 +201,7 @@ export default function MetricsPage({ search, proxyVersion }: Props) {
   const fetchMetrics = useCallback(async () => {
     setRefreshing(true);
     try {
-      const metricsRes = await fetch('/_/metrics', { credentials: 'include' });
+      const metricsRes = await fetchWithRelogin('/_/metrics', { credentials: 'include' });
       if (!metricsRes.ok) throw new Error(`HTTP ${metricsRes.status}`);
       const parsed = parsePrometheus(await metricsRes.text());
       setMetricsMap(parsed);

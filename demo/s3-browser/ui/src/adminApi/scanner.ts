@@ -1,5 +1,5 @@
 // === Usage Scanner ===
-import { ApiError } from '../errorHandling';
+import { ApiError, isSessionExpired } from '../errorHandling';
 import { adminJson, adminRequest } from './core';
 
 interface ChildUsage {
@@ -61,7 +61,7 @@ async function nullWithoutAdminSession<T>(request: Promise<T>): Promise<T | null
   try {
     return await request;
   } catch (e) {
-    if (e instanceof ApiError && (e.status === 401 || e.status === 403)) return null;
+    if (e instanceof ApiError && (isSessionExpired(e) || e.status === 403)) return null;
     throw e;
   }
 }

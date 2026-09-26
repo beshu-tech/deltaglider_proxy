@@ -8,6 +8,7 @@ import { browserBannerText, phaseLabel, activePercent } from './maintenanceStatu
 import Sidebar from './components/Sidebar';
 import ObjectTable from './components/ObjectTable';
 import InspectorPanel from './components/InspectorPanel';
+import ReloginModal from './components/ReloginModal';
 import FilePreview from './components/FilePreview';
 import DropZone from './components/DropZone';
 import UploadPage from './components/UploadPage';
@@ -790,6 +791,9 @@ export default function App() {
         hasAdminSession={sessionCaps.canFetchFullAdminConfig}
       />
 
+      {/* Outside Settings (which mounts its own), an admin session that
+          expires still asks to sign in again instead of signing out. */}
+      {view !== 'admin' && hasAdminSession && <ReloginModal />}
       <FilePreview
         open={previewObject !== null}
         object={previewObject}

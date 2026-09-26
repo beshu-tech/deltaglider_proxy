@@ -2,6 +2,7 @@
 import { ApiError, isSessionExpired, normalizeUiError, throwApiError } from '../errorHandling';
 import type { EnvOverride } from '../envOverrides';
 import { BASE as APP_BASE } from '../urlState';
+import { requestRelogin } from '../sessionRelogin';
 
 /** API path prefix: the SPA base without its trailing slash (`/_`). One
  *  source — `urlState.BASE` — so the app routes and the API cannot drift. */
@@ -11,6 +12,42 @@ export const BASE = APP_BASE.replace(/\/+$/, '');
 interface RawBody {
   raw: BodyInit;
   contentType: string;
+}
+
+/**
+ * Endpoints that answer the session question themselves (sign-in, sign-out,
+ * the session probe and credential restore, the unauthenticated whoami) or
+ * that use 401 for a wrong secret the user typed (recover-db). A 401 from
+ * them is their answer, never a reason to prompt.
+ */
+const NO_RELOGIN = /\/api\/(whoami|admin\/(login|login-as|logout|session|recover-db|oauth)(\/|\?|$))/;
+
+/** 401, or 403 `admin_session_required`: the session is gone (same rule as `isSessionExpired`). */
+async function responseIsExpiredSession(res: Response): Promise<boolean> {
+  if (res.status === 401) return true;
+  if (res.status !== 403) return false;
+  try {
+    const body = (await res.clone().json()) as { error?: string };
+    return body?.error === 'admin_session_required';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * THE place where an admin request meets an expired session. It asks the
+ * mounted ReloginModal to sign in again (sessionRelogin.ts) and sends the
+ * same request once more; without a modal, or when the admin cancels, the
+ * original response goes back to the caller. Every admin request goes
+ * through here (adminFetch, and the ZIP download); a source test keeps raw
+ * `fetch` out of the rest of src.
+ */
+export async function fetchWithRelogin(url: string, init: RequestInit): Promise<Response> {
+  const res = await fetch(url, init);
+  if (NO_RELOGIN.test(url) || !(await responseIsExpiredSession(res))) return res;
+  const background = (init.method ?? 'GET').toUpperCase() === 'GET';
+  if (!(await requestRelogin({ background }))) return res;
+  return fetch(url, init);
 }
 
 /**
@@ -31,7 +68,7 @@ export async function adminFetch(
     opts.headers = { 'Content-Type': 'application/json' };
     opts.body = JSON.stringify(body);
   }
-  return fetch(`${BASE}${path}`, opts);
+  return fetchWithRelogin(`${BASE}${path}`, opts);
 }
 
 interface AdminRequestOptions {

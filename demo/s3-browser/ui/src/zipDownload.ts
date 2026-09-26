@@ -19,6 +19,7 @@
  * The server builds the whole archive before it sends the first byte, so a
  * fetch that waits for the status costs nothing extra.
  */
+import { fetchWithRelogin } from './adminApi/core';
 import { throwApiError } from './errorHandling';
 import { formatBytes } from './utils';
 
@@ -59,7 +60,8 @@ export interface ZipDownloadDeps {
 
 function browserDeps(): ZipDownloadDeps {
   return {
-    fetch: (...args) => fetch(...args),
+    // An expired session asks to sign in again, like every admin request.
+    fetch: (input, init) => fetchWithRelogin(String(input), init ?? {}),
     picker: (window as unknown as { showSaveFilePicker?: SaveFilePicker }).showSaveFilePicker,
   };
 }
