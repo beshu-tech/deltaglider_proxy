@@ -1040,6 +1040,10 @@ pub(crate) fn content_verdict(
     if !src.md5.is_empty() && src.md5 == dst.md5 {
         return ContentVerdict::Same;
     }
+    // Two different simple MD5s are NOT `Differs`: this path only runs when a
+    // side has no SHA-256, i.e. a foreign object whose `md5` is the backend
+    // ETag, and an SSE-KMS / SSE-C ETag is not the MD5 of the content. A
+    // `Differs` here would fail a migrate verify for a correct copy.
     ContentVerdict::Unknown
 }
 
