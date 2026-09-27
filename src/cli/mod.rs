@@ -24,6 +24,7 @@ pub mod rm;
 pub mod s3_url;
 pub mod stats;
 pub mod sync;
+pub(crate) mod transfer_io;
 pub mod verify;
 
 /// What an engine error says is missing, if anything: `Some("object")` or

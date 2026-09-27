@@ -20,10 +20,11 @@
 
 use crate::cli::aws_args::{AwsArgs, EngineLimits};
 use crate::cli::config as cli_exit;
-use crate::cli::engine_factory::{build_cli_engine, copy_user_metadata, render_store_error};
+use crate::cli::engine_factory::{build_cli_engine, copy_user_metadata};
 use crate::cli::filter::Filter;
 use crate::cli::keys::{dir_prefix, rel_under};
 use crate::cli::s3_url::{is_s3_url, parse_s3_url, S3Loc};
+use crate::cli::transfer_io::{self, TransferError};
 use crate::deltaglider::DynEngine;
 use std::collections::HashSet;
 use std::io::BufRead;
@@ -93,8 +94,8 @@ pub struct MigrateArgs {
     #[arg(long, value_name = "URL")]
     pub source_endpoint_url: Option<String>,
 
-    /// Override the engine's per-object size ceiling (MiB) for BOTH
-    /// source and destination. Default 100 MiB. Migrations of large
+    /// Override the engine's size ceiling for delta-eligible objects
+    /// (MiB) for BOTH source and destination. Default 100 MiB. Migrations of large
     /// artifacts (release ZIPs, disk images) need this raised.
     #[arg(long, value_name = "MIB")]
     pub max_object_size_mb: Option<u64>,
@@ -344,26 +345,28 @@ async fn copy_one(
     dst_key: &str,
     no_delta: bool,
 ) -> i32 {
-    let (data, metadata) = match src_engine.retrieve(src_bucket, src_key).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("error: retrieve {src_key} failed: {e}");
-            return cli_exit::EXIT_HTTP;
-        }
+    let dest_attrs = |source: &crate::types::FileMetadata| {
+        (
+            source.content_type.clone(),
+            copy_user_metadata(
+                &source.user_metadata,
+                &std::collections::HashMap::new(),
+                no_delta,
+            ),
+        )
     };
-    let user_meta = copy_user_metadata(
-        &metadata.user_metadata,
-        &std::collections::HashMap::new(),
-        no_delta,
-    );
-    let ct = metadata.content_type;
-    match dst_engine
-        .store(dst_bucket, dst_key, &data, ct, user_meta)
-        .await
+    match transfer_io::copy_object(
+        src_engine, src_bucket, src_key, dst_engine, dst_bucket, dst_key, dest_attrs,
+    )
+    .await
     {
         Ok(_) => cli_exit::EXIT_OK,
+        Err(TransferError::Source(e)) => {
+            eprintln!("error: retrieve {src_key} failed: {e}");
+            cli_exit::EXIT_HTTP
+        }
         Err(e) => {
-            eprintln!("error: store {dst_key} failed: {}", render_store_error(&e));
+            eprintln!("error: store {dst_key} failed: {e}");
             cli_exit::EXIT_HTTP
         }
     }

@@ -22,10 +22,11 @@
 
 use crate::cli::aws_args::{AwsArgs, EngineLimits};
 use crate::cli::config as cli_exit;
-use crate::cli::engine_factory::{copy_user_metadata, render_store_error};
+use crate::cli::engine_factory::copy_user_metadata;
 use crate::cli::filter::Filter;
 use crate::cli::keys::{dir_prefix, local_path_for_key, rel_under, LocalPathError};
 use crate::cli::s3_url::{is_s3_url, parse_s3_url};
+use crate::cli::transfer_io::{self, TransferError};
 use crate::deltaglider::DynEngine;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -78,9 +79,9 @@ pub struct SyncArgs {
     #[command(flatten)]
     pub aws: AwsArgs,
 
-    /// Override the engine's per-object size ceiling (MiB). Default
-    /// 100 MiB. Sync of large artifacts (release ZIPs, disk images)
-    /// needs this raised. See `cp --help` for context.
+    /// Override the engine's size ceiling for delta-eligible objects
+    /// (MiB). Default 100 MiB. Sync of large artifacts (release ZIPs,
+    /// disk images) needs this raised. See `cp --help` for context.
     #[arg(long, value_name = "MIB")]
     pub max_object_size_mb: Option<u64>,
 }
@@ -543,45 +544,45 @@ async fn upload_one(
     local: &Path,
     no_delta: bool,
 ) -> i32 {
-    let data = match tokio::fs::read(local).await {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("error: read {} failed: {e}", local.display());
-            return cli_exit::EXIT_IO;
-        }
-    };
     let mut user_meta = HashMap::new();
     if no_delta {
         user_meta.insert("dg-no-delta".to_string(), "true".to_string());
     }
-    match engine.store(bucket, key, &data, None, user_meta).await {
+    match transfer_io::upload_file(engine, bucket, key, local, None, user_meta).await {
         Ok(_) => cli_exit::EXIT_OK,
+        Err(e @ TransferError::LocalRead(_)) => {
+            eprintln!("error: {} {e}", local.display());
+            cli_exit::EXIT_IO
+        }
         Err(e) => {
-            eprintln!("error: upload {key} failed: {}", render_store_error(&e));
+            eprintln!("error: upload {key} failed: {e}");
             cli_exit::EXIT_HTTP
         }
     }
 }
 
 async fn download_one(engine: &DynEngine, bucket: &str, key: &str, local: &Path) -> i32 {
-    let (data, _meta) = match engine.retrieve(bucket, key).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("error: retrieve {key} failed: {e}");
-            return cli_exit::EXIT_HTTP;
-        }
-    };
     if let Some(parent) = local.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             eprintln!("error: create parent dir {} failed: {e}", parent.display());
             return cli_exit::EXIT_IO;
         }
     }
-    if let Err(e) = std::fs::write(local, &data) {
-        eprintln!("error: write {} failed: {e}", local.display());
-        return cli_exit::EXIT_IO;
+    match transfer_io::download_file(engine, bucket, key, local).await {
+        Ok(_) => cli_exit::EXIT_OK,
+        Err(TransferError::Source(e)) => {
+            eprintln!("error: retrieve {key} failed: {e}");
+            cli_exit::EXIT_HTTP
+        }
+        Err(e @ TransferError::LocalWrite(_)) => {
+            eprintln!("error: {} {e}", local.display());
+            cli_exit::EXIT_IO
+        }
+        Err(e) => {
+            eprintln!("error: download {key} failed: {e}");
+            cli_exit::EXIT_HTTP
+        }
     }
-    cli_exit::EXIT_OK
 }
 
 async fn copy_one(
@@ -592,21 +593,24 @@ async fn copy_one(
     dst_key: &str,
     no_delta: bool,
 ) -> i32 {
-    let (data, metadata) = match engine.retrieve(src_bucket, src_key).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("error: retrieve {src_key} failed: {e}");
-            return cli_exit::EXIT_HTTP;
-        }
+    let dest_attrs = |source: &crate::types::FileMetadata| {
+        (
+            source.content_type.clone(),
+            copy_user_metadata(&source.user_metadata, &HashMap::new(), no_delta),
+        )
     };
-    let user_meta = copy_user_metadata(&metadata.user_metadata, &HashMap::new(), no_delta);
-    match engine
-        .store(dst_bucket, dst_key, &data, metadata.content_type, user_meta)
-        .await
+    match transfer_io::copy_object(
+        engine, src_bucket, src_key, engine, dst_bucket, dst_key, dest_attrs,
+    )
+    .await
     {
         Ok(_) => cli_exit::EXIT_OK,
+        Err(TransferError::Source(e)) => {
+            eprintln!("error: retrieve {src_key} failed: {e}");
+            cli_exit::EXIT_HTTP
+        }
         Err(e) => {
-            eprintln!("error: store {dst_key} failed: {}", render_store_error(&e));
+            eprintln!("error: store {dst_key} failed: {e}");
             cli_exit::EXIT_HTTP
         }
     }

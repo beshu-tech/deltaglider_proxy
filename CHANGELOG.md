@@ -96,6 +96,17 @@ job rows: it stays armed while a job is active, and it opens when the job
 settles, when a migrate passes its flip, or when a migrate unwinds before
 its flip.
 
+### Changed — The `s3` verbs stream large objects
+
+`s3 cp`, `s3 sync`, and `s3 migrate` read every object whole into memory and
+stored it with the buffered engine path. That path refuses any object above
+`max_object_size` (100 MiB by default), also a file that is never
+delta-encoded. Now an object above 8 MiB moves through a spool file or a
+stream, so memory use stays bounded. `--max-object-size-mb` now limits only
+delta-eligible objects; other files are limited by
+`max_passthrough_object_size`. A failed download no longer leaves a truncated
+file, and `s3 verify` hashes the object while it reads it.
+
 ### Changed — `config lint` refuses an empty file
 
 `config lint` now runs the same validation step as

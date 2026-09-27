@@ -5,20 +5,22 @@
 //!
 //! Direction is derived from the URL shape of each argument:
 //!
-//!   `cp local.zip s3://b/k`           → upload (engine.store)
-//!   `cp s3://b/k local.zip`           → download (engine.retrieve_stream)
-//!   `cp s3://a/k1 s3://b/k2`          → S3-to-S3 (retrieve then store)
+//!   `cp local.zip s3://b/k`           → upload
+//!   `cp s3://b/k local.zip`           → download
+//!   `cp s3://a/k1 s3://b/k2`          → S3-to-S3 copy
 //!   `cp local1 local2`                → rejected (use shell `cp`)
 //!
 //! Recursive mode (`-r`) walks the source side and filters with the
-//! include / exclude glob list.
+//! include / exclude glob list. Every body moves through
+//! [`transfer_io`] (bounded memory: spool files and streams).
 
 use crate::cli::aws_args::{AwsArgs, EngineLimits};
 use crate::cli::config as cli_exit;
-use crate::cli::engine_factory::{copy_user_metadata, render_store_error};
+use crate::cli::engine_factory::copy_user_metadata;
 use crate::cli::filter::Filter;
 use crate::cli::keys::{dir_prefix, local_path_for_key, rel_under, LocalPathError};
 use crate::cli::s3_url::{is_s3_url, parse_s3_url, S3Loc};
+use crate::cli::transfer_io::{self, TransferError};
 use crate::deltaglider::DynEngine;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -81,10 +83,11 @@ pub struct CpArgs {
     #[command(flatten)]
     pub aws: AwsArgs,
 
-    /// Override the engine's per-object size ceiling (MiB). The proxy
-    /// defaults to 100 MiB — the memory-safe ceiling for xdelta3-based
-    /// delta encoding. Raise this for large artifacts (release ZIPs,
-    /// disk images). Affects this CLI invocation only.
+    /// Override the engine's size ceiling for delta-eligible objects
+    /// (MiB). The default is 100 MiB, because xdelta3 memory scales with
+    /// the object size. Raise it for large artifacts (release ZIPs, disk
+    /// images). Other files are not bound by it. Affects this CLI
+    /// invocation only.
     #[arg(long, value_name = "MIB")]
     pub max_object_size_mb: Option<u64>,
 }
@@ -288,14 +291,6 @@ async fn upload_one(
     if args.dryrun {
         return cli_exit::EXIT_OK;
     }
-    let data = match tokio::fs::read(local).await {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("error: read {} failed: {e}", local.display());
-            return cli_exit::EXIT_IO;
-        }
-    };
-
     let content_type = args.content_type.clone();
     let meta = if args.no_delta {
         let mut m = user_meta.clone();
@@ -310,10 +305,14 @@ async fn upload_one(
         user_meta.clone()
     };
 
-    match engine.store(bucket, key, &data, content_type, meta).await {
+    match transfer_io::upload_file(engine, bucket, key, local, content_type, meta).await {
         Ok(_) => cli_exit::EXIT_OK,
+        Err(e @ TransferError::LocalRead(_)) => {
+            eprintln!("error: {} {e}", local.display());
+            cli_exit::EXIT_IO
+        }
         Err(e) => {
-            eprintln!("error: upload {} failed: {}", key, render_store_error(&e));
+            eprintln!("error: upload {key} failed: {e}");
             cli_exit::EXIT_HTTP
         }
     }
@@ -425,22 +424,25 @@ async fn download_one(
     if args.dryrun {
         return cli_exit::EXIT_OK;
     }
-    let (data, _meta) = match engine.retrieve(bucket, key).await {
-        Ok(t) => t,
-        Err(e) => {
+    match transfer_io::download_file(engine, bucket, key, dst).await {
+        Ok(_) => cli_exit::EXIT_OK,
+        Err(TransferError::Source(e)) => {
             if let Some(what) = super::missing(&e) {
                 eprintln!("error: {what} not found: s3://{bucket}/{key}");
                 return cli_exit::EXIT_NOT_FOUND;
             }
-            eprintln!("error: retrieve {} failed: {e}", key);
-            return cli_exit::EXIT_HTTP;
+            eprintln!("error: retrieve {key} failed: {e}");
+            cli_exit::EXIT_HTTP
         }
-    };
-    if let Err(e) = tokio::fs::write(dst, &data).await {
-        eprintln!("error: write {} failed: {e}", dst.display());
-        return cli_exit::EXIT_IO;
+        Err(e @ TransferError::LocalWrite(_)) => {
+            eprintln!("error: {} {e}", dst.display());
+            cli_exit::EXIT_IO
+        }
+        Err(e) => {
+            eprintln!("error: download {key} failed: {e}");
+            cli_exit::EXIT_HTTP
+        }
     }
-    cli_exit::EXIT_OK
 }
 
 async fn s3_to_s3(
@@ -550,19 +552,20 @@ async fn copy_one(
     if args.dryrun {
         return cli_exit::EXIT_OK;
     }
-    let (data, metadata) = match engine.retrieve(src_bucket, src_key).await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("error: source fetch failed: {e}");
-            return cli_exit::EXIT_HTTP;
-        }
+    let dest_attrs = |source: &crate::types::FileMetadata| {
+        (
+            args.content_type.clone().or(source.content_type.clone()),
+            copy_user_metadata(&source.user_metadata, user_meta, args.no_delta),
+        )
     };
-    let ct = args.content_type.clone().or(metadata.content_type);
-    let meta = copy_user_metadata(&metadata.user_metadata, user_meta, args.no_delta);
-    match engine.store(dst_bucket, dst_key, &data, ct, meta).await {
+    match transfer_io::copy_object(
+        engine, src_bucket, src_key, engine, dst_bucket, dst_key, dest_attrs,
+    )
+    .await
+    {
         Ok(_) => cli_exit::EXIT_OK,
         Err(e) => {
-            eprintln!("error: destination put failed: {}", render_store_error(&e));
+            eprintln!("error: {e}");
             cli_exit::EXIT_HTTP
         }
     }
@@ -594,6 +597,7 @@ fn partial_or_ok(succeeded: u64, failed: u64) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn direction_table() {
@@ -740,6 +744,79 @@ mod tests {
     fn resolve_local_dst_refuses_a_dot_dot_basename() {
         let dir = tempfile::tempdir().unwrap();
         assert!(resolve_local_dst(dir.path().to_str().unwrap(), "a/..").is_err());
+    }
+
+    /// Filesystem-backed engine with a 1 MiB delta ceiling.
+    async fn fs_engine(dir: &Path) -> DynEngine {
+        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+            crate::storage::FilesystemBackend::new(dir.to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let config = crate::config::Config {
+            max_object_size: 1024 * 1024,
+            ..Default::default()
+        };
+        let engine = crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &config,
+            None,
+        );
+        engine.create_bucket("b").await.unwrap();
+        engine
+    }
+
+    fn args(src: &str, dst: &str) -> CpArgs {
+        CpArgs {
+            src: src.into(),
+            dst: dst.into(),
+            recursive: false,
+            include: vec![],
+            exclude: vec![],
+            dryrun: false,
+            no_delta: false,
+            max_ratio: None,
+            content_type: None,
+            metadata: vec![],
+            quiet: true,
+            aws: Default::default(),
+            max_object_size_mb: None,
+        }
+    }
+
+    /// `cp` read the whole file into RAM and stored it with the buffered
+    /// `engine.store`, which refuses any body above `max_object_size`. A
+    /// passthrough file streams, so only the passthrough ceiling applies:
+    /// upload, S3-to-S3 copy and download of a 12 MiB `.jpg` under a
+    /// 1 MiB delta ceiling all succeed and keep the bytes.
+    #[tokio::test]
+    async fn cp_streams_a_passthrough_file_above_the_delta_ceiling() {
+        let store = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let engine = fs_engine(store.path()).await;
+        let body: Vec<u8> = (0..12 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let src = local.path().join("photo.jpg");
+        std::fs::write(&src, &body).unwrap();
+        let a = args(src.to_str().unwrap(), "s3://b/in/photo.jpg");
+        let meta = HashMap::new();
+
+        let code = upload_one(&engine, &a, &meta, "b", &src, "in/photo.jpg").await;
+        assert_eq!(code, cli_exit::EXIT_OK, "upload");
+        let code = copy_one(
+            &engine,
+            &a,
+            &meta,
+            "b",
+            "in/photo.jpg",
+            "b",
+            "out/photo.jpg",
+        )
+        .await;
+        assert_eq!(code, cli_exit::EXIT_OK, "s3-to-s3 copy");
+        let dst = local.path().join("back.jpg");
+        let code = download_one(&engine, &a, "b", "out/photo.jpg", &dst).await;
+        assert_eq!(code, cli_exit::EXIT_OK, "download");
+        assert!(std::fs::read(&dst).unwrap() == body, "bytes differ");
     }
 
     /// Guard for the class: every download path must build local paths
