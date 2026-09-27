@@ -555,7 +555,7 @@ The operator chain holds at most 1000 blocks. The proxy checks the blocks for ev
 
 `allow-anonymous` lets the request that matched the block through without credentials, as the `$anonymous` principal. It grants exactly that one request, and only when the request is a read: a `GET` or `HEAD` of the matched object, or a listing of the matched bucket with the requested `prefix`. It never grants a write. A `PUT`, `POST` or `DELETE` that matches an `allow-anonymous` block continues without credentials and is refused with `403 AccessDenied`. In the example above, an unsigned `GET /releases/builds/app.zip` returns the object, and an unsigned `PUT` of the same key returns `403`. The trace (`POST /_/api/admin/config/trace`) shows the grant in its `anonymous_grant` field (`{"action": "read", ...}`, `{"action": "list", ...}`, `{"action": "public-prefixes", ...}` for a public-access rule, whose grant is the bucket's `public_prefixes`, or `null`), and the live request path uses the same function to decide.
 
-The `source_ip` and `source_ip_list` conditions match the address of the TCP connection. The proxy reads the client address from `X-Forwarded-For` only when the connection comes from a network that `DGP_TRUSTED_PROXY_CIDRS` lists. `DGP_TRUST_PROXY_HEADERS=true` alone is not enough, because without the list the proxy cannot tell a header that a reverse proxy wrote from a header that the client forged.
+The `source_ip` and `source_ip_list` conditions match the address of the TCP connection. The proxy reads the client address from `X-Forwarded-For` only when `DGP_TRUST_PROXY_HEADERS=true` and the connection comes from a network that `DGP_TRUSTED_PROXY_CIDRS` lists. Without the list the proxy cannot tell a header that a reverse proxy wrote from a header that the client forged, so it refuses to start with `DGP_TRUST_PROXY_HEADERS=true` alone.
 
 ### Round-trip
 
@@ -569,9 +569,9 @@ The admin UI page **Request rules** (`/_/admin/access/admission`) edits these ru
 
 ### `trust_proxy_headers`
 
-Trust `X-Forwarded-For` / `X-Real-IP` for the per-IP rate-limit bucket. **Disable** if the proxy is internet-facing without a reverse proxy.
+Trust `X-Forwarded-For` / `X-Real-IP` from the reverse proxies that `DGP_TRUSTED_PROXY_CIDRS` lists. **Disable** if the proxy is internet-facing without a reverse proxy.
 
-This setting alone does not change admission `source_ip` rules, IAM `aws:SourceIp` conditions, or the known-good exemption from the login lockout. Those three decisions use the address of the TCP connection, because a client can write any `X-Forwarded-For` value. They read `X-Forwarded-For` only when the connection comes from a network that `DGP_TRUSTED_PROXY_CIDRS` lists. When this setting is `true` and `DGP_TRUSTED_PROXY_CIDRS` is unset, the proxy logs a warning at startup. Behind a reverse proxy, an `aws:SourceIp` condition then sees the reverse proxy's address, so set `DGP_TRUSTED_PROXY_CIDRS` to the networks of your reverse proxies.
+A client can write any `X-Forwarded-For` value, so the proxy reads the header only on a connection from a network in `DGP_TRUSTED_PROXY_CIDRS`. On any other connection it uses the address of the TCP connection. The one resulting client address is used for every decision: the per-IP rate limit, the IP binding of admin sessions, the known-good exemption from the login lockout, admission `source_ip` rules, and IAM `aws:SourceIp` conditions. The proxy refuses to start when this setting is `true` and `DGP_TRUSTED_PROXY_CIDRS` is unset or holds no valid network.
 
 | | |
 |---|---|
@@ -1152,8 +1152,8 @@ Tuning knobs for the large-object streaming multipart copy path (replication + l
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DGP_TRUST_PROXY_HEADERS` | false | Trust `X-Forwarded-For` / `X-Real-IP` for the per-IP rate-limit bucket |
-| `DGP_TRUSTED_PROXY_CIDRS` | unset | Comma-separated networks of trusted reverse proxies. Only a connection from these networks can name the client in `X-Forwarded-For` for admission `source_ip`, `aws:SourceIp`, and the login-lockout exemption |
+| `DGP_TRUST_PROXY_HEADERS` | false | Trust `X-Forwarded-For` / `X-Real-IP` from the `DGP_TRUSTED_PROXY_CIDRS` networks for the client address |
+| `DGP_TRUSTED_PROXY_CIDRS` | unset | Comma-separated networks of trusted reverse proxies. Only a connection from these networks can name the client in `X-Forwarded-For`. Required when `DGP_TRUST_PROXY_HEADERS=true` |
 | `DGP_SESSION_TTL_HOURS` | 4 | Admin session lifetime |
 | `DGP_CONFIG_ENV_ALLOWLIST` | — | Comma-separated names (a trailing `*` matches a prefix) that an admin apply, import, restore or section PUT may resolve as `${env:NAME}` from the server environment, in addition to the names that the boot config file uses. `DGP_BOOTSTRAP_*`, `DGP_*ENCRYPTION_KEY*` and `DGP_*SECRET*` never match |
 | `DGP_CLOCK_SKEW_SECONDS` | 900 | SigV4 clock skew tolerance |

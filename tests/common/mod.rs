@@ -186,7 +186,10 @@ fn proxy_command(config_path: &std::path::Path, production_security: bool) -> Co
         .env("DGP_CONFIG", config_path)
         .env("RUST_LOG", "deltaglider_proxy=warn")
         .env("DGP_DEBUG_HEADERS", "true")
+        // The test client is the "reverse proxy": its X-Forwarded-For names
+        // the client, so tests key per-IP state on distinct addresses.
         .env("DGP_TRUST_PROXY_HEADERS", "true")
+        .env("DGP_TRUSTED_PROXY_CIDRS", "127.0.0.0/8,::1/128")
         // Boot backend-health probe: OFF by default in the harness — many
         // tests deliberately spawn against dead/absent endpoints and must
         // not exit(1) or pay probe timeouts. Gate tests opt back in via

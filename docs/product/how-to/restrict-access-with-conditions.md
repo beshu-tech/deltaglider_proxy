@@ -21,7 +21,7 @@ Pin `ci-uploader`'s write access to Acme's office network, `203.0.113.0/24`. If 
 
 Multiple CIDRs are ORed: `"aws:SourceIp": ["203.0.113.0/24", "10.0.0.0/8"]`.
 
-If the proxy sits behind a load balancer or reverse proxy, the direct connection IP is the balancer's — set `DGP_TRUST_PROXY_HEADERS=true` and make the balancer forward the real client IP:
+If the proxy sits behind a load balancer or reverse proxy, the direct connection IP is the balancer's — set `DGP_TRUST_PROXY_HEADERS=true`, set `DGP_TRUSTED_PROXY_CIDRS` to the balancer's network (the proxy reads the header only on a connection from that network), and make the balancer forward the real client IP:
 
 ```nginx
 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;

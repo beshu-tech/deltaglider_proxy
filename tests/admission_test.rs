@@ -820,17 +820,17 @@ storage:
 
 // ── review second pass (failing tests for findings) ──────────────────────
 
-/// Review-2 (ee7bbb98): admission used the TCP peer; it now uses the
-/// resolved client IP. With `DGP_TRUST_PROXY_HEADERS=true` and no
-/// `DGP_TRUSTED_PROXY_CIDRS` (the harness default, and a common operator
-/// setup) that IP is the first XFF element, which the client writes, so one
-/// header escapes any `source_ip` deny block.
+/// Review-2 (ee7bbb98): admission uses the resolved client IP. A client
+/// that is not a trusted proxy writes its own `X-Forwarded-For`, so one
+/// forged header must not escape a `source_ip` deny block.
 #[tokio::test]
 async fn review2_source_ip_deny_not_bypassed_by_forged_xff() {
     let bucket = "xffdeny";
     let server = TestServer::builder()
         .bucket(bucket)
         .auth("XFFK", "XFFS")
+        // The loopback client is no trusted proxy here.
+        .env("DGP_TRUSTED_PROXY_CIDRS", "192.0.2.1/32")
         .bucket_policy(bucket, "public: true")
         .build()
         .await;

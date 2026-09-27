@@ -1335,7 +1335,7 @@ pub async fn require_bulk_session(
                 (
                     BulkSession::IamUser {
                         access_key_id,
-                        client_ip: rate_limiter::extract_trusted_client_ip(&headers, peer_ip),
+                        client_ip,
                     },
                     actor,
                 )

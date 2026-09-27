@@ -33,6 +33,7 @@ deltaglider_proxy:
   image: beshultd/deltaglider_proxy:latest
   environment:
     DGP_TRUST_PROXY_HEADERS: "true"
+    DGP_TRUSTED_PROXY_CIDRS: "127.0.0.1/32"   # Traefik connects over the loopback
   labels:
     traefik.enable: "true"
     traefik.http.routers.dgp.rule: "Host(`s3.acme.example`)"
@@ -69,11 +70,12 @@ s3.acme.example {
 }
 ```
 
-Set two env vars on the proxy when a reverse proxy is in front:
+Set three env vars on the proxy when a reverse proxy is in front:
 
 | Variable | Value | Why |
 |---|---|---|
 | `DGP_TRUST_PROXY_HEADERS` | `true` | Accept `X-Forwarded-For` / `X-Real-IP` for rate limiting and IAM IP conditions. Flip it **only** when a reverse proxy is genuinely in front — otherwise clients can spoof IPs. |
+| `DGP_TRUSTED_PROXY_CIDRS` | the reverse proxy's address, for example `127.0.0.1/32` | The proxy reads those headers only on a connection from these networks. It is required with `DGP_TRUST_PROXY_HEADERS=true`: without it, the proxy refuses to start. |
 | `DGP_SECURE_COOKIES` | `true` | The listener is plain HTTP behind the reverse proxy, so the proxy cannot see the TLS itself. It sets the `Secure` flag on its own only when a trusted `X-Forwarded-Proto: https` header arrives. Setting this variable to `true` makes the admin session cookies HTTPS-only for every request. |
 
 ## Raise the reverse-proxy read timeout — mandatory for large uploads

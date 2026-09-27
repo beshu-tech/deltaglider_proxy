@@ -3484,3 +3484,64 @@ async fn lockout_answers_429_with_retry_after_and_a_reason() {
     let page = r.text().await.unwrap();
     assert!(page.contains("Try again in 10 min"), "{page}");
 }
+
+// ============================================================================
+// Review 4 (auth track)
+// ============================================================================
+
+/// auth-2: `DGP_TRUST_PROXY_HEADERS=true` without `DGP_TRUSTED_PROXY_CIDRS`
+/// is a boot error. In that mode the limiter bucket and the admin-session IP
+/// binding were the first `X-Forwarded-For` element, which the client
+/// writes: anyone could lock out a chosen IP or pass a session IP binding.
+#[tokio::test]
+async fn trust_proxy_headers_without_cidrs_refuses_to_boot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config_path = dir.path().join("cfg.yaml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "access:\n  authentication: none\nstorage:\n  filesystem: {}\n",
+            dir.path().join("data").display()
+        ),
+    )
+    .unwrap();
+    for cidrs in [None, Some(""), Some("not-a-network")] {
+        let port = common::lease_free_port();
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_deltaglider_proxy"));
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("DGP_") {
+                cmd.env_remove(key);
+            }
+        }
+        cmd.current_dir(dir.path())
+            .env("DGP_CONFIG", &config_path)
+            .env("DGP_LISTEN_ADDR", format!("127.0.0.1:{}", port.port()))
+            .env("DGP_BOOT_BACKEND_PROBE", "off")
+            .env("DGP_TRUST_PROXY_HEADERS", "true")
+            .env("RUST_LOG", "deltaglider_proxy=error")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        if let Some(c) = cidrs {
+            cmd.env("DGP_TRUSTED_PROXY_CIDRS", c);
+        }
+        let mut child = cmd.spawn().expect("spawn proxy");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("CIDRs {cidrs:?}: the proxy booted with trust on and no trusted proxies");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let mut stderr = String::new();
+        std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+        assert!(!status.success(), "CIDRs {cidrs:?}: {status:?}");
+        assert!(
+            stderr.contains("DGP_TRUSTED_PROXY_CIDRS"),
+            "CIDRs {cidrs:?}: the error names the fix: {stderr}"
+        );
+    }
+}

@@ -368,13 +368,13 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_TRUST_PROXY_HEADERS",
-        description: "Trust X-Forwarded-For/X-Real-IP for the per-IP rate-limit bucket; admission, aws:SourceIp and the lockout exemption read them only from DGP_TRUSTED_PROXY_CIDRS peers",
+        description: "Trust X-Forwarded-For/X-Real-IP from the DGP_TRUSTED_PROXY_CIDRS peers (required with true; boot refuses otherwise) for the client IP: rate limits, sessions, admission source_ip, aws:SourceIp",
         example: "false",
         category: "Security",
     },
     EnvVarEntry {
         name: "DGP_TRUSTED_PROXY_CIDRS",
-        description: "Comma-separated CIDRs of trusted reverse proxies; XFF honored only from these peers (prevents aws:SourceIp / admission source_ip spoofing)",
+        description: "Comma-separated CIDRs of trusted reverse proxies; XFF honored only from these peers. Required when DGP_TRUST_PROXY_HEADERS=true",
         example: "10.0.0.0/8,192.168.1.5",
         category: "Security",
     },

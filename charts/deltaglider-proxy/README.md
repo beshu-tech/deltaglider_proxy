@@ -190,6 +190,8 @@ ingress:
 env:
   - name: DGP_TRUST_PROXY_HEADERS
     value: "true"
+  - name: DGP_TRUSTED_PROXY_CIDRS
+    value: "10.42.0.0/16"   # the ingress controller's pod network; required with trust on
 ```
 
 ## Verify

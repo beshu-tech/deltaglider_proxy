@@ -378,15 +378,11 @@ fn should_keep_entry(
 /// IP spoofing by untrusted clients.
 ///
 /// Controlled by `DGP_TRUST_PROXY_HEADERS`. **Defaults to `false`** for
-/// secure-by-default behaviour: direct-to-internet deployments are protected
-/// against IP spoofing out of the box.
-///
-/// Deployments behind a trusted reverse proxy (nginx, Caddy, ALB) should set
-/// `DGP_TRUST_PROXY_HEADERS=true` so the proxy can extract the real client IP
-/// from `X-Forwarded-For` / `X-Real-IP` headers for rate limiting and
-/// `aws:SourceIp` IAM conditions. The connection peer IP is always available
-/// via `ConnectInfo<SocketAddr>` (see `extract_client_ip_with_peer`), so per-IP
-/// rate limiting works regardless of this setting.
+/// secure-by-default behaviour. With `true`, `DGP_TRUSTED_PROXY_CIDRS` must
+/// list the reverse proxies (boot refuses otherwise, [`proxy_trust_config_error`]):
+/// only a connection from one of them can name another client. The
+/// connection peer IP is always available via `ConnectInfo<SocketAddr>`, so
+/// per-IP rate limiting works regardless of this setting.
 pub fn trust_proxy_headers() -> bool {
     crate::config::env_bool("DGP_TRUST_PROXY_HEADERS", false)
 }
@@ -422,9 +418,12 @@ pub fn trusted_proxy_cidrs() -> Vec<ipnet::IpNet> {
         .collect()
 }
 
-/// Extract client IP from trusted proxy headers or peer socket fallback.
-/// Reads env (`trust_proxy_headers()`, `trusted_proxy_cidrs()`) then delegates
-/// to the pure [`resolve_client_ip`] so the spoofing truth-table is unit-tested.
+/// THE client IP of a request, for every decision: the per-IP limiter
+/// bucket, session IP binding, audit, admission `source_ip` and IAM
+/// `aws:SourceIp`. Reads env (`trust_proxy_headers()`, `trusted_proxy_cidrs()`)
+/// then delegates to the pure [`resolve_client_ip`], so the spoofing
+/// truth-table is unit-tested. One resolver: two of them disagreed on the
+/// same request, and only one was spoof-safe (auth-7).
 pub fn extract_client_ip_with_peer(
     headers: &axum::http::HeaderMap,
     peer_ip: Option<IpAddr>,
@@ -437,49 +436,21 @@ pub fn extract_client_ip_with_peer(
     )
 }
 
-/// Client IP for decisions a forged header must never win: admission
-/// `source_ip` blocks and the known-good account-lock exemption. Reads env,
-/// then delegates to the pure [`resolve_trusted_client_ip`].
-pub fn extract_trusted_client_ip(
-    headers: &axum::http::HeaderMap,
-    peer_ip: Option<IpAddr>,
-) -> Option<IpAddr> {
-    resolve_trusted_client_ip(
-        headers,
-        peer_ip,
-        trust_proxy_headers(),
-        &trusted_proxy_cidrs(),
-    )
-}
-
-/// Like [`resolve_client_ip`], without the legacy "trust on, no CIDR list"
-/// path: there the first XFF element is client-written, so this returns the
-/// TCP peer. Only a `DGP_TRUSTED_PROXY_CIDRS` peer can name another client.
-pub fn resolve_trusted_client_ip(
-    headers: &axum::http::HeaderMap,
-    peer_ip: Option<IpAddr>,
-    trust: bool,
-    trusted_cidrs: &[ipnet::IpNet],
-) -> Option<IpAddr> {
-    if trusted_cidrs.is_empty() {
-        return peer_ip.map(normalize_ip);
-    }
-    resolve_client_ip(headers, peer_ip, trust, trusted_cidrs)
-}
-
-/// The boot warning for `DGP_TRUST_PROXY_HEADERS=true` without
-/// `DGP_TRUSTED_PROXY_CIDRS`: the proxy cannot tell a reverse proxy's
-/// X-Forwarded-For from a forged one, so only the per-IP limiter bucket
-/// reads it. `None` when there is nothing to warn about.
-pub fn xff_trust_warning(trust: bool, trusted_cidrs_set: bool) -> Option<&'static str> {
-    (trust && !trusted_cidrs_set).then_some(
-        "DGP_TRUST_PROXY_HEADERS=true but DGP_TRUSTED_PROXY_CIDRS is unset: \
-         admission source_ip rules, IAM aws:SourceIp conditions and the \
-         known-good login-lockout exemption IGNORE X-Forwarded-For and use the \
-         TCP peer; only the per-IP rate-limit bucket uses X-Forwarded-For. Set \
-         DGP_TRUSTED_PROXY_CIDRS to your reverse proxies' networks so the \
-         others see the real client IP",
-    )
+/// The boot error for `DGP_TRUST_PROXY_HEADERS=true` without a usable
+/// `DGP_TRUSTED_PROXY_CIDRS` (unset, empty, or only invalid entries). The
+/// proxy cannot tell a reverse proxy's X-Forwarded-For from a forged one,
+/// and the old fallback (the first XFF element) let any client pick the IP
+/// that the limiter locks out and that an admin session is bound to.
+/// `None` when the pair is consistent.
+pub fn proxy_trust_config_error(trust: bool, trusted_cidrs: &[ipnet::IpNet]) -> Option<String> {
+    (trust && trusted_cidrs.is_empty()).then(|| {
+        "DGP_TRUST_PROXY_HEADERS=true needs DGP_TRUSTED_PROXY_CIDRS: set it to the \
+         networks of your reverse proxies or load balancers (for example \
+         DGP_TRUSTED_PROXY_CIDRS=10.0.0.0/8), so that only a connection from them can \
+         name the client in X-Forwarded-For. Without a trusted proxy, set \
+         DGP_TRUST_PROXY_HEADERS=false."
+            .to_string()
+    })
 }
 
 /// Pure client-IP resolver — the anti-spoofing decision, injectable for tests.
@@ -492,10 +463,9 @@ pub fn xff_trust_warning(trust: bool, trusted_cidrs_set: bool) -> Option<&'stati
 ///   NOT itself a trusted hop — i.e. the real client the trusted proxy saw. This
 ///   defeats a client that prepends a forged XFF entry. `X-Real-IP` is read
 ///   only when the trusted peer sent no XFF.
-/// - `trust == true` AND `trusted_cidrs` EMPTY: back-compat with the historical
-///   "first XFF element" behavior (operators who set trust but no CIDR list),
-///   no `X-Real-IP`.
-///   This path is spoofable — operators should set `DGP_TRUSTED_PROXY_CIDRS`.
+/// - `trust == true` AND `trusted_cidrs` EMPTY: the peer. No peer is known to
+///   be a proxy, so every header is client-written. (Boot refuses this pair,
+///   [`proxy_trust_config_error`]; the peer is the safe answer regardless.)
 pub fn resolve_client_ip(
     headers: &axum::http::HeaderMap,
     peer_ip: Option<IpAddr>,
@@ -514,11 +484,6 @@ pub fn resolve_client_ip(
     };
 
     if trusted_cidrs.is_empty() {
-        // Legacy spoofable path (rate-limit bucket only): first XFF element,
-        // then the peer. No X-Real-IP: the peer is not known to be a proxy.
-        if let Some(ip) = first_xff(headers) {
-            return Some(normalize_ip(ip));
-        }
         return peer_ip.map(normalize_ip);
     }
 
@@ -578,15 +543,6 @@ fn header_ip(headers: &axum::http::HeaderMap, name: &str) -> Option<IpAddr> {
         .next_back()
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<IpAddr>().ok())
-}
-
-fn first_xff(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
-    xff_chain(headers)?
-        .split(',')
-        .next()?
-        .trim()
-        .parse::<IpAddr>()
-        .ok()
 }
 
 /// Collapse IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) back to their
@@ -728,9 +684,6 @@ impl Blocked {
 pub struct RateLimitGuard<'a> {
     rl: &'a RateLimiter,
     ip: IpAddr,
-    /// The IP the known-good exemption keys on: a forged XFF must not claim
-    /// an operator's exemption, so this ignores XFF without a CIDR list.
-    trusted_ip: IpAddr,
     /// The account-dimension key — empty when the caller didn't
     /// supply one. Currently set by callers via `enter_with_account`.
     subject: String,
@@ -764,7 +717,6 @@ impl<'a> RateLimitGuard<'a> {
     ) -> Result<Self, Blocked> {
         let unspecified = IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
         let ip = extract_client_ip_with_peer(headers, peer_ip).unwrap_or(unspecified);
-        let trusted_ip = extract_trusted_client_ip(headers, peer_ip).unwrap_or(unspecified);
         if let Some(retry_after) = rl.lockout_remaining(&ip) {
             let failure_count = rl.failure_count(&ip);
             tracing::warn!(
@@ -781,11 +733,7 @@ impl<'a> RateLimitGuard<'a> {
         }
         let account_left = rl.account_lockout_remaining(subject);
         if let Some(retry_after) = account_left.filter(|_| {
-            rl.account_lock_applies(
-                subject,
-                &trusted_ip,
-                is_direct_local_request(headers, peer_ip),
-            )
+            rl.account_lock_applies(subject, &ip, is_direct_local_request(headers, peer_ip))
         }) {
             tracing::warn!(
                 "SECURITY | event={}_brute_force_blocked | scope=account | subject={} | ip={}",
@@ -806,7 +754,6 @@ impl<'a> RateLimitGuard<'a> {
         Ok(Self {
             rl,
             ip,
-            trusted_ip,
             subject: subject.to_string(),
             event_prefix,
         })
@@ -828,7 +775,7 @@ impl<'a> RateLimitGuard<'a> {
         if !self.rl.is_limited_account(&self.subject) {
             self.rl.record_success_account(&self.subject);
         }
-        self.rl.record_known_good(&self.subject, self.trusted_ip);
+        self.rl.record_known_good(&self.subject, self.ip);
     }
 
     /// Record a failed operation. Increments BOTH bucket counters
@@ -1065,49 +1012,48 @@ mod tests {
             ("x-forwarded-for", "10.0.0.7, 10.0.0.5"),
             ("x-real-ip", "198.51.100.2"),
         ]);
-        for resolve in [resolve_client_ip, resolve_trusted_client_ip] {
-            assert_eq!(
-                resolve(&all_trusted, Some(proxy), true, &trusted),
-                Some(ip("10.0.0.7"))
-            );
-            // trusted peer, no XFF → its X-Real-IP (nginx often sets only
-            // that), else the peer.
-            assert_eq!(
-                resolve(
-                    &hdrs(&[("x-real-ip", "198.51.100.2")]),
-                    Some(proxy),
-                    true,
-                    &trusted
-                ),
-                Some(ip("198.51.100.2"))
-            );
-            assert_eq!(
-                resolve(
-                    &hdrs(&[("x-real-ip", "garbage")]),
-                    Some(proxy),
-                    true,
-                    &trusted
-                ),
-                Some(proxy)
-            );
-            // UNtrusted peer → X-Real-IP ignored.
-            let attacker = ip("203.0.113.50");
-            assert_eq!(
-                resolve(
-                    &hdrs(&[("x-real-ip", "198.51.100.2")]),
-                    Some(attacker),
-                    true,
-                    &trusted
-                ),
-                Some(attacker)
-            );
-        }
-        // trust=true but NO trusted CIDRs → legacy first-XFF behavior (spoofable).
+        assert_eq!(
+            resolve_client_ip(&all_trusted, Some(proxy), true, &trusted),
+            Some(ip("10.0.0.7"))
+        );
+        // trusted peer, no XFF → its X-Real-IP (nginx often sets only
+        // that), else the peer.
+        assert_eq!(
+            resolve_client_ip(
+                &hdrs(&[("x-real-ip", "198.51.100.2")]),
+                Some(proxy),
+                true,
+                &trusted
+            ),
+            Some(ip("198.51.100.2"))
+        );
+        assert_eq!(
+            resolve_client_ip(
+                &hdrs(&[("x-real-ip", "garbage")]),
+                Some(proxy),
+                true,
+                &trusted
+            ),
+            Some(proxy)
+        );
+        // UNtrusted peer → X-Real-IP ignored.
+        let attacker = ip("203.0.113.50");
+        assert_eq!(
+            resolve_client_ip(
+                &hdrs(&[("x-real-ip", "198.51.100.2")]),
+                Some(attacker),
+                true,
+                &trusted
+            ),
+            Some(attacker)
+        );
+        // auth-2/auth-7: trust=true but NO trusted CIDRs → the peer. The
+        // first XFF element is client-written; there is no legacy path.
         assert_eq!(
             resolve_client_ip(&xff("203.0.113.9, 10.0.0.5"), Some(proxy), true, &[]),
-            Some(ip("203.0.113.9"))
+            Some(proxy)
         );
-        // ... which never reads X-Real-IP: the peer is not known to be a proxy.
+        // ... and X-Real-IP is not read either: the peer is not known to be a proxy.
         assert_eq!(
             resolve_client_ip(
                 &hdrs(&[("x-real-ip", "198.51.100.2")]),
@@ -1188,7 +1134,6 @@ mod tests {
                 // The client's own X-Real-IP, passed through: XFF wins.
                 h.insert("x-real-ip", "6.6.6.6".parse().unwrap());
             }
-            proptest::prop_assert_eq!(resolve_trusted_client_ip(&h, peer, true, &trusted), expected);
             proptest::prop_assert_eq!(resolve_client_ip(&h, peer, true, &trusted), expected);
         }
 
@@ -1207,10 +1152,6 @@ mod tests {
             ] {
                 proptest::prop_assert_eq!(
                     resolve_client_ip(&h, Some(attacker), true, &trusted),
-                    Some(normalize_ip(attacker))
-                );
-                proptest::prop_assert_eq!(
-                    resolve_trusted_client_ip(&h, Some(attacker), true, &trusted),
                     Some(normalize_ip(attacker))
                 );
             }
@@ -1330,11 +1271,15 @@ mod tests {
     fn test_extract_client_ip_collapses_v4_mapped_from_xff() {
         let _g = env_lock();
         std::env::set_var("DGP_TRUST_PROXY_HEADERS", "true");
+        std::env::set_var("DGP_TRUSTED_PROXY_CIDRS", "10.0.0.0/8");
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("x-forwarded-for", "::ffff:1.2.3.4".parse().unwrap());
-        let ip = extract_client_ip_with_peer(&headers, None).unwrap();
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        let ip =
+            extract_client_ip_with_peer(&headers, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))))
+                .unwrap();
         std::env::remove_var("DGP_TRUST_PROXY_HEADERS");
+        std::env::remove_var("DGP_TRUSTED_PROXY_CIDRS");
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
     }
 
     /// Per-account bucket: same shape as per-IP but keyed on subject.
@@ -1457,96 +1402,41 @@ mod tests {
         );
     }
 
-    /// Truth table for the resolver admission and the known-good exemption
-    /// use: without a CIDR list the XFF header never wins, even with trust on.
+    /// Without a CIDR list no header ever wins, whatever the trust flag:
+    /// no peer is known to be a proxy (auth-2/auth-7).
     #[test]
-    fn trusted_client_ip_ignores_xff_without_a_cidr_list() {
-        let h = hdrs(&[("x-forwarded-for", "198.51.100.1")]);
+    fn client_ip_ignores_proxy_headers_without_a_cidr_list() {
+        let h = hdrs(&[
+            ("x-forwarded-for", "198.51.100.1"),
+            ("x-real-ip", "198.51.100.2"),
+        ]);
         let peer = Some(ip("127.0.0.1"));
-        assert_eq!(resolve_trusted_client_ip(&h, peer, true, &[]), peer);
-        assert_eq!(resolve_trusted_client_ip(&h, peer, false, &[]), peer);
+        assert_eq!(resolve_client_ip(&h, peer, true, &[]), peer);
+        assert_eq!(resolve_client_ip(&h, peer, false, &[]), peer);
         assert_eq!(
-            resolve_trusted_client_ip(&h, Some(ip("::ffff:127.0.0.1")), true, &[]),
+            resolve_client_ip(&h, Some(ip("::ffff:127.0.0.1")), true, &[]),
             peer,
             "the peer is normalized"
         );
         // A listed proxy may name the client.
         assert_eq!(
-            resolve_trusted_client_ip(&h, peer, true, &[cidr("127.0.0.0/8")]),
+            resolve_client_ip(&h, peer, true, &[cidr("127.0.0.0/8")]),
             Some(ip("198.51.100.1"))
         );
         // An unlisted peer may not.
         assert_eq!(
-            resolve_trusted_client_ip(&h, peer, true, &[cidr("10.0.0.0/8")]),
+            resolve_client_ip(&h, peer, true, &[cidr("10.0.0.0/8")]),
             peer
         );
     }
 
     #[test]
-    fn xff_trust_warning_only_for_trust_without_cidrs() {
-        assert!(xff_trust_warning(true, false).is_some());
-        assert!(xff_trust_warning(true, true).is_none());
-        assert!(xff_trust_warning(false, false).is_none());
-        assert!(xff_trust_warning(false, true).is_none());
-    }
-
-    /// Source guard: `aws:SourceIp` (and any policy condition) must come from
-    /// `extract_trusted_client_ip`. The legacy resolver takes the first XFF
-    /// element when no CIDR list is set, which the client writes. It may be
-    /// called only from the files below, none of which builds a policy
-    /// context except `api/auth.rs`, whose `RequestClientIp` is checked.
-    #[test]
-    fn policy_contexts_never_use_the_legacy_client_ip_resolver() {
-        const LEGACY: [&str; 2] = ["extract_client_ip_with_peer(", "resolve_client_ip("];
-        // Callers that key the per-IP limiter bucket, sessions or audit.
-        const ALLOWED: [&str; 6] = [
-            "rate_limiter.rs",
-            "api/auth.rs",
-            // The form-POST interceptor keys the limiter bucket on a failure.
-            "api/s3_router.rs",
-            "audit.rs",
-            "api/admin/auth.rs",
-            "api/admin/external_auth.rs",
-        ];
-        let root = crate::source_scan::root().join("src");
-        let files = crate::source_scan::rust_files("src");
-        assert!(files.len() > 50, "scan found the sources");
-        for f in files {
-            let rel = f
-                .strip_prefix(&root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            let text = std::fs::read_to_string(&f).unwrap();
-            let calls_legacy = LEGACY.iter().any(|p| text.contains(p));
-            let builds_policy =
-                text.contains("insert_source_ip(") || text.contains("insert(RequestClientIp(");
-            if calls_legacy {
-                assert!(
-                    ALLOWED.contains(&rel.as_str()),
-                    "{rel} calls the legacy client-IP resolver; use extract_trusted_client_ip for policy decisions, or add it to ALLOWED with a reason"
-                );
-            }
-            if calls_legacy && builds_policy && rel != "rate_limiter.rs" {
-                // Only api/auth.rs may do both: its RequestClientIp must be fed
-                // by the trusted resolver.
-                assert_eq!(
-                    rel, "api/auth.rs",
-                    "{rel} builds a policy context next to the legacy resolver"
-                );
-                let lines: Vec<&str> = text.lines().collect();
-                for (i, l) in lines.iter().enumerate() {
-                    if l.contains("insert(RequestClientIp(") {
-                        let before = lines[i.saturating_sub(2)..i].join("\n");
-                        assert!(
-                            before.contains("extract_trusted_client_ip("),
-                            "api/auth.rs:{} RequestClientIp must come from extract_trusted_client_ip",
-                            i + 1
-                        );
-                    }
-                }
-            }
-        }
+    fn trust_without_cidrs_is_a_boot_error() {
+        let msg = proxy_trust_config_error(true, &[]).expect("error");
+        assert!(msg.contains("DGP_TRUSTED_PROXY_CIDRS"), "{msg}");
+        assert!(proxy_trust_config_error(true, &[cidr("10.0.0.0/8")]).is_none());
+        assert!(proxy_trust_config_error(false, &[]).is_none());
+        assert!(proxy_trust_config_error(false, &[cidr("10.0.0.0/8")]).is_none());
     }
 
     /// Review-2: the known-good account-lock exemption (S22) keys on the
@@ -1558,11 +1448,12 @@ mod tests {
     async fn review2_forged_xff_cannot_claim_known_good_exemption() {
         let _g = env_lock();
         std::env::set_var("DGP_TRUST_PROXY_HEADERS", "true");
-        std::env::remove_var("DGP_TRUSTED_PROXY_CIDRS");
+        // The operator's proxies; the attacker connects from outside them.
+        std::env::set_var("DGP_TRUSTED_PROXY_CIDRS", "10.0.0.0/8");
         let rl = RateLimiter::new(100, Duration::from_secs(60), Duration::from_secs(60))
             .with_account_policy(3, Duration::from_secs(60), Duration::from_secs(60));
         let op = hdrs(&[("x-forwarded-for", "203.0.113.10")]);
-        RateLimitGuard::enter_with_account(&rl, &op, Some(ip("203.0.113.10")), "bootstrap", "t")
+        RateLimitGuard::enter_with_account(&rl, &op, Some(ip("10.0.0.1")), "bootstrap", "t")
             .await
             .unwrap()
             .record_success();
@@ -1584,6 +1475,7 @@ mod tests {
         )
         .await;
         std::env::remove_var("DGP_TRUST_PROXY_HEADERS");
+        std::env::remove_var("DGP_TRUSTED_PROXY_CIDRS");
         assert!(
             r.is_err(),
             "an attacker claimed the operator's known-good IP through XFF"

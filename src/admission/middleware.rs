@@ -152,7 +152,7 @@ pub async fn admission_middleware(mut request: Request<Body>, next: Next) -> Res
 /// Bucket, key and list prefix come from `RequestTarget`, decoded as s3s
 /// decodes them, so a block matches the resource s3s will serve.
 ///
-/// Source IP comes from `rate_limiter::extract_trusted_client_ip`: the TCP
+/// Source IP comes from `rate_limiter::extract_client_ip_with_peer`: the TCP
 /// peer, or the `X-Forwarded-For` client when the peer is in
 /// `DGP_TRUSTED_PROXY_CIDRS`. Admission's policy on missing IP is
 /// documented on [`RequestInfo::source_ip`]: fail-closed.
@@ -168,7 +168,7 @@ fn extract_request_info(request: &Request<Body>) -> OwnedRequestInfo {
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0.ip());
-    let source_ip = crate::rate_limiter::extract_trusted_client_ip(request.headers(), peer_ip);
+    let source_ip = crate::rate_limiter::extract_client_ip_with_peer(request.headers(), peer_ip);
 
     OwnedRequestInfo::from_raw(
         request.method().as_str(),

@@ -465,6 +465,14 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         std::process::exit(1);
     }
+    // Trust in X-Forwarded-For needs the list of proxies that may send it.
+    if let Some(msg) = deltaglider_proxy::rate_limiter::proxy_trust_config_error(
+        deltaglider_proxy::rate_limiter::trust_proxy_headers(),
+        &deltaglider_proxy::rate_limiter::trusted_proxy_cidrs(),
+    ) {
+        eprintln!("FATAL config error: {msg}");
+        std::process::exit(1);
+    }
 
     // Apply `advanced.log_level` from the config file to the already-
     // initialised tracing filter — caught during browser testing of
@@ -687,16 +695,18 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // (which also accepts yes/on via env_bool).
     let trust_proxy_explicit = std::env::var("DGP_TRUST_PROXY_HEADERS").ok();
     let trust_proxy = deltaglider_proxy::rate_limiter::trust_proxy_headers();
+    let trusted_cidrs = deltaglider_proxy::rate_limiter::trusted_proxy_cidrs();
     if trust_proxy {
-        info!("  Proxy headers: trusted (DGP_TRUST_PROXY_HEADERS=true) — X-Forwarded-For/X-Real-IP used for rate limiting; for admission source_ip and aws:SourceIp only from DGP_TRUSTED_PROXY_CIDRS peers");
-        if let Some(msg) = deltaglider_proxy::rate_limiter::xff_trust_warning(
-            trust_proxy,
-            !deltaglider_proxy::rate_limiter::trusted_proxy_cidrs().is_empty(),
-        ) {
-            tracing::warn!("{msg}");
-        }
+        info!(
+            "  Proxy headers: trusted from {} (DGP_TRUSTED_PROXY_CIDRS) — X-Forwarded-For/X-Real-IP name the client only on connections from those networks",
+            trusted_cidrs
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
     } else if trust_proxy_explicit.is_none() {
-        info!("  Proxy headers: untrusted (default) — set DGP_TRUST_PROXY_HEADERS=true if behind a reverse proxy (nginx, Caddy, ALB) to enable IP-based rate limiting and aws:SourceIp IAM conditions");
+        info!("  Proxy headers: untrusted (default) — behind a reverse proxy (nginx, Caddy, ALB) set DGP_TRUST_PROXY_HEADERS=true and DGP_TRUSTED_PROXY_CIDRS for per-client rate limiting and aws:SourceIp IAM conditions");
     } else {
         info!("  Proxy headers: untrusted (DGP_TRUST_PROXY_HEADERS=false) — per-IP rate limiting still works via the connection peer IP, but aws:SourceIp conditions derived from proxy headers will not match");
     }

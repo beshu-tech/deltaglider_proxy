@@ -101,12 +101,16 @@ the IP address that opened them.
 Two more operational notes:
 
 - **Client IP addresses.** The router adds an `X-Forwarded-For` header to every
-  request, and the operator sets `DGP_TRUST_PROXY_HEADERS=true` on the proxy pods.
-  Rate limits, `aws:SourceIp` permission conditions, and the IP binding of admin
-  sessions therefore see the real client address instead of the router's address. Note
-  that this setting trusts whatever traffic reaches the proxy pods — if untrusted
-  workloads share the cluster network, add a NetworkPolicy that only allows ingress to
-  the proxy pods from the router.
+  request. The operator sets `DGP_TRUST_PROXY_HEADERS=true` on the proxy pods, and it
+  sets `DGP_TRUSTED_PROXY_CIDRS` to `spec.router.trustedProxyCidrs`. The proxy reads
+  `X-Forwarded-For` only on a connection from one of those networks, so rate limits,
+  `aws:SourceIp` permission conditions, and the IP binding of admin sessions see the
+  real client address instead of the router's address. The operator cannot read the
+  pod network of the cluster, so the default is every private range (`10.0.0.0/8`,
+  `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`, `fc00::/7`). Any pod in those
+  ranges can name a client, so set `trustedProxyCidrs` to your pod CIDR. If
+  untrusted workloads share the cluster network, also add a NetworkPolicy that only
+  allows ingress to the proxy pods from the router.
 - **Scaling down keeps the volumes.** The operator never deletes a pod's persistent
   volume. After you scale `replicas` down, reclaim the removed pods' volumes manually
   if you want the storage back.

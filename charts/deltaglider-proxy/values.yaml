@@ -151,6 +151,8 @@ env: []
 # env:
 #   - name: DGP_TRUST_PROXY_HEADERS
 #     value: "true"
+#   - name: DGP_TRUSTED_PROXY_CIDRS   # required with trust on
+#     value: "10.42.0.0/16"
 envFrom: []
 
 extraVolumes: []

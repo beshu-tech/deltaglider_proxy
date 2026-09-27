@@ -354,6 +354,24 @@ So the total covered only the objects after the cursor, and the progress
 bar reached 99 % long before the end. Now the resumed count starts from
 the count that was saved with the cursor.
 
+### Changed — `DGP_TRUST_PROXY_HEADERS=true` needs `DGP_TRUSTED_PROXY_CIDRS`
+
+With trust on and no CIDR list, the per-IP rate limiter and the IP
+binding of admin sessions used the first `X-Forwarded-For` address, which
+the client writes. Any client could lock out a chosen IP address, escape
+the limiter, or use a stolen admin cookie from another address with a
+forged header. Now the proxy refuses to start with
+`DGP_TRUST_PROXY_HEADERS=true` and no valid `DGP_TRUSTED_PROXY_CIDRS`, and
+one client-IP rule serves every decision. The Kubernetes operator sets
+the CIDRs from the new `spec.router.trustedProxyCidrs` (default: every
+private range).
+
+**Upgrade:** if you set `DGP_TRUST_PROXY_HEADERS=true`, also set
+`DGP_TRUSTED_PROXY_CIDRS` to the networks of your reverse proxies or load
+balancers (for example `127.0.0.1/32` for a proxy on the same host), before
+you upgrade. Operator users: set `spec.router.trustedProxyCidrs` to the pod
+network of the cluster.
+
 ### Fixed — An uppercase `x-amz-content-sha256` no longer fails a `PUT`
 
 The proxy compared the body hash in lowercase hex with the header as sent,

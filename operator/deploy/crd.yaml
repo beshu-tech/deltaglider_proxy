@@ -91,6 +91,12 @@ spec:
                     format: int32
                     nullable: true
                     type: integer
+                  trustedProxyCidrs:
+                    description: 'Networks that the router pods connect from (the cluster pod network), set as DGP_TRUSTED_PROXY_CIDRS on the proxy pods: only a connection from these networks can name the client in X-Forwarded-For. Default (also for an empty list): every private range, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 and fc00::/7. Narrow it to your pod CIDR, because any pod in these ranges can name a client.'
+                    items:
+                      type: string
+                    nullable: true
+                    type: array
                 type: object
               service:
                 description: How the router is exposed.

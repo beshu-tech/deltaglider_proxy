@@ -149,7 +149,7 @@ pub async fn authorization_middleware(
     // LIST keys below (`s3:prefix`, ...) describe the request, not each key.
     let mut base_context = Context::new();
     // aws:SourceIp — the TCP peer, or the XFF client when the peer is in
-    // `DGP_TRUSTED_PROXY_CIDRS` (`extract_trusted_client_ip`). Without a CIDR
+    // `DGP_TRUSTED_PROXY_CIDRS` (`extract_client_ip_with_peer`). Without a CIDR
     // list the XFF header is client-written, and a forged one would satisfy
     // an IP condition. Always set (peer fallback): a `null` value makes
     // `iam-rs` skip the condition silently.
@@ -159,7 +159,7 @@ pub async fn authorization_middleware(
         .map(|ci| ci.0.ip());
     super::permissions::insert_source_ip(
         &mut base_context,
-        crate::rate_limiter::extract_trusted_client_ip(request.headers(), peer_ip),
+        crate::rate_limiter::extract_client_ip_with_peer(request.headers(), peer_ip),
     );
     let mut context = base_context.clone();
 

@@ -112,6 +112,8 @@ spec:
   envFromSecret: dgp-env
   storage:
     size: 20Gi
+  router:
+    trustedProxyCidrs: ["10.42.0.0/16"]   # the pod network of your cluster
   service:
     type: ClusterIP
 ```
@@ -138,6 +140,12 @@ hash or config DB key, the operator refuses to scale up — a fresh deployment c
 already-running fleet keeps its current size — and it sets the phase to `Degraded`
 with the exact problems listed in `status.message` (`kubectl -n dgp describe dgp dgp`
 shows them). Fix the spec and it scales up on its own.
+
+The routers add an `X-Forwarded-For` header that names the client. The proxy reads that
+header only on a connection from a network in `spec.router.trustedProxyCidrs`, so set it
+to the pod network of your cluster (`10.42.0.0/16` is the k3s default). When you leave it
+out, the operator uses every private range, and then any pod in those ranges can name a
+client.
 
 The operator creates the proxy pods (a StatefulSet with one persistent volume per
 pod), the HAProxy router pods, and a Service named `dgp` in front of the routers.

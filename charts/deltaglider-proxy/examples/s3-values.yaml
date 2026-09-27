@@ -8,6 +8,9 @@ auth:
 env:
   - name: DGP_TRUST_PROXY_HEADERS
     value: "true"
+  # Required with trust on: the ingress controller's pod network.
+  - name: DGP_TRUSTED_PROXY_CIDRS
+    value: "10.42.0.0/16"
 
 config:
   inline: |

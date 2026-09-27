@@ -28,7 +28,7 @@ Tells:
 - Throttling returns `503 SlowDown`, but a client retry that re-sends auth can surface as `403`; the auth/lockout log lines now include `bucket_key=` and `trust_proxy=` — if `bucket_key` is your proxy's IP for unrelated clients, that's the smoking gun.
 - The save-time config advisories flag the rate-limit-on + trust-off combination.
 
-Fix: set `DGP_TRUST_PROXY_HEADERS=true` (only behind a trusted proxy that injects `X-Forwarded-For`/`X-Real-IP`). See [Rate limits](../reference/rate-limits.md#ip-extraction).
+Fix: set `DGP_TRUST_PROXY_HEADERS=true` and `DGP_TRUSTED_PROXY_CIDRS` to the reverse proxy's network (only behind a trusted proxy that injects `X-Forwarded-For`/`X-Real-IP`). See [Rate limits](../reference/rate-limits.md#ip-extraction).
 
 ## Admin login fails with the right password
 
@@ -40,7 +40,7 @@ The bootstrap password verification uses bcrypt. Usually one of:
 
 2. **Rate limiter lockout.** 100 failed attempts / 5-minute window / per-IP, with a 10-minute lockout after. `/_/metrics` → `deltaglider_auth_failures_total`. Wait it out, or see [Rate limits](../reference/rate-limits.md) for the knobs.
 
-3. **Session IP binding.** If you log in from one IP and the admin cookie ends up used from a different IP (NAT flip, VPN change), the session is rejected. Log in again. Disable `DGP_TRUST_PROXY_HEADERS` if you're not behind a reverse proxy — otherwise clients can spoof IPs.
+3. **Session IP binding.** If you log in from one IP and the admin cookie ends up used from a different IP (NAT flip, VPN change), the session is rejected. Log in again. Behind a reverse proxy, the binding uses the client address that the proxy names in `X-Forwarded-For`, and only when the proxy's network is in `DGP_TRUSTED_PROXY_CIDRS`.
 
 ## Startup fails: `xattr` support missing
 

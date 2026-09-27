@@ -13,7 +13,7 @@ This guide shows you how to take a working DeltaGlider Proxy from "runs on my la
 - **Kubernetes** — official Helm chart with PVC, probes, and Ingress. See [How to deploy on Kubernetes with Helm](deploy-on-kubernetes.md).
 - **systemd** — run as `deltaglider_proxy.service` with `WorkingDirectory=/var/lib/deltaglider_proxy` and `EnvironmentFile=/etc/deltaglider_proxy/env`. The binary exits non-zero on unrecoverable errors, so `Restart=on-failure` is appropriate.
 - **Coolify / plain Docker hosts** — mount a persistent volume at `/data` and inject env vars via the platform's secret store. The container writes `./deltaglider_proxy.yaml`, `./deltaglider_config.db`, and `./data/` relative to its CWD (`/data`).
-- **Behind AWS ALB / NLB** — point at port 9000, health-check path `/_/health` (HTTP 200 = healthy). The ALB is a reverse proxy: set `DGP_TRUST_PROXY_HEADERS=true` and raise the idle timeout (see [How to serve TLS](serve-tls.md)).
+- **Behind AWS ALB / NLB** — point at port 9000, health-check path `/_/health` (HTTP 200 = healthy). The ALB is a reverse proxy: set `DGP_TRUST_PROXY_HEADERS=true`, set `DGP_TRUSTED_PROXY_CIDRS` to the subnets of the ALB, and raise the idle timeout (see [How to serve TLS](serve-tls.md)).
 
 Whatever the platform: one port serves everything — the UI (`/_/*`) and the S3 API (`/`) share the listener — and `/data` must persist across restarts.
 

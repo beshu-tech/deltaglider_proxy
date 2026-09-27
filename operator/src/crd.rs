@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_IMAGE: &str = "beshultd/deltaglider_proxy:1.17.0";
 /// Default router image when `spec.router.image` is not set.
 pub const DEFAULT_ROUTER_IMAGE: &str = "haproxy:3.0-alpine";
+/// Default `spec.router.trustedProxyCidrs`: every private range, because the
+/// operator cannot read the cluster's pod network.
+pub const DEFAULT_TRUSTED_PROXY_CIDRS: &str =
+    "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.64.0.0/10,fc00::/7";
 /// The single port everything listens on (S3 API + admin UI).
 pub const PROXY_PORT: i32 = 9000;
 
@@ -82,6 +86,13 @@ pub struct RouterSpec {
     pub replicas: Option<i32>,
     /// Router image (default haproxy:3.0-alpine).
     pub image: Option<String>,
+    /// Networks that the router pods connect from (the cluster pod network),
+    /// set as DGP_TRUSTED_PROXY_CIDRS on the proxy pods: only a connection
+    /// from these networks can name the client in X-Forwarded-For. Default
+    /// (also for an empty list): every private range, 10.0.0.0/8,
+    /// 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 and fc00::/7. Narrow it
+    /// to your pod CIDR, because any pod in these ranges can name a client.
+    pub trusted_proxy_cidrs: Option<Vec<String>>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema, Default)]
@@ -142,6 +153,16 @@ impl DeltaGliderProxy {
             .as_ref()
             .and_then(|r| r.image.clone())
             .unwrap_or_else(|| DEFAULT_ROUTER_IMAGE.into())
+    }
+    /// The DGP_TRUSTED_PROXY_CIDRS value for the proxy pods.
+    pub fn trusted_proxy_cidrs(&self) -> String {
+        self.spec
+            .router
+            .as_ref()
+            .and_then(|r| r.trusted_proxy_cidrs.clone())
+            .filter(|c| !c.is_empty())
+            .map(|c| c.join(","))
+            .unwrap_or_else(|| DEFAULT_TRUSTED_PROXY_CIDRS.into())
     }
     pub fn service_type(&self) -> String {
         self.spec

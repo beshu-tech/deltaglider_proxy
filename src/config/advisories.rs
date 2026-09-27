@@ -112,8 +112,9 @@ fn rule_shared_rate_limit_bucket(_cfg: &Config, env: &EnvView) -> Option<Advisor
             "Auth rate limiting is enabled but DGP_TRUST_PROXY_HEADERS is off. Behind a \
              reverse proxy (Coolify/Traefik/nginx/ALB) every client collapses onto ONE \
              rate-limit bucket — the proxy's IP — so one client's failures can lock out \
-             everyone. Set DGP_TRUST_PROXY_HEADERS=true if (and only if) DGP sits behind a \
-             trusted proxy that sets X-Forwarded-For.",
+             everyone. Set DGP_TRUST_PROXY_HEADERS=true and DGP_TRUSTED_PROXY_CIDRS to the \
+             proxy's networks if (and only if) DGP sits behind a trusted proxy that sets \
+             X-Forwarded-For.",
         )
     })
 }

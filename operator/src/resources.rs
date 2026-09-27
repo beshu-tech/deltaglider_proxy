@@ -207,8 +207,13 @@ pub fn proxy_statefulset(cr: &DeltaGliderProxy, replicas: i32) -> Value {
 
     // The router is the only supported entrypoint and stamps X-Forwarded-For
     // (option forwardfor): trust it so rate limits, aws:SourceIp conditions, and
-    // IP-bound admin sessions see the real client, not the router pod.
-    let mut env = vec![json!({ "name": "DGP_TRUST_PROXY_HEADERS", "value": "true" })];
+    // IP-bound admin sessions see the real client, not the router pod. Trust
+    // needs the router's networks: without them the proxy refuses to boot,
+    // because any client could write the header.
+    let mut env = vec![
+        json!({ "name": "DGP_TRUST_PROXY_HEADERS", "value": "true" }),
+        json!({ "name": "DGP_TRUSTED_PROXY_CIDRS", "value": cr.trusted_proxy_cidrs() }),
+    ];
     if has_config {
         env.push(json!({ "name": "DGP_CONFIG", "value": CONFIG_MOUNT }));
     }
@@ -443,6 +448,7 @@ mod tests {
                 router: Some(RouterSpec {
                     replicas: Some(2),
                     image: None,
+                    trusted_proxy_cidrs: None,
                 }),
                 service: None,
                 resources: None,
@@ -544,6 +550,46 @@ mod tests {
         assert!(env
             .iter()
             .any(|e| e.name == "DGP_TRUST_PROXY_HEADERS" && e.value.as_deref() == Some("true")));
+    }
+
+    /// auth-2: the proxy refuses DGP_TRUST_PROXY_HEADERS=true without
+    /// DGP_TRUSTED_PROXY_CIDRS, so the operator always sets both.
+    #[test]
+    fn proxy_pods_trust_only_the_router_networks() {
+        let cidrs = |cr: &DeltaGliderProxy| {
+            let sts: StatefulSet =
+                serde_json::from_value(proxy_statefulset(cr, cr.replicas())).unwrap();
+            let pod = sts.spec.unwrap().template.spec.unwrap();
+            pod.containers[0]
+                .env
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|e| e.name == "DGP_TRUSTED_PROXY_CIDRS")
+                .and_then(|e| e.value.clone())
+        };
+        assert_eq!(
+            cidrs(&cr(1)).as_deref(),
+            Some(crate::crd::DEFAULT_TRUSTED_PROXY_CIDRS)
+        );
+        let mut narrow = cr(1);
+        narrow
+            .spec
+            .router
+            .get_or_insert_with(Default::default)
+            .trusted_proxy_cidrs = Some(vec!["10.42.0.0/16".into(), "fd00:42::/56".into()]);
+        assert_eq!(cidrs(&narrow).as_deref(), Some("10.42.0.0/16,fd00:42::/56"));
+        let mut empty = cr(1);
+        empty
+            .spec
+            .router
+            .get_or_insert_with(Default::default)
+            .trusted_proxy_cidrs = Some(vec![]);
+        assert_eq!(
+            cidrs(&empty).as_deref(),
+            Some(crate::crd::DEFAULT_TRUSTED_PROXY_CIDRS),
+            "an empty list would make the proxy refuse to boot"
+        );
     }
 
     #[test]

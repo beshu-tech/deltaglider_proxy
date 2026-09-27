@@ -31,10 +31,15 @@ struct IamTestHarness {
 
 impl IamTestHarness {
     async fn setup() -> Self {
-        let server = TestServer::builder()
-            .auth("bootstrap_key", "bootstrap_secret")
-            .build()
-            .await;
+        Self::setup_with_env(&[]).await
+    }
+
+    async fn setup_with_env(env: &[(&str, &str)]) -> Self {
+        let mut builder = TestServer::builder().auth("bootstrap_key", "bootstrap_secret");
+        for (k, v) in env {
+            builder = builder.env(k, v);
+        }
+        let server = builder.build().await;
 
         let admin_client = admin_http_client(&server.endpoint()).await;
 
@@ -804,13 +809,13 @@ async fn test_reader_cannot_delete_bucket() {
 }
 
 /// `aws:SourceIp` must not come from a client-written `X-Forwarded-For`.
-/// The harness sets DGP_TRUST_PROXY_HEADERS=true with no
-/// DGP_TRUSTED_PROXY_CIDRS, so the first XFF element is forged: the policy
-/// must see the TCP peer (127.0.0.1), outside 10.0.0.0/8. Covers the IAM
-/// middleware and the CopyObject source-read check (RequestClientIp).
+/// The client connects from 127.0.0.1, which is not a trusted proxy here,
+/// so its XFF is forged: the policy must see the TCP peer, outside
+/// 10.0.0.0/8. Covers the IAM middleware and the CopyObject source-read
+/// check (RequestClientIp).
 #[tokio::test]
 async fn test_forged_xff_does_not_satisfy_source_ip_condition() {
-    let h = IamTestHarness::setup().await;
+    let h = IamTestHarness::setup_with_env(&[("DGP_TRUSTED_PROXY_CIDRS", "192.0.2.1/32")]).await;
     let admin_client = admin_http_client(&h.server.endpoint()).await;
     let ip_user = create_iam_user(
         &admin_client,
