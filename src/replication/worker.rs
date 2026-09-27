@@ -308,8 +308,7 @@ impl Drop for ObjectGuard {
 /// co-resident → the objects-inflight peak deterministically reaches the
 /// configured object concurrency. Inert in prod.
 async fn maybe_object_barrier() {
-    if crate::config::env_bool("DGP_TEST_OBJECT_BARRIER", false) {
-        let ms: u64 = crate::config::env_parse_with_default("DGP_TEST_OBJECT_DELAY_MS", 150);
+    if let Some(ms) = crate::config::test_seams::test_seams().object_delay_ms {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
 }
@@ -320,7 +319,7 @@ async fn maybe_object_barrier() {
 /// `DGP_TEST_COPY_STALL_MS` ms when set (>0) — the env var keeps its historical
 /// name. Inert in prod (unset → no-op).
 async fn maybe_pass_stall() {
-    let ms: u64 = crate::config::env_parse_with_default("DGP_TEST_COPY_STALL_MS", 0);
+    let ms = crate::config::test_seams::test_seams().copy_stall_ms;
     if ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
@@ -462,10 +461,9 @@ pub async fn run_rule(
         src_lite_authoritative: engine.lite_list_carries_logical_facts(&rule.source.bucket),
         dest_lite_authoritative: engine.lite_list_carries_logical_facts(&rule.destination.bucket),
     };
-    let max_pages = match crate::config::env_parse::<u32>("DGP_TEST_MAX_JOB_PAGES") {
-        Some(n) if n > 0 => n,
-        _ => MAX_JOB_PAGES,
-    };
+    let max_pages = crate::config::test_seams::test_seams()
+        .max_job_pages
+        .unwrap_or(MAX_JOB_PAGES);
     let dir_workers = concurrency.dir_concurrency.clamp(1, 16) as usize;
     let mut machine = match compile_rule_globs(rule) {
         Ok((include_globs, exclude_globs)) => Some(walk::WalkMachine::new(

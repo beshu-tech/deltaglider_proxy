@@ -297,7 +297,7 @@ pub(super) async fn run_multipart_completion(
     force_chunked_passthrough: bool,
 ) -> Result<(String, Option<FileMetadata>), crate::api::S3Error> {
     // Deterministic chaos hook for tests: hold the store window open.
-    let stall_ms: u64 = crate::config::env_parse_with_default("DGP_TEST_COMPLETE_STALL_MS", 0);
+    let stall_ms = crate::config::test_seams::test_seams().complete_stall_ms;
     if stall_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(stall_ms)).await;
     }

@@ -775,8 +775,7 @@ fn verify_size_verdict(
 fn maybe_inject_part_failure(part_number: i32) -> Option<CopyError> {
     use std::sync::atomic::{AtomicI32, Ordering};
     static FIRED: AtomicI32 = AtomicI32::new(-1);
-    let target: i32 = crate::config::env_parse_with_default("DGP_TEST_FAIL_PART_ONCE", -1);
-    if target < 0 || target != part_number {
+    if crate::config::test_seams::test_seams().fail_part_once != Some(part_number) {
         return None;
     }
     // compare_exchange(-1 → part#) succeeds for exactly one caller.
@@ -797,8 +796,7 @@ fn maybe_inject_part_failure(part_number: i32) -> Option<CopyError> {
 /// bumped so >=concurrency parts are co-resident — making the inflight peak
 /// DETERMINISTICALLY reach the configured concurrency. Inert in prod.
 async fn maybe_part_barrier() {
-    if crate::config::env_bool("DGP_TEST_PART_BARRIER", false) {
-        let ms: u64 = crate::config::env_parse_with_default("DGP_TEST_PART_DELAY_MS", 150);
+    if let Some(ms) = crate::config::test_seams::test_seams().part_delay_ms {
         tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
     }
 }

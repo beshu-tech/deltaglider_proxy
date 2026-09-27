@@ -121,12 +121,14 @@ pub fn log_startup_banner(config: &Config) {
 ///
 /// The decision itself is the pure [`Config::classify_auth_config`]; this
 /// wrapper owns the logging and the `process::exit` (the un-testable I/O).
-/// The DGP_TEST_* seams inject faults/delays and clamp page budgets. They ship
-/// in release code paths (inert unless set), so loudly warn if one is active —
-/// an operator who exported one by accident would otherwise silently run a
-/// crippled proxy (finding #32).
+/// The DGP_TEST_* seams inject faults/delays and clamp page budgets. Only a
+/// debug build reads them (`config::test_seams`), but warn loudly when one is
+/// set in any build: an operator who exported one by accident runs a crippled
+/// debug proxy, or expects an effect a release build does not have (finding
+/// #32). `DGP_RELAY_FOREIGN_MIN_AGE_SECS` applies in every build.
 fn warn_active_test_seams() {
     const SEAMS: &[&str] = &[
+        "DGP_TEST_COMPLETE_STALL_MS",
         "DGP_TEST_FAIL_PART_ONCE",
         "DGP_TEST_PART_BARRIER",
         "DGP_TEST_PART_DELAY_MS",
@@ -144,7 +146,8 @@ fn warn_active_test_seams() {
         .collect();
     if !active.is_empty() {
         warn!(
-            "  TEST SEAMS ACTIVE ({}) — these inject faults/delays/budget clamps and \
+            "  TEST SEAMS ACTIVE ({}) — a debug build injects faults/delays/budget \
+             clamps from them (a release build ignores the DGP_TEST_* ones); they \
              must NEVER be set in production.",
             active.join(", ")
         );

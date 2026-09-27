@@ -212,14 +212,9 @@ pub async fn client_writable_groups_with_default(
 /// separated) get a forced NonCas verdict without probing — the only way to
 /// exercise the fail-fast path against a MinIO-only test harness.
 pub fn forced_noncas_backends() -> std::collections::BTreeSet<String> {
-    crate::config::env_parse::<String>("DGP_TEST_FORCE_NONCAS_BACKEND")
-        .map(|v| {
-            v.split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
+    crate::config::test_seams::test_seams()
+        .force_noncas_backends
+        .clone()
 }
 
 /// How long a backend capability probe may run before we give up with an

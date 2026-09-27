@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 mod registry;
 pub use registry::*;
+pub mod test_seams;
 pub mod tuning;
 pub use tuning::RuntimeTuning;
 

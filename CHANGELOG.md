@@ -30,6 +30,14 @@ changes for an operator: a changed variable still takes effect after a
 restart. `GET /_/api/admin/config` now shows the rate limits, the session TTL
 and the multipart upload cap that the running server uses.
 
+### Changed — The `DGP_TEST_*` hooks work only in debug builds
+
+The integration tests set `DGP_TEST_*` variables on the proxy that they
+start, to hold a window open or to fail a step on purpose. A release binary
+now ignores these variables, so a variable that an operator sets by mistake
+cannot slow down or break a production proxy. The startup warning still names
+every such variable that is set.
+
 ### Fixed — A ZIP download stops reading when the client goes away
 
 The admin ZIP download noticed a closed connection only when it sent the next

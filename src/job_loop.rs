@@ -72,9 +72,9 @@ impl Pager {
 
     /// The env-seam variant: applies `DGP_TEST_MAX_JOB_PAGES` when set.
     pub fn with_test_max_pages_env(self) -> Self {
-        match crate::config::env_parse::<u32>("DGP_TEST_MAX_JOB_PAGES") {
-            Some(n) if n > 0 => self.with_max_pages(n),
-            _ => self,
+        match crate::config::test_seams::test_seams().max_job_pages {
+            Some(n) => self.with_max_pages(n),
+            None => self,
         }
     }
 
