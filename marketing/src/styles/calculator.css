@@ -53,8 +53,6 @@
   margin-top: 0;
   font-size: 1rem;
   color: var(--ink-soft);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
   margin-bottom: 1rem;
 }
 
@@ -308,9 +306,7 @@
 
 .breakdown thead th {
   text-align: right;
-  font-size: 0.75rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  font-size: var(--fs-label);
   color: var(--ink-soft);
   font-family: var(--font-sans);
   border-bottom: 2px solid var(--rule-strong);

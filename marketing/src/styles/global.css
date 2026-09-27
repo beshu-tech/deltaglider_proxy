@@ -94,12 +94,20 @@ h1 {
 }
 
 h2 {
-  font-size: clamp(1.5rem, 3vw, 2rem);
+  font-size: var(--fs-h2);
 }
 
 h3 {
-  font-size: 1.25rem;
-  font-weight: 600;
+  font-size: var(--fs-h3);
+  font-weight: 700;
+}
+
+/* Section rhythm: the section padding sets the space above the first
+   heading, so a heading that opens a section, or follows its eyebrow,
+   adds no margin of its own. */
+:is(section, .shell, header) > h2:first-child,
+.section-eyebrow + h2 {
+  margin-top: 0;
 }
 
 h4 {
@@ -293,12 +301,10 @@ hr {
   padding: 0.3rem 0.75rem;
   background: var(--brand-soft);
   border: 1px solid var(--brand-line-soft);
-  border-radius: 999px;
-  font-size: 0.78rem;
+  border-radius: var(--r-pill);
+  font-size: var(--fs-small);
   font-weight: 600;
   color: var(--brand-dark);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
   margin-bottom: 1.5rem;
 }
 
@@ -397,6 +403,9 @@ section { scroll-margin-top: 5rem; }
 .section {
   padding: 4rem 0;
 }
+@media (min-width: 768px) {
+  .section { padding: 6rem 0; }
+}
 
 .section-alt {
   background: var(--bg-soft);
@@ -410,21 +419,17 @@ section { scroll-margin-top: 5rem; }
 
 .section-eyebrow {
   display: block;
-  font-size: 0.78rem;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
+  font-size: var(--fs-small);
   color: var(--brand-dark);
   font-weight: 700;
-  margin-bottom: 0.6rem;
+  margin-bottom: 0.5rem;
 }
 
 /* === Reused chip used by testimonial cards + elsewhere === */
 
 .product-chip {
   display: inline-block;
-  font-size: 0.7rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  font-size: var(--fs-label);
   font-weight: 600;
   color: var(--brand-dark);
   background: var(--brand-soft);
