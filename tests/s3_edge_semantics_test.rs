@@ -351,3 +351,39 @@ async fn max_keys_zero_lists_nothing() {
         assert!(body.contains("<MaxKeys>0</MaxKeys>"), "{query}: {body}");
     }
 }
+
+/// A copy onto itself that changes nothing is `400 InvalidRequest`, as on S3;
+/// with `REPLACE` it goes on (s3surface-16).
+#[tokio::test]
+async fn self_copy_without_change_is_refused() {
+    let (server, http) = signed_setup().await;
+    let (endpoint, bucket) = (server.endpoint(), server.bucket().to_string());
+    put_object(
+        &http,
+        &endpoint,
+        &bucket,
+        "self.txt",
+        b"s".to_vec(),
+        "text/plain",
+    )
+    .await;
+    let url = format!("{endpoint}/{bucket}/self.txt");
+    let resp = http
+        .put(&url)
+        .header("x-amz-copy-source", format!("{bucket}/self.txt"))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("InvalidRequest"), "{body}");
+    let resp = http
+        .put(&url)
+        .header("x-amz-copy-source", format!("{bucket}/self.txt"))
+        .header("x-amz-metadata-directive", "REPLACE")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+}

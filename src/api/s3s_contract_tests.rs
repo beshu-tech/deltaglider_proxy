@@ -1411,3 +1411,46 @@ async fn generated_requests_reach_the_hook() {
         "only these operations were exercised: {ops:?}"
     );
 }
+
+/// `x-amz-copy-source` is authorized by the adapter, not the middleware, so
+/// the table above never sees it. The key the adapter authorizes must be
+/// the key the engine reads from s3s's parse of the header, or the engine
+/// must refuse that key (review 4: `b//k` once escaped a Deny on `b/k*`).
+#[test]
+fn copy_source_authorized_key_is_the_key_the_engine_reads() {
+    let headers = [
+        "bkt/k",
+        "/bkt/k",
+        "bkt//k",
+        "bkt///k",
+        "bkt/%2Fk",
+        "bkt/a%2Fk",
+        "bkt/%2E%2E/k",
+        "bkt/a/../k",
+        "bkt/./k",
+        "bkt/a+b",
+        "bkt/a%20b",
+        "bkt/a%2Bb",
+        "bkt/k?versionId=null",
+    ];
+    let mut checked = 0;
+    for header in headers {
+        let Ok(source) = s3s::dto::CopySource::parse(header) else {
+            continue;
+        };
+        let Ok((bucket, authorized)) = crate::s3_adapter_s3s::copy_source_bucket_key(&source)
+        else {
+            continue;
+        };
+        let s3s::dto::CopySource::Bucket { key: parsed, .. } = &source else {
+            unreachable!("copy_source_bucket_key accepts only bucket sources");
+        };
+        let engine = crate::types::ObjectKey::parse(&bucket, parsed);
+        if engine.validate_object().is_err() {
+            continue; // never served
+        }
+        assert_eq!(authorized, engine.full_key(), "x-amz-copy-source: {header}");
+        checked += 1;
+    }
+    assert!(checked >= 8, "only {checked} copy sources were servable");
+}

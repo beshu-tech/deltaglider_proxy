@@ -165,6 +165,14 @@ proxy installed the new engine before the refusal, so the new limit
 served requests while the config still showed the old one. Now every
 check runs first, and the new engine goes live as the last step.
 
+### Fixed — A copy of an object onto itself must change something
+
+A CopyObject onto its own key with `MetadataDirective: COPY` and no other
+change rewrote the object (and encoded its delta again). S3 refuses such a
+copy, so now the proxy answers `400 InvalidRequest` with the S3 message. A
+self-copy with `REPLACE`, or with a new storage class or encryption
+setting, still works.
+
 ### Fixed — A request to a missing bucket answers `NoSuchBucket`
 
 A LIST of a missing bucket answered an empty 200, a DELETE answered 204, and

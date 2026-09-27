@@ -996,6 +996,28 @@ impl s3s::S3 for DeltaGliderS3Service {
             &input.bucket,
         )
         .map_err(engine_error_to_s3s)?;
+        let directive = input
+            .metadata_directive
+            .as_ref()
+            .map(|d| d.as_str())
+            .unwrap_or(s3s::dto::MetadataDirective::COPY);
+        let changes_attributes = input.storage_class.is_some()
+            || input.server_side_encryption.is_some()
+            || input.ssekms_key_id.is_some()
+            || input.sse_customer_algorithm.is_some()
+            || input.website_redirect_location.is_some();
+        if is_illegal_self_copy(
+            (&source_bucket, &source_key),
+            (&input.bucket, &input.key),
+            directive.eq_ignore_ascii_case("REPLACE") || changes_attributes,
+        ) {
+            return Err(s3s::s3_error!(
+                InvalidRequest,
+                "This copy request is illegal because it is trying to copy an object to \
+                 itself without changing the object's metadata, storage class, website \
+                 redirect location or encryption attributes."
+            ));
+        }
         ensure_bucket_exists_s3s(&self.state, &source_bucket).await?;
         ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
         let engine = self.state.engine.load();
@@ -1028,11 +1050,6 @@ impl s3s::S3 for DeltaGliderS3Service {
             data.len() as u64,
         )
         .map_err(engine_error_to_s3s)?;
-        let directive = input
-            .metadata_directive
-            .as_ref()
-            .map(|d| d.as_str())
-            .unwrap_or(s3s::dto::MetadataDirective::COPY);
         let (content_type, mut user_metadata) = if directive.eq_ignore_ascii_case("REPLACE") {
             check_user_metadata_size_s3s(input.metadata.as_ref())?;
             (input.content_type, input.metadata.unwrap_or_default())
@@ -1982,7 +1999,9 @@ async fn client_list_page(
     Ok(page)
 }
 
-fn copy_source_bucket_key(source: &s3s::dto::CopySource) -> s3s::S3Result<(String, String)> {
+pub(crate) fn copy_source_bucket_key(
+    source: &s3s::dto::CopySource,
+) -> s3s::S3Result<(String, String)> {
     match source {
         s3s::dto::CopySource::Bucket {
             bucket,
@@ -2092,6 +2111,16 @@ fn evaluate_copy_source_conditionals_s3s(
     }
 
     Ok(())
+}
+
+/// Pure: whether a CopyObject copies an object onto itself and changes
+/// nothing. S3 refuses it with 400 InvalidRequest; the proxy re-encoded the
+/// object instead (s3surface-16). The engine trims leading `/` from keys, so
+/// `k` and `/k` are one object.
+fn is_illegal_self_copy(source: (&str, &str), dest: (&str, &str), changes: bool) -> bool {
+    !changes
+        && source.0 == dest.0
+        && source.1.trim_start_matches('/') == dest.1.trim_start_matches('/')
 }
 
 fn parse_copy_range(range: &str, len: usize) -> s3s::S3Result<(usize, usize)> {
@@ -3706,6 +3735,15 @@ mod tests {
         assert_eq!(client_max_keys(Some(-3)), 0);
         assert_eq!(client_max_keys(Some(7)), 7);
         assert_eq!(client_max_keys(Some(5000)), 1000);
+    }
+
+    #[test]
+    fn self_copy_is_illegal_only_when_it_changes_nothing() {
+        assert!(is_illegal_self_copy(("b", "k"), ("b", "k"), false));
+        assert!(is_illegal_self_copy(("b", "k"), ("b", "/k"), false));
+        assert!(!is_illegal_self_copy(("b", "k"), ("b", "k"), true));
+        assert!(!is_illegal_self_copy(("b", "k"), ("b", "k2"), false));
+        assert!(!is_illegal_self_copy(("b", "k"), ("c", "k"), false));
     }
 
     #[test]
