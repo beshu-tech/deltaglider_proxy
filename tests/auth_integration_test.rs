@@ -3545,3 +3545,61 @@ async fn trust_proxy_headers_without_cidrs_refuses_to_boot() {
         );
     }
 }
+
+/// auth-4: with declarative IAM users the bootstrap pair is not an S3
+/// credential (only IAM users are). The bootstrap login must then not hand
+/// the browser that pair: every request the file browser signed with it
+/// failed with 403.
+#[tokio::test]
+async fn bootstrap_login_stores_only_s3_credentials_the_proxy_accepts() {
+    let server = TestServer::builder()
+        .auth("AKBOOT", "SECRETBOOT")
+        .extra_yaml_root(
+            "iam_mode: declarative\niam_users:\n  - name: ci-uploader\n    access_key_id: AKCI\n    secret_access_key: SECRETCI\n    permissions:\n      - effect: Allow\n        actions: [\"*\"]\n        resources: [\"*\"]\n",
+        )
+        .build()
+        .await;
+    let (endpoint, bucket) = (server.endpoint(), server.bucket().to_string());
+    let boot = common::S3Http::signed("AKBOOT", "SECRETBOOT");
+    let r = boot
+        .get(format!("{endpoint}/{bucket}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        StatusCode::FORBIDDEN,
+        "precondition: pair refused"
+    );
+    let admin = admin_http_client(&endpoint).await;
+    let r = admin
+        .get(format!("{endpoint}/_/api/admin/session/s3-credentials"))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let body = r.text().await.unwrap();
+    assert!(
+        !body.contains("AKBOOT"),
+        "login stored a pair the S3 API refuses: {status} {body}"
+    );
+
+    // Bootstrap mode (no IAM users): the pair IS the credential and is stored.
+    let server = TestServer::builder()
+        .auth("AKBOOT", "SECRETBOOT")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let body = admin
+        .get(format!(
+            "{}/_/api/admin/session/s3-credentials",
+            server.endpoint()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("AKBOOT"), "bootstrap mode: {body}");
+}

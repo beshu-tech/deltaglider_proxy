@@ -96,6 +96,27 @@ impl IamState {
             IamState::Iam(index) => index.bootstrap_fallback.as_ref(),
         }
     }
+
+    /// Whether the S3 API accepts this key pair now: the bootstrap pair in
+    /// `Legacy` mode; in `Iam` mode only an enabled user's pair (the
+    /// bootstrap pair too when a user carries it, as `legacy-admin` does).
+    /// Open mode checks no credential, so no pair is "accepted".
+    pub fn accepts_credentials(&self, access_key_id: &str, secret_access_key: &str) -> bool {
+        use crate::security::secret_eq;
+        match self {
+            IamState::Disabled => false,
+            IamState::Legacy(auth) => {
+                secret_eq(access_key_id.as_bytes(), auth.access_key_id.as_bytes())
+                    && secret_eq(
+                        secret_access_key.as_bytes(),
+                        auth.secret_access_key.as_bytes(),
+                    )
+            }
+            IamState::Iam(index) => index.get(access_key_id).is_some_and(|u| {
+                u.enabled && secret_eq(secret_access_key.as_bytes(), u.secret_access_key.as_bytes())
+            }),
+        }
+    }
 }
 
 /// Thread-safe, hot-swappable IAM state.
@@ -282,6 +303,52 @@ pub struct CannedPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// auth-4: the pair the S3 API accepts, per mode. In IAM mode the
+    /// bootstrap pair counts only when a user carries it.
+    #[test]
+    fn accepts_credentials_truth_table() {
+        let boot = AuthConfig {
+            access_key_id: "AKBOOT".into(),
+            secret_access_key: "SKBOOT".into(),
+        };
+        let user = |ak: &str, sk: &str, enabled: bool| IamUser {
+            id: 1,
+            name: ak.to_lowercase(),
+            access_key_id: ak.into(),
+            secret_access_key: sk.into(),
+            enabled,
+            created_at: String::new(),
+            permissions: vec![],
+            group_ids: vec![],
+            auth_source: "local".into(),
+            iam_policies: vec![],
+        };
+        let legacy = IamState::Legacy(boot.clone());
+        assert!(legacy.accepts_credentials("AKBOOT", "SKBOOT"));
+        assert!(!legacy.accepts_credentials("AKBOOT", "wrong"));
+        assert!(!legacy.accepts_credentials("AKOTHER", "SKBOOT"));
+        let iam = IamState::Iam(
+            IamIndex::from_users(vec![
+                user("AKCI", "SKCI", true),
+                user("AKOFF", "SKOFF", false),
+            ])
+            .with_bootstrap_fallback(Some(boot.clone())),
+        );
+        assert!(iam.accepts_credentials("AKCI", "SKCI"));
+        assert!(!iam.accepts_credentials("AKCI", "wrong"));
+        assert!(!iam.accepts_credentials("AKOFF", "SKOFF"), "disabled");
+        assert!(
+            !iam.accepts_credentials("AKBOOT", "SKBOOT"),
+            "bootstrap pair"
+        );
+        let carried = IamState::Iam(IamIndex::from_users(vec![user("AKBOOT", "SKBOOT", true)]));
+        assert!(
+            carried.accepts_credentials("AKBOOT", "SKBOOT"),
+            "legacy-admin"
+        );
+        assert!(!IamState::Disabled.accepts_credentials("AKBOOT", "SKBOOT"));
+    }
 
     /// Only the preset that says "admin" may grant `*`; every other preset
     /// is Allow-only and delete appears only where the name says so.

@@ -592,13 +592,18 @@ pub async fn login(
     );
 
     // Auto-populate S3 credentials from config so "login IS connect".
-    // The legacy access_key_id/secret_access_key are the proxy's own auth credentials.
+    // The legacy access_key_id/secret_access_key are the proxy's own auth
+    // credentials, but only while the S3 API accepts them: with IAM users
+    // (declarative ones, or a DB without `legacy-admin`) the pair is refused,
+    // and a browser signing with it would fail every request.
     {
         let config = state.config.read().await;
+        let iam = state.iam_state.load();
         let creds = config
             .access_key_id
             .clone()
-            .zip(config.secret_access_key.clone());
+            .zip(config.secret_access_key.clone())
+            .filter(|(ak, sk)| iam.accepts_credentials(ak, sk));
         let auth_on = config.auth_enabled();
         let region = match &config.backend {
             crate::config::BackendConfig::S3 { region, .. } => region.clone(),

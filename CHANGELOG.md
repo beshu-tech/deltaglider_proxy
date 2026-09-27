@@ -354,6 +354,15 @@ So the total covered only the objects after the cursor, and the progress
 bar reached 99 % long before the end. Now the resumed count starts from
 the count that was saved with the cursor.
 
+### Fixed — The bootstrap login no longer hands the browser a refused key pair
+
+With declarative IAM users, the S3 API refuses the bootstrap pair, but the
+bootstrap password login still stored that pair for the file browser, so
+every browser request failed with `403`. Now the login stores the pair
+only when the S3 API accepts it. The authentication reference said that
+the bootstrap pair and IAM users are both tried; it now says which pair
+works in which mode.
+
 ### Fixed — OAuth users without admin rights can use bulk copy, move, delete and ZIP
 
 The bulk object endpoints (`/_/api/admin/objects/*`) accepted the browser
