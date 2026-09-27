@@ -230,7 +230,10 @@ single-instance planes below are addressed.
   else local if free, else fresh; FKs resolve through names (external
   identities follow), and local user ids that change owner end their live
   external sessions. No base (upgrade/first sync/unreadable) → union, no
-  deletes (never "remote wins"). A synced copy opens only with
+  deletes (never "remote wins"). A downloaded copy is a rollback only when its
+  `sync_generation` (v29, one row in `sync_state`, bumped before every upload
+  above the local DB and the base) is below the base's; a copy without one
+  (a pre-v29 peer) keeps the row-age rule (`is_rollback`, 5-min tolerance). A synced copy opens only with
   `DGP_CONFIG_DB_KEY` or `DGP_CONFIG_DB_KEY_PREVIOUS` (the legacy
   bootstrap-hash key only with `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC=true`). Mapping rules are keyed by `rule_uid` (v28: random
   on GUI insert via trigger, content-derived for the declarative reconcile and

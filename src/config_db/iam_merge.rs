@@ -193,6 +193,72 @@ pub(crate) fn install_rule_uid_schema(conn: &Connection) -> Result<(), ConfigDbE
     Ok(())
 }
 
+/// v29 migration: the per-upload `sync_generation` (one row). `0` is
+/// "unknown": a DB from before v29, or one that was never uploaded.
+pub(crate) fn install_generation_schema(conn: &Connection) -> Result<(), ConfigDbError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sync_state (
+            id              INTEGER PRIMARY KEY CHECK (id = 1),
+            sync_generation INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT OR IGNORE INTO sync_state (id, sync_generation) VALUES (1, 0);",
+    )?;
+    Ok(())
+}
+
+/// The `sync_generation` of `schema` (`main` or an attached DB). `0` when
+/// the DB has no `sync_state` table (written by a binary before v29).
+pub(crate) fn read_generation(conn: &Connection, schema: &str) -> Result<i64, ConfigDbError> {
+    if !is_safe_sql_ident(schema) {
+        return Err(ConfigDbError::Other(format!("unsafe identifier {schema}")));
+    }
+    let has_table: bool = conn.query_row(
+        &format!(
+            "SELECT count(*) > 0 FROM {schema}.sqlite_master \
+             WHERE type = 'table' AND name = 'sync_state'"
+        ),
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_table {
+        return Ok(0);
+    }
+    let gen = conn.query_row(
+        &format!("SELECT sync_generation FROM {schema}.sync_state WHERE id = 1"),
+        [],
+        |r| r.get::<_, i64>(0),
+    );
+    match gen {
+        Ok(g) => Ok(g),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// How a downloaded copy relates to the merge base, by upload generation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CopyOrder {
+    /// The copy is the base or a later upload.
+    Descendant,
+    /// The copy is an earlier upload than the base: put back from the past.
+    RolledBack,
+    /// One side carries no generation (a peer or a base from before v29).
+    Unknown,
+}
+
+/// Pure: order two copies by `sync_generation`. Every upload takes a number
+/// above every copy its node merged, so a later copy never has a smaller
+/// one. Node clocks play no part.
+pub(crate) fn copy_order(remote_gen: i64, base_gen: i64) -> CopyOrder {
+    if remote_gen <= 0 || base_gen <= 0 {
+        CopyOrder::Unknown
+    } else if remote_gen < base_gen {
+        CopyOrder::RolledBack
+    } else {
+        CopyOrder::Descendant
+    }
+}
+
 /// One logical row. FK columns hold the referenced row's NAME (Text), not an id.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Entity {
@@ -556,7 +622,10 @@ fn merge_table(
 
 /// How much older than the merge base a peer row may be before it counts as
 /// a rollback. `sync_mtime` is each writer's wall clock, so a small skew
-/// between nodes is normal; five minutes is far past NTP-level skew.
+/// between nodes is normal; five minutes is far past NTP-level skew. Used
+/// only when a copy carries no `sync_generation` ([`CopyOrder::Unknown`]):
+/// a node clock more than this behind a peer's makes a legitimate copy look
+/// old, which is why the generation replaces it.
 const ROLLBACK_TOLERANCE_MS: i64 = 5 * 60 * 1000;
 
 /// Pure: whether a peer row with `remote` mtime, which differs from the
@@ -1213,19 +1282,42 @@ impl ConfigDb {
                 )));
             }
             let remote = read_snapshot(&self.conn, "remote")?;
-            let base = base_path.and_then(|p| self.read_base(p, passphrase));
-            if let Some(b) = &base {
-                let old = rollback_rows(b, &remote);
-                if !old.is_empty() {
-                    return Err(ConfigDbError::Other(format!(
-                        "peer config DB holds rows older than the last synced copy ({}): \
-                         refusing it as a rollback (a copy put back into the sync bucket?)",
-                        old.join(", ")
-                    )));
+            let remote_gen = read_generation(&self.conn, "remote")?;
+            let base_read = base_path.and_then(|p| self.read_base(p, passphrase));
+            if let Some((b, base_gen)) = &base_read {
+                match copy_order(remote_gen, *base_gen) {
+                    CopyOrder::Descendant => {}
+                    CopyOrder::RolledBack => {
+                        return Err(ConfigDbError::Other(format!(
+                            "peer config DB is sync generation {remote_gen}, older than the \
+                             last synced copy ({base_gen}): refusing it as a rollback (a copy \
+                             put back into the sync bucket?)"
+                        )));
+                    }
+                    // A peer or base from before v29: judge by row age.
+                    CopyOrder::Unknown => {
+                        let old = rollback_rows(b, &remote);
+                        if !old.is_empty() {
+                            return Err(ConfigDbError::Other(format!(
+                                "peer config DB holds rows older than the last synced copy \
+                                 ({}): refusing it as a rollback (a copy put back into the \
+                                 sync bucket?)",
+                                old.join(", ")
+                            )));
+                        }
+                    }
                 }
             }
+            let base = base_read.map(|(b, _)| b);
 
             immediate_tx(&self.conn, |_| {
+                // This node has now merged `remote_gen`: its next upload
+                // must outrank it.
+                self.conn.execute(
+                    "UPDATE main.sync_state SET sync_generation = MAX(sync_generation, ?1) \
+                     WHERE id = 1",
+                    [remote_gen],
+                )?;
                 let local = read_snapshot(&self.conn, "main")?;
                 let out = merge_snapshots(base.as_ref(), &local, &remote);
                 let mut report = MergeReport {
@@ -1276,10 +1368,44 @@ impl ConfigDb {
         Ok(())
     }
 
-    /// The merge base, or `None` when it is missing or unusable (the merge
-    /// is then a union). Opening it first migrates a base left
-    /// by an older binary to the current schema.
-    fn read_base(&self, path: &Path, passphrase: &str) -> Option<Snapshot> {
+    /// Take the `sync_generation` for the next upload: one above every copy
+    /// this DB merged or uploaded, and above the merge base at `base_path`
+    /// (a live DB put back from a backup can hold a lower number than the
+    /// copy the bucket holds). Call it right before reading the DB for the
+    /// upload, under the DB lock.
+    pub fn next_sync_generation(
+        &self,
+        base_path: Option<&Path>,
+        passphrase: &str,
+    ) -> Result<i64, ConfigDbError> {
+        let base_gen = match base_path.filter(|p| p.exists()) {
+            Some(p) => match self.attach("genbase", p, passphrase) {
+                Ok(()) => {
+                    let g = read_generation(&self.conn, "genbase");
+                    let _ = self.conn.execute_batch("DETACH DATABASE genbase;");
+                    g.unwrap_or(0)
+                }
+                // An unreadable base costs only the floor.
+                Err(_) => 0,
+            },
+            None => 0,
+        };
+        self.conn.execute(
+            "UPDATE sync_state SET sync_generation = MAX(sync_generation, ?1) + 1 WHERE id = 1",
+            [base_gen],
+        )?;
+        read_generation(&self.conn, "main")
+    }
+
+    /// The `sync_generation` of this DB (`0` before its first upload).
+    pub fn sync_generation(&self) -> Result<i64, ConfigDbError> {
+        read_generation(&self.conn, "main")
+    }
+
+    /// The merge base and its `sync_generation`, or `None` when it is
+    /// missing or unusable (the merge is then a union). Opening it first
+    /// migrates a base left by an older binary to the current schema.
+    fn read_base(&self, path: &Path, passphrase: &str) -> Option<(Snapshot, i64)> {
         if !path.exists() {
             return None;
         }
@@ -1294,7 +1420,8 @@ impl ConfigDb {
             warn!("Config DB sync: cannot attach merge base: {e}; the merge is a union");
             return None;
         }
-        let snap = read_snapshot(&self.conn, "syncbase");
+        let snap = read_snapshot(&self.conn, "syncbase")
+            .and_then(|s| Ok((s, read_generation(&self.conn, "syncbase")?)));
         let _ = self.conn.execute_batch("DETACH DATABASE syncbase;");
         match snap {
             Ok(s) => Some(s),
@@ -1945,6 +2072,118 @@ mod tests {
         assert_eq!(keys(&m1), vec!["u3"]);
         assert_eq!(keys(&m1), keys(&m2));
         assert!(c1.is_empty() && c2.is_empty());
+    }
+
+    fn set_gen(p: &Path, gen: i64) {
+        open(p)
+            .conn
+            .execute("UPDATE sync_state SET sync_generation = ?1", [gen])
+            .unwrap();
+    }
+
+    /// Review 4 coordination-1: B's clock runs 6 min behind A's. B re-enables
+    /// u1 after A disabled it (real time) and creates u4, then uploads a copy
+    /// that descends from A's. A must merge it: the order of copies comes
+    /// from the upload generation, not from node clocks.
+    #[test]
+    fn a_peer_with_a_slow_clock_is_not_a_rollback() {
+        let t = trio(seed_three);
+        for p in [&t.base, &t.local] {
+            open(p)
+                .conn
+                .execute("UPDATE users SET enabled = 0 WHERE name = 'u1'", [])
+                .unwrap();
+            set_gen(p, 5);
+        }
+        tick();
+        {
+            let remote = open(&t.remote);
+            remote
+                .conn
+                .execute(
+                    "UPDATE users SET enabled = 1, sync_mtime = sync_mtime - 6*60*1000 \
+                     WHERE name = 'u1'",
+                    [],
+                )
+                .unwrap();
+            remote
+                .create_user("u4", "AKU4000000001", "s4", true, &[])
+                .unwrap();
+        }
+        set_gen(&t.remote, 6);
+        let local = open(&t.local);
+        local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .expect("a descendant copy is merged whatever its clock");
+        assert_eq!(names(&local), vec!["u1", "u2", "u3", "u4"]);
+        assert!(local.get_user_by_id(user_id(&local, "u1")).unwrap().enabled);
+        assert_eq!(local.sync_generation().unwrap(), 6, "merged gen is kept");
+    }
+
+    /// A copy with a LOWER generation than the base is a copy put back from
+    /// the past, even when its rows look newer.
+    #[test]
+    fn a_copy_with_an_older_generation_is_refused() {
+        let t = trio(seed_three);
+        set_gen(&t.base, 9);
+        set_gen(&t.local, 9);
+        open(&t.remote)
+            .create_user("u4", "AKU4000000001", "s4", true, &[])
+            .unwrap();
+        set_gen(&t.remote, 4);
+        let local = open(&t.local);
+        let err = local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .expect_err("an older generation is a rollback");
+        assert!(err.to_string().contains("generation 4"), "{err}");
+        assert_eq!(names(&local), vec!["u1", "u2", "u3"]);
+    }
+
+    /// A copy without a generation (a peer on a release before v29) keeps
+    /// the old row-age rule: the skewed copy is still refused, as before.
+    #[test]
+    fn a_copy_without_a_generation_keeps_the_row_age_rule() {
+        let t = trio(seed_three);
+        for p in [&t.base, &t.local] {
+            open(p)
+                .conn
+                .execute(
+                    "UPDATE users SET enabled = 0, sync_mtime = sync_mtime + 3600000 \
+                     WHERE name = 'u1'",
+                    [],
+                )
+                .unwrap();
+            set_gen(p, 5);
+        }
+        // The remote is an old peer's copy migrated for the merge: gen 0.
+        let local = open(&t.local);
+        let err = local
+            .merge_iam_from(&t.remote, Some(&t.base), PASS)
+            .expect_err("row-age rule for an old peer");
+        assert!(err.to_string().contains("users/u1"), "{err}");
+    }
+
+    /// The next upload outranks the local DB, every merged copy and the base.
+    #[test]
+    fn the_next_generation_outranks_the_base() {
+        let t = trio(seed_three);
+        set_gen(&t.base, 7);
+        let local = open(&t.local);
+        assert_eq!(local.sync_generation().unwrap(), 0);
+        assert_eq!(local.next_sync_generation(Some(&t.base), PASS).unwrap(), 8);
+        assert_eq!(local.next_sync_generation(Some(&t.base), PASS).unwrap(), 9);
+        // No base (first sync): one above the DB's own.
+        assert_eq!(local.next_sync_generation(None, PASS).unwrap(), 10);
+    }
+
+    #[test]
+    fn copy_order_truth_table() {
+        assert_eq!(copy_order(5, 5), CopyOrder::Descendant);
+        assert_eq!(copy_order(6, 5), CopyOrder::Descendant);
+        assert_eq!(copy_order(4, 5), CopyOrder::RolledBack);
+        assert_eq!(copy_order(0, 5), CopyOrder::Unknown);
+        assert_eq!(copy_order(5, 0), CopyOrder::Unknown);
+        assert_eq!(copy_order(0, 0), CopyOrder::Unknown);
     }
 }
 

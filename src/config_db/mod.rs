@@ -26,7 +26,7 @@ pub struct ConfigDb {
 }
 
 /// Schema version — bump when adding migrations.
-pub(crate) const SCHEMA_VERSION: i32 = 28;
+pub(crate) const SCHEMA_VERSION: i32 = 29;
 
 pub(crate) mod auth_providers;
 mod declarative;
@@ -965,6 +965,19 @@ impl ConfigDb {
             );
         }
 
+        if version < 29 {
+            // v29: per-upload `sync_generation`. The sync merge orders two
+            // copies by it, not by node wall clocks (a node clock behind a
+            // peer's made its copies look like a rollback). Additive: a copy
+            // from an older peer migrates with 0 = "unknown", and is judged
+            // by the old row-age rule.
+            iam_merge::install_generation_schema(conn)?;
+            info!(
+                "Migrated config DB schema from v{} to v29 (sync_generation)",
+                version
+            );
+        }
+
         Ok(())
     }
 
@@ -1826,6 +1839,32 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    /// v29 is additive: a v28 DB (no `sync_state`) opens, gains the table
+    /// with generation 0 ("unknown"), and keeps its IAM rows.
+    #[test]
+    fn v29_adds_sync_generation_to_a_v28_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v28.db");
+        {
+            let db = ConfigDb::open_or_create(&path, "pw").unwrap();
+            db.create_user("u1", "AKU1000000001", "s1", true, &[])
+                .unwrap();
+            drop(db);
+            let conn = db_stamped_at(&path, 28);
+            conn.execute_batch("DROP TABLE sync_state;").unwrap();
+            assert_eq!(iam_merge::read_generation(&conn, "main").unwrap(), 0);
+        }
+        let db = ConfigDb::open_or_create(&path, "pw").expect("v28 -> v29");
+        let v: i32 = db
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        assert_eq!(db.sync_generation().unwrap(), 0);
+        assert_eq!(db.load_users().unwrap().len(), 1);
+        assert_eq!(db.next_sync_generation(None, "pw").unwrap(), 1);
     }
 
     /// D14: only "not a database" (wrong key / not SQLCipher) is a passphrase

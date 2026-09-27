@@ -34,6 +34,20 @@ coordination bucket, a run also stops renewing its S3 lease on every listing
 page: only the heartbeat renews it, which removes two coordination-bucket
 requests for each listed directory.
 
+### Fixed — A peer with a slow clock no longer stops the IAM sync
+
+The config DB sync refused a downloaded copy as a rollback when one of its
+rows was more than five minutes older than the last synced copy. Row ages
+come from the clock of each writer, so an instance whose clock ran more
+than five minutes behind a peer made every later copy look old. The peer
+then refused all changes from it, every 5 minutes, until an operator
+stepped in. Now every upload carries a `sync_generation` (config DB schema
+v29, additive), and a copy is a rollback only when its generation is lower
+than the generation of the last synced copy. A copy from a peer on an older
+release has no generation and keeps the old rule. During a rolling upgrade,
+an instance on the older release does not merge copies from upgraded
+instances until it is upgraded too, as with every schema change.
+
 ### Changed — A migrate to a filesystem backend is about twice as fast
 
 A migrate made every copy durable on its own before the next one (one

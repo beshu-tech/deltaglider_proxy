@@ -818,16 +818,22 @@ fn classify_upload_error(err_str: &str) -> UploadError {
     }
 }
 
-/// Read the DB file while holding the DB lock. Every write goes through the
-/// one locked connection, so no commit can be half-written while we read.
+/// Read the DB file for an upload while holding the DB lock. Every write goes
+/// through the one locked connection, so no commit can be half-written while
+/// we read. First takes the next `sync_generation`, so the copy outranks
+/// every copy this node merged (peers order copies by it).
 async fn read_db_snapshot(
     sync: &ConfigDbSync,
     config_db: &Option<Arc<Mutex<ConfigDb>>>,
 ) -> Result<Vec<u8>, String> {
-    let _guard = match config_db {
+    let guard = match config_db {
         Some(db) => Some(db.lock().await),
         None => None,
     };
+    if let Some(db) = &guard {
+        db.next_sync_generation(Some(&sync_base_path(&sync.local_path)), sync.db_key())
+            .map_err(|e| format!("Failed to take the next sync generation: {e}"))?;
+    }
     tokio::fs::read(&sync.local_path)
         .await
         .map_err(|e| format!("Failed to read local config DB: {e}"))
