@@ -34,7 +34,10 @@ impl ScopeHarness {
             .auth("bootstrap_key", "bootstrap_secret")
             .build()
             .await;
+        Self::with_server(server).await
+    }
 
+    async fn with_server(server: TestServer) -> Self {
         let admin_client = admin_http_client(&server.endpoint()).await;
 
         // Admin for seeding.
@@ -643,4 +646,79 @@ async fn review3_a_bucket_wide_allow_with_a_deny_carve_out_hides_the_denied_keys
         !keys.iter().any(|k| k.starts_with("secret/")),
         "denied keys listed: {keys:?}"
     );
+}
+
+/// Seed `hidden` keys under `h/` plus one visible `v.txt` in bucket `scan`,
+/// and return a client whose policy (bucket-wide Allow, Deny on `h/*`) the
+/// proxy cannot narrow to prefixes, so a LIST scans the hidden keys.
+async fn scan_budget_client(h: &ScopeHarness, hidden: usize) -> aws_sdk_s3::Client {
+    let admin = h.admin_client().await;
+    let _ = admin.create_bucket().bucket("scan").send().await;
+    let mut keys: Vec<String> = (0..hidden).map(|i| format!("h/{i:04}.txt")).collect();
+    keys.push("v.txt".into());
+    for key in &keys {
+        admin
+            .put_object()
+            .bucket("scan")
+            .key(key)
+            .body(ByteStream::from(b"d".to_vec()))
+            .send()
+            .await
+            .expect("seed");
+    }
+    let (key, secret) = h
+        .create_user(
+            "scanner",
+            vec![
+                json!({"effect": "Allow", "actions": ["read"], "resources": ["scan/*"]}),
+                json!({"effect": "Deny", "actions": ["read"], "resources": ["scan/h/*"]}),
+            ],
+        )
+        .await;
+    h.user_client(&key, &secret).await
+}
+
+/// s3surface-11: the filtered-LIST scan budget of the PRODUCTION binary
+/// (default 50 engine pages, `advanced.filtered_list_max_engine_pages`).
+/// `max-keys=1` reads two entries per engine page, so 110 hidden keys need
+/// 55 pages: past the default budget the request fails with the "narrow the
+/// prefix" 400 instead of scanning on (the old budget was 10,000 pages).
+#[tokio::test]
+async fn filtered_list_stops_at_the_default_page_budget() {
+    let h = ScopeHarness::setup().await;
+    let user = scan_budget_client(&h, 110).await;
+    let err = user
+        .list_objects_v2()
+        .bucket("scan")
+        .max_keys(1)
+        .send()
+        .await
+        .expect_err("the scan must stop at 50 engine pages");
+    let code = err
+        .as_service_error()
+        .and_then(|e| aws_sdk_s3::error::ProvideErrorMetadata::code(e))
+        .map(str::to_string);
+    assert_eq!(code.as_deref(), Some("InvalidRequest"), "{err:?}");
+}
+
+/// The budget is a config field: raised by its env var, the same listing
+/// reaches the visible key.
+#[tokio::test]
+async fn filtered_list_budget_follows_the_config() {
+    let server = TestServer::builder()
+        .auth("bootstrap_key", "bootstrap_secret")
+        .env("DGP_FILTERED_LIST_MAX_ENGINE_PAGES", "100")
+        .build()
+        .await;
+    let h = ScopeHarness::with_server(server).await;
+    let user = scan_budget_client(&h, 110).await;
+    let page = user
+        .list_objects_v2()
+        .bucket("scan")
+        .max_keys(1)
+        .send()
+        .await
+        .expect("a budget of 100 pages reaches v.txt");
+    let keys: Vec<&str> = page.contents().iter().filter_map(|o| o.key()).collect();
+    assert_eq!(keys, vec!["v.txt"]);
 }

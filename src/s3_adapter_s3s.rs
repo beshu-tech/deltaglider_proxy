@@ -95,11 +95,17 @@ impl ListMetadataXmlExtensions {
 #[derive(Clone)]
 pub struct DeltaGliderS3Service {
     state: Arc<AppState>,
+    config: crate::config::SharedConfig,
 }
 
 impl DeltaGliderS3Service {
-    pub fn new(state: Arc<AppState>) -> Self {
-        Self { state }
+    pub fn new(state: Arc<AppState>, config: crate::config::SharedConfig) -> Self {
+        Self { state, config }
+    }
+
+    /// The live filtered-LIST scan budget (`advanced.filtered_list_max_engine_pages`).
+    async fn list_budget(&self) -> usize {
+        self.config.read().await.filtered_list_max_engine_pages
     }
 
     /// Exposed for adapter tests and for the future router builder.
@@ -348,6 +354,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             list_cursor(input.marker.as_deref(), None),
             false,
             list_scope.as_ref(),
+            self.list_budget().await,
         )
         .await?;
         let next_marker = page.next_continuation_token.clone();
@@ -409,6 +416,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             ),
             include_metadata,
             list_scope.as_ref(),
+            self.list_budget().await,
         )
         .await?;
         let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
@@ -1663,11 +1671,6 @@ fn decode_v2_token(token: Option<&str>) -> Option<String> {
     )
 }
 
-/// Engine pages one filtered LIST may scan before it gives up. A prefix-scoped
-/// user can ask for a prefix where every key is hidden; the scan must end.
-/// Small under test, so a test can pass the budget with few objects.
-const FILTERED_LIST_MAX_ENGINE_PAGES: usize = if cfg!(test) { 16 } else { 10_000 };
-
 /// The engine cursor for a LIST. S3 rule: a continuation token wins, and
 /// `start-after` applies only on the first request (no token). Both mean
 /// "entries strictly after this string", which is what the engine takes.
@@ -1751,7 +1754,9 @@ fn list_targets(prefix: &str, delimiter: Option<&str>, visible: &[String]) -> Ve
 /// (`list_targets`), so hidden keys outside them cost nothing and every
 /// visible key stays reachable. Only a policy that cannot be narrowed to
 /// prefixes (a bucket-wide Allow with Deny carve-outs) scans hidden keys,
-/// under the `FILTERED_LIST_MAX_ENGINE_PAGES` budget.
+/// under `budget` engine pages (`advanced.filtered_list_max_engine_pages`):
+/// a prefix-scoped user can ask for a prefix where every key is hidden, and
+/// the scan must end.
 #[allow(clippy::too_many_arguments)]
 async fn list_page_for_caller(
     engine: &crate::deltaglider::DynEngine,
@@ -1762,6 +1767,7 @@ async fn list_page_for_caller(
     cursor: Option<&str>,
     metadata: bool,
     scope: Option<&ListScope>,
+    budget: usize,
 ) -> s3s::S3Result<crate::deltaglider::ListObjectsPage> {
     let (user, context) = match scope {
         Some(ListScope::Filtered { user, context }) => (user, context),
@@ -1793,7 +1799,7 @@ async fn list_page_for_caller(
     // ONE engine-page budget for the whole request, shared by every target
     // (scans and roll-up probes): per target, N visible prefixes read N
     // budgets for one LIST.
-    let mut budget = FILTERED_LIST_MAX_ENGINE_PAGES;
+    let mut budget = budget;
     for target in targets {
         if objects.len() + prefixes.len() >= want {
             break;
@@ -2000,6 +2006,7 @@ async fn client_list_page(
     cursor: Option<&str>,
     metadata: bool,
     scope: Option<&ListScope>,
+    budget: usize,
 ) -> s3s::S3Result<crate::deltaglider::ListObjectsPage> {
     if max_keys == 0 {
         ensure_bucket_on(engine, bucket).await?;
@@ -2011,7 +2018,7 @@ async fn client_list_page(
         });
     }
     let page = list_page_for_caller(
-        engine, bucket, prefix, delimiter, max_keys, cursor, metadata, scope,
+        engine, bucket, prefix, delimiter, max_keys, cursor, metadata, scope, budget,
     )
     .await?;
     if page.objects.is_empty() && page.common_prefixes.is_empty() {
@@ -3891,7 +3898,10 @@ mod review2_tests {
         }
     }
 
-    /// Review-2 (S12): the refill scans at most FILTERED_LIST_MAX_ENGINE_PAGES
+    /// A small scan budget, so a test passes it with few objects.
+    pub(super) const TEST_BUDGET: usize = 16;
+
+    /// Review-2 (S12): the refill scans at most TEST_BUDGET
     /// engine pages and the token is the last VISIBLE key. More hidden
     /// entries than the budget between two visible ones make every later
     /// visible key unreachable: each follow-up restarts at the same token
@@ -3917,7 +3927,7 @@ mod review2_tests {
             .store("b", "d/a/v.png", b"x", None, Default::default())
             .await
             .unwrap();
-        for i in 0..=FILTERED_LIST_MAX_ENGINE_PAGES {
+        for i in 0..=TEST_BUDGET {
             engine
                 .store(
                     "b",
@@ -3950,9 +3960,19 @@ mod review2_tests {
             user: Box::new(user),
             context: Box::new(policy_context_for_ip(None)),
         };
-        let p1 = list_page_for_caller(&engine, "b", "d/", Some("/"), 1, None, false, Some(&scope))
-            .await
-            .unwrap();
+        let p1 = list_page_for_caller(
+            &engine,
+            "b",
+            "d/",
+            Some("/"),
+            1,
+            None,
+            false,
+            Some(&scope),
+            TEST_BUDGET,
+        )
+        .await
+        .unwrap();
         assert_eq!(p1.common_prefixes, vec!["d/a/".to_string()]);
         let p2 = list_page_for_caller(
             &engine,
@@ -3963,6 +3983,7 @@ mod review2_tests {
             p1.next_continuation_token.as_deref(),
             false,
             Some(&scope),
+            TEST_BUDGET,
         )
         .await;
         assert_eq!(
@@ -4065,6 +4086,7 @@ mod review2_tests {
                 token.as_deref(),
                 false,
                 Some(scope),
+                TEST_BUDGET,
             )
             .await
             .unwrap();
@@ -4127,7 +4149,7 @@ mod review2_tests {
     #[tokio::test]
     async fn bucket_wide_allow_with_a_large_deny_keeps_the_budget() {
         // `max_keys=1` reads two entries per engine page.
-        let mut keys: Vec<String> = (0..=2 * FILTERED_LIST_MAX_ENGINE_PAGES)
+        let mut keys: Vec<String> = (0..=2 * TEST_BUDGET)
             .map(|i| format!("h/{i:03}.png"))
             .collect();
         keys.push("v.png".into());
@@ -4139,9 +4161,19 @@ mod review2_tests {
             ..rule(effect, &[res])
         };
         let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/h/*")]);
-        let err = list_page_for_caller(&engine, "b", "", None, 1, None, false, Some(&scope))
-            .await
-            .unwrap_err();
+        let err = list_page_for_caller(
+            &engine,
+            "b",
+            "",
+            None,
+            1,
+            None,
+            false,
+            Some(&scope),
+            TEST_BUDGET,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
     }
 
@@ -4153,7 +4185,7 @@ mod review2_tests {
     #[tokio::test]
     async fn review3_one_page_budget_per_request() {
         // `max_keys=1` reads two entries per engine page.
-        let mut keys: Vec<String> = (0..2 * FILTERED_LIST_MAX_ENGINE_PAGES)
+        let mut keys: Vec<String> = (0..2 * TEST_BUDGET)
             .map(|i| format!("a/{i:03}.png"))
             .collect();
         keys.push("b/v.png".into());
@@ -4168,7 +4200,18 @@ mod review2_tests {
             read("Allow", "b/b/*"),
             read("Deny", "b/a/*"),
         ]);
-        let got = list_page_for_caller(&engine, "b", "", None, 1, None, false, Some(&scope)).await;
+        let got = list_page_for_caller(
+            &engine,
+            "b",
+            "",
+            None,
+            1,
+            None,
+            false,
+            Some(&scope),
+            TEST_BUDGET,
+        )
+        .await;
         assert!(
             got.is_err(),
             "the request read past its page budget: {:?}",
@@ -4241,9 +4284,19 @@ mod review3_tests {
             user: Box::new(user),
             context: Box::new(policy_context_for_ip(None)),
         };
-        let page = list_page_for_caller(&engine, "b", "", None, 1, None, false, Some(&scope))
-            .await
-            .expect("the listing must not fail on the write-only prefix");
+        let page = list_page_for_caller(
+            &engine,
+            "b",
+            "",
+            None,
+            1,
+            None,
+            false,
+            Some(&scope),
+            super::review2_tests::TEST_BUDGET,
+        )
+        .await
+        .expect("the listing must not fail on the write-only prefix");
         assert_eq!(
             page.objects.first().map(|(k, _)| k.as_str()),
             Some("releases/a.png")

@@ -148,6 +148,11 @@ pub struct Config {
     #[serde(default = "default_metadata_cache_mb")]
     pub metadata_cache_mb: usize,
 
+    /// Engine pages one filtered LIST (a policy the proxy cannot narrow to
+    /// prefixes) may scan before it answers "use a narrower prefix".
+    #[serde(default = "default_filtered_list_max_engine_pages")]
+    pub filtered_list_max_engine_pages: usize,
+
     /// Explicit authentication mode selector.
     ///
     /// Accepted values:
@@ -747,6 +752,10 @@ pub(crate) fn default_metadata_cache_mb() -> usize {
     50
 }
 
+pub(crate) fn default_filtered_list_max_engine_pages() -> usize {
+    50
+}
+
 fn default_region() -> String {
     "us-east-1".to_string()
 }
@@ -782,6 +791,7 @@ impl Default for Config {
             max_passthrough_object_size: default_max_passthrough_object_size(),
             cache_size_mb: default_cache_size_mb(),
             metadata_cache_mb: default_metadata_cache_mb(),
+            filtered_list_max_engine_pages: default_filtered_list_max_engine_pages(),
             authentication: None,
             access_key_id: None,
             secret_access_key: None,
@@ -918,6 +928,7 @@ fn classify_shape(doc: &serde_yaml::Value) -> ConfigShape {
         "max_object_size",
         "cache_size_mb",
         "metadata_cache_mb",
+        "filtered_list_max_engine_pages",
         "authentication",
         "access_key_id",
         "secret_access_key",
@@ -1393,6 +1404,12 @@ impl Config {
         );
         parsed!("DGP_CACHE_MB", usize, cache_size_mb, |v| v);
         parsed!("DGP_METADATA_CACHE_MB", usize, metadata_cache_mb, |v| v);
+        parsed!(
+            "DGP_FILTERED_LIST_MAX_ENGINE_PAGES",
+            usize,
+            filtered_list_max_engine_pages,
+            |v| v
+        );
         parsed!("DGP_CODEC_CONCURRENCY", usize, codec_concurrency, Some);
         parsed!("DGP_BLOCKING_THREADS", usize, blocking_threads, Some);
 

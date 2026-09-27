@@ -130,6 +130,11 @@ pub const ENV_FIELD_BINDINGS: &[EnvFieldBinding] = &[
         EnvValueKind::Unsigned,
     ),
     bind(
+        "DGP_FILTERED_LIST_MAX_ENGINE_PAGES",
+        "advanced.filtered_list_max_engine_pages",
+        EnvValueKind::Unsigned,
+    ),
+    bind(
         "DGP_CODEC_CONCURRENCY",
         "advanced.codec_concurrency",
         EnvValueKind::Unsigned,

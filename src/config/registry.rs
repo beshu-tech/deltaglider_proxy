@@ -92,6 +92,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Delta Engine",
     },
     EnvVarEntry {
+        name: "DGP_FILTERED_LIST_MAX_ENGINE_PAGES",
+        description: "Backend pages one filtered LIST may scan for a visible key before it fails with InvalidRequest (default: 50)",
+        example: "50",
+        category: "Delta Engine",
+    },
+    EnvVarEntry {
         name: "DGP_STREAM_COPY_THRESHOLD",
         description: "Object size (bytes) at/above which passthrough copies stream via multipart",
         example: "67108864",

@@ -26,6 +26,14 @@ says so, and names the `403 SignatureDoesNotMatch` that a real key pair
 gets. The security-model page no longer says that open mode skips the
 signature check.
 
+### Changed — A filtered LIST reads at most 50 backend pages
+
+A LIST whose policy the proxy cannot narrow to prefixes (an `Allow` on the
+whole bucket with `Deny` exceptions) could read 10,000 backend pages for one
+request. Now it reads at most 50, and then answers `400 InvalidRequest`
+("use a narrower prefix") as before. The limit is the new setting
+`advanced.filtered_list_max_engine_pages` (`DGP_FILTERED_LIST_MAX_ENGINE_PAGES`).
+
 ### Changed — A migrate is refused on a multi-instance deployment
 
 The migrate flip changed the routing of the instance that ran the job only,

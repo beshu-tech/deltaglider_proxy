@@ -279,6 +279,7 @@ storage:
 #   max_delta_ratio: 0.75           # default
 #   cache_size_mb: 2048             # production recommended ≥1 GiB
 #   metadata_cache_mb: 50
+#   filtered_list_max_engine_pages: 50   # backend pages one filtered LIST may read
 #   max_object_size: 104857600      # bytes; default 100 MiB
 #   max_passthrough_object_size: 68719476736   # default 64 GiB
 #   codec_concurrency: 16           # xdelta3 processes at once

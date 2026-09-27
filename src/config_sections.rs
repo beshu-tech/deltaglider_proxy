@@ -54,9 +54,10 @@
 
 use crate::bucket_policy::BucketPolicyConfig;
 use crate::config::{
-    default_cache_size_mb, default_listen_addr, default_log_level, default_max_delta_ratio,
-    default_max_object_size, default_max_passthrough_object_size, default_metadata_cache_mb,
-    BackendConfig, DefaultsVersion, NamedBackendConfig, TlsConfig,
+    default_cache_size_mb, default_filtered_list_max_engine_pages, default_listen_addr,
+    default_log_level, default_max_delta_ratio, default_max_object_size,
+    default_max_passthrough_object_size, default_metadata_cache_mb, BackendConfig, DefaultsVersion,
+    NamedBackendConfig, TlsConfig,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1413,6 +1414,9 @@ pub struct AdvancedSection {
     pub metadata_cache_mb: Option<usize>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filtered_list_max_engine_pages: Option<usize>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codec_concurrency: Option<usize>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1563,6 +1567,10 @@ impl SectionedConfig {
                     flat.metadata_cache_mb,
                     default_metadata_cache_mb(),
                 ),
+                filtered_list_max_engine_pages: some_if_nondefault(
+                    flat.filtered_list_max_engine_pages,
+                    default_filtered_list_max_engine_pages(),
+                ),
                 codec_concurrency: flat.codec_concurrency,
                 blocking_threads: flat.blocking_threads,
                 log_level: some_if_nondefault_str(&flat.log_level, default_log_level()),
@@ -1642,6 +1650,10 @@ impl SectionedConfig {
                 .advanced
                 .metadata_cache_mb
                 .unwrap_or(defaults.metadata_cache_mb),
+            filtered_list_max_engine_pages: self
+                .advanced
+                .filtered_list_max_engine_pages
+                .unwrap_or(defaults.filtered_list_max_engine_pages),
             authentication: self.access.authentication,
             access_key_id: self.access.access_key_id,
             secret_access_key: self.access.secret_access_key,

@@ -86,7 +86,7 @@ pub fn build_s3_router(
         public_prefix_snapshot,
         admission_chain,
         shared_config,
-        crate::s3_adapter_s3s::DeltaGliderS3Service::new(state.clone()),
+        crate::s3_adapter_s3s::DeltaGliderS3Service::new(state.clone(), shared_config.clone()),
         crate::api::s3s_hooks::VerifiedIdentityS3sAccess,
     )
 }

@@ -317,6 +317,7 @@ pub fn run_init_inner(
         max_passthrough_object_size: crate::config::default_max_passthrough_object_size(),
         cache_size_mb,
         metadata_cache_mb: 50,
+        filtered_list_max_engine_pages: crate::config::default_filtered_list_max_engine_pages(),
         authentication,
         access_key_id,
         secret_access_key,
