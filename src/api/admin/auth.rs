@@ -48,15 +48,23 @@ impl AdminSessionCheck {
 /// How often a streaming admin response re-checks its session.
 const STREAM_SESSION_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// End `stream` when its session stops passing the admin check (logout,
-/// revocation, expiry, or the principal disabled or demoted). The check runs
-/// on a timer, so an idle stream ends too, not only at the next frame.
-pub(crate) fn end_when_admin_session_lapses<S: futures::Stream>(
+/// The SSE response of an admin endpoint: `stream`, ended when its session
+/// stops passing the admin check (logout, revocation, expiry, or the
+/// principal disabled or demoted). The check runs on a timer, so an idle
+/// stream ends too, not only at the next frame. This is the only place that
+/// builds an `Sse` (clippy.toml disallows `Sse::new` elsewhere), so no admin
+/// stream can skip the re-check.
+#[allow(clippy::disallowed_methods, reason = "the one admin SSE constructor")]
+pub(crate) fn end_when_admin_session_lapses<S, E>(
     stream: S,
     session: AdminSessionCheck,
-) -> impl futures::Stream<Item = S::Item> {
+) -> axum::response::Sse<impl futures::Stream<Item = Result<axum::response::sse::Event, E>>>
+where
+    S: futures::Stream<Item = Result<axum::response::sse::Event, E>> + Send + 'static,
+    E: Into<axum::BoxError>,
+{
     use futures::StreamExt;
-    stream.take_until(async move {
+    let stream = stream.take_until(async move {
         let mut tick = tokio::time::interval(STREAM_SESSION_RECHECK);
         loop {
             tick.tick().await;
@@ -64,7 +72,8 @@ pub(crate) fn end_when_admin_session_lapses<S: futures::Stream>(
                 break;
             }
         }
-    })
+    });
+    axum::response::Sse::new(stream)
 }
 
 /// Constant-time secret check + `enabled` gate for IAM index users.
@@ -1615,34 +1624,6 @@ mod tests {
         assert!(login_audit_fields(&AuthMethod::Bootstrap, "")
             .0
             .starts_with("login"));
-    }
-
-    /// Every admin SSE response must end when its session stops being an
-    /// admin session: the gate runs once, and a stream can last for hours.
-    #[test]
-    fn every_admin_sse_stream_rechecks_its_session() {
-        // Every SSE endpoint in the crate is an admin endpoint; walk all of
-        // `src/`, so a stream added in a sub-module is covered too.
-        let files = crate::source_scan::rust_files("src");
-        let needle = concat!("Sse", "::new(");
-        let mut found = 0;
-        for path in files {
-            let src = std::fs::read_to_string(&path).unwrap();
-            for (i, _) in src.match_indices(needle) {
-                found += 1;
-                let rest = src[i + needle.len()..].trim_start();
-                assert!(
-                    rest.starts_with("end_when_admin_session_lapses(")
-                        || rest.starts_with("super::auth::end_when_admin_session_lapses("),
-                    "{}: an admin SSE stream must be wrapped in end_when_admin_session_lapses",
-                    path.display()
-                );
-            }
-        }
-        assert!(
-            found >= 2,
-            "expected the log and scan streams, found {found}"
-        );
     }
 
     /// Regression: SharedAuthConfig must reflect credential updates immediately.

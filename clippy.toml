@@ -25,4 +25,7 @@ disallowed-methods = [
     { path = "aws_sdk_s3::config::Builder::set_endpoint_url", reason = "set the endpoint through guard_s3_endpoint (SSRF check)" },
     # The request target is decoded once, in api::request_target, exactly as s3s decodes it.
     { path = "urlencoding::decode", reason = "decode the request target through api::request_target::RequestTarget" },
+    # An admin SSE stream ends when its session lapses: build it with
+    # api::admin::auth::end_when_admin_session_lapses.
+    { path = "axum::response::Sse::new", reason = "build admin SSE responses with end_when_admin_session_lapses" },
 ]

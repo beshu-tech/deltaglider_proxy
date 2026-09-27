@@ -100,5 +100,5 @@ pub async fn get_logs_stream(
         }
     });
 
-    Sse::new(end_when_admin_session_lapses(stream, session)).keep_alive(KeepAlive::new())
+    end_when_admin_session_lapses(stream, session).keep_alive(KeepAlive::new())
 }

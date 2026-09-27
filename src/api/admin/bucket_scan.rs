@@ -665,8 +665,7 @@ pub async fn get_scan_stream(
         },
     );
 
-    Sse::new(super::auth::end_when_admin_session_lapses(stream, session))
-        .keep_alive(KeepAlive::new())
+    super::auth::end_when_admin_session_lapses(stream, session).keep_alive(KeepAlive::new())
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
