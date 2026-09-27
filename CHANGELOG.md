@@ -80,6 +80,14 @@ release has no generation and keeps the old rule. During a rolling upgrade,
 an instance on the older release does not merge copies from upgraded
 instances until it is upgraded too, as with every schema change.
 
+### Docs — Every environment variable is in the configuration reference
+
+Eleven `DGP_*` variables that the proxy reads had no row in the
+configuration reference, for example `DGP_CODEC_STALL_SECS` and
+`DGP_CONFIG_SYNC_KEY`. Now they have one, and a unit test fails when a
+registered variable has no row. `--show-env` now gives the right default
+for `DGP_MAX_TOTAL_MULTIPART_BYTES`.
+
 ### Fixed — A commented-out `${env:NAME}` line no longer stops the proxy
 
 The proxy expanded `${env:NAME}` references in comment lines too, so a

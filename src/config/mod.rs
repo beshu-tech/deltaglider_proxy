@@ -422,7 +422,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_MAX_TOTAL_MULTIPART_BYTES",
-        description: "Cap on total buffered multipart bytes across all uploads (default: unbounded)",
+        description: "Cap on total buffered multipart bytes across all uploads (default: max_object_size * max_uploads / 4)",
         example: "1073741824",
         category: "Server",
     },
@@ -3882,6 +3882,26 @@ mod tests {
         assert_eq!(
             auth_cfg(Some("AK"), None, None).classify_auth_config(false),
             AuthConfigOutcome::Missing
+        );
+    }
+
+    /// Review 4 config-9: every registered variable has a row in the
+    /// configuration reference, so an operator can find what it does.
+    #[test]
+    fn every_registered_env_var_is_documented() {
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("docs/product/reference/configuration.md"),
+        )
+        .unwrap();
+        let missing: Vec<&str> = ENV_VAR_REGISTRY
+            .iter()
+            .map(|e| e.name)
+            .filter(|n| !doc.contains(&format!("`{n}`")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "add these to the env tables in docs/product/reference/configuration.md: {missing:?}"
         );
     }
 

@@ -226,6 +226,12 @@ Concurrent multipart uploads cap. Each upload holds part data in memory.
 | | |
 |---|---|
 | **Env var** | `DGP_MAX_MULTIPART_UPLOADS` |
+| `DGP_MAX_TOTAL_MULTIPART_BYTES` | `max_object_size × DGP_MAX_MULTIPART_UPLOADS / 4` | Cap on the multipart part bytes that all open uploads hold together. A part past the cap fails with `503 SlowDown` |
+| `DGP_MULTIPART_IDLE_TTL_HOURS` | 24 | An open multipart upload that receives no part for this many hours is garbage-collected |
+| `DGP_MULTIPART_SWEEP_INTERVAL_SECS` | 300 | How often the multipart sweeper runs, in seconds |
+| `DGP_MULTIPART_SWEEP_MAX_AGE_SECS` | 3600 | Age in seconds after which the sweeper removes an open multipart upload |
+| `DGP_MULTIPART_COMPLETING_TIMEOUT_SECS` | `DGP_MULTIPART_SWEEP_MAX_AGE_SECS` | Seconds after which the sweeper releases an upload that is stuck in the completing state |
+| `DGP_BUCKET_USAGE_FLUSH_SECS` | 10 | How often the per-bucket usage counters are written to storage, in seconds |
 | **Default** | `1000` |
 | **Hot-reload** | No |
 
@@ -336,6 +342,9 @@ Maximum time for an xdelta3 subprocess. Hung processes are killed after this.
 | | |
 |---|---|
 | **Env var** | `DGP_CODEC_TIMEOUT_SECS` |
+| `DGP_CODEC_STALL_SECS` | 30 | Streaming codec: the proxy stops an xdelta3 process that makes no progress for this many seconds |
+| `DGP_CODEC_ABSOLUTE_SECS` | 7200 | Streaming codec: the longest time one operation may take, in seconds, even while it makes progress |
+| `DGP_SPOOL_THRESHOLD_BYTES` | `max_object_size` | A delta GET larger than this reconstructs to a spool file and streams it, instead of in memory |
 | **Default** | `60` |
 | **Hot-reload** | No |
 
@@ -382,6 +391,7 @@ AWS S3 / MinIO / Hetzner / Backblaze / any S3-compatible service. Activated by s
 | endpoint | `DGP_S3_ENDPOINT` | `storage.s3: <url>` | `storage.backend.endpoint` | — (AWS default) |
 | region | `DGP_S3_REGION` | `storage.region` | `storage.backend.region` | `us-east-1` |
 | force_path_style | `DGP_S3_PATH_STYLE` | `storage.force_path_style` | `storage.backend.force_path_style` | `true` |
+| `DGP_BACKEND_ALLOW_LOCAL` | false | Allow `http://` and private-IP endpoints for an S3 backend (MinIO, development, CI) |
 | access_key_id | `DGP_BE_AWS_ACCESS_KEY_ID` | `storage.access_key_id` | `storage.backend.access_key_id` | — |
 | secret_access_key | `DGP_BE_AWS_SECRET_ACCESS_KEY` | `storage.secret_access_key` | `storage.backend.secret_access_key` | — |
 
@@ -674,6 +684,7 @@ Multi-instance coordination via S3. When enabled, the shared bucket does three t
 | | |
 |---|---|
 | **Env var** | `DGP_CONFIG_SYNC_BUCKET` |
+| `DGP_CONFIG_SYNC_KEY` | `.deltaglider/config.db` | Object key of the synced DB in the sync bucket (`advanced.config_sync_object_key`) |
 | **YAML** | `advanced.config_sync_bucket` |
 | **Default** | None (disabled) |
 
