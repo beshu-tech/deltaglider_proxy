@@ -14,6 +14,8 @@ Per-IP brute-force protection for SigV4 authentication and admin login endpoints
 
 After a lockout expires, the failure counter resets and the IP can authenticate again.
 
+Only a failed credential counts toward the lockout. On the S3 API, a failure is a request whose signature the proxy checked and refused: a wrong secret for a known access key, or a signature that is too old. Some requests are refused but not counted: a request with no credentials, a malformed `Authorization` header, an expired presigned link, and an unknown access key. These requests never reach a signature check, so they teach the sender nothing about a secret. If they counted, any anonymous client could lock out every client that shares its IP address, for example all clients behind one load balancer. On a browser form upload (a `POST` with `multipart/form-data`), only a signature that does not match counts. A read of a public prefix needs no credentials, so the proxy serves it to a locked-out IP too.
+
 A locked-out request gets a response that names the lockout and says how long it lasts. The correct password is refused too while the lockout lasts.
 
 - The admin API sign-in endpoints (`/_/api/admin/login`, `login-as`, the browser-session endpoints, `recover-db`, and a `/_/metrics` bearer token) answer `429 Too Many Requests` with a `Retry-After` header in seconds and the JSON body `{"ok": false, "error": "too_many_attempts", "message": "Too many failed sign-in attempts. Try again in 10 min.", "retry_after_secs": 600}`.

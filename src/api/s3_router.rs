@@ -297,22 +297,26 @@ where
         {
             Ok(response) => response,
             Err(s3_err) => {
-                // An auth-class rejection (bad signature, unknown/denied
-                // credential, expired/violated policy) feeds the per-IP
-                // brute-force limiter + auth-failure metric, so this surface
-                // is throttled and observable like the SigV4 path.
-                if matches!(
+                // Every auth-class rejection is counted in the metric; only
+                // a signature that did not match feeds the per-IP limiter,
+                // like the SigV4 path. A form with no signature fields, an
+                // unknown key or an IAM denial is no secret guess, and
+                // counting it let anyone lock out a shared peer IP.
+                let auth_class = matches!(
                     s3_err,
                     crate::api::S3Error::AccessDenied
                         | crate::api::S3Error::AccessDeniedReason(_)
                         | crate::api::S3Error::SignatureDoesNotMatch
-                ) {
+                );
+                if auth_class {
                     if let Some(m) = &metrics {
                         m.auth_attempts_total.with_label_values(&["failure"]).inc();
                         m.auth_failures_total
                             .with_label_values(&["form_post_denied"])
                             .inc();
                     }
+                }
+                if matches!(s3_err, crate::api::S3Error::SignatureDoesNotMatch) {
                     if let (Some(rl), Some(ip)) = (&rate_limiter, &peer_ip) {
                         let ip = crate::rate_limiter::extract_client_ip_with_peer(
                             &parts.headers,

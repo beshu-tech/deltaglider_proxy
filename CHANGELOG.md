@@ -354,6 +354,15 @@ So the total covered only the objects after the cursor, and the progress
 bar reached 99 % long before the end. Now the resumed count starts from
 the count that was saved with the cursor.
 
+### Fixed — Anonymous requests no longer lock out a shared client IP
+
+The S3 brute-force limiter counted every refused request, also one with
+no credentials, a malformed header or an unknown access key. Behind a load
+balancer every client can share one IP address, so 100 anonymous `GET`s
+locked the whole S3 API for 10 minutes, public-prefix reads included. Now
+only a signature that the proxy checked and refused counts (on the form
+upload too), and a locked-out IP still gets public-prefix reads.
+
 ### Changed — A migrate to a filesystem backend is about twice as fast
 
 A migrate made every copy durable on its own before the next one (one

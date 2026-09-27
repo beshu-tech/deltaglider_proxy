@@ -681,9 +681,14 @@ pub async fn sigv4_auth_middleware(
     let (audit_ip, audit_ua) =
         crate::audit::extract_client_info_with_peer(request.headers(), peer_ip);
 
-    let record_auth_failure = {
+    // Metrics + audit line for a refused credential. Every refusal is
+    // logged; only a signature s3s rejected feeds the limiter
+    // (`record_auth_failure`). A request with no credential, a malformed
+    // one, an expired link or an unknown access key never reached a
+    // signature check, so it teaches the sender nothing about a secret.
+    // Counting them let any anonymous client lock out a shared peer IP.
+    let log_auth_failure = {
         let metrics = metrics.clone();
-        let rate_limiter = rate_limiter.clone();
         let audit_ip = audit_ip.clone();
         let audit_ua = audit_ua.clone();
         move |reason: &str| {
@@ -691,10 +696,22 @@ pub async fn sigv4_auth_middleware(
                 m.auth_attempts_total.with_label_values(&["failure"]).inc();
                 m.auth_failures_total.with_label_values(&[reason]).inc();
             }
-            // Record failure in rate limiter + security logging. `bucket_key` is
-            // the IP the rate limiter buckets on; `trust_proxy` reveals whether
-            // that's the real client or a shared proxy IP — the field that makes
-            // "all clients collapsed onto one bucket" diagnosable at a glance.
+            info!(
+                "AUDIT | action=login_failed | user= | target={} | ip={} | ua={} | bucket= | path=",
+                reason, audit_ip, audit_ua
+            );
+        }
+    };
+    let record_auth_failure = {
+        let log_auth_failure = log_auth_failure.clone();
+        let rate_limiter = rate_limiter.clone();
+        let audit_ua = audit_ua.clone();
+        move |reason: &str| {
+            log_auth_failure(reason);
+            // `bucket_key` is the IP the rate limiter buckets on;
+            // `trust_proxy` reveals whether that's the real client or a
+            // shared proxy IP — the field that makes "all clients collapsed
+            // onto one bucket" diagnosable at a glance.
             if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
                 let locked = rl.record_failure(ip);
                 let count = rl.failure_count(ip);
@@ -711,10 +728,6 @@ pub async fn sigv4_auth_middleware(
                     );
                 }
             }
-            info!(
-                "AUDIT | action=login_failed | user= | target={} | ip={} | ua={} | bucket= | path=",
-                reason, audit_ip, audit_ua
-            );
         }
     };
 
@@ -767,35 +780,6 @@ pub async fn sigv4_auth_middleware(
         // Auth required — fall through to signature verification below.
         decision => decision,
     };
-
-    // Check rate limit before processing auth
-    if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
-        if let Some(left) = rl.lockout_remaining(ip) {
-            let count = rl.failure_count(ip);
-            warn!(
-                "SECURITY | event=brute_force_blocked | ip={} | bucket_key={} | trust_proxy={} | attempts={} | action=blocked",
-                ip, ip, crate::rate_limiter::trust_proxy_headers(), count
-            );
-            // S3 clients understand SlowDown; the message and Retry-After
-            // say how long the lockout lasts.
-            let (secs, message) = crate::rate_limiter::lockout_message(left);
-            let mut resp = S3Error::SlowDown(format!(
-                "Rate limited due to repeated auth failures. {message}"
-            ))
-            .into_response();
-            if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
-                resp.headers_mut()
-                    .insert(axum::http::header::RETRY_AFTER, v);
-            }
-            return Err(resp);
-        }
-        // Progressive delay: slow down responses proportional to failure count.
-        // Makes brute force expensive even before lockout threshold.
-        let delay = rl.progressive_delay(ip);
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
-    }
 
     // Log every incoming request before auth check for debugging
     debug!(
@@ -861,6 +845,38 @@ pub async fn sigv4_auth_middleware(
             return Ok(next.run(request).await);
         }
     }
+    // Lockout + progressive delay, AFTER the anonymous branch: a public
+    // read needs no credential, so a locked-out peer IP (every client
+    // behind a load balancer without DGP_TRUSTED_PROXY_CIDRS) still gets
+    // it. Before the form-POST deferral: that surface feeds the limiter too.
+    if let (Some(rl), Some(ip)) = (&rate_limiter, &client_ip) {
+        if let Some(left) = rl.lockout_remaining(ip) {
+            let count = rl.failure_count(ip);
+            warn!(
+                "SECURITY | event=brute_force_blocked | ip={} | bucket_key={} | trust_proxy={} | attempts={} | action=blocked",
+                ip, ip, crate::rate_limiter::trust_proxy_headers(), count
+            );
+            // S3 clients understand SlowDown; the message and Retry-After
+            // say how long the lockout lasts.
+            let (secs, message) = crate::rate_limiter::lockout_message(left);
+            let mut resp = S3Error::SlowDown(format!(
+                "Rate limited due to repeated auth failures. {message}"
+            ))
+            .into_response();
+            if let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                resp.headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, v);
+            }
+            return Err(resp);
+        }
+        // Progressive delay: slow down responses proportional to failure count.
+        // Makes brute force expensive even before lockout threshold.
+        let delay = rl.progressive_delay(ip);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
     let query_string = request.uri().query().unwrap_or("");
     // A browser form POST carries its signature in the policy fields; the
     // form handler checks it. One predicate decides both this deferral and
@@ -878,11 +894,11 @@ pub async fn sigv4_auth_middleware(
     let is_presigned = has_presigned_query_params(query_string);
     let params = if is_presigned {
         SigV4Params::from_query(&request).inspect_err(|_| {
-            record_auth_failure("invalid_presigned");
+            log_auth_failure("invalid_presigned");
         })?
     } else {
         SigV4Params::from_headers(&request).inspect_err(|_| {
-            record_auth_failure("missing_header");
+            log_auth_failure("missing_header");
         })?
     };
 
@@ -918,7 +934,7 @@ pub async fn sigv4_auth_middleware(
             );
             if !matches {
                 debug!("SigV4: access key mismatch (legacy mode)");
-                record_auth_failure("invalid_access_key");
+                log_auth_failure("invalid_access_key");
                 return Err(S3Error::AccessDenied.into_response());
             }
             // Legacy user gets full access via wildcard permissions
@@ -929,13 +945,13 @@ pub async fn sigv4_auth_middleware(
                 Some(u) => u,
                 None => {
                     debug!("SigV4: unknown access key '{}'", &params.access_key);
-                    record_auth_failure("invalid_access_key");
+                    log_auth_failure("invalid_access_key");
                     return Err(S3Error::AccessDenied.into_response());
                 }
             };
             if !user.enabled {
                 debug!("SigV4: user '{}' is disabled", user.name);
-                record_auth_failure("user_disabled");
+                log_auth_failure("user_disabled");
                 return Err(S3Error::AccessDenied.into_response());
             }
             Some(AuthenticatedUser::from(user))

@@ -1370,79 +1370,166 @@ async fn test_wrong_secret_signatures_are_rate_limited() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
-/// Multiple rapid auth failures should trigger rate limiting (progressive delay or lockout).
+/// auth-1: requests that never reach a signature check (no credential, a
+/// malformed header, an unknown access key) do not feed the per-IP limiter.
+/// Behind a load balancer without `DGP_TRUSTED_PROXY_CIDRS` every client
+/// shares one peer IP, so counting them let any anonymous party lock the
+/// whole S3 API. And a locked-out IP still gets public-prefix reads: they
+/// need no credential.
 #[tokio::test]
-async fn test_brute_force_rate_limiting() {
-    // Override rate limiter to small values for fast testing. Passed to the
-    // proxy child only: all integration tests share one process (tests/all.rs),
-    // so std::env::set_var would leak into every proxy other tests start.
+async fn requests_without_a_checked_signature_do_not_lock_out_the_peer() {
+    let bucket = "pubbucket";
     let server = TestServer::builder()
         .auth("testkey", "testsecret")
-        .env("DGP_RATE_LIMIT_MAX_ATTEMPTS", "5")
+        .bucket(bucket)
+        .bucket_policy(bucket, r#"public_prefixes: ["pub/"]"#)
+        .env("DGP_RATE_LIMIT_MAX_ATTEMPTS", "3")
         .env("DGP_RATE_LIMIT_WINDOW_SECS", "60")
         .env("DGP_RATE_LIMIT_LOCKOUT_SECS", "60")
         .build()
         .await;
-
-    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-
-    // Send rapid requests with UNKNOWN access keys from the same "IP" (via
-    // X-Forwarded-For, trusted because DGP_TRUST_PROXY_HEADERS=true in tests).
-    // Unknown access keys; wrong-secret signatures on a known key are
-    // covered by `test_wrong_secret_signatures_are_rate_limited`.
-    let mut statuses = Vec::new();
-    for i in 0..15 {
-        let resp = build_signed_get(
-            &server.endpoint(),
-            &format!("/{}", server.bucket()),
-            &format!("WRONGKEY{}", i),
-            "irrelevant_secret",
-            &now,
-        )
-        .header("x-forwarded-for", "10.0.0.99")
+    let endpoint = server.endpoint();
+    let signed = server.http();
+    let r = signed
+        .put(format!("{endpoint}/{bucket}/pub/a.txt"))
+        .body("hello")
         .send()
         .await
         .unwrap();
-        statuses.push(resp.status());
+    assert_eq!(r.status(), StatusCode::OK);
+    let anon = reqwest::Client::new();
+    let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    for i in 0..5 {
+        let r = anon
+            .get(format!("{endpoint}/{bucket}/private.txt"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "unsigned");
+        let r = anon
+            .get(format!("{endpoint}/{bucket}/private.txt"))
+            .header("authorization", "garbage")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST, "malformed");
+        let r = build_signed_get(
+            &endpoint,
+            &format!("/{bucket}"),
+            &format!("WRONGKEY{i}"),
+            "irrelevant_secret",
+            &now,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "unknown key");
     }
+    let r = signed
+        .get(format!("{endpoint}/{bucket}/pub/a.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "signed client locked out");
 
-    // After many failures, we should see either:
-    // - 403 (still rejecting, but with progressive delay)
-    // - 429/503 (rate limited / slow down)
-    // At minimum, verify none caused a server error
-    for (i, status) in statuses.iter().enumerate() {
-        assert_ne!(
-            *status,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "attempt {} should not cause server error",
-            i
-        );
+    // Wrong secrets on a known key DO lock the IP out ...
+    for _ in 0..3 {
+        let now = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let r = build_signed_get(&endpoint, &format!("/{bucket}"), "testkey", "wrong", &now)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
     }
+    let r = signed
+        .get(format!("{endpoint}/{bucket}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 503, "wrong secrets lock the IP out");
+    // ... but a public read needs no credential and is still served.
+    let r = anon
+        .get(format!("{endpoint}/{bucket}/pub/a.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "public read locked out");
+}
 
-    // Rate limiter threshold overridden to 5 failures for this test.
-    // After 15 rapid failures, we must see 503 SlowDown responses.
-    let rate_limited_count = statuses
-        .iter()
-        .filter(|s| s.as_u16() == 503 || s.as_u16() == 429)
-        .count();
-
-    // At least some requests after the 5th should be rate-limited
-    assert!(
-        rate_limited_count > 0,
-        "expected rate limiting after 5+ failures, but all {} responses were: {:?}",
-        statuses.len(),
-        statuses.iter().map(|s| s.as_u16()).collect::<Vec<_>>()
+/// A browser form POST. `secret: None` sends the form with no signature
+/// fields at all (an unsigned upload attempt).
+fn form_post(endpoint: &str, bucket: &str, secret: Option<&str>) -> reqwest::RequestBuilder {
+    use base64::Engine;
+    let amz_date = "20260507T120000Z";
+    let credential = "testkey/20260507/us-east-1/s3/aws4_request";
+    let policy = json!({
+        "expiration": "2099-01-01T00:00:00.000Z",
+        "conditions": [
+            { "bucket": bucket },
+            ["starts-with", "$key", "post/"],
+            { "x-amz-algorithm": "AWS4-HMAC-SHA256" },
+            { "x-amz-credential": credential },
+            { "x-amz-date": amz_date },
+            ["content-length-range", 1, 1048576]
+        ]
+    });
+    let policy_b64 = base64::engine::general_purpose::STANDARD.encode(policy.to_string());
+    let mut form = reqwest::multipart::Form::new().text("key", "post/x.txt");
+    if let Some(secret) = secret {
+        let signing_key = derive_signing_key(secret, "20260507", "us-east-1", "s3");
+        let signature = hex::encode(hmac_sha256(&signing_key, policy_b64.as_bytes()));
+        form = form
+            .text("policy", policy_b64)
+            .text("x-amz-algorithm", "AWS4-HMAC-SHA256")
+            .text("x-amz-credential", credential)
+            .text("x-amz-date", amz_date)
+            .text("x-amz-signature", signature);
+    }
+    let form = form.part(
+        "file",
+        reqwest::multipart::Part::bytes(b"hi".to_vec())
+            .file_name("x.txt")
+            .mime_str("text/plain")
+            .unwrap(),
     );
+    reqwest::Client::new()
+        .post(format!("{endpoint}/{bucket}"))
+        .multipart(form)
+}
 
-    // Verify the server didn't crash — no 500s
-    for (i, status) in statuses.iter().enumerate() {
-        assert_ne!(
-            *status,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "attempt {} should not cause server error",
-            i
-        );
+/// auth-1 on the form-POST surface: an unsigned form is no secret guess and
+/// does not feed the limiter; a wrong-secret form does.
+#[tokio::test]
+async fn form_post_counts_only_wrong_signatures_toward_lockout() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_RATE_LIMIT_MAX_ATTEMPTS", "3")
+        .env("DGP_RATE_LIMIT_WINDOW_SECS", "60")
+        .env("DGP_RATE_LIMIT_LOCKOUT_SECS", "60")
+        .build()
+        .await;
+    let (endpoint, bucket) = (server.endpoint(), server.bucket().to_string());
+    for _ in 0..5 {
+        let r = form_post(&endpoint, &bucket, None).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "unsigned form");
     }
+    let r = form_post(&endpoint, &bucket, Some("testsecret"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 204, "unsigned forms locked the IP out");
+    for i in 0..3 {
+        let r = form_post(&endpoint, &bucket, Some(&format!("guess-{i}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "wrong secret");
+    }
+    let r = form_post(&endpoint, &bucket, Some("testsecret"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 503, "wrong secrets lock the IP out");
 }
 
 // ============================================================================
