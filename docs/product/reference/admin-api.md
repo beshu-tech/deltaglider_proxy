@@ -200,6 +200,8 @@ These endpoints accept an admin GUI session and also the browser session of a us
 
 The response is `200` with `Content-Type: application/zip` and `Content-Disposition: attachment; filename="deltaglider-<date>.zip"`. The proxy streams the archive while it reads the objects, so the response has no `Content-Length` header and no size limit. Each object is read through the same path as an S3 `GET`, so a delta-stored object is reconstructed before its bytes enter the archive. The proxy does not hold a whole object or the whole archive in memory.
 
+The proxy takes one snapshot of its storage configuration when the download starts, and it reads every object of the archive through that snapshot. A configuration change that is applied during the download, such as a changed backend or bucket route, therefore does not reach that archive. The next download uses the new configuration.
+
 The archive uses these format choices:
 
 - Every entry is stored without compression (method `STORE`). Most objects that the proxy holds are already compressed, so compression would cost CPU time and save little space.

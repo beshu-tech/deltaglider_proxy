@@ -949,6 +949,10 @@ pub async fn download_zip(
     }
 
     let actor = BulkActor::for_session(&state, &session)?;
+    // One engine snapshot for the whole archive, on purpose: every entry
+    // reads through the same config, and a config change applied
+    // mid-download reaches the next ZIP, not this one (documented in
+    // admin-api.md).
     let engine = state.s3_state.engine.load_full();
     let names = zip_entry_names(&parsed);
     let mut skipped: Vec<(String, String)> = Vec::new();
