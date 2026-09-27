@@ -402,4 +402,14 @@ import {
   }
 
   .term-prompt { color: var(--panel-dark-accent); font-weight: 700; }
+
+  /* Phones: 2.4rem card padding left a 270 px text column; the links get
+     44 px rows. */
+  @media (max-width: 599px) {
+    .dd-card { padding: 1.5rem 1.25rem 1.25rem; }
+    .dd-card::before { font-size: 5.5rem; top: -1.1rem; }
+    .dd-q { font-size: 1.3rem; max-width: none; padding-right: 3.5rem; }
+    .dd-link { display: inline-block; padding: 0.6rem 0; }
+    .term-pre { padding: 1.1rem 1rem 1.2rem; font-size: 0.9rem; }
+  }
 </style>

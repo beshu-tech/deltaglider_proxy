@@ -192,6 +192,12 @@ import Glyph from './Glyph.astro';
 
   .feat-body { min-width: 0; }
 
+  /* Phones: the icon column took 80 px of a 353 px screen. Put the icon
+     above the text so the description gets the full width. */
+  @media (max-width: 599px) {
+    .feat { flex-direction: column; gap: 0.75rem; }
+  }
+
   .feat-idx {
     font-family: var(--font-mono);
     font-size: 0.95rem;
@@ -349,8 +355,8 @@ import Glyph from './Glyph.astro';
 
   @media (max-width: 768px) {
     .lightbox-close-wrapper { top: 0.5rem; right: 0.5rem; }
-    .lightbox-close { width: 32px; height: 32px; font-size: 1.2rem; }
-    .lightbox-nav { width: 38px; height: 38px; font-size: 1.4rem; }
+    .lightbox-close { width: 44px; height: 44px; font-size: 1.3rem; }
+    .lightbox-nav { width: 44px; height: 44px; font-size: 1.5rem; }
     .lightbox-nav--prev { left: 0.5rem; }
     .lightbox-nav--next { right: 0.5rem; }
   }

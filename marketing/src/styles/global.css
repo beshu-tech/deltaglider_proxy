@@ -657,6 +657,15 @@ section { scroll-margin-top: 5rem; }
 }
 
 
+/* === Phones === */
+
+@media (max-width: 599px) {
+  /* 13.8 px trust line and 15.2 px buttons read small on a phone. */
+  .hero-trust { font-size: 0.95rem; }
+  .btn { min-height: 44px; font-size: 1rem; }
+  .hero h1 { font-size: clamp(2.3rem, 10.5vw, 2.6rem); }
+}
+
 /* === Reduced-motion === */
 
 @media (prefers-reduced-motion: reduce) {

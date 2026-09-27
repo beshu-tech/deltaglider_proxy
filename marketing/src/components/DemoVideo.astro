@@ -67,6 +67,11 @@
 
 <style>
   .demo-video { text-align: center; }
+  /* A centred 6-line paragraph is hard to read on a phone: align left. */
+  @media (max-width: 599px) {
+    .demo-video { text-align: left; }
+    .demo-video-lede { margin-left: 0; }
+  }
   .demo-video-lede {
     max-width: 60ch;
     margin: 0.75rem auto 2rem;
