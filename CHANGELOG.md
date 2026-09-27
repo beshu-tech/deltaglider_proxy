@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed — A refused `/config/validate` keeps the warnings of `/config/apply`
+
+When the secret preservation, the config check, or a lifecycle/replication
+rule gate refused a document, `/config/apply` returned the parse-time warnings
+of the document, but `/config/validate` returned none. Now `/config/validate`
+returns the same warnings as `/config/apply`.
+
 ### Fixed — `--no-delta` stores the object as a plain object
 
 The `--no-delta` flag of `s3 cp`, `s3 sync` and `s3 migrate` added the user

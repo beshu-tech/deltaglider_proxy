@@ -553,6 +553,57 @@ lifecycle:
     );
 }
 
+/// A document that the lifecycle gate refuses still reports its parse-time
+/// warnings, and `/validate` reports the same ones as `/apply`.
+#[tokio::test]
+async fn test_config_validate_refusal_keeps_the_apply_warnings() {
+    let server = TestServer::builder()
+        .auth("VALWARN", "VALWARNSECRET")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let yaml = r#"
+listen_addr: "127.0.0.1:9000"
+max_delta_ratio: 1.5
+backend:
+  type: filesystem
+  path: /tmp/dgp-validate-warn-refusal
+lifecycle:
+  enabled: true
+  tick_interval: "1h"
+  rules:
+    - name: expire-old
+      enabled: true
+      bucket: b
+      prefix: ""
+      batch_size: 100
+      include_globs: ["old/**"]
+      exclude_globs: []
+"#;
+    let mut answers = Vec::new();
+    for route in ["validate", "apply"] {
+        let resp = admin
+            .post(format!("{}/_/api/admin/config/{route}", server.endpoint()))
+            .json(&json!({ "yaml": yaml }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{route}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        answers.push(body["warnings"].clone());
+    }
+    assert!(
+        answers[1]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w.as_str().unwrap_or("").contains("max_delta_ratio")),
+        "apply warns: {:?}",
+        answers[1]
+    );
+    assert_eq!(answers[0], answers[1], "validate = apply");
+}
+
 #[tokio::test]
 async fn test_config_apply_hot_reloads_ratio() {
     let server = TestServer::builder()

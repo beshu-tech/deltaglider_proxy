@@ -95,7 +95,10 @@
   "doc_validate_lifecycle_400": {
     "body": {
       "error": "lifecycle rule 'expire-old' delete action requires expire_after",
-      "ok": false
+      "ok": false,
+      "warnings": [
+        "lifecycle rule 'expire-old' delete action requires expire_after"
+      ]
     },
     "etag": false,
     "status": 400

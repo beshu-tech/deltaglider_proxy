@@ -28,7 +28,7 @@ use std::sync::Arc;
 use super::super::{audit_log, AdminError, AdminState, Bare};
 use super::write::{
     self, Built, ConfigWrite, EnvRefs, Mode, Outcome, Rejection, ScrubEnv, Stage, Surface,
-    WriteResult,
+    Warnings, WriteResult,
 };
 use super::{unknown_section_error, SectionName};
 use axum::response::Response;
@@ -292,43 +292,62 @@ pub async fn validate_config_doc(
     AdminJson(body): AdminJson<ConfigDocumentRequest>,
 ) -> impl IntoResponse {
     let known = state.config.read().await.env_refs.clone();
-    let result = match parse_and_validate_yaml(&body.yaml, &known) {
+    let no_env = EnvRefs::new();
+    let write = ConfigWrite {
+        surface: Surface::Document { yaml: &body.yaml },
+        mode: Mode::DryRun,
+        headers: None,
+        extra_env: &no_env,
+    };
+    shape_validate(run_document(&state, &body.yaml, known, write).await)
+}
+
+/// Parse a document and run it through the write pipeline: the one body of
+/// `/config/validate` and `/config/apply`, so both carry the same
+/// parse-time warnings.
+async fn run_document(
+    state: &Arc<AdminState>,
+    yaml: &str,
+    known: EnvRefs,
+    write: ConfigWrite<'_>,
+) -> WriteResult {
+    match parse_and_validate_yaml(yaml, &known) {
         Err(err) => WriteResult {
             outcome: Outcome::Rejected(Rejection::new(Stage::Build, StatusCode::BAD_REQUEST, err)),
             refs: known,
         },
-        Ok((incoming, _)) => {
-            let no_env = EnvRefs::new();
-            let write = ConfigWrite {
-                surface: Surface::Document { yaml: &body.yaml },
-                mode: Mode::DryRun,
-                headers: None,
-                extra_env: &no_env,
-            };
-            let built = Built {
-                incoming,
-                warnings: Vec::new(),
-            };
-            write::run(&state, write, |_| Ok(built)).await
+        Ok((incoming, warnings)) => {
+            write::run(state, write, |_| Ok(Built { incoming, warnings })).await
         }
-    };
-    shape_validate(result)
+    }
+}
+
+/// The warnings a refused document write reports, for validate and apply.
+fn rejection_warnings(stage: Stage, w: Warnings) -> Vec<String> {
+    match stage {
+        Stage::Transition => [w.check_new, w.preserve].concat(),
+        // The document's parse-time warnings ride along.
+        Stage::Preserve | Stage::Check | Stage::Gate => w.build,
+        _ => Vec::new(),
+    }
 }
 
 /// The `/config/validate` body of a write outcome.
 fn shape_validate(result: WriteResult) -> Response {
     let WriteResult { outcome, refs } = result;
-    let refused = |status, error| {
+    let refused = |status, error, warnings| {
         let body = ConfigValidateResponse {
             ok: false,
-            warnings: Vec::new(),
+            warnings,
             existing_warnings: Vec::new(),
             error: Some(error),
         };
         write::respond(status, body, &refs, None)
     };
     match outcome {
-        Outcome::Rejected(r) => refused(r.status, r.error),
+        Outcome::Rejected(r) => {
+            refused(r.status, r.error, rejection_warnings(r.stage, *r.warnings))
+        }
         Outcome::Validated { warnings: w, .. } => {
             let body = ConfigValidateResponse {
                 ok: true,
@@ -342,6 +361,7 @@ fn shape_validate(result: WriteResult) -> Response {
         Outcome::Conflict { .. } | Outcome::Applied { .. } => refused(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal: a dry run applied".to_string(),
+            Vec::new(),
         ),
     }
 }
@@ -405,23 +425,13 @@ pub(crate) async fn apply_config_inner_with_env(
     known.extend(extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
     // Parse before the lock (pure work): a bad document answers 400 even
     // with a stale `If-Match`.
-    let result = match parse_and_validate_yaml(&body.yaml, &known) {
-        Err(err) => WriteResult {
-            outcome: Outcome::Rejected(Rejection::new(Stage::Build, StatusCode::BAD_REQUEST, err)),
-            refs: known,
-        },
-        Ok((incoming, warnings)) => {
-            let write = ConfigWrite {
-                surface: Surface::Document { yaml: &body.yaml },
-                mode: Mode::Apply,
-                headers: Some(headers),
-                extra_env,
-            };
-            let built = Built { incoming, warnings };
-            write::run(state, write, |_| Ok(built)).await
-        }
+    let write = ConfigWrite {
+        surface: Surface::Document { yaml: &body.yaml },
+        mode: Mode::Apply,
+        headers: Some(headers),
+        extra_env,
     };
-    let WriteResult { outcome, refs } = result;
+    let WriteResult { outcome, refs } = run_document(state, &body.yaml, known, write).await;
     let (status, mut resp) = shape_apply(outcome);
     resp.scrub_env(&refs);
     (status, resp)
@@ -451,16 +461,13 @@ fn shape_apply(outcome: Outcome) -> (StatusCode, ConfigApplyResponse) {
             (StatusCode::CONFLICT, resp)
         }
         Outcome::Rejected(r) => {
-            let w = *r.warnings;
-            let (error, warnings) = match r.stage {
-                Stage::Transition => (
-                    format!("Config transition refused (no state changed): {}", r.error),
-                    [w.check_new, w.preserve].concat(),
-                ),
-                // The document's parse-time warnings ride along.
-                Stage::Preserve | Stage::Check | Stage::Gate => (r.error, w.build),
-                _ => (r.error, Vec::new()),
+            let error = match r.stage {
+                Stage::Transition => {
+                    format!("Config transition refused (no state changed): {}", r.error)
+                }
+                _ => r.error,
             };
+            let warnings = rejection_warnings(r.stage, *r.warnings);
             (r.status, refused(error, warnings))
         }
         Outcome::Applied {
