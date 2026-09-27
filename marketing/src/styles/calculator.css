@@ -47,8 +47,9 @@
   padding: 1.5rem;
 }
 
-.calc-inputs h3,
-.calc-result h3 {
+.calc-inputs h2,
+.calc-result h2 {
+  font-weight: 600;
   margin-top: 0;
   font-size: 1rem;
   color: var(--ink-soft);
@@ -193,7 +194,8 @@
   padding: 0;
 }
 
-.card h3 {
+.card h2 {
+  font-weight: 600;
   text-transform: none;
   letter-spacing: 0;
   font-size: 1.25rem;
@@ -228,8 +230,8 @@
   font-weight: 700;
 }
 
-.card-enterprise h3,
-.card-disqualify h3 {
+.card-enterprise h2,
+.card-disqualify h2 {
   color: var(--accent);
 }
 

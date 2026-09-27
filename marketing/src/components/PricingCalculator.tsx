@@ -89,7 +89,7 @@ export default function PricingCalculator() {
       <div className="calc-grid">
         {/* === INPUTS === */}
         <section className="calc-inputs" aria-labelledby="calc-inputs-heading">
-          <h3 id="calc-inputs-heading">Your numbers</h3>
+          <h2 id="calc-inputs-heading">Your numbers</h2>
 
           <div className="field">
             <label htmlFor="calc-source">
@@ -352,7 +352,7 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
   if (result.kind === 'belowThreshold') {
     return (
       <div className="card card-disqualify">
-        <h3 id="calc-result-heading">DeltaGlider isn't worth it for you yet</h3>
+        <h2 id="calc-result-heading">DeltaGlider isn't worth it for you yet</h2>
         <p>
           At under 1 TB of source artifacts, the savings are too small to
           matter. Come back at 5 TB+, or run the free build anyway; it
@@ -368,7 +368,7 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
   if (result.kind === 'negativeNet') {
     return (
       <div className="card card-disqualify">
-        <h3 id="calc-result-heading">Savings would not cover the license</h3>
+        <h2 id="calc-result-heading">Savings would not cover the license</h2>
         <p>
           At this scale you'd save about <strong>{formatUsd(result.savings)}/yr</strong> in
           storage, and the Commercial plan costs <strong>{formatUsd(result.licenseCost)}/yr</strong>,
@@ -390,9 +390,9 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
   if (result.kind === 'free') {
     return (
       <div className="card card-ok">
-        <h3 id="calc-result-heading" className="calc-hero-heading">
+        <h2 id="calc-result-heading" className="calc-hero-heading">
           You'd save about <strong className="calc-hero-number">{formatUsd(result.savings, { compact: true })}/year</strong>
-        </h3>
+        </h2>
         <p className="calc-hero-subtext">
           Your compressed footprint stays under the 15 TB free grant, so
           DeltaGlider costs you <strong className="calc-hero-net">nothing</strong> and
@@ -415,9 +415,9 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
   // kind === 'ok'
   return (
     <div className="card card-ok">
-      <h3 id="calc-result-heading" className="calc-hero-heading">
+      <h2 id="calc-result-heading" className="calc-hero-heading">
         You'd save about <strong className="calc-hero-number">{formatUsd(result.savings, { compact: true })}/year</strong>
-      </h3>
+      </h2>
       <p className="calc-hero-subtext">
         Your compressed footprint is above the 15 TB free grant, so the{' '}
         <strong>{result.bracket.name}</strong> plan at{' '}
