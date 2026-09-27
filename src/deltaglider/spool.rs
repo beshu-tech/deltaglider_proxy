@@ -240,6 +240,18 @@ impl SpoolDir {
         b_bytes: u64,
     ) -> std::io::Result<(Spool, Spool)> {
         let held_mib = held.map_or(0, Spool::reserved_mib);
+        // A holder of the whole budget would get the pair with 0 MiB
+        // accounted (the clamp), so the op used held + a + b on disk. The
+        // pair is optional work (the streaming PUT stores passthrough
+        // without it): refuse it. A storage write's own temp files
+        // (`SpoolBudget`) keep the clamp, because the object cannot be
+        // stored without them.
+        if held_mib > 0 && self.want_mib(a_bytes.saturating_add(b_bytes), held_mib) == 0 {
+            return Err(std::io::Error::new(
+                CONTENDED,
+                "spool budget: the op holds the whole budget, no room for a delta pair",
+            ));
+        }
         let permit = std::sync::Arc::new(
             self.reserve_within(a_bytes.saturating_add(b_bytes), held_mib)
                 .await?,
@@ -687,12 +699,33 @@ mod tests {
         for body_mib in [4u64, 8, 64] {
             let body = pool.acquire(body_mib * 1024 * 1024).await.unwrap();
             let fut = pool.acquire_pair_beside(Some(&body), 6 * 1024 * 1024, 6 * 1024 * 1024);
-            let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(2), fut)
+            let res = tokio::time::timeout(std::time::Duration::from_secs(2), fut)
                 .await
-                .unwrap_or_else(|_| panic!("body {body_mib} MiB: pair waited on its own budget"))
-                .unwrap();
-            drop((a, b, body));
+                .unwrap_or_else(|_| panic!("body {body_mib} MiB: pair waited on its own budget"));
+            // A body that fills the budget gets no pair (storage-6, below).
+            match res {
+                Ok(_pair) => assert_eq!(body_mib, 4, "{body_mib} MiB got a pair"),
+                Err(e) => assert_eq!(e.kind(), CONTENDED, "{body_mib} MiB"),
+            }
+            drop(body);
         }
+    }
+
+    /// storage-6: a holder that already holds the whole budget got a pair
+    /// with 0 MiB accounted, so a streaming PUT of a body at the budget
+    /// used body + ref + delta on disk. It gets CONTENDED instead (the PUT
+    /// stores passthrough).
+    #[tokio::test]
+    async fn a_full_holder_gets_no_unaccounted_pair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = SpoolDir::new(tmp.path().to_path_buf(), 4 * 1024 * 1024).unwrap();
+        let body = pool.acquire(4 * 1024 * 1024).await.unwrap();
+        let err = pool
+            .acquire_pair_beside(Some(&body), 1024 * 1024, 1024 * 1024)
+            .await
+            .err()
+            .expect("a full holder must not get an unaccounted pair");
+        assert_eq!(err.kind(), CONTENDED);
     }
 
     #[tokio::test]
