@@ -506,7 +506,7 @@ test('5. IAM: create prefix-scoped user and a group, delete the last user → bo
   await page.getByRole('textbox', { name: 'User name' }).fill(`qa-scoped-${RUN}`);
   await page.getByPlaceholder('e.g. user@company.com').fill(SCOPED_KEY);
   await page.getByPlaceholder('e.g. mysecretkey or leave empty').fill(SCOPED_SECRET);
-  const resource = page.getByRole('combobox', { name: 'my-bucket/builds/*' });
+  const resource = page.getByRole('combobox', { name: 'Resource pattern' });
   await resource.fill(`${BUCKET}/scoped/*`);
   // Leaving the WHERE field must not move CAN DO: its suggestion chips used
   // to collapse on blur and shift the action chips up under the pointer.
