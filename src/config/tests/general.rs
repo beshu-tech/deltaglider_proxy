@@ -217,11 +217,7 @@ fn classify_auth_config_missing_is_fatal() {
 /// configuration reference, so an operator can find what it does.
 #[test]
 fn every_registered_env_var_is_documented() {
-    let doc = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("docs/product/reference/configuration.md"),
-    )
-    .unwrap();
+    let doc = crate::source_scan::read("docs/product/reference/configuration.md");
     let missing: Vec<&str> = ENV_VAR_REGISTRY
         .iter()
         .map(|e| e.name)
