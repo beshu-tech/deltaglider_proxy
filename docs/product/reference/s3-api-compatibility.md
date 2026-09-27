@@ -76,6 +76,8 @@ The S3 backend stores keys as S3 keys, so there both objects can exist.
 
 The proxy enforces access control through its own **IAM / ABAC** model (see [IAM permissions](iam-permissions.md)), not through S3 ACLs, bucket policies, or object tags. The ACL probes below return a canned *private* response so clients that check ACLs on connect keep working; the mutation calls are explicitly rejected rather than silently ignored.
 
+A `PutObject`, `CopyObject` or `CreateMultipartUpload` request can carry an `x-amz-acl` header, an `x-amz-grant-*` header or the `x-amz-object-lock-*` headers. The proxy accepts these requests and ignores these headers, because it stores no ACL and no Object Lock setting. `PutObject` and `CopyObject` give the same answer to the same headers. To protect the stored objects with Object Lock, turn it on at the backend (see [Versioning vs S3 versioning](../explanation/versioning-vs-s3-versioning.md)).
+
 | Operation | Status | Notes |
 |---|---|---|
 | `GetBucketAcl` | ◑ Stub | Bucket existence checked; returns a canned private ACL (single owner, full control). |

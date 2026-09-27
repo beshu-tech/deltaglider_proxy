@@ -4212,3 +4212,80 @@ async fn test_form_post_waits_for_a_completion_of_the_same_key() {
     let bytes = got.body.collect().await.unwrap().into_bytes();
     assert_eq!(bytes.as_ref(), b"form", "the later write wins");
 }
+
+/// H14d: the proxy does not store ACLs or Object Lock settings. A
+/// PutObject that carries `x-amz-acl`, an `x-amz-grant-*` header or the
+/// `x-amz-object-lock-*` headers gets an answer, and a CopyObject or a
+/// CreateMultipartUpload with the same headers must get the SAME answer,
+/// never a different one.
+#[tokio::test]
+async fn test_copy_object_answers_acl_and_object_lock_headers_like_put_object() {
+    let (server, http) = signed_setup().await;
+    let base = format!("{}/{}", server.endpoint(), server.bucket());
+    let src = http
+        .put(format!("{base}/acl-src.txt"))
+        .body("hello")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(src.status(), 200);
+    let cases: [(&str, &str); 6] = [
+        ("x-amz-acl", "public-read"),
+        ("x-amz-acl", "private"),
+        (
+            "x-amz-grant-read",
+            "uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"",
+        ),
+        ("x-amz-object-lock-mode", "GOVERNANCE"),
+        (
+            "x-amz-object-lock-retain-until-date",
+            "2099-01-01T00:00:00Z",
+        ),
+        ("x-amz-object-lock-legal-hold", "ON"),
+    ];
+    for (i, (name, value)) in cases.iter().enumerate() {
+        let put = http
+            .put(format!("{base}/acl-put-{i}.txt"))
+            .header(*name, *value)
+            .body("hello")
+            .send()
+            .await
+            .unwrap();
+        let put_status = put.status();
+        let put_body = put.text().await.unwrap();
+        let copy = http
+            .put(format!("{base}/acl-copy-{i}.txt"))
+            .header(
+                "x-amz-copy-source",
+                format!("/{}/acl-src.txt", server.bucket()),
+            )
+            .header(*name, *value)
+            .send()
+            .await
+            .unwrap();
+        let copy_status = copy.status();
+        let copy_body = copy.text().await.unwrap();
+        assert_eq!(
+            put_status, copy_status,
+            "{name}: {value}: PutObject {put_status} {put_body} vs CopyObject {copy_status} {copy_body}"
+        );
+        let code = |b: &str| {
+            b.split("<Code>")
+                .nth(1)
+                .and_then(|r| r.split("</Code>").next())
+                .map(str::to_string)
+        };
+        assert_eq!(code(&put_body), code(&copy_body), "{name}: {value}");
+        let mpu = http
+            .post(format!("{base}/acl-mpu-{i}.txt?uploads"))
+            .header(*name, *value)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            put_status,
+            mpu.status(),
+            "{name}: {value}: CreateMultipartUpload"
+        );
+    }
+}

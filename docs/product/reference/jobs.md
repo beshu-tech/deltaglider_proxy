@@ -35,6 +35,8 @@ All routes except the last are session-gated admin routes.
 
 An object that reached the backend without the proxy (it was there before the proxy, or another tool wrote it) has none of the proxy's metadata: no content hash, no created-at. The proxy still serves it, but it cannot show or verify its checksum. The `backfill-metadata` job adds that metadata. It reads each such object once to compute its hashes and then rewrites only the metadata: an S3 backend does a server-side copy of the object onto itself, and a filesystem backend rewrites the extended attributes. The object bytes are not uploaded again, and objects that the proxy wrote are skipped.
 
+A server-side copy does not carry the object's ACL or its Object Lock settings, so the proxy restates them on the copy. It reads the object's ACL first, and when the ACL grants more than the owner's full control, the copy sends the same grants. When the object has a retention period that has not ended, or a legal hold that is on, the copy sends the same retention mode, date and legal hold. When the backend does not answer the ACL request, the copy gets the bucket's default ACL, as before.
+
 By default the job keeps the Last-Modified time that the proxy serves for each object, so sync tools and replication do not copy the objects again. Set `refresh_last_modified: true` to make the backfilled objects read as modified at the time of the job. A multipart object keeps the ETag that clients know. Start the job from **Settings → Jobs → New job → Backfill metadata…**, or with the API row above.
 
 ## The write gate

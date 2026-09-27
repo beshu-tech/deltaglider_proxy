@@ -6,11 +6,18 @@
 use super::*;
 
 /// What a metadata self-copy (MetadataDirective REPLACE) must restate so
-/// the object keeps everything that is not DG metadata (D17).
-/// NOT restated: the ACL (CopyObject never copies it; the object gets the
-/// bucket default), Object Lock settings, and tags (copied by default).
+/// the object keeps everything that is not DG metadata (D17). A copy does
+/// not carry the ACL (the object gets the bucket default) nor the Object
+/// Lock retention and legal hold (a new version gets the bucket default),
+/// so the plan restates both. Tags are copied by default.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct SelfCopyPlan {
+    /// The object's own ACL as grant headers; `None` when it is the
+    /// default (the owner's FULL_CONTROL only) or could not be read.
+    pub acl: Option<AclGrants>,
+    pub object_lock_mode: Option<aws_sdk_s3::types::ObjectLockMode>,
+    pub object_lock_retain_until: Option<aws_sdk_s3::primitives::DateTime>,
+    pub object_lock_legal_hold: Option<aws_sdk_s3::types::ObjectLockLegalHoldStatus>,
     pub metadata: HashMap<String, String>,
     pub cache_control: Option<String>,
     pub content_disposition: Option<String>,
@@ -46,13 +53,80 @@ pub(super) fn is_dg_owned_meta_key(key: &str) -> bool {
     k.starts_with("dg-") || k.starts_with("user-") || LEGACY.contains(&k.as_str())
 }
 
-/// Pure: build the self-copy plan from the pre-copy HEAD and the new DG
-/// metadata. `native_sse_configured` = the backend sets its own SSE on the
-/// request; otherwise the object's current SSE is kept.
+/// An object ACL as the `x-amz-grant-*` headers of a copy request: each
+/// value is a comma-separated list of `id="…"`, `uri="…"` or
+/// `emailAddress="…"`.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct AclGrants {
+    pub full_control: Option<String>,
+    pub read: Option<String>,
+    pub read_acp: Option<String>,
+    pub write_acp: Option<String>,
+}
+
+/// Pure: the grant headers that restate an object's ACL. `None` for the
+/// default ACL (only the owner, with FULL_CONTROL): the copy gets that
+/// anyway, and a bucket with ACLs disabled refuses explicit grants.
+pub(crate) fn acl_grants(
+    acl: &aws_sdk_s3::operation::get_object_acl::GetObjectAclOutput,
+) -> Option<AclGrants> {
+    use aws_sdk_s3::types::{Permission, Type};
+    let owner = acl.owner().and_then(|o| o.id());
+    let is_owner_full_control = |g: &aws_sdk_s3::types::Grant| {
+        g.permission() == Some(&Permission::FullControl)
+            && g.grantee().is_some_and(|e| {
+                *e.r#type() == Type::CanonicalUser && e.id().is_some() && e.id() == owner
+            })
+    };
+    if acl.grants().iter().all(is_owner_full_control) {
+        return None;
+    }
+    let mut out = AclGrants::default();
+    for grant in acl.grants() {
+        let Some(grantee) = grant.grantee() else {
+            continue;
+        };
+        let value = match grantee.r#type() {
+            Type::CanonicalUser => grantee.id().map(|v| format!("id=\"{v}\"")),
+            Type::Group => grantee.uri().map(|v| format!("uri=\"{v}\"")),
+            Type::AmazonCustomerByEmail => grantee
+                .email_address()
+                .map(|v| format!("emailAddress=\"{v}\"")),
+            _ => None,
+        };
+        let Some(value) = value else {
+            continue;
+        };
+        // WRITE has no meaning on an object; S3 never returns it there.
+        let slot = match grant.permission() {
+            Some(Permission::FullControl) => &mut out.full_control,
+            Some(Permission::Read) => &mut out.read,
+            Some(Permission::ReadAcp) => &mut out.read_acp,
+            Some(Permission::WriteAcp) => &mut out.write_acp,
+            _ => continue,
+        };
+        match slot {
+            Some(list) => {
+                list.push_str(", ");
+                list.push_str(&value);
+            }
+            None => *slot = Some(value),
+        }
+    }
+    Some(out)
+}
+
+/// Pure: build the self-copy plan from the pre-copy HEAD, the object's
+/// ACL (`None` when it could not be read) and the new DG metadata.
+/// `native_sse_configured` = the backend sets its own SSE on the request;
+/// otherwise the object's current SSE is kept. `now` decides whether a
+/// retention is still running: S3 refuses a retain-until date in the past.
 pub(crate) fn self_copy_plan(
     head: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
+    acl: Option<&aws_sdk_s3::operation::get_object_acl::GetObjectAclOutput>,
     dg_metadata: HashMap<String, String>,
     native_sse_configured: bool,
+    now: std::time::SystemTime,
 ) -> SelfCopyPlan {
     use aws_sdk_s3::types::{ServerSideEncryption, StorageClass};
     let mut metadata: HashMap<String, String> = head
@@ -79,7 +153,23 @@ pub(crate) fn self_copy_plan(
             head.bucket_key_enabled().filter(|_| kms),
         )
     };
+    use aws_sdk_s3::types::ObjectLockLegalHoldStatus;
+    let retain_until = head
+        .object_lock_retain_until_date()
+        .filter(|until| std::time::SystemTime::try_from(**until).is_ok_and(|until| until > now))
+        .copied();
+    let object_lock_mode = head
+        .object_lock_mode()
+        .filter(|_| retain_until.is_some())
+        .cloned();
     SelfCopyPlan {
+        acl: acl.and_then(acl_grants),
+        object_lock_retain_until: retain_until.filter(|_| object_lock_mode.is_some()),
+        object_lock_mode,
+        object_lock_legal_hold: head
+            .object_lock_legal_hold_status()
+            .filter(|s| **s == ObjectLockLegalHoldStatus::On)
+            .cloned(),
         metadata,
         cache_control: head.cache_control().map(String::from),
         content_disposition: head.content_disposition().map(String::from),

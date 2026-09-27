@@ -113,7 +113,13 @@ mod classify_tests {
             ("dg-tool".to_string(), "t".to_string()),
             ("user-new".to_string(), "v".to_string()),
         ]);
-        let plan = self_copy_plan(&foreign_head(), dg, false);
+        let plan = self_copy_plan(
+            &foreign_head(),
+            None,
+            dg,
+            false,
+            std::time::SystemTime::now(),
+        );
         assert_eq!(plan.metadata.get("owner").map(String::as_str), Some("bob"));
         assert_eq!(plan.metadata.get("dg-tool").map(String::as_str), Some("t"));
         assert_eq!(plan.metadata.get("user-new").map(String::as_str), Some("v"));
@@ -135,9 +141,102 @@ mod classify_tests {
         assert_eq!(plan.kms_key_id.as_deref(), Some("arn:kms:k1"));
         assert_eq!(plan.bucket_key_enabled, Some(true));
         // With native encryption configured, the backend's settings win.
-        let native = self_copy_plan(&foreign_head(), HashMap::new(), true);
+        let native = self_copy_plan(
+            &foreign_head(),
+            None,
+            HashMap::new(),
+            true,
+            std::time::SystemTime::now(),
+        );
         assert_eq!(native.sse, None);
         assert_eq!(native.kms_key_id, None);
+    }
+
+    /// H14d: a REPLACE self-copy does not carry the ACL, and the new
+    /// version gets the bucket's default retention and no legal hold. The
+    /// plan restates the object's own ACL (unless it is the default), a
+    /// retention that still runs, and a legal hold that is on.
+    #[test]
+    fn self_copy_plan_keeps_acl_retention_and_legal_hold() {
+        use aws_sdk_s3::operation::get_object_acl::GetObjectAclOutput;
+        use aws_sdk_s3::primitives::DateTime;
+        use aws_sdk_s3::types::{
+            Grant, Grantee, ObjectLockLegalHoldStatus, ObjectLockMode, Owner, Permission, Type,
+        };
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000);
+        let grant = |t: Type, id: Option<&str>, uri: Option<&str>, p: Permission| {
+            Grant::builder()
+                .grantee(
+                    Grantee::builder()
+                        .r#type(t)
+                        .set_id(id.map(String::from))
+                        .set_uri(uri.map(String::from))
+                        .build()
+                        .unwrap(),
+                )
+                .permission(p)
+                .build()
+        };
+        let owner_fc = grant(
+            Type::CanonicalUser,
+            Some("own"),
+            None,
+            Permission::FullControl,
+        );
+        let all_users = "http://acs.amazonaws.com/groups/global/AllUsers";
+        let public = GetObjectAclOutput::builder()
+            .owner(Owner::builder().id("own").build())
+            .grants(owner_fc.clone())
+            .grants(grant(Type::Group, None, Some(all_users), Permission::Read))
+            .grants(grant(
+                Type::CanonicalUser,
+                Some("peer"),
+                None,
+                Permission::Read,
+            ))
+            .build();
+        let head = aws_sdk_s3::operation::head_object::HeadObjectOutput::builder()
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(DateTime::from_secs(2_100_000_000))
+            .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+            .build();
+        let plan = self_copy_plan(&head, Some(&public), HashMap::new(), false, now);
+        assert_eq!(
+            plan.acl,
+            Some(AclGrants {
+                full_control: Some("id=\"own\"".into()),
+                read: Some(format!("uri=\"{all_users}\", id=\"peer\"")),
+                read_acp: None,
+                write_acp: None,
+            })
+        );
+        assert_eq!(plan.object_lock_mode, Some(ObjectLockMode::Governance));
+        assert_eq!(
+            plan.object_lock_retain_until,
+            Some(DateTime::from_secs(2_100_000_000))
+        );
+        assert_eq!(
+            plan.object_lock_legal_hold,
+            Some(ObjectLockLegalHoldStatus::On)
+        );
+
+        // The default ACL, an expired retention and a legal hold that is off
+        // are not restated (S3 refuses a past retain-until date, and a
+        // bucket with ACLs disabled refuses explicit grants).
+        let private = GetObjectAclOutput::builder()
+            .owner(Owner::builder().id("own").build())
+            .grants(owner_fc)
+            .build();
+        let expired = aws_sdk_s3::operation::head_object::HeadObjectOutput::builder()
+            .object_lock_mode(ObjectLockMode::Compliance)
+            .object_lock_retain_until_date(DateTime::from_secs(1_900_000_000))
+            .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::Off)
+            .build();
+        let plan = self_copy_plan(&expired, Some(&private), HashMap::new(), false, now);
+        assert_eq!(plan.acl, None);
+        assert_eq!(plan.object_lock_mode, None);
+        assert_eq!(plan.object_lock_retain_until, None);
+        assert_eq!(plan.object_lock_legal_hold, None);
     }
 
     /// STANDARD is the default: restating it is harmless but some
@@ -149,7 +248,13 @@ mod classify_tests {
             .storage_class(StorageClass::Standard)
             .server_side_encryption(ServerSideEncryption::Aes256)
             .build();
-        let plan = self_copy_plan(&head, HashMap::new(), false);
+        let plan = self_copy_plan(
+            &head,
+            None,
+            HashMap::new(),
+            false,
+            std::time::SystemTime::now(),
+        );
         assert_eq!(plan.storage_class, None);
         assert_eq!(plan.sse, Some(ServerSideEncryption::Aes256));
         assert_eq!(plan.kms_key_id, None);

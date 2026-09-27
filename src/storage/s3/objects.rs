@@ -83,10 +83,29 @@ impl S3Backend {
                 return Err(reference_fence_lost(bucket, key));
             }
         }
+        // The ACL is not on the HEAD. A backend that does not serve it (or a
+        // key without s3:GetObjectAcl) keeps the old behaviour: the copy
+        // gets the bucket default.
+        let acl = match self
+            .client
+            .get_object_acl()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(acl) => Some(acl),
+            Err(e) => {
+                debug!("S3 metadata rewrite {bucket}/{key}: ACL not read, not restated: {e}");
+                None
+            }
+        };
         let plan = self_copy_plan(
             &head,
+            acl.as_ref(),
             self.metadata_to_headers(metadata),
             !matches!(self.native_encryption, NativeEncryptionConfig::None),
+            std::time::SystemTime::now(),
         );
 
         let mut request = self
@@ -105,7 +124,17 @@ impl S3Backend {
             .set_storage_class(plan.storage_class)
             .set_server_side_encryption(plan.sse)
             .set_ssekms_key_id(plan.kms_key_id)
-            .set_bucket_key_enabled(plan.bucket_key_enabled);
+            .set_bucket_key_enabled(plan.bucket_key_enabled)
+            .set_object_lock_mode(plan.object_lock_mode)
+            .set_object_lock_retain_until_date(plan.object_lock_retain_until)
+            .set_object_lock_legal_hold_status(plan.object_lock_legal_hold);
+        if let Some(acl) = plan.acl {
+            request = request
+                .set_grant_full_control(acl.full_control)
+                .set_grant_read(acl.read)
+                .set_grant_read_acp(acl.read_acp)
+                .set_grant_write_acp(acl.write_acp);
+        }
         if let Some(ct) = metadata.content_type.as_deref() {
             request = request.content_type(ct);
         }

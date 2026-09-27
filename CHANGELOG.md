@@ -136,6 +136,18 @@ delta-eligible objects; other files are limited by
 `max_passthrough_object_size`. A failed download no longer leaves a truncated
 file, and `s3 verify` hashes the object while it reads it.
 
+### Fixed — A metadata rewrite on S3 keeps the ACL and the Object Lock settings
+
+The `backfill-metadata` job and the other metadata rewrites on an S3 backend
+copy the object onto itself. A copy does not carry the object's ACL, its
+retention period or its legal hold, so a backfilled object lost them. Now
+the proxy reads the object's ACL and sends the same grants on the copy, and
+it sends the retention (when it has not ended) and a legal hold that is on.
+The S3 API reference now also says that `PutObject`, `CopyObject` and
+`CreateMultipartUpload` ignore the `x-amz-acl`, `x-amz-grant-*` and
+`x-amz-object-lock-*` headers, and a test holds the three to the same
+answer.
+
 ### Fixed — CopyObject streams a large source through the spool
 
 CopyObject read the whole source object into memory before it stored the
