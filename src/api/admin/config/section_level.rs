@@ -245,14 +245,17 @@ pub async fn put_section(
     headers: HeaderMap,
     body: AdminJson<serde_json::Value>,
 ) -> impl IntoResponse {
-    apply_section(
-        state,
+    let mut refs = super::running_env_refs(&state).await;
+    let resp = apply_section(
+        state.clone(),
         name,
         body.0,
         ApplyMode::PersistAndApply,
         Some(headers),
     )
-    .await
+    .await;
+    refs.extend(super::running_env_refs(&state).await);
+    super::scrub_env_response(resp, &refs).await
 }
 
 /// `POST /api/admin/config/section/:name/validate` — dry-run a section apply.
@@ -268,7 +271,9 @@ pub async fn validate_section(
     Path(name): Path<String>,
     body: AdminJson<serde_json::Value>,
 ) -> impl IntoResponse {
-    apply_section(state, name, body.0, ApplyMode::DryRun, None).await
+    let refs = super::running_env_refs(&state).await;
+    let resp = apply_section(state, name, body.0, ApplyMode::DryRun, None).await;
+    super::scrub_env_response(resp, &refs).await
 }
 
 /// Whether a section operation should mutate + persist, or only report

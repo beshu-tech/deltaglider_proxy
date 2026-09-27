@@ -80,6 +80,15 @@ release has no generation and keeps the old rule. During a rolling upgrade,
 an instance on the older release does not merge copies from upgraded
 instances until it is upgraded too, as with every schema change.
 
+### Fixed — Config responses never show the value of an env reference
+
+The admin API resolves a `${env:NAME}` reference that the boot config
+file already uses. When an admin typed such a reference into a plain
+text field, for example a bucket `alias`, the validation warnings and
+the Apply-dialog diff showed the resolved value, which can be a backend
+secret. Now every config write and validate response shows the
+`${env:NAME}` reference instead of the value.
+
 ### Fixed — `config lint` refuses what an apply refuses
 
 `config lint` passed a file with two replication rules of the same name,

@@ -1619,3 +1619,73 @@ async fn bootstrap_credentials_are_removed_explicitly_and_never_leave_auth_off()
     let body: serde_json::Value = remove().send().await.unwrap().json().await.unwrap();
     assert_eq!(body["removed"], false, "{body}");
 }
+
+/// Review 4 config-2 (S7): a `${env:NAME}` that the boot file resolves may
+/// be typed into ANY string field of an admin write, for example a bucket
+/// `alias`. Its VALUE must not come back in a warning, an error or the
+/// section diff, on any of the four config write/validate endpoints.
+#[tokio::test]
+async fn env_ref_values_never_echo_in_config_write_responses() {
+    const SECRET: &str = "supersecretvalue-rv4-config2";
+    let data = tempfile::TempDir::new().unwrap();
+    let doc = format!(
+        "access:\n  access_key_id: RV4KEY\n  secret_access_key: ${{env:RV4_SECRET}}\n\
+         storage:\n  filesystem: {}\n\
+         advanced:\n  listen_addr: {}\n  bootstrap_password_hash: \"{}\"\n",
+        data.path().join("fs").display(),
+        common::LISTEN_ADDR_PLACEHOLDER,
+        common::TEST_BOOTSTRAP_PASSWORD_HASH
+    );
+    let server = TestServer::from_config_document(
+        &doc,
+        data,
+        ("RV4KEY", SECRET),
+        "releases",
+        vec![("RV4_SECRET".to_string(), SECRET.to_string())],
+    )
+    .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let url = |p: &str| format!("{}/_/api/admin/config/{p}", server.endpoint());
+    let alias = json!({ "buckets": { "releases": { "alias": "${env:RV4_SECRET}" } } });
+
+    let mut bodies = Vec::new();
+    for path in ["section/storage/validate", "section/storage"] {
+        let method = if path.ends_with("validate") {
+            admin.post(url(path))
+        } else {
+            admin.put(url(path))
+        };
+        let resp = method.json(&alias).send().await.unwrap();
+        bodies.push((path, resp.text().await.unwrap()));
+    }
+    let exported = admin
+        .get(url("export"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let mut yaml: serde_yaml::Value = serde_yaml::from_str(&exported).unwrap();
+    yaml["storage"]["buckets"]["downloads"] = serde_yaml::from_str(
+        "alias: ${env:RV4_SECRET}\n",
+    )
+    .unwrap();
+    let yaml = serde_yaml::to_string(&yaml).unwrap();
+    for path in ["validate", "apply"] {
+        let resp = admin
+            .post(url(path))
+            .json(&json!({ "yaml": yaml }))
+            .send()
+            .await
+            .unwrap();
+        bodies.push((path, resp.text().await.unwrap()));
+    }
+    for (path, body) in &bodies {
+        assert!(
+            body.contains("alias"),
+            "{path}: the alias warning or diff is missing: {body}"
+        );
+        assert!(!body.contains(SECRET), "{path} echoes the env value: {body}");
+    }
+}

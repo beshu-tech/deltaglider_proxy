@@ -327,6 +327,15 @@ pub async fn validate_config_doc(
     State(state): State<Arc<AdminState>>,
     AdminJson(body): AdminJson<ConfigDocumentRequest>,
 ) -> impl IntoResponse {
+    let refs = super::running_env_refs(&state).await;
+    let resp = validate_config_doc_inner(&state, body).await.into_response();
+    super::scrub_env_response(resp, &refs).await
+}
+
+async fn validate_config_doc_inner(
+    state: &Arc<AdminState>,
+    body: ConfigDocumentRequest,
+) -> impl IntoResponse {
     let current = state.config.read().await.clone();
     match parse_and_validate_yaml(&body.yaml, &current.env_refs) {
         Ok((mut cfg, _)) => {
@@ -562,6 +571,24 @@ pub(crate) async fn apply_config_inner(
 /// `extra_env` (`name → value`): a backup restore passes the refs it made
 /// for values this host's env already supplies (see `hydrate_restore_doc`).
 pub(crate) async fn apply_config_inner_with_env(
+    state: &Arc<AdminState>,
+    headers: &HeaderMap,
+    body: ConfigDocumentRequest,
+    extra_env: &std::collections::BTreeMap<String, String>,
+) -> (StatusCode, ConfigApplyResponse) {
+    let mut refs = super::running_env_refs(state).await;
+    refs.extend(extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    let (status, mut resp) = apply_config_pipeline(state, headers, body, extra_env).await;
+    refs.extend(super::running_env_refs(state).await);
+    // S7: the typed response reaches the admin client (and backup restore).
+    let scrub = |m: &mut String| *m = crate::config::scrub_env_values(m, &refs);
+    resp.warnings.iter_mut().for_each(scrub);
+    resp.existing_warnings.iter_mut().for_each(scrub);
+    resp.error.iter_mut().for_each(scrub);
+    (status, resp)
+}
+
+async fn apply_config_pipeline(
     state: &Arc<AdminState>,
     headers: &HeaderMap,
     body: ConfigDocumentRequest,

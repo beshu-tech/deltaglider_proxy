@@ -579,6 +579,53 @@ async fn declarative_iam_precommit_gate(
         .map_err(|e| format!("declarative IAM reconcile failed (no state changed): {e}"))
 }
 
+/// S7 (review 4 config-2): an admin write may type a `${env:NAME}` that the
+/// boot file resolves into ANY string field (a bucket alias, a rule name);
+/// the value then comes back in check warnings, errors and the section
+/// diff. This is THE scrub for every config write/validate response: each
+/// string leaf gets the recorded values replaced by their refs.
+pub(super) fn scrub_env_json(
+    v: &mut serde_json::Value,
+    refs: &std::collections::BTreeMap<String, String>,
+) {
+    match v {
+        serde_json::Value::String(s) => *s = crate::config::scrub_env_values(s, refs),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|x| scrub_env_json(x, refs)),
+        serde_json::Value::Object(map) => map.values_mut().for_each(|x| scrub_env_json(x, refs)),
+        _ => {}
+    }
+}
+
+/// [`scrub_env_json`] over a finished handler response (JSON, else text),
+/// with `refs` = the running config's env refs before and after the write.
+pub(super) async fn scrub_env_response(
+    resp: axum::response::Response,
+    refs: &std::collections::BTreeMap<String, String>,
+) -> axum::response::Response {
+    let (mut parts, body) = resp.into_parts();
+    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let scrubbed = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(mut v) => {
+            scrub_env_json(&mut v, refs);
+            serde_json::to_vec(&v).unwrap_or_default()
+        }
+        Err(_) => crate::config::scrub_env_values(&String::from_utf8_lossy(&bytes), refs)
+            .into_bytes(),
+    };
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    axum::response::Response::from_parts(parts, axum::body::Body::from(scrubbed))
+}
+
+/// The env refs of the running config: the scrub set of a write response.
+pub(super) async fn running_env_refs(
+    state: &Arc<AdminState>,
+) -> std::collections::BTreeMap<String, String> {
+    state.config.read().await.env_refs.clone()
+}
+
 /// Re-apply the `DGP_*` overrides to an edited config (env wins at runtime,
 /// see `Config::reapply_env_overrides`) and return the operator warnings:
 /// one per env-controlled field the edit changed, one per secret now written
