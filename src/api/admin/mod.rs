@@ -173,8 +173,9 @@ pub struct AdminState {
     /// Coordination lease (same instance the scheduler uses) so admin handlers
     /// (run-now / verify / delete) can check whether a run is in flight
     /// REGARDLESS of the lease backend — the node-local SQLite check alone is
-    /// blind to a scheduler holding the S3 lease (H14/H29/H48). None when no
-    /// coordination lease is wired (e.g. no config DB / legacy mode).
+    /// blind to a scheduler holding the S3 lease (H14/H29/H48). Built once at
+    /// startup: `Some` exactly when `config_db` is (no handler builds its own
+    /// `LocalLease` fallback).
     pub coordination_lease: Option<Arc<dyn crate::coordination::CoordinationLease>>,
 }
 

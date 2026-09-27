@@ -39,7 +39,7 @@ use crate::api::handlers::AppState;
 use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
 use crate::config_sections::ReplicationRule;
-use crate::coordination::{CoordinationLease, LeaseSubsystem, LocalLease};
+use crate::coordination::{CoordinationLease, LeaseSubsystem};
 use crate::event_outbox::{
     current_unix_seconds, EventKind, EventOutboxRecord, EventSource, NewEvent,
 };
@@ -269,14 +269,12 @@ pub fn spawn_event_consumer(
     config: SharedConfig,
     db: Arc<Mutex<ConfigDb>>,
     state: Arc<AppState>,
-    lease: Option<Arc<dyn CoordinationLease>>,
+    lease: Arc<dyn CoordinationLease>,
 ) -> tokio::task::JoinHandle<()> {
     let instance_id = format!("event-consumer:{}", uuid::Uuid::new_v4());
     // Per-rule leases go through the SAME lease the scheduler uses (S3 when a
     // coordination bucket is configured), so the consumer and a reconcile run
-    // exclude each other across instances too. Node-local when none is given.
-    let lease: Arc<dyn CoordinationLease> =
-        lease.unwrap_or_else(|| Arc::new(LocalLease::new(db.clone())));
+    // exclude each other across instances too.
     tokio::spawn(async move {
         info!(
             "Replication event consumer started: instance_id={}",
@@ -1588,7 +1586,7 @@ mod claim_rule_tests {
             .await
             .replication_set_paused("paused", true)
             .unwrap();
-        let lease = LocalLease::new(db.clone());
+        let lease = crate::coordination::LocalLease::new(db.clone());
 
         let claim = claim_rule(&lease, &db, &config, "live", "c", 60).await;
         assert!(matches!(claim, RuleClaim::Held { .. }), "{claim:?}");

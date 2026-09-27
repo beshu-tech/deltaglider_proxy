@@ -87,10 +87,13 @@ pub async fn run_now(
     // consumer: the coordination lease chosen at startup (S3 when a
     // coordination bucket is configured, else node-local SQLite). So a run-now
     // never overlaps a scheduled run or a consumer drain on any instance.
-    let lease: Arc<dyn crate::coordination::CoordinationLease> = state
-        .coordination_lease
-        .clone()
-        .unwrap_or_else(|| Arc::new(crate::coordination::LocalLease::new(db_arc.clone())));
+    // Built once at startup, present whenever the config DB is.
+    let lease = state.coordination_lease.clone().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "config DB not available".to_string(),
+        )
+    })?;
     {
         let now = replication::current_unix_seconds();
         // The state row must exist before the SQLite lease can target it.
@@ -189,7 +192,7 @@ pub async fn run_now(
             }),
             concurrency,
             Some(maintenance_gate),
-            Some(lease.clone()),
+            lease.clone(),
         )
         .await;
         let _ = lease

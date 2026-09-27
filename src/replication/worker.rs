@@ -374,7 +374,7 @@ pub async fn run_rule(
     lease: Option<RunLease>,
     concurrency: RunConcurrency,
     maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
-    coordination_lease: Option<Arc<dyn crate::coordination::CoordinationLease>>,
+    coordination_lease: Arc<dyn crate::coordination::CoordinationLease>,
 ) -> Result<(i64, RunOutcome), crate::config_db::ConfigDbError> {
     let transfers = concurrency.transfers.clamp(1, 64) as usize;
     let upload_concurrency = concurrency.upload_concurrency.clamp(1, 16) as usize;
@@ -426,19 +426,17 @@ pub async fn run_rule(
     let lease_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let lease_guard = RunLeaseGuard {
         heartbeat: spawn_lease_heartbeat(
-            db.clone(),
             &rule.name,
             lease.clone(),
             coordination_lease.clone(),
             lease_alive.clone(),
         ),
         release: lease.as_ref().map(|l| {
-            let holder: Arc<dyn crate::coordination::CoordinationLease> = match &coordination_lease
-            {
-                Some(cl) => cl.clone(),
-                None => Arc::new(crate::coordination::LocalLease::new(db.clone())),
-            };
-            (holder, rule.name.clone(), l.owner.clone())
+            (
+                coordination_lease.clone(),
+                rule.name.clone(),
+                l.owner.clone(),
+            )
         }),
     };
     // A run-now is a deliberate ONE-OFF: it runs even a paused rule (pause
@@ -448,7 +446,6 @@ pub async fn run_rule(
         rule_name: rule.name.clone(),
         run_id,
         lease: lease.clone(),
-        coordination_lease: coordination_lease.clone(),
         lease_alive: lease_alive.clone(),
         one_off: triggered_by == "run-now",
         max_failures_retained,
@@ -1421,10 +1418,9 @@ fn page_is_throttle_aborted(copied: i64, throttled: i64, attempted: i64) -> bool
 // ponytail: 1s poll → ≤1s kill latency. A notify channel would be tighter but
 // the run loop has no other reason to hold one; poll until that changes.
 fn spawn_lease_heartbeat(
-    db: Arc<Mutex<ConfigDb>>,
     rule_name: &str,
     lease: Option<RunLease>,
-    coordination_lease: Option<Arc<dyn crate::coordination::CoordinationLease>>,
+    coordination_lease: Arc<dyn crate::coordination::CoordinationLease>,
     lease_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let lease = lease?;
@@ -1432,15 +1428,11 @@ fn spawn_lease_heartbeat(
     let heartbeat_secs = lease.heartbeat_secs.max(1) as u64;
     Some(tokio::spawn(async move {
         let interval = std::time::Duration::from_secs(heartbeat_secs);
-        let lock_wait = std::time::Duration::from_secs(2);
         loop {
             tokio::time::sleep(interval).await;
-            let renewed = if let Some(cl) = &coordination_lease {
-                // Shared/cross-instance renew — matches the trait-based acquire.
-                // The trait impl already carries its own bounded transient retry
-                // (S3Lease) or is a single SQLite CAS (LocalLease). A false/err
-                // verdict is terminal (genuinely lapsed / stolen).
-                cl.renew(
+            // The same lease the run was acquired through (S3 or SQLite).
+            let renewed = coordination_lease
+                .renew(
                     crate::coordination::LeaseSubsystem::Replication,
                     &rule_name,
                     &lease.owner,
@@ -1448,30 +1440,7 @@ fn spawn_lease_heartbeat(
                     lease.ttl_secs,
                 )
                 .await
-                .is_ok()
-            } else {
-                // Node-local SQLite renew with lock-light retry: a slow worker-side
-                // DB hold shouldn't drop the lease. Lock-acquire timeout retried
-                // (up to 3×); only a renew returning false is terminal.
-                let mut ok = false;
-                for _ in 0..3 {
-                    match tokio::time::timeout(lock_wait, db.lock()).await {
-                        Ok(db) => {
-                            ok = db
-                                .replication_renew_lease(
-                                    &rule_name,
-                                    &lease.owner,
-                                    current_unix_seconds(),
-                                    lease.ttl_secs,
-                                )
-                                .unwrap_or(false);
-                            break;
-                        }
-                        Err(_elapsed) => continue,
-                    }
-                }
-                ok
-            };
+                .is_ok();
             if renewed {
                 continue;
             }
@@ -1630,11 +1599,6 @@ struct RunControl {
     rule_name: String,
     run_id: i64,
     lease: Option<RunLease>,
-    /// Cross-instance lease (when the job plane runs shared). When present the
-    /// heartbeat renews through it (matching the acquire), so an
-    /// S3-CAS lease is renewed against the SAME object the scheduler took — not
-    /// the node-local SQLite row.
-    coordination_lease: Option<Arc<dyn crate::coordination::CoordinationLease>>,
     lease_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     one_off: bool,
     max_failures_retained: u32,
@@ -1650,7 +1614,7 @@ impl RunControl {
     /// A lost lease is recorded as a run failure only on the `renew` variant
     /// so back-to-back checks don't double-log.
     async fn check(&self, renew: bool) -> Result<ControlVerdict, crate::config_db::ConfigDbError> {
-        let mut lease_ok =
+        let lease_ok =
             self.lease.is_none() || self.lease_alive.load(std::sync::atomic::Ordering::Acquire);
         // Read cancel/paused under the DB lock, then DROP it before any lease
         // renew — the trait renew may do S3 I/O and must never run while holding
@@ -1666,22 +1630,9 @@ impl RunControl {
             );
             (cancel, paused)
         };
-        // A coordination lease is renewed ONLY by the heartbeat task (its
-        // verdict lands in `lease_alive`): a trait renew here cost one S3 GET
-        // + conditional PUT per listing page and per 32 events.
-        if lease_ok && renew && self.coordination_lease.is_none() {
-            if let Some(l) = &self.lease {
-                // No injected coordination lease (e.g. an admin run-now without
-                // one) → the node-local SQLite renew, as before.
-                let g = self.db.lock().await;
-                lease_ok = g.replication_renew_lease(
-                    &self.rule_name,
-                    &l.owner,
-                    current_unix_seconds(),
-                    l.ttl_secs,
-                )?;
-            }
-        }
+        // The lease is renewed ONLY by the heartbeat task (its verdict lands
+        // in `lease_alive`): a renew here cost one S3 GET + conditional PUT
+        // per listing page and per 32 events.
         // Mid-run maintenance deferral: a dest bucket that became write-gated
         // (migrate / re-encrypt) must stop the run like a pause — cursor kept,
         // resumes when the maintenance job clears. Not suppressed by one_off:
@@ -2133,7 +2084,7 @@ mod tests {
             }),
             RunConcurrency::default(),
             None,
-            Some(lease.clone()),
+            lease.clone(),
         )
         .await
         .unwrap();
@@ -2194,7 +2145,7 @@ mod tests {
                     }),
                     RunConcurrency::default(),
                     None,
-                    Some(lease),
+                    lease,
                 )
                 .await
             }

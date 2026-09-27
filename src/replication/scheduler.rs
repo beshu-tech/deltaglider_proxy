@@ -11,7 +11,7 @@ use crate::background::parse_duration_or;
 use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
 use crate::config_sections::ReplicationConfig;
-use crate::coordination::{CoordinationLease, LeaseSubsystem, LocalLease};
+use crate::coordination::{CoordinationLease, LeaseSubsystem};
 use crate::replication::{current_unix_seconds, run_rule, RunLease};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,13 +27,9 @@ pub fn spawn_scheduler(
     config: SharedConfig,
     db: Arc<Mutex<ConfigDb>>,
     state: Arc<AppState>,
-    lease: Option<Arc<dyn CoordinationLease>>,
+    lease: Arc<dyn CoordinationLease>,
 ) -> tokio::task::JoinHandle<()> {
     let instance_id = format!("scheduler:{}", uuid::Uuid::new_v4());
-    // Default to a node-local lease when none was injected (dev / no coordination
-    // bucket) so the scheduler always has a lease handle to call.
-    let lease: Arc<dyn CoordinationLease> =
-        lease.unwrap_or_else(|| Arc::new(LocalLease::new(db.clone())));
     tokio::spawn(async move {
         info!("Replication scheduler started: instance_id={}", instance_id);
         loop {
@@ -178,7 +174,7 @@ async fn run_due_rules(
                 dir_concurrency: replication.dir_concurrency,
             },
             Some(state.maintenance_gate.clone()),
-            Some(lease.clone()),
+            lease.clone(),
         )
         .await
         {

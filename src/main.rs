@@ -882,13 +882,13 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             config_db.clone(),
             state.clone(),
         );
-        if let Some(db) = config_db.as_ref() {
+        if let (Some(db), Some(lease)) = (config_db.as_ref(), coordination_lease.as_ref()) {
             // Reconcile scheduler — the slow (≈24h) full list-and-diff safety net.
             deltaglider_proxy::replication::scheduler::spawn_scheduler(
                 shared_config.clone(),
                 db.clone(),
                 state.clone(),
-                coordination_lease.clone(),
+                lease.clone(),
             );
             // Event-driven consumer — the PRIMARY trigger: drains object
             // mutations from the outbox and replicates in near-real time.
@@ -896,7 +896,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 shared_config.clone(),
                 db.clone(),
                 state.clone(),
-                coordination_lease.clone(),
+                lease.clone(),
             );
             deltaglider_proxy::event_delivery::spawn_dispatcher(shared_config.clone(), db.clone());
         }
