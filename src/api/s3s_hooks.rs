@@ -23,12 +23,12 @@ impl S3Auth for DeltaGliderS3sAuth {
     async fn get_secret_key(&self, access_key: &str) -> s3s::S3Result<SecretKey> {
         match self.iam_state.load().as_ref() {
             IamState::Disabled => {
-                // The legacy Axum path ignores signatures in open-dev mode.
-                // In open mode, accept the common "same access key + secret"
-                // dummy pattern used by SDK clients (test/test, anonymous/
-                // anonymous). This lets s3s decode signed/chunked SDK
-                // requests without making local-dev users discover a magic
-                // hardcoded secret.
+                // s3s verifies every signed request, open mode included (it
+                // needs the secret to read aws-chunked bodies). Open mode
+                // accepts the "same access key + secret" dummy pattern
+                // (test/test, anonymous/anonymous); any other pair fails
+                // with SignatureDoesNotMatch, as the docs and the startup
+                // banner say.
                 Ok(SecretKey::from(access_key.to_string()))
             }
             IamState::Legacy(auth) if access_key == auth.access_key_id => {

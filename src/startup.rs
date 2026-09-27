@@ -177,6 +177,7 @@ pub fn validate_auth_config(config: &Config, iam_db_has_users: bool) {
             warn!("  ║  WARNING: All S3 data is accessible without credentials.        ║");
             warn!("  ║  Set access_key_id + secret_access_key for production use.      ║");
             warn!("  ╚══════════════════════════════════════════════════════════════════╝");
+            warn!("  Signed requests must use a secret key equal to the access key (e.g. dummy/dummy)");
         }
         AuthConfigOutcome::UnrecognizedMode => {
             error!(

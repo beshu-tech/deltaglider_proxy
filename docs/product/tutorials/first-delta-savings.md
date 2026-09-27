@@ -83,7 +83,7 @@ echo "fix: watchdog timeout on cold boot" > firmware-build/CHANGELOG
 tar -cf fw-1.4.1.tar firmware-build
 ```
 
-This time we'll upload the way a CI pipeline would: with the AWS CLI. The proxy speaks standard S3, so the only special thing is the endpoint URL. In open-access mode any credentials pass, so dummies will do:
+This time we'll upload the way a CI pipeline would: with the AWS CLI. The proxy speaks standard S3, so the only special thing is the endpoint URL. In open-access mode the proxy accepts a signed request whose secret key is the same as its access key, so the dummy pair below will do:
 
 ```bash
 export AWS_ACCESS_KEY_ID=dummy

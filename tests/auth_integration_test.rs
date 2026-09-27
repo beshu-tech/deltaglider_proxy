@@ -3603,3 +3603,36 @@ async fn bootstrap_login_stores_only_s3_credentials_the_proxy_accepts() {
         .unwrap();
     assert!(body.contains("AKBOOT"), "bootstrap mode: {body}");
 }
+
+/// auth-3: open access (`authentication: none`) still verifies a signed
+/// request, with the access key as the secret (s3s needs a secret to read
+/// signed and chunked bodies). Pins the documented contract: unsigned and
+/// key == secret are served, any other pair is refused.
+#[tokio::test]
+async fn open_access_serves_unsigned_and_key_equals_secret_only() {
+    let server = TestServer::builder().open_access().build().await;
+    let bucket = server.bucket().to_string();
+    let ok = server.s3_client_with_creds("dummy", "dummy").await;
+    ok.list_objects_v2()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect("dummy/dummy");
+    let r = reqwest::get(format!("{}/{bucket}", server.endpoint()))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "unsigned");
+    let real = server
+        .s3_client_with_creds("AKIAREALKEY", "realsecret")
+        .await;
+    let err = real
+        .list_objects_v2()
+        .bucket(&bucket)
+        .send()
+        .await
+        .expect_err("key != secret is refused in open mode");
+    assert!(
+        format!("{err:?}").contains("SignatureDoesNotMatch"),
+        "{err:?}"
+    );
+}
