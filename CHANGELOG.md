@@ -31,6 +31,34 @@
    - Delta objects larger than 16 MiB use the spool directory, so
      `DGP_SPOOL_DIR` must be writable.
 
+### Changed — licensing: the free grant and the plans are per organization
+
+The Additional Use Grant in `LICENSE` is rewritten for 2.0.0. The free
+limit stays at 15 TB, and the grant now says exactly what it measures:
+
+- **Per organization.** The limit applies to your organization as a whole:
+  you, together with every entity that you control, that controls you, or
+  that is under common control with you. The Commercial plan ($5k/year) is
+  also per organization, not per deployment, and it covers any number of
+  instances, clusters, and regions.
+- **Every stored copy counts.** The stored footprint counts every copy that
+  DeltaGlider writes, after compression: primary data, replicas, archives,
+  and reference and metadata objects. Copies that your storage provider
+  keeps for its own redundancy do not count.
+- **Monthly average.** The footprint is the average, over a calendar month,
+  of one measurement a day, so a short spike does not push you over.
+- **Enterprise tier.** Above 1 PB, or when you need custom terms, the
+  Enterprise plan applies. It has no fixed price.
+- **OEM for embedding.** Offering DeltaGlider as a hosted, managed, or
+  multi-tenant service, or shipping it inside a commercial product or
+  appliance, needs an OEM license. Running DeltaGlider for one customer, in
+  infrastructure that the customer controls, is that customer's own use.
+
+Older releases keep their terms: releases up to v1.17.0 stay GPL-3.0, and
+v1.18.x and v1.19.x keep the grant text that they shipped with. Every
+release still becomes Apache-2.0 two years after it ships. See
+[deltaglider.com/pricing](https://deltaglider.com/pricing/).
+
 ### Fixed — The first-run banner no longer ties the password to the IAM database
 
 Without a TTY, the first-run banner said that a password change in the admin
