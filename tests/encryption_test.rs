@@ -184,7 +184,7 @@ async fn test_data_encrypted_on_disk() {
 /// were plaintext — a silent data-corruption bug that looks like
 /// "DGE1...random bytes..." on the client side with no error.
 ///
-/// The fix is in `src/deltaglider/engine/mod.rs`: the EncryptingBackend
+/// The fix is in `src/deltaglider/engine/construction.rs`: the EncryptingBackend
 /// is always wrapped, and when the key is None its read path returns
 /// `StorageError::Encryption("object is encrypted but no key is
 /// configured")` on any object whose metadata carries the

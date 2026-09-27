@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
 
+use super::construction::{
+    native_encryption_for, resolve_legacy_shim, wrap_backend_with_encryption, KeyIdCollisionCheck,
+};
+use super::metadata::reference_integrity_ok;
 use super::*;
 
 // ──────────────────────────────────────────────────────────────

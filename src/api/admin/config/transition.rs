@@ -116,7 +116,7 @@ pub(super) fn engine_affecting_fields_changed(
         || old.cache_size_mb != new.cache_size_mb
         || old.max_delta_ratio != new.max_delta_ratio
         || old.metadata_cache_mb != new.metadata_cache_mb
-        // The engine snapshots these at construction (engine/mod.rs), so a
+        // The engine snapshots these at construction (engine/construction.rs), so a
         // change is a silent no-op without a rebuild (reported applied:true but
         // the running engine keeps the old limit / codec parallelism).
         || old.max_passthrough_object_size != new.max_passthrough_object_size

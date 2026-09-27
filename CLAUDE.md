@@ -78,7 +78,12 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
       form_post.rs           Browser multipart/form-data PostObject upload (s3s doesn't model this shape)
       status.rs              /_/health, /_/stats
   → deltaglider/engine/      Orchestration split into submodules:
-      mod.rs                 Core engine: route, compress, cache, metadata resolution, RetrieveResponse, validated_key
+      mod.rs                 Core types: DeltaGliderEngine, EngineError, RetrieveResponse, ListObjectsPage, StoreContext; re-exports
+      construction.rs        DynEngine::new, backend build + per-backend encryption wrapping (derive_key_id), builders
+      metadata.rs            validated_key, metadata resolution, HEAD, verified reference cache (get_reference_cached)
+      locking.rs             prefix_locks, ReferenceLockGuard + the `reference_writes` module (RefWriteProof), with_dest_prefix_lock
+      list.rs / delete.rs    ListObjects + pagination helpers / delete paths + reference reclamation
+      raw.rs / resources.rs  raw deltaspace blob accessors / spool + codec permits + accessors (also usage.rs, buckets.rs)
       store.rs               PUT pipeline: delta encoding, migration, reference management; `store_spooled_delta` (streaming PUT for objects > spool threshold)
       retrieve.rs            GET pipeline: delta reconstruction, streaming, range requests; `reconstruct_delta_to_spool` (streaming GET)
   → deltaglider/spool.rs    Quota'd temp space for streaming codec ops (SpoolDir byte-budget semaphore; `acquire_pair` for the deadlock-safe ref+out reservation; age-based startup orphan sweep; `SpoolBudget` hands a storage write — the encrypting wrapper's ciphertext/joined-parts temps — the caller's held spool + a reservation taken BEFORE the deltaspace lock, and a storage write never waits for budget; multipart relay parts and the buffered codec's source file are spool files too — `no_scratch_files_outside_the_spool` source-guards it). DGP_SPOOL_DIR/`_MAX_BYTES`/`_THRESHOLD_BYTES`/`_ACQUIRE_TIMEOUT_SECS`.
@@ -291,7 +296,7 @@ single-instance planes below are addressed.
 - **Maintenance write-gate busy-set** (`engine/mod.rs`, in-process) — still
   node-local.
 - **Delta-reference RMW lock** — the in-process `prefix_locks` mutex
-  (`engine/mod.rs`) serializes same-node threads; when a `config_sync_bucket` is
+  (`engine/locking.rs`) serializes same-node threads; when a `config_sync_bucket` is
   configured it is now ALSO wrapped by a CROSS-INSTANCE per-deltaspace mutex
   (`src/coordination/reference_lock.rs`, `S3ReferenceLock`) held around the
   reference read-modify-write in the two delta-baseline paths (`store_inner`,
@@ -311,7 +316,7 @@ single-instance planes below are addressed.
   therefore wait real time (TTL 2 s), a simulated `now` no longer expires a lock.
   Every engine write of reference.bin (and of a delta) goes through a guard method:
   the backend write takes a `RefWriteProof` that only the guard's
-  `reference_writes` module in `engine/mod.rs` makes, incl. delete-reclaim, sweep-reclaim,
+  `reference_writes` module in `engine/locking.rs` makes, incl. delete-reclaim, sweep-reclaim,
   legacy-reference migration and the replication fast-path seed
   (`with_dest_prefix_lock` holds both locks).
   FENCED: the acquire observes reference.bin (`StorageBackend::reference_fence`,

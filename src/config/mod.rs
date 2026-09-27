@@ -333,7 +333,7 @@ pub struct Config {
 ///
 /// Replaces the former global `advanced.encryption_key` single-key model.
 /// Each named backend declares its OWN mode; the engine wraps each
-/// backend independently (see `src/deltaglider/engine/mod.rs` backend
+/// backend independently (see `src/deltaglider/engine/construction.rs` backend
 /// registry construction). Four modes:
 ///
 /// - `None` — objects stored plaintext.
@@ -348,7 +348,7 @@ pub struct Config {
 /// - `SseS3` — delegate to S3 native AES256 (no KMS involvement).
 ///
 /// Name mixing in the default key_id derivation (see
-/// `resolve_encryption` in engine/mod.rs) is load-bearing: two
+/// `derive_key_id` in engine/construction.rs) is load-bearing: two
 /// backends with identical `key` bytes but different names produce
 /// DIFFERENT ids, so objects are NOT accidentally portable between
 /// them. Operators who want portability set an explicit identical
@@ -376,7 +376,7 @@ pub enum BackendEncryptionConfig {
     /// `key_id` is stamped on each object's `dg-encryption-key-id`
     /// metadata; derived automatically from `SHA-256(backend_name || key)`
     /// when absent. `legacy_key`/`legacy_key_id` provide a decrypt-only
-    /// shim during mode transitions (see engine/mod.rs resolver).
+    /// shim during mode transitions (see engine/construction.rs resolver).
     Aes256GcmProxy {
         /// 64-char hex key. Infra secret; stripped by redactors.
         #[serde(default, skip_serializing_if = "Option::is_none")]
