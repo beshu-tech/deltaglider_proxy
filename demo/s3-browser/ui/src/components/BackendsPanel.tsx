@@ -6,7 +6,8 @@ import { qk } from '../queries/keys';
 import { Button, Input, Radio, Switch, Typography, Space, Alert, Spin, message } from 'antd';
 import { PlusOutlined, DeleteOutlined, DatabaseOutlined, CloudOutlined, CheckCircleOutlined, ApiOutlined } from '@ant-design/icons';
 import type { BackendHealthEntry, BackendInfo, CreateBackendRequest } from '../adminApi';
-import { createBackend, deleteBackend, probeBackend, testS3Connection, updateAdminConfig, putSection, getSectionVersioned } from '../adminApi';
+import { createBackend, deleteBackend, probeBackend, testS3Connection, updateAdminConfig, getSectionVersioned } from '../adminApi';
+import { applySection, sectionApplyErrorText } from '../applySection';
 import { useAdminConfig } from '../queries/config';
 import { useBackends, useBucketOrigins } from '../queries/backends';
 import CreateBucketModal from './CreateBucketModal';
@@ -312,7 +313,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       // another editor changed the section in between.
       const { body: storage, version } = await getSectionVersioned<StorageSectionBackends>('storage');
       const body = buildEncryptionSectionBody(backendName, patch, storage);
-      const result = await putSection('storage', body, version);
+      const result = await applySection(qc, 'storage', body, version);
       if (!result.ok) {
         setSaveResult({
           ok: false,
@@ -349,7 +350,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       }
     } catch (e) {
       if (e instanceof Error && !resultSet) {
-        setSaveResult({ ok: false, message: normalizeUiError(e, 'Re-encryption proposal failed') });
+        setSaveResult({ ok: false, message: sectionApplyErrorText(e, 'Failed to apply the encryption change') });
       }
       throw e;
     }
@@ -359,7 +360,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
   const handleClearLegacy = async (backendName: string): Promise<void> => {
     try {
       const { body: storage, version } = await getSectionVersioned<StorageSectionBackends>('storage');
-      const result = await putSection('storage', buildClearLegacySectionBody(backendName, storage), version);
+      const result = await applySection(qc, 'storage', buildClearLegacySectionBody(backendName, storage), version);
       if (!result.ok) {
         setSaveResult({ ok: false, message: result.error || 'Failed to clear the legacy key' });
         return;
@@ -368,7 +369,7 @@ export default function BackendsPanel({ onSessionExpired }: Props) {
       qc.removeQueries({ queryKey: qk.backends.legacyKeyUsage(backendName) });
       await refresh();
     } catch (e) {
-      setSaveResult({ ok: false, message: normalizeUiError(e, 'Failed to clear the legacy key') });
+      setSaveResult({ ok: false, message: sectionApplyErrorText(e, 'Failed to clear the legacy key') });
     }
   };
 

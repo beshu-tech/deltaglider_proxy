@@ -41,14 +41,9 @@ import { createElement, useCallback, useEffect, useRef, useState } from 'react';
 import { Button, Modal, Space, Typography, message } from 'antd';
 import { useQueryClient } from '@tanstack/react-query';
 import type { SectionApplyResponse, SectionName } from './adminApi';
-import {
-  ConfigConflictError,
-  getSectionVersioned,
-  putSection,
-  validateSection,
-} from './adminApi';
-import { onSectionVersionAdvanced, sectionVersionAdvanced } from './sectionVersionBus';
-import { qk } from './queries/keys';
+import { ConfigConflictError, getSectionVersioned, validateSection } from './adminApi';
+import { SECTION_CONFLICT_TITLE, applySection } from './applySection';
+import { onSectionVersionAdvanced } from './sectionVersionBus';
 import { useApplyHandler, useDirtySection } from './useDirtySection';
 import { normalizeUiError } from './errorHandling';
 import { isSessionExpired } from './errorHandling';
@@ -277,7 +272,7 @@ export function useSectionEditor<Wire, Local = Wire>(
   // re-runs validate, so the ApplyDialog shows the diff from the new state).
   const openConflict = useCallback(() => {
     const dialog = Modal.confirm({
-      title: 'This section changed in another tab or by another admin',
+      title: SECTION_CONFLICT_TITLE,
       content: createElement(
         Space,
         { orientation: 'vertical', size: 8 },
@@ -319,27 +314,19 @@ export function useSectionEditor<Wire, Local = Wire>(
       // A 409 (stale version) goes to the conflict dialog below; a 401 is
       // handled (sign in again + retry) inside the admin fetch layer.
       const sent = versionRef.current;
-      const resp = await putSection<Wire>(section, pendingBody, sent);
+      const resp = await applySection<Wire>(queryClient, section, pendingBody, sent);
       if (!resp.ok) {
         message.error(resp.error || 'Apply failed');
         return false;
       }
-      if (sent && resp.version) {
-        // Sibling editors of this section in this tab follow our own edit.
-        sectionVersionAdvanced(section, sent, resp.version);
-        versionRef.current = resp.version;
-      }
+      // This editor now stands on the version its own PUT produced.
+      if (resp.version) versionRef.current = resp.version;
       message.success(
         resp.persisted_path ? `Applied + persisted to ${resp.persisted_path}` : 'Applied'
       );
       markApplied(pendingLocalRef.current ?? undefined);
       setApplyOpen(false);
       setPendingBody(null);
-      // Other panels read the full config via the cached `qk.config()`
-      // query (AdmissionPanel's synthesised-blocks preview, Authentication/
-      // Groups banners, the section overviews, etc.). A section PUT changed
-      // server truth, so invalidate that cache to refetch.
-      void queryClient.invalidateQueries({ queryKey: qk.config() });
       void rebaseAfterApply();
       return true;
     } catch (e) {
