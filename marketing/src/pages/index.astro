@@ -108,7 +108,7 @@ import {
       </p>
 
       <div class="dd-grid">
-        <article class="dd-card" data-n="01">
+        <article class="dd-card">
           <h3 class="dd-q">Will it corrupt my artifacts?</h3>
           <p class="dd-a">
             Every delta read is rebuilt and checked with SHA-256 against
@@ -119,7 +119,7 @@ import {
           <a class="dd-link" href="https://github.com/beshu-tech/deltaglider_proxy">Read the source: every line is public</a>
         </article>
 
-        <article class="dd-card dd-card--accent" data-n="02">
+        <article class="dd-card">
           <h3 class="dd-q">What breaks in production?</h3>
           <p class="dd-a">
             We pushed our own 1.71&nbsp;TB release catalog through the
@@ -129,7 +129,7 @@ import {
           <a class="dd-link" href="/case-studies/readonlyrest-builds">Read the migration log</a>
         </article>
 
-        <article class="dd-card dd-card--accent" data-n="03">
+        <article class="dd-card">
           <h3 class="dd-q">Will bugs get fixed, or hidden?</h3>
           <p class="dd-a">
             A correctness audit by five investigators found 10 bugs. We
@@ -139,7 +139,7 @@ import {
           <a class="dd-link" href="https://github.com/beshu-tech/deltaglider_proxy/blob/main/CHANGELOG.md">The bug-by-bug CHANGELOG</a>
         </article>
 
-        <article class="dd-card" data-n="04">
+        <article class="dd-card">
           <h3 class="dd-q">Who answers when it breaks at 2 a.m.?</h3>
           <p class="dd-a">
             The people whose names are in <code>git log</code>. Your mail
@@ -148,7 +148,7 @@ import {
           <a class="dd-link" href="mailto:contact@beshu.tech?subject=DeltaGlider%20-%20General%20inquiry">contact@beshu.tech</a>
         </article>
 
-        <article class="dd-card dd-card--wide" data-n="05">
+        <article class="dd-card dd-card--wide">
           <h3 class="dd-q">Who wrote it, engineers or an AI?</h3>
           <p class="dd-a">
             The engineers in <code>git log</code>, with help from Claude
@@ -250,7 +250,6 @@ import {
     height: 7px;
     border-radius: 50%;
     background: var(--brand);
-    box-shadow: 0 0 8px var(--brand-glow);
   }
 
   .hero-points strong {
@@ -271,51 +270,23 @@ import {
   .dd-card {
     position: relative;
     overflow: hidden;
-    padding: 2.2rem 2.4rem 2.1rem;
+    padding: 1.75rem 2rem;
     background: var(--bg-card);
     border: 1px solid var(--rule);
-    border-radius: 16px;
-    box-shadow: var(--shadow-sm);
-    transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+    border-radius: var(--r-md);
   }
 
-  .dd-card:hover {
-    transform: translateY(-3px);
-    border-color: var(--brand-glow);
-    box-shadow: var(--shadow-md);
-  }
-
-  .dd-card--accent:hover {
-    border-color: var(--accent-strong);
-  }
 
   /* the provenance card spans both columns; give its text more room */
   .dd-card--wide { grid-column: 1 / -1; }
   .dd-card--wide .dd-q { max-width: 30ch; }
   .dd-card--wide .dd-a { max-width: var(--measure); }
 
-  /* giant watermark number — graphic weight without clutter */
-  .dd-card::before {
-    content: attr(data-n);
-    position: absolute;
-    top: -1.6rem;
-    right: -0.6rem;
-    font-family: var(--font-mono);
-    font-size: 7.5rem;
-    font-weight: 800;
-    line-height: 1;
-    color: var(--brand-tint);
-    pointer-events: none;
-  }
-  .dd-card--accent::before {
-    color: var(--accent-wash);
-  }
-
   .dd-q {
     margin: 0 0 0.8rem;
-    font-size: 1.45rem;
-    font-weight: 800;
-    letter-spacing: -0.015em;
+    font-size: var(--fs-h3);
+    font-weight: 700;
+    letter-spacing: -0.01em;
     line-height: 1.15;
     color: var(--ink-strong);
     max-width: 18ch;

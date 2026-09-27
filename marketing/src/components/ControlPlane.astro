@@ -73,11 +73,10 @@ import Glyph from './Glyph.astro';
     </header>
 
     <div class="feat-grid">
-      {features.map((f, i) => (
+      {features.map((f) => (
         <div class="feat">
           <Glyph name={f.glyph} />
           <div class="feat-body">
-            <span class="feat-idx">{String(i + 1).padStart(2, '0')}</span>
             <h3 class="feat-title">{f.title}</h3>
             <p class="feat-desc">{f.desc}</p>
           </div>
@@ -176,14 +175,13 @@ import Glyph from './Glyph.astro';
     display: grid;
     grid-template-columns: 1fr;
     gap: 2rem 3rem;
-    max-width: var(--measure-wide);
   }
   @media (min-width: 720px) {
     .feat-grid { grid-template-columns: 1fr 1fr; }
   }
 
   .feat {
-    border-top: 2px solid var(--rule-strong);
+    border-top: 1px solid var(--rule-strong);
     padding-top: 1.4rem;
     display: flex;
     gap: 1.3rem;
@@ -198,19 +196,12 @@ import Glyph from './Glyph.astro';
     .feat { flex-direction: column; gap: 0.75rem; }
   }
 
-  .feat-idx {
-    font-family: var(--font-mono);
-    font-size: 0.95rem;
-    font-weight: 700;
-    letter-spacing: 0.1em;
-    color: var(--brand-dark);
-  }
 
   .feat-title {
-    margin: 0.45rem 0 0.55rem;
-    font-size: 1.4rem;
-    font-weight: 800;
-    letter-spacing: -0.015em;
+    margin: 0.6rem 0 0.5rem;
+    font-size: var(--fs-h3);
+    font-weight: 700;
+    letter-spacing: -0.01em;
     color: var(--ink-strong);
     line-height: 1.15;
   }
