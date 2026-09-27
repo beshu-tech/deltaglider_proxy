@@ -220,6 +220,17 @@ pub fn lint(file: &str) -> i32 {
         return EXIT_REJECTED;
     }
 
+    // The flat shape ignores unknown root keys (no deny_unknown_fields, for
+    // old files): name them, a typo keeps the default silently otherwise.
+    let mut warnings = warnings;
+    if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
+        warnings.extend(
+            crate::config::unknown_flat_root_keys(&doc)
+                .into_iter()
+                .map(|k| format!("unknown root key '{k}' is ignored")),
+        );
+    }
+
     for w in &warnings {
         eprintln!("warning: {w}");
     }

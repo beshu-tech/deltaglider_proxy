@@ -1595,6 +1595,27 @@ fn classify_shape(doc: &serde_yaml::Value) -> ConfigShape {
     }
 }
 
+/// Root keys of a FLAT-shape document that `Config` does not know. The flat
+/// shape keeps serde's lenient default (review 4 config-11: a
+/// `deny_unknown_fields` there would stop an existing file from booting), so
+/// the loader and `config lint` name them instead. Empty for any other shape.
+pub fn unknown_flat_root_keys(doc: &serde_yaml::Value) -> Vec<String> {
+    if !matches!(classify_shape(doc), ConfigShape::Flat) {
+        return Vec::new();
+    }
+    let Some(map) = doc.as_mapping() else {
+        return Vec::new();
+    };
+    let schema = schemars::schema_for!(Config);
+    let known = schema.schema.object.as_ref().map(|o| &o.properties);
+    map.keys()
+        .filter_map(|k| k.as_str())
+        .filter(|k| *k != "admin_password_hash") // serde alias
+        .filter(|k| !known.is_some_and(|p| p.contains_key(*k)))
+        .map(str::to_string)
+        .collect()
+}
+
 impl Config {
     /// Load configuration from a file. YAML is the only supported format;
     /// a `.toml` path fails loudly with [`TOML_REMOVED_MSG`] (operators
@@ -1658,6 +1679,13 @@ impl Config {
                 sectioned.into_flat().map_err(ConfigError::Parse)?
             }
             ConfigShape::Flat => {
+                let unknown = unknown_flat_root_keys(&doc);
+                if !unknown.is_empty() {
+                    tracing::warn!(
+                        "config: unknown root key(s) ignored: {} (a typo keeps the default)",
+                        unknown.join(", ")
+                    );
+                }
                 lenient::from_value(doc).map_err(|e| ConfigError::Parse(e.to_string()))?
             }
             ConfigShape::Mixed {
@@ -5536,6 +5564,22 @@ storage:
             msg.contains("default_backnd"),
             "error must name the offending field, got: {msg}"
         );
+    }
+
+    /// Review 4 config-11: the flat shape has no `deny_unknown_fields`
+    /// (tightening it would stop an existing file from booting), so a typo
+    /// such as `cache_size_mbb` loaded silently as the default. It is now
+    /// named: in the load log and in `config lint`.
+    #[test]
+    fn unknown_flat_root_keys_are_named() {
+        let doc: serde_yaml::Value = serde_yaml::from_str(
+            "cache_size_mbb: 5\nlisten_addr: 0.0.0.0:9000\nadmin_password_hash: x\ndefaults: v1\n",
+        )
+        .unwrap();
+        assert_eq!(unknown_flat_root_keys(&doc), vec!["cache_size_mbb".to_string()]);
+        // Sectioned documents are strict already: nothing to report.
+        let doc: serde_yaml::Value = serde_yaml::from_str("advanced: {}\n").unwrap();
+        assert!(unknown_flat_root_keys(&doc).is_empty());
     }
 
     #[test]

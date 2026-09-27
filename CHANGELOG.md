@@ -80,6 +80,13 @@ release has no generation and keeps the old rule. During a rolling upgrade,
 an instance on the older release does not merge copies from upgraded
 instances until it is upgraded too, as with every schema change.
 
+### Fixed — An unknown key in a flat config file is named
+
+A flat-shape config file ignored a root key that it did not know, so a
+typo such as `cache_size_mbb: 5` loaded as the default, with no message.
+Now the proxy logs a warning that names the key, and `config lint`
+reports it. The file still loads, so an existing file keeps working.
+
 ### Docs — Every environment variable is in the configuration reference
 
 Eleven `DGP_*` variables that the proxy reads had no row in the
