@@ -42,6 +42,11 @@ jobs:
         working-directory: marketing
         run: npm run typecheck
 
+      # Unit tests: docs anchors resolve, llms.txt lists every doc, pricing.
+      - name: Test
+        working-directory: marketing
+        run: npm test
+
       - name: Build (SSG + sitemap + SEO smoke test)
         working-directory: marketing
         run: npm run build
