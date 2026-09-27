@@ -62,20 +62,43 @@ fn head_range_is_partial(
 /// [`DeltaGliderS3Service`](crate::s3_adapter_s3s::DeltaGliderS3Service)
 /// and the [`VerifiedIdentityS3sAccess`](crate::api::s3s_hooks::VerifiedIdentityS3sAccess)
 /// hook.
-#[allow(clippy::too_many_arguments)]
-pub fn build_s3_router(
-    state: &Arc<AppState>,
-    iam_state: &SharedIamState,
-    metrics: &Arc<Metrics>,
-    rate_limiter: &RateLimiter,
-    replay_cache: &crate::api::auth::ReplayCache,
-    config: &Config,
-    config_db_mismatch: bool,
-    public_prefix_snapshot: &crate::bucket_policy::SharedPublicPrefixSnapshot,
-    admission_chain: &crate::admission::SharedAdmissionChain,
-    shared_config: &crate::config::SharedConfig,
-) -> Router {
+pub fn build_s3_router(deps: RouterDeps<'_>) -> Router {
+    let service = crate::s3_adapter_s3s::DeltaGliderS3Service::new(
+        deps.state.clone(),
+        deps.shared_config.clone(),
+    );
     build_s3_router_with(
+        deps,
+        service,
+        crate::api::s3s_hooks::VerifiedIdentityS3sAccess,
+    )
+}
+
+/// What the S3 router is built from: the shared state that every layer and
+/// the s3s service read.
+pub struct RouterDeps<'a> {
+    pub state: &'a Arc<AppState>,
+    pub iam_state: &'a SharedIamState,
+    pub metrics: &'a Arc<Metrics>,
+    pub rate_limiter: &'a RateLimiter,
+    pub replay_cache: &'a crate::api::auth::ReplayCache,
+    /// The config at build time (layer limits, CORS, timeouts).
+    pub config: &'a Config,
+    pub config_db_mismatch: bool,
+    pub public_prefix_snapshot: &'a crate::bucket_policy::SharedPublicPrefixSnapshot,
+    pub admission_chain: &'a crate::admission::SharedAdmissionChain,
+    /// The live, hot-reloaded config.
+    pub shared_config: &'a crate::config::SharedConfig,
+}
+
+/// [`build_s3_router`] with the `S3` impl and the s3s access hook given
+/// (the contract test records through them).
+pub fn build_s3_router_with<S, A>(deps: RouterDeps<'_>, s3: S, access: A) -> Router
+where
+    S: s3s::S3,
+    A: S3Access,
+{
+    let RouterDeps {
         state,
         iam_state,
         metrics,
@@ -86,30 +109,7 @@ pub fn build_s3_router(
         public_prefix_snapshot,
         admission_chain,
         shared_config,
-        crate::s3_adapter_s3s::DeltaGliderS3Service::new(state.clone(), shared_config.clone()),
-        crate::api::s3s_hooks::VerifiedIdentityS3sAccess,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn build_s3_router_with<S, A>(
-    state: &Arc<AppState>,
-    iam_state: &SharedIamState,
-    metrics: &Arc<Metrics>,
-    rate_limiter: &RateLimiter,
-    replay_cache: &crate::api::auth::ReplayCache,
-    config: &Config,
-    config_db_mismatch: bool,
-    public_prefix_snapshot: &crate::bucket_policy::SharedPublicPrefixSnapshot,
-    admission_chain: &crate::admission::SharedAdmissionChain,
-    shared_config: &crate::config::SharedConfig,
-    s3: S,
-    access: A,
-) -> Router
-where
-    S: s3s::S3,
-    A: S3Access,
-{
+    } = deps;
     use crate::api::s3s_hooks::DeltaGliderS3sAuth;
     use axum::error_handling::HandleError;
     use s3s::service::S3ServiceBuilder;

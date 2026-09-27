@@ -923,16 +923,18 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // --- S3 router ---
     let app = deltaglider_proxy::api::s3_router::build_s3_router(
-        &state,
-        &iam_state,
-        &metrics,
-        &rate_limiter,
-        &replay_cache,
-        &config,
-        config_db_mismatch,
-        &public_prefix_snapshot,
-        &admission_chain,
-        &shared_config,
+        deltaglider_proxy::api::s3_router::RouterDeps {
+            state: &state,
+            iam_state: &iam_state,
+            metrics: &metrics,
+            rate_limiter: &rate_limiter,
+            replay_cache: &replay_cache,
+            config: &config,
+            config_db_mismatch,
+            public_prefix_snapshot: &public_prefix_snapshot,
+            admission_chain: &admission_chain,
+            shared_config: &shared_config,
+        },
     );
 
     // Backend-health loop: every backend is probed each interval, so a

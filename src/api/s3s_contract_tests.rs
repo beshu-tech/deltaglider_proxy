@@ -270,16 +270,18 @@ async fn harness() -> Harness {
     let shared_config: crate::config::SharedConfig =
         Arc::new(tokio::sync::RwLock::new(config.clone()));
     let prod = crate::api::s3_router::build_s3_router_with(
-        &state,
-        &iam,
-        &metrics,
-        &rate_limiter,
-        &replay_cache,
-        &config,
-        false,
-        &snapshot,
-        &chain,
-        &shared_config,
+        crate::api::s3_router::RouterDeps {
+            state: &state,
+            iam_state: &iam,
+            metrics: &metrics,
+            rate_limiter: &rate_limiter,
+            replay_cache: &replay_cache,
+            config: &config,
+            config_db_mismatch: false,
+            public_prefix_snapshot: &snapshot,
+            admission_chain: &chain,
+            shared_config: &shared_config,
+        },
         NopS3,
         RecordingAccess,
     );
