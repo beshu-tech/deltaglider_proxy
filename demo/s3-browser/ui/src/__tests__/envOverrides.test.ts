@@ -70,6 +70,8 @@ test('every env-controlled YAML path the server reports has a UI consumer', asyn
     'advanced.max_passthrough_object_size',
     'advanced.filtered_list_max_engine_pages',
     'advanced.range_spool_ttl_secs',
+    'storage.replication.transfers',
+    'storage.replication.upload_concurrency',
     'advanced.config_sync_object_key',
     'storage.backend.force_path_style',
     'storage.backend.allow_local',
