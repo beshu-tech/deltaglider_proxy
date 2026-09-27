@@ -88,12 +88,10 @@ pub async fn run_now(
     // coordination bucket is configured, else node-local SQLite). So a run-now
     // never overlaps a scheduled run or a consumer drain on any instance.
     // Built once at startup, present whenever the config DB is.
-    let lease = state.coordination_lease.clone().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "config DB not available".to_string(),
-        )
-    })?;
+    let lease = state
+        .coordination_lease
+        .clone()
+        .ok_or_else(AdminError::no_config_db)?;
     {
         let now = replication::current_unix_seconds();
         // The state row must exist before the SQLite lease can target it.
