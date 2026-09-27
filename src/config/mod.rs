@@ -5576,7 +5576,10 @@ storage:
             "cache_size_mbb: 5\nlisten_addr: 0.0.0.0:9000\nadmin_password_hash: x\ndefaults: v1\n",
         )
         .unwrap();
-        assert_eq!(unknown_flat_root_keys(&doc), vec!["cache_size_mbb".to_string()]);
+        assert_eq!(
+            unknown_flat_root_keys(&doc),
+            vec!["cache_size_mbb".to_string()]
+        );
         // Sectioned documents are strict already: nothing to report.
         let doc: serde_yaml::Value = serde_yaml::from_str("advanced: {}\n").unwrap();
         assert!(unknown_flat_root_keys(&doc).is_empty());

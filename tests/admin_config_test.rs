@@ -382,7 +382,10 @@ async fn test_config_defaults_returns_schema() {
         schema["properties"]["advanced"].is_object(),
         "schema must describe the advanced section"
     );
-    assert!(schema["properties"]["listen_addr"].is_null(), "flat root key");
+    assert!(
+        schema["properties"]["listen_addr"].is_null(),
+        "flat root key"
+    );
 }
 
 #[tokio::test]

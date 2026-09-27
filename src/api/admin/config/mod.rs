@@ -612,8 +612,9 @@ pub(super) async fn scrub_env_response(
             scrub_env_json(&mut v, refs);
             serde_json::to_vec(&v).unwrap_or_default()
         }
-        Err(_) => crate::config::scrub_env_values(&String::from_utf8_lossy(&bytes), refs)
-            .into_bytes(),
+        Err(_) => {
+            crate::config::scrub_env_values(&String::from_utf8_lossy(&bytes), refs).into_bytes()
+        }
     };
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     axum::response::Response::from_parts(parts, axum::body::Body::from(scrubbed))

@@ -328,7 +328,9 @@ pub async fn validate_config_doc(
     AdminJson(body): AdminJson<ConfigDocumentRequest>,
 ) -> impl IntoResponse {
     let refs = super::running_env_refs(&state).await;
-    let resp = validate_config_doc_inner(&state, body).await.into_response();
+    let resp = validate_config_doc_inner(&state, body)
+        .await
+        .into_response();
     super::scrub_env_response(resp, &refs).await
 }
 

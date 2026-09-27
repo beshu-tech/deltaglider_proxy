@@ -1667,10 +1667,8 @@ async fn env_ref_values_never_echo_in_config_write_responses() {
         .await
         .unwrap();
     let mut yaml: serde_yaml::Value = serde_yaml::from_str(&exported).unwrap();
-    yaml["storage"]["buckets"]["downloads"] = serde_yaml::from_str(
-        "alias: ${env:RV4_SECRET}\n",
-    )
-    .unwrap();
+    yaml["storage"]["buckets"]["downloads"] =
+        serde_yaml::from_str("alias: ${env:RV4_SECRET}\n").unwrap();
     let yaml = serde_yaml::to_string(&yaml).unwrap();
     for path in ["validate", "apply"] {
         let resp = admin
@@ -1686,6 +1684,9 @@ async fn env_ref_values_never_echo_in_config_write_responses() {
             body.contains("alias"),
             "{path}: the alias warning or diff is missing: {body}"
         );
-        assert!(!body.contains(SECRET), "{path} echoes the env value: {body}");
+        assert!(
+            !body.contains(SECRET),
+            "{path} echoes the env value: {body}"
+        );
     }
 }
