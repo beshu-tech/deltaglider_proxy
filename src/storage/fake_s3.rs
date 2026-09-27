@@ -30,6 +30,11 @@ impl FakeS3 {
         self.requests.lock().clone()
     }
 
+    /// Forget the requests so far.
+    pub(crate) fn clear(&self) {
+        self.requests.lock().clear();
+    }
+
     /// Wait until a request matches `pred` (up to 10 s).
     pub(crate) async fn wait_for(&self, pred: impl Fn(&str) -> bool) -> bool {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);

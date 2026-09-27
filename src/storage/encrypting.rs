@@ -52,8 +52,8 @@
 use super::io_to_storage_error;
 use super::list_size_cache::ListedSize;
 use super::traits::{
-    BulkListing, DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend,
-    StorageError, UploadedPart,
+    BulkListing, ByteStream, DelegatedListResult, LiteScanResult, MultipartUpload, StorageBackend,
+    StorageError, StoredObject, UploadedPart,
 };
 use crate::deltaglider::spool::SpoolBudget;
 use crate::types::FileMetadata;
@@ -903,6 +903,17 @@ fn stripped_marker_error() -> StorageError {
 }
 
 /// First `n` bytes of an object (fewer for a shorter object), by range.
+/// A whole stream in one buffer.
+async fn collect_stream(stream: ByteStream) -> Result<Vec<u8>, StorageError> {
+    use futures::TryStreamExt;
+    let parts: Vec<Bytes> = stream.try_collect().await?;
+    let mut buf = Vec::with_capacity(parts.iter().map(|b| b.len()).sum());
+    for p in parts {
+        buf.extend_from_slice(&p);
+    }
+    Ok(buf)
+}
+
 async fn read_prefix<B: StorageBackend + ?Sized>(
     inner: &B,
     bucket: &str,
@@ -1489,9 +1500,10 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
     // ── Decrypt on read ──
 
     async fn get_reference(&self, bucket: &str, prefix: &str) -> Result<Vec<u8>, StorageError> {
-        let data = self.inner.get_reference(bucket, prefix).await?;
-        let meta = self.inner.get_reference_metadata(bucket, prefix).await?;
-        self.decrypt_if_needed(data, &meta)
+        let (stream, _) = self
+            .open_object(bucket, prefix, StoredObject::Reference)
+            .await?;
+        collect_stream(stream).await
     }
 
     // NOTE: get_reference_to_file deliberately uses the trait DEFAULT (get_reference
@@ -1507,53 +1519,25 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         prefix: &str,
         filename: &str,
     ) -> Result<Vec<u8>, StorageError> {
-        let data = self.inner.get_delta(bucket, prefix, filename).await?;
-        let meta = self
-            .inner
-            .get_delta_metadata(bucket, prefix, filename)
+        let (stream, _) = self
+            .open_object(bucket, prefix, StoredObject::Delta(filename))
             .await?;
-        self.decrypt_if_needed(data, &meta)
+        collect_stream(stream).await
     }
 
+    /// One blob, plaintext, for both wire formats: a chunked object runs
+    /// through the chunked decoder (a single-shot decrypt would read its
+    /// `DGE1` header as an IV and fail).
     async fn get_passthrough(
         &self,
         bucket: &str,
         prefix: &str,
         filename: &str,
     ) -> Result<Vec<u8>, StorageError> {
-        let meta = self
-            .inner
-            .get_passthrough_metadata(bucket, prefix, filename)
+        let (stream, _) = self
+            .open_object(bucket, prefix, StoredObject::Passthrough(filename))
             .await?;
-
-        // Chunked path: decrypt_if_needed's single-shot decrypt would
-        // treat the first 12 bytes of the `DGE1`-prefixed wire format
-        // as an IV and AEAD-reject the rest — a silent caller footgun.
-        // Instead, fetch the stream and run it through the chunked
-        // decoder, collecting into a contiguous Vec<u8>. This matches
-        // the semantics every `get_passthrough` caller expects (one
-        // blob, plaintext) without requiring them to know about the
-        // two wire formats.
-        //
-        // Every current caller of `get_passthrough` is a unit/test
-        // helper or a fallback path that won't see chunked objects in
-        // production — but fixing this closes the footgun before any
-        // future caller trips over it.
-        if is_chunked_encrypted(&meta) {
-            let stream = self
-                .get_passthrough_stream(bucket, prefix, filename)
-                .await?;
-            use futures::TryStreamExt;
-            let parts: Vec<Bytes> = stream.try_collect().await?;
-            let mut buf = Vec::with_capacity(parts.iter().map(|b| b.len()).sum());
-            for p in parts {
-                buf.extend_from_slice(&p);
-            }
-            return Ok(buf);
-        }
-
-        let data = self.inner.get_passthrough(bucket, prefix, filename).await?;
-        self.decrypt_if_needed(data, &meta)
+        collect_stream(stream).await
     }
 
     async fn get_passthrough_stream(
@@ -1562,54 +1546,54 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         prefix: &str,
         filename: &str,
     ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError> {
-        let meta = self
-            .inner
-            .get_passthrough_metadata(bucket, prefix, filename)
+        let (stream, _) = self
+            .open_object(bucket, prefix, StoredObject::Passthrough(filename))
             .await?;
+        Ok(stream)
+    }
 
-        // Chunked path: stream end-to-end, decrypt frame-by-frame, no
-        // whole-object buffer. This is the whole point of the chunked
-        // format — a 5 GiB download stays at ~130 KiB peak memory in
-        // the decoder.
-        if is_chunked_encrypted(&meta) {
-            // Shim-aware key selection: primary first, legacy if set
-            // and the object's stamped id matches it. Emits the
-            // specific "rotated without legacy_key" error on full
-            // mismatch so the operator knows what the fix is.
-            let key = self.pick_decrypt_key(stamped_key_id(&meta))?;
-            let ct_stream = self
-                .inner
-                .get_passthrough_stream(bucket, prefix, filename)
-                .await?;
-            let final_idx = final_chunk_index_for_plaintext_size(meta.file_size);
-            return Ok(chunked_decrypt_stream(ct_stream, key, final_idx, 0, None));
-        }
-
-        // v1 single-shot path (bounded by max_object_size). Buffer the
-        // encrypted blob into memory, decrypt whole, wrap as a
-        // single-emission stream. Same as before — unchanged.
-        if is_encrypted(&meta) {
-            let data = self.inner.get_passthrough(bucket, prefix, filename).await?;
-            let plain = self.decrypt_if_needed(data, &meta)?;
-            return Ok(Box::pin(futures::stream::once(async {
-                Ok(Bytes::from(plain))
-            })));
-        }
-
-        // Not encrypted per metadata — stream straight through, but
-        // peek the first 4 bytes of the body as a belt-and-suspenders
-        // check against the "xattr got stripped during backup/restore
-        // and the on-disk body is still ciphertext" scenario. If we
-        // see the chunked-format `DGE1` magic on an object that
-        // metadata claims is plaintext, refuse rather than serving
-        // ciphertext to the client. The odds of plaintext happening
-        // to start with those 4 bytes are 1/2^32 and in practice zero
-        // for any realistic file type.
-        let stream = self
-            .inner
-            .get_passthrough_stream(bucket, prefix, filename)
-            .await?;
-        Ok(Box::pin(sniff_dge1_magic(stream)))
+    /// The inner read carries the raw stored metadata, markers included, so
+    /// the format decision needs no HEAD of its own (storage-7). Returns
+    /// that raw metadata, as `get_*_metadata` does.
+    async fn open_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'_>,
+    ) -> Result<(ByteStream, FileMetadata), StorageError> {
+        let (stream, meta) = self.inner.open_object(bucket, prefix, object).await?;
+        let plain: ByteStream = match object {
+            // References and deltas are single-shot or plaintext.
+            StoredObject::Reference | StoredObject::Delta(_) => {
+                if is_encrypted(&meta) {
+                    let data = collect_stream(stream).await?;
+                    let plain = self.decrypt_if_needed(data, &meta)?;
+                    Box::pin(futures::stream::once(async { Ok(Bytes::from(plain)) }))
+                } else {
+                    stream
+                }
+            }
+            // Chunked: decrypt frame by frame, no whole-object buffer (a
+            // 5 GiB download stays at ~130 KiB peak in the decoder). The
+            // shim-aware key choice names the fix on a key-id mismatch.
+            StoredObject::Passthrough(_) if is_chunked_encrypted(&meta) => {
+                let key = self.pick_decrypt_key(stamped_key_id(&meta))?;
+                let final_idx = final_chunk_index_for_plaintext_size(meta.file_size);
+                chunked_decrypt_stream(stream, key, final_idx, 0, None)
+            }
+            // Single-shot (bounded by max_object_size): decrypt whole.
+            StoredObject::Passthrough(_) if is_encrypted(&meta) => {
+                let data = collect_stream(stream).await?;
+                let plain = self.decrypt_if_needed(data, &meta)?;
+                Box::pin(futures::stream::once(async { Ok(Bytes::from(plain)) }))
+            }
+            // Plaintext per metadata: refuse a body that starts with the
+            // chunked `DGE1` magic (the xattr got stripped in a
+            // backup/restore and the body is still ciphertext). Plaintext
+            // that starts with those 4 bytes is a 1-in-2^32 case.
+            StoredObject::Passthrough(_) => Box::pin(sniff_dge1_magic(stream)),
+        };
+        Ok((plain, meta))
     }
 
     // === Multipart upload (Phase B) ===
@@ -2882,6 +2866,17 @@ mod tests {
         /// Full-stream read. Serves the whole byte vec as a single
         /// Bytes so the chunked decoder's phase-1 header parse hits
         /// the same code path it would over a real network stream.
+        async fn open_object(
+            &self,
+            b: &str,
+            p: &str,
+            o: crate::storage::StoredObject<'_>,
+        ) -> Result<
+            (crate::storage::ByteStream, crate::types::FileMetadata),
+            crate::storage::StorageError,
+        > {
+            crate::storage::open_object_by_parts(self, b, p, o).await
+        }
         async fn get_passthrough_stream(
             &self,
             _: &str,
@@ -4163,5 +4158,96 @@ mod tests {
             keyed.file_put_spool_bytes("b", 0, false).await,
             chunked_wire_len_bound(0)
         );
+    }
+}
+
+/// storage-7: a read decides encrypted-or-plaintext from the markers of its
+/// own backend response, so it sends no separate metadata HEAD.
+#[cfg(test)]
+mod read_request_tests {
+    use super::*;
+    use crate::storage::fake_s3;
+    use futures::TryStreamExt;
+
+    fn cfg(key: Option<EncryptionKey>) -> Arc<ArcSwap<EncryptionConfig>> {
+        let key_id = key.as_ref().map(|_| "kid-1".to_string());
+        Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key,
+            key_id,
+            ..Default::default()
+        })))
+    }
+
+    fn key() -> EncryptionKey {
+        EncryptionKey::from_hex(&"42".repeat(32)).unwrap()
+    }
+
+    fn meta(data: &[u8]) -> FileMetadata {
+        FileMetadata::new_passthrough(
+            "a.bin".into(),
+            hex::encode(<sha2::Sha256 as sha2::Digest>::digest(data)),
+            hex::encode(<md5::Md5 as md5::Digest>::digest(data)),
+            data.len() as u64,
+            None,
+        )
+    }
+
+    async fn wrapped(
+        key: Option<EncryptionKey>,
+    ) -> (
+        EncryptingBackend<crate::storage::S3Backend>,
+        Arc<fake_s3::FakeS3>,
+    ) {
+        let (ep, fake) = fake_s3::start().await;
+        let s3 = super::super::s3::test_support::for_test_endpoint(&ep);
+        (EncryptingBackend::new(s3, cfg(key)), fake)
+    }
+
+    fn one_get(requests: &[String]) -> bool {
+        requests.len() == 1 && requests[0].starts_with("GET ")
+    }
+
+    #[tokio::test]
+    async fn a_passthrough_stream_read_is_one_get() {
+        for k in [None, Some(key())] {
+            let (w, fake) = wrapped(k.clone()).await;
+            let body = b"hello passthrough".to_vec();
+            w.put_passthrough("b", "p", "a.bin", &body, &meta(&body))
+                .await
+                .unwrap();
+            fake.clear();
+            let got: Vec<Bytes> = w
+                .get_passthrough_stream("b", "p", "a.bin")
+                .await
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(got.concat(), body, "key: {}", k.is_some());
+            assert!(one_get(&fake.requests()), "{:?}", fake.requests());
+            fake.clear();
+            assert_eq!(w.get_passthrough("b", "p", "a.bin").await.unwrap(), body);
+            assert!(one_get(&fake.requests()), "{:?}", fake.requests());
+        }
+    }
+
+    #[tokio::test]
+    async fn delta_and_reference_reads_are_one_get() {
+        for k in [None, Some(key())] {
+            let (w, fake) = wrapped(k.clone()).await;
+            let body = b"delta bytes".to_vec();
+            w.put_delta("b", "p", "a.bin", &body, &meta(&body))
+                .await
+                .unwrap();
+            w.put_reference("b", "p", &body, &meta(&body))
+                .await
+                .unwrap();
+            fake.clear();
+            assert_eq!(w.get_delta("b", "p", "a.bin").await.unwrap(), body);
+            assert!(one_get(&fake.requests()), "{:?}", fake.requests());
+            fake.clear();
+            assert_eq!(w.get_reference("b", "p").await.unwrap(), body);
+            assert!(one_get(&fake.requests()), "{:?}", fake.requests());
+        }
     }
 }

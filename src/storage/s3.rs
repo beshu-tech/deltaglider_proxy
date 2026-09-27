@@ -30,7 +30,7 @@ use super::list_size_cache::{self, ListedSize, LogicalFacts, StoredObjectId};
 use super::listing_facts;
 use super::traits::{
     reference_fence_lost, BulkListing, DelegatedListResult, LiteScanResult, MultipartUpload,
-    RefFence, RefWrite, StorageBackend, StorageError, UploadedPart,
+    RefFence, RefWrite, StorageBackend, StorageError, StoredObject, UploadedPart,
 };
 use crate::config::BackendConfig;
 use crate::types::{FileMetadata, StorageInfo};
@@ -507,6 +507,15 @@ pub struct S3Backend {
     list_cache_scope: String,
     /// Batched removal of deleted objects' listing facts.
     facts_cleanup: super::facts_cleanup::FactsCleanupQueue,
+}
+
+/// The headers of a HEAD or GET object response that carry its metadata.
+struct ObjectHeaders<'a> {
+    user: Option<&'a HashMap<String, String>>,
+    last_modified: Option<&'a aws_sdk_s3::primitives::DateTime>,
+    e_tag: Option<&'a str>,
+    content_length: Option<i64>,
+    content_type: Option<&'a str>,
 }
 
 impl S3Backend {
@@ -1569,8 +1578,30 @@ impl S3Backend {
                 self.classify(bucket, &e, S3Op::HeadObject)
             })?;
 
+        Ok(self.metadata_of_response(
+            bucket,
+            key,
+            &ObjectHeaders {
+                user: response.metadata(),
+                last_modified: response.last_modified(),
+                e_tag: response.e_tag(),
+                content_length: response.content_length(),
+                content_type: response.content_type(),
+            },
+        ))
+    }
+
+    /// The metadata of the object `key` from the headers of a HEAD or GET
+    /// response: its DG metadata, or the fallback passthrough metadata of
+    /// an object without it.
+    fn metadata_of_response(
+        &self,
+        bucket: &str,
+        key: &str,
+        response: &ObjectHeaders<'_>,
+    ) -> FileMetadata {
         let headers: HashMap<String, String> = response
-            .metadata()
+            .user
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
 
@@ -1581,7 +1612,7 @@ impl S3Backend {
         // `Utc::now()` on every read, making replication's NewerWins re-copy the
         // object every tick forever. See docs/plan/rca-replication-recopy-2026-06-30.md.
         let s3_last_modified = response
-            .last_modified()
+            .last_modified
             .and_then(|t| {
                 DateTime::parse_from_rfc3339(&t.to_string())
                     .ok()
@@ -1607,11 +1638,11 @@ impl S3Backend {
         if !headers.is_empty() {
             match self.headers_to_metadata(&headers, s3_last_modified) {
                 Ok(meta) => {
-                    let stored_etag = response.e_tag().unwrap_or_default();
-                    let stored_size = response.content_length().unwrap_or(0).max(0) as u64;
+                    let stored_etag = response.e_tag.unwrap_or_default();
+                    let stored_size = response.content_length.unwrap_or(0).max(0) as u64;
                     self.remember_listed_facts(bucket, key, stored_etag, stored_size, &meta);
                     self.backfill_listing_facts(bucket, key, stored_etag, stored_size, &meta);
-                    return Ok(meta);
+                    return meta;
                 }
                 Err(e) if delta_critical => {
                     warn!(
@@ -1646,7 +1677,7 @@ impl S3Backend {
             );
         }
         // Treat as passthrough with best-effort metadata from HEAD response.
-        let file_size = response.content_length().unwrap_or(0).max(0) as u64;
+        let file_size = response.content_length.unwrap_or(0).max(0) as u64;
         let last_modified = s3_last_modified;
         // Upstream S3 returns the ETag already wrapped in quotes (e.g.
         // `"abc123"`). FileMetadata.md5 must hold the BARE value — the
@@ -1655,19 +1686,19 @@ impl S3Backend {
         // (`""abc123""`) that strict S3 clients reject. Strip to match the
         // listing path (`object.e_tag.map(|e| e.trim_matches('"'))`).
         let etag = response
-            .e_tag()
+            .e_tag
             .unwrap_or_default()
             .trim_matches('"')
             .to_string();
-        let content_type = response.content_type().map(|s| s.to_string());
-        Ok(FileMetadata::fallback(
+        let content_type = response.content_type.map(|s| s.to_string());
+        FileMetadata::fallback(
             key.rsplit('/').next().unwrap_or(key).to_string(),
             file_size,
             etag,
             last_modified,
             content_type,
             StorageInfo::Passthrough,
-        ))
+        )
     }
 
     /// Delete an object from S3
@@ -2830,6 +2861,41 @@ impl StorageBackend for S3Backend {
         debug!("S3 GET stream {}/{}", bucket, key);
 
         Ok(Box::pin(Self::s3_body_to_stream(response.body)))
+    }
+
+    /// One GET: the body, and the metadata from the response's own headers.
+    async fn open_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'_>,
+    ) -> Result<(super::ByteStream, FileMetadata), StorageError> {
+        let key = match object {
+            StoredObject::Reference => self.reference_key(prefix),
+            StoredObject::Delta(f) => self.delta_key(prefix, f),
+            StoredObject::Passthrough(f) => self.passthrough_key(prefix, f),
+        };
+        let response = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(&key)
+            .send()
+            .await
+            .map_err(|e| self.classify_get(bucket, &key, &e))?;
+        let meta = self.metadata_of_response(
+            bucket,
+            &key,
+            &ObjectHeaders {
+                user: response.metadata(),
+                last_modified: response.last_modified(),
+                e_tag: response.e_tag(),
+                content_length: response.content_length(),
+                content_type: response.content_type(),
+            },
+        );
+        debug!("S3 GET stream {}/{} (with its metadata)", bucket, key);
+        Ok((Self::s3_body_to_stream(response.body), meta))
     }
 
     #[instrument(skip(self))]
@@ -5236,7 +5302,7 @@ mod review3_tests {
 /// Test-only construction (in a test module, so the endpoint source guard
 /// sees one production endpoint override).
 #[cfg(test)]
-mod test_support {
+pub(crate) mod test_support {
     use super::*;
 
     /// A backend on a test endpoint (no retries, no SSRF guard).

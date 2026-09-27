@@ -1057,6 +1057,15 @@ impl StorageBackend for RoutingBackend {
         route_existing!(self, bucket, get_passthrough_stream, prefix, filename)
     }
 
+    async fn open_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: crate::storage::StoredObject<'_>,
+    ) -> Result<(crate::storage::ByteStream, FileMetadata), StorageError> {
+        route_existing!(self, bucket, open_object, prefix, object)
+    }
+
     async fn get_passthrough_stream_range(
         &self,
         bucket: &str,
@@ -1514,6 +1523,17 @@ mod tests {
             Err(StorageError::NotFound("object".to_string()))
         }
 
+        async fn open_object(
+            &self,
+            b: &str,
+            p: &str,
+            o: crate::storage::StoredObject<'_>,
+        ) -> Result<
+            (crate::storage::ByteStream, crate::types::FileMetadata),
+            crate::storage::StorageError,
+        > {
+            crate::storage::open_object_by_parts(self, b, p, o).await
+        }
         async fn get_passthrough_stream(
             &self,
             _: &str,

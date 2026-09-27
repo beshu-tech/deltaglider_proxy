@@ -44,6 +44,14 @@ request. Now it reads at most 50, and then answers `400 InvalidRequest`
 ("use a narrower prefix") as before. The limit is the new setting
 `advanced.filtered_list_max_engine_pages` (`DGP_FILTERED_LIST_MAX_ENGINE_PAGES`).
 
+### Changed — A GET on S3 sends one HEAD fewer
+
+The encryption layer, which wraps every backend, sent its own HEAD before
+each object read to learn whether the object was encrypted. Now it reads
+the encryption markers from the headers of the GET response itself. A GET
+of a passthrough object, a delta or a reference costs one backend request
+less.
+
 ### Changed — An S3 upload no longer waits for its listing facts
 
 Each upload of a delta or of a proxy-encrypted object on an S3 backend sent

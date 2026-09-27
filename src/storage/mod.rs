@@ -31,10 +31,10 @@ pub use s3::{
     DELEGATED_LIST_PROBE_REQUESTS, DELEGATED_LIST_UPSTREAM_PAGES, LISTING_FACTS_REQUESTS,
 };
 pub use traits::{
-    clamp_range, io_error_is_name_too_long, io_error_is_path_type_conflict, reference_fence_lost,
-    unfenced_reference_fence, unfenced_reference_write, BucketListing, BulkListing,
-    DelegatedListResult, MultipartUpload, ObjectVariant, RefFence, RefWrite, StorageBackend,
-    StorageError, UploadedPart,
+    clamp_range, io_error_is_name_too_long, io_error_is_path_type_conflict, open_object_by_parts,
+    reference_fence_lost, unfenced_reference_fence, unfenced_reference_write, BucketListing,
+    BulkListing, ByteStream, DelegatedListResult, MultipartUpload, ObjectVariant, RefFence,
+    RefWrite, StorageBackend, StorageError, StoredObject, UploadedPart,
 };
 
 tokio::task_local! {

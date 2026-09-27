@@ -4,6 +4,7 @@
 
 use super::traits::{
     BulkListing, DelegatedListResult, RefFence, RefWrite, StorageBackend, StorageError,
+    StoredObject,
 };
 use super::xattr_meta;
 use crate::types::FileMetadata;
@@ -1525,6 +1526,46 @@ impl StorageBackend for FilesystemBackend {
             bucket, prefix, filename
         );
         Ok(Box::pin(stream))
+    }
+
+    /// The metadata read (xattr, or the fallback of a file without it) and
+    /// the file, opened once.
+    async fn open_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'_>,
+    ) -> Result<(super::ByteStream, FileMetadata), StorageError> {
+        use futures::StreamExt;
+        let (path, meta, label, name) = match object {
+            StoredObject::Reference => (
+                self.reference_path(bucket, prefix)?,
+                self.get_reference_metadata(bucket, prefix).await?,
+                "reference",
+                "reference.bin",
+            ),
+            StoredObject::Delta(f) => (
+                self.delta_path(bucket, prefix, f)?,
+                self.get_delta_metadata(bucket, prefix, f).await?,
+                "delta",
+                f,
+            ),
+            StoredObject::Passthrough(f) => (
+                self.passthrough_path(bucket, prefix, f)?,
+                self.get_passthrough_metadata(bucket, prefix, f).await?,
+                "passthrough",
+                f,
+            ),
+        };
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StorageError::NotFound(format!("{label}: {prefix}/{name}")));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let stream = ReaderStream::new(file).map(|r| r.map_err(StorageError::Io));
+        Ok((Box::pin(stream), meta))
     }
 
     #[instrument(skip(self))]

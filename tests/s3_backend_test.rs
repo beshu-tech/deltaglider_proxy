@@ -279,6 +279,68 @@ async fn backend_heads(endpoint: &str) -> u64 {
     scrape_counter(endpoint, "deltaglider_backend_head_requests_total").await
 }
 
+/// storage-7: the encrypting wrapper (present on every backend) reads the
+/// encryption markers from the GET response itself, so a GET sends no
+/// HEAD of its own: it sends no more HEADs than a HeadObject of the same
+/// key (the engine's metadata probes). The wrapper's extra HEAD made it one
+/// more.
+#[tokio::test]
+async fn a_passthrough_get_sends_no_wrapper_head() {
+    skip_unless_minio!();
+    let proxy = || {
+        TestServer::builder()
+            .s3_endpoint(&common::minio_endpoint_url())
+            .bucket(common::MINIO_BUCKET)
+            .build()
+    };
+    let writer = proxy().await;
+    let key = format!("{}/photo.jpg", unique_prefix());
+    let body = generate_binary(10_000, 5);
+    writer
+        .s3_client()
+        .await
+        .put_object()
+        .bucket(writer.bucket())
+        .key(&key)
+        .body(ByteStream::from(body.clone()))
+        .send()
+        .await
+        .unwrap();
+
+    // A cold proxy: no cached metadata.
+    let reader = proxy().await;
+    let client = reader.s3_client().await;
+    let before = backend_heads(&reader.endpoint()).await;
+    let got = client
+        .get_object()
+        .bucket(reader.bucket())
+        .key(&key)
+        .send()
+        .await
+        .unwrap()
+        .body
+        .collect()
+        .await
+        .unwrap()
+        .into_bytes();
+    assert_eq!(got.as_ref(), body.as_slice());
+    let get_heads = backend_heads(&reader.endpoint()).await - before;
+
+    let before = backend_heads(&reader.endpoint()).await;
+    client
+        .head_object()
+        .bucket(reader.bucket())
+        .key(&key)
+        .send()
+        .await
+        .unwrap();
+    let head_heads = backend_heads(&reader.endpoint()).await - before;
+    assert!(
+        get_heads <= head_heads,
+        "a GET sent {get_heads} backend HEADs, a HeadObject {head_heads}"
+    );
+}
+
 /// Issue #92 and review C3: a client LIST reports the ORIGINAL size and ETag
 /// of a delta, and sends ZERO backend HEADs doing it, on every node.
 ///

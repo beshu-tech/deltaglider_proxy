@@ -51,6 +51,17 @@ pub enum ObjectVariant {
     Passthrough,
 }
 
+/// One stored object of a deltaspace, for [`StorageBackend::open_object`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoredObject<'a> {
+    Reference,
+    Delta(&'a str),
+    Passthrough(&'a str),
+}
+
+/// A stream of object bytes.
+pub type ByteStream = BoxStream<'static, Result<Bytes, StorageError>>;
+
 /// One fenced write to `reference.bin` (see
 /// [`StorageBackend::write_reference_fenced`]).
 #[derive(Debug, Clone, Copy)]
@@ -192,6 +203,37 @@ pub async fn unfenced_reference_write<B: StorageBackend + ?Sized>(
         RefWrite::Delete => backend.delete_reference(bucket, prefix).await?,
     }
     Ok(RefFence::Unfenced)
+}
+
+/// `open_object` from two reads: the metadata read, then the data read. For
+/// a backend (or a test double) whose data read does not carry the
+/// metadata.
+pub async fn open_object_by_parts<B: StorageBackend + ?Sized>(
+    backend: &B,
+    bucket: &str,
+    prefix: &str,
+    object: StoredObject<'_>,
+) -> Result<(ByteStream, FileMetadata), StorageError> {
+    let once = |data: Vec<u8>| -> ByteStream {
+        Box::pin(futures::stream::once(async move { Ok(Bytes::from(data)) }))
+    };
+    Ok(match object {
+        StoredObject::Reference => {
+            let meta = backend.get_reference_metadata(bucket, prefix).await?;
+            (once(backend.get_reference(bucket, prefix).await?), meta)
+        }
+        StoredObject::Delta(f) => {
+            let meta = backend.get_delta_metadata(bucket, prefix, f).await?;
+            (once(backend.get_delta(bucket, prefix, f).await?), meta)
+        }
+        StoredObject::Passthrough(f) => {
+            let meta = backend.get_passthrough_metadata(bucket, prefix, f).await?;
+            (
+                backend.get_passthrough_stream(bucket, prefix, f).await?,
+                meta,
+            )
+        }
+    })
 }
 
 /// Pure: clamp an inclusive byte range `start..=end` to an object of `len`
@@ -581,6 +623,21 @@ pub trait StorageBackend: Send + Sync {
         prefix: &str,
         filename: &str,
     ) -> Result<BoxStream<'static, Result<Bytes, StorageError>>, StorageError>;
+
+    /// Stream one stored object together with the metadata stored with it,
+    /// both from ONE read of the backend (S3: the GET response's headers;
+    /// filesystem: the file and its xattr). The metadata is the raw stored
+    /// one, markers included, so the encrypting wrapper decides
+    /// encrypted-or-plaintext from it and sends no separate HEAD
+    /// (storage-7). A missing object is `NotFound`. No default: a wrapper
+    /// that forgot it would read the object through the inner backend
+    /// without its own transform.
+    async fn open_object(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        object: StoredObject<'_>,
+    ) -> Result<(ByteStream, FileMetadata), StorageError>;
 
     /// Stream a byte range of a passthrough file without buffering the entire
     /// object. REQUIRED (no default) — same memory-bound rationale as
@@ -1238,6 +1295,15 @@ macro_rules! impl_storage_backend_for_box {
                 (**self)
                     .get_passthrough_stream(bucket, prefix, filename)
                     .await
+            }
+
+            async fn open_object(
+                &self,
+                bucket: &str,
+                prefix: &str,
+                object: StoredObject<'_>,
+            ) -> Result<(ByteStream, FileMetadata), StorageError> {
+                (**self).open_object(bucket, prefix, object).await
             }
 
             async fn get_passthrough_stream_range(

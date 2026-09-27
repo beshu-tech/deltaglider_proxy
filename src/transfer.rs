@@ -2296,6 +2296,18 @@ mod multipart_abort_tests {
         async fn delete_passthrough(&self, _: &str, _: &str, _: &str) -> Result<(), StorageError> {
             Err(nope())
         }
+        async fn open_object(
+            &self,
+            b: &str,
+            p: &str,
+            o: crate::storage::StoredObject<'_>,
+        ) -> Result<
+            (crate::storage::ByteStream, crate::types::FileMetadata),
+            crate::storage::StorageError,
+        > {
+            let _ = (b, p, o);
+            Err(nope())
+        }
         async fn get_passthrough_stream(
             &self,
             _: &str,
@@ -2504,6 +2516,17 @@ mod multipart_abort_tests {
         }
         async fn delete_passthrough(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
             self.0.delete_passthrough(b, p, f).await
+        }
+        async fn open_object(
+            &self,
+            b: &str,
+            p: &str,
+            o: crate::storage::StoredObject<'_>,
+        ) -> Result<
+            (crate::storage::ByteStream, crate::types::FileMetadata),
+            crate::storage::StorageError,
+        > {
+            self.0.open_object(b, p, o).await
         }
         async fn get_passthrough_stream(
             &self,

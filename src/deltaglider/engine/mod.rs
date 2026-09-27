@@ -2915,6 +2915,17 @@ mod tests {
         ) -> Result<Vec<u8>, crate::storage::StorageError> {
             Ok(vec![])
         }
+        async fn open_object(
+            &self,
+            b: &str,
+            p: &str,
+            o: crate::storage::StoredObject<'_>,
+        ) -> Result<
+            (crate::storage::ByteStream, crate::types::FileMetadata),
+            crate::storage::StorageError,
+        > {
+            crate::storage::open_object_by_parts(self, b, p, o).await
+        }
         async fn get_passthrough_stream(
             &self,
             _: &str,
@@ -4304,6 +4315,17 @@ mod reference_lock_hold_tests {
         }
         async fn delete_passthrough(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
             self.inner.delete_passthrough(b, p, f).await
+        }
+        async fn open_object(
+            &self,
+            b: &str,
+            p: &str,
+            o: crate::storage::StoredObject<'_>,
+        ) -> Result<
+            (crate::storage::ByteStream, crate::types::FileMetadata),
+            crate::storage::StorageError,
+        > {
+            crate::storage::open_object_by_parts(self, b, p, o).await
         }
         async fn get_passthrough_stream(
             &self,
