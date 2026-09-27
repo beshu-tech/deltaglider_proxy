@@ -695,7 +695,12 @@ advanced:
 
 Every instance that shares the bucket must set `DGP_CONFIG_DB_KEY` to the same value: the synced DB is encrypted with that key, and the proxy refuses to start with a sync bucket but without the variable. For the same reason, the admin API refuses a configuration change that sets or changes `config_sync_bucket` when the instance runs without `DGP_CONFIG_DB_KEY`. An instance whose key does not open the synced DB refuses to merge it and logs an error that names `DGP_CONFIG_DB_KEY`.
 
-Sync uses the same S3 credentials as the storage backend (`DGP_BE_AWS_*`) and only works when the storage backend is S3 (not filesystem). On every IAM mutation, the DB is uploaded to `s3://<bucket>/.deltaglider/config.db`; readers poll the S3 ETag every 5 minutes and download on change.
+The sync bucket lives on an S3 backend, and the proxy uses the endpoint and the credentials of that backend. The proxy picks the backend in this order:
+
+- When no named backends exist, or when the singleton backend (`storage.backend`) is S3, the sync bucket is on the singleton backend. Older releases always used that backend.
+- Otherwise, the proxy routes the sync bucket like any other bucket: a `backend:` route under `storage.buckets.<sync bucket>` names its backend, else `default_backend` hosts it. So a filesystem singleton beside a named S3 backend also works.
+
+Sync needs that backend to be S3, because a filesystem backend is local to one node. On every IAM mutation, the proxy uploads the DB to `s3://<bucket>/.deltaglider/config.db` (`advanced.config_sync_object_key` or `DGP_CONFIG_SYNC_KEY` changes the key). The other instances poll the ETag of that object every 5 minutes and download the DB when the ETag changes.
 
 The sync bucket is reserved for the proxy itself. The proxy refuses every S3 request to it with `403 AccessDenied`, for every identity including administrators, because an object that a client writes there could replace the synced IAM database or a lease on every instance. For the same reason, ListBuckets and the admin bucket list do not show it, and the admin bulk endpoints refuse it. A configuration that makes it public, gives it an alias, aliases another bucket onto it, or uses it in a replication or lifecycle rule is refused. A `backend:` route for it is allowed, because that only says which backend hosts it.
 
