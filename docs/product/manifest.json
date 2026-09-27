@@ -82,6 +82,11 @@
       "order": 30
     },
     {
+      "path": "how-to/upgrade-to-2-0",
+      "group": "Guides: deploy & operate",
+      "order": 39
+    },
+    {
       "path": "how-to/upgrade",
       "group": "Guides: deploy & operate",
       "order": 40
