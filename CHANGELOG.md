@@ -80,6 +80,13 @@ release has no generation and keeps the old rule. During a rolling upgrade,
 an instance on the older release does not merge copies from upgraded
 instances until it is upgraded too, as with every schema change.
 
+### Fixed — A commented-out `${env:NAME}` line no longer stops the proxy
+
+The proxy expanded `${env:NAME}` references in comment lines too, so a
+commented-out template line with an unset variable failed the load.
+Now a line whose first character other than a space is `#` is left as
+it is.
+
 ### Fixed — Config responses never show the value of an env reference
 
 The admin API resolves a `${env:NAME}` reference that the boot config

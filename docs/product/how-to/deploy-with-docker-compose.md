@@ -8,6 +8,8 @@ The pattern: the proxy expands `${env:NAME}` and `${env:NAME:-default}` referenc
 
 > When a placeholder is the whole value of a field, you do not need to quote it. The proxy gives the value the type of its field, so an AES key that has only digits stays a string, and `force_path_style: ${env:S3_PATH_STYLE:-false}` still becomes a boolean. When a placeholder is only part of a value (for example `https://${env:HOST}:9000`), the proxy inserts the value as text.
 
+> The proxy does not expand a placeholder on a comment line, that is, a line whose first character other than a space is `#`. For this reason, a commented-out template line with an unset variable does not stop the proxy.
+
 You need three files:
 
 - **`deltaglider_proxy.yaml`** — the config; secret values are `${env:...}` placeholders. Commit it.

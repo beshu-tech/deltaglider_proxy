@@ -262,6 +262,18 @@ fn expand_core(
         }
         // Flush the literal run before this `$`.
         out.push_str(&input[cursor..i]);
+        // A whole-line YAML comment is not config: a commented-out template
+        // line must not fail the load on its unset variable (review 4
+        // config-8). Copied verbatim, `$$` included.
+        if doc {
+            let line_start = input[..i].rfind('\n').map_or(0, |p| p + 1);
+            if input[line_start..i].trim_start().starts_with('#') {
+                out.push('$');
+                i += 1;
+                cursor = i;
+                continue;
+            }
+        }
         match bytes.get(i + 1) {
             Some(b'$') => {
                 out.push('$'); // `$$` → literal `$`
@@ -413,6 +425,19 @@ mod tests {
         assert_eq!(expand_env_admin("${env:HOME:-d}", &known).unwrap().0, "d");
     }
     use super::*;
+
+    /// Review 4 config-8: a commented-out template line with an unset
+    /// variable failed the whole load with `MissingEnvVar`.
+    #[test]
+    fn a_ref_in_a_comment_line_is_not_expanded() {
+        let doc = "# secret: ${env:UNSET_X}\n  #  also: ${env:UNSET_Y}\nkey: ${env:SET}\n";
+        let lookup = |n: &str| (n == "SET").then(|| "v".to_string());
+        let out = expand_env_doc_with(doc, lookup).unwrap();
+        assert!(out.starts_with("# secret: ${env:UNSET_X}\n  #  also: ${env:UNSET_Y}\n"));
+        assert!(out.contains("key: !envref \"v\""), "{out}");
+        // Not a comment: `#` after content on the line, or inside a value.
+        assert!(expand_env_doc_with("k: a#${env:UNSET_X}\n", lookup).is_err());
+    }
 
     // ── ${VAR} expansion (expand_env_with) ──────────────────────────────────
 
