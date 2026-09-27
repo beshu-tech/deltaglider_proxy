@@ -102,7 +102,7 @@ fn emit_schema_json(output: Option<&str>, label: &str) -> i32 {
 ///   advisory, not fatal — matches the admin API's return shape
 ///   where `ok: true` can coexist with warnings).
 /// - 3: file not found / unreadable.
-/// - 4: parse error (shape, unknown field, bad IP/CIDR, etc.).
+/// - 4: parse error (empty document, shape, unknown field, bad IP/CIDR, etc.).
 /// - 6: validation error (duplicate admission block name, bad
 ///   Reject status, `public: true` conflict, etc.).
 ///
@@ -139,32 +139,30 @@ pub fn lint(file: &str) -> i32 {
         return EXIT_PARSE;
     }
 
-    // `Config::from_yaml_str` runs `normalize_shorthands` internally,
-    // so lint catches the same semantic violations (duplicate admission
-    // block names, bad Reject status, `public: true` conflicts) that
-    // the server would reject at `/apply` time.
-    let cfg = Config::from_yaml_str(&content);
-    let mut cfg = match cfg {
-        Ok(c) => c,
-        Err(e) => {
-            // ConfigError::Parse covers both shape and semantic
-            // violations (deny_unknown_fields, normalize_shorthands,
-            // AdmissionSpec::validate). We don't split them today;
-            // the client-side convention is "exit 4 for parse, 6 for
-            // rejected" — use 4 for everything here, and rely on the
-            // message carrying the distinction.
+    // THE document validation step `/config/validate` and `/config/apply`
+    // run (`Config::validate_document`): empty document, parse (shape and
+    // semantic: unknown field, admission spec, shorthand conflict), log
+    // filter, then `check_all` — fatal errors reject, the rest are warnings.
+    use crate::config::DocumentRefusal as R;
+    let (cfg, warnings) = match Config::validate_document(&content) {
+        Ok(v) => v,
+        Err(R::Empty) => {
+            eprintln!("error: {file}: empty document (it would reset every field to its default)");
+            return EXIT_PARSE;
+        }
+        // Shape and semantic parse errors are not split: exit 4 for both,
+        // the message carries the distinction.
+        Err(R::Parse(e)) => {
             eprintln!("error: {e}");
             return EXIT_PARSE;
         }
-    };
-
-    // Run the same `check_all()` the admin API's /validate uses: fatal
-    // errors (the ones boot and apply refuse) reject with exit 6;
-    // otherwise it mutates fields that can't be satisfied (e.g. clears an
-    // unresolved default_backend) and returns human-readable warnings.
-    let warnings = match cfg.check_all() {
-        Ok(w) => w,
-        Err(fatal) => {
+        Err(R::LogFilter(filter)) => {
+            eprintln!(
+                "error: invalid log_level filter '{filter}' — expected a tracing-subscriber EnvFilter"
+            );
+            return EXIT_REJECTED;
+        }
+        Err(R::Fatal(fatal)) => {
             for e in &fatal {
                 eprintln!("error: {e}");
             }
@@ -172,49 +170,18 @@ pub fn lint(file: &str) -> i32 {
             return EXIT_REJECTED;
         }
     };
-
-    // Log-filter check: /validate rejects malformed filters with 400.
-    // Here we surface it as exit 6.
-    if cfg
-        .log_level
-        .parse::<tracing_subscriber::EnvFilter>()
-        .is_err()
-    {
-        eprintln!(
-            "error: invalid log_level filter '{}' — expected a tracing-subscriber EnvFilter",
-            cfg.log_level
-        );
-        return EXIT_REJECTED;
-    }
-
-    // Fatal lifecycle rule errors: reject (exit 6) the same way /apply does,
-    // so a CI `config lint` catches a delete rule missing expire_after before
-    // it ships. Suppress the (now-redundant) advisory warnings when errors are
-    // present so the operator sees the fatal message once, not twice.
-    let lifecycle_errors = crate::lifecycle::planner::lifecycle_config_errors(&cfg.lifecycle);
-    if !lifecycle_errors.is_empty() {
-        for e in &lifecycle_errors {
+    // The same rule gates as the admin write pipeline. Offline there is no
+    // running config, so every rule counts as changed.
+    if let Err(refusal) = cfg.rule_gates(&Config::default()) {
+        let (errors, kind) = match &refusal {
+            crate::config::RuleGateRefusal::Lifecycle(e) => (e, "lifecycle"),
+            crate::config::RuleGateRefusal::Replication(e) => (e, "replication"),
+        };
+        for e in errors {
             eprintln!("error: {e}");
         }
         eprintln!(
-            "{file}: rejected — {} fatal lifecycle rule error(s)",
-            lifecycle_errors.len()
-        );
-        return EXIT_REJECTED;
-    }
-
-    // The replication gate (duplicate rule names, unbounded nesting) that
-    // /apply and /validate run against the running config; offline there is
-    // no running config, so every rule counts as changed.
-    if let Err(errors) = crate::config_sections::replication_gate(
-        &crate::config_sections::ReplicationConfig::default(),
-        &cfg.replication,
-    ) {
-        for e in &errors {
-            eprintln!("error: {e}");
-        }
-        eprintln!(
-            "{file}: rejected — {} fatal replication rule error(s)",
+            "{file}: rejected — {} fatal {kind} rule error(s)",
             errors.len()
         );
         return EXIT_REJECTED;

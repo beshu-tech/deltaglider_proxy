@@ -271,10 +271,7 @@ fn parse_and_validate_yaml(
     known_env: &std::collections::BTreeMap<String, String>,
 ) -> Result<(crate::config::Config, Vec<String>), String> {
     if yaml.trim().is_empty() {
-        return Err(
-            "empty YAML body: apply requires a full canonical config document. Refusing to reset every field to its default."
-                .to_string(),
-        );
+        return Err(EMPTY_DOCUMENT.to_string());
     }
     // Expand `${env:NAME}` refs, but ONLY names the running config already
     // resolved from its file (S7: see `expand_env_admin`), and record the
@@ -291,37 +288,27 @@ fn parse_and_validate_yaml(
         )
     })?;
     let scrub = |m: String| crate::config::scrub_env_values(&m, &env_refs);
-    // Go through the dual-shape deserializer so GitOps operators can POST
-    // either the legacy flat shape or the Phase 3 sectioned shape
-    // (admission/access/storage/advanced). Export round-trips re-emit
-    // sectioned — if we used plain `serde_yaml::from_str::<Config>` here
-    // the roundtrip would break.
-    let mut cfg = crate::config::Config::from_yaml_str(&yaml)
-        .map_err(|e| scrub(format!("YAML parse error: {}", e)))?;
-    // Validate the log filter up front so it can't silently enter runtime
-    // state and then fail at the next process restart. An invalid filter is
-    // a non-recoverable structural error for this doc, not a warning.
-    if cfg
-        .log_level
-        .parse::<tracing_subscriber::EnvFilter>()
-        .is_err()
-    {
-        return Err(scrub(format!(
-            "invalid log_level filter '{}': expected a tracing-subscriber EnvFilter (e.g. 'info', 'deltaglider_proxy=debug')",
-            cfg.log_level
-        )));
-    }
-    let warnings = cfg
-        .check_all()
-        .map_err(|fatal| scrub(format!("config refused: {}", fatal.join("; "))))?
-        .into_iter()
-        .map(scrub)
-        .collect();
-    cfg.env_refs = env_refs;
-    // Lifecycle fatality is decided by the callers via `lifecycle_gate` (needs
-    // the RUNNING config to tell a new defect from a pre-existing one).
-    Ok((cfg, warnings))
+    use crate::config::DocumentRefusal as R;
+    let (mut cfg, warnings) =
+        crate::config::Config::validate_document(&yaml).map_err(|refusal| {
+            scrub(match refusal {
+                R::Empty => EMPTY_DOCUMENT.to_string(),
+                R::Parse(e) => format!("YAML parse error: {}", e),
+                R::LogFilter(filter) => format!(
+                    "invalid log_level filter '{filter}': expected a tracing-subscriber \
+                     EnvFilter (e.g. 'info', 'deltaglider_proxy=debug')"
+                ),
+                R::Fatal(fatal) => format!("config refused: {}", fatal.join("; ")),
+            })
+        })?;
+    cfg.env_refs = env_refs.clone();
+    // The rule gates need the RUNNING config (a new defect vs. a standing
+    // one): the write pipeline runs them.
+    Ok((cfg, warnings.into_iter().map(scrub).collect()))
 }
+
+const EMPTY_DOCUMENT: &str = "empty YAML body: apply requires a full canonical config document. \
+     Refusing to reset every field to its default.";
 
 /// `POST /api/admin/config/validate` — dry-run.
 ///
@@ -1123,6 +1110,76 @@ mod tests {
         )
         .expect_err("fatal config must not validate");
         assert!(err.contains("undefined backend 'hetzner-fsn1'"), "{err}");
+    }
+
+    /// `config lint` and `/config/validate` run the same validation step:
+    /// one YAML corpus through both gives the same verdict (the validate
+    /// side against a default running config, as lint has none).
+    #[test]
+    fn lint_and_validate_give_the_same_verdict() {
+        let corpus: &[(&str, &str, bool)] = &[
+            ("minimal", "storage:\n  filesystem: /var/dgp\n", true),
+            ("empty", "", false),
+            ("whitespace", "  \n\n", false),
+            ("parse error", "advanced: [unclosed\n", false),
+            ("unknown field", "advanced:\n  no_such_field: 1\n", false),
+            ("bad log filter", "advanced:\n  log_level: \"not==valid\"\n", false),
+            (
+                "route to undefined backend",
+                "storage:\n  buckets:\n    releases: { backend: hetzner-fsn1 }\n",
+                false,
+            ),
+            (
+                "duplicate admission block",
+                "admission:\n  blocks:\n    - name: dup\n      match: {}\n      action: deny\n    \
+                 - name: dup\n      match: {}\n      action: deny\n",
+                false,
+            ),
+            (
+                "public and prefixes",
+                "storage:\n  buckets:\n    releases:\n      public: true\n      \
+                 public_prefixes: [\"x/\"]\n",
+                false,
+            ),
+            (
+                "lifecycle delete without expire_after",
+                "storage:\n  lifecycle:\n    enabled: true\n    rules:\n      - name: r\n        \
+                 bucket: releases\n        prefix: \"\"\n",
+                false,
+            ),
+            (
+                "duplicate replication rule",
+                "storage:\n  replication:\n    rules:\n      - name: r\n        source:\n          \
+                 bucket: releases\n        destination:\n          bucket: downloads\n        \
+                 interval: 1h\n      - name: r\n        source:\n          bucket: releases\n        \
+                 destination:\n          bucket: db-archive\n        interval: 1h\n",
+                false,
+            ),
+            ("warning only", "advanced:\n  max_delta_ratio: 0.99\n", true),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let running = crate::config::Config::default();
+        let no_env = EnvRefs::new();
+        for (name, yaml, ok) in corpus {
+            let path = dir.path().join("cfg.yaml");
+            std::fs::write(&path, yaml).unwrap();
+            let lint_ok =
+                crate::cli::config::lint(path.to_str().unwrap()) == crate::cli::config::EXIT_OK;
+            let write = ConfigWrite {
+                surface: Surface::Document { yaml },
+                mode: Mode::DryRun,
+                headers: None,
+                extra_env: &no_env,
+            };
+            let validate_ok = parse_and_validate_yaml(yaml, &no_env)
+                .map_err(|e| Rejection::new(Stage::Build, StatusCode::BAD_REQUEST, e))
+                .and_then(|(incoming, warnings)| {
+                    write::prepare(&running, Built { incoming, warnings }, &write)
+                })
+                .is_ok();
+            assert_eq!(lint_ok, validate_ok, "{name}: lint and validate disagree");
+            assert_eq!(validate_ok, *ok, "{name}: unexpected verdict");
+        }
     }
 }
 

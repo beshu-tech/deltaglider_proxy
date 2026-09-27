@@ -451,10 +451,9 @@ pub(super) fn prepare(
                 format!("config refused: {}", fatal.join("; "))
             ),
         }
-        // Changed-only gates: an error on UNCHANGED lifecycle content is a
-        // standing warning, so a pre-existing bad rule cannot block an
-        // unrelated edit.
-        match crate::lifecycle::planner::lifecycle_gate(&old.lifecycle, &incoming.lifecycle) {
+        // The changed-only rule gates (lifecycle, replication): the same
+        // step `config lint` runs.
+        match incoming.rule_gates(old) {
             Ok(standing) => {
                 if !standing.is_empty() {
                     tracing::warn!(
@@ -464,14 +463,11 @@ pub(super) fn prepare(
                 }
                 w.existing.extend(standing);
             }
-            Err(errs) => reject!(Stage::Gate, StatusCode::BAD_REQUEST, errs.join("; ")),
-        }
-        // Duplicate replication rule names (#13): state, cursor and lease
-        // are keyed by name.
-        if let Err(errs) =
-            crate::config_sections::replication_gate(&old.replication, &incoming.replication)
-        {
-            reject!(Stage::Gate, StatusCode::BAD_REQUEST, errs.join("; "));
+            Err(refusal) => reject!(
+                Stage::Gate,
+                StatusCode::BAD_REQUEST,
+                refusal.errors().join("; ")
+            ),
         }
     }
 

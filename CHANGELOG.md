@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed — `config lint` refuses an empty file
+
+`config lint` now runs the same validation step as
+`POST /_/api/admin/config/validate`. An empty or whitespace-only file was
+accepted, because it parses to the default config, but the admin API refuses
+it because an apply would reset every field. Now lint refuses it too, with
+exit code 4.
+
 ### Changed — The default log level is info
 
 Without `RUST_LOG`, `DGP_LOG_LEVEL` or `advanced.log_level`, the proxy used

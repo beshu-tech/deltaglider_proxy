@@ -4,6 +4,7 @@
 
 pub mod advisories;
 mod check;
+pub use check::{DocumentRefusal, RuleGateRefusal};
 mod env;
 pub mod env_overrides;
 pub mod env_shadow;

@@ -1,11 +1,82 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! `Config::check` and its fatal / advisory siblings: the one validation
-//! step that boot, the admin API and `config lint` share.
+//! `Config::check` and its fatal / advisory siblings, plus the document
+//! validation step (`validate_document`, `rule_gates`) that the admin API
+//! and `config lint` share.
 
 use super::*;
 
+/// Why a config document is refused on its own, before any running config
+/// is involved. [`Config::validate_document`] returns it; each caller words
+/// it for its surface.
+#[derive(Debug)]
+pub enum DocumentRefusal {
+    /// An empty or whitespace-only document: it would reset every field to
+    /// its default, which is almost always a template or pipeline mistake.
+    Empty,
+    /// Shape or semantic parse error (unknown field, bad value, admission
+    /// spec, shorthand conflict).
+    Parse(ConfigError),
+    /// `log_level` is not a tracing `EnvFilter` (the value in the file).
+    LogFilter(String),
+    /// Fatal `check_all` errors: the ones boot refuses too.
+    Fatal(Vec<String>),
+}
+
+/// Which changed-only rule gate refused a write (see [`Config::rule_gates`]).
+#[derive(Debug)]
+pub enum RuleGateRefusal {
+    Lifecycle(Vec<String>),
+    Replication(Vec<String>),
+}
+
+impl RuleGateRefusal {
+    pub fn errors(&self) -> &[String] {
+        match self {
+            Self::Lifecycle(e) | Self::Replication(e) => e,
+        }
+    }
+}
+
 impl Config {
+    /// THE document validation step, on the already-expanded text:
+    /// `POST /config/validate`, `POST /config/apply` and `config lint` all
+    /// run it. Returns the config and its advisory warnings.
+    pub fn validate_document(text: &str) -> Result<(Config, Vec<String>), DocumentRefusal> {
+        if text.trim().is_empty() {
+            return Err(DocumentRefusal::Empty);
+        }
+        // The dual-shape loader: the legacy flat shape or the sectioned one.
+        let mut cfg = Config::from_yaml_str(text).map_err(DocumentRefusal::Parse)?;
+        // A malformed filter must not enter the runtime config and then fail
+        // at the next restart.
+        if cfg
+            .log_level
+            .parse::<tracing_subscriber::EnvFilter>()
+            .is_err()
+        {
+            return Err(DocumentRefusal::LogFilter(cfg.log_level));
+        }
+        let warnings = cfg.check_all().map_err(DocumentRefusal::Fatal)?;
+        Ok((cfg, warnings))
+    }
+
+    /// The changed-only rule gates of a write from `old` to `self`: a fatal
+    /// lifecycle rule error (a delete rule without `expire_after`, …) and a
+    /// duplicate replication rule name refuse the write only when the write
+    /// changes that block. An error on UNCHANGED lifecycle content comes back
+    /// as a standing warning, so a pre-existing bad rule cannot block an
+    /// unrelated edit. `config lint` passes a default `old`: every rule
+    /// counts as changed.
+    pub fn rule_gates(&self, old: &Config) -> Result<Vec<String>, RuleGateRefusal> {
+        let standing = crate::lifecycle::planner::lifecycle_gate(&old.lifecycle, &self.lifecycle)
+            .map_err(RuleGateRefusal::Lifecycle)?;
+        // State, cursor and lease are keyed by rule name (#13).
+        crate::config_sections::replication_gate(&old.replication, &self.replication)
+            .map_err(RuleGateRefusal::Replication)?;
+        Ok(standing)
+    }
+
     /// Check the config for problems. Returns a list of human-readable
     /// warnings; also clears fields that cannot be satisfied (currently just
     /// unresolvable `default_backend`).
