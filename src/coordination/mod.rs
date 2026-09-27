@@ -51,14 +51,16 @@ pub use s3_lease::S3Lease;
 /// Purely a provenance/self-reclaim label — NEVER a coordination decision (the
 /// lease CAS is the only arbiter). `dir` is the config-DB directory.
 pub fn durable_node_id(dir: &std::path::Path) -> String {
-    if let Ok(id) = std::env::var("DGP_NODE_ID") {
-        if !id.trim().is_empty() {
-            return id;
-        }
-    }
-    if let Ok(host) = std::env::var("HOSTNAME") {
-        if !host.trim().is_empty() {
-            return host;
+    durable_node_id_with(&crate::config::process_env, dir)
+}
+
+/// [`durable_node_id`] over an injected environment.
+pub fn durable_node_id_with(env: crate::config::EnvLookup, dir: &std::path::Path) -> String {
+    for var in ["DGP_NODE_ID", "HOSTNAME"] {
+        if let Some(id) = crate::config::lookup_parse::<String>(env, var) {
+            if !id.trim().is_empty() {
+                return id;
+            }
         }
     }
     let path = dir.join("node-id");
@@ -108,8 +110,33 @@ fn rotate_boot_id(dir: &std::path::Path) -> BootIds {
 }
 
 #[cfg(test)]
-mod boot_id_tests {
+mod node_identity_tests {
     use super::*;
+
+    #[test]
+    fn node_id_resolution_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let both = env(&[("DGP_NODE_ID", "pinned"), ("HOSTNAME", "host")]);
+        assert_eq!(durable_node_id_with(&both, dir.path()), "pinned");
+        let blank = env(&[("DGP_NODE_ID", "  "), ("HOSTNAME", "host")]);
+        assert_eq!(durable_node_id_with(&blank, dir.path()), "host");
+        let none = env(&[]);
+        let generated = durable_node_id_with(&none, dir.path());
+        assert!(generated.starts_with("node-"));
+        assert_eq!(
+            durable_node_id_with(&none, dir.path()),
+            generated,
+            "persisted"
+        );
+    }
 
     #[test]
     fn each_boot_sees_the_one_before_it() {
