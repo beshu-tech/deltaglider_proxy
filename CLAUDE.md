@@ -147,8 +147,10 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                             StorageBackend::put_passthrough_metadata; dg-created-at pinned to the pre-job time unless refresh_last_modified,
                             multipart ETag preserved via dg-multipart-etag; POST /jobs/backfill-metadata),
                             mod.rs (pure: resolve_desired/needs_rewrite/progress_percent/display_percent)
-  → config_apply.rs         ConfigMutator: mutate → rebuild engine (rollback on failure) → persist, for BACKGROUND tasks (migrate flips);
-                            admin rebuild_engine delegates to rebuild_engine_only
+  → config_apply.rs         ConfigMutator: background config mutations (migrate flips) through the same apply_config_transition
+                            (TransitionCtx::Background names the skipped steps). Every admin config writer — PATCH, section, document,
+                            bootstrap removal, backup secrets, backends, bucket-on-backend, rule delete — goes through ONE pipeline in
+                            api/admin/config/write.rs (run / run_internal / run_internal_held); a source guard refuses hand persists
   → job_loop.rs             THE canonical pagination state machine (Pager): token threading, resume detection, poison-token
                             guard (one-shot restart_fresh), MAX_JOB_PAGES cap, truncated_by_page_budget() — phase machines (migrate/reencrypt)
                             MUST fail on budget truncation instead of falling through to the next phase; cursor loops may ignore it
