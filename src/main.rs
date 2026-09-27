@@ -465,10 +465,12 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         std::process::exit(1);
     }
+    // Parsed once here (warnings too); no request reads these env vars.
     // Trust in X-Forwarded-For needs the list of proxies that may send it.
+    let proxy_trust = deltaglider_proxy::rate_limiter::install_proxy_trust_from_env();
     if let Some(msg) = deltaglider_proxy::rate_limiter::proxy_trust_config_error(
-        deltaglider_proxy::rate_limiter::trust_proxy_headers(),
-        &deltaglider_proxy::rate_limiter::trusted_proxy_cidrs(),
+        proxy_trust.trust,
+        &proxy_trust.cidrs,
     ) {
         eprintln!("FATAL config error: {msg}");
         std::process::exit(1);

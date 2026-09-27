@@ -384,38 +384,84 @@ fn should_keep_entry(
 /// connection peer IP is always available via `ConnectInfo<SocketAddr>`, so
 /// per-IP rate limiting works regardless of this setting.
 pub fn trust_proxy_headers() -> bool {
-    crate::config::env_bool("DGP_TRUST_PROXY_HEADERS", false)
+    proxy_trust().trust
 }
 
-/// Parse `DGP_TRUSTED_PROXY_CIDRS` (comma-separated CIDRs / bare IPs) into a set
-/// of networks. Empty / unset → empty vec. A bare IP becomes a /32 (or /128).
-/// When non-empty, `X-Forwarded-For` is honored ONLY for a peer inside one of
-/// these networks (a real reverse proxy); otherwise the header is attacker-
-/// controlled and ignored. Invalid entries are skipped with a warning.
+/// `DGP_TRUST_PROXY_HEADERS` + `DGP_TRUSTED_PROXY_CIDRS`, parsed.
+#[derive(Debug, Clone, Default)]
+pub struct ProxyTrust {
+    pub trust: bool,
+    pub cidrs: Vec<ipnet::IpNet>,
+}
+
+impl ProxyTrust {
+    /// Parse both variables through `env` (injected, so unit tests never
+    /// read the process env). Also returns the invalid CIDR entries.
+    pub fn from_env_with(env: crate::config::EnvLookup) -> (Self, Vec<String>) {
+        let trust = crate::config::lookup_bool(env, "DGP_TRUST_PROXY_HEADERS", false);
+        let (cidrs, invalid) =
+            parse_trusted_proxy_cidrs(&env("DGP_TRUSTED_PROXY_CIDRS").unwrap_or_default());
+        (Self { trust, cidrs }, invalid)
+    }
+}
+
+/// The snapshot `main` installs at boot, so no request parses the env.
+static PROXY_TRUST: arc_swap::ArcSwapOption<ProxyTrust> = arc_swap::ArcSwapOption::const_empty();
+
+/// Parse the env once and install it as THE proxy trust of this process;
+/// each invalid `DGP_TRUSTED_PROXY_CIDRS` entry is warned about here, once.
+/// Env is not hot-reloaded, so the snapshot holds for the process's life.
+pub fn install_proxy_trust_from_env() -> Arc<ProxyTrust> {
+    let (trust, invalid) = ProxyTrust::from_env_with(&crate::config::process_env);
+    for entry in invalid {
+        tracing::warn!("DGP_TRUSTED_PROXY_CIDRS: ignoring invalid entry {entry:?}");
+    }
+    install_proxy_trust(trust)
+}
+
+/// Install `trust` as the process snapshot.
+pub fn install_proxy_trust(trust: ProxyTrust) -> Arc<ProxyTrust> {
+    let trust = Arc::new(trust);
+    PROXY_TRUST.store(Some(trust.clone()));
+    trust
+}
+
+/// The installed snapshot; without one (unit tests, library callers) the
+/// env is parsed on the spot, silently.
+fn proxy_trust() -> Arc<ProxyTrust> {
+    PROXY_TRUST
+        .load_full()
+        .unwrap_or_else(|| Arc::new(ProxyTrust::from_env_with(&crate::config::process_env).0))
+}
+
+/// The trusted proxy networks (see [`ProxyTrust`]). A bare IP becomes a
+/// /32 (or /128). When non-empty, `X-Forwarded-For` is honored ONLY for a
+/// peer inside one of these networks (a real reverse proxy); otherwise the
+/// header is attacker-controlled and ignored.
 pub fn trusted_proxy_cidrs() -> Vec<ipnet::IpNet> {
-    let raw = match std::env::var("DGP_TRUSTED_PROXY_CIDRS") {
-        Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-    raw.split(',')
+    proxy_trust().cidrs.clone()
+}
+
+/// Pure: comma-separated CIDRs / bare IPs → networks, plus the entries that
+/// are neither.
+pub fn parse_trusted_proxy_cidrs(raw: &str) -> (Vec<ipnet::IpNet>, Vec<String>) {
+    let mut invalid = Vec::new();
+    let nets = raw
+        .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter_map(|s| match s.parse::<ipnet::IpNet>() {
             Ok(net) => Some(net),
             Err(_) => match s.parse::<IpAddr>() {
-                Ok(IpAddr::V4(v4)) => Some(ipnet::IpNet::V4(
-                    ipnet::Ipv4Net::new(v4, 32).expect("32 valid"),
-                )),
-                Ok(IpAddr::V6(v6)) => Some(ipnet::IpNet::V6(
-                    ipnet::Ipv6Net::new(v6, 128).expect("128 valid"),
-                )),
+                Ok(ip) => Some(ipnet::IpNet::from(ip)),
                 Err(_) => {
-                    tracing::warn!("DGP_TRUSTED_PROXY_CIDRS: ignoring invalid entry {s:?}");
+                    invalid.push(s.to_string());
                     None
                 }
             },
         })
-        .collect()
+        .collect();
+    (nets, invalid)
 }
 
 /// THE client IP of a request, for every decision: the per-IP limiter
@@ -428,12 +474,8 @@ pub fn extract_client_ip_with_peer(
     headers: &axum::http::HeaderMap,
     peer_ip: Option<IpAddr>,
 ) -> Option<IpAddr> {
-    resolve_client_ip(
-        headers,
-        peer_ip,
-        trust_proxy_headers(),
-        &trusted_proxy_cidrs(),
-    )
+    let t = proxy_trust();
+    resolve_client_ip(headers, peer_ip, t.trust, &t.cidrs)
 }
 
 /// Pure: whether this connection comes from a trusted reverse proxy, so its
@@ -457,7 +499,8 @@ pub fn peer_is_trusted_proxy(
 /// `audit::scope_request_peer`.
 pub fn from_trusted_proxy(peer_ip: Option<IpAddr>) -> bool {
     let peer = peer_ip.or_else(crate::audit::current_request_peer);
-    peer_is_trusted_proxy(peer, trust_proxy_headers(), &trusted_proxy_cidrs())
+    let t = proxy_trust();
+    peer_is_trusted_proxy(peer, t.trust, &t.cidrs)
 }
 
 /// A proxy-set header such as `X-Forwarded-Host` / `X-Forwarded-Proto`,
@@ -1477,6 +1520,35 @@ mod tests {
         assert!(!peer_is_trusted_proxy(Some(ip("192.0.2.1")), true, &nets));
         assert!(!peer_is_trusted_proxy(Some(ip("10.1.2.3")), true, &[]));
         assert!(!peer_is_trusted_proxy(None, true, &nets));
+    }
+
+    #[test]
+    fn proxy_trust_parses_once_and_reports_invalid_entries() {
+        let (nets, invalid) = parse_trusted_proxy_cidrs(" 10.0.0.0/8, 192.0.2.7,nope,, ::1 ");
+        assert_eq!(
+            nets,
+            vec![cidr("10.0.0.0/8"), cidr("192.0.2.7/32"), cidr("::1/128")]
+        );
+        assert_eq!(invalid, vec!["nope".to_string()]);
+        let env = |k: &str| match k {
+            "DGP_TRUST_PROXY_HEADERS" => Some("yes".to_string()),
+            "DGP_TRUSTED_PROXY_CIDRS" => Some("10.0.0.0/8,bad".to_string()),
+            _ => None,
+        };
+        let (t, invalid) = ProxyTrust::from_env_with(&env);
+        assert!(t.trust);
+        assert_eq!(t.cidrs, vec![cidr("10.0.0.0/8")]);
+        assert_eq!(invalid, vec!["bad".to_string()]);
+
+        // Once installed, the snapshot answers; the env is not read again.
+        let _g = env_lock();
+        std::env::remove_var("DGP_TRUST_PROXY_HEADERS");
+        std::env::remove_var("DGP_TRUSTED_PROXY_CIDRS");
+        install_proxy_trust(t);
+        let (trust, cidrs) = (trust_proxy_headers(), trusted_proxy_cidrs());
+        PROXY_TRUST.store(None);
+        assert!(trust, "the snapshot, not the (empty) env");
+        assert_eq!(cidrs, vec![cidr("10.0.0.0/8")]);
     }
 
     #[test]
