@@ -1758,7 +1758,13 @@ async fn admin_error_bodies_keep_their_shape() {
             StatusCode::BAD_REQUEST,
             text("no items to copy"),
         ),
-        // sessions: JSON.
+        // sessions / savings / scanner: JSON.
+        (
+            "revoke-user without identity",
+            admin.post(api("/sessions/revoke-user")).json(&json!({})),
+            StatusCode::BAD_REQUEST,
+            ErrorBody::Json(json!({ "error": "identity (or access_key_id) is required" })),
+        ),
         (
             "session missing",
             admin.delete(api("/sessions/nope")),
