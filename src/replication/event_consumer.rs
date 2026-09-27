@@ -861,14 +861,14 @@ async fn drain_rule_rows(
                             )
                             .await;
                         match renewed {
-                            Ok(true) => {
+                            Ok(()) => {
                                 claims.insert(rule.name.clone(), RuleClaim::Held { since: t });
                             }
-                            lost_or_unknown => {
-                                // Ok(false): lost, nothing to release. Err: the
+                            Err(e) => {
+                                // Lost: nothing to release. Backend: the
                                 // lease may still be ours — release it, so it
                                 // does not block the rule for a whole TTL.
-                                if lost_or_unknown.is_err() {
+                                if matches!(e, crate::coordination::LeaseError::Backend(_)) {
                                     let _ = lease
                                         .release(
                                             LeaseSubsystem::Replication,
@@ -1515,7 +1515,7 @@ mod claim_rule_tests {
             _: &str,
             _: i64,
             _: i64,
-        ) -> Result<bool, String> {
+        ) -> Result<bool, crate::coordination::LeaseError> {
             Ok(rule != "r")
         }
         async fn renew(
@@ -1525,14 +1525,24 @@ mod claim_rule_tests {
             _: &str,
             _: i64,
             _: i64,
-        ) -> Result<bool, String> {
-            Ok(false)
+        ) -> Result<(), crate::coordination::LeaseError> {
+            Err(crate::coordination::LeaseError::Lost)
         }
-        async fn release(&self, _: LeaseSubsystem, rule: &str, _: &str) -> Result<(), String> {
+        async fn release(
+            &self,
+            _: LeaseSubsystem,
+            rule: &str,
+            _: &str,
+        ) -> Result<(), crate::coordination::LeaseError> {
             self.released.lock().unwrap().push(rule.to_string());
             Ok(())
         }
-        async fn is_held(&self, _: LeaseSubsystem, rule: &str, _: i64) -> Result<bool, String> {
+        async fn is_held(
+            &self,
+            _: LeaseSubsystem,
+            rule: &str,
+            _: i64,
+        ) -> Result<bool, crate::coordination::LeaseError> {
             Ok(rule == "r")
         }
     }
@@ -1673,7 +1683,7 @@ mod per_rule_cursor_tests {
             _: &str,
             _: i64,
             _: i64,
-        ) -> Result<bool, String> {
+        ) -> Result<bool, crate::coordination::LeaseError> {
             Ok(rule != self.0)
         }
         async fn renew(
@@ -1683,13 +1693,23 @@ mod per_rule_cursor_tests {
             _: &str,
             _: i64,
             _: i64,
-        ) -> Result<bool, String> {
-            Ok(true)
-        }
-        async fn release(&self, _: LeaseSubsystem, _: &str, _: &str) -> Result<(), String> {
+        ) -> Result<(), crate::coordination::LeaseError> {
             Ok(())
         }
-        async fn is_held(&self, _: LeaseSubsystem, rule: &str, _: i64) -> Result<bool, String> {
+        async fn release(
+            &self,
+            _: LeaseSubsystem,
+            _: &str,
+            _: &str,
+        ) -> Result<(), crate::coordination::LeaseError> {
+            Ok(())
+        }
+        async fn is_held(
+            &self,
+            _: LeaseSubsystem,
+            rule: &str,
+            _: i64,
+        ) -> Result<bool, crate::coordination::LeaseError> {
             Ok(rule == self.0)
         }
     }

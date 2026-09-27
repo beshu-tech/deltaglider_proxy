@@ -230,12 +230,15 @@ async fn reference_lock_renew_extends_and_detects_a_steal() {
     assert!(a.try_acquire(&key, "ref-a", now()).await.unwrap());
     // A renew inside the TTL moves Last-Modified on: B is still blocked.
     tokio::time::sleep(Duration::from_millis(1_500)).await;
-    assert!(a.renew(&key, "ref-a", now()).await.unwrap());
+    assert_eq!(a.renew(&key, "ref-a", now()).await, Ok(()));
     assert!(!b.try_acquire(&key, "ref-b", now()).await.unwrap());
     // B steals after the renewed lock lapses; A's next renew reports the loss.
     tokio::time::sleep(PAST_TTL).await;
     assert!(b.try_acquire(&key, "ref-b", now()).await.unwrap());
-    assert!(!a.renew(&key, "ref-a", now()).await.unwrap());
+    assert_eq!(
+        a.renew(&key, "ref-a", now()).await,
+        Err(deltaglider_proxy::coordination::LeaseError::Lost)
+    );
 
     b.release(&key, "ref-b").await.unwrap();
     cleanup(&key).await;

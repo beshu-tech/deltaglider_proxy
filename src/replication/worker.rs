@@ -1448,7 +1448,7 @@ fn spawn_lease_heartbeat(
                     lease.ttl_secs,
                 )
                 .await
-                .unwrap_or(false)
+                .is_ok()
             } else {
                 // Node-local SQLite renew with lock-light retry: a slow worker-side
                 // DB hold shouldn't drop the lease. Lock-acquire timeout retried
@@ -2051,7 +2051,7 @@ mod tests {
             _o: &str,
             _n: i64,
             _t: i64,
-        ) -> Result<bool, String> {
+        ) -> Result<bool, crate::coordination::LeaseError> {
             Ok(true)
         }
         async fn renew(
@@ -2061,16 +2061,16 @@ mod tests {
             _o: &str,
             _n: i64,
             _t: i64,
-        ) -> Result<bool, String> {
+        ) -> Result<(), crate::coordination::LeaseError> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(true)
+            Ok(())
         }
         async fn release(
             &self,
             _s: crate::coordination::LeaseSubsystem,
             _r: &str,
             _o: &str,
-        ) -> Result<(), String> {
+        ) -> Result<(), crate::coordination::LeaseError> {
             self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
@@ -2079,7 +2079,7 @@ mod tests {
             _s: crate::coordination::LeaseSubsystem,
             _r: &str,
             _n: i64,
-        ) -> Result<bool, String> {
+        ) -> Result<bool, crate::coordination::LeaseError> {
             Ok(true)
         }
     }

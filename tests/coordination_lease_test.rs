@@ -13,7 +13,9 @@
 use crate::common;
 
 use common::{minio_available, minio_client, MINIO_BUCKET};
-use deltaglider_proxy::coordination::{BootIds, CoordinationLease, LeaseSubsystem, S3Lease};
+use deltaglider_proxy::coordination::{
+    BootIds, CoordinationLease, LeaseError, LeaseSubsystem, S3Lease,
+};
 
 fn unique_rule() -> String {
     format!("itest-{}", uuid::Uuid::new_v4())
@@ -85,11 +87,9 @@ async fn s3_lease_full_failover_lifecycle() {
 
     // 3. A renews while live.
     tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
-    assert!(
-        node_a
-            .renew(SUB, &rule, "task-a1", now(), TTL)
-            .await
-            .unwrap(),
+    assert_eq!(
+        node_a.renew(SUB, &rule, "task-a1", now(), TTL).await,
+        Ok(()),
         "A should renew its live lease"
     );
 
@@ -105,20 +105,16 @@ async fn s3_lease_full_failover_lifecycle() {
     );
 
     // 5. The old owner A can no longer renew (it was stolen) — E3b.
-    assert!(
-        !node_a
-            .renew(SUB, &rule, "task-a1", now(), 60)
-            .await
-            .unwrap(),
+    assert_eq!(
+        node_a.renew(SUB, &rule, "task-a1", now(), 60).await,
+        Err(LeaseError::Lost),
         "A must NOT renew a lease B has stolen"
     );
 
     // 6. B now holds it and renews normally.
-    assert!(
-        node_b
-            .renew(SUB, &rule, "task-b1", now(), 60)
-            .await
-            .unwrap(),
+    assert_eq!(
+        node_b.renew(SUB, &rule, "task-b1", now(), 60).await,
+        Ok(()),
         "B should renew the lease it stole"
     );
 

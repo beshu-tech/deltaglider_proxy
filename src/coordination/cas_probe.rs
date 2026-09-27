@@ -61,7 +61,7 @@ where
             let signal = crate::coordination::cas::sdk_error_signal(e);
             if crate::coordination::cas::conditional_write_lost(&signal) {
                 StepOutcome::PreconditionFailed
-            } else if crate::config_db_sync::is_not_implemented(&signal) {
+            } else if crate::coordination::cas::is_not_implemented(&signal) {
                 StepOutcome::NotImplemented
             } else {
                 StepOutcome::Other(format!("{signal}: {e:?}"))

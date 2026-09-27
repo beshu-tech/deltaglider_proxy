@@ -32,7 +32,7 @@ pub mod server_clock;
 
 pub use capability::{BackendCapabilityCache, CapabilityVerdict, VerifiedVia};
 pub use health::{BackendHealthCache, HealthVerdict};
-pub use lease::{CoordinationLease, LeaseSubsystem, LocalLease};
+pub use lease::{CoordinationLease, LeaseError, LeaseSubsystem, LocalLease};
 pub use reference_lock::{ReferenceLock, S3ReferenceLock};
 pub use s3_lease::S3Lease;
 

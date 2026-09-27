@@ -8,6 +8,33 @@ use tokio::sync::Mutex;
 
 use crate::config_db::ConfigDb;
 
+/// Why a lease or lock step did not succeed. `Lost` is a verdict (refused,
+/// stolen, lapsed: stop before more work); `Backend` is "could not tell"
+/// (the store errored: the holder may still own it until its TTL).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LeaseError {
+    #[error("lease lost")]
+    Lost,
+    #[error("{0}")]
+    Backend(String),
+}
+
+impl LeaseError {
+    /// Map a boolean renewal (`false` = refused) and its store error.
+    pub fn from_renewal<E: std::fmt::Display>(r: Result<bool, E>) -> Result<(), LeaseError> {
+        match r {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(LeaseError::Lost),
+            Err(e) => Err(LeaseError::Backend(e.to_string())),
+        }
+    }
+
+    /// A store error (not a verdict).
+    pub fn backend<E: std::fmt::Display>(e: E) -> LeaseError {
+        LeaseError::Backend(e.to_string())
+    }
+}
+
 /// Which job subsystem a lease belongs to. Selects the backing table (for the
 /// local impl) and namespaces the lease key (for the S3 impl). Only
 /// replication runs through this seam: lifecycle and maintenance keep their
@@ -50,10 +77,10 @@ pub trait CoordinationLease: Send + Sync {
         owner: &str,
         now: i64,
         ttl_secs: i64,
-    ) -> Result<bool, String>;
+    ) -> Result<bool, LeaseError>;
 
-    /// Extend a lease this owner still holds. `false` = lost/stolen/lapsed →
-    /// the caller must stop before starting more work.
+    /// Extend a lease this owner still holds. `Err(Lost)` = lost/stolen/lapsed
+    /// → the caller must stop before starting more work.
     async fn renew(
         &self,
         subsystem: LeaseSubsystem,
@@ -61,7 +88,7 @@ pub trait CoordinationLease: Send + Sync {
         owner: &str,
         now: i64,
         ttl_secs: i64,
-    ) -> Result<bool, String>;
+    ) -> Result<(), LeaseError>;
 
     /// Release a lease this owner holds (no-op for a different owner).
     async fn release(
@@ -69,7 +96,7 @@ pub trait CoordinationLease: Send + Sync {
         subsystem: LeaseSubsystem,
         rule: &str,
         owner: &str,
-    ) -> Result<(), String>;
+    ) -> Result<(), LeaseError>;
 
     /// Read-only: is a (non-expired) lease currently held for `(subsystem,
     /// rule)`? Used by admin handlers (run-now / verify / delete) to gate against
@@ -81,7 +108,7 @@ pub trait CoordinationLease: Send + Sync {
         subsystem: LeaseSubsystem,
         rule: &str,
         now: i64,
-    ) -> Result<bool, String>;
+    ) -> Result<bool, LeaseError>;
 }
 
 /// Node-local lease backed by the SQLite CAS in `config_db/job_store.rs` (via the
@@ -107,7 +134,7 @@ impl CoordinationLease for LocalLease {
         owner: &str,
         now: i64,
         ttl_secs: i64,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, LeaseError> {
         let db = self.db.lock().await;
         match subsystem {
             // The lease lives in the rule's state row: create it first, or
@@ -116,7 +143,7 @@ impl CoordinationLease for LocalLease {
                 .replication_ensure_state(rule, now)
                 .and_then(|_| db.replication_try_acquire_lease(rule, owner, now, ttl_secs)),
         }
-        .map_err(|e| e.to_string())
+        .map_err(LeaseError::backend)
     }
 
     async fn renew(
@@ -126,12 +153,11 @@ impl CoordinationLease for LocalLease {
         owner: &str,
         now: i64,
         ttl_secs: i64,
-    ) -> Result<bool, String> {
+    ) -> Result<(), LeaseError> {
         let db = self.db.lock().await;
-        match subsystem {
+        LeaseError::from_renewal(match subsystem {
             LeaseSubsystem::Replication => db.replication_renew_lease(rule, owner, now, ttl_secs),
-        }
-        .map_err(|e| e.to_string())
+        })
     }
 
     async fn release(
@@ -139,12 +165,12 @@ impl CoordinationLease for LocalLease {
         subsystem: LeaseSubsystem,
         rule: &str,
         owner: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), LeaseError> {
         let db = self.db.lock().await;
         let _held = match subsystem {
             LeaseSubsystem::Replication => db.replication_release_lease(rule, owner),
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(LeaseError::backend)?;
         Ok(())
     }
 
@@ -153,12 +179,12 @@ impl CoordinationLease for LocalLease {
         subsystem: LeaseSubsystem,
         rule: &str,
         now: i64,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, LeaseError> {
         let db = self.db.lock().await;
         match subsystem {
             LeaseSubsystem::Replication => db.replication_lease_is_held(rule, now),
         }
-        .map_err(|e| e.to_string())
+        .map_err(LeaseError::backend)
     }
 }
 
@@ -189,17 +215,20 @@ mod tests {
         // A rival B cannot steal a LIVE lease (expires_at 160 > now 150).
         assert!(!lease.try_acquire(r, "rule1", "B", 150, 60).await.unwrap());
         // Owner A CAN renew while live (expires_at 160 >= now 150 → new 210).
-        assert!(lease.renew(r, "rule1", "A", 150, 60).await.unwrap());
+        assert_eq!(lease.renew(r, "rule1", "A", 150, 60).await, Ok(()));
 
         // At the exact expiry instant the OWNER can renew but a RIVAL can't steal
         // (the >=/< tiling): with expires_at now 210, at now=210 renew succeeds…
-        assert!(lease.renew(r, "rule1", "A", 210, 60).await.unwrap()); // → 270
-                                                                       // …and a steal at now=270 (== new expiry) is refused (needs < now).
+        assert_eq!(lease.renew(r, "rule1", "A", 210, 60).await, Ok(())); // → 270
+                                                                         // …and a steal at now=270 (== new expiry) is refused (needs < now).
         assert!(!lease.try_acquire(r, "rule1", "B", 270, 60).await.unwrap());
         // Once truly lapsed (now > expiry), a rival steals.
         assert!(lease.try_acquire(r, "rule1", "B", 271, 60).await.unwrap());
         // And the old owner A can no longer renew (lapsed → stop).
-        assert!(!lease.renew(r, "rule1", "A", 271, 60).await.unwrap());
+        assert_eq!(
+            lease.renew(r, "rule1", "A", 271, 60).await,
+            Err(LeaseError::Lost)
+        );
     }
 
     #[tokio::test]
@@ -230,6 +259,20 @@ mod tests {
         // The real owner releasing frees it immediately (before expiry).
         lease.release(r, "rule1", "A").await.unwrap();
         assert!(lease.try_acquire(r, "rule1", "B", 120, 60).await.unwrap());
+    }
+
+    /// A refused renewal is a verdict; a store error is not.
+    #[test]
+    fn a_refused_renewal_is_lost_and_a_store_error_is_backend() {
+        assert_eq!(LeaseError::from_renewal(Ok::<_, String>(true)), Ok(()));
+        assert_eq!(
+            LeaseError::from_renewal(Ok::<_, String>(false)),
+            Err(LeaseError::Lost)
+        );
+        assert_eq!(
+            LeaseError::from_renewal(Err::<bool, _>("db locked")),
+            Err(LeaseError::Backend("db locked".into()))
+        );
     }
 
     #[test]

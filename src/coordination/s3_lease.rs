@@ -24,7 +24,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use serde::{Deserialize, Serialize};
 
-use super::lease::{CoordinationLease, LeaseSubsystem};
+use super::lease::{CoordinationLease, LeaseError, LeaseSubsystem};
 
 /// The lease object body. `epoch` is monotonic (bumped on every steal) — a
 /// diagnostic + future fence token; it is NOT used to fence customer-bucket
@@ -217,7 +217,7 @@ impl S3Lease {
     /// Read the lease object + its ETag. The lease's `expires_at` comes back
     /// re-based onto the caller's clock `now` from the server-clock age
     /// (`server_clock::effective_expires_at`).
-    async fn read_lease(&self, key: &str, now: i64) -> Result<LeaseRead, String> {
+    async fn read_lease(&self, key: &str, now: i64) -> Result<LeaseRead, LeaseError> {
         match super::server_clock::get_with_server_age(&self.client, &self.bucket, key).await {
             Ok((out, age)) => {
                 let etag = out.e_tag().map(str::to_string).unwrap_or_default();
@@ -225,7 +225,7 @@ impl S3Lease {
                     .body
                     .collect()
                     .await
-                    .map_err(|e| format!("lease body read: {e}"))?
+                    .map_err(|e| LeaseError::Backend(format!("lease body read: {e}")))?
                     .into_bytes();
                 Ok(match serde_json::from_slice::<Lease>(&bytes) {
                     Ok(mut lease) => {
@@ -241,12 +241,10 @@ impl S3Lease {
                 })
             }
             Err(e) => {
-                if crate::config_db_sync::is_object_absent(
-                    &crate::coordination::cas::sdk_error_signal(&*e),
-                ) {
+                if super::cas::is_object_absent(&super::cas::sdk_error_signal(&*e)) {
                     Ok(LeaseRead::Absent)
                 } else {
-                    Err(format!("{e:?}"))
+                    Err(LeaseError::Backend(format!("{e:?}")))
                 }
             }
         }
@@ -273,8 +271,10 @@ impl S3Lease {
         key: &str,
         body: ByteStream,
         precondition: Option<&str>,
-    ) -> Result<bool, String> {
-        super::cas::conditional_put(&self.client, &self.bucket, key, body, precondition).await
+    ) -> Result<bool, LeaseError> {
+        super::cas::conditional_put(&self.client, &self.bucket, key, body, precondition)
+            .await
+            .map_err(LeaseError::Backend)
     }
 }
 
@@ -287,7 +287,7 @@ impl CoordinationLease for S3Lease {
         owner: &str,
         now: i64,
         ttl_secs: i64,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, LeaseError> {
         let key = Self::object_key(subsystem, rule);
         let current = self.read_lease(&key, now).await?;
         let expires_at = now.saturating_add(ttl_secs.max(1));
@@ -320,7 +320,7 @@ impl CoordinationLease for S3Lease {
         owner: &str,
         now: i64,
         ttl_secs: i64,
-    ) -> Result<bool, String> {
+    ) -> Result<(), LeaseError> {
         let key = Self::object_key(subsystem, rule);
         // Bounded retry loop (E5): a transient blip on read or PUT shouldn't drop
         // a lease we still hold. Only a real 412 (stolen) or a lapsed/foreign
@@ -334,7 +334,7 @@ impl CoordinationLease for S3Lease {
         // real monotonic elapsed since loop start, so both the plan_renew
         // freshness check and the new expires_at reflect wall-clock progress.
         let started = std::time::Instant::now();
-        let mut last_err: Option<String> = None;
+        let mut last_err: Option<LeaseError> = None;
         for _ in 0..RENEW_MAX_ATTEMPTS {
             let elapsed_secs = started.elapsed().as_secs() as i64;
             let effective_now = now.saturating_add(elapsed_secs);
@@ -347,7 +347,7 @@ impl CoordinationLease for S3Lease {
                 }
             };
             match plan_renew(current.valid(), effective_now, owner) {
-                RenewAction::Lost => return Ok(false),
+                RenewAction::Lost => return Err(LeaseError::Lost),
                 RenewAction::Renew { etag, epoch } => {
                     match self
                         .put_lease(
@@ -357,7 +357,7 @@ impl CoordinationLease for S3Lease {
                         )
                         .await
                     {
-                        Ok(true) => return Ok(true),
+                        Ok(true) => return Ok(()),
                         // 412 here = a concurrent writer moved the etag. Re-read
                         // and re-evaluate: either we still own it (rare same-owner
                         // double-renew race) or we were stolen (→ Lost next pass).
@@ -373,7 +373,8 @@ impl CoordinationLease for S3Lease {
         // Exhausted retries on transient errors: report the error so the caller
         // logs it, but the run should pause (treat like a lost renew) rather than
         // crash — the next tick re-acquires.
-        Err(last_err.unwrap_or_else(|| "lease renew exhausted retries".to_string()))
+        Err(last_err
+            .unwrap_or_else(|| LeaseError::Backend("lease renew exhausted retries".to_string())))
     }
 
     async fn release(
@@ -381,7 +382,7 @@ impl CoordinationLease for S3Lease {
         subsystem: LeaseSubsystem,
         rule: &str,
         owner: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), LeaseError> {
         let key = Self::object_key(subsystem, rule);
         // Owner-scoped release: only delete the object if WE still own it, so a
         // release can't clobber a lease a peer legitimately stole.
@@ -406,7 +407,7 @@ impl CoordinationLease for S3Lease {
         subsystem: LeaseSubsystem,
         rule: &str,
         now: i64,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, LeaseError> {
         let key = Self::object_key(subsystem, rule);
         // Held = the lease object exists AND hasn't lapsed. A transient read
         // error is surfaced (the caller treats an Err conservatively).

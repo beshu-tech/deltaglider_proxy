@@ -23,7 +23,7 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 // The classifier input lives next to the classifier (coordination::cas).
-pub(crate) use crate::coordination::cas::sdk_error_signal;
+pub(crate) use crate::coordination::cas::{is_not_implemented, is_object_absent, sdk_error_signal};
 
 use crate::config::BackendConfig;
 use crate::config_db::ConfigDb;
@@ -906,21 +906,6 @@ where
     )
 }
 
-/// Pure classifier: did the backend LOUDLY reject the conditional request as
-/// unimplemented (HTTP 501 / NotImplemented)? Backblaze B2 answers conditional
-/// writes this way — a DEFINITIVE "no CAS", unlike a transport error.
-pub(crate) fn is_not_implemented(err_str: &str) -> bool {
-    err_str.contains("NotImplemented") || err_str.contains("501")
-}
-
-/// Pure: does a stringified GET error signal the object is ABSENT (a 404-class
-/// response) rather than a real failure? Extracted so `read_witness`'s
-/// absent-vs-error decision is unit-testable without a live backend. Shared with
-/// the S3 coordination-lease read path.
-pub(crate) fn is_object_absent(err_str: &str) -> bool {
-    err_str.contains("NoSuchKey") || err_str.contains("NotFound") || err_str.contains("404")
-}
-
 /// Pure classifier: map a stringified S3 PUT error to [`UploadError`] — a
 /// lost conditional write (412, or AWS's 409 ConditionalRequestConflict,
 /// see [`crate::coordination::cas::conditional_write_lost`]) becomes
@@ -1588,18 +1573,6 @@ mod tests {
     }
 
     #[test]
-    fn object_absent_detected_from_common_shapes() {
-        // The sdk_error_signal contract shape:
-        assert!(is_object_absent("status=404 code=NoSuchKey"));
-        assert!(!is_object_absent("status=403 code=AccessDenied"));
-        assert!(is_object_absent("service error: NoSuchKey"));
-        assert!(is_object_absent("dispatch failure: NotFound"));
-        assert!(is_object_absent("HTTP 404"));
-        assert!(!is_object_absent("AccessDenied"));
-        assert!(!is_object_absent("PreconditionFailed"));
-    }
-
-    #[test]
     fn witness_json_round_trips() {
         let w = Witness {
             version: 1,
@@ -1611,27 +1584,6 @@ mod tests {
         let back: Witness = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.validated_at_unix, w.validated_at_unix);
         assert_eq!(back.primitive, "if-none-match-cas");
-    }
-
-    #[test]
-    fn not_implemented_classification() {
-        // B2-style loud rejections → DEFINITIVE non-CAS.
-        assert!(is_not_implemented(
-            "service error: NotImplemented: conditional writes not supported"
-        ));
-        assert!(is_not_implemented("http status: 501"));
-        // The sdk_error_signal contract shape — and the poisoning class it
-        // exists to prevent: "501" in an endpoint/bucket must never classify.
-        assert!(is_not_implemented("status=501 code=NotImplemented"));
-        assert!(!is_not_implemented("status=403 code=AccessDenied"));
-        // Transport-class errors are NOT "not implemented" — they must map to
-        // Indeterminate, never to a fatal non-CAS verdict.
-        assert!(!is_not_implemented("dispatch failure: connection refused"));
-        assert!(!is_not_implemented("timeout waiting for response"));
-        assert!(!is_not_implemented(
-            "service error: AccessDenied (status 403)"
-        ));
-        assert!(!is_not_implemented(""));
     }
 
     #[test]

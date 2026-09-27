@@ -493,8 +493,8 @@ impl ReferenceLockGuard {
                 .renew(&key, &owner, crate::event_outbox::current_unix_seconds())
                 .await
             {
-                Ok(true) => *state.confirmed_at.lock() = started,
-                Ok(false) => {
+                Ok(()) => *state.confirmed_at.lock() = started,
+                Err(crate::coordination::LeaseError::Lost) => {
                     warn!("reference lock {key} lost while held; the write will be refused");
                     state.lost.store(true, Ordering::SeqCst);
                     return;
@@ -551,11 +551,11 @@ impl ReferenceLockGuard {
                     )
                     .await
                 {
-                    Ok(true) => {
+                    Ok(()) => {
                         *h.state.confirmed_at.lock() = started;
                         Ok(())
                     }
-                    Ok(false) => {
+                    Err(crate::coordination::LeaseError::Lost) => {
                         h.state.lost.store(true, Ordering::SeqCst);
                         Err(lost_err())
                     }
@@ -3610,6 +3610,7 @@ legacy_key_id: "old-kid"
 #[cfg(test)]
 mod reference_lock_hold_tests {
     use super::*;
+    use crate::coordination::LeaseError;
     use crate::storage::FilesystemBackend;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3639,16 +3640,16 @@ mod reference_lock_hold_tests {
 
     #[async_trait]
     impl crate::coordination::ReferenceLock for ScriptedLock {
-        async fn try_acquire(&self, _: &str, _: &str, _: i64) -> Result<bool, String> {
+        async fn try_acquire(&self, _: &str, _: &str, _: i64) -> Result<bool, LeaseError> {
             self.acquires.fetch_add(1, Ordering::SeqCst);
             Ok(self.grant)
         }
-        async fn release(&self, _: &str, _: &str) -> Result<(), String> {
+        async fn release(&self, _: &str, _: &str) -> Result<(), LeaseError> {
             Ok(())
         }
-        async fn renew(&self, _: &str, _: &str, _: i64) -> Result<bool, String> {
+        async fn renew(&self, _: &str, _: &str, _: i64) -> Result<(), LeaseError> {
             self.renews.fetch_add(1, Ordering::SeqCst);
-            Ok(self.renew_ok.load(Ordering::SeqCst))
+            LeaseError::from_renewal(Ok::<_, LeaseError>(self.renew_ok.load(Ordering::SeqCst)))
         }
         fn ttl_secs(&self) -> i64 {
             self.ttl_secs
@@ -3920,7 +3921,7 @@ mod reference_lock_hold_tests {
 
     #[async_trait]
     impl crate::coordination::ReferenceLock for CasLock {
-        async fn try_acquire(&self, _: &str, owner: &str, _: i64) -> Result<bool, String> {
+        async fn try_acquire(&self, _: &str, owner: &str, _: i64) -> Result<bool, LeaseError> {
             let mut s = self.state.lock();
             if s.1.is_some() {
                 return Ok(false);
@@ -3929,7 +3930,7 @@ mod reference_lock_hold_tests {
             s.1 = Some(owner.to_string());
             Ok(true)
         }
-        async fn release(&self, _: &str, owner: &str) -> Result<(), String> {
+        async fn release(&self, _: &str, owner: &str) -> Result<(), LeaseError> {
             let mut s = self.state.lock();
             if s.1.as_deref() == Some(owner) {
                 s.0 += 1;
@@ -3937,21 +3938,21 @@ mod reference_lock_hold_tests {
             }
             Ok(())
         }
-        async fn renew(&self, _: &str, owner: &str, _: i64) -> Result<bool, String> {
+        async fn renew(&self, _: &str, owner: &str, _: i64) -> Result<(), LeaseError> {
             let seen = {
                 let s = self.state.lock();
                 if s.1.as_deref() != Some(owner) {
-                    return Ok(false);
+                    return Err(LeaseError::Lost);
                 }
                 s.0
             };
             tokio::time::sleep(self.rtt).await; // the If-Match PUT round trip
             let mut s = self.state.lock();
             if s.0 != seen {
-                return Ok(false); // 412 -> put_lock Ok(false)
+                return Err(LeaseError::Lost); // 412 -> put_lock Ok(false)
             }
             s.0 += 1;
-            Ok(true)
+            Ok(())
         }
         fn ttl_secs(&self) -> i64 {
             120
@@ -4007,7 +4008,7 @@ mod reference_lock_hold_tests {
 
     #[async_trait]
     impl crate::coordination::ReferenceLock for WireLock {
-        async fn try_acquire(&self, _: &str, owner: &str, _: i64) -> Result<bool, String> {
+        async fn try_acquire(&self, _: &str, owner: &str, _: i64) -> Result<bool, LeaseError> {
             let mut s = self.state.lock();
             if s.1.is_some() {
                 return Ok(false);
@@ -4015,7 +4016,7 @@ mod reference_lock_hold_tests {
             *s = (s.0 + 1, Some(owner.to_string()));
             Ok(true)
         }
-        async fn release(&self, _: &str, owner: &str) -> Result<(), String> {
+        async fn release(&self, _: &str, owner: &str) -> Result<(), LeaseError> {
             let seen = self.state.lock().clone();
             tokio::time::sleep(self.rtt).await;
             let mut s = self.state.lock();
@@ -4024,10 +4025,10 @@ mod reference_lock_hold_tests {
             }
             Ok(())
         }
-        async fn renew(&self, _: &str, owner: &str, _: i64) -> Result<bool, String> {
+        async fn renew(&self, _: &str, owner: &str, _: i64) -> Result<(), LeaseError> {
             let seen = self.state.lock().clone();
             if seen.1.as_deref() != Some(owner) {
-                return Ok(false);
+                return Err(LeaseError::Lost);
             }
             let (tx, rx) = tokio::sync::oneshot::channel();
             let (state, rtt) = (self.state.clone(), self.rtt);
@@ -4040,7 +4041,7 @@ mod reference_lock_hold_tests {
                 }
                 let _ = tx.send(ok);
             });
-            Ok(rx.await.unwrap_or(false))
+            LeaseError::from_renewal(Ok::<_, LeaseError>(rx.await.unwrap_or(false)))
         }
         fn ttl_secs(&self) -> i64 {
             120

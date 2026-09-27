@@ -66,6 +66,7 @@
 
 use std::time::Duration;
 
+use super::lease::LeaseError;
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
@@ -173,16 +174,17 @@ pub trait ReferenceLock: Send + Sync {
     /// = a live foreign holder blocks us (caller should back off and retry),
     /// `Err` = an I/O error (caller treats conservatively — fail the write rather
     /// than risk two baselines).
-    async fn try_acquire(&self, key: &str, owner: &str, now: i64) -> Result<bool, String>;
+    async fn try_acquire(&self, key: &str, owner: &str, now: i64) -> Result<bool, LeaseError>;
 
     /// Release the lock, but only if we still own it (owner-scoped delete), so a
     /// release can never clobber a lock a peer legitimately stole after our TTL
     /// lapsed. Best-effort: the TTL backstops a failed release.
-    async fn release(&self, key: &str, owner: &str) -> Result<(), String>;
+    async fn release(&self, key: &str, owner: &str) -> Result<(), LeaseError>;
 
-    /// Extend a lock this owner still holds. `Ok(false)` = lost (stolen,
-    /// lapsed, gone): the holder must not commit. `Err` = could not tell.
-    async fn renew(&self, key: &str, owner: &str, now: i64) -> Result<bool, String>;
+    /// Extend a lock this owner still holds. `Err(Lost)` = lost (stolen,
+    /// lapsed, gone): the holder must not commit. `Err(Backend)` = could not
+    /// tell.
+    async fn renew(&self, key: &str, owner: &str, now: i64) -> Result<(), LeaseError>;
 
     /// The crash-backstop TTL applied to a freshly acquired lock, in seconds.
     fn ttl_secs(&self) -> i64 {
@@ -244,7 +246,7 @@ impl S3ReferenceLock {
     /// `expires_at` is re-based onto it from the server-clock age (see
     /// `server_clock::effective_expires_at`), so the planners compare like
     /// with like.
-    async fn read_lock(&self, key: &str, now: i64) -> Result<Observed, String> {
+    async fn read_lock(&self, key: &str, now: i64) -> Result<Observed, LeaseError> {
         match super::server_clock::get_with_server_age(&self.client, &self.bucket, key).await {
             Ok((out, age)) => {
                 let etag = out.e_tag().map(str::to_string).unwrap_or_default();
@@ -252,7 +254,7 @@ impl S3ReferenceLock {
                     .body
                     .collect()
                     .await
-                    .map_err(|e| format!("lock body read: {e}"))?
+                    .map_err(|e| LeaseError::Backend(format!("lock body read: {e}")))?
                     .into_bytes();
                 Ok(match serde_json::from_slice::<RefLock>(&bytes) {
                     Ok(mut lock) => {
@@ -268,12 +270,10 @@ impl S3ReferenceLock {
                 })
             }
             Err(e) => {
-                if crate::config_db_sync::is_object_absent(
-                    &crate::coordination::cas::sdk_error_signal(&*e),
-                ) {
+                if super::cas::is_object_absent(&super::cas::sdk_error_signal(&*e)) {
                     Ok(Observed::Absent)
                 } else {
-                    Err(format!("{e:?}"))
+                    Err(LeaseError::Backend(format!("{e:?}")))
                 }
             }
         }
@@ -295,14 +295,16 @@ impl S3ReferenceLock {
         key: &str,
         body: ByteStream,
         precondition: Option<&str>,
-    ) -> Result<bool, String> {
-        super::cas::conditional_put(&self.client, &self.bucket, key, body, precondition).await
+    ) -> Result<bool, LeaseError> {
+        super::cas::conditional_put(&self.client, &self.bucket, key, body, precondition)
+            .await
+            .map_err(LeaseError::Backend)
     }
 }
 
 #[async_trait]
 impl ReferenceLock for S3ReferenceLock {
-    async fn try_acquire(&self, key: &str, owner: &str, now: i64) -> Result<bool, String> {
+    async fn try_acquire(&self, key: &str, owner: &str, now: i64) -> Result<bool, LeaseError> {
         let current = self.read_lock(key, now).await?;
         let expires_at = now.saturating_add(self.ttl_secs.max(1));
         match plan_lock_acquire(&current, now) {
@@ -322,7 +324,7 @@ impl ReferenceLock for S3ReferenceLock {
         }
     }
 
-    async fn release(&self, key: &str, owner: &str) -> Result<(), String> {
+    async fn release(&self, key: &str, owner: &str) -> Result<(), LeaseError> {
         let now = crate::event_outbox::current_unix_seconds();
         if let Observed::Held { lock, etag } = self.read_lock(key, now).await? {
             if lock.owner == owner {
@@ -339,15 +341,17 @@ impl ReferenceLock for S3ReferenceLock {
         Ok(())
     }
 
-    async fn renew(&self, key: &str, owner: &str, now: i64) -> Result<bool, String> {
+    async fn renew(&self, key: &str, owner: &str, now: i64) -> Result<(), LeaseError> {
         let current = self.read_lock(key, now).await?;
         match plan_lock_renew(&current, now, owner) {
-            RenewLockAction::Lost => Ok(false),
+            RenewLockAction::Lost => Err(LeaseError::Lost),
             // A 412 here means the object moved under us: lost.
             RenewLockAction::Renew { etag, epoch } => {
                 let expires_at = now.saturating_add(self.ttl_secs.max(1));
-                self.put_lock(key, self.body_for(owner, epoch, expires_at), Some(&etag))
-                    .await
+                LeaseError::from_renewal(
+                    self.put_lock(key, self.body_for(owner, epoch, expires_at), Some(&etag))
+                        .await,
+                )
             }
         }
     }
@@ -374,7 +378,7 @@ pub async fn acquire_blocking(
     owner: &str,
     deadline: std::time::Instant,
     now_fn: &(dyn Fn() -> i64 + Send + Sync),
-) -> Result<bool, String> {
+) -> Result<bool, LeaseError> {
     loop {
         if lock.try_acquire(key, owner, now_fn()).await? {
             return Ok(true);
@@ -583,14 +587,14 @@ mod tests {
         struct T;
         #[async_trait]
         impl ReferenceLock for T {
-            async fn try_acquire(&self, _: &str, _: &str, _: i64) -> Result<bool, String> {
+            async fn try_acquire(&self, _: &str, _: &str, _: i64) -> Result<bool, LeaseError> {
                 Ok(true)
             }
-            async fn release(&self, _: &str, _: &str) -> Result<(), String> {
+            async fn release(&self, _: &str, _: &str) -> Result<(), LeaseError> {
                 Ok(())
             }
-            async fn renew(&self, _: &str, _: &str, _: i64) -> Result<bool, String> {
-                Ok(true)
+            async fn renew(&self, _: &str, _: &str, _: i64) -> Result<(), LeaseError> {
+                Ok(())
             }
         }
         assert_eq!(T.renew_interval(), Duration::from_secs(30));
@@ -628,7 +632,12 @@ mod tests {
 
     #[async_trait]
     impl ReferenceLock for MockLock {
-        async fn try_acquire(&self, _key: &str, owner: &str, _now: i64) -> Result<bool, String> {
+        async fn try_acquire(
+            &self,
+            _key: &str,
+            owner: &str,
+            _now: i64,
+        ) -> Result<bool, LeaseError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             if self.block_until.fetch_sub(1, Ordering::SeqCst) > 0 {
                 return Ok(false);
@@ -636,15 +645,17 @@ mod tests {
             *self.held_by.lock().await = Some(owner.to_string());
             Ok(true)
         }
-        async fn release(&self, _key: &str, owner: &str) -> Result<(), String> {
+        async fn release(&self, _key: &str, owner: &str) -> Result<(), LeaseError> {
             let mut h = self.held_by.lock().await;
             if h.as_deref() == Some(owner) {
                 *h = None;
             }
             Ok(())
         }
-        async fn renew(&self, _key: &str, owner: &str, _now: i64) -> Result<bool, String> {
-            Ok(self.held_by.lock().await.as_deref() == Some(owner))
+        async fn renew(&self, _key: &str, owner: &str, _now: i64) -> Result<(), LeaseError> {
+            LeaseError::from_renewal(Ok::<_, LeaseError>(
+                self.held_by.lock().await.as_deref() == Some(owner),
+            ))
         }
     }
 
@@ -688,14 +699,18 @@ mod tests {
         struct ErrLock;
         #[async_trait]
         impl ReferenceLock for ErrLock {
-            async fn try_acquire(&self, _k: &str, _o: &str, _n: i64) -> Result<bool, String> {
-                Err("coordination bucket unreachable".into())
+            async fn try_acquire(&self, _k: &str, _o: &str, _n: i64) -> Result<bool, LeaseError> {
+                Err(LeaseError::Backend(
+                    "coordination bucket unreachable".into(),
+                ))
             }
-            async fn release(&self, _k: &str, _o: &str) -> Result<(), String> {
+            async fn release(&self, _k: &str, _o: &str) -> Result<(), LeaseError> {
                 Ok(())
             }
-            async fn renew(&self, _k: &str, _o: &str, _n: i64) -> Result<bool, String> {
-                Err("coordination bucket unreachable".into())
+            async fn renew(&self, _k: &str, _o: &str, _n: i64) -> Result<(), LeaseError> {
+                Err(LeaseError::Backend(
+                    "coordination bucket unreachable".into(),
+                ))
             }
         }
         let now_fn = || 1000i64;

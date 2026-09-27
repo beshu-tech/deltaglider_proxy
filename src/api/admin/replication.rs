@@ -107,7 +107,7 @@ pub async fn run_now(
                 replication::scheduler::lease_ttl_secs(&repl),
             )
             .await
-            .map_err(AdminError::internal)?;
+            .map_err(|e| AdminError::internal(e.to_string()))?;
         if !acquired {
             return Err(AdminError::conflict(
                 "rule is already running; wait for the current run to finish",

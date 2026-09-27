@@ -31,6 +31,20 @@ pub fn conditional_write_lost(signal: &str) -> bool {
     is_precondition_failed(signal) || is_conditional_conflict(signal)
 }
 
+/// Pure classifier: did the backend LOUDLY reject the conditional request as
+/// unimplemented (HTTP 501 / NotImplemented)? Backblaze B2 answers conditional
+/// writes this way — a DEFINITIVE "no CAS", unlike a transport error.
+pub(crate) fn is_not_implemented(err_str: &str) -> bool {
+    err_str.contains("NotImplemented") || err_str.contains("501")
+}
+
+/// Pure: does a stringified GET error signal the object is ABSENT (a 404-class
+/// response) rather than a real failure? Used by the sync witness read and
+/// the lease and lock reads.
+pub(crate) fn is_object_absent(err_str: &str) -> bool {
+    err_str.contains("NoSuchKey") || err_str.contains("NotFound") || err_str.contains("404")
+}
+
 /// Compact classification signal from a typed SDK error: HTTP status + error
 /// code ONLY. Never feed the substring classifiers `format!("{e:?}")` — the
 /// debug string embeds endpoint/bucket/request-ids that can contain "412"/
@@ -122,5 +136,38 @@ mod tests {
         assert!(!conditional_write_lost("status=409 code=OperationAborted"));
         assert!(!conditional_write_lost("status=503 code=SlowDown"));
         assert!(!conditional_write_lost("transport code="));
+    }
+
+    #[test]
+    fn object_absent_detected_from_common_shapes() {
+        // The sdk_error_signal contract shape:
+        assert!(is_object_absent("status=404 code=NoSuchKey"));
+        assert!(!is_object_absent("status=403 code=AccessDenied"));
+        assert!(is_object_absent("service error: NoSuchKey"));
+        assert!(is_object_absent("dispatch failure: NotFound"));
+        assert!(is_object_absent("HTTP 404"));
+        assert!(!is_object_absent("AccessDenied"));
+        assert!(!is_object_absent("PreconditionFailed"));
+    }
+
+    #[test]
+    fn not_implemented_classification() {
+        // B2-style loud rejections → DEFINITIVE non-CAS.
+        assert!(is_not_implemented(
+            "service error: NotImplemented: conditional writes not supported"
+        ));
+        assert!(is_not_implemented("http status: 501"));
+        // The sdk_error_signal contract shape — and the poisoning class it
+        // exists to prevent: "501" in an endpoint/bucket must never classify.
+        assert!(is_not_implemented("status=501 code=NotImplemented"));
+        assert!(!is_not_implemented("status=403 code=AccessDenied"));
+        // Transport-class errors are NOT "not implemented" — they must map to
+        // Indeterminate, never to a fatal non-CAS verdict.
+        assert!(!is_not_implemented("dispatch failure: connection refused"));
+        assert!(!is_not_implemented("timeout waiting for response"));
+        assert!(!is_not_implemented(
+            "service error: AccessDenied (status 403)"
+        ));
+        assert!(!is_not_implemented(""));
     }
 }
