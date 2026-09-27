@@ -746,7 +746,7 @@ mod source_guards {
     #[test]
     fn request_audits_carry_the_request_headers() {
         const ALLOWED: [(&str, &str); 0] = [];
-        let mut files = vec![root().join("src/s3_adapter_s3s.rs")];
+        let mut files = rust_files("src/s3_adapter_s3s");
         files.extend(rust_files("src/api"));
         let empty = ["HeaderMap", "::new()"].concat();
         let mut offenders = Vec::new();

@@ -3,7 +3,7 @@
 //! S3 API request handlers (shared state + helpers).
 //!
 //! With the legacy axum-handler S3 path retired, the only S3
-//! implementation is `src/s3_adapter_s3s.rs` (the `s3s` crate
+//! implementation is `src/s3_adapter_s3s/` (the `s3s` crate
 //! adapter). This module now hosts only:
 //!
 //! - `AppState` — shared application state for both the s3s adapter
