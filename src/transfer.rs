@@ -2116,8 +2116,9 @@ mod multipart_abort_tests {
             p: &str,
             op: crate::storage::RefWrite<'_>,
             _: &crate::storage::RefFence,
+            proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
-            crate::storage::unfenced_reference_write(self, b, p, op).await
+            crate::storage::unfenced_reference_write(self, b, p, op, proof).await
         }
         async fn create_multipart_upload(
             &self,
@@ -2232,6 +2233,7 @@ mod multipart_abort_tests {
             _: &str,
             _: &[u8],
             _: &FileMetadata,
+            _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
             Err(nope())
         }
@@ -2240,6 +2242,7 @@ mod multipart_abort_tests {
             _: &str,
             _: &str,
             _: &FileMetadata,
+            _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
             Err(nope())
         }
@@ -2253,7 +2256,12 @@ mod multipart_abort_tests {
         async fn has_reference(&self, _: &str, _: &str) -> Result<bool, StorageError> {
             Ok(false)
         }
-        async fn delete_reference(&self, _: &str, _: &str) -> Result<(), StorageError> {
+        async fn delete_reference(
+            &self,
+            _: &str,
+            _: &str,
+            _proof: &crate::deltaglider::RefWriteProof,
+        ) -> Result<(), StorageError> {
             Err(nope())
         }
         async fn flush_pending(&self) -> Result<(), StorageError> {
@@ -2269,6 +2277,7 @@ mod multipart_abort_tests {
             _: &str,
             _: &[u8],
             _: &FileMetadata,
+            _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
             Err(nope())
         }
@@ -2365,8 +2374,9 @@ mod multipart_abort_tests {
             p: &str,
             op: crate::storage::RefWrite<'_>,
             f: &crate::storage::RefFence,
+            proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
-            self.0.write_reference_fenced(b, p, op, f).await
+            self.0.write_reference_fenced(b, p, op, f, proof).await
         }
         async fn create_multipart_upload(
             &self,
@@ -2453,16 +2463,18 @@ mod multipart_abort_tests {
             p: &str,
             d: &[u8],
             m: &FileMetadata,
+            proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
-            self.0.put_reference(b, p, d, m).await
+            self.0.put_reference(b, p, d, m, proof).await
         }
         async fn put_reference_metadata(
             &self,
             b: &str,
             p: &str,
             m: &FileMetadata,
+            proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
-            self.0.put_reference_metadata(b, p, m).await
+            self.0.put_reference_metadata(b, p, m, proof).await
         }
         async fn get_reference_metadata(
             &self,
@@ -2474,8 +2486,13 @@ mod multipart_abort_tests {
         async fn has_reference(&self, b: &str, p: &str) -> Result<bool, StorageError> {
             self.0.has_reference(b, p).await
         }
-        async fn delete_reference(&self, b: &str, p: &str) -> Result<(), StorageError> {
-            self.0.delete_reference(b, p).await
+        async fn delete_reference(
+            &self,
+            b: &str,
+            p: &str,
+            proof: &crate::deltaglider::RefWriteProof,
+        ) -> Result<(), StorageError> {
+            self.0.delete_reference(b, p, proof).await
         }
         async fn flush_pending(&self) -> Result<(), StorageError> {
             self.0.flush_pending().await
@@ -2490,8 +2507,9 @@ mod multipart_abort_tests {
             f: &str,
             d: &[u8],
             m: &FileMetadata,
+            proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
-            self.0.put_delta(b, p, f, d, m).await
+            self.0.put_delta(b, p, f, d, m, proof).await
         }
         async fn delete_delta(&self, b: &str, p: &str, f: &str) -> Result<(), StorageError> {
             self.0.delete_delta(b, p, f).await

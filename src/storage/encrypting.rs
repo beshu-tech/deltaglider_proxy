@@ -1261,10 +1261,13 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         prefix: &str,
         data: &[u8],
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         let mut meta = without_markers(metadata);
         let enc = self.encrypt_if_enabled(data, &mut meta)?;
-        self.inner.put_reference(bucket, prefix, &enc, &meta).await
+        self.inner
+            .put_reference(bucket, prefix, &enc, &meta, proof)
+            .await
     }
 
     async fn put_delta(
@@ -1274,11 +1277,12 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         filename: &str,
         data: &[u8],
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         let mut meta = without_markers(metadata);
         let enc = self.encrypt_if_enabled(data, &mut meta)?;
         self.inner
-            .put_delta(bucket, prefix, filename, &enc, &meta)
+            .put_delta(bucket, prefix, filename, &enc, &meta, proof)
             .await
     }
 
@@ -1881,15 +1885,21 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         b: &str,
         p: &str,
         m: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         // Same rule as put_passthrough_metadata: the body is not rewritten,
         // so its markers stay those of the stored reference.
         let raw = self.inner.get_reference_metadata(b, p).await?;
         let meta = with_markers_of(m, &raw);
-        self.inner.put_reference_metadata(b, p, &meta).await
+        self.inner.put_reference_metadata(b, p, &meta, proof).await
     }
-    async fn delete_reference(&self, b: &str, p: &str) -> Result<(), StorageError> {
-        self.inner.delete_reference(b, p).await
+    async fn delete_reference(
+        &self,
+        b: &str,
+        p: &str,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> Result<(), StorageError> {
+        self.inner.delete_reference(b, p, proof).await
     }
     async fn flush_pending(&self) -> Result<(), StorageError> {
         self.inner.flush_pending().await
@@ -1911,6 +1921,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         p: &str,
         op: super::traits::RefWrite<'_>,
         fence: &super::traits::RefFence,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<super::traits::RefFence, StorageError> {
         use super::traits::RefWrite;
         match op {
@@ -1926,6 +1937,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                             metadata: &meta,
                         },
                         fence,
+                        proof,
                     )
                     .await
             }
@@ -1944,6 +1956,7 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                             metadata: &meta,
                         },
                         fence,
+                        proof,
                     )
                     .await
             }
@@ -1951,12 +1964,18 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
                 let raw = self.inner.get_reference_metadata(b, p).await?;
                 let meta = with_markers_of(metadata, &raw);
                 self.inner
-                    .write_reference_fenced(b, p, RefWrite::Metadata { metadata: &meta }, fence)
+                    .write_reference_fenced(
+                        b,
+                        p,
+                        RefWrite::Metadata { metadata: &meta },
+                        fence,
+                        proof,
+                    )
                     .await
             }
             RefWrite::Delete => {
                 self.inner
-                    .write_reference_fenced(b, p, RefWrite::Delete, fence)
+                    .write_reference_fenced(b, p, RefWrite::Delete, fence, proof)
                     .await
             }
         }
@@ -2842,8 +2861,9 @@ mod tests {
             p: &str,
             op: crate::storage::RefWrite<'_>,
             _: &crate::storage::RefFence,
+            proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
-            crate::storage::unfenced_reference_write(self, b, p, op).await
+            crate::storage::unfenced_reference_write(self, b, p, op, proof).await
         }
         async fn get_passthrough_stream_range(
             &self,
@@ -2957,6 +2977,7 @@ mod tests {
             _: &str,
             _: &[u8],
             _: &FileMetadata,
+            _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
             Err(cb_err())
         }
@@ -2975,10 +2996,16 @@ mod tests {
             _: &str,
             _: &str,
             _: &FileMetadata,
+            _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
             Err(cb_err())
         }
-        async fn delete_reference(&self, _: &str, _: &str) -> Result<(), StorageError> {
+        async fn delete_reference(
+            &self,
+            _: &str,
+            _: &str,
+            _proof: &crate::deltaglider::RefWriteProof,
+        ) -> Result<(), StorageError> {
             Err(cb_err())
         }
         async fn flush_pending(&self) -> Result<(), StorageError> {
@@ -2991,6 +3018,7 @@ mod tests {
             _: &str,
             _: &[u8],
             _: &FileMetadata,
+            _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
             Err(cb_err())
         }
@@ -3925,10 +3953,26 @@ mod tests {
                 .await
                 .unwrap();
             wrapper
-                .put_delta("b", "p", "f", &body, &meta)
+                .put_delta(
+                    "b",
+                    "p",
+                    "f",
+                    &body,
+                    &meta,
+                    crate::deltaglider::RefWriteProof::for_tests(),
+                )
                 .await
                 .unwrap();
-            wrapper.put_reference("b", "p", &body, &meta).await.unwrap();
+            wrapper
+                .put_reference(
+                    "b",
+                    "p",
+                    &body,
+                    &meta,
+                    crate::deltaglider::RefWriteProof::for_tests(),
+                )
+                .await
+                .unwrap();
             for f in ["a", "c", "d", "e"] {
                 assert_eq!(
                     wrapper.get_passthrough("b", "p", f).await.unwrap(),
@@ -4236,12 +4280,25 @@ mod read_request_tests {
         for k in [None, Some(key())] {
             let (w, fake) = wrapped(k.clone()).await;
             let body = b"delta bytes".to_vec();
-            w.put_delta("b", "p", "a.bin", &body, &meta(&body))
-                .await
-                .unwrap();
-            w.put_reference("b", "p", &body, &meta(&body))
-                .await
-                .unwrap();
+            w.put_delta(
+                "b",
+                "p",
+                "a.bin",
+                &body,
+                &meta(&body),
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
+            .await
+            .unwrap();
+            w.put_reference(
+                "b",
+                "p",
+                &body,
+                &meta(&body),
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
+            .await
+            .unwrap();
             fake.clear();
             assert_eq!(w.get_delta("b", "p", "a.bin").await.unwrap(), body);
             assert!(one_get(&fake.requests()), "{:?}", fake.requests());

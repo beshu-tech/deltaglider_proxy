@@ -331,8 +331,9 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
 /// a release that never completes. Inert (`hold: None`) single-instance.
 ///
 /// Every engine write of reference.bin (bytes or metadata) goes through a
-/// method on this guard, so the write cannot happen without the lock. The
-/// source test `reference_writes_go_through_the_guard` keeps it that way.
+/// method on this guard, so the write cannot happen without the lock: the
+/// backend write needs a [`RefWriteProof`], which only the guard's
+/// `reference_writes` module makes.
 pub(crate) struct ReferenceLockGuard {
     hold: Option<CrossNodeHold>,
 }
@@ -432,46 +433,6 @@ impl ReferenceLockGuard {
             RefFence::ETag(_) => Some(true),
             RefFence::Unfenced => None,
         }
-    }
-
-    /// One reference write: fenced under a cross-instance hold, plain
-    /// otherwise (single instance: the in-process lock is the whole story).
-    async fn write_reference<B: StorageBackend + ?Sized>(
-        &self,
-        storage: &B,
-        bucket: &str,
-        deltaspace: &str,
-        op: crate::storage::RefWrite<'_>,
-    ) -> Result<(), EngineError> {
-        use crate::storage::RefWrite;
-        self.ensure_held().await?;
-        if let Some(h) = &self.hold {
-            let fence = h.fence.lock().clone();
-            let next = storage
-                .write_reference_fenced(bucket, deltaspace, op, &fence)
-                .await?;
-            *h.fence.lock() = next;
-            return Ok(());
-        }
-        match op {
-            RefWrite::Put { data, metadata } => {
-                storage
-                    .put_reference(bucket, deltaspace, data, metadata)
-                    .await?
-            }
-            RefWrite::PutFile { path, metadata } => {
-                storage
-                    .put_reference_from_file(bucket, deltaspace, path, metadata)
-                    .await?
-            }
-            RefWrite::Metadata { metadata } => {
-                storage
-                    .put_reference_metadata(bucket, deltaspace, metadata)
-                    .await?
-            }
-            RefWrite::Delete => storage.delete_reference(bucket, deltaspace).await?,
-        }
-        Ok(())
     }
 
     /// Renew every `renew_interval` until dropped. A renew that reports the
@@ -576,101 +537,177 @@ impl ReferenceLockGuard {
     pub(crate) fn is_cross_instance(&self) -> bool {
         self.hold.is_some()
     }
+}
 
-    // ── Reference writes: the only engine path to them ──
+/// The only engine path to reference.bin and delta writes. A backend
+/// write takes a [`RefWriteProof`], and only this module makes one, so
+/// the compiler (not a source scan) keeps every reference and delta write
+/// behind the [`ReferenceLockGuard`] and its lock check.
+mod reference_writes {
+    use super::*;
 
-    pub(crate) async fn put_reference<B: StorageBackend + ?Sized>(
-        &self,
-        storage: &B,
-        bucket: &str,
-        deltaspace: &str,
-        data: &[u8],
-        meta: &FileMetadata,
-    ) -> Result<(), EngineError> {
-        let op = crate::storage::RefWrite::Put {
-            data,
-            metadata: meta,
-        };
-        self.write_reference(storage, bucket, deltaspace, op).await
+    /// Proof, for a backend reference or delta write, that the engine holds
+    /// the deltaspace's reference lock (and ran its check). Made only here.
+    #[derive(Debug)]
+    pub struct RefWriteProof {
+        _private: (),
     }
 
-    pub(crate) async fn put_reference_from_file<B: StorageBackend + ?Sized>(
-        &self,
-        storage: &B,
-        bucket: &str,
-        deltaspace: &str,
-        path: &std::path::Path,
-        meta: &FileMetadata,
-    ) -> Result<(), EngineError> {
-        let op = crate::storage::RefWrite::PutFile {
-            path,
-            metadata: meta,
-        };
-        self.write_reference(storage, bucket, deltaspace, op).await
-    }
+    const PROOF: &RefWriteProof = &RefWriteProof { _private: () };
 
-    pub(crate) async fn put_reference_metadata<B: StorageBackend + ?Sized>(
-        &self,
-        storage: &B,
-        bucket: &str,
-        deltaspace: &str,
-        meta: &FileMetadata,
-    ) -> Result<(), EngineError> {
-        let op = crate::storage::RefWrite::Metadata { metadata: meta };
-        self.write_reference(storage, bucket, deltaspace, op).await
-    }
-
-    pub(crate) async fn delete_reference<B: StorageBackend + ?Sized>(
-        &self,
-        storage: &B,
-        bucket: &str,
-        deltaspace: &str,
-    ) -> Result<(), EngineError> {
-        let op = crate::storage::RefWrite::Delete;
-        self.write_reference(storage, bucket, deltaspace, op).await
-    }
-
-    /// A delta is valid only against the baseline it was encoded from. The
-    /// delta write cannot be conditional on reference.bin (another object),
-    /// so under a cross-instance hold re-read the reference fence AFTER the
-    /// write: a peer that replaced the baseline meanwhile makes our delta
-    /// undecodable, so remove it and fail retryably instead of a 200.
-    pub(crate) async fn put_delta<B: StorageBackend + ?Sized>(
-        &self,
-        storage: &B,
-        bucket: &str,
-        deltaspace: &str,
-        filename: &str,
-        data: &[u8],
-        meta: &FileMetadata,
-    ) -> Result<(), EngineError> {
-        self.ensure_held().await?;
-        storage
-            .put_delta(bucket, deltaspace, filename, data, meta)
-            .await?;
-        let Some(h) = &self.hold else {
-            return Ok(());
-        };
-        let expected = h.fence.lock().clone();
-        if expected == crate::storage::RefFence::Unfenced {
-            return Ok(());
+    impl RefWriteProof {
+        /// For tests that drive a backend directly.
+        #[cfg(test)]
+        pub(crate) fn for_tests() -> &'static RefWriteProof {
+            PROOF
         }
-        let verdict = match storage.reference_fence(bucket, deltaspace).await {
-            Ok(now) if now == expected => return Ok(()),
-            Ok(_) => crate::storage::reference_fence_lost(bucket, deltaspace),
-            // Baseline unknown: the delta may be undecodable, so the same
-            // answer as a lost fence (the client retries under a fresh lock).
-            Err(e) => e,
-        };
-        if let Err(e) = storage.delete_delta(bucket, deltaspace, filename).await {
-            tracing::warn!(
-                "delta {bucket}/{deltaspace}/{filename} is not fenced to its baseline; \
-                 its removal failed: {e}"
-            );
+
+        /// For an integration test that drives a backend's fenced writes
+        /// itself (it cannot reach `for_tests`). Production code never
+        /// calls it: source test `production_code_never_writes_unguarded`.
+        #[doc(hidden)]
+        pub fn unguarded() -> &'static RefWriteProof {
+            PROOF
         }
-        Err(verdict.into())
+    }
+
+    impl ReferenceLockGuard {
+        /// One reference write: fenced under a cross-instance hold, plain
+        /// otherwise (single instance: the in-process lock is the whole story).
+        async fn write_reference<B: StorageBackend + ?Sized>(
+            &self,
+            storage: &B,
+            bucket: &str,
+            deltaspace: &str,
+            op: crate::storage::RefWrite<'_>,
+        ) -> Result<(), EngineError> {
+            use crate::storage::RefWrite;
+            self.ensure_held().await?;
+            if let Some(h) = &self.hold {
+                let fence = h.fence.lock().clone();
+                let next = storage
+                    .write_reference_fenced(bucket, deltaspace, op, &fence, PROOF)
+                    .await?;
+                *h.fence.lock() = next;
+                return Ok(());
+            }
+            match op {
+                RefWrite::Put { data, metadata } => {
+                    storage
+                        .put_reference(bucket, deltaspace, data, metadata, PROOF)
+                        .await?
+                }
+                RefWrite::PutFile { path, metadata } => {
+                    storage
+                        .put_reference_from_file(bucket, deltaspace, path, metadata, PROOF)
+                        .await?
+                }
+                RefWrite::Metadata { metadata } => {
+                    storage
+                        .put_reference_metadata(bucket, deltaspace, metadata, PROOF)
+                        .await?
+                }
+                RefWrite::Delete => storage.delete_reference(bucket, deltaspace, PROOF).await?,
+            }
+            Ok(())
+        }
+
+        // ── Reference writes: the only engine path to them ──
+
+        pub(crate) async fn put_reference<B: StorageBackend + ?Sized>(
+            &self,
+            storage: &B,
+            bucket: &str,
+            deltaspace: &str,
+            data: &[u8],
+            meta: &FileMetadata,
+        ) -> Result<(), EngineError> {
+            let op = crate::storage::RefWrite::Put {
+                data,
+                metadata: meta,
+            };
+            self.write_reference(storage, bucket, deltaspace, op).await
+        }
+
+        pub(crate) async fn put_reference_from_file<B: StorageBackend + ?Sized>(
+            &self,
+            storage: &B,
+            bucket: &str,
+            deltaspace: &str,
+            path: &std::path::Path,
+            meta: &FileMetadata,
+        ) -> Result<(), EngineError> {
+            let op = crate::storage::RefWrite::PutFile {
+                path,
+                metadata: meta,
+            };
+            self.write_reference(storage, bucket, deltaspace, op).await
+        }
+
+        pub(crate) async fn put_reference_metadata<B: StorageBackend + ?Sized>(
+            &self,
+            storage: &B,
+            bucket: &str,
+            deltaspace: &str,
+            meta: &FileMetadata,
+        ) -> Result<(), EngineError> {
+            let op = crate::storage::RefWrite::Metadata { metadata: meta };
+            self.write_reference(storage, bucket, deltaspace, op).await
+        }
+
+        pub(crate) async fn delete_reference<B: StorageBackend + ?Sized>(
+            &self,
+            storage: &B,
+            bucket: &str,
+            deltaspace: &str,
+        ) -> Result<(), EngineError> {
+            let op = crate::storage::RefWrite::Delete;
+            self.write_reference(storage, bucket, deltaspace, op).await
+        }
+
+        /// A delta is valid only against the baseline it was encoded from. The
+        /// delta write cannot be conditional on reference.bin (another object),
+        /// so under a cross-instance hold re-read the reference fence AFTER the
+        /// write: a peer that replaced the baseline meanwhile makes our delta
+        /// undecodable, so remove it and fail retryably instead of a 200.
+        pub(crate) async fn put_delta<B: StorageBackend + ?Sized>(
+            &self,
+            storage: &B,
+            bucket: &str,
+            deltaspace: &str,
+            filename: &str,
+            data: &[u8],
+            meta: &FileMetadata,
+        ) -> Result<(), EngineError> {
+            self.ensure_held().await?;
+            storage
+                .put_delta(bucket, deltaspace, filename, data, meta, PROOF)
+                .await?;
+            let Some(h) = &self.hold else {
+                return Ok(());
+            };
+            let expected = h.fence.lock().clone();
+            if expected == crate::storage::RefFence::Unfenced {
+                return Ok(());
+            }
+            let verdict = match storage.reference_fence(bucket, deltaspace).await {
+                Ok(now) if now == expected => return Ok(()),
+                Ok(_) => crate::storage::reference_fence_lost(bucket, deltaspace),
+                // Baseline unknown: the delta may be undecodable, so the same
+                // answer as a lost fence (the client retries under a fresh lock).
+                Err(e) => e,
+            };
+            if let Err(e) = storage.delete_delta(bucket, deltaspace, filename).await {
+                tracing::warn!(
+                    "delta {bucket}/{deltaspace}/{filename} is not fenced to its baseline; \
+                     its removal failed: {e}"
+                );
+            }
+            Err(verdict.into())
+        }
     }
 }
+pub use reference_writes::RefWriteProof;
 
 impl Drop for ReferenceLockGuard {
     fn drop(&mut self) {
@@ -2808,8 +2845,9 @@ mod tests {
             p: &str,
             op: crate::storage::RefWrite<'_>,
             _: &crate::storage::RefFence,
+            proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
-            crate::storage::unfenced_reference_write(self, b, p, op).await
+            crate::storage::unfenced_reference_write(self, b, p, op, proof).await
         }
         async fn create_bucket(&self, _: &str) -> Result<(), crate::storage::StorageError> {
             Ok(())
@@ -2838,6 +2876,7 @@ mod tests {
             _: &str,
             _: &[u8],
             _: &crate::types::FileMetadata,
+            _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), crate::storage::StorageError> {
             Ok(())
         }
@@ -2860,6 +2899,7 @@ mod tests {
             _: &str,
             _: &str,
             _: &crate::types::FileMetadata,
+            _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), crate::storage::StorageError> {
             Ok(())
         }
@@ -2867,6 +2907,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
+            _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), crate::storage::StorageError> {
             Ok(())
         }
@@ -2880,6 +2921,7 @@ mod tests {
             _: &str,
             _: &[u8],
             _: &crate::types::FileMetadata,
+            _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), crate::storage::StorageError> {
             Ok(())
         }
@@ -3886,51 +3928,24 @@ mod reference_lock_hold_tests {
         assert!(!ran.load(Ordering::SeqCst));
     }
 
-    /// Source guard: every engine write of reference.bin goes through a
-    /// `ReferenceLockGuard` method, which checks the lock first. Reference
-    /// RMW paths that called the backend directly skipped the cross-instance
-    /// lock (reclaim-on-delete, sweep reclaim, fast-path seed).
+    /// A backend reference or delta write needs a `RefWriteProof`, which
+    /// only the guard's `reference_writes` module makes; the compiler
+    /// enforces that. `RefWriteProof::unguarded` exists for integration
+    /// tests only: no production file calls it.
     #[test]
-    fn reference_writes_go_through_the_guard() {
-        // Built at runtime so this file's own text does not match.
-        let forbidden: Vec<String> = [
-            "put_reference",
-            "put_reference_from_file",
-            "put_reference_metadata",
-            "delete_reference",
-            // A delta depends on the baseline: fenced like a reference write.
-            "put_delta",
-        ]
-        .iter()
-        .map(|m| format!("storage.{m}("))
-        .collect();
-        let allowed: [&str; 0] = [];
-        let mut offenders = Vec::new();
-        for path in crate::source_scan::rust_files("src") {
-            let rel = crate::source_scan::rel(&path);
-            // Backends implement the writes; they are below the lock.
-            if rel.starts_with("src/storage/") || allowed.contains(&rel.as_str()) {
-                continue;
-            }
-            let mut text = std::fs::read_to_string(&path).unwrap();
-            if rel == "src/deltaglider/engine/mod.rs" {
-                // The guard's own methods are the one allowed home.
-                let start = text.find("impl ReferenceLockGuard {").unwrap();
-                let end = text.find("impl Drop for ReferenceLockGuard").unwrap();
-                text.replace_range(start..end, "");
-            }
-            let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-            for p in &forbidden {
-                if text.contains(p.as_str()) {
-                    offenders.push(format!("{rel}: {p}"));
-                }
-            }
-        }
+    fn production_code_never_writes_unguarded() {
+        let needle = ["RefWriteProof::", "unguarded("].concat();
+        let offenders: Vec<String> = crate::source_scan::prod_sources("src")
+            .into_iter()
+            .filter(|(_, text)| crate::source_scan::prod_text(text).contains(needle.as_str()))
+            .map(|(rel, _)| rel)
+            .collect();
         assert!(
             offenders.is_empty(),
-            "write reference.bin and deltas through ReferenceLockGuard: {offenders:?}"
+            "unguarded reference writes: {offenders:?}"
         );
     }
+
     // ── review second pass (failing tests for findings) ──────────────────
 
     /// A lock that models `S3ReferenceLock::renew`: read the etag, one round
@@ -4171,7 +4186,13 @@ mod reference_lock_hold_tests {
                     None,
                 );
                 self.inner
-                    .put_reference(b, p, b"PEER", &meta)
+                    .put_reference(
+                        b,
+                        p,
+                        b"PEER",
+                        &meta,
+                        crate::deltaglider::RefWriteProof::for_tests(),
+                    )
                     .await
                     .unwrap();
                 self.bump(b, p);
@@ -4202,9 +4223,10 @@ mod reference_lock_hold_tests {
             p: &str,
             d: &[u8],
             m: &Meta,
+            proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
             self.maybe_peer_write(b, p).await;
-            self.inner.put_reference(b, p, d, m).await?;
+            self.inner.put_reference(b, p, d, m, proof).await?;
             self.bump(b, p);
             Ok(())
         }
@@ -4213,8 +4235,9 @@ mod reference_lock_hold_tests {
             b: &str,
             p: &str,
             m: &Meta,
+            proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
-            self.inner.put_reference_metadata(b, p, m).await
+            self.inner.put_reference_metadata(b, p, m, proof).await
         }
         async fn get_reference_metadata(&self, b: &str, p: &str) -> Result<Meta, StorageError> {
             self.inner.get_reference_metadata(b, p).await
@@ -4225,8 +4248,13 @@ mod reference_lock_hold_tests {
         async fn flush_pending(&self) -> Result<(), StorageError> {
             self.inner.flush_pending().await
         }
-        async fn delete_reference(&self, b: &str, p: &str) -> Result<(), StorageError> {
-            self.inner.delete_reference(b, p).await?;
+        async fn delete_reference(
+            &self,
+            b: &str,
+            p: &str,
+            proof: &crate::deltaglider::RefWriteProof,
+        ) -> Result<(), StorageError> {
+            self.inner.delete_reference(b, p, proof).await?;
             self.versions.lock().remove(&Self::slot(b, p));
             Ok(())
         }
@@ -4242,6 +4270,7 @@ mod reference_lock_hold_tests {
             p: &str,
             op: RefWrite<'_>,
             fence: &RefFence,
+            proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<RefFence, StorageError> {
             self.maybe_peer_write(b, p).await;
             let now = self.reference_fence(b, p).await?;
@@ -4250,18 +4279,22 @@ mod reference_lock_hold_tests {
             }
             match op {
                 RefWrite::Put { data, metadata } => {
-                    self.inner.put_reference(b, p, data, metadata).await?
+                    self.inner
+                        .put_reference(b, p, data, metadata, proof)
+                        .await?
                 }
                 RefWrite::PutFile { path, metadata } => {
                     self.inner
-                        .put_reference_from_file(b, p, path, metadata)
+                        .put_reference_from_file(b, p, path, metadata, proof)
                         .await?
                 }
                 RefWrite::Metadata { metadata } => {
-                    self.inner.put_reference_metadata(b, p, metadata).await?
+                    self.inner
+                        .put_reference_metadata(b, p, metadata, proof)
+                        .await?
                 }
                 RefWrite::Delete => {
-                    self.inner.delete_reference(b, p).await?;
+                    self.inner.delete_reference(b, p, proof).await?;
                     self.versions.lock().remove(&Self::slot(b, p));
                     return Ok(RefFence::Absent);
                 }
@@ -4279,12 +4312,13 @@ mod reference_lock_hold_tests {
             f: &str,
             d: &[u8],
             m: &Meta,
+            proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
             if self.peer_race_on_delta.swap(false, Ordering::SeqCst) {
                 self.peer_race.store(true, Ordering::SeqCst);
                 self.maybe_peer_write(b, p).await;
             }
-            self.inner.put_delta(b, p, f, d, m).await
+            self.inner.put_delta(b, p, f, d, m, proof).await
         }
         async fn get_delta_metadata(
             &self,

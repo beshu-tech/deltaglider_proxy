@@ -190,24 +190,25 @@ pub async fn unfenced_reference_write<B: StorageBackend + ?Sized>(
     bucket: &str,
     prefix: &str,
     op: RefWrite<'_>,
+    proof: &crate::deltaglider::RefWriteProof,
 ) -> Result<RefFence, StorageError> {
     match op {
         RefWrite::Put { data, metadata } => {
             backend
-                .put_reference(bucket, prefix, data, metadata)
+                .put_reference(bucket, prefix, data, metadata, proof)
                 .await?
         }
         RefWrite::PutFile { path, metadata } => {
             backend
-                .put_reference_from_file(bucket, prefix, path, metadata)
+                .put_reference_from_file(bucket, prefix, path, metadata, proof)
                 .await?
         }
         RefWrite::Metadata { metadata } => {
             backend
-                .put_reference_metadata(bucket, prefix, metadata)
+                .put_reference_metadata(bucket, prefix, metadata, proof)
                 .await?
         }
-        RefWrite::Delete => backend.delete_reference(bucket, prefix).await?,
+        RefWrite::Delete => backend.delete_reference(bucket, prefix, proof).await?,
     }
     Ok(RefFence::Unfenced)
 }
@@ -372,6 +373,7 @@ pub trait StorageBackend: Send + Sync {
         prefix: &str,
         data: &[u8],
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError>;
 
     /// Store a reference whose data is on a local file, WITHOUT heap-loading it
@@ -385,9 +387,11 @@ pub trait StorageBackend: Send + Sync {
         prefix: &str,
         source_path: &std::path::Path,
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         let data = tokio::fs::read(source_path).await?;
-        self.put_reference(bucket, prefix, &data, metadata).await
+        self.put_reference(bucket, prefix, &data, metadata, proof)
+            .await
     }
 
     /// Store/update reference metadata without rewriting reference data.
@@ -396,6 +400,7 @@ pub trait StorageBackend: Send + Sync {
         bucket: &str,
         prefix: &str,
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError>;
 
     /// Update a passthrough object's DG metadata IN PLACE, without
@@ -437,7 +442,12 @@ pub trait StorageBackend: Send + Sync {
     async fn has_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError>;
 
     /// Delete a reference file and its metadata
-    async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError>;
+    async fn delete_reference(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> Result<(), StorageError>;
 
     /// Make durable every object write that this backend deferred (see
     /// [`crate::storage::with_deferred_fsync`]). A backend whose writes are
@@ -461,6 +471,7 @@ pub trait StorageBackend: Send + Sync {
         prefix: &str,
         op: RefWrite<'_>,
         fence: &RefFence,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<RefFence, StorageError>;
 
     // === Delta file operations ===
@@ -481,6 +492,7 @@ pub trait StorageBackend: Send + Sync {
         filename: &str,
         data: &[u8],
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError>;
 
     /// Get delta file metadata
@@ -1074,8 +1086,11 @@ macro_rules! impl_storage_backend_for_box {
                 prefix: &str,
                 data: &[u8],
                 metadata: &FileMetadata,
+                proof: &crate::deltaglider::RefWriteProof,
             ) -> Result<(), StorageError> {
-                (**self).put_reference(bucket, prefix, data, metadata).await
+                (**self)
+                    .put_reference(bucket, prefix, data, metadata, proof)
+                    .await
             }
             // MUST forward: these two are the bounded-memory backbone (stream the
             // reference to/from a local file). Falling through to the trait
@@ -1094,9 +1109,10 @@ macro_rules! impl_storage_backend_for_box {
                 prefix: &str,
                 source_path: &std::path::Path,
                 metadata: &FileMetadata,
+                proof: &crate::deltaglider::RefWriteProof,
             ) -> Result<(), StorageError> {
                 (**self)
-                    .put_reference_from_file(bucket, prefix, source_path, metadata)
+                    .put_reference_from_file(bucket, prefix, source_path, metadata, proof)
                     .await
             }
             async fn put_passthrough_parts(
@@ -1122,9 +1138,10 @@ macro_rules! impl_storage_backend_for_box {
                 bucket: &str,
                 prefix: &str,
                 metadata: &FileMetadata,
+                proof: &crate::deltaglider::RefWriteProof,
             ) -> Result<(), StorageError> {
                 (**self)
-                    .put_reference_metadata(bucket, prefix, metadata)
+                    .put_reference_metadata(bucket, prefix, metadata, proof)
                     .await
             }
             async fn put_passthrough_metadata(
@@ -1156,8 +1173,9 @@ macro_rules! impl_storage_backend_for_box {
                 &self,
                 bucket: &str,
                 prefix: &str,
+                proof: &crate::deltaglider::RefWriteProof,
             ) -> Result<(), StorageError> {
-                (**self).delete_reference(bucket, prefix).await
+                (**self).delete_reference(bucket, prefix, proof).await
             }
             async fn flush_pending(&self) -> Result<(), StorageError> {
                 (**self).flush_pending().await
@@ -1175,9 +1193,10 @@ macro_rules! impl_storage_backend_for_box {
                 prefix: &str,
                 op: RefWrite<'_>,
                 fence: &RefFence,
+                proof: &crate::deltaglider::RefWriteProof,
             ) -> Result<RefFence, StorageError> {
                 (**self)
-                    .write_reference_fenced(bucket, prefix, op, fence)
+                    .write_reference_fenced(bucket, prefix, op, fence, proof)
                     .await
             }
 
@@ -1196,9 +1215,10 @@ macro_rules! impl_storage_backend_for_box {
                 filename: &str,
                 data: &[u8],
                 metadata: &FileMetadata,
+                proof: &crate::deltaglider::RefWriteProof,
             ) -> Result<(), StorageError> {
                 (**self)
-                    .put_delta(bucket, prefix, filename, data, metadata)
+                    .put_delta(bucket, prefix, filename, data, metadata, proof)
                     .await
             }
             async fn get_delta_metadata(

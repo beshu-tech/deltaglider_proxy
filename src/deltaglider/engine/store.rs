@@ -2086,7 +2086,13 @@ mod stale_reference_cache_tests {
             None,
         );
         backend
-            .put_reference("b", "rel", &r2, &r2_meta)
+            .put_reference(
+                "b",
+                "rel",
+                &r2,
+                &r2_meta,
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
             .await
             .unwrap();
 

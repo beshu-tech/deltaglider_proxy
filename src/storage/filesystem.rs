@@ -1129,6 +1129,7 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         data: &[u8],
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         self.put_object_file(
@@ -1151,6 +1152,7 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         source_path: &Path,
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         let dest = self.reference_path(bucket, prefix)?;
@@ -1168,6 +1170,7 @@ impl StorageBackend for FilesystemBackend {
         bucket: &str,
         prefix: &str,
         metadata: &FileMetadata,
+        _proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         xattr_meta::write_metadata(&self.reference_path(bucket, prefix)?, metadata).await
@@ -1222,8 +1225,9 @@ impl StorageBackend for FilesystemBackend {
         prefix: &str,
         op: RefWrite<'_>,
         _fence: &RefFence,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<RefFence, StorageError> {
-        super::traits::unfenced_reference_write(self, bucket, prefix, op).await
+        super::traits::unfenced_reference_write(self, bucket, prefix, op, proof).await
     }
 
     async fn has_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {
@@ -1233,7 +1237,12 @@ impl StorageBackend for FilesystemBackend {
     }
 
     #[instrument(skip(self))]
-    async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError> {
+    async fn delete_reference(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> Result<(), StorageError> {
         self.delete_object_file(
             &self.reference_path(bucket, prefix)?,
             &self.deltaspace_dir(bucket, "")?,
@@ -1270,6 +1279,7 @@ impl StorageBackend for FilesystemBackend {
         filename: &str,
         data: &[u8],
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         self.put_object_file(
@@ -2032,7 +2042,14 @@ mod tests {
             .expect("new backend");
 
         let err = backend
-            .put_delta("ghost", "ns", "f.delta", b"x", &dummy_metadata("f.delta"))
+            .put_delta(
+                "ghost",
+                "ns",
+                "f.delta",
+                b"x",
+                &dummy_metadata("f.delta"),
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
             .await
             .expect_err("must refuse");
 
@@ -2055,7 +2072,13 @@ mod tests {
         // Before: writing to an undeclared bucket 404s.
         assert!(matches!(
             backend
-                .put_reference("declared", "ns", b"x", &dummy_metadata("reference.bin"))
+                .put_reference(
+                    "declared",
+                    "ns",
+                    b"x",
+                    &dummy_metadata("reference.bin"),
+                    crate::deltaglider::RefWriteProof::for_tests()
+                )
                 .await,
             Err(StorageError::BucketNotFound(_))
         ));
@@ -2069,7 +2092,13 @@ mod tests {
 
         // Now the first write succeeds — no explicit CreateBucket needed.
         backend
-            .put_reference("declared", "ns", b"x", &dummy_metadata("reference.bin"))
+            .put_reference(
+                "declared",
+                "ns",
+                b"x",
+                &dummy_metadata("reference.bin"),
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
             .await
             .expect("write into declared bucket");
 
@@ -2088,7 +2117,13 @@ mod tests {
             .expect("new backend");
 
         let err = backend
-            .put_reference("ghost", "ns", b"ref", &dummy_metadata("reference.bin"))
+            .put_reference(
+                "ghost",
+                "ns",
+                b"ref",
+                &dummy_metadata("reference.bin"),
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
             .await
             .expect_err("must refuse");
 
@@ -2241,6 +2276,7 @@ mod tests {
                 "file.bin",
                 b"delta",
                 &dummy_metadata("file.bin"),
+                crate::deltaglider::RefWriteProof::for_tests(),
             )
             .await
             .expect("put delta");
@@ -2275,11 +2311,21 @@ mod tests {
         );
 
         backend
-            .put_reference("bucket", "only/ref", b"ref", &meta)
+            .put_reference(
+                "bucket",
+                "only/ref",
+                b"ref",
+                &meta,
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
             .await
             .expect("put reference");
         backend
-            .delete_reference("bucket", "only/ref")
+            .delete_reference(
+                "bucket",
+                "only/ref",
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
             .await
             .expect("delete reference");
 
@@ -2349,7 +2395,13 @@ mod tests {
         );
         for ds in ["fw/v1", "fw2", "other"] {
             backend
-                .put_reference("bucket", ds, b"ref", &meta)
+                .put_reference(
+                    "bucket",
+                    ds,
+                    b"ref",
+                    &meta,
+                    crate::deltaglider::RefWriteProof::for_tests(),
+                )
                 .await
                 .expect("put reference");
         }
@@ -2393,7 +2445,13 @@ mod tests {
             None,
         );
         backend
-            .put_reference("bucket", "ghost", b"ref", &meta)
+            .put_reference(
+                "bucket",
+                "ghost",
+                b"ref",
+                &meta,
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
             .await
             .expect("put reference");
 
@@ -2445,7 +2503,14 @@ mod tests {
             assert!(
                 invalid(
                     backend
-                        .put_delta("bucket", prefix, "x.zip", b"d", &dummy_metadata("x.zip"))
+                        .put_delta(
+                            "bucket",
+                            prefix,
+                            "x.zip",
+                            b"d",
+                            &dummy_metadata("x.zip"),
+                            crate::deltaglider::RefWriteProof::for_tests()
+                        )
                         .await
                 ),
                 "raw delta write through {prefix:?}"
@@ -2558,7 +2623,13 @@ mod tests {
             None,
         );
         backend
-            .put_reference("bucket", "ghost", b"ref", &meta)
+            .put_reference(
+                "bucket",
+                "ghost",
+                b"ref",
+                &meta,
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
             .await
             .expect("put reference");
         let hidden = tmp
@@ -2688,7 +2759,13 @@ mod tests {
             None,
         );
         backend
-            .put_reference("bucket", "visible", b"ref", &meta)
+            .put_reference(
+                "bucket",
+                "visible",
+                b"ref",
+                &meta,
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
             .await
             .expect("put reference");
 
@@ -2725,7 +2802,13 @@ mod tests {
             None,
         );
         backend
-            .put_reference("bucket", "deltas", &payload, &meta)
+            .put_reference(
+                "bucket",
+                "deltas",
+                &payload,
+                &meta,
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
             .await
             .expect("put reference");
 
@@ -2779,12 +2862,24 @@ mod tests {
             .expect("new backend");
         backend.create_bucket("bucket").await.expect("create");
         backend
-            .put_reference("bucket", "d", b"old-baseline", &ref_meta(12))
+            .put_reference(
+                "bucket",
+                "d",
+                b"old-baseline",
+                &ref_meta(12),
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
             .await
             .expect("put reference");
         let missing = tmp.path().join("no-such-spool-file");
         backend
-            .put_reference_from_file("bucket", "d", &missing, &ref_meta(3))
+            .put_reference_from_file(
+                "bucket",
+                "d",
+                &missing,
+                &ref_meta(3),
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
             .await
             .expect_err("unreadable source must fail");
         assert_eq!(
@@ -2809,7 +2904,13 @@ mod tests {
         let src = tmp.path().join("spool.bin");
         fs::write(&src, b"baseline").await.expect("write src");
         backend
-            .put_reference_from_file("bucket", "d", &src, &ref_meta(8))
+            .put_reference_from_file(
+                "bucket",
+                "d",
+                &src,
+                &ref_meta(8),
+                crate::deltaglider::RefWriteProof::for_tests(),
+            )
             .await
             .expect("put from file");
         // Overwrite the source in place (same inode).
@@ -2945,7 +3046,13 @@ mod tests {
                 .await
                 .unwrap();
             backend
-                .put_reference("bucket", "d", b"ref", &ref_meta(3))
+                .put_reference(
+                    "bucket",
+                    "d",
+                    b"ref",
+                    &ref_meta(3),
+                    crate::deltaglider::RefWriteProof::for_tests(),
+                )
                 .await
                 .unwrap();
         })

@@ -2435,6 +2435,7 @@ impl StorageBackend for S3Backend {
         prefix: &str,
         data: &[u8],
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         let key = self.reference_key(prefix);
         self.put_object_with_metadata(bucket, &key, data, metadata)
@@ -2454,6 +2455,7 @@ impl StorageBackend for S3Backend {
         prefix: &str,
         source_path: &std::path::Path,
         metadata: &FileMetadata,
+        _proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         // Stream the file body to S3 (ByteStream::from_path) — never heap-load it.
         let key = self.reference_key(prefix);
@@ -2469,6 +2471,7 @@ impl StorageBackend for S3Backend {
         bucket: &str,
         prefix: &str,
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         let key = self.reference_key(prefix);
         self.replace_metadata_in_place(bucket, &key, metadata)
@@ -2572,7 +2575,12 @@ impl StorageBackend for S3Backend {
     }
 
     #[instrument(skip(self))]
-    async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError> {
+    async fn delete_reference(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> Result<(), StorageError> {
         let key = self.reference_key(prefix);
         self.delete_s3_object(bucket, &key).await?;
         debug!("Deleted reference for {}/{}", bucket, prefix);
@@ -2607,6 +2615,7 @@ impl StorageBackend for S3Backend {
         prefix: &str,
         op: RefWrite<'_>,
         fence: &RefFence,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<RefFence, StorageError> {
         let key = self.reference_key(prefix);
         let etag = match op {
@@ -2642,6 +2651,7 @@ impl StorageBackend for S3Backend {
         filename: &str,
         data: &[u8],
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         let key = self.delta_key(prefix, filename);
         self.put_object_with_metadata(bucket, &key, data, metadata)
@@ -5352,9 +5362,16 @@ mod facts_off_the_put_path_tests {
     async fn a_delta_put_sends_only_the_object_write_inline() {
         let (ep, fake) = fake_s3::start().await;
         let s3 = test_support::for_test_endpoint(&ep);
-        s3.put_delta("b", "v1", "a.zip", b"0123456789", &delta_meta())
-            .await
-            .unwrap();
+        s3.put_delta(
+            "b",
+            "v1",
+            "a.zip",
+            b"0123456789",
+            &delta_meta(),
+            crate::deltaglider::RefWriteProof::for_tests(),
+        )
+        .await
+        .unwrap();
         let inline = fake.requests();
         assert!(
             inline.len() == 1 && inline[0].starts_with("PUT /b/v1/a.zip.delta"),
@@ -5570,6 +5587,7 @@ mod lost_response_tests {
                     metadata: &meta(&data),
                 },
                 &RefFence::Absent,
+                crate::deltaglider::RefWriteProof::for_tests(),
             )
             .await;
         assert!(fake.puts.load(Ordering::SeqCst) >= 1);
@@ -5600,6 +5618,7 @@ mod lost_response_tests {
                     metadata: &meta(&data),
                 },
                 &RefFence::Absent,
+                crate::deltaglider::RefWriteProof::for_tests(),
             )
             .await;
         assert!(
@@ -5632,6 +5651,7 @@ mod lost_response_tests {
                     metadata: &meta(&data),
                 },
                 &RefFence::ETag("\"v1\"".into()),
+                crate::deltaglider::RefWriteProof::for_tests(),
             )
             .await;
         assert_eq!(
@@ -5661,6 +5681,7 @@ mod lost_response_tests {
                     metadata: &meta(&data),
                 },
                 &RefFence::ETag("\"v1\"".into()),
+                crate::deltaglider::RefWriteProof::for_tests(),
             )
             .await;
         assert!(matches!(got, Err(StorageError::Throttled(_))), "{got:?}");

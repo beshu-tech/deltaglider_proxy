@@ -787,8 +787,9 @@ impl StorageBackend for RoutingBackend {
         prefix: &str,
         data: &[u8],
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
-        route_existing!(self, bucket, put_reference, prefix, data, metadata)
+        route_existing!(self, bucket, put_reference, prefix, data, metadata, proof)
     }
 
     async fn put_reference_from_file(
@@ -797,6 +798,7 @@ impl StorageBackend for RoutingBackend {
         prefix: &str,
         source_path: &std::path::Path,
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
         route_existing!(
             self,
@@ -804,7 +806,8 @@ impl StorageBackend for RoutingBackend {
             put_reference_from_file,
             prefix,
             source_path,
-            metadata
+            metadata,
+            proof
         )
     }
 
@@ -813,8 +816,16 @@ impl StorageBackend for RoutingBackend {
         bucket: &str,
         prefix: &str,
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
-        route_existing!(self, bucket, put_reference_metadata, prefix, metadata)
+        route_existing!(
+            self,
+            bucket,
+            put_reference_metadata,
+            prefix,
+            metadata,
+            proof
+        )
     }
 
     async fn get_reference_metadata(
@@ -830,8 +841,13 @@ impl StorageBackend for RoutingBackend {
         backend.has_reference(&real_bucket, prefix).await
     }
 
-    async fn delete_reference(&self, bucket: &str, prefix: &str) -> Result<(), StorageError> {
-        route_existing!(self, bucket, delete_reference, prefix)
+    async fn delete_reference(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        proof: &crate::deltaglider::RefWriteProof,
+    ) -> Result<(), StorageError> {
+        route_existing!(self, bucket, delete_reference, prefix, proof)
     }
 
     /// Every backend, not the one a bucket routes to: a route can change
@@ -858,8 +874,17 @@ impl StorageBackend for RoutingBackend {
         prefix: &str,
         op: super::traits::RefWrite<'_>,
         fence: &super::traits::RefFence,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<super::traits::RefFence, StorageError> {
-        route_existing!(self, bucket, write_reference_fenced, prefix, op, fence)
+        route_existing!(
+            self,
+            bucket,
+            write_reference_fenced,
+            prefix,
+            op,
+            fence,
+            proof
+        )
     }
 
     // === Delta file operations ===
@@ -880,8 +905,9 @@ impl StorageBackend for RoutingBackend {
         filename: &str,
         data: &[u8],
         metadata: &FileMetadata,
+        proof: &crate::deltaglider::RefWriteProof,
     ) -> Result<(), StorageError> {
-        route_existing!(self, bucket, put_delta, prefix, filename, data, metadata)
+        route_existing!(self, bucket, put_delta, prefix, filename, data, metadata, proof)
     }
 
     async fn get_delta_metadata(
@@ -1400,8 +1426,9 @@ mod tests {
             p: &str,
             op: crate::storage::RefWrite<'_>,
             _: &crate::storage::RefFence,
+            proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
-            crate::storage::unfenced_reference_write(self, b, p, op).await
+            crate::storage::unfenced_reference_write(self, b, p, op, proof).await
         }
         async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError> {
             self.create_calls.lock().unwrap().push(bucket.to_string());
@@ -1453,6 +1480,7 @@ mod tests {
             _: &str,
             _: &[u8],
             _: &FileMetadata,
+            _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
             Ok(())
         }
@@ -1462,6 +1490,7 @@ mod tests {
             _: &str,
             _: &str,
             _: &FileMetadata,
+            _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
             Ok(())
         }
@@ -1478,7 +1507,12 @@ mod tests {
             Ok(false)
         }
 
-        async fn delete_reference(&self, _: &str, _: &str) -> Result<(), StorageError> {
+        async fn delete_reference(
+            &self,
+            _: &str,
+            _: &str,
+            _proof: &crate::deltaglider::RefWriteProof,
+        ) -> Result<(), StorageError> {
             Ok(())
         }
 
@@ -1497,6 +1531,7 @@ mod tests {
             _: &str,
             _: &[u8],
             _: &FileMetadata,
+            _proof: &crate::deltaglider::RefWriteProof,
         ) -> Result<(), StorageError> {
             Ok(())
         }

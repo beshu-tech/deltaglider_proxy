@@ -309,8 +309,9 @@ single-instance planes below are addressed.
   clock skew does not matter; `expires_at` is still written for the previous
   release's readers, and a body without `ttl_secs` is judged by it. MinIO tests
   therefore wait real time (TTL 2 s), a simulated `now` no longer expires a lock.
-  Every engine write of reference.bin goes through a guard method (source test
-  `reference_writes_go_through_the_guard`), incl. delete-reclaim, sweep-reclaim,
+  Every engine write of reference.bin (and of a delta) goes through a guard method:
+  the backend write takes a `RefWriteProof` that only the guard's
+  `reference_writes` module in `engine/mod.rs` makes, incl. delete-reclaim, sweep-reclaim,
   legacy-reference migration and the replication fast-path seed
   (`with_dest_prefix_lock` holds both locks).
   FENCED: the acquire observes reference.bin (`StorageBackend::reference_fence`,

@@ -16,8 +16,8 @@ pub use engine::conditional::{ConditionalError, ObjectWriteGuard, Precondition};
 pub use engine::store::PassthroughMultipartHandle;
 pub(crate) use engine::{derive_key_id, effective_legacy_key_id, interleave_and_paginate};
 pub use engine::{
-    ConditionalDelete, DeltaGliderEngine, DynEngine, EngineError, ListObjectsPage, ReferenceScan,
-    RetrieveResponse, REFERENCE_SCAN_LIMIT,
+    ConditionalDelete, DeltaGliderEngine, DynEngine, EngineError, ListObjectsPage, RefWriteProof,
+    ReferenceScan, RetrieveResponse, REFERENCE_SCAN_LIMIT,
 };
 pub use file_router::{CompressionStrategy, FileRouter};
 pub use savings::SavingsTotals;

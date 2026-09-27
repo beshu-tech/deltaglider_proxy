@@ -338,17 +338,18 @@ async fn s3_reference_writes_are_fenced() {
         metadata: &meta,
     };
 
+    let proof = deltaglider_proxy::deltaglider::RefWriteProof::unguarded();
     let seen = s3.reference_fence(MINIO_BUCKET, &ds).await.unwrap();
     assert_eq!(seen, RefFence::Absent);
     // A peer creates the baseline after our observation.
     let peer = s3
-        .write_reference_fenced(MINIO_BUCKET, &ds, put(b"P"), &RefFence::Absent)
+        .write_reference_fenced(MINIO_BUCKET, &ds, put(b"P"), &RefFence::Absent, proof)
         .await
         .unwrap();
     assert!(matches!(peer, RefFence::ETag(ref e) if !e.is_empty()));
     // Our create (fence: absent) must not overwrite it.
     let err = s3
-        .write_reference_fenced(MINIO_BUCKET, &ds, put(b"A"), &seen)
+        .write_reference_fenced(MINIO_BUCKET, &ds, put(b"A"), &seen, proof)
         .await
         .unwrap_err();
     assert!(matches!(err, StorageError::Throttled(_)), "{err:?}");
@@ -357,22 +358,22 @@ async fn s3_reference_writes_are_fenced() {
     let stale = RefFence::ETag("\"00000000000000000000000000000000\"".into());
     let meta_op = RefWrite::Metadata { metadata: &meta };
     assert!(matches!(
-        s3.write_reference_fenced(MINIO_BUCKET, &ds, meta_op, &stale)
+        s3.write_reference_fenced(MINIO_BUCKET, &ds, meta_op, &stale, proof)
             .await,
         Err(StorageError::Throttled(_))
     ));
     assert!(matches!(
-        s3.write_reference_fenced(MINIO_BUCKET, &ds, RefWrite::Delete, &stale)
+        s3.write_reference_fenced(MINIO_BUCKET, &ds, RefWrite::Delete, &stale, proof)
             .await,
         Err(StorageError::Throttled(_))
     ));
     // The current fence passes, and the returned fence is the next one.
     let next = s3
-        .write_reference_fenced(MINIO_BUCKET, &ds, meta_op, &peer)
+        .write_reference_fenced(MINIO_BUCKET, &ds, meta_op, &peer, proof)
         .await
         .unwrap();
     let gone = s3
-        .write_reference_fenced(MINIO_BUCKET, &ds, RefWrite::Delete, &next)
+        .write_reference_fenced(MINIO_BUCKET, &ds, RefWrite::Delete, &next, proof)
         .await
         .unwrap();
     assert_eq!(gone, RefFence::Absent);
