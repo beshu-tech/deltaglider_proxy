@@ -1101,30 +1101,15 @@ fn plan_bootstrap_restore(
 /// Unpack a Full Backup zip and apply all four parts atomically.
 ///
 /// Two-phase flow (x-ray MED #3: validate first, side-effect second):
-///   Phase A — unpack + parse every part + verify manifest sha256.
-///             No state change. Any failure returns before we've
-///             touched the DB or config.
-///   Phase B — apply in order: config.yaml (via apply_config_doc),
-///             then secrets.json (storage creds + bootstrap hash),
-///             then iam.json. Secrets land before IAM so the
+///   Phase A — unpack + parse every part + verify manifest sha256
+///             ([`verify_manifest`], [`parse_backup_parts`]). No state
+///             change. Any failure returns before we've touched the DB
+///             or config.
+///   Phase B — apply in order: config.yaml ([`apply_backup_config`]),
+///             then secrets.json ([`apply_backup_secrets`]: storage
+///             creds + bootstrap hash), then iam.json
+///             ([`apply_backup_iam`]). Secrets land before IAM so the
 ///             post-IAM S3-sync push uses the restored storage creds.
-///
-/// ## Maintenance note (hygiene review, 2026-04-23)
-///
-/// This function is ~220 LOC covering six phases with clear seams
-/// (unpack → manifest → parse parts → validate IAM → merge secrets
-/// → apply). It was NOT split as a pure refactor because disaster-
-/// recovery paths are sensitive and the risk/reward didn't earn a
-/// reshape. The next person who touches this (e.g. adding a v3
-/// manifest field, supporting partial restore, or shipping encrypted
-/// backups) should split it as part of that change — the natural
-/// boundaries are:
-///
-///   - `extract_and_verify_manifest(archive) -> HashMap<path, bytes>`
-///   - `parse_backup_parts(files) -> ParsedBackup`
-///   - `apply_imported_backup(state, parsed)` (Phase B)
-///
-/// Leave `import_zip_full_backup` as the thin orchestrator.
 async fn import_zip_full_backup(
     state: Arc<AdminState>,
     headers: HeaderMap,
@@ -1147,7 +1132,29 @@ async fn import_zip_full_backup(
         has_iam = files.contains_key("iam.json"),
         "Full-backup import: zip unpacked"
     );
+    verify_manifest(&files)?;
+    let parts = parse_backup_parts(&files)?;
 
+    apply_backup_config(&state, &headers, mode, parts.yaml, parts.secrets.as_ref()).await?;
+    apply_backup_secrets(&state, &headers, mode, parts.secrets.as_ref()).await?;
+    let iam_result = apply_backup_iam(&state, &headers, mode, parts.iam, iam_mode).await?;
+
+    audit_log(
+        "import_full_backup",
+        "admin",
+        &format!("zip applied ({mode:?})"),
+        &headers,
+    );
+
+    Ok(iam_result)
+}
+
+/// Phase A.2 + A.3 of [`import_zip_full_backup`]: the manifest is present,
+/// of a known version, and every file it lists is in the zip with the
+/// listed sha256. Pure.
+fn verify_manifest(
+    files: &std::collections::HashMap<String, Vec<u8>>,
+) -> Result<(), BackupImportError> {
     // ── Phase A.2: manifest is required (LOW #1) ───────────────
     let m_bytes = files.get("manifest.json").ok_or_else(|| {
         import_fail(
@@ -1234,7 +1241,20 @@ async fn import_zip_full_backup(
         }
     }
     tracing::info!("Full-backup import: manifest hashes verified");
+    Ok(())
+}
 
+/// The parts of a backup zip, parsed (Phase A.4 of [`import_zip_full_backup`]).
+struct BackupParts {
+    yaml: Option<String>,
+    secrets: Option<BackupSecrets>,
+    iam: Option<IamBackup>,
+}
+
+/// Phase A.4 of [`import_zip_full_backup`]. Pure.
+fn parse_backup_parts(
+    files: &std::collections::HashMap<String, Vec<u8>>,
+) -> Result<BackupParts, BackupImportError> {
     // ── Phase A.4: pre-parse every part (MED #3) ───────────────
     //    Build owned typed values for everything that might be
     //    applied, so Phase B only hits side-effect paths once the
@@ -1294,7 +1314,21 @@ async fn import_zip_full_backup(
             .map_or(0, |b| b.external_identities.len()),
         "Full-backup import: backup parts parsed"
     );
+    Ok(BackupParts {
+        yaml: yaml_str,
+        secrets,
+        iam: iam_backup,
+    })
+}
 
+/// Phase B.1 of [`import_zip_full_backup`]: apply config.yaml.
+async fn apply_backup_config(
+    state: &Arc<AdminState>,
+    headers: &HeaderMap,
+    mode: ImportMode,
+    yaml_str: Option<String>,
+    secrets: Option<&BackupSecrets>,
+) -> Result<(), BackupImportError> {
     if mode.restores_config() {
         if let Some(yaml_str) = yaml_str {
             // Skip application if the YAML is empty/whitespace-only.
@@ -1302,15 +1336,16 @@ async fn import_zip_full_backup(
             // fires on deliberate-empty zips.
             if !yaml_str.trim().is_empty() {
                 let (yaml_str, restore_refs) =
-                    hydrate_restore_doc(&yaml_str, secrets.as_ref(), &crate::config::process_env)
-                        .map_err(|e| {
-                        import_fail(
-                            StatusCode::BAD_REQUEST,
-                            "parse_config_yaml",
-                            "config.yaml",
-                            e,
-                        )
-                    })?;
+                    hydrate_restore_doc(&yaml_str, secrets, &crate::config::process_env).map_err(
+                        |e| {
+                            import_fail(
+                                StatusCode::BAD_REQUEST,
+                                "parse_config_yaml",
+                                "config.yaml",
+                                e,
+                            )
+                        },
+                    )?;
                 tracing::info!(
                     bytes = yaml_str.len(),
                     "Full-backup import: applying config.yaml"
@@ -1319,8 +1354,8 @@ async fn import_zip_full_backup(
                 // Call the apply pipeline DIRECTLY (typed result) — no self-HTTP
                 // round-trip + response-body re-parse (retired the v0.9 TODO).
                 let (status, result) = crate::api::admin::apply_config_inner_with_env(
-                    &state,
-                    &headers,
+                    state,
+                    headers,
                     req,
                     &restore_refs,
                 )
@@ -1355,13 +1390,22 @@ async fn import_zip_full_backup(
     } else {
         tracing::info!("Full-backup import: skipping config.yaml for IAM-only restore");
     }
+    Ok(())
+}
 
+/// Phase B.2 of [`import_zip_full_backup`]: apply secrets.json.
+async fn apply_backup_secrets(
+    state: &Arc<AdminState>,
+    headers: &HeaderMap,
+    mode: ImportMode,
+    secrets: Option<&BackupSecrets>,
+) -> Result<(), BackupImportError> {
     // ── Phase B.2: apply secrets.json BEFORE iam import. Storage
     //       creds need to be in place before a subsequent import of
     //       a v0.8.3+ iam.json fires an S3 sync push. Bootstrap
     //       hash must land before any admin session is re-issued. ──
     if mode.restores_config() {
-        if let Some(secrets) = secrets.as_ref() {
+        if let Some(secrets) = secrets {
             tracing::info!(
                 has_bootstrap_hash = secrets.bootstrap_password_hash.is_some(),
                 has_access = secrets.access.is_some(),
@@ -1370,7 +1414,7 @@ async fn import_zip_full_backup(
                 oauth_client_secret_count = secrets.oauth_client_secrets.len(),
                 "Full-backup import: applying secrets.json"
             );
-            apply_secrets(&state, secrets, mode.restores_bootstrap(), &headers)
+            apply_secrets(state, secrets, mode.restores_bootstrap(), headers)
                 .await
                 .map_err(|err| {
                     import_fail(err.status, "apply_secrets", "secrets.json", err.detail)
@@ -1380,7 +1424,17 @@ async fn import_zip_full_backup(
     } else {
         tracing::info!("Full-backup import: skipping secrets.json for IAM-only restore");
     }
+    Ok(())
+}
 
+/// Phase B.3 of [`import_zip_full_backup`]: apply iam.json.
+async fn apply_backup_iam(
+    state: &Arc<AdminState>,
+    headers: &HeaderMap,
+    mode: ImportMode,
+    iam_backup: Option<IamBackup>,
+    iam_mode: IamRestoreMode,
+) -> Result<Json<ImportResult>, BackupImportError> {
     // ── Phase B.3: apply iam.json (same flow as legacy JSON import) ──
     let iam_result = if mode.restores_iam() {
         if let Some(backup) = iam_backup {
@@ -1426,14 +1480,6 @@ async fn import_zip_full_backup(
         tracing::info!("Full-backup import: skipping iam.json for config-only restore");
         Json(ImportResult::default())
     };
-
-    audit_log(
-        "import_full_backup",
-        "admin",
-        &format!("zip applied ({mode:?})"),
-        &headers,
-    );
-
     Ok(iam_result)
 }
 
@@ -2018,6 +2064,99 @@ storage:
             w.finish().unwrap();
         }
         buf
+    }
+
+    fn files(entries: &[(&str, &[u8])]) -> std::collections::HashMap<String, Vec<u8>> {
+        entries
+            .iter()
+            .map(|(n, b)| (n.to_string(), b.to_vec()))
+            .collect()
+    }
+
+    fn manifest(version: u64, entries: &[(&str, &str)]) -> Vec<u8> {
+        let files: Vec<_> = entries
+            .iter()
+            .map(|(n, sha)| serde_json::json!({ "name": n, "sha256": sha }))
+            .collect();
+        serde_json::to_vec(&serde_json::json!({ "version": version, "files": files })).unwrap()
+    }
+
+    /// The stage and detail of a Phase A refusal.
+    fn refusal(e: BackupImportError) -> (StatusCode, String, String) {
+        (e.status, e.stage, e.detail.unwrap_or_default())
+    }
+
+    #[test]
+    fn verify_manifest_accepts_listed_files_with_their_hash() {
+        let yaml = b"storage: {}\n";
+        let m = manifest(1, &[("config.yaml", &sha_hex(yaml))]);
+        let fs = files(&[
+            ("manifest.json", &m),
+            ("config.yaml", yaml),
+            ("extra.txt", b"x"),
+        ]);
+        assert!(verify_manifest(&fs).is_ok(), "an unlisted file is ignored");
+    }
+
+    #[test]
+    fn verify_manifest_refusals() {
+        let yaml = b"storage: {}\n";
+        let bad = |fs: std::collections::HashMap<String, Vec<u8>>| {
+            refusal(verify_manifest(&fs).unwrap_err())
+        };
+        let (st, stage, detail) = bad(files(&[("config.yaml", yaml)]));
+        assert_eq!(
+            (st, stage.as_str()),
+            (StatusCode::BAD_REQUEST, "parse_manifest")
+        );
+        assert_eq!(detail, "required file is missing");
+
+        let (_, stage, detail) = bad(files(&[("manifest.json", b"{")]));
+        assert_eq!(stage, "parse_manifest");
+        assert!(detail.starts_with("malformed JSON"), "{detail}");
+
+        let (_, stage, detail) = bad(files(&[("manifest.json", &manifest(2, &[]))]));
+        assert_eq!(stage, "parse_manifest");
+        assert_eq!(detail, "unsupported manifest version 2");
+
+        let m = manifest(1, &[("iam.json", "00")]);
+        let (_, stage, detail) = bad(files(&[("manifest.json", &m)]));
+        assert_eq!(stage, "verify_manifest");
+        assert_eq!(detail, "manifest lists file but zip has no such entry");
+
+        let m = manifest(1, &[("config.yaml", "00")]);
+        let (_, stage, detail) = bad(files(&[("manifest.json", &m), ("config.yaml", yaml)]));
+        assert_eq!(stage, "verify_manifest");
+        assert!(
+            detail.starts_with("sha256 mismatch (expected 00, got "),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn parse_backup_parts_reads_what_is_there() {
+        let parts = parse_backup_parts(&files(&[("config.yaml", b"storage: {}\n")])).unwrap();
+        assert_eq!(parts.yaml.as_deref(), Some("storage: {}\n"));
+        assert!(parts.secrets.is_none() && parts.iam.is_none());
+
+        let parts = parse_backup_parts(&files(&[])).unwrap();
+        assert!(parts.yaml.is_none() && parts.secrets.is_none() && parts.iam.is_none());
+    }
+
+    #[test]
+    fn parse_backup_parts_refusals() {
+        let bad =
+            |entries: &[(&str, &[u8])]| refusal(parse_backup_parts(&files(entries)).err().unwrap());
+        let (st, stage, detail) = bad(&[("config.yaml", &[0xff, 0xfe])]);
+        assert_eq!(
+            (st, stage.as_str()),
+            (StatusCode::BAD_REQUEST, "parse_config_yaml")
+        );
+        assert_eq!(detail, "file is not UTF-8");
+        let (_, stage, _) = bad(&[("secrets.json", b"[")]);
+        assert_eq!(stage, "parse_secrets");
+        let (_, stage, _) = bad(&[("iam.json", b"[")]);
+        assert_eq!(stage, "parse_iam");
     }
 
     #[test]
