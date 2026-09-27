@@ -327,7 +327,8 @@ fn secure_cookies() -> bool {
 }
 
 /// Same as [`secure_cookies`] but also consults the inbound request's
-/// `X-Forwarded-Proto` header (only when `DGP_TRUST_PROXY_HEADERS=true`).
+/// `X-Forwarded-Proto` header (only from a trusted proxy,
+/// [`rate_limiter::trusted_forwarded_header`]).
 /// Use this on the response-issuing path so a TLS-terminated front
 /// proxy yields a `Secure` cookie even when our listener is plain HTTP.
 pub(super) fn secure_cookies_with(headers: Option<&HeaderMap>) -> bool {
@@ -346,20 +347,9 @@ pub(super) fn secure_cookies_with(headers: Option<&HeaderMap>) -> bool {
     if crate::tls::listener_tls() {
         return true;
     }
-    if crate::rate_limiter::trust_proxy_headers() {
-        if let Some(h) = headers {
-            if let Some(proto) = h
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.trim().to_ascii_lowercase())
-            {
-                if proto == "https" {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+    headers
+        .and_then(|h| rate_limiter::trusted_forwarded_header(h, "x-forwarded-proto", None))
+        .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"))
 }
 
 /// Remove the caller's previous session, if any. Called at every
@@ -1955,11 +1945,14 @@ mod tests {
             "must NOT trust XFP without DGP_TRUST_PROXY_HEADERS=true"
         );
 
-        // Case B: trust=true, XFP=https → secure.
+        // Case B: trust=true but no trusted-proxy peer → still NOT secure:
+        // only a DGP_TRUSTED_PROXY_CIDRS peer's XFP counts (the positive
+        // case, over a real connection, is the integration test
+        // `forwarded_host_and_proto_count_only_from_a_trusted_proxy`).
         unsafe { std::env::set_var("DGP_TRUST_PROXY_HEADERS", "true") };
         assert!(
-            secure_cookies_with(Some(&h)),
-            "trusted XFP=https must yield Secure cookie"
+            !secure_cookies_with(Some(&h)),
+            "XFP=https from no trusted proxy must not yield a Secure cookie"
         );
 
         // Case C: trust=true, no XFP → falls back to the listener's TLS → false.

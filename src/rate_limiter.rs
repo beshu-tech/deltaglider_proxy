@@ -436,6 +436,43 @@ pub fn extract_client_ip_with_peer(
     )
 }
 
+/// Pure: whether this connection comes from a trusted reverse proxy, so its
+/// proxy-set headers (`X-Forwarded-*`, `X-Real-IP`) may speak for the
+/// client: trust is on AND the peer is inside a `DGP_TRUSTED_PROXY_CIDRS`
+/// network. THE rule for every proxy header, the client IP included.
+pub fn peer_is_trusted_proxy(
+    peer_ip: Option<IpAddr>,
+    trust: bool,
+    trusted_cidrs: &[ipnet::IpNet],
+) -> bool {
+    trust
+        && peer_ip.is_some_and(|p| {
+            let p = normalize_ip(p);
+            trusted_cidrs.iter().any(|n| n.contains(&p))
+        })
+}
+
+/// [`peer_is_trusted_proxy`] with the configured trust. `peer_ip` is the
+/// TCP peer; `None` falls back to the request's peer from
+/// `audit::scope_request_peer`.
+pub fn from_trusted_proxy(peer_ip: Option<IpAddr>) -> bool {
+    let peer = peer_ip.or_else(crate::audit::current_request_peer);
+    peer_is_trusted_proxy(peer, trust_proxy_headers(), &trusted_proxy_cidrs())
+}
+
+/// A proxy-set header such as `X-Forwarded-Host` / `X-Forwarded-Proto`,
+/// only [`from_trusted_proxy`]; else `None` (a client wrote it).
+pub fn trusted_forwarded_header<'a>(
+    headers: &'a axum::http::HeaderMap,
+    name: &str,
+    peer_ip: Option<IpAddr>,
+) -> Option<&'a str> {
+    if !from_trusted_proxy(peer_ip) {
+        return None;
+    }
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
 /// The boot error for `DGP_TRUST_PROXY_HEADERS=true` without a usable
 /// `DGP_TRUSTED_PROXY_CIDRS` (unset, empty, or only invalid entries). The
 /// proxy cannot tell a reverse proxy's X-Forwarded-For from a forged one,
@@ -478,10 +515,7 @@ pub fn resolve_client_ip(
 
     // Normalize first: a dual-stack listener reports an IPv4 proxy as
     // `::ffff:a.b.c.d`, which no V4 CIDR contains.
-    let peer_trusted = |ip: IpAddr| {
-        let ip = normalize_ip(ip);
-        trusted_cidrs.iter().any(|n| n.contains(&ip))
-    };
+    let peer_trusted = |ip: IpAddr| peer_is_trusted_proxy(Some(ip), true, trusted_cidrs);
 
     if trusted_cidrs.is_empty() {
         return peer_ip.map(normalize_ip);
@@ -1428,6 +1462,21 @@ mod tests {
             resolve_client_ip(&h, peer, true, &[cidr("10.0.0.0/8")]),
             peer
         );
+    }
+
+    #[test]
+    fn peer_is_trusted_proxy_truth_table() {
+        let nets = [cidr("10.0.0.0/8")];
+        assert!(peer_is_trusted_proxy(Some(ip("10.1.2.3")), true, &nets));
+        assert!(peer_is_trusted_proxy(
+            Some(ip("::ffff:10.1.2.3")),
+            true,
+            &nets
+        ));
+        assert!(!peer_is_trusted_proxy(Some(ip("10.1.2.3")), false, &nets));
+        assert!(!peer_is_trusted_proxy(Some(ip("192.0.2.1")), true, &nets));
+        assert!(!peer_is_trusted_proxy(Some(ip("10.1.2.3")), true, &[]));
+        assert!(!peer_is_trusted_proxy(None, true, &nets));
     }
 
     #[test]

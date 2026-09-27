@@ -571,7 +571,7 @@ The admin UI page **Request rules** (`/_/admin/access/admission`) edits these ru
 
 Trust `X-Forwarded-For` / `X-Real-IP` from the reverse proxies that `DGP_TRUSTED_PROXY_CIDRS` lists. **Disable** if the proxy is internet-facing without a reverse proxy.
 
-A client can write any `X-Forwarded-For` value, so the proxy reads the header only on a connection from a network in `DGP_TRUSTED_PROXY_CIDRS`. On any other connection it uses the address of the TCP connection. The one resulting client address is used for every decision: the per-IP rate limit, the IP binding of admin sessions, the known-good exemption from the login lockout, admission `source_ip` rules, and IAM `aws:SourceIp` conditions. The proxy refuses to start when this setting is `true` and `DGP_TRUSTED_PROXY_CIDRS` is unset or holds no valid network.
+A client can write any `X-Forwarded-For` value, so the proxy reads the header only on a connection from a network in `DGP_TRUSTED_PROXY_CIDRS`. On any other connection it uses the address of the TCP connection. The one resulting client address is used for every decision: the per-IP rate limit, the IP binding of admin sessions, the known-good exemption from the login lockout, admission `source_ip` rules, and IAM `aws:SourceIp` conditions. The proxy refuses to start when this setting is `true` and `DGP_TRUSTED_PROXY_CIDRS` is unset or holds no valid network. The same rule covers `X-Forwarded-Host` and `X-Forwarded-Proto`: they count for the same-origin check of admin requests, the `Secure` flag of session cookies, and the OAuth callback address only on a connection from a trusted proxy.
 
 | | |
 |---|---|

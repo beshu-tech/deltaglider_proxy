@@ -3683,3 +3683,61 @@ async fn failed_logins_never_store_an_unknown_access_key_verbatim() {
         "a known access key id stays readable: {audit}"
     );
 }
+
+/// X-Forwarded-Host / X-Forwarded-Proto count only on a connection from a
+/// `DGP_TRUSTED_PROXY_CIDRS` peer. Before, `DGP_TRUST_PROXY_HEADERS=true`
+/// alone made any client's headers count: a forged host passed the CSRF
+/// origin check, and a forged proto set the cookie's `Secure` flag.
+#[tokio::test]
+async fn forwarded_host_and_proto_count_only_from_a_trusted_proxy() {
+    async fn probe(server: &TestServer) -> (StatusCode, String) {
+        let url = format!("{}/_/api/admin/login", server.endpoint());
+        let http = reqwest::Client::new();
+        let csrf = http
+            .post(&url)
+            .header("origin", "http://evil.example")
+            .header("x-forwarded-host", "evil.example")
+            .json(&json!({ "password": common::TEST_BOOTSTRAP_PASSWORD }))
+            .send()
+            .await
+            .unwrap()
+            .status();
+        let r = http
+            .post(&url)
+            .header("x-forwarded-proto", "https")
+            .json(&json!({ "password": common::TEST_BOOTSTRAP_PASSWORD }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let cookie = r.headers()["set-cookie"].to_str().unwrap().to_string();
+        (csrf, cookie)
+    }
+    // The loopback client is no trusted proxy: its headers do not count.
+    let untrusted = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .env("DGP_TRUSTED_PROXY_CIDRS", "192.0.2.1/32")
+        .build()
+        .await;
+    let (csrf, cookie) = probe(&untrusted).await;
+    assert_eq!(
+        csrf,
+        StatusCode::FORBIDDEN,
+        "a forged X-Forwarded-Host passed CSRF"
+    );
+    assert!(
+        !cookie.contains("Secure"),
+        "a forged X-Forwarded-Proto: {cookie}"
+    );
+    // The harness default trusts loopback as the proxy: they count.
+    let trusted = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let (csrf, cookie) = probe(&trusted).await;
+    assert_eq!(csrf, StatusCode::OK, "trusted proxy's X-Forwarded-Host");
+    assert!(
+        cookie.contains("Secure"),
+        "trusted proxy's X-Forwarded-Proto: {cookie}"
+    );
+}

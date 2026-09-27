@@ -1115,12 +1115,13 @@ fn validate_mapping_rule(match_type: &str, match_value: &str) -> Result<(), Stri
 
 /// Build the OAuth callback URI from request headers.
 fn build_callback_uri(headers: &HeaderMap) -> String {
-    build_callback_uri_with(headers, crate::rate_limiter::trust_proxy_headers())
+    // The same trust rule as every proxy header: a trusted proxy's peer.
+    build_callback_uri_with(headers, crate::rate_limiter::from_trusted_proxy(None))
 }
 
-/// Pure core. X-Forwarded-Proto/-Host count only when proxy headers are
-/// trusted (S23): otherwise any client picks the redirect_uri host, and the
-/// IdP (if it allows that URI) sends the authorization code there.
+/// Pure core. X-Forwarded-Proto/-Host count only from a trusted proxy
+/// (S23): otherwise any client picks the redirect_uri host, and the IdP (if
+/// it allows that URI) sends the authorization code there.
 fn build_callback_uri_with(headers: &HeaderMap, trust_proxy: bool) -> String {
     let fwd = |name: &str| {
         trust_proxy

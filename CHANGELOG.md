@@ -354,6 +354,15 @@ So the total covered only the objects after the cursor, and the progress
 bar reached 99 % long before the end. Now the resumed count starts from
 the count that was saved with the cursor.
 
+### Fixed — `X-Forwarded-Host` / `-Proto` count only from a trusted proxy
+
+With `DGP_TRUST_PROXY_HEADERS=true`, any client's `X-Forwarded-Host`
+counted for the same-origin (CSRF) check of admin requests and the OAuth
+callback address, and any client's `X-Forwarded-Proto` set the `Secure`
+flag of session cookies. Now these headers count only on a connection
+from a `DGP_TRUSTED_PROXY_CIDRS` network, the rule that already covers
+`X-Forwarded-For`.
+
 ### Fixed — A failed login never stores an unknown access key as typed
 
 A failed `login-as` or browser connect with an access key that no user

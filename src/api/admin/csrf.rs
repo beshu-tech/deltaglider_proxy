@@ -60,11 +60,15 @@ pub async fn require_same_origin(req: Request, next: Next) -> Response {
         return next.run(req).await;
     }
     let h = req.headers();
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
     let mut hosts: Vec<&str> = header(h, "host").into_iter().collect();
-    if crate::rate_limiter::trust_proxy_headers() {
-        if let Some(fh) = header(h, "x-forwarded-host") {
-            hosts.extend(fh.split(',').map(str::trim));
-        }
+    // Only a trusted proxy's X-Forwarded-Host counts: a client could name
+    // any host and pass the check with it.
+    if let Some(fh) = crate::rate_limiter::trusted_forwarded_header(h, "x-forwarded-host", peer) {
+        hosts.extend(fh.split(',').map(str::trim));
     }
     if is_same_origin_request(
         req.method(),
@@ -78,7 +82,7 @@ pub async fn require_same_origin(req: Request, next: Next) -> Response {
         StatusCode::FORBIDDEN,
         axum::Json(serde_json::json!({
             "error": "cross_origin_request",
-            "message": "state-changing admin requests must come from the proxy's own origin. Behind a reverse proxy, forward the original Host header (or set DGP_TRUST_PROXY_HEADERS=true so X-Forwarded-Host counts)"
+            "message": "state-changing admin requests must come from the proxy's own origin. Behind a reverse proxy, forward the original Host header (or set DGP_TRUST_PROXY_HEADERS=true and DGP_TRUSTED_PROXY_CIDRS so X-Forwarded-Host counts)"
         })),
     )
         .into_response()

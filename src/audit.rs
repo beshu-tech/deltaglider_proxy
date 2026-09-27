@@ -45,7 +45,7 @@ pub async fn scope_request_peer(
     REQUEST_PEER.scope(peer, next.run(req)).await
 }
 
-fn current_request_peer() -> Option<std::net::IpAddr> {
+pub(crate) fn current_request_peer() -> Option<std::net::IpAddr> {
     REQUEST_PEER.try_with(|p| *p).ok().flatten()
 }
 
