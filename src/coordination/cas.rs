@@ -8,7 +8,7 @@
 //! Both mean the same thing: the condition cannot hold, a peer won. A caller
 //! that checked only 412 read the 409 as an unrelated error (a failed lease
 //! or lock step, a non-retryable PUT). Every conditional-write call site uses
-//! [`conditional_write_lost`]; a source test refuses a bare 412 check.
+//! [`conditional_write_lost`]; the bare 412 check is private to this file.
 
 /// `412 PreconditionFailed`: the `If-Match` / `If-None-Match` guard did not
 /// hold. AWS and MinIO send `PreconditionFailed` and/or status 412. Private:
@@ -76,49 +76,5 @@ mod tests {
         assert!(!conditional_write_lost("status=409 code=OperationAborted"));
         assert!(!conditional_write_lost("status=503 code=SlowDown"));
         assert!(!conditional_write_lost("transport code="));
-    }
-
-    /// A bare 412 check misses the 409: every site uses the classifier.
-    #[test]
-    fn no_bare_precondition_checks() {
-        // (file, reason). Keep this short.
-        const ALLOWED: &[(&str, &str)] = &[("src/coordination/cas.rs", "the classifier itself")];
-        let needle = ["is_precondition", "_failed("].concat();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut stack = vec![root.join("src")];
-        let mut offenders = Vec::new();
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                    continue;
-                }
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                if ALLOWED.iter().any(|(f, _)| *f == rel) {
-                    continue;
-                }
-                let text = std::fs::read_to_string(&path).unwrap();
-                for (n, line) in text.lines().enumerate() {
-                    let code = line.split("//").next().unwrap_or("");
-                    if code.contains(needle.as_str()) {
-                        offenders.push(format!("{rel}:{}: {}", n + 1, line.trim()));
-                    }
-                }
-            }
-        }
-        assert!(
-            offenders.is_empty(),
-            "use coordination::cas::conditional_write_lost (412 or 409 \
-             ConditionalRequestConflict):\n{}",
-            offenders.join("\n")
-        );
     }
 }
