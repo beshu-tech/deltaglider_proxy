@@ -43,10 +43,8 @@ fn head_range_is_partial(
 /// Build the S3-compatible router with all routes and middleware layers.
 ///
 /// Backed by the `s3s` crate, which translates wire-level S3 protocol
-/// onto our [`crate::s3_adapter_s3s::DeltaGliderS3Service`].
-/// Until recently this function selected between `s3s` and a hand-
-/// rolled axum-handler implementation via `DGP_S3_ADAPTER`; the axum
-/// path has been retired and `s3s` is the only S3 implementation.
+/// onto our [`crate::s3_adapter_s3s::DeltaGliderS3Service`], the only S3
+/// implementation.
 ///
 /// What's still axum, around the s3s service:
 ///   1. Pre-auth ADMISSION middleware (operator gating).

@@ -884,13 +884,9 @@ impl s3s::S3 for DeltaGliderS3Service {
         .await?;
         verify_signed_payload_hash_s3s(signed_payload_hash.as_ref(), &data)?;
         validate_content_md5_s3s(input.content_md5.as_deref(), &data)?;
-        // Per-bucket storage quota enforcement (parity with axum's
-        // `put_object_inner` in `api/handlers/object_helpers.rs`). The
-        // s3s adapter shipped without this — letting a quota-bound
-        // bucket overrun silently when DGP_S3_ADAPTER=s3s. Same
-        // `check_quota` is reused from the axum path so the policy
-        // ("freeze when quota=0, soft-enforce after cached usage
-        // available") stays single-sourced.
+        // Per-bucket storage quota enforcement. The shared `check_quota`
+        // keeps the policy ("freeze when quota=0, soft-enforce after cached
+        // usage available") single-sourced with form POST and copy.
         crate::api::handlers::object_helpers::check_quota(
             &self.state,
             &input.bucket,
