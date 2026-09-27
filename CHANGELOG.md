@@ -26,6 +26,17 @@ to the source, and the cleanup deleted those writes. Now
 `POST /_/api/admin/buckets/:bucket/migrate` answers `409 Conflict` while
 `config_sync_bucket` is set. Move a bucket on a single instance.
 
+### Fixed — One failed lease renewal no longer stops a replication run
+
+The replication run and the parity audit read any error of a lease renewal
+(one S3 or DB error that outlasted the lease's own retries) as a lost
+lease, and stopped. The maintenance keeper instead retried a DB error
+forever. Every job kind now uses one rule: a refused renewal stops the run,
+and an error is retried while the next retry still lands before the lease
+expires. Counting, verify and the mirror prune of a maintenance job also
+stop at a graceful shutdown between objects now, like the other phases, so
+the job goes back to the queue with its cursor.
+
 ### Fixed — A maintenance job keeps its write gate through a DB error
 
 The per-object lease renewal read a config DB error as a lost lease. The job
