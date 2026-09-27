@@ -256,6 +256,10 @@ mod folder_marker_tests;
 #[cfg(test)]
 mod tests;
 
+/// The store decision, pinned for the buffered and the streaming PUT.
+#[cfg(test)]
+mod store_plan_tests;
+
 /// Cross-instance reference lock, engine side: loss detection before a
 /// commit, renewal while held, and the reference writes that once skipped
 /// the lock (delete-reclaim, sweep-reclaim, fast-path seed).
