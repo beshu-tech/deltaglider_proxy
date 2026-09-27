@@ -15,9 +15,10 @@
 //! file part; `authenticate_form_post` rebuilds the SigV4 signing key,
 //! verifies the form signature in constant time, decodes and validates
 //! the policy document, and authorises the user against IAM;
-//! `handle_form_post_upload` runs auth first, then the bucket-existence + quota gates,
-//! hands the file body to `engine.store`, and emits the object-created
-//! event + audit log.
+//! `handle_form_post_upload` runs auth first, then the bucket-existence gate,
+//! hands the file body to `store_client_write` (quota, the object's write
+//! lock, the `If-Match`/`If-None-Match` preconditions, the store, the
+//! object-created event), and writes the audit log.
 //!
 //! Lives in its own module because none of this code path is shared
 //! with the GET/PUT/HEAD/DELETE handlers in `object.rs` — the only
@@ -36,10 +37,9 @@
 //! `content-length-range`, `expiration` — are re-validated on EVERY request
 //! (`validate_form_post_policy`) and are the real bound on a leaked signature.
 
-use super::object_helpers::{check_client_write_allowed, check_quota, enqueue_object_event};
+use super::object_helpers::{check_client_write_allowed, store_client_write, ClientWrite};
 use super::{audit_log_s3, ensure_bucket_exists, AppState};
 use crate::api::errors::S3Error;
-use crate::event_outbox::{current_unix_seconds, EventKind, EventSource, NewEvent};
 use crate::iam::{AuthenticatedUser, IamState, S3Action, SharedIamState};
 use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
@@ -203,6 +203,26 @@ fn ensure_supported_form_fields(fields_ci: &HashMap<String, String>) -> Result<(
         ));
     }
     Ok(())
+}
+
+/// The write preconditions of a form POST: its `If-Match` /
+/// `If-None-Match` request headers, judged as on PutObject.
+fn form_post_precondition(
+    headers: &HeaderMap,
+) -> Result<crate::deltaglider::Precondition, S3Error> {
+    let parse = |name: axum::http::HeaderName| {
+        headers
+            .get(&name)
+            .map(|v| {
+                s3s::dto::ETagCondition::parse_http_header(v.as_bytes())
+                    .map_err(|_| S3Error::InvalidArgument(format!("invalid {name} header")))
+            })
+            .transpose()
+    };
+    Ok(crate::deltaglider::Precondition {
+        if_match: parse(axum::http::header::IF_MATCH)?,
+        if_none_match: parse(axum::http::header::IF_NONE_MATCH)?,
+    })
 }
 
 fn resolve_form_key(key_field: &str, filename: Option<&str>) -> Result<String, S3Error> {
@@ -728,8 +748,8 @@ fn authenticate_form_post(
 ///
 /// Called from `object::delete_objects` when the dispatcher detects a
 /// `multipart/form-data` body via [`is_multipart_form_upload`]. Performs
-/// parse + auth + gate + bucket-existence + quota checks, in that order, hands the file body
-/// to `engine.store`, emits the object-created event, and returns a
+/// parse + auth + gate + bucket-existence checks, in that order, hands the file body
+/// to `store_client_write` (quota, write lock, preconditions, store, event), and returns a
 /// 204 No Content with the persisted object's ETag.
 pub async fn handle_form_post_upload(
     state: &Arc<AppState>,
@@ -781,61 +801,22 @@ pub async fn handle_form_post_upload(
         &format!("/{bucket}"),
     )?;
     ensure_bucket_exists(state, bucket).await?;
-    check_quota(state, bucket, parsed.file_data.len() as u64)?;
-    let engine = state.engine.load();
-    let size = parsed.file_data.len() as u64;
-    // Large delta-eligible POST uploads: route through the streaming spool store
-    // (Phase 4) so the delta encode runs with bounded memory — same path the s3s
-    // PUT uses. (Like PUT, the body is already collected here for parsing; full
-    // streaming intake is Phase 4.1.)
-    let result = if size > engine.spool_store_threshold()
-        && engine.is_delta_eligible_key(&parsed.resolved_key)
-    {
-        let spool = engine.spool_acquire(size).await?;
-        tokio::fs::write(spool.path(), &parsed.file_data)
-            .await
-            .map_err(|e| {
-                crate::deltaglider::EngineError::Storage(crate::storage::StorageError::from(e))
-            })?;
-        engine
-            .store_spooled_delta(
-                bucket,
-                &parsed.resolved_key,
-                &spool,
-                size,
-                parsed.content_type.clone(),
-                parsed.user_metadata.clone(),
-                None,
-            )
-            .await?
-    } else {
-        engine
-            .store(
-                bucket,
-                &parsed.resolved_key,
-                &parsed.file_data,
-                parsed.content_type.clone(),
-                parsed.user_metadata.clone(),
-            )
-            .await?
-    };
-    let storage_type = result.metadata.storage_info.label();
-    enqueue_object_event(
+    let precondition = form_post_precondition(headers)?;
+    // The same client write as PutObject: quota, the object's write lock,
+    // the preconditions, the store (spooled when large), the event.
+    let result = store_client_write(
         state,
-        NewEvent::new(
-            EventKind::ObjectCreated,
+        ClientWrite {
             bucket,
-            &parsed.resolved_key,
-            EventSource::S3Api,
-            current_unix_seconds(),
-            serde_json::json!({
-                "content_length": parsed.file_data.len(),
-                "storage_type": storage_type,
-                "etag": result.metadata.etag(),
-            }),
-        ),
+            key: &parsed.resolved_key,
+            data: &parsed.file_data,
+            content_type: parsed.content_type.clone(),
+            user_metadata: parsed.user_metadata.clone(),
+            precondition: &precondition,
+        },
     )
-    .await;
+    .await?;
+    let storage_type = result.metadata.storage_info.label();
     let user_name = auth_user
         .as_ref()
         .map(|u| u.name.as_str())

@@ -4065,3 +4065,150 @@ async fn review2_large_metadata_listing_is_not_truncated_to_empty() {
         text.len()
     );
 }
+
+/// POST one form upload of `body` to `key`, with extra request headers.
+async fn form_post(
+    server: &TestServer,
+    key: &str,
+    body: &[u8],
+    headers: &[(&str, &str)],
+) -> reqwest::Response {
+    let boundary = "----conditional-form-boundary";
+    let mut req = reqwest::Client::new()
+        .post(format!("{}/{}", server.endpoint(), server.bucket()))
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(build_multipart_body(boundary, server.bucket(), key, body));
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    req.send().await.unwrap()
+}
+
+/// A form POST honours the write preconditions as PutObject does: the
+/// handler stored without looking at them, so `If-None-Match: *` over an
+/// existing object overwrote it.
+#[tokio::test]
+async fn test_form_post_honours_write_preconditions() {
+    let server = TestServer::builder()
+        .auth("POSTACCESSKEY", "POSTSECRETKEY123")
+        .build()
+        .await;
+    let s3 = server.s3_client().await;
+    let first = form_post(&server, "cond.bin", b"first", &[]).await;
+    assert_eq!(first.status().as_u16(), 204);
+
+    let create_only = form_post(&server, "cond.bin", b"second", &[("if-none-match", "*")]).await;
+    assert_eq!(
+        create_only.status().as_u16(),
+        412,
+        "create-only over an object"
+    );
+    let stale = form_post(&server, "cond.bin", b"second", &[("if-match", "\"0000\"")]).await;
+    assert_eq!(stale.status().as_u16(), 412, "If-Match with another ETag");
+    let got = s3
+        .get_object()
+        .bucket(server.bucket())
+        .key("cond.bin")
+        .send()
+        .await
+        .unwrap();
+    let etag = got.e_tag().unwrap().to_string();
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"first", "a refused POST must not store");
+
+    let matching = form_post(&server, "cond.bin", b"third", &[("if-match", &etag)]).await;
+    assert_eq!(
+        matching.status().as_u16(),
+        204,
+        "If-Match with the current ETag"
+    );
+    let fresh = form_post(&server, "new.bin", b"x", &[("if-none-match", "*")]).await;
+    assert_eq!(fresh.status().as_u16(), 204, "create-only of a new key");
+}
+
+/// A form POST takes the object write lock that a conditional
+/// CompleteMultipartUpload holds through its store, so the two writes of
+/// one key never interleave: the POST waits for the completion and lands
+/// after it. It used to store at once, inside the completion's window.
+#[tokio::test]
+async fn test_form_post_waits_for_a_completion_of_the_same_key() {
+    let server = TestServer::builder()
+        .auth("POSTACCESSKEY", "POSTSECRETKEY123")
+        .env("DGP_TEST_COMPLETE_STALL_MS", "1500")
+        .build()
+        .await;
+    let s3 = server.s3_client().await;
+    let bucket = server.bucket().to_string();
+    let key = "serial.bin";
+    let upload_id = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap()
+        .upload_id()
+        .unwrap()
+        .to_string();
+    let etag = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(aws_sdk_s3::primitives::ByteStream::from(
+            b"multipart".to_vec(),
+        ))
+        .send()
+        .await
+        .unwrap()
+        .e_tag()
+        .unwrap()
+        .to_string();
+    let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+        .parts(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(1)
+                .e_tag(etag)
+                .build(),
+        )
+        .build();
+    let complete = {
+        let s3 = s3.clone();
+        let bucket = bucket.clone();
+        tokio::spawn(async move {
+            s3.complete_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .if_none_match("*")
+                .multipart_upload(completed)
+                .send()
+                .await
+                .expect("complete");
+            std::time::Instant::now()
+        })
+    };
+    // Inside the stalled completion, which holds the key's write lock.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let post = form_post(&server, key, b"form", &[]).await;
+    let post_done = std::time::Instant::now();
+    assert_eq!(post.status().as_u16(), 204);
+    let complete_done = complete.await.unwrap();
+    assert!(
+        post_done >= complete_done,
+        "the form POST stored inside the completion's write window"
+    );
+    let got = s3
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"form", "the later write wins");
+}

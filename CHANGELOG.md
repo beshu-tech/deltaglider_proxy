@@ -26,6 +26,16 @@ says so, and names the `403 SignatureDoesNotMatch` that a real key pair
 gets. The security-model page no longer says that open mode skips the
 signature check.
 
+### Fixed — Form POST and admin bulk copy take the object write lock
+
+A browser form POST and an admin bulk copy stored without the per-object
+write lock that PutObject and CompleteMultipartUpload take. So they could
+land between the check and the store of a conditional write
+(`If-None-Match: *`) of the same key. Now every client write of a body
+takes the lock, and a form POST also honours its `If-Match` and
+`If-None-Match` request headers the way PutObject does (`412
+PreconditionFailed`, `404 NoSuchKey`, `501 NotImplemented`).
+
 ### Changed — A filtered LIST reads at most 50 backend pages
 
 A LIST whose policy the proxy cannot narrow to prefixes (an `Allow` on the

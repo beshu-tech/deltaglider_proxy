@@ -929,3 +929,104 @@ async fn browser_session_bulk_ops_are_authorized_per_key() {
     let r: Value = resp.json().await.unwrap();
     assert_eq!(r["keys"], json!([]), "{r}");
 }
+
+/// A bulk copy takes the destination's object write lock, which a
+/// conditional CompleteMultipartUpload holds through its store: the copy
+/// waits for the completion and lands after it. It used to store at once,
+/// inside the completion's write window.
+#[tokio::test]
+async fn test_bulk_copy_waits_for_a_completion_of_the_destination() {
+    let server = TestServer::builder()
+        .env("DGP_TEST_COMPLETE_STALL_MS", "1500")
+        .build()
+        .await;
+    let s3 = server.s3_client().await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let bucket = server.bucket().to_string();
+    let key = "dst.bin";
+    s3.put_object()
+        .bucket(&bucket)
+        .key("src.bin")
+        .body(aws_sdk_s3::primitives::ByteStream::from(b"copied".to_vec()))
+        .send()
+        .await
+        .unwrap();
+    let upload_id = s3
+        .create_multipart_upload()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap()
+        .upload_id()
+        .unwrap()
+        .to_string();
+    let etag = s3
+        .upload_part()
+        .bucket(&bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(aws_sdk_s3::primitives::ByteStream::from(
+            b"multipart".to_vec(),
+        ))
+        .send()
+        .await
+        .unwrap()
+        .e_tag()
+        .unwrap()
+        .to_string();
+    let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
+        .parts(
+            aws_sdk_s3::types::CompletedPart::builder()
+                .part_number(1)
+                .e_tag(etag)
+                .build(),
+        )
+        .build();
+    let complete = {
+        let s3 = s3.clone();
+        let bucket = bucket.clone();
+        tokio::spawn(async move {
+            s3.complete_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .if_none_match("*")
+                .multipart_upload(completed)
+                .send()
+                .await
+                .expect("complete");
+            std::time::Instant::now()
+        })
+    };
+    // Inside the stalled completion, which holds the key's write lock.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let resp = admin
+        .post(format!("{}/_/api/admin/objects/copy", server.endpoint()))
+        .json(&json!({
+            "source_bucket": bucket,
+            "dest_bucket": bucket,
+            "dest_prefix": "",
+            "items": [{ "source_key": "src.bin", "relative": key }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let copy_done = std::time::Instant::now();
+    assert_eq!(resp.status().as_u16(), 200);
+    let complete_done = complete.await.unwrap();
+    assert!(
+        copy_done >= complete_done,
+        "the bulk copy stored inside the completion's write window"
+    );
+    let got = s3
+        .get_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let bytes = got.body.collect().await.unwrap().into_bytes();
+    assert_eq!(bytes.as_ref(), b"copied", "the later write wins");
+}

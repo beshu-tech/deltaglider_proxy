@@ -527,6 +527,9 @@ async fn copy_one(
         .map_err(|e| format!("head {}/{}: {}", src_bucket, src_key, e))?;
     crate::api::handlers::object_helpers::check_quota(s3, dst_bucket, head.file_size)
         .map_err(|e| e.to_string())?;
+    // The destination's object write lock, as every client write takes it,
+    // so the copy never lands inside a conditional PUT's check-then-store.
+    let _write_lock = engine.lock_object_write(dst_bucket, dst_key).await;
     let outcome = crate::transfer::copy_object_with_retries(
         engine,
         crate::transfer::ObjectTransferRequest {
