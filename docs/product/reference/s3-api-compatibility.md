@@ -46,7 +46,7 @@ The S3 backend stores keys as S3 keys, so there both objects can exist.
 
 | Operation | Status | Notes |
 |---|---|---|
-| `ListObjectsV2` | ✅ Full | Continuation-token and `start-after` pagination; delimiter / common-prefix; `encoding-type=url`; IAM-filtered (a user sees only objects they can read, and a continuation token never names a hidden key; the proxy reads only the prefixes that the user's policy can reach, see [ListBucket prefix scoping](iam-permissions.md#listbucket-prefix-scoping)). Folder markers are listed as zero-byte objects. |
+| `ListObjectsV2` | ✅ Full | Continuation-token and `start-after` pagination; delimiter / common-prefix; `encoding-type=url`; IAM-filtered (a user sees only objects they can read, and a continuation token never names a hidden key; the proxy reads only the prefixes that the user's policy can reach, see [ListBucket prefix scoping](iam-permissions.md#listbucket-prefix-scoping)). Folder markers are listed as zero-byte objects. On an S3 backend, a delta or a proxy-encrypted object is listed with its original size and ETag. For a short time after the upload (usually well under one second), another proxy instance, or this one after a restart, can list the stored size and ETag instead, because the proxy writes the listing facts index in the background after the upload completes. |
 | `ListObjects` | ✅ Full | Legacy marker-based listing, implemented over the same path as V2. |
 | `ListBuckets` | ✅ Full | IAM-filtered; optional prefix / `max-buckets` pagination. |
 

@@ -669,7 +669,10 @@ impl S3Backend {
             BackendConfig::S3 { region, .. } => format!("aws:{region}"),
             _ => String::new(),
         };
-        let facts_cleanup = super::facts_cleanup::FactsCleanupQueue::start(client.clone());
+        let facts_cleanup = super::facts_cleanup::FactsCleanupQueue::start(
+            client.clone(),
+            native_encryption.clone(),
+        );
         Ok(Self {
             client,
             bulk_client,
@@ -1244,8 +1247,7 @@ impl S3Backend {
                         resp.e_tag().unwrap_or_default(),
                         data.len() as u64,
                         metadata,
-                    )
-                    .await;
+                    );
                     let etag = resp.e_tag().map(str::to_string);
                     if attempt > 0 {
                         debug!(
@@ -1275,8 +1277,7 @@ impl S3Backend {
                             let etag = self.own_write_or_lost(bucket, key, &md5).await?;
                             let stored = data.len() as u64;
                             self.remember_listed_facts(bucket, key, &etag, stored, metadata);
-                            self.persist_listing_facts(bucket, key, &etag, stored, metadata)
-                                .await;
+                            self.persist_listing_facts(bucket, key, &etag, stored, metadata);
                             return Ok(Some(etag));
                         }
                         // Retry at once without the condition (the last
@@ -1431,8 +1432,7 @@ impl S3Backend {
                             resp.e_tag().unwrap_or_default(),
                             size,
                             metadata,
-                        )
-                        .await;
+                        );
                     }
                     return Ok(resp.e_tag().map(str::to_string));
                 }
@@ -1448,8 +1448,7 @@ impl S3Backend {
                             let etag = self.own_write_or_lost(bucket, key, &md5).await?;
                             if let Some(size) = stored_size {
                                 self.remember_listed_facts(bucket, key, &etag, size, metadata);
-                                self.persist_listing_facts(bucket, key, &etag, size, metadata)
-                                    .await;
+                                self.persist_listing_facts(bucket, key, &etag, size, metadata);
                             }
                             return Ok(Some(etag));
                         }
@@ -1786,11 +1785,12 @@ impl S3Backend {
         );
     }
 
-    /// Write the durable listing facts of the stored object `key` (see
-    /// `storage::listing_facts`), then drop its older entries. Best effort:
-    /// the object is stored already, and a missing entry only makes a LIST
-    /// report the stored size until a HEAD backfills it.
-    async fn persist_listing_facts(
+    /// Queue the durable listing facts of the stored object `key` (see
+    /// `storage::listing_facts`) for the background writer (storage-8: no
+    /// facts request on the client's PUT path). Best effort: the object is
+    /// stored already; until the facts object lands, a LIST reports the
+    /// stored size. Older entries of the key are left to the facts GC.
+    fn persist_listing_facts(
         &self,
         bucket: &str,
         key: &str,
@@ -1806,16 +1806,7 @@ impl S3Backend {
         else {
             return;
         };
-        if let Err(e) =
-            put_facts_object(&self.client, &self.native_encryption, bucket, &facts_key).await
-        {
-            warn!("listing facts for {bucket}/{key} not written: {e}");
-            return;
-        }
-        // Entries stored before this one describe objects that no longer
-        // exist; a newer one (a concurrent overwrite elsewhere) stays.
-        self.facts_cleanup.note_rewrite(bucket, key);
-        super::facts_cleanup::cleanup_after_write(&self.client, bucket, key, &facts_key).await;
+        self.facts_cleanup.write(bucket, key, facts_key);
     }
 
     /// Lazy backfill: a HEAD learned the facts of a stored object that a LIST
@@ -3557,7 +3548,7 @@ impl StorageBackend for S3Backend {
 
 /// PUT one zero-byte facts object (native SSE headers as for any object: a
 /// bucket policy may require them).
-async fn put_facts_object(
+pub(super) async fn put_facts_object(
     client: &Client,
     native: &NativeEncryptionConfig,
     bucket: &str,
@@ -5242,6 +5233,84 @@ mod review3_tests {
     }
 }
 
+/// Test-only construction (in a test module, so the endpoint source guard
+/// sees one production endpoint override).
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    /// A backend on a test endpoint (no retries, no SSRF guard).
+    pub(crate) fn for_test_endpoint(endpoint: &str) -> S3Backend {
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("a", "b", None, None, "t"))
+            .force_path_style(true)
+            .endpoint_url(endpoint)
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .build();
+        let client = Client::from_conf(conf);
+        S3Backend {
+            facts_cleanup: super::super::facts_cleanup::FactsCleanupQueue::start(
+                client.clone(),
+                NativeEncryptionConfig::None,
+            ),
+            bulk_client: client.clone(),
+            health_key: None,
+            client,
+            native_encryption: NativeEncryptionConfig::None,
+            list_cache_scope: endpoint.to_string(),
+        }
+    }
+}
+
+/// storage-8: the listing-facts write of a PUT is off the client's path.
+#[cfg(test)]
+mod facts_off_the_put_path_tests {
+    use super::*;
+    use crate::storage::fake_s3;
+
+    fn delta_meta() -> FileMetadata {
+        FileMetadata::new_delta(
+            "a.zip".into(),
+            "ab".repeat(32),
+            "cd".repeat(16),
+            1000,
+            "reference.bin".into(),
+            "ef".repeat(32),
+            10,
+            None,
+        )
+    }
+
+    /// The PUT of a delta waits for its own object write only; the facts
+    /// object follows in the background, and no LIST of older facts runs
+    /// (the facts GC owns stale entries).
+    #[tokio::test]
+    async fn a_delta_put_sends_only_the_object_write_inline() {
+        let (ep, fake) = fake_s3::start().await;
+        let s3 = test_support::for_test_endpoint(&ep);
+        s3.put_delta("b", "v1", "a.zip", b"0123456789", &delta_meta())
+            .await
+            .unwrap();
+        let inline = fake.requests();
+        assert!(
+            inline.len() == 1 && inline[0].starts_with("PUT /b/v1/a.zip.delta"),
+            "the PUT sent more than its object write: {inline:?}"
+        );
+        assert!(
+            fake.wait_for(|r| r.starts_with("PUT /b/.dg/facts/")).await,
+            "the facts object is written in the background: {:?}",
+            fake.requests()
+        );
+        assert!(
+            !fake.requests().iter().any(|r| r.contains("list-type=2")),
+            "no LIST of older facts entries: {:?}",
+            fake.requests()
+        );
+    }
+}
+
 /// A fenced PUT whose response is lost: the write landed, the retry meets
 /// its own write and gets 412.
 #[cfg(test)]
@@ -5402,7 +5471,10 @@ mod lost_response_tests {
             .build();
         let client = Client::from_conf(conf);
         S3Backend {
-            facts_cleanup: super::super::facts_cleanup::FactsCleanupQueue::start(client.clone()),
+            facts_cleanup: super::super::facts_cleanup::FactsCleanupQueue::start(
+                client.clone(),
+                NativeEncryptionConfig::None,
+            ),
             bulk_client: client.clone(),
             health_key: None,
             client,
@@ -5643,7 +5715,10 @@ mod conditional_delete_tests {
             .build();
         let client = Client::from_conf(conf);
         S3Backend {
-            facts_cleanup: super::super::facts_cleanup::FactsCleanupQueue::start(client.clone()),
+            facts_cleanup: super::super::facts_cleanup::FactsCleanupQueue::start(
+                client.clone(),
+                NativeEncryptionConfig::None,
+            ),
             bulk_client: client.clone(),
             health_key: None,
             client,

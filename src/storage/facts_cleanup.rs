@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! Cleanup of the S3 listing facts (`storage::listing_facts`): the requests
-//! that remove the entries of overwritten and deleted objects.
+//! Background upkeep of the S3 listing facts (`storage::listing_facts`): the
+//! facts writes of stored objects, and the requests that remove the entries
+//! of deleted objects.
 //!
-//! A delete does not clean up in its own request path. It queues the stored
+//! A PUT does not write its facts object in its own request path (storage-8):
+//! it queues the write, and the drain task below sends it. Until then a LIST
+//! reports the stored size. The entries of an overwritten object are left to
+//! the facts GC (`gc_bucket`), which deletes every entry that does not
+//! describe the live object.
+//!
+//! A delete does not clean up in its own request path either. It queues the stored
 //! key, and one background task per backend drains the queue in batches: it
 //! reads each directory's facts range ONCE and deletes the matching entries
 //! with batched `DeleteObjects` requests. A 1000-key `DeleteObjects` from a
@@ -18,10 +25,10 @@ use std::time::Duration;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use aws_sdk_s3::Client;
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::listing_facts::{self, CleanupRead};
-use super::s3::LISTING_FACTS_REQUESTS;
+use super::s3::{put_facts_object, NativeEncryptionConfig, LISTING_FACTS_REQUESTS};
 
 /// How long the task waits for more deletes before it flushes a batch.
 const DEBOUNCE: Duration = Duration::from_millis(200);
@@ -87,22 +94,6 @@ async fn entries_of(client: &Client, bucket: &str, stored_key: &str) -> Vec<List
             debug!("listing facts of {bucket}/{stored_key} not read: {e:?}");
             Vec::new()
         }
-    }
-}
-
-/// After a PUT wrote `mine`: delete the entries of the same stored key that
-/// the backend stored before it (`listing_facts::stale_after_write`). A newer
-/// entry from a concurrent overwrite on another node survives.
-pub(super) async fn cleanup_after_write(
-    client: &Client,
-    bucket: &str,
-    stored_key: &str,
-    mine: &str,
-) {
-    let listed = entries_of(client, bucket, stored_key).await;
-    let stale = listing_facts::stale_after_write(&listed, mine);
-    if !stale.is_empty() {
-        delete_facts_keys(client, bucket, stale).await;
     }
 }
 
@@ -267,10 +258,16 @@ struct QueueState {
 
 type Rewritten = Arc<Mutex<QueueState>>;
 
-/// `(bucket, stored key, server time of the delete)`.
-type Queued = (String, String, Option<i64>);
+/// One job of the drain task.
+enum Queued {
+    /// `(bucket, stored key, server time of the delete)`.
+    Deleted(String, String, Option<i64>),
+    /// Write the facts object `facts_key` into `bucket`.
+    Write { bucket: String, facts_key: String },
+}
 
-/// Queue of deleted stored keys whose facts the background task removes.
+/// Queue of facts writes, and of deleted stored keys whose facts the
+/// background task removes.
 pub(super) struct FactsCleanupQueue {
     tx: mpsc::UnboundedSender<Queued>,
     rewritten: Rewritten,
@@ -290,10 +287,10 @@ impl Drop for FactsCleanupQueue {
 impl FactsCleanupQueue {
     /// Start the drain task. Needs a tokio runtime (the S3 backend is built
     /// in one). The task ends when the queue is dropped, after a last flush.
-    pub(super) fn start(client: Client) -> Self {
+    pub(super) fn start(client: Client, native: NativeEncryptionConfig) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let rewritten: Rewritten = Default::default();
-        tokio::spawn(drain(client.clone(), rx, rewritten.clone()));
+        tokio::spawn(drain(client.clone(), native, rx, rewritten.clone()));
         let gc = crate::config::env_bool(GC_ENV, true).then(|| tokio::spawn(gc_loop(client)));
         Self { tx, rewritten, gc }
     }
@@ -306,24 +303,42 @@ impl FactsCleanupQueue {
             st.rewritten.remove(&pair);
             st.pending.insert(pair.clone());
         }
-        if self.tx.send((pair.0, pair.1, deleted_at)).is_err() {
+        if self
+            .tx
+            .send(Queued::Deleted(pair.0, pair.1, deleted_at))
+            .is_err()
+        {
             debug!("facts cleanup queue closed; {bucket}/{stored_key} keeps its entries");
         }
     }
 
-    /// `stored_key` got a new facts entry: a queued delete cleanup of it
-    /// keeps the newest entry.
-    pub(super) fn note_rewrite(&self, bucket: &str, stored_key: &str) {
+    /// `stored_key` was written again, with the facts object `facts_key`:
+    /// write it in the background, and a queued delete cleanup of the key
+    /// keeps its newest entry. The drain sends the writes of a batch before
+    /// its delete cleanup, so that entry exists when the cleanup lists.
+    pub(super) fn write(&self, bucket: &str, stored_key: &str, facts_key: String) {
         if let Ok(mut st) = self.rewritten.lock() {
             let pair = (bucket.to_string(), stored_key.to_string());
             if st.pending.contains(&pair) {
                 st.rewritten.insert(pair);
             }
         }
+        let job = Queued::Write {
+            bucket: bucket.to_string(),
+            facts_key,
+        };
+        if self.tx.send(job).is_err() {
+            debug!("facts queue closed; {bucket}/{stored_key} lists its stored size");
+        }
     }
 }
 
-async fn drain(client: Client, mut rx: mpsc::UnboundedReceiver<Queued>, rewritten: Rewritten) {
+async fn drain(
+    client: Client,
+    native: NativeEncryptionConfig,
+    mut rx: mpsc::UnboundedReceiver<Queued>,
+    rewritten: Rewritten,
+) {
     while let Some(first) = rx.recv().await {
         let mut batch = vec![first];
         while batch.len() < MAX_BATCH {
@@ -337,6 +352,26 @@ async fn drain(client: Client, mut rx: mpsc::UnboundedReceiver<Queued>, rewritte
                     }
                 }
             }
+        }
+        let (writes, deletes): (Vec<Queued>, Vec<Queued>) = batch
+            .into_iter()
+            .partition(|q| matches!(q, Queued::Write { .. }));
+        for job in writes {
+            if let Queued::Write { bucket, facts_key } = job {
+                if let Err(e) = put_facts_object(&client, &native, &bucket, &facts_key).await {
+                    warn!("listing facts {bucket}/{facts_key} not written: {e}");
+                }
+            }
+        }
+        let batch: Vec<(String, String, Option<i64>)> = deletes
+            .into_iter()
+            .filter_map(|q| match q {
+                Queued::Deleted(b, k, at) => Some((b, k, at)),
+                Queued::Write { .. } => None,
+            })
+            .collect();
+        if batch.is_empty() {
+            continue;
         }
         // A write after this point is not seen by the flush: its new entry
         // can be deleted, which only makes a LIST report the stored size
@@ -544,7 +579,10 @@ mod tests {
         let metrics = tokio::runtime::Handle::current().metrics();
         let before = metrics.num_alive_tasks();
         for _ in 0..5 {
-            drop(FactsCleanupQueue::start(client.clone()));
+            drop(FactsCleanupQueue::start(
+                client.clone(),
+                NativeEncryptionConfig::None,
+            ));
         }
         // Aborted and closed tasks end on their next poll.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);

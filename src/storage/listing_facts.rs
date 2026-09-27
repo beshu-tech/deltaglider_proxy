@@ -300,24 +300,6 @@ pub fn facts_for<'a>(
     found.cloned()
 }
 
-/// After a PUT wrote the facts entry `mine`, the entries of the same stored
-/// key that the cleanup may delete: those the backend stored EARLIER than
-/// `mine` (by the backend's own `LastModified`, so node clocks do not
-/// matter). A newer entry comes from a later write on another node and must
-/// survive; an equal time cannot be ordered and survives too (harmless: it
-/// matches only its own stored object). Without `mine` in the listing,
-/// nothing is deleted.
-pub fn stale_after_write<T: Ord + Copy>(listed: &[(String, Option<T>)], mine: &str) -> Vec<String> {
-    let Some(Some(mine_at)) = listed.iter().find(|(k, _)| k == mine).map(|(_, t)| *t) else {
-        return Vec::new();
-    };
-    listed
-        .iter()
-        .filter(|(k, t)| k != mine && t.is_some_and(|t| t < mine_at))
-        .map(|(k, _)| k.clone())
-        .collect()
-}
-
 /// How a batch cleanup finds the facts entries of deleted stored keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CleanupRead {
@@ -460,39 +442,6 @@ mod tests {
             (".dg/facts/", Some("/"))
         );
         assert!(plan_facts_scan([]).is_none());
-    }
-
-    #[test]
-    fn a_cleanup_deletes_only_entries_older_than_the_write() {
-        let l = |k: &str, t: Option<u32>| (k.to_string(), t);
-        let listed = [
-            l("old", Some(1)),
-            l("mine", Some(5)),
-            l("newer", Some(9)),
-            l("same", Some(5)),
-            l("unknown", None),
-        ];
-        assert_eq!(stale_after_write(&listed, "mine"), vec!["old".to_string()]);
-        // The newer node's own cleanup removes both older entries.
-        assert_eq!(
-            stale_after_write(&listed, "newer"),
-            vec!["old".to_string(), "mine".to_string(), "same".to_string()]
-        );
-        assert!(stale_after_write(&listed, "absent").is_empty());
-        assert!(stale_after_write(&[l("mine", None), l("old", Some(1))], "mine").is_empty());
-    }
-
-    /// Two nodes overwrite the same key; each cleanup runs after both
-    /// writes. Whatever the order of the cleanups, the last write survives.
-    #[test]
-    fn the_last_writer_survives_both_cleanups() {
-        let listed = vec![("a".to_string(), Some(1u32)), ("b".to_string(), Some(2))];
-        let mut left: Vec<&str> = vec!["a", "b"];
-        for mine in ["a", "b"] {
-            let stale = stale_after_write(&listed, mine);
-            left.retain(|k| !stale.iter().any(|s| s == k));
-        }
-        assert_eq!(left, vec!["b"]);
     }
 
     #[test]

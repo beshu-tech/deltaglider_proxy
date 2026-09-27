@@ -359,6 +359,7 @@ async fn list_reports_original_delta_sizes_without_backend_heads() {
     assert_eq!(warm.e_tag(), head.e_tag());
 
     // Cold (a second proxy on the same bucket): original size, no HEAD.
+    wait_for_facts(&minio_client().await, &format!("{prefix}/v1.zip"), 1).await;
     let reader = TestServer::builder()
         .open_access()
         .s3_endpoint(&common::minio_endpoint_url())
@@ -421,6 +422,7 @@ async fn cold_list_of_an_encrypted_backend_reports_plaintext_facts() {
         .send()
         .await
         .unwrap();
+    wait_for_facts(&common::minio_client().await, &key, 1).await;
 
     let reader = encrypted().build().await;
     let reader_client = reader.s3_client().await;
@@ -495,6 +497,7 @@ async fn a_head_backfills_missing_listing_facts() {
     }
     // Simulate an object from before the facts: drop its entries.
     let raw = minio_client().await;
+    wait_for_facts(&raw, &format!("{prefix}/v1.zip"), 1).await;
     let facts_keys = |raw: aws_sdk_s3::Client, prefix: String| async move {
         raw.list_objects_v2()
             .bucket(MINIO_BUCKET)
@@ -570,6 +573,39 @@ async fn a_head_backfills_missing_listing_facts() {
     assert_eq!(size_on(&other).await, variant.len());
 }
 
+/// A PUT writes its listing facts in the background (storage-8): wait until
+/// the facts namespace under `prefix` holds at least `n` entries.
+async fn wait_for_facts(raw: &aws_sdk_s3::Client, prefix: &str, n: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let mut have = 0;
+        let mut token = None;
+        loop {
+            let r = raw
+                .list_objects_v2()
+                .bucket(MINIO_BUCKET)
+                .prefix(format!(".dg/facts/{prefix}"))
+                .set_continuation_token(token)
+                .send()
+                .await
+                .unwrap();
+            have += r.contents().len();
+            token = r.next_continuation_token().map(String::from);
+            if token.is_none() {
+                break;
+            }
+        }
+        if have >= n {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{have} of {n} listing facts under {prefix} written"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 async fn facts_requests(endpoint: &str, kind: &str) -> u64 {
     scrape_counter(
         endpoint,
@@ -639,6 +675,7 @@ async fn batch_delete_drops_listing_facts_in_a_few_requests() {
             }
         }
     };
+    wait_for_facts(&raw, &format!("{prefix}/"), N).await;
     assert_eq!(facts_left(raw.clone(), prefix.clone()).await, N);
 
     let (lists, deletes) = (

@@ -44,6 +44,15 @@ request. Now it reads at most 50, and then answers `400 InvalidRequest`
 ("use a narrower prefix") as before. The limit is the new setting
 `advanced.filtered_list_max_engine_pages` (`DGP_FILTERED_LIST_MAX_ENGINE_PAGES`).
 
+### Changed — An S3 upload no longer waits for its listing facts
+
+Each upload of a delta or of a proxy-encrypted object on an S3 backend sent
+three more requests before it answered: the listing-facts index object, a
+LIST of the older index objects of the key, and their delete. Now the index
+object is written in the background, and the periodic facts cleanup deletes
+the stale ones. For a short time after an upload, another instance can list
+the stored size of the object.
+
 ### Changed — A migrate is refused on a multi-instance deployment
 
 The migrate flip changed the routing of the instance that ran the job only,
