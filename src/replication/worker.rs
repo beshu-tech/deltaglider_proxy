@@ -1600,11 +1600,12 @@ mod tests {
         // Poll once (the run stops at its first storage I/O), then drop.
         let db = Arc::new(Mutex::new(ConfigDb::in_memory("t").unwrap()));
         assert!(run(db).now_or_never().is_none(), "the run must yield");
-        for _ in 0..100 {
-            if released() > 0 {
-                break;
-            }
-            tokio::task::yield_now().await;
+        // The release runs in a spawned task that may wait on blocking DB
+        // work, so a fixed number of yields is not enough under load: poll
+        // with a real-time deadline.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while released() == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert_eq!(released(), 1, "the dropped run must release its lease");
     }
