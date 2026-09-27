@@ -1747,7 +1747,12 @@ async fn config_write_surfaces_answer_as_the_golden_file() {
     let r = admin
         .put(url(""))
         .json(&json!({ "access_key_id": "", "secret_access_key": "" }));
-    record(&mut out, "patch_transition_refused", r.send().await.unwrap()).await;
+    record(
+        &mut out,
+        "patch_transition_refused",
+        r.send().await.unwrap(),
+    )
+    .await;
     let r = admin.put(url("")).json(&json!({
         "bucket_policies": { "b1": { "public": true, "public_prefixes": ["x/"] } }
     }));
@@ -1759,7 +1764,9 @@ async fn config_write_surfaces_answer_as_the_golden_file() {
 
     // ── Section PUT / validate ──
     let adv = "/section/advanced";
-    let r = admin.put(url(adv)).json(&json!({ "max_delta_ratio": 0.42 }));
+    let r = admin
+        .put(url(adv))
+        .json(&json!({ "max_delta_ratio": 0.42 }));
     record(&mut out, "section_ok", r.send().await.unwrap()).await;
     let r = admin
         .put(url(adv))
@@ -1821,19 +1828,26 @@ async fn config_write_surfaces_answer_as_the_golden_file() {
     record(&mut out, "doc_apply_empty", r.send().await.unwrap()).await;
     let changed_hash = yaml.replace(bootstrap, "$2b$12$abcdefghijklmnopqrstuv");
     let with_hash = if changed_hash == yaml {
-        format!("{yaml}\n")
-            .replace("advanced:\n", "advanced:\n  bootstrap_password_hash: \"$2b$12$abcdefghijklmnopqrstuv\"\n")
+        format!("{yaml}\n").replace(
+            "advanced:\n",
+            "advanced:\n  bootstrap_password_hash: \"$2b$12$abcdefghijklmnopqrstuv\"\n",
+        )
     } else {
         changed_hash
     };
-    let r = admin.post(url("/apply")).json(&json!({ "yaml": with_hash }));
+    let r = admin
+        .post(url("/apply"))
+        .json(&json!({ "yaml": with_hash }));
     record(&mut out, "doc_apply_403", r.send().await.unwrap()).await;
     let r = admin.post(url("/validate")).json(&json!({ "yaml": yaml }));
     record(&mut out, "doc_validate_ok", r.send().await.unwrap()).await;
     let mut doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
     doc["storage"]["lifecycle"] = serde_yaml::to_value(&lifecycle["lifecycle"]).unwrap();
     let lc_yaml = serde_yaml::to_string(&doc).unwrap();
-    for (name, path) in [("doc_apply_lifecycle_400", "/apply"), ("doc_validate_lifecycle_400", "/validate")] {
+    for (name, path) in [
+        ("doc_apply_lifecycle_400", "/apply"),
+        ("doc_validate_lifecycle_400", "/validate"),
+    ] {
         let r = admin.post(url(path)).json(&json!({ "yaml": lc_yaml }));
         record(&mut out, name, r.send().await.unwrap()).await;
     }
