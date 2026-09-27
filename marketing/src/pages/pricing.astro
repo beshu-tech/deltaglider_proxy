@@ -71,7 +71,7 @@ function renderDescription(id: string, description: string): string {
 
     <section class="calculator-hero shell">
       <div class="calculator-hero-inner measure-wide">
-        <h2>What does DeltaGlider save you?</h2>
+        <h1>What does DeltaGlider save you?</h1>
         <p>
           Type the numbers from your current AWS S3 bill and get an answer in 30
           seconds, even when the answer is no. We don't ask for your email.
@@ -79,7 +79,7 @@ function renderDescription(id: string, description: string): string {
       </div>
     </section>
 
-    <section class="calculator-section shell">
+    <section class="calculator-section shell" id="calculator">
       <div class="calculator-container">
         <PricingCalculator client:load />
       </div>
@@ -428,8 +428,9 @@ function renderDescription(id: string, description: string): string {
     margin-inline: auto;
   }
 
-  .calculator-hero h2 {
+  .calculator-hero h1 {
     font-size: 3rem;
+    margin-top: 3rem;
     margin-bottom: 1rem;
     letter-spacing: -0.02em;
     color: var(--ink-strong);
