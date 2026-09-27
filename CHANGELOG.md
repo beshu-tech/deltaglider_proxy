@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.0 — 2026-09-27
+
 ### Upgrade steps for 2.0.0 (read before you upgrade)
 
 2.0.0 is a major release because some changes stop a setup that worked on
