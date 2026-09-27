@@ -389,7 +389,8 @@ mod tests {
                 concat!(env!("CARGO_MANIFEST_DIR"), "/").to_string() + file,
             )
             .unwrap();
-            let text = text.split("\n#[cfg(test)]\nmod ").next().unwrap();
+            let text = crate::source_scan::prod_text(&text);
+            let text = text.as_str();
             for part in text
                 .split("#[serde(tag")
                 .skip(1)

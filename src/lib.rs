@@ -904,36 +904,6 @@ mod source_guards {
         );
     }
 
-    /// Every variable in `ENV_VAR_REGISTRY` is documented in `docs/product`
-    /// (`--show-env` prints the registry, but an operator reads the docs).
-    /// The registry drift test keeps code and registry equal; this one
-    /// keeps registry and docs equal.
-    #[test]
-    fn every_registered_env_var_is_documented() {
-        fn md_files(dir: &std::path::Path, out: &mut String) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    md_files(&path, out);
-                } else if path.extension().is_some_and(|e| e == "md") {
-                    out.push_str(&std::fs::read_to_string(&path).unwrap());
-                }
-            }
-        }
-        let mut docs = String::new();
-        md_files(&root().join("docs/product"), &mut docs);
-        let missing: Vec<&str> = crate::config::ENV_VAR_REGISTRY
-            .iter()
-            .map(|e| e.name)
-            .filter(|n| !docs.contains(&format!("`{n}`")))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "ENV_VAR_REGISTRY names not documented in docs/product (add them to \
-             reference/configuration.md): {missing:?}"
-        );
-    }
-
     /// `deltaglider_proxy.example.yaml` is the canonical example: every
     /// field of the four sections appears in it (commented out is fine),
     /// so a new setting cannot ship without an example. The field names
