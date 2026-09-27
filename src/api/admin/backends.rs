@@ -4,7 +4,7 @@
 
 use crate::api::admin::extract::AdminJson;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::config::{BackendConfig, NamedBackendConfig};
 
-use super::{audit_log, AdminState};
+use super::{audit_log, AdminError, AdminState};
 
 #[derive(Serialize)]
 pub struct BackendListResponse {
@@ -175,7 +175,7 @@ pub async fn probe_backend(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
     headers: HeaderMap,
-) -> Result<Json<crate::coordination::health::HealthEntry>, (StatusCode, String)> {
+) -> Result<Json<crate::coordination::health::HealthEntry>, AdminError> {
     let target = {
         let cfg = state.config.read().await;
         crate::coordination::health::probe_targets(&cfg)
@@ -183,7 +183,7 @@ pub async fn probe_backend(
             .find(|(n, _, _)| *n == name)
     };
     let Some((name, backend, fallback)) = target else {
-        return Err((StatusCode::NOT_FOUND, format!("no backend named '{name}'")));
+        return Err(AdminError::not_found(format!("no backend named '{name}'")));
     };
     let verdict =
         crate::coordination::health::probe_backend_health(&backend, fallback.as_deref()).await;
@@ -206,7 +206,7 @@ pub async fn probe_backend(
 /// semantics do not change for non-admin IAM users.
 pub async fn list_bucket_origins(
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<BucketOriginListResponse>, (StatusCode, String)> {
+) -> Result<Json<BucketOriginListResponse>, AdminError> {
     let cfg = state.config.read().await;
     let backend_infos: Vec<super::config::BackendInfoResponse> = if cfg.backends.is_empty() {
         vec![super::config::BackendInfoResponse::synthesized_default(
@@ -226,12 +226,10 @@ pub async fn list_bucket_origins(
         .map(|backend| (backend.name.as_str(), backend))
         .collect();
     let engine = state.s3_state.engine.load();
-    let bucket_list = engine.list_bucket_origins().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to list bucket origins: {e}"),
-        )
-    })?;
+    let bucket_list = engine
+        .list_bucket_origins()
+        .await
+        .map_err(|e| AdminError::internal(format!("failed to list bucket origins: {e}")))?;
 
     // The coordination bucket is not a client bucket.
     let registry = engine.bucket_policy_registry();
@@ -272,13 +270,10 @@ pub async fn create_bucket_on_backend(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AdminJson(body): AdminJson<CreateBucketOnBackendRequest>,
-) -> Result<Json<CreateBucketOnBackendResponse>, (StatusCode, String)> {
+) -> Result<Json<CreateBucketOnBackendResponse>, AdminError> {
     let bucket = body.name.trim().to_string();
     if bucket.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Bucket name cannot be empty".into(),
-        ));
+        return Err(AdminError::invalid("Bucket name cannot be empty"));
     }
     if let Some(reason) = state
         .s3_state
@@ -287,14 +282,11 @@ pub async fn create_bucket_on_backend(
         .bucket_policy_registry()
         .reserved_bucket_reason(&bucket)
     {
-        return Err((StatusCode::FORBIDDEN, reason));
+        return Err(AdminError::forbidden(reason));
     }
     let backend_name = body.backend_name.trim().to_string();
     if backend_name.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "backend_name cannot be empty".into(),
-        ));
+        return Err(AdminError::invalid("backend_name cannot be empty"));
     }
 
     let mut cfg = state.config.write().await;
@@ -305,10 +297,10 @@ pub async fn create_bucket_on_backend(
         cfg.backends.iter().any(|b| b.name == backend_name)
     };
     if !backend_exists {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("Unknown backend '{}'", backend_name),
-        ));
+        return Err(AdminError::invalid(format!(
+            "Unknown backend '{}'",
+            backend_name
+        )));
     }
 
     // Buckets are keyed by virtual bucket name, normalized lowercase.
@@ -335,7 +327,7 @@ pub async fn create_bucket_on_backend(
             Some(previous) => cfg.buckets.insert(bucket_key, previous),
             None => cfg.buckets.remove(&bucket_key),
         };
-        return Err((StatusCode::CONFLICT, e));
+        return Err(AdminError::conflict(e));
     }
 
     if let Err(e) = super::config::rebuild_engine(
@@ -353,10 +345,9 @@ pub async fn create_bucket_on_backend(
         } else {
             cfg.buckets.remove(&bucket_key);
         }
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to rebuild engine: {e}"),
-        ));
+        return Err(AdminError::internal(format!(
+            "Failed to rebuild engine: {e}"
+        )));
     }
 
     // Create using the SAME key the route is stored under (`bucket_key`,
@@ -386,7 +377,7 @@ pub async fn create_bucket_on_backend(
             ),
         )
         .await;
-        return Err((StatusCode::BAD_REQUEST, e.to_string()));
+        return Err(AdminError::invalid(e.to_string()));
     }
 
     let persist_path = super::config::active_config_path(&state);
@@ -797,7 +788,7 @@ pub async fn legacy_key_usage(
     crate::api::admin::extract::AdminQuery(q): crate::api::admin::extract::AdminQuery<
         LegacyKeyUsageQuery,
     >,
-) -> Result<Json<LegacyKeyUsage>, (StatusCode, String)> {
+) -> Result<Json<LegacyKeyUsage>, AdminError> {
     use futures::StreamExt;
 
     let limit = q
@@ -805,12 +796,10 @@ pub async fn legacy_key_usage(
         .unwrap_or(LEGACY_SCAN_DEFAULT_LIMIT)
         .clamp(1, LEGACY_SCAN_MAX_LIMIT);
     let engine = state.s3_state.engine.load().clone();
-    let origins = engine.list_bucket_origins().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to list buckets: {e}"),
-        )
-    })?;
+    let origins = engine
+        .list_bucket_origins()
+        .await
+        .map_err(|e| AdminError::internal(format!("failed to list buckets: {e}")))?;
     let mut usage = LegacyKeyUsage {
         backend: name.clone(),
         limit,
@@ -820,7 +809,7 @@ pub async fn legacy_key_usage(
         let cfg = state.config.read().await;
         let enc = cfg
             .backend_encryption_by_name(&name)
-            .ok_or((StatusCode::NOT_FOUND, format!("no backend named '{name}'")))?;
+            .ok_or(AdminError::not_found(format!("no backend named '{name}'")))?;
         usage.legacy_key_id = crate::deltaglider::effective_legacy_key_id(&name, enc);
         let registry = engine.bucket_policy_registry();
         for b in &origins {
