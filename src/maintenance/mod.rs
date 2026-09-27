@@ -43,6 +43,7 @@
 pub mod backfill;
 pub mod gate;
 pub mod migrate;
+mod paged;
 pub mod store;
 pub mod worker;
 

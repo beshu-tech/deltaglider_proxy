@@ -37,10 +37,10 @@ use crate::config::SharedConfig;
 use crate::config_apply::ConfigMutator;
 use crate::config_db::ConfigDb;
 use crate::coordination::LeaseError;
-use crate::job_loop::Pager;
 use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
 use crate::transfer::{copy_object_with_retries, ObjectTransferRequest};
 
+use super::paged::{paged_phase, JobCtx, KeyPage, PageStep, PhaseSpec};
 use super::store::{current_unix_seconds, MaintenanceJob};
 use super::{needs_rewrite, resolve_desired, strip_encryption_markers, DesiredEncryption};
 
@@ -292,17 +292,11 @@ async fn execute_phases(
         bucket,
         desired: None,
     };
-    let Counters {
-        total,
-        done,
-        skipped,
-        mut failed,
-        bytes,
-    } = run_count_then_walk(db, state, instance_id, job, "rewrite", &mut visitor).await?;
+    let mut c = run_count_then_walk(db, state, instance_id, job, "rewrite", &mut visitor).await?;
     let mut phase = job.phase.clone();
     if phase == "counting" || phase == "objects" {
         phase = "references".to_string();
-        persist(db, job, &phase, total, done, skipped, failed, bytes, None).await;
+        persist(db, job, &phase, &c, None).await;
     }
 
     // ── Phase: references (deltaspace reference.bin blobs) ──
@@ -326,24 +320,13 @@ async fn execute_phases(
                 Ok(()) => {}
                 Err(e) => {
                     record_failure(db, job.id, &format!("{prefix}/.dg/reference.bin"), &e).await?;
-                    failed += 1;
+                    c.failed += 1;
                 }
             }
             heartbeat(db, job.id, instance_id).await?;
         }
         // Final counters (the per-reference failure increments above).
-        persist(
-            db,
-            job,
-            "references",
-            total,
-            done,
-            skipped,
-            failed,
-            bytes,
-            None,
-        )
-        .await;
+        persist(db, job, "references", &c, None).await;
     }
 
     Ok(())
@@ -429,6 +412,7 @@ pub(crate) trait ObjectVisitor {
 }
 
 /// A job's counters, as its row stores them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Counters {
     pub total: Option<i64>,
     pub done: i64,
@@ -437,10 +421,22 @@ pub(crate) struct Counters {
     pub bytes: i64,
 }
 
+impl Counters {
+    /// The counters the row holds now.
+    pub(crate) fn of(job: &MaintenanceJob) -> Self {
+        Self {
+            total: job.objects_total,
+            done: job.objects_done,
+            skipped: job.objects_skipped,
+            failed: job.objects_failed,
+            bytes: job.bytes_done,
+        }
+    }
+}
+
 /// The `counting` → `objects` phases that the reencrypt and backfill kinds
-/// share: page-granular resume, the poison-token restart, per-object
-/// failures recorded and skipped over, cancel per page, shutdown per
-/// object. Returns the counters at the end of `objects`; a job persisted in
+/// share, on [`paged_phase`]: per-object failures recorded and skipped
+/// over. Returns the counters at the end of `objects`; a job persisted in
 /// a later phase gets its row's counters back untouched. `what` names the
 /// job in the page-budget error.
 pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
@@ -451,118 +447,123 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
     what: &str,
     visitor: &mut V,
 ) -> Result<Counters, PhaseStop> {
-    let bucket = &job.bucket;
     let mut phase = job.phase.clone();
-    let resume_token = job.continuation_token.clone();
-    let mut c = Counters {
-        total: job.objects_total,
-        done: job.objects_done,
-        skipped: job.objects_skipped,
-        failed: job.objects_failed,
-        bytes: job.bytes_done,
-    };
+    let mut c = Counters::of(job);
 
     // ── Phase: counting ──
     if phase == "counting" {
-        let count = counting_phase(db, state, instance_id, job, resume_token.clone()).await?;
+        let count =
+            counting_phase(db, state, instance_id, job, job.continuation_token.clone()).await?;
         c = Counters {
             total: Some(count),
-            done: 0,
-            skipped: 0,
-            failed: 0,
-            bytes: 0,
+            ..Counters::default()
         };
         phase = "objects".to_string();
-        persist(db, job, &phase, c.total, 0, 0, 0, 0, None).await;
+        persist(db, job, &phase, &c, None).await;
     }
 
     // ── Phase: objects ──
     if phase != "objects" {
         return Ok(c);
     }
-    // Resume only when the job was persisted IN this phase (a fresh
-    // transition from counting starts at page 0).
-    let mut pager = Pager::resuming(if job.phase == "objects" {
-        resume_token
+    let budget = format!(
+        "{what} stopped at the page budget with more pages pending — bucket \
+         too large for one pass; job left resumable in phase 'objects' \
+         (cursor persisted)"
+    );
+    let mut step = ObjectsStep {
+        db,
+        state,
+        job,
+        visitor,
+        engine: None,
+        c,
+    };
+    paged_phase(
+        JobCtx {
+            db,
+            instance_id,
+            job,
+        },
+        PhaseSpec {
+            phase: "objects",
+            // Resume only when the job was persisted IN this phase (a fresh
+            // transition from counting starts at page 0).
+            resume: resumable_in(job, "objects"),
+            cancel_every: None,
+            budget_exhausted: &budget,
+        },
+        &mut step,
+    )
+    .await?;
+    Ok(step.c)
+}
+
+/// The saved cursor of a job persisted IN `phase` (else a fresh start).
+pub(crate) fn resumable_in(job: &MaintenanceJob, phase: &str) -> Option<String> {
+    if job.phase == phase {
+        job.continuation_token.clone()
     } else {
         None
-    });
-    while pager.begin_page().is_some() {
-        check_cancel(db, job.id).await?;
-        visitor.begin_page().await?;
-        let engine = state.engine.load().clone();
-        let page = match engine
-            .list_objects(bucket, "", None, PAGE_SIZE, pager.token(), false)
+    }
+}
+
+/// The `objects` phase: HEAD each object, hand it to the visitor.
+struct ObjectsStep<'a, V> {
+    db: &'a Arc<Mutex<ConfigDb>>,
+    state: &'a Arc<AppState>,
+    job: &'a MaintenanceJob,
+    visitor: &'a mut V,
+    /// The page's engine (one per page: an apply mid-page swaps it).
+    engine: Option<Arc<crate::deltaglider::DynEngine>>,
+    c: Counters,
+}
+
+impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
+    async fn begin_page(&mut self) -> Result<(), PhaseStop> {
+        self.visitor.begin_page().await?;
+        self.engine = Some(self.state.engine.load().clone());
+        Ok(())
+    }
+
+    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, String> {
+        let engine = self.engine.as_ref().expect("begin_page runs first");
+        engine
+            .list_objects(&self.job.bucket, "", None, PAGE_SIZE, token, false)
             .await
-        {
-            Ok(p) => p,
-            Err(e) if pager.poisoned_resume_token() => {
-                // Restart the phase from page 0: the visitor skips objects
-                // already done, so the re-scan is idempotent. Counters are
-                // NOT reset: re-encountered objects tally as `skipped`
-                // again — display drift only, never a second rewrite.
-                warn!(
-                    "maintenance: job #{} objects resume token rejected ({e}); restarting phase fresh",
-                    job.id
-                );
-                pager.restart_fresh();
-                persist(
-                    db, job, "objects", c.total, c.done, c.skipped, c.failed, c.bytes, None,
-                )
-                .await;
-                continue;
-            }
-            Err(e) => return Err(format!("object list failed: {e}").into()),
+            .map(KeyPage::from)
+            .map_err(|e| format!("object list failed: {e}"))
+    }
+
+    // A restart re-scans from page 0: the visitor skips objects already
+    // done, so the re-scan is idempotent. Counters are NOT reset:
+    // re-encountered objects tally as `skipped` again — display drift only,
+    // never a second rewrite.
+
+    async fn save(&mut self, token: Option<&str>) -> Result<(), PhaseStop> {
+        persist(self.db, self.job, "objects", &self.c, token).await;
+        Ok(())
+    }
+
+    async fn object(&mut self, key: &str) -> Result<(), PhaseStop> {
+        let engine = self.engine.clone().expect("begin_page runs first");
+        let visit = match engine.head(&self.job.bucket, key).await {
+            Ok(meta) => self.visitor.visit(&engine, key, &meta).await?,
+            Err(e) => Visit::Failed(format!("could not read object metadata: {e}")),
         };
-
-        for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
-            stop_if_shutting_down()?;
-            let visit = match engine.head(bucket, key).await {
-                Ok(meta) => visitor.visit(&engine, key, &meta).await?,
-                Err(e) => Visit::Failed(format!("could not read object metadata: {e}")),
-            };
-            match visit {
-                Visit::Done { bytes } => {
-                    c.done += 1;
-                    c.bytes += bytes;
-                }
-                Visit::Skipped => c.skipped += 1,
-                Visit::Failed(reason) => {
-                    record_failure(db, job.id, key, &reason).await?;
-                    c.failed += 1;
-                }
+        match visit {
+            Visit::Done { bytes } => {
+                self.c.done += 1;
+                self.c.bytes += bytes;
+            }
+            Visit::Skipped => self.c.skipped += 1,
+            Visit::Failed(reason) => {
+                record_failure(self.db, self.job.id, key, &reason).await?;
+                self.c.failed += 1;
             }
         }
-
-        let more = pager.advance(page.is_truncated, page.next_continuation_token);
-        persist(
-            db,
-            job,
-            "objects",
-            c.total,
-            c.done,
-            c.skipped,
-            c.failed,
-            c.bytes,
-            pager.token(),
-        )
-        .await;
-        heartbeat(db, job.id, instance_id).await?;
-        if !more {
-            break;
-        }
+        Ok(())
     }
-    if pager.truncated_by_page_budget() {
-        // Falling through would report `completed` with the tail still
-        // unprocessed — silent truncation.
-        return Err(format!(
-            "{what} stopped at the page budget with more pages pending — bucket \
-             too large for one pass; job left resumable in phase 'objects' \
-             (cursor persisted)"
-        )
-        .into());
-    }
-    Ok(c)
 }
 
 /// The shared `counting` phase: one LIST sweep for the exact object total
@@ -576,55 +577,73 @@ pub(crate) async fn counting_phase(
     job: &MaintenanceJob,
     resume_token: Option<String>,
 ) -> Result<i64, PhaseStop> {
-    let bucket = &job.bucket;
     // A resumed count keeps the pages before its cursor: the row's total
     // is the count up to that cursor (persisted with it, page by page).
-    let mut count: i64 = match (&resume_token, job.phase.as_str()) {
+    let count: i64 = match (&resume_token, job.phase.as_str()) {
         (Some(_), "counting") => job.objects_total.unwrap_or(0),
         _ => 0,
     };
-    let mut pager = Pager::resuming(resume_token);
-    while pager.begin_page().is_some() {
-        check_cancel(db, job.id).await?;
-        let engine = state.engine.load().clone();
-        let page = match engine
-            .list_objects(bucket, "", None, PAGE_SIZE, pager.token(), false)
+    let mut step = CountStep {
+        db,
+        state,
+        job,
+        count,
+    };
+    paged_phase(
+        JobCtx {
+            db,
+            instance_id,
+            job,
+        },
+        PhaseSpec {
+            phase: "counting",
+            resume: resume_token,
+            cancel_every: None,
+            budget_exhausted: "counting stopped at the page budget with more pages \
+                 pending — bucket too large for one pass; job left resumable",
+        },
+        &mut step,
+    )
+    .await?;
+    Ok(step.count)
+}
+
+/// The `counting` phase: count the user objects of each page.
+struct CountStep<'a> {
+    db: &'a Arc<Mutex<ConfigDb>>,
+    state: &'a Arc<AppState>,
+    job: &'a MaintenanceJob,
+    count: i64,
+}
+
+impl PageStep for CountStep<'_> {
+    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, String> {
+        let engine = self.state.engine.load().clone();
+        engine
+            .list_objects(&self.job.bucket, "", None, PAGE_SIZE, token, false)
             .await
-        {
-            Ok(p) => p,
-            Err(e) if pager.poisoned_resume_token() => {
-                // The persisted cursor is the prime suspect — drop it,
-                // persist the clean cursor (a crash mid-retry must not
-                // re-poison), and recount from page 0 (idempotent).
-                warn!(
-                    "maintenance: job #{} counting resume token rejected ({e}); restarting phase fresh",
-                    job.id
-                );
-                pager.restart_fresh();
-                count = 0;
-                persist(db, job, "counting", Some(0), 0, 0, 0, 0, None).await;
-                continue;
-            }
-            Err(e) => return Err(format!("counting list failed: {e}").into()),
+            .map(KeyPage::from)
+            .map_err(|e| format!("counting list failed: {e}"))
+    }
+
+    /// Recount from page 0 (idempotent).
+    fn on_restart(&mut self) {
+        self.count = 0;
+    }
+
+    async fn save(&mut self, token: Option<&str>) -> Result<(), PhaseStop> {
+        let c = Counters {
+            total: Some(self.count),
+            ..Counters::default()
         };
-        count += page
-            .objects
-            .iter()
-            .filter(|(k, _)| !k.ends_with('/'))
-            .count() as i64;
-        let more = pager.advance(page.is_truncated, page.next_continuation_token);
-        persist(db, job, "counting", Some(count), 0, 0, 0, 0, pager.token()).await;
-        heartbeat(db, job.id, instance_id).await?;
-        if !more {
-            break;
-        }
+        persist(self.db, self.job, "counting", &c, token).await;
+        Ok(())
     }
-    if pager.truncated_by_page_budget() {
-        return Err("counting stopped at the page budget with more pages \
-             pending — bucket too large for one pass; job left resumable"
-            .into());
+
+    async fn object(&mut self, _key: &str) -> Result<(), PhaseStop> {
+        self.count += 1;
+        Ok(())
     }
-    Ok(count)
 }
 
 /// Re-store a deltaspace's reference blob through the (encrypting)
@@ -772,27 +791,39 @@ pub(crate) fn after_run(outcome: &Result<(), PhaseStop>, shutting_down: bool) ->
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn persist(
+/// Save the job's progress. Private: the migrate phases save through
+/// [`persist_flushed`], which takes the proof that their deferred copies
+/// are durable.
+async fn persist(
     db: &Arc<Mutex<ConfigDb>>,
     job: &MaintenanceJob,
     phase: &str,
-    total: Option<i64>,
-    done: i64,
-    skipped: i64,
-    failed: i64,
-    bytes: i64,
+    c: &Counters,
     token: Option<&str>,
 ) {
     let db = db.lock().await;
-    if let Err(e) =
-        db.maintenance_update_progress(job.id, phase, total, done, skipped, failed, bytes, token)
-    {
+    if let Err(e) = db.maintenance_update_progress(
+        job.id, phase, c.total, c.done, c.skipped, c.failed, c.bytes, token,
+    ) {
         warn!(
             "maintenance: progress persist failed for job #{}: {}",
             job.id, e
         );
     }
+}
+
+/// [`persist`] for a phase that writes without the per-object fsync: only
+/// a [`super::migrate::Flushed`] (made by a successful flush) opens it, so
+/// a saved cursor never points past a copy that a crash can lose.
+pub(crate) async fn persist_flushed(
+    _proof: super::migrate::Flushed,
+    db: &Arc<Mutex<ConfigDb>>,
+    job: &MaintenanceJob,
+    phase: &str,
+    c: &Counters,
+    token: Option<&str>,
+) {
+    persist(db, job, phase, c, token).await;
 }
 
 /// The job's lease keeper. The per-page `heartbeat` is not enough on its

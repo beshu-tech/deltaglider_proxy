@@ -63,10 +63,11 @@ use crate::transfer::{
     TransferProvenance,
 };
 
+use super::paged::{paged_phase, JobCtx, KeyPage, PageStep, PhaseSpec};
 use super::store::MaintenanceJob;
 use super::worker::{
-    after_run, check_cancel, drain_inflight_writes, heartbeat, persist, record_failure,
-    stop_if_shutting_down, AfterRun, PhaseStop,
+    after_run, check_cancel, drain_inflight_writes, heartbeat, persist_flushed, record_failure,
+    resumable_in, stop_if_shutting_down, AfterRun, Counters, PhaseStop,
 };
 
 pub const TRANSIENT_PREFIX: &str = "__dgmigrate_";
@@ -240,28 +241,34 @@ pub fn real_bucket_name<'a>(
     }
 }
 
+/// Proof that the deferred copy writes are durable. Only [`flush_copies`]
+/// makes one, and [`persist_flushed`] (the only save this file can reach)
+/// takes one, so every migrate save waits for a successful flush.
+pub(crate) struct Flushed(());
+
 /// Save progress only after the copies made so far are durable. The copy
 /// phase writes without the per-object fsync (`storage::with_deferred_fsync`),
 /// so a cursor saved first could point past a copy that a crash loses. A
 /// failed flush saves nothing and fails the phase (the source stays
-/// authoritative). Every `persist` in this file goes through here (source
-/// test `every_migrate_persist_is_a_checkpoint`).
-async fn checkpoint<F, P>(flush: F, save: P) -> Result<(), PhaseStop>
+/// authoritative).
+async fn save_after_flush<F, S, Fut>(flush: F, save: S) -> Result<(), PhaseStop>
 where
-    F: std::future::Future<Output = Result<(), crate::deltaglider::EngineError>>,
-    P: std::future::Future<Output = ()>,
+    F: std::future::Future<Output = Result<Flushed, crate::deltaglider::EngineError>>,
+    S: FnOnce(Flushed) -> Fut,
+    Fut: std::future::Future<Output = ()>,
 {
-    flush
+    let flushed = flush
         .await
         .map_err(|e| format!("could not make the copied objects durable: {e}"))?;
-    save.await;
+    save(flushed).await;
     Ok(())
 }
 
 /// Flush the deferred copy writes of the live engine (every backend).
-async fn flush_copies(state: &Arc<AppState>) -> Result<(), crate::deltaglider::EngineError> {
+async fn flush_copies(state: &Arc<AppState>) -> Result<Flushed, crate::deltaglider::EngineError> {
     let engine = state.engine.load().clone();
-    engine.flush_pending().await
+    engine.flush_pending().await?;
+    Ok(Flushed(()))
 }
 
 /// Which target copies a resumed copy phase must re-copy instead of trusting
@@ -437,87 +444,6 @@ async fn count_objects(
     Ok((count, true))
 }
 
-/// `target: mirror`: delete every destination object that the source does
-/// not hold, before the flip (the gate still freezes the source). Each
-/// delete is audited. Any source HEAD error other than not-found stops the
-/// job: an object is deleted only when the source provably lacks it.
-async fn prune_destination_extras(
-    db: &Arc<Mutex<ConfigDb>>,
-    state: &Arc<AppState>,
-    instance_id: &str,
-    job: &MaintenanceJob,
-    params: &MigrateParams,
-) -> Result<(), PhaseStop> {
-    let bucket = &job.bucket;
-    let mut pager = Pager::resuming(None);
-    let mut pruned = 0u64;
-    while pager.begin_page().is_some() {
-        check_cancel(db, job.id).await?;
-        let engine = state.engine.load().clone();
-        let page = engine
-            .list_objects(
-                &params.transient_key,
-                "",
-                None,
-                PAGE_SIZE,
-                pager.token(),
-                false,
-            )
-            .await
-            .map_err(|e| format!("mirror: list destination failed: {e}"))?;
-        for (i, (key, _)) in page
-            .objects
-            .iter()
-            .filter(|(k, _)| !k.ends_with('/'))
-            .enumerate()
-        {
-            if i > 0 && i % CANCEL_CHECK_EVERY == 0 {
-                check_cancel(db, job.id).await?;
-            }
-            match engine.head(bucket, key).await {
-                Ok(_) => continue,
-                Err(e) if e.is_not_found() => {}
-                Err(e) => {
-                    return Err(PhaseStop::from(format!(
-                        "mirror: could not check '{key}' at the source ({e}) — nothing deleted \
-                         for it; source remains authoritative"
-                    )))
-                }
-            }
-            engine
-                .delete(&params.transient_key, key)
-                .await
-                .map_err(|e| format!("mirror: delete of destination extra '{key}' failed: {e}"))?;
-            pruned += 1;
-            crate::audit::audit_log(
-                "maintenance_migrate_mirror_delete",
-                job.triggered_by.as_deref().unwrap_or("system"),
-                &format!("job:{}", job.id),
-                &axum::http::HeaderMap::new(),
-                bucket,
-                key,
-            );
-        }
-        let more = pager.advance(page.is_truncated, page.next_continuation_token);
-        heartbeat(db, job.id, instance_id).await?;
-        if !more {
-            break;
-        }
-    }
-    if pager.truncated_by_page_budget() {
-        return Err(PhaseStop::from(
-            "mirror: destination listing stopped at the page budget — refusing to \
-             flip over an incompletely mirrored destination"
-                .to_string(),
-        ));
-    }
-    info!(
-        "migrate: job #{} mirror deleted {pruned} destination object(s) absent at the source",
-        job.id
-    );
-    Ok(())
-}
-
 /// Pre-flip unwind: delete the destination objects THIS job copied (their
 /// `dg-migration` value carries the job id), and nothing else — objects
 /// this job did not write stay. Best effort: a
@@ -648,35 +574,106 @@ async fn run_phases(
     job: &MaintenanceJob,
     params: &MigrateParams,
 ) -> Result<(), PhaseStop> {
-    let bucket = &job.bucket;
-    let mut phase = job.phase.clone();
-    let resume_token = job.continuation_token.clone();
-    let mut done = job.objects_done;
-    let mut skipped = job.objects_skipped;
-    let mut failed = job.objects_failed;
-    let mut bytes = job.bytes_done;
-    let provenance_value = provenance_value(params, job.id);
-
-    // ── Phase: stage ──
+    let m = MigrateRun {
+        mutator,
+        db,
+        state,
+        instance_id,
+        job,
+        params,
+        provenance: provenance_value(params, job.id),
+    };
+    // Migrate rows never carry a total.
+    let mut c = Counters {
+        total: None,
+        ..Counters::of(job)
+    };
+    let mut phase = job.phase.as_str();
     if phase == "stage" {
-        check_cancel(db, job.id).await?;
+        m.stage(&c).await?;
+        phase = "copy";
+    }
+    if phase == "copy" {
+        m.copy(&mut c).await?;
+        phase = "verify";
+    }
+    if phase == "verify" {
+        m.verify(&c).await?;
+        phase = "flip";
+    }
+    if phase == "flip" {
+        m.flip(&c).await?;
+        phase = "cleanup";
+    }
+    if phase == "cleanup" && params.delete_source {
+        m.cleanup().await?;
+    }
+    Ok(())
+}
+
+/// One migrate job's run: what every phase needs.
+struct MigrateRun<'a> {
+    mutator: &'a ConfigMutator,
+    db: &'a Arc<Mutex<ConfigDb>>,
+    state: &'a Arc<AppState>,
+    instance_id: &'a str,
+    job: &'a MaintenanceJob,
+    params: &'a MigrateParams,
+    /// The `dg-migration` value this job stamps on its copies.
+    provenance: String,
+}
+
+impl MigrateRun<'_> {
+    fn ctx(&self) -> JobCtx<'_> {
+        JobCtx {
+            db: self.db,
+            instance_id: self.instance_id,
+            job: self.job,
+        }
+    }
+
+    /// Flush the deferred copies, then save `phase` with `token`.
+    async fn checkpoint(
+        &self,
+        phase: &str,
+        c: &Counters,
+        token: Option<&str>,
+    ) -> Result<(), PhaseStop> {
+        save_after_flush(flush_copies(self.state), |flushed| {
+            persist_flushed(flushed, self.db, self.job, phase, c, token)
+        })
+        .await
+    }
+
+    /// Re-assert the staging route: an admin config apply mid-job replaces
+    /// cfg.buckets wholesale; without the route the copies would silently
+    /// land on the DEFAULT backend.
+    async fn ensure_staging_route(&self, context: &str) -> Result<(), String> {
         ensure_route(
-            mutator,
-            &params.transient_key,
-            &params.target_backend,
-            bucket,
-            &format!(
-                "Migration staging route '{}' → '{}'",
-                params.transient_key, params.target_backend
-            ),
+            self.mutator,
+            &self.params.transient_key,
+            &self.params.target_backend,
+            &self.job.bucket,
+            context,
         )
+        .await
+    }
+
+    /// ── Phase: stage ──
+    async fn stage(&self, c: &Counters) -> Result<(), PhaseStop> {
+        let (bucket, params) = (&self.job.bucket, self.params);
+        check_cancel(self.db, self.job.id).await?;
+        self.ensure_staging_route(&format!(
+            "Migration staging route '{}' → '{}'",
+            params.transient_key, params.target_backend
+        ))
         .await?;
         // Real bucket on the target (idempotent). "Already exists" must be
         // tolerated for crash-resume, but backend error strings don't
         // reliably contain "exist" (the AWS SDK renders a 409 as a terse
         // "service error") — so on ANY create failure, probe the bucket
         // through the staging route instead of string-matching.
-        let engine = state.engine.load().clone();
+        let engine = self.state.engine.load().clone();
         if let Err(e) = engine.create_bucket(&params.transient_key).await {
             if engine
                 .list_objects(&params.transient_key, "", None, 1, None, false)
@@ -691,284 +688,105 @@ async fn run_phases(
         // Stage runs before any copy, so every object seen here predates
         // this job.
         let (existing, more) = count_objects(&engine, &params.transient_key).await?;
-        let dest = real_bucket_name(&mutator.read().await.buckets, bucket).to_string();
+        let dest = real_bucket_name(&self.mutator.read().await.buckets, bucket).to_string();
         destination_check(params.target, existing, more, &dest, &params.target_backend)?;
         // The gate has been rejecting NEW source writes since job creation;
         // wait out any write admitted before it armed.
-        drain_inflight_writes(state, bucket).await?;
-        phase = "copy".to_string();
-        checkpoint(
-            flush_copies(state),
-            persist(db, job, &phase, None, done, skipped, failed, bytes, None),
-        )
-        .await?;
+        drain_inflight_writes(self.state, bucket).await?;
+        self.checkpoint("copy", c, None).await
     }
 
-    // ── Phase: copy (resumable; ANY copy failure aborts pre-flip) ──
-    if phase == "copy" {
-        // Resume only when the job was persisted IN this phase.
-        let mut pager = Pager::resuming(if job.phase == "copy" {
-            resume_token.clone()
-        } else {
-            None
-        });
-        let mut recopy = RecopyScope::on_resume(job.phase == "copy");
-        while pager.begin_page().is_some() {
-            check_cancel(db, job.id).await?;
-            // Re-assert the staging route: an admin config apply mid-job
-            // replaces cfg.buckets wholesale; without the route the copies
-            // below would silently land on the DEFAULT backend.
-            ensure_route(
-                mutator,
-                &params.transient_key,
-                &params.target_backend,
-                bucket,
-                "Migration staging route re-asserted after config change",
-            )
-            .await?;
-            let engine = state.engine.load().clone();
-            let page = match engine
-                .list_objects(bucket, "", None, PAGE_SIZE, pager.token(), false)
-                .await
-            {
-                Ok(p) => p,
-                Err(e) if pager.poisoned_resume_token() => {
-                    // Restart the phase from page 0: HEAD-skip makes the
-                    // re-list idempotent. (Counters are NOT reset, so
-                    // already-copied objects tally as `skipped` a second
-                    // time — display drift only, never a re-copy.)
-                    tracing::warn!(
-                        "migrate: job #{} copy resume token rejected ({e}); restarting phase fresh",
-                        job.id
-                    );
-                    pager.restart_fresh();
-                    recopy = recopy.on_restart_fresh();
-                    checkpoint(
-                        flush_copies(state),
-                        persist(db, job, "copy", None, done, skipped, failed, bytes, None),
-                    )
-                    .await?;
-                    continue;
-                }
-                Err(e) => return Err(PhaseStop::from(format!("list source failed: {e}"))),
-            };
-            for (i, (key, _)) in page
-                .objects
-                .iter()
-                .filter(|(k, _)| !k.ends_with('/'))
-                .enumerate()
-            {
-                if i > 0 && i % CANCEL_CHECK_EVERY == 0 {
-                    // Resume token = this page's: HEAD-skip makes the redo
-                    // of its first part idempotent.
-                    checkpoint(
-                        flush_copies(state),
-                        persist(
-                            db,
-                            job,
-                            "copy",
-                            None,
-                            done,
-                            skipped,
-                            failed,
-                            bytes,
-                            pager.token(),
-                        ),
-                    )
-                    .await?;
-                    check_cancel(db, job.id).await?;
-                }
-                stop_if_shutting_down()?;
-                // Skip only a target copy that PROVABLY matches the source: a
-                // cancelled earlier attempt leaves copies that the source has
-                // since outgrown.
-                if !recopy.recopies()
-                    && copy_verdict_for(&engine, bucket, &params.transient_key, key).await
-                        == ContentVerdict::Same
-                {
-                    skipped += 1;
-                    continue;
-                }
-                let req = ObjectTransferRequest {
-                    source_bucket: bucket,
-                    source_key: key,
-                    destination_bucket: &params.transient_key,
-                    destination_key: key,
-                    provenance: Some(TransferProvenance {
-                        metadata_key: "dg-migration",
-                        metadata_value: &provenance_value,
-                    }),
-                    strip_user_metadata_keys: &[],
-                    operation: "migrate",
-                    upload_concurrency: None,
-                    keep_created_at: true,
-                };
-                // No per-object fsync: `checkpoint` flushes the copies
-                // before any progress that counts on them is saved.
-                match crate::storage::with_deferred_fsync(copy_object_with_retries(&engine, req))
-                    .await
-                {
-                    Ok(outcome) => {
-                        done += 1;
-                        bytes += outcome.bytes_copied as i64;
-                    }
-                    Err(e) => {
-                        record_failure(db, job.id, key, &e.to_string()).await?;
-                        failed += 1;
-                        checkpoint(
-                            flush_copies(state),
-                            persist(db, job, "copy", None, done, skipped, failed, bytes, None),
-                        )
-                        .await?;
-                        return Err(PhaseStop::from(format!(
-                            "copy of '{key}' failed — source remains authoritative: {e}"
-                        )));
-                    }
-                }
-            }
-            recopy = recopy.after_page();
-            let more = pager.advance(page.is_truncated, page.next_continuation_token);
-            checkpoint(
-                flush_copies(state),
-                persist(
-                    db,
-                    job,
-                    "copy",
-                    None,
-                    done,
-                    skipped,
-                    failed,
-                    bytes,
-                    pager.token(),
-                ),
-            )
-            .await?;
-            heartbeat(db, job.id, instance_id).await?;
-            if !more {
-                break;
-            }
-        }
-        if pager.truncated_by_page_budget() {
-            // Falling through to verify here would "verify" (and later flip
-            // + delete) over a silently truncated listing — never-copied
-            // tail objects would be lost. Fail instead; the persisted
-            // cursor resumes the tail on retry.
-            return Err(PhaseStop::from(
-                "copy stopped at the page budget with more source pages \
-                 pending — bucket too large for one pass; job left resumable \
-                 in phase 'copy' (cursor persisted, source authoritative)"
-                    .to_string(),
-            ));
-        }
-        phase = "verify".to_string();
-        checkpoint(
-            flush_copies(state),
-            persist(db, job, &phase, None, done, skipped, failed, bytes, None),
+    /// ── Phase: copy (resumable; ANY copy failure aborts pre-flip) ──
+    async fn copy(&self, c: &mut Counters) -> Result<(), PhaseStop> {
+        let mut step = CopyStep {
+            m: self,
+            c,
+            recopy: RecopyScope::on_resume(self.job.phase == "copy"),
+            engine: None,
+        };
+        paged_phase(
+            self.ctx(),
+            PhaseSpec {
+                phase: "copy",
+                resume: resumable_in(self.job, "copy"),
+                cancel_every: Some(CANCEL_CHECK_EVERY),
+                // Falling through to verify here would "verify" (and later
+                // flip + delete) over a silently truncated listing —
+                // never-copied tail objects would be lost. Fail instead; the
+                // persisted cursor resumes the tail on retry.
+                budget_exhausted: "copy stopped at the page budget with more source pages \
+                     pending — bucket too large for one pass; job left resumable \
+                     in phase 'copy' (cursor persisted, source authoritative)",
+            },
+            &mut step,
         )
         .await?;
+        self.checkpoint("verify", c, None).await
     }
 
-    // ── Phase: verify ──
-    if phase == "verify" {
-        let mut pager = Pager::resuming(if job.phase == "verify" {
-            resume_token.clone()
-        } else {
-            None
-        });
-        while pager.begin_page().is_some() {
-            check_cancel(db, job.id).await?;
-            let engine = state.engine.load().clone();
-            let page = match engine
-                .list_objects(bucket, "", None, PAGE_SIZE, pager.token(), false)
-                .await
-            {
-                Ok(p) => p,
-                Err(e) if pager.poisoned_resume_token() => {
-                    tracing::warn!(
-                        "migrate: job #{} verify resume token rejected ({e}); restarting phase fresh",
-                        job.id
-                    );
-                    pager.restart_fresh();
-                    checkpoint(
-                        flush_copies(state),
-                        persist(db, job, "verify", None, done, skipped, failed, bytes, None),
-                    )
-                    .await?;
-                    continue;
-                }
-                Err(e) => return Err(PhaseStop::from(format!("verify list failed: {e}"))),
-            };
-            for (i, (key, _)) in page
-                .objects
-                .iter()
-                .filter(|(k, _)| !k.ends_with('/'))
-                .enumerate()
-            {
-                if i > 0 && i % CANCEL_CHECK_EVERY == 0 {
-                    check_cancel(db, job.id).await?;
-                }
-                match copy_verdict_for(&engine, bucket, &params.transient_key, key).await {
-                    ContentVerdict::Missing => {
-                        return Err(PhaseStop::from(format!(
-                            "verification failed: '{key}' missing on target"
-                        )));
-                    }
-                    ContentVerdict::Differs => {
-                        return Err(PhaseStop::from(format!(
-                            "verification failed: '{key}' on target differs from the source"
-                        )));
-                    }
-                    // Unknown = no common fingerprint (foreign object); the
-                    // copy phase re-copied it, so it is current.
-                    ContentVerdict::Same | ContentVerdict::Unknown => {}
-                }
-            }
-            let more = pager.advance(page.is_truncated, page.next_continuation_token);
-            checkpoint(
-                flush_copies(state),
-                persist(
-                    db,
-                    job,
-                    "verify",
-                    None,
-                    done,
-                    skipped,
-                    failed,
-                    bytes,
-                    pager.token(),
-                ),
-            )
-            .await?;
-            heartbeat(db, job.id, instance_id).await?;
-            if !more {
-                break;
-            }
-        }
-        if pager.truncated_by_page_budget() {
-            return Err(PhaseStop::from(
-                "verify stopped at the page budget with more source pages \
-                 pending — refusing to flip over an incompletely verified \
-                 listing; job left resumable in phase 'verify'"
-                    .to_string(),
-            ));
-        }
-        if params.target == MigrateTarget::Mirror {
-            prune_destination_extras(db, state, instance_id, job, params).await?;
-        }
-        phase = "flip".to_string();
-        checkpoint(
-            flush_copies(state),
-            persist(db, job, &phase, None, done, skipped, failed, bytes, None),
+    /// ── Phase: verify ──
+    async fn verify(&self, c: &Counters) -> Result<(), PhaseStop> {
+        let mut step = VerifyStep {
+            m: self,
+            c,
+            engine: None,
+        };
+        paged_phase(
+            self.ctx(),
+            PhaseSpec {
+                phase: "verify",
+                resume: resumable_in(self.job, "verify"),
+                cancel_every: Some(CANCEL_CHECK_EVERY),
+                budget_exhausted: "verify stopped at the page budget with more source pages \
+                     pending — refusing to flip over an incompletely verified \
+                     listing; job left resumable in phase 'verify'",
+            },
+            &mut step,
         )
         .await?;
+        if self.params.target == MigrateTarget::Mirror {
+            self.prune_destination_extras().await?;
+        }
+        self.checkpoint("flip", c, None).await
     }
 
-    // ── Phase: flip (idempotent; NOT interruptible) ──
-    if phase == "flip" {
+    /// `target: mirror`: delete every destination object that the source
+    /// does not hold, before the flip (the gate still freezes the source).
+    /// Each delete is audited. Any source HEAD error other than not-found
+    /// stops the job: an object is deleted only when the source provably
+    /// lacks it.
+    async fn prune_destination_extras(&self) -> Result<(), PhaseStop> {
+        let mut step = PruneStep {
+            m: self,
+            engine: None,
+            pruned: 0,
+        };
+        paged_phase(
+            self.ctx(),
+            PhaseSpec {
+                phase: "mirror",
+                resume: None,
+                cancel_every: Some(CANCEL_CHECK_EVERY),
+                budget_exhausted: "mirror: destination listing stopped at the page budget — \
+                     refusing to flip over an incompletely mirrored destination",
+            },
+            &mut step,
+        )
+        .await?;
+        info!(
+            "migrate: job #{} mirror deleted {} destination object(s) absent at the source",
+            self.job.id, step.pruned
+        );
+        Ok(())
+    }
+
+    /// ── Phase: flip (idempotent; NOT interruptible) ──
+    async fn flip(&self, c: &Counters) -> Result<(), PhaseStop> {
+        let (bucket, params) = (&self.job.bucket, self.params);
         let bucket_key = bucket.clone();
         let target = params.target_backend.clone();
         let transient = params.transient_key.clone();
-        mutator
+        self.mutator
             // STRICT: the flip's file-persist must succeed or the whole flip
             // rolls back (engine swapped back to source). A file that lags
             // the flip is the data-loss crash window: boot would route
@@ -991,22 +809,30 @@ async fn run_phases(
         // job settle (cleanup below doesn't need the gate). The transient
         // route was just removed from the config, so its gate entry goes
         // too.
-        state.maintenance_gate.clear(bucket);
-        state.maintenance_gate.clear(&params.transient_key);
+        self.state.maintenance_gate.clear(bucket);
+        self.state.maintenance_gate.clear(&params.transient_key);
         info!(
             "migrate: bucket '{}' flipped to backend '{}'",
             bucket, params.target_backend
         );
-        phase = "cleanup".to_string();
-        checkpoint(
-            flush_copies(state),
-            persist(db, job, &phase, None, done, skipped, failed, bytes, None),
-        )
-        .await?;
+        self.checkpoint("cleanup", c, None).await
     }
 
-    // ── Phase: cleanup (optional delete-source; never fails the job) ──
-    if phase == "cleanup" && params.delete_source {
+    /// ── Phase: cleanup (optional delete-source; never fails the job) ──
+    ///
+    /// Not a [`paged_phase`]: it has no cursor (deletes shift the key
+    /// tokens, so a sweep that deleted restarts from the top), and a cancel
+    /// here is a note on a finished migration, not a stop.
+    async fn cleanup(&self) -> Result<(), PhaseStop> {
+        let (mutator, db, state, instance_id, job, params) = (
+            self.mutator,
+            self.db,
+            self.state,
+            self.instance_id,
+            self.job,
+            self.params,
+        );
+        let bucket = &job.bucket;
         let cleanup_key = format!("{}__src", params.transient_key);
         let mut delete_failures = 0u32;
         let mut cancelled_mid_cleanup = false;
@@ -1133,9 +959,214 @@ async fn run_phases(
             let _ = db.maintenance_finish(job.id, status, Some(&note));
             return Ok(());
         }
+        Ok(())
+    }
+}
+
+/// The copy phase's per-page and per-object work.
+struct CopyStep<'a, 'r> {
+    m: &'a MigrateRun<'r>,
+    c: &'a mut Counters,
+    recopy: RecopyScope,
+    engine: Option<Arc<crate::deltaglider::DynEngine>>,
+}
+
+impl PageStep for CopyStep<'_, '_> {
+    async fn begin_page(&mut self) -> Result<(), PhaseStop> {
+        self.m
+            .ensure_staging_route("Migration staging route re-asserted after config change")
+            .await?;
+        self.engine = Some(self.m.state.engine.load().clone());
+        Ok(())
     }
 
-    Ok(())
+    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, String> {
+        let engine = self.engine.as_ref().expect("begin_page runs first");
+        engine
+            .list_objects(&self.m.job.bucket, "", None, PAGE_SIZE, token, false)
+            .await
+            .map(KeyPage::from)
+            .map_err(|e| format!("list source failed: {e}"))
+    }
+
+    /// Restart from page 0: the verdict skip makes the re-list idempotent.
+    /// (Counters are NOT reset, so already-copied objects tally as
+    /// `skipped` a second time — display drift only, never a re-copy.)
+    fn on_restart(&mut self) {
+        self.recopy = self.recopy.on_restart_fresh();
+    }
+
+    async fn save(&mut self, token: Option<&str>) -> Result<(), PhaseStop> {
+        self.m.checkpoint("copy", self.c, token).await
+    }
+
+    /// Resume token = this page's: the verdict skip makes the redo of its
+    /// first part idempotent.
+    async fn mid_page(&mut self, page_token: Option<&str>) -> Result<(), PhaseStop> {
+        self.m.checkpoint("copy", self.c, page_token).await
+    }
+
+    async fn object(&mut self, key: &str) -> Result<(), PhaseStop> {
+        let (m, engine) = (self.m, self.engine.clone().expect("begin_page runs first"));
+        let (bucket, params) = (&m.job.bucket, m.params);
+        // Skip only a target copy that PROVABLY matches the source: a
+        // cancelled earlier attempt leaves copies that the source has
+        // since outgrown.
+        if !self.recopy.recopies()
+            && copy_verdict_for(&engine, bucket, &params.transient_key, key).await
+                == ContentVerdict::Same
+        {
+            self.c.skipped += 1;
+            return Ok(());
+        }
+        let req = ObjectTransferRequest {
+            source_bucket: bucket,
+            source_key: key,
+            destination_bucket: &params.transient_key,
+            destination_key: key,
+            provenance: Some(TransferProvenance {
+                metadata_key: "dg-migration",
+                metadata_value: &m.provenance,
+            }),
+            strip_user_metadata_keys: &[],
+            operation: "migrate",
+            upload_concurrency: None,
+            keep_created_at: true,
+        };
+        // No per-object fsync: `checkpoint` flushes the copies before any
+        // progress that counts on them is saved.
+        match crate::storage::with_deferred_fsync(copy_object_with_retries(&engine, req)).await {
+            Ok(outcome) => {
+                self.c.done += 1;
+                self.c.bytes += outcome.bytes_copied as i64;
+                Ok(())
+            }
+            Err(e) => {
+                record_failure(m.db, m.job.id, key, &e.to_string()).await?;
+                self.c.failed += 1;
+                m.checkpoint("copy", self.c, None).await?;
+                Err(PhaseStop::from(format!(
+                    "copy of '{key}' failed — source remains authoritative: {e}"
+                )))
+            }
+        }
+    }
+
+    fn end_page(&mut self) {
+        self.recopy = self.recopy.after_page();
+    }
+}
+
+/// The verify phase: HEAD every source key on the transient.
+struct VerifyStep<'a, 'r> {
+    m: &'a MigrateRun<'r>,
+    c: &'a Counters,
+    engine: Option<Arc<crate::deltaglider::DynEngine>>,
+}
+
+impl PageStep for VerifyStep<'_, '_> {
+    async fn begin_page(&mut self) -> Result<(), PhaseStop> {
+        self.engine = Some(self.m.state.engine.load().clone());
+        Ok(())
+    }
+
+    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, String> {
+        let engine = self.engine.as_ref().expect("begin_page runs first");
+        engine
+            .list_objects(&self.m.job.bucket, "", None, PAGE_SIZE, token, false)
+            .await
+            .map(KeyPage::from)
+            .map_err(|e| format!("verify list failed: {e}"))
+    }
+
+    async fn save(&mut self, token: Option<&str>) -> Result<(), PhaseStop> {
+        self.m.checkpoint("verify", self.c, token).await
+    }
+
+    async fn object(&mut self, key: &str) -> Result<(), PhaseStop> {
+        let engine = self.engine.as_ref().expect("begin_page runs first");
+        match copy_verdict_for(
+            engine,
+            &self.m.job.bucket,
+            &self.m.params.transient_key,
+            key,
+        )
+        .await
+        {
+            ContentVerdict::Missing => Err(PhaseStop::from(format!(
+                "verification failed: '{key}' missing on target"
+            ))),
+            ContentVerdict::Differs => Err(PhaseStop::from(format!(
+                "verification failed: '{key}' on target differs from the source"
+            ))),
+            // Unknown = no common fingerprint (foreign object); the copy
+            // phase re-copied it, so it is current.
+            ContentVerdict::Same | ContentVerdict::Unknown => Ok(()),
+        }
+    }
+}
+
+/// The mirror prune: list the destination, delete what the source lacks.
+struct PruneStep<'a, 'r> {
+    m: &'a MigrateRun<'r>,
+    engine: Option<Arc<crate::deltaglider::DynEngine>>,
+    pruned: u64,
+}
+
+impl PageStep for PruneStep<'_, '_> {
+    async fn begin_page(&mut self) -> Result<(), PhaseStop> {
+        self.engine = Some(self.m.state.engine.load().clone());
+        Ok(())
+    }
+
+    async fn list(&mut self, token: Option<&str>) -> Result<KeyPage, String> {
+        let engine = self.engine.as_ref().expect("begin_page runs first");
+        engine
+            .list_objects(
+                &self.m.params.transient_key,
+                "",
+                None,
+                PAGE_SIZE,
+                token,
+                false,
+            )
+            .await
+            .map(KeyPage::from)
+            .map_err(|e| format!("mirror: list destination failed: {e}"))
+    }
+
+    /// No cursor: a resumed job re-runs the prune from the top.
+    async fn save(&mut self, _token: Option<&str>) -> Result<(), PhaseStop> {
+        Ok(())
+    }
+
+    async fn object(&mut self, key: &str) -> Result<(), PhaseStop> {
+        let (m, engine) = (self.m, self.engine.as_ref().expect("begin_page runs first"));
+        let bucket = &m.job.bucket;
+        match engine.head(bucket, key).await {
+            Ok(_) => return Ok(()),
+            Err(e) if e.is_not_found() => {}
+            Err(e) => {
+                return Err(PhaseStop::from(format!(
+                    "mirror: could not check '{key}' at the source ({e}) — nothing deleted                      for it; source remains authoritative"
+                )))
+            }
+        }
+        engine
+            .delete(&m.params.transient_key, key)
+            .await
+            .map_err(|e| format!("mirror: delete of destination extra '{key}' failed: {e}"))?;
+        self.pruned += 1;
+        crate::audit::audit_log(
+            "maintenance_migrate_mirror_delete",
+            m.job.triggered_by.as_deref().unwrap_or("system"),
+            &format!("job:{}", m.job.id),
+            &axum::http::HeaderMap::new(),
+            bucket,
+            key,
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1188,48 +1219,35 @@ mod tests {
 
     /// The checkpoint saves only after the flush, and never after a failed
     /// flush: a saved cursor must not point past a copy that is not durable.
+    /// (That every migrate save is such a checkpoint is the type's job: the
+    /// only save this file can reach, `persist_flushed`, takes a `Flushed`.)
     #[tokio::test]
     async fn checkpoint_saves_only_after_a_successful_flush() {
+        use super::{save_after_flush, Flushed};
         let log = std::sync::Mutex::new(Vec::new());
         let flush = |ok: bool| {
             let log = &log;
             async move {
                 log.lock().unwrap().push("flush");
                 if ok {
-                    Ok(())
+                    Ok(Flushed(()))
                 } else {
                     Err(crate::deltaglider::EngineError::Overloaded("disk".into()))
                 }
             }
         };
-        let save = || async {
+        let save = |_: Flushed| async {
             log.lock().unwrap().push("save");
         };
-        checkpoint(flush(true), save()).await.unwrap();
+        save_after_flush(flush(true), save).await.unwrap();
         assert_eq!(*log.lock().unwrap(), ["flush", "save"]);
         log.lock().unwrap().clear();
-        assert!(checkpoint(flush(false), save()).await.is_err());
+        assert!(save_after_flush(flush(false), save).await.is_err());
         assert_eq!(
             *log.lock().unwrap(),
             ["flush"],
             "no save after a failed flush"
         );
-    }
-
-    /// Every progress save of the migrate phases waits for the flush of the
-    /// deferred copies.
-    #[test]
-    fn every_migrate_persist_is_a_checkpoint() {
-        let src: String = crate::source_scan::prod_text(include_str!("migrate.rs"))
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        let saves = src.matches("persist(db").count();
-        let checkpoints = src
-            .matches("checkpoint(flush_copies(state),persist(db")
-            .count();
-        assert!(saves >= 10, "scan found the saves ({saves})");
-        assert_eq!(saves, checkpoints, "a persist that skips the flush");
     }
 
     use super::*;
