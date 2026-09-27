@@ -16,7 +16,7 @@ export const SITE = {
   description:
     'Storage compression for S3, behind the same S3 API your apps already use. It is source-available (BUSL-1.1) and free up to 15 TB. Built by Beshu Tech.',
   /** Path to the default Open Graph preview image (1200x630). */
-  ogImage: '/og-default.svg',
+  ogImage: '/og-default.jpg',
   /** Repo URL (also used for sameAs in SoftwareApplication). */
   repoUrl: 'https://github.com/beshu-tech/deltaglider_proxy',
 } as const;
