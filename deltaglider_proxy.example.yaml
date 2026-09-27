@@ -39,6 +39,7 @@ storage:
   #     public: true
   #   releases:
   #     public_prefixes: ["builds/", "stable/"]
+  #     # alias: releases-2026   # the real bucket name on the backend
   #     quota_bytes: 10737418240   # 10 GiB
   #     compression: true
   #     max_delta_ratio: 0.5
@@ -82,6 +83,85 @@ storage:
   #       include_globs: ["builds/**/*.zip"]
   #       exclude_globs: [".deltaglider/**"]
 
+  #
+  #     # Count-based retention: keep the newest `count` qualifying objects.
+  #     - name: keep-last-nightlies
+  #       enabled: false
+  #       bucket: db-archive
+  #       prefix: "nightly/"
+  #       action:
+  #         type: retain-newest
+  #         count: 7
+  #         qualify:                  # only these objects are counted
+  #           min_size_bytes: 1048576
+  #           min_age: "1h"
+  #         protect_younger_than: "24h"
+  #
+  # Encryption at rest of the single-backend shorthand above. Modes:
+  # none | aes256-gcm-proxy | sse-kms | sse-s3. `legacy_key` /
+  # `legacy_key_id` keep old objects readable after a key or mode change.
+  # backend_encryption:
+  #   mode: aes256-gcm-proxy
+  #   key: "${env:DGP_ENCRYPTION_KEY}"   # 64 hex characters
+  #   key_id: releases-2026
+  #   legacy_key: "..."
+  #   legacy_key_id: releases-2025
+  #
+  # Named backends (instead of `s3:` / `filesystem:`): each bucket routes
+  # to one with `buckets.<name>.backend`; the rest go to default_backend.
+  # backends:
+  #   - name: hetzner-fsn1
+  #     type: s3
+  #     endpoint: https://fsn1.your-objectstorage.com
+  #     region: fsn1
+  #     force_path_style: true
+  #     access_key_id: "${env:HETZNER_KEY_ID}"
+  #     secret_access_key: "${env:HETZNER_SECRET}"
+  #   - name: aws-dr
+  #     type: s3
+  #     region: eu-central-1
+  #     encryption:
+  #       mode: sse-kms
+  #       kms_key_id: arn:aws:kms:eu-central-1:111122223333:alias/dgp
+  #       bucket_key_enabled: true
+  #   - name: local-disk
+  #     type: filesystem
+  #     path: /var/lib/deltaglider
+  #     encryption:
+  #       mode: aes256-gcm-proxy
+  #       key: "${env:DGP_BACKEND_LOCAL_DISK_ENCRYPTION_KEY}"
+  # default_backend: hetzner-fsn1
+  #
+  # Bucket replication. Nothing runs until a rule is enabled; preview a
+  # rule first on the Jobs screen. The runner values are the defaults.
+  # replication:
+  #   enabled: true
+  #   tick_interval: "30s"
+  #   lease_ttl: "300s"
+  #   heartbeat_interval: "60s"
+  #   max_failures_retained: 100
+  #   object_timeout: "30m"          # 0s disables
+  #   object_skip_after_failures: 5  # 0 = never skip a failing object
+  #   transfers: 4                   # objects copied at once
+  #   upload_concurrency: 4          # parts in flight per large object
+  #   dir_concurrency: 4             # listings in flight during a walk
+  #   rules:
+  #     - name: mirror-releases-to-dr
+  #       enabled: false
+  #       source:
+  #         bucket: releases
+  #         prefix: "builds/"
+  #       destination:
+  #         bucket: releases-mirror
+  #         prefix: ""
+  #       interval: "24h"
+  #       batch_size: 100
+  #       replicate_deletes: false
+  #       conflict: newer-wins       # or content-diff, skip-if-dest-exists
+  #       strict_content_diff: false
+  #       include_globs: []
+  #       exclude_globs: [".deltaglider/**"]
+
 
 # ── access — SigV4 credentials + IAM source-of-truth mode ──────────
 #
@@ -96,6 +176,60 @@ storage:
 #   # iam_mode: declarative  — YAML is authoritative; admin API
 #   #                          IAM mutation routes return 403.
 #   iam_mode: gui
+#
+#   # "none" turns SigV4 off (development only). Absent = auto-detect.
+#   # authentication: none
+#
+#   # Declarative mode only: the IAM state itself. Groups and providers
+#   # are referenced by NAME. See docs/product/reference/declarative-iam.md.
+#   iam_users:
+#     - name: ci-uploader
+#       access_key_id: "${env:CI_UPLOADER_KEY_ID}"
+#       secret_access_key: "${env:CI_UPLOADER_SECRET}"
+#       enabled: true
+#       groups: [Engineering]
+#       permissions:
+#         - effect: Allow
+#           actions: [read, write, list]
+#           resources: ["releases/builds/*"]
+#           conditions:
+#             StringLike:
+#               s3:prefix: ["builds/"]
+#       # auth_source: local        # "external" for OAuth-provisioned users
+#   iam_groups:
+#     - name: Engineering
+#       description: Read builds
+#       permissions:
+#         - effect: Allow
+#           actions: [read, list]
+#           resources: ["releases/*"]
+#   auth_providers:
+#     - name: google-sso
+#       provider_type: oidc
+#       enabled: true
+#       priority: 0
+#       display_name: Google
+#       client_id: "${env:OIDC_CLIENT_ID}"
+#       client_secret: "${env:OIDC_CLIENT_SECRET}"
+#       issuer_url: https://accounts.google.com
+#       scopes: openid email profile
+#       # extra_config: { allow_local: true, ca_cert_path: /etc/deltaglider/idp-ca.pem }
+#   group_mapping_rules:
+#     - provider: google-sso
+#       priority: 0
+#       match_type: email_domain
+#       match_field: email
+#       match_value: acme.example
+#       group: Engineering
+#   # Written by the full-IAM export only (user <-> IdP subject bindings):
+#   # external_identities:
+#   #   - user: dana
+#   #     provider: google-sso
+#   #     subject: "1234567890"
+#   #     email: dana@acme.example
+#   #     display_name: Dana
+#   #     email_verified: true
+#   #     raw_claims: {}
 
 
 # ── admission — operator-authored pre-auth request gating ──────────
@@ -128,6 +262,14 @@ storage:
 #         bucket: releases
 #         path_glob: "*.zip"
 #       action: allow-anonymous
+#
+#     - name: deny-anonymous-writes-from-one-host
+#       match:
+#         method: [PUT, POST, DELETE]
+#         source_ip: "203.0.113.9"
+#         authenticated: false
+#         config_flag: maintenance_mode
+#       action: deny
 
 
 # ── advanced — process-level tunables ──────────────────────────────
@@ -138,6 +280,19 @@ storage:
 #   max_delta_ratio: 0.75           # default
 #   cache_size_mb: 2048             # production recommended ≥1 GiB
 #   metadata_cache_mb: 50
+#   max_object_size: 104857600      # bytes; default 100 MiB
+#   max_passthrough_object_size: 68719476736   # default 64 GiB
+#   codec_concurrency: 16           # xdelta3 processes at once
+#   blocking_threads: 512
+#
+#   # Multi-instance: share the encrypted IAM DB through an S3 bucket.
+#   # Every instance needs the same DGP_CONFIG_DB_KEY.
+#   config_sync_bucket: dgp-iam-sync
+#   config_sync_object_key: .deltaglider/config.db
+#
+#   # Bcrypt hash of the admin password (an infra secret; prefer the
+#   # DGP_BOOTSTRAP_PASSWORD_HASH env var).
+#   bootstrap_password_hash: "${env:DGP_BOOTSTRAP_PASSWORD_HASH}"
 #
 #   # TLS — both S3 and admin GUI served over HTTPS on the same port.
 #   # `enabled: true` is REQUIRED to serve HTTPS: supplying the paths alone

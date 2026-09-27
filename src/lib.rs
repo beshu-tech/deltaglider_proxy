@@ -222,9 +222,9 @@ pub(crate) mod source_scan {
         assert!(files.len() > 100, "scan found the sources");
         let tests = out_of_line_test_modules(&files);
         assert!(!tests.is_empty(), "found the out-of-line test modules");
-        assert!(prod_sources("src").iter().all(|(rel, _)| {
-            !tests.iter().any(|t| crate::source_scan::rel(t) == *rel)
-        }));
+        assert!(prod_sources("src")
+            .iter()
+            .all(|(rel, _)| { !tests.iter().any(|t| crate::source_scan::rel(t) == *rel) }));
     }
 }
 
@@ -232,8 +232,7 @@ pub(crate) mod source_scan {
 #[cfg(test)]
 mod source_guards {
     use crate::source_scan::{
-        out_of_line_test_modules, prod_mask, rel as rel_path, root, rust_files,
-        test_module_lines,
+        out_of_line_test_modules, prod_mask, rel as rel_path, root, rust_files, test_module_lines,
     };
 
     /// Every object HEAD the server sends is counted in
@@ -522,6 +521,88 @@ mod source_guards {
             offenders.is_empty(),
             "map config-DB errors with super::db_error_status(&e), not a fixed code:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    /// Every variable in `ENV_VAR_REGISTRY` is documented in `docs/product`
+    /// (`--show-env` prints the registry, but an operator reads the docs).
+    /// The registry drift test keeps code and registry equal; this one
+    /// keeps registry and docs equal.
+    #[test]
+    fn every_registered_env_var_is_documented() {
+        fn md_files(dir: &std::path::Path, out: &mut String) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    md_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "md") {
+                    out.push_str(&std::fs::read_to_string(&path).unwrap());
+                }
+            }
+        }
+        let mut docs = String::new();
+        md_files(&root().join("docs/product"), &mut docs);
+        let missing: Vec<&str> = crate::config::ENV_VAR_REGISTRY
+            .iter()
+            .map(|e| e.name)
+            .filter(|n| !docs.contains(&format!("`{n}`")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "ENV_VAR_REGISTRY names not documented in docs/product (add them to \
+             reference/configuration.md): {missing:?}"
+        );
+    }
+
+    /// `deltaglider_proxy.example.yaml` is the canonical example: every
+    /// field of the four sections appears in it (commented out is fine),
+    /// so a new setting cannot ship without an example. The field names
+    /// come from the sections' JSON Schemas, nested types included.
+    #[test]
+    fn example_config_names_every_field() {
+        fn property_names(v: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    if let Some(serde_json::Value::Object(props)) = map.get("properties") {
+                        out.extend(props.keys().cloned());
+                    }
+                    map.values().for_each(|x| property_names(x, out));
+                }
+                serde_json::Value::Array(items) => {
+                    items.iter().for_each(|x| property_names(x, out))
+                }
+                _ => {}
+            }
+        }
+        use crate::config_sections::{
+            AccessSection, AdmissionSection, AdvancedSection, StorageSection,
+        };
+        let schemas = [
+            serde_json::to_value(schemars::schema_for!(AdmissionSection)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(AccessSection)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(StorageSection)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(AdvancedSection)).unwrap(),
+        ];
+        let mut names = std::collections::BTreeSet::new();
+        schemas.iter().for_each(|s| property_names(s, &mut names));
+        assert!(
+            names.len() > 50,
+            "schema walk found the fields ({})",
+            names.len()
+        );
+        let example =
+            std::fs::read_to_string(root().join("deltaglider_proxy.example.yaml")).unwrap();
+        // A capitalised name is a variant of an enum whose serde form the
+        // derived schema does not model (`LifecycleAction`: the YAML is
+        // `type: transition`), not a YAML key.
+        let missing: Vec<&String> = names
+            .iter()
+            .filter(|n| !n.starts_with(|c: char| c.is_ascii_uppercase()))
+            .filter(|n| !example.contains(&format!("{n}:")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "fields missing from deltaglider_proxy.example.yaml: {missing:?}"
         );
     }
 
