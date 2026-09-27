@@ -56,342 +56,419 @@ impl ConfigDb {
 
         let mut stats = ReconcileStats::default();
 
-        // ── 1. Delete mapping rules wholesale IFF the diff says we
-        //      must (ClearAll or ReplaceWith). `Keep` is the idempotent
-        //      no-op path — never touches the table. This is the
-        //      post-C1 shape: the old `Vec + helper` form couldn't
-        //      distinguish "YAML matches non-empty DB, keep" from
-        //      "YAML empty, wipe" and silently wiped on every
-        //      idempotent re-apply.
-        match &diff.mapping_rules {
-            MappingRulesAction::Keep => {}
-            MappingRulesAction::ClearAll | MappingRulesAction::ReplaceWith(_) => {
-                tx.execute("DELETE FROM group_mapping_rules", [])?;
-                // We'll re-insert in step 8 iff ReplaceWith.
-            }
-        }
-
-        // ── 2. Delete users. Cascades permissions, group_members,
-        //      external_identities (by design — see module doc).
-        for (id, _name) in &diff.users_to_delete {
-            tx.execute("DELETE FROM users WHERE id = ?1", params![id])?;
-            stats.users_deleted.push(_name.clone());
-        }
-
-        // ── 3. Delete providers. Cascades mapping_rules +
-        //      external_identities tied to the provider.
-        for (id, _name) in &diff.providers_to_delete {
-            tx.execute("DELETE FROM auth_providers WHERE id = ?1", params![id])?;
-            stats.providers_deleted.push(_name.clone());
-        }
-
-        // ── 4. Delete groups. Cascades memberships, permissions, rules.
-        for (id, _name) in &diff.groups_to_delete {
-            tx.execute("DELETE FROM groups WHERE id = ?1", params![id])?;
-            stats.groups_deleted.push(_name.clone());
-        }
-
-        // ── 5. Create + update groups → name→id map.
-        let mut group_name_to_id: HashMap<String, i64> = current
-            .groups
-            .iter()
-            .filter(|g| !diff.groups_to_delete.iter().any(|(id, _)| *id == g.id))
-            .map(|g| (g.name.clone(), g.id))
-            .collect();
-
-        for g in &diff.groups_to_create {
-            tx.execute(
-                "INSERT INTO groups (name, description) VALUES (?1, ?2)",
-                params![g.name, g.description],
-            )?;
-            let gid = tx.last_insert_rowid();
-            replace_group_permissions(&tx, gid, &g.permissions)?;
-            group_name_to_id.insert(g.name.clone(), gid);
-            stats.groups_created.push(g.name.clone());
-        }
-        for (gid, g) in &diff.groups_to_update {
-            tx.execute(
-                "UPDATE groups SET name = ?1, description = ?2 WHERE id = ?3",
-                params![g.name, g.description, gid],
-            )?;
-            replace_group_permissions(&tx, *gid, &g.permissions)?;
-            group_name_to_id.insert(g.name.clone(), *gid);
-            stats.groups_updated.push(g.name.clone());
-        }
-
-        // ── 6. Create + update providers → name→id map.
-        let mut provider_name_to_id: HashMap<String, i64> = current
-            .auth_providers
-            .iter()
-            .filter(|p| !diff.providers_to_delete.iter().any(|(id, _)| *id == p.id))
-            .map(|p| (p.name.clone(), p.id))
-            .collect();
-
-        for p in &diff.providers_to_create {
-            tx.execute(
-                "INSERT INTO auth_providers \
-                 (name, provider_type, enabled, priority, display_name, client_id, \
-                  client_secret, issuer_url, scopes, extra_config) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    p.name,
-                    p.provider_type,
-                    p.enabled as i32,
-                    p.priority,
-                    p.display_name,
-                    p.client_id,
-                    p.client_secret,
-                    p.issuer_url,
-                    p.scopes,
-                    p.extra_config.as_ref().map(|v| v.to_string()),
-                ],
-            )?;
-            let pid = tx.last_insert_rowid();
-            provider_name_to_id.insert(p.name.clone(), pid);
-            stats.providers_created.push(p.name.clone());
-        }
-        for (pid, p) in &diff.providers_to_update {
-            tx.execute(
-                "UPDATE auth_providers SET \
-                   name = ?1, provider_type = ?2, enabled = ?3, priority = ?4, \
-                   display_name = ?5, client_id = ?6, client_secret = ?7, \
-                   issuer_url = ?8, scopes = ?9, extra_config = ?10, \
-                   updated_at = CURRENT_TIMESTAMP \
-                 WHERE id = ?11",
-                params![
-                    p.name,
-                    p.provider_type,
-                    p.enabled as i32,
-                    p.priority,
-                    p.display_name,
-                    p.client_id,
-                    p.client_secret,
-                    p.issuer_url,
-                    p.scopes,
-                    p.extra_config.as_ref().map(|v| v.to_string()),
-                    pid,
-                ],
-            )?;
-            provider_name_to_id.insert(p.name.clone(), *pid);
-            stats.providers_updated.push(p.name.clone());
-        }
-
-        // ── 7. Create + update users. Resolve `groups` names via the
-        //      group_name_to_id map built above. `auth_source` rides the
-        //      row verbatim (default 'local' when the YAML was silent) so
-        //      a full-IAM round-trip restores OAuth rows as external (#71).
-        for u in &diff.users_to_create {
-            tx.execute(
-                "INSERT INTO users (name, access_key_id, secret_access_key, enabled, auth_source) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    u.name,
-                    u.access_key_id,
-                    u.secret_access_key,
-                    u.enabled as i32,
-                    u.auth_source.clone().unwrap_or_else(|| "local".into()),
-                ],
-            )?;
-            let uid = tx.last_insert_rowid();
-            replace_user_permissions(&tx, uid, &u.permissions)?;
-            replace_user_group_memberships(&tx, uid, &u.groups, &group_name_to_id)?;
-            stats.users_created.push(u.name.clone());
-        }
-        for (uid, u) in &diff.users_to_update {
-            tx.execute(
-                "UPDATE users SET \
-                   name = ?1, access_key_id = ?2, secret_access_key = ?3, enabled = ?4, \
-                   auth_source = ?5 \
-                 WHERE id = ?6",
-                params![
-                    u.name,
-                    u.access_key_id,
-                    u.secret_access_key,
-                    u.enabled as i32,
-                    u.auth_source.clone().unwrap_or_else(|| "local".into()),
-                    uid,
-                ],
-            )?;
-            replace_user_permissions(&tx, *uid, &u.permissions)?;
-            replace_user_group_memberships(&tx, *uid, &u.groups, &group_name_to_id)?;
-            stats.users_updated.push(u.name.clone());
-        }
-
-        // ── 8. Re-insert mapping rules if diff says ReplaceWith.
-        //      ClearAll has already done its DELETE in step 1; Keep
-        //      is a no-op.
-        if let MappingRulesAction::ReplaceWith(ref rules) = diff.mapping_rules {
-            // Content uids: every node that applies this YAML writes the same
-            // uids, so the sync merge sees one rule set, not two.
-            let mut taken = std::collections::HashSet::new();
-            for r in rules {
-                let provider_id: Option<i64> = match &r.provider {
-                    Some(name) => Some(*provider_name_to_id.get(name).ok_or_else(|| {
-                        // Defensive — validation caught this already,
-                        // but build a clear error if the invariant
-                        // breaks somehow.
-                        ConfigDbError::Other(format!(
-                            "mapping rule references unknown provider '{}' — this is a bug \
-                             (validation should have caught it)",
-                            name
-                        ))
-                    })?),
-                    None => None,
-                };
-                let group_id = *group_name_to_id.get(&r.group).ok_or_else(|| {
-                    ConfigDbError::Other(format!(
-                        "mapping rule references unknown group '{}' — this is a bug",
-                        r.group
-                    ))
-                })?;
-                let uid = super::iam_merge::unique_rule_uid(
-                    super::iam_merge::content_rule_uid(
-                        r.provider.as_deref(),
-                        r.priority,
-                        &r.match_type,
-                        &r.match_field,
-                        &r.match_value,
-                        &r.group,
-                    ),
-                    &mut taken,
-                );
-                tx.execute(
-                    "INSERT INTO group_mapping_rules \
-                     (provider_id, priority, match_type, match_field, match_value, group_id, rule_uid) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        provider_id,
-                        r.priority,
-                        r.match_type,
-                        r.match_field,
-                        r.match_value,
-                        group_id,
-                        uid,
-                    ],
-                )?;
-            }
-            stats.mapping_rules_replaced = rules.len();
-        } else if matches!(diff.mapping_rules, MappingRulesAction::ClearAll) {
-            // Track the clear for audit accuracy — stats previously
-            // showed 0 even when rules were wiped. We don't know the
-            // old count cheaply (it's in `current.mapping_rules` but
-            // re-reading after DELETE would be silly); use its len.
-            stats.mapping_rules_replaced = current.mapping_rules.len();
-        }
-
-        // ── 9. Upsert OAuth login bindings (#71). Keyed by
-        //      (provider_id, external_sub) — the pair the OAuth callback
-        //      looks up, so an upsert of the SAME subject can never
-        //      create a duplicate binding, and a restore after a DB wipe
-        //      re-links to the freshly-created user id. Bindings absent
-        //      from the YAML are left alone (never deleted — hand-
-        //      authored YAML and redacted exports don't carry them, and
-        //      deletes already cascade through user/provider deletes).
-        if !diff.external_identities.is_empty() {
-            // Post-commit-writes state: created users/providers are in the
-            // maps from steps 6-7; deleted ones were filtered out there.
-            // Created users' ids resolve by UNIQUE access_key_id (rule INSERTs
-            // interleave, so last_insert_rowid is unreliable here).
-            let mut user_name_to_id: HashMap<String, i64> = current
-                .users
-                .iter()
-                .filter(|u| !diff.users_to_delete.iter().any(|(id, _)| *id == u.id))
-                .map(|u| (u.name.clone(), u.id))
-                .collect();
-            // Users UPDATED by step 7 may have been renamed — their new name
-            // only exists in the diff, not in `current`. Insert it so a
-            // binding referencing the new name resolves.
-            for (uid, u) in &diff.users_to_update {
-                user_name_to_id.insert(u.name.clone(), *uid);
-            }
-            for u in &diff.users_to_create {
-                if let Some(uid) = query_user_id_by_access_key(&tx, &u.access_key_id)? {
-                    user_name_to_id.insert(u.name.clone(), uid);
-                }
-            }
-            for ident in &diff.external_identities {
-                let Some(uid) = user_name_to_id.get(&ident.user) else {
-                    // Validation rejects unknown refs; defensive skip keeps
-                    // a restore applying even if a binding names a user the
-                    // snapshot omitted.
-                    continue;
-                };
-                let Some(pid) = provider_name_to_id.get(&ident.provider) else {
-                    continue;
-                };
-                let claims_json: Option<String> = ident
-                    .raw_claims
-                    .as_ref()
-                    .map(|v| serde_json::to_string(v).unwrap_or_default());
-                let verified = ident.email_verified.unwrap_or(false);
-                // Idempotency: only count (and write) a binding whose stored
-                // row differs. Re-applying an unchanged lossless export must
-                // stay a no-op — the docstring promises it.
-                if external_identity_matches(
-                    &tx,
-                    *pid,
-                    &ident.subject,
-                    *uid,
-                    ident.email.as_deref(),
-                    ident.display_name.as_deref(),
-                    claims_json.as_deref(),
-                    verified,
-                )? {
-                    continue;
-                }
-                tx.execute(
-                    "INSERT INTO external_identities \
-                     (user_id, provider_id, external_sub, email, display_name, raw_claims, email_verified) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-                     ON CONFLICT(provider_id, external_sub) DO UPDATE SET \
-                       user_id = excluded.user_id, \
-                       email = excluded.email, \
-                       display_name = excluded.display_name, \
-                       raw_claims = excluded.raw_claims, \
-                       email_verified = excluded.email_verified",
-                    params![
-                        uid,
-                        pid,
-                        ident.subject,
-                        ident.email,
-                        ident.display_name,
-                        claims_json,
-                        verified as i32,
-                    ],
-                )?;
-                stats.external_identities_applied += 1;
-            }
-        }
+        delete_rows(&tx, diff, &mut stats)?;
+        let group_name_to_id = upsert_groups(&tx, diff, current, &mut stats)?;
+        let provider_name_to_id = upsert_providers(&tx, diff, current, &mut stats)?;
+        upsert_users(&tx, diff, &group_name_to_id, &mut stats)?;
+        replace_mapping_rules(
+            &tx,
+            diff,
+            current,
+            &provider_name_to_id,
+            &group_name_to_id,
+            &mut stats,
+        )?;
+        upsert_external_identities(&tx, diff, current, &provider_name_to_id, &mut stats)?;
 
         tx.commit()?;
 
-        stats.users_total = diff.users_to_create.len()
-            + diff.users_to_update.len()
-            + current
-                .users
-                .iter()
-                .filter(|u| !diff.users_to_delete.iter().any(|(id, _)| *id == u.id))
-                .filter(|u| !diff.users_to_update.iter().any(|(id, _)| *id == u.id))
-                .count();
-        stats.groups_total = diff.groups_to_create.len()
-            + diff.groups_to_update.len()
-            + current
-                .groups
-                .iter()
-                .filter(|g| !diff.groups_to_delete.iter().any(|(id, _)| *id == g.id))
-                .filter(|g| !diff.groups_to_update.iter().any(|(id, _)| *id == g.id))
-                .count();
-        stats.providers_total = diff.providers_to_create.len()
-            + diff.providers_to_update.len()
-            + current
-                .auth_providers
-                .iter()
-                .filter(|p| !diff.providers_to_delete.iter().any(|(id, _)| *id == p.id))
-                .filter(|p| !diff.providers_to_update.iter().any(|(id, _)| *id == p.id))
-                .count();
-
+        count_totals(diff, current, &mut stats);
         Ok(stats)
     }
+}
+
+/// Steps 1–4 of [`ConfigDb::apply_iam_reconcile`]: the deletes.
+fn delete_rows(
+    tx: &rusqlite::Transaction,
+    diff: &IamDiff,
+    stats: &mut ReconcileStats,
+) -> Result<(), ConfigDbError> {
+    // ── 1. Delete mapping rules wholesale IFF the diff says we
+    //      must (ClearAll or ReplaceWith). `Keep` is the idempotent
+    //      no-op path — never touches the table. This is the
+    //      post-C1 shape: the old `Vec + helper` form couldn't
+    //      distinguish "YAML matches non-empty DB, keep" from
+    //      "YAML empty, wipe" and silently wiped on every
+    //      idempotent re-apply.
+    match &diff.mapping_rules {
+        MappingRulesAction::Keep => {}
+        MappingRulesAction::ClearAll | MappingRulesAction::ReplaceWith(_) => {
+            tx.execute("DELETE FROM group_mapping_rules", [])?;
+            // We'll re-insert in step 8 iff ReplaceWith.
+        }
+    }
+
+    // ── 2. Delete users. Cascades permissions, group_members,
+    //      external_identities (by design — see module doc).
+    for (id, _name) in &diff.users_to_delete {
+        tx.execute("DELETE FROM users WHERE id = ?1", params![id])?;
+        stats.users_deleted.push(_name.clone());
+    }
+
+    // ── 3. Delete providers. Cascades mapping_rules +
+    //      external_identities tied to the provider.
+    for (id, _name) in &diff.providers_to_delete {
+        tx.execute("DELETE FROM auth_providers WHERE id = ?1", params![id])?;
+        stats.providers_deleted.push(_name.clone());
+    }
+
+    // ── 4. Delete groups. Cascades memberships, permissions, rules.
+    for (id, _name) in &diff.groups_to_delete {
+        tx.execute("DELETE FROM groups WHERE id = ?1", params![id])?;
+        stats.groups_deleted.push(_name.clone());
+    }
+    Ok(())
+}
+
+/// Step 5: create + update groups; the `name → id` map of every group
+/// that stays.
+fn upsert_groups(
+    tx: &rusqlite::Transaction,
+    diff: &IamDiff,
+    current: &CurrentIam,
+    stats: &mut ReconcileStats,
+) -> Result<HashMap<String, i64>, ConfigDbError> {
+    // ── 5. Create + update groups → name→id map.
+    let mut group_name_to_id: HashMap<String, i64> = current
+        .groups
+        .iter()
+        .filter(|g| !diff.groups_to_delete.iter().any(|(id, _)| *id == g.id))
+        .map(|g| (g.name.clone(), g.id))
+        .collect();
+
+    for g in &diff.groups_to_create {
+        tx.execute(
+            "INSERT INTO groups (name, description) VALUES (?1, ?2)",
+            params![g.name, g.description],
+        )?;
+        let gid = tx.last_insert_rowid();
+        replace_group_permissions(tx, gid, &g.permissions)?;
+        group_name_to_id.insert(g.name.clone(), gid);
+        stats.groups_created.push(g.name.clone());
+    }
+    for (gid, g) in &diff.groups_to_update {
+        tx.execute(
+            "UPDATE groups SET name = ?1, description = ?2 WHERE id = ?3",
+            params![g.name, g.description, gid],
+        )?;
+        replace_group_permissions(tx, *gid, &g.permissions)?;
+        group_name_to_id.insert(g.name.clone(), *gid);
+        stats.groups_updated.push(g.name.clone());
+    }
+    Ok(group_name_to_id)
+}
+
+/// Step 6: create + update providers; the `name → id` map of every
+/// provider that stays.
+fn upsert_providers(
+    tx: &rusqlite::Transaction,
+    diff: &IamDiff,
+    current: &CurrentIam,
+    stats: &mut ReconcileStats,
+) -> Result<HashMap<String, i64>, ConfigDbError> {
+    // ── 6. Create + update providers → name→id map.
+    let mut provider_name_to_id: HashMap<String, i64> = current
+        .auth_providers
+        .iter()
+        .filter(|p| !diff.providers_to_delete.iter().any(|(id, _)| *id == p.id))
+        .map(|p| (p.name.clone(), p.id))
+        .collect();
+
+    for p in &diff.providers_to_create {
+        tx.execute(
+            "INSERT INTO auth_providers \
+             (name, provider_type, enabled, priority, display_name, client_id, \
+              client_secret, issuer_url, scopes, extra_config) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                p.name,
+                p.provider_type,
+                p.enabled as i32,
+                p.priority,
+                p.display_name,
+                p.client_id,
+                p.client_secret,
+                p.issuer_url,
+                p.scopes,
+                p.extra_config.as_ref().map(|v| v.to_string()),
+            ],
+        )?;
+        let pid = tx.last_insert_rowid();
+        provider_name_to_id.insert(p.name.clone(), pid);
+        stats.providers_created.push(p.name.clone());
+    }
+    for (pid, p) in &diff.providers_to_update {
+        tx.execute(
+            "UPDATE auth_providers SET \
+               name = ?1, provider_type = ?2, enabled = ?3, priority = ?4, \
+               display_name = ?5, client_id = ?6, client_secret = ?7, \
+               issuer_url = ?8, scopes = ?9, extra_config = ?10, \
+               updated_at = CURRENT_TIMESTAMP \
+             WHERE id = ?11",
+            params![
+                p.name,
+                p.provider_type,
+                p.enabled as i32,
+                p.priority,
+                p.display_name,
+                p.client_id,
+                p.client_secret,
+                p.issuer_url,
+                p.scopes,
+                p.extra_config.as_ref().map(|v| v.to_string()),
+                pid,
+            ],
+        )?;
+        provider_name_to_id.insert(p.name.clone(), *pid);
+        stats.providers_updated.push(p.name.clone());
+    }
+    Ok(provider_name_to_id)
+}
+
+/// Step 7: create + update users with their permissions and memberships.
+fn upsert_users(
+    tx: &rusqlite::Transaction,
+    diff: &IamDiff,
+    group_name_to_id: &HashMap<String, i64>,
+    stats: &mut ReconcileStats,
+) -> Result<(), ConfigDbError> {
+    // ── 7. Create + update users. Resolve `groups` names via the
+    //      group_name_to_id map built above. `auth_source` rides the
+    //      row verbatim (default 'local' when the YAML was silent) so
+    //      a full-IAM round-trip restores OAuth rows as external (#71).
+    for u in &diff.users_to_create {
+        tx.execute(
+            "INSERT INTO users (name, access_key_id, secret_access_key, enabled, auth_source) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                u.name,
+                u.access_key_id,
+                u.secret_access_key,
+                u.enabled as i32,
+                u.auth_source.clone().unwrap_or_else(|| "local".into()),
+            ],
+        )?;
+        let uid = tx.last_insert_rowid();
+        replace_user_permissions(tx, uid, &u.permissions)?;
+        replace_user_group_memberships(tx, uid, &u.groups, group_name_to_id)?;
+        stats.users_created.push(u.name.clone());
+    }
+    for (uid, u) in &diff.users_to_update {
+        tx.execute(
+            "UPDATE users SET \
+               name = ?1, access_key_id = ?2, secret_access_key = ?3, enabled = ?4, \
+               auth_source = ?5 \
+             WHERE id = ?6",
+            params![
+                u.name,
+                u.access_key_id,
+                u.secret_access_key,
+                u.enabled as i32,
+                u.auth_source.clone().unwrap_or_else(|| "local".into()),
+                uid,
+            ],
+        )?;
+        replace_user_permissions(tx, *uid, &u.permissions)?;
+        replace_user_group_memberships(tx, *uid, &u.groups, group_name_to_id)?;
+        stats.users_updated.push(u.name.clone());
+    }
+    Ok(())
+}
+
+/// Step 8: re-insert the mapping rules (`ReplaceWith`), or count the
+/// rules that step 1 cleared (`ClearAll`).
+fn replace_mapping_rules(
+    tx: &rusqlite::Transaction,
+    diff: &IamDiff,
+    current: &CurrentIam,
+    provider_name_to_id: &HashMap<String, i64>,
+    group_name_to_id: &HashMap<String, i64>,
+    stats: &mut ReconcileStats,
+) -> Result<(), ConfigDbError> {
+    // ── 8. Re-insert mapping rules if diff says ReplaceWith.
+    //      ClearAll has already done its DELETE in step 1; Keep
+    //      is a no-op.
+    if let MappingRulesAction::ReplaceWith(ref rules) = diff.mapping_rules {
+        // Content uids: every node that applies this YAML writes the same
+        // uids, so the sync merge sees one rule set, not two.
+        let mut taken = std::collections::HashSet::new();
+        for r in rules {
+            let provider_id: Option<i64> = match &r.provider {
+                Some(name) => Some(*provider_name_to_id.get(name).ok_or_else(|| {
+                    // Defensive — validation caught this already,
+                    // but build a clear error if the invariant
+                    // breaks somehow.
+                    ConfigDbError::Other(format!(
+                        "mapping rule references unknown provider '{}' — this is a bug \
+                         (validation should have caught it)",
+                        name
+                    ))
+                })?),
+                None => None,
+            };
+            let group_id = *group_name_to_id.get(&r.group).ok_or_else(|| {
+                ConfigDbError::Other(format!(
+                    "mapping rule references unknown group '{}' — this is a bug",
+                    r.group
+                ))
+            })?;
+            let uid = super::iam_merge::unique_rule_uid(
+                super::iam_merge::content_rule_uid(
+                    r.provider.as_deref(),
+                    r.priority,
+                    &r.match_type,
+                    &r.match_field,
+                    &r.match_value,
+                    &r.group,
+                ),
+                &mut taken,
+            );
+            tx.execute(
+                "INSERT INTO group_mapping_rules \
+                 (provider_id, priority, match_type, match_field, match_value, group_id, rule_uid) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    provider_id,
+                    r.priority,
+                    r.match_type,
+                    r.match_field,
+                    r.match_value,
+                    group_id,
+                    uid,
+                ],
+            )?;
+        }
+        stats.mapping_rules_replaced = rules.len();
+    } else if matches!(diff.mapping_rules, MappingRulesAction::ClearAll) {
+        // Track the clear for audit accuracy — stats previously
+        // showed 0 even when rules were wiped. We don't know the
+        // old count cheaply (it's in `current.mapping_rules` but
+        // re-reading after DELETE would be silly); use its len.
+        stats.mapping_rules_replaced = current.mapping_rules.len();
+    }
+    Ok(())
+}
+
+/// Step 9: upsert the OAuth login bindings.
+fn upsert_external_identities(
+    tx: &rusqlite::Transaction,
+    diff: &IamDiff,
+    current: &CurrentIam,
+    provider_name_to_id: &HashMap<String, i64>,
+    stats: &mut ReconcileStats,
+) -> Result<(), ConfigDbError> {
+    // ── 9. Upsert OAuth login bindings (#71). Keyed by
+    //      (provider_id, external_sub) — the pair the OAuth callback
+    //      looks up, so an upsert of the SAME subject can never
+    //      create a duplicate binding, and a restore after a DB wipe
+    //      re-links to the freshly-created user id. Bindings absent
+    //      from the YAML are left alone (never deleted — hand-
+    //      authored YAML and redacted exports don't carry them, and
+    //      deletes already cascade through user/provider deletes).
+    if !diff.external_identities.is_empty() {
+        // Post-commit-writes state: created users/providers are in the
+        // maps from steps 6-7; deleted ones were filtered out there.
+        // Created users' ids resolve by UNIQUE access_key_id (rule INSERTs
+        // interleave, so last_insert_rowid is unreliable here).
+        let mut user_name_to_id: HashMap<String, i64> = current
+            .users
+            .iter()
+            .filter(|u| !diff.users_to_delete.iter().any(|(id, _)| *id == u.id))
+            .map(|u| (u.name.clone(), u.id))
+            .collect();
+        // Users UPDATED by step 7 may have been renamed — their new name
+        // only exists in the diff, not in `current`. Insert it so a
+        // binding referencing the new name resolves.
+        for (uid, u) in &diff.users_to_update {
+            user_name_to_id.insert(u.name.clone(), *uid);
+        }
+        for u in &diff.users_to_create {
+            if let Some(uid) = query_user_id_by_access_key(tx, &u.access_key_id)? {
+                user_name_to_id.insert(u.name.clone(), uid);
+            }
+        }
+        for ident in &diff.external_identities {
+            let Some(uid) = user_name_to_id.get(&ident.user) else {
+                // Validation rejects unknown refs; defensive skip keeps
+                // a restore applying even if a binding names a user the
+                // snapshot omitted.
+                continue;
+            };
+            let Some(pid) = provider_name_to_id.get(&ident.provider) else {
+                continue;
+            };
+            let claims_json: Option<String> = ident
+                .raw_claims
+                .as_ref()
+                .map(|v| serde_json::to_string(v).unwrap_or_default());
+            let verified = ident.email_verified.unwrap_or(false);
+            // Idempotency: only count (and write) a binding whose stored
+            // row differs. Re-applying an unchanged lossless export must
+            // stay a no-op — the docstring promises it.
+            if external_identity_matches(
+                tx,
+                *pid,
+                &ident.subject,
+                *uid,
+                ident.email.as_deref(),
+                ident.display_name.as_deref(),
+                claims_json.as_deref(),
+                verified,
+            )? {
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO external_identities \
+                 (user_id, provider_id, external_sub, email, display_name, raw_claims, email_verified) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(provider_id, external_sub) DO UPDATE SET \
+                   user_id = excluded.user_id, \
+                   email = excluded.email, \
+                   display_name = excluded.display_name, \
+                   raw_claims = excluded.raw_claims, \
+                   email_verified = excluded.email_verified",
+                params![
+                    uid,
+                    pid,
+                    ident.subject,
+                    ident.email,
+                    ident.display_name,
+                    claims_json,
+                    verified as i32,
+                ],
+            )?;
+            stats.external_identities_applied += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Pure: the post-reconcile row totals (created + updated + kept).
+fn count_totals(diff: &IamDiff, current: &CurrentIam, stats: &mut ReconcileStats) {
+    stats.users_total = diff.users_to_create.len()
+        + diff.users_to_update.len()
+        + current
+            .users
+            .iter()
+            .filter(|u| !diff.users_to_delete.iter().any(|(id, _)| *id == u.id))
+            .filter(|u| !diff.users_to_update.iter().any(|(id, _)| *id == u.id))
+            .count();
+    stats.groups_total = diff.groups_to_create.len()
+        + diff.groups_to_update.len()
+        + current
+            .groups
+            .iter()
+            .filter(|g| !diff.groups_to_delete.iter().any(|(id, _)| *id == g.id))
+            .filter(|g| !diff.groups_to_update.iter().any(|(id, _)| *id == g.id))
+            .count();
+    stats.providers_total = diff.providers_to_create.len()
+        + diff.providers_to_update.len()
+        + current
+            .auth_providers
+            .iter()
+            .filter(|p| !diff.providers_to_delete.iter().any(|(id, _)| *id == p.id))
+            .filter(|p| !diff.providers_to_update.iter().any(|(id, _)| *id == p.id))
+            .count();
 }
 
 /// Replace permission rows for a given owner (user or group). The
@@ -553,6 +630,44 @@ mod tests {
         let mut v: Vec<String> = rows.iter().map(name).collect();
         v.sort();
         v
+    }
+
+    /// Totals count created + updated + the current rows that the diff
+    /// neither deletes nor updates.
+    #[test]
+    fn count_totals_adds_kept_rows() {
+        use crate::iam::{CurrentIam, IamDiff, IamUser, ReconcileStats};
+        let user = |id: i64, name: &str| IamUser {
+            id,
+            name: name.into(),
+            access_key_id: format!("AK{id}"),
+            secret_access_key: "sk".into(),
+            enabled: true,
+            created_at: String::new(),
+            permissions: vec![],
+            group_ids: vec![],
+            auth_source: "local".into(),
+            iam_policies: vec![],
+        };
+        let decl = |name: &str| -> crate::iam::DeclarativeUser {
+            serde_yaml::from_str(&format!("{{ name: {name}, access_key_id: AK{name} }}")).unwrap()
+        };
+        let current = CurrentIam {
+            users: vec![user(1, "a"), user(2, "b"), user(3, "c")],
+            ..Default::default()
+        };
+        let diff = IamDiff {
+            users_to_delete: vec![(1, "a".into())],
+            users_to_update: vec![(2, decl("b"))],
+            users_to_create: vec![decl("x"), decl("y")],
+            ..Default::default()
+        };
+        let mut stats = ReconcileStats::default();
+        super::count_totals(&diff, &current, &mut stats);
+        assert_eq!(
+            (stats.users_total, stats.groups_total, stats.providers_total),
+            (4, 0, 0)
+        );
     }
 
     /// Every step of the reconcile, in two applies: the first creates
