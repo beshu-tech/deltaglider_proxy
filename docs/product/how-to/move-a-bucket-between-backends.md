@@ -77,7 +77,7 @@ A proxy restart mid-job does not orphan the bucket: the job is re-queued on boot
 
 ## 4. Clean up the source (optional)
 
-Once verified, delete the old copy yourself — for the example, the `db-archive` data directory on `local-disk`. If you'd rather have the job do it, pass `"delete_source": true` when starting the migration; cleanup then runs only after the flip succeeds.
+Once verified, delete the old copy yourself — for the example, the `db-archive` data directory on `local-disk`. If you'd rather have the job do it, pass `"delete_source": true` when starting the migration; cleanup then runs only after the flip succeeds. A cleanup that cannot finish never fails the migration, because the bucket already lives on the new backend. This happens when a source delete fails, when you cancel the job during the cleanup, or when the bucket no longer routes to the target. The job then settles as `completed_with_errors` with a note, and you remove the remaining source objects yourself.
 
 ## Related
 

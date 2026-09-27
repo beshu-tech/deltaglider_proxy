@@ -17,6 +17,14 @@ stopped, and the write gate on its bucket opened while the job was still
 active, so writes could race a migrate copy. Now a DB error is retried, and
 a job that loses its lease keeps the gate for as long as its row is active.
 
+### Fixed — A migrate cleanup that stops never fails the migration
+
+When the source-cleanup route could not be staged, or the bucket no longer
+routed to the target, the job settled `failed` although the bucket already
+lived on the new backend. Now it settles `completed_with_errors` with a note.
+The audit entry also names that status instead of `completed`. A cancel in
+the cleanup is checked every 20 objects, like the other phases.
+
 ### Fixed — A replication run that dies releases its lease
 
 A replication run that panicked or was dropped left its lease renewed by a

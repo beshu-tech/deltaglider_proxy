@@ -232,12 +232,17 @@ async fn run_job(
         Err(e) if e == CANCELLED => ("cancelled", None),
         Err(e) => ("failed", Some(e.clone())),
     };
-    {
+    // A phase can pre-settle its row (migrate cleanup: a note and
+    // `completed_with_errors`); `maintenance_finish` then leaves it alone,
+    // and the log + audit must report the row's status, not the recomputed one.
+    let status = {
         let db = db.lock().await;
         if let Err(e) = db.maintenance_finish(job.id, status, last_error.as_deref()) {
             warn!("maintenance: failed to settle job #{}: {}", job.id, e);
         }
-    }
+        let row = db.maintenance_job_by_id(job.id).ok().flatten();
+        settled_status(status, row.as_ref().map(|j| j.status.as_str())).to_string()
+    };
     for k in &gated {
         state.maintenance_gate.clear(k);
     }
@@ -426,6 +431,8 @@ async fn execute_phases(
             .await
             .map_err(|e| format!("list deltaspaces failed: {e}"))?;
         for prefix in deltaspaces {
+            // A graceful stop waits for the end of the current object only.
+            stop_if_shutting_down()?;
             check_cancel(db, job.id).await?;
             match rewrite_reference_if_needed(&engine, bucket, &prefix, &desired).await {
                 Ok(()) => {}
@@ -729,6 +736,16 @@ pub(crate) async fn heartbeat(
     }
 }
 
+/// Pure: the status to log and audit after the settle. The row's own
+/// terminal status wins over the recomputed one (a phase may pre-settle).
+pub(crate) fn settled_status<'a>(computed: &'a str, row_status: Option<&'a str>) -> &'a str {
+    match row_status {
+        // Not one of store.rs's ACTIVE_STATUSES.
+        Some(s) if !matches!(s, "queued" | "running" | "cancelling") => s,
+        _ => computed,
+    }
+}
+
 /// Gate keys a job may clear after it lost its lease: only the keys that
 /// no ACTIVE row still needs (`maintenance_gate_arm_keys` is the truth).
 /// The row stays active after a lapse (the requeue scan hands it back), so
@@ -864,6 +881,18 @@ mod tests {
             heartbeat(&db, id, "other").await,
             Err(LEASE_LOST.to_string())
         );
+    }
+
+    /// jobs-6: migrate cleanup pre-settles `completed_with_errors`; the audit
+    /// must report that, not the `completed` that the row counters give.
+    #[test]
+    fn settled_status_prefers_the_rows_terminal_status() {
+        assert_eq!(
+            settled_status("completed", Some("completed_with_errors")),
+            "completed_with_errors"
+        );
+        assert_eq!(settled_status("failed", Some("running")), "failed");
+        assert_eq!(settled_status("completed", None), "completed");
     }
 
     /// jobs-2: a job that lost its lease keeps the gate keys an active row

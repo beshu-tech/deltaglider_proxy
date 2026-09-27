@@ -29,8 +29,9 @@
 //!    optional cleanup below doesn't need the gate).
 //! 5. **cleanup** — optional `delete_source`: a second transient route to
 //!    the OLD backend, delete every copied key through it, remove the
-//!    route. Delete failures are recorded but do not fail the migration
-//!    (the flip already happened).
+//!    route. Delete failures and a stopped sweep are recorded but do not
+//!    fail the migration (the flip already happened): the job settles
+//!    `completed_with_errors` with a note.
 //!
 //! Cancellation: checked every [`CANCEL_CHECK_EVERY`] objects. Pre-flip →
 //! release the source gate, delete the staged copies THIS job made (by
@@ -318,6 +319,37 @@ async fn copy_verdict_for(
         // The copy (or verify) reports the source error itself.
         Err(_) => ContentVerdict::Unknown,
     }
+}
+
+/// Pure: how a post-flip cleanup settles, or `None` for a clean sweep (the
+/// worker then settles from the row counters). The migration already
+/// happened, so every outcome is a `completed*` status with a note: a failed
+/// delete or a stopped sweep leaves source objects behind (`_with_errors`).
+fn cleanup_settlement(
+    cancelled: bool,
+    delete_failures: u32,
+    stopped: Option<&str>,
+) -> Option<(&'static str, String)> {
+    let failures = if delete_failures > 0 {
+        format!(" ({delete_failures} failure(s))")
+    } else {
+        String::new()
+    };
+    let note = if let Some(reason) = stopped {
+        format!("source cleanup stopped{failures}: {reason} — remaining source objects can be removed manually")
+    } else if cancelled {
+        format!("source cleanup stopped by cancel{failures} — remaining source objects can be removed manually")
+    } else if delete_failures > 0 {
+        format!("source cleanup incomplete{failures} — remaining source objects can be removed manually")
+    } else {
+        return None;
+    };
+    let status = if delete_failures > 0 || stopped.is_some() {
+        "completed_with_errors"
+    } else {
+        "completed"
+    };
+    Some((status, note))
 }
 
 /// Ensure the transient (or cleanup) route to `bucket`'s real name on
@@ -968,18 +1000,29 @@ async fn run_phases(
     // ── Phase: cleanup (optional delete-source; never fails the job) ──
     if phase == "cleanup" && params.delete_source {
         let cleanup_key = format!("{}__src", params.transient_key);
-        ensure_route(
+        let mut delete_failures = 0u32;
+        let mut cancelled_mid_cleanup = false;
+        // A stop that is not a delete failure (the route cannot be staged,
+        // or the live config no longer routes the bucket to the target).
+        // The flip already happened, so it becomes a note, never a failed
+        // job: a failed row invites a retry that 400s ("already on backend").
+        let mut stopped: Option<String> = None;
+        if let Err(e) = ensure_route(
             mutator,
             &cleanup_key,
             &params.from_backend,
             bucket,
             "Migration source-cleanup route staged",
         )
-        .await?;
+        .await
+        {
+            stopped = Some(format!("the source-cleanup route could not be staged: {e}"));
+        }
         let mut cleanup_token: Option<String> = None;
-        let mut delete_failures = 0u32;
-        let mut cancelled_mid_cleanup = false;
         'cleanup: for _ in 0..MAX_JOB_PAGES {
+            if stopped.is_some() {
+                break 'cleanup;
+            }
             if check_cancel(db, job.id).await.is_err() {
                 // Flip already happened; stop deleting and settle with a
                 // note below (NOT the generic cancel path — the MIGRATION
@@ -1001,11 +1044,12 @@ async fn run_phases(
                     .unwrap_or(false)
             };
             if !routed_to_target {
-                return Err(format!(
+                stopped = Some(format!(
                     "cleanup refused: bucket '{}' is not routed to '{}' in the live \
                      config — source data left untouched",
                     bucket, params.target_backend
                 ));
+                break 'cleanup;
             }
             let engine = state.engine.load().clone();
             let page = match engine
@@ -1027,8 +1071,17 @@ async fn run_phases(
                 }
             };
             let mut deleted_this_sweep = 0u32;
-            for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
+            for (i, (key, _)) in page
+                .objects
+                .iter()
+                .filter(|(k, _)| !k.ends_with('/'))
+                .enumerate()
+            {
                 stop_if_shutting_down()?;
+                if i > 0 && i % CANCEL_CHECK_EVERY == 0 && check_cancel(db, job.id).await.is_err() {
+                    cancelled_mid_cleanup = true;
+                    break 'cleanup;
+                }
                 match engine.delete(&cleanup_key, key).await {
                     Ok(_) => deleted_this_sweep += 1,
                     Err(e) => {
@@ -1065,32 +1118,9 @@ async fn run_phases(
         .await;
         // The MIGRATION succeeded either way; an interrupted cleanup is
         // surfaced as a note, never as a failed/cancelled job.
-        let note = if cancelled_mid_cleanup {
-            Some(format!(
-                "source cleanup stopped by cancel{} — remaining source \
-                 objects can be removed manually",
-                if delete_failures > 0 {
-                    format!(" ({delete_failures} failure(s))")
-                } else {
-                    String::new()
-                }
-            ))
-        } else if delete_failures > 0 {
-            Some(format!(
-                "source cleanup incomplete ({delete_failures} failure(s)) — \
-                 remaining source objects can be removed manually"
-            ))
-        } else {
-            None
-        };
-        if let Some(note) = note {
-            // The migration itself succeeded; failed source deletes still
-            // make it `completed_with_errors`, never plain `completed`.
-            let status = if delete_failures > 0 {
-                "completed_with_errors"
-            } else {
-                "completed"
-            };
+        if let Some((status, note)) =
+            cleanup_settlement(cancelled_mid_cleanup, delete_failures, stopped.as_deref())
+        {
             let db = db.lock().await;
             let _ = db.maintenance_finish(job.id, status, Some(&note));
             return Ok(());
@@ -1102,6 +1132,23 @@ async fn run_phases(
 
 #[cfg(test)]
 mod tests {
+    /// jobs-5: a stopped cleanup (route staging failed, or the bucket no
+    /// longer routes to the target) settles `completed_with_errors`, never
+    /// `failed`: the flip already happened.
+    #[test]
+    fn cleanup_settlement_never_fails_the_migration() {
+        use super::cleanup_settlement as settle;
+        assert_eq!(settle(false, 0, None), None);
+        let (s, n) = settle(false, 0, Some("route refused")).unwrap();
+        assert_eq!(s, "completed_with_errors");
+        assert!(n.contains("route refused"), "{n}");
+        assert_eq!(settle(true, 0, None).unwrap().0, "completed");
+        assert_eq!(settle(true, 2, None).unwrap().0, "completed_with_errors");
+        let (s, n) = settle(false, 3, None).unwrap();
+        assert_eq!(s, "completed_with_errors");
+        assert!(n.contains("3 failure(s)"), "{n}");
+    }
+
     #[test]
     fn multi_instance_refusal_only_with_a_coordination_bucket() {
         use super::multi_instance_refusal as refuse;
