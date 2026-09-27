@@ -22,7 +22,7 @@
 
 use super::{AdminError, AdminState, Bare};
 use crate::api::admin::extract::AdminJson;
-use crate::maintenance::migrate::{parse_params, pick_transient_key, MigrateParams, MigrateTarget};
+use crate::maintenance::migrate::{pick_transient_key, MigrateParams, MigrateTarget};
 use crate::maintenance::store::{current_unix_seconds, CancelOutcome, MaintenanceJob};
 use crate::maintenance::{display_percent, resolve_desired};
 use axum::extract::{Path, State};
@@ -166,19 +166,20 @@ pub async fn start_reencrypt(
         }
         let created = {
             let db = db.lock().await;
-            db.maintenance_create_job(
+            let created = db.maintenance_create_job(
                 "reencrypt",
                 &key,
                 "counting",
                 None,
                 "admin",
                 current_unix_seconds(),
-            )
+            );
+            // Gate from CREATION: no create→claim window for writes.
+            state.s3_state.maintenance_gate.sync_from(&db);
+            created
         };
         match created {
             Ok(Some(job_id)) => {
-                // Gate from CREATION: no create→claim window for writes.
-                state.s3_state.maintenance_gate.set_busy(&key);
                 started.push(ReencryptStarted {
                     bucket: bucket.to_string(),
                     job_id,
@@ -251,19 +252,20 @@ pub async fn start_backfill(
         }
         let created = {
             let db = db.lock().await;
-            db.maintenance_create_job(
+            let created = db.maintenance_create_job(
                 crate::maintenance::backfill::KIND,
                 &key,
                 "counting",
                 Some(&params),
                 "admin",
                 current_unix_seconds(),
-            )
+            );
+            // Gate from CREATION: no create→claim window for writes.
+            state.s3_state.maintenance_gate.sync_from(&db);
+            created
         };
         match created {
             Ok(Some(job_id)) => {
-                // Gate from CREATION: no create→claim window for writes.
-                state.s3_state.maintenance_gate.set_busy(&key);
                 started.push(ReencryptStarted {
                     bucket: bucket.to_string(),
                     job_id,
@@ -399,14 +401,20 @@ pub async fn start_migrate(
         serde_json::to_string(&params).map_err(|e| AdminError::internal(e.to_string()))?;
     let created = {
         let db = db.lock().await;
-        db.maintenance_create_job(
+        let created = db.maintenance_create_job(
             "migrate",
             &bucket_key,
             "stage",
             Some(&params_json),
             "admin",
             current_unix_seconds(),
-        )?
+        )?;
+        // Gate WRITES from creation — the source write-set freezes through
+        // the flip (this is what makes migrate race-free, unlike the old
+        // handler). The transient staging route is gated too: admin
+        // copy/move endpoints could otherwise write through it mid-copy.
+        state.s3_state.maintenance_gate.sync_from(&db);
+        created
     };
     let Some(job_id) = created else {
         return Err(AdminError::conflict(format!(
@@ -414,15 +422,6 @@ pub async fn start_migrate(
         )));
     };
 
-    // Gate WRITES from creation — the source write-set freezes through the
-    // flip (this is what makes migrate race-free, unlike the old handler).
-    // The transient staging route is gated too: admin copy/move endpoints
-    // could otherwise write through it mid-copy.
-    state.s3_state.maintenance_gate.set_busy(&bucket_key);
-    state
-        .s3_state
-        .maintenance_gate
-        .set_busy(&params.transient_key);
     state.s3_state.maintenance_notify.notify_one();
     info!(
         "maintenance: migrate requested for '{}' → '{}' (job #{job_id})",
@@ -466,17 +465,18 @@ pub async fn cancel_job(
         let db = db.lock().await;
         let job = db.maintenance_job_by_id(id)?;
         let outcome = db.maintenance_request_cancel(id)?;
+        // A queued job that never ran settles now, and its gate (bucket AND,
+        // for migrate, the staging route) goes with the row.
+        state.s3_state.maintenance_gate.sync_from(&db);
         (outcome, job)
     };
     match outcome {
         CancelOutcome::CancelledImmediately => {
-            // Queued job never ran: release the gate now (bucket AND, for
-            // migrate, the transient staging route gated at creation).
             if let Some(j) = &job {
-                state.s3_state.maintenance_gate.clear(&j.bucket);
-                if let Some(p) = j.params.as_deref().and_then(|p| parse_params(p).ok()) {
-                    state.s3_state.maintenance_gate.clear(&p.transient_key);
-                }
+                info!(
+                    "maintenance: job #{id} on '{}' cancelled before it ran",
+                    j.bucket
+                );
             }
             super::audit_log(
                 "maintenance_job_cancel",

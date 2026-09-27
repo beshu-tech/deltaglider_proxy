@@ -518,7 +518,7 @@ async fn remove_staged_copies(
 }
 
 /// Run one migrate job to completion (or error). The caller settles the
-/// job row and clears the gate; THIS function unwinds the transient
+/// job row (which releases the gate); THIS function unwinds the transient
 /// route on any PRE-FLIP termination (cancel or failure).
 pub(crate) async fn execute_migrate_phases(
     mutator: &ConfigMutator,
@@ -538,18 +538,21 @@ pub(crate) async fn execute_migrate_phases(
     let settles = after_run(&result, crate::shutdown::is_shutting_down()) == AfterRun::Settle;
     if result.is_err() && settles {
         // Determine the phase we died in (re-read — phases persist it).
-        let phase = {
-            let db = db.lock().await;
-            db.maintenance_job_by_id(job.id)
-                .ok()
-                .flatten()
-                .map(|j| j.phase)
-                .unwrap_or_else(|| job.phase.clone())
-        };
-        if unwinds_on_failure(&phase) {
+        let db_guard = db.lock().await;
+        let phase = db_guard
+            .maintenance_job_by_id(job.id)
+            .ok()
+            .flatten()
+            .map(|j| j.phase)
+            .unwrap_or_else(|| job.phase.clone());
+        let unwinds = unwinds_on_failure(&phase);
+        if unwinds {
             // Source stays authoritative: clients may write to it again
             // now, not after the staged-copy cleanup below.
-            state.maintenance_gate.clear(&job.bucket);
+            state.maintenance_gate.release_for_unwind(job.id, &db_guard);
+        }
+        drop(db_guard);
+        if unwinds {
             // Stage copies nothing, so there is nothing to remove.
             if phase != "stage" {
                 remove_staged_copies(mutator, db, state, job, &params).await;
@@ -805,17 +808,18 @@ impl MigrateRun<'_> {
                 },
             )
             .await?;
-        // Destination is authoritative — client writes resume NOW, not at
-        // job settle (cleanup below doesn't need the gate). The transient
-        // route was just removed from the config, so its gate entry goes
-        // too.
-        self.state.maintenance_gate.clear(bucket);
-        self.state.maintenance_gate.clear(&params.transient_key);
         info!(
             "migrate: bucket '{}' flipped to backend '{}'",
             bucket, params.target_backend
         );
-        self.checkpoint("cleanup", c, None).await
+        self.checkpoint("cleanup", c, None).await?;
+        // Destination is authoritative — client writes resume NOW, not at
+        // job settle: the row is in `cleanup`, which gates neither the
+        // bucket nor the (just removed) staging route.
+        self.state
+            .maintenance_gate
+            .sync_from(&*self.db.lock().await);
+        Ok(())
     }
 
     /// ── Phase: cleanup (optional delete-source; never fails the job) ──

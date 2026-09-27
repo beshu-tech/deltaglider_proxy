@@ -786,14 +786,11 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // serves: a gated bucket's writes stay blocked across the restart.
     if let Some(db) = config_db.as_ref() {
         let db = db.lock().await;
-        match db.maintenance_gate_arm_keys() {
-            Ok(keys) => {
-                for k in keys {
-                    tracing::info!("maintenance: re-arming write gate for '{}'", k);
-                    maintenance_gate.set_busy(&k);
-                }
+        maintenance_gate.sync_from(&db);
+        if let Ok(arms) = db.maintenance_gate_arms() {
+            for a in arms {
+                tracing::info!("maintenance: re-arming write gate for '{}'", a.key);
             }
-            Err(e) => tracing::warn!("maintenance: gate re-arm failed: {}", e),
         }
     }
 

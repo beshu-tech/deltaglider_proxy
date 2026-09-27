@@ -107,6 +107,16 @@ const JOB_COLUMNS: &str = "id, kind, bucket, status, phase, objects_total, objec
      objects_skipped, objects_failed, bytes_done, continuation_token, last_error, \
      triggered_by, params, created_at, started_at, finished_at, updated_at";
 
+/// One write-gate key that an active job needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateArm {
+    pub job_id: i64,
+    pub key: String,
+    /// The source bucket of a migrate: the one key that a pre-flip unwind
+    /// releases before its row settles (see `MaintenanceGate::release_for_unwind`).
+    pub migrate_source: bool,
+}
+
 impl ConfigDb {
     /// Create a queued job for `bucket`. Returns `Ok(None)` when the
     /// bucket already has an active job (the partial unique index fires) —
@@ -187,23 +197,27 @@ impl ConfigDb {
         Ok(job)
     }
 
-    /// Gate keys to arm for active jobs — the boot-time re-arm input.
-    /// Kind/phase-aware: a reencrypt gates its bucket; a PRE-flip migrate
-    /// gates its bucket AND its transient staging route (admin copy/move
-    /// could otherwise write through the transient mid-copy); a POST-flip
-    /// migrate (cleanup) gates NOTHING — the flipped bucket is fully live
-    /// and must not 503 client writes for the delete sweep.
-    pub fn maintenance_gate_arm_keys(&self) -> Result<Vec<String>, ConfigDbError> {
+    /// The write-gate arms of the active jobs: the ONE input of
+    /// [`super::gate::MaintenanceGate::sync_from`]. Kind/phase-aware: a
+    /// reencrypt or backfill gates its bucket; a PRE-flip migrate gates its
+    /// bucket AND its transient staging route (admin copy/move could
+    /// otherwise write through the transient mid-copy); a POST-flip migrate
+    /// (cleanup) gates NOTHING — the flipped bucket is fully live and must
+    /// not 503 client writes for the delete sweep.
+    pub fn maintenance_gate_arms(&self) -> Result<Vec<GateArm>, ConfigDbError> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT bucket, kind, phase, params FROM maintenance_jobs
+            "SELECT id, bucket, kind, phase, params FROM maintenance_jobs
               WHERE status IN {ACTIVE_STATUSES}"
         ))?;
-        let rows: Vec<(String, String, String, Option<String>)> = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        let rows: Vec<(i64, String, String, String, Option<String>)> = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
-        let mut keys = Vec::new();
-        for (bucket, kind, phase, params) in rows {
-            if kind == "migrate" {
+        let mut arms = Vec::new();
+        for (job_id, bucket, kind, phase, params) in rows {
+            let migrate = kind == "migrate";
+            if migrate {
                 // Only `cleanup` is post-flip (bucket live on the new backend);
                 // `flip` STAYS gated (a crash can persist phase="flip" before the
                 // flip runs, leaving the bucket routed to source).
@@ -214,12 +228,30 @@ impl ConfigDb {
                     .as_deref()
                     .and_then(|p| super::migrate::parse_params(p).ok())
                 {
-                    keys.push(t.transient_key);
+                    arms.push(GateArm {
+                        job_id,
+                        key: t.transient_key,
+                        migrate_source: false,
+                    });
                 }
             }
-            keys.push(bucket);
+            arms.push(GateArm {
+                job_id,
+                key: bucket,
+                migrate_source: migrate,
+            });
         }
-        Ok(keys)
+        Ok(arms)
+    }
+
+    /// The keys of [`Self::maintenance_gate_arms`].
+    #[cfg(test)]
+    pub fn maintenance_gate_arm_keys(&self) -> Result<Vec<String>, ConfigDbError> {
+        Ok(self
+            .maintenance_gate_arms()?
+            .into_iter()
+            .map(|a| a.key)
+            .collect())
     }
 
     /// Transient route keys (`__dgmigrate_*`) referenced by ACTIVE migrate

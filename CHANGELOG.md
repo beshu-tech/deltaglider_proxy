@@ -77,6 +77,16 @@ baseline (the buffered PUT counted them). A streaming passthrough PUT no
 longer stores the body MD5 as a multipart ETag; the ETag on the wire is the
 same.
 
+### Fixed — A graceful stop keeps the write gate of a maintenance job
+
+When the proxy stopped (`SIGTERM`) during a maintenance job, it put the job
+back to `queued` but opened its write gate. So a client write in the last
+seconds of the process could reach a bucket that a migrate had already
+copied, and the resumed job did not copy it again. Now the gate follows the
+job rows: it stays armed while a job is active, and it opens when the job
+settles, when a migrate passes its flip, or when a migrate unwinds before
+its flip.
+
 ### Changed — `config lint` refuses an empty file
 
 `config lint` now runs the same validation step as

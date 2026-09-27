@@ -81,11 +81,16 @@ pub fn spawn_worker(
                     if let Err(e) = db.maintenance_requeue_abandoned() {
                         warn!("maintenance: requeue scan failed: {}", e);
                     }
-                    db.maintenance_claim_next_job(
+                    let claimed = db.maintenance_claim_next_job(
                         &instance_id,
                         current_unix_seconds(),
                         LEASE_TTL_SECS,
-                    )
+                    );
+                    // Every tick re-derives the gate: the claim (a migrate
+                    // resumed in `cleanup` gates nothing), the requeue, and
+                    // any transition a crashed path did not sync.
+                    state.maintenance_gate.sync_from(&db);
+                    claimed
                 };
                 match claimed {
                     Ok(Some(job)) => {
@@ -113,38 +118,8 @@ async fn run_job(
     job: MaintenanceJob,
 ) {
     let bucket = job.bucket.clone();
-    // The gate is armed at job creation and at boot; re-assert for safety
-    // (idempotent) so a lost gate can never let writes race the rewrite.
-    // For migrate jobs the TRANSIENT staging route is gated too (admin
-    // copy/move endpoints could otherwise write through it mid-copy; the
-    // S3 surface can't — s3s rejects `__`-named buckets at parse time).
-    // EXCEPT: a migrate resumed in the `cleanup` phase must NOT re-arm — the
-    // flip already happened, the bucket is fully live on the new backend, and
-    // gating it would 503 client writes for the whole source-delete sweep.
-    // The `flip` phase itself STAYS armed: a crash can persist phase="flip"
-    // before the flip actually runs (bucket still routed to source), so writes
-    // there must be gated or they are lost.
-    let mut gated: Vec<String> = vec![bucket.clone()];
-    if job.kind == "migrate" {
-        if let Some(p) = job
-            .params
-            .as_deref()
-            .and_then(|j| super::migrate::parse_params(j).ok())
-        {
-            gated.push(p.transient_key);
-        }
-    }
-    let clear_gate = job.kind == "migrate" && !super::migrate::gate_armed_during(&job.phase);
-    if clear_gate {
-        // Resumed in cleanup: the gate may be armed from before the restart.
-        for k in &gated {
-            state.maintenance_gate.clear(k);
-        }
-    } else {
-        for k in &gated {
-            state.maintenance_gate.set_busy(k);
-        }
-    }
+    // The write gate needs nothing here: the claim above synced it from the
+    // rows (armed since creation; a migrate resumed in `cleanup` is not).
 
     info!(
         "maintenance: job #{} ({}) starting on bucket '{}' (phase={}, resuming={})",
@@ -188,10 +163,14 @@ async fn run_job(
         // job, or made its work fail. Neither says anything about the data:
         // never settle. Hand the row back with its cursor, so the next boot
         // resumes it at once instead of after one lease TTL.
-        let released = db
-            .lock()
-            .await
-            .maintenance_release_for_resume(job.id, instance_id);
+        // The row goes back to `queued`, still active, so its gate stays
+        // armed until the next run settles it.
+        let released = {
+            let db = db.lock().await;
+            let released = db.maintenance_release_for_resume(job.id, instance_id);
+            state.maintenance_gate.sync_from(&db);
+            released
+        };
         warn!(
             "maintenance: job #{} on '{}' stopped by shutdown ({}) — left resumable \
              (released: {:?})",
@@ -204,9 +183,6 @@ async fn run_job(
                 .unwrap_or_default(),
             released
         );
-        for k in &gated {
-            state.maintenance_gate.clear(k);
-        }
         return;
     }
 
@@ -221,10 +197,7 @@ async fn run_job(
              (the job resumes under the next claimer)",
             job.id, bucket
         );
-        let still_armed = db.lock().await.maintenance_gate_arm_keys();
-        for k in gate_keys_to_clear_after_lease_loss(&gated, still_armed) {
-            state.maintenance_gate.clear(&k);
-        }
+        state.maintenance_gate.sync_from(&*db.lock().await);
         return;
     }
 
@@ -246,12 +219,10 @@ async fn run_job(
         if let Err(e) = db.maintenance_finish(job.id, status, last_error.as_deref()) {
             warn!("maintenance: failed to settle job #{}: {}", job.id, e);
         }
+        state.maintenance_gate.sync_from(&db);
         let row = db.maintenance_job_by_id(job.id).ok().flatten();
         settled_status(status, row.as_ref().map(|j| j.status.as_str())).to_string()
     };
-    for k in &gated {
-        state.maintenance_gate.clear(k);
-    }
     info!(
         "maintenance: job #{} on '{}' finished: {}{}",
         job.id,
@@ -902,25 +873,6 @@ pub(crate) fn settled_status<'a>(computed: &'a str, row_status: Option<&'a str>)
     }
 }
 
-/// Gate keys a job may clear after it lost its lease: only the keys that
-/// no ACTIVE row still needs (`maintenance_gate_arm_keys` is the truth).
-/// The row stays active after a lapse (the requeue scan hands it back), so
-/// clearing its gate let writes race a pre-flip migrate. An unreadable DB
-/// clears nothing (fail closed: the next claim or boot re-derives it).
-pub(crate) fn gate_keys_to_clear_after_lease_loss(
-    gated: &[String],
-    still_armed: Result<Vec<String>, crate::config_db::ConfigDbError>,
-) -> Vec<String> {
-    match still_armed {
-        Ok(armed) => gated
-            .iter()
-            .filter(|k| !armed.contains(k))
-            .cloned()
-            .collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
 /// Record a per-object failure. Refuses with `Err(ShuttingDown)` once the
 /// process shuts down: a failure then is most likely the runtime teardown,
 /// not the object, and counting it would settle a healthy job with errors.
@@ -1046,33 +998,6 @@ mod tests {
         );
         assert_eq!(settled_status("failed", Some("running")), "failed");
         assert_eq!(settled_status("completed", None), "completed");
-    }
-
-    /// jobs-2: a job that lost its lease keeps the gate keys an active row
-    /// still needs (a pre-flip migrate: bucket + staging route).
-    #[test]
-    fn lease_loss_keeps_the_gate_of_an_active_row() {
-        let db = ConfigDb::in_memory("testpass").unwrap();
-        let params = r#"{"target_backend":"t","delete_source":true,"transient_key":"__dgmigrate_b_0","from_backend":"s"}"#;
-        db.maintenance_create_job("migrate", "b", "copy", Some(params), "admin", 1)
-            .unwrap()
-            .unwrap();
-        let gated = vec!["b".to_string(), "__dgmigrate_b_0".to_string()];
-        assert!(
-            gate_keys_to_clear_after_lease_loss(&gated, db.maintenance_gate_arm_keys()).is_empty()
-        );
-        // No active row → the keys clear.
-        let empty = ConfigDb::in_memory("testpass").unwrap();
-        assert_eq!(
-            gate_keys_to_clear_after_lease_loss(&gated, empty.maintenance_gate_arm_keys()),
-            gated
-        );
-        // An unreadable DB clears nothing.
-        assert!(gate_keys_to_clear_after_lease_loss(
-            &gated,
-            Err(crate::config_db::ConfigDbError::Other("x".into()))
-        )
-        .is_empty());
     }
 
     /// A `counting` phase resumed from a persisted cursor keeps the count
