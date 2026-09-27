@@ -1282,9 +1282,7 @@ impl s3s::S3 for DeltaGliderS3Service {
             crate::multipart::BeginComplete::AlreadyDone { etag } => complete_response(&etag, None),
             crate::multipart::BeginComplete::Join(rx) => match await_completion_outcome(rx).await {
                 Ok(etag) => complete_response(&etag, None),
-                Err(msg) => Err(engine_error_to_s3s(
-                    crate::api::errors::S3Error::InternalError(msg),
-                )),
+                Err(failure) => Err(failure.to_s3s()),
             },
             crate::multipart::BeginComplete::Owner(publisher) => {
                 // Admission (quota) + routing decisions run ONLY for the owner: a
@@ -1340,16 +1338,19 @@ impl s3s::S3 for DeltaGliderS3Service {
                         parts,
                         force_chunked_passthrough,
                     )
-                    .await;
+                    .await
+                    .map_err(engine_error_to_s3s);
                     match &result {
                         Ok((etag, _)) => publisher.publish(Ok(etag.clone())),
-                        Err(e) => publisher.publish(Err(e.to_string())),
+                        Err(e) => {
+                            publisher.publish(Err(crate::multipart::CompletionFailure::of(e)))
+                        }
                     }
                     result
                 });
                 match handle.await {
                     Ok(Ok((etag, meta))) => complete_response(&etag, meta.as_ref()),
-                    Ok(Err(e)) => Err(engine_error_to_s3s(e)),
+                    Ok(Err(e)) => Err(e),
                     Err(join_err) => Err(engine_error_to_s3s(
                         crate::api::errors::S3Error::InternalError(format!(
                             "completion task failed: {join_err}"
@@ -2507,7 +2508,9 @@ async fn await_completion_outcome(
             return result;
         }
         if rx.changed().await.is_err() {
-            return Err("completion task dropped before publishing".to_string());
+            return Err(crate::multipart::CompletionFailure::internal(
+                "completion task dropped before publishing",
+            ));
         }
     }
 }

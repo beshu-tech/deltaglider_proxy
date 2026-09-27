@@ -266,7 +266,38 @@ fn default_multipart_idle_ttl_hours() -> i64 {
 
 /// Thread-safe in-memory store for multipart upload state
 /// Outcome of a completion, shareable with retried Complete requests.
-pub type CompletionResult = Result<String, String>;
+pub type CompletionResult = Result<String, CompletionFailure>;
+
+/// A failed completion as the owner answered it: a joined retry answers the
+/// same S3 error, not a 500 for an owner's 400 (s3surface-17).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompletionFailure {
+    pub code: s3s::S3ErrorCode,
+    pub message: Option<String>,
+}
+
+impl CompletionFailure {
+    pub fn of(err: &s3s::S3Error) -> Self {
+        Self {
+            code: err.code().clone(),
+            message: err.message().map(str::to_string),
+        }
+    }
+
+    pub fn internal(message: &str) -> Self {
+        Self {
+            code: s3s::S3ErrorCode::InternalError,
+            message: Some(message.to_string()),
+        }
+    }
+
+    pub fn to_s3s(&self) -> s3s::S3Error {
+        match &self.message {
+            Some(message) => s3s::S3Error::with_message(self.code.clone(), message.clone()),
+            None => s3s::S3Error::new(self.code.clone()),
+        }
+    }
+}
 
 const COMPLETION_TOMBSTONE_TTL_SECS: u64 = 900;
 
@@ -323,9 +354,9 @@ impl Drop for CompletionPublisher {
     fn drop(&mut self) {
         if !self.published {
             self.store.clear_completion_slot(&self.upload_id);
-            let _ = self.tx.send(Some(Err(
-                "completion task aborted before finishing".to_string()
-            )));
+            let _ = self.tx.send(Some(Err(CompletionFailure::internal(
+                "completion task aborted before finishing",
+            ))));
         }
     }
 }
@@ -782,11 +813,9 @@ impl MultipartStore {
             }) if *f == fingerprint && b == bucket && k == key => {
                 Ok(BeginComplete::AlreadyDone { etag: etag.clone() })
             }
-            Some(CompletionSlot::Done { .. }) => Err(S3Error::InvalidPart(
-                "CompleteMultipartUpload retried with a different part list than the \
-                 completed upload"
-                    .to_string(),
-            )),
+            // The upload is complete, so it no longer exists: S3 answers
+            // NoSuchUpload to a Complete that does not match it (s3surface-17).
+            Some(CompletionSlot::Done { .. }) => Err(S3Error::NoSuchUpload(upload_id.to_string())),
             Some(CompletionSlot::InFlight {
                 fingerprint: f, rx, ..
             }) if *f == fingerprint => Ok(BeginComplete::Join(rx.clone())),
@@ -1616,9 +1645,14 @@ mod tests {
             BeginComplete::AlreadyDone { etag } => assert_eq!(etag, "\"final-etag\""),
             _ => panic!("retry after success must hit the tombstone"),
         }
-        // Tombstone with a different part list is refused; different bucket/key too.
-        assert!(store.begin_complete("up1", "b", "k", &other).is_err());
-        assert!(store.begin_complete("up1", "OTHER", "k", &parts).is_err());
+        // Tombstone with a different part list is refused; different bucket/key
+        // too. The completed upload is gone, so the answer is NoSuchUpload.
+        for (bucket, parts) in [("b", &other), ("OTHER", &parts)] {
+            assert!(matches!(
+                store.begin_complete("up1", bucket, "k", parts),
+                Err(S3Error::NoSuchUpload(_))
+            ));
+        }
     }
 
     #[tokio::test]
@@ -1629,12 +1663,32 @@ mod tests {
             BeginComplete::Owner(p) => p,
             _ => panic!("must be Owner"),
         };
-        owner.publish(Err("backend exploded".to_string()));
+        owner.publish(Err(CompletionFailure::internal("backend exploded")));
         // Failure clears the slot: the next attempt is a fresh Owner, not a join.
         assert!(matches!(
             store.begin_complete("up2", "b", "k", &parts).unwrap(),
             BeginComplete::Owner(_)
         ));
+    }
+
+    /// A joined retry answers the owner's S3 error, not a 500 (s3surface-17).
+    #[tokio::test]
+    async fn completion_joiner_sees_the_owners_error() {
+        let store = std::sync::Arc::new(MultipartStore::new(1024));
+        let parts = parts_fixture();
+        let owner = match store.begin_complete("up4", "b", "k", &parts).unwrap() {
+            BeginComplete::Owner(p) => p,
+            _ => panic!("must be Owner"),
+        };
+        let rx = match store.begin_complete("up4", "b", "k", &parts).unwrap() {
+            BeginComplete::Join(rx) => rx,
+            _ => panic!("must Join"),
+        };
+        let owner_error = s3s::S3Error::with_message(s3s::S3ErrorCode::EntityTooSmall, "tiny");
+        owner.publish(Err(CompletionFailure::of(&owner_error)));
+        let seen = rx.borrow().clone().unwrap().unwrap_err().to_s3s();
+        assert_eq!(seen.code(), &s3s::S3ErrorCode::EntityTooSmall);
+        assert_eq!(seen.message(), Some("tiny"));
     }
 
     #[tokio::test]

@@ -165,6 +165,15 @@ proxy installed the new engine before the refusal, so the new limit
 served requests while the config still showed the old one. Now every
 check runs first, and the new engine goes live as the last step.
 
+### Fixed — Retried multipart completions answer the right error
+
+A CompleteMultipartUpload for an upload that was already completed, with
+another part list, answered `400 InvalidPart`. The upload no longer exists,
+so now it answers `404 NoSuchUpload`, as S3 does. A retry that joined a
+completion in flight answered `500 InternalError` when that completion
+failed; now it answers the same error as the first request (for example a
+400).
+
 ### Fixed — A copy of an object onto itself must change something
 
 A CopyObject onto its own key with `MetadataDirective: COPY` and no other

@@ -223,9 +223,7 @@ async fn tombstone_rejects_mismatched_part_list() {
         .send()
         .await
         .expect_err("mismatched retry must be refused");
+    // The completed upload no longer exists: NoSuchUpload, as on S3.
     let msg = format!("{:?}", err.into_service_error());
-    assert!(
-        msg.contains("InvalidPart") || msg.contains("different part list"),
-        "unexpected error: {msg}"
-    );
+    assert!(msg.contains("NoSuchUpload"), "unexpected error: {msg}");
 }
