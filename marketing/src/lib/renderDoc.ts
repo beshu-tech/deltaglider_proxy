@@ -65,6 +65,32 @@ function fenceLang(codeNode: any): string {
   return m ? m.slice('language-'.length) : '';
 }
 
+/** Minimum column count at which a table stacks into cards on a phone. */
+export const STACK_TABLE_MIN_COLUMNS = 3;
+
+function childElements(node: any, tagName: string): any[] {
+  return (node?.children ?? []).filter((c: any) => c.type === 'element' && c.tagName === tagName);
+}
+
+/** Set `data-label` on each <td> from its column's <th>, and tag wide tables. */
+function labelTableCells(table: any): void {
+  const headRow = childElements(childElements(table, 'thead')[0], 'tr')[0];
+  const labels = childElements(headRow, 'th').map((th) => textOf(th).trim());
+  if (labels.length === 0) return;
+  for (const tbody of childElements(table, 'tbody')) {
+    for (const tr of childElements(tbody, 'tr')) {
+      childElements(tr, 'td').forEach((td, i) => {
+        if (labels[i]) td.properties = { ...td.properties, dataLabel: labels[i] };
+      });
+    }
+  }
+  if (labels.length >= STACK_TABLE_MIN_COLUMNS) {
+    const cls = table.properties?.className;
+    const classes = Array.isArray(cls) ? cls : cls ? [cls] : [];
+    table.properties = { ...table.properties, className: [...classes, 'docs-table-stack'] };
+  }
+}
+
 function rehypeDocRewrites(fromPath: string) {
   // Async transformer: the link/image/heading rewrites are sync, but code-fence
   // syntax highlighting (shiki) is async, so we collect fence nodes during the
@@ -93,6 +119,10 @@ function rehypeDocRewrites(fromPath: string) {
           ];
         }
       }
+      // Tables: label every body cell with its column header so a phone can
+      // stack each row as a card (docs.css). Three or more columns do not fit
+      // a phone's width, so only those tables get the stacking class.
+      if (node.tagName === 'table') labelTableCells(node);
       // "Last updated: …" paragraph → a top-right badge.
       if (node.tagName === 'p' && /^last updated:/i.test(textOf(node).trim())) {
         node.properties = { ...node.properties, className: ['cl-updated'] };

@@ -951,3 +951,111 @@
   white-space: nowrap;
 }
 .docs-prose p.cl-updated em { font-style: normal; }
+
+/* ════════════════════════════════════════════════════════════════════════
+   Phones — readability and thumb ergonomics
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* Touch screens have no hover: the code Copy button must always show, and
+   the language tag (which it would cover) steps aside. */
+@media (hover: none) {
+  .docs-copy-btn { opacity: 1; transform: none; }
+  .docs-prose .shiki-wrap[data-lang]::after { display: none; }
+  .docs-search-kbd { display: none; }
+}
+
+@media (max-width: 860px) {
+  /* Less chrome above the page title: the breadcrumb already links to the
+     docs home, and Search sits beside "Browse all docs" in one row. */
+  .docs-nav-home { display: none; }
+  .docs-sidebar {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 10px;
+    align-items: stretch;
+  }
+  .docs-sidebar > .docs-nav-panel { grid-column: 1 / -1; }
+  .docs-sidebar .docs-search-btn { margin: 0; }
+  .docs-sidebar .docs-search-btn,
+  .docs-nav-toggle { min-height: 44px; font-size: 0.95rem; }
+
+  /* Page actions: one row of 44 px pills that scrolls sideways (three rows
+     of wrapped pills pushed the title down). The cut-off last pill shows
+     that the row scrolls. TOC links: 44 px rows. */
+  .docs-page-actions {
+    flex-wrap: nowrap; gap: 8px; margin: -4px -16px 20px; padding: 0 16px;
+    overflow-x: auto; scrollbar-width: none;
+    -webkit-mask-image: linear-gradient(to right, #000 85%, transparent);
+            mask-image: linear-gradient(to right, #000 85%, transparent);
+  }
+  .docs-page-actions::-webkit-scrollbar { display: none; }
+  .docs-action { min-height: 44px; padding: 0 14px; font-size: 0.8125rem; white-space: nowrap; }
+  .docs-breadcrumb a { display: inline-block; padding: 6px 0; }
+  .docs-toc-mobile > summary { padding-top: 12px; padding-bottom: 12px; }
+  .docs-prose .docs-toc-mobile li a { padding: 12px 0; }
+  .docs-prose .docs-toc-mobile li { font-size: 0.95rem; }
+  .docs-prose .docs-toc-mobile li.docs-toc-sub a { font-size: 0.9rem; }
+  .docs-nav-children a { padding-top: 9px; padding-bottom: 9px; }
+  .docs-pager-card { min-height: 44px; }
+
+  /* Landing cards: 14 px notes instead of 13. */
+  .docs-landing-list-note, .docs-start-note { font-size: 0.9rem; }
+  .docs-start-eyebrow { font-size: 0.72rem; }
+  .docs-landing-group .docs-landing-tagline { margin-left: 0; }
+}
+
+@media (max-width: 640px) {
+  /* Code blocks: keep 14 px text but give it more of the width. */
+  .docs-prose pre { padding: 14px 14px; }
+
+  /* Table headers were 11.2 px; the scrolling table gets an edge shadow so
+     a reader can see that more columns sit off screen. */
+  .docs-prose thead th { font-size: 0.75rem; }
+  .docs-prose table:not(.docs-table-stack) {
+    background:
+      linear-gradient(to right, var(--bg), var(--bg)) left / 24px 100% no-repeat local,
+      linear-gradient(to left, var(--bg), var(--bg)) right / 24px 100% no-repeat local,
+      radial-gradient(farthest-side at 0 50%, var(--scrim-strong), transparent) left / 12px 100% no-repeat scroll,
+      radial-gradient(farthest-side at 100% 50%, var(--scrim-strong), transparent) right / 12px 100% no-repeat scroll;
+    background-color: var(--bg);
+  }
+
+  /* Three or more columns do not fit a phone. Each row becomes a card, and
+     each cell shows its column name (data-label, set by renderDoc). */
+  .docs-prose table.docs-table-stack {
+    display: block; overflow: visible; border: none; border-radius: 0;
+    font-size: 0.95rem;
+  }
+  .docs-prose table.docs-table-stack thead {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap;
+  }
+  .docs-prose table.docs-table-stack tbody { display: block; }
+  .docs-prose table.docs-table-stack tr {
+    display: block; margin: 0 0 12px;
+    border: 1px solid var(--rule); border-radius: 10px;
+    background: var(--bg-card); overflow: hidden;
+  }
+  .docs-prose table.docs-table-stack tbody td {
+    display: block; padding: 8px 14px 10px;
+    border-bottom: 1px solid var(--doc-grid-line);
+  }
+  .docs-prose table.docs-table-stack tbody td:last-child { border-bottom: none; }
+  .docs-prose table.docs-table-stack tbody td[data-label]::before {
+    content: attr(data-label);
+    display: block; margin: 0 0 2px;
+    font-family: var(--doc-label); font-size: 0.75rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-500);
+  }
+  /* The first cell names the row: it is the card's title. */
+  .docs-prose table.docs-table-stack tbody td:first-child {
+    background: var(--bg-soft); font-weight: 600; color: var(--ink-strong);
+    padding-top: 10px;
+  }
+  .docs-prose table.docs-table-stack tbody td:first-child::before { display: none; }
+  .docs-prose table.docs-table-stack tbody td:empty { display: none; }
+  .docs-prose table.docs-table-stack tbody tr:hover td { background: none; }
+  .docs-prose table.docs-table-stack tbody tr:hover td:first-child { background: var(--bg-soft); }
+  /* A card has the full width, so long code chips may wrap again. */
+  .docs-prose table.docs-table-stack td code { white-space: normal; }
+}

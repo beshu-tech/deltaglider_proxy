@@ -4,7 +4,7 @@
 // can't silently break the changelog page's hover-date / ToC logic.
 
 import { describe, it, expect } from 'vitest';
-import { VERSION_HEADING_RE, slugifyHeading } from './renderDoc';
+import { VERSION_HEADING_RE, slugifyHeading, renderDoc } from './renderDoc';
 
 const parse = (h: string) => {
   const m = h.match(VERSION_HEADING_RE);
@@ -43,5 +43,24 @@ describe('slugifyHeading', () => {
     expect(slugifyHeading('502 Bad Gateway / 504 Gateway Timeout on large uploads'))
       .toBe('502-bad-gateway--504-gateway-timeout-on-large-uploads');
     expect(slugifyHeading('The `legacy_key` shim')).toBe('the-legacy_key-shim');
+  });
+});
+
+describe('renderDoc tables', () => {
+  it('labels each body cell with its header and stacks tables of 3+ columns', async () => {
+    const html = await renderDoc(
+      '| Operation | Status | Notes |\n|---|---|---|\n| `GetObject` | Full | Delta-decoded |\n',
+      'reference/x.md',
+    );
+    expect(html).toContain('<table class="docs-table-stack">');
+    expect(html).toContain('<td data-label="Operation">');
+    expect(html).toContain('<td data-label="Status">Full</td>');
+    expect(html).toContain('<td data-label="Notes">Delta-decoded</td>');
+  });
+
+  it('labels a two-column table but does not stack it', async () => {
+    const html = await renderDoc('| Key | Value |\n|---|---|\n| a | b |\n', 'reference/x.md');
+    expect(html).not.toContain('docs-table-stack');
+    expect(html).toContain('<td data-label="Value">b</td>');
   });
 });
