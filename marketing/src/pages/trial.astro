@@ -315,39 +315,46 @@ const timeline = [
     padding: 0;
     position: relative;
   }
+  /* The line runs in the gutter between the day labels and the text, so
+     it never crosses a label. One dot per entry marks the day. */
   .tl::before {
     content: '';
     position: absolute;
-    left: 5.4rem;
-    top: 0.5rem;
-    bottom: 0.5rem;
+    left: calc(7rem + 1rem - 1px);
+    top: 0.6rem;
+    bottom: 0.6rem;
     width: 2px;
-    background: linear-gradient(180deg, var(--brand), var(--accent-strong));
-    opacity: 0.5;
+    background: var(--rule-strong);
   }
 
   .tl-item {
     display: grid;
-    grid-template-columns: 8rem 1fr;
-    gap: 1.5rem;
+    grid-template-columns: 7rem 1fr;
+    column-gap: 2rem;
     align-items: start;
     margin: 0 0 1.9rem;
     position: relative;
+  }
+  .tl-item::before {
+    content: '';
+    position: absolute;
+    left: calc(7rem + 1rem - 5px);
+    top: 0.45rem;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--brand);
+    box-shadow: 0 0 0 3px var(--bg);
   }
 
   .tl-day {
     font-family: var(--font-mono);
     font-size: 0.88rem;
     font-weight: 700;
-    color: var(--brand-dark);
+    color: var(--brand);
     text-align: right;
-    padding: 0.3rem 0.6rem;
-    border: 1px solid var(--brand-line);
-    border-radius: 8px;
-    background: var(--brand-tint);
-    text-align: center;
-    position: relative;
-    z-index: 1;
+    line-height: 1.6;
+    padding-top: 0.1rem;
   }
 
   .tl-text {
@@ -357,10 +364,12 @@ const timeline = [
     max-width: 62ch;
   }
 
+  /* Phones: the line moves to the left edge, labels sit above the text. */
   @media (max-width: 560px) {
-    .tl::before { display: none; }
-    .tl-item { grid-template-columns: 1fr; gap: 0.5rem; }
-    .tl-day { justify-self: start; }
+    .tl::before { left: 4px; }
+    .tl-item { grid-template-columns: 1fr; row-gap: 0.25rem; padding-left: 1.75rem; }
+    .tl-item::before { left: 0; }
+    .tl-day { text-align: left; }
   }
 
   /* ── honesty columns ───────────────────────────────────────────────── */
