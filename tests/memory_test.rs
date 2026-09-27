@@ -224,17 +224,17 @@ async fn test_multipart_memory_bounded() {
     // INFORMATIONAL ONLY — never gating. Raw RSS deltas flake on shared CI
     // runners.
     //
-    // KNOWN COVERAGE GAP: `large_object_e2e_test::memory_bounded_resident_part_bytes`
-    // pins the REPLICATION streaming-copy path (replication_part_bytes_resident),
-    // NOT this CLIENT CompleteMultipartUpload path — which assembles every part
-    // into one BytesMut (multipart.rs), so it is O(total_size) by design. No
-    // byte-counter exists for it, so its memory bound is deterministically
-    // unpinned; this RSS spike is the only (informational) signal. Adding a
-    // resident-bytes gauge to the client-complete assembly would restore a
-    // deterministic gate — tracked as a follow-up.
+    // The deterministic gates live elsewhere: an upload that tries no delta
+    // (this `.bin`) relays its parts to the spool from part 1
+    // (`multipart_relay_test::an_upload_that_tries_no_delta_relays_its_parts_from_the_start`),
+    // and a delta candidate is assembled in memory only up to
+    // `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES`, above which it is stored from
+    // the parts. The replication copy path is pinned by
+    // `large_object_e2e_test::memory_bounded_resident_part_bytes`. This RSS
+    // spike stays an informational signal for the whole complete.
     eprintln!(
         "[info] CompleteMultipartUpload RSS spike {:.1} MB (informational; \
-         client-complete path has no deterministic memory gate — see comment)",
+         see the comment for the deterministic gates)",
         spike as f64 / MB as f64
     );
 
