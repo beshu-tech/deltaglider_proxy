@@ -154,6 +154,18 @@ pub fn io_error_is_name_too_long(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(libc::ENAMETOOLONG) || e.kind() == std::io::ErrorKind::InvalidFilename
 }
 
+/// Pure: whether an I/O error says that a path component is a directory
+/// where a file must be, or the reverse (`EISDIR`, `ENOTDIR`). The filesystem
+/// backend stores key `a` as a file and key `a/b` under a directory `a`, so
+/// the two keys cannot coexist there.
+pub fn io_error_is_path_type_conflict(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EISDIR) | Some(libc::ENOTDIR))
+        || matches!(
+            e.kind(),
+            std::io::ErrorKind::IsADirectory | std::io::ErrorKind::NotADirectory
+        )
+}
+
 /// Abstract storage backend for S3-like object storage
 /// Uses per-file metadata following DeltaGlider schema (xattr on filesystem, S3 user metadata headers on S3)
 ///

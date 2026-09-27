@@ -3082,8 +3082,9 @@ impl aws_sdk_s3::config::Intercept for OnRetry {
 }
 
 /// With the production replay window, an SDK retry after a server 5xx
-/// succeeds. The first PutObject fails in the storage backend (a regular
-/// file sits where the key's directory must go) and the proxy answers 500.
+/// succeeds. The first PutObject fails in the storage backend (the key's
+/// directory is read-only) and the proxy answers 500. (A file where the
+/// directory must go is a 400 since review 4, so it cannot drive a 5xx.)
 /// A failed mutation gives its replay-cache slot back (`replay_slot_kept`),
 /// so the SDK's byte-identical retry is served, not refused as a replay.
 #[tokio::test]
@@ -3097,16 +3098,20 @@ async fn production_defaults_sdk_retry_after_a_5xx_succeeds() {
         .expect("filesystem backend")
         .join(server.bucket())
         .join("deltaspaces");
-    std::fs::create_dir_all(&blocker).unwrap();
     let blocker = blocker.join("blocked");
-    std::fs::write(&blocker, b"not a directory").unwrap();
+    std::fs::create_dir_all(&blocker).unwrap();
+    let set_mode = |path: &std::path::Path, mode: u32| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set_mode(&blocker, 0o555);
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let unblock = blocker.clone();
     let client = retrying_client(
         &server,
         OnRetry {
             attempts: attempts.clone(),
-            before_retry: Box::new(move || std::fs::remove_file(&unblock).unwrap()),
+            before_retry: Box::new(move || set_mode(&unblock, 0o755)),
         },
     );
 

@@ -427,13 +427,20 @@ impl FilesystemBackend {
         use crate::types::StorageInfo;
         use chrono::{DateTime, Utc};
 
+        // A directory (a key prefix) or a path under a file is no object
+        // (s3surface-2): without this a GET of `dir` answered 200 with the
+        // directory's size and then failed mid-body.
         let stat = fs::metadata(path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+            if e.kind() == std::io::ErrorKind::NotFound || super::io_error_is_path_type_conflict(&e)
+            {
                 StorageError::NotFound(path.display().to_string())
             } else {
                 StorageError::from(e)
             }
         })?;
+        if !stat.is_file() {
+            return Err(StorageError::NotFound(path.display().to_string()));
+        }
         let modified: DateTime<Utc> = stat
             .modified()
             .map(DateTime::<Utc>::from)

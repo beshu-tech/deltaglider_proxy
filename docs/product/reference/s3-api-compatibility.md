@@ -33,6 +33,15 @@ The longest key that the proxy stores depends on the backend of the bucket:
 
 A key over the limit gets `400 KeyTooLongError`. SDKs do not retry a 400.
 
+### A key and a folder with the same name (filesystem backend)
+
+The filesystem backend stores the key `a` as a file named `a`, and it stores every key that starts with `a/` inside a directory named `a`. One path cannot be a file and a directory at the same time, so on this backend an object `a` and an object under `a/` (such as `a/b`) cannot both exist. S3 has no such limit.
+
+- A `PutObject` (or copy, or multipart completion) that needs the other kind of entry gets `400 InvalidRequest`, with a message that names this limitation. SDKs do not retry a 400. To store the key, delete the other object first, or put the bucket on an S3 backend.
+- A read of a key whose path is a directory, or whose path is under a file, gets `404 NoSuchKey`, because no object has that key. A `DeleteObject` of such a key succeeds and deletes nothing.
+
+The S3 backend stores keys as S3 keys, so there both objects can exist.
+
 ## List operations
 
 | Operation | Status | Notes |

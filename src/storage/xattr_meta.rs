@@ -28,6 +28,10 @@ pub async fn read_metadata(path: &Path) -> Result<FileMetadata, StorageError> {
             "No metadata xattr on {}",
             path.display()
         ))),
+        // `a/b` under a FILE `a` cannot exist: a read of it is a miss.
+        Err(e) if super::io_error_is_path_type_conflict(&e) => Err(StorageError::NotFound(
+            format!("No object at {}", path.display()),
+        )),
         Err(e) => Err(io_to_storage_error(e)),
     })
     .await

@@ -223,3 +223,64 @@ async fn stale_if_range_serves_the_whole_object() {
     assert_eq!(resp.status().as_u16(), 206);
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"56789");
 }
+
+/// On the filesystem backend a key prefix is a directory. It never reads as
+/// an object, and a key that needs a file where a directory is (or the
+/// reverse) is a 400 that names the limitation, not a 500 (s3surface-2/9).
+#[tokio::test]
+async fn filesystem_prefix_directory_is_not_an_object() {
+    let (server, http) = signed_setup().await;
+    let (endpoint, bucket) = (server.endpoint(), server.bucket().to_string());
+    put_object(
+        &http,
+        &endpoint,
+        &bucket,
+        "dir/x.txt",
+        b"x".to_vec(),
+        "text/plain",
+    )
+    .await;
+    put_object(
+        &http,
+        &endpoint,
+        &bucket,
+        "file",
+        b"f".to_vec(),
+        "text/plain",
+    )
+    .await;
+
+    for key in ["dir", "file/child"] {
+        let url = format!("{endpoint}/{bucket}/{key}");
+        let resp = http.get(&url).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 404, "GET {key}");
+        assert!(
+            resp.text().await.unwrap().contains("NoSuchKey"),
+            "GET {key}"
+        );
+        let resp = http.head(&url).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 404, "HEAD {key}");
+        let resp = http.delete(&url).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 204, "DELETE {key}");
+
+        let resp = http.put(&url).body("new").send().await.unwrap();
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, 400, "PUT {key}: {body}");
+        assert!(body.contains("InvalidRequest"), "PUT {key}: {body}");
+        assert!(body.contains("filesystem backend"), "PUT {key}: {body}");
+    }
+    // The objects that own the paths are untouched.
+    let resp = http
+        .get(format!("{endpoint}/{bucket}/dir/x.txt"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"x");
+    let resp = http
+        .get(format!("{endpoint}/{bucket}/file"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"f");
+}

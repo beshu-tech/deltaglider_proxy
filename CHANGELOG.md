@@ -165,6 +165,17 @@ proxy installed the new engine before the refusal, so the new limit
 served requests while the config still showed the old one. Now every
 check runs first, and the new engine goes live as the last step.
 
+### Fixed — On the filesystem backend, a folder is not an object
+
+On the filesystem backend, key `a` is a file and keys under `a/` live in a
+directory `a`. A GET or HEAD of a key whose path is a directory answered 200
+with the directory's size and then failed in the body; now it answers
+`404 NoSuchKey`. A PUT that needs a file where a directory is, or the
+reverse, answered `500 InternalError`, which SDKs retry; now it answers
+`400 InvalidRequest` with a message that names the limitation. The
+[S3 API compatibility](docs/product/reference/s3-api-compatibility.md) page
+describes it.
+
 ### Fixed — A `metadata=true` listing names user metadata as HEAD does
 
 The `metadata=true` ListObjectsV2 extension named a user metadata key `foo`

@@ -217,6 +217,14 @@ pub(crate) const KEY_TOO_LONG_FS: &str = "Your key is too long for this storage 
      filesystem backend stores each '/'-separated part of a key as a file name of at most \
      255 bytes, including a '.delta' suffix on delta-compressed objects";
 
+/// The client message for a key whose path is taken by the other kind of
+/// entry on the filesystem backend (a directory where the object's file must
+/// be, or a file where its parent directory must be).
+pub(crate) const KEY_PATH_CONFLICT_FS: &str = "This key cannot be stored on the filesystem \
+     backend: it stores key 'a' as a file and keys 'a/...' under a directory 'a', so an \
+     object 'a' and an object under 'a/' cannot both exist. Delete the other object, or \
+     use an S3 backend";
+
 impl From<crate::storage::StorageError> for S3Error {
     fn from(err: crate::storage::StorageError) -> Self {
         match err {
@@ -227,6 +235,11 @@ impl From<crate::storage::StorageError> for S3Error {
                 if crate::storage::io_error_is_name_too_long(&e) =>
             {
                 S3Error::KeyTooLong(KEY_TOO_LONG_FS.to_string())
+            }
+            crate::storage::StorageError::Io(e)
+                if crate::storage::io_error_is_path_type_conflict(&e) =>
+            {
+                S3Error::InvalidRequest(KEY_PATH_CONFLICT_FS.to_string())
             }
             crate::storage::StorageError::MetadataTooLarge(msg) => {
                 S3Error::InvalidArgument(format!("MetadataTooLarge: {msg}"))
@@ -327,6 +340,22 @@ mod tests {
                 f.display()
             );
         }
+    }
+
+    /// A filesystem key whose path is the other kind of entry is a client
+    /// error that names the limitation, never a retried 500 (s3surface-9).
+    #[test]
+    fn filesystem_path_type_conflict_is_invalid_request() {
+        for errno in [libc::EISDIR, libc::ENOTDIR] {
+            let err: S3Error =
+                crate::storage::StorageError::Io(std::io::Error::from_raw_os_error(errno)).into();
+            assert_eq!(err.code(), "InvalidRequest", "errno {errno}");
+            assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+            assert!(err.to_string().contains("filesystem backend"));
+        }
+        let other: S3Error =
+            crate::storage::StorageError::Io(std::io::Error::from_raw_os_error(libc::EIO)).into();
+        assert_eq!(other.code(), "InternalError");
     }
 
     /// Regression: EntityTooLarge must return 413, not 400.
