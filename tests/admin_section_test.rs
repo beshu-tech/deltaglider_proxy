@@ -713,7 +713,7 @@ async fn defaults_with_section_filter_returns_section_schema() {
 }
 
 #[tokio::test]
-async fn defaults_without_section_returns_full_config_schema() {
+async fn defaults_without_section_returns_the_sectioned_document_schema() {
     let server = TestServer::builder()
         .auth("SECKEY13", "SECSECRET13")
         .build()
@@ -727,7 +727,7 @@ async fn defaults_without_section_returns_full_config_schema() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let schema: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(schema["title"], "Config");
+    assert_eq!(schema["title"], "SectionedConfig");
 }
 
 // ═══════════════════════════════════════════════════
