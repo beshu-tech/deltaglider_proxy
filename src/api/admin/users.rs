@@ -83,12 +83,11 @@ pub(super) fn rebuild_iam_index<B: ErrorBody>(
 /// must not auto-author a `legacy-admin` user that YAML didn't declare.
 /// Callers outside the declarative reconcile path keep the legacy
 /// behaviour via the public [`rebuild_iam_index`] entry point.
-pub(super) fn rebuild_iam_index_declarative(
+pub(super) fn rebuild_iam_index_declarative<B: ErrorBody>(
     db: &ConfigDb,
     iam_state: &SharedIamState,
-) -> Result<(), StatusCode> {
-    rebuild_iam_index_inner(db, iam_state, true)
-        .map_err(|e| AdminError::<Bare>::from(e).status_code())
+) -> Result<(), AdminError<B>> {
+    Ok(rebuild_iam_index_inner(db, iam_state, true)?)
 }
 
 fn rebuild_iam_index_inner(

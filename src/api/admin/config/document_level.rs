@@ -25,7 +25,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::super::{audit_log, AdminState};
+use super::super::{audit_log, AdminError, AdminState, Bare};
 use super::write::{
     self, Built, ConfigWrite, EnvRefs, Mode, Outcome, Rejection, ScrubEnv, Stage, Surface,
     WriteResult,
@@ -119,7 +119,7 @@ pub struct SectionFilterQuery {
 pub async fn export_config(
     State(state): State<Arc<AdminState>>,
     AdminQuery(query): AdminQuery<SectionFilterQuery>,
-) -> impl IntoResponse {
+) -> Result<Response, AdminError> {
     let cfg = state.config.read().await;
     let redacted = cfg.redact_all_secrets();
     // The version an apply sends back in `If-Match`: of the whole document,
@@ -131,34 +131,18 @@ pub async fn export_config(
 
     let Some(section_name) = query.section.as_deref() else {
         // Full document path — unchanged from the pre-Wave-1 behavior.
-        return match redacted.to_canonical_yaml() {
-            Ok(yaml) => (
-                StatusCode::OK,
-                [
-                    (
-                        axum::http::header::CONTENT_TYPE,
-                        axum::http::HeaderValue::from_static("application/yaml"),
-                    ),
-                    etag,
-                ],
-                yaml,
-            )
-                .into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to serialize config to YAML: {}", e),
-            )
-                .into_response(),
-        };
+        let yaml = redacted.to_canonical_yaml().map_err(|e| {
+            AdminError::internal(format!("failed to serialize config to YAML: {}", e))
+        })?;
+        return Ok(yaml_response(yaml, etag));
     };
 
     // Section-scoped export. We reuse the SectionedConfig projection
     // the full export does, then pick out just the requested slice.
     // Each section serializes as `<name>:\n  ...` — valid standalone
     // YAML that can be edited and posted back via section PUT.
-    let Some(section) = SectionName::parse(section_name) else {
-        return (StatusCode::NOT_FOUND, unknown_section_error(section_name)).into_response();
-    };
+    let section = SectionName::parse(section_name)
+        .ok_or_else(|| AdminError::not_found(unknown_section_error(section_name)))?;
     let sectioned = crate::config_sections::SectionedConfig::from_flat(&redacted);
     let value = match section {
         SectionName::Admission => serde_yaml::to_value(sectioned.admission.unwrap_or_default()),
@@ -166,40 +150,35 @@ pub async fn export_config(
         SectionName::Storage => serde_yaml::to_value(sectioned.storage),
         SectionName::Advanced => serde_yaml::to_value(sectioned.advanced),
     };
-    let yaml_value = match value {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to serialize section: {}", e),
-            )
-                .into_response();
-        }
-    };
+    let yaml_value =
+        value.map_err(|e| AdminError::internal(format!("failed to serialize section: {}", e)))?;
     let mut map = serde_yaml::Mapping::new();
     map.insert(
         serde_yaml::Value::String(section.as_str().to_string()),
         yaml_value,
     );
-    match serde_yaml::to_string(&serde_yaml::Value::Mapping(map)) {
-        Ok(s) => (
-            StatusCode::OK,
-            [
-                (
-                    axum::http::header::CONTENT_TYPE,
-                    axum::http::HeaderValue::from_static("application/yaml"),
-                ),
-                etag,
-            ],
-            s,
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to serialize section to YAML: {}", e),
-        )
-            .into_response(),
-    }
+    let s = serde_yaml::to_string(&serde_yaml::Value::Mapping(map))
+        .map_err(|e| AdminError::internal(format!("failed to serialize section to YAML: {}", e)))?;
+    Ok(yaml_response(s, etag))
+}
+
+/// A 200 `application/yaml` body with the given `ETag`.
+fn yaml_response(
+    yaml: String,
+    etag: (axum::http::HeaderName, axum::http::HeaderValue),
+) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/yaml"),
+            ),
+            etag,
+        ],
+        yaml,
+    )
+        .into_response()
 }
 
 /// `GET /api/admin/config/defaults[?section=<name>]` — JSON Schema for
@@ -213,7 +192,7 @@ pub async fn export_config(
 /// per-section YAML linting.
 pub async fn config_defaults(
     AdminQuery(query): AdminQuery<SectionFilterQuery>,
-) -> impl IntoResponse {
+) -> Result<Response, AdminError> {
     let schema = match query.section.as_deref() {
         None => serde_json::to_value(crate::cli::config::canonical_schema()),
         Some(name) => match SectionName::parse(name) {
@@ -229,24 +208,17 @@ pub async fn config_defaults(
             Some(SectionName::Advanced) => serde_json::to_value(schemars::schema_for!(
                 crate::config_sections::AdvancedSection
             )),
-            None => {
-                return (StatusCode::NOT_FOUND, unknown_section_error(name)).into_response();
-            }
+            None => return Err(AdminError::not_found(unknown_section_error(name))),
         },
     };
-    match schema {
-        Ok(v) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/schema+json")],
-            Json(v),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to serialize schema: {}", e),
-        )
-            .into_response(),
-    }
+    let v =
+        schema.map_err(|e| AdminError::internal(format!("failed to serialize schema: {}", e)))?;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/schema+json")],
+        Json(v),
+    )
+        .into_response())
 }
 
 /// Parse a YAML config document and collect validation warnings.
@@ -595,43 +567,28 @@ pub async fn export_declarative_iam(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<ExportIamQuery>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    let Some(db_arc) = state.config_db.as_ref() else {
-        return (
-            StatusCode::NOT_FOUND,
-            "config DB not initialised — nothing to export".to_string(),
-        )
-            .into_response();
-    };
+) -> Result<Response, AdminError> {
+    let db_arc = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not initialised — nothing to export"))?;
     let db = db_arc.lock().await;
     // `include_secrets=true` produces a lossless, round-trippable full-IAM file
     // (the "Export full IAM (YAML)" affordance). The file then contains LIVE
     // credentials — the UI warns the operator and the route is admin-gated.
-    let snapshot = match crate::iam::export_as_declarative_inner(&db, q.include_secrets) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("export_as_declarative: {}", e),
-            )
-                .into_response();
-        }
-    };
+    let snapshot = crate::iam::export_as_declarative_inner(&db, q.include_secrets)
+        .map_err(|e| AdminError::internal(format!("export_as_declarative: {}", e)))?;
     // #71 review: the reconciler keys users by NAME, so a same-name pair cannot
     // be represented in this YAML. User names are unique since schema v25, so
     // this is a safety check: refuse rather than hand back a file that cannot
     // be re-imported.
     if let Some(name) = crate::iam::duplicate_user_name(&snapshot) {
-        return (
-            StatusCode::CONFLICT,
-            format!(
-                "full-IAM export cannot represent two users named '{name}': the reconciler \
+        return Err(AdminError::conflict(format!(
+            "full-IAM export cannot represent two users named '{name}': the reconciler \
                  keys users by name, so this database's same-name pair would not round-trip. \
                  Use the admin backup (POST /_/api/admin/backup) for a lossless artifact, or \
                  rename one of the users."
-            ),
-        )
-            .into_response();
+        )));
     }
     drop(db);
     if q.include_secrets {
@@ -676,19 +633,14 @@ pub async fn export_declarative_iam(
         serde_yaml::Value::Mapping(access_map),
     );
 
-    match serde_yaml::to_string(&serde_yaml::Value::Mapping(root)) {
-        Ok(yaml) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/yaml")],
-            yaml,
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("serialize declarative IAM to YAML: {}", e),
-        )
-            .into_response(),
-    }
+    let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(root))
+        .map_err(|e| AdminError::internal(format!("serialize declarative IAM to YAML: {}", e)))?;
+    Ok((
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/yaml")],
+        yaml,
+    )
+        .into_response())
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -743,23 +695,15 @@ fn parse_iam_yaml(yaml: &str) -> Result<crate::iam::DeclarativeIam, String> {
 pub async fn validate_declarative_iam(
     State(state): State<Arc<AdminState>>,
     AdminJson(body): AdminJson<ConfigDocumentRequest>,
-) -> impl IntoResponse {
-    let Some(db_arc) = state.config_db.as_ref() else {
-        return (
-            StatusCode::NOT_FOUND,
-            "config DB not initialised — IAM import unavailable".to_string(),
-        )
-            .into_response();
-    };
-    let snapshot = match parse_iam_yaml(&body.yaml) {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
-    };
+) -> Result<Json<IamImportSummary>, AdminError> {
+    let db_arc = state.config_db.as_ref().ok_or_else(|| {
+        AdminError::not_found("config DB not initialised — IAM import unavailable")
+    })?;
+    let snapshot = parse_iam_yaml(&body.yaml).map_err(AdminError::invalid)?;
     let db = db_arc.lock().await;
-    match crate::iam::preview_declarative_iam(&db, &snapshot) {
-        Ok(diff) => Json(summarise_diff(&diff)).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, format!("validation failed: {e}")).into_response(),
-    }
+    let diff = crate::iam::preview_declarative_iam(&db, &snapshot)
+        .map_err(|e| AdminError::invalid(format!("validation failed: {e}")))?;
+    Ok(Json(summarise_diff(&diff)))
 }
 
 /// `POST /_/api/admin/config/declarative-iam-apply` — apply a full-IAM YAML
@@ -768,42 +712,29 @@ pub async fn apply_declarative_iam(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AdminJson(body): AdminJson<ConfigDocumentRequest>,
-) -> impl IntoResponse {
-    let Some(db_arc) = state.config_db.as_ref() else {
-        return (
-            StatusCode::NOT_FOUND,
-            "config DB not initialised — IAM import unavailable".to_string(),
-        )
-            .into_response();
-    };
-    let snapshot = match parse_iam_yaml(&body.yaml) {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
-    };
+) -> Result<Json<IamImportSummary>, AdminError> {
+    let db_arc = state.config_db.as_ref().ok_or_else(|| {
+        AdminError::not_found("config DB not initialised — IAM import unavailable")
+    })?;
+    let snapshot = parse_iam_yaml(&body.yaml).map_err(AdminError::invalid)?;
 
     let db = db_arc.lock().await;
-    let stats = match crate::iam::reconcile_declarative_iam(&db, &snapshot) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("IAM import failed (no state changed): {e}"),
-            )
-                .into_response();
-        }
-    };
+    let stats = crate::iam::reconcile_declarative_iam(&db, &snapshot)
+        .map_err(|e| AdminError::invalid(format!("IAM import failed (no state changed): {e}")))?;
     // Rebuild the in-memory index from the now-committed DB. Use the
     // `_declarative` variant (bumps IAM_VERSION for test barriers AND skips the
     // legacy-admin auto-migration): a full-IAM YAML import is authoritative for
     // the entire IAM set, so we must not silently auto-author a `legacy-admin`
     // row the imported document didn't declare — same contract as the
     // declarative config-apply path (config/mod.rs).
-    if let Err(e) = super::super::users::rebuild_iam_index_declarative(&db, &state.iam_state) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("rebuild_iam_index after IAM import: {e:?}"),
-        )
-            .into_response();
+    if let Err(e) =
+        super::super::users::rebuild_iam_index_declarative::<Bare>(&db, &state.iam_state)
+    {
+        // The message names the status only, as it always did.
+        return Err(AdminError::internal(format!(
+            "rebuild_iam_index after IAM import: {:?}",
+            e.status_code()
+        )));
     }
     drop(db);
 
@@ -817,7 +748,7 @@ pub async fn apply_declarative_iam(
     }
     tracing::info!("[iam-yaml-import] {}", stats.summary_line());
 
-    Json(summarise_stats(&stats)).into_response()
+    Ok(Json(summarise_stats(&stats)))
 }
 
 fn summarise_diff(diff: &crate::iam::IamDiff) -> IamImportSummary {

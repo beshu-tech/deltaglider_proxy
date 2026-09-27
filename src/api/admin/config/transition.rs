@@ -11,7 +11,7 @@ use axum::http::HeaderMap;
 use tokio::sync::RwLockWriteGuard;
 use tracing_subscriber::EnvFilter;
 
-use super::super::AdminState;
+use super::super::{AdminState, Bare};
 use crate::api::handlers::AppState;
 use crate::config::Config;
 use crate::iam::{AuthConfig, IamState};
@@ -435,10 +435,13 @@ async fn reconcile_declarative_iam(
     // warning, never an `Err` (the caller would keep the old config over
     // the new DB). The `_declarative` variant skips the legacy-admin
     // auto-migration: YAML is authoritative.
-    if let Err(e) = super::super::users::rebuild_iam_index_declarative(&db, &state.iam_state) {
+    if let Err(e) =
+        super::super::users::rebuild_iam_index_declarative::<Bare>(&db, &state.iam_state)
+    {
         warnings.push(format!(
             "declarative IAM reconciled, but the in-memory IAM index could not be rebuilt \
-             ({e:?}): the previous index serves until the next IAM change or restart"
+             ({:?}): the previous index serves until the next IAM change or restart",
+            e.status_code()
         ));
     }
     drop(db);
