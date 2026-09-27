@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useId, useState } from 'react';
 import { Button, Typography, Input, Alert, Switch, Divider, Spin, message } from 'antd';
 import { PlusOutlined, SearchOutlined, CopyOutlined, SafetyOutlined, CheckCircleOutlined, CloseCircleOutlined, SyncOutlined } from '@ant-design/icons';
 import {
@@ -476,6 +476,8 @@ interface ProviderFormProps {
 function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDeleted, onTest }: ProviderFormProps) {
   const colors = useColors();
   const label = useFormLabelStyle();
+  const labelBlock = { ...label, display: 'block' };
+  const fid = useId();
   const isEdit = provider !== null;
 
   const createMutation = useCreateAuthProvider();
@@ -576,22 +578,23 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
 
   return (
     <div style={{ background: colors.BG_CARD, border: `1px solid ${colors.BORDER}`, borderRadius: 10, padding: 20 }}>
-      <div style={label}>Display Name</div>
-      <Input value={formDisplayName} onChange={e => setFormDisplayName(e.target.value)} placeholder="Google Workspace" disabled={readOnly} style={{ marginBottom: 12 }} />
+      <label htmlFor={`${fid}-display`} style={labelBlock}>Display Name</label>
+      <Input id={`${fid}-display`} value={formDisplayName} onChange={e => setFormDisplayName(e.target.value)} placeholder="Google Workspace" disabled={readOnly} style={{ marginBottom: 12 }} />
 
-      <div style={label}>Provider Name (unique identifier)</div>
-      <Input value={formName} onChange={e => setFormName(e.target.value)} placeholder="google-corp" disabled={readOnly} style={{ marginBottom: 12 }} />
+      <label htmlFor={`${fid}-name`} style={labelBlock}>Provider Name (unique identifier)</label>
+      <Input id={`${fid}-name`} value={formName} onChange={e => setFormName(e.target.value)} placeholder="google-corp" disabled={readOnly} style={{ marginBottom: 12 }} />
 
-      <div style={label}>Issuer URL</div>
-      <Input value={formIssuerUrl} onChange={e => setFormIssuerUrl(e.target.value)} placeholder="https://accounts.google.com" disabled={readOnly} style={{ marginBottom: 12 }} />
+      <label htmlFor={`${fid}-issuer`} style={labelBlock}>Issuer URL</label>
+      <Input id={`${fid}-issuer`} value={formIssuerUrl} onChange={e => setFormIssuerUrl(e.target.value)} placeholder="https://accounts.google.com" disabled={readOnly} style={{ marginBottom: 12 }} />
 
-      <div style={label}>Client ID</div>
-      <Input value={formClientId} onChange={e => setFormClientId(e.target.value)} placeholder="123456.apps.googleusercontent.com" disabled={readOnly} style={{ marginBottom: 12 }} />
+      <label htmlFor={`${fid}-client-id`} style={labelBlock}>Client ID</label>
+      <Input id={`${fid}-client-id`} value={formClientId} onChange={e => setFormClientId(e.target.value)} placeholder="123456.apps.googleusercontent.com" disabled={readOnly} style={{ marginBottom: 12 }} />
 
       {!readOnly && (
         <>
-          <div style={label}>Client Secret</div>
+          <label htmlFor={`${fid}-secret`} style={labelBlock}>Client Secret</label>
           <MaskedSecretInput
+            id={`${fid}-secret`}
             mode={isEdit ? 'blank-keeps' : 'new'}
             value={formClientSecret}
             onChange={setFormClientSecret}
@@ -601,8 +604,8 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
         </>
       )}
 
-      <div style={label}>Scopes</div>
-      <Input value={formScopes} onChange={e => setFormScopes(e.target.value)} disabled={readOnly} style={{ marginBottom: 12 }} />
+      <label htmlFor={`${fid}-scopes`} style={labelBlock}>Scopes</label>
+      <Input id={`${fid}-scopes`} value={formScopes} onChange={e => setFormScopes(e.target.value)} disabled={readOnly} style={{ marginBottom: 12 }} />
 
       {/* Callback URL */}
       <div style={label}>Callback URL (register this with your provider)</div>
@@ -638,11 +641,11 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
         requests to any address that the issuer and its discovery document name, so a wrong
         issuer URL can reach internal services. Cloud metadata addresses stay refused.
       </div>
-      <label htmlFor={`ca-cert-${provider?.id ?? 'new'}`} style={{ ...label, display: 'block' }}>
+      <label htmlFor={`${fid}-ca-cert`} style={labelBlock}>
         CA certificate file
       </label>
       <Input
-        id={`ca-cert-${provider?.id ?? 'new'}`}
+        id={`${fid}-ca-cert`}
         value={formCaCertPath}
         onChange={e => setFormCaCertPath(e.target.value)}
         placeholder="/etc/deltaglider/idp-ca.pem"
@@ -666,7 +669,7 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginBottom: 16 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <Switch checked={formEnabled} onChange={setFormEnabled} size="small" disabled={readOnly} />
+          <Switch checked={formEnabled} onChange={setFormEnabled} size="small" disabled={readOnly} aria-label="Enabled" />
           <Text style={{ fontSize: 13 }}>Enabled</Text>
         </div>
       </div>

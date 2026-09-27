@@ -33,7 +33,8 @@
  *   it into the form state. That avoids FormField needing to know about
  *   the form controller (react-hook-form vs. uncontrolled input).
  */
-import type { CSSProperties, ReactNode } from 'react';
+import { Children, Fragment, cloneElement, isValidElement, useId } from 'react';
+import type { CSSProperties, ReactElement, ReactNode } from 'react';
 import { Tag } from 'antd';
 import { useColors } from '../ThemeContext';
 import { useEnvOverride } from '../queries/config';
@@ -82,6 +83,36 @@ interface FormFieldProps {
   style?: CSSProperties;
 }
 
+interface LabelledProps {
+  id?: string;
+  'aria-label'?: string;
+  'aria-labelledby'?: string;
+}
+
+/**
+ * Give the single control child the label: `id` (for `<label htmlFor>`)
+ * when it has none, and `aria-labelledby` for controls a `<label>` cannot
+ * name (a radio group's div), unless the child carries its own
+ * `aria-label`. AntD Input/InputNumber/Select/Switch forward
+ * both to their focusable element. Anything else renders untouched.
+ */
+function labelChild(children: ReactNode, controlId: string, labelId: string): ReactNode {
+  if (Children.count(children) !== 1 || !isValidElement(children) || children.type === Fragment) {
+    return children;
+  }
+  const child = children as ReactElement<LabelledProps>;
+  return cloneElement(child, {
+    id: child.props.id ?? controlId,
+    // A caller's own aria-label wins (aria-labelledby would override it).
+    'aria-labelledby': child.props['aria-label'] ? undefined : (child.props['aria-labelledby'] ?? labelId),
+  });
+}
+
+/** The id a FormField gives its control: `useId`, unless the child brings one. */
+function controlIdOf(children: ReactNode, fallback: string): string {
+  return isValidElement<LabelledProps>(children) && children.props.id ? children.props.id : fallback;
+}
+
 export default function FormField({
   label,
   yamlPath,
@@ -106,6 +137,9 @@ export default function FormField({
     : envVar
       ? `set with env ${envVar}`
       : undefined;
+  const baseId = useId();
+  const labelId = `${baseId}-label`;
+  const controlId = controlIdOf(children, `${baseId}-control`);
   const barColour = overrideColour || ACCENT_AMBER; // amber — matches §2.6 "override" indicator
   // Tight groups, air between: the label→input→help unit hugs together; the
   // BIG gap lives at the bottom of the group so each field reads as one chunk.
@@ -143,11 +177,13 @@ export default function FormField({
           flexWrap: 'wrap',
         }}
       >
-        <span
+        <label
+          id={labelId}
+          htmlFor={envOverride ? undefined : controlId}
           style={{ color: TEXT, fontSize: 13.5, fontWeight: 600, letterSpacing: '-0.005em' }}
         >
           {label}
-        </span>
+        </label>
         {yamlPath && (
           <code
             className="dg-yaml-path"
@@ -201,7 +237,7 @@ export default function FormField({
           {envOverrideText(envOverride)}
         </div>
       ) : (
-        <div>{children}</div>
+        <div>{labelChild(children, controlId, labelId)}</div>
       )}
       {/* Help text — clearly subordinate: smaller, fainter, tight line-height.
           Example chips share this row. */}

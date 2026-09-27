@@ -60,6 +60,10 @@ interface BaseProps {
    * only controls whether the dots-toggle eye is present.
    */
   reveal?: boolean;
+  /** Forwarded to the input, so a FormField label names it. */
+  id?: string;
+  'aria-label'?: string;
+  'aria-labelledby'?: string;
 }
 
 interface SentinelProps extends BaseProps {
@@ -117,6 +121,9 @@ export default function MaskedSecretInput(props: MaskedSecretInputProps) {
       placeholder={resolvedPlaceholder}
       size={size}
       autoComplete={autoComplete}
+      id={props.id}
+      aria-label={props['aria-label']}
+      aria-labelledby={props['aria-labelledby']}
       style={{
         fontFamily: 'var(--font-mono)',
         color: colors.TEXT_PRIMARY,

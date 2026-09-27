@@ -46,3 +46,14 @@ test('clearing the display name sends it cleared', async () => {
   const body = http.callsTo('PUT', '/_/api/admin/ext-auth/providers/7')[0].body as Record<string, unknown>;
   expect(body.display_name).toBe('');
 });
+
+test('every provider form field is named by its label', async () => {
+  const user = userEvent.setup();
+  renderWithQuery(<AuthenticationPanel />);
+  await user.click(await screen.findByText('Corp SSO'));
+  for (const name of ['Display Name', 'Provider Name (unique identifier)', 'Issuer URL', 'Client ID', 'Scopes', 'CA certificate file']) {
+    expect(screen.getByRole('textbox', { name })).toBeInTheDocument();
+  }
+  expect(screen.getByLabelText('Client Secret')).toBeInTheDocument();
+  expect(screen.getByRole('switch', { name: 'Enabled' })).toBeInTheDocument();
+});
