@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed — A ZIP download stops reading when the client goes away
+
+The admin ZIP download noticed a closed connection only when it sent the next
+bytes. While it skipped objects that it could not open, or while it waited
+for a slow backend, it sent nothing, so it continued to open and read the
+selected objects for nobody. Now it stops as soon as the client is gone.
+
 ### Changed — A missing config DB answers 503 on every admin endpoint
 
 When an instance has no config DB open, the IAM, group, external-auth,

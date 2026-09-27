@@ -379,9 +379,10 @@ where
         for entry in entries {
             let src = match entry.opened {
                 Some(src) => src,
-                None => match open(&entry.key).await {
-                    Ok(src) => src,
-                    Err(reason) => {
+                None => match until_closed(&tx, open(&entry.key)).await {
+                    Err(_) => return,
+                    Ok(Ok(src)) => src,
+                    Ok(Err(reason)) => {
                         skipped.push((entry.label, reason));
                         continue;
                     }
@@ -427,6 +428,20 @@ enum Stop {
     Failed(io::Error),
 }
 
+/// Run `fut` unless the client goes away first. A skip or a slow backend
+/// sends nothing, so the next send alone would notice the client too late:
+/// the producer would keep opening and reading objects for nobody.
+async fn until_closed<T>(
+    tx: &tokio::sync::mpsc::Sender<io::Result<Bytes>>,
+    fut: impl Future<Output = T>,
+) -> Result<T, Stop> {
+    tokio::select! {
+        biased;
+        _ = tx.closed() => Err(Stop::Closed),
+        v = fut => Ok(v),
+    }
+}
+
 async fn pump(
     tx: &tokio::sync::mpsc::Sender<io::Result<Bytes>>,
     w: &mut ZipWriter,
@@ -439,7 +454,7 @@ async fn pump(
         .map_err(|e| Stop::Failed(io::Error::other(e)))?;
     send(header).await?;
     let mut body = src.body;
-    while let Some(chunk) = body.next().await {
+    while let Some(chunk) = until_closed(tx, body.next()).await? {
         let chunk = chunk.map_err(Stop::Failed)?;
         w.write_data(&chunk);
         send(chunk).await?;
@@ -811,17 +826,75 @@ mod tests {
         );
         drop(s);
         // The producer task ends and drops `open` (and its counter clone).
-        for _ in 0..1000 {
-            if std::sync::Arc::strong_count(&opened) == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            std::sync::Arc::strong_count(&opened),
-            1,
+        assert!(
+            within(10, || std::sync::Arc::strong_count(&opened) == 1).await,
             "producer still runs"
         );
         assert!(opened.load(Ordering::SeqCst) <= ahead + 1);
+    }
+
+    /// Poll `done` until it holds or `secs` pass (no fixed yield count: a
+    /// loaded host can need many more turns).
+    async fn within(secs: u64, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while tokio::time::Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        done()
+    }
+
+    /// A client that goes away stops the producer at once, also when it
+    /// sends nothing: while it skips unopenable entries, and while an open
+    /// or a body read waits on the backend.
+    #[tokio::test]
+    async fn a_gone_client_stops_the_producer_before_the_next_open() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // (open result, body) per case: every open fails (a skip sends
+        // nothing), every open hangs, and a body read that hangs.
+        for case in ["skip", "hang_open", "hang_body"] {
+            let opened = std::sync::Arc::new(AtomicUsize::new(0));
+            let mut first = entry("first");
+            first.opened = Some(src(b"x"));
+            let entries: Vec<Entry<String>> = std::iter::once(first)
+                .chain((0..1000).map(|i| entry(&format!("{i}"))))
+                .collect();
+            let counter = opened.clone();
+            let mut s = Box::pin(stream_archive(
+                Limits::ZIP,
+                entries,
+                vec![],
+                move |_: &String| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        // Let the client's drop land between two opens.
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        match case {
+                            "skip" => Err("NoSuchKey".to_string()),
+                            "hang_open" => std::future::pending().await,
+                            _ => Ok(EntrySource {
+                                size: 1,
+                                modified: t0(),
+                                body: futures::stream::pending().boxed(),
+                            }),
+                        }
+                    }
+                },
+                |_: &[String], _: &[(String, String)]| None,
+            ));
+            s.next().await.unwrap().unwrap();
+            drop(s);
+            assert!(
+                within(10, || std::sync::Arc::strong_count(&opened) == 1).await,
+                "{case}: the producer still runs"
+            );
+            let n = opened.load(Ordering::SeqCst);
+            assert!(
+                n <= 2,
+                "{case}: the producer opened {n} entries after the client left"
+            );
+        }
     }
 }
