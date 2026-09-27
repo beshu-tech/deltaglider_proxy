@@ -1781,3 +1781,73 @@ async fn admin_error_bodies_keep_their_shape() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// The session gates' error bodies: the SPA signs in again on a 401, or a
+/// 403 whose JSON `error` is `admin_session_required`.
+#[tokio::test]
+async fn session_gate_error_bodies_keep_their_shape() {
+    let server = TestServer::filesystem().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let api = |p: &str| format!("{ep}/_/api/admin{p}");
+    let reader = create_user(
+        &admin,
+        &ep,
+        "gate-reader",
+        json!([{ "actions": ["read", "list"], "resources": ["*"] }]),
+    )
+    .await;
+    let unauthorized = || ErrorBody::Json(json!({ "error": "unauthorized" }));
+
+    let anon = reqwest::Client::builder().no_proxy().build().unwrap();
+    for (what, req) in [
+        ("admin gui gate", anon.get(api("/users"))),
+        ("session gate", anon.get(api("/jobs/bucket/releases"))),
+        (
+            "bulk gate",
+            anon.post(api("/objects/delete")).json(&json!({})),
+        ),
+    ] {
+        let got = error_body(req.send().await.unwrap()).await;
+        assert_eq!(got, (StatusCode::UNAUTHORIZED, unauthorized()), "{what}");
+    }
+
+    let lift = reqwest::Client::builder()
+        .cookie_store(true)
+        .no_proxy()
+        .build()
+        .unwrap();
+    let resp = lift
+        .post(api("/session/browser-connect"))
+        .json(&json!({
+            "access_key_id": reader["access_key_id"],
+            "secret_access_key": reader["secret_access_key"],
+            "endpoint": ep, "bucket": "", "region": "us-east-1",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let got = error_body(lift.get(api("/config")).send().await.unwrap()).await;
+    assert_eq!(
+        got,
+        (
+            StatusCode::FORBIDDEN,
+            ErrorBody::Json(json!({ "error": "admin_session_required" }))
+        )
+    );
+    let cleared = lift
+        .delete(api("/session/s3-credentials"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cleared.status(), StatusCode::OK);
+    let got = error_body(
+        lift.get(api("/session/s3-credentials"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(got, (StatusCode::NOT_FOUND, ErrorBody::Empty));
+}
