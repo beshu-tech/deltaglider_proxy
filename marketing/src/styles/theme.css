@@ -45,6 +45,11 @@
   --accent-wash: rgba(217, 70, 239, 0.11);
   --accent-strong: rgba(217, 70, 239, 0.5);
 
+  /* Warning amber: key chips and calculator warnings */
+  --amber-ink: #fcd34d;
+  --amber-wash: rgba(252, 211, 77, 0.08);
+  --amber-line: rgba(252, 211, 77, 0.4);
+
   /* Semantic aliases */
   --ink: var(--ink-900);
   --ink-strong: #ffffff;
@@ -127,6 +132,11 @@
   --accent: #c026d3;
   --accent-wash: rgba(192, 38, 211, 0.1);
   --accent-strong: rgba(192, 38, 211, 0.45);
+
+  /* Amber text on the light page: #fcd34d was 1.3:1, #92400e is 6.6:1. */
+  --amber-ink: #92400e;
+  --amber-wash: rgba(180, 83, 9, 0.08);
+  --amber-line: rgba(180, 83, 9, 0.35);
 
   --ink: var(--ink-900);
   --ink-strong: #020617;

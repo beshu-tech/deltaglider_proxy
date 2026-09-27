@@ -250,12 +250,12 @@
 }
 
 .warning-chip {
-  background: rgba(245, 158, 11, 0.1);
-  border: 1px solid rgba(245, 158, 11, 0.3);
+  background: var(--amber-wash);
+  border: 1px solid var(--amber-line);
   border-radius: 4px;
   padding: 0.5rem 0.75rem;
   font-size: 0.85rem;
-  color: #fcd34d;
+  color: var(--amber-ink);
   margin: 0.3rem 0;
 }
 
