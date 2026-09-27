@@ -151,7 +151,8 @@ pub struct Config {
     /// Explicit authentication mode selector.
     ///
     /// Accepted values:
-    ///   - `"none"` — Open access, no SigV4 verification. Must be explicit.
+    ///   - `"none"` — Open access: no identity. Must be explicit. A signed
+    ///     request is still verified, with the access key as the secret.
     ///
     /// When absent, the proxy infers the mode from credentials:
     ///   - Credentials present → bootstrap or IAM mode (auto-detected)

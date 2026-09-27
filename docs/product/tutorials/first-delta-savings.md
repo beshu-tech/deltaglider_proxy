@@ -20,11 +20,14 @@ You should see the proxy come up and complain loudly about open access:
 
 ```
 INFO Starting DeltaGlider Proxy v1.4.2 (built ...)
-WARN   Authentication: DISABLED (authentication = "none")
+WARN   Authentication: DISABLED (`authentication: none`)
 WARN   ╔══════════════════════════════════════════════════════════════════╗
 WARN   ║  WARNING: All S3 data is accessible without credentials.        ║
 WARN   ║  Set access_key_id + secret_access_key for production use.      ║
 WARN   ╚══════════════════════════════════════════════════════════════════╝
+WARN   The proxy still checks the signature of a signed request, with the access key as the secret.
+WARN   Signed requests must use a secret key equal to the access key (e.g. dummy/dummy);
+WARN   any other key pair gets 403 SignatureDoesNotMatch. Unsigned requests are served.
 INFO Dashboard: http://0.0.0.0:9000/_/
 INFO DeltaGlider Proxy listening on http://0.0.0.0:9000
 ```

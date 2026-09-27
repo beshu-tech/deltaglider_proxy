@@ -50,7 +50,7 @@ It is not a compliance log. It's bounded, in-memory, and gone on restart. The sa
 
 ## Open mode, honestly
 
-`authentication: none` disables SigV4 verification entirely. It's fine on localhost — a dev loop where signing requests is friction with no payoff. Anywhere else, turn auth on. There is no nuance to add: open mode exposes every object to anyone who can reach the port, and "we'll add auth later" is how that port ends up on the internet. The proxy makes you type the setting explicitly for exactly this reason.
+`authentication: none` removes identity: the proxy serves every request without a user behind it. It does not skip the signature check, though. The proxy still needs a secret to read signed and chunked uploads, so it checks the signature of every signed request with the access key as the secret. A client that signs with the same value for both keys (for example `dummy` / `dummy`) is served, and a client that signs with a real key pair gets `403 SignatureDoesNotMatch`. An unsigned request is served. Open mode is fine on localhost — a dev loop where signing requests is friction with no payoff. Anywhere else, turn auth on. There is no nuance to add: open mode exposes every object to anyone who can reach the port, and "we'll add auth later" is how that port ends up on the internet. The proxy makes you type the setting explicitly for exactly this reason.
 
 ## Related
 

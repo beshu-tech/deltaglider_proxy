@@ -18,6 +18,14 @@ request. The default is now `deltaglider_proxy=info,tower_http=info`. To get
 the old output, set `advanced.log_level` or `DGP_LOG_LEVEL` to the debug
 filter.
 
+### Changed — The open-access banner says that signatures are still checked
+
+With `authentication: none`, the proxy still checks the signature of a
+signed request, with the access key as the secret. The startup banner now
+says so, and names the `403 SignatureDoesNotMatch` that a real key pair
+gets. The security-model page no longer says that open mode skips the
+signature check.
+
 ### Changed — A migrate is refused on a multi-instance deployment
 
 The migrate flip changed the routing of the instance that ran the job only,

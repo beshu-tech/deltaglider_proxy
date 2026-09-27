@@ -151,6 +151,18 @@ fn warn_active_test_seams() {
     }
 }
 
+/// The startup warning for `authentication: none`.
+const OPEN_ACCESS_BANNER: &[&str] = &[
+    "  Authentication: DISABLED (`authentication: none`)",
+    "  ╔══════════════════════════════════════════════════════════════════╗",
+    "  ║  WARNING: All S3 data is accessible without credentials.        ║",
+    "  ║  Set access_key_id + secret_access_key for production use.      ║",
+    "  ╚══════════════════════════════════════════════════════════════════╝",
+    "  The proxy still checks the signature of a signed request, with the access key as the secret.",
+    "  Signed requests must use a secret key equal to the access key (e.g. dummy/dummy);",
+    "  any other key pair gets 403 SignatureDoesNotMatch. Unsigned requests are served.",
+];
+
 /// Runs after the config DB is open: IAM users in the DB (or a DB this key
 /// cannot read, which may hold them) count as configured credentials.
 pub fn validate_auth_config(config: &Config, iam_db_has_users: bool) {
@@ -172,12 +184,9 @@ pub fn validate_auth_config(config: &Config, iam_db_has_users: bool) {
             }
         }
         AuthConfigOutcome::OpenAccess => {
-            warn!("  Authentication: DISABLED (`authentication: none`)");
-            warn!("  ╔══════════════════════════════════════════════════════════════════╗");
-            warn!("  ║  WARNING: All S3 data is accessible without credentials.        ║");
-            warn!("  ║  Set access_key_id + secret_access_key for production use.      ║");
-            warn!("  ╚══════════════════════════════════════════════════════════════════╝");
-            warn!("  Signed requests must use a secret key equal to the access key (e.g. dummy/dummy)");
+            for line in OPEN_ACCESS_BANNER {
+                warn!("{line}");
+            }
         }
         AuthConfigOutcome::UnrecognizedMode => {
             error!(
@@ -1582,6 +1591,21 @@ pub async fn shutdown_signal() {
 mod tests {
     use super::*;
     use deltaglider_proxy::config::Config;
+
+    /// Open access still checks the signature of a signed request, with
+    /// the access key as the secret. The banner says so, and names the
+    /// error that any other key pair gets.
+    #[test]
+    fn open_access_banner_says_signed_requests_need_key_equal_to_secret() {
+        let text = OPEN_ACCESS_BANNER.join("\n");
+        assert!(text.contains("DISABLED (`authentication: none`)"), "{text}");
+        assert!(text.contains("still checks the signature"), "{text}");
+        assert!(
+            text.contains("secret key equal to the access key"),
+            "{text}"
+        );
+        assert!(text.contains("403 SignatureDoesNotMatch"), "{text}");
+    }
 
     #[test]
     fn backup_clobber_guard() {

@@ -426,7 +426,7 @@ The proxy **refuses to start** without credentials unless you set `authenticatio
 
 ### `authentication`
 
-Explicit auth-mode selector. Absent = auto-detect from credentials; `"none"` = open access (dev only).
+Explicit auth-mode selector. Absent = auto-detect from credentials; `"none"` = open access (dev only). In open access, the proxy still checks the signature of a signed request, with the access key as the secret, so a signed client must use the same value for both keys (see [Authentication and access](authentication.md#authentication-modes)).
 
 | | |
 |---|---|
