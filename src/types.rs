@@ -472,7 +472,7 @@ impl FileMetadata {
 
     /// Convert metadata to a bare-key map (keys like `dg-tool`, `user-{key}`).
     /// This is the single source of truth for the metadata-to-map conversion.
-    /// Used by the S3 backend for `x-amz-meta-*` headers and by `all_amz_metadata()`
+    /// Used by the S3 backend for `x-amz-meta-*` headers
     /// for the ListObjectsV2 `metadata=true` extension.
     pub fn to_bare_metadata_map(&self) -> HashMap<String, String> {
         use crate::types::meta_keys as mk;
@@ -524,23 +524,6 @@ impl FileMetadata {
         }
 
         map
-    }
-
-    /// Build the full `x-amz-meta-*` map as it would appear in S3 response headers.
-    /// Used by the `metadata=true` MinIO ListObjectsV2 extension.
-    pub fn all_amz_metadata(&self) -> HashMap<String, String> {
-        use crate::types::meta_keys as mk;
-        self.to_bare_metadata_map()
-            .into_iter()
-            .map(|(k, v)| {
-                // content-type is a standard header, not user metadata
-                if k == "content-type" {
-                    (k, v)
-                } else {
-                    (format!("{}{}", mk::AMZ_META_PREFIX, k), v)
-                }
-            })
-            .collect()
     }
 
     /// Get ETag value (quoted MD5)

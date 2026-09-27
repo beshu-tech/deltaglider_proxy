@@ -1766,9 +1766,15 @@ async fn test_list_v2_metadata_true_returns_user_metadata() {
         body
     );
 
-    // Verify custom metadata keys appear with x-amz-meta- prefix
+    // Custom metadata keys are named as HEAD names them (s3surface-8):
+    // `x-amz-meta-custom-key`, never the storage form `x-amz-meta-user-…`.
     assert!(
-        body.contains("x-amz-meta-user-custom-key"),
+        !body.contains("x-amz-meta-user-"),
+        "LIST metadata leaked the storage namespace:\n{}",
+        body
+    );
+    assert!(
+        body.contains("<Key>x-amz-meta-custom-key</Key>"),
         "Response should contain user custom metadata key, got:\n{}",
         body
     );
@@ -1778,7 +1784,7 @@ async fn test_list_v2_metadata_true_returns_user_metadata() {
         body
     );
     assert!(
-        body.contains("x-amz-meta-user-another-key"),
+        body.contains("<Key>x-amz-meta-another-key</Key>"),
         "Response should contain second custom metadata key, got:\n{}",
         body
     );

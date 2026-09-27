@@ -165,6 +165,13 @@ proxy installed the new engine before the refusal, so the new limit
 served requests while the config still showed the old one. Now every
 check runs first, and the new engine goes live as the last step.
 
+### Fixed — A `metadata=true` listing names user metadata as HEAD does
+
+The `metadata=true` ListObjectsV2 extension named a user metadata key `foo`
+as `x-amz-meta-user-foo`, which is the storage form, while HEAD and GET name
+it `x-amz-meta-foo`. Now the listing uses the same map as HEAD, so both name
+it `x-amz-meta-foo`.
+
 ### Fixed — Conditional and range requests answer as S3 does
 
 A date condition compared the object's time to the nanosecond with an HTTP

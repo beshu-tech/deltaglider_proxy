@@ -411,10 +411,8 @@ impl s3s::S3 for DeltaGliderS3Service {
                 page.objects
                     .iter()
                     .map(|(key, meta)| {
-                        let mut amz = meta.all_amz_metadata();
-                        strip_fingerprint_metadata(&mut amz, reader);
                         // Matched against the rendered <Key>, so encode alike.
-                        (enc.apply(key.clone()), amz)
+                        (enc.apply(key.clone()), list_metadata_map(meta, reader))
                     })
                     .collect(),
             )
@@ -2721,6 +2719,29 @@ fn response_metadata_map(
     map
 }
 
+/// The `metadata=true` LIST map: the HEAD map (`response_metadata_map`) under
+/// `x-amz-meta-`, plus `content-type`. It used the storage map, which names user
+/// metadata `x-amz-meta-user-foo` where HEAD says `x-amz-meta-foo`
+/// (s3surface-8).
+fn list_metadata_map(
+    meta: &FileMetadata,
+    reader: Reader,
+) -> std::collections::HashMap<String, String> {
+    let mut map: std::collections::HashMap<String, String> = response_metadata_map(meta, reader)
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                format!("{}{k}", crate::types::meta_keys::AMZ_META_PREFIX),
+                v,
+            )
+        })
+        .collect();
+    if let Some(content_type) = meta.content_type.as_ref() {
+        map.insert("content-type".to_string(), content_type.clone());
+    }
+    map
+}
+
 fn add_storage_debug_headers(headers: &mut axum::http::HeaderMap, meta: &FileMetadata) {
     if !debug_headers_enabled() {
         return;
@@ -3544,6 +3565,27 @@ mod tests {
             "Tue, 14 Nov 2023 22:13:25 GMT"
         );
         assert!(headers.get("content-type").is_none());
+    }
+
+    #[test]
+    fn list_metadata_names_user_metadata_as_head_does() {
+        let mut meta = meta_at_subsecond();
+        meta.content_type = Some("text/plain".to_string());
+        meta.user_metadata
+            .insert("foo".to_string(), "bar".to_string());
+        let list = list_metadata_map(&meta, Reader::Anonymous);
+        let head = response_metadata_map(&meta, Reader::Anonymous);
+        assert_eq!(list.get("x-amz-meta-foo").map(String::as_str), Some("bar"));
+        assert!(!list.contains_key("x-amz-meta-user-foo"));
+        assert_eq!(
+            list.get("content-type").map(String::as_str),
+            Some("text/plain")
+        );
+        assert!(!list.contains_key("x-amz-meta-dg-tool"), "anonymous strip");
+        for key in head.keys() {
+            assert!(list.contains_key(&format!("x-amz-meta-{key}")), "{key}");
+        }
+        assert_eq!(list.len(), head.len() + 1);
     }
 
     #[test]
