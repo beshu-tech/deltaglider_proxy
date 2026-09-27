@@ -805,7 +805,7 @@ function SceneDropIn() {
           right: PAD,
           display: 'flex',
           justifyContent: 'center',
-          gap: 14,
+          gap: 10,
           flexWrap: 'wrap',
           opacity: ease((lt - 1.2) / 0.6),
         }}
@@ -816,11 +816,13 @@ function SceneDropIn() {
               key={i}
               style={{
                 fontFamily: MONO,
-                fontSize: 22,
+                // Sized so all six chips fit one row: a second row
+                // ran into the progress dots.
+                fontSize: 19,
                 color: C.ink,
                 background: C.paper,
                 border: `1px solid ${C.line}`,
-                padding: '12px 22px',
+                padding: '10px 16px',
                 borderRadius: 11,
               }}
             >
