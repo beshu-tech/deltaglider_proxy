@@ -19,7 +19,7 @@
    holds client-writable buckets must support conditional writes, or the
    proxy refuses to start. A bucket migrate is refused (`409`) while a sync
    bucket is set.
-4. **Kubernetes operator:** apply the new `deploy/crd.yaml` before you
+4. **Kubernetes operator:** apply the new `operator/deploy/crd.yaml` before you
    upgrade the operator to 0.3.0.
 5. **Scripts and monitoring:** check the "Changed" entries below. The ones
    that most often need an edit:
