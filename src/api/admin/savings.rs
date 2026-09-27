@@ -177,12 +177,8 @@ pub async fn get_savings(
     State(state): State<Arc<crate::api::admin::AdminState>>,
     AdminQuery(q): AdminQuery<SavingsQuery>,
 ) -> Result<Json<SavingsResponse>, AdminError<JsonError>> {
-    // Defensive: empty bucket is meaningless — clients shouldn't ask
-    // and the listing path would explode if they did.
-    if q.bucket.is_empty() {
-        return Err(AdminError::invalid("bucket required"));
-    }
-
+    // `AdminBucket` refuses an empty name at extraction (400
+    // `invalid_bucket`), so `q.bucket` is never empty here.
     let s3_state = state.s3_state.clone();
     let bucket_for_compute = q.bucket.clone();
     let prefix_for_compute = q.prefix.clone();
@@ -322,4 +318,20 @@ async fn compute_savings(
         truncated,
         computed_at: Utc::now(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The query extractor refuses an empty bucket, so the handler needs
+    /// no empty-bucket branch of its own.
+    #[test]
+    fn savings_query_refuses_an_empty_bucket() {
+        let q: Result<SavingsQuery, _> = serde_json::from_str(r#"{"bucket":""}"#);
+        let err = q.err().expect("empty bucket must not parse").to_string();
+        assert!(err.contains("invalid bucket name"), "{err}");
+        let ok: SavingsQuery = serde_json::from_str(r#"{"bucket":"releases"}"#).unwrap();
+        assert_eq!(ok.prefix.as_str(), "");
+    }
 }
