@@ -26,9 +26,55 @@ pub fn is_conditional_conflict(signal: &str) -> bool {
 }
 
 /// Pure: did a conditional write lose (412, or 409 ConditionalRequestConflict)?
-/// `signal` is `config_db_sync::sdk_error_signal` of the SDK error.
+/// `signal` is [`sdk_error_signal`] of the SDK error.
 pub fn conditional_write_lost(signal: &str) -> bool {
     is_precondition_failed(signal) || is_conditional_conflict(signal)
+}
+
+/// Compact classification signal from a typed SDK error: HTTP status + error
+/// code ONLY. Never feed the substring classifiers `format!("{e:?}")` — the
+/// debug string embeds endpoint/bucket/request-ids that can contain "412"/
+/// "501"/"404" and poison the match (e.g. a backend on port 9501).
+pub(crate) fn sdk_error_signal<E>(e: &aws_sdk_s3::error::SdkError<E>) -> String
+where
+    E: aws_sdk_s3::error::ProvideErrorMetadata,
+{
+    use aws_sdk_s3::error::ProvideErrorMetadata;
+    let code = e.code().unwrap_or("");
+    match e {
+        aws_sdk_s3::error::SdkError::ServiceError(svc) => {
+            format!("status={} code={code}", svc.raw().status().as_u16())
+        }
+        _ => format!("transport code={code}"),
+    }
+}
+
+/// PUT a JSON coordination object with a precondition: `None` →
+/// `If-None-Match: *` (create only), `Some(etag)` → `If-Match: etag`.
+/// `Ok(true)` = written, `Ok(false)` = a peer won the race, `Err` = any
+/// other failure. The one conditional PUT of the lease and the lock.
+pub(crate) async fn conditional_put(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    body: aws_sdk_s3::primitives::ByteStream,
+    precondition: Option<&str>,
+) -> Result<bool, String> {
+    let put = client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(body)
+        .content_type("application/json");
+    let put = match precondition {
+        Some(etag) => put.if_match(etag),
+        None => put.if_none_match("*"),
+    };
+    match put.send().await {
+        Ok(_) => Ok(true),
+        Err(e) if conditional_write_lost(&sdk_error_signal(&e)) => Ok(false),
+        Err(e) => Err(format!("{e:?}")),
+    }
 }
 
 #[cfg(test)]

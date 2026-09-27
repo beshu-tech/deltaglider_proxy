@@ -103,26 +103,31 @@ pub struct ReencryptResponse {
     pub errors: Vec<ReencryptError>,
 }
 
-/// POST /_/api/admin/jobs/reencrypt
-pub async fn start_reencrypt(
-    State(state): State<Arc<AdminState>>,
-    headers: HeaderMap,
-    AdminJson(req): AdminJson<ReencryptRequest>,
-) -> Result<Json<ReencryptResponse>, (StatusCode, String)> {
-    if req.buckets.is_empty() {
+/// The request gate that the reencrypt and backfill starts share: 1 to
+/// 100 buckets, a config DB, and the real bucket set from the engine
+/// (authoritative across backends), lowercased.
+async fn check_job_request(
+    state: &AdminState,
+    n_buckets: usize,
+) -> Result<
+    (
+        &Arc<tokio::sync::Mutex<crate::config_db::ConfigDb>>,
+        std::collections::HashSet<String>,
+    ),
+    (StatusCode, String),
+> {
+    if n_buckets == 0 {
         return Err((StatusCode::BAD_REQUEST, "no buckets given".into()));
     }
-    if req.buckets.len() > 100 {
+    if n_buckets > 100 {
         return Err((StatusCode::BAD_REQUEST, "too many buckets (max 100)".into()));
     }
     let db = state
         .config_db
         .as_ref()
         .ok_or((StatusCode::NOT_FOUND, "config DB unavailable".to_string()))?;
-
-    // Real-bucket set from the engine (authoritative across backends).
     let engine = state.s3_state.engine.load().clone();
-    let real: std::collections::HashSet<String> = engine
+    let real = engine
         .list_bucket_origins()
         .await
         .map_err(|e| {
@@ -134,6 +139,16 @@ pub async fn start_reencrypt(
         .into_iter()
         .map(|b| b.name.to_ascii_lowercase())
         .collect();
+    Ok((db, real))
+}
+
+/// POST /_/api/admin/jobs/reencrypt
+pub async fn start_reencrypt(
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+    AdminJson(req): AdminJson<ReencryptRequest>,
+) -> Result<Json<ReencryptResponse>, (StatusCode, String)> {
+    let (db, real) = check_job_request(&state, req.buckets.len()).await?;
 
     let cfg = state.config.read().await;
     let mut started = Vec::new();
@@ -221,30 +236,7 @@ pub async fn start_backfill(
     headers: HeaderMap,
     AdminJson(req): AdminJson<BackfillRequest>,
 ) -> Result<Json<ReencryptResponse>, (StatusCode, String)> {
-    if req.buckets.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "no buckets given".into()));
-    }
-    if req.buckets.len() > 100 {
-        return Err((StatusCode::BAD_REQUEST, "too many buckets (max 100)".into()));
-    }
-    let db = state
-        .config_db
-        .as_ref()
-        .ok_or((StatusCode::NOT_FOUND, "config DB unavailable".to_string()))?;
-
-    let engine = state.s3_state.engine.load().clone();
-    let real: std::collections::HashSet<String> = engine
-        .list_bucket_origins()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to list buckets: {e}"),
-            )
-        })?
-        .into_iter()
-        .map(|b| b.name.to_ascii_lowercase())
-        .collect();
+    let (db, real) = check_job_request(&state, req.buckets.len()).await?;
 
     let params = serde_json::to_string(&crate::maintenance::backfill::BackfillParams {
         refresh_last_modified: req.refresh_last_modified,

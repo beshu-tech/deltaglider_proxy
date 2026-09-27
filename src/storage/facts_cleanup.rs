@@ -168,7 +168,7 @@ async fn live_now(client: &Client, bucket: &str, stored_key: &str) -> LiveNow {
         ),
         Err(e)
             if crate::config_db_sync::is_object_absent(
-                &crate::config_db_sync::sdk_error_signal(&e),
+                &crate::coordination::cas::sdk_error_signal(&e),
             ) =>
         {
             LiveNow::Gone

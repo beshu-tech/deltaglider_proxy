@@ -22,6 +22,9 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
+// The classifier input lives next to the classifier (coordination::cas).
+pub(crate) use crate::coordination::cas::sdk_error_signal;
+
 use crate::config::BackendConfig;
 use crate::config_db::ConfigDb;
 use crate::iam::external_auth::ExternalAuthManager;
@@ -876,24 +879,6 @@ fn witness_is_fresh(validated_at: i64, now: i64, max_age: i64) -> bool {
 fn node_id() -> String {
     let db = crate::config_db::config_db_path();
     crate::coordination::durable_node_id(db.parent().unwrap_or_else(|| std::path::Path::new(".")))
-}
-
-/// Compact classification signal from a typed SDK error: HTTP status + error
-/// code ONLY. Never feed the substring classifiers `format!("{e:?}")` — the
-/// debug string embeds endpoint/bucket/request-ids that can contain "412"/
-/// "501"/"404" and poison the match (e.g. a backend on port 9501).
-pub(crate) fn sdk_error_signal<E>(e: &aws_sdk_s3::error::SdkError<E>) -> String
-where
-    E: aws_sdk_s3::error::ProvideErrorMetadata,
-{
-    use aws_sdk_s3::error::ProvideErrorMetadata;
-    let code = e.code().unwrap_or("");
-    match e {
-        aws_sdk_s3::error::SdkError::ServiceError(svc) => {
-            format!("status={} code={code}", svc.raw().status().as_u16())
-        }
-        _ => format!("transport code={code}"),
-    }
 }
 
 /// Is this HeadObject error "the config DB object does not exist yet"?

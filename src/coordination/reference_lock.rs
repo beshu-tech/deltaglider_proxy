@@ -269,7 +269,7 @@ impl S3ReferenceLock {
             }
             Err(e) => {
                 if crate::config_db_sync::is_object_absent(
-                    &crate::config_db_sync::sdk_error_signal(&*e),
+                    &crate::coordination::cas::sdk_error_signal(&*e),
                 ) {
                     Ok(Observed::Absent)
                 } else {
@@ -296,29 +296,7 @@ impl S3ReferenceLock {
         body: ByteStream,
         precondition: Option<&str>,
     ) -> Result<bool, String> {
-        let mut put = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(body)
-            .content_type("application/json");
-        put = match precondition {
-            Some(etag) => put.if_match(etag),
-            None => put.if_none_match("*"),
-        };
-        match put.send().await {
-            Ok(_) => Ok(true),
-            Err(e) => {
-                if crate::coordination::cas::conditional_write_lost(
-                    &crate::config_db_sync::sdk_error_signal(&e),
-                ) {
-                    Ok(false) // a peer won the race — expected, not an error
-                } else {
-                    Err(format!("{e:?}"))
-                }
-            }
-        }
+        super::cas::conditional_put(&self.client, &self.bucket, key, body, precondition).await
     }
 }
 

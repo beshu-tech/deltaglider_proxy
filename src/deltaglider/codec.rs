@@ -132,6 +132,36 @@ pub enum CodecError {
 
 type IoResult<T> = Result<T, std::io::Error>;
 
+/// The flag a pump raises when its pipe I/O ends, so its watchdog stands
+/// down at once (the condvar wakes it) instead of at its next timeout.
+type DoneFlag = std::sync::Arc<(
+    std::sync::atomic::AtomicBool,
+    std::sync::Condvar,
+    std::sync::Mutex<()>,
+)>;
+
+fn done_flag() -> DoneFlag {
+    std::sync::Arc::new((
+        std::sync::atomic::AtomicBool::new(false),
+        std::sync::Condvar::new(),
+        std::sync::Mutex::new(()),
+    ))
+}
+
+/// Tell the watchdog that the pipe I/O ended.
+fn stand_down(done: &DoneFlag) {
+    let (ref flag, ref condvar, _) = **done;
+    flag.store(true, std::sync::atomic::Ordering::Release);
+    condvar.notify_one();
+}
+
+/// Read xdelta3's stderr to its end (it is small: the error text).
+fn drain(stderr: &mut std::process::ChildStderr) -> IoResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    stderr.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
 /// Pipe data to a child process's stdin while concurrently reading stdout and
 /// draining stderr. All three streams are consumed concurrently to prevent
 /// pipe-buffer deadlocks. A watchdog thread kills the child after `timeout`
@@ -158,11 +188,7 @@ fn pipe_stdin_stdout_stderr(
     // Flag set to true when pipe I/O completes normally, signalling the
     // watchdog to stand down. Using AtomicBool + Condvar so the watchdog
     // can wake immediately instead of sleeping the full timeout.
-    let done = std::sync::Arc::new((
-        std::sync::atomic::AtomicBool::new(false),
-        std::sync::Condvar::new(),
-        std::sync::Mutex::new(()),
-    ));
+    let done = done_flag();
 
     std::thread::scope(|s| {
         // Watchdog: kills the child if pipe I/O takes longer than codec_timeout().
@@ -250,11 +276,7 @@ fn pipe_stdin_stdout_stderr(
             Ok::<Vec<u8>, std::io::Error>(buf)
         });
 
-        let stderr_reader = s.spawn(|| {
-            let mut buf = Vec::new();
-            child_stderr.read_to_end(&mut buf)?;
-            Ok::<Vec<u8>, std::io::Error>(buf)
-        });
+        let stderr_reader = s.spawn(|| drain(&mut child_stderr));
 
         let result = (
             writer.join().unwrap(),
@@ -262,10 +284,7 @@ fn pipe_stdin_stdout_stderr(
             stderr_reader.join().unwrap(),
         );
 
-        // Signal the watchdog to stand down
-        let (ref flag, ref condvar, _) = *done;
-        flag.store(true, std::sync::atomic::Ordering::Release);
-        condvar.notify_one();
+        stand_down(&done);
 
         result
     })
@@ -307,11 +326,7 @@ where
     /// is a good balance of syscall overhead vs resident memory.
     const PUMP_CHUNK: usize = 256 * 1024;
 
-    let done = std::sync::Arc::new((
-        std::sync::atomic::AtomicBool::new(false),
-        std::sync::Condvar::new(),
-        std::sync::Mutex::new(()),
-    ));
+    let done = done_flag();
 
     std::thread::scope(|s| {
         // Stall-based watchdog. Wakes every `slice` to re-check progress instead
@@ -385,11 +400,7 @@ where
             Ok::<u64, std::io::Error>(total)
         });
 
-        let stderr_reader = s.spawn(|| {
-            let mut buf = Vec::new();
-            child_stderr.read_to_end(&mut buf)?;
-            Ok::<Vec<u8>, std::io::Error>(buf)
-        });
+        let stderr_reader = s.spawn(|| drain(&mut child_stderr));
 
         let result = (
             writer.join().unwrap(),
@@ -397,9 +408,7 @@ where
             stderr_reader.join().unwrap(),
         );
 
-        let (ref flag, ref condvar, _) = *done;
-        flag.store(true, std::sync::atomic::Ordering::Release);
-        condvar.notify_one();
+        stand_down(&done);
 
         result
     })

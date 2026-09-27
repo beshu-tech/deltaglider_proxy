@@ -58,7 +58,7 @@ where
     match res {
         Ok(_) => StepOutcome::Written,
         Err(e) => {
-            let signal = crate::config_db_sync::sdk_error_signal(e);
+            let signal = crate::coordination::cas::sdk_error_signal(e);
             if crate::coordination::cas::conditional_write_lost(&signal) {
                 StepOutcome::PreconditionFailed
             } else if crate::config_db_sync::is_not_implemented(&signal) {

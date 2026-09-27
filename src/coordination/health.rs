@@ -155,7 +155,7 @@ fn is_hard_auth_code(code: Option<&str>) -> bool {
 }
 
 /// Structured signal from a typed SDK error: (transport?, status, code).
-/// Mirror of `config_db_sync::sdk_error_signal`, kept structured instead of
+/// Mirror of `coordination::cas::sdk_error_signal`, kept structured instead of
 /// stringified so the classifier match can't be poisoned by endpoint text.
 fn sdk_probe_signal<E>(e: &aws_sdk_s3::error::SdkError<E>) -> (bool, Option<u16>, Option<String>)
 where

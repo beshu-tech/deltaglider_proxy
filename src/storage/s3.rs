@@ -997,7 +997,7 @@ impl S3Backend {
             Err(e)
                 if expect_etag.is_some()
                     && crate::coordination::cas::conditional_write_lost(
-                        &crate::config_db_sync::sdk_error_signal(&e),
+                        &crate::coordination::cas::sdk_error_signal(&e),
                     ) =>
             {
                 // An SDK retry of a copy whose response was lost meets our
@@ -1262,8 +1262,10 @@ impl S3Backend {
                     return Ok(etag);
                 }
                 Err(e) => {
-                    match fenced_write_verdict(&fence, &crate::config_db_sync::sdk_error_signal(&e))
-                    {
+                    match fenced_write_verdict(
+                        &fence,
+                        &crate::coordination::cas::sdk_error_signal(&e),
+                    ) {
                         FencedWriteVerdict::Lost => {
                             let md5 = hex::encode(<md5::Md5 as md5::Digest>::digest(data));
                             let etag = self.own_write_or_lost(bucket, key, &md5).await?;
@@ -1431,8 +1433,10 @@ impl S3Backend {
                     return Ok(resp.e_tag().map(str::to_string));
                 }
                 Err(e) => {
-                    match fenced_write_verdict(&fence, &crate::config_db_sync::sdk_error_signal(&e))
-                    {
+                    match fenced_write_verdict(
+                        &fence,
+                        &crate::coordination::cas::sdk_error_signal(&e),
+                    ) {
                         FencedWriteVerdict::Lost => {
                             let Some(md5) = md5_hex_of_file(source_path).await else {
                                 return Err(reference_fence_lost(bucket, key));
@@ -1710,7 +1714,7 @@ impl S3Backend {
         {
             Ok(_) => Ok(()),
             Err(e) => {
-                match fenced_write_verdict(fence, &crate::config_db_sync::sdk_error_signal(&e)) {
+                match fenced_write_verdict(fence, &crate::coordination::cas::sdk_error_signal(&e)) {
                     FencedWriteVerdict::Lost => Err(reference_fence_lost(bucket, key)),
                     FencedWriteVerdict::Unsupported => self.delete_s3_object(bucket, key).await,
                     FencedWriteVerdict::Other => Err(self.classify(bucket, &e, S3Op::DeleteObject)),
@@ -2788,7 +2792,7 @@ impl StorageBackend for S3Backend {
         match sent {
             Ok(_) => {}
             Err(e) => {
-                match conditional_delete_verdict(&crate::config_db_sync::sdk_error_signal(&e)) {
+                match conditional_delete_verdict(&crate::coordination::cas::sdk_error_signal(&e)) {
                     ConditionalDeleteVerdict::Changed => return Ok(false),
                     ConditionalDeleteVerdict::Unsupported => {
                         let at = self.delete_s3_object_dated(bucket, &key).await?;
