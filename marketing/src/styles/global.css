@@ -550,65 +550,49 @@ hr {
   align-items: center;
   gap: 0.4rem;
   padding: 0.65rem 1.15rem;
-  border-radius: 6px;
+  border-radius: var(--r-sm);
   text-decoration: none;
   font-weight: 600;
   font-size: 0.95rem;
-  border: 1px solid var(--rule);
-  background: var(--bg-card);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-  color: var(--ink-strong);
-  box-shadow: var(--shadow-sm);
-  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-  cursor: pointer;
   line-height: 1.3;
+  cursor: pointer;
+  /* Secondary: outlined. */
+  border: 1px solid var(--rule-strong);
+  background: transparent;
+  color: var(--ink-strong);
+  transition: background-color 150ms ease, border-color 150ms ease, color 150ms ease;
 }
 
+/* Hover changes colour only: no lift, no scale, no glow. */
 .btn:hover {
   border-color: var(--brand);
-  color: var(--brand-dark);
-  box-shadow: var(--shadow-glow);
+  color: var(--brand);
   text-decoration: none;
-  transform: translateY(-2px);
 }
 
-.btn-primary {
-  background: var(--ink-100);
-  border-color: var(--ink-100);
-  color: var(--ink-900);
-  box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.5);
-}
-
-.btn-primary:hover {
-  background: var(--ink-200);
-  border-color: var(--ink-200);
-  color: var(--ink-900);
-}
-
+/* Primary: the one brand-filled action of a view. `.btn-brand` is the
+   older name for the same thing. */
+.btn-primary,
 .btn-brand {
   background: var(--brand-fill);
   border-color: var(--brand-fill);
   color: var(--bg);
-  box-shadow: var(--shadow-glow);
 }
 
+.btn-primary:hover,
 .btn-brand:hover {
   background: var(--brand-fill-hover);
   border-color: var(--brand-fill-hover);
   color: var(--bg);
-  transform: translateY(-2px) scale(1.02);
 }
 
 /* Tertiary, low-emphasis button (e.g. GitHub next to the primary CTAs). */
 .btn-ghost {
-  background: transparent;
-  border-color: var(--rule-strong);
-  box-shadow: none;
+  border-color: transparent;
   color: var(--ink-soft);
 }
 .btn-ghost:hover {
-  background: var(--bg-card);
+  border-color: var(--rule-strong);
   color: var(--ink-strong);
 }
 
