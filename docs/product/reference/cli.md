@@ -44,7 +44,7 @@ Dry-runs a synthetic request through the running server's admission chain via `P
 
 ## `--init`
 
-Interactive wizard, in the style of `npm init`. Prompts for output path (default `deltaglider_proxy.yaml`), listen address, log level, backend (filesystem or S3 with endpoint/region/credentials), delta settings (`max_delta_ratio`, max object size, cache size), optional SigV4 credentials, and optional TLS. The generated config is printed for confirmation before writing; an existing file requires an explicit overwrite confirmation. The output is always canonical sectioned YAML (a `.toml` output path is refused).
+Interactive wizard, in the style of `npm init`. Prompts for output path (default `deltaglider_proxy.yaml`), listen address, log level, backend (filesystem or S3 with endpoint/region/credentials), delta settings (`max_delta_ratio`, max object size, cache size), optional SigV4 credentials, and optional TLS. Every file that the wizard writes starts the proxy. When you enable SigV4 authentication and leave the key prompts empty, the wizard generates the key pair and prints the secret. The proxy refuses to start without credentials unless the file sets `authentication: none`. For this reason, when you decline authentication, the wizard writes `authentication: none`. Use that file for development only. The generated config is printed for confirmation before writing; an existing file requires an explicit overwrite confirmation. The output is always canonical sectioned YAML (a `.toml` output path is refused).
 
 ## `--set-bootstrap-password`
 

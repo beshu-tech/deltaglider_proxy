@@ -235,19 +235,30 @@ pub fn run_init_inner(
     // --- Proxy Authentication ---
     writeln!(writer, "--- Proxy Authentication ---")?;
     let auth_enabled = prompt_yes_no(reader, writer, "Enable SigV4 authentication?", false)?;
-    let (access_key_id, secret_access_key) = if auth_enabled {
-        let key = prompt(reader, writer, "Access key ID", "")?;
-        let secret = prompt(reader, writer, "Secret access key", "")?;
-        (
-            if key.is_empty() { None } else { Some(key) },
-            if secret.is_empty() {
-                None
-            } else {
-                Some(secret)
-            },
-        )
+    // Every answer must give a file that boots: the proxy refuses to start
+    // with no SigV4 pair unless `authentication: none` says so explicitly.
+    let (access_key_id, secret_access_key, authentication) = if auth_enabled {
+        let key = prompt(reader, writer, "Access key ID (empty = generate)", "")?;
+        let secret = prompt(reader, writer, "Secret access key (empty = generate)", "")?;
+        let key = if key.is_empty() {
+            crate::iam::keygen::generate_access_key_id()
+        } else {
+            key
+        };
+        let secret = if secret.is_empty() {
+            let s = crate::iam::keygen::generate_secret_access_key();
+            writeln!(writer, "  Generated secret access key: {s}")?;
+            s
+        } else {
+            secret
+        };
+        (Some(key), Some(secret), None)
     } else {
-        (None, None)
+        writeln!(
+            writer,
+            "  S3 authentication stays OFF (`authentication: none`): for development only."
+        )?;
+        (None, None, Some("none".to_string()))
     };
 
     writeln!(writer)?;
@@ -306,7 +317,7 @@ pub fn run_init_inner(
         max_passthrough_object_size: crate::config::default_max_passthrough_object_size(),
         cache_size_mb,
         metadata_cache_mb: 50,
-        authentication: None,
+        authentication,
         access_key_id,
         secret_access_key,
         bootstrap_password_hash: None,
@@ -399,6 +410,31 @@ mod tests {
         assert!(
             (cfg.max_delta_ratio - 0.5).abs() < f32::EPSILON,
             "wizard max_delta_ratio default must persist, got: {file}"
+        );
+    }
+
+    /// Review 4 config-3: every wizard output must boot. The default answer
+    /// to "Enable SigV4 authentication?" (no) wrote a file with no pair and
+    /// no `authentication`, which `classify_auth_config` refuses.
+    #[test]
+    fn test_wizard_output_boots_with_either_auth_answer() {
+        use crate::config::AuthConfigOutcome;
+        // Declined auth (the default answer).
+        let (_, file) = run_wizard("\n\n\n\n\n\n\n\nn\nn\ny\n");
+        let cfg = crate::config::Config::from_yaml_str(&file.unwrap()).unwrap();
+        assert!(matches!(
+            cfg.classify_auth_config(false),
+            AuthConfigOutcome::OpenAccess
+        ));
+        // Auth enabled with both prompts left empty: a pair is generated.
+        let (out, file) = run_wizard("\n\n\n\n\n\n\n\ny\n\n\nn\ny\n");
+        let cfg = crate::config::Config::from_yaml_str(&file.unwrap()).unwrap();
+        assert!(
+            matches!(
+                cfg.classify_auth_config(false),
+                AuthConfigOutcome::CredentialsEnabled { .. }
+            ),
+            "{out}"
         );
     }
 

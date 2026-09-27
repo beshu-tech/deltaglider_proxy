@@ -80,6 +80,13 @@ release has no generation and keeps the old rule. During a rolling upgrade,
 an instance on the older release does not merge copies from upgraded
 instances until it is upgraded too, as with every schema change.
 
+### Fixed — Every file that `--init` writes starts the proxy
+
+The default answer to "Enable SigV4 authentication?" (no) wrote a file
+with no credentials and no `authentication` setting, and the proxy
+refused to start with it. Now a "no" writes `authentication: none`, for
+development only. A "yes" with empty key prompts generates the pair.
+
 ### Fixed — Unsaved-change markers compare against the right file
 
 The admin GUI marks a field as unsaved when the running value differs
