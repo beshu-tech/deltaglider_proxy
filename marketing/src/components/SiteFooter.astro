@@ -22,7 +22,7 @@ import { FOOTER_COLUMNS } from '../lib/nav';
 
     {FOOTER_COLUMNS.map((col) => (
       <div class="footer-col">
-        <h4 class="footer-col-title">{col.title}</h4>
+        <h2 class="footer-col-title">{col.title}</h2>
         <ul>
           {col.links.map((l) => (
             <li><a href={l.href}>{l.label}</a></li>
