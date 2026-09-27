@@ -915,7 +915,8 @@ mod source_guards {
     /// constructor or the engine), and integration tests do not hand-write
     /// DG metadata onto stored objects (S3 user metadata, headers, xattrs).
     ///
-    /// Allowed: a test whose subject IS a foreign or corrupt shape.
+    /// Allowed: a test whose subject IS a foreign or corrupt shape, and the
+    /// `dg-no-delta` store hint (not stored).
     #[test]
     fn test_fixtures_come_from_the_write_path() {
         const ALLOWED: [(&str, &str); 3] = [
@@ -966,8 +967,11 @@ mod source_guards {
                 let struct_literal = line
                     .match_indices(literal.as_str())
                     .any(|(i, _)| is_file_metadata_literal(line, i));
-                let meta_write =
-                    is_integration && hand_written_meta.iter().any(|x| line.contains(x.as_str()));
+                // The no-delta hint is a store instruction the engine drops,
+                // never stored metadata.
+                let meta_write = is_integration
+                    && hand_written_meta.iter().any(|x| line.contains(x.as_str()))
+                    && !line.contains(crate::types::meta_keys::NO_DELTA);
                 if !(struct_literal || meta_write) {
                     continue;
                 }
