@@ -105,7 +105,13 @@ pub async fn run_now(
     name: String,
     headers: &HeaderMap,
 ) -> Result<(StatusCode, lifecycle::LifecycleRunOutcome), AdminError> {
-    let lifecycle_cfg = { state.config.read().await.lifecycle.clone() };
+    let (lifecycle_cfg, lease) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.lifecycle.clone(),
+            lifecycle::scheduler::lease_timing(&cfg.jobs),
+        )
+    };
     let rule = lifecycle_cfg
         .rules
         .iter()
@@ -171,12 +177,8 @@ pub async fn run_now(
                 rule.name
             )));
         }
-        let acquired = db.lifecycle_try_acquire_lease(
-            &rule.name,
-            &lease_owner,
-            now,
-            lifecycle::scheduler::lease_ttl_secs(),
-        )?;
+        let acquired =
+            db.lifecycle_try_acquire_lease(&rule.name, &lease_owner, now, lease.ttl_secs)?;
         if !acquired {
             return Err(AdminError::conflict(
                 "rule is already running; wait for the current run to finish",
@@ -240,8 +242,8 @@ pub async fn run_now(
             lifecycle::scheduler::scheduler_tick(&lifecycle_cfg).as_secs() as i64,
             Some(lifecycle::RunLease {
                 owner: lease_owner.clone(),
-                ttl_secs: lifecycle::scheduler::lease_ttl_secs(),
-                heartbeat_secs: lifecycle::scheduler::heartbeat_secs(),
+                ttl_secs: lease.ttl_secs,
+                heartbeat_secs: lease.heartbeat_secs,
             }),
             Some(gate),
         )

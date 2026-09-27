@@ -6,7 +6,7 @@
 //! Listing, runs, and failures live in the jobs module.
 
 use super::{AdminError, AdminState};
-use crate::config_sections::{ReplicationConfig, ReplicationRule};
+use crate::config_sections::{LeaseTiming, ReplicationConfig, ReplicationRule};
 use crate::replication;
 use axum::http::{HeaderMap, StatusCode};
 use serde::Serialize;
@@ -342,9 +342,15 @@ pub async fn verify(
         ));
     }
     // Acquire the lease; if someone else holds it, just report current status.
+    let lease = state
+        .config
+        .read()
+        .await
+        .jobs
+        .lease_timing(LeaseTiming::PARITY);
     let acquired = {
         let db = db_arc.lock().await;
-        db.parity_try_acquire_lease(&rule.name, &owner, now, PARITY_LEASE_TTL_SECS)?
+        db.parity_try_acquire_lease(&rule.name, &owner, now, lease.ttl_secs)?
     };
     if !acquired {
         // Someone else holds the lease → a scan IS in flight. Report 'running'
@@ -425,15 +431,15 @@ pub async fn verify(
             }),
         ));
         let audit = futures::FutureExt::catch_unwind(audit);
-        // Keeper: renew the lease every TTL/3 so a scan that runs longer than
-        // the TTL doesn't let a concurrent POST acquire + double-scan. It stops
+        // Keeper: renew the lease every heartbeat so a scan that runs longer
+        // than the TTL doesn't let a concurrent POST acquire + double-scan. It stops
         // (drop) the moment the audit completes.
         let keeper = {
             let (db, rule, owner) = (db_for_task.clone(), rule_clone.name.clone(), owner.clone());
             crate::background::LeaseKeeper::spawn(
                 format!("parity audit '{rule}'"),
-                std::time::Duration::from_secs((PARITY_LEASE_TTL_SECS / 3).max(1) as u64),
-                std::time::Duration::from_secs(PARITY_LEASE_TTL_SECS as u64),
+                std::time::Duration::from_secs(lease.heartbeat_secs.max(1) as u64),
+                std::time::Duration::from_secs(lease.ttl_secs as u64),
                 move || {
                     let (db, rule, owner) = (db.clone(), rule.clone(), owner.clone());
                     async move {
@@ -443,7 +449,7 @@ pub async fn verify(
                             &rule,
                             &owner,
                             now,
-                            PARITY_LEASE_TTL_SECS,
+                            lease.ttl_secs,
                         ))
                     }
                 },
@@ -564,10 +570,6 @@ pub async fn verify_cancel(
     };
     Ok(parity_status_from_row(row))
 }
-
-/// Background-job lease TTL for a parity audit. Long enough to cover a large
-/// scan; a crash clears it on the next boot reconcile.
-const PARITY_LEASE_TTL_SECS: i64 = 1800;
 
 /// Check whether a rule with the given name exists in the live config.
 /// M1 fix: previously pause/resume called `replication_ensure_state`

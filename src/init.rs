@@ -336,6 +336,7 @@ pub fn run_init_inner(
         replication: crate::config_sections::ReplicationConfig::default(),
         lifecycle: crate::config_sections::LifecycleConfig::default(),
         event_delivery: crate::config_sections::EventDeliveryConfig::default(),
+        jobs: crate::config_sections::JobsConfig::default(),
         admission_blocks: Vec::new(),
         iam_mode: crate::config_sections::IamMode::default(),
         iam_users: Vec::new(),

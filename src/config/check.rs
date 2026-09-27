@@ -375,6 +375,7 @@ impl Config {
             &self.replication,
         ));
         warnings.extend(crate::config_sections::validate_lifecycle(&self.lifecycle));
+        warnings.extend(crate::config_sections::validate_jobs(&self.jobs));
         warnings.extend(crate::config_sections::validate_event_delivery(
             &self.event_delivery,
         ));

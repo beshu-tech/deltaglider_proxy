@@ -77,6 +77,15 @@ baseline (the buffered PUT counted them). A streaming passthrough PUT no
 longer stores the body MD5 as a multipart ETag; the ETag on the wire is the
 same.
 
+### Added — One lease setting for background jobs
+
+`advanced.jobs.lease_ttl` and `advanced.jobs.heartbeat_interval` set the
+lease of maintenance jobs, lifecycle rules, parity audits and rule deletes.
+Before, each of these had a fixed lease in the code. When the fields are
+unset, each job kind keeps its old values (maintenance 60s/20s, lifecycle
+5m/60s, parity audit 30m/10m, rule delete 60s). Replication keeps its own
+`storage.replication.lease_ttl`.
+
 ### Fixed — A graceful stop keeps the write gate of a maintenance job
 
 When the proxy stopped (`SIGTERM`) during a maintenance job, it put the job

@@ -331,6 +331,138 @@ pub(crate) fn is_default_lifecycle(l: &LifecycleConfig) -> bool {
     l == &LifecycleConfig::default()
 }
 
+/// `advanced.jobs`: ONE lease setting for the leases that maintenance
+/// jobs, lifecycle rules, parity audits and rule deletes take. A field left
+/// unset keeps each subsystem's own default ([`LeaseTiming`]). Replication
+/// keeps its own `replication.lease_ttl` / `heartbeat_interval`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct JobsConfig {
+    /// How long one renewal holds a job lease (humantime, min `15s`). A dead
+    /// runner's job becomes claimable after this. Unset: 60s for maintenance
+    /// and rule deletes, 5m for lifecycle, 30m for parity audits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ttl: Option<String>,
+
+    /// How often a running job renews its lease (humantime, min `5s`, below
+    /// `lease_ttl`). Unset: a third of `lease_ttl` when that is set, else
+    /// each subsystem's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_interval: Option<String>,
+}
+
+pub(crate) fn is_default_jobs(j: &JobsConfig) -> bool {
+    j == &JobsConfig::default()
+}
+
+/// A job lease: how long one renewal holds it, and how often it renews.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseTiming {
+    pub ttl_secs: i64,
+    pub heartbeat_secs: i64,
+}
+
+impl LeaseTiming {
+    /// Each subsystem's default: the values before `advanced.jobs` existed.
+    pub const MAINTENANCE: Self = Self {
+        ttl_secs: 60,
+        heartbeat_secs: 20,
+    };
+    /// Lifecycle runs hourly and does full prefix scans, so its lease is
+    /// 5x longer than maintenance's: a peer does not steal it mid-run.
+    pub const LIFECYCLE: Self = Self {
+        ttl_secs: 300,
+        heartbeat_secs: 60,
+    };
+    /// A parity audit lists both sides in full.
+    pub const PARITY: Self = Self {
+        ttl_secs: 1800,
+        heartbeat_secs: 600,
+    };
+    /// A rule delete only bounds a crash mid-purge (a persist plus a few
+    /// DB deletes); it never renews.
+    pub const RULE_DELETE: Self = Self {
+        ttl_secs: 60,
+        heartbeat_secs: 20,
+    };
+}
+
+/// Pure: a job-lease duration in whole seconds, or `None` when the value
+/// does not parse or is below `min_secs` (`validate_jobs` warns for both).
+fn job_lease_secs(value: Option<&str>, min_secs: u64) -> Option<i64> {
+    let d = humantime::parse_duration(value?).ok()?;
+    (d.as_secs() >= min_secs).then(|| d.as_secs().min(i64::MAX as u64) as i64)
+}
+
+impl JobsConfig {
+    /// Pure: the lease timing of a subsystem whose own default is `default`.
+    /// The heartbeat always stays below the TTL (else half the TTL).
+    pub fn lease_timing(&self, default: LeaseTiming) -> LeaseTiming {
+        let ttl = job_lease_secs(self.lease_ttl.as_deref(), MIN_LEASE_TTL_SECS);
+        let ttl_secs = ttl.unwrap_or(default.ttl_secs);
+        let heartbeat_secs = job_lease_secs(
+            self.heartbeat_interval.as_deref(),
+            MIN_HEARTBEAT_INTERVAL_SECS,
+        )
+        .unwrap_or(match ttl {
+            Some(t) => (t / 3).max(1),
+            None => default.heartbeat_secs,
+        });
+        LeaseTiming {
+            ttl_secs,
+            heartbeat_secs: if heartbeat_secs < ttl_secs {
+                heartbeat_secs
+            } else {
+                (ttl_secs / 2).max(1)
+            },
+        }
+    }
+}
+
+/// Config-check warnings for `advanced.jobs`. A value that the warning
+/// names is ignored at run time (the subsystem default applies).
+pub fn validate_jobs(cfg: &JobsConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (label, value, min) in [
+        (
+            "advanced.jobs.lease_ttl",
+            &cfg.lease_ttl,
+            MIN_LEASE_TTL_SECS,
+        ),
+        (
+            "advanced.jobs.heartbeat_interval",
+            &cfg.heartbeat_interval,
+            MIN_HEARTBEAT_INTERVAL_SECS,
+        ),
+    ] {
+        let Some(v) = value.as_deref() else { continue };
+        match humantime::parse_duration(v) {
+            Ok(d) if d.as_secs() < min => warnings.push(format!(
+                "{label}={v} is below the minimum {min}s; the default applies"
+            )),
+            Ok(_) => {}
+            Err(e) => warnings.push(format!(
+                "{label}={v} is not a valid humantime duration ({e}); the default applies"
+            )),
+        }
+    }
+    if let (Some(ttl), Some(hb)) = (
+        job_lease_secs(cfg.lease_ttl.as_deref(), MIN_LEASE_TTL_SECS),
+        job_lease_secs(
+            cfg.heartbeat_interval.as_deref(),
+            MIN_HEARTBEAT_INTERVAL_SECS,
+        ),
+    ) {
+        if hb >= ttl {
+            warnings.push(format!(
+                "advanced.jobs.heartbeat_interval must be lower than advanced.jobs.lease_ttl; \
+                 half the TTL ({}s) applies",
+                (ttl / 2).max(1)
+            ));
+        }
+    }
+    warnings
+}
+
 /// Global replication controls + the rules list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ReplicationConfig {
@@ -346,12 +478,12 @@ pub struct ReplicationConfig {
     pub tick_interval: String,
 
     /// Per-rule lease TTL used by scheduler/run-now single-flight guard.
-    /// Defaults to `60s`; failed replicas can be replaced after this
-    /// expires.
+    /// Defaults to `300s`; failed replicas can be replaced after this
+    /// expires. Replication's own setting: `advanced.jobs` does not apply.
     #[serde(default = "default_lease_ttl")]
     pub lease_ttl: String,
 
-    /// How often long-running rules renew their lease. Defaults to `20s`.
+    /// How often long-running rules renew their lease. Defaults to `60s`.
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: String,
 
@@ -1449,6 +1581,10 @@ pub struct AdvancedSection {
     /// blocking S3 operations.
     #[serde(default, skip_serializing_if = "is_default_event_delivery")]
     pub event_delivery: EventDeliveryConfig,
+
+    /// One lease setting for the job leases (see [`JobsConfig`]).
+    #[serde(default, skip_serializing_if = "is_default_jobs")]
+    pub jobs: JobsConfig,
 }
 
 // ══ skip_serializing_if helpers — any non-default value surfaces. ══════
@@ -1588,6 +1724,7 @@ impl SectionedConfig {
                 tls: flat.tls.clone(),
                 bootstrap_password_hash: flat.bootstrap_password_hash.clone(),
                 event_delivery: flat.event_delivery.clone(),
+                jobs: flat.jobs.clone(),
             },
         }
     }
@@ -1685,6 +1822,7 @@ impl SectionedConfig {
             config_sync_object_key: self.advanced.config_sync_object_key,
             tls: self.advanced.tls,
             event_delivery: self.advanced.event_delivery,
+            jobs: self.advanced.jobs,
             buckets: self.storage.buckets,
             backend_encryption: self.storage.backend_encryption,
             backends: self.storage.backends,
@@ -2473,6 +2611,71 @@ mod tests {
             "a valid https URL is fine: {w:?}"
         );
     }
+    /// R7: one `advanced.jobs` setting. Unset keeps each subsystem's own
+    /// default; a TTL alone gives a third of it as heartbeat; the heartbeat
+    /// always stays below the TTL; a bad value is ignored.
+    #[test]
+    fn jobs_lease_timing_truth_table() {
+        let t = |ttl: Option<&str>, hb: Option<&str>, d: LeaseTiming| {
+            let r = JobsConfig {
+                lease_ttl: ttl.map(str::to_string),
+                heartbeat_interval: hb.map(str::to_string),
+            }
+            .lease_timing(d);
+            (r.ttl_secs, r.heartbeat_secs)
+        };
+        use LeaseTiming as L;
+        assert_eq!(t(None, None, L::MAINTENANCE), (60, 20));
+        assert_eq!(t(None, None, L::LIFECYCLE), (300, 60));
+        assert_eq!(t(None, None, L::PARITY), (1800, 600));
+        assert_eq!(t(None, None, L::RULE_DELETE), (60, 20));
+        for d in [L::MAINTENANCE, L::LIFECYCLE, L::PARITY, L::RULE_DELETE] {
+            assert_eq!(t(Some("2m"), None, d), (120, 40));
+            assert_eq!(t(Some("2m"), Some("30s"), d), (120, 30));
+        }
+        // Heartbeat alone keeps the subsystem TTL; at or above it → TTL/2.
+        assert_eq!(t(None, Some("30s"), L::LIFECYCLE), (300, 30));
+        assert_eq!(t(None, Some("90s"), L::MAINTENANCE), (60, 30));
+        assert_eq!(t(Some("30s"), Some("30s"), L::PARITY), (30, 15));
+        // Unparseable or below the minimum: ignored.
+        assert_eq!(t(Some("soon"), None, L::LIFECYCLE), (300, 60));
+        assert_eq!(t(Some("10s"), Some("1s"), L::MAINTENANCE), (60, 20));
+    }
+
+    #[test]
+    fn jobs_validation_names_each_ignored_value() {
+        assert!(validate_jobs(&JobsConfig::default()).is_empty());
+        let w = validate_jobs(&JobsConfig {
+            lease_ttl: Some("10s".into()),
+            heartbeat_interval: Some("x".into()),
+        });
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].contains("advanced.jobs.lease_ttl") && w[0].contains("minimum"));
+        assert!(w[1].contains("advanced.jobs.heartbeat_interval"));
+        let w = validate_jobs(&JobsConfig {
+            lease_ttl: Some("30s".into()),
+            heartbeat_interval: Some("30s".into()),
+        });
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("must be lower"), "{w:?}");
+    }
+
+    /// `advanced.jobs` parses from the sectioned YAML, reaches the flat
+    /// config, and a default config exports no `jobs` key.
+    #[test]
+    fn advanced_jobs_round_trips_through_yaml() {
+        let cfg = Config::from_yaml_str(
+            "advanced:\n  jobs:\n    lease_ttl: 2m\n    heartbeat_interval: 30s\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.jobs.lease_ttl.as_deref(), Some("2m"));
+        assert_eq!(cfg.jobs.heartbeat_interval.as_deref(), Some("30s"));
+        let back = SectionedConfig::from_flat(&cfg);
+        assert_eq!(back.advanced.jobs, cfg.jobs);
+        let yaml = serde_yaml::to_string(&SectionedConfig::from_flat(&Config::default())).unwrap();
+        assert!(!yaml.contains("jobs"), "{yaml}");
+    }
+
     use crate::config::Config;
 
     #[test]

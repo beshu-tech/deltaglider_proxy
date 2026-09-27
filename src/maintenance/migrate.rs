@@ -67,7 +67,7 @@ use super::paged::{paged_phase, JobCtx, KeyPage, PageStep, PhaseSpec};
 use super::store::MaintenanceJob;
 use super::worker::{
     after_run, check_cancel, drain_inflight_writes, heartbeat, persist_flushed, record_failure,
-    resumable_in, stop_if_shutting_down, AfterRun, Counters, PhaseStop,
+    resumable_in, stop_if_shutting_down, AfterRun, Counters, Holder, PhaseStop,
 };
 
 pub const TRANSIENT_PREFIX: &str = "__dgmigrate_";
@@ -524,11 +524,11 @@ pub(crate) async fn execute_migrate_phases(
     mutator: &ConfigMutator,
     db: &Arc<Mutex<ConfigDb>>,
     state: &Arc<AppState>,
-    instance_id: &str,
+    holder: Holder<'_>,
     job: &MaintenanceJob,
 ) -> Result<(), PhaseStop> {
     let params = parse_params(job.params.as_deref().ok_or("migrate job has no params")?)?;
-    let result = run_phases(mutator, db, state, instance_id, job, &params).await;
+    let result = run_phases(mutator, db, state, holder, job, &params).await;
 
     // Only an outcome the worker SETTLES unwinds. Lease loss is NOT an
     // unwind: the job continues under the next claimer, which needs the
@@ -573,7 +573,7 @@ async fn run_phases(
     mutator: &ConfigMutator,
     db: &Arc<Mutex<ConfigDb>>,
     state: &Arc<AppState>,
-    instance_id: &str,
+    holder: Holder<'_>,
     job: &MaintenanceJob,
     params: &MigrateParams,
 ) -> Result<(), PhaseStop> {
@@ -581,7 +581,7 @@ async fn run_phases(
         mutator,
         db,
         state,
-        instance_id,
+        holder,
         job,
         params,
         provenance: provenance_value(params, job.id),
@@ -619,7 +619,7 @@ struct MigrateRun<'a> {
     mutator: &'a ConfigMutator,
     db: &'a Arc<Mutex<ConfigDb>>,
     state: &'a Arc<AppState>,
-    instance_id: &'a str,
+    holder: Holder<'a>,
     job: &'a MaintenanceJob,
     params: &'a MigrateParams,
     /// The `dg-migration` value this job stamps on its copies.
@@ -630,7 +630,7 @@ impl MigrateRun<'_> {
     fn ctx(&self) -> JobCtx<'_> {
         JobCtx {
             db: self.db,
-            instance_id: self.instance_id,
+            holder: self.holder,
             job: self.job,
         }
     }
@@ -828,11 +828,11 @@ impl MigrateRun<'_> {
     /// tokens, so a sweep that deleted restarts from the top), and a cancel
     /// here is a note on a finished migration, not a stop.
     async fn cleanup(&self) -> Result<(), PhaseStop> {
-        let (mutator, db, state, instance_id, job, params) = (
+        let (mutator, db, state, holder, job, params) = (
             self.mutator,
             self.db,
             self.state,
-            self.instance_id,
+            self.holder,
             self.job,
             self.params,
         );
@@ -946,7 +946,7 @@ impl MigrateRun<'_> {
             } else {
                 cleanup_token = None;
             }
-            heartbeat(db, job.id, instance_id).await?;
+            heartbeat(db, job.id, holder).await?;
         }
         remove_routes(
             mutator,

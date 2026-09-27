@@ -6,7 +6,7 @@ use crate::api::handlers::AppState;
 use crate::background::parse_duration_or;
 use crate::config::SharedConfig;
 use crate::config_db::ConfigDb;
-use crate::config_sections::LifecycleConfig;
+use crate::config_sections::{JobsConfig, LeaseTiming, LifecycleConfig};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -14,19 +14,12 @@ use tracing::{debug, info, warn};
 
 const DEFAULT_TICK: Duration = Duration::from_secs(3600);
 const MIN_TICK: Duration = Duration::from_secs(60);
-// Lifecycle leases are deliberately 5x longer than replication's
-// (TTL 300s/heartbeat 60s here vs 60s/20s in `replication::scheduler`).
-// The tick cadence differs by the same order of magnitude: lifecycle wakes
-// at most once a minute (MIN_TICK) and typically hourly (DEFAULT_TICK),
-// whereas replication wakes every few seconds. A single lifecycle run also
-// does heavier, slower work (full prefix scans + deletes through the engine),
-// so a longer TTL keeps the lease alive across a slow run without a peer
-// stealing it mid-flight. The tradeoff: if the lease holder crashes, another
-// instance waits up to TTL seconds before taking over — acceptable given how
-// rarely lifecycle runs. Heartbeat stays well under TTL so a live-but-slow run
-// keeps refreshing the lease.
-const DEFAULT_LEASE_TTL_SECS: i64 = 300;
-const DEFAULT_HEARTBEAT_SECS: i64 = 60;
+// Lifecycle leases default to 5x maintenance's (`LeaseTiming::LIFECYCLE`,
+// 300s/60s): lifecycle wakes at most once a minute (MIN_TICK) and typically
+// hourly (DEFAULT_TICK), and one run does full prefix scans + deletes, so a
+// longer TTL keeps the lease alive across a slow run without a peer stealing
+// it mid-flight. The tradeoff: a crashed holder blocks a peer for up to one
+// TTL. `advanced.jobs` overrides it.
 
 pub fn spawn_scheduler(
     config: SharedConfig,
@@ -43,9 +36,12 @@ pub fn spawn_scheduler(
             };
             tokio::time::sleep(tick).await;
 
-            let lifecycle = { config.read().await.lifecycle.clone() };
+            let (lifecycle, lease) = {
+                let cfg = config.read().await;
+                (cfg.lifecycle.clone(), lease_timing(&cfg.jobs))
+            };
             if lifecycle.enabled {
-                run_due_rules(&lifecycle, db.clone(), &state, &instance_id).await;
+                run_due_rules(&lifecycle, lease, db.clone(), &state, &instance_id).await;
             } else {
                 debug!("Lifecycle scheduler skipped: global lifecycle disabled");
             }
@@ -55,6 +51,7 @@ pub fn spawn_scheduler(
 
 async fn run_due_rules(
     lifecycle: &LifecycleConfig,
+    lease: LeaseTiming,
     db: Option<Arc<Mutex<ConfigDb>>>,
     state: &Arc<AppState>,
     instance_id: &str,
@@ -109,7 +106,7 @@ async fn run_due_rules(
                         &rule.name,
                         instance_id,
                         now,
-                        lease_ttl_secs(),
+                        lease.ttl_secs,
                     ) {
                         Ok(true) => true,
                         Ok(false) => {
@@ -179,8 +176,8 @@ async fn run_due_rules(
             scheduler_tick(lifecycle).as_secs() as i64,
             Some(super::RunLease {
                 owner: instance_id.to_string(),
-                ttl_secs: lease_ttl_secs(),
-                heartbeat_secs: heartbeat_secs(),
+                ttl_secs: lease.ttl_secs,
+                heartbeat_secs: lease.heartbeat_secs,
             }),
             Some(state.maintenance_gate.clone()),
         )
@@ -217,12 +214,9 @@ pub(crate) fn scheduler_tick(lifecycle: &LifecycleConfig) -> Duration {
     )
 }
 
-pub(crate) fn lease_ttl_secs() -> i64 {
-    DEFAULT_LEASE_TTL_SECS
-}
-
-pub(crate) fn heartbeat_secs() -> i64 {
-    DEFAULT_HEARTBEAT_SECS
+/// The lifecycle lease timing: `advanced.jobs`, else `LeaseTiming::LIFECYCLE`.
+pub(crate) fn lease_timing(jobs: &JobsConfig) -> LeaseTiming {
+    jobs.lease_timing(LeaseTiming::LIFECYCLE)
 }
 
 #[cfg(test)]
@@ -333,7 +327,14 @@ mod tests {
     }
 
     async fn run(env: &Env, cfg: &LifecycleConfig) {
-        run_due_rules(cfg, Some(env.db.clone()), &env.state, "sched-test").await;
+        run_due_rules(
+            cfg,
+            LeaseTiming::LIFECYCLE,
+            Some(env.db.clone()),
+            &env.state,
+            "sched-test",
+        )
+        .await;
     }
 
     /// A due rule runs, releases its lease, and is not due again until one
@@ -477,10 +478,10 @@ mod tests {
         seed(&env, "sched-nodb").await;
         let cfg = lifecycle(&[("sched-nodb-rule", "sched-nodb")]);
         let held = crate::lifecycle::try_acquire_rule("sched-nodb-rule").unwrap();
-        run_due_rules(&cfg, None, &env.state, "sched-test").await;
+        run_due_rules(&cfg, LeaseTiming::LIFECYCLE, None, &env.state, "sched-test").await;
         assert!(exists(&env, "sched-nodb").await, "busy here: skipped");
         drop(held);
-        run_due_rules(&cfg, None, &env.state, "sched-test").await;
+        run_due_rules(&cfg, LeaseTiming::LIFECYCLE, None, &env.state, "sched-test").await;
         assert!(!exists(&env, "sched-nodb").await, "free: runs");
     }
 

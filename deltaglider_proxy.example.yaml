@@ -286,6 +286,13 @@ storage:
 #   codec_concurrency: 16           # xdelta3 processes at once
 #   blocking_threads: 512
 #
+#   # One lease setting for maintenance jobs, lifecycle rules, parity audits
+#   # and rule deletes. Unset: each kind's default (60s / 5m / 30m / 60s).
+#   # Replication keeps storage.replication.lease_ttl.
+#   # jobs:
+#   #   lease_ttl: "2m"
+#   #   heartbeat_interval: "40s"
+#
 #   # Multi-instance: share the encrypted IAM DB through an S3 bucket.
 #   # Every instance needs the same DGP_CONFIG_DB_KEY.
 #   config_sync_bucket: dgp-iam-sync

@@ -839,13 +839,20 @@ async fn delete_rule(
             Some(super::JobPlane { lease, .. }) => {
                 let owner = format!("delete:{}", uuid::Uuid::new_v4());
                 let now = crate::replication::state_store::current_unix_seconds();
+                let ttl_secs = state
+                    .config
+                    .read()
+                    .await
+                    .jobs
+                    .lease_timing(crate::config_sections::LeaseTiming::RULE_DELETE)
+                    .ttl_secs;
                 let held = lease
                     .try_acquire(
                         crate::coordination::LeaseSubsystem::Replication,
                         name,
                         &owner,
                         now,
-                        DELETE_LEASE_TTL_SECS,
+                        ttl_secs,
                     )
                     .await
                     .map_err(|e| {
@@ -888,10 +895,6 @@ async fn delete_rule(
     );
     Ok(())
 }
-
-/// How long `delete_rule` may hold the rule lease: the purge is a config
-/// persist plus a few DB deletes, so this only bounds a crash mid-delete.
-const DELETE_LEASE_TTL_SECS: i64 = 60;
 
 /// The locked part of [`delete_rule`]. `holds_rule_lease`: the caller holds
 /// the rule's coordination lease, so no run holds it (and the SQLite lease

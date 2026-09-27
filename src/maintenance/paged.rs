@@ -18,13 +18,13 @@ use crate::config_db::ConfigDb;
 use crate::job_loop::Pager;
 
 use super::store::MaintenanceJob;
-use super::worker::{check_cancel, heartbeat, stop_if_shutting_down, PhaseStop};
+use super::worker::{check_cancel, heartbeat, stop_if_shutting_down, Holder, PhaseStop};
 
 /// The job a phase runs for.
 #[derive(Clone, Copy)]
 pub(crate) struct JobCtx<'a> {
     pub db: &'a Arc<Mutex<ConfigDb>>,
-    pub instance_id: &'a str,
+    pub holder: Holder<'a>,
     pub job: &'a MaintenanceJob,
 }
 
@@ -124,7 +124,7 @@ pub(crate) async fn paged_phase<S: PageStep>(
         step.end_page();
         let more = pager.advance(page.is_truncated, page.next_token);
         step.save(pager.token()).await?;
-        heartbeat(ctx.db, ctx.job.id, ctx.instance_id).await?;
+        heartbeat(ctx.db, ctx.job.id, ctx.holder).await?;
         if !more {
             break;
         }
@@ -222,7 +222,7 @@ mod tests {
         let db = Arc::new(Mutex::new(db));
         let ctx = JobCtx {
             db: &db,
-            instance_id: "inst",
+            holder: Holder::test("inst"),
             job: &job,
         };
         let mut f = two_pages();
@@ -248,7 +248,7 @@ mod tests {
         let db = Arc::new(Mutex::new(db));
         let ctx = JobCtx {
             db: &db,
-            instance_id: "inst",
+            holder: Holder::test("inst"),
             job: &job,
         };
         let mut f = two_pages();
@@ -276,7 +276,7 @@ mod tests {
         let db = Arc::new(Mutex::new(db));
         let ctx = JobCtx {
             db: &db,
-            instance_id: "inst",
+            holder: Holder::test("inst"),
             job: &job,
         };
         let mut f = Fake::default();
@@ -310,7 +310,7 @@ mod tests {
         let db = Arc::new(Mutex::new(db));
         let ctx = JobCtx {
             db: &db,
-            instance_id: "someone-else",
+            holder: Holder::test("someone-else"),
             job: &job,
         };
         let mut f = two_pages();
@@ -328,7 +328,7 @@ mod tests {
         let db = Arc::new(Mutex::new(db));
         let ctx = JobCtx {
             db: &db,
-            instance_id: "inst",
+            holder: Holder::test("inst"),
             job: &job,
         };
         // A token loop: every page points at itself.

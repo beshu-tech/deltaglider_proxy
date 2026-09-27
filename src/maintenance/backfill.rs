@@ -150,7 +150,7 @@ pub async fn hash_object_content<S: crate::storage::StorageBackend>(
 pub(crate) async fn execute_backfill_phases(
     db: &std::sync::Arc<tokio::sync::Mutex<crate::config_db::ConfigDb>>,
     state: &std::sync::Arc<crate::api::handlers::AppState>,
-    instance_id: &str,
+    holder: super::worker::Holder<'_>,
     job: &super::store::MaintenanceJob,
 ) -> Result<(), super::worker::PhaseStop> {
     use super::worker::{drain_inflight_writes, run_count_then_walk};
@@ -169,7 +169,7 @@ pub(crate) async fn execute_backfill_phases(
         bucket: &job.bucket,
         refresh_last_modified: params.refresh_last_modified,
     };
-    run_count_then_walk(db, state, instance_id, job, "backfill", &mut visitor).await?;
+    run_count_then_walk(db, state, holder, job, "backfill", &mut visitor).await?;
     Ok(())
 }
 

@@ -36,6 +36,7 @@ use crate::background::LeaseKeeper;
 use crate::config::SharedConfig;
 use crate::config_apply::ConfigMutator;
 use crate::config_db::ConfigDb;
+use crate::config_sections::LeaseTiming;
 use crate::coordination::LeaseError;
 use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
 use crate::transfer::{copy_object_with_retries, ObjectTransferRequest};
@@ -45,10 +46,28 @@ use super::store::{current_unix_seconds, MaintenanceJob};
 use super::{needs_rewrite, resolve_desired, strip_encryption_markers, DesiredEncryption};
 
 const POLL_INTERVAL_SECS: u64 = 3;
-const LEASE_TTL_SECS: i64 = 60;
 pub(crate) const PAGE_SIZE: u32 = 1000;
 const MAX_FAILURES_RETAINED: usize = 200;
 const DRAIN_POLL_MS: u64 = 250;
+
+/// Who holds a job's lease, and its timing (`advanced.jobs`, read at
+/// claim). The claim, the keeper and the per-page heartbeat all renew
+/// with the same TTL.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Holder<'a> {
+    pub id: &'a str,
+    pub lease: LeaseTiming,
+}
+
+#[cfg(test)]
+impl<'a> Holder<'a> {
+    pub(crate) fn test(id: &'a str) -> Self {
+        Self {
+            id,
+            lease: LeaseTiming::MAINTENANCE,
+        }
+    }
+}
 
 /// Spawn the maintenance worker loop. Wakes on `state.maintenance_notify`
 /// (job creation) or every few seconds (boot-requeued jobs, lease retry).
@@ -73,6 +92,11 @@ pub fn spawn_worker(
                     info!("Maintenance worker stopped: the process shuts down");
                     return;
                 }
+                let lease = config
+                    .read()
+                    .await
+                    .jobs
+                    .lease_timing(LeaseTiming::MAINTENANCE);
                 let claimed = {
                     let db = db.lock().await;
                     // Re-queue abandoned rows first (lease-aware): a job
@@ -84,7 +108,7 @@ pub fn spawn_worker(
                     let claimed = db.maintenance_claim_next_job(
                         &instance_id,
                         current_unix_seconds(),
-                        LEASE_TTL_SECS,
+                        lease.ttl_secs,
                     );
                     // Every tick re-derives the gate: the claim (a migrate
                     // resumed in `cleanup` gates nothing), the requeue, and
@@ -94,7 +118,11 @@ pub fn spawn_worker(
                 };
                 match claimed {
                     Ok(Some(job)) => {
-                        run_job(&mutator, &config, &db, &state, &instance_id, job).await;
+                        let holder = Holder {
+                            id: &instance_id,
+                            lease,
+                        };
+                        run_job(&mutator, &config, &db, &state, holder, job).await;
                     }
                     Ok(None) => break,
                     Err(e) => {
@@ -114,7 +142,7 @@ async fn run_job(
     config: &SharedConfig,
     db: &Arc<Mutex<ConfigDb>>,
     state: &Arc<AppState>,
-    instance_id: &str,
+    holder: Holder<'_>,
     job: MaintenanceJob,
 ) {
     let bucket = job.bucket.clone();
@@ -141,17 +169,15 @@ async fn run_job(
     let keeper = spawn_lease_keeper(
         db.clone(),
         job.id,
-        instance_id.to_string(),
-        LEASE_TTL_SECS,
-        keeper_interval(LEASE_TTL_SECS),
+        holder.id.to_string(),
+        holder.lease.ttl_secs,
+        std::time::Duration::from_secs(holder.lease.heartbeat_secs.max(1) as u64),
     );
     let outcome = match job.kind.as_str() {
-        "reencrypt" => execute_phases(config, db, state, instance_id, &job).await,
-        "migrate" => {
-            super::migrate::execute_migrate_phases(mutator, db, state, instance_id, &job).await
-        }
+        "reencrypt" => execute_phases(config, db, state, holder, &job).await,
+        "migrate" => super::migrate::execute_migrate_phases(mutator, db, state, holder, &job).await,
         super::backfill::KIND => {
-            super::backfill::execute_backfill_phases(db, state, instance_id, &job).await
+            super::backfill::execute_backfill_phases(db, state, holder, &job).await
         }
         other => Err(format!("unknown maintenance job kind '{other}'").into()),
     };
@@ -167,7 +193,7 @@ async fn run_job(
         // armed until the next run settles it.
         let released = {
             let db = db.lock().await;
-            let released = db.maintenance_release_for_resume(job.id, instance_id);
+            let released = db.maintenance_release_for_resume(job.id, holder.id);
             state.maintenance_gate.sync_from(&db);
             released
         };
@@ -250,7 +276,7 @@ async fn execute_phases(
     config: &SharedConfig,
     db: &Arc<Mutex<ConfigDb>>,
     state: &Arc<AppState>,
-    instance_id: &str,
+    holder: Holder<'_>,
     job: &MaintenanceJob,
 ) -> Result<(), PhaseStop> {
     let bucket = &job.bucket;
@@ -263,7 +289,7 @@ async fn execute_phases(
         bucket,
         desired: None,
     };
-    let mut c = run_count_then_walk(db, state, instance_id, job, "rewrite", &mut visitor).await?;
+    let mut c = run_count_then_walk(db, state, holder, job, "rewrite", &mut visitor).await?;
     let mut phase = job.phase.clone();
     if phase == "counting" || phase == "objects" {
         phase = "references".to_string();
@@ -294,7 +320,7 @@ async fn execute_phases(
                     c.failed += 1;
                 }
             }
-            heartbeat(db, job.id, instance_id).await?;
+            heartbeat(db, job.id, holder).await?;
         }
         // Final counters (the per-reference failure increments above).
         persist(db, job, "references", &c, None).await;
@@ -413,7 +439,7 @@ impl Counters {
 pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
     db: &Arc<Mutex<ConfigDb>>,
     state: &Arc<AppState>,
-    instance_id: &str,
+    holder: Holder<'_>,
     job: &MaintenanceJob,
     what: &str,
     visitor: &mut V,
@@ -423,8 +449,7 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
 
     // ── Phase: counting ──
     if phase == "counting" {
-        let count =
-            counting_phase(db, state, instance_id, job, job.continuation_token.clone()).await?;
+        let count = counting_phase(db, state, holder, job, job.continuation_token.clone()).await?;
         c = Counters {
             total: Some(count),
             ..Counters::default()
@@ -451,11 +476,7 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
         c,
     };
     paged_phase(
-        JobCtx {
-            db,
-            instance_id,
-            job,
-        },
+        JobCtx { db, holder, job },
         PhaseSpec {
             phase: "objects",
             // Resume only when the job was persisted IN this phase (a fresh
@@ -544,7 +565,7 @@ impl<V: ObjectVisitor> PageStep for ObjectsStep<'_, V> {
 pub(crate) async fn counting_phase(
     db: &Arc<Mutex<ConfigDb>>,
     state: &Arc<AppState>,
-    instance_id: &str,
+    holder: Holder<'_>,
     job: &MaintenanceJob,
     resume_token: Option<String>,
 ) -> Result<i64, PhaseStop> {
@@ -561,11 +582,7 @@ pub(crate) async fn counting_phase(
         count,
     };
     paged_phase(
-        JobCtx {
-            db,
-            instance_id,
-            job,
-        },
+        JobCtx { db, holder, job },
         PhaseSpec {
             phase: "counting",
             resume: resume_token,
@@ -829,11 +846,6 @@ pub(crate) fn spawn_lease_keeper(
     )
 }
 
-/// Renew three times per TTL, so one slow renewal never lapses the lease.
-fn keeper_interval(ttl_secs: i64) -> std::time::Duration {
-    std::time::Duration::from_millis((ttl_secs.max(1) as u64) * 1000 / 3)
-}
-
 /// Renew the job lease; `Err(LeaseLost)` means the renewal was refused
 /// (lapsed, or taken by another instance) and the phase MUST stop — this
 /// is the one subsystem that flips config and deletes source data, so a
@@ -844,11 +856,16 @@ fn keeper_interval(ttl_secs: i64) -> std::time::Duration {
 pub(crate) async fn heartbeat(
     db: &Arc<Mutex<ConfigDb>>,
     job_id: i64,
-    instance_id: &str,
+    holder: Holder<'_>,
 ) -> Result<(), PhaseStop> {
     let renewed = {
         let db = db.lock().await;
-        db.maintenance_heartbeat(job_id, instance_id, current_unix_seconds(), LEASE_TTL_SECS)
+        db.maintenance_heartbeat(
+            job_id,
+            holder.id,
+            current_unix_seconds(),
+            holder.lease.ttl_secs,
+        )
     };
     match LeaseError::from_renewal(renewed) {
         Ok(()) => Ok(()),
@@ -978,14 +995,17 @@ mod tests {
             .conn
             .execute_batch("ALTER TABLE maintenance_jobs RENAME TO maintenance_jobs_away")
             .unwrap();
-        assert_eq!(heartbeat(&db, id, "inst").await, Ok(()));
+        assert_eq!(heartbeat(&db, id, Holder::test("inst")).await, Ok(()));
         // A refused renewal (another holder) still stops the phase.
         db.lock()
             .await
             .conn
             .execute_batch("ALTER TABLE maintenance_jobs_away RENAME TO maintenance_jobs")
             .unwrap();
-        assert_eq!(heartbeat(&db, id, "other").await, Err(PhaseStop::LeaseLost));
+        assert_eq!(
+            heartbeat(&db, id, Holder::test("other")).await,
+            Err(PhaseStop::LeaseLost)
+        );
     }
 
     /// jobs-6: migrate cleanup pre-settles `completed_with_errors`; the audit
@@ -1053,9 +1073,15 @@ mod tests {
             .unwrap();
         let job = db.maintenance_job_by_id(id).unwrap().unwrap();
         let db = Arc::new(Mutex::new(db));
-        let count = counting_phase(&db, &state, "inst", &job, job.continuation_token.clone())
-            .await
-            .unwrap();
+        let count = counting_phase(
+            &db,
+            &state,
+            Holder::test("inst"),
+            &job,
+            job.continuation_token.clone(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             count, 3,
             "the resumed count includes the objects before the cursor"
@@ -1096,11 +1122,10 @@ mod tests {
     }
 
     #[test]
-    fn keeper_interval_is_well_inside_the_ttl() {
-        assert!(
-            keeper_interval(LEASE_TTL_SECS) * 3
-                <= std::time::Duration::from_secs(LEASE_TTL_SECS as u64)
-        );
-        assert_eq!(keeper_interval(1), std::time::Duration::from_millis(333));
+    fn keeper_renews_three_times_per_default_ttl() {
+        let t = LeaseTiming::MAINTENANCE;
+        assert_eq!((t.ttl_secs, t.heartbeat_secs), (60, 20));
+        let t = crate::config_sections::JobsConfig::default().lease_timing(t);
+        assert_eq!((t.ttl_secs, t.heartbeat_secs), (60, 20));
     }
 }

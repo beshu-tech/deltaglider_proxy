@@ -25,6 +25,7 @@ YAML is the only supported format. TOML support was removed in v1.4.1: a `.toml`
 - [Multi-backend routing](#multi-backend-routing)
 - [Bucket policies](#bucket-policies)
 - [Lifecycle rules](#lifecycle-rules)
+- [Job leases](#job-leases)
 - [Event delivery](#event-delivery)
 - [Encryption at rest](#encryption-at-rest)
 - [CLI subcommands](#cli-subcommands)
@@ -828,6 +829,27 @@ storage:
 ```
 
 Use `POST /_/api/admin/jobs/lifecycle:<name>/preview` (or the Preview button on the Jobs screen) before enabling a rule. See [Lifecycle Rules](lifecycle.md) for API details, skip rules, and limitations.
+
+---
+
+## Job leases
+
+A background job holds a lease while it runs, so that two runners never run the same job at the same time. The runner renews the lease at a fixed interval. When a runner dies, its lease lapses after the TTL, and another runner can then take the job. `advanced.jobs` sets one TTL and one renewal interval for the leases of maintenance jobs, lifecycle rules, parity audits and rule deletes.
+
+```yaml
+# validate
+advanced:
+  jobs:
+    lease_ttl: "2m"
+    heartbeat_interval: "40s"
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `lease_ttl` | per job kind: maintenance `60s`, lifecycle `5m`, parity audit `30m`, rule delete `60s` | How long one renewal holds the lease (humantime, minimum `15s`). A shorter TTL lets another runner take a dead runner's job sooner. A longer TTL gives a slow runner more time between renewals. |
+| `heartbeat_interval` | a third of `lease_ttl` when you set `lease_ttl`, else per job kind: maintenance `20s`, lifecycle `60s`, parity audit `10m` | How often a running job renews its lease (humantime, minimum `5s`). It must be lower than `lease_ttl`; a value at or above it is replaced by half the TTL. |
+
+A value that does not parse, or that is below the minimum, is ignored with a config warning, and the default of the job kind applies. Replication rules do not use `advanced.jobs`: they keep `storage.replication.lease_ttl` and `heartbeat_interval` (see [Replication](replication.md)), because their lease can be a cross-instance S3 lease with its own failover window.
 
 ---
 
