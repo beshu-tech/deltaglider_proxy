@@ -314,8 +314,7 @@ pub struct SignedPayloadHash(pub String);
 pub struct RequestClientIp(pub std::net::IpAddr);
 
 impl SignedPayloadHash {
-    /// Returns the inner header value lowercase-trimmed (header
-    /// values are sometimes uppercase from older SDKs).
+    /// The header value as sent (it may be uppercase hex).
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -357,8 +356,9 @@ impl SignedPayloadHash {
             return Ok(());
         }
         let actual = hex::encode(Sha256::digest(body));
-        let matches: bool =
-            ConstantTimeEq::ct_eq(actual.as_bytes(), self.as_str().as_bytes()).into();
+        // `hex::encode` is lowercase; the header may be uppercase hex.
+        let claimed = self.as_str().to_ascii_lowercase();
+        let matches: bool = ConstantTimeEq::ct_eq(actual.as_bytes(), claimed.as_bytes()).into();
         if !matches {
             return Err(super::S3Error::BadDigest);
         }
@@ -1333,6 +1333,20 @@ mod tests {
             "signed streaming payload must be accepted (verified upstream by s3s)"
         );
     }
+
+    /// auth-8: hex is case-insensitive. `is_verifiable_hex` accepts an
+    /// uppercase `x-amz-content-sha256`, so the body check must too; a
+    /// wrong body stays `BadDigest` in either case.
+    #[test]
+    fn uppercase_payload_hash_verifies_the_same_body() {
+        let body = b"hello";
+        let upper = hex::encode(Sha256::digest(body)).to_ascii_uppercase();
+        let hash = SignedPayloadHash(upper);
+        assert!(hash.is_verifiable_hex());
+        assert!(hash.verify_against_body(body).is_ok());
+        assert!(hash.verify_against_body(b"other").is_err());
+    }
+
     #[test]
     fn test_has_presigned_query_params() {
         assert!(has_presigned_query_params(

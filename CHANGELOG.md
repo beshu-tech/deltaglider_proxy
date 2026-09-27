@@ -354,6 +354,12 @@ So the total covered only the objects after the cursor, and the progress
 bar reached 99 % long before the end. Now the resumed count starts from
 the count that was saved with the cursor.
 
+### Fixed — An uppercase `x-amz-content-sha256` no longer fails a `PUT`
+
+The proxy compared the body hash in lowercase hex with the header as sent,
+so a correct hash in uppercase hex failed with `BadDigest`. Hex is now
+compared without regard to case.
+
 ### Fixed — Anonymous requests no longer lock out a shared client IP
 
 The S3 brute-force limiter counted every refused request, also one with
