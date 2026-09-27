@@ -84,7 +84,7 @@ Either route ends the same way: swap the endpoint.
 2. Issue proxy credentials — clients sign with the proxy's SigV4 credentials now, not the provider's. Create per-client IAM users (e.g. `ci-uploader` with write on `releases/*`) in **Settings → Access → Users**.
 3. If you ran route 2, freeze or retire the old bucket once traffic has moved, so nothing writes around the proxy.
 
-Do not keep writing to the backend bucket directly (e.g. with the Python DeltaGlider CLI or raw AWS credentials) — writes that bypass the proxy don't get compressed, and on an encrypted backend they'd be stored plaintext. Standardize on the proxy as the only write path.
+Do not keep writing to the backend bucket directly (e.g. with the Python DeltaGlider CLI or raw AWS credentials). A write with a plain S3 client is not compressed. No tool that writes to the backend directly encrypts with the proxy's key, so on a proxy-encrypted backend such a write is stored in plaintext. Standardize on the proxy as the only write path.
 
 ## Verify
 
@@ -96,7 +96,7 @@ Do not keep writing to the backend bucket directly (e.g. with the Python DeltaGl
 
    The hash must match the original — the proxy is byte-exact.
 
-2. Upload a new version and confirm it stored as a delta — check the `x-amz-storage-type` response header on a GET/HEAD (`delta` for compressed, `passthrough` otherwise).
+2. Upload a new version and confirm it stored as a delta — check the `x-amz-storage-type` response header on a GET/HEAD (`delta` for compressed, `passthrough` otherwise). The proxy sends this header only when it runs with `DGP_DEBUG_HEADERS=true`. Without it, the `x-amz-meta-dg-note` header carries the same value.
 
 3. Watch the overall savings grow on the dashboard at **Settings → Observability → Dashboard** (`/_/admin/dashboard`). Its **Analytics** view shows the savings for each bucket. The same counters are also available to Prometheus at `/_/metrics`.
 

@@ -101,7 +101,7 @@ Keys can also be set in the admin GUI (Settings → Storage → Backends); GUI-g
 
 ## Key IDs
 
-Every proxy-AES write stamps a `dg-encryption-key-id` metadata field on the object. The id is either the explicit `key_id` from YAML or derived as `SHA-256(backend_name ‖ 0x00 ‖ key)[..16]`. The backend name is part of the derivation: two backends with identical key material but different names produce different ids, so objects are not portable across backends by default. Pinning the same explicit `key_id` with identical key bytes on two backends is the documented portability escape hatch.
+Every proxy-AES write stamps a `dg-encryption-key-id` metadata field on the object. The id is either the explicit `key_id` from YAML or derived as the first 8 bytes of `SHA-256(backend_name ‖ 0x00 ‖ key)`, written as 16 hex characters. The backend name is part of the derivation: two backends with identical key material but different names produce different ids, so objects are not portable across backends by default. Pinning the same explicit `key_id` with identical key bytes on two backends is the documented portability escape hatch.
 
 On read, the object's stamped id is compared against the backend's configured `key_id`, then against `legacy_key_id`. A mismatch produces a specific error rather than an opaque GCM authentication failure:
 
@@ -122,7 +122,7 @@ On filesystem backends these markers live in the `user.dg.metadata` xattr; on S3
 
 ## Chunked wire format (proxy-AES)
 
-Large passthrough uploads stream end-to-end without buffering the whole object. The codec slices plaintext into 64-KiB windows and produces this layout:
+Passthrough bodies use this format. The codec slices plaintext into 64-KiB windows and produces this layout:
 
 ```
 ┌──────────┬───────────┬────────────────────────────────────────────────┐
@@ -166,7 +166,7 @@ When `legacy_key` / `legacy_key_id` are set, reads check the object's `dg-encryp
 - **No per-bucket encryption.** Encryption is backend-scoped; a bucket inherits the encryption of the backend it routes to.
 - **Metadata is plaintext** under every mode, including SSE-KMS: object names, sizes, content-type, and `x-amz-meta-*` user metadata are stored unencrypted.
 - **No forward secrecy.** A disclosed proxy-AES key decrypts all past ciphertext written under it.
-- **Memory.** Encrypted GET is streaming: the decoder holds ~130 KiB in flight regardless of object size, and range GETs fetch only the target chunks plus a 16-byte header probe. Encrypted PUT in proxy-AES mode buffers every encrypted frame before handing off to the inner backend: peak write memory ≈ plaintext size + 0.03%; combined with multipart part buffering, a 100 MiB encrypted upload peaks around 200–300 MiB RSS. Passthrough objects above `max_object_size` (default 100 MiB) are rejected up front. SSE-KMS / SSE-S3 stream through without this buffering.
+- **Memory.** Encrypted GET is streaming: the decoder holds ~130 KiB in flight regardless of object size, and range GETs fetch only the target chunks plus a 16-byte header probe. An encrypted PUT in proxy-AES mode of a body that the proxy holds in memory buffers every encrypted frame before handing off to the inner backend: peak write memory ≈ plaintext size + 0.03%, so a 100 MiB `PutObject` peaks around 200–300 MiB RSS. A body that the proxy stores from a file (a large upload, or a multipart upload whose parts are relay files) is encrypted into a temporary file in `DGP_SPOOL_DIR` instead. That file counts against `DGP_SPOOL_MAX_BYTES`, and when the budget is in use the upload gets `503 SlowDown`. Passthrough objects above `max_object_size` (default 100 MiB) are rejected up front. SSE-KMS / SSE-S3 stream through without this buffering.
 - **Latency.** AES-256-GCM throughput is roughly 1–3 GB/s per core with AES-NI; a 100 MiB proxy-AES upload adds ~30–100 ms of proxy-side crypto work. Native SSE modes move this cost to AWS.
 - The pre-v0.9 global `advanced.encryption_key` field no longer exists; encryption is configured per backend.
 

@@ -33,7 +33,7 @@ If the backend is a non-AWS provider (Hetzner, MinIO, Backblaze, Wasabi), set `f
 
 On AWS you can omit both and let the SDK pick up instance credentials. The complete field list is in the [configuration reference](../reference/configuration.md).
 
-From the admin UI: **Settings → Storage → Backends → + Add backend**.
+From the admin UI: **Settings → Storage → Backends → + Add backend**. The admin UI and `POST /_/api/admin/backends` refuse a filesystem backend whose `path` is not absolute, because a relative path resolves against the working directory of the proxy process, and that directory is different under systemd, Docker and a shell.
 
 ![Storage backends](/_/screenshots/storage_backends.jpg)
 

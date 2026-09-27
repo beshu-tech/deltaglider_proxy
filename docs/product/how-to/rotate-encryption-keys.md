@@ -50,7 +50,7 @@ This guide shows you how to change a backend's encryption key or mode without lo
 Use when the old key must not remain in runtime at all.
 
 1. Declare a NEW backend with the new key (same underlying storage or different). Route no buckets to it yet.
-2. Move each bucket with the built-in migrate job — **Settings → Storage → Buckets → (bucket) → Migrate data…** or `POST /_/api/admin/buckets/:bucket/migrate` with the new backend as `target_backend`. The proxy decrypts with the old key on read and re-encrypts with the new key on write; the job is durable, resumable, cancellable pre-flip, and write-gates the bucket. Full procedure: [How to move a bucket to another backend](move-a-bucket-between-backends.md).
+2. Move each bucket with the built-in migrate job — **Settings → Storage → Buckets → (bucket) → Migrate data…** or `POST /_/api/admin/buckets/:bucket/migrate` with the new backend as `target_backend`. The proxy decrypts with the old key on read and re-encrypts with the new key on write; the job is durable, resumable, cancellable pre-flip, and write-gates the bucket. Full procedure: [How to move a bucket to another backend](move-a-bucket-between-backends.md). The migrate request gets `409 Conflict` while `config_sync_bucket` is set, because the flip changes the routing of one instance only. Run the migrate on a single instance.
 3. Once all buckets are flipped, delete the old backend from the config. The old key can be forgotten.
 
 ## Recipe C: migrate from proxy-AES to SSE-KMS
@@ -65,7 +65,7 @@ The re-encrypt job cannot do this change. It refuses a bucket whose backend uses
      kms_key_id: arn:aws:kms:eu-west-1:123456789012:key/new-kms
    ```
 
-2. Move each bucket to the new backend with the migrate job: **Settings → Storage → Buckets → (bucket) → Migrate data…**, or `POST /_/api/admin/buckets/:bucket/migrate`. The migrate job reads every object through the old backend, which decrypts it with the proxy key. Then it writes the object through the new backend, where AWS encrypts it with the KMS key. Full procedure: [How to move a bucket to another backend](move-a-bucket-between-backends.md).
+2. Move each bucket to the new backend with the migrate job: **Settings → Storage → Buckets → (bucket) → Migrate data…**, or `POST /_/api/admin/buckets/:bucket/migrate`. The migrate job reads every object through the old backend, which decrypts it with the proxy key. Then it writes the object through the new backend, where AWS encrypts it with the KMS key. As in recipe B, the migrate request gets `409 Conflict` while `config_sync_bucket` is set. Full procedure: [How to move a bucket to another backend](move-a-bucket-between-backends.md).
 3. When every bucket has moved, delete the old backend. The old proxy key is then no longer needed.
 
 You can also switch the existing backend in place, with the old key as the shim:

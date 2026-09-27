@@ -91,7 +91,7 @@ Reads and lists keep working; every write is rejected.
    curl -b cookies https://s3.acme.example/_/api/admin/config/section/storage?format=yaml
    ```
 
-2. Compression behaves as configured — upload two versions of a file and check the `x-amz-storage-type` header on a HEAD: `delta` means compressed, `passthrough` means not.
+2. Compression behaves as configured — upload two versions of a file and check the `x-amz-storage-type` header on a HEAD: `delta` means compressed, `passthrough` means not. The proxy sends this header only when it runs with `DGP_DEBUG_HEADERS=true`. Without it, the `x-amz-meta-dg-note` header of the HEAD response carries the same value.
 
 3. The quota bites — on a frozen bucket, a PUT should fail with `403`:
 

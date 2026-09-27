@@ -18,6 +18,8 @@ Two design choices matter here. First, every delta is computed **directly agains
 
 Not everything should be delta-encoded, and the proxy decides per object. The file router looks at the extension first: archives, database dumps, tarballs, and similar version-prone formats are delta candidates; images, video, and other already-compressed media go straight to **passthrough** storage. There's no point diffing a JPEG — compression has already squeezed out the redundancy that a binary diff would exploit.
 
+Two settings also skip the delta for an eligible file. A bucket with `compression: false` stores every object passthrough. A single upload can carry the user metadata `x-amz-meta-dg-no-delta: true` (the `--no-delta` flag of the `deltaglider_proxy s3` verbs sets it), and the proxy then stores that object passthrough and does not keep the hint.
+
 Even for an eligible file, the delta must earn its keep. If the encoded delta comes out at 75% or more of the original size (the `max_delta_ratio` guard, tunable), the proxy discards it and stores the object passthrough instead. A delta that barely saves space isn't worth paying reconstruction CPU on every future read. This guard is also the safety net for misclassified files: you don't need a perfectly curated extension list, because anything that doesn't actually delta well falls back automatically.
 
 ## The GET path, and why you can trust it
@@ -53,7 +55,7 @@ xdelta3 actually knows a trick for whole-stream formats: decompress, diff the pa
 
 ## The trade-off: streaming versus buffering
 
-Passthrough objects stream through the proxy in constant memory. Delta objects can't — xdelta3 is a batch algorithm, so reconstruction buffers the reference and the output in RAM, bounded by the max-object-size cap. That's the real price of the storage savings: delta reads cost memory and CPU that passthrough reads don't. The reference cache softens it considerably — the baseline for a hot deltaspace stays in an LRU cache, so only the first cold read pays a backend round-trip — but if your workload is huge objects read constantly and stored once, passthrough (or disabling compression on that bucket) is the better trade.
+Passthrough objects stream through the proxy in constant memory. Delta objects can't, because xdelta3 needs the whole reference as its source, and the proxy must verify the whole reconstruction before it sends the first byte. A delta object up to the spool threshold (`DGP_SPOOL_THRESHOLD_BYTES`, default 16 MiB, or `max_object_size` when that is smaller) is reconstructed in RAM. A larger delta object is reconstructed into a spool file in `DGP_SPOOL_DIR`, and the proxy streams that file to the client. The memory of that path stays small for any object size, but it uses disk space from the spool budget (`DGP_SPOOL_MAX_BYTES`). The verified file stays in the spool for `advanced.range_spool_ttl_secs` (default 60 seconds), so the range requests of a parallel downloader share one reconstruction. An upload of a delta-eligible object larger than the threshold is also encoded from a spool file. That's the real price of the storage savings: delta reads cost CPU, and memory or spool space, that passthrough reads don't. The reference cache softens it considerably — the baseline for a hot deltaspace stays in an LRU cache, so only the first cold read pays a backend round-trip — but if your workload is huge objects read constantly and stored once, passthrough (or disabling compression on that bucket) is the better trade.
 
 ## What it looks like on the backend
 
