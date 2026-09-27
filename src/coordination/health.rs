@@ -344,7 +344,7 @@ pub async fn reprobe_all(health: &BackendHealthCache, config: &crate::config::Sh
 
 /// Probe one backend definition's connectivity + auth.
 ///
-/// S3: an authenticated `ListBuckets` under [`HEALTH_PROBE_TIMEOUT`]. If it is
+/// S3: an authenticated `ListBuckets` under `HEALTH_PROBE_TIMEOUT`. If it is
 /// DENIED, fall back to `HeadBucket` on `fallback_bucket` — bucket-scoped
 /// application keys (Backblaze B2) legitimately cannot ListBuckets, and a 404
 /// there still proves the credentials work (authenticated + bucket absent).

@@ -688,7 +688,7 @@ pub(crate) fn inactive_prune_floor(
     }
 }
 
-/// Prune the outbox while delivery is off (see [`inactive_prune_floor`]).
+/// Prune the outbox while delivery is off (see `inactive_prune_floor`).
 /// Events are therefore not kept for a later enable of delivery: the UI says so.
 pub async fn prune_while_inactive(
     db: &Arc<Mutex<ConfigDb>>,

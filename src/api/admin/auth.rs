@@ -192,7 +192,7 @@ fn bearer_matches(headers: &HeaderMap, token: &str) -> bool {
         .is_some_and(|presented| crate::security::secret_eq(presented.as_bytes(), token.as_bytes()))
 }
 
-/// Middleware for `/_/metrics` — see [`metrics_bearer_token`]. A pass-through
+/// Middleware for `/_/metrics` — see `metrics_bearer_token`. A pass-through
 /// when no token is configured.
 pub async fn require_metrics_access(
     State(state): State<Arc<AdminState>>,

@@ -14,7 +14,7 @@
 //!    which treated 1 entry = 1 MB regardless of actual size. A 50KB entry and a
 //!    50MB entry both counted as "1 unit". moka's weigher tracks actual byte size.
 //!
-//! Do NOT replace moka with a simple Mutex<HashMap> or Mutex<LruCache> — it will
+//! Do NOT replace moka with a simple `Mutex<HashMap>` or `Mutex<LruCache>` — it will
 //! re-introduce the global-lock serialization bottleneck on every GET request.
 
 use bytes::Bytes;

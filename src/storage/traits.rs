@@ -835,7 +835,7 @@ pub trait StorageBackend: Send + Sync {
         prefix: &str,
     ) -> Result<Vec<FileMetadata>, StorageError>;
 
-    /// Cheap variant of [`scan_deltaspace`] for diagnostics-only callers
+    /// Cheap variant of [`scan_deltaspace`](Self::scan_deltaspace) for diagnostics-only callers
     /// that don't need exact `original_size` for delta files.
     ///
     /// On S3, `scan_deltaspace` fires a bounded-parallel HEAD storm to

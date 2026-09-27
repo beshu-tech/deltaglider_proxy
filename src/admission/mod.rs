@@ -164,7 +164,7 @@ pub enum Action {
     Deny,
     /// Short-circuit with a custom HTTP status + body. Status must be
     /// 4xx or 5xx (validated at parse time in
-    /// [`crate::admission::ActionSpec::validate`]).
+    /// `ActionSpec::validate`).
     Reject {
         status: u16,
         #[serde(default, skip_serializing_if = "Option::is_none")]

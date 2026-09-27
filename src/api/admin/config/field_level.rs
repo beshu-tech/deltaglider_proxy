@@ -599,8 +599,8 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
 ///
 /// The GUI forms post partial JSON (only the fields being edited). The
 /// handler applies the patch to a copy of the running config
-/// ([`build_patch`]) and hands it to the shared write pipeline
-/// ([`super::write`]) — the same one the section and document surfaces
+/// (`build_patch`) and hands it to the shared write pipeline
+/// (`super::write`) — the same one the section and document surfaces
 /// use — so hot-reload side effects never drift between them.
 ///
 /// The PATCH contract: a refused transition (a gate, the engine build, the

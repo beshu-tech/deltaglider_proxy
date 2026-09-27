@@ -50,7 +50,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Best-effort counter update for the delta-passthrough FAST PATH
     /// (`transfer.rs`), which ships a `.delta` verbatim via `put_delta_raw` and
     /// thus bypasses the `store()` choke point. Overwrite-aware + adds any
-    /// reference the copy seeded. Mirrors [`Self::record_store`].
+    /// reference the copy seeded. Mirrors `Self::record_store`.
     /// Snapshot the destination's PRIOR metadata for fast-path accounting.
     /// MUST be called BEFORE the fast-path write — calling `prior_for_counter`
     /// after the write returns the just-written delta, netting an overwrite to

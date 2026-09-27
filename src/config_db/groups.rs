@@ -83,7 +83,7 @@ impl ConfigDb {
     }
 
     /// Load just the group names — a single `SELECT name FROM groups` with
-    /// none of the per-group permission/member fan-out that [`load_groups`]
+    /// none of the per-group permission/member fan-out that [`load_groups`](Self::load_groups)
     /// does. Used where only the existing names matter (e.g. picking a
     /// non-colliding auto-name when cloning a group).
     pub fn load_group_names(&self) -> Result<Vec<String>, ConfigDbError> {

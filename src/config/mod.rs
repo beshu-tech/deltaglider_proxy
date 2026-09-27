@@ -1621,7 +1621,7 @@ impl Config {
     ///
     /// This is the `--config <path>` entry point. Without this helper, callers
     /// that specify a config path (via the CLI flag) had to remember to call
-    /// [`Self::apply_env_overrides`] themselves — and the main startup path
+    /// `Self::apply_env_overrides` themselves — and the main startup path
     /// didn't, meaning `DGP_*` vars were ignored when `--config` was used
     /// but respected when it wasn't. The asymmetry surprised operators; this
     /// helper folds the behaviour of [`Self::load`] onto a caller-provided
@@ -2449,7 +2449,7 @@ impl Config {
     }
 }
 
-/// What [`Config::reapply_env_overrides`] found. Paths are dotted flat
+/// What `Config::reapply_env_overrides` found. Paths are dotted flat
 /// config paths.
 #[derive(Debug, Default, PartialEq)]
 pub struct EnvReapply {

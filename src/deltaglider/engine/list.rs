@@ -299,7 +299,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// (bounded by `limit`).
     /// `limit: None` means "no cap"; `limit: Some(n)` stops after n
     /// matches and sets `truncated: true`. The constant
-    /// [`Self::REFERENCE_SCAN_LIMIT`] is the recommended cap for
+    /// [`REFERENCE_SCAN_LIMIT`](super::REFERENCE_SCAN_LIMIT) is the recommended cap for
     /// latency-sensitive paths.
     ///
     /// Errors from `get_reference_metadata` for individual deltaspaces

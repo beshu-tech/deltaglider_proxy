@@ -40,7 +40,7 @@ use super::{
 static EXT_AUTH_VERSION: AtomicU64 = AtomicU64::new(0);
 
 /// Increment the external-auth version counter and return the new value.
-/// Called from [`rebuild_external_auth`] after the new provider set is live.
+/// Called from `rebuild_external_auth` after the new provider set is live.
 pub fn bump_ext_auth_version() -> u64 {
     EXT_AUTH_VERSION.fetch_add(1, Ordering::SeqCst) + 1
 }

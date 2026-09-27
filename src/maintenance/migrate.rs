@@ -33,7 +33,7 @@
 //!    fail the migration (the flip already happened): the job settles
 //!    `completed_with_errors` with a note.
 //!
-//! Cancellation: checked every [`CANCEL_CHECK_EVERY`] objects. Pre-flip →
+//! Cancellation: checked every `CANCEL_CHECK_EVERY` objects. Pre-flip →
 //! release the source gate, delete the staged copies THIS job made (by
 //! their job-stamped `dg-migration` value), unwind the transient route
 //! and settle `cancelled` (source untouched, still authoritative). A

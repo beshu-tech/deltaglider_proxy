@@ -7,7 +7,7 @@
 //!
 //! - **quick** (default): one LIST pass, no HEAD. Compression ratios for
 //!   delta files come from whatever the storage layer already returned
-//!   (cached original sizes via [`crate::deltaglider::engine`]'s metadata
+//!   (cached original sizes via the engine's metadata
 //!   cache, or stored sizes for cold objects). Sub-second on large buckets.
 //! - **sampled**: LIST + one HEAD per deltaspace, project the metadata
 //!   onto siblings. Catches buckets where the metadata cache is cold but

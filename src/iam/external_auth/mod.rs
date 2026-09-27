@@ -29,7 +29,7 @@ pub const SUPPORTED_PROVIDER_TYPE: &str = "oidc";
 /// and update, declarative apply): the type must be `oidc` (another type
 /// is skipped by [`ExternalAuthManager::rebuild`], so its sign-in would
 /// never work), then the OIDC settings must pass
-/// [`oidc::validate_provider_config`].
+/// `oidc::validate_provider_config`.
 pub fn validate_provider(
     provider_type: &str,
     issuer_url: Option<&str>,

@@ -45,7 +45,7 @@
 //!   [`crate::admission`].
 //! - Phase 3c.1/3c.2: `access.iam_mode: gui | declarative` toggle
 //!   gating admin-API IAM mutation routes; see [`IamMode`] and
-//!   [`crate::api::admin::auth::require_not_declarative`].
+//!   [`crate::api::admin::auth::require_not_declarative`](crate::api::admin::require_not_declarative).
 //!
 //! Still pending:
 //! - Phase 3c.3: the reconciler (sync-diff DB ↔ YAML on apply when
@@ -1606,7 +1606,7 @@ fn is_backend_default(b: &BackendConfig) -> bool {
 }
 
 impl SectionedConfig {
-    /// Build a `SectionedConfig` from a flat [`Config`].
+    /// Build a `SectionedConfig` from a flat [`Config`](crate::config::Config).
     ///
     /// This is the canonical exporter — called by `to_canonical_yaml`.
     /// We deliberately keep default-valued `Option<T>` fields as `None`
@@ -1729,7 +1729,7 @@ impl SectionedConfig {
         }
     }
 
-    /// Collapse a `SectionedConfig` back into a flat [`Config`]. The
+    /// Collapse a `SectionedConfig` back into a flat [`Config`](crate::config::Config). The
     /// inverse of [`SectionedConfig::from_flat`].
     ///
     /// Missing scalars fall back to their `Config::default()` values —

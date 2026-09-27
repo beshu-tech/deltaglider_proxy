@@ -393,7 +393,7 @@ impl Config {
         warnings
     }
 
-    /// Run [`Self::check`] and log each warning to stderr. Used by the
+    /// Run `Self::check` and log each warning to stderr. Used by the
     /// startup path where eprintln is the right sink.
     pub fn validate(&mut self) {
         for warning in self.check() {
@@ -415,7 +415,7 @@ impl Config {
     }
 
     /// FATAL config errors — graph states the proxy must never run with,
-    /// as opposed to [`Self::check`]'s advisory warnings:
+    /// as opposed to `Self::check`'s advisory warnings:
     ///
     ///   * a bucket routed to an UNDEFINED backend name — requests would
     ///     silently fall through to the default backend and 404/misroute

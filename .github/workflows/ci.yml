@@ -232,6 +232,12 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit $rc
+      # Broken intra-doc links and links to private items fail the build.
+      - name: cargo doc (rustdoc warnings are errors)
+        env:
+          RUSTC_WRAPPER: ""
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --locked --no-deps
 
   # ── Test jobs: split into 3 parallel groups for ~3x faster wall-clock ──
   # Each job compiles via sccache (near-instant after first job populates cache).

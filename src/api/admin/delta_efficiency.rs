@@ -275,7 +275,7 @@ impl DeltaEfficiencyScanner {
     }
 
     /// Read the cached entry for this `(bucket, min_deltas)` pair if
-    /// present AND younger than [`CACHE_TTL_SECS`]. Stale entries are
+    /// present AND younger than `CACHE_TTL_SECS`. Stale entries are
     /// ignored on read; they get overwritten by the next scan.
     pub fn get(&self, bucket: &str, min_deltas: usize) -> Option<EfficiencyResponse> {
         let key = Self::cache_key(bucket, min_deltas);
@@ -738,7 +738,7 @@ pub struct VerifyRequest {
 /// ~700 HEADs, ~1-2 s wall-clock at 64-way concurrency. Tolerable
 /// because it's per-row opt-in, not bulk.
 ///
-/// Why not enable this by default? See [`scan_deltaspace_lite`]'s
+/// Why not enable this by default? See [`scan_deltaspace_lite`](crate::storage::StorageBackend::scan_deltaspace_lite)'s
 /// docstring — for a 308-prefix bucket, the bulk version is ~70k
 /// HEADs and times out. This endpoint surfaces the trade explicitly:
 /// the operator pays the cost only when they want true numbers for

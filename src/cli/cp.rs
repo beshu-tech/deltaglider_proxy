@@ -12,7 +12,7 @@
 //!
 //! Recursive mode (`-r`) walks the source side and filters with the
 //! include / exclude glob list. Every body moves through
-//! [`transfer_io`] (bounded memory: spool files and streams).
+//! `transfer_io` (bounded memory: spool files and streams).
 
 use crate::cli::aws_args::{AwsArgs, EngineLimits};
 use crate::cli::config as cli_exit;

@@ -320,8 +320,8 @@ impl SpoolDir {
     /// in a [`SpoolBudget`]; waiting for budget under that lock is
     /// hold-and-wait. Same rules as [`Self::acquire_beside`]: clamped, and
     /// an op that holds `held` does not wait ([`CONTENDED`]).
-    /// `held_mib`: the budget the op holds already ([`Spool::reserved_mib`],
-    /// [`mib_ceil`]).
+    /// `held_mib`: the budget the op holds already (`Spool::reserved_mib`,
+    /// `mib_ceil`).
     pub async fn reserve_beside(
         &self,
         held_mib: usize,

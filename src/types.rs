@@ -581,7 +581,7 @@ impl FileMetadata {
     ///
     /// Note: `Reference` objects are NOT in the user-visible listing —
     /// callers that fold references into a per-scope total must source
-    /// them via [`engine::list_deltaspace_references`], not from a normal
+    /// them via [`list_deltaspace_references`](crate::deltaglider::DeltaGliderEngine::list_deltaspace_references), not from a normal
     /// `list_objects` walk. See `src/deltaglider/savings.rs` for the
     /// scope-level accumulator that ties this together.
     pub fn stored_size(&self) -> u64 {

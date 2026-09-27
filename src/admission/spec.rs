@@ -295,7 +295,7 @@ impl AdmissionSpec {
     /// config loader so that semantic errors (duplicate block names,
     /// invalid Reject status, conflicting source IP forms) surface
     /// with precise file-position information via
-    /// [`ConfigError::Parse`] rather than much later from the evaluator.
+    /// [`ConfigError::Parse`](crate::config::ConfigError::Parse) rather than much later from the evaluator.
     pub fn validate(&self) -> Result<(), String> {
         if self.blocks.len() > MAX_ADMISSION_BLOCKS {
             return Err(format!(

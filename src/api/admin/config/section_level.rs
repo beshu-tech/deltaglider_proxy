@@ -86,7 +86,7 @@ pub struct SectionApplyResponse {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub existing_warnings: Vec<String>,
     /// `true` when at least one field in the transition is in the restart-
-    /// required set (see [`apply_config_transition`]). The UI surfaces this
+    /// required set (see `apply_config_transition`). The UI surfaces this
     /// as a banner in the Apply dialog so operators don't ship a
     /// restart-requiring change during a busy window without noticing.
     pub requires_restart: bool,
@@ -141,7 +141,7 @@ fn reject(status: StatusCode, error: impl Into<String>) -> Response {
 /// JSON by default (matches the shape the UI's form controllers expect).
 /// `?format=yaml` emits the canonical YAML for that one section — useful
 /// for the per-section Copy-as-YAML button described in §3.3 of the plan.
-/// Secrets are redacted via the same [`Config::redact_all_secrets`] used
+/// Secrets are redacted via the same [`Config::redact_all_secrets`](crate::config::Config::redact_all_secrets) used
 /// by the document-level export.
 pub async fn get_section(
     State(state): State<Arc<AdminState>>,
@@ -220,7 +220,7 @@ fn emit_section<T: serde::Serialize>(
 /// merge patch on the running config's section. The handler builds the
 /// incoming config (project → merge → `into_flat`, which runs the YAML
 /// loader's `normalize` + admission validation); the shared write pipeline
-/// ([`super::write`]) does the rest under one write lock: If-Match, secret
+/// (`super::write`) does the rest under one write lock: If-Match, secret
 /// preservation, env overrides, checks and gates, transition, persist.
 ///
 /// The result's `diff` field shows exactly what changed relative to the

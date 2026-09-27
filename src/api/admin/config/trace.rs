@@ -71,7 +71,7 @@ pub struct TraceResolved {
 /// `POST /_/api/admin/config/trace` — evaluate a synthetic request against
 /// the current admission chain.
 ///
-/// The trace handler is deliberately thin: it builds a [`RequestInfo`] from
+/// The trace handler is deliberately thin: it builds a [`RequestInfo`](crate::admission::evaluator::RequestInfo) from
 /// the body using the same normalization rules as the live middleware, then
 /// calls [`crate::admission::evaluate`]. The point is that **the same
 /// evaluator backs live traffic and trace requests** — operators can trust

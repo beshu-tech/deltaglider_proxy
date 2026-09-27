@@ -51,7 +51,7 @@ docker build -t deltaglider-proxy .
 
 Frontend tests are vitest (`npm run test:all` = `vitest run`, in the CI Frontend Lint job). Two projects: `unit` runs `src/**/*.test.ts` in Node; `dom` runs `src/**/*.test.tsx` in jsdom for hooks and components. Helpers in `src/test/`: `renderWithQuery` / `renderHookWithQuery` (no-retry QueryClient), `mockFetch` (route-table `fetch` stub; an unmatched request fails the test — mock HTTP there, not `adminApi`), and a setup file with AntD layout shims. AntD animations are off in tests because jsdom never ends them.
 
-CI merge gate: `verify-integration-test-registry` → `fmt` → `clippy -D warnings` → parallel test jobs (lib, curated integration + extended admin/IAM/replication, delta) → `e2e-smoke` (open access AND bootstrap auth, Playwright `retries: 0`) → RustSec audit → Cargo deny → frontend (`lint:strict` zero-warning ESLint incl. the UI rules, tsc, knip, `npm run test:all` = vitest) → docs/schema → claude-review. See `ci.yml` for the exact `--test` lists.
+CI merge gate: `verify-integration-test-registry` → `fmt` → `clippy -D warnings` + `cargo doc` (`RUSTDOCFLAGS=-D warnings`) → parallel test jobs (lib, curated integration + extended admin/IAM/replication, delta) → `e2e-smoke` (open access AND bootstrap auth, Playwright `retries: 0`) → RustSec audit → Cargo deny → frontend (`lint:strict` zero-warning ESLint incl. the UI rules, tsc, knip, `npm run test:all` = vitest) → docs/schema → claude-review. See `ci.yml` for the exact `--test` lists.
 
 ## Architecture
 

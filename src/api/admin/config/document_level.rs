@@ -358,7 +358,7 @@ pub(super) fn document_probe(yaml: &str) -> super::section_level::BackendEncrypt
 }
 
 /// `POST /api/admin/config/apply` — atomic full-document apply through the
-/// write pipeline (see [`super::write`]): parse and validate, merge runtime
+/// write pipeline (see `super::write`): parse and validate, merge runtime
 /// secrets forward, refuse a bootstrap-hash change (the legitimate path is
 /// `PUT /password`), transition, persist. A persist failure answers 500 with
 /// the in-memory state applied, so an operator can retry.

@@ -13,7 +13,7 @@
 //! write to a different file than the operator's apply does).
 //!
 //! The mutation runs through the SAME transition as every admin write
-//! ([`crate::api::admin::config::apply_config_transition`]) in its
+//! (`crate::api::admin::config::apply_config_transition`) in its
 //! background scope: the gates and the engine rebuild run, the steps that
 //! need admin-side state are skipped, and a change that needs one of them
 //! is refused (see `TransitionCtx::Background`).

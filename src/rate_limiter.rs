@@ -782,7 +782,7 @@ impl<'a> RateLimitGuard<'a> {
         Self::enter_with_account(rl, headers, peer_ip, "", true, event_prefix).await
     }
 
-    /// Like [`enter`], but also consults the per-account bucket. If
+    /// Like [`enter`](Self::enter), but also consults the per-account bucket. If
     /// EITHER the per-IP or per-account bucket reports locked, the
     /// guard returns `Err(Blocked)`. `subject` is the account key —
     /// `"bootstrap"` for the bootstrap password, the access-key-id

@@ -365,9 +365,6 @@ Maximum time for an xdelta3 subprocess. Hung processes are killed after this.
 | | |
 |---|---|
 | **Env var** | `DGP_CODEC_TIMEOUT_SECS` |
-| `DGP_CODEC_STALL_SECS` | 30 | Streaming codec: the proxy stops an xdelta3 process that makes no progress for this many seconds |
-| `DGP_CODEC_ABSOLUTE_SECS` | 7200 | Streaming codec: the longest time one operation may take, in seconds, even while it makes progress |
-| `DGP_SPOOL_THRESHOLD_BYTES` | 16 MiB (`16777216`), or `max_object_size` when that is smaller | A delta GET of an object larger than this reconstructs the object to a spool file and streams the file, instead of reconstructing it in memory. A delta-eligible upload larger than this is encoded from a spool file. Objects of this size or smaller use the in-memory path |
 | **Default** | `60` |
 | **Hot-reload** | No |
 
@@ -1143,6 +1140,9 @@ The list of `DGP_*` variables that the server reads. The unit test `every_dgp_li
 | `DGP_LISTING_FACTS_GC` | true | On an S3 backend, every six hours each instance reads part of each bucket's listing-facts namespace (`.dg/facts/`) and deletes the entries whose object is gone or was overwritten. An entry younger than one hour is never deleted. Set `false` to turn this off, for example to save the requests on a large bucket |
 | `DGP_CODEC_CONCURRENCY` | `num_cpus * 4` (min 16) | Max concurrent xdelta3 subprocesses |
 | `DGP_CODEC_TIMEOUT_SECS` | 60 | Per-subprocess timeout |
+| `DGP_CODEC_STALL_SECS` | 30 | Streaming codec: the proxy stops an xdelta3 process that makes no progress for this many seconds |
+| `DGP_CODEC_ABSOLUTE_SECS` | 7200 | Streaming codec: the longest time one operation may take, in seconds, even while it makes progress |
+| `DGP_SPOOL_THRESHOLD_BYTES` | 16 MiB (`16777216`), or `max_object_size` when that is smaller | A delta GET of an object larger than this reconstructs the object to a spool file and streams the file, instead of reconstructing it in memory. A delta-eligible upload larger than this is encoded from a spool file. Objects of this size or smaller use the in-memory path |
 | `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES` | 64 MiB | Largest delta-stored source object that `UploadPartCopy` reconstructs in memory |
 
 ### Storage

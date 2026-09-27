@@ -35,7 +35,7 @@ use super::state_store::{ObjectFailure, ParityCacheEntry, ParitySide};
 
 /// Live-progress + cancel control for a background parity audit. The driver
 /// reports `objects scanned so far` into the parity row (throttled — every
-/// [`PROGRESS_FLUSH_EVERY_N_PAGES`] pages), and checks for cancellation. Cancel uses
+/// `PROGRESS_FLUSH_EVERY_N_PAGES` pages), and checks for cancellation. Cancel uses
 /// TWO signals: a fast in-process `AtomicBool` (no lock, checked every page)
 /// AND the durable `cancelling` DB row (checked at phase boundaries — covers a
 /// cancel from ANOTHER instance / after a restart, where the in-process flag is

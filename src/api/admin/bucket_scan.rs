@@ -608,7 +608,7 @@ pub async fn delete_scan(
 
 /// `GET /_/api/admin/diagnostics/scan/stream?bucket=X`
 ///
-/// Server-Sent Events stream of [`ScanProgress`] frames. If no scan
+/// Server-Sent Events stream of `ScanProgress` frames. If no scan
 /// is currently running for the bucket, this kicks one off
 /// implicitly — the dashboard treats opening the stream as "start
 /// and watch". Closes when the scan ends (success, cancel, error), or when

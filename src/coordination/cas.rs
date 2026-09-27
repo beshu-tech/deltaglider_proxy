@@ -26,7 +26,7 @@ pub fn is_conditional_conflict(signal: &str) -> bool {
 }
 
 /// Pure: did a conditional write lose (412, or 409 ConditionalRequestConflict)?
-/// `signal` is [`sdk_error_signal`] of the SDK error.
+/// `signal` is `sdk_error_signal` of the SDK error.
 pub fn conditional_write_lost(signal: &str) -> bool {
     is_precondition_failed(signal) || is_conditional_conflict(signal)
 }

@@ -581,7 +581,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// cross-instance reference lock, serialising the fast-path reference
     /// seed against concurrent PUTs to that deltaspace on every node. When
     /// the cross-instance lock cannot be taken, `f` does not run and `R`
-    /// reports the failure ([`ReferenceLockFailure`]).
+    /// reports the failure (`ReferenceLockFailure`).
     pub async fn with_dest_prefix_lock<F, Fut, R>(&self, bucket: &str, prefix: &str, f: F) -> R
     where
         F: FnOnce() -> Fut,

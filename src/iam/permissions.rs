@@ -151,7 +151,7 @@ fn expand_condition_templates(
 /// Stored DB/YAML permissions remain raw templates. At index-build time,
 /// `${iam:username}` and `${iam:access_key_id}` are substituted with the
 /// identity values verbatim. A value that holds a pattern metacharacter is an
-/// error (see [`encode_template_value`]), so user-controlled names cannot
+/// error (see `encode_template_value`), so user-controlled names cannot
 /// inject `/` or `*`, and cannot defeat a templated Deny either.
 pub fn expand_permission_templates(
     permissions: &[Permission],

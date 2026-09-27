@@ -455,7 +455,7 @@ pub fn validate_public_prefix(prefix: &str) -> Result<(), &'static str> {
 
 /// reqwest DNS resolver that closes the DNS-rebinding gap `validate_outbound_url`
 /// documents: it resolves the hostname via the system resolver, then drops any
-/// address that fails [`ip_is_acceptable`] for this [`UrlKind`]. A hostile A
+/// address that fails `ip_is_acceptable` for this [`UrlKind`]. A hostile A
 /// record pointing a legit name at 169.254.169.254 / private space yields zero
 /// acceptable addresses → the connection fails closed. Attach via
 /// `reqwest::Client::builder().dns_resolver(Arc::new(SsrfGuardedResolver::new(kind)))`.
@@ -550,7 +550,7 @@ fn refused_resolution_message(host: &str, refused: &[IpAddr], kind: UrlKind) -> 
 /// [`SsrfGuardedResolver`]. `validate_outbound_url` checks only the
 /// endpoint TEXT, so an endpoint name whose A/AAAA record points at IMDS
 /// (or later rebinds there) passed. This resolver drops every address that
-/// [`resolved_backend_ip_refused`] refuses for the endpoint host, so the
+/// `resolved_backend_ip_refused` refuses for the endpoint host, so the
 /// connection fails closed. Literal-IP endpoints never reach a resolver;
 /// the text check covers them.
 #[derive(Debug, Clone)]

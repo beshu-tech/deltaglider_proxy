@@ -158,7 +158,7 @@ pub fn pick_default_probe_bucket(
 /// with no policy (clients write those, and config cannot name them), and
 /// no policy bucket already put it in [`client_writable_s3_backends`].
 /// Lists the backend's buckets to find one to probe on (bounded by
-/// [`PROBE_TIMEOUT`]). The forced-non-CAS seam skips the listing.
+/// `PROBE_TIMEOUT`). The forced-non-CAS seam skips the listing.
 pub async fn default_backend_group(
     config: &crate::config::Config,
     groups: &std::collections::BTreeMap<String, ClientWritableGroup>,
@@ -301,7 +301,7 @@ pub fn noncas_enforcement_message(name: &str, buckets: &[String]) -> String {
 ///
 /// Verdicts are trusted only for the exact backend DEFINITION they were
 /// probed against (fingerprint match); a redefined backend re-probes once,
-/// bounded by [`PROBE_TIMEOUT`]. A fingerprint-matched `Unknown` IS re-probed
+/// bounded by `PROBE_TIMEOUT`. A fingerprint-matched `Unknown` IS re-probed
 /// here — it's a non-verdict whose cause (missing bucket, network) may since
 /// be fixed; staying sticky would leave the corruption window open until a
 /// restart. Accepted cost: while a client-writable backend is unreachable AND

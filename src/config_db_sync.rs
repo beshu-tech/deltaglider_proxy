@@ -596,7 +596,7 @@ impl ConfigDbSync {
     /// [`UploadError::Conflict`]; `upload_with_reconcile` pulls the peer's
     /// version, merges, and retries on top of the reconciled DB.
     /// `data` is a consistent snapshot of the DB file: read it with
-    /// [`read_db_snapshot`] (under the DB lock), never straight from disk while
+    /// `read_db_snapshot` (under the DB lock), never straight from disk while
     /// the connection may be mid-commit (a torn upload).
     pub async fn upload(&self, data: Vec<u8>) -> Result<(), UploadError> {
         if data.is_empty() {
