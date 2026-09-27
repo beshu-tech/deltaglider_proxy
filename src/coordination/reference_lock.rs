@@ -10,7 +10,7 @@
 //!
 //! `S3Lease` is a TTL LEADER lease: acquired once, heartbeat-renewed for
 //! minutes, stolen on death. The reference read-modify-write is the opposite
-//! shape — a SHORT critical section (has_reference → set_reference_baseline →
+//! shape — a SHORT critical section (has_reference → write_baseline →
 //! put_delta, typically milliseconds to a few seconds for the xdelta3 encode)
 //! that wants plain mutual exclusion, acquired and released within one store
 //! call, with a TTL only as a crash backstop. So this is a distinct primitive,

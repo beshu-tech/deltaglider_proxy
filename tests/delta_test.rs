@@ -295,10 +295,10 @@ async fn test_streaming_spool_store_put() {
 /// TOCTOU regression: in the streaming store, a fresh-baseline PUT whose first
 /// member LOSES the ratio used to tear down the reference AFTER dropping the
 /// prefix lock — racing a concurrent PUT that deltas against that reference, and
-/// orphaning the 2nd object. The fix leaves a ratio-lost fresh baseline's
-/// reference in place. This drives two PUTs to the same fresh deltaspace (first a
-/// dissimilar/ratio-losing object, then a delta-eligible sibling) and asserts
-/// BOTH stay retrievable. Forced through the streaming path via threshold=1.
+/// orphaning the 2nd object. Now the passthrough write and the removal of the
+/// fresh baseline run under the lock (StorePlan), as on the buffered PUT. This
+/// drives two PUTs to the same fresh deltaspace and asserts BOTH stay
+/// retrievable. Forced through the streaming path via threshold=1.
 #[tokio::test]
 async fn test_streaming_baseline_ratio_loss_does_not_orphan_sibling() {
     let server = TestServer::builder()

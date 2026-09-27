@@ -47,6 +47,191 @@ impl PassthroughMultipartHandle {
     }
 }
 
+/// What the encode of a delta-eligible PUT produced, as [`StorePlan::decide`]
+/// sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EncodeOutcome {
+    /// A complete delta of `delta_len` bytes.
+    Encoded { delta_len: u64 },
+    /// The streaming encode stopped at the ratio cap: the delta loses.
+    OverCap,
+    /// No spool budget for the streaming encode now (a holder never waits).
+    NoSpool,
+}
+
+/// How a PUT is stored. Pure: both delta-eligible PUT paths (buffered and
+/// streaming) decide through [`Self::tries_delta`] and [`Self::decide`], and
+/// commit through one pipeline (`store_delta_eligible`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StorePlan {
+    /// Keep the delta.
+    Delta,
+    /// Store the body as it is. `remove_fresh_baseline`: this PUT created
+    /// the baseline, and no delta uses it.
+    Passthrough { remove_fresh_baseline: bool },
+}
+
+impl StorePlan {
+    /// Whether a PUT tries a delta at all. No: store passthrough, with no
+    /// baseline.
+    pub(crate) fn tries_delta(compression_enabled: bool, delta_eligible: bool) -> bool {
+        compression_enabled && delta_eligible
+    }
+
+    /// After the encode. S-P1-1: the ratio is checked on EVERY PUT, not only
+    /// the first one in the deltaspace. A poor delta is stored passthrough;
+    /// a baseline that other deltas use stays, and a baseline this PUT
+    /// created is removed (the next PUT may bring a useful one).
+    pub(crate) fn decide(
+        size: u64,
+        outcome: EncodeOutcome,
+        max_ratio: f32,
+        fresh_baseline: bool,
+    ) -> Self {
+        let keep = match outcome {
+            EncodeOutcome::Encoded { delta_len } => {
+                DeltaCodec::compression_ratio(size as usize, delta_len as usize) < max_ratio
+            }
+            EncodeOutcome::OverCap | EncodeOutcome::NoSpool => false,
+        };
+        if keep {
+            StorePlan::Delta
+        } else {
+            StorePlan::Passthrough {
+                remove_fresh_baseline: fresh_baseline,
+            }
+        }
+    }
+}
+
+/// A PUT body: in RAM (the buffered PUT) or on a spool file that the caller
+/// holds (the streaming PUT).
+#[derive(Clone, Copy)]
+enum PutBody<'a> {
+    Buffered(&'a [u8]),
+    Spooled(&'a crate::deltaglider::spool::Spool),
+}
+
+impl PutBody<'_> {
+    /// The spool this op holds already, if any.
+    fn held(&self) -> Option<&crate::deltaglider::spool::Spool> {
+        match self {
+            PutBody::Spooled(s) => Some(s),
+            PutBody::Buffered(_) => None,
+        }
+    }
+}
+
+/// One delta-eligible PUT through the store pipeline.
+struct PutObject<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    obj_key: &'a ObjectKey,
+    deltaspace_id: &'a str,
+    body: PutBody<'a>,
+    size: u64,
+    sha256: String,
+    md5: String,
+    content_type: Option<String>,
+    user_metadata: HashMap<String, String>,
+    /// When `Some`, the persisted `FileMetadata.multipart_etag` is stamped
+    /// with this value so later HEAD/GET/LIST return the ETag that the
+    /// CompleteMultipartUpload response gave (H1). A single PUT passes
+    /// `None` and gets the full-body-MD5 ETag.
+    multipart_etag: Option<String>,
+}
+
+impl PutObject<'_> {
+    fn passthrough_write(&self) -> PassthroughWrite<'_> {
+        PassthroughWrite {
+            bucket: self.bucket,
+            key: self.key,
+            deltaspace_id: self.deltaspace_id,
+            metadata: passthrough_metadata(
+                &self.obj_key.filename,
+                self.sha256.clone(),
+                self.md5.clone(),
+                self.size,
+                self.content_type.clone(),
+                self.user_metadata.clone(),
+                self.multipart_etag.clone(),
+            ),
+            source: match self.body {
+                PutBody::Buffered(data) => PassthroughSource::Bytes(data),
+                PutBody::Spooled(spool) => PassthroughSource::File {
+                    path: spool.path(),
+                    held: Some(spool),
+                },
+            },
+        }
+    }
+}
+
+/// The metadata of a passthrough object.
+#[allow(clippy::too_many_arguments)]
+fn passthrough_metadata(
+    filename: &str,
+    sha256: String,
+    md5: String,
+    size: u64,
+    content_type: Option<String>,
+    user_metadata: HashMap<String, String>,
+    multipart_etag: Option<String>,
+) -> FileMetadata {
+    let mut metadata =
+        FileMetadata::new_passthrough(filename.to_string(), sha256, md5, size, content_type);
+    metadata.user_metadata = user_metadata;
+    metadata.multipart_etag = multipart_etag;
+    metadata
+}
+
+/// Where a passthrough write reads its bytes.
+#[derive(Clone, Copy)]
+enum PassthroughSource<'a> {
+    Bytes(&'a [u8]),
+    /// A file; `held` is the spool it lives on when the op holds one.
+    File {
+        path: &'a Path,
+        held: Option<&'a crate::deltaglider::spool::Spool>,
+    },
+}
+
+/// One passthrough write (`write_passthrough_locked`).
+struct PassthroughWrite<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    deltaspace_id: &'a str,
+    metadata: FileMetadata,
+    source: PassthroughSource<'a>,
+}
+
+/// The delta the encode produced, where it lives until the commit.
+enum EncodedDelta {
+    InRam(Vec<u8>),
+    /// On the delta spool of the (ref, delta) pair.
+    Spooled {
+        _ref_spool: crate::deltaglider::spool::Spool,
+        delta_spool: crate::deltaglider::spool::Spool,
+    },
+    /// No delta to keep.
+    None,
+}
+
+impl EncodedDelta {
+    /// The delta bytes, for the commit (a kept delta is below the cap).
+    async fn into_bytes(self) -> Result<Vec<u8>, EngineError> {
+        match self {
+            EncodedDelta::InRam(delta) => Ok(delta),
+            EncodedDelta::Spooled { delta_spool, .. } => Ok(tokio::fs::read(delta_spool.path())
+                .await
+                .map_err(StorageError::from)?),
+            EncodedDelta::None => Err(EngineError::Storage(StorageError::Other(
+                "store plan kept a delta that the encode did not produce".into(),
+            ))),
+        }
+    }
+}
+
 /// Store an object with automatic delta compression
 impl<S: StorageBackend> DeltaGliderEngine<S> {
     #[instrument(skip(self, data, user_metadata))]
@@ -164,202 +349,52 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             &sha256[..8]
         );
 
-        // Check per-bucket compression policy + file type eligibility
-        let compression_disabled = !self.bucket_policies.compression_enabled(bucket);
-        if compression_disabled || !self.file_router.is_delta_eligible(&obj_key.filename) {
-            if compression_disabled {
-                debug!("Compression disabled for bucket '{bucket}', storing as passthrough");
-            } else {
-                debug!("File type not delta-eligible, storing as passthrough");
-            }
-            self.with_metrics(|m| {
-                m.delta_decisions_total
-                    .with_label_values(&["passthrough"])
-                    .inc()
-            });
-            let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
-            let ctx = StoreContext {
-                bucket,
-                obj_key: &obj_key,
-                deltaspace_id: &deltaspace_id,
-                data,
-                sha256,
-                md5,
-                content_type,
-                user_metadata,
-                multipart_etag: multipart_etag.clone(),
-            };
-            let result = self.store_passthrough(ctx).await?;
-            // Write succeeded — now safe to clean up old delta variant
-            if let Err(e) = self
-                .delete_delta_idempotent(bucket, &deltaspace_id, &obj_key.filename)
-                .await
-            {
-                warn!(
-                    "Failed to clean up old delta after passthrough write: {}",
-                    e
-                );
-            }
-            self.metadata_cache
-                .insert(bucket, key, result.metadata.clone());
-            // Passthrough creates no reference baseline; only overwrite-net.
-            return Ok(result.with_accounting(prior_for_counter, 0));
-        }
-
-        // Acquire per-deltaspace lock to prevent concurrent reference overwrites.
-        // The critical section: has_reference check → set_reference → store_delta
-        // must be atomic per-prefix to avoid two writers both creating a reference.
-        // The in-process mutex serializes same-node threads; the cross-instance
-        // lock (multi-instance only, inert otherwise) serializes across nodes.
-        let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
-        let xnode = self.acquire_reference_lock(bucket, &deltaspace_id).await?;
-
-        let ctx = StoreContext {
+        let put = PutObject {
             bucket,
+            key,
             obj_key: &obj_key,
             deltaspace_id: &deltaspace_id,
-            data,
+            body: PutBody::Buffered(data),
+            size: data.len() as u64,
             sha256,
             md5,
             content_type,
             user_metadata,
             multipart_etag,
         };
-
-        // Check if deltaspace already has a reference (existing deltaspace).
-        // A backend error here must ABORT the PUT — never fall through to the
-        // "create baseline" branch, which would overwrite a reference.bin that
-        // may exist and orphan every sibling delta.
-        let has_existing_reference = match xnode.observed_reference() {
-            Some(seen) => seen,
-            None => {
-                self.storage
-                    .has_reference(ctx.bucket, ctx.deltaspace_id)
-                    .await?
-            }
-        };
-
-        // Ensure deltaspace has an internal reference baseline.
-        //
-        // S-P1-2: when we CREATE the reference here, we own its
-        // lifecycle. If the subsequent `encode_and_store` fails (codec
-        // semaphore exhausted, codec panic, size cap, storage write
-        // error), the reference would otherwise remain on disk with no
-        // sibling delta — every future PUT to this prefix would anchor
-        // against bytes the user never successfully stored, poisoning
-        // the deltaspace permanently. Rollback on failure to restore
-        // the "no reference yet" invariant.
-        let ref_meta = if has_existing_reference {
-            let read = self
-                .storage
-                .get_reference_metadata(ctx.bucket, ctx.deltaspace_id)
+        if !self.tries_delta(bucket, &obj_key) {
+            let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
+            let result = self
+                .write_passthrough_locked(put.passthrough_write(), None)
                 .await?;
-            // Heal a stripped-metadata reference in place (same bytes) so the
-            // delta we write next carries a valid ref_sha256 and replication
-            // stops re-copying this deltaspace. No-op (zero I/O) when healthy.
-            self.heal_reference_if_corrupt(ctx.bucket, ctx.deltaspace_id, read, None, &xnode)
-                .await?
-        } else {
-            debug!("No reference in deltaspace, creating baseline");
-            self.set_reference_baseline(&ctx, &xnode).await?
-        };
-
-        // Encode delta and decide: keep as delta or fall back to direct storage
-        let result = match self
-            .encode_and_store(ctx, &ref_meta, has_existing_reference, &xnode)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                if !has_existing_reference {
-                    // Best-effort: undo the reference we just created.
-                    // Errors here are logged but do not mask the
-                    // original encode failure.
-                    let cache_key = self.cache_key(bucket, &deltaspace_id);
-                    self.cache.invalidate(&cache_key);
-                    if let Err(cleanup_err) = xnode
-                        .delete_reference(&*self.storage, bucket, &deltaspace_id)
-                        .await
-                    {
-                        warn!(
-                            "S-P1-2: encode failed AND reference rollback failed for {}/{}: encode_err={}, rollback_err={}",
-                            bucket, deltaspace_id, e, cleanup_err
-                        );
-                    } else {
-                        debug!(
-                            "S-P1-2: encode failed; rolled back fresh reference for {}/{}",
-                            bucket, deltaspace_id
-                        );
-                    }
-                }
-                return Err(e);
-            }
-        };
-        self.metadata_cache
-            .insert(bucket, key, result.metadata.clone());
+            // Passthrough creates no reference baseline; only overwrite-net.
+            return Ok(result.with_accounting(prior_for_counter, 0));
+        }
         // NB: the COUNTER is recorded in the public delegators (store /
         // store_with_multipart_etag), not here — store_inner is shared, so
-        // recording here would double-count. We only attach the accounting the
-        // delegators need: the prior object (overwrite-net) + a newly-seeded
-        // reference's bytes (symmetric with delete's reclamation subtraction).
-        let reference_created_bytes = if has_existing_reference {
-            0
-        } else {
-            ref_meta.file_size
-        };
-        Ok(result.with_accounting(prior_for_counter, reference_created_bytes))
+        // recording here would double-count.
+        self.store_delta_eligible(put, prior_for_counter).await
     }
 
-    /// Encode a delta against the reference, evaluate the compression ratio,
-    /// and either commit as delta or fall back to passthrough storage.
-    async fn encode_and_store(
-        &self,
-        ctx: StoreContext<'_>,
-        ref_meta: &FileMetadata,
-        has_existing_reference: bool,
-        xnode: &super::ReferenceLockGuard,
-    ) -> Result<StoreResult, EngineError> {
-        let (reference, _cache_hit) = self
-            .get_reference_cached(ctx.bucket, ctx.deltaspace_id, &ref_meta.file_sha256)
-            .await?;
-        // PERF: try_acquire instead of acquire — fail fast with 503 when all codec
-        // slots are busy rather than queuing unbounded requests in memory (each
-        // holding a full object body while waiting for a permit).
-        // The source file first (spool before codec slot, as on every path).
-        let source_file = self.codec_source_spool_now(reference.len())?;
-        let _codec_permit = self.try_acquire_codec()?;
-        // spawn_blocking: xdelta3 is CPU-bound; data must be owned ('static).
-        let ref_clone = reference.clone();
-        let data_owned = ctx.data.to_vec();
-        let codec = self.codec.clone();
-        let encode_start = Instant::now();
-        let delta = tokio::task::spawn_blocking(move || {
-            codec.encode_spooled(&source_file, &ref_clone, &data_owned)
-        })
-        .await
-        .map_err(|e| {
-            tracing::error!("Delta encode task panicked: {}", e);
-            EngineError::Storage(StorageError::Other(format!("codec task panicked: {}", e)))
-        })??;
-        let encode_secs = encode_start.elapsed().as_secs_f64();
-        drop(_codec_permit);
+    /// [`StorePlan::tries_delta`] for this bucket and key, counting a
+    /// passthrough decision.
+    fn tries_delta(&self, bucket: &str, obj_key: &ObjectKey) -> bool {
+        let compression = self.bucket_policies.compression_enabled(bucket);
+        let eligible = self.file_router.is_delta_eligible(&obj_key.filename);
+        if StorePlan::tries_delta(compression, eligible) {
+            return true;
+        }
+        if compression {
+            debug!("File type not delta-eligible, storing as passthrough");
+        } else {
+            debug!("Compression disabled for bucket '{bucket}', storing as passthrough");
+        }
+        self.count_decision("passthrough");
+        false
+    }
 
-        let ratio = DeltaCodec::compression_ratio(ctx.data.len(), delta.len());
-
-        self.with_metrics(|m| {
-            m.delta_encode_duration_seconds.observe(encode_secs);
-            m.delta_compression_ratio.observe(ratio as f64);
-        });
-
-        info!(
-            "Delta computed: {} bytes -> {} bytes (ratio: {:.2}%)",
-            ctx.data.len(),
-            delta.len(),
-            ratio * 100.0
-        );
-
-        self.commit_delta_or_passthrough(ctx, ref_meta, has_existing_reference, delta, ratio, xnode)
-            .await
+    fn count_decision(&self, decision: &str) {
+        self.with_metrics(|m| m.delta_decisions_total.with_label_values(&[decision]).inc());
     }
 
     /// STREAMING delta PUT (Phase 4): store a large delta-eligible object whose
@@ -368,12 +403,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Memory is bounded by the codec pump (Spike C: 2MB RSS on a 1.5GB target).
     /// Flow:
     /// 1. Hash the body by streaming the spool (sha256 + md5) — no full-RAM read.
-    /// 2. If not delta-eligible / compression off / no reference yet → passthrough
-    ///    straight from the body spool (store_passthrough_file).
-    /// 3. Else: materialise the reference to a spool, encode_from_reader(body →
-    ///    delta spool) capped at `ratio_threshold × size`. If the cap trips or the
-    ///    ratio loses → passthrough from the body spool (we still have it). Else →
-    ///    commit the delta.
+    /// 2. If not delta-eligible / compression off → passthrough straight from
+    ///    the body spool (store_passthrough_file).
+    /// 3. Else: the same pipeline as the buffered PUT
+    ///    ([`Self::store_delta_eligible`]), with the encode reading the body
+    ///    spool, capped at `ratio_threshold × size`.
     ///
     /// The caller owns `body` (a `Spool`); it lives until this returns.
     #[allow(clippy::too_many_arguments)]
@@ -415,8 +449,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: std::collections::HashMap<String, String>,
         multipart_etag: Option<String>,
     ) -> Result<StoreResult, EngineError> {
-        use tokio::io::AsyncReadExt;
-
         self.metadata_cache.invalidate(bucket, key);
         let (obj_key, deltaspace_id) = self.validated_key_ingest(bucket, key)?;
         // Size ceiling depends on the STRATEGY: a delta-eligible object is
@@ -425,9 +457,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         // larger max_passthrough_object_size. Applying the delta limit to
         // passthrough objects made every spooled passthrough copy fail
         // TooLarge under default config (finding #3).
-        let compression_disabled = !self.bucket_policies.compression_enabled(bucket);
-        let is_passthrough =
-            compression_disabled || !self.file_router.is_delta_eligible(&obj_key.filename);
+        let is_passthrough = !StorePlan::tries_delta(
+            self.bucket_policies.compression_enabled(bucket),
+            self.file_router.is_delta_eligible(&obj_key.filename),
+        );
         let ceiling = if is_passthrough {
             self.max_passthrough_object_size
         } else {
@@ -437,7 +470,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             return Err(EngineError::TooLarge { size, max: ceiling });
         }
         let prior_for_counter = self.prior_for_counter(bucket, key).await;
-        let mpe = multipart_etag.clone().unwrap_or_default();
 
         // (1) Hash the body by streaming the spool — bounded memory. Also count
         // the observed bytes and reject a spool that doesn't match the declared
@@ -451,14 +483,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             ))));
         }
 
-        let etag = if mpe.is_empty() {
-            format!("\"{md5}\"")
-        } else {
-            mpe.clone()
-        };
-
         // (2) Not delta-eligible → passthrough from the body spool.
-        if is_passthrough {
+        if !self.tries_delta(bucket, &obj_key) {
             let result = self
                 .store_passthrough_file_inner(
                     bucket,
@@ -470,139 +496,251 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                         md5: &md5,
                     }),
                     size,
-                    content_type.clone(),
-                    user_metadata.clone(),
-                    etag.clone(),
+                    content_type,
+                    user_metadata,
+                    multipart_etag,
                 )
                 .await?;
-            self.metadata_cache
-                .insert(bucket, key, result.metadata.clone());
             return Ok(result.with_accounting(prior_for_counter, 0));
         }
 
-        // B1: the in-process mutex serializes same-node threads; the
-        // cross-instance lock (multi-instance only, inert single-instance)
-        // serializes across NODES, so two instances can no longer both create a
-        // baseline and corrupt reference.bin (see CLAUDE.md HA contract).
-        let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
-        let xnode = self.acquire_reference_lock(bucket, &deltaspace_id).await?;
-        // Write path: a backend error must abort, not read as "no reference".
+        // (3) The pipeline the buffered PUT uses, reading the body spool.
+        let put = PutObject {
+            bucket,
+            key,
+            obj_key: &obj_key,
+            deltaspace_id: &deltaspace_id,
+            body: PutBody::Spooled(body),
+            size,
+            sha256,
+            md5,
+            content_type,
+            user_metadata,
+            multipart_etag,
+        };
+        self.store_delta_eligible(put, prior_for_counter).await
+    }
+
+    /// THE delta-eligible PUT, for both body forms: under both deltaspace
+    /// locks it finds or creates the baseline, encodes, lets
+    /// [`StorePlan::decide`] choose, and commits. One rule for a baseline
+    /// that this PUT created (S-P1-2): it stays only when the PUT commits a
+    /// delta against it. A lost ratio or a failure removes it, under the
+    /// same locks, so no other PUT can have used it in between.
+    async fn store_delta_eligible(
+        &self,
+        put: PutObject<'_>,
+        prior_for_counter: Option<FileMetadata>,
+    ) -> Result<StoreResult, EngineError> {
+        let (bucket, deltaspace_id) = (put.bucket, put.deltaspace_id);
+        // The critical section: has_reference check → set_reference → store_delta
+        // must be atomic per-prefix to avoid two writers both creating a reference.
+        // The in-process mutex serializes same-node threads; the cross-instance
+        // lock (multi-instance only, inert otherwise) serializes across nodes
+        // (B1, see CLAUDE.md HA contract). The passthrough write below runs
+        // under the same locks: it never re-acquires them.
+        let _guard = self.acquire_prefix_lock(bucket, deltaspace_id).await;
+        let xnode = self.acquire_reference_lock(bucket, deltaspace_id).await?;
+
+        // A backend error here must ABORT the PUT — never fall through to the
+        // "create baseline" branch, which would overwrite a reference.bin that
+        // may exist and orphan every sibling delta.
         let has_existing_reference = match xnode.observed_reference() {
             Some(seen) => seen,
-            None => self.storage.has_reference(bucket, &deltaspace_id).await?,
+            None => self.storage.has_reference(bucket, deltaspace_id).await?,
         };
-        // A fresh baseline stays in place on both branches below (even when the
-        // ratio loses — see the NOTE there), so its bytes are always counted.
-        let reference_created_bytes = if has_existing_reference { 0 } else { size };
-
-        // No reference yet → this object becomes the deltaspace baseline. Stream
-        // the reference into place from the spool (put_reference_from_file: no
-        // heap-load — M1.4 fix). Then FALL THROUGH to the encode-against-reference
-        // path below: the first member self-deltas (tiny) against its own fresh
-        // reference, exactly like the buffered baseline branch.
-        if !has_existing_reference {
-            let ref_meta = FileMetadata::new_reference(
-                Self::INTERNAL_REFERENCE_NAME.to_string(),
-                obj_key.full_key(),
-                sha256.clone(),
-                md5.clone(),
-                size,
-                content_type.clone(),
-            );
-            xnode
-                .put_reference_from_file(
-                    &*self.storage,
-                    bucket,
-                    &deltaspace_id,
-                    body.path(),
-                    &ref_meta,
-                )
-                .await?;
-            self.with_metrics(|m| {
-                m.delta_decisions_total
-                    .with_label_values(&["reference"])
-                    .inc()
-            });
-            // The streaming path doesn't pre-cache the reference bytes; next GET
-            // loads fresh.
-            self.cache
-                .invalidate(&self.cache_key(bucket, &deltaspace_id));
-            // Fall through — the encode block below now sees has_existing_reference
-            // effectively true (the reference is on disk).
-        }
-
-        // Existing-reference metadata, carried forward for the spool reservation
-        // below (avoids a redundant re-read). `None` on the fresh-baseline path.
-        let existing_ref_meta = if has_existing_reference {
-            // Heal it in place (same bytes) if its DG metadata was stripped, so
-            // the delta we encode next carries a valid ref_sha256 and
-            // replication stops re-copying this deltaspace. No-op (zero extra
-            // I/O) when the reference is healthy; returns the current metadata.
+        let ref_meta = if has_existing_reference {
             let read = self
                 .storage
-                .get_reference_metadata(bucket, &deltaspace_id)
+                .get_reference_metadata(bucket, deltaspace_id)
                 .await?;
-            Some(
-                self.heal_reference_if_corrupt(bucket, &deltaspace_id, read, Some(body), &xnode)
-                    .await?,
-            )
+            // Heal a stripped-metadata reference in place (same bytes) so the
+            // delta we write next carries a valid ref_sha256 and replication
+            // stops re-copying this deltaspace. No-op (zero I/O) when healthy.
+            self.heal_reference_if_corrupt(bucket, deltaspace_id, read, put.body.held(), &xnode)
+                .await?
         } else {
-            None
+            debug!("No reference in deltaspace, creating baseline");
+            self.write_baseline(&put, &xnode).await?
         };
+        let fresh_baseline = !has_existing_reference;
 
-        // (3) Encode from the body spool against the reference, capped. Reaches
-        // here both for an existing reference AND a freshly-created baseline
-        // (the first member self-deltas against its own reference).
+        match self
+            .encode_and_commit(put, &ref_meta, fresh_baseline, &xnode)
+            .await
+        {
+            Ok((result, baseline_kept)) => {
+                // A seeded reference's bytes count (symmetric with delete's
+                // reclamation subtraction); a removed one does not.
+                let created = if fresh_baseline && baseline_kept {
+                    ref_meta.file_size
+                } else {
+                    0
+                };
+                Ok(result.with_accounting(prior_for_counter, created))
+            }
+            Err(e) => {
+                if fresh_baseline {
+                    debug!("S-P1-2: store failed ({e}); removing the fresh baseline");
+                    self.remove_fresh_baseline(bucket, deltaspace_id, &xnode)
+                        .await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Encode against the reference, decide, commit. Returns the result and
+    /// whether the baseline is still in place.
+    async fn encode_and_commit(
+        &self,
+        put: PutObject<'_>,
+        ref_meta: &FileMetadata,
+        fresh_baseline: bool,
+        xnode: &super::ReferenceLockGuard,
+    ) -> Result<(StoreResult, bool), EngineError> {
+        let max_ratio = self.bucket_policies.max_delta_ratio(put.bucket);
+        let (outcome, delta) = match put.body {
+            PutBody::Buffered(data) => self.encode_buffered(&put, data, ref_meta).await?,
+            PutBody::Spooled(body) => {
+                self.encode_spooled(&put, body, ref_meta, fresh_baseline, max_ratio)
+                    .await?
+            }
+        };
+        if let EncodeOutcome::Encoded { delta_len } = outcome {
+            let ratio = DeltaCodec::compression_ratio(put.size as usize, delta_len as usize);
+            self.with_metrics(|m| m.delta_compression_ratio.observe(ratio as f64));
+            info!(
+                "Delta computed: {} bytes -> {} bytes (ratio: {:.2}%)",
+                put.size,
+                delta_len,
+                ratio * 100.0
+            );
+        }
+        match StorePlan::decide(put.size, outcome, max_ratio, fresh_baseline) {
+            StorePlan::Delta => {
+                let delta = delta.into_bytes().await?;
+                let result = self.commit_delta(&put, ref_meta, delta, xnode).await?;
+                Ok((result, true))
+            }
+            StorePlan::Passthrough {
+                remove_fresh_baseline,
+            } => {
+                debug!(
+                    "Delta for {}/{} not kept ({outcome:?}, max ratio {max_ratio:.2}); storing as passthrough",
+                    put.bucket, put.key
+                );
+                self.count_decision("passthrough");
+                // Free the (ref, delta) spools before the write reserves its own.
+                drop(delta);
+                // The streaming PUT holds its body spool, so this reservation
+                // never waits (a holder never waits): safe under the lock.
+                let reserved = match put.body {
+                    PutBody::Spooled(body) => {
+                        self.reserve_storage_spool(put.bucket, put.size, false, body.reserved_mib())
+                            .await?
+                    }
+                    PutBody::Buffered(_) => None,
+                };
+                // Write passthrough FIRST, then clean up. This prevents
+                // transient 404s on concurrent GETs during strategy
+                // transition.
+                let result = self
+                    .write_passthrough_locked(put.passthrough_write(), reserved.as_ref())
+                    .await?;
+                let removed = remove_fresh_baseline
+                    && self
+                        .remove_fresh_baseline(put.bucket, put.deltaspace_id, xnode)
+                        .await;
+                Ok((result, !removed))
+            }
+        }
+    }
+
+    /// The buffered encode: the reference from the cache, the body in RAM.
+    async fn encode_buffered(
+        &self,
+        put: &PutObject<'_>,
+        data: &[u8],
+        ref_meta: &FileMetadata,
+    ) -> Result<(EncodeOutcome, EncodedDelta), EngineError> {
+        let (reference, _cache_hit) = self
+            .get_reference_cached(put.bucket, put.deltaspace_id, &ref_meta.file_sha256)
+            .await?;
+        // PERF: try_acquire instead of acquire — fail fast with 503 when all codec
+        // slots are busy rather than queuing unbounded requests in memory (each
+        // holding a full object body while waiting for a permit).
+        // The source file first (spool before codec slot, as on every path).
+        let source_file = self.codec_source_spool_now(reference.len())?;
+        let _codec_permit = self.try_acquire_codec()?;
+        // spawn_blocking: xdelta3 is CPU-bound; data must be owned ('static).
+        let data_owned = data.to_vec();
+        let codec = self.codec.clone();
+        let encode_start = Instant::now();
+        let delta = tokio::task::spawn_blocking(move || {
+            codec.encode_spooled(&source_file, &reference, &data_owned)
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!("Delta encode task panicked: {}", e);
+            EngineError::Storage(StorageError::Other(format!("codec task panicked: {}", e)))
+        })??;
+        self.with_metrics(|m| {
+            m.delta_encode_duration_seconds
+                .observe(encode_start.elapsed().as_secs_f64())
+        });
+        let delta_len = delta.len() as u64;
+        Ok((
+            EncodeOutcome::Encoded { delta_len },
+            EncodedDelta::InRam(delta),
+        ))
+    }
+
+    /// The streaming encode: body spool → delta spool, stopped at the ratio
+    /// cap. A fresh baseline IS the body (storage-9), so the encode reads it
+    /// from the body spool and the ref spool stays empty.
+    async fn encode_spooled(
+        &self,
+        put: &PutObject<'_>,
+        body: &crate::deltaglider::spool::Spool,
+        ref_meta: &FileMetadata,
+        fresh_baseline: bool,
+        max_ratio: f32,
+    ) -> Result<(EncodeOutcome, EncodedDelta), EngineError> {
         // ONE timed, combined reservation for both spools (ref + delta) — two raw
         // sequential acquire()s self-deadlock when 2×size > budget, the exact
         // class the GET path uses acquire_pair to prevent (mega-review finding).
         // The ref spool holds the REFERENCE, which can be larger than this object
         // — reserve it at the reference's actual size so the byte-budget isn't
-        // under-accounted under concurrency (→ ENOSPC). Falls back to `size` for
-        // a freshly-created baseline (no reference metadata yet).
-        // A fresh baseline is the body itself (storage-9): the encode reads
-        // it from the body spool, so the ref spool stays empty.
-        let ref_size = existing_ref_meta.map_or(1, |m| m.file_size);
+        // under-accounted under concurrency (→ ENOSPC).
+        let ref_size = if fresh_baseline {
+            1
+        } else {
+            ref_meta.file_size
+        };
         // Clamped beside the body spool this op already holds (else body +
         // pair > budget waited on itself for the whole acquire timeout).
-        let pair = self.spool_acquire_pair_beside(body, ref_size, size).await?;
-        let Some((ref_spool, delta_spool)) = pair else {
+        let Some((ref_spool, delta_spool)) = self
+            .spool_acquire_pair_beside(body, ref_size, put.size)
+            .await?
+        else {
             // No budget free now. Waiting while this PUT holds its body could
-            // deadlock with another PUT that waits on ours. Store it as
-            // passthrough, exactly as when the ratio loses (a fresh baseline
-            // stays: see the NOTE in that branch).
-            tracing::debug!("streaming PUT {bucket}/{key}: spool contended, storing passthrough");
-            drop((_guard, xnode));
-            return self
-                .store_spooled_body_as_passthrough(
-                    bucket,
-                    key,
-                    HashedSpool {
-                        spool: body,
-                        sha256: &sha256,
-                        md5: &md5,
-                    },
-                    size,
-                    content_type,
-                    user_metadata,
-                    etag,
-                )
-                .await
-                .map(|r| r.with_accounting(prior_for_counter, reference_created_bytes));
+            // deadlock with another PUT that waits on ours.
+            debug!("streaming PUT {}/{}: spool contended", put.bucket, put.key);
+            return Ok((EncodeOutcome::NoSpool, EncodedDelta::None));
         };
-        // The reference just written from the body has the body's bytes:
-        // reading it back cost a second transfer of the object on S3.
-        let ref_path = if has_existing_reference {
+        let ref_path = if fresh_baseline {
+            // Reading the reference back would cost a second transfer of
+            // the object on S3.
+            body.path().to_path_buf()
+        } else {
             self.storage
-                .get_reference_to_file(bucket, &deltaspace_id, ref_spool.path())
+                .get_reference_to_file(put.bucket, put.deltaspace_id, ref_spool.path())
                 .await?;
             ref_spool.path().to_path_buf()
-        } else {
-            body.path().to_path_buf()
         };
 
-        let effective_ratio = self.bucket_policies.max_delta_ratio(bucket);
-        let cap = ((size as f64) * (effective_ratio as f64)).ceil() as u64;
+        let cap = ((put.size as f64) * (max_ratio as f64)).ceil() as u64;
         let _permit = self.try_acquire_codec()?;
         let codec = self.codec.clone();
         let body_path = body.path().to_path_buf();
@@ -611,336 +749,179 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
         // Encode body→delta spool, aborting if the delta exceeds the cap (ratio
         // loses — Spike C). A capped-write error signals "passthrough wins".
-        let encode_res =
-            tokio::task::spawn_blocking(move || -> Result<Option<u64>, EngineError> {
-                use std::io::Write;
-                struct CapWriter<W: Write> {
-                    inner: W,
-                    written: u64,
-                    cap: u64,
-                    capped: bool,
-                }
-                impl<W: Write> Write for CapWriter<W> {
-                    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                        self.written = self.written.saturating_add(buf.len() as u64);
-                        if self.written > self.cap {
-                            self.capped = true;
-                            return Err(std::io::Error::other("delta exceeded ratio cap"));
-                        }
-                        self.inner.write_all(buf)?;
-                        Ok(buf.len())
+        let encoded = tokio::task::spawn_blocking(move || -> Result<Option<u64>, EngineError> {
+            use std::io::Write;
+            struct CapWriter<W: Write> {
+                inner: W,
+                written: u64,
+                cap: u64,
+                capped: bool,
+            }
+            impl<W: Write> Write for CapWriter<W> {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.written = self.written.saturating_add(buf.len() as u64);
+                    if self.written > self.cap {
+                        self.capped = true;
+                        return Err(std::io::Error::other("delta exceeded ratio cap"));
                     }
-                    fn flush(&mut self) -> std::io::Result<()> {
-                        self.inner.flush()
-                    }
+                    self.inner.write_all(buf)?;
+                    Ok(buf.len())
                 }
-                let body = std::fs::File::open(&body_path)
-                    .map_err(|e| EngineError::Storage(StorageError::from(e)))?;
-                let out = std::fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(&delta_path)
-                    .map_err(|e| EngineError::Storage(StorageError::from(e)))?;
-                let mut sink = CapWriter {
-                    inner: std::io::BufWriter::new(out),
-                    written: 0,
-                    cap,
-                    capped: false,
-                };
-                match codec.encode_from_reader(&ref_path, body, &mut sink) {
-                    Ok(n) => {
-                        sink.flush()
-                            .map_err(|e| EngineError::Storage(StorageError::from(e)))?;
-                        Ok(Some(n))
-                    }
-                    // Cap tripped → ratio loses; signal passthrough (None).
-                    Err(_) if sink.capped => Ok(None),
-                    Err(e) => Err(EngineError::Codec(e)),
+                fn flush(&mut self) -> std::io::Result<()> {
+                    self.inner.flush()
                 }
-            })
-            .await
-            .map_err(|e| {
-                EngineError::Storage(StorageError::Other(format!("encode task: {e}")))
-            })??;
+            }
+            let body = std::fs::File::open(&body_path)
+                .map_err(|e| EngineError::Storage(StorageError::from(e)))?;
+            let out = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&delta_path)
+                .map_err(|e| EngineError::Storage(StorageError::from(e)))?;
+            let mut sink = CapWriter {
+                inner: std::io::BufWriter::new(out),
+                written: 0,
+                cap,
+                capped: false,
+            };
+            match codec.encode_from_reader(&ref_path, body, &mut sink) {
+                Ok(n) => {
+                    sink.flush()
+                        .map_err(|e| EngineError::Storage(StorageError::from(e)))?;
+                    Ok(Some(n))
+                }
+                // Cap tripped → ratio loses; signal passthrough (None).
+                Err(_) if sink.capped => Ok(None),
+                Err(e) => Err(EngineError::Codec(e)),
+            }
+        })
+        .await
+        .map_err(|e| EngineError::Storage(StorageError::Other(format!("encode task: {e}"))))??;
         drop(_permit);
         self.with_metrics(|m| {
             m.delta_encode_duration_seconds
                 .observe(encode_start.elapsed().as_secs_f64())
         });
+        Ok(match encoded {
+            Some(delta_len) => (
+                EncodeOutcome::Encoded { delta_len },
+                EncodedDelta::Spooled {
+                    _ref_spool: ref_spool,
+                    delta_spool,
+                },
+            ),
+            None => (EncodeOutcome::OverCap, EncodedDelta::None),
+        })
+    }
 
-        match encode_res {
-            None => {
-                // Ratio lost → passthrough from the body spool.
-                // Drop BOTH locks FIRST — store_passthrough_file re-acquires the
-                // prefix lock internally, so holding it here would re-entrant-
-                // deadlock; the cross-node lock is released too (passthrough does
-                // not touch reference.bin, so it needs no cross-node exclusion).
-                drop((ref_spool, delta_spool, _guard, xnode));
-                let result = self
-                    .store_spooled_body_as_passthrough(
-                        bucket,
-                        key,
-                        HashedSpool {
-                            spool: body,
-                            sha256: &sha256,
-                            md5: &md5,
-                        },
-                        size,
-                        content_type.clone(),
-                        user_metadata.clone(),
-                        etag.clone(),
+    /// Write this PUT's body as the deltaspace baseline.
+    async fn write_baseline(
+        &self,
+        put: &PutObject<'_>,
+        xnode: &super::ReferenceLockGuard,
+    ) -> Result<FileMetadata, EngineError> {
+        let metadata = FileMetadata::new_reference(
+            Self::INTERNAL_REFERENCE_NAME.to_string(),
+            put.obj_key.full_key(),
+            put.sha256.clone(),
+            put.md5.clone(),
+            put.size,
+            put.content_type.clone(),
+        );
+        let cache_key = self.cache_key(put.bucket, put.deltaspace_id);
+        match put.body {
+            PutBody::Buffered(data) => {
+                xnode
+                    .put_reference(
+                        &*self.storage,
+                        put.bucket,
+                        put.deltaspace_id,
+                        data,
+                        &metadata,
                     )
                     .await?;
-                // NOTE: a fresh baseline whose first member lost the ratio is
-                // LEFT IN PLACE — we deliberately do NOT tear it down here.
-                // The buffered path deletes it inside its prefix-lock scope; the
-                // streaming path had to DROP the lock before the passthrough
-                // store (which re-acquires it), so an unguarded delete_reference
-                // here would race a concurrent PUT B that, between our drop and
-                // our delete, sees the reference, deltas against it, and commits —
-                // we'd then delete the reference B needs (MissingReference on B's
-                // GET). A reference with no delta pointing at it is harmless: a
-                // later sibling PUT may delta against it, and it's reclaimed when
-                // the deltaspace empties. Correctness over a minor cleanup.
-                Ok(result.with_accounting(prior_for_counter, reference_created_bytes))
+                self.cache
+                    .put(&cache_key, Bytes::copy_from_slice(data), &put.sha256);
             }
-            Some(delta_size) => {
-                // Delta wins → read the delta spool (small, < cap) + commit it.
-                let mut df = tokio::fs::File::open(delta_spool.path())
-                    .await
-                    .map_err(StorageError::from)?;
-                let mut delta_bytes = Vec::with_capacity(delta_size as usize);
-                df.read_to_end(&mut delta_bytes)
-                    .await
-                    .map_err(StorageError::from)?;
-                let result = self
-                    .commit_streamed_delta(
-                        bucket,
-                        &deltaspace_id,
-                        &obj_key,
-                        delta_bytes,
-                        size,
-                        sha256,
-                        md5,
-                        content_type.clone(),
-                        user_metadata.clone(),
-                        multipart_etag.clone(),
-                        &xnode,
+            PutBody::Spooled(body) => {
+                // Streamed into place from the spool (no heap-load — M1.4).
+                xnode
+                    .put_reference_from_file(
+                        &*self.storage,
+                        put.bucket,
+                        put.deltaspace_id,
+                        body.path(),
+                        &metadata,
                     )
                     .await?;
-                drop((ref_spool, delta_spool, _guard, xnode));
-                self.metadata_cache
-                    .insert(bucket, key, result.metadata.clone());
-                Ok(result.with_accounting(prior_for_counter, reference_created_bytes))
+                // Not pre-cached; the next GET loads it fresh.
+                self.cache.invalidate(&cache_key);
             }
         }
+        self.count_decision("reference");
+        Ok(metadata)
     }
 
-    /// The streaming PUT's body, stored as passthrough (the ratio lost, or no
-    /// spool for the encode). The caller holds no deltaspace lock:
-    /// `store_passthrough_file_inner` takes it.
-    #[allow(clippy::too_many_arguments)]
-    async fn store_spooled_body_as_passthrough(
-        &self,
-        bucket: &str,
-        key: &str,
-        body: HashedSpool<'_>,
-        size: u64,
-        content_type: Option<String>,
-        user_metadata: std::collections::HashMap<String, String>,
-        etag: String,
-    ) -> Result<StoreResult, EngineError> {
-        let result = self
-            .store_passthrough_file_inner(
-                bucket,
-                key,
-                body.spool.path(),
-                Some(body),
-                size,
-                content_type,
-                user_metadata,
-                etag,
-            )
-            .await?;
-        self.metadata_cache
-            .insert(bucket, key, result.metadata.clone());
-        Ok(result)
-    }
-
-    /// Persist a pre-computed delta (from the streaming PUT path) as a delta
-    /// object. Mirrors the delta-commit tail of `commit_delta_or_passthrough`,
-    /// but takes the original `size` explicitly (the body isn't in RAM) and the
-    /// already-encoded `delta` bytes.
-    #[allow(clippy::too_many_arguments)]
-    async fn commit_streamed_delta(
+    /// Best-effort removal of the baseline this PUT created. Errors are
+    /// logged and do not mask the PUT's outcome. Returns whether it went.
+    async fn remove_fresh_baseline(
         &self,
         bucket: &str,
         deltaspace_id: &str,
-        obj_key: &ObjectKey,
-        delta: Vec<u8>,
-        size: u64,
-        sha256: String,
-        md5: String,
-        content_type: Option<String>,
-        user_metadata: std::collections::HashMap<String, String>,
-        multipart_etag: Option<String>,
         xnode: &super::ReferenceLockGuard,
-    ) -> Result<StoreResult, EngineError> {
-        let ref_meta = self
-            .storage
-            .get_reference_metadata(bucket, deltaspace_id)
-            .await?;
-        self.with_metrics(|m| {
-            m.delta_decisions_total.with_label_values(&["delta"]).inc();
-            let saved = size.saturating_sub(delta.len() as u64);
-            m.delta_bytes_saved_total.inc_by(saved);
-        });
-        let mut metadata = FileMetadata::new_delta(
-            obj_key.filename.clone(),
-            sha256,
-            md5,
-            size,
-            "reference.bin".to_string(),
-            ref_meta.file_sha256.clone(),
-            delta.len() as u64,
-            content_type,
-        );
-        metadata.user_metadata = user_metadata;
-        metadata.multipart_etag = multipart_etag;
-        let stored_size = delta.len() as u64;
-        // The delta is only valid against the reference we locked.
-        xnode
-            .put_delta(
-                &*self.storage,
-                bucket,
-                deltaspace_id,
-                &obj_key.filename,
-                &delta,
-                &metadata,
-            )
-            .await?;
-        // Clean up any prior passthrough variant at this key.
-        if let Err(e) = self
-            .delete_passthrough_idempotent(bucket, deltaspace_id, &obj_key.filename)
+    ) -> bool {
+        self.cache
+            .invalidate(&self.cache_key(bucket, deltaspace_id));
+        match xnode
+            .delete_reference(&*self.storage, bucket, deltaspace_id)
             .await
         {
-            warn!("Failed to clean up passthrough after delta write: {}", e);
+            Ok(()) => true,
+            Err(e) => {
+                warn!("S-P1-2: fresh baseline of {bucket}/{deltaspace_id} not removed: {e}");
+                false
+            }
         }
-        Ok(StoreResult::new(metadata, stored_size))
     }
 
-    /// Decide whether to commit the encoded delta or fall back to passthrough,
-    /// then persist the chosen storage strategy.
-    async fn commit_delta_or_passthrough(
+    /// Commit the encoded delta: write it (only valid against the reference
+    /// we locked), then drop an older passthrough variant of the key.
+    async fn commit_delta(
         &self,
-        ctx: StoreContext<'_>,
+        put: &PutObject<'_>,
         ref_meta: &FileMetadata,
-        has_existing_reference: bool,
         delta: Vec<u8>,
-        ratio: f32,
         xnode: &super::ReferenceLockGuard,
     ) -> Result<StoreResult, EngineError> {
-        // S-P1-1: re-evaluate the ratio on every PUT, not just the
-        // first one in the deltaspace. Pre-fix, the threshold gate
-        // was `!has_existing_reference && ratio >= effective_ratio` —
-        // once any file pinned the reference, every subsequent file
-        // was forced into delta storage regardless of cost. A 1 KB
-        // sentinel followed by a 50 MB unrelated file produced a 50
-        // MB delta + 1 KB reference (worse than the 50 MB plain
-        // passthrough would have been). When the deltas were against
-        // unrelated bytes, storage grew without bound.
-        //
-        // Post-fix: the ratio is checked unconditionally. When the
-        // delta is poor, we store passthrough. Three sub-cases:
-        //
-        //   1. `!has_existing_reference` AND poor ratio — same as
-        //      before, except now we also tear down the just-written
-        //      reference (next file may benefit; the heuristic is
-        //      "don't pin a reference for a deltaspace whose first
-        //      file proves we don't have a useful baseline").
-        //   2. `has_existing_reference` AND poor ratio — NEW
-        //      behaviour. Other delta files in this deltaspace need
-        //      the reference, so we KEEP the reference and only
-        //      store this single file as passthrough.
-        //   3. Good ratio — commit as delta as before.
-        let effective_ratio = self.bucket_policies.max_delta_ratio(ctx.bucket);
-        if ratio >= effective_ratio {
-            debug!(
-                "Delta ratio {:.2} >= {:.2} (has_existing_reference={}), storing as passthrough",
-                ratio, effective_ratio, has_existing_reference
-            );
-            self.with_metrics(|m| {
-                m.delta_decisions_total
-                    .with_label_values(&["passthrough"])
-                    .inc()
-            });
-            let del_bucket = ctx.bucket.to_string();
-            let del_dsid = ctx.deltaspace_id.to_string();
-            let del_filename = ctx.obj_key.filename.clone();
-            // Write passthrough FIRST, then clean up. This prevents
-            // transient 404s on concurrent GETs during strategy
-            // transition.
-            let result = self.store_passthrough(ctx).await?;
-            // Always tear down any prior delta for THIS key (we just
-            // overwrote it with passthrough at the same logical key).
-            if let Err(e) = self
-                .delete_delta_idempotent(&del_bucket, &del_dsid, &del_filename)
-                .await
-            {
-                warn!("Failed to clean up delta after passthrough write: {}", e);
-            }
-            // Reference cleanup ONLY when we just minted the reference
-            // for this PUT (case 1). If the reference pre-existed, it
-            // belongs to other delta siblings and must stay.
-            if !has_existing_reference {
-                let cache_key = self.cache_key(&del_bucket, &del_dsid);
-                self.cache.invalidate(&cache_key);
-                if let Err(e) = xnode
-                    .delete_reference(&*self.storage, &del_bucket, &del_dsid)
-                    .await
-                {
-                    warn!(
-                        "Failed to clean up reference after passthrough write: {}",
-                        e
-                    );
-                }
-            }
-            return Ok(result);
-        }
-
-        // Commit as delta
         self.with_metrics(|m| {
             m.delta_decisions_total.with_label_values(&["delta"]).inc();
-            let saved = ctx.data.len().saturating_sub(delta.len()) as u64;
-            m.delta_bytes_saved_total.inc_by(saved);
+            m.delta_bytes_saved_total
+                .inc_by(put.size.saturating_sub(delta.len() as u64));
         });
         let mut metadata = FileMetadata::new_delta(
-            ctx.obj_key.filename.clone(),
-            ctx.sha256,
-            ctx.md5,
-            ctx.data.len() as u64,
+            put.obj_key.filename.clone(),
+            put.sha256.clone(),
+            put.md5.clone(),
+            put.size,
             "reference.bin".to_string(),
             ref_meta.file_sha256.clone(),
             delta.len() as u64,
-            ctx.content_type,
+            put.content_type.clone(),
         );
-        metadata.user_metadata = ctx.user_metadata;
-        metadata.multipart_etag = ctx.multipart_etag;
-
-        // Write delta first, then clean up old passthrough variant. The delta
-        // is only valid against the reference we locked.
+        metadata.user_metadata = put.user_metadata.clone();
+        metadata.multipart_etag = put.multipart_etag.clone();
         xnode
             .put_delta(
                 &*self.storage,
-                ctx.bucket,
-                ctx.deltaspace_id,
-                &ctx.obj_key.filename,
+                put.bucket,
+                put.deltaspace_id,
+                &put.obj_key.filename,
                 &delta,
                 &metadata,
             )
             .await?;
         if let Err(e) = self
-            .delete_passthrough_idempotent(ctx.bucket, ctx.deltaspace_id, &ctx.obj_key.filename)
+            .delete_passthrough_idempotent(put.bucket, put.deltaspace_id, &put.obj_key.filename)
             .await
         {
             warn!(
@@ -948,46 +929,57 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 e
             );
         }
-
+        self.metadata_cache
+            .insert(put.bucket, put.key, metadata.clone());
         Ok(StoreResult::new(metadata, delta.len() as u64))
     }
 
-    /// Store the internal deltaspace reference baseline.
-    async fn set_reference_baseline(
+    /// Write a passthrough object, then drop an older delta variant of the
+    /// key. The caller holds the deltaspace prefix lock; this never takes it.
+    /// `reserved`: the spool the storage write uses, reserved by the caller
+    /// before the lock, or under it when the op holds a spool already (a
+    /// holder never waits).
+    async fn write_passthrough_locked(
         &self,
-        ctx: &StoreContext<'_>,
-        xnode: &super::ReferenceLockGuard,
-    ) -> Result<FileMetadata, EngineError> {
-        let metadata = FileMetadata::new_reference(
-            Self::INTERNAL_REFERENCE_NAME.to_string(),
-            ctx.obj_key.full_key(),
-            ctx.sha256.clone(),
-            ctx.md5.clone(),
-            ctx.data.len() as u64,
-            ctx.content_type.clone(),
-        );
-
-        xnode
-            .put_reference(
-                &*self.storage,
-                ctx.bucket,
-                ctx.deltaspace_id,
-                ctx.data,
-                &metadata,
-            )
-            .await?;
-
-        self.with_metrics(|m| {
-            m.delta_decisions_total
-                .with_label_values(&["reference"])
-                .inc()
-        });
-
-        let cache_key = self.cache_key(ctx.bucket, ctx.deltaspace_id);
-        self.cache
-            .put(&cache_key, Bytes::copy_from_slice(ctx.data), &ctx.sha256);
-
-        Ok(metadata)
+        write: PassthroughWrite<'_>,
+        reserved: Option<&crate::deltaglider::spool::SpoolReservation>,
+    ) -> Result<StoreResult, EngineError> {
+        let PassthroughWrite {
+            bucket,
+            key,
+            deltaspace_id,
+            metadata,
+            source,
+        } = write;
+        let filename = metadata.original_name.clone();
+        match source {
+            PassthroughSource::Bytes(data) => {
+                self.storage
+                    .put_passthrough(bucket, deltaspace_id, &filename, data, &metadata)
+                    .await?
+            }
+            PassthroughSource::File { path, held } => {
+                self.storage
+                    .put_passthrough_file(
+                        bucket,
+                        deltaspace_id,
+                        &filename,
+                        path,
+                        &metadata,
+                        SpoolBudget::new(&self.spool, held, reserved),
+                    )
+                    .await?
+            }
+        }
+        if let Err(e) = self
+            .delete_delta_idempotent(bucket, deltaspace_id, &filename)
+            .await
+        {
+            warn!("Failed to clean up old delta after passthrough write: {e}");
+        }
+        let size = metadata.file_size;
+        self.metadata_cache.insert(bucket, key, metadata.clone());
+        Ok(StoreResult::new(metadata, size))
     }
 
     /// True iff a read reference's DG metadata is missing/corrupt (its S3
@@ -1401,7 +1393,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 total_size,
                 content_type,
                 user_metadata,
-                multipart_etag,
+                Some(multipart_etag),
             ),
         )
         .await
@@ -1419,7 +1411,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         total_size: u64,
         content_type: Option<String>,
         user_metadata: HashMap<String, String>,
-        multipart_etag: String,
+        multipart_etag: Option<String>,
     ) -> Result<StoreResult, EngineError> {
         self.ensure_within_passthrough_ceiling(total_size)?;
 
@@ -1450,42 +1442,27 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             )
             .await?;
         let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
-
-        let mut metadata = FileMetadata::new_passthrough(
-            obj_key.filename.clone(),
-            sha256,
-            md5,
-            total_size,
-            content_type,
-        );
-        metadata.user_metadata = user_metadata;
-        metadata.multipart_etag = Some(multipart_etag);
-
-        self.storage
-            .put_passthrough_file(
-                bucket,
-                &deltaspace_id,
+        let write = PassthroughWrite {
+            bucket,
+            key,
+            deltaspace_id: &deltaspace_id,
+            metadata: passthrough_metadata(
                 &obj_key.filename,
-                source_path,
-                &metadata,
-                SpoolBudget::new(&self.spool, held, reserved.as_ref()),
-            )
-            .await?;
-        if let Err(e) = self
-            .delete_delta_idempotent(bucket, &deltaspace_id, &obj_key.filename)
-            .await
-        {
-            warn!(
-                "Failed to clean up old delta after relay passthrough write: {}",
-                e
-            );
-        }
-
-        let result = StoreResult::new(metadata, total_size);
-        self.metadata_cache
-            .insert(bucket, key, result.metadata.clone());
+                sha256,
+                md5,
+                total_size,
+                content_type,
+                user_metadata,
+                multipart_etag,
+            ),
+            source: PassthroughSource::File {
+                path: source_path,
+                held,
+            },
+        };
         // NB: recorded in the public wrapper, not here (shared inner).
-        Ok(result)
+        self.write_passthrough_locked(write, reserved.as_ref())
+            .await
     }
 
     /// Begin a streaming passthrough multipart upload (Phase B). Gated on
@@ -1649,31 +1626,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 handle.bucket, handle.key, e
             );
         }
-    }
-
-    /// Store as passthrough without delta compression
-    async fn store_passthrough(&self, ctx: StoreContext<'_>) -> Result<StoreResult, EngineError> {
-        let mut metadata = FileMetadata::new_passthrough(
-            ctx.obj_key.filename.clone(),
-            ctx.sha256,
-            ctx.md5,
-            ctx.data.len() as u64,
-            ctx.content_type,
-        );
-        metadata.user_metadata = ctx.user_metadata;
-        metadata.multipart_etag = ctx.multipart_etag;
-
-        self.storage
-            .put_passthrough(
-                ctx.bucket,
-                ctx.deltaspace_id,
-                &ctx.obj_key.filename,
-                ctx.data,
-                &metadata,
-            )
-            .await?;
-
-        Ok(StoreResult::new(metadata, ctx.data.len() as u64))
     }
 
     /// Delete a storage object, ignoring NotFound errors (idempotent delete).

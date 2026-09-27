@@ -318,3 +318,138 @@ async fn usage_accounting_is_the_same_on_both_paths() {
     assert_eq!(row(&a, "b").0, 4);
     assert_eq!(row(&a, "b"), row(&b, "b"));
 }
+
+// ---- One rollback rule for both paths (R11). These failed on the streaming
+// path before StorePlan: it kept a fresh baseline that no delta used.
+
+/// A tiny first member loses the ratio even against itself (the delta
+/// header is larger than the body). It is stored passthrough and the fresh
+/// baseline is removed, so the next PUT picks a useful baseline.
+#[tokio::test]
+async fn a_fresh_baseline_whose_ratio_loses_is_removed() {
+    for path in PATHS {
+        let h = harness().await;
+        let tiny = b"sixteen bytes!!!".to_vec();
+        let r = put(&h, path, "rel/a.zip", &tiny).await;
+        assert_eq!(r.metadata.storage_info.label(), "passthrough", "{path:?}");
+        assert!(!has_reference(&h, "b", "rel").await, "{path:?}");
+        assert_eq!(r.reference_created_bytes, 0, "{path:?}: removed baseline");
+        assert_eq!(read_back(&h, "b", "rel/a.zip").await, tiny, "{path:?}");
+        // The counter holds the one passthrough object, no baseline bytes.
+        assert_eq!(
+            row(&h, "b"),
+            (1, tiny.len() as u64, tiny.len() as u64),
+            "{path:?}"
+        );
+    }
+}
+
+/// A PUT that fails after it creates the baseline removes the baseline
+/// (here: every codec slot is busy, a retryable SlowDown).
+#[tokio::test]
+async fn a_failed_put_removes_its_fresh_baseline() {
+    for path in PATHS {
+        let h = harness().await;
+        let all = h.engine.codec_semaphore.available_permits() as u32;
+        let busy = h.engine.codec_semaphore.acquire_many(all).await.unwrap();
+        let v1 = noise(1, 200_000);
+        let r = put_as(&h, path, "b", "rel/a.zip", &v1, None).await;
+        assert!(
+            matches!(r, Err(EngineError::Overloaded(_))),
+            "{path:?}: {r:?}"
+        );
+        assert!(!has_reference(&h, "b", "rel").await, "{path:?}");
+        drop(busy);
+        put(&h, path, "rel/a.zip", &v1).await;
+        assert_eq!(read_back(&h, "b", "rel/a.zip").await, v1, "{path:?}");
+    }
+}
+
+/// A single PUT stores no multipart ETag, on every strategy (the streaming
+/// passthrough stamped the body MD5 as one).
+#[tokio::test]
+async fn a_single_put_stores_no_multipart_etag() {
+    for path in PATHS {
+        let h = harness().await;
+        let v1 = noise(1, 200_000);
+        for (key, data) in [
+            ("rel/a.zip", v1.clone()),
+            ("rel/c.zip", noise(3, 200_000)),
+            ("img/a.jpg", noise(4, 1000)),
+        ] {
+            put(&h, path, key, &data).await;
+            let head = h.engine.head("b", key).await.unwrap();
+            assert_eq!(head.multipart_etag, None, "{path:?} {key}");
+        }
+    }
+}
+
+// ---- The pure decision.
+
+use super::store::{EncodeOutcome, StorePlan};
+
+#[test]
+fn tries_delta_only_when_compressing_an_eligible_key() {
+    assert!(StorePlan::tries_delta(true, true));
+    assert!(!StorePlan::tries_delta(true, false));
+    assert!(!StorePlan::tries_delta(false, true));
+    assert!(!StorePlan::tries_delta(false, false));
+}
+
+#[test]
+fn decide_truth_table() {
+    let encoded = |delta_len| EncodeOutcome::Encoded { delta_len };
+    let pass = |remove_fresh_baseline| StorePlan::Passthrough {
+        remove_fresh_baseline,
+    };
+    for fresh in [false, true] {
+        assert_eq!(
+            StorePlan::decide(1000, encoded(10), 0.75, fresh),
+            StorePlan::Delta
+        );
+        assert_eq!(
+            StorePlan::decide(1000, encoded(749), 0.75, fresh),
+            StorePlan::Delta
+        );
+        // At the threshold the delta loses, as it always did on the
+        // buffered PUT (`ratio >= max` is passthrough).
+        assert_eq!(
+            StorePlan::decide(1000, encoded(750), 0.75, fresh),
+            pass(fresh)
+        );
+        assert_eq!(
+            StorePlan::decide(1000, encoded(2000), 0.75, fresh),
+            pass(fresh)
+        );
+        assert_eq!(
+            StorePlan::decide(1000, EncodeOutcome::OverCap, 0.75, fresh),
+            pass(fresh)
+        );
+        assert_eq!(
+            StorePlan::decide(1000, EncodeOutcome::NoSpool, 0.75, fresh),
+            pass(fresh)
+        );
+        // An empty body never keeps a delta (ratio 1.0).
+        assert_eq!(StorePlan::decide(0, encoded(0), 0.75, fresh), pass(fresh));
+    }
+}
+
+proptest::proptest! {
+    /// Delta iff the encode finished and the ratio is below the maximum; a
+    /// passthrough removes exactly a baseline that this PUT created.
+    #[test]
+    fn decide_keeps_a_delta_only_below_the_ratio(
+        size in 1u64..10_000_000,
+        delta_len in 0u64..20_000_000,
+        max_ratio in 0.01f32..1.5,
+        fresh: bool,
+    ) {
+        let plan = StorePlan::decide(size, EncodeOutcome::Encoded { delta_len }, max_ratio, fresh);
+        let ratio = DeltaCodec::compression_ratio(size as usize, delta_len as usize);
+        if ratio < max_ratio {
+            proptest::prop_assert_eq!(plan, StorePlan::Delta);
+        } else {
+            proptest::prop_assert_eq!(plan, StorePlan::Passthrough { remove_fresh_baseline: fresh });
+        }
+    }
+}

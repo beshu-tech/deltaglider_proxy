@@ -41,6 +41,21 @@ warned that secrets are "saved to the config file as the reference", and the
 apply does not give these warnings. Now the validate refuses a hash change
 with the same 403, and it gives only the warnings that the apply gives.
 
+### Fixed — The streaming PUT removes a baseline that no delta uses
+
+A delta-eligible PUT above the spool threshold (and every replication,
+lifecycle or migrate copy of such an object) makes its body the baseline of
+a new deltaspace. When the delta then lost the ratio, or the store failed
+(for example a `503 SlowDown` because every codec slot was busy), the
+streaming PUT kept that baseline, and the next PUT to the prefix encoded
+against bytes that no object needs. Now both PUT paths use one decision and
+one commit: a baseline that this PUT created stays only when the PUT
+commits a delta against it, and is removed under the same deltaspace lock
+otherwise. The usage counter no longer counts the bytes of a removed
+baseline (the buffered PUT counted them). A streaming passthrough PUT no
+longer stores the body MD5 as a multipart ETag; the ETag on the wire is the
+same.
+
 ### Changed — `config lint` refuses an empty file
 
 `config lint` now runs the same validation step as

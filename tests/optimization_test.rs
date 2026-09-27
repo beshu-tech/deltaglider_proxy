@@ -713,8 +713,8 @@ async fn test_codec_concurrency_one() {
 
 // ─── S-P1-2: orphan-reference rollback on encode failure ───
 
-/// S-P1-2 regression: when `set_reference_baseline` succeeds but the
-/// subsequent `encode_and_store` fails, the freshly-minted reference
+/// S-P1-2 regression: when `write_baseline` succeeds but the
+/// subsequent encode fails, the freshly-minted reference
 /// must be rolled back. Pre-fix the reference stayed durably on disk
 /// with no delta sibling — every future PUT to that prefix anchored
 /// against bytes the user never successfully stored, poisoning the
@@ -744,7 +744,7 @@ async fn test_orphan_reference_rolled_back_on_encode_overload() {
 
     // Burst 8 concurrent PUTs to a fresh deltaspace. With
     // codec_concurrency=1, only one acquires the codec; the rest race
-    // to set_reference_baseline (which is per-prefix-locked in the
+    // to write_baseline (which is per-prefix-locked in the
     // engine), then fail try_acquire_codec → 503. The reference must
     // be rolled back when encode fails, otherwise repeat creates
     // and rollbacks under the per-prefix lock leave consistent state.

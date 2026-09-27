@@ -43,25 +43,6 @@ pub(crate) use construction::{derive_key_id, effective_legacy_key_id};
 pub(crate) use list::interleave_and_paginate;
 pub use locking::RefWriteProof;
 
-/// Common fields passed through the store pipeline (store → encode_and_store / store_passthrough).
-/// Eliminates the 8-parameter signatures that triggered `clippy::too_many_arguments`.
-struct StoreContext<'a> {
-    bucket: &'a str,
-    obj_key: &'a ObjectKey,
-    deltaspace_id: &'a str,
-    data: &'a [u8],
-    sha256: String,
-    md5: String,
-    content_type: Option<String>,
-    user_metadata: HashMap<String, String>,
-    /// When `Some`, the persisted `FileMetadata.multipart_etag` is
-    /// stamped with this value so subsequent HEAD/GET/LIST return the
-    /// same ETag the CompleteMultipartUpload response advertised
-    /// (H1 correctness fix). Normal single-PUT writes pass `None` and
-    /// get the standard full-body-MD5 ETag.
-    multipart_etag: Option<String>,
-}
-
 /// Errors from the DeltaGlider engine
 #[derive(Debug, Error)]
 pub enum EngineError {
