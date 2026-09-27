@@ -8,7 +8,7 @@ The `deltaglider_proxy` binary is both the server and its CLI. With no subcomman
 |---|---|
 | `-c, --config <FILE>` | Path to the config file (global; also honored by subcommands) |
 | `-l, --listen <ADDR>` | Listen address, overrides config |
-| `-v, --verbose` | Verbose logging (lowest priority in the log-level resolution order) |
+| `-v, --verbose` | Trace logging for the startup lines before the config loads. After the load, the level comes from `RUST_LOG`, `DGP_LOG_LEVEL` or `advanced.log_level` (default `info`), so the flag has no lasting effect |
 | `--init` | Interactive configuration wizard, then exit |
 | `--set-bootstrap-password` | Read a password from stdin, write its bcrypt hash, then exit (alias: `--set-admin-password`) |
 | `--show-env` | Print all `DGP_*` environment variables in `.env` format, then exit |
@@ -20,7 +20,7 @@ Shared registry across all subcommands: `0` OK, `2` usage, `3` I/O error, `4` pa
 
 ## `config lint <FILE>`
 
-Offline validation — the same pipeline as the admin API's `/config/validate`: shape classification, deny-unknown-fields, shorthand normalization, admission-block semantics, `Config::check` warnings (including the cross-field [config advisories](configuration.md#config-advisories) — shared rate-limit bucket, stale IAM template, frozen quota, redundant public prefix). `${env:NAME}` / `${env:NAME:-default}` references are expanded against the environment first; an unset variable without a default fails the lint. YAML is the only supported format; a `.toml` input fails with the TOML-removed error (removed in v1.4.1 — convert with `config migrate` on v1.4.0). Warnings go to stderr and are non-fatal. An unknown root key of a flat-shape document is an error, although the proxy loads such a file and ignores the key. Exit: `0` valid (with or without warnings), `3` unreadable, `4` parse error (also an unknown key), `6` validation error (including an unparseable `log_level` filter).
+Offline validation — the same pipeline as the admin API's `/config/validate`: shape classification, deny-unknown-fields, shorthand normalization, admission-block semantics, `Config::check` warnings (including the cross-field [config advisories](configuration.md#config-advisories) — shared rate-limit bucket, stale IAM template, frozen quota, redundant public prefix). `${env:NAME}` / `${env:NAME:-default}` references are expanded against the environment first; an unset variable without a default fails the lint. YAML is the only supported format; a `.toml` input fails with the TOML-removed error (removed in v1.4.1 — convert with `config migrate` on v1.4.0). Warnings go to stderr and are non-fatal. An unknown root key of a flat-shape document is an error, although the proxy loads such a file and ignores the key. Exit: `0` valid (with or without warnings), `3` unreadable, `4` parse error (also an unknown key, an unset `${env:NAME}` without a default, and an empty or whitespace-only file, which an apply would refuse because it resets every field), `6` validation error (including an unparseable `log_level` filter, and a lifecycle or replication rule that an apply refuses, such as two replication rules with the same name).
 
 ## `config schema [--out <OUTPUT>]`
 
@@ -92,11 +92,11 @@ A download (`cp -r` or `sync` from S3 to a local directory) writes only below th
 
 ### Object size and memory
 
-`cp`, `sync`, `migrate`, and `verify` do not hold a large object in memory. An object of 8 MiB or less is read into memory, because a spool copy costs more than it saves for a small file. A larger upload is first copied into a spool file (in `DGP_SPOOL_DIR`, within the `DGP_SPOOL_MAX_BYTES` budget) and then stored from that file. A download writes the object to a temporary file beside the destination and renames the file into place at the end, so a failed download does not leave a truncated file. An S3-to-S3 copy writes the source into a spool file first. `verify` hashes the object while it reads it. The engine itself reconstructs a delta object in memory when the object is smaller than the spool threshold (`DGP_SPOOL_THRESHOLD_BYTES`), and in a spool file when it is larger.
+`cp`, `sync`, `migrate`, and `verify` do not hold a large object in memory. An object of 8 MiB or less is read into memory, because a spool copy costs more than it saves for a small file. A larger upload is first copied into a spool file (in `DGP_SPOOL_DIR`, within the `DGP_SPOOL_MAX_BYTES` budget) and then stored from that file. A download writes the object to a temporary file beside the destination and renames the file into place at the end, so a failed download does not leave a truncated file. An S3-to-S3 copy writes the source into a spool file first. `verify` hashes the object while it reads it. The engine itself reconstructs a delta object in memory when the object is 16 MiB or smaller, and in a spool file when it is larger. The verbs do not read `DGP_SPOOL_THRESHOLD_BYTES` or the proxy config file, so this threshold is fixed; it is lower only when `--max-object-size-mb` is lower. The verbs do read `DGP_SPOOL_DIR` and `DGP_SPOOL_MAX_BYTES`.
 
 `--no-delta` on `cp`, `sync`, and `migrate` stores each object as a plain object, without a delta against the `reference.bin` baseline. The verb sends the user metadata `dg-no-delta: true`, and the engine does not store this hint with the object. An S3 client that stores through the proxy can send the same hint as the header `x-amz-meta-dg-no-delta: true`.
 
-`--max-object-size-mb` sets the size limit for delta-eligible objects only (default 100 MiB), because the xdelta3 memory use grows with the object size. Other files are limited only by `advanced.max_passthrough_object_size` (default 64 GiB).
+`--max-object-size-mb` sets the size limit for delta-eligible objects only (default 100 MiB), because the xdelta3 memory use grows with the object size. Other files are limited to 64 GiB, the default of `max_passthrough_object_size`. The verbs do not read the proxy config file, so no setting changes this limit.
 
 ### `s3 verify` results
 

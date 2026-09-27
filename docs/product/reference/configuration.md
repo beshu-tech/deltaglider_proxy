@@ -174,7 +174,7 @@ advanced:
 
 Tracing filter string (`tracing-subscriber` syntax). Overridden by `RUST_LOG` if set. Changeable at runtime via the admin GUI (Settings → System → Logging card), which hot-reloads the filter through the apply pipeline. When `RUST_LOG` or `DGP_LOG_LEVEL` is set, that variable decides the level, so the Logging card shows its value read-only and names the variable. An apply cannot replace that level, because the environment variable wins over the file at every apply, not only at startup.
 
-Resolution order at startup: `RUST_LOG` > `DGP_LOG_LEVEL` > `advanced.log_level` in file > `--verbose` CLI flag (sets `trace`) > default.
+Resolution order: `RUST_LOG` > `DGP_LOG_LEVEL` > `advanced.log_level` in the file > default. The `--verbose` CLI flag sets `deltaglider_proxy=trace,tower_http=trace` only for the startup lines that the proxy logs before it loads the config. After the load, `advanced.log_level` (or its default) replaces that filter, so the flag has no lasting effect.
 
 | | |
 |---|---|
@@ -222,19 +222,24 @@ Global tower `ConcurrencyLimit`. Requests beyond this queue.
 
 ### `max_multipart_uploads`
 
-Concurrent multipart uploads cap. Each upload holds part data in memory.
+Concurrent multipart uploads cap. The proxy holds the parts of each open upload itself, in memory or in relay files in `DGP_SPOOL_DIR`, until the upload completes. A CreateMultipartUpload past the cap fails with `503 SlowDown`.
 
 | | |
 |---|---|
 | **Env var** | `DGP_MAX_MULTIPART_UPLOADS` |
+| **Default** | `1000` |
+| **Hot-reload** | No |
+
+These env-only variables set the other multipart limits and the sweeper:
+
+| Env var | Default | Effect |
+|---|---|---|
 | `DGP_MAX_TOTAL_MULTIPART_BYTES` | `max_object_size × DGP_MAX_MULTIPART_UPLOADS / 4` | Cap on the multipart part bytes that all open uploads hold together. A part past the cap fails with `503 SlowDown` |
 | `DGP_MULTIPART_IDLE_TTL_HOURS` | 24 | An open multipart upload that receives no part for this many hours is garbage-collected |
 | `DGP_MULTIPART_SWEEP_INTERVAL_SECS` | 300 | How often the multipart sweeper runs, in seconds |
 | `DGP_MULTIPART_SWEEP_MAX_AGE_SECS` | 3600 | Age in seconds after which the sweeper removes an open multipart upload |
 | `DGP_MULTIPART_COMPLETING_TIMEOUT_SECS` | `DGP_MULTIPART_SWEEP_MAX_AGE_SECS` | Seconds after which the sweeper releases an upload that is stuck in the completing state |
 | `DGP_BUCKET_USAGE_FLUSH_SECS` | 10 | How often the per-bucket usage counters are written to storage, in seconds |
-| **Default** | `1000` |
-| **Hot-reload** | No |
 
 ### `blocking_threads`
 
@@ -249,7 +254,7 @@ Tokio blocking thread-pool size. Controls how many concurrent CPU-bound ops (xde
 
 ### `debug_headers`
 
-Expose debug/fingerprinting headers (`x-amz-storage-type`, `x-deltaglider-cache`). Disable in production to prevent server fingerprinting.
+Expose debug/fingerprinting headers: `x-amz-storage-type` and `x-deltaglider-stored-size` on an object response, and `x-deltaglider-listing-facts-misses` on a LIST. Disable in production to prevent server fingerprinting.
 
 | | |
 |---|---|
@@ -402,7 +407,7 @@ Paths containing `..` components are rejected at load time.
 
 ### S3 backend
 
-AWS S3 / MinIO / Hetzner / Backblaze / any S3-compatible service. Activated by setting `DGP_S3_ENDPOINT` or a `backend:` block with `type = "s3"`.
+AWS S3 / MinIO / Hetzner / Backblaze / any S3-compatible service. Activated by setting `DGP_S3_ENDPOINT` or `DGP_S3_REGION`, or a `backend:` block with `type = "s3"`. When one of these two variables is set, the proxy replaces the whole singleton backend with an S3 backend built from the `DGP_S3_*` and `DGP_BE_AWS_*` variables, and a member without a variable takes its default. Without one of the two variables, the proxy ignores `DGP_S3_PATH_STYLE` and the `DGP_BE_AWS_*` keys. `DGP_BACKEND_ALLOW_LOCAL=true` applies to every S3 backend, named backends included, as if each one set `allow_local: true`.
 
 #### `endpoint` / `region` / `force_path_style` / `access_key_id` / `secret_access_key`
 
@@ -411,7 +416,7 @@ AWS S3 / MinIO / Hetzner / Backblaze / any S3-compatible service. Activated by s
 | endpoint | `DGP_S3_ENDPOINT` | `storage.s3: <url>` | `storage.backend.endpoint` | — (AWS default) |
 | region | `DGP_S3_REGION` | `storage.region` | `storage.backend.region` | `us-east-1` |
 | force_path_style | `DGP_S3_PATH_STYLE` | `storage.force_path_style` | `storage.backend.force_path_style` | `true` |
-| `DGP_BACKEND_ALLOW_LOCAL` | false | Allow `http://` and private-IP endpoints for an S3 backend (MinIO, development, CI) |
+| allow_local | `DGP_BACKEND_ALLOW_LOCAL` | — | `storage.backend.allow_local` (also on each named backend) | `false` (allow `http://` and private-IP endpoints, for MinIO, development and CI) |
 | access_key_id | `DGP_BE_AWS_ACCESS_KEY_ID` | `storage.access_key_id` | `storage.backend.access_key_id` | — |
 | secret_access_key | `DGP_BE_AWS_SECRET_ACCESS_KEY` | `storage.secret_access_key` | `storage.backend.secret_access_key` | — |
 
@@ -699,14 +704,15 @@ TLS is bound once at startup — a `tls.*` change applied at runtime (admin API 
 
 ## Config sync
 
-Multi-instance coordination via S3. When enabled, the shared bucket does three things: the encrypted config DB file is replicated to it (IAM sync); it hosts the per-rule replication leader leases (`_dgp/leases/replication/…`, automatic failover); and setting it activates the boot-time conditional-write validation — of this bucket AND of every named S3 backend hosting client-writable buckets (non-CAS → the proxy refuses to start; see [backend capability validation](../how-to/backend-capability-validation.md)).
+Multi-instance coordination via S3. When enabled, the shared bucket does these things: the encrypted config DB file is replicated to it (IAM sync); it hosts the per-rule replication leader leases (`_dgp/leases/replication/…`, automatic failover) and the cross-instance `reference.bin` locks (`_dgp/locks/reference/…`); and setting it activates the boot-time conditional-write validation — of this bucket AND of every named S3 backend hosting client-writable buckets (non-CAS → the proxy refuses to start; see [backend capability validation](../how-to/backend-capability-validation.md)).
 
 | | |
 |---|---|
 | **Env var** | `DGP_CONFIG_SYNC_BUCKET` |
-| `DGP_CONFIG_SYNC_KEY` | `.deltaglider/config.db` | Object key of the synced DB in the sync bucket (`advanced.config_sync_object_key`) |
 | **YAML** | `advanced.config_sync_bucket` |
 | **Default** | None (disabled) |
+
+`DGP_CONFIG_SYNC_KEY` (YAML `advanced.config_sync_object_key`) sets the object key of the synced DB in the sync bucket. The default is `.deltaglider/config.db`.
 
 ```yaml
 advanced:
@@ -1095,7 +1101,7 @@ DGP_TLS_KEY=/etc/ssl/private/proxy-key.pem
 
 ## Environment variable registry
 
-The list of `DGP_*` variables that the server reads. The unit test `every_dgp_literal_in_src_is_registered` in `src/config/mod.rs` scans the source code and fails when the code reads a variable that `ENV_VAR_REGISTRY` does not list. `deltaglider_proxy --show-env` prints that registry.
+The list of `DGP_*` variables that the server reads. The unit test `every_dgp_literal_in_src_is_registered` in `src/config/tests/general.rs` scans the source code and fails when the code reads a variable that `ENV_VAR_REGISTRY` does not list. `deltaglider_proxy --show-env` prints that registry.
 
 The server reads these variables when it starts, and again when an admin apply rebuilds the engine. A request never reads the environment itself: it uses the values of the running config. The environment of a running process does not change, so a changed variable takes effect only after a restart.
 
@@ -1130,7 +1136,7 @@ The server reads these variables when it starts, and again when an admin apply r
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DGP_MAX_DELTA_RATIO` | 0.75 | Keep delta only if `delta/original < ratio` |
-| `DGP_MAX_OBJECT_SIZE` | 104857600 | Max bytes eligible for delta (xdelta3 mem cap) |
+| `DGP_MAX_OBJECT_SIZE` | 104857600 | Largest object that a client can upload (the request body limit), and the largest object that the proxy delta-encodes; see [`max_object_size`](#max_object_size) |
 | `DGP_CACHE_MB` | 100 | Reference cache size in MB |
 | `DGP_SPOOL_DIR` | `<system temp>/dgp-spool` | Directory for every scratch file of the proxy: the delta codec's files, the multipart relay parts, and the temporary files of encrypted uploads |
 | `DGP_SPOOL_MAX_BYTES` | 17179869184 (16 GiB) | Byte budget for all the files in `DGP_SPOOL_DIR`. A request that needs spool space while it holds none waits for it (up to `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS`). A request that already holds spool space, or that holds a lock, does not wait: it fails with `503 SlowDown`, and S3 clients retry it. A relayed multipart upload holds its parts here until it completes; see `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES` |
@@ -1144,6 +1150,7 @@ The server reads these variables when it starts, and again when an admin apply r
 | `DGP_CODEC_TIMEOUT_SECS` | 60 | Per-subprocess timeout |
 | `DGP_CODEC_STALL_SECS` | 30 | Streaming codec: the proxy stops an xdelta3 process that makes no progress for this many seconds |
 | `DGP_CODEC_ABSOLUTE_SECS` | 7200 | Streaming codec: the longest time one operation may take, in seconds, even while it makes progress |
+| `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS` | 120 | The longest time, in seconds, that a request waits for free spool space. When the time runs out, the request fails with `503 SlowDown` |
 | `DGP_SPOOL_THRESHOLD_BYTES` | 16 MiB (`16777216`), or `max_object_size` when that is smaller | A delta GET of an object larger than this reconstructs the object to a spool file and streams the file, instead of reconstructing it in memory. A delta-eligible upload larger than this is encoded from a spool file. Objects of this size or smaller use the in-memory path |
 | `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES` | 64 MiB | Largest delta-stored source object that `UploadPartCopy` reconstructs in memory |
 
@@ -1157,14 +1164,14 @@ The server reads these variables when it starts, and again when an admin apply r
 | `DGP_S3_PATH_STYLE` | true | Use path-style URLs (MinIO/LocalStack) |
 | `DGP_BE_AWS_ACCESS_KEY_ID` | — | Backend S3 access key |
 | `DGP_BE_AWS_SECRET_ACCESS_KEY` | — | Backend S3 secret key |
-| `DGP_MAX_PASSTHROUGH_OBJECT_SIZE` | 64 GiB | Max size of a passthrough (non-delta) object |
+| `DGP_MAX_PASSTHROUGH_OBJECT_SIZE` | 64 GiB | Largest passthrough (non-delta) object that the proxy stores from a spool file or a streaming copy: replication, lifecycle transitions, bucket migrations, copies and the `s3` CLI verbs. A client upload is limited first by `DGP_MAX_OBJECT_SIZE` |
 | `DGP_S3_CONNECT_TIMEOUT_SECS` | 10 | Backend S3 connect timeout |
 | `DGP_BACKEND_REQUEST_TIMEOUT_SECS` | 30 | Deadline for one S3-backend request that carries no large body (HEAD, GET until the first byte, LIST, DELETE), including the SDK's retries. When a backend does not answer in time, the client gets `503 ServiceUnavailable` naming the backend, and the proxy marks the backend unhealthy, so the next requests to its buckets get the 503 at once. Uploads and server-side copies are not capped by this value, because their duration grows with the object size. `0` turns the deadline off |
 | `DGP_BOOT_CREATE_DECLARED_BUCKETS` | true | At startup, create every bucket declared under `storage.buckets` that its backend does not have: a directory on a filesystem backend, or a `CreateBucket` (after a `HeadBucket`) on an S3 backend. A failure is a warning, not fatal. `false` turns this off for every backend |
 | `DGP_BACKEND_HEALTH_INTERVAL_SECS` | 30 | How often the proxy probes every storage backend, healthy or not. A backend that hangs or goes down turns unhealthy within one interval even with no traffic, and an unhealthy backend reopens when a probe succeeds. `0` turns the loop off; `DGP_BOOT_BACKEND_PROBE=off` also turns it off |
 | `DGP_S3_READ_TIMEOUT_SECS` | 60 | Backend S3 read timeout |
 | `DGP_S3_OPERATION_ATTEMPT_TIMEOUT_SECS` | 300 | Per-attempt backend S3 operation timeout |
-| `DGP_S3_STALL_GRACE_SECS` | 30 | Backend S3 no-progress stall grace |
+| `DGP_S3_STALL_GRACE_SECS` | 20 | Backend S3 no-progress stall grace |
 | `DGP_PARITY_HEAD_CONCURRENCY` | 15 | Concurrent HEADs during a replication Verify (parity) audit on an S3 backend; raise to speed up a large audit, lower to be gentler on a throttling backend (clamped 1–64) |
 | `DGP_PARITY_MAX_OBJECTS` | 1000000 | Max objects a Verify audit scans across both sides before it caps and reports a partial ("scan capped") result; a runaway-scan safety ceiling (≈500k objects/side), raise for even larger mirrors (min 1000) |
 | `DGP_BOOT_BACKEND_PROBE` | enforce | Boot-time backend health gate: `enforce` probes every configured backend's connectivity + credentials at startup and refuses to start when ALL fail; `warn` probes and logs but never exits; `off` skips probing. Unhealthy backends' buckets answer 503 until recovery (every backend is re-probed every `DGP_BACKEND_HEALTH_INTERVAL_SECS`) |
@@ -1180,8 +1187,8 @@ Tuning knobs for the large-object streaming multipart copy path (replication + l
 |----------|---------|-------------|
 | `DGP_STREAM_COPY_THRESHOLD` | 64 MiB | Object size at/above which a passthrough copy streams via multipart (floored at 1) |
 | `DGP_MULTIPART_PART_SIZE` | 64 MiB | Part size for the streaming copy (clamped to the 5 MiB S3 minimum) |
-| `DGP_UPLOAD_CONCURRENCY` | 4 | In-flight parts per streaming object (1–16) |
-| `DGP_REPLICATION_TRANSFERS` | 4 | Concurrent objects per replication page (1–64) |
+| `DGP_UPLOAD_CONCURRENCY` | 4 | In-flight parts per streaming object (1–16), for the copies of event-driven replication, lifecycle transitions, bucket migrations and admin copies. A scheduled replication run uses `storage.replication.upload_concurrency` instead |
+| `DGP_REPLICATION_TRANSFERS` | 4 | Has no effect in this release. The number of objects that one replication run copies at the same time comes from `storage.replication.transfers` (default 4, clamped to 1 to 64) |
 
 ### Authentication
 
@@ -1225,7 +1232,7 @@ Tuning knobs for the large-object streaming multipart copy path (replication + l
 | `DGP_CONFIG_SYNC_KEY` | `.deltaglider/config.db` | Object key of the synced config DB inside the sync bucket (`advanced.config_sync_object_key`) |
 | `DGP_REFERENCE_LOCK_TTL_SECS` | 120 | Lifetime of the cross-instance `reference.bin` lock, when config sync is on |
 | `DGP_REFERENCE_LOCK_ACQUIRE_TIMEOUT_SECS` | 30 | How long a PUT waits for the cross-instance reference lock before it fails |
-| `DGP_NODE_ID` | derived | Stable node label for coordination leases. By default the proxy derives one and saves it next to the config database. A restarted instance takes back its own live lease at once only when the `boot-id` file next to the config database names the process that wrote the lease, so two live instances with one node id never take a lease from each other |
+| `DGP_NODE_ID` | `HOSTNAME`, else generated | Stable node label for coordination leases. When `DGP_NODE_ID` is unset, the proxy uses the `HOSTNAME` variable. When that is unset too, the proxy generates an id and saves it in the `node-id` file next to the config database. A restarted instance takes back its own live lease at once only when the `boot-id` file next to the config database names the process that wrote the lease, so two live instances with one node id never take a lease from each other |
 | `DGP_BUCKET_USAGE_FLUSH_SECS` | 10 | How often the per-bucket usage counters are written to their own file (`deltaglider_usage.db`), in seconds |
 | `DGP_ENCRYPTION_KEY` | — | Singleton-backend AES-256 key (64-char hex). Named backends use `DGP_BACKEND_<NAME>_ENCRYPTION_KEY`. |
 | `DGP_SSE_KMS_KEY_ID` | — | Singleton-backend SSE-KMS ARN/alias. Named backends use `DGP_BACKEND_<NAME>_SSE_KMS_KEY_ID`. |

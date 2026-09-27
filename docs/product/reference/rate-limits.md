@@ -14,6 +14,18 @@ Per-IP brute-force protection for SigV4 authentication and admin login endpoints
 
 After a lockout expires, the failure counter resets and the IP can authenticate again.
 
+### Per-account lockout
+
+The admin sign-in endpoints also count failures for each account, from every IP address together. The bootstrap password login and `recover-db` count against the account `bootstrap`, and `login-as` counts against the access key id that the request names. An attacker who sends guesses from many IP addresses stays below every per-IP limit, but the per-account count still stops the guesses.
+
+| Setting | Default | Env var |
+|---------|---------|---------|
+| Max failures for one account before it locks | 10 | `DGP_RATE_LIMIT_ACCOUNT_MAX_ATTEMPTS` |
+| Rolling window | 3600 s (1 h) | `DGP_RATE_LIMIT_ACCOUNT_WINDOW_SECS` |
+| Lockout duration | 3600 s (1 h) | `DGP_RATE_LIMIT_ACCOUNT_LOCKOUT_SECS` |
+
+A locked account still admits two kinds of caller, so that the attacker cannot lock the operator out. The first is an IP address that signed in to that account successfully within the last 30 days. The second is a direct request from the host itself: its TCP peer is a loopback address and it carries no forwarding header, for example a request through an SSH tunnel. The per-IP limit still applies to both.
+
 Only a failed credential counts toward the lockout. On the S3 API, a failure is a request whose signature the proxy checked and refused: a wrong secret for a known access key, or a signature that is too old. Some requests are refused but not counted: a request with no credentials, a malformed `Authorization` header, an expired presigned link, and an unknown access key. These requests never reach a signature check, so they teach the sender nothing about a secret. If they counted, any anonymous client could lock out every client that shares its IP address, for example all clients behind one load balancer. On a browser form upload (a `POST` with `multipart/form-data`), only a signature that does not match counts. A read of a public prefix needs no credentials, so the proxy serves it to a locked-out IP too.
 
 A locked-out request gets a response that names the lockout and says how long it lasts. The correct password is refused too while the lockout lasts.
@@ -79,7 +91,7 @@ Per-request deadline applied to all S3 API requests; returns HTTP `504 Gateway T
 
 ## Multipart upload limit
 
-Caps concurrent in-progress multipart uploads. Each upload holds part data in memory until completion; the limit bounds memory consumption from abandoned or excessive uploads. Returns `503 SlowDown` when exceeded.
+Caps concurrent in-progress multipart uploads. The proxy holds the parts of each upload until completion, in memory or in relay files in `DGP_SPOOL_DIR`, so the limit bounds the memory and the spool space that abandoned or excessive uploads can take. A CreateMultipartUpload past the limit returns `503 SlowDown`.
 
 | Setting | Default | Env var |
 |---------|---------|---------|
@@ -103,7 +115,7 @@ During LIST operations that require per-object metadata, the proxy issues HEAD r
 
 | Setting | Default | Configurable |
 |---------|---------|--------------|
-| Max concurrent HEADs | 50 | No |
+| Max concurrent HEADs | 10 | No |
 
 ## Summary of all env vars
 
@@ -112,6 +124,9 @@ During LIST operations that require per-object metadata, the proxy issues HEAD r
 | `DGP_RATE_LIMIT_MAX_ATTEMPTS` | 100 | Auth failures before lockout |
 | `DGP_RATE_LIMIT_WINDOW_SECS` | 300 | Rolling window for failure counting |
 | `DGP_RATE_LIMIT_LOCKOUT_SECS` | 600 | Lockout duration after max failures |
+| `DGP_RATE_LIMIT_ACCOUNT_MAX_ATTEMPTS` | 10 | Failed sign-ins for one account, from any IP, before that account locks |
+| `DGP_RATE_LIMIT_ACCOUNT_WINDOW_SECS` | 3600 | Rolling window for the per-account failure count |
+| `DGP_RATE_LIMIT_ACCOUNT_LOCKOUT_SECS` | 3600 | Per-account lockout duration |
 | `DGP_TRUST_PROXY_HEADERS` | false | Trust `X-Forwarded-For` / `X-Real-IP` for IP extraction (only behind a reverse proxy) |
 | `DGP_TRUSTED_PROXY_CIDRS` | unset | Networks of the trusted reverse proxies; required when `DGP_TRUST_PROXY_HEADERS=true` |
 | `DGP_CODEC_CONCURRENCY` | cpus*4 (min 16) | Max concurrent xdelta3 processes |
