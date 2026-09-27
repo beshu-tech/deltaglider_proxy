@@ -1,6 +1,6 @@
 # How to upgrade the proxy
 
-This guide shows you how to move between DeltaGlider Proxy versions safely, including the one-time TOML → YAML config conversion (mandatory before v1.4.1) and the v0.9 encryption-config change.
+This guide shows you how to move between DeltaGlider Proxy versions safely, including the one-time TOML → YAML config conversion (mandatory before v1.4.1) and the v0.9 encryption-config change. To go from 1.19 to 2.0, follow [How to upgrade to 2.0](upgrade-to-2-0.md) first, because that release has steps that you must do before the new version starts.
 
 ## Standard upgrade workflow
 
@@ -19,12 +19,12 @@ The proxy is a single stateful binary. Upgrades are "backup, swap, verify."
 2. **Roll the image/binary.** For Docker:
 
    ```bash
-   docker pull beshultd/deltaglider_proxy:0.8.x
+   docker pull beshultd/deltaglider_proxy:2.0.0
    docker stop dgp && docker rm dgp
    docker run -d --name dgp -p 9000:9000 \
      -v dgp-data:/data \
      -e DGP_BOOTSTRAP_PASSWORD_HASH=... \
-     beshultd/deltaglider_proxy:0.8.x
+     beshultd/deltaglider_proxy:2.0.0
    ```
 
    Coolify, Kubernetes, and systemd have their own "pull + restart" verbs. All that matters: `/data` persists across the swap.
@@ -56,11 +56,11 @@ The proxy is a single stateful binary. Upgrades are "backup, swap, verify."
 
 ## Version compatibility
 
-Patch and minor upgrades inside the `0.8.x` line are drop-in. The config file format, IAM DB schema, and S3 wire format are stable across `0.8.*`.
+Patch and minor upgrades inside one major version (for example from 1.18 to 1.19) need no extra steps. Read the [changelog](../changelog.md) entries of the versions that you skip, because a minor release can still change a default.
 
-**Across minors:** schema migrations run automatically on first start. The config DB is on schema v6 in current builds (v6 adds replication runtime-state tables); any binary `0.8.0+` migrates forward on boot. **Forward migrations are one-way** — once the DB is upgraded, an older binary may not read it.
+Schema migrations of the config DB run automatically on the first start. The config DB is on schema v29 in 2.0. A migration is one-way: a binary refuses a config DB whose schema is newer than the one it knows, so an older binary cannot open a database that a newer binary migrated.
 
-**Across majors (future 0.x → 1.0):** pre-release — expect breaking changes. Always follow the [release notes for that version](https://github.com/beshu-tech/deltaglider_proxy/releases), and always export a Full Backup before trying it.
+A major upgrade (for example from 1.19 to 2.0) has steps that you must do before the new version starts. Follow the upgrade guide of that version ([How to upgrade to 2.0](upgrade-to-2-0.md)) and the [release notes](https://github.com/beshu-tech/deltaglider_proxy/releases), and always export a Full Backup before you start.
 
 ## TOML → YAML migration (mandatory before v1.4.1)
 
@@ -214,7 +214,7 @@ With `DGP_ENCRYPTION_KEY` in the environment unchanged.
 
 After any upgrade or migration:
 
-- [ ] `/_/health` returns HTTP 200.
+- [ ] `/_/health` returns HTTP 200, and `/_/ready` returns HTTP 200 (it checks the backends and the config DB).
 - [ ] `/_/api/whoami` (with an admin session cookie — anonymous callers do not get `version`) reports the expected `version`.
 - [ ] An existing object downloads byte-identical: `aws s3 cp s3://releases/known-file ./out && sha256sum out` matches the known checksum.
 - [ ] The admin UI logs in with the bootstrap password (or OAuth) on the first try.
@@ -223,6 +223,7 @@ After any upgrade or migration:
 
 ## Related
 
+- [How to upgrade to 2.0](upgrade-to-2-0.md): the steps for the 1.19 to 2.0 upgrade
 - [How to back up and restore](back-up-and-restore.md) — the backup you take in step 1
 - [Configuration reference](../reference/configuration.md) — the complete YAML field reference
 - [CLI reference](../reference/cli.md) — `config lint` exit codes
