@@ -97,7 +97,7 @@ pub struct AppState {
 ///
 /// 1. **Cross-backend NoSuchBucket parity** — closes a silent-bucket-creation
 ///    bug on the filesystem backend (C2 from the security audit):
-///    `ensure_dir` at `src/storage/filesystem.rs::ensure_dir` calls
+///    `ensure_dir` at `src/storage/filesystem/mod.rs::ensure_dir` calls
 ///    `create_dir_all(parent)`, which would otherwise quietly create the
 ///    bucket root as a side effect of the first PUT. That diverges from S3
 ///    (`NoSuchBucket`) and bypasses any `s3:CreateBucket`-equivalent gate.
