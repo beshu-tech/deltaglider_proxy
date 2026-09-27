@@ -72,6 +72,7 @@ const description =
         region, over a single stream:
       </p>
 
+      <div class="tax-scroll">
       <table>
         <thead>
           <tr><th>Mode</th><th>PUT</th><th>Cold GET</th><th>Warm GET</th></tr>
@@ -83,6 +84,7 @@ const description =
           <tr><td>Compression + encryption</td><td>9 MB/s</td><td>85 MB/s</td><td>no slowdown</td></tr>
         </tbody>
       </table>
+      </div>
 
       <p>
         The tax lands on the write path, once, where CI is the one
@@ -193,6 +195,9 @@ const description =
 </BaseLayout>
 
 <style>
+  /* Four columns do not fit a phone: scroll the table, not the page. */
+  .tax-scroll { overflow-x: auto; }
+
   /* === Animations === */
   @keyframes fadeUp {
     from { opacity: 0; transform: translateY(20px); }
@@ -324,13 +329,15 @@ const description =
   /* === In Progress Grid === */
   .in-progress-grid {
     display: grid;
-    grid-template-columns: 1fr;
+    /* minmax(0, …) so the results table scrolls inside its card
+       instead of widening the page on phones. */
+    grid-template-columns: minmax(0, 1fr);
     gap: 3rem;
   }
 
   @media (min-width: 1024px) {
     .in-progress-grid {
-      grid-template-columns: 1fr 1fr;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
       align-items: center;
     }
   }
