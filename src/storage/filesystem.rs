@@ -277,13 +277,22 @@ async fn atomic_write_with_metadata(
     metadata: Option<&FileMetadata>,
     durability: Durability,
 ) -> Result<(), StorageError> {
+    use tokio::io::AsyncWriteExt;
     let path = path.to_path_buf();
-    let data = data.to_vec();
     let meta_json = metadata.map(serde_json::to_vec).transpose()?;
 
+    let tmp = tokio::task::spawn_blocking(move || dir.temp())
+        .await
+        .map_err(super::join_error)??;
+    // The body goes through an async file handle, which copies it in small
+    // chunks: a blocking task needs an owned buffer, and a copy of the whole
+    // body doubled the RAM of every buffered write (storage-15).
+    let handle = tmp.as_file().try_clone().map_err(io_to_storage_error)?;
+    let mut file = tokio::fs::File::from_std(handle);
+    file.write_all(data).await.map_err(io_to_storage_error)?;
+    file.flush().await.map_err(io_to_storage_error)?;
+    drop(file);
     tokio::task::spawn_blocking(move || {
-        let mut tmp = dir.temp()?;
-        tmp.write_all(&data).map_err(io_to_storage_error)?;
         // Write xattr to temp file BEFORE rename — atomic metadata+data visibility.
         if let Some(json) = &meta_json {
             xattr_meta::set_metadata_xattr(tmp.path(), json)?;
