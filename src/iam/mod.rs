@@ -17,6 +17,7 @@
 pub mod declarative;
 pub mod external_auth;
 pub mod keygen;
+pub(crate) mod listing;
 pub mod middleware;
 pub mod permissions;
 pub mod types;
