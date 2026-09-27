@@ -26,6 +26,16 @@ const features = [
     title: 'Jobs, events & audit',
     desc: 'Replication, lifecycle, migrations, and re-encryption run as resumable jobs with run history. The proxy can send every event to a webhook or to Slack. It keeps an audit trail of each admin action, and it shows live operational logs that you can tail and filter in the browser.',
   },
+  {
+    glyph: 'binary',
+    title: 'Runs as a fleet',
+    desc: 'Run several instances on shared S3 storage. They sync users, groups, and SSO settings through an encrypted database in a bucket, elect one leader per replication rule with automatic failover, and lock each delta baseline across nodes. The Kubernetes operator puts them behind a router that keeps each multipart upload on one pod.',
+  },
+  {
+    glyph: 'wrench',
+    title: 'Config as code',
+    desc: 'The proxy config is one YAML file. The admin UI edits it and exports it back, and secret references like ${env:NAME} survive the round trip. The config lint command checks a file offline, and in declarative mode the YAML also owns users, groups, and SSO providers.',
+  },
 ] as const;
 
 const shots = [
