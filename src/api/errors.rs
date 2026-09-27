@@ -316,35 +316,36 @@ impl S3Error {
 mod tests {
     use super::*;
 
-    /// Source guard: a `tracing` target outside `deltaglider_proxy::` is
+    /// Source guard: a `tracing` target outside `deltaglider_proxy` is
     /// dropped by the default filter (`deltaglider_proxy=debug,…`, plus the
-    /// audit directive), so the event never reaches a log.
+    /// audit directive `deltaglider_proxy::audit`), so the event never
+    /// reaches a log. Every literal `target: "…"` names the crate.
     #[test]
     fn no_log_event_uses_a_target_outside_the_crate() {
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for e in std::fs::read_dir(dir).unwrap().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    out.push(p);
+        use crate::source_scan::{prod_lines, prod_sources};
+        let key = ["target", ": \""].concat();
+        let mut offenders = Vec::new();
+        for (rel, text) in prod_sources("src") {
+            for (n, line) in prod_lines(&text) {
+                let Some(at) = line.find(key.as_str()) else {
+                    continue;
+                };
+                let value = &line[at + key.len()..];
+                let Some(end) = value.find('"') else {
+                    continue;
+                };
+                // `target: "x".into()` is a struct field, not a log target.
+                let is_log_target = !value[end + 1..].starts_with('.');
+                if is_log_target && !value[..end].starts_with("deltaglider_proxy") {
+                    offenders.push(format!("{rel}:{n}: {}", line.trim()));
                 }
             }
         }
-        let mut files = Vec::new();
-        walk(
-            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
-            &mut files,
+        assert!(
+            offenders.is_empty(),
+            "a log target outside the crate (the default filter drops it):\n{}",
+            offenders.join("\n")
         );
-        let pattern = ["target", ": \"dgp::"].concat();
-        for f in files {
-            let text = std::fs::read_to_string(&f).unwrap();
-            assert!(
-                !text.contains(&pattern),
-                "{}: a log target outside the crate",
-                f.display()
-            );
-        }
     }
 
     /// A filesystem key whose path is the other kind of entry is a client
