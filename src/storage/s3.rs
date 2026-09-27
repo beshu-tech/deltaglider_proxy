@@ -1206,7 +1206,7 @@ impl S3Backend {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
 
-        check_metadata_size(&headers, bucket, &key)?;
+        check_metadata_size(&headers, bucket, key)?;
 
         let backoff_ms = [100, 200, 400];
 
@@ -1385,7 +1385,7 @@ impl S3Backend {
         if let Some(marker) = self.native_encryption.marker() {
             headers.insert("dg-encrypted-native".to_string(), marker.to_string());
         }
-        check_metadata_size(&headers, bucket, &key)?;
+        check_metadata_size(&headers, bucket, key)?;
 
         // The stored size for the listing-size cache: what this PUT sends.
         let stored_size = tokio::fs::metadata(source_path).await.ok().map(|m| m.len());
