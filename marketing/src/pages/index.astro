@@ -123,7 +123,7 @@ import {
           <h3 class="dd-q">Will it corrupt my artifacts?</h3>
           <p class="dd-a">
             Every delta read is rebuilt and checked with SHA-256 against
-            the hash recorded at upload. More than 1,100 unit tests and an
+            the hash recorded at upload. More than 2,000 unit tests and an
             integration matrix against a real MinIO must pass before every
             merge.
           </p>
@@ -163,8 +163,8 @@ import {
           <h3 class="dd-q">Who wrote it, engineers or an AI?</h3>
           <p class="dd-a">
             The engineers in <code>git log</code>, with help from Claude
-            (Fable 5.x today); most of the commits are by Simone Scarduzio,
-            the founder of Beshu Tech. About four in five commits on
+            (Opus 5.5 in the latest commits); most of the commits are by
+            Simone Scarduzio, the founder of Beshu Tech. Nearly nine in ten commits on
             <code>main</code> carry a <code>Co-Authored-By: Claude</code>
             trailer that names the model used for that commit, starting
             with the first release in December 2025. The engineers make
@@ -172,7 +172,7 @@ import {
             <code>CLAUDE.md</code>, a public file in the repo with the
             architecture rules and the design decisions it may not change
             (shelling out to the xdelta3 CLI is one). Every commit, with
-            or without Claude, goes through the same gate: more than 1,100
+            or without Claude, goes through the same gate: more than 2,000
             unit tests, the MinIO integration matrix, clippy with warnings
             as errors, a RustSec audit, and cargo-deny.
           </p>
