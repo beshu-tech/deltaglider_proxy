@@ -1230,11 +1230,12 @@ async fn import_zip_full_backup(
             .as_ref()
             .is_some_and(|s| !s.oauth_client_secrets.is_empty());
     if oauth_secrets && state.config_db.is_none() {
+        let e = AdminError::<super::error::Text>::no_config_db();
         return Err(import_fail(
-            StatusCode::SERVICE_UNAVAILABLE,
+            e.status_code(),
             "apply_secrets",
             "secrets.json",
-            "config DB is not available for OAuth client-secret restore",
+            e.message(),
         ));
     }
 
