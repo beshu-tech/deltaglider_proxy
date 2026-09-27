@@ -947,7 +947,7 @@ body.shell-wide { --shell: 1240px; }
 
   /* Landing cards: 14 px notes instead of 13. */
   .docs-landing-list-note, .docs-start-note { font-size: 0.9rem; }
-  .docs-start-eyebrow { font-size: 0.72rem; }
+  .docs-start-eyebrow { font-size: var(--fs-label); }
   .docs-landing-group .docs-landing-tagline { margin-left: 0; }
 }
 
