@@ -206,32 +206,28 @@ fn engine_affecting_fields_changed(
 /// Side effects of transitioning the runtime config from `old` to `new`.
 ///
 /// This is the **single source of truth** for what happens when the admin
-/// config changes — previously duplicated (and drifting) between the
-/// field-level PATCH path (`update_config`) and the document-level APPLY
-/// path (`apply_config_doc`). Both now build a prospective `new_cfg` and
-/// hand off to this helper under their write lock.
+/// config changes. Every write path (PATCH, section PUT, document apply,
+/// backup restore, bootstrap-pair removal) builds a prospective `new_cfg`
+/// and hands off to this helper under its write lock.
 ///
-/// The helper:
-/// 1. Rebuilds the storage engine when any engine-affecting field changed
-///    (see [`engine_affecting_fields_changed`]) — rollback is the caller's
-///    responsibility; on failure the helper returns `Err` without touching
-///    any other state.
-/// 2. Hot-reloads the log filter when `log_level` changed and parses.
-/// 3. Swaps the IAM state when the legacy SigV4 credentials changed —
-///    unless the deployment is in full IAM-mode, in which case the YAML/
-///    patch values are ignored (the DB is the source of truth) and a
-///    warning is emitted so operators can see their legacy edits had no
-///    effect.
-/// 4. Rebuilds all bucket-derived snapshots (public-prefix + admission
-///    chain) when `buckets` changed.
-/// 5. Emits `requires_restart` + warnings for fields that cannot be
-///    hot-applied (`listen_addr`, `cache_size_mb`).
+/// ## Contract: `Err` ⇒ no runtime state changed
 ///
-/// Returns `(warnings, requires_restart)`. Warnings include both the
-/// "restart required" notices and any hot-reload failures (invalid log
-/// filter strings, IAM-mode-blocked credential edits). Callers can
-/// extend the returned vec with handler-specific warnings before
-/// composing their response.
+/// Callers answer "no state changed" on `Err` and keep the old config, so
+/// the helper runs in two phases (review 4 config-1):
+///
+/// 1. **Pre-commit** — every fallible step, with no side effect: config-graph
+///    and capability/health gates, the declarative-IAM validation, the SigV4
+///    decision ([`sigv4_transition`]) and the engine BUILD (the new engine is
+///    held, not stored).
+/// 2. **Commit** — the declarative-IAM reconcile first (the only fallible
+///    commit step; one SQLite transaction, so its `Err` changes nothing),
+///    then the infallible publishes: log filter, IAM state, bucket-derived
+///    snapshots, and the engine store LAST.
+///
+/// A failure after the reconcile commits (the in-memory index rebuild) is a
+/// warning, not an `Err`: the DB and the new config already agree.
+///
+/// Returns `(warnings, requires_restart)`.
 ///
 /// ## Lock invariant — do not weaken
 ///
@@ -241,22 +237,126 @@ fn engine_affecting_fields_changed(
 /// before returning; releasing the config write lock between engine-swap
 /// and config-swap would expose a window where a concurrent
 /// `state.config.read()` sees the *old* config with the *new* engine
-/// serving requests. Any refactor that moves the await points must
-/// preserve "both happen under one write lock" as the atomicity barrier.
+/// serving requests.
 pub(crate) async fn apply_config_transition(
     state: &Arc<AdminState>,
     old_cfg: &crate::config::Config,
     new_cfg: &crate::config::Config,
     headers: &axum::http::HeaderMap,
 ) -> Result<(Vec<String>, bool), String> {
-    let mut warnings = Vec::new();
+    // ── Phase 1: pre-commit (fallible, no side effect) ───────────────────
+    transition_gates(state, old_cfg, new_cfg).await?;
+    let iam_active = matches!(**state.iam_state.load(), IamState::Iam(_));
+    let sigv4 = sigv4_transition(old_cfg, new_cfg, iam_active)?;
+    let new_engine = if engine_affecting_fields_changed(old_cfg, new_cfg) {
+        Some(crate::config_apply::build_engine(&state.s3_state, new_cfg).await?)
+    } else {
+        None
+    };
+
+    // ── Phase 2: commit ──────────────────────────────────────────────────
+    // The only fallible commit step; it runs before every publish below.
+    let mut warnings = reconcile_declarative_iam(state, old_cfg, new_cfg, headers).await?;
     let mut requires_restart = false;
 
-    // -1. FATAL config-graph errors (bucket → undefined backend, duplicate
-    //     backend names): reject before ANY side effect. These states are
-    //     un-runnable — a misrouted bucket silently falls to the default
-    //     backend and 404s (the beshu-b2 incident). Boot enforces the same
-    //     invariant; an apply must not smuggle one past it.
+    // Nothing below returns Err.
+
+    // Log-level hot reload. An invalid filter is a warning: the old filter
+    // stays, the config change goes through.
+    if old_cfg.log_level != new_cfg.log_level {
+        match crate::audit::with_audit_directive(&new_cfg.log_level).parse::<EnvFilter>() {
+            Ok(new_filter) => {
+                if let Err(e) = state.log_reload.reload(new_filter) {
+                    warnings.push(format!("Failed to reload log filter: {}", e));
+                } else {
+                    tracing::info!("Log level changed to: {}", new_cfg.log_level);
+                }
+            }
+            Err(e) => {
+                warnings.push(format!("Invalid log filter '{}': {}", new_cfg.log_level, e));
+            }
+        }
+    }
+
+    // Legacy SigV4 pair. Judged on the state AFTER the reconcile: in IAM
+    // mode the per-user index is authoritative and the pair is only its
+    // fallback for an empty DB — overwriting the index would destroy every
+    // per-user credential.
+    if let Some(new_pair) = sigv4 {
+        let current_iam = state.iam_state.load();
+        if let IamState::Iam(index) = &**current_iam {
+            state.iam_state.store(Arc::new(IamState::Iam(
+                index.with_bootstrap_fallback(new_pair),
+            )));
+            warnings.push(
+                "IAM mode is active: the bootstrap SigV4 pair is only the fallback for an empty \
+                 IAM database. IAM users (including 'legacy-admin', which carries the old pair) \
+                 are unchanged; manage them in the Users panel."
+                    .to_string(),
+            );
+        } else {
+            let new_state = match new_pair {
+                Some(pair) => IamState::Legacy(pair),
+                None => IamState::Disabled,
+            };
+            state.iam_state.store(Arc::new(new_state));
+            tracing::info!(
+                "Auth credentials hot-reloaded (auth enabled: {})",
+                new_cfg.auth_enabled()
+            );
+        }
+    }
+
+    // Bucket-derived snapshots — public prefix + admission chain.
+    if old_cfg.buckets != new_cfg.buckets || old_cfg.admission_blocks != new_cfg.admission_blocks {
+        rebuild_bucket_derived_snapshots(state, &new_cfg.buckets, &new_cfg.admission_blocks);
+    }
+
+    // IAM-mode flips are security-meaningful (the declarative "escape hatch"
+    // is flip to gui → mutate → flip back): a warn-level line for SIEM.
+    if old_cfg.iam_mode != new_cfg.iam_mode {
+        tracing::warn!(
+            target: "deltaglider_proxy::config",
+            from = ?old_cfg.iam_mode,
+            to = ?new_cfg.iam_mode,
+            "[config] access.iam_mode changed: {:?} → {:?}. In declarative mode the admin-\
+             API IAM mutation routes return 403; a flip to `gui` restores them. Review the \
+             subsequent apply_config audit log entries to see what mutations followed.",
+            old_cfg.iam_mode,
+            new_cfg.iam_mode
+        );
+    }
+
+    // Restart-required fields: applied in memory, live only after a restart.
+    // `requires_restart_warnings` is the single source (the section dry-run
+    // uses it too).
+    for w in requires_restart_warnings(old_cfg, new_cfg) {
+        requires_restart = true;
+        warnings.push(w);
+    }
+
+    // The engine store is the LAST step: every check above passed.
+    if let Some(engine) = new_engine {
+        crate::config_apply::install_engine(
+            &state.s3_state,
+            engine,
+            "Engine rebuilt on config transition",
+        );
+    }
+
+    Ok((warnings, requires_restart))
+}
+
+/// The pre-commit gates of [`apply_config_transition`] that need no plan
+/// output: config-graph errors, the sync-bucket key rule, the backend
+/// capability and health probes, and the declarative-IAM validation.
+async fn transition_gates(
+    state: &Arc<AdminState>,
+    old_cfg: &crate::config::Config,
+    new_cfg: &crate::config::Config,
+) -> Result<(), String> {
+    // FATAL config-graph errors (bucket → undefined backend, duplicate
+    // backend names): un-runnable states that boot refuses too.
     let mut fatal = new_cfg.check_fatal();
     // A webhook URL that every delivery would refuse: refuse the apply that
     // adds it, instead of failing (and retrying) every event later.
@@ -279,320 +379,96 @@ pub(crate) async fn apply_config_transition(
     )
     .map_err(|e| format!("config refused: {e}"))?;
 
-    // 0. Backend write-capability pre-commit gate (guard B, hot-apply half):
-    //    refuse a transition that would route a client-writable bucket onto a
-    //    known/probed non-CAS backend under multi-instance — the startup gate
-    //    alone would let a runtime apply bypass it. Runs FIRST so a refusal
-    //    side-effects nothing. No-op when single-instance.
+    // Backend write-capability gate (guard B, hot-apply half): refuse routing
+    // a client-writable bucket onto a non-CAS backend under multi-instance.
     crate::coordination::capability::hot_apply_capability_gate(
         new_cfg,
         &state.s3_state.backend_capabilities,
     )
     .await?;
 
-    // 0a. Backend HEALTH pre-commit gate: any backend whose DEFINITION this
-    //     transition changes must pass a live connection/credentials probe —
-    //     "Test connection" built into apply, so a typo'd secret or dead
-    //     endpoint is rejected with a named cause instead of going live
-    //     silently. Unchanged backends are never re-probed; an already-
-    //     unhealthy unchanged backend doesn't block unrelated applies.
+    // Backend HEALTH gate: a backend whose DEFINITION changes must pass a
+    // live connection probe ("Test connection" built into apply).
     crate::coordination::health::hot_apply_health_gate(new_cfg, &state.s3_state.backend_health)
         .await?;
 
-    // 0b. Declarative-IAM PRE-COMMIT validation gate (H8/H19). The full
-    //     reconcile at step 4c runs AFTER the engine rebuild + IAM swap +
-    //     snapshot publish (steps 1-4); if it fails there, those side effects
-    //     are already live but the caller reports "no state changed" and reverts
-    //     cfg/disk — a runtime-vs-config split-brain that can leave a rejected
-    //     public prefix anonymously readable. Run the SAME fallible checks
-    //     (empty-YAML gate, config-DB presence, diff_iam validation) here FIRST,
-    //     write-free, so a doomed apply is refused before anything is committed.
-    declarative_iam_precommit_gate(state, old_cfg, new_cfg).await?;
-
-    // 1. Engine rebuild — only on fields the engine reads. Bail early on
-    //    failure so callers can roll back their in-memory mutation
-    //    without having side-effected anything downstream.
-    if engine_affecting_fields_changed(old_cfg, new_cfg) {
-        rebuild_engine(state, new_cfg, "Engine rebuilt on config transition").await?;
-    }
-
-    // 2. Log-level hot reload. Invalid filter is a warning, not an error —
-    //    this matches the existing behavior where an invalid log level
-    //    keeps the old filter but doesn't block the config change.
-    if old_cfg.log_level != new_cfg.log_level {
-        match crate::audit::with_audit_directive(&new_cfg.log_level).parse::<EnvFilter>() {
-            Ok(new_filter) => {
-                if let Err(e) = state.log_reload.reload(new_filter) {
-                    warnings.push(format!("Failed to reload log filter: {}", e));
-                } else {
-                    tracing::info!("Log level changed to: {}", new_cfg.log_level);
-                }
-            }
-            Err(e) => {
-                warnings.push(format!("Invalid log filter '{}': {}", new_cfg.log_level, e));
-            }
-        }
-    }
-
-    // 3. Legacy SigV4 credentials — hot-swap the IamState, but only when
-    //    the deployment is NOT in full IAM mode. In IAM mode the IamIndex
-    //    is authoritative; overwriting it here would silently destroy
-    //    every per-user credential (which is how the old field-level
-    //    patch path discovered this rule, the hard way).
-    if old_cfg.access_key_id != new_cfg.access_key_id
-        || old_cfg.secret_access_key != new_cfg.secret_access_key
-    {
-        let new_pair = match (&new_cfg.access_key_id, &new_cfg.secret_access_key) {
-            (Some(k), Some(s)) => Some(AuthConfig {
-                access_key_id: k.clone(),
-                secret_access_key: s.clone(),
-            }),
-            _ => None,
-        };
-        let current_iam = state.iam_state.load();
-        if let IamState::Iam(index) = &**current_iam {
-            // Per-user keys are authoritative; the pair is only the fallback
-            // for an empty IAM DB. Keep it in step with the config.
-            state.iam_state.store(Arc::new(IamState::Iam(
-                index.with_bootstrap_fallback(new_pair),
-            )));
-            warnings.push(
-                "IAM mode is active: the bootstrap SigV4 pair is only the fallback for an empty \
-                 IAM database. IAM users (including 'legacy-admin', which carries the old pair) \
-                 are unchanged; manage them in the Users panel."
-                    .to_string(),
-            );
-        } else {
-            // Without IAM users, dropping the pair turns S3 authentication
-            // OFF at runtime (and the next boot refuses to start).
-            if new_pair.is_none()
-                && old_cfg.auth_enabled()
-                && !matches!(
-                    new_cfg.classify_auth_config(false),
-                    crate::config::AuthConfigOutcome::OpenAccess
-                )
-            {
-                return Err(
-                    "removing the bootstrap SigV4 pair would leave the proxy without \
-                     authentication: create an IAM admin user first, or set \
-                     `authentication: none` explicitly"
-                        .to_string(),
-                );
-            }
-            let new_state = match new_pair {
-                Some(pair) => IamState::Legacy(pair),
-                None => IamState::Disabled,
-            };
-            state.iam_state.store(Arc::new(new_state));
-            tracing::info!(
-                "Auth credentials hot-reloaded (auth enabled: {})",
-                new_cfg.auth_enabled()
-            );
-        }
-    }
-
-    // 4. Bucket-derived snapshots — public prefix + admission chain.
-    //    Rebuild iff the bucket policy set OR the operator-authored
-    //    admission blocks changed; changing other fields doesn't affect
-    //    these.
-    if old_cfg.buckets != new_cfg.buckets || old_cfg.admission_blocks != new_cfg.admission_blocks {
-        rebuild_bucket_derived_snapshots(state, &new_cfg.buckets, &new_cfg.admission_blocks);
-    }
-
-    // 4b. IAM-mode transitions. Declarative ↔ gui flips are security-
-    //     meaningful — the declarative-mode "escape hatch" is a pair of
-    //     `/apply` calls (flip to gui, mutate, flip back) and auditors
-    //     need to see it distinctly from other config changes. Emits a
-    //     warn-level log line with the direction so SIEM / log-review
-    //     workflows can alert on it.
-    if old_cfg.iam_mode != new_cfg.iam_mode {
-        tracing::warn!(
-            target: "deltaglider_proxy::config",
-            from = ?old_cfg.iam_mode,
-            to = ?new_cfg.iam_mode,
-            "[config] access.iam_mode changed: {:?} → {:?}. In declarative mode the admin-\
-             API IAM mutation routes return 403; a flip to `gui` restores them. Review the \
-             subsequent apply_config audit log entries to see what mutations followed.",
-            old_cfg.iam_mode,
-            new_cfg.iam_mode
-        );
-    }
-
-    // 4c. Phase 3c.3 — Declarative IAM reconciler.
-    //
-    //     Runs iff the TARGET mode is Declarative AND the IAM fields
-    //     actually differ from old_cfg (correctness-xray M2: previously
-    //     the reconcile fired on every PATCH touching anything in the
-    //     access section — log_level fiddling would trigger the full
-    //     diff + sync cycle for no reason).
-    //
-    //     Covers three transition cases:
-    //       - Gui      → Declarative : empty-YAML gate (below), reconcile otherwise.
-    //       - Declarative → Declarative : reconcile when IAM fields changed.
-    //       - Declarative → Gui / Gui → Gui : no-op (DB owned by GUI).
-    //
-    //     Validation + diff happens BEFORE any DB write (via diff_iam);
-    //     a single SQLite transaction covers every create/update/delete
-    //     (via ConfigDb::apply_iam_reconcile). Partial failures roll the
-    //     whole reconcile back.
-    if matches!(
-        new_cfg.iam_mode,
-        crate::config_sections::IamMode::Declarative
-    ) {
-        let yaml_snapshot = crate::iam::snapshot_from_access(
-            &new_cfg.iam_users,
-            &new_cfg.iam_groups,
-            &new_cfg.auth_providers,
-            &new_cfg.group_mapping_rules,
-            &[],
-        );
-
-        // Short-circuit when the target mode is unchanged AND the IAM
-        // fields are identical to the old snapshot. This matters
-        // because apply_config_transition runs on any PATCH — most
-        // of which (log_level, cache_size_mb, …) don't touch IAM.
-        // Without this guard we'd pay reconcile overhead + a config-
-        // sync upload on every unrelated admin click.
-        let old_iam_unchanged = matches!(
-            old_cfg.iam_mode,
-            crate::config_sections::IamMode::Declarative
-        ) && old_cfg.iam_users == new_cfg.iam_users
-            && old_cfg.iam_groups == new_cfg.iam_groups
-            && old_cfg.auth_providers == new_cfg.auth_providers
-            && old_cfg.group_mapping_rules == new_cfg.group_mapping_rules;
-
-        if !old_iam_unchanged {
-            // Empty-gate: only on the gui→declarative flip. A flip to
-            // declarative with empty YAML would delete every DB user in
-            // one go; make the operator opt in by specifying IAM in YAML.
-            if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui)
-                && yaml_snapshot.is_empty()
-            {
-                return Err(
-                    "Refusing to flip to iam_mode: declarative with empty IAM in YAML — \
-                     this would wipe the existing users/groups in the encrypted config DB. \
-                     Add access.iam_users / access.iam_groups to the YAML first, or keep \
-                     iam_mode: gui to preserve the DB as source of truth."
-                        .to_string(),
-                );
-            }
-
-            // The reconciler requires a config DB. On instances without
-            // one (bootstrap-disabled deployments), declarative mode is
-            // meaningless — surface the error at apply time rather than
-            // silently succeed.
-            let Some(db_arc) = state.config_db.as_ref() else {
-                return Err("iam_mode: declarative requires an encrypted config DB; \
-                     this instance has none initialised (check DGP_BOOTSTRAP_PASSWORD_HASH \
-                     and that the DB was successfully opened at startup)."
-                    .to_string());
-            };
-            let db = db_arc.lock().await;
-            let stats = crate::iam::reconcile_declarative_iam(&db, &yaml_snapshot)
-                .map_err(|e| format!("declarative IAM reconcile failed (no state changed): {e}"))?;
-
-            // Rebuild the in-memory IAM index from the now-committed DB.
-            // `rebuild_iam_index_declarative` bumps `IAM_VERSION` so
-            // integration-test barriers fire correctly. The `_declarative`
-            // variant skips the legacy-admin auto-migration branch: in
-            // declarative mode YAML is authoritative, so auto-creating
-            // a row YAML didn't declare would be a silent side-effect
-            // that breaks idempotency.
-            super::users::rebuild_iam_index_declarative(&db, &state.iam_state)
-                .map_err(|e| format!("rebuild_iam_index after reconcile: {e:?}"))?;
-            drop(db);
-
-            // Config sync upload only when the reconcile actually changed
-            // state (correctness-xray L1). Idempotent re-applies produce
-            // stats.is_noop() == true; skipping avoids spurious ETag bumps
-            // + peer-replica churn on GitOps reconcile loops.
-            if !stats.is_noop() {
-                super::trigger_config_sync(state);
-            }
-
-            // Emit one audit entry per mutation via the `audit_entries()`
-            // helper (hygiene #1: replaces a 10-block copy-paste loop).
-            // The request's headers name the admin client (IP, UA).
-            for (action, names) in stats.audit_entries() {
-                for name in names {
-                    super::audit_log(action, "declarative", name, headers);
-                }
-            }
-            if stats.mapping_rules_replaced > 0 {
-                super::audit_log(
-                    "iam_reconcile_mapping_rules_replaced",
-                    "declarative",
-                    &format!("{} rules", stats.mapping_rules_replaced),
-                    headers,
-                );
-            }
-
-            tracing::info!(
-                target: "deltaglider_proxy::config",
-                "[declarative-iam] reconciled: {}",
-                stats.summary_line()
-            );
-
-            // Surface stats as an apply-response warning when anything
-            // actually changed; idempotent apply stays silent
-            // (operators rely on "no warning line" = "true no-op").
-            if !stats.is_noop() {
-                warnings.push(format!(
-                    "declarative IAM reconciled: {} users total, {} groups total, \
-                     {} providers total — {}",
-                    stats.users_total,
-                    stats.groups_total,
-                    stats.providers_total,
-                    stats.summary_line(),
-                ));
-            }
-        }
-    }
-
-    // 5. Restart-required fields. The values are applied to the config
-    //    in memory (the caller has already swapped them), but the server
-    //    must restart for them to take effect at the HTTP layer. The
-    //    set of restart-required fields is the SINGLE source of truth
-    //    here in `requires_restart_warnings` — the section-level
-    //    dry-run (`/config/section/:name/validate`) delegates to it
-    //    too so the two code paths can't drift.
-    for w in requires_restart_warnings(old_cfg, new_cfg) {
-        requires_restart = true;
-        warnings.push(w);
-    }
-
-    Ok((warnings, requires_restart))
+    // Declarative-IAM validation (H8/H19): the same fallible checks as the
+    // reconcile, write-free.
+    declarative_iam_precommit_gate(state, old_cfg, new_cfg).await
 }
 
-/// Pre-commit gate for the declarative-IAM reconcile (H8/H19). Runs the SAME
-/// fallible checks as step 4c — empty-YAML gate, config-DB presence, and
-/// `diff_iam` validation — but WITHOUT writing anything, so a config-apply that
-/// would fail its reconcile is rejected before any runtime side effect (engine
-/// rebuild, IAM swap, snapshot publish) is committed. The condition set MUST
-/// stay identical to 4c's, or the gate and the real reconcile can disagree.
-async fn declarative_iam_precommit_gate(
-    state: &Arc<AdminState>,
+/// Pure SigV4 decision of a transition. `Ok(None)`: the pair did not change.
+/// `Ok(Some(pair))`: publish `pair` (`None` = no pair). `Err`: without IAM
+/// users (`iam_active == false`), dropping the pair would turn S3
+/// authentication off at runtime (and the next boot refuses to start).
+pub(crate) fn sigv4_transition(
     old_cfg: &crate::config::Config,
     new_cfg: &crate::config::Config,
-) -> Result<(), String> {
-    if !matches!(
-        new_cfg.iam_mode,
-        crate::config_sections::IamMode::Declarative
-    ) {
-        return Ok(());
+    iam_active: bool,
+) -> Result<Option<Option<AuthConfig>>, String> {
+    if old_cfg.access_key_id == new_cfg.access_key_id
+        && old_cfg.secret_access_key == new_cfg.secret_access_key
+    {
+        return Ok(None);
     }
+    let new_pair = match (&new_cfg.access_key_id, &new_cfg.secret_access_key) {
+        (Some(k), Some(s)) => Some(AuthConfig {
+            access_key_id: k.clone(),
+            secret_access_key: s.clone(),
+        }),
+        _ => None,
+    };
+    if !iam_active
+        && new_pair.is_none()
+        && old_cfg.auth_enabled()
+        && !matches!(
+            new_cfg.classify_auth_config(false),
+            crate::config::AuthConfigOutcome::OpenAccess
+        )
+    {
+        return Err(
+            "removing the bootstrap SigV4 pair would leave the proxy without \
+             authentication: create an IAM admin user first, or set \
+             `authentication: none` explicitly"
+                .to_string(),
+        );
+    }
+    Ok(Some(new_pair))
+}
 
-    let old_iam_unchanged = matches!(
-        old_cfg.iam_mode,
-        crate::config_sections::IamMode::Declarative
-    ) && old_cfg.iam_users == new_cfg.iam_users
+/// True when the transition must run the declarative reconcile: the target
+/// mode is declarative and the IAM fields (or the mode) changed. Shared by
+/// the pre-commit gate and the reconcile so the two cannot disagree.
+fn declarative_reconcile_needed(
+    old_cfg: &crate::config::Config,
+    new_cfg: &crate::config::Config,
+) -> bool {
+    use crate::config_sections::IamMode;
+    if !matches!(new_cfg.iam_mode, IamMode::Declarative) {
+        return false;
+    }
+    let old_iam_unchanged = matches!(old_cfg.iam_mode, IamMode::Declarative)
+        && old_cfg.iam_users == new_cfg.iam_users
         && old_cfg.iam_groups == new_cfg.iam_groups
         && old_cfg.auth_providers == new_cfg.auth_providers
         && old_cfg.group_mapping_rules == new_cfg.group_mapping_rules;
-    if old_iam_unchanged {
-        return Ok(());
-    }
+    !old_iam_unchanged
+}
 
+/// Phase 3c.3 declarative IAM reconcile, the first commit step of
+/// [`apply_config_transition`]. Validation + diff run before any DB write
+/// (`diff_iam`); one SQLite transaction covers every create/update/delete,
+/// so an `Err` leaves the DB unchanged. Returns the operator warnings.
+async fn reconcile_declarative_iam(
+    state: &Arc<AdminState>,
+    old_cfg: &crate::config::Config,
+    new_cfg: &crate::config::Config,
+    headers: &axum::http::HeaderMap,
+) -> Result<Vec<String>, String> {
+    let mut warnings = Vec::new();
+    if !declarative_reconcile_needed(old_cfg, new_cfg) {
+        return Ok(warnings);
+    }
     let yaml_snapshot = crate::iam::snapshot_from_access(
         &new_cfg.iam_users,
         &new_cfg.iam_groups,
@@ -600,23 +476,103 @@ async fn declarative_iam_precommit_gate(
         &new_cfg.group_mapping_rules,
         &[],
     );
-
+    // The empty-YAML gate and the DB-presence check ran in the pre-commit
+    // gate; they repeat here because the DB lock was released in between.
     if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui) && yaml_snapshot.is_empty()
     {
-        return Err(
-            "Refusing to flip to iam_mode: declarative with empty IAM in YAML — \
-             this would wipe the existing users/groups in the encrypted config DB. \
-             Add access.iam_users / access.iam_groups to the YAML first, or keep \
-             iam_mode: gui to preserve the DB as source of truth."
-                .to_string(),
+        return Err(EMPTY_DECLARATIVE_FLIP.to_string());
+    }
+    let Some(db_arc) = state.config_db.as_ref() else {
+        return Err(NO_CONFIG_DB_FOR_DECLARATIVE.to_string());
+    };
+    let db = db_arc.lock().await;
+    let stats = crate::iam::reconcile_declarative_iam(&db, &yaml_snapshot)
+        .map_err(|e| format!("declarative IAM reconcile failed (no state changed): {e}"))?;
+
+    // The DB is committed from here: a failed in-memory rebuild is a
+    // warning, never an `Err` (the caller would keep the old config over
+    // the new DB). The `_declarative` variant skips the legacy-admin
+    // auto-migration: YAML is authoritative.
+    if let Err(e) = super::users::rebuild_iam_index_declarative(&db, &state.iam_state) {
+        warnings.push(format!(
+            "declarative IAM reconciled, but the in-memory IAM index could not be rebuilt \
+             ({e:?}): the previous index serves until the next IAM change or restart"
+        ));
+    }
+    drop(db);
+
+    // Sync + stats warning only when the reconcile changed state: GitOps
+    // re-applies stay silent and cause no peer churn.
+    if !stats.is_noop() {
+        super::trigger_config_sync(state);
+    }
+    for (action, names) in stats.audit_entries() {
+        for name in names {
+            super::audit_log(action, "declarative", name, headers);
+        }
+    }
+    if stats.mapping_rules_replaced > 0 {
+        super::audit_log(
+            "iam_reconcile_mapping_rules_replaced",
+            "declarative",
+            &format!("{} rules", stats.mapping_rules_replaced),
+            headers,
         );
     }
+    tracing::info!(
+        target: "deltaglider_proxy::config",
+        "[declarative-iam] reconciled: {}",
+        stats.summary_line()
+    );
+    if !stats.is_noop() {
+        warnings.push(format!(
+            "declarative IAM reconciled: {} users total, {} groups total, \
+             {} providers total — {}",
+            stats.users_total,
+            stats.groups_total,
+            stats.providers_total,
+            stats.summary_line(),
+        ));
+    }
+    Ok(warnings)
+}
 
+const EMPTY_DECLARATIVE_FLIP: &str =
+    "Refusing to flip to iam_mode: declarative with empty IAM in YAML — \
+     this would wipe the existing users/groups in the encrypted config DB. \
+     Add access.iam_users / access.iam_groups to the YAML first, or keep \
+     iam_mode: gui to preserve the DB as source of truth.";
+
+const NO_CONFIG_DB_FOR_DECLARATIVE: &str =
+    "iam_mode: declarative requires an encrypted config DB; \
+     this instance has none initialised (check DGP_BOOTSTRAP_PASSWORD_HASH \
+     and that the DB was successfully opened at startup).";
+
+/// Pre-commit gate for the declarative-IAM reconcile (H8/H19). Runs the SAME
+/// fallible checks as [`reconcile_declarative_iam`] — empty-YAML gate,
+/// config-DB presence, and `diff_iam` validation — WITHOUT writing anything.
+/// Both use [`declarative_reconcile_needed`], so they cannot disagree.
+async fn declarative_iam_precommit_gate(
+    state: &Arc<AdminState>,
+    old_cfg: &crate::config::Config,
+    new_cfg: &crate::config::Config,
+) -> Result<(), String> {
+    if !declarative_reconcile_needed(old_cfg, new_cfg) {
+        return Ok(());
+    }
+    let yaml_snapshot = crate::iam::snapshot_from_access(
+        &new_cfg.iam_users,
+        &new_cfg.iam_groups,
+        &new_cfg.auth_providers,
+        &new_cfg.group_mapping_rules,
+        &[],
+    );
+    if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui) && yaml_snapshot.is_empty()
+    {
+        return Err(EMPTY_DECLARATIVE_FLIP.to_string());
+    }
     let Some(db_arc) = state.config_db.as_ref() else {
-        return Err("iam_mode: declarative requires an encrypted config DB; \
-             this instance has none initialised (check DGP_BOOTSTRAP_PASSWORD_HASH \
-             and that the DB was successfully opened at startup)."
-            .to_string());
+        return Err(NO_CONFIG_DB_FOR_DECLARATIVE.to_string());
     };
     let db = db_arc.lock().await;
     crate::iam::validate_declarative_iam(&db, &yaml_snapshot)
@@ -2280,5 +2236,97 @@ mod transition_lock_guard {
         }
         assert!(calls >= 4, "guard found only {calls} call sites");
         assert!(bad.is_empty(), "transition without the write lock: {bad:?}");
+    }
+}
+
+/// Review 4 config-1: `apply_config_transition` returns `Err` only before its
+/// first runtime publish, and the engine store is its last step.
+#[cfg(test)]
+mod transition_order_tests {
+    use super::sigv4_transition;
+    use crate::config::Config;
+
+    fn with_pair(k: Option<&str>, s: Option<&str>) -> Config {
+        Config {
+            access_key_id: k.map(str::to_string),
+            secret_access_key: s.map(str::to_string),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn sigv4_decision_is_made_before_commit() {
+        let old = with_pair(Some("K"), Some("S"));
+        // Unchanged pair: nothing to publish.
+        assert!(matches!(sigv4_transition(&old, &old, false), Ok(None)));
+        // Removal without IAM users: refused (the pre-commit phase).
+        let none = with_pair(None, None);
+        assert!(sigv4_transition(&old, &none, false).is_err());
+        // Half pair = no pair: refused the same way.
+        let half = with_pair(Some("NEW"), None);
+        assert!(sigv4_transition(&old, &half, false).is_err());
+        // With IAM users the pair is only the fallback: removal is fine.
+        assert!(matches!(
+            sigv4_transition(&old, &none, true),
+            Ok(Some(None))
+        ));
+        // A new full pair is published.
+        let new = with_pair(Some("K2"), Some("S2"));
+        match sigv4_transition(&old, &new, false) {
+            Ok(Some(Some(p))) => assert_eq!(p.access_key_id, "K2"),
+            other => panic!("{:?}", other.map(|o| o.map(|p| p.is_some()))),
+        }
+    }
+
+    /// The body of `apply_config_transition` (comments stripped).
+    fn transition_body() -> String {
+        let src = include_str!("mod.rs");
+        let start = src
+            .find(concat!("pub(crate) async fn ", "apply_config_transition("))
+            .unwrap();
+        let end = start + src[start..].find("\n}\n").unwrap();
+        src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn no_err_after_the_first_publish_and_the_engine_store_is_last() {
+        let body = transition_body();
+        let publishes = [
+            ".store(",
+            "log_reload.reload(",
+            "rebuild_bucket_derived_snapshots(",
+            "install_engine(",
+        ];
+        let first_publish = publishes
+            .iter()
+            .filter_map(|p| body.find(p))
+            .min()
+            .expect("publishes found");
+        let tail = &body[first_publish..];
+        assert!(
+            !tail.contains(")?") && !tail.contains("return Err"),
+            "a fallible step follows a publish in apply_config_transition:\n{tail}"
+        );
+        // Every fallible step (gates, SigV4 decision, engine build, reconcile)
+        // sits before the first publish.
+        for step in [
+            "transition_gates(",
+            "sigv4_transition(",
+            "build_engine(",
+            "reconcile_declarative_iam(",
+        ] {
+            let at = body.find(step).unwrap_or_else(|| panic!("{step} missing"));
+            assert!(at < first_publish, "{step} runs after a publish");
+        }
+        let engine_store = body.find("install_engine(").unwrap();
+        for p in publishes {
+            if let Some(at) = body.rfind(p) {
+                assert!(at <= engine_store, "{p} runs after the engine store");
+            }
+        }
     }
 }

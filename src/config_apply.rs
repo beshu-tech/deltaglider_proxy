@@ -25,6 +25,25 @@ use crate::api::handlers::AppState;
 use crate::config::{Config, SharedConfig};
 use crate::deltaglider::DynEngine;
 
+/// Build an engine from `cfg` WITHOUT installing it. The admin transition
+/// builds in its pre-commit phase and installs last (review 4 config-1).
+pub async fn build_engine(app: &AppState, cfg: &Config) -> Result<DynEngine, String> {
+    let new_engine = DynEngine::new(cfg, Some(app.metrics.clone()))
+        .await
+        .map_err(|e| e.to_string())?;
+    // Re-attach the usage counter and cross-instance reference lock — a
+    // rebuild must not drop either.
+    Ok(new_engine
+        .with_bucket_usage(app.bucket_usage.clone())
+        .with_reference_lock(app.reference_lock.clone()))
+}
+
+/// Hot-swap an engine built by [`build_engine`] into `app.engine`.
+pub fn install_engine(app: &AppState, engine: DynEngine, context: &str) {
+    app.engine.store(Arc::new(engine));
+    tracing::info!("{}", context);
+}
+
 /// Rebuild the engine from `cfg` and hot-swap it into `app.engine`.
 /// On failure the OLD engine keeps serving (nothing is swapped).
 pub async fn rebuild_engine_only(
@@ -32,19 +51,9 @@ pub async fn rebuild_engine_only(
     cfg: &Config,
     context: &str,
 ) -> Result<(), String> {
-    match DynEngine::new(cfg, Some(app.metrics.clone())).await {
-        Ok(new_engine) => {
-            // Re-attach the usage counter and cross-instance reference lock —
-            // a rebuild must not drop either.
-            let new_engine = new_engine
-                .with_bucket_usage(app.bucket_usage.clone())
-                .with_reference_lock(app.reference_lock.clone());
-            app.engine.store(Arc::new(new_engine));
-            tracing::info!("{}", context);
-            Ok(())
-        }
-        Err(e) => Err(format!("{}", e)),
-    }
+    let engine = build_engine(app, cfg).await?;
+    install_engine(app, engine, context);
+    Ok(())
 }
 
 #[derive(Clone)]

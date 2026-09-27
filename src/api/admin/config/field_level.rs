@@ -727,7 +727,7 @@ pub async fn update_config(
     }
 
     // ── Run transition side effects ──────────────────────────────────────
-    // Any failure here (currently: engine rebuild) means the patch can't
+    // Any failure here (a gate, the engine build, the auth decision) means the patch can't
     // be honored. Roll back the in-memory mutation and surface a warning,
     // preserving the legacy PATCH contract ("success: true, warnings: [...]")
     // instead of returning a 5xx like apply_config_doc does.
@@ -774,9 +774,9 @@ pub async fn update_config(
         }
         Err(engine_err) => {
             // Roll back the in-memory mutation so the next read sees the
-            // pre-patch state. The engine was left untouched by the helper
-            // (failure happens before it's stored), so we only need to
-            // restore `*cfg`.
+            // pre-patch state. The helper changes no runtime state on Err
+            // (every fallible step precedes its first publish), so only
+            // `*cfg` needs restoring.
             *cfg = old_cfg;
             warnings.push(format!(
                 "Failed to apply config patch: {}. Pre-patch config restored.",

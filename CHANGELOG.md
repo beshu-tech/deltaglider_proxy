@@ -80,6 +80,15 @@ release has no generation and keeps the old rule. During a rolling upgrade,
 an instance on the older release does not merge copies from upgraded
 instances until it is upgraded too, as with every schema change.
 
+### Fixed — A refused config apply leaves the running engine unchanged
+
+A config apply that changed a storage setting, such as
+`max_object_size`, and that the proxy then refused, for example because
+it removed the bootstrap SigV4 pair, answered "no state changed". But the
+proxy installed the new engine before the refusal, so the new limit
+served requests while the config still showed the old one. Now every
+check runs first, and the new engine goes live as the last step.
+
 ### Changed — A migrate to a filesystem backend is about twice as fast
 
 A migrate made every copy durable on its own before the next one (one

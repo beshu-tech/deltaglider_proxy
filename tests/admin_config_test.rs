@@ -1182,6 +1182,75 @@ async fn test_apply_refuses_asymmetric_sigv4_credentials_without_iam_users() {
     assert_eq!(cfg["access_key_id"], "ASYMK");
 }
 
+/// Review 4 config-1: an apply refused at the auth step must not leave the
+/// engine it rebuilt serving. The document changes an engine field
+/// (`max_object_size`) AND removes the SigV4 pair: the auth refusal came
+/// after the engine store, so the 1 KiB limit went live over a config that
+/// still said the old limit.
+#[tokio::test]
+async fn test_refused_apply_leaves_the_running_engine_unchanged() {
+    let server = TestServer::builder().build().await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let s3 = server.s3_client().await;
+    let put_4k = |key: &'static str| {
+        s3.put_object()
+            .bucket(server.bucket())
+            .key(key)
+            .body(aws_sdk_s3::primitives::ByteStream::from(vec![7u8; 4096]))
+            .send()
+    };
+    put_4k("before.bin").await.expect("4 KiB PUT before apply");
+
+    let exported = admin
+        .get(format!("{}/_/api/admin/config/export", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let mut doc: serde_yaml::Value = serde_yaml::from_str(&exported).unwrap();
+    let map = doc.as_mapping_mut().unwrap();
+    let advanced = map
+        .entry("advanced".into())
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+    advanced
+        .as_mapping_mut()
+        .unwrap()
+        .insert("max_object_size".into(), 1024.into());
+    let access = map
+        .entry("access".into())
+        .or_insert_with(|| serde_yaml::Value::Mapping(Default::default()));
+    access
+        .as_mapping_mut()
+        .unwrap()
+        .insert("access_key_id".into(), "".into());
+    let modified = serde_yaml::to_string(&doc).unwrap();
+
+    let resp = admin
+        .post(format!("{}/_/api/admin/config/apply", server.endpoint()))
+        .json(&json!({ "yaml": modified }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["applied"], false, "{body}");
+
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(cfg["max_object_size"], 1024, "{cfg}");
+    put_4k("after.bin")
+        .await
+        .expect("the refused apply must not install its 1 KiB limit");
+}
+
 #[tokio::test]
 async fn test_backend_mutations_persist_to_configured_file_not_cwd_default() {
     // Regression coverage for a latent bug in `api/admin/backends.rs`:
