@@ -29,6 +29,7 @@ use crate::types::{FileMetadata, StorageInfo};
 use dashmap::DashMap;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -102,8 +103,9 @@ pub fn usage_delta_for(meta: &FileMetadata, sign: i8) -> (i64, i64, i64) {
 ///
 /// - `read`/`read_all` merge pending deltas OVER the stored row, so a read
 ///   is exact even before a flush.
-/// - `overwrite_from_scan` (Refresh) flushes first, then replaces the row —
-///   the scan is ground truth and must not be clobbered by stale deltas.
+/// - `overwrite_from_scan` (Refresh) replaces the row with the scan totals
+///   plus the deltas journaled since `begin_scan`: stale deltas from before
+///   the scan are superseded, writes during the scan are kept.
 ///
 /// Durability is unchanged from the old write-through shape: this DB is a
 /// best-effort derived counter (WAL + `synchronous=NORMAL`, failures are
@@ -112,9 +114,49 @@ pub fn usage_delta_for(meta: &FileMetadata, sign: i8) -> (i64, i64, i64) {
 /// already caused, just with a slightly larger window.
 pub struct BucketUsage {
     conn: Mutex<Connection>,
-    /// Un-flushed net deltas keyed by bucket. Values are the SAME signed
-    /// (count, logical, stored) triple `apply_delta` takes.
-    pending: DashMap<String, (i64, i64, i64)>,
+    /// Un-flushed net deltas keyed by bucket, plus the journal of each
+    /// Refresh scan that runs on the bucket.
+    pending: DashMap<String, Pending>,
+    /// Source of [`ScanTicket`] ids.
+    next_scan: AtomicU64,
+}
+
+/// A signed (count, logical, stored) delta — the triple `apply_delta` takes.
+type Triple = (i64, i64, i64);
+
+fn add(t: &mut Triple, (c, l, s): Triple) {
+    t.0 += c;
+    t.1 += l;
+    t.2 += s;
+}
+
+/// One bucket's entry in the pending map.
+#[derive(Default)]
+struct Pending {
+    /// Not yet flushed to SQLite.
+    delta: Triple,
+    /// Per running scan (ticket id): every delta since that scan started,
+    /// flushed or not. One shard lock guards both fields, so a delta can
+    /// never reach one and miss the other.
+    scans: Vec<(u64, Triple)>,
+}
+
+/// A Refresh scan in flight, from [`BucketUsage::begin_scan`]. Consumed by
+/// [`BucketUsage::overwrite_from_scan`]; a dropped ticket (failed scan)
+/// removes its journal.
+pub struct ScanTicket<'a> {
+    db: &'a BucketUsage,
+    bucket: String,
+    id: u64,
+    consumed: bool,
+}
+
+impl Drop for ScanTicket<'_> {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.db.end_scan(&self.bucket, self.id);
+        }
+    }
 }
 
 impl BucketUsage {
@@ -142,6 +184,7 @@ impl BucketUsage {
         let db = Self {
             conn: Mutex::new(conn),
             pending: DashMap::new(),
+            next_scan: AtomicU64::new(0),
         };
         db.migrate()?;
         Ok(db)
@@ -154,6 +197,7 @@ impl BucketUsage {
         let db = Self {
             conn: Mutex::new(conn),
             pending: DashMap::new(),
+            next_scan: AtomicU64::new(0),
         };
         db.migrate()?;
         Ok(db)
@@ -190,14 +234,12 @@ impl BucketUsage {
         if d_count == 0 && d_logical == 0 && d_stored == 0 {
             return;
         }
-        self.pending
-            .entry(bucket.to_string())
-            .and_modify(|(c, l, s)| {
-                *c += d_count;
-                *l += d_logical;
-                *s += d_stored;
-            })
-            .or_insert((d_count, d_logical, d_stored));
+        let d = (d_count, d_logical, d_stored);
+        let mut e = self.pending.entry(bucket.to_string()).or_default();
+        add(&mut e.delta, d);
+        for (_, journal) in e.scans.iter_mut() {
+            add(journal, d);
+        }
     }
 
     /// Apply one object's create (+1) or delete (-1) via [`usage_delta_for`].
@@ -230,9 +272,10 @@ impl BucketUsage {
         // each — a delta folded in between phases is simply flushed early,
         // which is harmless (flush is only the point deltas become durable).
         let keys: Vec<String> = self.pending.iter().map(|e| e.key().clone()).collect();
-        let drained: Vec<(String, (i64, i64, i64))> = keys
+        let drained: Vec<(String, Triple)> = keys
             .into_iter()
-            .filter_map(|k| self.pending.remove(&k))
+            .filter_map(|k| self.take_delta(&k).map(|d| (k, d)))
+            .filter(|(_, d)| *d != (0, 0, 0))
             .collect();
         if drained.is_empty() {
             return;
@@ -279,14 +322,12 @@ impl BucketUsage {
                         "bucket_usage: flush failed for '{}': {} (re-queued)",
                         bucket, e
                     );
-                    self.pending
-                        .entry(bucket)
-                        .and_modify(|(c, l, s)| {
-                            *c += d_count;
-                            *l += d_logical;
-                            *s += d_stored;
-                        })
-                        .or_insert((d_count, d_logical, d_stored));
+                    // Not through apply_delta: the scan journals hold
+                    // this delta already.
+                    add(
+                        &mut self.pending.entry(bucket).or_default().delta,
+                        (d_count, d_logical, d_stored),
+                    );
                 }
             }
         }
@@ -297,8 +338,57 @@ impl BucketUsage {
     }
 
     /// Pending (un-flushed) net delta for one bucket, if any.
-    fn pending_for(&self, bucket: &str) -> (i64, i64, i64) {
-        self.pending.get(bucket).map(|e| *e).unwrap_or((0, 0, 0))
+    fn pending_for(&self, bucket: &str) -> Triple {
+        self.pending
+            .get(bucket)
+            .map(|e| e.delta)
+            .unwrap_or((0, 0, 0))
+    }
+
+    /// Move one bucket's un-flushed delta out; the entry stays while a scan
+    /// journal needs it.
+    fn take_delta(&self, bucket: &str) -> Option<Triple> {
+        let removed = self
+            .pending
+            .remove_if(bucket, |_, p| p.scans.is_empty())
+            .map(|(_, p)| p.delta);
+        removed.or_else(|| {
+            self.pending
+                .get_mut(bucket)
+                .map(|mut p| std::mem::take(&mut p.delta))
+        })
+    }
+
+    /// Remove one scan's journal and return it; drop the entry when nothing
+    /// is left in it.
+    fn end_scan(&self, bucket: &str, id: u64) -> Option<Triple> {
+        let journal = {
+            let mut p = self.pending.get_mut(bucket)?;
+            let i = p.scans.iter().position(|(sid, _)| *sid == id)?;
+            p.scans.swap_remove(i).1
+        };
+        self.pending
+            .remove_if(bucket, |_, p| p.scans.is_empty() && p.delta == (0, 0, 0));
+        Some(journal)
+    }
+
+    /// Start a Refresh scan of `bucket`: from now on every delta of the
+    /// bucket is also journaled for this scan, so
+    /// [`Self::overwrite_from_scan`] can keep the writes that land while
+    /// the scan runs.
+    pub fn begin_scan(&self, bucket: &str) -> ScanTicket<'_> {
+        let id = self.next_scan.fetch_add(1, Ordering::Relaxed);
+        self.pending
+            .entry(bucket.to_string())
+            .or_default()
+            .scans
+            .push((id, (0, 0, 0)));
+        ScanTicket {
+            db: self,
+            bucket: bucket.to_string(),
+            id,
+            consumed: false,
+        }
     }
 
     /// Read one bucket's counters (clamped at 0), merging any un-flushed
@@ -373,7 +463,7 @@ impl BucketUsage {
             if rows.iter().any(|(b, _)| b == bucket) {
                 continue;
             }
-            let (dc, dl, ds) = *e;
+            let (dc, dl, ds) = e.delta;
             if dc == 0 && dl == 0 && ds == 0 {
                 continue;
             }
@@ -390,37 +480,45 @@ impl BucketUsage {
         Ok(rows)
     }
 
-    /// Overwrite a bucket's row with full-scan ground truth + stamp `last_scan_at`.
+    /// Overwrite a bucket's row with full-scan ground truth + stamp
+    /// `last_scan_at`.
     ///
-    /// Flushes any OTHER bucket's pending deltas first, then DISCARDS this
-    /// bucket's pending entry before the REPLACE. The scan is authoritative,
-    /// so a stale delta must not survive to double-apply on top of the fresh
-    /// ground truth — including one a failed flush re-queued. (Dropping it
-    /// matches the old write-through behaviour, where the REPLACE clobbered
-    /// whatever the counter had accumulated.)
+    /// The row becomes the scan totals PLUS every delta since the scan
+    /// started (the ticket's journal): a PUT or DELETE that lands while the
+    /// scan runs is kept, also when a periodic flush already moved it into
+    /// the row that this REPLACE overwrites. The bucket's un-flushed delta
+    /// is dropped: its part from before the scan is superseded, its part
+    /// from during the scan is in the journal. A write whose key the scan
+    /// passes after the write can count twice; a Refresh repairs it, which
+    /// is better than losing writes on every Refresh of a busy bucket.
     pub fn overwrite_from_scan(
         &self,
-        bucket: &str,
+        mut ticket: ScanTicket<'_>,
         totals: &SavingsTotals,
         now: i64,
     ) -> Result<(), rusqlite::Error> {
-        self.flush_pending();
-        // Scan supersedes: drop this bucket's pending entry (a delta raced in
-        // during the scan, or a flush failure re-queued one).
-        self.pending.remove(bucket);
+        // conn → pending, the lock order of flush and read: no flush can run
+        // between the journal take and the REPLACE.
+        let conn = self.conn.lock().unwrap();
+        let bucket = std::mem::take(&mut ticket.bucket);
+        let (jc, jl, js) = self.end_scan(&bucket, ticket.id).unwrap_or_default();
+        ticket.consumed = true;
+        let _ = self.take_delta(&bucket);
+        self.pending
+            .remove_if(&bucket, |_, p| p.scans.is_empty() && p.delta == (0, 0, 0));
         // object_count = user-visible only (delta + passthrough); logical =
         // original_bytes; stored = stored_bytes (incl references). Same
         // interpretation as usage_delta_for, so inline + scan agree.
-        let object_count = totals.delta_count + totals.passthrough_count;
-        self.conn.lock().unwrap().execute(
+        let object_count = (totals.delta_count + totals.passthrough_count) as i64;
+        conn.execute(
             "INSERT OR REPLACE INTO bucket_usage
                 (bucket, object_count, logical_bytes, stored_bytes, last_scan_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 bucket,
-                object_count as i64,
-                totals.original_bytes as i64,
-                totals.stored_bytes as i64,
+                object_count + jc,
+                totals.original_bytes as i64 + jl,
+                totals.stored_bytes as i64 + js,
                 now
             ],
         )?;
@@ -589,7 +687,8 @@ mod tests {
         totals.accumulate(&meta_delta(1000, 30));
         totals.accumulate(&meta_passthrough(100));
         totals.accumulate(&meta_reference(8000));
-        db.overwrite_from_scan("b", &totals, 1234).unwrap();
+        db.overwrite_from_scan(db.begin_scan("b"), &totals, 1234)
+            .unwrap();
         let row = db.read("b").unwrap().unwrap();
         assert_eq!(
             row.object_count, 2,
@@ -669,7 +768,8 @@ mod tests {
         let mut totals = SavingsTotals::default();
         totals.accumulate(&meta_delta(1000, 30));
         totals.accumulate(&meta_passthrough(100));
-        db.overwrite_from_scan("b", &totals, 99).unwrap();
+        db.overwrite_from_scan(db.begin_scan("b"), &totals, 99)
+            .unwrap();
         assert!(
             db.pending.is_empty(),
             "scan must flush pending so stale deltas cannot double-apply later"
@@ -679,6 +779,57 @@ mod tests {
         assert_eq!(row.logical_bytes, 1100);
         assert_eq!(row.stored_bytes, 130);
         assert_eq!(row.last_scan_at, Some(99));
+    }
+
+    /// H14b: a PUT or DELETE that lands while the Refresh scan runs is
+    /// kept on top of the scan result, also when a periodic flush moves it
+    /// into SQLite before the scan ends. A delta from BEFORE the scan is
+    /// still superseded.
+    #[test]
+    fn scan_keeps_deltas_that_arrive_during_the_scan() {
+        let db = BucketUsage::in_memory().unwrap();
+        db.apply_object("b", &meta_passthrough(5), 1); // before: superseded
+        let ticket = db.begin_scan("b");
+        db.apply_object("b", &meta_passthrough(7), 1); // during, flushed
+        db.flush_pending();
+        db.apply_object("b", &meta_passthrough(11), 1); // during, pending
+        db.apply_object("other", &meta_passthrough(3), 1);
+        let mut totals = SavingsTotals::default();
+        totals.accumulate(&meta_passthrough(100));
+        db.overwrite_from_scan(ticket, &totals, 42).unwrap();
+        let row = db.read("b").unwrap().unwrap();
+        assert_eq!(row.object_count, 3, "scan (1) + two writes during it");
+        assert_eq!(row.logical_bytes, 100 + 7 + 11);
+        assert_eq!(row.last_scan_at, Some(42));
+        // Nothing double-applies at the next flush; other buckets keep theirs.
+        db.flush_pending();
+        let row = db.read("b").unwrap().unwrap();
+        assert_eq!(row.logical_bytes, 118);
+        assert_eq!(db.read("other").unwrap().unwrap().logical_bytes, 3);
+        // A write after the overwrite counts once, as usual.
+        db.apply_object("b", &meta_passthrough(1), 1);
+        db.flush_pending();
+        assert_eq!(db.read("b").unwrap().unwrap().logical_bytes, 119);
+    }
+
+    /// Two overlapping scans of one bucket: each keeps the deltas since
+    /// its own start. An abandoned scan (dropped ticket) leaves nothing.
+    #[test]
+    fn overlapping_and_abandoned_scans() {
+        let db = BucketUsage::in_memory().unwrap();
+        let first = db.begin_scan("b");
+        db.apply_object("b", &meta_passthrough(1), 1);
+        let second = db.begin_scan("b");
+        db.apply_object("b", &meta_passthrough(2), 1);
+        let abandoned = db.begin_scan("b");
+        drop(abandoned);
+        let mut totals = SavingsTotals::default();
+        totals.accumulate(&meta_passthrough(10));
+        db.overwrite_from_scan(first, &totals, 1).unwrap();
+        assert_eq!(db.read("b").unwrap().unwrap().logical_bytes, 13);
+        db.overwrite_from_scan(second, &totals, 2).unwrap();
+        assert_eq!(db.read("b").unwrap().unwrap().logical_bytes, 12);
+        assert!(db.pending.is_empty(), "no scan journal left behind");
     }
 
     #[test]

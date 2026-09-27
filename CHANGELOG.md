@@ -167,6 +167,14 @@ cannot change the decision. One answer is now retried that was not before:
 a proxy that has no free delta codec slot. The failure rows show the same
 text as before.
 
+### Fixed — A usage Refresh keeps the writes that land during its scan
+
+`POST /_/api/admin/usage/refresh` replaced the bucket counter with the scan
+result and dropped every PUT and DELETE that arrived while the scan ran, so
+the counter of a busy bucket was wrong right after a Refresh. The counter now
+records the writes from the start of the scan and adds them to the scan
+result.
+
 ### Changed — `config lint` refuses an empty file
 
 `config lint` now runs the same validation step as

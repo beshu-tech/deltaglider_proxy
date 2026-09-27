@@ -157,12 +157,15 @@ pub async fn refresh_bucket_usage(
             serde_json::json!({"bucket": q.bucket, "disabled": true}),
         ));
     };
+    // The ticket marks the scan start: a write that lands while the scan
+    // runs is kept on top of the scan result (H14b).
+    let ticket = usage.begin_scan(&q.bucket);
     let totals = scan_bucket_totals(&state.s3_state, &q.bucket)
         .await
         .map_err(AdminError::internal)?;
     let now = crate::replication::current_unix_seconds();
     usage
-        .overwrite_from_scan(&q.bucket, &totals, now)
+        .overwrite_from_scan(ticket, &totals, now)
         .map_err(|e| AdminError::internal(e.to_string()))?;
     let row = usage
         .read(&q.bucket)
