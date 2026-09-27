@@ -526,8 +526,21 @@ pub async fn cancel_job(
 /// GET /_/api/admin/jobs/bucket/:bucket — session-light tier.
 pub async fn bucket_status(
     State(state): State<Arc<AdminState>>,
+    connect_info: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: axum::http::HeaderMap,
     Path(bucket): Path<super::path_guard::AdminBucket>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Session-light, but bucket-scoped: only a principal that may list the
+    // bucket learns its maintenance state (403, as the S3 LIST answers).
+    let client_ip = crate::rate_limiter::extract_client_ip_with_peer(
+        &headers,
+        connect_info.map(|ci| ci.0.ip()),
+    );
+    let may = super::auth::extract_session_token(&headers)
+        .is_some_and(|t| super::auth::session_may_list_bucket(&state, &t, client_ip, &bucket));
+    if !may {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let job = super::with_config_db(&state, "read bucket maintenance status", |db| {
         db.maintenance_active_job_for_bucket(&bucket.to_ascii_lowercase())
     })

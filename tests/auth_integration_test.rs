@@ -3741,3 +3741,53 @@ async fn forwarded_host_and_proto_count_only_from_a_trusted_proxy() {
         "trusted proxy's X-Forwarded-Proto: {cookie}"
     );
 }
+
+/// `GET /_/api/admin/jobs/bucket/:bucket` is session-light so a non-admin
+/// browser user sees the busy banner of the bucket it views. It answered
+/// any session for any bucket, so a user learned the maintenance state of
+/// buckets it cannot list. Now only a principal that may list the bucket
+/// gets it; others get 403, as the S3 LIST does.
+#[tokio::test]
+async fn bucket_busy_state_only_for_a_principal_that_may_list_the_bucket() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let own = server.bucket().to_string();
+    let admin = admin_http_client(&endpoint).await;
+    let dana = create_user(
+        &admin,
+        &server,
+        "dana",
+        vec![json!({"effect": "Allow", "actions": ["read", "list"], "resources": [format!("{own}/*")]})],
+    )
+    .await;
+    let browser = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .unwrap();
+    let r = browser
+        .post(format!("{endpoint}/_/api/admin/session/browser-connect"))
+        .json(&json!({
+            "access_key_id": dana.access_key_id,
+            "secret_access_key": dana.secret_access_key,
+            "endpoint": endpoint,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK, "browser-connect");
+    let status = |c: &reqwest::Client, bucket: &str| {
+        let url = format!("{endpoint}/_/api/admin/jobs/bucket/{bucket}");
+        let c = c.clone();
+        async move { c.get(url).send().await.unwrap().status() }
+    };
+    assert_eq!(status(&browser, &own).await, StatusCode::OK, "own bucket");
+    assert_eq!(
+        status(&browser, "db-archive").await,
+        StatusCode::FORBIDDEN,
+        "a bucket dana cannot list"
+    );
+    assert_eq!(status(&admin, "db-archive").await, StatusCode::OK, "admin");
+}

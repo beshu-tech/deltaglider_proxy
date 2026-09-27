@@ -153,7 +153,8 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         // Bucket maintenance status is session-light ON PURPOSE: non-admin
         // browser users (S3BrowserLift) need to see "busy + progress" for
         // the bucket they are viewing. The view carries only job
-        // status/phase/counts — no config detail.
+        // status/phase/counts — no config detail — and only to a principal
+        // that may list the bucket (`session_may_list_bucket`).
         .route(
             "/_/api/admin/jobs/bucket/:bucket",
             get(admin::maintenance_bucket_status),

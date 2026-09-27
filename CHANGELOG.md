@@ -354,6 +354,13 @@ So the total covered only the objects after the cursor, and the progress
 bar reached 99 % long before the end. Now the resumed count starts from
 the count that was saved with the cursor.
 
+### Fixed — The bucket busy banner is shown only to users who may list the bucket
+
+`GET /_/api/admin/jobs/bucket/:bucket` answered any browser session for
+any bucket, so a user learned the maintenance state of buckets it cannot
+list. Now it answers `403` unless the session's user may list the bucket
+(an admin, an open-access session, or an IAM user who sees the bucket).
+
 ### Fixed — An `allow-anonymous` grant never covers more than one object
 
 The grant for a `GET` of a key with `*` or `?` was a permission pattern,

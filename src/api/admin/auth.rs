@@ -1386,6 +1386,37 @@ fn non_admin_bulk_session(
     }
 }
 
+/// Whether the principal of the session `token` may list `bucket`, the rule
+/// for bucket-scoped views on the session-light surface (the busy banner):
+/// a live admin session; an open-mode session while access is open; an
+/// IAM user (keys or OAuth) that sees the bucket, as ListBuckets does.
+pub(crate) fn session_may_list_bucket(
+    state: &AdminState,
+    token: &str,
+    client_ip: Option<IpAddr>,
+    bucket: &str,
+) -> bool {
+    if admin_gui_session_ok(state, token, client_ip) {
+        return true;
+    }
+    let iam = state.iam_state.load();
+    match non_admin_bulk_session(
+        state.sessions.auth_method(token, client_ip),
+        &iam,
+        client_ip,
+    ) {
+        Some((BulkSession::Open | BulkSession::AdminGui, _)) => true,
+        Some((BulkSession::IamUser { access_key_id, .. }, _)) => match iam.as_ref() {
+            IamState::Iam(index) => index
+                .get(&access_key_id)
+                .filter(|u| u.enabled)
+                .is_some_and(|u| crate::iam::AuthenticatedUser::from(u).can_see_bucket(bucket)),
+            _ => false,
+        },
+        None => false,
+    }
+}
+
 /// Audit actor for an admin session: the IAM user name when known.
 fn session_actor_label(method: &AuthMethod, iam: &IamState) -> String {
     let index = match iam {
