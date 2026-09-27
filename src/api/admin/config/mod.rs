@@ -111,7 +111,7 @@ use std::sync::Arc;
 
 use crate::iam::IamState;
 
-use super::AdminState;
+use super::{AdminError, AdminState, Bare, JsonError, Text};
 
 #[derive(Deserialize)]
 pub struct TestS3Request {
@@ -390,14 +390,8 @@ pub async fn remove_bootstrap_credentials(
     State(state): State<Arc<AdminState>>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
-    use axum::http::StatusCode;
-    let conflict = |msg: &str| {
-        (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": msg })),
-        )
-            .into_response()
-    };
+    // The refusals answer `{"error": ..}`; an env re-apply failure a text 500.
+    let conflict = |msg: &str| AdminError::<JsonError>::conflict(msg).into_response();
     let mut cfg = state.config.write().await;
     let iam_active = matches!(&**state.iam_state.load(), IamState::Iam(_));
     let env_controlled = ["DGP_ACCESS_KEY_ID", "DGP_SECRET_ACCESS_KEY"]
@@ -429,7 +423,7 @@ pub async fn remove_bootstrap_credentials(
         Ok(w) => w,
         Err(e) => {
             *cfg = old_cfg;
-            return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+            return AdminError::<Text>::internal(e).into_response();
         }
     };
     // The transition swaps the edit in itself: put the running config back.
@@ -917,11 +911,8 @@ pub struct SyncNowResponse {
 /// why), 502 when the bucket cannot be read.
 pub async fn sync_now(
     State(state): State<Arc<AdminState>>,
-) -> Result<(axum::http::StatusCode, Json<SyncNowResponse>), axum::http::StatusCode> {
-    let sync = state
-        .config_sync
-        .as_ref()
-        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+) -> Result<(axum::http::StatusCode, Json<SyncNowResponse>), AdminError<Bare>> {
+    let sync = state.config_sync.as_ref().ok_or_else(no_sync_bucket)?;
 
     // Same helper as the periodic poll: download, three-way merge, rebuild.
     let outcome = crate::config_db_sync::pull_and_merge(
@@ -984,6 +975,11 @@ fn sync_now_reply(
     }
 }
 
+/// The bare 404 of the sync endpoints on an instance without a sync bucket.
+fn no_sync_bucket() -> AdminError<Bare> {
+    AdminError::not_found("no config sync bucket configured")
+}
+
 #[derive(Serialize)]
 pub struct SyncStatusResponse {
     #[serde(flatten)]
@@ -997,11 +993,8 @@ pub struct SyncStatusResponse {
 /// base. 404 when no sync bucket is configured.
 pub async fn sync_status(
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<SyncStatusResponse>, axum::http::StatusCode> {
-    let sync = state
-        .config_sync
-        .as_ref()
-        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+) -> Result<Json<SyncStatusResponse>, AdminError<Bare>> {
+    let sync = state.config_sync.as_ref().ok_or_else(no_sync_bucket)?;
     let sync_generation = match &state.config_db {
         Some(db) => db.lock().await.sync_generation().ok(),
         None => None,
