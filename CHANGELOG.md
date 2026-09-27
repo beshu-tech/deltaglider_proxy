@@ -34,6 +34,17 @@ coordination bucket, a run also stops renewing its S3 lease on every listing
 page: only the heartbeat renews it, which removes two coordination-bucket
 requests for each listed directory.
 
+### Fixed — Two live instances with one node id no longer steal each other's replication lease
+
+An instance took back a live replication lease at once when the lease
+carried its node id and another process id, so that a restarted instance
+did not wait for the lease to expire. Two live instances with the same
+node id (docker `--network host` gives both the host name, or a shared
+`DGP_NODE_ID`) therefore took the lease from each other on every tick, and
+each run stopped when its lease was lost. Now the instance records its
+process id in `boot-id` next to the config database, and it takes back a
+live lease only when its previous process wrote it.
+
 ### Fixed — An OAuth login on two instances is not a sync conflict
 
 Every OAuth login rewrote `last_login` and `raw_claims` and uploaded the

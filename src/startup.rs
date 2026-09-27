@@ -992,7 +992,7 @@ pub async fn build_coordination_lease(
     config_db: &Arc<tokio::sync::Mutex<deltaglider_proxy::config_db::ConfigDb>>,
     db_keys: &deltaglider_proxy::config_db::ConfigDbKeys,
 ) -> Arc<dyn deltaglider_proxy::coordination::CoordinationLease> {
-    use deltaglider_proxy::coordination::{durable_node_id, LocalLease, S3Lease};
+    use deltaglider_proxy::coordination::{durable_node_id, process_boot_ids, LocalLease, S3Lease};
 
     let local = || Arc::new(LocalLease::new(config_db.clone()));
 
@@ -1050,7 +1050,12 @@ pub async fn build_coordination_lease(
                 "Job-plane lease: S3-CAS on bucket '{sync_bucket}' (cross-node failover, \
                  node_id={node_id})"
             );
-            Arc::new(S3Lease::new(client, sync_bucket, node_id))
+            let boot = process_boot_ids(
+                config_db_path()
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            );
+            Arc::new(S3Lease::with_boot(client, sync_bucket, node_id, boot))
         }
         Err(e) => {
             warn!("Job-plane lease: coordination client build failed ({e}) — node-local fallback");

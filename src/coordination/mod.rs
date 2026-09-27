@@ -75,6 +75,55 @@ pub fn durable_node_id(dir: &std::path::Path) -> String {
     generated
 }
 
+/// This process's boot id, and the one this node's previous process
+/// recorded. The lease writes `current` into its body and reclaims a live
+/// lease only when it carries `previous` (a restart of this node), never a
+/// lease of a live twin that shares the node id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootIds {
+    pub current: String,
+    pub previous: Option<String>,
+}
+
+/// The boot ids of this process. The first call reads `<dir>/boot-id` (the
+/// previous process's id) and writes a fresh one; later calls return the
+/// same pair, so every lease of the process shares one id. `dir` is the
+/// config-DB directory.
+pub fn process_boot_ids(dir: &std::path::Path) -> BootIds {
+    static IDS: std::sync::OnceLock<BootIds> = std::sync::OnceLock::new();
+    IDS.get_or_init(|| rotate_boot_id(dir)).clone()
+}
+
+/// Read the recorded boot id and replace it with a fresh one. A failed
+/// write only costs the next boot its self-reclaim (its leases free at TTL).
+fn rotate_boot_id(dir: &std::path::Path) -> BootIds {
+    let path = dir.join("boot-id");
+    let previous = std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let current = uuid::Uuid::new_v4().to_string();
+    let _ = std::fs::write(&path, &current);
+    BootIds { current, previous }
+}
+
+#[cfg(test)]
+mod boot_id_tests {
+    use super::*;
+
+    #[test]
+    fn each_boot_sees_the_one_before_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = rotate_boot_id(dir.path());
+        assert_eq!(first.previous, None);
+        let second = rotate_boot_id(dir.path());
+        assert_eq!(second.previous.as_deref(), Some(first.current.as_str()));
+        // A twin with its own data dir never sees this node's boot id.
+        let twin_dir = tempfile::tempdir().unwrap();
+        assert_eq!(rotate_boot_id(twin_dir.path()).previous, None);
+    }
+}
+
 #[cfg(test)]
 mod test_s3 {
     //! Test-only S3 client over a canned connector: a GET answers with a fixed

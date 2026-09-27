@@ -1153,7 +1153,7 @@ Tuning knobs for the large-object streaming multipart copy path (replication + l
 | `DGP_CONFIG_SYNC_BUCKET` | — | S3 bucket for encrypted-DB multi-instance sync |
 | `DGP_REFERENCE_LOCK_TTL_SECS` | 120 | Lifetime of the cross-instance `reference.bin` lock, when config sync is on |
 | `DGP_REFERENCE_LOCK_ACQUIRE_TIMEOUT_SECS` | 30 | How long a PUT waits for the cross-instance reference lock before it fails |
-| `DGP_NODE_ID` | derived | Stable node label for coordination leases. By default the proxy derives one and saves it next to the config database |
+| `DGP_NODE_ID` | derived | Stable node label for coordination leases. By default the proxy derives one and saves it next to the config database. A restarted instance takes back its own live lease at once only when the `boot-id` file next to the config database names the process that wrote the lease, so two live instances with one node id never take a lease from each other |
 | `DGP_ENCRYPTION_KEY` | — | Singleton-backend AES-256 key (64-char hex). Named backends use `DGP_BACKEND_<NAME>_ENCRYPTION_KEY`. |
 | `DGP_SSE_KMS_KEY_ID` | — | Singleton-backend SSE-KMS ARN/alias. Named backends use `DGP_BACKEND_<NAME>_SSE_KMS_KEY_ID`. |
 

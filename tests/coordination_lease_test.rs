@@ -13,7 +13,7 @@
 use crate::common;
 
 use common::{minio_available, minio_client, MINIO_BUCKET};
-use deltaglider_proxy::coordination::{CoordinationLease, LeaseSubsystem, S3Lease};
+use deltaglider_proxy::coordination::{BootIds, CoordinationLease, LeaseSubsystem, S3Lease};
 
 fn unique_rule() -> String {
     format!("itest-{}", uuid::Uuid::new_v4())
@@ -145,7 +145,19 @@ async fn s3_lease_self_reclaim_after_restart() {
     // E7: a rebooted NODE (same durable node_id, new task owner) reclaims its own
     // still-live lease immediately instead of waiting a full TTL.
     let rule = unique_rule();
-    let before_restart = lease_for("nodeC").await;
+    let boot = |current: &str, previous: Option<&str>| BootIds {
+        current: current.into(),
+        previous: previous.map(Into::into),
+    };
+    let with_boot = |b: BootIds| async move {
+        S3Lease::with_boot(
+            minio_client().await,
+            MINIO_BUCKET.to_string(),
+            "nodeC".to_string(),
+            b,
+        )
+    };
+    let before_restart = with_boot(boot("boot-c1", None)).await;
     assert!(
         before_restart
             .try_acquire(SUB, &rule, "task-c-old", now(), 300)
@@ -154,9 +166,20 @@ async fn s3_lease_self_reclaim_after_restart() {
         "node C acquires (long TTL, still live after 'restart')"
     );
 
-    // Same node_id, fresh task owner (a new process) — the lease is still LIVE
-    // but ours, so we reclaim it now rather than blocking.
-    let after_restart = lease_for("nodeC").await;
+    // A LIVE twin with the same node id (docker --network host) is blocked:
+    // the lease is not its previous boot's.
+    let twin = with_boot(boot("boot-twin", Some("boot-twin-0"))).await;
+    assert!(
+        !twin
+            .try_acquire(SUB, &rule, "task-twin", now(), 300)
+            .await
+            .unwrap(),
+        "a live twin with one node id must not steal the lease"
+    );
+
+    // The next process of this node (its previous boot wrote the lease) — the
+    // lease is still LIVE but ours, so we reclaim it now rather than blocking.
+    let after_restart = with_boot(boot("boot-c2", Some("boot-c1"))).await;
     assert!(
         after_restart
             .try_acquire(SUB, &rule, "task-c-new", now(), 300)
