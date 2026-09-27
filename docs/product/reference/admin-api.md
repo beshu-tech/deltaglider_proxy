@@ -8,7 +8,7 @@ A browser marks each request with a `Sec-Fetch-Site` header, and it adds an `Ori
 
 A request body or query string that the proxy cannot accept gets `400` with a JSON body `{"error": <code>, "message": <text>}`. The message names the field and the rule that the value breaks, for example `dest_prefix: invalid path "../x/": '.' and '..' segments are not allowed`. The code is `invalid_path` for an object key or prefix with a `.` or `..` segment, a leading `/` or a NUL character, `invalid_bucket` for a bucket name that breaks the S3 naming rules, and `invalid_request` for every other bad input, such as a missing field or a body that is not valid JSON. A body sent without the `application/json` content type gets `415` with the same JSON shape.
 
-An endpoint that needs the encrypted config DB (IAM users, groups, external auth, backup, declarative IAM, maintenance jobs) answers `503` with the message `config DB not available` when the instance has no config DB open.
+An endpoint that needs the encrypted config DB (for example IAM users, groups, external auth, backup, declarative IAM, the event log, and the job actions) answers `503` with the message `config DB not available` when the instance has no config DB open.
 
 Endpoints documented here are **admin** only. The S3-compatible API lives under `/` and is documented by AWS themselves.
 
@@ -72,7 +72,7 @@ The bootstrap `access_key_id` is an identifier, not a secret, so every GET and e
 | `POST` | `/_/api/admin/config/sync-now` | — | Force an immediate config-DB pull from the sync bucket. `200` = current, `409` = a newer copy was not merged (the body says why), `502` = the bucket cannot be read, `404` = no sync bucket |
 | `GET` | `/_/api/admin/config/sync` | — | This instance's sync state: `healthy`, `last_pull_ok_at`, `last_push_ok_at`, `pull_error`, `push_error`, `last_error_at`, `pending_upload`, `base_present`, `sync_generation`. `404` = no sync bucket |
 
-Full-document apply returns `{applied, persisted, requires_restart, warnings, existing_warnings, persisted_path}`. Full-document validate returns `{ok, warnings, existing_warnings}`. As on the section endpoints, `warnings` holds only the warnings the document introduces, and `existing_warnings` holds the warnings the running config already produces. The field-level `PUT /_/api/admin/config` returns only warnings about its own change. A bucket policy that the YAML loader would refuse, for example `public: true` beside non-empty `public_prefixes`, makes that PUT answer `400` with `{success: false, error}`, and nothing changes. **Persist failure returns HTTP 500**, not 200+warning — GitOps pipelines can't mistake a half-applied state for a clean success.
+Full-document apply returns `{applied, persisted, requires_restart, warnings, existing_warnings, persisted_path}`. Full-document validate returns `{ok, warnings, existing_warnings}`. When validate refuses a document, it returns `ok: false` with the reason in `error`, and it still returns the same warnings that `/config/apply` returns for that document. As on the section endpoints, `warnings` holds only the warnings the document introduces, and `existing_warnings` holds the warnings the running config already produces. The field-level `PUT /_/api/admin/config` returns only warnings about its own change. A bucket policy that the YAML loader would refuse, for example `public: true` beside non-empty `public_prefixes`, makes that PUT answer `400` with `{success: false, error}`, and nothing changes. **Persist failure returns HTTP 500**, not 200+warning — GitOps pipelines can't mistake a half-applied state for a clean success.
 
 **Environment variables win.** A `DGP_*` environment variable overrides its field at startup and again after every apply. `GET /_/api/admin/config` lists these fields in `env_overrides` (`{env, yaml_path, secret, value, set, activated_by}`; a secret never carries its value). Some variables control a whole block: `DGP_S3_ENDPOINT` or `DGP_S3_REGION` controls all of `storage.backend`, and `DGP_TLS_ENABLED=true` controls all of `advanced.tls`. A block member whose own variable is unset has `set: false`, and `activated_by` names the variable that controls the block. The config file and every export hold the value the file had, never the environment value. When an apply changes an env-controlled field, the new value is saved to the file, the environment value stays in effect, and the response carries a warning that says so. The comparison is per field, also inside a block such as `storage.backend`: a field that still holds the environment value keeps the file's value, so changing one field never writes the other environment values into the file. When an edit copies a secret environment value into another field (for example, turning off encryption moves an environment-provided key to `legacy_key`), the file stores the reference `${env:NAME}` instead of the value, and the response says so. As a last check, persist and export refuse to write any value of a secret environment variable that the config file did not already hold. Full-document validate runs the same steps as apply, so its warnings match.
 
@@ -92,6 +92,7 @@ deltaglider_proxy config apply deltaglider_proxy.yaml --server https://s3.acme.e
 | `GET` | `/_/api/admin/backends` | List named backends |
 | `POST` | `/_/api/admin/backends` | Create; validates S3 creds upfront |
 | `DELETE` | `/_/api/admin/backends/:name` | Remove — refuses to delete the default or in-use backends |
+| `POST` | `/_/api/admin/backends/:name/probe` | Test connection: probe one backend now, update its health state, and return the result (`:name` is a named backend or `default`) |
 | `GET` | `/_/api/admin/backends/:name/legacy-key-usage?limit=N` | Count the objects and delta references that still carry the backend's legacy key id — see below |
 | `POST` | `/_/api/admin/test-s3` | Test an arbitrary S3 connection without persisting |
 | `GET` / `POST` | `/_/api/admin/buckets` | List bucket origins / create a bucket on a backend |
@@ -149,10 +150,12 @@ A Test Connection request may carry a JSON body with the fields of the provider 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/_/api/admin/backup` | Export zip (manifest + config + IAM + secrets) |
-| `POST` | `/_/api/admin/backup` | Import — atomic; all parts sha256-verified before any state change. Gated by `iam_mode`. |
+| `POST` | `/_/api/admin/backup[?mode=&iam=]` | Import — atomic; all parts sha256-verified before any state change. Gated by `iam_mode`. |
+
+`mode` selects what a zip restore applies: `full` (the default: configuration, secrets, IAM and the admin password), `preserve-bootstrap` (the same, but the admin password of this instance stays), `config-only` (configuration and secrets, with the admin password) or `iam-only` (IAM only). `iam` selects how the IAM rows are restored: `replace` (the default) deletes the users, groups, OIDC providers, mapping rules and external identities that the backup does not hold, in one database transaction, and `merge` adds only the rows that the instance does not have. See [How to back up and restore](../how-to/back-up-and-restore.md#restore-a-full-backup).
 
 Response on `POST` carries per-resource counters:
-`{users_created, users_skipped, groups_created, groups_skipped, memberships_created, external_identities_created, external_identities_skipped}`.
+`{users_created, users_skipped, users_renamed, users_deleted, groups_created, groups_skipped, groups_deleted, memberships_created, external_identities_created, external_identities_skipped}`. `users_deleted` and `groups_deleted` count the rows that a `replace` restore removed. `users_renamed` lists the users that the restore imported under a new name, because another user already had the name.
 
 `external_identities` are remapped through the imported user + provider ID maps. Orphaned records (user or provider didn't import) are dropped with a WARN log.
 
@@ -173,13 +176,18 @@ Legacy JSON-only import path is still supported for pre-v0.8.4 scripts.
 | `GET` | `/_/api/admin/diagnostics/scan[/status]` | Integrity-scan status (per-bucket or all-buckets map) |
 | `POST` | `/_/api/admin/diagnostics/scan/start` / `/stop` | Start / stop a background integrity scan |
 | `GET` | `/_/api/admin/diagnostics/scan/stream` | SSE stream of live scan progress |
+| `DELETE` | `/_/api/admin/diagnostics/scan?bucket=X` | Remove the stored scan result of a bucket, so that the bucket shows as never scanned |
 | `GET` | `/_/api/admin/audit[?limit=N]` | Snapshot of the in-memory audit ring, newest first. Bounded (default 500, override `DGP_AUDIT_RING_SIZE`). Stdout `tracing::info!` is still the long-term audit source. |
 | `GET` | `/_/api/admin/logs[?level=&target=&q=&limit=N]` | Filtered backlog of the in-memory operational-log ring (INFO+ floor), newest first. Bounded (`DGP_LOG_RING_SIZE`, default 2000). |
 | `GET` | `/_/api/admin/logs/stream[?level=&target=&q=]` | Live tail of operational logs via server-sent events, same filters as the backlog. |
 | `GET` | `/_/api/admin/event-outbox[?status=failed&limit=N&offset=N&sort=occurred_at&order=desc]` | Paged durable object-event outbox rows plus status counts. Each row carries `deliveries`, its per-endpoint delivery state. Delivery is background-only; delivered rows default to 24h/10,000-row retention; see [event-outbox.md](event-outbox.md). |
 | `POST` | `/_/api/admin/event-outbox/:id/requeue` | Requeue a single failed outbox row for re-delivery |
 | `POST` | `/_/api/admin/event-outbox/requeue` | Bulk-requeue failed outbox rows |
+| `POST` | `/_/api/admin/event-outbox/purge-failed` | Delete the failed outbox rows that no replication consumer still needs: `{purged}`. `409` when event-driven replication may still read a failed row |
 | `GET` / `PUT` / `DELETE` | `/_/api/admin/session/s3-credentials` | Per-session S3 credential store for the browse panel |
+| `GET` | `/_/api/admin/sessions` | Live sessions on this instance, redacted: `{sessions}`. The caller's own session has `current: true` |
+| `DELETE` | `/_/api/admin/sessions/:id` | End one session by its short id. `400` for the caller's own session (use logout), `404` for an unknown id |
+| `POST` | `/_/api/admin/sessions/revoke-user` | `{identity}` (an IAM access key id, or `provider:user_id` for an external login): end every session of that identity on this instance, and on the other instances through the config sync |
 
 ## Object operations (browse panel)
 
@@ -219,7 +227,7 @@ When the download starts, the proxy writes a `bulk_zip` audit entry. Its target 
 ## Jobs — one surface for everything background
 
 Replication rules, lifecycle rules, and one-off maintenance jobs (re-encrypt,
-bucket migration) share a single read+action API. Job ids are namespaced:
+bucket migration, metadata backfill) share a single read+action API. Job ids are namespaced:
 `replication:<rule>`, `lifecycle:<rule>`, `maintenance:<n>`. Rules stay
 YAML-authoritative under `storage.replication.rules[]` / `storage.lifecycle.rules[]`;
 maintenance one-offs are DB-born. See [replication.md](replication.md) and
@@ -227,23 +235,33 @@ maintenance one-offs are DB-born. See [replication.md](replication.md) and
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/_/api/admin/jobs` | Every job as one normalized row: kind, scope, status (`idle` / `queued` / `running` / `cancelling` / `succeeded` / `failed` / `cancelled`), pause flag, progress, last run. |
+| `GET` | `/_/api/admin/jobs` | Every job as one normalized row: kind, scope, status (`idle` / `queued` / `running` / `cancelling` / `succeeded` / `completed_with_errors` / `failed` / `cancelled`), pause flag, progress, last run. |
 | `GET` | `/_/api/admin/jobs/:id/runs?limit=N` | Recent runs, newest first. A maintenance one-off synthesizes a single run — the job IS its run. |
 | `GET` | `/_/api/admin/jobs/:id/failures?limit=N` | Recent per-object failures, newest first. |
 | `POST` | `/_/api/admin/jobs/:id/pause` / `/resume` | Replication and lifecycle rules. Persists across restarts. |
-| `POST` | `/_/api/admin/jobs/:id/run-now` | Replication and lifecycle rules. Starts the run in the background and answers `202` with the `run_id` and `status: "running"`; poll `GET /jobs/:id/runs` for the result. Lifecycle answers 409 when the rule is disabled, paused, or already running. |
+| `POST` | `/_/api/admin/jobs/:id/run-now` | Replication and lifecycle rules. Starts the run in the background and answers `202` with `status: "running"`; poll `GET /jobs/:id/runs` for the result. Lifecycle returns the `run_id` of the new run. Replication opens its run row in the background, so its response has `run_id: 0`. Replication runs a disabled or paused rule once. Both answer `409` when the subsystem is disabled globally, when the rule is already running, or when a maintenance job is active on a bucket that the rule writes to. Lifecycle also answers `409` when the rule is disabled or paused. |
 | `POST` | `/_/api/admin/jobs/:id/preview` | Lifecycle only — dry-run candidate keys. Read-only: no deletes, no history rows. |
+| `POST` | `/_/api/admin/jobs/:id/verify` | Replication only: start a parity audit in the background (`202`). `409` while a replication run of the rule is in progress. |
+| `GET` | `/_/api/admin/jobs/:id/verify` | Replication only: the state of the parity audit: `{status, progress_scanned, progress_total, scanned_at, outcome, error}`. |
+| `POST` | `/_/api/admin/jobs/:id/verify/cancel` | Replication only: stop a running parity audit. |
+| `POST` | `/_/api/admin/jobs/:id/kill` | Replication only: stop the running run of the rule on the instance that runs it (`202`). `409` when no run is in progress. |
+| `POST` | `/_/api/admin/jobs/:id/delete` | Replication and lifecycle rules: remove the rule from the config and delete its run state (`204`). `409` while the rule has a run or an audit in progress. |
 | `POST` | `/_/api/admin/jobs/:id/cancel` | Maintenance only — cancel a queued or running one-off. A pre-flip migrate cancel unwinds cleanly. |
 | `POST` | `/_/api/admin/jobs/reencrypt` | `{"buckets": [...]}` (max 100) → one durable re-encrypt job per bucket: `{started: [{bucket, job_id}], errors: [...]}`. |
+| `POST` | `/_/api/admin/jobs/backfill-metadata` | `{"buckets": [...], "refresh_last_modified": false}` (max 100) → one durable metadata-backfill job per bucket, with the same response as re-encrypt. See [Jobs](jobs.md#metadata-backfill). |
 | `POST` | `/_/api/admin/buckets/:bucket/migrate` | `{"target_backend": "...", "delete_source": false, "target": "empty"}` → `202 Accepted` + `{job_id, id: "maintenance:<n>", bucket, from_backend, to_backend, target}`. `target: "empty"` (default) makes the job fail when the destination bucket already holds objects; `target: "mirror"` deletes the destination objects that the source does not hold. |
-| `GET` | `/_/api/admin/jobs/bucket/:bucket` | The bucket's active maintenance job, if any — status/phase/counts only, no config detail. Session-light: browser-lift sessions can read it (powers the busy banner in the object browser). |
+| `GET` | `/_/api/admin/jobs/parity-version`, `/_/api/admin/jobs/replication-run-version`, `/_/api/admin/jobs/replication-event-version` | Public monotonic counters (`{version}`), bumped when a parity audit settles, when a scheduled replication run settles, and when event-driven replication advances its cursor. Like `iam/version`, they let tests and tools wait for background work without a fixed sleep. `GET /_/api/admin/usage-scan-version` does the same for completed usage scans. |
+| `GET` | `/_/api/admin/jobs/bucket/:bucket` | The bucket's active maintenance job, if any — status/phase/counts only, no config detail. Session-light: browser-lift sessions can read it (powers the busy banner in the object browser). A session that may not list the bucket gets `403`. |
 
-Actions outside a kind's capability matrix return `405` with the supported
-list. Lifecycle preview is intentionally read-only; scheduler and run-now
-executions persist history/failure rows in the config DB and use per-rule
-leases so instances sharing the DB never double-execute.
+An action outside a kind's capability matrix returns `400`, and the error names
+the actions that the kind supports. An unknown action returns `404`. Lifecycle
+preview is intentionally read-only; scheduler and run-now executions persist
+history/failure rows in the config DB and take a per-rule lease, so two
+workers never run the same rule at the same time. With a coordination bucket,
+the replication lease is shared by every instance. The lifecycle and
+maintenance leases are node-local: the config sync does not carry them.
 
-**Write gate:** while a re-encrypt or migrate job is active, S3 **writes** to
+**Write gate:** while a re-encrypt, migrate or metadata-backfill job is active, S3 **writes** to
 that bucket return `503 SlowDown` (SDKs back off and retry); reads pass
 untouched. The gate engages at job creation and lifts when the job finishes
 (for migrations, the moment the bucket flips to the new backend).
@@ -288,13 +306,13 @@ Unauthenticated — needed for load-balancer probes and Prometheus:
 |---|---|---|
 | `GET` | `/_/health` | Liveness — process answers; no backend I/O, no version (anti-fingerprinting) |
 | `GET` | `/_/ready` | Readiness — actually probes the storage backend + config DB; `200 {status:"ready"}` or `503`. Point LB **readiness** checks here; use `/_/health` for **liveness**. |
-| `GET` | `/_/metrics` | Prometheus text format |
+| `GET` | `/_/metrics` | Prometheus text format. When `DGP_METRICS_BEARER_TOKEN` is set, it answers only to `Authorization: Bearer <token>` or to an admin session, and `401` to other requests |
 
 `/_/ready` probes the backend with a bounded, retried `ListBuckets` so a brief provider latency spike doesn't flip readiness to a paging `503`: it only reports not-ready if **every** attempt fails. Tune with `DGP_READY_TIMEOUT_SECS` (per-attempt, default 3) and `DGP_READY_RETRIES` (extra attempts, default 2) — raise the timeout for a storage provider with a long tail latency, raise retries to ride out short blips.
 
 The response also carries `backends`, a map from each backend name to its live health (`healthy`, `unreachable`, `auth-rejected` or `erroring`). The proxy keeps this map current with the periodic health probe (`DGP_BACKEND_HEALTH_INTERVAL_SECS`) and with requests that find a backend unavailable. When every backend in the map is `unreachable` or `auth-rejected`, the node reports `503 not_ready`, because it cannot serve any bucket. When only some backends are down, the node stays ready: the other backends' buckets still work, and every node sees the same outage.
 
-Session-protected (reveals per-bucket sizes):
+Admin-session-protected (reveals per-bucket sizes; `401` without a live session, `403` for a browser-lift session):
 
 | Method | Path | Purpose |
 |---|---|---|

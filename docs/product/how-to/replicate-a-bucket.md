@@ -72,19 +72,23 @@ curl -b cookies -X POST \
   https://s3.acme.example/_/api/admin/jobs/replication:mirror-releases-to-dr/run-now
 ```
 
+The proxy starts the run in the background and answers `202 Accepted` at once:
+
 ```json
 {
-  "run_id": 42,
-  "status": "succeeded",
-  "objects_scanned": 3,
-  "objects_copied": 3,
+  "run_id": 0,
+  "status": "running",
+  "objects_scanned": 0,
+  "objects_copied": 0,
   "objects_skipped": 0,
-  "bytes_copied": 15,
+  "bytes_copied": 0,
   "errors": 0
 }
 ```
 
-If you get `409 Conflict`, the rule is already running (or paused) — check the Jobs screen.
+The run opens its row in the run history after this response, so `run_id` is `0` and the counters are empty. To see the result, poll the runs of the rule (step 7) until the newest run has a terminal status. Run-now also runs a rule that is disabled or paused, once.
+
+If you get `409 Conflict`, the rule is already running, replication is disabled globally (`storage.replication.enabled: false`), or a maintenance job is active on `releases-dr`. Check the Jobs screen.
 
 ## 7. Watch it in Jobs
 
@@ -99,7 +103,7 @@ curl -b cookies https://s3.acme.example/_/api/admin/jobs/replication:mirror-rele
 curl -b cookies https://s3.acme.example/_/api/admin/jobs/replication:mirror-releases-to-dr/failures
 ```
 
-Pause and resume from the job row (or `POST …/pause` / `…/resume`); paused rules are skipped by events, the scheduler, and run-now alike, and the pause survives restarts.
+Pause and resume from the job row (or `POST …/pause` / `…/resume`). A paused rule copies and deletes nothing, also for new events, and the pause survives restarts. The events of the pause are not kept, so a resume starts a full reconcile at the next scheduler tick to bring `releases-dr` in sync. With `replicate_deletes: true`, that reconcile also applies the deletes of the pause.
 
 ## Verify
 

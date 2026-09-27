@@ -21,8 +21,8 @@ The full reconcile is a **directory-scoped tree walk**, not an up-front full lis
 ## Scope
 
 - One-way, bucket/prefix-level replication through the DeltaGlider engine. The event consumer replicates mutations automatically; the reconcile scheduler runs due rules on their `interval`; a rule can also be triggered through the admin API (`POST /_/api/admin/jobs/replication:<name>/run-now`) or the Jobs screen.
-- Disabled rules and paused rules are skipped by the event consumer, the reconcile scheduler, and run-now alike.
-- A per-rule leader lease prevents two executions of the same rule at the same time. Single-instance (no `config_sync_bucket`) it is a node-local DB lease; with a coordination bucket configured it is an S3 conditional-write lease object (`_dgp/leases/replication/<rule>.json`) visible to every instance — a dead leader's lease lapses and a peer takes over automatically. If a rule is already leased, run-now returns `409 Conflict` and the scheduler skips that tick. Long runs heartbeat the lease before starting new pages/objects; if the lease is lost, the worker stops before doing more work and records a failure.
+- The event consumer and the reconcile scheduler skip disabled rules and paused rules. A paused rule copies and deletes nothing, and the events that arrive during the pause are not kept for it. Resuming a paused rule makes it due at once, so the next scheduler tick starts a full reconcile from the start, which brings the destination in sync (with `replicate_deletes: true`, that run also applies the deletes of the pause). Run-now is a deliberate one-off: it runs a disabled or paused rule once, and it does not change either flag.
+- A per-rule leader lease prevents two executions of the same rule at the same time. Single-instance (no `config_sync_bucket`) it is a node-local DB lease; with a coordination bucket configured it is an S3 conditional-write lease object (`_dgp/leases/replication/<rule>.json`) visible to every instance — a dead leader's lease lapses and a peer takes over automatically. The scheduler, the event consumer, run-now and rule delete all take this same lease. If a rule is already leased, run-now returns `409 Conflict` and the scheduler skips that tick. While another instance runs a reconcile of a rule, the event consumer holds that rule's events until the run ends. A heartbeat renews the lease every `heartbeat_interval` for the whole run, and the run releases the lease on every exit. When a renewal fails with an error, the heartbeat retries it while the next retry still lands before the lease expires. When a renewal is refused, the lease is lost: the worker stops before it does more work and records a failure.
 - At-least-once semantics. Conflict policies: `newer-wins` (default), `content-diff`, `skip-if-dest-exists`.
 - Optional delete replication (faithful mirror): any destination object absent at source is removed. Requires a destination bucket dedicated to the rule.
 - Optional include / exclude glob filters per rule.
@@ -86,7 +86,7 @@ The only guardrail is source-absence: a destination object is deleted only after
 ## Durability model
 
 - **Rules** are YAML-authored. Changes apply through the section PUT pipeline; cycle detection runs on every load.
-- **Runtime state** lives in the encrypted config DB (`ConfigDb` v6):
+- **Runtime state** lives in the encrypted config DB:
     - `replication_state`: one row per rule. Scheduling state + pause flag + lifetime counters + resume cursor + leader lease columns (the node-local lease; with a coordination bucket the authoritative lease is the S3 lease object, and these columns back the run-now/worker bookkeeping on the leader). The resume cursor is a scope-stamped position in the reconcile walk's tree traversal — an interrupted run resumes exactly where it stopped; a cursor from an incompatible earlier format is discarded and the next run starts a fresh (idempotent) pass. `INSERT OR IGNORE` on config load preserves operator-set pause + lifetime counters across reloads.
     - `replication_run_history`: append-only per-run records. CASCADE DELETE on rule removal.
     - `replication_failures`: per-object error ring, bounded by `max_failures_retained`.
@@ -123,7 +123,7 @@ Every copy goes through `engine.retrieve` → `engine.store`. That means:
 | List fails (source bucket gone) | Entire run marked `failed` with a single "list source failed" row. |
 | Planner error (malformed glob at runtime) | Entire run marked `failed`. Should never happen post-`Config::check`. |
 | All copies error out | Run marked `failed` even if some objects were skipped legitimately. |
-| Some copies error, some succeed | Run marked `succeeded` with `errors > 0` — lazy-sync catches up on the next tick. |
+| Some copies error, some succeed | Run marked `completed_with_errors` with `errors > 0` — lazy-sync catches up on the next tick. |
 
 ## Resumption
 

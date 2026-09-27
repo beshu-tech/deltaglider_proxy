@@ -12,9 +12,9 @@ Three subsystems, one surface. Every job appears as a row in `GET /_/api/admin/j
 | Lifecycle rule | `lifecycle:<name>` | YAML (`storage.lifecycle.rules[]`) | pause, resume, run-now, preview, delete |
 | Maintenance one-off | `maintenance:<n>` | created via API/GUI, stored in the config DB | cancel |
 
-`run-now` is a deliberate one-off. For **replication** it runs even a disabled or paused rule once (without flipping the flag); for **lifecycle** it returns `409` on a disabled or paused rule. `kill` interrupts a running replication run mid-object (replication only). `verify` runs a parity audit; it returns `409` while a replication run is in flight for the same rule. `delete` refuses (`409`) while the rule has a run or verify in progress.
+`run-now` is a deliberate one-off. For **replication** it runs even a disabled or paused rule once (without flipping the flag); for **lifecycle** it returns `409` on a disabled or paused rule. Both start the run in the background and answer `202` with `status: "running"`, so poll `GET /jobs/:id/runs` for the result. `kill` interrupts a running replication run mid-object (replication only). `verify` runs a parity audit; it returns `409` while a replication run is in flight for the same rule. `delete` refuses (`409`) while the rule has a run or verify in progress.
 
-Rules are recurring and YAML-authored; maintenance jobs are one-offs born in the DB. An action outside a kind's capability matrix returns `405` with the supported list. `GET /jobs/:id/runs` and `GET /jobs/:id/failures` work for all kinds — a one-off synthesizes a single run, because the job is its run.
+Rules are recurring and YAML-authored; maintenance jobs are one-offs born in the DB. An action outside a kind's capability matrix returns `400`, and the error names the actions that the kind supports. `GET /jobs/:id/runs` and `GET /jobs/:id/failures` work for all kinds — a one-off synthesizes a single run, because the job is its run.
 
 ## API
 
@@ -23,11 +23,13 @@ Rules are recurring and YAML-authored; maintenance jobs are one-offs born in the
 | `GET` | `/_/api/admin/jobs` | All jobs, normalized rows |
 | `GET` | `/_/api/admin/jobs/:id/runs?limit=N` | Recent runs for one job |
 | `GET` | `/_/api/admin/jobs/:id/failures?limit=N` | Recent per-object failures |
-| `POST` | `/_/api/admin/jobs/:id/pause` / `resume` / `run-now` / `preview` / `cancel` / `verify` / `kill` / `delete` | Per-kind actions; `405` outside the matrix |
+| `POST` | `/_/api/admin/jobs/:id/pause` / `resume` / `run-now` / `preview` / `cancel` / `verify` / `kill` / `delete` | Per-kind actions; `400` outside the matrix |
+| `GET` | `/_/api/admin/jobs/:id/verify` | State of the parity audit of a replication rule |
+| `POST` | `/_/api/admin/jobs/:id/verify/cancel` | Stop a running parity audit |
 | `POST` | `/_/api/admin/jobs/reencrypt` | Create re-encrypt jobs: `{"buckets": [...]}` (max 100), one job per bucket |
 | `POST` | `/_/api/admin/jobs/backfill-metadata` | Create metadata-backfill jobs: `{"buckets": [...], "refresh_last_modified": false}` (max 100), one job per bucket |
 | `POST` | `/_/api/admin/buckets/:bucket/migrate` | Create a migrate job: `{"target_backend", "delete_source", "target"}` → `202` + `maintenance:<n>`. `target` is `empty` (default: the job fails in `stage` when the destination holds objects) or `mirror` (destination objects absent at the source are deleted before the flip, audited). `409` while `config_sync_bucket` is set: the routing flip is per-instance |
-| `GET` | `/_/api/admin/jobs/bucket/:bucket` | Busy state for one bucket; readable by non-admin browser sessions |
+| `GET` | `/_/api/admin/jobs/bucket/:bucket` | Busy state for one bucket; readable by non-admin browser sessions that may list the bucket (`403` otherwise) |
 
 All routes except the last are session-gated admin routes.
 

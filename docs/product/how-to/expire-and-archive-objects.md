@@ -65,7 +65,7 @@ curl -b cookies -X POST \
   https://s3.acme.example/_/api/admin/jobs/lifecycle:expire-nightly-dumps/run-now
 ```
 
-A `409` means the rule is disabled, paused, or already running.
+The request does not wait for the run. It answers `202 Accepted` with the `run_id` of the new run and `status: "running"`, and the run continues in the background. Step 5 shows how to read its result. A `409` means that lifecycle or the rule is disabled, the rule is paused or already running, or a maintenance job is active on a bucket that the rule writes to.
 
 In the admin UI, **Run now** on a lifecycle rule does not start the run at once. The proxy first computes a preview, and a dialog shows the objects that the run would delete or move, with their count and total size. The run starts only when you press the button that names the count, for example **Run: delete 12 objects**. The run acts on the objects that match the rule when it starts, so the result can differ slightly from the preview.
 

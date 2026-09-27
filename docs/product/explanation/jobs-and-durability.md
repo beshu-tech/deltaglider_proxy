@@ -1,20 +1,20 @@
 # About jobs, write gates, and durability
 
-DeltaGlider Proxy runs four kinds of background work — replication rules, lifecycle rules, bucket re-encryption, and bucket migration — and presents all of them on one surface. This page explains why that's one surface and not four, why some jobs deliberately block writes, and what "durable" actually means here.
+DeltaGlider Proxy runs five kinds of background work (replication rules, lifecycle rules, bucket re-encryption, bucket migration, and metadata backfill) and presents all of them on one surface. This page explains why that's one surface and not five, why some jobs deliberately block writes, and what "durable" actually means here.
 
-## One surface for four kinds
+## One surface for every kind
 
-The operator's mental model should be: *anything that runs in the background is a job, and every job has runs, failures, and actions.* Whether Acme is mirroring `releases` to `aws-dr`, expiring `db-archive` dumps after 90 days, or re-encrypting a bucket after a key change, the questions are identical — is it running, when did it last run, what failed, can I pause it? Four bespoke screens would mean four places to look during an incident, and four slightly different vocabularies for "it's stuck." So there's one jobs list, one runs/failures drawer, and a per-kind capability matrix (you can pause a rule but not a migration; you can cancel a migration but not a rule) rather than four APIs.
+The operator's mental model should be: *anything that runs in the background is a job, and every job has runs, failures, and actions.* Whether Acme is mirroring `releases` to `aws-dr`, expiring `db-archive` dumps after 90 days, or re-encrypting a bucket after a key change, the questions are identical — is it running, when did it last run, what failed, can I pause it? Separate screens would mean several places to look during an incident, and slightly different vocabularies for "it's stuck." So there's one jobs list, one runs/failures drawer, and a per-kind capability matrix (you can pause a rule but not a migration; you can cancel a migration but not a rule) rather than one API per kind.
 
 ![The Jobs screen](/_/screenshots/jobs-screen.jpg)
 
 ## Rules vs one-offs
 
-Two shapes exist because the work is genuinely two-shaped. **Rules** — replication and lifecycle — are recurring policy: they belong in YAML, reviewed in git, identical across replicas, with runtime state (cursors, pause flags, run history) kept separately in the config DB so a config reload doesn't forget what's been done. **One-offs** — re-encrypt and migrate — are born from an operator action, not a policy file; they're created via API or GUI, live entirely in the DB, and *are* their own single run. Forcing a migration into YAML would mean committing a file to express "do this once, now"; forcing replication into the DB would hide standing policy from code review. Each shape lives where its authorship lives.
+Two shapes exist because the work is genuinely two-shaped. **Rules** — replication and lifecycle — are recurring policy: they belong in YAML, reviewed in git, identical across replicas, with runtime state (cursors, pause flags, run history) kept separately in the config DB so a config reload doesn't forget what's been done. **One-offs** (re-encrypt, migrate and metadata backfill) are born from an operator action, not a policy file; they're created via API or GUI, live entirely in the DB, and *are* their own single run. Forcing a migration into YAML would mean committing a file to express "do this once, now"; forcing replication into the DB would hide standing policy from code review. Each shape lives where its authorship lives.
 
 ## Why maintenance jobs take a write gate
 
-While a re-encrypt or migrate job works a bucket, S3 writes to that bucket get `503 SlowDown`; reads pass untouched. This is consistency chosen over availability, deliberately.
+While a re-encrypt, migrate or metadata-backfill job works a bucket, S3 writes to that bucket get `503 SlowDown`; reads pass untouched. This is consistency chosen over availability, deliberately.
 
 Consider the race the gate prevents: a re-encrypt job is sweeping `db-archive` after a key rotation while `backup-bot` PUTs tonight's dump. Without the gate, that PUT can land under the old configuration *after* the sweep has passed its key — and the job finishes "successfully" with one object silently stranded under a key you're about to retire. A migration has the same race with a worse ending: a write to the old backend after the copy phase simply vanishes when traffic flips.
 
