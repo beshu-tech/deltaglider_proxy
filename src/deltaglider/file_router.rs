@@ -54,9 +54,11 @@ impl FileRouter {
         CompressionStrategy::DirectStore
     }
 
-    /// Check if a file is eligible for delta compression
-    pub fn is_delta_eligible(&self, filename: &str) -> bool {
-        self.route(filename) == CompressionStrategy::DeltaEligible
+    /// Whether an object key (or a bare filename) is eligible for delta
+    /// compression. No suffix holds a `/`, so the whole key and its last
+    /// segment give the same answer: callers pass the key, never a split.
+    pub fn is_delta_eligible(&self, key: &str) -> bool {
+        self.route(key) == CompressionStrategy::DeltaEligible
     }
 }
 
@@ -91,6 +93,51 @@ mod tests {
         assert!(!router.is_delta_eligible("bundle.tar.bz2"));
         assert!(!router.is_delta_eligible("backup.rar"));
         assert!(!router.is_delta_eligible("snapshot.7z"));
+    }
+
+    /// N11: the old helpers split the key two ways (`ObjectKey::parse`'s
+    /// filename, and `rsplit('/')`). A suffix never holds `/`, so both splits
+    /// and the whole key give the same answer: the router takes the key as is.
+    #[test]
+    fn key_parsings_agree_on_eligibility() {
+        let router = FileRouter::new();
+        let by_parse =
+            |k: &str| router.is_delta_eligible(&crate::types::ObjectKey::parse("_", k).filename);
+        let by_rsplit = |k: &str| router.is_delta_eligible(k.rsplit('/').next().unwrap_or(k));
+        for k in [
+            "",
+            "/",
+            "//",
+            "app.zip",
+            "/app.zip",
+            "//app.zip",
+            "releases/v1/app.zip",
+            "releases//app.ZIP",
+            "releases.zip/",
+            "releases.zip/readme",
+            "a.zip/b.tar",
+            "a/.zip",
+            "a/b.zip.sha1",
+            "a/b.tar.gz",
+            ".zip",
+            "x/",
+        ] {
+            let whole = router.is_delta_eligible(k);
+            assert_eq!(whole, by_parse(k), "ObjectKey::parse disagrees: {k:?}");
+            assert_eq!(whole, by_rsplit(k), "rsplit disagrees: {k:?}");
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn key_parsings_agree_on_any_key(k in "[a-zA-Z./]{0,24}") {
+            let router = FileRouter::new();
+            let parsed = crate::types::ObjectKey::parse("_", &k).filename;
+            let split = k.rsplit('/').next().unwrap_or(&k);
+            let whole = router.is_delta_eligible(&k);
+            proptest::prop_assert_eq!(whole, router.is_delta_eligible(&parsed));
+            proptest::prop_assert_eq!(whole, router.is_delta_eligible(split));
+        }
     }
 
     #[test]

@@ -57,13 +57,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self.tuning
     }
 
-    /// Whether `key`'s filename is delta-eligible (used by the adapter to decide
-    /// the streaming-store route before constructing a spool).
-    pub fn is_delta_eligible_key(&self, key: &str) -> bool {
-        let filename = key.rsplit('/').next().unwrap_or(key);
-        self.file_router.is_delta_eligible(filename)
-    }
-
     /// Run a spool acquisition under the configured timeout, mapping a timeout to
     /// SlowDown (don't park the request + its budget forever under contention).
     /// The ONE place the timeout/Overloaded policy lives — both PUT/POST

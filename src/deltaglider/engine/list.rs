@@ -121,8 +121,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         if meta.is_delta() {
             return true;
         }
-        let filename = key.rsplit('/').next().unwrap_or(key);
-        router.is_delta_eligible(filename)
+        router.is_delta_eligible(key)
     }
 
     /// A delta entry built from LIST data alone (no HEAD) — the `delta_stub`

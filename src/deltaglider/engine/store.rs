@@ -1116,8 +1116,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Check if a key's filename is eligible for delta compression.
     pub fn is_delta_eligible(&self, key: &str) -> bool {
-        let obj_key = ObjectKey::parse("_", key);
-        self.file_router.is_delta_eligible(&obj_key.filename)
+        self.file_router.is_delta_eligible(key)
     }
 
     /// Store a non-delta-eligible object from pre-split chunks without assembling

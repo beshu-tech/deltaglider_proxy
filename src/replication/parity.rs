@@ -784,7 +784,7 @@ fn is_skippable_key(key: &str) -> bool {
 /// passthrough object (a `.sha1` sidecar, an image) is stored verbatim — the
 /// lite size/etag ARE the truth, so no resolution is needed (the common case).
 fn needs_logical_resolution(engine: &DynEngine, key: &str, meta: &FileMetadata) -> bool {
-    meta.is_delta() || engine.is_delta_eligible_key(key)
+    meta.is_delta() || engine.is_delta_eligible(key)
 }
 
 /// True for a small VERBATIM sidecar (`.sha1`/`.sha256`/`.sha512`) that is
@@ -796,7 +796,7 @@ fn needs_logical_resolution(engine: &DynEngine, key: &str, meta: &FileMetadata) 
 /// are decided from the lite entry, which is exact for a verbatim object.
 fn is_verbatim_sidecar(engine: &DynEngine, key: &str, meta: &FileMetadata) -> bool {
     !meta.is_delta()
-        && !engine.is_delta_eligible_key(key)
+        && !engine.is_delta_eligible(key)
         && (key.ends_with(".sha1") || key.ends_with(".sha256") || key.ends_with(".sha512"))
 }
 
