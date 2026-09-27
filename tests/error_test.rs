@@ -25,15 +25,16 @@ async fn test_nosuchbucket_xml_response() {
     let resp = client.head(&url).send().await.unwrap();
     assert_eq!(resp.status().as_u16(), 404);
 
-    // GET on a key inside a valid-but-empty bucket → NoSuchKey (multi-bucket: any bucket is accepted)
+    // GET on a key in a bucket that does not exist → NoSuchBucket, as on S3
+    // (review 4, s3surface-5; it answered NoSuchKey).
     let url = format!("{}/nonexistent-bucket/file.txt", server.endpoint());
     let resp = client.get(&url).send().await.unwrap();
 
     assert_eq!(resp.status().as_u16(), 404);
     let body = resp.text().await.unwrap();
     assert!(
-        body.contains("<Code>NoSuchKey</Code>"),
-        "Multi-bucket mode: unknown bucket with missing key returns NoSuchKey, got: {}",
+        body.contains("<Code>NoSuchBucket</Code>"),
+        "unknown bucket with missing key returns NoSuchBucket, got: {}",
         body
     );
 }

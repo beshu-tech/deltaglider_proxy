@@ -165,6 +165,16 @@ proxy installed the new engine before the refusal, so the new limit
 served requests while the config still showed the old one. Now every
 check runs first, and the new engine goes live as the last step.
 
+### Fixed — A request to a missing bucket answers `NoSuchBucket`
+
+A LIST of a missing bucket answered an empty 200, a DELETE answered 204, and
+a GET or HEAD answered `NoSuchKey`. Clients that check whether a bucket
+exists with a LIST (such as rclone and Terraform) took the bucket as
+present. Now all of them answer `404 NoSuchBucket`, as S3 does. The proxy
+asks for the bucket only after a miss, so a request that finds its object
+costs nothing more. A LIST with `max-keys=0` now answers no keys (it
+answered one).
+
 ### Fixed — PutObject conditionals follow S3
 
 A PUT with `If-Match` on a missing key answered 412; now it answers

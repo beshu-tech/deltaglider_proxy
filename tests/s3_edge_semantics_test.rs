@@ -284,3 +284,70 @@ async fn filesystem_prefix_directory_is_not_an_object() {
         .unwrap();
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"f");
 }
+
+/// Every object and list request to a missing bucket is `404 NoSuchBucket`,
+/// never an empty 200, a 204, or `NoSuchKey` (s3surface-5).
+#[tokio::test]
+async fn missing_bucket_is_no_such_bucket() {
+    let (server, http) = signed_setup().await;
+    let endpoint = server.endpoint();
+    let base = format!("{endpoint}/no-such-bucket-here");
+    let requests = [
+        ("LIST v2", http.get(format!("{base}?list-type=2"))),
+        ("LIST v1", http.get(base.clone())),
+        ("GET", http.get(format!("{base}/k"))),
+        ("DELETE", http.delete(format!("{base}/k"))),
+        (
+            "DELETE batch",
+            http.post(format!("{base}?delete"))
+                .header("content-md5", "5DKh5iefM5MSKvRILIuFwQ==")
+                .body("<Delete><Object><Key>k</Key></Object></Delete>"),
+        ),
+    ];
+    for (name, request) in requests {
+        let resp = request.send().await.unwrap();
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, 404, "{name}: {body}");
+        assert!(body.contains("NoSuchBucket"), "{name}: {body}");
+    }
+    let resp = http.head(format!("{base}/k")).send().await.unwrap();
+    assert_eq!(resp.status().as_u16(), 404, "HEAD");
+    // An empty bucket that exists still lists as an empty 200.
+    let resp = http
+        .get(format!(
+            "{endpoint}/{}?list-type=2&prefix=nothing/",
+            server.bucket()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+}
+
+/// `max-keys=0` answers no keys (it answered one, s3surface-14).
+#[tokio::test]
+async fn max_keys_zero_lists_nothing() {
+    let (server, http) = signed_setup().await;
+    let (endpoint, bucket) = (server.endpoint(), server.bucket().to_string());
+    put_object(
+        &http,
+        &endpoint,
+        &bucket,
+        "a.txt",
+        b"a".to_vec(),
+        "text/plain",
+    )
+    .await;
+    for query in ["list-type=2&max-keys=0", "max-keys=0"] {
+        let resp = http
+            .get(format!("{endpoint}/{bucket}?{query}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200, "{query}");
+        let body = resp.text().await.unwrap();
+        assert!(!body.contains("<Contents>"), "{query}: {body}");
+        assert!(body.contains("<MaxKeys>0</MaxKeys>"), "{query}: {body}");
+    }
+}

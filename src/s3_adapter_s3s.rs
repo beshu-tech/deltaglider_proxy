@@ -173,13 +173,15 @@ impl s3s::S3 for DeltaGliderS3Service {
         let reader = Reader::of(&req.extensions);
         let if_range = req.headers.get(axum::http::header::IF_RANGE).cloned();
         let input = req.input;
-        let meta = self
-            .state
-            .engine
-            .load()
-            .head(&input.bucket, &input.key)
-            .await
-            .map_err(engine_error_to_s3s)?;
+        let engine = self.state.engine.load();
+        let meta = match engine.head(&input.bucket, &input.key).await {
+            Ok(meta) => meta,
+            Err(e) => {
+                return Err(
+                    no_such_key_or_bucket(&engine, &input.bucket, engine_error_to_s3s(e)).await,
+                )
+            }
+        };
         evaluate_read_conditionals_s3s(
             &meta,
             input.if_match.as_ref(),
@@ -221,10 +223,14 @@ impl s3s::S3 for DeltaGliderS3Service {
         let input = req.input;
         check_response_overrides_allowed(&input, anonymous_principal)?;
         let engine = self.state.engine.load();
-        let head = engine
-            .head(&input.bucket, &input.key)
-            .await
-            .map_err(engine_error_to_s3s)?;
+        let head = match engine.head(&input.bucket, &input.key).await {
+            Ok(meta) => meta,
+            Err(e) => {
+                return Err(
+                    no_such_key_or_bucket(&engine, &input.bucket, engine_error_to_s3s(e)).await,
+                )
+            }
+        };
         evaluate_read_conditionals_s3s(
             &head,
             input.if_match.as_ref(),
@@ -331,9 +337,9 @@ impl s3s::S3 for DeltaGliderS3Service {
     ) -> s3s::S3Result<s3s::S3Response<s3s::dto::ListObjectsOutput>> {
         let list_scope = req.extensions.get::<ListScope>().cloned();
         let input = req.input;
-        let max_keys = input.max_keys.unwrap_or(1000).clamp(1, 1000) as u32;
+        let max_keys = client_max_keys(input.max_keys);
         let enc = ListKeyEncoding::of(input.encoding_type.as_ref());
-        let page = list_page_for_caller(
+        let page = client_list_page(
             &self.state.engine.load(),
             &input.bucket,
             input.prefix.as_deref().unwrap_or(""),
@@ -390,8 +396,8 @@ impl s3s::S3 for DeltaGliderS3Service {
         let reader = Reader::of(&req.extensions);
         let include_metadata = query_flag(&req.uri, "metadata", "true");
         let input = req.input;
-        let max_keys = input.max_keys.unwrap_or(1000).clamp(1, 1000) as u32;
-        let page = list_page_for_caller(
+        let max_keys = client_max_keys(input.max_keys);
+        let page = client_list_page(
             &self.state.engine.load(),
             &input.bucket,
             input.prefix.as_deref().unwrap_or(""),
@@ -718,6 +724,7 @@ impl s3s::S3 for DeltaGliderS3Service {
                 Ok(s3s::S3Response::new(s3s::dto::DeleteObjectOutput::default()))
             }
             Err(crate::deltaglider::EngineError::NotFound(_)) => {
+                ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
                 Ok(s3s::S3Response::new(s3s::dto::DeleteObjectOutput::default()))
             }
             Err(e) => Err(engine_error_to_s3s(e)),
@@ -736,6 +743,8 @@ impl s3s::S3 for DeltaGliderS3Service {
         )
         .map_err(engine_error_to_s3s)?;
         validate_delete_objects_count(input.delete.objects.len())?;
+        // Per-key misses are successes, so a missing bucket is asked here.
+        ensure_bucket_exists_s3s(&self.state, &input.bucket).await?;
         let quiet = input.delete.quiet.unwrap_or(false);
         // Per-key IAM authorization. The middleware only authorized the
         // bucket-level POST ?delete; each key in the batch body must be
@@ -1901,9 +1910,14 @@ impl ListKeyEncoding {
 }
 
 async fn ensure_bucket_exists_s3s(state: &Arc<AppState>, bucket: &str) -> s3s::S3Result<()> {
-    if state
-        .engine
-        .load()
+    ensure_bucket_on(&state.engine.load(), bucket).await
+}
+
+async fn ensure_bucket_on(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+) -> s3s::S3Result<()> {
+    if engine
         .head_bucket(bucket)
         .await
         .map_err(engine_error_to_s3s)?
@@ -1912,6 +1926,60 @@ async fn ensure_bucket_exists_s3s(state: &Arc<AppState>, bucket: &str) -> s3s::S
     } else {
         Err(s3s::s3_error!(NoSuchBucket))
     }
+}
+
+/// S3 answers any request to a missing bucket with `NoSuchBucket`; the
+/// proxy answered `NoSuchKey` (GET, HEAD) or success (DELETE) (s3surface-5).
+/// Asked only after a miss, so a hit pays no extra bucket request.
+async fn no_such_key_or_bucket(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+    err: s3s::S3Error,
+) -> s3s::S3Error {
+    if *err.code() != s3s::S3ErrorCode::NoSuchKey {
+        return err;
+    }
+    ensure_bucket_on(engine, bucket).await.err().unwrap_or(err)
+}
+
+/// Pure: the page size of a client LIST. S3 takes `max-keys` from 0 to 1000;
+/// 0 is an empty page, which the engine (at least one key) cannot give.
+fn client_max_keys(max_keys: Option<i32>) -> u32 {
+    max_keys.unwrap_or(1000).clamp(0, 1000) as u32
+}
+
+/// A client LIST page: `list_page_for_caller` with the S3 edges. `max-keys=0`
+/// answers an empty page (it answered one key, s3surface-14), and an empty
+/// answer from a missing bucket is `NoSuchBucket`, not an empty 200
+/// (s3surface-5).
+#[allow(clippy::too_many_arguments)]
+async fn client_list_page(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+    prefix: &str,
+    delimiter: Option<&str>,
+    max_keys: u32,
+    cursor: Option<&str>,
+    metadata: bool,
+    scope: Option<&ListScope>,
+) -> s3s::S3Result<crate::deltaglider::ListObjectsPage> {
+    if max_keys == 0 {
+        ensure_bucket_on(engine, bucket).await?;
+        return Ok(crate::deltaglider::ListObjectsPage {
+            objects: Vec::new(),
+            common_prefixes: Vec::new(),
+            is_truncated: false,
+            next_continuation_token: None,
+        });
+    }
+    let page = list_page_for_caller(
+        engine, bucket, prefix, delimiter, max_keys, cursor, metadata, scope,
+    )
+    .await?;
+    if page.objects.is_empty() && page.common_prefixes.is_empty() {
+        ensure_bucket_on(engine, bucket).await?;
+    }
+    Ok(page)
 }
 
 fn copy_source_bucket_key(source: &s3s::dto::CopySource) -> s3s::S3Result<(String, String)> {
@@ -3629,6 +3697,15 @@ mod tests {
                 "exists {exists}, If-Match {im:?}, If-None-Match {inm:?}"
             );
         }
+    }
+
+    #[test]
+    fn client_max_keys_keeps_zero() {
+        assert_eq!(client_max_keys(None), 1000);
+        assert_eq!(client_max_keys(Some(0)), 0);
+        assert_eq!(client_max_keys(Some(-3)), 0);
+        assert_eq!(client_max_keys(Some(7)), 7);
+        assert_eq!(client_max_keys(Some(5000)), 1000);
     }
 
     #[test]
