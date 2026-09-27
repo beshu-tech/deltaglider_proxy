@@ -7,8 +7,11 @@ on:
   workflow_dispatch:
   workflow_call:
 
+# On main every commit keeps its own run: release.yml refuses a tag whose
+# commit has no successful CI run, and a newer push used to cancel it.
+# Other refs still cancel their older runs.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: true
 
 permissions:
