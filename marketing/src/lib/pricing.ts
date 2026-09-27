@@ -30,6 +30,13 @@ export interface CalculatorInputs {
   compressionRatio: number;
   /** Annual data growth as a decimal (0.30 = 30%/yr). */
   annualGrowthRate: number;
+  /**
+   * Storage cost per GB per month for the COMPRESSED footprint, in USD.
+   * Defaults to `costPerGbMonthUsd`. A provider with a minimum billable
+   * size (Wasabi, iDrive, Hetzner: 1 TB) charges a higher effective rate
+   * on the small compressed footprint than on the source footprint.
+   */
+  dgpCostPerGbMonthUsd?: number;
 }
 
 /** A line item shown in the breakdown table. */
@@ -87,6 +94,7 @@ export const SOURCE_TB_LOWER_THRESHOLD = 1;
  */
 export function calculate(inputs: CalculatorInputs): CalculatorResult {
   const { sourceTb, regions, costPerGbMonthUsd, compressionRatio, annualGrowthRate } = inputs;
+  const dgpCostPerGbMonthUsd = inputs.dgpCostPerGbMonthUsd ?? costPerGbMonthUsd;
 
   // Below threshold: don't bother.
   if (sourceTb < SOURCE_TB_LOWER_THRESHOLD) {
@@ -98,7 +106,7 @@ export function calculate(inputs: CalculatorInputs): CalculatorResult {
   // Storage costs — per region × number of regions.
   const todayStoragePerRegion = tbPerYearCost(sourceTb, costPerGbMonthUsd);
   const todayStorageTotal = todayStoragePerRegion * regions;
-  const dgpStoragePerRegion = tbPerYearCost(storedFootprintTb, costPerGbMonthUsd);
+  const dgpStoragePerRegion = tbPerYearCost(storedFootprintTb, dgpCostPerGbMonthUsd);
   const dgpStorageTotal = dgpStoragePerRegion * regions;
 
   // Replication egress: only the replica regions (regions - 1) get charged,

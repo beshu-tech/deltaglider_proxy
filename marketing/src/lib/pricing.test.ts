@@ -240,3 +240,29 @@ describe('buildMarkdown', () => {
     expect(md).toContain('costs you nothing');
   });
 });
+
+describe('calculate: the compressed footprint has its own billing rate', () => {
+  it('defaults to the source rate when no separate rate is given', () => {
+    const a = calculate(defaultInputs());
+    const b = calculate(defaultInputs({ dgpCostPerGbMonthUsd: 0.023 }));
+    expect(a).toEqual(b);
+  });
+
+  it('a minimum billable size on the compressed side lowers the savings', () => {
+    // 5 TB at 99% saved = 51 GB stored, billed as 1 TB on a 1 TB-minimum
+    // provider: the effective rate on the stored side is ~20× the list rate.
+    const listRate = 0.00799;
+    const storedGb = (5 * 1024) / 100;
+    const floored = calculate(defaultInputs({
+      sourceTb: 5, regions: 1, compressionRatio: 100,
+      costPerGbMonthUsd: listRate,
+      dgpCostPerGbMonthUsd: (1000 * listRate) / storedGb,
+    }));
+    const naive = calculate(defaultInputs({
+      sourceTb: 5, regions: 1, compressionRatio: 100, costPerGbMonthUsd: listRate,
+    }));
+    if (floored.kind !== 'free' || naive.kind !== 'free') throw new Error('expected free');
+    expect(floored.lines[1].dgp).toBeCloseTo(1000 * listRate * 12, 6);
+    expect(floored.savings).toBeLessThan(naive.savings);
+  });
+});

@@ -16,6 +16,7 @@ import {
   type CalculatorInputs,
   type CalculatorResult,
   type BreakdownLine,
+  type Warning,
 } from '../lib/pricing';
 import {
   PROVIDERS,
@@ -60,6 +61,9 @@ export default function PricingCalculator() {
   const effectiveInputs: CalculatorInputs = {
     ...inputs,
     costPerGbMonthUsd: effectiveUsdPerGbMonth(providerId, sourceGb),
+    // The compressed footprint is billed at its own effective rate, so a
+    // provider's minimum billable size applies to it too.
+    dgpCostPerGbMonthUsd: effectiveUsdPerGbMonth(providerId, sourceGb / inputs.compressionRatio),
   };
 
   const result = useMemo(() => calculate(effectiveInputs), [effectiveInputs]);
@@ -319,6 +323,23 @@ function ProviderComparison({ sourceGb, storedGb, selectedId, onSelect }: Provid
 
 // ===========================================================================
 
+/** Caveat chips next to a result. Shown for free and paid results alike. */
+function Warnings({ warnings }: { warnings: Warning[] }) {
+  if (warnings.length === 0) return null;
+  return (
+    <ul className="warnings">
+          {warnings.map((w) => (
+            <li key={w} className="warning-chip">
+              {w === 'lowCompressionRatio' &&
+                'Your data compresses below 67% bytes saved. At that ratio DeltaGlider may not be worth it for you. Run the free build and its Delta Efficiency Panel on your own data to check.'}
+              {w === 'cheapBackendAlready' &&
+                "You're already on cheap object storage, so the savings will be smaller. The data sovereignty and lock-in benefits still apply."}
+            </li>
+          ))}
+        </ul>
+  );
+}
+
 interface ResultCardProps {
   result: CalculatorResult;
   onCopy: () => void;
@@ -377,6 +398,7 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
           DeltaGlider costs you <strong className="calc-hero-net">nothing</strong> and
           the figure above is your net saving.
         </p>
+        <Warnings warnings={result.warnings} />
         <div className="card-ctas">
           <a className="btn btn-brand" href="https://github.com/beshu-tech/deltaglider_proxy">
             Run it free
@@ -403,18 +425,7 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
         your net annual savings are <strong className="calc-hero-net">{formatUsd(result.netSavings)}</strong>.
       </p>
 
-      {result.warnings.length > 0 && (
-        <ul className="warnings">
-          {result.warnings.map((w) => (
-            <li key={w} className="warning-chip">
-              {w === 'lowCompressionRatio' &&
-                'Your data compresses below 67% bytes saved. At that ratio DeltaGlider may not be worth it for you. Run the free build and its Delta Efficiency Panel on your own data to check.'}
-              {w === 'cheapBackendAlready' &&
-                "You're already on cheap object storage, so the savings will be smaller. The data sovereignty and lock-in benefits still apply."}
-            </li>
-          ))}
-        </ul>
-      )}
+      <Warnings warnings={result.warnings} />
 
       <div className="card-ctas">
         <a className="btn btn-brand" href="/trial">
@@ -476,12 +487,14 @@ function Formula() {
     <div className="formula-body">
       <p>
         All the math is in USD. AWS S3 inter-region replication egress is $0.02/GB.
-        We count 1 TB as 1024 GB.
+        We count 1 TB as 1024 GB. The cost per GB is the provider's effective
+        rate at each footprint, so a minimum billable size (1 TB on Wasabi,
+        iDrive e2, and Hetzner) also applies to the compressed footprint.
       </p>
       <pre>
 {`stored_footprint   = source_tb / compression_ratio
 today_storage      = source_tb × 1024 × 12 × cost_per_gb_month × regions
-dgp_storage        = stored_footprint × 1024 × 12 × cost_per_gb_month × regions
+dgp_storage        = stored_footprint × 1024 × 12 × stored_cost_per_gb_month × regions
 today_egress       = source_tb × growth × 1024 × (regions - 1) × $0.02
 dgp_egress         = stored_footprint × growth × 1024 × (regions - 1) × $0.02
 savings            = (today_storage + today_egress)
