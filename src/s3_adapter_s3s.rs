@@ -646,18 +646,12 @@ impl s3s::S3 for DeltaGliderS3Service {
         let engine = self.state.engine.load();
 
         // Check object emptiness first: only visible objects are hard blockers.
-        // Mirror the axum handler in `src/api/handlers/bucket.rs::delete_bucket`
-        // — keep both adapters' contracts in sync.
-        let page = engine
-            .list_objects(&bucket, "", None, 1, None, false)
+        let first_object = first_visible_key(engine.as_ref(), &bucket)
             .await
             .map_err(engine_error_to_s3s)?;
-        let has_objects = !page.objects.is_empty();
-        let first_object = page.objects.first().map(|(key, _)| key.as_str());
 
         let mpu_count = self.state.multipart.count_uploads_for_bucket(&bucket);
-        if has_objects {
-            let sample = first_object.unwrap_or("<unknown>");
+        if let Some(sample) = first_object {
             return Err(s3s::s3_error!(
                 BucketNotEmpty,
                 "{} (blocked: visible object remains, example_key={}, multipart_uploads={}; action: delete user objects first)",
@@ -1612,6 +1606,36 @@ fn list_cursor<'a>(
     continuation_token
         .filter(|t| !t.is_empty())
         .or(start_after.filter(|s| !s.is_empty()))
+}
+
+/// The first visible key of `bucket` in key order, or `None` when it holds
+/// none. It descends one `/`-delimited level at a time: a listing without a
+/// delimiter walks the whole bucket on the filesystem backend just to find
+/// one key (s3surface-12). The first entry of each level is the prefix of
+/// the first key, so the result is the first key of the flat listing.
+async fn first_visible_key<L: crate::iam::listing::Lister>(
+    lister: &L,
+    bucket: &str,
+) -> Result<Option<String>, crate::deltaglider::EngineError> {
+    let mut prefix = String::new();
+    loop {
+        let page = lister
+            .list(bucket, &prefix, Some("/"), 1, None, false)
+            .await?;
+        if let Some((key, _)) = page.objects.first() {
+            return Ok(Some(key.clone()));
+        }
+        match page.common_prefixes.first() {
+            Some(next) => prefix = next.clone(),
+            None if prefix.is_empty() => return Ok(None),
+            // A prefix with nothing visible under it (on S3, one that holds
+            // only proxy-internal keys): the flat listing decides.
+            None => {
+                let flat = lister.list(bucket, "", None, 1, None, false).await?;
+                return Ok(flat.objects.first().map(|(key, _)| key.clone()));
+            }
+        }
+    }
 }
 
 /// `encoding-type=url` (review C2): S3 then URL-encodes every key-shaped
@@ -3468,6 +3492,96 @@ mod review2_tests {
             assert!(
                 content_type_needs_sandbox(ct),
                 "{ct} renders as text/html but gets no sandbox"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod delete_bucket_tests {
+    use super::*;
+
+    /// Forwards to the engine and records each request's delimiter.
+    struct Recording<'a> {
+        engine: &'a crate::deltaglider::DynEngine,
+        delimiters: Mutex<Vec<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::iam::listing::Lister for Recording<'_> {
+        async fn list(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            delimiter: Option<&str>,
+            max_keys: u32,
+            cursor: Option<&str>,
+            metadata: bool,
+        ) -> Result<crate::deltaglider::ListObjectsPage, crate::deltaglider::EngineError> {
+            self.delimiters
+                .lock()
+                .unwrap()
+                .push(delimiter.map(str::to_string));
+            self.engine
+                .list_objects(bucket, prefix, delimiter, max_keys, cursor, metadata)
+                .await
+        }
+    }
+
+    /// s3surface-12: DeleteBucket's emptiness check answers the first key
+    /// of the flat listing (the `example_key` of `BucketNotEmpty`), but
+    /// reads only `/`-delimited levels: a flat listing walked the whole
+    /// bucket on the filesystem backend.
+    #[tokio::test]
+    async fn first_visible_key_is_the_flat_first_key_by_delimited_reads() {
+        let layouts: &[&[&str]] = &[
+            &[],
+            &["z.txt"],
+            &["a/b/c.txt", "a.txt", "b.txt"],
+            &["a/b/c.txt", "z.txt"],
+            &["se/x.txt", "seg/y.txt"],
+            &["docs/", "docs/a.txt"],
+            &["deep/1/2/3/4.bin", "deep/1/2/5.bin"],
+        ];
+        for keys in layouts {
+            let dir = tempfile::tempdir().unwrap();
+            let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+                crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let engine: crate::deltaglider::DynEngine =
+                crate::deltaglider::DeltaGliderEngine::new_with_backend(
+                    Arc::new(backend),
+                    &crate::config::Config::default(),
+                    None,
+                );
+            engine.create_bucket("b").await.unwrap();
+            for k in *keys {
+                // A folder marker (`docs/`) has an empty body.
+                let body: &[u8] = if k.ends_with('/') { b"" } else { b"x" };
+                engine
+                    .store("b", k, body, None, Default::default())
+                    .await
+                    .unwrap();
+            }
+            let flat = engine
+                .list_objects("b", "", None, 1, None, false)
+                .await
+                .unwrap()
+                .objects
+                .first()
+                .map(|(k, _)| k.clone());
+            let recording = Recording {
+                engine: &engine,
+                delimiters: Mutex::new(Vec::new()),
+            };
+            let got = first_visible_key(&recording, "b").await.unwrap();
+            assert_eq!(got, flat, "layout {keys:?}");
+            let delimiters = recording.delimiters.into_inner().unwrap();
+            assert!(
+                delimiters.iter().all(|d| d.as_deref() == Some("/")),
+                "a flat listing for layout {keys:?}: {delimiters:?}"
             );
         }
     }
