@@ -11,7 +11,14 @@ import {
   SOURCE_TB_LOWER_THRESHOLD,
   type CalculatorInputs,
 } from './pricing';
-import { FREE_GRANT_TB, COMMERCIAL_PRICE_USD } from './brackets';
+import {
+  FREE_GRANT_TB,
+  COMMERCIAL_PRICE_USD,
+  ENTERPRISE_FOOTPRINT_TB,
+  bracketForFootprintTb,
+  BRACKETS,
+  SCHEMA_OFFER_BRACKETS,
+} from './brackets';
 
 /** Default inputs matching the calculator's default slider positions. */
 const defaultInputs = (overrides: Partial<CalculatorInputs> = {}): CalculatorInputs => ({
@@ -24,15 +31,46 @@ const defaultInputs = (overrides: Partial<CalculatorInputs> = {}): CalculatorInp
 });
 
 describe('calculate', () => {
-  it('free under the grant: 50 TB source × 10× = 5 TB stored → free', () => {
+  it('free under the grant: 50 TB source × 10× = 5 TB stored × 2 regions = 10 TB → free', () => {
     const result = calculate(defaultInputs({ sourceTb: 50 }));
+    expect(result.kind).toBe('free');
+    if (result.kind === 'free') expect(result.licenseFootprintTb).toBeCloseTo(10, 5);
+  });
+
+  it('free at the grant boundary: 150 TB source × 10× = 15 TB stored × 1 region → still free', () => {
+    // The grant is inclusive: footprint ≤ 15 TB stays free.
+    const result = calculate(defaultInputs({ sourceTb: 150, regions: 1 }));
     expect(result.kind).toBe('free');
   });
 
-  it('free at the grant boundary: 150 TB source × 10× = 15 TB stored → still free', () => {
-    // The grant is inclusive: footprint ≤ 15 TB stays free.
-    const result = calculate(defaultInputs({ sourceTb: 150 }));
-    expect(result.kind).toBe('free');
+  it('every region is a stored copy: 10 TB stored × 2 regions = 20 TB → Commercial', () => {
+    const result = calculate(defaultInputs({ sourceTb: 100, regions: 2 }));
+    expect(result.kind).toBe('ok');
+    if (result.kind === 'ok') {
+      expect(result.licenseFootprintTb).toBeCloseTo(20, 5);
+      expect(result.bracket.id).toBe('commercial');
+    }
+  });
+
+  it('the same 10 TB stored in 1 region stays free', () => {
+    expect(calculate(defaultInputs({ sourceTb: 100, regions: 1 })).kind).toBe('free');
+  });
+
+  it('enterprise above 1 PB: 600 TB stored × 2 regions = 1,200 TB → Enterprise', () => {
+    const result = calculate(defaultInputs({ sourceTb: 6000, regions: 2 }));
+    expect(result.kind).toBe('enterprise');
+    if (result.kind === 'enterprise') {
+      expect(result.licenseFootprintTb).toBeCloseTo(1200, 5);
+      expect(result.bracket.id).toBe('enterprise');
+      expect(result.bracket.priceUsd).toBeNull();
+      expect(result.savings).toBeGreaterThan(0);
+    }
+  });
+
+  it('500 TB stored × 2 regions = exactly 1 PB → still Commercial (the bound is inclusive)', () => {
+    const result = calculate(defaultInputs({ sourceTb: 5000, regions: 2 }));
+    expect(result.kind).toBe('ok');
+    if (result.kind === 'ok') expect(result.bracket.id).toBe('commercial');
   });
 
   it('commercial above the grant: 300 TB source × 10× = 30 TB stored → Commercial ($5k)', () => {
@@ -44,7 +82,7 @@ describe('calculate', () => {
     }
   });
 
-  it('commercial stays flat at any scale: 3000 TB source × 10× = 300 TB stored → same $5k', () => {
+  it('commercial stays flat up to 1 PB: 3000 TB source × 10× = 300 TB stored × 2 = 600 TB → same $5k', () => {
     const result = calculate(defaultInputs({ sourceTb: 3000 }));
     expect(result.kind).toBe('ok');
     if (result.kind === 'ok') {
@@ -69,6 +107,10 @@ describe('calculate', () => {
 
   it('FREE_GRANT_TB matches the license grant (15 TB)', () => {
     expect(FREE_GRANT_TB).toBe(15);
+  });
+
+  it('ENTERPRISE_FOOTPRINT_TB is 1 PB (1000 TB)', () => {
+    expect(ENTERPRISE_FOOTPRINT_TB).toBe(1000);
   });
 
   it('negativeNet when the license costs more than the savings (over grant, cheap storage, low ratio)', () => {
@@ -156,8 +198,8 @@ describe('calculate', () => {
   });
 
   it('warnings: cheap backend (< $0.005/GB-month) emits cheapBackendAlready chip (free kind too)', () => {
-    // 100 TB × 10× = 10 TB stored → under the grant → 'free' carries warnings.
-    const result = calculate(defaultInputs({ sourceTb: 100, costPerGbMonthUsd: 0.003 }));
+    // 100 TB × 10× = 10 TB stored × 1 region → under the grant → 'free' carries warnings.
+    const result = calculate(defaultInputs({ sourceTb: 100, regions: 1, costPerGbMonthUsd: 0.003 }));
     expect(result.kind).toBe('free');
     if (result.kind === 'free') {
       expect(result.warnings).toContain('cheapBackendAlready');
@@ -238,6 +280,32 @@ describe('buildMarkdown', () => {
     const md = buildMarkdown(inputs, result);
     expect(md).toContain('15 TB free grant');
     expect(md).toContain('costs you nothing');
+    expect(md).toContain('10 TB (the compressed data × 2 regions)');
+  });
+
+  it('enterprise markdown names the tier and has no net figure', () => {
+    const inputs = defaultInputs({ sourceTb: 6000 });
+    const md = buildMarkdown(inputs, calculate(inputs));
+    expect(md).toContain('Enterprise');
+    expect(md).toContain('above 1 PB');
+    expect(md).not.toContain('Net annual savings');
+  });
+});
+
+describe('bracketForFootprintTb', () => {
+  it('free ≤ 15, commercial ≤ 1000, enterprise above', () => {
+    expect(bracketForFootprintTb(15).id).toBe('free');
+    expect(bracketForFootprintTb(15.01).id).toBe('commercial');
+    expect(bracketForFootprintTb(1000).id).toBe('commercial');
+    expect(bracketForFootprintTb(1000.01).id).toBe('enterprise');
+  });
+
+  it('JSON-LD Offers stay fixed-price only (Commercial)', () => {
+    expect(SCHEMA_OFFER_BRACKETS.map((b) => b.id)).toEqual(['commercial']);
+  });
+
+  it('no tier says "per production deployment"', () => {
+    for (const b of BRACKETS) expect(b.description).not.toMatch(/per production deployment/);
   });
 });
 

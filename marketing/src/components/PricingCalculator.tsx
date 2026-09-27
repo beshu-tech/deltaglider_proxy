@@ -134,8 +134,9 @@ export default function PricingCalculator() {
               ))}
             </div>
             <p className="field-help">
-              Enter how many regions you replicate this data to. Each region
-              holds a full copy, so each one adds the full storage cost.
+              Enter how many regions DeltaGlider replicates this data to.
+              Each region holds a full copy, so each one adds the full
+              storage cost, and each one counts toward the 15 TB free grant.
             </p>
           </div>
 
@@ -370,7 +371,8 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
       <div className="card card-disqualify">
         <h2 id="calc-result-heading">Savings would not cover the license</h2>
         <p>
-          At this scale you'd save about <strong>{formatUsd(result.savings)}/yr</strong> in
+          Your license footprint is <strong>{formatTb(result.licenseFootprintTb)}</strong>,
+          which is above the 15 TB free grant. At this scale you'd save about <strong>{formatUsd(result.savings)}/yr</strong> in
           storage, and the Commercial plan costs <strong>{formatUsd(result.licenseCost)}/yr</strong>,
           so the plan would cost more than it saves you. Talk to us about a
           different fit.
@@ -394,7 +396,9 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
           You'd save about <strong className="calc-hero-number">{formatUsd(result.savings, { compact: true })}/year</strong>
         </h2>
         <p className="calc-hero-subtext">
-          Your compressed footprint stays under the 15 TB free grant, so
+          Your license footprint is{' '}
+          <strong>{formatTb(result.licenseFootprintTb)}</strong>, the compressed
+          data times the regions. It stays under the 15 TB free grant, so
           DeltaGlider costs you <strong className="calc-hero-net">nothing</strong> and
           the figure above is your net saving.
         </p>
@@ -412,6 +416,46 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
     );
   }
 
+  if (result.kind === 'enterprise') {
+    return (
+      <div className="card card-ok">
+        <h2 id="calc-result-heading" className="calc-hero-heading">
+          You'd save about <strong className="calc-hero-number">{formatUsd(result.savings, { compact: true })}/year</strong>
+        </h2>
+        <p className="calc-hero-subtext">
+          Your license footprint is{' '}
+          <strong>{formatTb(result.licenseFootprintTb)}</strong>, the compressed
+          data times the regions. That is above 1 PB, so the{' '}
+          <strong>{result.bracket.name}</strong> plan applies. It has no fixed
+          price, so talk to sales for a quote.
+        </p>
+
+        <Warnings warnings={result.warnings} />
+
+        <div className="card-ctas">
+          <a className="btn btn-brand" href="mailto:sales@beshu.tech?subject=DeltaGlider%20-%20Enterprise%20inquiry">
+            Talk to sales
+          </a>
+          <a className="link-action" href="/trial">
+            Start a 30-day trial
+          </a>
+          <button type="button" className="link-action" onClick={onCopy}>
+            {copyState === 'copied' ? 'Copied!' : copyState === 'failed' ? 'Copy failed' : 'Copy this estimate'}
+          </button>
+        </div>
+
+        <BreakdownTable lines={result.lines} />
+
+        <details className="formula" open={showFormula} onToggle={onToggleFormula}>
+          <summary>
+            <span>Show your work</span>
+          </summary>
+          <Formula />
+        </details>
+      </div>
+    );
+  }
+
   // kind === 'ok'
   return (
     <div className="card card-ok">
@@ -419,7 +463,9 @@ function ResultCard({ result, onCopy, copyState, showFormula, onToggleFormula }:
         You'd save about <strong className="calc-hero-number">{formatUsd(result.savings, { compact: true })}/year</strong>
       </h2>
       <p className="calc-hero-subtext">
-        Your compressed footprint is above the 15 TB free grant, so the{' '}
+        Your license footprint is{' '}
+        <strong>{formatTb(result.licenseFootprintTb)}</strong>, the compressed
+        data times the regions. That is above the 15 TB free grant, so the{' '}
         <strong>{result.bracket.name}</strong> plan at{' '}
         <strong>{result.bracket.priceLabel}</strong> applies. After the license,
         your net annual savings are <strong className="calc-hero-net">{formatUsd(result.netSavings)}</strong>.
@@ -499,13 +545,18 @@ today_egress       = source_tb × growth × 1024 × (regions - 1) × $0.02
 dgp_egress         = stored_footprint × growth × 1024 × (regions - 1) × $0.02
 savings            = (today_storage + today_egress)
                    − (dgp_storage  + dgp_egress)
-license_cost       = 0 if stored_footprint ≤ 15 TB, else $5k (Commercial)
+license_footprint  = stored_footprint × regions
+license_cost       = 0 if license_footprint ≤ 15 TB,
+                     $5k (Commercial) if ≤ 1 PB,
+                     talk to sales (Enterprise) above 1 PB
 net_savings        = savings − license_cost`}
       </pre>
       <p>
-        The license cost comes from the BUSL-1.1 grant. Production use is free
-        up to 15 TB of compressed stored data, and above that the flat
-        Commercial plan at $5k/year applies.
+        The license cost comes from the BUSL-1.1 grant. The license counts
+        every copy that DeltaGlider writes, after compression, so each region
+        adds one copy to the footprint. Production use is free up to 15 TB for
+        each organization. Above that, the flat Commercial plan at $5k/year
+        applies up to 1 PB, and above 1 PB the Enterprise plan applies.
       </p>
     </div>
   );

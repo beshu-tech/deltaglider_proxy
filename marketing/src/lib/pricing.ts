@@ -14,7 +14,8 @@ import {
 export interface CalculatorInputs {
   /** Current artifact footprint on the visitor's existing storage, in TB. */
   sourceTb: number;
-  /** Number of regions the visitor replicates to today. */
+  /** Number of regions DeltaGlider keeps a copy in. Each region is a copy
+   * that DeltaGlider writes, so each one counts toward the license footprint. */
   regions: number;
   /** Storage cost per GB per month, in USD. */
   costPerGbMonthUsd: number;
@@ -55,9 +56,10 @@ export interface BreakdownLine {
  * telling the UI to swap to a "self-disqualify" card. */
 export type CalculatorResult =
   | { kind: 'belowThreshold' }
-  | { kind: 'negativeNet'; savings: number; licenseCost: number }
-  | { kind: 'free'; savings: number; lines: BreakdownLine[]; warnings: Warning[] }
-  | { kind: 'ok'; bracket: Bracket; savings: number; netSavings: number; lines: BreakdownLine[]; warnings: Warning[] };
+  | { kind: 'negativeNet'; savings: number; licenseCost: number; licenseFootprintTb: number }
+  | { kind: 'free'; savings: number; licenseFootprintTb: number; lines: BreakdownLine[]; warnings: Warning[] }
+  | { kind: 'ok'; bracket: Bracket; savings: number; netSavings: number; licenseFootprintTb: number; lines: BreakdownLine[]; warnings: Warning[] }
+  | { kind: 'enterprise'; bracket: Bracket; savings: number; licenseFootprintTb: number; lines: BreakdownLine[]; warnings: Warning[] };
 
 /** Soft warnings rendered as warning chips next to the result card.
  * Don't suppress the result — surface a caveat. */
@@ -86,11 +88,14 @@ export const SOURCE_TB_LOWER_THRESHOLD = 1;
  *   today egress    = sourceTb * growthRate * 1024 * (regions - 1 replicas) * $0.02
  *   dgp egress      = storedFootprint * growthRate * 1024 * (regions - 1 replicas) * $0.02
  *   savings         = (todayStorage + todayEgress) - (dgpStorage + dgpEgress)
- *   licenseCost     = 0 under the 15 TB grant, else the flat Commercial price
+ *   licenseFootprint = storedFootprint * regions
+ *   licenseCost     = 0 under the 15 TB grant, the flat Commercial price up
+ *                     to 1 PB, Enterprise (no fixed price) above
  *   netSavings      = savings - licenseCost
  *
- * Tier selection happens against `storedFootprint` (compressed bytes),
- * because that is what the BUSL-1.1 grant is measured on.
+ * Tier selection happens against `licenseFootprint`: the license counts
+ * every stored copy that DeltaGlider writes, after compression, and each
+ * region is one such copy.
  */
 export function calculate(inputs: CalculatorInputs): CalculatorResult {
   const { sourceTb, regions, costPerGbMonthUsd, compressionRatio, annualGrowthRate } = inputs;
@@ -134,9 +139,10 @@ export function calculate(inputs: CalculatorInputs): CalculatorResult {
     { label: 'Subtotal: storage + transfer', today: todaySubtotal, dgp: dgpSubtotal },
   ];
 
-  // Tier selection based on the compressed stored footprint — the
-  // number the BUSL-1.1 grant is measured on.
-  const bracket = bracketForFootprintTb(storedFootprintTb);
+  // Tier selection based on the license footprint: every stored copy
+  // DeltaGlider writes (one per region), after compression.
+  const licenseFootprintTb = storedFootprintTb * regions;
+  const bracket = bracketForFootprintTb(licenseFootprintTb);
 
   // Warnings: surfaced as chips alongside the result; don't override.
   const warnings: Warning[] = [];
@@ -144,8 +150,13 @@ export function calculate(inputs: CalculatorInputs): CalculatorResult {
   if (costPerGbMonthUsd < 0.005) warnings.push('cheapBackendAlready');
 
   // Under the free grant: DeltaGlider costs nothing.
-  if (bracket.id === 'free' || bracket.priceUsd === null || bracket.priceUsd === 0) {
-    return { kind: 'free', savings, lines, warnings };
+  if (bracket.id === 'free') {
+    return { kind: 'free', savings, licenseFootprintTb, lines, warnings };
+  }
+
+  // Above 1 PB: no fixed price, so no net figure.
+  if (bracket.priceUsd === null || bracket.priceUsd === 0) {
+    return { kind: 'enterprise', bracket, savings, licenseFootprintTb, lines, warnings };
   }
 
   const licenseCost = bracket.priceUsd;
@@ -153,7 +164,7 @@ export function calculate(inputs: CalculatorInputs): CalculatorResult {
 
   // Bad-case: the license costs more than the savings.
   if (netSavings < 0) {
-    return { kind: 'negativeNet', savings, licenseCost };
+    return { kind: 'negativeNet', savings, licenseCost, licenseFootprintTb };
   }
 
   // Add the license-cost line + total-annual-cost line to the breakdown.
@@ -168,7 +179,7 @@ export function calculate(inputs: CalculatorInputs): CalculatorResult {
     dgp: dgpSubtotal + licenseCost,
   });
 
-  return { kind: 'ok', bracket, savings, netSavings, lines, warnings };
+  return { kind: 'ok', bracket, savings, netSavings, licenseFootprintTb, lines, warnings };
 }
 
 /** Format a USD amount as "$1,234" or "$1.2M" depending on magnitude.
@@ -205,7 +216,7 @@ export function buildMarkdown(inputs: CalculatorInputs, result: CalculatorResult
   lines.push('## Inputs');
   lines.push('');
   lines.push(`- Current artifact footprint: ${formatTb(inputs.sourceTb)}`);
-  lines.push(`- Regions: ${inputs.regions}`);
+  lines.push(`- Regions (copies that DeltaGlider writes): ${inputs.regions}`);
   lines.push(`- Storage cost: $${inputs.costPerGbMonthUsd}/GB/month`);
   // Golden rule: savings magnitudes are presented as percentages, never as
   // N× multipliers. Show both "% smaller" (ratio × 100) and % bytes saved —
@@ -222,10 +233,11 @@ export function buildMarkdown(inputs: CalculatorInputs, result: CalculatorResult
     lines.push('Below 1 TB, DeltaGlider isn\'t worth it for you yet. Run the free build anyway if you like; it costs nothing at this size.');
     return lines.join('\n');
   }
+  const footprint = `${formatTb(result.licenseFootprintTb)} (the compressed data × ${inputs.regions} ${inputs.regions === 1 ? 'region' : 'regions'})`;
   if (result.kind === 'negativeNet') {
     lines.push('## Verdict');
     lines.push('');
-    lines.push(`At this scale you'd save about ${formatUsd(result.savings)} in storage, and the Commercial plan costs ${formatUsd(result.licenseCost)}, so the plan would cost more than it saves you. Talk to us about a different fit, or reduce scope until you fit the free 15 TB grant.`);
+    lines.push(`Your license footprint is ${footprint}, which is above the ${FREE_GRANT_TB} TB free grant. At this scale you'd save about ${formatUsd(result.savings)} in storage, and the Commercial plan costs ${formatUsd(result.licenseCost)}, so the plan would cost more than it saves you. Talk to us about a different fit, or reduce scope until you fit the free ${FREE_GRANT_TB} TB grant.`);
     return lines.join('\n');
   }
   if (result.kind === 'free') {
@@ -233,15 +245,18 @@ export function buildMarkdown(inputs: CalculatorInputs, result: CalculatorResult
     lines.push('');
     lines.push(`You'd save about **${formatUsd(result.savings)}** a year in storage.`);
     lines.push('');
-    lines.push(`Your compressed footprint stays under the ${FREE_GRANT_TB} TB free grant, so DeltaGlider costs you nothing and the figure above is your net saving.`);
+    lines.push(`Your license footprint is ${footprint}. It stays under the ${FREE_GRANT_TB} TB free grant, so DeltaGlider costs you nothing and the figure above is your net saving.`);
     return lines.join('\n');
   }
-  // OK case
   lines.push('## Verdict');
   lines.push('');
   lines.push(`You'd save about **${formatUsd(result.savings)}** a year in storage.`);
-  lines.push(`Your compressed footprint is above the ${FREE_GRANT_TB} TB free grant, so the ${result.bracket.name} plan at ${result.bracket.priceLabel} applies.`);
-  lines.push(`Net annual savings after the license: **${formatUsd(result.netSavings)}**.`);
+  if (result.kind === 'enterprise') {
+    lines.push(`Your license footprint is ${footprint}, which is above 1 PB, so the ${result.bracket.name} plan applies. It has no fixed price: talk to sales at sales@beshu.tech.`);
+  } else {
+    lines.push(`Your license footprint is ${footprint}, which is above the ${FREE_GRANT_TB} TB free grant, so the ${result.bracket.name} plan at ${result.bracket.priceLabel} applies.`);
+    lines.push(`Net annual savings after the license: **${formatUsd(result.netSavings)}**.`);
+  }
   lines.push('');
   lines.push('## Breakdown');
   lines.push('');
