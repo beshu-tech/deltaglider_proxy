@@ -1463,6 +1463,10 @@ impl MultipartStore {
 
 /// The relay parent of releases before the relay moved into the spool. Only
 /// swept (its roots are crash debris or an older process's uploads).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "sweeps the relay root of releases before the relay moved into the spool"
+)]
 fn legacy_relay_parent_dir() -> PathBuf {
     std::env::temp_dir().join(RELAY_ROOT_DIR)
 }

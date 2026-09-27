@@ -29,6 +29,10 @@ pub struct RequestTarget {
 
 impl RequestTarget {
     /// Decode a raw path and optional raw query string.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "THE request-target decode, the one s3s does"
+    )]
     pub fn parse(raw_path: &str, raw_query: Option<&str>) -> Result<Self, InvalidUri> {
         let path = urlencoding::decode(raw_path)
             .map_err(|_| InvalidUri)?
@@ -194,14 +198,14 @@ mod tests {
         assert_eq!(RequestTarget::parse("/b/%ff", None), Err(InvalidUri));
     }
 
-    /// The pre-s3s decision points decode the request target only through
-    /// this module. A hand-rolled decode or query split there re-opens the
-    /// gap between the resource the policy checks and the one s3s serves.
+    /// The pre-s3s decision points parse the request target only through
+    /// this module. A hand-rolled query split or path split there re-opens
+    /// the gap between the resource the policy checks and the one s3s
+    /// serves. (A hand-rolled `urlencoding::decode` is a clippy
+    /// `disallowed-methods` error anywhere in the crate: clippy.toml.)
     #[test]
     fn pre_s3s_decision_points_do_not_decode_by_hand() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         // Built at runtime so this test's own source is no hit.
-        let decode = ["urlencoding::", "decode("].concat();
         let query_split = [".split('", "&')"].concat();
         // Splitting a path into bucket/key by hand (the raw-path bug class).
         let path_split = ["split_once('", "/')"].concat();
@@ -209,7 +213,6 @@ mod tests {
         let path_split_all = [".split('", "/')"].concat();
         let path_trim_both = ["trim_matches('", "/')"].concat();
         let all = [
-            decode.clone(),
             query_split.clone(),
             path_split,
             path_trim,
@@ -217,8 +220,8 @@ mod tests {
             path_trim_both,
         ];
         // `api/auth.rs` also splits SigV4 credential scopes on `/`, which is
-        // not a request path, so it gets only the decode/query needles.
-        let auth_only = [decode, query_split];
+        // not a request path, so it gets only the query needle.
+        let auth_only = [query_split];
         for (file, needles) in [
             ("api/auth.rs", &auth_only[..]),
             // Splits form fields and credential scopes on `/`, not paths.
@@ -229,7 +232,7 @@ mod tests {
             ("maintenance/gate.rs", &all[..]),
             ("coordination/health.rs", &all[..]),
         ] {
-            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            let text = crate::source_scan::read(&format!("src/{file}"));
             for needle in needles {
                 assert!(
                     !text.contains(needle.as_str()),

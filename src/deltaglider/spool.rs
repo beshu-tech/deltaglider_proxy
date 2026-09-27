@@ -61,6 +61,10 @@ impl SpoolDir {
     /// crash leaves spool files behind since `NamedTempFile`'s Drop never ran;
     /// any file present at boot is from a previous process and is safe to delete
     /// — every live spool is held by a `NamedTempFile` in THIS process).
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the spool's own default directory"
+    )]
     pub fn from_env() -> std::io::Result<Self> {
         let dir = std::env::var("DGP_SPOOL_DIR")
             .map(PathBuf::from)
@@ -759,53 +763,6 @@ mod tests {
             .expect("waiter proceeds once the whole pair drops")
             .unwrap()
             .unwrap();
-    }
-
-    /// Every scratch file of the proxy goes through the spool, so it is in
-    /// the spool dir and counts against the budget. A temp file made
-    /// anywhere else is outside both (the encrypting wrapper, the multipart
-    /// relay and the buffered codec all were). Non-test code outside this
-    /// module must not reach for the system temp dir.
-    #[test]
-    fn no_scratch_files_outside_the_spool() {
-        const BANNED: &[&str] = &[
-            "NamedTempFile::new()",
-            "env::temp_dir()",
-            "tempfile::tempfile(",
-            "tempfile::tempdir(",
-            "TempDir::new(",
-        ];
-        // (file, pattern, reason). Keep this short.
-        const ALLOWED: &[(&str, &str, &str)] = &[
-            (
-                "src/deltaglider/spool.rs",
-                "env::temp_dir()",
-                "the spool's own default directory",
-            ),
-            (
-                "src/multipart.rs",
-                "env::temp_dir()",
-                "sweeps the relay root of releases before the relay moved into the spool",
-            ),
-        ];
-        let mut offenders = Vec::new();
-        for (rel, text) in crate::source_scan::prod_sources("src") {
-            for (n, line) in crate::source_scan::prod_lines(&text) {
-                let code = line.split("//").next().unwrap_or("");
-                for pat in BANNED {
-                    let allowed = ALLOWED.iter().any(|(f, p, _)| *f == rel && p == pat);
-                    if code.contains(pat) && !allowed {
-                        offenders.push(format!("{rel}:{n}: {}", line.trim()));
-                    }
-                }
-            }
-        }
-        assert!(
-            offenders.is_empty(),
-            "scratch files outside the spool (use SpoolDir, or add an ALLOWED entry \
-             with a reason):\n{}",
-            offenders.join("\n")
-        );
     }
 }
 

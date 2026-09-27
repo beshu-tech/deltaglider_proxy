@@ -1,0 +1,28 @@
+# Tier (a) source rules: "never call X outside Y". Each allowed call site
+# carries `#[allow(clippy::disallowed_methods)]` with the reason. Test code
+# is exempt (`cfg_attr(test, allow(..))` in src/lib.rs and src/main.rs, a
+# crate-level allow in tests/all.rs): these rules protect production paths.
+disallowed-methods = [
+    # SQLite opens go through crate::sqlite_open (the one-time init gate).
+    { path = "rusqlite::Connection::open", reason = "open through crate::sqlite_open" },
+    { path = "rusqlite::Connection::open_with_flags", reason = "open through crate::sqlite_open" },
+    { path = "rusqlite::Connection::open_in_memory", reason = "open through crate::sqlite_open" },
+    { path = "rusqlite::Connection::open_in_memory_with_flags", reason = "open through crate::sqlite_open" },
+    { path = "rusqlite::Connection::open_with_flags_and_vfs", reason = "open through crate::sqlite_open" },
+    # Scratch files live in the spool: in the spool dir, counted against its budget.
+    { path = "std::env::temp_dir", reason = "scratch files go through deltaglider::spool::SpoolDir" },
+    { path = "tempfile::tempfile", reason = "scratch files go through deltaglider::spool::SpoolDir" },
+    { path = "tempfile::tempdir", reason = "scratch files go through deltaglider::spool::SpoolDir" },
+    { path = "tempfile::TempDir::new", reason = "scratch files go through deltaglider::spool::SpoolDir" },
+    { path = "tempfile::TempDir::with_prefix", reason = "scratch files go through deltaglider::spool::SpoolDir" },
+    { path = "tempfile::NamedTempFile::new", reason = "scratch files go through deltaglider::spool::SpoolDir" },
+    { path = "tempfile::NamedTempFile::with_prefix", reason = "scratch files go through deltaglider::spool::SpoolDir" },
+    { path = "tempfile::NamedTempFile::with_suffix", reason = "scratch files go through deltaglider::spool::SpoolDir" },
+    { path = "tempfile::Builder::tempfile", reason = "scratch files go through deltaglider::spool::SpoolDir" },
+    { path = "tempfile::Builder::tempdir", reason = "scratch files go through deltaglider::spool::SpoolDir" },
+    # A custom S3 endpoint is SSRF-checked: set it through storage::s3::guard_s3_endpoint.
+    { path = "aws_sdk_s3::config::Builder::endpoint_url", reason = "set the endpoint through guard_s3_endpoint (SSRF check)" },
+    { path = "aws_sdk_s3::config::Builder::set_endpoint_url", reason = "set the endpoint through guard_s3_endpoint (SSRF check)" },
+    # The request target is decoded once, in api::request_target, exactly as s3s decodes it.
+    { path = "urlencoding::decode", reason = "decode the request target through api::request_target::RequestTarget" },
+]

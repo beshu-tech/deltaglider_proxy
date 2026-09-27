@@ -286,6 +286,10 @@ pub(crate) fn check_s3_endpoint(
 /// still work — opted into via either the typed `BackendConfig::S3.allow_local`
 /// field (the preferred path) or the legacy `DGP_BACKEND_ALLOW_LOCAL=true`
 /// env var. A hardened production env must keep both off.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "THE endpoint setter: runs the SSRF check first"
+)]
 pub(crate) fn guard_s3_endpoint(
     builder: aws_sdk_s3::config::Builder,
     ep: &str,
@@ -3932,28 +3936,6 @@ fn classify_create_bucket_conflict(
 // in-tree via existing transitive dependencies, and constructing a
 // ServiceError for a classifier test is ~3 lines, not a mock server.
 // ────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod endpoint_guard_source_test {
-    /// Every S3 client that gets a custom endpoint goes through
-    /// `guard_s3_endpoint`. The config-sync/lease/probe client once set it
-    /// directly and skipped the SSRF check (review-2 #6).
-    #[test]
-    fn only_guard_s3_endpoint_sets_an_endpoint_url() {
-        let mut offenders = Vec::new();
-        for (rel, text) in crate::source_scan::prod_sources("src") {
-            let allowed = usize::from(rel == "src/storage/s3.rs");
-            if crate::source_scan::prod_text(&text)
-                .matches(".endpoint_url(")
-                .count()
-                > allowed
-            {
-                offenders.push(rel);
-            }
-        }
-        assert!(offenders.is_empty(), "use guard_s3_endpoint: {offenders:?}");
-    }
-}
 
 /// Pure: the fence for a reference.bin that a HEAD found. A HEAD with no
 /// ETag gave `ETag("")`, which every fenced write then skipped in silence;

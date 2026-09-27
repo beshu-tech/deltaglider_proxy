@@ -2,6 +2,9 @@
 
 //! DeltaGlider Proxy - S3-compatible object storage with DeltaGlider deduplication
 
+// Tests may make the calls clippy.toml bans (see src/lib.rs).
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 mod demo;
 mod startup;
 use startup::*;

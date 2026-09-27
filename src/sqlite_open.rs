@@ -26,16 +26,28 @@ fn initialized() {
     });
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the one gate: every open runs the init first"
+)]
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     initialized();
     Connection::open(path)
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the one gate: every open runs the init first"
+)]
 pub fn open_with_flags(path: &Path, flags: rusqlite::OpenFlags) -> rusqlite::Result<Connection> {
     initialized();
     Connection::open_with_flags(path, flags)
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the one gate: every open runs the init first"
+)]
 pub fn open_in_memory() -> rusqlite::Result<Connection> {
     initialized();
     Connection::open_in_memory()
@@ -83,23 +95,5 @@ mod tests {
                 String::from_utf8_lossy(&out.stdout)
             );
         }
-    }
-
-    /// Every connection opens through the gate above.
-    #[test]
-    fn sqlite_opens_go_through_the_init_gate() {
-        let mut hits = Vec::new();
-        for path in crate::source_scan::rust_files("src") {
-            if path.ends_with("sqlite_open.rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).unwrap();
-            for (i, l) in text.lines().enumerate() {
-                if l.contains(concat!("Connection", "::open")) {
-                    hits.push(format!("{}:{}", path.display(), i + 1));
-                }
-            }
-        }
-        assert!(hits.is_empty(), "open through crate::sqlite_open: {hits:?}");
     }
 }

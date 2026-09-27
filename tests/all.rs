@@ -9,6 +9,10 @@
 //! `scripts/check-integration-tests-in-ci.sh` enforces that every file is
 //! listed here and selected by a filter in `.github/workflows/ci.yml`.
 
+// clippy.toml bans calls that the PROXY makes in one place only (temp dirs,
+// S3 endpoints, sqlite opens); a test harness makes them freely.
+#![allow(clippy::disallowed_methods)]
+
 #[macro_use]
 mod common;
 

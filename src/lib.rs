@@ -4,6 +4,11 @@
 //!
 //! This library provides the core functionality for the DeltaGlider Proxy S3 server.
 
+// clippy.toml bans calls that production code makes in one place only (the
+// sqlite gate, the spool, the SSRF-checked endpoint, ...). Tests may make
+// them: a test temp dir is not a scratch file of the proxy.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod admission;
 pub mod api;
 pub mod audit;
