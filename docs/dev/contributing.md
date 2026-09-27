@@ -238,7 +238,7 @@ Open an issue on GitHub. If it's a bug, include:
 
 DeltaGlider Proxy is licensed under the
 [Business Source License 1.1](../../LICENSE): production use is free up
-to 15 TB of compressed stored data, and every release converts to
+to 15 TB of compressed stored data per organization, and every release converts to
 Apache-2.0 two years after it ships. Releases up to and including
 v1.17.0 remain GPL-3.0. Every Rust source file must start with the
 SPDX header:

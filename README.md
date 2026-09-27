@@ -293,22 +293,28 @@ Plus the [FAQ index](docs/product/faq.md).
 
 [Business Source License 1.1](LICENSE) (BUSL-1.1). In plain terms:
 
-- Free for most users. Production use is free as long as the total
-  compressed data stored through the proxy stays under 15 TB per
-  organization, and you don't resell the proxy itself as a hosted
-  service. Development, testing, and evaluation are always free, at any
-  size. There are no license keys and no locked features. The license is
-  a legal term, and the software does not enforce it technically.
+- Free for most users. Production use is free as long as your
+  organization's stored footprint stays at or under 15 TB. The stored
+  footprint counts every copy that DeltaGlider writes, after compression,
+  including replicas and archives, and it is measured as a monthly
+  average. Copies that your storage provider keeps for its own redundancy
+  do not count. Development, testing, and evaluation are always free, at
+  any size. There are no license keys and no locked features. The license
+  is a legal term, and the software does not enforce it technically.
 - Every release becomes open source. Two years after each version
   is released, that version automatically converts to the
   [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
-- Larger deployments need a commercial license. If your compressed
-  footprint exceeds 15 TB, or you want to embed DeltaGlider in a
-  proprietary product or offer it as a service, see
+- Larger organizations need a commercial license. Above 15 TB, the
+  Commercial plan is priced per organization and covers any number of
+  instances, clusters, and regions up to 1 PB. Above 1 PB, or for custom
+  terms, there is an Enterprise plan. Offering DeltaGlider to third
+  parties as a hosted service, or shipping it inside a commercial product
+  or appliance, needs an OEM license. See
   [deltaglider.com/pricing](https://deltaglider.com/pricing/).
-- Older releases stay GPL. Every release up to and including
+- Older releases keep their terms. Every release up to and including
   v1.17.0 was published under GPL-3.0 and remains under GPL-3.0
-  forever.
+  forever. Releases v1.18.x and v1.19.x keep the grant text that they
+  shipped with.
 
 Contributors must sign the [Contributor License Agreement](CLA.md),
 which assigns copyright to Beshu Limited so the project can be licensed
