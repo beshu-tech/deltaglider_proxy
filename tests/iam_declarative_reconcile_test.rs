@@ -85,6 +85,14 @@ async fn declarative_iam_is_reconciled_at_startup_no_apply() {
              \x20     - effect: Allow\n\
              \x20       actions: [read, write, list]\n\
              \x20       resources: [\"bucket/*\"]\n\
+             \x20 - name: iac-admin\n\
+             \x20   access_key_id: iac-admin-key\n\
+             \x20   secret_access_key: iac-admin-secret-123\n\
+             \x20   enabled: true\n\
+             \x20   permissions:\n\
+             \x20     - effect: Allow\n\
+             \x20       actions: [\"*\"]\n\
+             \x20       resources: [\"*\"]\n\
              iam_groups:\n\
              \x20 - name: readers\n\
              \x20   description: read-only\n\
@@ -102,8 +110,17 @@ async fn declarative_iam_is_reconciled_at_startup_no_apply() {
     let s3 = server
         .s3_client_with_creds("iac-user-key", "iac-user-secret-123")
         .await;
-    // ensure the bucket exists, then list as the reconciled user.
-    let _ = s3.create_bucket().bucket("bucket").send().await;
+    // The bucket must exist: the harness creates it with the bootstrap pair,
+    // which declarative IAM refuses, and iac-user may not create buckets. A
+    // declarative admin creates it (which also proves the admin reconciled).
+    server
+        .s3_client_with_creds("iac-admin-key", "iac-admin-secret-123")
+        .await
+        .create_bucket()
+        .bucket("bucket")
+        .send()
+        .await
+        .expect("declarative admin creates the bucket");
     let listed = s3.list_objects_v2().bucket("bucket").send().await;
     assert!(
         listed.is_ok(),
