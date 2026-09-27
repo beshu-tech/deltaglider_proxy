@@ -364,7 +364,8 @@ struct HoldState {
 /// is. Pure, so the timing rule is unit-tested without a clock.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum HoldCheck {
-    /// Confirmed recently: no peer can steal it yet (skew bound: ttl / 2).
+    /// Confirmed less than `renew_interval` (ttl / 4) ago: no peer can steal
+    /// it yet, so the commit needs no extra round trip.
     Trust,
     /// Old confirmation: renew synchronously before the write.
     Confirm,

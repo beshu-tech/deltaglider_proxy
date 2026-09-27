@@ -47,10 +47,12 @@
 //!
 //! A peer judges expiry by the S3 server's clock: the lock object's
 //! `Last-Modified` against the `Date` of the GET (see `server_clock`), so
-//! node clocks do not matter. The holder trusts its hold for at most
-//! `ttl / 2` after its last confirmed renew (a monotonic clock), and renews
-//! every `ttl / 4`. A body from the previous release (no `ttl_secs`) is
-//! still judged by its writer-clock `expires_at`.
+//! node clocks do not matter. The holder renews every `renew_interval`
+//! (`ttl / 4`). A commit trusts a confirmation younger than that (a
+//! monotonic clock) and renews synchronously otherwise; the heartbeat
+//! declares the hold lost after `ttl / 2` of failed renews. A body from the
+//! previous release (no `ttl_secs`) is still judged by its writer-clock
+//! `expires_at`.
 //!
 //! ## Fencing
 //!
