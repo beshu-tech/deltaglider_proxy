@@ -466,7 +466,7 @@ async fn ranged_part_copy_reads_only_the_range() {
 /// share one filesystem directory, so a PUT through node A leaves node B's
 /// metadata cache stale.
 #[tokio::test]
-async fn conditional_get_judges_fresh_storage_and_plain_get_takes_no_head() {
+async fn every_get_judges_fresh_storage_metadata() {
     const KEY_ID: &str = "CONDKEY";
     const SECRET: &str = "CONDSECRET";
     let shared = tempfile::TempDir::new().unwrap();
@@ -504,14 +504,31 @@ async fn conditional_get_judges_fresh_storage_and_plain_get_takes_no_head() {
     let etag1 = header(&first, "etag").unwrap();
     put(b"v2").await;
 
-    // No condition: served from B's cache, so no HEAD read the new version.
+    // No condition: B's cache still holds v1, but the GET reads fresh
+    // metadata, so the ETag and the body agree on v2 (a cached ETag with the
+    // stored bytes would mix two versions in one answer).
     let plain = hb.get(&url_b).send().await.unwrap();
     assert_eq!(plain.status(), 200);
-    assert_eq!(
+    assert_ne!(
         header(&plain, "etag").as_ref(),
         Some(&etag1),
-        "a plain GET takes no HEAD"
+        "a plain GET must not answer the cached ETag"
     );
+    assert_eq!(&plain.bytes().await.unwrap()[..], b"v2");
+    // A range on B is judged on the fresh size too.
+    let ranged = hb
+        .get(&url_b)
+        .header("range", "bytes=0-0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ranged.status(), 206);
+    assert_eq!(&ranged.bytes().await.unwrap()[..], b"v");
+    // Re-cache v1 on B for the conditional checks below.
+    put(b"v1").await;
+    let first = hb.head(&url_b).send().await.unwrap();
+    let etag1 = header(&first, "etag").unwrap();
+    put(b"v2").await;
 
     // If-Match the stale ETag: storage holds another version → 412.
     let stale = hb
