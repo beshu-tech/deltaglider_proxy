@@ -24,14 +24,15 @@ const { quote, name, title, about } = Astro.props;
   .testimonial-card {
     background: var(--bg-card);
     border: 1px solid var(--rule);
-    border-radius: 8px;
+    border-radius: var(--r-md);
     padding: 1.5rem 1.75rem;
-    box-shadow: var(--shadow-sm);
     display: flex;
     flex-direction: column;
     gap: 0.75rem;
   }
 
+  /* A tag, not a banner: the flex column would stretch it full width. */
+  .testimonial-card .product-chip { align-self: flex-start; margin-bottom: 0; }
   .testimonial-quote {
     margin: 0;
     color: var(--ink);
@@ -46,8 +47,7 @@ const { quote, name, title, about } = Astro.props;
     font-size: 1.5rem;
     line-height: 1;
     margin-right: 0.15rem;
-    font-family: Georgia, 'Times New Roman', serif;
-    font-weight: 700;
+    font-weight: 800;
   }
 
   .testimonial-attr {
