@@ -6,7 +6,7 @@ use crate::api::admin::extract::AdminJson;
 use axum::{
     extract::{ConnectInfo, State},
     http::{header, HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ use crate::iam::{Group, IamIndex, IamState, IamUser};
 use crate::rate_limiter;
 use crate::session::{AuthMethod, S3SessionCredentials, SessionKind};
 
-use super::{audit_log, AdminState};
+use super::{audit_log, AdminError, AdminState, Bare, JsonError};
 
 /// Marker type inserted by [`require_admin_gui_session`] into request extensions.
 /// Handlers that must never run under a browser-lift session take
@@ -1166,6 +1166,17 @@ pub async fn open_browser_connect(
     ))
 }
 
+/// 401 `{"error": "unauthorized"}`: no live session; the UI signs in again.
+fn unauthorized() -> AdminError<JsonError> {
+    AdminError::status(StatusCode::UNAUTHORIZED, "unauthorized")
+}
+
+/// 403 `{"error": "admin_session_required"}`: a live session of the wrong
+/// kind (a browser-only session on an admin route).
+fn admin_session_required() -> AdminError<JsonError> {
+    AdminError::forbidden("admin_session_required")
+}
+
 /// Middleware: validate session for protected admin routes.
 /// Returns 401 if the session cookie is missing or invalid.
 pub async fn require_session(
@@ -1173,7 +1184,7 @@ pub async fn require_session(
     headers: HeaderMap,
     request: axum::extract::Request,
     next: axum::middleware::Next,
-) -> impl IntoResponse {
+) -> Result<Response, AdminError<JsonError>> {
     let peer_ip = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -1184,14 +1195,10 @@ pub async fn require_session(
         .unwrap_or(false);
 
     if !valid {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "unauthorized"})),
-        )
-            .into_response();
+        return Err(unauthorized());
     }
 
-    next.run(request).await.into_response()
+    Ok(next.run(request).await.into_response())
 }
 
 /// Whether the principal behind a session is, right now, an enabled admin.
@@ -1234,34 +1241,22 @@ pub async fn require_admin_gui_session(
     headers: HeaderMap,
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
-) -> impl IntoResponse {
+) -> Result<Response, AdminError<JsonError>> {
     let peer_ip = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
     let client_ip = rate_limiter::extract_client_ip_with_peer(&headers, peer_ip);
     let Some(token) = extract_session_token(&headers) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "unauthorized"})),
-        )
-            .into_response();
+        return Err(unauthorized());
     };
     // No LIVE session (unknown / expired / REVOKED / wrong IP) is 401 — the UI
     // must re-login. 403 is reserved for a live session of the wrong KIND.
     if !state.sessions.validate(&token, client_ip) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "unauthorized"})),
-        )
-            .into_response();
+        return Err(unauthorized());
     }
     if !admin_gui_session_ok(&state, &token, client_ip) {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "admin_session_required"})),
-        )
-            .into_response();
+        return Err(admin_session_required());
     }
 
     let actor = state
@@ -1275,9 +1270,9 @@ pub async fn require_admin_gui_session(
         token,
         client_ip,
     });
-    crate::audit::with_actor(actor, next.run(request))
+    Ok(crate::audit::with_actor(actor, next.run(request))
         .await
-        .into_response()
+        .into_response())
 }
 
 /// Who runs a bulk object request (`/_/api/admin/objects/*`), inserted by
@@ -1306,24 +1301,17 @@ pub async fn require_bulk_session(
     headers: HeaderMap,
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
-) -> impl IntoResponse {
+) -> Result<Response, AdminError<JsonError>> {
     let peer_ip = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
     let client_ip = rate_limiter::extract_client_ip_with_peer(&headers, peer_ip);
-    let unauthorized = || {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "unauthorized"})),
-        )
-            .into_response()
-    };
     let Some(token) = extract_session_token(&headers) else {
-        return unauthorized();
+        return Err(unauthorized());
     };
     if !state.sessions.validate(&token, client_ip) {
-        return unauthorized();
+        return Err(unauthorized());
     }
     let iam = state.iam_state.load();
     let (session, actor) = if admin_gui_session_ok(&state, &token, client_ip) {
@@ -1340,19 +1328,13 @@ pub async fn require_bulk_session(
             client_ip,
         ) {
             Some(pair) => pair,
-            None => {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({"error": "admin_session_required"})),
-                )
-                    .into_response()
-            }
+            None => return Err(admin_session_required()),
         }
     };
     request.extensions_mut().insert(session);
-    crate::audit::with_actor(actor, next.run(request))
+    Ok(crate::audit::with_actor(actor, next.run(request))
         .await
-        .into_response()
+        .into_response())
 }
 
 /// The bulk session (and audit actor) of a browser session that is not a
@@ -1515,27 +1497,26 @@ pub async fn get_s3_session_creds(
     State(state): State<Arc<AdminState>>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    let token = match extract_session_token(&headers) {
-        Some(t) => t,
-        None => return StatusCode::UNAUTHORIZED.into_response(),
-    };
+) -> Result<Response, AdminError<Bare>> {
+    let token = extract_session_token(&headers)
+        .ok_or_else(|| AdminError::status(StatusCode::UNAUTHORIZED, "no session"))?;
     let client_ip = request_client_ip(&headers, connect_info.as_ref());
-    match state.sessions.get_s3_creds(&token, client_ip) {
-        Some(creds) => (
-            StatusCode::OK,
-            [
-                (
-                    "cache-control",
-                    "no-store, no-cache, must-revalidate, private",
-                ),
-                ("pragma", "no-cache"),
-            ],
-            Json(creds),
-        )
-            .into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
+    let creds = state
+        .sessions
+        .get_s3_creds(&token, client_ip)
+        .ok_or_else(|| AdminError::not_found("no S3 credentials in this session"))?;
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                "cache-control",
+                "no-store, no-cache, must-revalidate, private",
+            ),
+            ("pragma", "no-cache"),
+        ],
+        Json(creds),
+    )
+        .into_response())
 }
 
 /// PUT /api/admin/session/s3-credentials — store or update S3 credentials.
@@ -1544,26 +1525,22 @@ pub async fn set_s3_session_creds(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AdminJson(creds): AdminJson<S3SessionCredentials>,
-) -> impl IntoResponse {
-    let token = match extract_session_token(&headers) {
-        Some(t) => t,
-        None => return StatusCode::UNAUTHORIZED.into_response(),
-    };
+) -> Result<StatusCode, AdminError<Bare>> {
+    let token = extract_session_token(&headers)
+        .ok_or_else(|| AdminError::status(StatusCode::UNAUTHORIZED, "no session"))?;
     state.sessions.set_s3_creds(&token, creds);
-    StatusCode::OK.into_response()
+    Ok(StatusCode::OK)
 }
 
 /// DELETE /api/admin/session/s3-credentials — clear S3 credentials (disconnect).
 pub async fn clear_s3_session_creds(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-) -> impl IntoResponse {
-    let token = match extract_session_token(&headers) {
-        Some(t) => t,
-        None => return StatusCode::UNAUTHORIZED.into_response(),
-    };
+) -> Result<StatusCode, AdminError<Bare>> {
+    let token = extract_session_token(&headers)
+        .ok_or_else(|| AdminError::status(StatusCode::UNAUTHORIZED, "no session"))?;
     state.sessions.clear_s3_creds(&token);
-    StatusCode::OK.into_response()
+    Ok(StatusCode::OK)
 }
 
 #[cfg(test)]
