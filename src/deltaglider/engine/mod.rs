@@ -1667,7 +1667,28 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.storage.get_delta(bucket, prefix, filename).await
     }
 
-    /// Write a delta blob + metadata verbatim into a deltaspace.
+    /// The cross-instance hold of the enclosing [`Self::with_dest_prefix_lock`]
+    /// for a raw `what` write. Outside it: an inert guard single-instance
+    /// (the in-process lock is the whole story), a refusal multi-instance
+    /// (the write would be unfenced against a reference nobody holds).
+    fn held_reference_lock(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        what: &str,
+    ) -> Result<Arc<ReferenceLockGuard>, StorageError> {
+        match HELD_REFERENCE_LOCK.try_with(Arc::clone) {
+            Ok(held) => Ok(held),
+            Err(_) if self.reference_lock.is_none() => Ok(Arc::new(ReferenceLockGuard::inert())),
+            Err(_) => Err(StorageError::Other(format!(
+                "{what} write to {bucket}/{prefix} outside the deltaspace lock"
+            ))),
+        }
+    }
+
+    /// Write a delta blob + metadata verbatim into a deltaspace. Call it
+    /// inside [`Self::with_dest_prefix_lock`]; outside it, multi-instance
+    /// refuses.
     pub async fn put_delta_raw(
         &self,
         bucket: &str,
@@ -1678,9 +1699,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<(), StorageError> {
         // Inside `with_dest_prefix_lock`: the delta is only valid against the
         // reference the held cross-instance lock protects.
-        let held = HELD_REFERENCE_LOCK
-            .try_with(Arc::clone)
-            .unwrap_or_else(|_| Arc::new(ReferenceLockGuard::inert()));
+        let held = self.held_reference_lock(bucket, prefix, "delta")?;
         held.put_delta(&*self.storage, bucket, prefix, filename, data, metadata)
             .await
             .map_err(engine_to_storage)?;
@@ -1727,15 +1746,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         data: &[u8],
         metadata: &FileMetadata,
     ) -> Result<(), StorageError> {
-        let held = match HELD_REFERENCE_LOCK.try_with(Arc::clone) {
-            Ok(held) => held,
-            Err(_) if self.reference_lock.is_none() => Arc::new(ReferenceLockGuard::inert()),
-            Err(_) => {
-                return Err(StorageError::Other(format!(
-                    "reference write to {bucket}/{prefix} outside the deltaspace lock"
-                )))
-            }
-        };
+        let held = self.held_reference_lock(bucket, prefix, "reference")?;
         held.put_reference(&*self.storage, bucket, prefix, data, metadata)
             .await
             .map_err(engine_to_storage)
@@ -3794,6 +3805,27 @@ mod reference_lock_hold_tests {
             .put_reference_raw("releases", "v1", b"abc", &meta)
             .await
             .is_err());
+        // The same for a raw delta (review 4 coordination-5): outside the
+        // lock it would be an unfenced write against an unheld reference.
+        let delta_meta = FileMetadata::new_delta(
+            "app.zip".into(),
+            "00".repeat(32),
+            "00".repeat(16),
+            3,
+            "v1/reference.bin".into(),
+            "00".repeat(32),
+            3,
+            None,
+        );
+        let err = engine
+            .put_delta_raw("releases", "v1", "app.zip", b"abc", &delta_meta)
+            .await
+            .expect_err("a raw delta outside the deltaspace lock is refused");
+        assert!(
+            err.to_string().contains("outside the deltaspace lock"),
+            "{err}"
+        );
+        assert_eq!(lock.acquires.load(Ordering::SeqCst), 1, "no lock taken");
 
         // A lock that cannot be taken: the closure never runs.
         let busy = Arc::new(ScriptedLock {
