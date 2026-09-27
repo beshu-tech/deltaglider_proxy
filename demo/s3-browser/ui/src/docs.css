@@ -83,11 +83,18 @@
 .docs-content h4 + p { margin-top: 0; }
 
 /* Italic sub-lede pattern seen in every doc (`*One-line summary.*`). */
-.docs-content h1 + p > em:first-child:only-child {
+.docs-content h1 + p > em:first-child:only-child,
+.docs-content h1 + .docs-toc-inline + p > em:first-child:only-child {
   display: block;
   color: var(--docs-toc-text);
   font-size: 16px;
   margin-top: -8px;
+}
+
+@media (max-width: 768px) {
+  .docs-content h1 { font-size: 30px; }
+  .docs-content h2 { font-size: 24px; margin-top: 40px; }
+  .docs-content h3 { font-size: 19px; }
 }
 
 /* ── Paragraphs and rhythm ────────────────────────────────────── */
@@ -100,13 +107,16 @@
 
 /* ── Links ────────────────────────────────────────────────────── */
 
+/* Underlined, so a link never reads like the teal inline-code chips. */
 .docs-content a {
   color: var(--docs-link);
-  text-decoration: none;
-  border-bottom: 1px solid transparent;
-  transition: border-color 0.15s;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+  text-decoration-color: color-mix(in srgb, var(--docs-link) 45%, transparent);
+  transition: text-decoration-color 0.15s;
 }
-.docs-content a:hover { border-bottom-color: var(--docs-link); }
+.docs-content a:hover { text-decoration-color: var(--docs-link); }
 
 /* ── Code blocks ──────────────────────────────────────────────── */
 
@@ -168,19 +178,20 @@
   background: var(--docs-table-stripe);
 }
 
-/* ── Blockquotes ──────────────────────────────────────────────── */
-
+/* ── Blockquotes → callouts ───────────────────────────────────── */
+/* Upright body text: a callout is often several sentences, and a long italic
+ * run is hard to read. Same shape as the website's callout. */
 .docs-content blockquote {
+  border: 1px solid var(--docs-border);
   border-left: 3px solid var(--docs-link);
+  border-radius: 0 8px 8px 0;
   margin: 20px 0 0 0;
-  padding: 4px 20px;
+  padding: 4px 18px;
   background: var(--docs-blockquote-bg);
-  color: var(--docs-toc-text);
-  font-style: italic;
+  color: var(--docs-text);
 }
 .docs-content blockquote p { margin: 12px 0; }
 .docs-content blockquote p:first-child { margin-top: 12px; }
-.docs-content blockquote em { font-style: normal; font-weight: 600; }
 
 /* ── Lists ────────────────────────────────────────────────────── */
 

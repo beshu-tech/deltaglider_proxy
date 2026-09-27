@@ -21,6 +21,15 @@ interface Props {
  * Sort within each group uses the `order` field from the docs bundle,
  * not the title — titles change, order stays stable.
  */
+/** Both hero shots share one frame, so a tall and a wide screenshot line up. */
+const HERO_IMG = {
+  width: '100%',
+  display: 'block',
+  aspectRatio: '16 / 10',
+  objectFit: 'cover',
+  objectPosition: 'top left',
+} as const;
+
 export default function DocsLanding({ bundle, onSelectDoc }: Props) {
   const colors = useColors();
   // Same breakpoint as the docs sidebar's `hide-mobile` (768px). With the
@@ -90,10 +99,10 @@ export default function DocsLanding({ bundle, onSelectDoc }: Props) {
         style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 40 }}
       >
         <Lightbox caption="S3 file browser with compression indicators and bulk operations">
-          <img src="/_/screenshots/filebrowser.jpg" alt="Object Browser" style={{ width: '100%', display: 'block' }} />
+          <img src="/_/screenshots/filebrowser.jpg" alt="Object Browser" style={HERO_IMG} />
         </Lightbox>
         <Lightbox caption="Storage analytics — per-bucket savings and cost estimation">
-          <img src="/_/screenshots/analytics.jpg" alt="Analytics" style={{ width: '100%', display: 'block' }} />
+          <img src="/_/screenshots/analytics.jpg" alt="Analytics" style={HERO_IMG} />
         </Lightbox>
       </div>
 
