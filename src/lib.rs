@@ -228,6 +228,386 @@ pub(crate) mod source_scan {
     }
 }
 
+/// The served section schemas (`GET /config/defaults?section=`, `config
+/// schema`, the admin YAML editor) must accept the YAML the loader accepts.
+/// A small draft-07 checker (the subset schemars emits) runs the product
+/// docs' `# validate` blocks, the prod-shape fixture and the example's
+/// lifecycle block against them.
+#[cfg(test)]
+mod schema_conformance {
+    use serde_json::Value;
+
+    fn resolve<'a>(root: &'a Value, s: &'a Value) -> &'a Value {
+        match s.get("$ref").and_then(Value::as_str) {
+            Some(r) => {
+                let name = r.trim_start_matches("#/definitions/");
+                resolve(root, &root["definitions"][name])
+            }
+            None => s,
+        }
+    }
+
+    fn type_ok(t: &str, v: &Value) -> bool {
+        match t {
+            "null" => v.is_null(),
+            "boolean" => v.is_boolean(),
+            "string" => v.is_string(),
+            "integer" => v.is_i64() || v.is_u64(),
+            "number" => v.is_number(),
+            "array" => v.is_array(),
+            "object" => v.is_object(),
+            _ => true,
+        }
+    }
+
+    /// Errors of `v` against `schema` (empty = valid).
+    pub(crate) fn check(root: &Value, schema: &Value, v: &Value, path: &str) -> Vec<String> {
+        let s = resolve(root, schema);
+        if s == &Value::Bool(true) {
+            return vec![];
+        }
+        let mut errs = Vec::new();
+        if let Some(t) = s.get("type") {
+            let ok = match t {
+                Value::String(t) => type_ok(t, v),
+                Value::Array(ts) => ts.iter().filter_map(Value::as_str).any(|t| type_ok(t, v)),
+                _ => true,
+            };
+            if !ok {
+                return vec![format!("{path}: {v} is not of type {t}")];
+            }
+        }
+        if let Some(Value::Array(allowed)) = s.get("enum") {
+            if !allowed.contains(v) {
+                errs.push(format!("{path}: {v} is not one of {allowed:?}"));
+            }
+        }
+        if let (Some(p), Some(text)) = (s.get("pattern").and_then(Value::as_str), v.as_str()) {
+            if !regex_lite::Regex::new(p).unwrap().is_match(text) {
+                errs.push(format!("{path}: {v} does not match {p}"));
+            }
+        }
+        if let Some(c) = s.get("const") {
+            if c != v {
+                errs.push(format!("{path}: {v} is not {c}"));
+            }
+        }
+        for key in ["anyOf", "oneOf"] {
+            if let Some(Value::Array(alts)) = s.get(key) {
+                let passing = alts
+                    .iter()
+                    .filter(|a| check(root, a, v, path).is_empty())
+                    .count();
+                if passing == 0 || (key == "oneOf" && passing > 1) {
+                    errs.push(format!(
+                        "{path}: {v} matches {passing} of the {key} branches"
+                    ));
+                }
+            }
+        }
+        if let Some(Value::Array(all)) = s.get("allOf") {
+            for a in all {
+                errs.extend(check(root, a, v, path));
+            }
+        }
+        if let Value::Object(map) = v {
+            let props = s.get("properties").and_then(Value::as_object);
+            if let Some(Value::Array(req)) = s.get("required") {
+                for r in req.iter().filter_map(Value::as_str) {
+                    if !map.contains_key(r) {
+                        errs.push(format!("{path}: missing required `{r}`"));
+                    }
+                }
+            }
+            for (k, val) in map {
+                let sub = format!("{path}.{k}");
+                match props.and_then(|p| p.get(k)) {
+                    Some(ps) => errs.extend(check(root, ps, val, &sub)),
+                    None => match s.get("additionalProperties") {
+                        Some(Value::Bool(false)) => errs.push(format!("{sub}: unknown field")),
+                        Some(ap @ Value::Object(_)) => errs.extend(check(root, ap, val, &sub)),
+                        _ => {}
+                    },
+                }
+            }
+        }
+        if let (Value::Array(items), Some(is)) = (v, s.get("items")) {
+            for (i, item) in items.iter().enumerate() {
+                errs.extend(check(root, is, item, &format!("{path}[{i}]")));
+            }
+        }
+        errs
+    }
+
+    fn section_schema(name: &str) -> Value {
+        use crate::config_sections::*;
+        serde_json::to_value(match name {
+            "admission" => schemars::schema_for!(AdmissionSection),
+            "access" => schemars::schema_for!(AccessSection),
+            "storage" => schemars::schema_for!(StorageSection),
+            "advanced" => schemars::schema_for!(AdvancedSection),
+            other => panic!("not a section: {other}"),
+        })
+        .unwrap()
+    }
+
+    /// Errors of a sectioned YAML document against the section schemas.
+    fn check_document(label: &str, yaml: &str) -> Vec<String> {
+        let doc: Value = serde_yaml::from_str(yaml).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let Value::Object(map) = doc else {
+            return vec![];
+        };
+        let mut errs = Vec::new();
+        for (section, body) in &map {
+            let schema = section_schema(section);
+            errs.extend(check(
+                &schema,
+                &schema,
+                body,
+                &format!("{label}: {section}"),
+            ));
+        }
+        errs
+    }
+
+    /// `# validate` blocks of `docs/product` (what `check-docs-yaml-examples.sh`
+    /// lints), as `(file:line, yaml)`.
+    fn docs_validate_blocks() -> Vec<(String, String)> {
+        fn md_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    md_files(&p, out);
+                } else if p.extension().is_some_and(|x| x == "md") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        md_files(&crate::source_scan::root().join("docs/product"), &mut files);
+        let mut out = Vec::new();
+        for f in files {
+            let text = std::fs::read_to_string(&f).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            let mut i = 0;
+            while i + 1 < lines.len() {
+                let fence = lines[i];
+                let indent = fence.len() - fence.trim_start().len();
+                if fence.trim() == "```yaml" && lines[i + 1].trim() == "# validate" {
+                    let mut body = String::new();
+                    let mut j = i + 2;
+                    while j < lines.len() && !lines[j].trim_start().starts_with("```") {
+                        body.push_str(lines[j].get(indent..).unwrap_or(""));
+                        body.push('\n');
+                        j += 1;
+                    }
+                    out.push((format!("{}:{}", crate::source_scan::rel(&f), i + 1), body));
+                    i = j;
+                }
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn served_schemas_accept_the_documented_yaml() {
+        let blocks = docs_validate_blocks();
+        assert!(
+            blocks.len() > 10,
+            "found the docs blocks ({})",
+            blocks.len()
+        );
+        let mut errs = Vec::new();
+        for (label, yaml) in &blocks {
+            errs.extend(check_document(label, yaml));
+        }
+        let fixture = std::fs::read_to_string(
+            crate::source_scan::root().join("tests/fixtures/prod_shape_config.yaml"),
+        )
+        .unwrap();
+        errs.extend(check_document("prod_shape_config.yaml", &fixture));
+        assert!(
+            errs.is_empty(),
+            "schema refuses valid YAML:\n{}",
+            errs.join("\n")
+        );
+    }
+
+    /// The example's commented `lifecycle:` block (every action shape).
+    #[test]
+    fn served_schema_accepts_the_example_lifecycle_block() {
+        let example = std::fs::read_to_string(
+            crate::source_scan::root().join("deltaglider_proxy.example.yaml"),
+        )
+        .unwrap();
+        let mut body = String::from("storage:\n");
+        let mut inside = false;
+        for line in example.lines() {
+            if line == "  # lifecycle:" {
+                inside = true;
+            } else if inside && !(line == "  #" || line.starts_with("  #   ")) {
+                break;
+            }
+            if inside {
+                body.push_str("  ");
+                body.push_str(line.strip_prefix("  # ").unwrap_or(""));
+                body.push('\n');
+            }
+        }
+        assert!(body.contains("retain-newest"), "found the block:\n{body}");
+        // The loader accepts it ...
+        let parsed: crate::config_sections::StorageSection =
+            serde_yaml::from_str(body.trim_start_matches("storage:\n")).unwrap();
+        assert_eq!(parsed.lifecycle.rules.len(), 3);
+        // ... and so must the schema.
+        let errs = check_document("example lifecycle", &body);
+        assert!(
+            errs.is_empty(),
+            "schema refuses valid YAML:\n{}",
+            errs.join("\n")
+        );
+    }
+
+    /// Every value a custom-serde type SERIALIZES to (what the canonical
+    /// export writes and the editor then shows) validates.
+    #[test]
+    fn served_schema_accepts_every_lifecycle_action_form() {
+        use crate::config_sections::*;
+        let actions = [
+            LifecycleAction::Delete,
+            LifecycleAction::Transition(LifecycleTransitionAction {
+                destination: LifecycleDestination {
+                    bucket: "releases".into(),
+                    prefix: "cold/".into(),
+                },
+                delete_source_after_success: true,
+            }),
+            LifecycleAction::RetainNewest(LifecycleRetainNewestAction {
+                count: 3,
+                qualify: LifecycleQualifySpec {
+                    min_size_bytes: Some(1),
+                    min_age: Some("1h".into()),
+                },
+                protect_younger_than: Some("1d".into()),
+            }),
+        ];
+        let schema = serde_json::to_value(schemars::schema_for!(LifecycleAction)).unwrap();
+        for a in actions {
+            let v = serde_json::to_value(&a).unwrap();
+            let errs = check(&schema, &schema, &v, "action");
+            assert!(errs.is_empty(), "{v}: {errs:?}");
+        }
+        // And the schema still refuses what the loader refuses.
+        for bad in [
+            serde_json::json!("archive-please"),
+            serde_json::json!({"type": "transition"}),
+            serde_json::json!({"type": "retain-newest"}),
+        ] {
+            assert!(
+                !check(&schema, &schema, &bad, "action").is_empty(),
+                "{bad} passes"
+            );
+        }
+    }
+
+    /// `lenient::bool_or_string` fields load `"true"` / `"false"` strings
+    /// too (an `${env:…}` value arrives as one); the schema says so.
+    #[test]
+    fn served_schema_accepts_string_bools_the_loader_accepts() {
+        let yaml = r#"
+storage:
+  backends:
+    - name: aws-dr
+      type: s3
+      region: eu-central-1
+      force_path_style: "true"
+      allow_local: "false"
+      encryption:
+        mode: sse-kms
+        kms_key_id: alias/dgp
+        bucket_key_enabled: "false"
+"#;
+        let doc: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        let _: crate::config_sections::StorageSection =
+            serde_yaml::from_value(doc["storage"].clone()).expect("the loader accepts it");
+        let errs = check_document("string bools", yaml);
+        assert!(
+            errs.is_empty(),
+            "schema refuses valid YAML:\n{}",
+            errs.join("\n")
+        );
+        let bad = yaml.replace("\"false\"\n      encryption", "\"nope\"\n      encryption");
+        assert!(
+            !check_document("bad bool", &bad).is_empty(),
+            "a non-bool string passes"
+        );
+    }
+
+    /// The class guard: a type with a hand-written `Deserialize` (or a
+    /// field with a custom `deserialize_with`) accepts a wire form that a
+    /// derived schema does not describe, so it carries its own schema.
+    #[test]
+    fn custom_deserializers_carry_their_own_schema() {
+        let sources = crate::source_scan::prod_sources("src");
+        let all: String = sources.iter().map(|(_, t)| t.as_str()).collect();
+        let mut offenders = Vec::new();
+        for (rel, text) in &sources {
+            let prod = crate::source_scan::prod_text(text);
+            for part in prod.split("impl<'de> Deserialize<'de> for ").skip(1) {
+                let ty: String = part
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                let derived = prod.contains(&format!("JsonSchema)]\npub enum {ty} "))
+                    || prod.contains(&format!("JsonSchema)]\npub struct {ty} "));
+                let own = all.contains(&format!("JsonSchema for {ty} "));
+                if derived || !own {
+                    offenders.push(format!("{rel}: {ty}"));
+                }
+            }
+            let custom = prod
+                .matches("deserialize_with = \"lenient::bool_or_string\"")
+                .count();
+            let schema = prod
+                .matches("schema_with = \"lenient::bool_or_string_schema\"")
+                .count();
+            if custom != schema {
+                offenders.push(format!(
+                    "{rel}: {custom} bool_or_string fields, {schema} schemas"
+                ));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a custom deserializer without a matching schema: {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn checker_truth_table() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["a"],
+            "additionalProperties": false,
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"oneOf": [{"type": "string", "enum": ["x"]}, {"$ref": "#/definitions/D"}]}
+            },
+            "definitions": {"D": {"type": "object", "properties": {"k": {"type": "boolean"}}}}
+        });
+        let ok = |v: Value| check(&schema, &schema, &v, "$").is_empty();
+        assert!(ok(serde_json::json!({"a": 1})));
+        assert!(ok(serde_json::json!({"a": 1, "b": "x"})));
+        assert!(ok(serde_json::json!({"a": 1, "b": {"k": true}})));
+        assert!(!ok(serde_json::json!({})), "required");
+        assert!(!ok(serde_json::json!({"a": "1"})), "type");
+        assert!(!ok(serde_json::json!({"a": 1, "c": 1})), "unknown field");
+        assert!(!ok(serde_json::json!({"a": 1, "b": "y"})), "enum");
+        assert!(!ok(serde_json::json!({"a": 1, "b": {"k": 1}})), "ref");
+    }
+}
+
 /// Source guards: rules that a unit test cannot express per call site.
 #[cfg(test)]
 mod source_guards {
@@ -592,12 +972,8 @@ mod source_guards {
         );
         let example =
             std::fs::read_to_string(root().join("deltaglider_proxy.example.yaml")).unwrap();
-        // A capitalised name is a variant of an enum whose serde form the
-        // derived schema does not model (`LifecycleAction`: the YAML is
-        // `type: transition`), not a YAML key.
         let missing: Vec<&String> = names
             .iter()
-            .filter(|n| !n.starts_with(|c: char| c.is_ascii_uppercase()))
             .filter(|n| !example.contains(&format!("{n}:")))
             .collect();
         assert!(

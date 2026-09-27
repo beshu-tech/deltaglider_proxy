@@ -82,7 +82,6 @@ storage:
   #       expire_after: "90d"
   #       include_globs: ["builds/**/*.zip"]
   #       exclude_globs: [".deltaglider/**"]
-
   #
   #     # Count-based retention: keep the newest `count` qualifying objects.
   #     - name: keep-last-nightlies

@@ -37,6 +37,21 @@ pub(crate) fn bool_or_string<'de, D: de::Deserializer<'de>>(d: D) -> Result<bool
     }
 }
 
+/// `schema_with` for a [`bool_or_string`] field: the schema accepts what
+/// the deserializer accepts: a bool, or a `true` / `false` string
+/// (the three spellings of [`parse_bool`], surrounding spaces allowed).
+pub(crate) fn bool_or_string_schema(
+    _: &mut schemars::gen::SchemaGenerator,
+) -> schemars::schema::Schema {
+    serde_json::from_value(serde_json::json!({
+        "anyOf": [
+            { "type": "boolean" },
+            { "type": "string", "pattern": "^\\s*(true|True|TRUE|false|False|FALSE)\\s*$" }
+        ]
+    }))
+    .expect("a well-formed schema")
+}
+
 /// The tag the expander puts on a whole-scalar env value.
 pub(crate) const ENV_REF_TAG: &str = "!envref";
 

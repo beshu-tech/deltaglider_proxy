@@ -499,7 +499,7 @@ fn default_lifecycle_max_failures() -> u32 {
 
 /// Lifecycle action. `delete` preserves the v1 shape; transition/archive uses
 /// a map so destination and source-delete semantics stay explicit.
-#[derive(Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum LifecycleAction {
     #[default]
     Delete,
@@ -633,6 +633,56 @@ impl Serialize for LifecycleAction {
             }
             .serialize(serializer),
         }
+    }
+}
+
+/// The schema of the wire form that `Serialize`/`Deserialize` below
+/// read and write (`delete`, or a map tagged by `type:`). A derived
+/// schema described the Rust variants (`Transition: {...}`), so the admin
+/// YAML editor flagged every valid lifecycle action.
+impl JsonSchema for LifecycleAction {
+    fn schema_name() -> String {
+        "LifecycleAction".to_string()
+    }
+
+    fn json_schema(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+        let destination = gen.subschema_for::<LifecycleDestination>();
+        let qualify = gen.subschema_for::<LifecycleQualifySpec>();
+        serde_json::from_value(serde_json::json!({
+            "oneOf": [
+                { "type": "string", "enum": ["delete"] },
+                {
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": { "type": { "type": "string", "enum": ["delete"] } },
+                    "additionalProperties": false
+                },
+                {
+                    "description": "Copy expired objects to `destination` (`archive` is an alias).",
+                    "type": "object",
+                    "required": ["type", "destination"],
+                    "properties": {
+                        "type": { "type": "string", "enum": ["transition", "archive"] },
+                        "destination": destination,
+                        "delete_source_after_success": { "type": "boolean" }
+                    },
+                    "additionalProperties": false
+                },
+                {
+                    "description": "Keep the newest `count` qualifying objects, delete the rest.",
+                    "type": "object",
+                    "required": ["type", "count"],
+                    "properties": {
+                        "type": { "type": "string", "enum": ["retain-newest"] },
+                        "count": { "type": "integer", "minimum": 1 },
+                        "qualify": qualify,
+                        "protect_younger_than": { "type": "string" }
+                    },
+                    "additionalProperties": false
+                }
+            ]
+        }))
+        .expect("a well-formed schema")
     }
 }
 

@@ -1035,6 +1035,7 @@ pub enum BackendEncryptionConfig {
             default = "crate::types::default_true",
             deserialize_with = "lenient::bool_or_string"
         )]
+        #[schemars(schema_with = "lenient::bool_or_string_schema")]
         bucket_key_enabled: bool,
         /// Decrypt-only shim: keep reading objects written with the
         /// old proxy-mode key after migrating to SSE-KMS.
@@ -1310,6 +1311,7 @@ pub enum BackendConfig {
             default = "default_force_path_style",
             deserialize_with = "lenient::bool_or_string"
         )]
+        #[schemars(schema_with = "lenient::bool_or_string_schema")]
         force_path_style: bool,
 
         /// AWS access key ID (optional, can use env/instance credentials)
@@ -1334,6 +1336,7 @@ pub enum BackendConfig {
             skip_serializing_if = "is_false",
             deserialize_with = "lenient::bool_or_string"
         )]
+        #[schemars(schema_with = "lenient::bool_or_string_schema")]
         allow_local: bool,
 
         /// Session token of temporary (STS) credentials. Runtime only:

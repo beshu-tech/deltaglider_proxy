@@ -336,6 +336,16 @@ before that removal, and then fail to create its file, so the client got
 is gone, and tries again. The reference write also no longer re-creates a
 bucket that a concurrent request deleted.
 
+### Fixed — The YAML editor accepts every valid lifecycle action
+
+The section schema that the admin YAML editor and `config schema` use
+described the lifecycle `action` as the Rust variants (`Transition: {…}`),
+not as the YAML that the proxy reads (`action: delete`, or a map with
+`type: transition` or `type: retain-newest`). So the editor marked every
+valid lifecycle action as an error. The schema now describes the YAML
+form. Also, `force_path_style`, `allow_local` and `bucket_key_enabled`
+accept the strings `"true"` and `"false"` (as the loader does) in the schema.
+
 ### Fixed — A resumed re-encrypt or backfill counts the whole bucket
 
 A re-encrypt or metadata-backfill job that restarts during its `counting`
