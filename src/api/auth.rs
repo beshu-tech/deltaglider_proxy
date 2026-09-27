@@ -945,7 +945,10 @@ pub async fn sigv4_auth_middleware(
             let user = match index.get(&params.access_key) {
                 Some(u) => u,
                 None => {
-                    debug!("SigV4: unknown access key '{}'", &params.access_key);
+                    debug!(
+                        "SigV4: {}",
+                        crate::security::unknown_access_key_label(&params.access_key)
+                    );
                     log_auth_failure("invalid_access_key");
                     return Err(S3Error::AccessDenied.into_response());
                 }

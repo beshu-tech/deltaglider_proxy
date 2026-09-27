@@ -3636,3 +3636,50 @@ async fn open_access_serves_unsigned_and_key_equals_secret_only() {
         "{err:?}"
     );
 }
+
+/// A value typed into the access-key field of a login form may be a secret
+/// (a pasted secret key in the wrong field). A failed login with an access
+/// key that no user has must not put that value in the audit ring, which the
+/// admin GUI shows. A known key id is no secret and stays readable.
+#[tokio::test]
+async fn failed_logins_never_store_an_unknown_access_key_verbatim() {
+    let server = TestServer::builder()
+        .auth("testkey", "testsecret")
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+    let known = create_user(&admin, &server, "dana", vec![]).await;
+    let pasted = "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY42";
+    let http = reqwest::Client::new();
+    for path in ["login-as", "session/browser-connect"] {
+        for akid in [pasted, known.access_key_id.as_str()] {
+            let r = http
+                .post(format!("{endpoint}/_/api/admin/{path}"))
+                .json(
+                    &json!({ "access_key_id": akid, "secret_access_key": "nope", "endpoint": "" }),
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{path} {akid}");
+        }
+    }
+    let audit = admin
+        .get(format!("{endpoint}/_/api/admin/audit?limit=100"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(audit.contains("login_failed"), "{audit}");
+    assert!(
+        !audit.contains(pasted),
+        "the audit ring stores the attempted value verbatim: {audit}"
+    );
+    assert!(
+        audit.contains(&known.access_key_id),
+        "a known access key id stays readable: {audit}"
+    );
+}

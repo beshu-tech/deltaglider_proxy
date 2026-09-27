@@ -251,6 +251,16 @@ pub fn str_prefix(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// How a log line or the audit ring names an access key id that matches
+/// no user. Such a value may be a secret key pasted into the wrong login
+/// field, so it is never kept verbatim: a short SHA-256 prefix still lets
+/// an operator see that several attempts used the same value.
+pub fn unknown_access_key_label(attempted: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = hex::encode(Sha256::digest(attempted.as_bytes()));
+    format!("unknown-key:{}", &digest[..12])
+}
+
 /// Canonical S3 bucket-name validator. The CLI URL parser
 /// (`cli/s3_url.rs`) collapses to `validate_bucket_name(name).is_ok()`;
 /// the live S3 request path delegates bucket-name syntax to the upstream
@@ -589,6 +599,20 @@ impl aws_smithy_runtime_api::client::dns::ResolveDns for SdkSsrfGuardedResolver 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unknown_access_key_label_never_contains_the_value() {
+        use super::unknown_access_key_label;
+        let pasted = "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY";
+        let label = unknown_access_key_label(pasted);
+        assert!(
+            label.starts_with("unknown-key:") && label.len() == 24,
+            "{label}"
+        );
+        assert!(!label.contains(&pasted[..8]));
+        assert_eq!(label, unknown_access_key_label(pasted), "stable");
+        assert_ne!(label, unknown_access_key_label("other"));
+    }
+
     #[test]
     fn str_prefix_cuts_on_a_char_boundary() {
         assert_eq!(str_prefix("abcdef", 3), "abc");

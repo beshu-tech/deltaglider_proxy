@@ -354,6 +354,14 @@ So the total covered only the objects after the cursor, and the progress
 bar reached 99 % long before the end. Now the resumed count starts from
 the count that was saved with the cursor.
 
+### Fixed — A failed login never stores an unknown access key as typed
+
+A failed `login-as` or browser connect with an access key that no user
+has put the typed value into the audit log and the admin GUI's audit
+view. That value can be a secret key pasted into the wrong field. Now the
+entry names it `unknown-key:` and a short hash, so repeated attempts with
+one value still group. A known access key id stays readable.
+
 ### Fixed — The bootstrap login no longer hands the browser a refused key pair
 
 With declarative IAM users, the S3 API refuses the bootstrap pair, but the

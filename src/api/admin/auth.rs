@@ -910,12 +910,13 @@ pub async fn login_as(
         Some(u) => u,
         None => {
             guard.record_failure();
+            // Never the attempted value itself: it may be a pasted secret.
+            let label = crate::security::unknown_access_key_label(&body.access_key_id);
             tracing::warn!(
-                "Failed login-as attempt from {} (unknown access key '{}')",
-                guard.ip(),
-                body.access_key_id
+                "Failed login-as attempt from {} (unknown access key, {label})",
+                guard.ip()
             );
-            audit_log("login_failed", "", &body.access_key_id, &req_headers);
+            audit_log("login_failed", "", &label, &req_headers);
             return Err(StatusCode::FORBIDDEN.into());
         }
     };
@@ -1016,12 +1017,12 @@ pub async fn browser_session_connect(
 
     let Some(user) = index.get(access_key_id) else {
         guard.record_failure();
+        let label = crate::security::unknown_access_key_label(access_key_id);
         tracing::warn!(
-            "Failed browser-session-connect from {} (unknown access key '{}')",
-            guard.ip(),
-            access_key_id
+            "Failed browser-session-connect from {} (unknown access key, {label})",
+            guard.ip()
         );
-        audit_log("login_failed", "", access_key_id, &req_headers);
+        audit_log("login_failed", "", &label, &req_headers);
         return Err(StatusCode::FORBIDDEN.into());
     };
 
