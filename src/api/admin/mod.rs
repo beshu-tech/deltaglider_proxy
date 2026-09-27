@@ -283,7 +283,7 @@ where
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
     f(&db).map_err(|e| {
         let e = AdminError::from(e);

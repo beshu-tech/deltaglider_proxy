@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed — A missing config DB answers 503 on every admin endpoint
+
+When an instance has no config DB open, the IAM, group, external-auth,
+backup, declarative-IAM and maintenance-job endpoints answered
+`404 config DB not available` (maintenance: `config DB unavailable`). A
+`404` says that the resource does not exist, but here the service that holds
+it is not available. Now every such endpoint answers `503` with the message
+`config DB not available`.
+
 ### Changed — Only a conditional GET reads fresh metadata
 
 A GET request with `If-Match`, `If-None-Match`, `If-Modified-Since` or

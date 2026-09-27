@@ -125,7 +125,7 @@ async fn check_job_request(
     let db = state
         .config_db
         .as_ref()
-        .ok_or(AdminError::not_found("config DB unavailable"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let engine = state.s3_state.engine.load().clone();
     let real = engine
         .list_bucket_origins()
@@ -330,7 +330,7 @@ pub async fn start_migrate(
     let db = state
         .config_db
         .as_ref()
-        .ok_or(AdminError::not_found("config DB unavailable"))?;
+        .ok_or_else(AdminError::no_config_db)?;
 
     // The bucket must actually exist (the old handler skipped this check).
     let engine = state.s3_state.engine.load().clone();
@@ -461,7 +461,7 @@ pub async fn cancel_job(
     let db = state
         .config_db
         .as_ref()
-        .ok_or(AdminError::not_found("config DB unavailable"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let (outcome, job) = {
         let db = db.lock().await;
         let job = db.maintenance_job_by_id(id)?;

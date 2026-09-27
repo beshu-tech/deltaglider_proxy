@@ -571,7 +571,7 @@ pub async fn export_declarative_iam(
     let db_arc = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not initialised — nothing to export"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db_arc.lock().await;
     // `include_secrets=true` produces a lossless, round-trippable full-IAM file
     // (the "Export full IAM (YAML)" affordance). The file then contains LIVE
@@ -696,9 +696,10 @@ pub async fn validate_declarative_iam(
     State(state): State<Arc<AdminState>>,
     AdminJson(body): AdminJson<ConfigDocumentRequest>,
 ) -> Result<Json<IamImportSummary>, AdminError> {
-    let db_arc = state.config_db.as_ref().ok_or_else(|| {
-        AdminError::not_found("config DB not initialised — IAM import unavailable")
-    })?;
+    let db_arc = state
+        .config_db
+        .as_ref()
+        .ok_or_else(AdminError::no_config_db)?;
     let snapshot = parse_iam_yaml(&body.yaml).map_err(AdminError::invalid)?;
     let db = db_arc.lock().await;
     let diff = crate::iam::preview_declarative_iam(&db, &snapshot)
@@ -713,9 +714,10 @@ pub async fn apply_declarative_iam(
     headers: HeaderMap,
     AdminJson(body): AdminJson<ConfigDocumentRequest>,
 ) -> Result<Json<IamImportSummary>, AdminError> {
-    let db_arc = state.config_db.as_ref().ok_or_else(|| {
-        AdminError::not_found("config DB not initialised — IAM import unavailable")
-    })?;
+    let db_arc = state
+        .config_db
+        .as_ref()
+        .ok_or_else(AdminError::no_config_db)?;
     let snapshot = parse_iam_yaml(&body.yaml).map_err(AdminError::invalid)?;
 
     let db = db_arc.lock().await;

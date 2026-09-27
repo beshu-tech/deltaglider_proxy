@@ -8,6 +8,8 @@ A browser marks each request with a `Sec-Fetch-Site` header, and it adds an `Ori
 
 A request body or query string that the proxy cannot accept gets `400` with a JSON body `{"error": <code>, "message": <text>}`. The message names the field and the rule that the value breaks, for example `dest_prefix: invalid path "../x/": '.' and '..' segments are not allowed`. The code is `invalid_path` for an object key or prefix with a `.` or `..` segment, a leading `/` or a NUL character, `invalid_bucket` for a bucket name that breaks the S3 naming rules, and `invalid_request` for every other bad input, such as a missing field or a body that is not valid JSON. A body sent without the `application/json` content type gets `415` with the same JSON shape.
 
+An endpoint that needs the encrypted config DB (IAM users, groups, external auth, backup, declarative IAM, maintenance jobs) answers `503` with the message `config DB not available` when the instance has no config DB open.
+
 Endpoints documented here are **admin** only. The S3-compatible API lives under `/` and is documented by AWS themselves.
 
 ## Authentication and session

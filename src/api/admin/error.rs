@@ -240,6 +240,34 @@ mod tests {
         assert_eq!(no_db.message(), "config DB not available");
     }
 
+    /// Every handler that finds no config DB answers the one
+    /// [`AdminError::no_config_db`] (503): a hand-written message drifted to
+    /// 404 in some handlers.
+    #[test]
+    fn a_missing_config_db_is_always_no_config_db() {
+        let mut bad = Vec::new();
+        for (file, text) in crate::source_scan::prod_sources("src") {
+            if file == "src/api/admin/error.rs" {
+                continue;
+            }
+            for (n, line) in text.lines().enumerate() {
+                let l = line.to_ascii_lowercase();
+                let names_it = l.contains("\"config db") || l.contains(" config db");
+                let missing = ["not available", "unavailable", "not initialised"]
+                    .iter()
+                    .any(|m| l.contains(m));
+                if line.contains('"') && names_it && missing {
+                    bad.push(format!("{file}:{}: {}", n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "use AdminError::no_config_db():\n{}",
+            bad.join("\n")
+        );
+    }
+
     /// `?` on a DB error keeps the legacy `db_error_reply` answer: the
     /// mapped status and the error's Display text.
     #[test]

@@ -425,7 +425,7 @@ async fn build_iam_backup(state: &Arc<AdminState>) -> Result<IamBackup, AdminErr
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
     let users = db.load_users().inspect_err(|e| {
@@ -1594,10 +1594,8 @@ async fn apply_secrets(
     // subsequent iam.json import carries client_secret too.
     if !secrets.oauth_client_secrets.is_empty() {
         let db = state.config_db.as_ref().ok_or_else(|| {
-            BackupSecretApplyError::new(
-                StatusCode::NOT_FOUND,
-                "config DB is not available for OAuth client-secret restore",
-            )
+            let e = AdminError::<super::error::Text>::no_config_db();
+            BackupSecretApplyError::new(e.status_code(), e.message())
         })?;
         let db = db.lock().await;
         let providers = db.load_auth_providers().unwrap_or_default();
@@ -1640,7 +1638,7 @@ async fn import_backup_iam(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
     // A backup user with the bootstrap key would collide with the bootstrap login.

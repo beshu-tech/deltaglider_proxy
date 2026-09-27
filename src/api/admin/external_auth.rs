@@ -817,7 +817,7 @@ pub async fn test_provider(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
     let provider_config = db.get_auth_provider(id).inspect_err(|e| {
         tracing::error!("Failed to load auth provider {}: {}", id, e);
@@ -875,7 +875,7 @@ pub async fn create_mapping(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
     validate_mapping_rule(&body.match_type, &body.match_value).map_err(AdminError::invalid)?;
@@ -921,7 +921,7 @@ pub async fn update_mapping(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
     let rule = db.update_group_mapping_rule(id, &body).inspect_err(|e| {
@@ -946,7 +946,7 @@ pub async fn delete_mapping(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
     let target = db
         .load_group_mapping_rules()
@@ -986,7 +986,7 @@ pub async fn preview_mapping(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
     let rules = db.load_group_mapping_rules().inspect_err(|e| {
@@ -1034,7 +1034,7 @@ pub async fn sync_memberships(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
     let rules = db.load_group_mapping_rules().unwrap_or_default();

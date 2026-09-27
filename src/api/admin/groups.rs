@@ -69,7 +69,7 @@ pub async fn create_group(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
     if crate::iam::types::is_blank_principal_name(&body.name) {
@@ -141,7 +141,7 @@ pub async fn clone_group(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
     let body = body.map(|Json(body)| body);
     let source = db.get_group_by_id(group_id).inspect_err(|e| {
@@ -191,7 +191,7 @@ pub async fn update_group(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
     // Refuse a RENAME to a blank name; a row that already has one (created
@@ -246,7 +246,7 @@ pub async fn delete_group(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
     let target = group_target(&db, group_id);
 
@@ -272,7 +272,7 @@ pub async fn add_group_member(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
     db.add_user_to_group(group_id, body.user_id)
@@ -307,7 +307,7 @@ pub async fn remove_group_member(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
     db.remove_user_from_group(group_id, user_id)

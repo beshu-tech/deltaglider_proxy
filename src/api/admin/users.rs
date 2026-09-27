@@ -226,7 +226,7 @@ pub async fn create_user(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
     let access_key_id = body
@@ -293,7 +293,7 @@ pub async fn clone_user(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
     let body = body.map(|Json(body)| body);
     let source = db.get_user_by_id(user_id).inspect_err(|e| {
@@ -363,7 +363,7 @@ pub async fn update_user(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
     // Refuse a RENAME to a reserved name. A row that already carries one (an
@@ -424,7 +424,7 @@ pub async fn delete_user(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
     // Capture every revocation identity BEFORE the rows disappear: the access
@@ -513,7 +513,7 @@ pub async fn rotate_user_keys(
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
+        .ok_or_else(AdminError::no_config_db)?;
     let db = db.lock().await;
 
     let (new_access_key, new_secret_key) = match body {
