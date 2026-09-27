@@ -342,3 +342,25 @@ async fn test_mode_flip_cycle_preserves_session_and_chain() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// H9: Test Connection mutates nothing, so it answers in declarative mode
+/// too (the GUI keeps the button live there).
+#[tokio::test]
+async fn provider_test_connection_works_in_declarative_mode() {
+    let server = TestServer::builder().auth("IAMMK9", "IAMMS9").build().await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    set_iam_mode(&admin, &ep, "declarative").await;
+    let resp = admin
+        .post(format!("{ep}/_/api/admin/ext-auth/providers/test"))
+        .json(&json!({
+            "client_id": "cid",
+            "issuer_url": "https://this-does-not-exist.invalid",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let result: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(result["success"], false, "{result}");
+}

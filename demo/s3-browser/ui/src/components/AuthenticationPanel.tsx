@@ -3,7 +3,7 @@ import { Button, Typography, Input, Alert, Switch, Divider, Spin, message } from
 import { PlusOutlined, SearchOutlined, CopyOutlined, SafetyOutlined, CheckCircleOutlined, CloseCircleOutlined, SyncOutlined } from '@ant-design/icons';
 import {
   testAuthProvider, previewMapping, syncMemberships,
-  type AuthProvider, type ProviderTestResult,
+  type AuthProvider, type ProviderTestForm, type ProviderTestResult,
 } from '../adminApi';
 import { useIamMode } from '../queries/config';
 import { useAuthProviders, useCreateAuthProvider, useUpdateAuthProvider, useDeleteAuthProvider } from '../queries/authProviders';
@@ -94,11 +94,16 @@ export default function AuthenticationPanel({ onSessionExpired }: Props) {
   // Sync
   const [syncing, setSyncing] = useState(false);
 
-  const handleTest = async (id: number, setTestResult: (r: ProviderTestResult | null) => void, setTesting: (b: boolean) => void) => {
+  const handleTest = async (
+    id: number | null,
+    form: ProviderTestForm,
+    setTestResult: (r: ProviderTestResult | null) => void,
+    setTesting: (b: boolean) => void,
+  ) => {
     setTesting(true);
     setTestResult(null);
     try {
-      const result = await testAuthProvider(id);
+      const result = await testAuthProvider(id, form);
       setTestResult(result);
     } catch (e) {
       setTestResult({ success: false, error: normalizeUiError(e, 'Test failed') });
@@ -467,8 +472,11 @@ interface ProviderFormProps {
   readOnly?: boolean;
   onSaved: () => void;
   onDeleted?: () => void;
+  /** Test the form as it is now (unsaved edits included); `id` null =
+   *  a provider that is not saved yet. */
   onTest: (
-    id: number,
+    id: number | null,
+    form: ProviderTestForm,
     setTestResult: (r: ProviderTestResult | null) => void,
     setTesting: (b: boolean) => void,
   ) => void;
@@ -699,11 +707,20 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
             {isEdit ? 'Save' : 'Create'}
           </Button>
         )}
-        {isEdit && (
-          <Button onClick={() => onTest(provider.id, setTestResult, setTesting)} loading={testing}>
-            Test Connection
-          </Button>
-        )}
+        <Button
+          onClick={() => onTest(provider?.id ?? null, {
+            client_id: formClientId,
+            client_secret: formClientSecret,
+            issuer_url: formIssuerUrl,
+            scopes: formScopes,
+            extra_config: withNetworkPolicy(provider?.extra_config, formAllowLocal, formCaCertPath),
+          }, setTestResult, setTesting)}
+          loading={testing}
+          disabled={!formClientId || !formIssuerUrl}
+          title="Test the values in this form. Nothing is saved."
+        >
+          Test Connection
+        </Button>
         {isEdit && !readOnly && (
           <Button danger onClick={handleDelete}>Delete</Button>
         )}

@@ -167,6 +167,19 @@ cannot change the decision. One answer is now retried that was not before:
 a proxy that has no free delta codec slot. The failure rows show the same
 text as before.
 
+### Fixed — OIDC Test Connection tests the form, also before the first save
+
+Test Connection tested only the saved provider, so an operator had to save
+a change before the proxy could test it, and the create form had no test
+button. `POST /_/api/admin/ext-auth/providers/:id/test` now takes an
+optional JSON body with the form fields, which replace the saved values for
+that test only; a blank `client_secret` keeps the saved secret. The new
+`POST /_/api/admin/ext-auth/providers/test` tests a provider that is not
+saved yet. A provider without a client ID or an issuer URL is now a failed
+test (`200` with `success: false`) instead of an empty `400`. Test
+Connection also works in declarative IAM mode now: it saves nothing, so
+the declarative gate no longer refuses it with `403`.
+
 ### Fixed — A failed full-backup restore changes nothing
 
 A full-backup restore applied the configuration, then the secrets, then the

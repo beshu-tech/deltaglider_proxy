@@ -209,6 +209,63 @@ async fn oidc_login_against_a_private_idp_with_a_private_ca() {
         "the TLS cause is missing: {err}"
     );
 
+    // 2b. H9: Test Connection runs on the unsaved form. The body's fields
+    //     override the saved ones (here: the CA), a blank secret keeps the
+    //     saved one, and the saved provider does not change.
+    let with_ca = json!({ "extra_config": {
+        "allow_local": true, "ca_cert_path": ca_path.display().to_string()
+    }, "client_secret": "" });
+    let r = admin
+        .post(format!("{providers}/{id}/test"))
+        .json(&with_ca)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let test: Value = r.json().await.unwrap();
+    assert_eq!(test["success"], true, "{test}");
+    let test: Value = admin
+        .post(format!("{providers}/{id}/test"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        test["success"], false,
+        "the saved provider is unchanged: {test}"
+    );
+    // A provider that is not saved yet (the create form).
+    let mut unsaved = provider(json!({
+        "allow_local": true, "ca_cert_path": ca_path.display().to_string()
+    }));
+    unsaved["client_secret"] = json!("");
+    let r = admin
+        .post(format!("{providers}/test"))
+        .json(&unsaved)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let test: Value = r.json().await.unwrap();
+    assert_eq!(test["success"], true, "{test}");
+    // A form without a client ID fails the test, as a 200 with the cause.
+    unsaved["client_id"] = json!("");
+    let r = admin
+        .post(format!("{providers}/test"))
+        .json(&unsaved)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let test: Value = r.json().await.unwrap();
+    assert_eq!(test["success"], false, "{test}");
+    assert!(
+        test["error"].as_str().unwrap_or("").contains("client_id"),
+        "{test}"
+    );
+
     // 3. A CA path that does not exist is refused at save time.
     let r = admin
         .put(format!("{providers}/{id}"))

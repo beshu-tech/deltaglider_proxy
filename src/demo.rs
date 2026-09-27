@@ -100,10 +100,6 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
             put(admin::external_auth::update_provider)
                 .delete(admin::external_auth::delete_provider),
         )
-        .route(
-            "/_/api/admin/ext-auth/providers/:id/test",
-            post(admin::external_auth::test_provider),
-        )
         // Group mapping rules.
         .route(
             "/_/api/admin/ext-auth/mappings",
@@ -173,6 +169,16 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
 
     // Full admin GUI only (bootstrap / login-as / OAuth — not browser-lift).
     let admin_gui_protected = Router::new()
+        // Test Connection mutates nothing, so it stays off the
+        // declarative-IAM gate (the GUI keeps it live in that mode).
+        .route(
+            "/_/api/admin/ext-auth/providers/test",
+            post(admin::external_auth::test_unsaved_provider),
+        )
+        .route(
+            "/_/api/admin/ext-auth/providers/:id/test",
+            post(admin::external_auth::test_provider),
+        )
         .route(
             "/_/api/admin/config",
             get(admin::get_config).put(admin::update_config),

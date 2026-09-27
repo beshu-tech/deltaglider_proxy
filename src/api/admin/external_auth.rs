@@ -809,11 +809,134 @@ pub async fn delete_provider(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Body of the Test Connection routes: the provider form as it is now,
+/// saved or not. An absent field keeps the saved value; an absent or blank
+/// `client_secret` keeps the saved secret (the form never shows it). The
+/// form fields that the test does not read are accepted, so the GUI can
+/// send its whole form; an unknown field is refused.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestProviderRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub provider_type: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub priority: Option<i64>,
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+    #[serde(default)]
+    pub scopes: Option<String>,
+    #[serde(default)]
+    pub extra_config: Option<serde_json::Value>,
+}
+
+/// What a Test Connection builds its OIDC client from.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ProviderTestConfig {
+    pub name: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub issuer_url: String,
+    pub scopes: String,
+    pub extra_config: serde_json::Value,
+}
+
+/// Pure: the form over the saved provider (if any). `Err` names the
+/// missing field; the handler answers it as a failed test, not an error.
+pub(crate) fn resolve_provider_test(
+    saved: Option<&crate::config_db::auth_providers::AuthProviderConfig>,
+    form: TestProviderRequest,
+) -> Result<ProviderTestConfig, String> {
+    let non_blank = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    // A field the form sends wins, also a blank one (a cleared field).
+    let pick = |form: Option<String>, saved: Option<&String>| match form {
+        Some(v) => non_blank(Some(v)),
+        None => non_blank(saved.cloned()),
+    };
+    let client_id = pick(form.client_id, saved.and_then(|p| p.client_id.as_ref()))
+        .ok_or("provider has no client_id")?;
+    let issuer_url = pick(form.issuer_url, saved.and_then(|p| p.issuer_url.as_ref()))
+        .ok_or("provider has no issuer_url")?;
+    // Blank = keep: the form never holds the saved secret.
+    let client_secret = non_blank(form.client_secret)
+        .or_else(|| saved.and_then(|p| p.client_secret.clone()))
+        .unwrap_or_default();
+    Ok(ProviderTestConfig {
+        name: form
+            .name
+            .or_else(|| saved.map(|p| p.name.clone()))
+            .unwrap_or_default(),
+        client_id,
+        client_secret,
+        issuer_url,
+        scopes: form
+            .scopes
+            .or_else(|| saved.map(|p| p.scopes.clone()))
+            .unwrap_or_else(|| "openid email profile".to_string()),
+        extra_config: form
+            .extra_config
+            .or_else(|| saved.and_then(|p| p.extra_config.clone()))
+            .unwrap_or(serde_json::json!({})),
+    })
+}
+
+/// The optional JSON body of a test route. Empty = test the saved provider.
+fn test_form(body: &[u8]) -> Result<TestProviderRequest, AdminError<Bare>> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(TestProviderRequest::default());
+    }
+    serde_json::from_slice(body).map_err(|e| AdminError::invalid(format!("test body: {e}")))
+}
+
+/// Run the discovery test. A config the test cannot use is a failed test
+/// (200 `success: false`), like an unreachable issuer.
+async fn run_provider_test(
+    saved: Option<&crate::config_db::auth_providers::AuthProviderConfig>,
+    form: TestProviderRequest,
+) -> crate::iam::external_auth::types::ProviderTestResult {
+    use crate::iam::external_auth::oidc::OidcProvider;
+    let failed = |error: String| crate::iam::external_auth::types::ProviderTestResult {
+        success: false,
+        issuer: None,
+        authorization_endpoint: None,
+        error: Some(error),
+    };
+    let cfg = match resolve_provider_test(saved, form) {
+        Ok(c) => c,
+        Err(e) => return failed(e),
+    };
+    let oidc = OidcProvider::new(
+        cfg.name,
+        cfg.client_id,
+        cfg.client_secret,
+        cfg.issuer_url,
+        cfg.scopes,
+        cfg.extra_config,
+    );
+    oidc.test_connection().await.unwrap_or_else(|e| {
+        tracing::warn!("Provider test failed: {e}");
+        failed(format!("provider test failed: {e}"))
+    })
+}
+
 /// POST /api/admin/ext-auth/providers/:id/test — test provider connectivity.
+/// An optional JSON body ([`TestProviderRequest`]) tests the unsaved form
+/// over the saved provider; nothing is saved.
 pub async fn test_provider(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
+    body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, AdminError<Bare>> {
+    let form = test_form(&body)?;
     let db = state
         .config_db
         .as_ref()
@@ -823,34 +946,16 @@ pub async fn test_provider(
         tracing::error!("Failed to load auth provider {}: {}", id, e);
     })?;
     drop(db);
+    Ok(Json(run_provider_test(Some(&provider_config), form).await))
+}
 
-    // Build a temporary OIDC provider and test it
-    use crate::iam::external_auth::oidc::OidcProvider;
-    let client_id = provider_config
-        .client_id
-        .ok_or_else(|| AdminError::invalid("provider has no client_id"))?;
-    let client_secret = provider_config.client_secret.unwrap_or_default();
-    let issuer_url = provider_config
-        .issuer_url
-        .ok_or_else(|| AdminError::invalid("provider has no issuer_url"))?;
-
-    let oidc = OidcProvider::new(
-        provider_config.name,
-        client_id,
-        client_secret,
-        issuer_url,
-        provider_config.scopes,
-        provider_config
-            .extra_config
-            .unwrap_or(serde_json::json!({})),
-    );
-
-    let result = oidc.test_connection().await.map_err(|e| {
-        tracing::error!("Provider test failed: {}", e);
-        AdminError::internal(format!("provider test failed: {e}"))
-    })?;
-
-    Ok(Json(result))
+/// POST /api/admin/ext-auth/providers/test — test a provider that is not
+/// saved yet (the create form). The body is the form.
+pub async fn test_unsaved_provider(
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, AdminError<Bare>> {
+    let form = test_form(&body)?;
+    Ok(Json(run_provider_test(None, form).await))
 }
 
 // ── Group Mapping Rules (protected) ──
@@ -1417,5 +1522,83 @@ mod tests {
         assert!(c.contains("Max-Age=0"), "{c}");
         assert!(c.contains("Path=/_/api/admin/oauth"), "{c}");
         assert!(c.contains("SameSite=Lax"), "{c}");
+    }
+}
+
+#[cfg(test)]
+mod provider_test_tests {
+    use super::*;
+
+    fn saved() -> crate::config_db::auth_providers::AuthProviderConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": 1, "name": "corp", "provider_type": "oidc", "enabled": true,
+            "priority": 0, "client_id": "saved-cid", "client_secret": "saved-secret",
+            "issuer_url": "https://idp.example", "scopes": "openid",
+            "extra_config": { "allow_local": true },
+            "created_at": "", "updated_at": ""
+        }))
+        .unwrap()
+    }
+
+    fn form(v: serde_json::Value) -> TestProviderRequest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// H9: the form overrides the saved provider field by field, a blank
+    /// secret keeps the saved one, and a missing client id or issuer is a
+    /// test failure message.
+    #[test]
+    fn provider_test_config_truth_table() {
+        let s = saved();
+        let c = resolve_provider_test(Some(&s), TestProviderRequest::default()).unwrap();
+        assert_eq!(
+            (
+                c.client_id.as_str(),
+                c.client_secret.as_str(),
+                c.issuer_url.as_str()
+            ),
+            ("saved-cid", "saved-secret", "https://idp.example")
+        );
+        let c = resolve_provider_test(
+            Some(&s),
+            form(serde_json::json!({
+                "issuer_url": "https://new.example", "client_secret": "  ",
+                "extra_config": {}
+            })),
+        )
+        .unwrap();
+        assert_eq!(c.issuer_url, "https://new.example");
+        assert_eq!(
+            c.client_secret, "saved-secret",
+            "blank keeps the saved secret"
+        );
+        assert_eq!(c.extra_config, serde_json::json!({}));
+        let c = resolve_provider_test(Some(&s), form(serde_json::json!({"client_secret": "new"})))
+            .unwrap();
+        assert_eq!(c.client_secret, "new");
+        // Clearing the client id in the form is not "keep".
+        let e = resolve_provider_test(Some(&s), form(serde_json::json!({"client_id": ""})))
+            .unwrap_err();
+        assert!(e.contains("client_id"), "{e}");
+        // Unsaved: the form alone.
+        let e =
+            resolve_provider_test(None, form(serde_json::json!({"client_id": "c"}))).unwrap_err();
+        assert!(e.contains("issuer_url"), "{e}");
+        let c = resolve_provider_test(
+            None,
+            form(serde_json::json!({"client_id": "c", "issuer_url": "https://i"})),
+        )
+        .unwrap();
+        assert_eq!(c.client_secret, "");
+        assert_eq!(c.scopes, "openid email profile");
+    }
+
+    #[test]
+    fn test_body_is_optional_and_strict() {
+        assert!(test_form(b"").is_ok());
+        assert!(test_form(b" \n").is_ok());
+        assert!(test_form(br#"{"issuer_url":"https://i"}"#).is_ok());
+        assert!(test_form(b"{not json").is_err());
+        assert!(test_form(br#"{"issuer":"typo"}"#).is_err());
     }
 }
