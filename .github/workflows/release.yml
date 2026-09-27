@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*"
+  # tag-on-merge.yml starts this run: a tag that GITHUB_TOKEN pushes fires
+  # no push workflow, but a workflow_dispatch on the tag ref does.
+  workflow_dispatch:
 
 # Deny all permissions at workflow level — each job declares its own
 permissions: {}

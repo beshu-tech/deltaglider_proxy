@@ -28,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -93,4 +94,15 @@ jobs:
           # — defensive in case main moved between merge and this job).
           git tag -a "$NEW_TAG" -m "$NEW_TAG" "$MERGE_SHA"
           git push origin "$NEW_TAG"
-          echo "Pushed $NEW_TAG → release.yml will build artifacts"
+          echo "Pushed $NEW_TAG"
+
+      # A tag pushed with GITHUB_TOKEN fires no push workflow, so start the
+      # release on the tag ref explicitly (GITHUB_REF_NAME is the tag there).
+      - name: Start release.yml on the tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_TAG: v${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$NEW_TAG"
+          echo "Started release.yml on $NEW_TAG"
