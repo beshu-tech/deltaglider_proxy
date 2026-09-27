@@ -282,6 +282,7 @@ storage:
 #   filtered_list_max_engine_pages: 50   # backend pages one filtered LIST may read
 #   max_object_size: 104857600      # bytes; default 100 MiB
 #   max_passthrough_object_size: 68719476736   # default 64 GiB
+#   range_spool_ttl_secs: 60        # keep a verified delta reconstruction for more range reads (0 = off)
 #   codec_concurrency: 16           # xdelta3 processes at once
 #   blocking_threads: 512
 #

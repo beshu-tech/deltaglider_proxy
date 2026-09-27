@@ -121,6 +121,7 @@ pub(super) fn engine_affecting_fields_changed(
         // the running engine keeps the old limit / codec parallelism).
         || old.max_passthrough_object_size != new.max_passthrough_object_size
         || old.codec_concurrency != new.codec_concurrency
+        || old.range_spool_ttl_secs != new.range_spool_ttl_secs
 }
 
 /// Side effects of transitioning the runtime config from `**cfg` to `new_cfg`.

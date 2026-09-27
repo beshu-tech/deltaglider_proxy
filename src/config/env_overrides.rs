@@ -120,6 +120,11 @@ pub const ENV_FIELD_BINDINGS: &[EnvFieldBinding] = &[
         EnvValueKind::Unsigned,
     ),
     bind(
+        "DGP_RANGE_SPOOL_TTL_SECS",
+        "advanced.range_spool_ttl_secs",
+        EnvValueKind::Unsigned,
+    ),
+    bind(
         "DGP_CACHE_MB",
         "advanced.cache_size_mb",
         EnvValueKind::Unsigned,

@@ -316,6 +316,9 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     /// delta GETs decode to a spool file here, then stream the file to the
     /// client — bounded memory regardless of object size.
     spool: Arc<crate::deltaglider::spool::SpoolDir>,
+    /// Verified reconstructions of large delta objects, kept briefly for
+    /// more range reads of the same object (storage-11).
+    range_spools: Arc<crate::deltaglider::range_spool::RangeSpoolCache>,
 }
 
 /// RAII guard for the optional cross-instance reference lock. Held for the
@@ -1173,6 +1176,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .unwrap_or(4);
             (cpus * 4).max(16)
         });
+        let spool = Arc::new(
+            crate::deltaglider::spool::SpoolDir::shared()
+                .unwrap_or_else(|e| panic!("failed to init spool dir: {e}")),
+        );
+        let range_spools = crate::deltaglider::range_spool::RangeSpoolCache::new(
+            std::time::Duration::from_secs(config.range_spool_ttl_secs),
+            crate::deltaglider::range_spool::MAX_ENTRIES,
+        );
+        spool.register_evictor(Arc::downgrade(&range_spools) as _);
         Self {
             storage,
             codec: Arc::new(DeltaCodec::new(config.max_object_size as usize)),
@@ -1191,10 +1203,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             )
             .with_reserved_bucket(config.config_sync_bucket.as_deref()),
             bucket_usage: None,
-            spool: Arc::new(
-                crate::deltaglider::spool::SpoolDir::shared()
-                    .unwrap_or_else(|e| panic!("failed to init spool dir: {e}")),
-            ),
+            spool,
+            range_spools,
         }
     }
 

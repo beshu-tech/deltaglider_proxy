@@ -139,6 +139,12 @@ pub struct Config {
     #[serde(default = "default_max_passthrough_object_size")]
     pub max_passthrough_object_size: u64,
 
+    /// Seconds a verified reconstruction of a large delta object stays
+    /// cached, so the other range reads of the object skip the decode
+    /// (storage-11). `0` turns the cache off. Default 60.
+    #[serde(default = "default_range_spool_ttl_secs")]
+    pub range_spool_ttl_secs: u64,
+
     /// Reference cache size in MB
     #[serde(default = "default_cache_size_mb")]
     pub cache_size_mb: usize,
@@ -744,6 +750,10 @@ pub(crate) fn default_max_passthrough_object_size() -> u64 {
     64 * 1024 * 1024 * 1024 // 64 GiB
 }
 
+pub(crate) fn default_range_spool_ttl_secs() -> u64 {
+    60
+}
+
 pub(crate) fn default_cache_size_mb() -> usize {
     100
 }
@@ -789,6 +799,7 @@ impl Default for Config {
             max_delta_ratio: default_max_delta_ratio(),
             max_object_size: default_max_object_size(),
             max_passthrough_object_size: default_max_passthrough_object_size(),
+            range_spool_ttl_secs: default_range_spool_ttl_secs(),
             cache_size_mb: default_cache_size_mb(),
             metadata_cache_mb: default_metadata_cache_mb(),
             filtered_list_max_engine_pages: default_filtered_list_max_engine_pages(),
@@ -1402,6 +1413,7 @@ impl Config {
             max_passthrough_object_size,
             |v| v
         );
+        parsed!("DGP_RANGE_SPOOL_TTL_SECS", u64, range_spool_ttl_secs, |v| v);
         parsed!("DGP_CACHE_MB", usize, cache_size_mb, |v| v);
         parsed!("DGP_METADATA_CACHE_MB", usize, metadata_cache_mb, |v| v);
         parsed!(

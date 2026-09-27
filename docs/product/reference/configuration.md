@@ -346,6 +346,17 @@ Maximum concurrent xdelta3 subprocesses. Auto-detected as `num_cpus * 4` (min 16
 | **Default** | `num_cpus * 4` (min 16) |
 | **Hot-reload** | Yes (triggers engine rebuild) |
 
+### `range_spool_ttl_secs`
+
+The number of seconds that a verified reconstruction of a large delta object stays in the spool for more range reads of the same object. A range GET of a delta object that is larger than `DGP_SPOOL_THRESHOLD_BYTES` reconstructs the whole object into a spool file and checks its SHA-256 before it sends the range. The proxy keeps that file for this long, so the other range reads of the object (a parallel downloader sends many) read the same file instead of reconstructing the object again. A range read that arrives while the reconstruction runs waits for it. The file counts against `DGP_SPOOL_MAX_BYTES`, and the proxy deletes cached files first when another request needs spool space that is not free. At most 16 reconstructions are cached. `0` turns the cache off.
+
+| | |
+|---|---|
+| **Env var** | `DGP_RANGE_SPOOL_TTL_SECS` |
+| **YAML** | `advanced.range_spool_ttl_secs` |
+| **Default** | `60` |
+| **Hot-reload** | Yes (triggers engine rebuild) |
+
 ### `codec_timeout_secs`
 
 Maximum time for an xdelta3 subprocess. Hung processes are killed after this.
@@ -1102,6 +1113,7 @@ The list of `DGP_*` variables that the server reads. The unit test `every_dgp_li
 | `DGP_CACHE_MB` | 100 | Reference cache size in MB |
 | `DGP_SPOOL_DIR` | `<system temp>/dgp-spool` | Directory for every scratch file of the proxy: the delta codec's files, the multipart relay parts, and the temporary files of encrypted uploads |
 | `DGP_SPOOL_MAX_BYTES` | 17179869184 (16 GiB) | Byte budget for all the files in `DGP_SPOOL_DIR`. A request that needs spool space while it holds none waits for it (up to `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS`). A request that already holds spool space, or that holds a lock, does not wait: it fails with `503 SlowDown`, and S3 clients retry it. A relayed multipart upload holds its parts here until it completes; see `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES` |
+| `DGP_RANGE_SPOOL_TTL_SECS` | 60 | Seconds that a verified reconstruction of a large delta object stays in the spool for more range reads of it; see [`range_spool_ttl_secs`](#range_spool_ttl_secs). `0` turns it off |
 | `DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES` | half of `DGP_SPOOL_MAX_BYTES` (8 GiB with the default) | The most spool space that one relayed multipart upload can hold. The proxy stages every client multipart upload itself: it keeps the parts in memory until the upload holds more than 64 MiB (`DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES`), and then it moves them to files in `DGP_SPOOL_DIR` (the relay). So this limit applies to every client multipart upload larger than 64 MiB, on every backend. Only the copies that replication and lifecycle make use the backend's own multipart upload, and they use no spool space. A part that would take one upload past this limit fails with `413 EntityTooLarge`, and the error message names this variable and the limit. Set `0` to remove the per-upload limit; then only `DGP_SPOOL_MAX_BYTES` applies, and one large upload can use the whole budget, so the requests of other clients that need spool space fail with `503 SlowDown` until it completes. The largest object is also limited by `max_object_size` |
 | `DGP_METADATA_CACHE_MB` | 50 | `FileMetadata` cache size in MB (0 to disable) |
 | `DGP_FILTERED_LIST_MAX_ENGINE_PAGES` | 50 | Backend pages one filtered LIST request may read before it fails with `400 InvalidRequest` (see `filtered_list_max_engine_pages`) |

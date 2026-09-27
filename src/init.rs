@@ -315,6 +315,7 @@ pub fn run_init_inner(
         max_delta_ratio,
         max_object_size: max_object_size_mb * 1024 * 1024,
         max_passthrough_object_size: crate::config::default_max_passthrough_object_size(),
+        range_spool_ttl_secs: crate::config::default_range_spool_ttl_secs(),
         cache_size_mb,
         metadata_cache_mb: 50,
         filtered_list_max_engine_pages: crate::config::default_filtered_list_max_engine_pages(),

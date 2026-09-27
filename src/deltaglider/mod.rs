@@ -6,6 +6,7 @@ mod cache;
 mod codec;
 mod engine;
 mod file_router;
+pub(crate) mod range_spool;
 pub mod savings;
 pub mod spool;
 

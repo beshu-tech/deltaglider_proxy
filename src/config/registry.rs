@@ -98,6 +98,12 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
         category: "Delta Engine",
     },
     EnvVarEntry {
+        name: "DGP_RANGE_SPOOL_TTL_SECS",
+        description: "Seconds a verified reconstruction of a large delta object stays cached for further range reads (0 = off; default: 60)",
+        example: "60",
+        category: "Delta Engine",
+    },
+    EnvVarEntry {
         name: "DGP_STREAM_COPY_THRESHOLD",
         description: "Object size (bytes) at/above which passthrough copies stream via multipart",
         example: "67108864",

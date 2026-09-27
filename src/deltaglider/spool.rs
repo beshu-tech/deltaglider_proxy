@@ -29,6 +29,17 @@ pub struct SpoolDir {
     dir: PathBuf,
     budget: Arc<Budget>,
     max_bytes: u64,
+    /// Holders of optional spool files (the range-read reconstruction
+    /// cache) that give budget back when an acquire finds it short.
+    evictors: Arc<parking_lot::Mutex<Vec<std::sync::Weak<dyn SpoolEvictor>>>>,
+}
+
+/// A holder of spool files that are optional (a cache): it drops one when
+/// an acquire finds the budget short, before the acquire waits or fails.
+pub(crate) trait SpoolEvictor: Send + Sync {
+    /// Drop one idle file; `false` when there is none. The file's budget
+    /// returns once no reader holds it.
+    fn evict_one(&self) -> bool;
 }
 
 /// `io::ErrorKind` of a reservation refused to an op that already holds a
@@ -100,7 +111,33 @@ impl SpoolDir {
             dir,
             budget: Budget::new(max_mib),
             max_bytes,
+            evictors: Default::default(),
         })
+    }
+
+    /// Let `evictor` give budget back when an acquire finds it short. A
+    /// dropped evictor is forgotten.
+    pub(crate) fn register_evictor(&self, evictor: std::sync::Weak<dyn SpoolEvictor>) {
+        let mut evictors = self.evictors.lock();
+        evictors.retain(|e| e.strong_count() > 0);
+        evictors.push(evictor);
+    }
+
+    /// Evict optional spool files until `want_mib` is free or none is left.
+    /// Runs outside the budget lock (a dropped file releases into it).
+    fn make_room(&self, want_mib: usize) {
+        if self.budget.free() >= want_mib {
+            return;
+        }
+        let evictors: Vec<_> = self
+            .evictors
+            .lock()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        for evictor in evictors {
+            while self.budget.free() < want_mib && evictor.evict_one() {}
+        }
     }
 
     /// Do both handles draw on one budget?
@@ -173,7 +210,9 @@ impl SpoolDir {
     /// (hold-and-wait), until the acquire timeout.
     async fn reserve_within(&self, bytes: u64, held_mib: usize) -> std::io::Result<BudgetPermit> {
         if held_mib == 0 {
-            return Ok(self.budget.acquire(self.want_mib(bytes, 0)).await);
+            let want = self.want_mib(bytes, 0);
+            self.make_room(want);
+            return Ok(self.budget.acquire(want).await);
         }
         self.try_permit(bytes, held_mib)
     }
@@ -187,8 +226,10 @@ impl SpoolDir {
     /// The no-wait half of [`Self::reserve_within`]: the space now, or
     /// [`CONTENDED`]. Sync, so a sync caller under a lock can use it.
     fn try_permit(&self, bytes: u64, held_mib: usize) -> std::io::Result<BudgetPermit> {
+        let want = self.want_mib(bytes, held_mib);
+        self.make_room(want);
         self.budget
-            .try_acquire(self.want_mib(bytes, held_mib))
+            .try_acquire(want)
             .ok_or_else(|| {
                 std::io::Error::new(
                     CONTENDED,
@@ -466,7 +507,6 @@ impl Budget {
         })
     }
 
-    #[cfg(test)]
     fn free(&self) -> usize {
         self.max - self.state.lock().used
     }

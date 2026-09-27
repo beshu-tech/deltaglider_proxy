@@ -373,8 +373,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// Serve a byte range of a large delta object from a reconstructed spool file
     /// (blocker 6). Reconstructs once (verified), then seeks to `start` and
-    /// streams `end-start+1` bytes — no full-object re-buffer. Returns
-    /// `(stream, content_length)`.
+    /// streams `end-start+1` bytes — no full-object re-buffer. The verified
+    /// spool is cached briefly (storage-11): the other ranges of the object
+    /// read it instead of decoding again, and a concurrent range waits for a
+    /// running decode. Returns `(stream, content_length)`.
     async fn retrieve_delta_range_spooled(
         &self,
         bucket: &str,
@@ -386,8 +388,16 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     ) -> Result<(BoxStream<'static, Result<Bytes, StorageError>>, u64), EngineError> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
+        let key = crate::deltaglider::range_spool::RangeSpoolKey {
+            bucket: bucket.to_string(),
+            key: obj_key.full_key(),
+            sha256: metadata.file_sha256.clone(),
+        };
         let out_spool = self
-            .reconstruct_delta_to_spool(bucket, deltaspace_id, obj_key, metadata)
+            .range_spools
+            .get_or_fill(key, || {
+                self.reconstruct_delta_to_spool(bucket, deltaspace_id, obj_key, metadata)
+            })
             .await?;
 
         // Clamp the range to the object size; compute the content length.
@@ -857,5 +867,88 @@ mod generation_tests {
             &meta(10, "", "", None),
             &meta(10, "", "", None)
         ));
+    }
+}
+
+/// storage-11: range reads of a large delta object share one verified
+/// reconstruction.
+#[cfg(test)]
+mod range_spool_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::storage::FilesystemBackend;
+    use futures::TryStreamExt;
+    use std::collections::HashMap;
+
+    fn versions() -> (Vec<u8>, Vec<u8>) {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let v1: Vec<u8> = (0..200_000)
+            .map(|_| {
+                x ^= x >> 12;
+                x ^= x << 25;
+                x ^= x >> 27;
+                (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8
+            })
+            .collect();
+        let mut v2 = v1.clone();
+        v2[100_000..100_100].fill(0xAB);
+        (v1, v2)
+    }
+
+    /// Eight concurrent ranges and four later ones decode the object once.
+    #[tokio::test]
+    async fn many_ranges_of_a_large_delta_decode_it_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            FilesystemBackend::new(tmp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        backend.create_bucket("b").await.unwrap();
+        let (v1, v2) = versions();
+        let writer = DeltaGliderEngine::new_with_backend(backend.clone(), &Config::default(), None);
+        for (k, body) in [("v/a.zip", &v1), ("v/b.zip", &v2)] {
+            writer
+                .store("b", k, body, None, HashMap::new())
+                .await
+                .unwrap();
+        }
+        assert!(writer.head("b", "v/b.zip").await.unwrap().is_delta());
+
+        // Objects above max_object_size (the spool threshold) take the
+        // spooled range path.
+        let config = Config {
+            max_object_size: 64 * 1024,
+            ..Config::default()
+        };
+        let metrics = Arc::new(crate::metrics::Metrics::new());
+        let reader = DeltaGliderEngine::new_with_backend(backend, &config, Some(metrics.clone()));
+        let range = |start: u64| {
+            let reader = &reader;
+            async move {
+                let (stream, len, _) = reader
+                    .retrieve_stream_range("b", "v/b.zip", start, start + 999, None)
+                    .await
+                    .unwrap()
+                    .expect("spooled range");
+                let got: Vec<Bytes> = stream.try_collect().await.unwrap();
+                (start, len, got.concat())
+            }
+        };
+        let concurrent = futures::future::join_all((0..8).map(|i| range(i * 20_000))).await;
+        let mut all = concurrent;
+        for i in 8..12 {
+            all.push(range(i * 15_000).await);
+        }
+        for (start, len, got) in all {
+            let s = start as usize;
+            assert_eq!(len, 1000);
+            assert_eq!(got, v2[s..s + 1000], "range at {start}");
+        }
+        assert_eq!(
+            metrics.delta_decode_duration_seconds.get_sample_count(),
+            1,
+            "twelve ranges, one decode"
+        );
     }
 }

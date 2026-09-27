@@ -56,8 +56,8 @@ use crate::bucket_policy::BucketPolicyConfig;
 use crate::config::{
     default_cache_size_mb, default_filtered_list_max_engine_pages, default_listen_addr,
     default_log_level, default_max_delta_ratio, default_max_object_size,
-    default_max_passthrough_object_size, default_metadata_cache_mb, BackendConfig, DefaultsVersion,
-    NamedBackendConfig, TlsConfig,
+    default_max_passthrough_object_size, default_metadata_cache_mb, default_range_spool_ttl_secs,
+    BackendConfig, DefaultsVersion, NamedBackendConfig, TlsConfig,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1407,6 +1407,11 @@ pub struct AdvancedSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_passthrough_object_size: Option<u64>,
 
+    /// Seconds a verified reconstruction of a large delta object stays
+    /// cached for more range reads of it (`0` = off, default 60).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_spool_ttl_secs: Option<u64>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_size_mb: Option<usize>,
 
@@ -1562,6 +1567,10 @@ impl SectionedConfig {
                     flat.max_passthrough_object_size,
                     default_max_passthrough_object_size(),
                 ),
+                range_spool_ttl_secs: some_if_nondefault(
+                    flat.range_spool_ttl_secs,
+                    default_range_spool_ttl_secs(),
+                ),
                 cache_size_mb: some_if_nondefault(flat.cache_size_mb, default_cache_size_mb()),
                 metadata_cache_mb: some_if_nondefault(
                     flat.metadata_cache_mb,
@@ -1642,6 +1651,10 @@ impl SectionedConfig {
                 .advanced
                 .max_passthrough_object_size
                 .unwrap_or(defaults.max_passthrough_object_size),
+            range_spool_ttl_secs: self
+                .advanced
+                .range_spool_ttl_secs
+                .unwrap_or(defaults.range_spool_ttl_secs),
             cache_size_mb: self
                 .advanced
                 .cache_size_mb

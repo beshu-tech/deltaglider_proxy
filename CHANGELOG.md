@@ -44,6 +44,16 @@ request. Now it reads at most 50, and then answers `400 InvalidRequest`
 ("use a narrower prefix") as before. The limit is the new setting
 `advanced.filtered_list_max_engine_pages` (`DGP_FILTERED_LIST_MAX_ENGINE_PAGES`).
 
+### Changed — Range reads of a large delta object decode it once
+
+Each range GET of a delta object above the spool threshold reconstructed
+the whole object, so a parallel downloader that read a multi-GB object in
+many ranges paid one full decode per range. Now the verified reconstruction
+stays in the spool for `advanced.range_spool_ttl_secs` (default 60 s,
+`DGP_RANGE_SPOOL_TTL_SECS`, `0` turns it off), and a range that arrives
+during the decode waits for it. The cached file counts against the spool
+budget and is deleted first when the budget is short.
+
 ### Changed — A GET on S3 sends one HEAD fewer
 
 The encryption layer, which wraps every backend, sent its own HEAD before
