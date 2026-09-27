@@ -1,0 +1,40 @@
+---
+// 404 — GitHub Pages serves dist/404.html for every unknown path.
+// Moved docs pages 301 through REDIRECTS in astro.config.mjs; this page
+// catches everything else.
+import BaseLayout from '../layouts/BaseLayout.astro';
+---
+
+<BaseLayout
+  title="Page not found — DeltaGlider"
+  description="This page does not exist. Go to the DeltaGlider homepage, the documentation, or the pricing page."
+>
+  <section class="hero">
+    <div class="shell">
+      <span class="section-eyebrow">404</span>
+      <h1>This page does not exist</h1>
+      <p class="hero-lede">
+        The link may be old, or the address may have a typo. Pages that
+        moved send you to their new address, so this one was either
+        removed or never existed.
+      </p>
+      <div class="hero-ctas">
+        <a href="/" class="btn btn-brand">Homepage</a>
+        <a href="/docs" class="btn">Documentation</a>
+        <a href="/pricing" class="btn">Pricing</a>
+      </div>
+      <p class="nf-search">
+        Looking for a docs page? The documentation has a search box.
+      </p>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .hero { padding: 6rem 0 7rem; }
+  .nf-search {
+    margin-top: 2rem;
+    color: var(--ink-soft);
+    font-size: 0.95rem;
+  }
+</style>
