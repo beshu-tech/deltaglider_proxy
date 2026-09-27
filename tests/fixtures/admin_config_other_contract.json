@@ -1,0 +1,83 @@
+{
+  "defaults_404": {
+    "body": "unknown section 'nope'; valid names: admission, access, storage, advanced",
+    "content_type": "text/plain; charset=utf-8",
+    "status": 404
+  },
+  "defaults_ok": {
+    "body": null,
+    "content_type": "application/schema+json",
+    "status": 200
+  },
+  "export_404": {
+    "body": "unknown section 'nope'; valid names: admission, access, storage, advanced",
+    "content_type": "text/plain; charset=utf-8",
+    "status": 404
+  },
+  "export_ok": {
+    "body": null,
+    "content_type": "application/yaml",
+    "status": 200
+  },
+  "export_section_ok": {
+    "body": null,
+    "content_type": "application/yaml",
+    "status": 200
+  },
+  "iam_apply_bad_yaml": {
+    "body": "invalid YAML: access: invalid type: sequence, expected struct AccessSection at line 1 column 9",
+    "content_type": "text/plain; charset=utf-8",
+    "status": 400
+  },
+  "iam_apply_invalid": {
+    "body": "IAM import failed (no state changed): user 'dana': references unknown group 'Missing'",
+    "content_type": "text/plain; charset=utf-8",
+    "status": 400
+  },
+  "iam_export_ok": {
+    "body": null,
+    "content_type": "application/yaml",
+    "status": 200
+  },
+  "iam_validate_bad_yaml": {
+    "body": "invalid YAML: access: invalid type: sequence, expected struct AccessSection at line 1 column 9",
+    "content_type": "text/plain; charset=utf-8",
+    "status": 400
+  },
+  "iam_validate_invalid": {
+    "body": "validation failed: user 'dana': references unknown group 'Missing'",
+    "content_type": "text/plain; charset=utf-8",
+    "status": 400
+  },
+  "remove_bootstrap_409": {
+    "body": {
+      "error": "no IAM users exist: removing the bootstrap SigV4 pair would leave the proxy without authentication. Create an IAM admin user first"
+    },
+    "content_type": "application/json",
+    "status": 409
+  },
+  "section_get_404": {
+    "body": {
+      "error": "unknown section 'nope'; valid names: admission, access, storage, advanced",
+      "ok": false,
+      "requires_restart": false
+    },
+    "content_type": "application/json",
+    "status": 404
+  },
+  "section_get_yaml_ok": {
+    "body": null,
+    "content_type": "application/yaml",
+    "status": 200
+  },
+  "sync_now_404": {
+    "body": "",
+    "content_type": null,
+    "status": 404
+  },
+  "sync_status_404": {
+    "body": "",
+    "content_type": null,
+    "status": 404
+  }
+}

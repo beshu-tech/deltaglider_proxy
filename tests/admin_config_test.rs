@@ -1880,3 +1880,116 @@ async fn config_write_surfaces_answer_as_the_golden_file() {
         "the config write responses changed; if on purpose, update {golden_path}"
     );
 }
+
+/// Characterisation test for the other config surfaces (export, defaults,
+/// section GET, declarative-IAM import/export, sync, bootstrap-credential
+/// removal): status, content type and, for the error arms, the body,
+/// compared with a golden file. It pins what clients see while the error
+/// type of these handlers changes.
+#[tokio::test]
+async fn config_other_surfaces_answer_as_the_golden_file() {
+    let server = TestServer::builder()
+        .auth("GOLDKEY2", "GOLDSECRET2")
+        .build()
+        .await;
+    let admin = admin_http_client(&server.endpoint()).await;
+    let url = |p: &str| format!("{}/_/api/admin/config{p}", server.endpoint());
+
+    let mut out = serde_json::Map::new();
+    async fn record(
+        out: &mut serde_json::Map<String, serde_json::Value>,
+        name: &str,
+        resp: reqwest::Response,
+        keep_body: bool,
+    ) {
+        let status = resp.status().as_u16();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap().to_string());
+        let text = resp.text().await.unwrap();
+        let body = if keep_body {
+            serde_json::from_str::<serde_json::Value>(&text)
+                .unwrap_or(serde_json::Value::String(text))
+        } else {
+            serde_json::Value::Null
+        };
+        out.insert(
+            name.to_string(),
+            json!({ "status": status, "content_type": ct, "body": body }),
+        );
+    }
+
+    let r = admin.get(url("/export")).send().await.unwrap();
+    record(&mut out, "export_ok", r, false).await;
+    let r = admin
+        .get(url("/export?section=storage"))
+        .send()
+        .await
+        .unwrap();
+    record(&mut out, "export_section_ok", r, false).await;
+    let r = admin.get(url("/export?section=nope")).send().await.unwrap();
+    record(&mut out, "export_404", r, true).await;
+    let r = admin.get(url("/defaults")).send().await.unwrap();
+    record(&mut out, "defaults_ok", r, false).await;
+    let r = admin
+        .get(url("/defaults?section=nope"))
+        .send()
+        .await
+        .unwrap();
+    record(&mut out, "defaults_404", r, true).await;
+    let r = admin.get(url("/section/storage?format=yaml")).send().await;
+    record(&mut out, "section_get_yaml_ok", r.unwrap(), false).await;
+    let r = admin.get(url("/section/nope")).send().await.unwrap();
+    record(&mut out, "section_get_404", r, true).await;
+
+    let r = admin.get(url("/declarative-iam-export")).send().await;
+    record(&mut out, "iam_export_ok", r.unwrap(), false).await;
+    let bad_group = "access:\n  iam_users:\n    - name: dana\n      access_key_id: AKDANA\n      \
+                     secret_access_key: SECRETDANA\n      groups: [\"Missing\"]\n";
+    for (name, path) in [
+        ("iam_validate", "/declarative-iam-validate"),
+        ("iam_apply", "/declarative-iam-apply"),
+    ] {
+        let r = admin.post(url(path)).json(&json!({ "yaml": "access: [" }));
+        record(
+            &mut out,
+            &format!("{name}_bad_yaml"),
+            r.send().await.unwrap(),
+            true,
+        )
+        .await;
+        let r = admin.post(url(path)).json(&json!({ "yaml": bad_group }));
+        record(
+            &mut out,
+            &format!("{name}_invalid"),
+            r.send().await.unwrap(),
+            true,
+        )
+        .await;
+    }
+
+    let r = admin.post(url("/sync-now")).send().await.unwrap();
+    record(&mut out, "sync_now_404", r, true).await;
+    let r = admin.get(url("/sync")).send().await.unwrap();
+    record(&mut out, "sync_status_404", r, true).await;
+
+    let r = admin.delete(url("/bootstrap-credentials")).send().await;
+    record(&mut out, "remove_bootstrap_409", r.unwrap(), true).await;
+
+    let got = serde_json::to_string_pretty(&serde_json::Value::Object(out)).unwrap();
+    let golden_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/admin_config_other_contract.json"
+    );
+    let Ok(golden) = std::fs::read_to_string(golden_path) else {
+        // First run: record the golden file, then fail so it is reviewed.
+        std::fs::write(golden_path, format!("{got}\n")).unwrap();
+        panic!("golden file written to {golden_path}: review and commit it");
+    };
+    assert_eq!(
+        golden.trim(),
+        got.trim(),
+        "the config responses changed; if on purpose, update {golden_path}"
+    );
+}
