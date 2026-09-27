@@ -533,7 +533,9 @@ function ProviderForm({ provider, callbackUrl, readOnly = false, onSaved, onDele
         const patch: Record<string, unknown> = {
           name: formName,
           enabled: formEnabled,
-          display_name: formDisplayName || undefined,
+          // "" clears it on the server; `undefined` would drop the key, and
+          // an absent key means "keep the old name".
+          display_name: formDisplayName,
           client_id: formClientId || undefined,
           issuer_url: formIssuerUrl || undefined,
           scopes: formScopes,

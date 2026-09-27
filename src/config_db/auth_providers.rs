@@ -305,6 +305,9 @@ impl ConfigDb {
             )?;
         }
         if let Some(ref display_name) = req.display_name {
+            // "" is how a client clears it (the GUI's empty field); an
+            // absent field keeps the old value.
+            let display_name = (!display_name.is_empty()).then_some(display_name);
             tx.execute(
                 "UPDATE auth_providers SET display_name = ?1 WHERE id = ?2",
                 params![display_name, id],
@@ -754,6 +757,21 @@ mod tests {
     use super::*;
     use crate::config_db::ConfigDb;
 
+    fn no_change() -> UpdateAuthProviderRequest {
+        UpdateAuthProviderRequest {
+            name: None,
+            provider_type: None,
+            enabled: None,
+            priority: None,
+            display_name: None,
+            client_id: None,
+            client_secret: None,
+            issuer_url: None,
+            scopes: None,
+            extra_config: None,
+        }
+    }
+
     #[test]
     fn test_auth_provider_crud() {
         let db = ConfigDb::in_memory("test-pass").unwrap();
@@ -795,6 +813,15 @@ mod tests {
         let updated = db.update_auth_provider(provider.id, &update).unwrap();
         assert!(!updated.enabled);
         assert_eq!(updated.display_name.as_deref(), Some("Google (disabled)"));
+
+        // An empty display name clears it (the GUI sends "" for a cleared
+        // field); an absent one keeps it.
+        let clear = UpdateAuthProviderRequest {
+            display_name: Some(String::new()),
+            ..no_change()
+        };
+        let cleared = db.update_auth_provider(provider.id, &clear).unwrap();
+        assert_eq!(cleared.display_name, None);
 
         // Delete
         db.delete_auth_provider(provider.id).unwrap();

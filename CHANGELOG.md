@@ -249,6 +249,14 @@ that does not match serves the whole object with 200. A suffix range on an
 empty object is 416 (it was a 206 that promised one byte and sent none), and
 a HEAD with `Range` answers 206 (it answered 200).
 
+### Fixed — A cleared provider display name is saved
+
+When an operator cleared an OIDC provider's display name and saved, the
+GUI left the field out of the request. The server read an absent field as
+"keep", so the old name stayed while the form showed it empty. Now the GUI
+sends the empty name, and `PUT /_/api/admin/ext-auth/providers/:id` reads
+`display_name: ""` as "clear".
+
 ### Fixed — An edit typed just after an apply is kept
 
 After an apply, a config panel read its section again and replaced the
