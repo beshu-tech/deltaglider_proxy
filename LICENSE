@@ -8,23 +8,52 @@ Licensed Work:        DeltaGlider Proxy
                       The Licensed Work is (c) Beshu Limited.
 
 Additional Use Grant: You may make production use of the Licensed Work,
-                      provided that:
+                      provided that all of the following conditions are
+                      met:
 
-                      (a) the total compressed storage footprint managed
-                      through the Licensed Work — that is, the bytes
-                      physically stored in backing storage by all
-                      production deployments of the Licensed Work within
-                      your organization, measured after the Licensed
-                      Work's compression — does not exceed 15 terabytes
-                      at any time; and
+                      (a) Footprint. The Stored Footprint of your
+                      Organization does not exceed 15 terabytes (15 x
+                      10^12 bytes).
 
-                      (b) you do not offer the Licensed Work, or a
-                      service whose primary value derives from the
-                      Licensed Work, to third parties as a hosted or
-                      managed service.
+                      (b) No hosted service. You do not offer the
+                      Licensed Work, or a service whose primary value
+                      derives from the Licensed Work, to third parties
+                      as a hosted, managed, or multi-tenant service.
+                      Operating the Licensed Work on behalf of a single
+                      customer, within infrastructure that customer
+                      controls, is that customer's production use and
+                      not a hosted service.
 
-                      Use of the Licensed Work beyond this grant requires
-                      a commercial license from Beshu Limited. See
+                      (c) No embedded copy. The copy of the Licensed Work
+                      that you use in production was not supplied to you
+                      as a component of, or bundled with, a commercial
+                      product or appliance of a third party, unless that
+                      third party holds an OEM license from Beshu Limited
+                      that covers your use.
+
+                      Definitions:
+
+                      "Organization" means you together with every
+                      entity that controls you, that you control, or
+                      that is under common control with you. "Control"
+                      means direct or indirect ownership of more than 50%
+                      of the voting interests of an entity.
+
+                      "Stored Footprint" means the total number of bytes
+                      that the production deployments of the Licensed
+                      Work within your Organization cause to be stored in
+                      backing storage, measured after the Licensed Work's
+                      compression. It includes every stored copy: primary
+                      data, replicas and archives that the Licensed Work
+                      writes, and its reference and metadata objects. It
+                      does not include bytes that your storage provider
+                      stores for its own redundancy without the Licensed
+                      Work writing them. The Stored Footprint is the
+                      average, over a calendar month, of one daily
+                      measurement.
+
+                      Production use beyond this grant requires a
+                      commercial license from Beshu Limited. See
                       https://deltaglider.com/pricing/ for terms.
 
 Change Date:          Two years from the date each specific version of
