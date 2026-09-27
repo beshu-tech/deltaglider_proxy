@@ -335,19 +335,22 @@ pub struct ConfigUpdateResponse {
     requires_restart: bool,
 }
 
-/// Compare the runtime config against the config file on disk.
+/// Compare the runtime config against the config file on disk at `path` —
+/// the file persist writes (`active_config_path`), never a path re-resolved
+/// at request time (review 4 config-6: a `--config` file and a stray
+/// `./deltaglider_proxy.yaml` diffed the wrong one).
 /// Returns a list of field names where the runtime value differs from disk.
-fn compute_tainted_fields(runtime: &crate::config::Config) -> Vec<String> {
+fn compute_tainted_fields(runtime: &crate::config::Config, path: &str) -> Vec<String> {
     // Compare the FILE view: an env-controlled field differs from the file on
     // purpose, and is shown through `env_overrides`, not as unsaved.
     let file_view = runtime.file_view().unwrap_or_else(|_| runtime.clone());
     let runtime = &file_view;
-    let disk = match crate::config::Config::resolve_config_path() {
-        Some(path) => match crate::config::Config::from_file(&path) {
-            Ok(cfg) => cfg,
-            Err(_) => return vec![], // Can't read file — nothing to compare
-        },
-        None => return vec![], // No config file on disk
+    if !std::path::Path::new(path).exists() {
+        return vec![]; // No config file on disk
+    }
+    let disk = match crate::config::Config::from_file(path) {
+        Ok(cfg) => cfg,
+        Err(_) => return vec![], // Can't read file — nothing to compare
     };
 
     let mut tainted = Vec::new();
@@ -511,7 +514,7 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         .map(|n| n.get())
         .unwrap_or(4);
 
-    let tainted_fields = compute_tainted_fields(&cfg);
+    let tainted_fields = compute_tainted_fields(&cfg, &active_config_path(&state));
 
     // Assemble the per-backend response list. When the operator is on
     // the legacy singleton path (no `backends:` in YAML), synthesise
@@ -923,6 +926,26 @@ pub(super) fn apply_backend_patch(
 mod tests {
     use super::*;
     use crate::config::{BackendConfig, Config};
+
+    #[test]
+    fn tainted_fields_diff_the_given_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.yaml");
+        std::fs::write(&path, "advanced:\n  max_delta_ratio: 0.3\n").unwrap();
+        let path = path.to_str().unwrap();
+        let runtime = Config {
+            max_delta_ratio: 0.6,
+            ..Config::default()
+        };
+        assert!(compute_tainted_fields(&runtime, path).contains(&"max_delta_ratio".to_string()));
+        let same = Config {
+            max_delta_ratio: 0.3,
+            ..Config::default()
+        };
+        assert!(!compute_tainted_fields(&same, path).contains(&"max_delta_ratio".to_string()));
+        // No file at the persist target: nothing is tainted.
+        assert!(compute_tainted_fields(&runtime, &format!("{path}.missing")).is_empty());
+    }
 
     #[test]
     fn synthesized_default_flags_and_projects_singleton() {

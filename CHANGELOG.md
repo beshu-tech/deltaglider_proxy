@@ -80,6 +80,14 @@ release has no generation and keeps the old rule. During a rolling upgrade,
 an instance on the older release does not merge copies from upgraded
 instances until it is upgraded too, as with every schema change.
 
+### Fixed — Unsaved-change markers compare against the right file
+
+The admin GUI marks a field as unsaved when the running value differs
+from the config file. The proxy read the file from the search path at
+each request, not the file that it saves to. With `--config`, it could
+compare against a different file, or report nothing. Now it compares
+against the file that an apply writes.
+
 ### Fixed — A refused config apply leaves the running engine unchanged
 
 A config apply that changed a storage setting, such as
