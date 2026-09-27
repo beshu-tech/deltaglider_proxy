@@ -276,7 +276,7 @@ For a migration, the gate ends at the moment the bucket flips to the new backend
 | `DGP_MULTIPART_IDLE_TTL_HOURS` | `24` | Idle-TTL for incomplete multipart uploads. The periodic sweeper drops uploads with no UploadPart activity for this long (excluding uploads currently being completed). |
 | `DGP_AUDIT_RING_SIZE` | `500` | In-memory audit ring capacity. |
 | `DGP_LOG_RING_SIZE` | `2000` | In-memory operational-log ring capacity (backs the admin Logs viewer). |
-| `DGP_LOG_RING_LEVEL` | `info` | Minimum severity captured into the operational-log ring/stream (`error`/`warn`/`info`/`debug`/`trace`). Independent of the stdout log level. |
+| `DGP_LOG_RING_LEVEL` | `info` | Minimum severity captured into the operational-log ring/stream (`error`/`warn`/`info`/`debug`/`trace`). The ring sees only the events that the global log level lets through, so this floor can narrow the capture but not widen it. |
 | `DGP_LOG_FORMAT` | `text` | Stdout log format: `text` (human-readable) or `json` (one JSON object per line, `jq`-greppable). Startup-only. |
 | `DGP_SESSION_TTL_HOURS` | `4` | Admin session cookie lifetime. |
 

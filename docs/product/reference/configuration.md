@@ -166,7 +166,7 @@ advanced:
 
 Tracing filter string (`tracing-subscriber` syntax). `RUST_LOG` overrides it when set. You can change it at runtime in the admin GUI (Settings → System → Logging card), which hot-reloads the filter through the apply pipeline. When `RUST_LOG` or `DGP_LOG_LEVEL` is set, that variable decides the level, so the Logging card shows its value read-only and names the variable. An apply cannot replace that level, because the environment variable wins over the file at every apply, not only at startup.
 
-Resolution order: `RUST_LOG` > `DGP_LOG_LEVEL` > `advanced.log_level` in the file > default. The `--verbose` CLI flag sets `deltaglider_proxy=trace,tower_http=trace` only for the startup lines that the proxy logs before it loads the config. After the load, `advanced.log_level` (or its default) replaces that filter, so the flag has no lasting effect.
+Resolution order: `RUST_LOG` > `DGP_LOG_LEVEL` > `advanced.log_level` in the file > the `--verbose` CLI flag (`deltaglider_proxy=trace,tower_http=trace`) > default. A file `log_level` equal to the default counts as not set, so `--verbose` wins over it.
 
 | | |
 |---|---|
@@ -188,7 +188,7 @@ Three env-only knobs control log output and the admin **System logs** viewer (se
 |---|---|---|
 | `DGP_LOG_FORMAT` | `text` | `json` emits one JSON object per stdout line, which you can filter with `jq` by client IP, bucket or action. The proxy reads it only at startup. |
 | `DGP_LOG_RING_SIZE` | `2000` | Capacity of the in-memory operational-log ring behind the admin Logs viewer. |
-| `DGP_LOG_RING_LEVEL` | `info` | Minimum severity captured into the ring/live-tail stream, independent of `DGP_LOG_LEVEL`. |
+| `DGP_LOG_RING_LEVEL` | `info` | Minimum severity captured into the ring/live-tail stream. The ring sees only the events that the global log level lets through, so this floor can narrow the capture but not widen it. |
 
 The ring is per-instance, in memory, and bounded. It is meant for triage. Point a log shipper at the `DGP_LOG_FORMAT=json` stdout stream for retention and aggregation.
 
@@ -1113,9 +1113,9 @@ The server reads these variables when it starts, and again when an admin apply r
 | `DGP_CODEC_TIMEOUT_SECS` | 60 | Per-subprocess timeout |
 | `DGP_CODEC_STALL_SECS` | 30 | Streaming codec: the proxy stops an xdelta3 process that makes no progress for this many seconds |
 | `DGP_CODEC_ABSOLUTE_SECS` | 7200 | Streaming codec: the longest time one operation may take, in seconds, even while it makes progress |
-| `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS` | 120 | The longest time, in seconds, that a request waits for free spool space. When the time runs out, the request fails with `503 SlowDown` |
+| `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS` | 120 | How long, in seconds, a request that needs spool space (a large PUT or POST, a copy, a delta GET) waits for spool budget before it fails with `503 SlowDown` |
 | `DGP_SPOOL_THRESHOLD_BYTES` | 16 MiB (`16777216`), or `max_object_size` when that is smaller | A delta GET of an object larger than this reconstructs the object to a spool file and streams the file, instead of reconstructing it in memory. A delta-eligible upload larger than this is encoded from a spool file. Objects of this size or smaller use the in-memory path |
-| `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES` | 64 MiB | Largest delta-stored source object that `UploadPartCopy` reconstructs in memory |
+| `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES` | 64 MiB | Largest multipart upload that CompleteMultipartUpload assembles in memory to try a delta. The parts stay in memory up to this total, then go to relay files in the spool. A larger upload, or one that tries no delta, is stored from its parts without a delta |
 
 ### Storage
 
@@ -1150,8 +1150,8 @@ These variables tune the streaming multipart copy of large objects (replication 
 |----------|---------|-------------|
 | `DGP_STREAM_COPY_THRESHOLD` | 64 MiB | Object size at/above which a passthrough copy streams via multipart (floored at 1) |
 | `DGP_MULTIPART_PART_SIZE` | 64 MiB | Part size for the streaming copy (clamped to the 5 MiB S3 minimum) |
-| `DGP_UPLOAD_CONCURRENCY` | 4 | In-flight parts per streaming object (1 to 16), for the copies of event-driven replication, lifecycle transitions, bucket migrations and admin copies. A scheduled replication run uses `storage.replication.upload_concurrency` instead |
-| `DGP_REPLICATION_TRANSFERS` | 4 | Has no effect in this release. The number of objects that one replication run copies at the same time comes from `storage.replication.transfers` (default 4, clamped to 1 to 64) |
+| `DGP_UPLOAD_CONCURRENCY` | 4 | In-flight parts per streaming object. Overrides `storage.replication.upload_concurrency` (1 to 16). It is also the value for every other streaming copy: event-driven replication, lifecycle transitions, bucket migrations and admin copies |
+| `DGP_REPLICATION_TRANSFERS` | 4 | Concurrent objects per replication run. Overrides `storage.replication.transfers` (1 to 64) |
 
 ### Authentication
 

@@ -8,7 +8,7 @@ The `deltaglider_proxy` binary is both the server and its CLI. With no subcomman
 |---|---|
 | `-c, --config <FILE>` | Path to the config file (global; also honored by subcommands) |
 | `-l, --listen <ADDR>` | Listen address, overrides config |
-| `-v, --verbose` | Trace logging for the startup lines before the config loads. After the load, the level comes from `RUST_LOG`, `DGP_LOG_LEVEL` or `advanced.log_level` (default `info`), so the flag has no lasting effect |
+| `-v, --verbose` | Verbose logging (`trace`). `RUST_LOG`, `DGP_LOG_LEVEL` and a `log_level` that the config file sets win over it |
 | `--init` | Interactive configuration wizard, then exit |
 | `--set-bootstrap-password` | Read a password from stdin, write its bcrypt hash, then exit (alias: `--set-admin-password`) |
 | `--show-env` | Print all `DGP_*` environment variables in `.env` format, then exit |
