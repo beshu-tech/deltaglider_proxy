@@ -264,4 +264,75 @@ const rows: Row[] = [
     font-weight: 700;
     margin-left: 0.25rem;
   }
+
+  /* Phones: the scroll hid the stored size and the badge behind the right
+     edge. Each version becomes a card: name and verdict on one line, the
+     size flow on the next, all on screen. */
+  @media (max-width: 599px) {
+    .compact-table,
+    .compact-table tbody {
+      display: block;
+      min-width: 0;
+    }
+    .compact-table thead {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip: rect(0 0 0 0);
+    }
+    .compact-table tr {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 0.6rem 1rem;
+      padding: 1rem;
+      border-bottom: 1px solid var(--rule);
+    }
+    .compact-table tr:last-child {
+      border-bottom: none;
+    }
+    .compact-table td,
+    .compact-table th:first-child,
+    .compact-table td:first-child,
+    .compact-table th:last-child,
+    .compact-table td:last-child {
+      display: block;
+      width: auto;
+      padding: 0;
+      border: none;
+    }
+    .compact-table td:nth-child(2) {
+      grid-column: 1 / -1;
+      grid-row: 2;
+    }
+    .compact-table .verdict-cell {
+      grid-column: 2;
+      grid-row: 1;
+      text-align: right;
+      max-width: 11rem;
+    }
+    .total-row {
+      background: var(--brand-tint);
+      border-top: 2px solid var(--brand-line);
+    }
+    .total-row td {
+      background: none;
+      border-top: none;
+    }
+    .variant-label,
+    .verdict-note {
+      font-size: 0.875rem;
+    }
+    .grade {
+      font-size: 0.8rem;
+    }
+    .compression-badge {
+      font-size: 0.875rem;
+    }
+    .size-flow {
+      gap: 0.35rem;
+      padding: 0.35rem 0.6rem;
+      flex-wrap: wrap;
+    }
+  }
 </style>

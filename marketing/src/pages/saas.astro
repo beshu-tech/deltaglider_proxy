@@ -434,4 +434,30 @@ const description =
     margin: 0 auto;
     color: var(--ink-faint);
   }
+
+  /* Phones: 8rem section gaps, 2rem card padding and a 3rem heading
+     margin inside each step left more air than text. */
+  @media (max-width: 599px) {
+    .in-progress,
+    .playbook,
+    .cta {
+      margin: 4.5rem 0;
+    }
+    .glass-card {
+      padding: 1.25rem;
+    }
+    .playbook-step {
+      padding: 1.25rem;
+    }
+    .step-number {
+      font-size: 2rem;
+      margin-bottom: 0.5rem;
+    }
+    .playbook-step h3 {
+      margin-top: 0;
+    }
+    .playbook-step p {
+      font-size: 1rem;
+    }
+  }
 </style>
