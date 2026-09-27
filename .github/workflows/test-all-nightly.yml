@@ -59,6 +59,7 @@ jobs:
           docker run -d --name minio-nightly --network container:$(hostname) \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
+            -e MINIO_KMS_SECRET_KEY=dgp-test-key:mbmnuALQu7bPqu79OjbARJ3l6zlJ/wQE2tGSfmdqA/k= \
             pgsty/silo@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46 server /data
           for i in $(seq 1 30); do
             mc alias set local http://localhost:9000 minioadmin minioadmin 2>/dev/null && break
@@ -112,6 +113,7 @@ jobs:
           docker run -d --name minio-coverage --network container:$(hostname) \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
+            -e MINIO_KMS_SECRET_KEY=dgp-test-key:mbmnuALQu7bPqu79OjbARJ3l6zlJ/wQE2tGSfmdqA/k= \
             pgsty/silo@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46 server /data
           for i in $(seq 1 30); do
             mc alias set local http://localhost:9000 minioadmin minioadmin 2>/dev/null && break

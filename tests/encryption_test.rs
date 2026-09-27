@@ -323,9 +323,11 @@ async fn test_unencrypted_still_readable() {
 // Requires MinIO running at the default endpoint. Skipped when absent.
 // ═══════════════════════════════════════════════════
 
-#[ignore = "Requires MinIO running at http://localhost:9000 (docker compose up)"]
+// MinIO serves SSE-S3 only with a KMS: CI and docker-compose.yml set a
+// static `MINIO_KMS_SECRET_KEY`.
 #[tokio::test]
 async fn test_sse_s3_roundtrip_through_s3_backend() {
+    skip_unless_minio!();
     let server = TestServer::builder()
         .bucket(BUCKET)
         .auth("SSES3K", "SSES3SECRET")
