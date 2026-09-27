@@ -14,7 +14,7 @@ export const SITE = {
   productName: 'DeltaGlider — S3-compatible storage compression',
   /** Default description for pages that don't override it. */
   description:
-    'Storage compression for S3, behind the same S3 API your apps already use. It is source-available (BUSL-1.1) and free up to 15 TB. Built by Beshu Tech.',
+    'The object storage control plane: delta compression, routing across backends, replication and IAM, behind the same S3 API your apps already use. It is source-available (BUSL-1.1) and free up to 15 TB. Built by Beshu Tech.',
   /** Path to the default Open Graph preview image (1200x630). */
   ogImage: '/og-default.jpg',
   /** Repo URL (also used for sameAs in SoftwareApplication). */

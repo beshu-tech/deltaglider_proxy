@@ -50,7 +50,8 @@
   --ink-strong: #ffffff;
   --ink-soft: var(--ink-600);
   --ink-faint: var(--ink-500);
-  --ink-mute: var(--ink-400);
+  /* ink-400 on --bg is 2.3:1, under WCAG AA; ink-500 is 6.8:1. */
+  --ink-mute: var(--ink-500);
 
   --bg: #141a2b;
   --bg-soft: rgba(15, 23, 42, 0.4);
