@@ -248,6 +248,22 @@ async fn ha_sync_now_propagates_post_startup_mutation() {
          body={body:?}, users_before={}, users_after={users_after:?}",
         users_before.len()
     );
+
+    // Both nodes report a healthy sync, and B holds a merged generation.
+    for (client, ep) in [
+        (&admin_a, server_a.endpoint()),
+        (&admin_b, server_b.endpoint()),
+    ] {
+        let r = client
+            .get(format!("{ep}/_/api/admin/config/sync"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        let s: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(s["healthy"], true, "{ep}: {s}");
+        assert!(s["sync_generation"].as_i64().unwrap() >= 1, "{ep}: {s}");
+    }
 }
 
 /// ETag optimisation: a second sync-now when B is already current

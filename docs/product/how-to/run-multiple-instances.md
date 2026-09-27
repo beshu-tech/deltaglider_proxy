@@ -69,6 +69,16 @@ curl -b cookies -X POST https://dgp-reader-1:9000/_/api/admin/config/sync-now
 
 Use this during rollouts and incident response — e.g. you just disabled a leaked key on the writer and want every reader to enforce it now.
 
+The request answers `200` when the reader is current afterwards. It answers `409` when the reader downloaded a newer copy but did not merge it, for example because it refused the copy as a rollback or because the copy comes from a newer release. The response body says why. It answers `502` when the reader cannot read the sync bucket.
+
+To see the sync state of one instance, send a request to the sync status endpoint:
+
+```bash
+curl -b cookies https://dgp-reader-1:9000/_/api/admin/config/sync
+```
+
+The response holds `healthy`, the time of the last good pull (`last_pull_ok_at`) and the last good upload (`last_push_ok_at`), the last errors (`pull_error`, `push_error`), whether a local change waits for upload (`pending_upload`), whether the merge base exists (`base_present`), and the `sync_generation` of the local database. The same health is on `/_/metrics` as `deltaglider_config_sync_healthy`: it is `1` while the sync works and `0` while a pull or an upload fails or a change waits for upload. Alert on `0` for longer than one poll interval (5 minutes), because a peer does not receive the changes of an unhealthy instance.
+
 ## 5. If you scale with Helm
 
 `replicaCount` defaults to `1` — do not raise it until the sync bucket is configured. With the sync bucket set, **replication** rules elect a single leader per rule through an S3 lease object in that bucket (conditional-write CAS): if the leader dies, its lease lapses (default `lease_ttl: "300s"`) and a peer takes over automatically — no double-run, no shared DB required. **Lifecycle and maintenance** jobs still use node-local database leases (`heartbeat_interval: "60s"` renewals), so under multiple replicas those can run on more than one pod; their operations are idempotent, so this wastes work rather than corrupting data. The one exception is the **migrate** job: its routing flip changes only the configuration of the instance that runs it, so the proxy refuses to start a migrate with `409 Conflict` while the sync bucket is set (see [How to move a bucket to another backend](move-a-bucket-between-backends.md)). The sync bucket must pass the boot-time conditional-write validation — see [How to use non-CAS backends safely](backend-capability-validation.md).

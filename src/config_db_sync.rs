@@ -83,6 +83,57 @@ impl std::fmt::Display for UploadError {
     }
 }
 
+/// `1` while the config sync is healthy (see [`SyncStatus::healthy`]), `0`
+/// while a pull or a push fails or an upload is parked. Registered on
+/// `/_/metrics` by `Metrics::new`.
+pub static SYNC_HEALTHY: std::sync::LazyLock<prometheus::IntGauge> =
+    std::sync::LazyLock::new(|| {
+        let g = prometheus::IntGauge::new(
+            "deltaglider_config_sync_healthy",
+            "1 when the config DB sync last pulled and pushed without error and no upload \
+             is parked (always 1 without a sync bucket)",
+        )
+        .expect("valid metric");
+        // Without a sync bucket there is nothing to diverge.
+        g.set(1);
+        g
+    });
+
+/// What the sync saw last; `GET /_/api/admin/config/sync` reads it.
+#[derive(Debug, Clone, Default)]
+struct SyncHealth {
+    last_pull_ok_at: Option<i64>,
+    last_push_ok_at: Option<i64>,
+    pull_error: Option<String>,
+    push_error: Option<String>,
+    last_error_at: Option<i64>,
+}
+
+/// The sync state an operator needs to see that multi-instance IAM diverges.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SyncStatus {
+    /// Unix time of the last pull that ended current (merged, or no change).
+    pub last_pull_ok_at: Option<i64>,
+    /// Unix time of the last successful upload.
+    pub last_push_ok_at: Option<i64>,
+    /// Why the last pull failed (a download error, or a merge that refused
+    /// or failed); `None` after a successful pull.
+    pub pull_error: Option<String>,
+    /// Why the last upload failed after its retries; `None` after a success.
+    pub push_error: Option<String>,
+    pub last_error_at: Option<i64>,
+    /// A local change that the peers do not have is parked for the next poll.
+    pub pending_upload: bool,
+    /// The merge base exists (without it, the next merge is a union).
+    pub base_present: bool,
+    pub healthy: bool,
+}
+
+/// Pure: healthy = no pull or push error, and nothing parked.
+fn sync_is_healthy(pull_error: bool, push_error: bool, pending_upload: bool) -> bool {
+    !pull_error && !push_error && !pending_upload
+}
+
 pub struct ConfigDbSync {
     s3_client: Client,
     bucket: String,
@@ -104,6 +155,7 @@ pub struct ConfigDbSync {
     /// the whole read→PUT→reconcile→retry sequence so same-node uploads are
     /// strictly ordered; cross-node conflicts still use the reconcile path.
     upload_lock: tokio::sync::Mutex<()>,
+    health: parking_lot::Mutex<SyncHealth>,
 }
 
 impl ConfigDbSync {
@@ -159,7 +211,9 @@ impl ConfigDbSync {
             db_keys,
             needs_upload: AtomicBool::new(pending.is_some()),
             upload_lock: tokio::sync::Mutex::new(()),
+            health: parking_lot::Mutex::new(SyncHealth::default()),
         })
+        .inspect(|s: &Self| s.publish_health())
     }
 
     /// The primary config DB key (the key of the local DB after boot).
@@ -172,6 +226,7 @@ impl ConfigDbSync {
     /// drop the change: the boot flushes it instead of downloading over it.
     pub async fn mark_needs_upload(&self) {
         self.needs_upload.store(true, Ordering::SeqCst);
+        self.publish_health();
         let marker = PendingUpload {
             base_etag: self.last_etag.read().await.clone(),
         };
@@ -195,8 +250,70 @@ impl ConfigDbSync {
         let taken = self.needs_upload.swap(false, Ordering::SeqCst);
         if taken {
             let _ = std::fs::remove_file(pending_marker_path(&self.local_path));
+            self.publish_health();
         }
         taken
+    }
+
+    /// Record how a pull ended: `Ok` = the local copy is current.
+    pub fn record_pull(&self, outcome: Result<(), String>) {
+        let now = crate::event_outbox::current_unix_seconds();
+        {
+            let mut h = self.health.lock();
+            match outcome {
+                Ok(()) => {
+                    h.last_pull_ok_at = Some(now);
+                    h.pull_error = None;
+                }
+                Err(e) => {
+                    h.pull_error = Some(e);
+                    h.last_error_at = Some(now);
+                }
+            }
+        }
+        self.publish_health();
+    }
+
+    /// Record how an upload (with its retries) ended.
+    pub fn record_push(&self, outcome: Result<(), String>) {
+        let now = crate::event_outbox::current_unix_seconds();
+        {
+            let mut h = self.health.lock();
+            match outcome {
+                Ok(()) => {
+                    h.last_push_ok_at = Some(now);
+                    h.push_error = None;
+                }
+                Err(e) => {
+                    h.push_error = Some(e);
+                    h.last_error_at = Some(now);
+                }
+            }
+        }
+        self.publish_health();
+    }
+
+    pub fn status(&self) -> SyncStatus {
+        let h = self.health.lock().clone();
+        let pending_upload = self.has_pending_upload();
+        SyncStatus {
+            healthy: sync_is_healthy(
+                h.pull_error.is_some(),
+                h.push_error.is_some(),
+                pending_upload,
+            ),
+            last_pull_ok_at: h.last_pull_ok_at,
+            last_push_ok_at: h.last_push_ok_at,
+            pull_error: h.pull_error,
+            push_error: h.push_error,
+            last_error_at: h.last_error_at,
+            pending_upload,
+            base_present: sync_base_path(&self.local_path).exists(),
+        }
+    }
+
+    fn publish_health(&self) {
+        SYNC_HEALTHY.set(i64::from(self.status().healthy));
     }
 
     /// Build an S3 client from BackendConfig, reusing the same credentials.
@@ -288,6 +405,7 @@ impl ConfigDbSync {
                         "Config DB not found in S3 (bucket={}) — using local copy",
                         self.bucket
                     );
+                    self.record_pull(Ok(()));
                     return Ok(None);
                 }
                 return Err(format!(
@@ -301,6 +419,8 @@ impl ConfigDbSync {
         let current_etag = self.last_etag.read().await;
         if *current_etag == remote_etag {
             debug!("Config DB S3 ETag unchanged — no download needed");
+            drop(current_etag);
+            self.record_pull(Ok(()));
             return Ok(None);
         }
         drop(current_etag);
@@ -362,6 +482,7 @@ impl ConfigDbSync {
             Err(e) => {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 warn!("Config DB downloaded from S3 cannot be read — NOT merging it: {e}");
+                self.record_pull(Err(format!("the synced copy cannot be read: {e}")));
                 return Ok(None);
             }
         };
@@ -373,6 +494,11 @@ impl ConfigDbSync {
                      v{} (rolling upgrade in progress?) — NOT merging it",
                     crate::config_db::SCHEMA_VERSION
                 );
+                self.record_pull(Err(format!(
+                    "the synced copy has schema v{v}, newer than this binary's v{}: upgrade \
+                     this instance",
+                    crate::config_db::SCHEMA_VERSION
+                )));
                 return Ok(None);
             }
             Some(v) if v < crate::config_db::SCHEMA_VERSION => warn!(
@@ -409,6 +535,9 @@ impl ConfigDbSync {
                             "Config DB downloaded from S3 comes from a newer binary (rolling \
                              upgrade in progress?) — NOT merging into the local copy: {e}"
                         );
+                        self.record_pull(Err(format!(
+                            "the synced copy comes from a newer binary: {e}"
+                        )));
                         Ok(None)
                     }
                     _ => {
@@ -416,6 +545,7 @@ impl ConfigDbSync {
                             "Config DB downloaded from S3 cannot be opened — NOT merging into \
                              the local copy: {e}"
                         );
+                        self.record_pull(Err(format!("the synced copy cannot be opened: {e}")));
                         Ok(None)
                     }
                 };
@@ -945,6 +1075,7 @@ pub async fn upload_with_reconcile(
         match sync.upload(data.clone()).await {
             Ok(()) => {
                 write_sync_base(&sync.local_path, &data).await;
+                sync.record_push(Ok(()));
                 return Ok(());
             }
             Err(UploadError::Conflict) => {
@@ -978,6 +1109,7 @@ pub async fn upload_with_reconcile(
         }
     }
     sync.mark_needs_upload().await;
+    sync.record_push(Err(last_err.to_string()));
     warn!("Config DB sync ({context}): upload retries exhausted — queued for next poll tick");
     Err(last_err)
 }
@@ -1019,10 +1151,15 @@ async fn pull_locked(
     sessions: Option<&Arc<crate::session::SessionStore>>,
     context: &str,
 ) -> Result<Option<bool>, String> {
-    let Some(dl) = sync.download_if_newer().await? else {
-        return Ok(None);
+    let dl = match sync.download_if_newer().await {
+        Ok(Some(dl)) => dl,
+        Ok(None) => return Ok(None),
+        Err(e) => {
+            sync.record_pull(Err(e.clone()));
+            return Err(e);
+        }
     };
-    let applied = reopen_and_rebuild_iam(
+    let merged = reopen_and_rebuild_iam(
         config_db,
         db_key,
         iam_state,
@@ -1032,6 +1169,8 @@ async fn pull_locked(
         context,
     )
     .await;
+    let applied = merged.is_ok();
+    sync.record_pull(merged.map_err(|e| format!("the IAM merge failed: {e}")));
     // Commit the ETag only on a successful merge so a failure retries.
     if applied {
         sync.commit_downloaded_etag(dl.etag).await;
@@ -1062,8 +1201,8 @@ async fn pull_locked(
 ///
 /// Gracefully no-ops when `config_db` is `None` (legacy/open-access
 /// mode, no IAM DB to reopen).
-/// Returns `true` if the IAM merge was applied (so the caller can commit the
-/// downloaded ETag); `false` on any failure, so the next poll retries.
+/// Returns `Ok` if the IAM merge was applied (so the caller can commit the
+/// downloaded ETag); `Err(why)` on any failure, so the next poll retries.
 #[allow(clippy::too_many_arguments)]
 pub async fn reopen_and_rebuild_iam(
     config_db: &Option<Arc<Mutex<ConfigDb>>>,
@@ -1073,12 +1212,12 @@ pub async fn reopen_and_rebuild_iam(
     sessions: Option<&Arc<crate::session::SessionStore>>,
     downloaded: &std::path::Path,
     context: &str,
-) -> bool {
+) -> Result<(), String> {
     let Some(db_arc) = config_db else {
         // No live DB (legacy/open mode) — nothing to merge into. Drop the temp.
         // Treat as applied (there's no IAM to converge), so we don't re-download.
         let _ = tokio::fs::remove_file(downloaded).await;
-        return true;
+        return Ok(());
     };
     let db = db_arc.lock().await;
     // B3: merge ONLY the IAM tables out of the downloaded peer DB into the live
@@ -1103,7 +1242,7 @@ pub async fn reopen_and_rebuild_iam(
                 "Config DB S3 sync ({}): failed to merge IAM after download: {}",
                 context, e
             );
-            return false;
+            return Err(e.to_string());
         }
     };
     if !report.base_used {
@@ -1182,7 +1321,7 @@ pub async fn reopen_and_rebuild_iam(
             context
         );
     }
-    true
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1310,6 +1449,56 @@ mod tests {
         .unwrap();
         assert!(sync.has_pending_upload());
         assert_eq!(sync.last_etag.read().await.as_deref(), None);
+    }
+
+    /// Review 4 coordination-4: a refused merge, a failed push and a parked
+    /// upload are visible in the status, and a later success clears them.
+    #[tokio::test]
+    async fn sync_status_shows_a_wedge_until_it_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("deltaglider_config.db");
+        let sync = ConfigDbSync::new(
+            &dead_s3_backend(),
+            "sync".into(),
+            "k.db".into(),
+            db_path.clone(),
+            crate::config_db::ConfigDbKeys::primary_only("pw"),
+            false,
+        )
+        .await
+        .unwrap();
+        let s = sync.status();
+        assert!(s.healthy && !s.pending_upload && !s.base_present);
+
+        sync.record_pull(Err("the IAM merge failed: rollback".into()));
+        let s = sync.status();
+        assert!(!s.healthy);
+        assert_eq!(
+            s.pull_error.as_deref(),
+            Some("the IAM merge failed: rollback")
+        );
+        assert!(s.last_error_at.is_some() && s.last_pull_ok_at.is_none());
+
+        sync.record_push(Err("upload conflict".into()));
+        sync.mark_needs_upload().await;
+        sync.record_pull(Ok(()));
+        let s = sync.status();
+        assert!(s.pull_error.is_none() && s.last_pull_ok_at.is_some());
+        assert!(!s.healthy, "a push error and a park stay visible");
+        assert!(s.pending_upload);
+
+        assert!(sync.take_needs_upload());
+        sync.record_push(Ok(()));
+        let s = sync.status();
+        assert!(s.healthy && s.last_push_ok_at.is_some() && s.push_error.is_none());
+    }
+
+    #[test]
+    fn sync_health_truth_table() {
+        assert!(sync_is_healthy(false, false, false));
+        assert!(!sync_is_healthy(true, false, false));
+        assert!(!sync_is_healthy(false, true, false));
+        assert!(!sync_is_healthy(false, false, true));
     }
 
     #[tokio::test]

@@ -34,6 +34,17 @@ coordination bucket, a run also stops renewing its S3 lease on every listing
 page: only the heartbeat renews it, which removes two coordination-bucket
 requests for each listed directory.
 
+### Added — The config sync state is visible
+
+A merge that failed or that refused a copy was only a log line every 5
+minutes, so the IAM of two instances could diverge for days without a
+sign. Now `GET /_/api/admin/config/sync` shows the state of the sync on
+one instance: the last good pull and upload, the last errors, a parked
+upload, and the merge base. The gauge `deltaglider_config_sync_healthy` on
+`/_/metrics` is `0` while the sync fails. `POST
+/_/api/admin/config/sync-now` answers `409` with the reason when it
+downloaded a copy but did not merge it (it answered `200` before).
+
 ### Fixed — A peer with a slow clock no longer stops the IAM sync
 
 The config DB sync refused a downloaded copy as a rollback when one of its

@@ -1342,19 +1342,20 @@ pub struct SyncNowResponse {
 /// config-sync S3 bucket and reopen the IAM database if newer.
 ///
 /// Returns 404 when `config_sync_bucket` is not configured (this
-/// instance isn't part of a sync group). 200 on any outcome when
-/// sync IS configured — the response body says whether a download
-/// actually happened.
+/// instance isn't part of a sync group). With sync configured: 200 when
+/// the local copy is current afterwards, 409 when the synced copy was not
+/// merged (refused as a rollback, newer schema, merge error: the body says
+/// why), 502 when the bucket cannot be read.
 pub async fn sync_now(
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<SyncNowResponse>, axum::http::StatusCode> {
+) -> Result<(axum::http::StatusCode, Json<SyncNowResponse>), axum::http::StatusCode> {
     let sync = state
         .config_sync
         .as_ref()
         .ok_or(axum::http::StatusCode::NOT_FOUND)?;
 
     // Same helper as the periodic poll: download, three-way merge, rebuild.
-    match crate::config_db_sync::pull_and_merge(
+    let outcome = crate::config_db_sync::pull_and_merge(
         sync,
         &state.config_db,
         sync.db_key(),
@@ -1363,24 +1364,110 @@ pub async fn sync_now(
         Some(&state.sessions),
         "sync-now endpoint",
     )
-    .await
-    {
-        Ok(Some(applied)) => Ok(Json(SyncNowResponse {
-            downloaded: applied,
-            status: if applied {
-                "Downloaded newer config DB and reloaded IAM".to_string()
-            } else {
-                "Downloaded newer config DB but IAM merge failed; will retry".to_string()
+    .await;
+    if let Err(e) = &outcome {
+        tracing::warn!("sync-now failed: {e}");
+    }
+    let (code, body) = sync_now_reply(outcome, sync.status().pull_error);
+    Ok((code, Json(body)))
+}
+
+/// Pure: the sync-now answer from the pull result and the pull error that
+/// the sync recorded. A copy that was downloaded but not merged is a 409,
+/// never a 200: the instances diverge until an operator acts.
+fn sync_now_reply(
+    outcome: Result<Option<bool>, String>,
+    pull_error: Option<String>,
+) -> (axum::http::StatusCode, SyncNowResponse) {
+    use axum::http::StatusCode;
+    match (outcome, pull_error) {
+        (Err(e), _) => (
+            StatusCode::BAD_GATEWAY,
+            SyncNowResponse {
+                downloaded: false,
+                status: format!("Cannot read the sync bucket: {e}"),
             },
-        })),
-        Ok(None) => Ok(Json(SyncNowResponse {
-            downloaded: false,
-            status: "Local copy is current (ETag unchanged)".to_string(),
-        })),
-        Err(e) => {
-            tracing::warn!("sync-now failed: {e}");
-            Err(axum::http::StatusCode::BAD_GATEWAY)
-        }
+        ),
+        (Ok(Some(true)), _) => (
+            StatusCode::OK,
+            SyncNowResponse {
+                downloaded: true,
+                status: "Downloaded newer config DB and reloaded IAM".to_string(),
+            },
+        ),
+        (Ok(_), Some(e)) => (
+            StatusCode::CONFLICT,
+            SyncNowResponse {
+                downloaded: false,
+                status: format!(
+                    "The synced config DB was not merged: {e}. GET \
+                     /_/api/admin/config/sync shows the sync state"
+                ),
+            },
+        ),
+        (Ok(_), None) => (
+            StatusCode::OK,
+            SyncNowResponse {
+                downloaded: false,
+                status: "Local copy is current (ETag unchanged)".to_string(),
+            },
+        ),
+    }
+}
+
+#[derive(Serialize)]
+pub struct SyncStatusResponse {
+    #[serde(flatten)]
+    status: crate::config_db_sync::SyncStatus,
+    /// The local DB's `sync_generation` (the last copy merged or uploaded).
+    sync_generation: Option<i64>,
+}
+
+/// GET /api/admin/config/sync — the config-sync state of THIS instance:
+/// last good pull and push, the last errors, a parked upload, the merge
+/// base. 404 when no sync bucket is configured.
+pub async fn sync_status(
+    State(state): State<Arc<AdminState>>,
+) -> Result<Json<SyncStatusResponse>, axum::http::StatusCode> {
+    let sync = state
+        .config_sync
+        .as_ref()
+        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+    let sync_generation = match &state.config_db {
+        Some(db) => db.lock().await.sync_generation().ok(),
+        None => None,
+    };
+    Ok(Json(SyncStatusResponse {
+        status: sync.status(),
+        sync_generation,
+    }))
+}
+
+#[cfg(test)]
+mod sync_now_reply_tests {
+    use super::sync_now_reply;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn a_refused_or_failed_merge_is_a_conflict() {
+        let (code, body) = sync_now_reply(Ok(Some(false)), Some("rollback".into()));
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(!body.downloaded && body.status.contains("rollback"));
+        // A refusal inside the download (newer schema) returns Ok(None).
+        let (code, _) = sync_now_reply(Ok(None), Some("schema v30".into()));
+        assert_eq!(code, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn current_or_merged_is_ok_and_a_read_error_is_bad_gateway() {
+        assert_eq!(sync_now_reply(Ok(None), None).0, StatusCode::OK);
+        let (code, body) = sync_now_reply(Ok(Some(true)), None);
+        assert_eq!(code, StatusCode::OK);
+        assert!(body.downloaded);
+        assert_eq!(
+            sync_now_reply(Err("boom".into()), None).0,
+            StatusCode::BAD_GATEWAY
+        );
     }
 }
 

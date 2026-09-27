@@ -67,7 +67,8 @@ The bootstrap `access_key_id` is an identifier, not a secret, so every GET and e
 | `POST` | `/_/api/admin/config/apply` | `{yaml: <doc>}` | Atomic full-document apply + persist |
 | `POST` | `/_/api/admin/config/trace` | synthetic request body | Evaluate against the admission chain |
 | `GET` | `/_/api/admin/config/trace?method=&path=&...` | — | Query-param variant (bookmarkable trace URLs) |
-| `POST` | `/_/api/admin/config/sync-now` | — | Force an immediate config-DB pull from the sync bucket |
+| `POST` | `/_/api/admin/config/sync-now` | — | Force an immediate config-DB pull from the sync bucket. `200` = current, `409` = a newer copy was not merged (the body says why), `502` = the bucket cannot be read, `404` = no sync bucket |
+| `GET` | `/_/api/admin/config/sync` | — | This instance's sync state: `healthy`, `last_pull_ok_at`, `last_push_ok_at`, `pull_error`, `push_error`, `last_error_at`, `pending_upload`, `base_present`, `sync_generation`. `404` = no sync bucket |
 
 Full-document apply returns `{applied, persisted, requires_restart, warnings, existing_warnings, persisted_path}`. Full-document validate returns `{ok, warnings, existing_warnings}`. As on the section endpoints, `warnings` holds only the warnings the document introduces, and `existing_warnings` holds the warnings the running config already produces. The field-level `PUT /_/api/admin/config` returns only warnings about its own change. **Persist failure returns HTTP 500**, not 200+warning — GitOps pipelines can't mistake a half-applied state for a clean success.
 
