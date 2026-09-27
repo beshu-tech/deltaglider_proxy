@@ -10,7 +10,9 @@ proptest! {
     fn v2_token_round_trips(key in any::<String>()) {
         let token = encode_v2_token(&key);
         prop_assert!(token.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)));
-        prop_assert_eq!(decode_v2_token(Some(&token)), Some(key));
+        let cursor = decode_v2_token(Some(&token)).unwrap();
+        prop_assert!(!cursor.legacy);
+        prop_assert_eq!(cursor.key, key);
     }
 
     /// The CSP inert check never panics, and exempts a value only when

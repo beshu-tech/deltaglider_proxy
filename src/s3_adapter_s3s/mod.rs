@@ -40,7 +40,7 @@ use self::{bucket::*, list::*, object::*};
 use self::{copy::*, multipart::*};
 #[cfg(test)]
 pub(crate) use copy::copy_source_bucket_key;
-pub use list::ListMetadataXmlExtensions;
+pub use list::{ListMetadataXmlExtensions, LEGACY_V2_TOKENS};
 
 /// The `s3s::S3` service. Each verb is a one-line delegation to its verb
 /// group (`bucket`, `object`, `list`, `multipart`, `copy`); a verb that is

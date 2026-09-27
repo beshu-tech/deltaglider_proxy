@@ -90,14 +90,29 @@ fn list_metadata_goes_into_its_own_contents_block() {
 
 #[test]
 fn v2_tokens_are_opaque_and_accept_the_raw_form() {
+    let cursor = |t: &str| decode_v2_token(Some(t)).map(|c| (c.key, c.legacy));
     for key in ["p/a.txt", "ctl/a\u{1}b.txt", "", "é/<x>&"] {
         let t = encode_v2_token(key);
         assert!(t.bytes().all(|b| b.is_ascii_graphic()), "{t}");
-        assert_eq!(decode_v2_token(Some(&t)).as_deref(), Some(key));
+        assert_eq!(cursor(&t), Some((key.to_string(), false)));
     }
-    assert_eq!(decode_v2_token(Some("p/a.txt")).as_deref(), Some("p/a.txt"));
-    assert_eq!(decode_v2_token(Some("dg1.!!")).as_deref(), Some("dg1.!!"));
-    assert_eq!(decode_v2_token(None), None);
+    // The raw fallback says so, so the caller can count it.
+    assert_eq!(cursor("p/a.txt"), Some(("p/a.txt".into(), true)));
+    assert_eq!(cursor("dg1.!!"), Some(("dg1.!!".into(), true)));
+    assert!(decode_v2_token(None).is_none());
+}
+
+/// Each raw-token fallback bumps the counter that tells when the
+/// fallback can go; an opaque token does not.
+#[test]
+fn the_raw_token_fallback_is_counted() {
+    let counter = &*super::list::LEGACY_V2_TOKENS;
+    let before = counter.get();
+    assert_eq!(
+        super::list::v2_cursor("b", Some("p/a.txt")).as_deref(),
+        Some("p/a.txt")
+    );
+    assert!(counter.get() > before, "the fallback must be counted");
 }
 
 #[test]

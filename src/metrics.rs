@@ -570,6 +570,9 @@ impl Metrics {
         registry
             .register(Box::new(crate::storage::LISTING_FACTS_MISSES.clone()))
             .expect("duplicate metric name");
+        registry
+            .register(Box::new(crate::s3_adapter_s3s::LEGACY_V2_TOKENS.clone()))
+            .expect("duplicate metric name");
         // Config DB sync health (a static: the sync has no Metrics handle).
         registry
             .register(Box::new(crate::config_db_sync::SYNC_HEALTHY.clone()))

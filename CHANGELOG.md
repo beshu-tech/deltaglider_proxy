@@ -105,7 +105,9 @@ with a control character made the XML response ill-formed. Now the token is
 client that sends the token back unchanged sees no difference. A client that
 reads the key out of the token must stop doing so. A token in the old raw
 form is still accepted in this release, so a listing that spans the upgrade
-goes on; a later release refuses it.
+goes on; a later release refuses it. Each such request adds one to the new
+counter `deltaglider_list_legacy_continuation_tokens_total` and writes an
+info log line, so you can see whether a client still sends the old form.
 
 ### Changed — The `s3` verbs stream large objects
 

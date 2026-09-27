@@ -154,7 +154,7 @@ pub(super) async fn list_objects_v2(
         input.delimiter.as_deref(),
         max_keys,
         list_cursor(
-            decode_v2_token(input.continuation_token.as_deref()).as_deref(),
+            v2_cursor(&input.bucket, input.continuation_token.as_deref()).as_deref(),
             input.start_after.as_deref(),
         ),
         include_metadata,
@@ -197,23 +197,60 @@ pub(super) fn encode_v2_token(key: &str) -> String {
     )
 }
 
+/// The engine cursor of a V2 continuation token, and whether it came from
+/// the raw-key fallback.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct V2Cursor {
+    pub key: String,
+    pub legacy: bool,
+}
+
 /// Pure: the engine cursor for a V2 continuation token. A token without the
 /// prefix (or that does not decode) is the old raw-key form, accepted for
 /// one release so a listing that spans the upgrade goes on.
-pub(super) fn decode_v2_token(token: Option<&str>) -> Option<String> {
+pub(super) fn decode_v2_token(token: Option<&str>) -> Option<V2Cursor> {
     use base64::Engine as _;
     let token = token?;
-    Some(
-        token
-            .strip_prefix(V2_TOKEN_PREFIX)
-            .and_then(|b| {
-                base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(b)
-                    .ok()
-            })
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .unwrap_or_else(|| token.to_string()),
-    )
+    let opaque = token
+        .strip_prefix(V2_TOKEN_PREFIX)
+        .and_then(|b| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(b)
+                .ok()
+        })
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    Some(match opaque {
+        Some(key) => V2Cursor { key, legacy: false },
+        None => V2Cursor {
+            key: token.to_string(),
+            legacy: true,
+        },
+    })
+}
+
+/// ListObjectsV2 requests whose continuation token took the raw-key
+/// fallback. When it stays at zero, a later release can refuse such tokens.
+pub static LEGACY_V2_TOKENS: std::sync::LazyLock<prometheus::IntCounter> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounter::new(
+            "deltaglider_list_legacy_continuation_tokens_total",
+            "ListObjectsV2 continuation tokens accepted in the old raw-key form",
+        )
+        .expect("valid metric")
+    });
+
+/// [`decode_v2_token`], with a log line and a count for the fallback.
+pub(super) fn v2_cursor(bucket: &str, token: Option<&str>) -> Option<String> {
+    let cursor = decode_v2_token(token)?;
+    if cursor.legacy {
+        LEGACY_V2_TOKENS.inc();
+        tracing::info!(
+            bucket,
+            "ListObjectsV2 continuation token in the old raw-key form (not `{V2_TOKEN_PREFIX}`); \
+             accepted in this release only"
+        );
+    }
+    Some(cursor.key)
 }
 
 /// The engine cursor for a LIST. S3 rule: a continuation token wins, and

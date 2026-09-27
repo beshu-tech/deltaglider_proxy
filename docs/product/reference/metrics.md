@@ -111,6 +111,7 @@ deltaglider_cache_miss_rate_ratio > 0.5     # cache thrashing
 | `deltaglider_delegated_list_probe_requests_total` | Counter | — | Exact-key probes that client listings send to complete a page |
 | `deltaglider_listing_facts_misses_total` | Counter | — | Listed objects whose listing facts were not found, so the listing shows their stored size. An object stored before the index existed, or restored from a backend version, counts until a download or a `HEAD` request writes its index entry |
 | `deltaglider_listing_facts_requests_total` | Counter | `kind` | Requests for the listing facts index on S3 (`.dg/facts/`): `list` (a listing page reads the original sizes of its objects, or a cleanup finds old entries), `put` (an upload or a lazy backfill writes an entry), `delete` (a cleanup drops the entries of overwritten or deleted objects; one batched `DeleteObjects` request counts once) |
+| `deltaglider_list_legacy_continuation_tokens_total` | Counter | — | ListObjectsV2 requests whose continuation token has the old raw-key form instead of the opaque `dg1.` form. This release still accepts such tokens, and a later release refuses them. A value that stays at zero means that no client depends on the old form |
 
 A client listing of an S3-backed bucket costs one `list` request per page when the page holds deltas or ciphertext that this proxy did not write or read since it started. A `list` rate far above the client listing rate means that the index holds many old entries.
 
