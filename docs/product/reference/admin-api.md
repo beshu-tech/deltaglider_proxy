@@ -62,7 +62,7 @@ The bootstrap `access_key_id` is an identifier, not a secret, so every GET and e
 | `POST` | `/_/api/admin/config/declarative-iam-validate` | `{yaml: <access fragment>}` | Dry-run the declarative IAM reconcile (`diff_iam` preview, zero DB writes) |
 | `POST` | `/_/api/admin/config/declarative-iam-apply` | `{yaml: <access fragment>}` | Atomic single-transaction IAM reconcile from the YAML fragment |
 | `GET` | `/_/api/admin/config/defaults[?section=<name>]` | — | JSON Schema (for YAML LSP and Monaco) |
-| `POST` | `/_/api/admin/config/validate` | `{yaml: <doc>}` | Dry-run full-document apply |
+| `POST` | `/_/api/admin/config/validate` | `{yaml: <doc>}` | Dry-run full-document apply: the same checks as `/config/apply` (including the `403` for a changed `bootstrap_password_hash`), without the If-Match check and without any state change |
 | `POST` | `/_/api/admin/config/section/:name/validate` | `{<section-body>}` | Dry-run section apply; in declarative mode warns with `diff_iam` preview (see [declarative-iam.md](declarative-iam.md)) |
 | `POST` | `/_/api/admin/config/apply` | `{yaml: <doc>}` | Atomic full-document apply + persist |
 | `POST` | `/_/api/admin/config/trace` | synthetic request body | Evaluate against the admission chain |

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed — The document validate runs the same checks as the apply
+
+`POST /_/api/admin/config/validate` skipped two steps of
+`POST /_/api/admin/config/apply`. It accepted a document that changes
+`bootstrap_password_hash`, which the apply refuses with 403. It also did not
+carry the env references of the running config into the document, so it
+warned that secrets are "saved to the config file as the reference", and the
+apply does not give these warnings. Now the validate refuses a hash change
+with the same 403, and it gives only the warnings that the apply gives.
+
 ### Changed — `config lint` refuses an empty file
 
 `config lint` now runs the same validation step as

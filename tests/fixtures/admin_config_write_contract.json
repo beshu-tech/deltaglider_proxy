@@ -84,6 +84,14 @@
     "etag": false,
     "status": 400
   },
+  "doc_validate_403": {
+    "body": {
+      "error": "bootstrap_password_hash cannot be changed via /config/apply; use PUT /api/admin/password (verifies the current password)",
+      "ok": false
+    },
+    "etag": false,
+    "status": 403
+  },
   "doc_validate_lifecycle_400": {
     "body": {
       "error": "lifecycle rule 'expire-old' delete action requires expire_after",

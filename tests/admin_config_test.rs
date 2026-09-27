@@ -1839,6 +1839,10 @@ async fn config_write_surfaces_answer_as_the_golden_file() {
         .post(url("/apply"))
         .json(&json!({ "yaml": with_hash }));
     record(&mut out, "doc_apply_403", r.send().await.unwrap()).await;
+    let r = admin
+        .post(url("/validate"))
+        .json(&json!({ "yaml": with_hash }));
+    record(&mut out, "doc_validate_403", r.send().await.unwrap()).await;
     let r = admin.post(url("/validate")).json(&json!({ "yaml": yaml }));
     record(&mut out, "doc_validate_ok", r.send().await.unwrap()).await;
     let mut doc: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();

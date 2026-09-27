@@ -71,7 +71,9 @@ struct Steps {
 }
 
 impl Surface<'_> {
-    fn steps(self, mode: Mode) -> Steps {
+    /// The steps take no [`Mode`] on purpose: a dry run runs exactly the
+    /// checks of its apply, so a validate answers what the apply answers.
+    fn steps(self) -> Steps {
         match self {
             Surface::Patch => Steps {
                 bootstrap_guard: false,
@@ -85,14 +87,11 @@ impl Surface<'_> {
                 normalize: true,
                 merge_env_refs: false,
             },
-            // Kept as on the wire before the pipeline existed: the document
-            // validate neither refuses a hash change nor merges env refs
-            // (only the apply does).
             Surface::Document { .. } => Steps {
-                bootstrap_guard: mode == Mode::Apply,
+                bootstrap_guard: true,
                 validate: true,
                 normalize: false,
-                merge_env_refs: mode == Mode::Apply,
+                merge_env_refs: true,
             },
         }
     }
@@ -320,7 +319,7 @@ pub(super) fn prepare(
     built: Built,
     write: &ConfigWrite<'_>,
 ) -> Result<Prepared, Rejection> {
-    let steps = write.surface.steps(write.mode);
+    let steps = write.surface.steps();
     let Built {
         mut incoming,
         warnings: build_warnings,
@@ -609,9 +608,25 @@ mod tests {
             (Stage::Bootstrap, StatusCode::FORBIDDEN)
         );
         assert!(r.error.contains("/config/apply"), "{}", r.error);
-        // The document validate does not guard the hash.
+        // Validate = apply: the document validate refuses it the same way.
         let dv = write(Surface::Document { yaml }, Mode::DryRun);
-        assert!(prepare(&old, built(changed), &dv).is_ok());
+        let r = prepare(&old, built(changed), &dv).unwrap_err();
+        assert_eq!(
+            (r.stage, r.status),
+            (Stage::Bootstrap, StatusCode::FORBIDDEN)
+        );
+    }
+
+    /// A pre-expanded document (the `config apply` CLI) records no refs: the
+    /// validate carries the running refs forward like the apply, so it
+    /// reports no "saved as the reference" warnings the apply would not.
+    #[test]
+    fn document_validate_merges_the_running_env_refs() {
+        let mut old = running();
+        old.env_refs.insert("T_SECRET".into(), "v4lue".into());
+        let dv = write(Surface::Document { yaml: "" }, Mode::DryRun);
+        let p = prepare(&old, built(Config::default()), &dv).unwrap();
+        assert_eq!(p.new_cfg.env_refs, old.env_refs);
     }
 
     #[test]
