@@ -73,7 +73,14 @@ When you apply a change in the admin UI, the proxy writes the whole configuratio
 - A field that equals its default value is left out of the file.
 - A shorthand such as `public_prefixes: [""]` can come back as `public: true`.
 
-Some values do survive the rewrite. A `${env:NAME}` reference that the file held stays a reference, so a secret that came from the environment does not end up in the file. An encryption key that you wrote into the YAML stays in the YAML.
+Some values do survive the rewrite. An encryption key that you wrote into the YAML stays in the YAML. A `${env:NAME}` reference survives only in some positions, because the running configuration holds the resolved value, not your text. At load time, the proxy records which value came from which variable. At save time, it writes a reference back wherever a whole string value equals a recorded value. These rules follow from that mechanism:
+
+- A reference that is the whole value, such as `secret_access_key: ${env:S3_SECRET}`, stays a reference. A secret that came from the environment does not end up in the file.
+- A reference inside a longer string, such as `endpoint: "https://${env:S3_HOST}:9000"`, is written out as its resolved value, for example `endpoint: "https://s3.acme.example:9000"`. The file then no longer follows the variable.
+- When a value of 16 characters or more occurs in several fields, every one of those fields gets the reference. For this reason, a secret that you copy into a second field also stays out of the file.
+- When a shorter value, such as a region, occurs in several fields, no field gets the reference. The proxy cannot tell which field came from the variable, and it does not couple an unrelated field to it.
+
+To keep a composed value under the control of the environment, put the whole value in one variable, for example `endpoint: ${env:S3_ENDPOINT}`.
 
 If you manage the file in Git, keep your commented copy in the repository and treat the file on the server as generated output. To see the layout that the proxy writes, with its secrets redacted, request `GET /api/admin/config/export`.
 
