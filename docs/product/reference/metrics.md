@@ -142,6 +142,14 @@ A client listing of an S3-backed bucket costs one `list` request per page when t
 
 Auth metrics stay at zero when SigV4 is disabled.
 
+## Config DB sync
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `deltaglider_config_sync_healthy` | Gauge | — | `1` while the config DB sync works, `0` while a pull or an upload fails or a local change waits for upload. Always `1` without a sync bucket |
+
+`GET /_/api/admin/config/sync` shows the reason when the gauge is `0`.
+
 ## Label cardinality
 
 All label sets are bounded:
