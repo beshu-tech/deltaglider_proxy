@@ -370,6 +370,11 @@ pub async fn start_migrate(
     // under one config read.
     let params = {
         let cfg = state.config.read().await;
+        if let Some(reason) =
+            crate::maintenance::migrate::multi_instance_refusal(cfg.config_sync_bucket.as_deref())
+        {
+            return Err((StatusCode::CONFLICT, reason));
+        }
         if cfg.backend_by_name(&target_backend).is_none() {
             return Err((
                 StatusCode::BAD_REQUEST,

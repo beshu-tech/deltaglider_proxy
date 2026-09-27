@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Changed — A migrate is refused on a multi-instance deployment
+
+The migrate flip changed the routing of the instance that ran the job only,
+and config sync does not carry routing. The other instances kept writing
+to the source, and the cleanup deleted those writes. Now
+`POST /_/api/admin/buckets/:bucket/migrate` answers `409 Conflict` while
+`config_sync_bucket` is set. Move a bucket on a single instance.
 
 ### Fixed — A maintenance job keeps its write gate through a DB error
 

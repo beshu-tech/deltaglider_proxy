@@ -40,10 +40,11 @@
 //! interruptible; during cleanup a cancel stops deleting and settles with
 //! a note.
 //!
-//! Multi-instance caveat (bigger blast radius than reencrypt, restated
-//! deliberately): the route flip mutates THIS instance's config file +
-//! engine; peers converge only via config sync, and their write gates
-//! never arm. Single-runner posture, same as the rest of `maintenance`.
+//! Single-instance only: the route flip mutates THIS instance's config
+//! file + engine, and config sync carries IAM tables, not routing. A peer
+//! keeps routing the bucket to the source, its write gate never arms, and
+//! cleanup deletes the writes it accepts. So `start_migrate` refuses (409)
+//! while a coordination bucket is configured ([`multi_instance_refusal`]).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -143,6 +144,24 @@ pub fn provenance_value(params: &MigrateParams, job_id: i64) -> String {
         "{}->{}#job{job_id}",
         params.from_backend, params.target_backend
     )
+}
+
+/// Where the refusal below sends the operator.
+pub const MIGRATE_DOC_URL: &str =
+    "https://deltaglider.com/docs/how-to/move-a-bucket-between-backends";
+
+/// Pure: refuse a migrate on a multi-instance deployment (a coordination
+/// bucket is set). Bucket routing is per-instance YAML; config sync does not
+/// carry it, so peers would keep writing to the source that cleanup deletes.
+pub fn multi_instance_refusal(config_sync_bucket: Option<&str>) -> Option<String> {
+    let bucket = config_sync_bucket.filter(|b| !b.is_empty())?;
+    Some(format!(
+        "migrate is refused on a multi-instance deployment (config_sync_bucket \
+         '{bucket}' is set): the routing flip changes only this instance's \
+         config, config sync does not carry routing, so the other instances \
+         keep writing to the source that cleanup deletes. Run the move on a \
+         single instance, see {MIGRATE_DOC_URL}"
+    ))
 }
 
 pub fn parse_params(json: &str) -> Result<MigrateParams, String> {
@@ -1083,6 +1102,15 @@ async fn run_phases(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn multi_instance_refusal_only_with_a_coordination_bucket() {
+        use super::multi_instance_refusal as refuse;
+        assert!(refuse(None).is_none());
+        assert!(refuse(Some("")).is_none());
+        let msg = refuse(Some("dgp-sync")).expect("refused");
+        assert!(msg.contains("dgp-sync") && msg.contains(super::MIGRATE_DOC_URL));
+    }
+
     use super::RecopyScope;
 
     /// A resumed copy re-copies the page that can hold torn copies: the first

@@ -317,6 +317,32 @@ async fn test_migrate_validations() {
     wait_job_done(&admin, &endpoint, bucket).await;
 }
 
+/// jobs-1: routing is per-instance YAML and config sync does not carry it,
+/// so a migrate on a multi-instance deployment lets peers keep writing to the
+/// source that cleanup deletes. The start is refused with 409.
+#[tokio::test]
+async fn test_migrate_refused_when_a_coordination_bucket_is_set() {
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let bucket = "migmulti";
+    // config_sync on a filesystem singleton degrades to a warning at boot.
+    let server = TestServer::builder()
+        .bucket(bucket)
+        .config_sync_bucket("dgp-sync")
+        .extra_yaml_storage_section(&two_backend_yaml(dir_a.path(), dir_b.path()))
+        .build()
+        .await;
+    let endpoint = server.endpoint();
+    let admin = admin_http_client(&endpoint).await;
+    let r = start_migrate(&admin, &endpoint, bucket, "dst", false).await;
+    assert_eq!(r.status(), 409);
+    let body = r.text().await.unwrap();
+    assert!(
+        body.contains("multi-instance") && body.contains("move-a-bucket-between-backends"),
+        "refusal must name the reason and link the doc, got: {body}"
+    );
+}
+
 #[tokio::test]
 async fn test_migrate_cancel_preflip_restores_source() {
     let dir_a = tempfile::TempDir::new().unwrap();
