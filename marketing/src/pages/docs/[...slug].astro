@@ -81,6 +81,16 @@ if (props.kind === 'doc') {
 }
 
 const showToc = props.kind === 'doc' && toc.length >= 2;
+
+// Below 1100px the right-rail TOC is hidden; a collapsible copy sits right
+// under the doc title instead (CSS shows it only at those widths).
+if (showToc && html) {
+  const items = toc
+    .map((h) => `<li${h.depth === 3 ? ' class="docs-toc-sub"' : ''}><a href="#${h.id}">${h.html}</a></li>`)
+    .join('');
+  const mobileToc = `<details class="docs-toc-mobile" data-pagefind-ignore><summary>On this page</summary><ul>${items}</ul></details>`;
+  html = html.replace('</h1>', `</h1>${mobileToc}`);
+}
 ---
 
 <DocsLayout title={title} description={description} activeSlug={activeSlug} hasToc={showToc}>

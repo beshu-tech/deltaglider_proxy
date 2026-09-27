@@ -682,6 +682,10 @@
     border-bottom: 1px solid var(--rule); padding-bottom: 16px;
   }
   .docs-nav-group { margin-bottom: 14px; }
+  .docs-sidebar .docs-search-btn { margin-bottom: 10px; }
+  .docs-sidebar:not(.is-open) .docs-nav-panel { display: none; }
+  .docs-sidebar.is-open .docs-nav-panel { margin-top: 14px; }
+  .docs-sidebar.is-open .docs-nav-toggle .docs-nav-chevron { transform: rotate(0deg); }
   .docs-shell::before { --doc-grid-size: 24px; }
   .docs-pager { grid-template-columns: 1fr; }
   .docs-pager-next { text-align: left; }
@@ -696,6 +700,53 @@
   .docs-pager-card { transition: border-color 0.14s; }
   .docs-pager-card:hover, .docs-prose pre.has-copy:hover .docs-copy-btn, .docs-copy-btn:focus-visible { transform: none; }
   html { scroll-behavior: auto; }
+}
+
+/* ── Phone nav toggle + in-flow "On this page" ─────────────────────────── */
+.docs-nav-toggle {
+  display: none; /* shown below 860px (see Responsive) */
+  align-items: center; gap: 8px; width: 100%;
+  padding: 9px 10px;
+  font-family: var(--doc-display); font-size: 0.95rem; font-weight: 600;
+  color: var(--ink-strong); background: var(--bg-card);
+  border: 1px solid var(--rule); border-radius: 8px; cursor: pointer;
+}
+.docs-nav-toggle span { flex: 1 1 auto; text-align: left; }
+.docs-nav-toggle:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+.docs-nav-toggle .docs-nav-chevron { transform: rotate(-90deg); }
+@media (max-width: 860px) {
+  .docs-nav-toggle { display: flex; }
+}
+
+/* The right-rail TOC hides below 1100px; this collapsible copy takes its
+   place above the prose so long reference pages stay navigable. */
+.docs-toc-mobile {
+  display: none;
+  margin: 0 0 24px;
+  border: 1px solid var(--rule); border-radius: 10px;
+  background: var(--bg-card);
+  font-variant-ligatures: none;
+}
+.docs-toc-mobile > summary {
+  padding: 10px 14px; cursor: pointer;
+  font-family: var(--doc-label); font-size: 0.8125rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-500);
+}
+/* It sits inside .docs-prose, so undo the prose list and link styling. */
+.docs-prose .docs-toc-mobile ul { list-style: none; margin: 0; padding: 0 14px 12px; max-width: none; }
+.docs-prose .docs-toc-mobile li { margin: 0; font-size: 0.92rem; line-height: 1.4; }
+.docs-prose .docs-toc-mobile li::before { content: none; }
+.docs-prose .docs-toc-mobile li a {
+  display: block; padding: 5px 0; color: var(--ink-soft); text-decoration: none;
+}
+.docs-prose .docs-toc-mobile li.docs-toc-sub a { padding-left: 14px; font-size: 0.86rem; color: var(--ink-500); }
+.docs-prose .docs-toc-mobile a code {
+  text-decoration: none;
+  font-family: var(--font-mono); font-size: 0.9em;
+  background: none; border: none; padding: 0; color: inherit;
+}
+@media (max-width: 1100px) {
+  .docs-toc-mobile { display: block; }
 }
 
 /* ── Search (Pagefind) ──────────────────────────────────────────────────
