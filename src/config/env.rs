@@ -18,9 +18,24 @@ where
 /// touching the process environment.
 pub type EnvLookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
-/// The real process environment, as an [`EnvLookup`].
+/// The real process environment, as an [`EnvLookup`]. With
+/// [`process_env_os`], the one reader of the process environment: clippy
+/// refuses `std::env::var` everywhere else (`clippy.toml`).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the one reader of the process environment"
+)]
 pub fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
+}
+
+/// [`process_env`] for a value that need not be UTF-8 (a path).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the one reader of the process environment"
+)]
+pub fn process_env_os(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name)
 }
 
 /// [`env_parse`] over an injected lookup.

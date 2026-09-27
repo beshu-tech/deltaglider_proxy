@@ -321,7 +321,7 @@ impl Default for AdminClientOpts {
 /// GitOps convention is to pipe secrets via env from the secret
 /// manager anyway.
 async fn admin_login(opts: &AdminClientOpts) -> Result<reqwest::Client, CliError> {
-    let password = std::env::var(PASSWORD_ENV).map_err(|_| CliError::MissingPassword)?;
+    let password = crate::config::process_env(PASSWORD_ENV).ok_or(CliError::MissingPassword)?;
     if password.is_empty() {
         return Err(CliError::MissingPassword);
     }

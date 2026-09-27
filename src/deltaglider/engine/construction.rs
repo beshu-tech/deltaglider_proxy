@@ -221,7 +221,7 @@ pub(super) fn wrap_backend_with_encryption(
                 kid
             );
             let env_name = env_name_for_backend(backend_name);
-            if std::env::var(&env_name).is_err() {
+            if crate::config::process_env(&env_name).is_none() {
                 tracing::warn!(
                     "backend '{}' encryption key was loaded from config file (not {}). \
                      Keep an off-box backup of the key; if the config file is lost, all \

@@ -94,7 +94,7 @@ pub fn resolve(inputs: CredsInputs<'_>) -> Result<ResolvedCreds, CredsError> {
     // 2. Env vars fill any unfilled slot.
     let mut from_env_any = false;
     if access_key.is_none() {
-        if let Ok(v) = std::env::var("AWS_ACCESS_KEY_ID") {
+        if let Some(v) = crate::config::process_env("AWS_ACCESS_KEY_ID") {
             if !v.is_empty() {
                 access_key = Some(v);
                 from_env_any = true;
@@ -102,7 +102,7 @@ pub fn resolve(inputs: CredsInputs<'_>) -> Result<ResolvedCreds, CredsError> {
         }
     }
     if secret_key.is_none() {
-        if let Ok(v) = std::env::var("AWS_SECRET_ACCESS_KEY") {
+        if let Some(v) = crate::config::process_env("AWS_SECRET_ACCESS_KEY") {
             if !v.is_empty() {
                 secret_key = Some(v);
                 from_env_any = true;
@@ -110,7 +110,7 @@ pub fn resolve(inputs: CredsInputs<'_>) -> Result<ResolvedCreds, CredsError> {
         }
     }
     if session_token.is_none() {
-        if let Ok(v) = std::env::var("AWS_SESSION_TOKEN") {
+        if let Some(v) = crate::config::process_env("AWS_SESSION_TOKEN") {
             if !v.is_empty() {
                 session_token = Some(v);
                 from_env_any = true;
@@ -119,7 +119,7 @@ pub fn resolve(inputs: CredsInputs<'_>) -> Result<ResolvedCreds, CredsError> {
     }
     if region.is_none() {
         for var in ["AWS_REGION", "AWS_DEFAULT_REGION"] {
-            if let Ok(v) = std::env::var(var) {
+            if let Some(v) = crate::config::process_env(var) {
                 if !v.is_empty() {
                     region = Some(v);
                     from_env_any = true;
@@ -135,7 +135,7 @@ pub fn resolve(inputs: CredsInputs<'_>) -> Result<ResolvedCreds, CredsError> {
         let profile_name = inputs
             .profile_flag
             .map(str::to_string)
-            .or_else(|| std::env::var("AWS_PROFILE").ok())
+            .or_else(|| crate::config::process_env("AWS_PROFILE"))
             .unwrap_or_else(|| "default".to_string());
         let path = credentials_file_path()?;
         if path.exists() {
@@ -195,12 +195,12 @@ pub fn resolve(inputs: CredsInputs<'_>) -> Result<ResolvedCreds, CredsError> {
 /// `AWS_SHARED_CREDENTIALS_FILE` then falls back to
 /// `$HOME/.aws/credentials`.
 fn credentials_file_path() -> Result<PathBuf, CredsError> {
-    if let Ok(p) = std::env::var("AWS_SHARED_CREDENTIALS_FILE") {
+    if let Some(p) = crate::config::process_env("AWS_SHARED_CREDENTIALS_FILE") {
         if !p.is_empty() {
             return Ok(PathBuf::from(p));
         }
     }
-    let home = std::env::var_os("HOME")
+    let home = crate::config::process_env_os("HOME")
         .map(PathBuf::from)
         .ok_or(CredsError::HomeDirUnknown)?;
     Ok(home.join(".aws").join("credentials"))

@@ -112,8 +112,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = args.get(1).cloned();
     let secrets_out_path = args.get(2).map(PathBuf::from);
 
-    let raw_hash = std::env::var("DGP_BOOTSTRAP_PASSWORD_HASH")
-        .map_err(|_| "DGP_BOOTSTRAP_PASSWORD_HASH must be set in the environment")?;
+    let raw_hash = deltaglider_proxy::config::process_env("DGP_BOOTSTRAP_PASSWORD_HASH")
+        .ok_or("DGP_BOOTSTRAP_PASSWORD_HASH must be set in the environment")?;
     let hash = decode_hash(&raw_hash);
 
     // Accumulator populated at every `!secret NAME` emission below. The

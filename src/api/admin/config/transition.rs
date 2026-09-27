@@ -314,9 +314,7 @@ async fn transition_gates(
     crate::config_db::key::check_sync_bucket_change(
         old_cfg.config_sync_bucket.as_deref(),
         new_cfg.config_sync_bucket.as_deref(),
-        std::env::var(crate::config_db::key::CONFIG_DB_KEY_ENV)
-            .ok()
-            .as_deref(),
+        crate::config::process_env(crate::config_db::key::CONFIG_DB_KEY_ENV).as_deref(),
     )
     .map_err(|e| format!("config refused: {e}"))?;
 

@@ -27,9 +27,10 @@ pub use deltaglider_proxy::config_db::config_db_path;
 /// Initialize tracing with reload support.
 /// Priority: RUST_LOG > DGP_LOG_LEVEL > --verbose > default.
 pub fn init_tracing(cli: &Cli) -> reload::Handle<EnvFilter, tracing_subscriber::Registry> {
-    let spec = std::env::var("RUST_LOG")
-        .or_else(|_| std::env::var("DGP_LOG_LEVEL"))
-        .unwrap_or_else(|_| {
+    let env = deltaglider_proxy::config::process_env;
+    let spec = env("RUST_LOG")
+        .or_else(|| env("DGP_LOG_LEVEL"))
+        .unwrap_or_else(|| {
             if cli.verbose {
                 "deltaglider_proxy=trace,tower_http=trace".to_string()
             } else {
@@ -45,7 +46,7 @@ pub fn init_tracing(cli: &Cli) -> reload::Handle<EnvFilter, tracing_subscriber::
     // every span field becomes a key), else the human-readable text format.
     // Boxed so both arms share one registry-build site.
     use tracing_subscriber::Layer;
-    let json_format = std::env::var("DGP_LOG_FORMAT")
+    let json_format = env("DGP_LOG_FORMAT")
         .map(|v| v.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
     let fmt_layer = if json_format {
@@ -142,7 +143,7 @@ fn warn_active_test_seams() {
     let active: Vec<&str> = SEAMS
         .iter()
         .copied()
-        .filter(|k| std::env::var_os(k).is_some())
+        .filter(|k| deltaglider_proxy::config::process_env_os(k).is_some())
         .collect();
     if !active.is_empty() {
         warn!(
@@ -530,15 +531,18 @@ pub fn migrate_legacy_config_db_key() -> Result<(), String> {
     // in the YAML config also works: the boot migrates with it.)
     let current_hash = ["DGP_BOOTSTRAP_PASSWORD_HASH", "DGP_ADMIN_PASSWORD_HASH"]
         .iter()
-        .find_map(|n| std::env::var(n).ok().filter(|v| !v.trim().is_empty()))
+        .find_map(|n| deltaglider_proxy::config::process_env(n).filter(|v| !v.trim().is_empty()))
         .or_else(|| {
             [".deltaglider_bootstrap_hash", ".deltaglider_admin_hash"]
                 .iter()
                 .find_map(|f| std::fs::read_to_string(f).ok())
         })
         .map(|raw| Config::decode_hash(raw.trim()));
-    let keys =
-        key::resolve_config_db_keys(&db_path, current_hash.as_deref(), |n| std::env::var(n).ok())?;
+    let keys = key::resolve_config_db_keys(
+        &db_path,
+        current_hash.as_deref(),
+        deltaglider_proxy::config::process_env,
+    )?;
     // The CLI does not know whether the config has a sync bucket, so it
     // always parks the upload: without a sync bucket the marker is inert.
     match deltaglider_proxy::config_db_sync::open_live_db(&db_path, &keys, true) {
@@ -571,7 +575,7 @@ pub fn resolve_config_db_keys_or_exit(
     use deltaglider_proxy::config_db::key::{
         check_sync_needs_env_key, resolve_config_db_keys, CONFIG_DB_KEY_ENV,
     };
-    let env_key = std::env::var(CONFIG_DB_KEY_ENV).ok();
+    let env_key = deltaglider_proxy::config::process_env(CONFIG_DB_KEY_ENV);
     // Before any key file exists: a multi-instance node must not mint its own.
     if let Err(e) =
         check_sync_needs_env_key(config.config_sync_bucket.as_deref(), env_key.as_deref())
@@ -579,9 +583,11 @@ pub fn resolve_config_db_keys_or_exit(
         error!("FATAL: {e}");
         std::process::exit(1);
     }
-    match resolve_config_db_keys(&config_db_path(), Some(admin_password_hash), |n| {
-        std::env::var(n).ok()
-    }) {
+    match resolve_config_db_keys(
+        &config_db_path(),
+        Some(admin_password_hash),
+        deltaglider_proxy::config::process_env,
+    ) {
         Ok(keys) => {
             info!("  Config DB key: {}", keys.source.describe());
             keys

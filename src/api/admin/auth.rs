@@ -168,8 +168,7 @@ fn metrics_bearer_token() -> Option<&'static str> {
     static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     TOKEN
         .get_or_init(|| {
-            std::env::var("DGP_METRICS_BEARER_TOKEN")
-                .ok()
+            crate::config::process_env("DGP_METRICS_BEARER_TOKEN")
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty())
         })

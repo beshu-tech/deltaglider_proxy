@@ -57,8 +57,7 @@ pub enum OpenedWith {
 /// Derives the directory from `DGP_CONFIG` (parent of the config file)
 /// or falls back to the current working directory.
 pub fn config_db_path() -> PathBuf {
-    let db_dir = std::env::var("DGP_CONFIG")
-        .ok()
+    let db_dir = crate::config::process_env("DGP_CONFIG")
         .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
     db_dir.join("deltaglider_config.db")

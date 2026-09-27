@@ -432,6 +432,7 @@ grounds that another commit introduced it.
 - Passthrough files (images, video) skip delta entirely — already compressed
 - Streaming is preferred for large files; delta reconstruction requires buffering the reference
 - Parse env vars through `env_parse` / `env_bool` / `env_parse_with_default` in `config.rs` — these are THE convention; don't hand-roll `std::env::var(...).ok().and_then(...)` at call sites
+- The request path never reads the environment: an env-only setting lives in `config::RuntimeTuning` (`src/config/tuning.rs`, filled at load + every apply, copied into the engine at build → `engine.tuning()`), or is parsed where its owner is built. `clippy.toml` refuses `std::env::var*` outside `config::process_env`; `request_path_reads_no_env` (src/lib.rs) catches the `env_parse` helpers there. `DGP_TEST_*` chaos hooks go through `config::test_seams` (debug builds only)
 
 ## Testability principles (write code that's testable from day one)
 

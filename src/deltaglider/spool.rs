@@ -77,9 +77,9 @@ impl SpoolDir {
         reason = "the spool's own default directory"
     )]
     pub fn from_env() -> std::io::Result<Self> {
-        let dir = std::env::var("DGP_SPOOL_DIR")
+        let dir = crate::config::process_env_os("DGP_SPOOL_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir().join("dgp-spool"));
+            .unwrap_or_else(|| std::env::temp_dir().join("dgp-spool"));
         let max_bytes: u64 =
             crate::config::env_parse_with_default("DGP_SPOOL_MAX_BYTES", 16 * 1024 * 1024 * 1024);
         let pool = Self::new(dir, max_bytes)?;

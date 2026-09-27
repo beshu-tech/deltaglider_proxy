@@ -3,6 +3,13 @@
 # is exempt (`cfg_attr(test, allow(..))` in src/lib.rs and src/main.rs, a
 # crate-level allow in tests/all.rs): these rules protect production paths.
 disallowed-methods = [
+    # The environment is read through crate::config::process_env (and the
+    # env_parse helpers on top of it). A request reads a field of the config
+    # snapshot (config::tuning::RuntimeTuning, copied into the engine).
+    { path = "std::env::var", reason = "read the environment through crate::config::process_env; the request path reads RuntimeTuning" },
+    { path = "std::env::var_os", reason = "read the environment through crate::config::process_env_os; the request path reads RuntimeTuning" },
+    { path = "std::env::vars", reason = "read the environment through crate::config::process_env" },
+    { path = "std::env::vars_os", reason = "read the environment through crate::config::process_env" },
     # SQLite opens go through crate::sqlite_open (the one-time init gate).
     { path = "rusqlite::Connection::open", reason = "open through crate::sqlite_open" },
     { path = "rusqlite::Connection::open_with_flags", reason = "open through crate::sqlite_open" },

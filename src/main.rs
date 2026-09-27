@@ -488,7 +488,9 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // reload from `config.log_level` if neither env var was set (so
     // env-driven deployments keep their semantics) and the config
     // value differs from what init_tracing chose.
-    if std::env::var("RUST_LOG").is_err() && std::env::var("DGP_LOG_LEVEL").is_err() {
+    if deltaglider_proxy::config::process_env("RUST_LOG").is_none()
+        && deltaglider_proxy::config::process_env("DGP_LOG_LEVEL").is_none()
+    {
         match deltaglider_proxy::audit::with_audit_directive(&config.log_level)
             .parse::<tracing_subscriber::EnvFilter>()
         {
@@ -698,7 +700,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Raw read ONLY for the unset-vs-set log distinction; the truth value comes
     // from the canonical parse so the banner can't disagree with the runtime
     // (which also accepts yes/on via env_bool).
-    let trust_proxy_explicit = std::env::var("DGP_TRUST_PROXY_HEADERS").ok();
+    let trust_proxy_explicit = deltaglider_proxy::config::process_env("DGP_TRUST_PROXY_HEADERS");
     let trust_proxy = deltaglider_proxy::rate_limiter::trust_proxy_headers();
     let trusted_cidrs = deltaglider_proxy::rate_limiter::trusted_proxy_cidrs();
     if trust_proxy {

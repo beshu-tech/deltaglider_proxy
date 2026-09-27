@@ -1538,7 +1538,7 @@ impl Config {
     ///    returned too — the load path rejects it loudly rather than
     ///    silently skipping it.
     pub fn resolve_config_path() -> Option<String> {
-        if let Ok(path) = std::env::var("DGP_CONFIG") {
+        if let Some(path) = process_env("DGP_CONFIG") {
             if !path.is_empty() {
                 return Some(path);
             }
@@ -1575,7 +1575,7 @@ impl Config {
     }
 
     fn load_unchecked() -> Self {
-        let mut config = if let Ok(path) = std::env::var("DGP_CONFIG") {
+        let mut config = if let Some(path) = process_env("DGP_CONFIG") {
             if path_is_toml(&path) {
                 eprintln!("ERROR: DGP_CONFIG points at '{path}': {TOML_REMOVED_MSG}");
                 std::process::exit(1);

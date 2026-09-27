@@ -43,7 +43,7 @@ use super::ConfigError;
 /// values with YAML indicators (leading `@`, `*`, `:` `, ` etc.) parse as
 /// intended only when the field is quoted in the template (`key: "${env:X}"`).
 pub fn expand_env_vars(input: &str) -> Result<String, ConfigError> {
-    expand_env_doc_with(input, |name| std::env::var(name).ok())
+    expand_env_doc_with(input, super::process_env)
 }
 
 /// True if `s` is exactly one `${env:NAME}` / `${env:NAME:-default}`
@@ -64,7 +64,7 @@ pub fn is_env_ref(s: &str) -> bool {
 pub fn expand_env_vars_recording(
     input: &str,
 ) -> Result<(String, std::collections::BTreeMap<String, String>), ConfigError> {
-    expand_env_with_recording(input, |name| std::env::var(name).ok())
+    expand_env_with_recording(input, super::process_env)
 }
 
 /// Expansion for documents that arrive over the ADMIN API (`/config/apply`,
@@ -103,7 +103,7 @@ pub fn admin_env_lookup(
     }
     let allowlist: String = super::env_parse(CONFIG_ENV_ALLOWLIST_VAR)?;
     env_name_allowlisted(name, &allowlist)
-        .then(|| std::env::var(name).ok())
+        .then(|| super::process_env(name))
         .flatten()
 }
 

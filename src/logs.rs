@@ -90,7 +90,8 @@ pub fn recent_logs(limit: usize) -> Vec<LogEntry> {
 /// Parse the capture floor from `DGP_LOG_RING_LEVEL` (default INFO).
 fn ring_min_level() -> Level {
     // Default + any unrecognised value → INFO.
-    level_from_str(&std::env::var("DGP_LOG_RING_LEVEL").unwrap_or_default()).unwrap_or(Level::INFO)
+    level_from_str(&crate::config::process_env("DGP_LOG_RING_LEVEL").unwrap_or_default())
+        .unwrap_or(Level::INFO)
 }
 
 /// A `tracing` Layer that captures events (at/above its floor) into the ring +

@@ -38,8 +38,7 @@ const SCHEMA_VERSION: i32 = 1;
 
 /// Path to the usage DB — beside the config DB (same dir-derivation rule).
 pub fn bucket_usage_db_path() -> PathBuf {
-    let db_dir = std::env::var("DGP_CONFIG")
-        .ok()
+    let db_dir = crate::config::process_env("DGP_CONFIG")
         .and_then(|p| Path::new(&p).parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
     db_dir.join("deltaglider_usage.db")
