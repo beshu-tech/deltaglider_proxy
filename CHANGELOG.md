@@ -165,6 +165,17 @@ proxy installed the new engine before the refusal, so the new limit
 served requests while the config still showed the old one. Now every
 check runs first, and the new engine goes live as the last step.
 
+### Changed — A ranged part copy of a stored-as-is object reads only its range
+
+`UploadPartCopy` read the whole source object into memory for each part,
+and then cut the part out of it. An SDK managed copy sends one request per
+part, so one copy of a 100 MiB object held about 1 GiB with ten parallel
+parts. Now a ranged part of an object that is stored as-is (not as a
+delta) reads only that range, from the version that the copy-source
+conditions checked. The part, not the whole source, must fit
+`max_object_size`, so such a source can be larger than that limit. A
+delta-compressed source is still read whole.
+
 ### Fixed — Oversized metadata answers `MetadataTooLarge` on every path
 
 A browser form upload with user metadata over 2 KB, and a write whose stored

@@ -387,3 +387,76 @@ async fn self_copy_without_change_is_refused() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
 }
+
+fn upload_id(body: &str) -> String {
+    body.split("<UploadId>")
+        .nth(1)
+        .unwrap()
+        .split("</UploadId>")
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// A ranged UploadPartCopy of a passthrough source reads only the range: a
+/// source larger than `max_object_size` can be copied
+/// part by part. The whole-source read refused it (s3surface-10).
+#[tokio::test]
+async fn ranged_part_copy_reads_only_the_range() {
+    let server = common::TestServer::builder()
+        .max_object_size(4096)
+        .build()
+        .await;
+    let http = server.http();
+    let (endpoint, bucket) = (server.endpoint(), server.bucket().to_string());
+    // A 9000-byte passthrough source over max_object_size: a file that is on
+    // the backend already (a PUT could not store it).
+    let dir = server.data_dir().unwrap().join(&bucket).join("deltaspaces");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source: Vec<u8> = (1..=3u8).flat_map(|n| vec![b'a' + n; 3000]).collect();
+    std::fs::write(dir.join("big.jpg"), &source).unwrap();
+
+    let dst = format!("{endpoint}/{bucket}/copy.jpg");
+    let resp = http.post(format!("{dst}?uploads")).send().await.unwrap();
+    let id = upload_id(&resp.text().await.unwrap());
+    let resp = http
+        .put(format!("{dst}?partNumber=1&uploadId={id}"))
+        .header("x-amz-copy-source", format!("{bucket}/big.jpg"))
+        .header("x-amz-copy-source-range", "bytes=2990-3009")
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    let etag = body
+        .split("<ETag>")
+        .nth(1)
+        .unwrap()
+        .split("</ETag>")
+        .next()
+        .unwrap();
+    // A part over max_object_size is still refused.
+    let resp = http
+        .put(format!("{dst}?partNumber=2&uploadId={id}"))
+        .header("x-amz-copy-source", format!("{bucket}/big.jpg"))
+        .header("x-amz-copy-source-range", "bytes=0-4999")
+        .send()
+        .await
+        .unwrap();
+    let refused = resp.text().await.unwrap();
+    assert!(refused.contains("EntityTooLarge"), "{refused}");
+    let resp = http
+        .post(format!("{dst}?uploadId={id}"))
+        .body(format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let got = http.get(&dst).send().await.unwrap().bytes().await.unwrap();
+    let mut want = vec![b'b'; 10];
+    want.extend(vec![b'c'; 10]);
+    assert_eq!(got.as_ref(), want.as_slice());
+}

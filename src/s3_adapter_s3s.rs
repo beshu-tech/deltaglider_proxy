@@ -1437,33 +1437,57 @@ impl s3s::S3 for DeltaGliderS3Service {
             input.copy_source_if_modified_since.as_ref(),
             input.copy_source_if_unmodified_since.as_ref(),
         )?;
-        // `engine.retrieve` buffers the ENTIRE source object into a heap Vec
-        // (delta reconstruction can't stream, and passthrough is collected too),
-        // and `copy_source_range` is sliced only AFTER that buffer exists — so a
-        // small requested part does NOT bound memory. Passthrough objects are
-        // stored up to `max_passthrough_object_size` (64 GiB default), so without
-        // this gate a standard aws-cli/boto3 managed copy (which auto-issues
-        // UploadPartCopy per chunk, each re-buffering the whole source) would OOM
-        // the shared process. Mirror `copy_object`'s guard: reject oversized
-        // sources with EntityTooLarge before and after the buffering read.
-        if source_meta.file_size > engine.max_object_size() {
-            return Err(s3s::s3_error!(EntityTooLarge));
-        }
-        let (data, _) = engine
-            .retrieve(&source_bucket, &source_key)
-            .await
-            .map_err(engine_error_to_s3s)?;
-        if data.len() as u64 > engine.max_object_size() {
-            return Err(s3s::s3_error!(EntityTooLarge));
-        }
         self.state
             .multipart
             .set_max_object_size(engine.max_object_size());
-        let part = if let Some(range) = input.copy_source_range.as_deref() {
-            let (start, end) = parse_copy_range(range, data.len())?;
-            bytes::Bytes::from(data[start..=end].to_vec())
+        // A ranged part of a passthrough source is read as that range only,
+        // pinned to the generation the conditionals judged: an SDK managed copy
+        // sends one UploadPartCopy per part, and each used to buffer the whole
+        // source (s3surface-10). The part itself is bounded like an UploadPart.
+        let ranged = match input.copy_source_range.as_deref() {
+            Some(range) => {
+                let len = usize::try_from(source_meta.file_size).unwrap_or(usize::MAX);
+                let (start, end) = parse_copy_range(range, len)?;
+                if (end - start) as u64 >= engine.max_object_size() {
+                    return Err(s3s::s3_error!(EntityTooLarge));
+                }
+                engine
+                    .retrieve_stream_range(
+                        &source_bucket,
+                        &source_key,
+                        start as u64,
+                        end as u64,
+                        Some(&source_meta),
+                    )
+                    .await
+                    .map_err(engine_error_to_s3s)?
+            }
+            None => None,
+        };
+        let part = if let Some((stream, content_length, _)) = ranged {
+            collect_exact(stream, content_length).await?
         } else {
-            bytes::Bytes::from(data)
+            // A delta source (or a whole-object part): `engine.retrieve`
+            // buffers the ENTIRE source, and the range is sliced only after,
+            // so a small part does not bound memory. Reject a source over
+            // `max_object_size` before and after the buffering read, as
+            // `copy_object` does.
+            if source_meta.file_size > engine.max_object_size() {
+                return Err(s3s::s3_error!(EntityTooLarge));
+            }
+            let (data, _) = engine
+                .retrieve(&source_bucket, &source_key)
+                .await
+                .map_err(engine_error_to_s3s)?;
+            if data.len() as u64 > engine.max_object_size() {
+                return Err(s3s::s3_error!(EntityTooLarge));
+            }
+            if let Some(range) = input.copy_source_range.as_deref() {
+                let (start, end) = parse_copy_range(range, data.len())?;
+                bytes::Bytes::from(data[start..=end].to_vec())
+            } else {
+                bytes::Bytes::from(data)
+            }
         };
         let etag = self
             .state
@@ -2118,6 +2142,32 @@ fn is_illegal_self_copy(source: (&str, &str), dest: (&str, &str), changes: bool)
     !changes
         && source.0 == dest.0
         && source.1.trim_start_matches('/') == dest.1.trim_start_matches('/')
+}
+
+/// Collect a ranged read of `len` bytes. More or fewer bytes than the backend
+/// announced is a backend fault (500), never a short part.
+async fn collect_exact(
+    mut stream: BoxStream<'static, Result<bytes::Bytes, StorageError>>,
+    len: u64,
+) -> s3s::S3Result<bytes::Bytes> {
+    let mut buf = bytes::BytesMut::with_capacity(usize::try_from(len).unwrap_or(0));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(engine_error_to_s3s)?;
+        if (buf.len() + chunk.len()) as u64 > len {
+            return Err(s3s::s3_error!(
+                InternalError,
+                "copy source range is longer than announced"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    if buf.len() as u64 != len {
+        return Err(s3s::s3_error!(
+            InternalError,
+            "copy source range is shorter than announced"
+        ));
+    }
+    Ok(buf.freeze())
 }
 
 fn parse_copy_range(range: &str, len: usize) -> s3s::S3Result<(usize, usize)> {
