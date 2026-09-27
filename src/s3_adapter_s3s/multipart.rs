@@ -15,19 +15,20 @@ pub(super) async fn create_multipart_upload(
     crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)?;
     check_user_metadata_size_s3s(input.metadata.as_ref())?;
     ensure_bucket_exists_s3s(&svc.state, &input.bucket).await?;
-    let delta_limit = svc
-        .state
-        .engine
-        .load()
-        .tuning()
-        .mpu_delta_reconstruct_max_bytes;
+    let engine = svc.state.engine.load();
+    let delta_limit = engine.tuning().mpu_delta_reconstruct_max_bytes;
+    let user_metadata = input.metadata.unwrap_or_default();
+    // A write that tries no delta is never assembled in memory: its parts go
+    // to relay files from the first one. Completion decides again (the config
+    // can change mid-upload) and reads relay files either way.
+    let relay_now = !engine.write_tries_delta(&input.bucket, &input.key, &user_metadata);
     let upload_id = svc.state.multipart.create_with_relay_policy(
         &input.bucket,
         &input.key,
         input.content_type.clone(),
-        input.metadata.unwrap_or_default(),
+        user_metadata,
         Some(delta_limit),
-        false,
+        relay_now,
     )?;
     Ok(s3s::S3Response::new(
         s3s::dto::CreateMultipartUploadOutput {

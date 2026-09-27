@@ -9,6 +9,17 @@ rule gate refused a document, `/config/apply` returned the parse-time warnings
 of the document, but `/config/validate` returned none. Now `/config/validate`
 returns the same warnings as `/config/apply`.
 
+### Changed — A multipart upload that tries no delta keeps its parts in the spool
+
+A client multipart upload kept its parts in memory until it held more than
+64 MiB (`DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES`), also when the upload was
+certain to be stored as a plain object: a key that is not delta-eligible, the
+`dg-no-delta: true` hint, or a bucket with compression disabled. Such an
+upload never needs its parts in one buffer, so now CreateMultipartUpload
+sends its parts to relay files in `DGP_SPOOL_DIR` from the first part. These
+parts count against `DGP_SPOOL_MAX_BYTES` and
+`DGP_SPOOL_RELAY_UPLOAD_MAX_BYTES`.
+
 ### Fixed — A multipart upload that tries no delta is not assembled in memory
 
 CompleteMultipartUpload assembled the parts of a delta-eligible key into one

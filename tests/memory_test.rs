@@ -128,7 +128,7 @@ async fn complete_multipart_upload(
 /// upload of a non-delta-eligible `.bin` file.
 ///
 /// Threshold rationale (35 MB above pre-complete baseline):
-///   - Parts buffered in MultipartStore: 30 MB (unavoidable, present before complete)
+///   - Parts: relay files in the spool (a `.bin` upload tries no delta)
 ///   - Old path: +30 MB contiguous BytesMut assembly -> ~60 MB spike
 ///   - New path: sequential chunk writes -> ~5 MB streaming overhead
 ///   - 35 MB threshold catches the old 60 MB spike while tolerating OS jitter
@@ -179,8 +179,8 @@ async fn test_multipart_memory_bounded() {
         etags.push(etag);
     }
 
-    // Snapshot peak RSS before CompleteMultipartUpload
-    // At this point all 30 MB of parts are buffered in the server's MultipartStore
+    // Snapshot peak RSS before CompleteMultipartUpload. A `.bin` upload tries
+    // no delta, so its parts are relay files in the spool, not in memory.
     let peak_before = get_peak_rss(&http, &endpoint).await;
     eprintln!(
         "Peak RSS before CompleteMultipartUpload: {:.1} MB",
