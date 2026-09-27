@@ -50,7 +50,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_LOG_RING_LEVEL",
-        description: "Minimum severity captured into the GUI log ring/stream (error|warn|info|debug|trace; default: info). Independent of the stdout log level.",
+        description: "Minimum severity captured into the GUI log ring/stream (error|warn|info|debug|trace; default: info). The ring sees only events that the global log filter (log_level) lets through, so this floor can narrow it but not widen it.",
         example: "info",
         category: "Server",
     },
