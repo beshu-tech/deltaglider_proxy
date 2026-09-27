@@ -354,6 +354,14 @@ So the total covered only the objects after the cursor, and the progress
 bar reached 99 % long before the end. Now the resumed count starts from
 the count that was saved with the cursor.
 
+### Fixed — OAuth users without admin rights can use bulk copy, move, delete and ZIP
+
+The bulk object endpoints (`/_/api/admin/objects/*`) accepted the browser
+session of an IAM user who connected with access keys, but refused the
+browser session of a user who signed in through OAuth/OIDC with
+`admin_session_required`. Now that session acts under the user's own IAM
+policy, like the same user's S3 requests.
+
 ### Changed — `DGP_TRUST_PROXY_HEADERS=true` needs `DGP_TRUSTED_PROXY_CIDRS`
 
 With trust on and no CIDR list, the per-IP rate limiter and the IP

@@ -1325,25 +1325,13 @@ pub async fn require_bulk_session(
             .unwrap_or_else(|| "admin".to_string());
         (BulkSession::AdminGui, actor)
     } else {
-        match state.sessions.auth_method(&token, client_ip) {
-            Some(AuthMethod::IamBrowserLift { access_key_id }) => {
-                let actor = match iam.as_ref() {
-                    IamState::Iam(index) => index.get(&access_key_id).map(|u| u.name.clone()),
-                    _ => None,
-                }
-                .unwrap_or_else(|| access_key_id.clone());
-                (
-                    BulkSession::IamUser {
-                        access_key_id,
-                        client_ip,
-                    },
-                    actor,
-                )
-            }
-            Some(AuthMethod::OpenLift) if matches!(iam.as_ref(), IamState::Disabled) => {
-                (BulkSession::Open, "anonymous".to_string())
-            }
-            _ => {
+        match non_admin_bulk_session(
+            state.sessions.auth_method(&token, client_ip),
+            &iam,
+            client_ip,
+        ) {
+            Some(pair) => pair,
+            None => {
                 return (
                     StatusCode::FORBIDDEN,
                     Json(serde_json::json!({"error": "admin_session_required"})),
@@ -1356,6 +1344,46 @@ pub async fn require_bulk_session(
     crate::audit::with_actor(actor, next.run(request))
         .await
         .into_response()
+}
+
+/// The bulk session (and audit actor) of a browser session that is not a
+/// live admin session, or `None` (403). A non-admin IAM user acts under its
+/// own policy, whether it connected with its keys (`IamBrowserLift`) or
+/// signed in through OAuth/OIDC (`External`: the provisioned user by id).
+/// An open-mode session is unrestricted while access is open.
+fn non_admin_bulk_session(
+    method: Option<AuthMethod>,
+    iam: &IamState,
+    client_ip: Option<IpAddr>,
+) -> Option<(BulkSession, String)> {
+    let index = match iam {
+        IamState::Iam(index) => Some(index),
+        _ => None,
+    };
+    let iam_user = |access_key_id: String, actor: String| {
+        let session = BulkSession::IamUser {
+            access_key_id,
+            client_ip,
+        };
+        Some((session, actor))
+    };
+    match method? {
+        AuthMethod::IamBrowserLift { access_key_id } => {
+            let actor = index
+                .and_then(|i| i.get(&access_key_id))
+                .map(|u| u.name.clone())
+                .unwrap_or_else(|| access_key_id.clone());
+            iam_user(access_key_id, actor)
+        }
+        AuthMethod::External { user_id, .. } => {
+            let user = index?.get_by_id(user_id)?;
+            iam_user(user.access_key_id.clone(), user.name.clone())
+        }
+        AuthMethod::OpenLift if matches!(iam, IamState::Disabled) => {
+            Some((BulkSession::Open, "anonymous".to_string()))
+        }
+        AuthMethod::OpenLift | AuthMethod::Bootstrap | AuthMethod::IamLoginAs { .. } => None,
+    }
 }
 
 /// Audit actor for an admin session: the IAM user name when known.
@@ -1715,6 +1743,47 @@ mod tests {
             auth_source: "local".into(),
             iam_policies: vec![],
         }
+    }
+
+    /// auth-5: a non-admin browser session reaches the bulk endpoints under
+    /// its own IAM identity, also when it signed in through OAuth/OIDC.
+    #[test]
+    fn non_admin_bulk_session_truth_table() {
+        let iam = IamState::Iam(IamIndex::from_users_and_groups(
+            vec![admin_test_user(4, "AKPLAIN", true, false, vec![])],
+            vec![],
+        ));
+        let ip = Some("198.51.100.1".parse().unwrap());
+        let akid = |r: Option<(BulkSession, String)>| match r {
+            Some((BulkSession::IamUser { access_key_id, .. }, actor)) => {
+                Some((access_key_id, actor))
+            }
+            _ => None,
+        };
+        let external = |id: i64| AuthMethod::External {
+            provider_name: "corp".into(),
+            user_id: id,
+        };
+        assert_eq!(
+            akid(non_admin_bulk_session(Some(external(4)), &iam, ip)),
+            Some(("AKPLAIN".into(), "akplain".into()))
+        );
+        assert!(non_admin_bulk_session(Some(external(99)), &iam, ip).is_none());
+        assert!(non_admin_bulk_session(Some(external(4)), &IamState::Disabled, ip).is_none());
+        let lift = AuthMethod::IamBrowserLift {
+            access_key_id: "AKPLAIN".into(),
+        };
+        assert_eq!(
+            akid(non_admin_bulk_session(Some(lift), &iam, ip)),
+            Some(("AKPLAIN".into(), "akplain".into()))
+        );
+        assert!(matches!(
+            non_admin_bulk_session(Some(AuthMethod::OpenLift), &IamState::Disabled, ip),
+            Some((BulkSession::Open, _))
+        ));
+        assert!(non_admin_bulk_session(Some(AuthMethod::OpenLift), &iam, ip).is_none());
+        assert!(non_admin_bulk_session(Some(AuthMethod::Bootstrap), &iam, ip).is_none());
+        assert!(non_admin_bulk_session(None, &iam, ip).is_none());
     }
 
     /// Truth table: a session reaches the admin surface only while its

@@ -291,6 +291,26 @@ async fn oidc_login_against_a_private_idp_with_a_private_ca() {
         .unwrap();
     assert_eq!(session["valid"], true, "{session}");
 
+    // auth-5: the OAuth non-admin's browser session reaches the bulk object
+    // endpoints, which judge each request by that user's own IAM policy
+    // (Alice has none, so the list is refused by policy, not by session kind).
+    let r = browser
+        .get(format!(
+            "{ep}/_/api/admin/objects/list?bucket={}&prefix=x/",
+            server.bucket()
+        ))
+        .send()
+        .await
+        .unwrap();
+    let status = r.status();
+    let body = r.text().await.unwrap_or_default();
+    assert!(
+        !body.contains("admin_session_required"),
+        "an OAuth browser session was refused by kind: {status} {body}"
+    );
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("may not list"), "{body}");
+
     // The login provisioned an external user.
     let users: Value = admin
         .get(format!("{ep}/_/api/admin/users"))
