@@ -6,6 +6,7 @@
 
 import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
+import ScaleChart from '../components/ScaleChart.astro';
 import MechanismExplanation from '../components/MechanismExplanation.astro';
 import CompressionResultsTable from '../components/CompressionResultsTable.astro';
 import { webPageSchema, breadcrumbListSchema } from '../lib/seo';
@@ -27,7 +28,7 @@ const description =
   </Fragment>
   <section class="saas-hero">
     <div class="shell hero-grid">
-      <div class="hero-content fade-up">
+      <div class="hero-content">
         <h1>Cut the S3 bill for your build artifacts.</h1>
 
         <p class="hero-lede">
@@ -45,16 +46,8 @@ const description =
         </div>
       </div>
       
-      <div class="hero-visual fade-up delay-1">
-        <div class="abstract-jars">
-          <div class="jar jar-1"><span class="jar-label">91 MB</span></div>
-          <div class="jar jar-2"></div>
-          <div class="jar jar-3"></div>
-          <div class="delta-block">
-            <span class="delta-stat">148 KB</span>
-            <span class="delta-label">Encrypted delta</span>
-          </div>
-        </div>
+      <div class="hero-visual">
+        <ScaleChart compact />
       </div>
     </div>
   </section>
@@ -62,7 +55,7 @@ const description =
   <div class="shell">
     <MechanismExplanation />
 
-    <section class="compute-tax fade-up delay-2">
+    <section class="compute-tax">
       <span class="section-eyebrow">The cost</span>
       <h2>What it costs in speed</h2>
 
@@ -99,7 +92,7 @@ const description =
       </p>
     </section>
 
-    <section class="in-progress fade-up delay-2">
+    <section class="in-progress">
       <div class="in-progress-grid">
         <div class="narrative-col">
           <span class="section-eyebrow">Dogfooding</span>
@@ -122,7 +115,7 @@ const description =
     </section>
 
 
-    <section class="playbook fade-up delay-3">
+    <section class="playbook">
       <span class="section-eyebrow">Playbook</span>
       <h2>What a migration looks like</h2>
 
@@ -198,25 +191,10 @@ const description =
   /* Four columns do not fit a phone: scroll the table, not the page. */
   .tax-scroll { overflow-x: auto; }
 
-  /* === Animations === */
-  @keyframes fadeUp {
-    from { opacity: 0; transform: translateY(20px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-
-  .fade-up {
-    animation: fadeUp 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-    opacity: 0;
-  }
-  
-  .delay-1 { animation-delay: 0.1s; }
-  .delay-2 { animation-delay: 0.2s; }
-  .delay-3 { animation-delay: 0.3s; }
-
   /* === Hero Section === */
   .saas-hero {
     padding: 6rem 0 4rem;
-    background: radial-gradient(circle at 80% -20%, var(--brand-soft), transparent 50%),
+    background: radial-gradient(circle at 80% -20%, var(--brand-tint), transparent 50%),
                 var(--bg);
     overflow: hidden;
   }
@@ -235,89 +213,13 @@ const description =
   }
 
   .saas-hero h1 {
-    font-size: clamp(2.5rem, 5vw, 4rem);
-    line-height: 1.1;
+    font-size: var(--fs-display);
+    line-height: 1.05;
     margin-bottom: 1.5rem;
     letter-spacing: -0.03em;
   }
 
-  .hero-visual {
-    position: relative;
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    height: 480px;
-  }
-
-  .abstract-jars {
-    position: relative;
-    width: 360px;
-    height: 360px;
-  }
-
-  .jar {
-    position: absolute;
-    width: 300px;
-    height: 300px;
-    border: 2px solid rgba(255, 255, 255, 0.12);
-    border-radius: 18px;
-    background: var(--bg-alt);
-    top: 0; left: 30px;
-    transform-origin: bottom center;
-    transition: transform 0.5s ease;
-  }
-
-  .jar-1 {
-    transform: translateY(0) scale(1) translateZ(-40px);
-    opacity: 0.3;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .jar-label {
-    color: var(--ink-faint);
-    font-size: 2.6rem;
-    font-weight: 700;
-    font-family: var(--font-mono);
-    text-transform: uppercase;
-  }
-  .jar-2 { transform: translateY(26px) scale(0.95) translateZ(-20px); opacity: 0.45; border-color: var(--brand-line-soft); }
-  .jar-3 { transform: translateY(52px) scale(0.9); opacity: 0.85; border-color: var(--brand-glow); }
-
-  .delta-block {
-    position: absolute;
-    bottom: -48px;
-    left: 25px;
-    width: 310px;
-    padding: 2.2rem;
-    background: var(--brand-wash);
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
-    border: 1px solid var(--brand);
-    border-radius: 16px;
-    box-shadow: 0 14px 44px var(--brand-line-soft);
-    text-align: center;
-    z-index: 10;
-  }
-
-  .delta-stat {
-    display: block;
-    font-size: 3.2rem;
-    font-weight: 800;
-    color: var(--brand);
-    line-height: 1;
-    font-family: var(--font-mono);
-  }
-
-  .delta-label {
-    display: block;
-    font-size: 1rem;
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-    color: var(--brand-dark);
-    margin-top: 0.6rem;
-  }
+  .hero-visual { min-width: 0; }
 
   /* === Rhythm & Layouts === */
   .in-progress,
