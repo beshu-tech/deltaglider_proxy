@@ -21,7 +21,7 @@ describe('providers', () => {
 
   it('free tier: B2 bills nothing for the first 10 GB', () => {
     expect(monthlyCostUsd('b2', 10)).toBe(0);
-    expect(monthlyCostUsd('b2', 110)).toBeCloseTo(100 * 0.006, 6); // (110-10)*0.006
+    expect(monthlyCostUsd('b2', 110)).toBeCloseTo(100 * 0.00695, 6); // (110-10)*0.00695
   });
 
   it('minimum threshold: Wasabi floors at 1 TB even for tiny footprints', () => {

@@ -43,7 +43,7 @@ export const PROVIDERS: Provider[] = [
     name: 'Backblaze B2',
     currency: 'USD',
     notes: 'The first 10 GB are free, and after that you pay as you go.',
-    nativeMonthlyCost: withFreeTier(10, 0.006),
+    nativeMonthlyCost: withFreeTier(10, 0.00695),
   },
   {
     id: 'idrive',
