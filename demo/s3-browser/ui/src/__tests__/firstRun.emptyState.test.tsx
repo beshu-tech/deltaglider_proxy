@@ -2,7 +2,7 @@
  * Browser-review item 17: a fresh proxy (no buckets) showed only "Create a
  * bucket". An admin also gets a link to the first-run setup wizard there.
  */
-import { screen } from '@testing-library/react';
+import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, expect, test, vi } from 'vitest';
 import { json, mockFetch } from '../test/fetchMock';
@@ -20,9 +20,10 @@ vi.mock('../s3client', async (importOriginal) => {
 import Root from '../Root';
 import ThemeProvider from '../ThemeProvider';
 
+let http: ReturnType<typeof mockFetch>;
 beforeEach(() => {
   window.history.replaceState(null, '', '/_/browse/');
-  const http = mockFetch();
+  http = mockFetch();
   for (const m of ['GET', 'POST', 'PUT', 'DELETE']) http.on(m, /./, json({}, 404));
   http.on('GET', '/_/api/admin/session/s3-credentials', json({
     endpoint: 'http://localhost:9000', region: 'us-east-1', bucket: '', access_key_id: 'AK', secret_access_key: 'secret',
@@ -35,7 +36,15 @@ afterEach(() => vi.unstubAllGlobals());
 test('the no-buckets empty state links an admin to the setup wizard', async () => {
   const user = userEvent.setup();
   renderWithQuery(<ThemeProvider><Root /></ThemeProvider>);
-  const link = await screen.findByRole('button', { name: 'Run the setup wizard' });
-  await user.click(link);
+  // Wait in the app's own steps, each on its real condition, so no single
+  // wait spans the whole restore-session → shell → identity chain (under CPU
+  // load that chain alone outlasted one findBy budget). The text query is
+  // cheap; a role query over the whole shell re-computes accessible names on
+  // every DOM mutation, which is what ate the budget.
+  await waitFor(() => expect(http.callsTo('GET', '/_/api/whoami')).toHaveLength(1));
+  const label = await screen.findByText('Run the setup wizard');
+  const link = label.closest('button');
+  expect(link).not.toBeNull();
+  await user.click(link!);
   expect(window.location.pathname).toBe('/_/admin/setup');
 });
