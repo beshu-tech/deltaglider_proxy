@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+
+### Fixed — A maintenance job keeps its write gate through a DB error
+
+The per-object lease renewal read a config DB error as a lost lease. The job
+stopped, and the write gate on its bucket opened while the job was still
+active, so writes could race a migrate copy. Now a DB error is retried, and
+a job that loses its lease keeps the gate for as long as its row is active.
 ### Changed — A migrate to a filesystem backend is about twice as fast
 
 A migrate made every copy durable on its own before the next one (one

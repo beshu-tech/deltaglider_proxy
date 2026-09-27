@@ -208,15 +208,16 @@ async fn run_job(
         // Do NOT settle the row: losing the lease means it lapsed (the
         // requeue scan will hand it to the next claimer with its cursor
         // intact) or another instance already claimed it — settling here
-        // would terminate THAT run's row out from under it. Just stop and
-        // release our gate.
+        // would terminate THAT run's row out from under it. Just stop; the
+        // gate stays armed for as long as the row is active.
         warn!(
             "maintenance: job #{} on '{}' lost its lease — stopping without settling \
              (the job resumes under the next claimer)",
             job.id, bucket
         );
-        for k in &gated {
-            state.maintenance_gate.clear(k);
+        let still_armed = db.lock().await.maintenance_gate_arm_keys();
+        for k in gate_keys_to_clear_after_lease_loss(&gated, still_armed) {
+            state.maintenance_gate.clear(&k);
         }
         return;
     }
@@ -700,8 +701,10 @@ fn keeper_interval(ttl_secs: i64) -> std::time::Duration {
 /// Renew the job lease; `Err(LEASE_LOST)` means the renewal was refused
 /// (lapsed, or taken by another instance) and the phase MUST stop — this
 /// is the one subsystem that flips config and deletes source data, so a
-/// lapsed worker must never keep going. DB errors are treated the same,
-/// conservatively.
+/// lapsed worker must never keep going. A DB error is NOT a refusal (same
+/// verdict as the keeper): stopping on it cleared the write gate while the
+/// row stayed active. A lapsed lease never renews, so once the DB answers
+/// again a lapse still reads as LEASE_LOST.
 pub(crate) async fn heartbeat(
     db: &Arc<Mutex<ConfigDb>>,
     job_id: i64,
@@ -710,12 +713,38 @@ pub(crate) async fn heartbeat(
     let renewed = {
         let db = db.lock().await;
         db.maintenance_heartbeat(job_id, instance_id, current_unix_seconds(), LEASE_TTL_SECS)
-            .unwrap_or(false)
     };
-    if renewed {
-        Ok(())
-    } else {
-        Err(LEASE_LOST.to_string())
+    use crate::config_db::job_store::{keeper_step, KeeperStep};
+    match keeper_step(&renewed) {
+        KeeperStep::Held => Ok(()),
+        KeeperStep::Lost => Err(LEASE_LOST.to_string()),
+        KeeperStep::Retry => {
+            warn!(
+                "maintenance: job #{job_id} per-page lease renewal failed ({:?}); \
+                 the keeper retries it",
+                renewed.err()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Gate keys a job may clear after it lost its lease: only the keys that
+/// no ACTIVE row still needs (`maintenance_gate_arm_keys` is the truth).
+/// The row stays active after a lapse (the requeue scan hands it back), so
+/// clearing its gate let writes race a pre-flip migrate. An unreadable DB
+/// clears nothing (fail closed: the next claim or boot re-derives it).
+pub(crate) fn gate_keys_to_clear_after_lease_loss(
+    gated: &[String],
+    still_armed: Result<Vec<String>, crate::config_db::ConfigDbError>,
+) -> Vec<String> {
+    match still_armed {
+        Ok(armed) => gated
+            .iter()
+            .filter(|k| !armed.contains(k))
+            .cloned()
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -811,6 +840,57 @@ mod tests {
             0,
             "the keeper stopped at a DB error and the lease lapsed"
         );
+    }
+
+    /// jobs-2: the per-page heartbeat read a DB ERROR as a lost lease, while
+    /// the keeper retries the same error. The job then stopped with its gate
+    /// cleared and its row still `running`.
+    #[tokio::test]
+    async fn heartbeat_does_not_read_a_db_error_as_a_lost_lease() {
+        let (db, id) = claimed_job(60);
+        db.lock()
+            .await
+            .conn
+            .execute_batch("ALTER TABLE maintenance_jobs RENAME TO maintenance_jobs_away")
+            .unwrap();
+        assert_eq!(heartbeat(&db, id, "inst").await, Ok(()));
+        // A refused renewal (another holder) still stops the phase.
+        db.lock()
+            .await
+            .conn
+            .execute_batch("ALTER TABLE maintenance_jobs_away RENAME TO maintenance_jobs")
+            .unwrap();
+        assert_eq!(
+            heartbeat(&db, id, "other").await,
+            Err(LEASE_LOST.to_string())
+        );
+    }
+
+    /// jobs-2: a job that lost its lease keeps the gate keys an active row
+    /// still needs (a pre-flip migrate: bucket + staging route).
+    #[test]
+    fn lease_loss_keeps_the_gate_of_an_active_row() {
+        let db = ConfigDb::in_memory("testpass").unwrap();
+        let params = r#"{"target_backend":"t","delete_source":true,"transient_key":"__dgmigrate_b_0","from_backend":"s"}"#;
+        db.maintenance_create_job("migrate", "b", "copy", Some(params), "admin", 1)
+            .unwrap()
+            .unwrap();
+        let gated = vec!["b".to_string(), "__dgmigrate_b_0".to_string()];
+        assert!(
+            gate_keys_to_clear_after_lease_loss(&gated, db.maintenance_gate_arm_keys()).is_empty()
+        );
+        // No active row → the keys clear.
+        let empty = ConfigDb::in_memory("testpass").unwrap();
+        assert_eq!(
+            gate_keys_to_clear_after_lease_loss(&gated, empty.maintenance_gate_arm_keys()),
+            gated
+        );
+        // An unreadable DB clears nothing.
+        assert!(gate_keys_to_clear_after_lease_loss(
+            &gated,
+            Err(crate::config_db::ConfigDbError::Other("x".into()))
+        )
+        .is_empty());
     }
 
     #[test]
