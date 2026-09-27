@@ -31,6 +31,14 @@
    - Delta objects larger than 16 MiB use the spool directory, so
      `DGP_SPOOL_DIR` must be writable.
 
+### Fixed — `--verbose` lasts after the config file loads
+
+`--verbose` set the `trace` level only until the config file loaded. The
+config always holds a log level (the default when the file sets none), and
+startup applied it over the flag. Now `--verbose` stays in effect unless
+`RUST_LOG`, `DGP_LOG_LEVEL` or a `log_level` that the file sets says
+otherwise. A file `log_level` equal to the default counts as not set.
+
 ### Fixed — `DGP_REPLICATION_TRANSFERS` and `DGP_UPLOAD_CONCURRENCY` change a replication run
 
 A replication run takes its concurrency from `storage.replication.transfers`

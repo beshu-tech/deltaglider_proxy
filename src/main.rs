@@ -482,30 +482,30 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // Apply `advanced.log_level` from the config file to the already-
     // initialised tracing filter — caught during browser testing of
     // v0.8.0 where `advanced.log_level: info` was silently ignored
-    // because `init_tracing` only reads env vars. Priority:
-    //   RUST_LOG > DGP_LOG_LEVEL > config.log_level > --verbose > default.
-    // The first two were already honoured by `init_tracing`; we only
-    // reload from `config.log_level` if neither env var was set (so
-    // env-driven deployments keep their semantics) and the config
-    // value differs from what init_tracing chose.
+    // because `init_tracing` only reads env vars. Priority (see
+    // `effective_log_spec`): RUST_LOG > DGP_LOG_LEVEL > a file log_level >
+    // --verbose > default. `init_tracing` already honoured the env vars, so
+    // reload only when neither is set (env-driven deployments keep their
+    // semantics).
     if deltaglider_proxy::config::process_env("RUST_LOG").is_none()
         && deltaglider_proxy::config::process_env("DGP_LOG_LEVEL").is_none()
     {
-        match deltaglider_proxy::audit::with_audit_directive(&config.log_level)
+        let spec = startup::effective_log_spec(None, None, &config.log_level, cli.verbose);
+        match deltaglider_proxy::audit::with_audit_directive(&spec)
             .parse::<tracing_subscriber::EnvFilter>()
         {
             Ok(filter) => {
                 if let Err(e) = log_reload_handle.reload(filter) {
                     eprintln!(
                         "Warning: could not apply log_level={:?} from config: {}",
-                        config.log_level, e
+                        spec, e
                     );
                 }
             }
             Err(e) => {
                 eprintln!(
                     "Warning: ignoring invalid log_level={:?} from config: {}",
-                    config.log_level, e
+                    spec, e
                 );
             }
         }

@@ -24,19 +24,41 @@ use crate::Cli;
 /// Re-export for binary crate convenience.
 pub use deltaglider_proxy::config_db::config_db_path;
 
-/// Initialize tracing with reload support.
-/// Priority: RUST_LOG > DGP_LOG_LEVEL > --verbose > default.
+/// The filter `--verbose` asks for.
+pub const VERBOSE_LOG_LEVEL: &str = "deltaglider_proxy=trace,tower_http=trace";
+
+/// The log filter spec. Priority: RUST_LOG > DGP_LOG_LEVEL > a `log_level`
+/// the file sets > --verbose > default. The flat config always holds a
+/// level, so a file level equal to the default counts as not set (the
+/// canonical export drops it for the same reason).
+pub fn effective_log_spec(
+    rust_log: Option<String>,
+    dgp_log_level: Option<String>,
+    file_log_level: &str,
+    verbose: bool,
+) -> String {
+    use deltaglider_proxy::config::DEFAULT_LOG_LEVEL;
+    rust_log.or(dgp_log_level).unwrap_or_else(|| {
+        if file_log_level != DEFAULT_LOG_LEVEL {
+            file_log_level.to_string()
+        } else if verbose {
+            VERBOSE_LOG_LEVEL.to_string()
+        } else {
+            DEFAULT_LOG_LEVEL.to_string()
+        }
+    })
+}
+
+/// Initialize tracing with reload support, before the config file loads
+/// (see [`effective_log_spec`]; `main` applies the file level later).
 pub fn init_tracing(cli: &Cli) -> reload::Handle<EnvFilter, tracing_subscriber::Registry> {
     let env = deltaglider_proxy::config::process_env;
-    let spec = env("RUST_LOG")
-        .or_else(|| env("DGP_LOG_LEVEL"))
-        .unwrap_or_else(|| {
-            if cli.verbose {
-                "deltaglider_proxy=trace,tower_http=trace".to_string()
-            } else {
-                deltaglider_proxy::config::DEFAULT_LOG_LEVEL.to_string()
-            }
-        });
+    let spec = effective_log_spec(
+        env("RUST_LOG"),
+        env("DGP_LOG_LEVEL"),
+        deltaglider_proxy::config::DEFAULT_LOG_LEVEL,
+        cli.verbose,
+    );
     let initial_filter = EnvFilter::new(deltaglider_proxy::audit::with_audit_directive(&spec));
 
     let (filter_layer, reload_handle) = reload::Layer::new(initial_filter);
@@ -1616,6 +1638,31 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("403 SignatureDoesNotMatch"), "{text}");
+    }
+
+    /// A command-line flag wins over the file default: `--verbose` used to
+    /// last only until the config loaded, because the file level (always
+    /// set, by default) replaced it.
+    #[test]
+    fn verbose_wins_over_the_file_default_only() {
+        use deltaglider_proxy::config::DEFAULT_LOG_LEVEL;
+        let spec = |rust_log: Option<&str>, dgp: Option<&str>, file: &str, verbose: bool| {
+            effective_log_spec(
+                rust_log.map(str::to_string),
+                dgp.map(str::to_string),
+                file,
+                verbose,
+            )
+        };
+        assert_eq!(
+            spec(None, None, DEFAULT_LOG_LEVEL, false),
+            DEFAULT_LOG_LEVEL
+        );
+        assert_eq!(spec(None, None, DEFAULT_LOG_LEVEL, true), VERBOSE_LOG_LEVEL);
+        assert_eq!(spec(None, None, "warn", true), "warn", "a file level wins");
+        assert_eq!(spec(None, None, "warn", false), "warn");
+        assert_eq!(spec(None, Some("error"), DEFAULT_LOG_LEVEL, true), "error");
+        assert_eq!(spec(Some("debug"), Some("error"), "warn", true), "debug");
     }
 
     #[test]
