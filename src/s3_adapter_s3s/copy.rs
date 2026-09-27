@@ -67,7 +67,7 @@ pub(super) async fn copy_object(
         &source_bucket,
         &source_key,
         source_meta.file_size,
-        engine.spool_store_threshold(),
+        engine.spool_threshold(),
     )
     .await?;
     let source_meta = body.metadata();
