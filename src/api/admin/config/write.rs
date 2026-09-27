@@ -49,6 +49,12 @@ pub(super) enum Surface<'a> {
     },
     /// `POST /config/apply|validate`: the YAML document.
     Document { yaml: &'a str },
+    /// An internal writer ([`run_internal`]): the running config with an
+    /// edit applied, audited as `action` on `target`.
+    Internal {
+        action: &'static str,
+        target: &'a str,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -92,6 +98,14 @@ impl Surface<'_> {
                 validate: true,
                 normalize: false,
                 merge_env_refs: true,
+            },
+            // Starts from the full running config (nothing redacted, env
+            // refs carried), so only the gates of `validate` run.
+            Surface::Internal { .. } => Steps {
+                bootstrap_guard: false,
+                validate: true,
+                normalize: false,
+                merge_env_refs: false,
             },
         }
     }
@@ -245,9 +259,13 @@ pub(super) async fn run(
     refs.extend(cfg.env_refs.clone());
     let section = write.surface.section();
     let current = super::version::config_version(&cfg, section);
-    if write
-        .headers
-        .is_some_and(|h| super::version::if_match_conflicts(h, &current))
+    // An internal write carries the headers of a request to another
+    // endpoint: its `If-Match` names no config version.
+    let internal = matches!(write.surface, Surface::Internal { .. });
+    if !internal
+        && write
+            .headers
+            .is_some_and(|h| super::version::if_match_conflicts(h, &current))
     {
         let outcome = Outcome::Conflict { current };
         return WriteResult { outcome, refs };
@@ -299,6 +317,9 @@ pub(super) async fn run(
         ),
         Surface::Document { .. } => {
             super::super::audit_log("apply_config", "admin", &path, headers)
+        }
+        Surface::Internal { action, target } => {
+            super::super::audit_log(action, "admin", target, headers)
         }
         _ => {}
     }
@@ -405,14 +426,18 @@ pub(super) fn prepare(
     if steps.validate {
         let probe = match write.surface {
             Surface::Section { section, body } => {
-                super::section_level::BackendEncryptionKeyProbe::from_section(section, body)
+                Some(super::section_level::BackendEncryptionKeyProbe::from_section(section, body))
             }
-            Surface::Document { yaml } => super::document_level::document_probe(yaml),
+            Surface::Document { yaml } => Some(super::document_level::document_probe(yaml)),
+            // Nothing redacted: the running config carries its secrets.
+            Surface::Internal { .. } => None,
             Surface::Patch => unreachable!("PATCH does not preserve"),
         };
-        match super::preserve_runtime_secrets(&mut incoming, old, &probe) {
-            Ok(pw) => w.preserve = pw,
-            Err(e) => reject!(Stage::Preserve, StatusCode::BAD_REQUEST, e),
+        if let Some(probe) = probe {
+            match super::preserve_runtime_secrets(&mut incoming, old, &probe) {
+                Ok(pw) => w.preserve = pw,
+                Err(e) => reject!(Stage::Preserve, StatusCode::BAD_REQUEST, e),
+            }
         }
     }
 
@@ -481,6 +506,80 @@ pub(super) fn prepare(
         requires_restart,
         diff,
     })
+}
+
+/// The result of [`run_internal`].
+pub(crate) struct InternalApplied {
+    /// Env re-apply, new check warnings, then the transition's.
+    pub warnings: Vec<String>,
+    /// `Ok(path)`, or `Err((path, error))` when the file write failed (the
+    /// config is live in memory either way).
+    pub persist: Result<String, (String, String)>,
+}
+
+/// Why [`run_internal`] changed nothing.
+#[derive(Debug)]
+pub(crate) enum InternalRefusal {
+    /// The `DGP_*` overrides could not be re-applied.
+    EnvReapply(String),
+    /// `check_all` or a rule gate refused the edit.
+    Invalid { status: StatusCode, error: String },
+    /// `apply_config_transition` refused or failed (nothing live changed).
+    Transition(String),
+}
+
+/// THE path for a config write that no admin config endpoint makes
+/// (bootstrap-credential removal, the backup secrets restore and its
+/// rollback): `edit` changes a copy of the running config, then the same
+/// env re-apply, `check_all`, rule gates, transition, persist and audit as
+/// every config write run. Errors and warnings are env-scrubbed.
+pub(crate) async fn run_internal(
+    state: &Arc<AdminState>,
+    headers: &HeaderMap,
+    action: &'static str,
+    target: &str,
+    edit: impl FnOnce(&mut Config),
+) -> Result<InternalApplied, InternalRefusal> {
+    let write = ConfigWrite {
+        surface: Surface::Internal { action, target },
+        mode: Mode::Apply,
+        headers: Some(headers),
+        extra_env: &EnvRefs::new(),
+    };
+    let WriteResult { outcome, refs } = run(state, write, |running| {
+        let mut incoming = running.clone();
+        edit(&mut incoming);
+        Ok(Built {
+            incoming,
+            warnings: Vec::new(),
+        })
+    })
+    .await;
+    let scrub = |s: String| crate::config::scrub_env_values(&s, &refs);
+    match outcome {
+        Outcome::Applied {
+            warnings, persist, ..
+        } => {
+            let mut all = warnings.env;
+            all.extend(warnings.check_new);
+            all.extend(warnings.transition);
+            Ok(InternalApplied {
+                warnings: all.into_iter().map(scrub).collect(),
+                persist: persist.map_err(|(p, e)| (p, scrub(e))),
+            })
+        }
+        Outcome::Rejected(r) => Err(match r.stage {
+            Stage::EnvReapply => InternalRefusal::EnvReapply(scrub(r.error)),
+            Stage::Transition => InternalRefusal::Transition(scrub(r.error)),
+            _ => InternalRefusal::Invalid {
+                status: r.status,
+                error: scrub(r.error),
+            },
+        }),
+        Outcome::Conflict { .. } | Outcome::Validated { .. } => {
+            unreachable!("an internal write is an apply without If-Match")
+        }
+    }
 }
 
 /// The section dry run's declarative-IAM preview: the would-be reconcile
@@ -692,6 +791,61 @@ mod tests {
         assert!(p.requires_restart);
         let diff = p.diff.unwrap();
         assert!(diff["advanced"]["cache_size_mb"].is_object(), "{diff}");
+    }
+
+    /// R10: an internal write (bootstrap removal, backup secrets restore)
+    /// runs the boot gate like every other config write, skips secret
+    /// preservation (nothing is redacted) and the hash guard.
+    #[test]
+    fn internal_writes_run_the_fatal_gate() {
+        let old = running();
+        let w = write(
+            Surface::Internal {
+                action: "t",
+                target: "t",
+            },
+            Mode::Apply,
+        );
+        let mut bad = old.clone();
+        bad.buckets.insert(
+            "releases".into(),
+            crate::bucket_policy::BucketPolicyConfig {
+                backend: Some("nope".into()),
+                ..Default::default()
+            },
+        );
+        let r = prepare(&old, built(bad), &w).unwrap_err();
+        assert_eq!((r.stage, r.status), (Stage::Check, StatusCode::BAD_REQUEST));
+        let mut ok = old.clone();
+        ok.access_key_id = None;
+        ok.bootstrap_password_hash = Some("$2b$12$other".into());
+        assert!(prepare(&old, built(ok), &w).is_ok());
+    }
+
+    /// R10: every admin config write goes through [`run`]: no other admin
+    /// file calls the transition by hand (skipping `check_all`, the gates
+    /// and the audit).
+    #[test]
+    fn only_the_pipeline_calls_the_transition() {
+        let mut bad = Vec::new();
+        for p in crate::source_scan::rust_files("src/api/admin") {
+            let path = p.to_string_lossy().replace('\\', "/");
+            if path.ends_with("config/write.rs") || path.ends_with("config/transition.rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&p).unwrap();
+            for (i, line) in src.lines().enumerate() {
+                if line.contains("apply_config_transition(") && !line.trim_start().starts_with("//")
+                {
+                    bad.push(format!("{path}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "use write::run / run_internal:\n{}",
+            bad.join("\n")
+        );
     }
 
     #[tokio::test]

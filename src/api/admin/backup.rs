@@ -1492,89 +1492,80 @@ async fn apply_backup_iam(
 ///   the admin password, not the config DB key), written to the state file
 ///   and swapped into the login verifier; kept when an env var pins it
 ///   (`plan_bootstrap_restore`).
-/// * **Engine rebuild**: after mutating storage creds under the write
-///   lock, call `apply_config_transition` so the S3 client picks up
-///   the new credentials on the next request. Without this, the
-///   running engine would keep using the old (possibly-wrong) creds
-///   until the next restart.
-/// * **Persist to disk**: write the merged config back to the active
-///   config file so the change survives a restart.
+/// * **Config write pipeline** (`run_internal`): the merged config goes
+///   through the same env re-apply, `check_all`, rule gates, transition
+///   (the S3 client picks up the new credentials on the next request),
+///   persist (the change survives a restart) and audit as every config
+///   write.
 async fn apply_secrets(
     state: &Arc<AdminState>,
     secrets: &BackupSecrets,
     restore_bootstrap_hash: bool,
     headers: &HeaderMap,
 ) -> Result<(), BackupSecretApplyError> {
-    // Same lock discipline as apply_config_inner: hold the config write lock
-    // across the whole read → transition → swap → persist, and swap only
-    // after the transition succeeds. It used to mutate the live config,
-    // drop the lock, then rebuild: a concurrent apply could interleave, and
-    // a failed rebuild left the new secrets live over the old engine.
-    let mut cfg = state.config.write().await;
-    let old_cfg = cfg.clone();
-
+    // The config write pipeline (THE path of every config write): env
+    // re-apply, check_all + rule gates, transition, persist, audit, under
+    // the config write lock, swapped in only after the transition succeeds.
     // The bootstrap hash is only the admin password now (S8: it does not
     // encrypt the config DB), so a restore adopts a different one, unless an
-    // env var pins it.
-    let hash_plan = if restore_bootstrap_hash {
-        plan_bootstrap_restore(
-            old_cfg.bootstrap_password_hash.as_deref(),
-            secrets.bootstrap_password_hash.as_deref(),
-            super::config::password::env_pinned_hash_var(|n| std::env::var(n).ok()),
-        )
-    } else {
-        BootstrapRestore::Keep
-    };
+    // env var pins it; it is installed separately below (state file + login
+    // verifier), never through the config.
+    let mut hash_plan = BootstrapRestore::Keep;
+    let applied = crate::api::admin::config::run_internal(
+        state,
+        headers,
+        "restore_backup_secrets",
+        "secrets.json",
+        |cfg| {
+            if restore_bootstrap_hash {
+                hash_plan = plan_bootstrap_restore(
+                    cfg.bootstrap_password_hash.as_deref(),
+                    secrets.bootstrap_password_hash.as_deref(),
+                    super::config::password::env_pinned_hash_var(|n| std::env::var(n).ok()),
+                );
+            }
+            hydrate_config_secrets(cfg, secrets, false);
+        },
+    )
+    .await;
+    use crate::api::admin::config::InternalRefusal;
+    match applied {
+        Ok(a) => {
+            // Without the file write the restore "works" until the next
+            // restart, then silently reverts.
+            if let Err((path, e)) = a.persist {
+                tracing::error!("Full-backup import: persist merged config to {path} failed: {e}");
+                return Err(BackupSecretApplyError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to persist merged config to {path}"),
+                ));
+            }
+        }
+        Err(InternalRefusal::EnvReapply(e)) => {
+            tracing::error!("Full-backup import: env overrides could not be re-applied: {e}");
+            return Err(BackupSecretApplyError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to re-apply environment overrides after restoring backup secrets",
+            ));
+        }
+        Err(InternalRefusal::Transition(e)) => {
+            tracing::error!("Full-backup import: apply_config_transition failed: {e}");
+            return Err(BackupSecretApplyError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to rebuild engine after applying backup secrets",
+            ));
+        }
+        Err(InternalRefusal::Invalid { status, error }) => {
+            tracing::error!("Full-backup import: restored secrets refused: {error}");
+            return Err(BackupSecretApplyError::new(status, error));
+        }
+    }
     if let BootstrapRestore::EnvPinned(var) = &hash_plan {
         tracing::warn!(
             "Full-backup import: {var} is set, so the admin password of the backup is not \
              restored (the env var sets it at every start)"
         );
     }
-
-    let mut new_cfg = old_cfg.clone();
-    // The hash is installed separately below (state file + login verifier).
-    hydrate_config_secrets(&mut new_cfg, secrets, false);
-    // Env wins consistently: the restored secrets reach the file, but an
-    // env-controlled field keeps its env value at runtime.
-    if let Err(e) = crate::api::admin::config::reapply_env(&old_cfg, &mut new_cfg, false) {
-        tracing::error!("Full-backup import: env overrides could not be re-applied: {e}");
-        return Err(BackupSecretApplyError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to re-apply environment overrides after restoring backup secrets",
-        ));
-    }
-
-    // Rebuild the S3 engine so the new storage creds take effect
-    // immediately. A mismatch between Config and the running engine
-    // would cause every subsequent S3 op to use stale credentials
-    // until restart.
-    let ctx = crate::api::admin::config::TransitionCtx::Admin { state, headers };
-    if let Err(e) = crate::api::admin::config::apply_config_transition(ctx, &mut cfg, new_cfg).await
-    {
-        tracing::error!("Full-backup import: apply_config_transition failed: {}", e);
-        return Err(BackupSecretApplyError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to rebuild engine after applying backup secrets",
-        ));
-    }
-
-    // Persist the merged config so storage/access creds survive a
-    // restart. Without this, the operator would see the restore "work"
-    // until the next process restart, then silently revert.
-    let path = crate::api::admin::config::active_config_path(state);
-    if let Err(e) = cfg.persist_to_file(&path) {
-        tracing::error!(
-            "Full-backup import: persist merged config to {} failed: {}",
-            path,
-            e
-        );
-        return Err(BackupSecretApplyError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to persist merged config to {path}"),
-        ));
-    }
-    drop(cfg); // before the config-DB lock below
 
     if let BootstrapRestore::Adopt(hash) = &hash_plan {
         if let Err(e) = super::config::password::install_bootstrap_hash(state, hash).await {

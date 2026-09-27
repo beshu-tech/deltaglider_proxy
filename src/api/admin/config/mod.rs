@@ -37,6 +37,7 @@ use transition::engine_affecting_fields_changed;
 use transition::requires_restart_warnings;
 pub(crate) use transition::{apply_config_transition, TransitionCtx};
 pub use version::install_version_key as install_config_version_key;
+pub(crate) use write::{run_internal, InternalRefusal};
 
 /// Names of the four sections the admin API understands. Canonical
 /// home for the enum + its string-wire spelling — any consumer that
@@ -392,12 +393,14 @@ pub async fn remove_bootstrap_credentials(
 ) -> axum::response::Response {
     // The refusals answer `{"error": ..}`; an env re-apply failure a text 500.
     let conflict = |msg: &str| AdminError::<JsonError>::conflict(msg).into_response();
-    let mut cfg = state.config.write().await;
     let iam_active = matches!(&**state.iam_state.load(), IamState::Iam(_));
     let env_controlled = ["DGP_ACCESS_KEY_ID", "DGP_SECRET_ACCESS_KEY"]
         .iter()
         .any(|v| std::env::var_os(v).is_some());
-    let has_pair = cfg.access_key_id.is_some() || cfg.secret_access_key.is_some();
+    let has_pair = {
+        let cfg = state.config.read().await;
+        cfg.access_key_id.is_some() || cfg.secret_access_key.is_some()
+    };
     match bootstrap_removal_decision(has_pair, env_controlled, iam_active) {
         BootstrapRemoval::NothingToRemove => {
             return Json(serde_json::json!({ "removed": false, "warnings": [] })).into_response()
@@ -416,31 +419,34 @@ pub async fn remove_bootstrap_credentials(
         }
         BootstrapRemoval::Remove => {}
     }
-    let old_cfg = cfg.clone();
-    let removed_key = cfg.access_key_id.take();
-    cfg.secret_access_key = None;
-    let mut warnings = match reapply_env(&old_cfg, &mut cfg, false) {
-        Ok(w) => w,
-        Err(e) => {
-            *cfg = old_cfg;
-            return AdminError::<Text>::internal(e).into_response();
+    let mut removed_key = None;
+    let applied = run_internal(
+        &state,
+        &headers,
+        "remove_bootstrap_credentials",
+        "access_key_id",
+        |cfg| {
+            removed_key = cfg.access_key_id.take();
+            cfg.secret_access_key = None;
+        },
+    )
+    .await;
+    let mut warnings = match applied {
+        Ok(a) => {
+            let mut w = a.warnings;
+            if let Err((path, e)) = a.persist {
+                w.push(format!("Failed to persist config to {path}: {e}"));
+            }
+            w
+        }
+        Err(InternalRefusal::EnvReapply(e)) => {
+            return AdminError::<Text>::internal(e).into_response()
+        }
+        Err(InternalRefusal::Transition(e)) => return conflict(&e),
+        Err(InternalRefusal::Invalid { status, error }) => {
+            return AdminError::<JsonError>::status(status, error).into_response()
         }
     };
-    // The transition swaps the edit in itself: put the running config back.
-    let new_cfg = std::mem::replace(&mut *cfg, old_cfg);
-    let ctx = TransitionCtx::Admin {
-        state: &state,
-        headers: &headers,
-    };
-    match apply_config_transition(ctx, &mut cfg, new_cfg).await {
-        Ok(report) => warnings.extend(report.warnings),
-        Err(e) => return conflict(&e),
-    }
-    let path = active_config_path(&state);
-    if let Err(e) = cfg.persist_to_file(&path) {
-        warnings.push(format!("Failed to persist config to {path}: {e}"));
-    }
-    drop(cfg);
     // The same key may live on as an IAM user (the first IAM user carries
     // the pair over as 'legacy-admin'): say so, it still signs requests.
     let still_iam_user = removed_key
@@ -455,12 +461,6 @@ pub async fn remove_bootstrap_credentials(
              requests: delete or disable that user in the Users panel to revoke the key"
         ));
     }
-    super::audit_log(
-        "remove_bootstrap_credentials",
-        "",
-        "access_key_id",
-        &headers,
-    );
     Json(serde_json::json!({ "removed": true, "warnings": warnings })).into_response()
 }
 

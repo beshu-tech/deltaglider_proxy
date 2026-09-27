@@ -1601,8 +1601,21 @@ async fn bootstrap_credentials_are_removed_explicitly_and_never_leave_auth_off()
     let r = remove().send().await.unwrap();
     assert_eq!(r.status(), StatusCode::OK);
     let body: serde_json::Value = r.json().await.unwrap();
-    assert_eq!(body["removed"], true, "{body}");
-    assert!(body.to_string().contains("legacy-admin"), "{body}");
+    // Pins the whole success body (R10 moves the handler onto the config
+    // write pipeline; the body must not change).
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "removed": true,
+            "warnings": [
+                "IAM mode is active: the bootstrap SigV4 pair is only the fallback for an \
+                 empty IAM database. IAM users (including 'legacy-admin', which carries the old \
+                 pair) are unchanged; manage them in the Users panel.",
+                "the removed access key id is also IAM user 'legacy-admin', which still signs \
+                 S3 requests: delete or disable that user in the Users panel to revoke the key"
+            ]
+        }),
+    );
     let access: serde_json::Value = admin
         .get(format!("{ep}/_/api/admin/config/section/access"))
         .send()
