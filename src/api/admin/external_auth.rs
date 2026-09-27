@@ -24,7 +24,9 @@ use crate::iam::keygen;
 use crate::rate_limiter;
 use crate::session::AuthMethod;
 
-use super::{audit_log, trigger_config_sync, users::rebuild_iam_index, AdminState};
+use super::{
+    audit_log, trigger_config_sync, users::rebuild_iam_index, AdminError, AdminState, Bare,
+};
 
 /// Monotonic external-auth (OAuth/OIDC provider) version counter.
 ///
@@ -549,14 +551,14 @@ pub async fn oauth_callback(
     }
 
     // Rebuild IAM index to reflect the new/updated user and group memberships.
-    // This handler returns a redirect Response (not Result<_, StatusCode>), so
+    // This handler returns a redirect Response (not a Result), so
     // we can't `?`-propagate here — but a swallowed rebuild error would leave
     // the just-provisioned user invisible to auth, so log it loudly.
-    if let Err(status) = rebuild_iam_index(&db, &state.iam_state) {
+    if let Err(e) = rebuild_iam_index::<Bare>(&db, &state.iam_state) {
         tracing::error!(
             "OAuth callback: IAM index rebuild failed after provisioning '{}' (status {})",
             user.name,
-            status
+            e.status_code()
         );
     }
 
@@ -702,7 +704,7 @@ fn check_provider(
 /// GET /api/admin/ext-auth/providers — list all providers (secrets masked).
 pub async fn list_providers(
     State(state): State<Arc<AdminState>>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, AdminError<Bare>> {
     let mut providers =
         super::with_config_db(&state, "load auth providers", |db| db.load_auth_providers()).await?;
     providers.iter_mut().for_each(mask_client_secret);
@@ -722,14 +724,15 @@ pub async fn create_provider(
     ) {
         return invalid_provider(e);
     }
-    let mut provider = match super::with_config_db(&state, "create auth provider", |db| {
-        db.create_auth_provider(&body)
-    })
-    .await
-    {
-        Ok(p) => p,
-        Err(status) => return status.into_response(),
-    };
+    let mut provider =
+        match super::with_config_db::<_, Bare, _>(&state, "create auth provider", |db| {
+            db.create_auth_provider(&body)
+        })
+        .await
+        {
+            Ok(p) => p,
+            Err(status) => return status.into_response(),
+        };
 
     audit_log("create_auth_provider", "", &body.name, &req_headers);
     if let Err(status) = rebuild_external_auth(&state).await {
@@ -749,13 +752,14 @@ pub async fn update_provider(
     AdminJson(body): AdminJson<UpdateAuthProviderRequest>,
 ) -> Response {
     // Validate the provider as it will be after the update.
-    let current =
-        match super::with_config_db(&state, "load auth provider", |db| db.get_auth_provider(id))
-            .await
-        {
-            Ok(p) => p,
-            Err(status) => return status.into_response(),
-        };
+    let current = match super::with_config_db::<_, Bare, _>(&state, "load auth provider", |db| {
+        db.get_auth_provider(id)
+    })
+    .await
+    {
+        Ok(p) => p,
+        Err(status) => return status.into_response(),
+    };
     if let Err(e) = check_provider(
         body.provider_type
             .as_deref()
@@ -765,14 +769,15 @@ pub async fn update_provider(
     ) {
         return invalid_provider(e);
     }
-    let mut updated = match super::with_config_db(&state, "update auth provider", |db| {
-        db.update_auth_provider(id, &body)
-    })
-    .await
-    {
-        Ok(p) => p,
-        Err(status) => return status.into_response(),
-    };
+    let mut updated =
+        match super::with_config_db::<_, Bare, _>(&state, "update auth provider", |db| {
+            db.update_auth_provider(id, &body)
+        })
+        .await
+        {
+            Ok(p) => p,
+            Err(status) => return status.into_response(),
+        };
 
     audit_log("update_auth_provider", "", &updated.name, &req_headers);
     if let Err(status) = rebuild_external_auth(&state).await {
@@ -789,7 +794,7 @@ pub async fn delete_provider(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
     req_headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, AdminError<Bare>> {
     let target = super::with_config_db(&state, "delete auth provider", |db| {
         let name = db.get_auth_provider(id).ok().map(|p| p.name);
         db.delete_auth_provider(id)
@@ -808,20 +813,26 @@ pub async fn delete_provider(
 pub async fn test_provider(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<impl IntoResponse, AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
-    let provider_config = db.get_auth_provider(id).map_err(|e| {
+    let provider_config = db.get_auth_provider(id).inspect_err(|e| {
         tracing::error!("Failed to load auth provider {}: {}", id, e);
-        super::db_error_status(&e)
     })?;
     drop(db);
 
     // Build a temporary OIDC provider and test it
     use crate::iam::external_auth::oidc::OidcProvider;
-    let client_id = provider_config.client_id.ok_or(StatusCode::BAD_REQUEST)?;
+    let client_id = provider_config
+        .client_id
+        .ok_or_else(|| AdminError::invalid("provider has no client_id"))?;
     let client_secret = provider_config.client_secret.unwrap_or_default();
-    let issuer_url = provider_config.issuer_url.ok_or(StatusCode::BAD_REQUEST)?;
+    let issuer_url = provider_config
+        .issuer_url
+        .ok_or_else(|| AdminError::invalid("provider has no issuer_url"))?;
 
     let oidc = OidcProvider::new(
         provider_config.name,
@@ -836,7 +847,7 @@ pub async fn test_provider(
 
     let result = oidc.test_connection().await.map_err(|e| {
         tracing::error!("Provider test failed: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        AdminError::internal(format!("provider test failed: {e}"))
     })?;
 
     Ok(Json(result))
@@ -847,7 +858,7 @@ pub async fn test_provider(
 /// GET /api/admin/ext-auth/mappings — list all mapping rules.
 pub async fn list_mappings(
     State(state): State<Arc<AdminState>>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, AdminError<Bare>> {
     let rules = super::with_config_db(&state, "load mapping rules", |db| {
         db.load_group_mapping_rules()
     })
@@ -860,16 +871,17 @@ pub async fn create_mapping(
     State(state): State<Arc<AdminState>>,
     req_headers: HeaderMap,
     AdminJson(body): AdminJson<CreateMappingRuleRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<impl IntoResponse, AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
 
-    validate_mapping_rule(&body.match_type, &body.match_value)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    validate_mapping_rule(&body.match_type, &body.match_value).map_err(AdminError::invalid)?;
 
-    let rule = db.create_group_mapping_rule(&body).map_err(|e| {
+    let rule = db.create_group_mapping_rule(&body).inspect_err(|e| {
         tracing::error!("Failed to create mapping rule: {}", e);
-        super::db_error_status(&e)
     })?;
     let target = rule_target(&db, &rule);
 
@@ -891,27 +903,29 @@ pub async fn update_mapping(
     Path(id): Path<i64>,
     req_headers: HeaderMap,
     AdminJson(body): AdminJson<UpdateMappingRuleRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, AdminError<Bare>> {
     // Validate match_type / match_value when either is being changed.
     // On a partial update we may have a type without a value (or vice
     // versa); only run the full validator when both are present, but
     // still reject a bad match_type on its own.
     match (body.match_type.as_deref(), body.match_value.as_deref()) {
         (Some(mt), Some(mv)) => {
-            validate_mapping_rule(mt, mv).map_err(|_| StatusCode::BAD_REQUEST)?;
+            validate_mapping_rule(mt, mv).map_err(AdminError::invalid)?;
         }
         (Some(mt), None) => {
-            validate_match_type(mt).map_err(|_| StatusCode::BAD_REQUEST)?;
+            validate_match_type(mt).map_err(AdminError::invalid)?;
         }
         _ => {}
     }
 
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
 
-    let rule = db.update_group_mapping_rule(id, &body).map_err(|e| {
+    let rule = db.update_group_mapping_rule(id, &body).inspect_err(|e| {
         tracing::warn!("Failed to update mapping rule: {}", e);
-        super::db_error_status(&e)
     })?;
     let target = rule_target(&db, &rule);
 
@@ -928,8 +942,11 @@ pub async fn delete_mapping(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
     req_headers: HeaderMap,
-) -> Result<impl IntoResponse, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<impl IntoResponse, AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
     let target = db
         .load_group_mapping_rules()
@@ -938,9 +955,8 @@ pub async fn delete_mapping(
         .map(|r| rule_target(&db, &r))
         .unwrap_or_else(|| format!("rule {id}"));
 
-    db.delete_group_mapping_rule(id).map_err(|e| {
+    db.delete_group_mapping_rule(id).inspect_err(|e| {
         tracing::warn!("Failed to delete mapping rule: {}", e);
-        super::db_error_status(&e)
     })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
@@ -966,13 +982,15 @@ pub struct PreviewResponse {
 pub async fn preview_mapping(
     State(state): State<Arc<AdminState>>,
     AdminJson(body): AdminJson<PreviewRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<impl IntoResponse, AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
 
-    let rules = db.load_group_mapping_rules().map_err(|e| {
+    let rules = db.load_group_mapping_rules().inspect_err(|e| {
         tracing::error!("Failed to load mapping rules: {}", e);
-        super::db_error_status(&e)
     })?;
 
     let group_ids = mapping::preview_email_mappings(&rules, &body.email);
@@ -995,7 +1013,7 @@ pub async fn preview_mapping(
 /// GET /api/admin/ext-auth/identities — list all external identities.
 pub async fn list_identities(
     State(state): State<Arc<AdminState>>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Result<impl IntoResponse, AdminError<Bare>> {
     let identities = super::with_config_db(&state, "load external identities", |db| {
         db.list_external_identities()
     })
@@ -1012,8 +1030,11 @@ pub struct SyncResult {
 
 pub async fn sync_memberships(
     State(state): State<Arc<AdminState>>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<impl IntoResponse, AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
 
     let rules = db.load_group_mapping_rules().unwrap_or_default();
@@ -1153,12 +1174,11 @@ fn build_callback_uri_with(headers: &HeaderMap, trust_proxy: bool) -> String {
 /// `GET /_/api/admin/ext-auth/version` pollers). Callers propagate the error so
 /// a provider mutation whose rebuild failed surfaces a 500 instead of a lying
 /// 2xx — mirroring how `rebuild_iam_index` errors propagate.
-async fn rebuild_external_auth(state: &Arc<AdminState>) -> Result<(), StatusCode> {
+async fn rebuild_external_auth(state: &Arc<AdminState>) -> Result<(), AdminError<Bare>> {
     if let (Some(ext_auth), Some(config_db)) = (&state.external_auth, &state.config_db) {
         let db = config_db.lock().await;
-        let providers = db.load_auth_providers().map_err(|e| {
+        let providers = db.load_auth_providers().inspect_err(|e| {
             tracing::error!("rebuild_external_auth: load_auth_providers failed: {e}");
-            super::db_error_status(&e)
         })?;
         ext_auth.rebuild(&providers);
         drop(db);

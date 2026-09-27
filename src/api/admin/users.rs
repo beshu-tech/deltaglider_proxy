@@ -17,7 +17,9 @@ use crate::iam::{
     SharedIamState,
 };
 
-use super::{audit_log, next_copy_name, trigger_config_sync, AdminState};
+use super::{
+    audit_log, next_copy_name, trigger_config_sync, AdminError, AdminState, Bare, ErrorBody,
+};
 
 #[derive(Deserialize)]
 pub struct CreateUserRequest {
@@ -68,11 +70,11 @@ fn mask_user(user: &IamUser) -> IamUser {
 /// On first IAM user creation (Legacy -> IAM transition), auto-migrates the
 /// legacy config-file credentials as a "legacy-admin" user with full access so
 /// existing S3 clients don't break.
-pub(super) fn rebuild_iam_index(
+pub(super) fn rebuild_iam_index<B: ErrorBody>(
     db: &ConfigDb,
     iam_state: &SharedIamState,
-) -> Result<(), StatusCode> {
-    rebuild_iam_index_inner(db, iam_state, false)
+) -> Result<(), AdminError<B>> {
+    Ok(rebuild_iam_index_inner(db, iam_state, false)?)
 }
 
 /// Internal: `rebuild_iam_index` with a `skip_legacy_migration` knob.
@@ -86,16 +88,16 @@ pub(super) fn rebuild_iam_index_declarative(
     iam_state: &SharedIamState,
 ) -> Result<(), StatusCode> {
     rebuild_iam_index_inner(db, iam_state, true)
+        .map_err(|e| AdminError::<Bare>::from(e).status_code())
 }
 
 fn rebuild_iam_index_inner(
     db: &ConfigDb,
     iam_state: &SharedIamState,
     skip_legacy_migration: bool,
-) -> Result<(), StatusCode> {
-    let mut users = db.load_users().map_err(|e| {
+) -> Result<(), crate::config_db::ConfigDbError> {
+    let mut users = db.load_users().inspect_err(|e| {
         tracing::error!("Failed to load users from config DB: {}", e);
-        super::db_error_status(&e)
     })?;
     if users.is_empty() {
         let state = IamIndex::build_iam_state(users, Vec::new(), &iam_state.load());
@@ -152,9 +154,8 @@ fn rebuild_iam_index_inner(
         }
     }
 
-    let groups = db.load_groups().map_err(|e| {
+    let groups = db.load_groups().inspect_err(|e| {
         tracing::error!("Failed to load groups from config DB: {}", e);
-        super::db_error_status(&e)
     })?;
 
     let count = users.len();
@@ -205,15 +206,14 @@ pub async fn usage_scan_version() -> impl IntoResponse {
 /// Returns empty list if IAM DB is not initialized (legacy/open mode).
 pub async fn list_users(
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<Vec<IamUser>>, StatusCode> {
+) -> Result<Json<Vec<IamUser>>, AdminError<Bare>> {
     let db = match state.config_db.as_ref() {
         Some(db) => db,
         None => return Ok(Json(vec![])), // No IAM DB -> empty list (not an error)
     };
     let db = db.lock().await;
-    let users = db.load_users().map_err(|e| {
+    let users = db.load_users().inspect_err(|e| {
         tracing::error!("Failed to load users: {}", e);
-        super::db_error_status(&e)
     })?;
     Ok(Json(users.iter().map(mask_user).collect()))
 }
@@ -223,8 +223,11 @@ pub async fn create_user(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AdminJson(body): AdminJson<CreateUserRequest>,
-) -> Result<(StatusCode, Json<IamUser>), StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<(StatusCode, Json<IamUser>), AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
 
     let access_key_id = body
@@ -240,24 +243,24 @@ pub async fn create_user(
         || access_key_id.contains(char::is_whitespace)
     {
         tracing::warn!("Invalid access key format: {:?}", access_key_id);
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(AdminError::invalid("invalid access key format"));
     }
 
     // Block reserved and blank names
     if crate::iam::types::is_blank_principal_name(&body.name) {
         tracing::warn!("User name cannot be blank");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(AdminError::invalid("user name cannot be blank"));
     }
     if crate::iam::types::is_reserved_principal_name(&body.name) {
         tracing::warn!("User name cannot start with '$': {:?}", body.name);
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(AdminError::invalid("user name cannot start with '$'"));
     }
 
     let mut perms = body.permissions.clone();
     normalize_permissions(&mut perms);
     if let Err(msg) = validate_permissions(&perms) {
         tracing::warn!("Invalid permissions for user '{}': {}", body.name, msg);
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(AdminError::invalid("invalid permissions"));
     }
 
     let user = db
@@ -268,9 +271,8 @@ pub async fn create_user(
             body.enabled,
             &perms,
         )
-        .map_err(|e| {
+        .inspect_err(|e| {
             tracing::warn!("Failed to create user '{}': {}", body.name, e);
-            super::db_error_status(&e)
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
@@ -288,13 +290,15 @@ pub async fn clone_user(
     axum::extract::Path(user_id): axum::extract::Path<i64>,
     headers: HeaderMap,
     body: Option<Json<CloneUserRequest>>,
-) -> Result<(StatusCode, Json<IamUser>), StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<(StatusCode, Json<IamUser>), AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
     let body = body.map(|Json(body)| body);
-    let source = db.get_user_by_id(user_id).map_err(|e| {
+    let source = db.get_user_by_id(user_id).inspect_err(|e| {
         tracing::warn!("Failed to load source user {} for clone: {}", user_id, e);
-        super::db_error_status(&e)
     })?;
 
     let name = body
@@ -313,7 +317,7 @@ pub async fn clone_user(
 
     if crate::iam::types::is_reserved_principal_name(&name) {
         tracing::warn!("User name cannot start with '$': {:?}", name);
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(AdminError::invalid("user name cannot start with '$'"));
     }
 
     let access_key_id = iam::generate_access_key_id();
@@ -328,9 +332,8 @@ pub async fn clone_user(
             &secret_access_key,
             copy_groups,
         )
-        .map_err(|e| {
+        .inspect_err(|e| {
             tracing::warn!("Failed to clone user {} as '{}': {}", user_id, name, e);
-            super::db_error_status(&e)
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
@@ -357,8 +360,11 @@ pub async fn update_user(
     axum::extract::Path(user_id): axum::extract::Path<i64>,
     headers: HeaderMap,
     AdminJson(body): AdminJson<UpdateUserRequest>,
-) -> Result<Json<IamUser>, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Json<IamUser>, AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
 
     // Refuse a RENAME to a reserved name. A row that already carries one (an
@@ -368,12 +374,12 @@ pub async fn update_user(
         if crate::iam::types::is_reserved_principal_name(name)
             || crate::iam::types::is_blank_principal_name(name)
         {
-            let current = db
-                .get_user_by_id(user_id)
-                .map_err(|e| super::db_error_status(&e))?;
+            let current = db.get_user_by_id(user_id)?;
             if current.name != name {
                 tracing::warn!("User name cannot be blank or start with '$': {:?}", name);
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(AdminError::invalid(
+                    "user name cannot be blank or start with '$'",
+                ));
             }
         }
     }
@@ -386,7 +392,7 @@ pub async fn update_user(
     if let Some(ref perms) = normalized_perms {
         if let Err(msg) = validate_permissions(perms) {
             tracing::warn!("Invalid permissions for user {}: {}", user_id, msg);
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(AdminError::invalid("invalid permissions"));
         }
     }
 
@@ -397,10 +403,9 @@ pub async fn update_user(
             body.enabled,
             normalized_perms.as_deref(),
         )
-        .map_err(|e| {
+        .inspect_err(|e| {
             tracing::warn!("Failed to update user {}: {}", user_id, e);
             // A rename to a name another user has (names are unique) → 409.
-            super::db_error_status(&e)
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
@@ -416,8 +421,11 @@ pub async fn delete_user(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(user_id): axum::extract::Path<i64>,
     headers: HeaderMap,
-) -> Result<StatusCode, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<StatusCode, AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
 
     // Capture every revocation identity BEFORE the rows disappear: the access
@@ -432,9 +440,8 @@ pub async fn delete_user(
         user_id,
     );
 
-    db.delete_user(user_id).map_err(|e| {
+    db.delete_user(user_id).inspect_err(|e| {
         tracing::warn!("Failed to delete user {}: {}", user_id, e);
-        super::db_error_status(&e)
     })?;
 
     // Check if this was the last user before rebuilding
@@ -503,8 +510,11 @@ pub async fn rotate_user_keys(
     axum::extract::Path(user_id): axum::extract::Path<i64>,
     headers: HeaderMap,
     body: Option<Json<RotateKeysRequest>>,
-) -> Result<Json<IamUser>, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Json<IamUser>, AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
 
     let (new_access_key, new_secret_key) = match body {
@@ -525,9 +535,8 @@ pub async fn rotate_user_keys(
 
     let user = db
         .rotate_keys(user_id, &new_access_key, &new_secret_key)
-        .map_err(|e| {
+        .inspect_err(|e| {
             tracing::warn!("Failed to rotate keys for user {}: {}", user_id, e);
-            super::db_error_status(&e)
         })?;
 
     // Rebuild AFTER capturing the result — the old-key revocation below must
@@ -582,13 +591,13 @@ mod tests {
         let state = legacy_state();
         db.create_user("alice", "AKALICE", "alice-secret", true, &[])
             .unwrap();
-        rebuild_iam_index(&db, &state).unwrap();
+        rebuild_iam_index::<Bare>(&db, &state).unwrap();
         assert!(matches!(&**state.load(), IamState::Iam(_)));
 
         for u in db.load_users().unwrap() {
             db.delete_user(u.id).unwrap();
         }
-        rebuild_iam_index(&db, &state).unwrap();
+        rebuild_iam_index::<Bare>(&db, &state).unwrap();
         match &**state.load() {
             IamState::Legacy(auth) => assert_eq!(auth.access_key_id, "AKBOOT"),
             IamState::Disabled => panic!("empty IAM DB opened access"),
@@ -604,11 +613,11 @@ mod tests {
         let state: SharedIamState = Arc::new(ArcSwap::from_pointee(IamState::Disabled));
         db.create_user("alice", "AKALICE", "alice-secret", true, &[])
             .unwrap();
-        rebuild_iam_index(&db, &state).unwrap();
+        rebuild_iam_index::<Bare>(&db, &state).unwrap();
         for u in db.load_users().unwrap() {
             db.delete_user(u.id).unwrap();
         }
-        rebuild_iam_index(&db, &state).unwrap();
+        rebuild_iam_index::<Bare>(&db, &state).unwrap();
         assert!(matches!(&**state.load(), IamState::Disabled));
     }
 }

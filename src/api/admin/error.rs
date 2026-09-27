@@ -164,7 +164,7 @@ impl From<(StatusCode, String)> for AdminError<Text> {
 /// caller's 404 (also a FOREIGN KEY failure: the request names a user or
 /// group that does not exist), a UNIQUE violation its 409; only the rest
 /// is a 500.
-pub(crate) fn db_error_status(e: &ConfigDbError) -> StatusCode {
+fn db_error_status(e: &ConfigDbError) -> StatusCode {
     use crate::config_db::{classify_sqlite_error, SqliteErrorClass};
     match e {
         ConfigDbError::NotFound(_) => StatusCode::NOT_FOUND,

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::iam::{normalize_permissions, validate_permissions, Group, Permission};
 
 use super::users::rebuild_iam_index;
-use super::{audit_log, next_copy_name, trigger_config_sync, AdminState};
+use super::{audit_log, next_copy_name, trigger_config_sync, AdminError, AdminState, Bare};
 
 #[derive(Deserialize)]
 pub struct CreateGroupRequest {
@@ -48,15 +48,14 @@ pub struct AddGroupMemberRequest {
 /// GET /api/admin/groups — list all groups.
 pub async fn list_groups(
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<Vec<Group>>, StatusCode> {
+) -> Result<Json<Vec<Group>>, AdminError<Bare>> {
     let db = match state.config_db.as_ref() {
         Some(db) => db,
         None => return Ok(Json(vec![])),
     };
     let db = db.lock().await;
-    let groups = db.load_groups().map_err(|e| {
+    let groups = db.load_groups().inspect_err(|e| {
         tracing::error!("Failed to load groups: {}", e);
-        super::db_error_status(&e)
     })?;
     Ok(Json(groups))
 }
@@ -66,26 +65,28 @@ pub async fn create_group(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AdminJson(body): AdminJson<CreateGroupRequest>,
-) -> Result<(StatusCode, Json<Group>), StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<(StatusCode, Json<Group>), AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
 
     if crate::iam::types::is_blank_principal_name(&body.name) {
         tracing::warn!("Group name cannot be blank");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(AdminError::invalid("group name cannot be blank"));
     }
     let mut perms = body.permissions.clone();
     normalize_permissions(&mut perms);
     if let Err(msg) = validate_permissions(&perms) {
         tracing::warn!("Invalid permissions for group '{}': {}", body.name, msg);
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(AdminError::invalid("invalid permissions"));
     }
 
     let group = db
         .create_group(&body.name, &body.description, &perms)
-        .map_err(|e| {
+        .inspect_err(|e| {
             tracing::warn!("Failed to create group '{}': {}", body.name, e);
-            super::db_error_status(&e)
         })?;
 
     // Add members if provided in the creation request.
@@ -115,9 +116,8 @@ pub async fn create_group(
 
     // Reload group to include member_ids in the response
     let group = if !body.member_ids.is_empty() {
-        db.get_group_by_id(group.id).map_err(|e| {
+        db.get_group_by_id(group.id).inspect_err(|e| {
             tracing::error!("Failed to reload group after adding members: {}", e);
-            super::db_error_status(&e)
         })?
     } else {
         group
@@ -137,13 +137,15 @@ pub async fn clone_group(
     axum::extract::Path(group_id): axum::extract::Path<i64>,
     headers: HeaderMap,
     body: Option<Json<CloneGroupRequest>>,
-) -> Result<(StatusCode, Json<Group>), StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<(StatusCode, Json<Group>), AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
     let body = body.map(|Json(body)| body);
-    let source = db.get_group_by_id(group_id).map_err(|e| {
+    let source = db.get_group_by_id(group_id).inspect_err(|e| {
         tracing::warn!("Failed to load source group {} for clone: {}", group_id, e);
-        super::db_error_status(&e)
     })?;
 
     let name = body
@@ -160,10 +162,11 @@ pub async fn clone_group(
         });
     let copy_members = body.map(|b| b.copy_members).unwrap_or(false);
 
-    let group = db.clone_group(group_id, &name, copy_members).map_err(|e| {
-        tracing::warn!("Failed to clone group {} as '{}': {}", group_id, name, e);
-        super::db_error_status(&e)
-    })?;
+    let group = db
+        .clone_group(group_id, &name, copy_members)
+        .inspect_err(|e| {
+            tracing::warn!("Failed to clone group {} as '{}': {}", group_id, name, e);
+        })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
     trigger_config_sync(&state);
@@ -184,20 +187,21 @@ pub async fn update_group(
     axum::extract::Path(group_id): axum::extract::Path<i64>,
     headers: HeaderMap,
     AdminJson(body): AdminJson<UpdateGroupRequest>,
-) -> Result<Json<Group>, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Json<Group>, AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
 
     // Refuse a RENAME to a blank name; a row that already has one (created
     // before names were checked) stays editable.
     if let Some(name) = body.name.as_deref() {
         if crate::iam::types::is_blank_principal_name(name) {
-            let current = db
-                .get_group_by_id(group_id)
-                .map_err(|e| super::db_error_status(&e))?;
+            let current = db.get_group_by_id(group_id)?;
             if current.name != name {
                 tracing::warn!("Group name cannot be blank");
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(AdminError::invalid("group name cannot be blank"));
             }
         }
     }
@@ -209,7 +213,7 @@ pub async fn update_group(
     if let Some(ref perms) = normalized_perms {
         if let Err(msg) = validate_permissions(perms) {
             tracing::warn!("Invalid permissions for group {}: {}", group_id, msg);
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(AdminError::invalid("invalid permissions"));
         }
     }
 
@@ -220,10 +224,9 @@ pub async fn update_group(
             body.description.as_deref(),
             normalized_perms.as_deref(),
         )
-        .map_err(|e| {
+        .inspect_err(|e| {
             tracing::warn!("Failed to update group {}: {}", group_id, e);
             // A rename to a name another group has → 409.
-            super::db_error_status(&e)
         })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
@@ -239,14 +242,16 @@ pub async fn delete_group(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path(group_id): axum::extract::Path<i64>,
     headers: HeaderMap,
-) -> Result<StatusCode, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<StatusCode, AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
     let target = group_target(&db, group_id);
 
-    db.delete_group(group_id).map_err(|e| {
+    db.delete_group(group_id).inspect_err(|e| {
         tracing::warn!("Failed to delete group {}: {}", group_id, e);
-        super::db_error_status(&e)
     })?;
 
     rebuild_iam_index(&db, &state.iam_state)?;
@@ -263,19 +268,22 @@ pub async fn add_group_member(
     axum::extract::Path(group_id): axum::extract::Path<i64>,
     headers: HeaderMap,
     AdminJson(body): AdminJson<AddGroupMemberRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<StatusCode, AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
 
-    db.add_user_to_group(group_id, body.user_id).map_err(|e| {
-        tracing::warn!(
-            "Failed to add user {} to group {}: {}",
-            body.user_id,
-            group_id,
-            e
-        );
-        super::db_error_status(&e)
-    })?;
+    db.add_user_to_group(group_id, body.user_id)
+        .inspect_err(|e| {
+            tracing::warn!(
+                "Failed to add user {} to group {}: {}",
+                body.user_id,
+                group_id,
+                e
+            );
+        })?;
     let target = format!(
         "user {} to group {}",
         user_target(&db, body.user_id),
@@ -295,19 +303,22 @@ pub async fn remove_group_member(
     State(state): State<Arc<AdminState>>,
     axum::extract::Path((group_id, user_id)): axum::extract::Path<(i64, i64)>,
     headers: HeaderMap,
-) -> Result<StatusCode, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<StatusCode, AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
 
-    db.remove_user_from_group(group_id, user_id).map_err(|e| {
-        tracing::warn!(
-            "Failed to remove user {} from group {}: {}",
-            user_id,
-            group_id,
-            e
-        );
-        super::db_error_status(&e)
-    })?;
+    db.remove_user_from_group(group_id, user_id)
+        .inspect_err(|e| {
+            tracing::warn!(
+                "Failed to remove user {} from group {}: {}",
+                user_id,
+                group_id,
+                e
+            );
+        })?;
     let target = format!(
         "user {} from group {}",
         user_target(&db, user_id),

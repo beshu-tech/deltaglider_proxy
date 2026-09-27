@@ -50,7 +50,7 @@ use std::sync::Arc;
 use crate::config::{BackendConfig, Config};
 
 use super::users::rebuild_iam_index;
-use super::{audit_log, trigger_config_sync, AdminState};
+use super::{audit_log, trigger_config_sync, AdminError, AdminState, Bare};
 
 #[derive(Serialize)]
 struct ImportErrorBody {
@@ -421,18 +421,19 @@ struct SecretsStorage {
 
 /// Build the IamBackup struct from current DB state. Used by both
 /// the JSON and zip export paths.
-async fn build_iam_backup(state: &Arc<AdminState>) -> Result<IamBackup, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+async fn build_iam_backup(state: &Arc<AdminState>) -> Result<IamBackup, AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
 
-    let users = db.load_users().map_err(|e| {
+    let users = db.load_users().inspect_err(|e| {
         tracing::error!("Failed to load users for backup: {}", e);
-        super::db_error_status(&e)
     })?;
 
-    let groups = db.load_groups().map_err(|e| {
+    let groups = db.load_groups().inspect_err(|e| {
         tracing::error!("Failed to load groups for backup: {}", e);
-        super::db_error_status(&e)
     })?;
 
     let auth_providers = db.load_auth_providers().unwrap_or_default();
@@ -480,7 +481,7 @@ pub async fn export_backup(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<ExportQuery>,
     headers: axum::http::HeaderMap,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, AdminError<Bare>> {
     let iam = build_iam_backup(&state).await?;
 
     let format = q.format.as_deref().unwrap_or("zip");
@@ -504,7 +505,9 @@ pub async fn export_backup(
             );
             resp
         }),
-        _ => Err(StatusCode::BAD_REQUEST),
+        _ => Err(AdminError::invalid(format!(
+            "unknown backup format {format:?}"
+        ))),
     }
 }
 
@@ -512,7 +515,7 @@ pub async fn export_backup(
 async fn export_zip(
     state: &Arc<AdminState>,
     iam: &IamBackup,
-) -> Result<(Bytes, String), StatusCode> {
+) -> Result<(Bytes, String), AdminError<Bare>> {
     // We hold the read lock for the entire inspection of config so
     // a concurrent apply can't tear the YAML + secrets harvest apart.
     let cfg = state.config.read().await;
@@ -533,7 +536,7 @@ async fn export_zip(
     let redacted = cfg.redact_all_secrets();
     let yaml = redacted.to_canonical_yaml().map_err(|e| {
         tracing::error!("Full-backup: YAML serialise failed: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        AdminError::internal(e.to_string())
     })?;
 
     // ── secrets.json — harvest real plaintext values that YAML
@@ -541,7 +544,7 @@ async fn export_zip(
     let secrets = {
         let mut s = harvest_config_secrets(&cfg).map_err(|e| {
             tracing::error!("Full-backup: config file view failed: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            AdminError::internal(e.to_string())
         })?;
         // OAuth client secrets (indexed by provider name, not id, so
         // restore is robust across id reshuffles).
@@ -560,11 +563,11 @@ async fn export_zip(
     // ── Serialise all three parts ──────────────────────────────
     let iam_bytes = serde_json::to_vec_pretty(&iam).map_err(|e| {
         tracing::error!("Full-backup: iam.json serialise failed: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        AdminError::internal(e.to_string())
     })?;
     let secrets_bytes = serde_json::to_vec_pretty(&secrets).map_err(|e| {
         tracing::error!("Full-backup: secrets.json serialise failed: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        AdminError::internal(e.to_string())
     })?;
     let yaml_bytes = yaml.into_bytes();
 
@@ -594,7 +597,7 @@ async fn export_zip(
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| {
         tracing::error!("Full-backup: manifest.json serialise failed: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
+        AdminError::internal(e.to_string())
     })?;
 
     // ── Write zip (in-memory) ──────────────────────────────────
@@ -613,16 +616,16 @@ async fn export_zip(
         ] {
             zw.start_file(name, opts).map_err(|e| {
                 tracing::error!("Full-backup: zip start_file({}) failed: {}", name, e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                AdminError::internal(e.to_string())
             })?;
             zw.write_all(bytes).map_err(|e| {
                 tracing::error!("Full-backup: zip write({}) failed: {}", name, e);
-                StatusCode::INTERNAL_SERVER_ERROR
+                AdminError::internal(e.to_string())
             })?;
         }
         zw.finish().map_err(|e| {
             tracing::error!("Full-backup: zip finish failed: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
+            AdminError::internal(e.to_string())
         })?;
     }
     let bytes = Bytes::from(buf.into_inner());
@@ -685,7 +688,8 @@ pub async fn import_backup(
     })?;
     import_backup_iam(state, headers, backup, query.iam)
         .await
-        .map_err(|status| {
+        .map_err(|e| {
+            let status = e.status_code();
             import_fail(
                 status,
                 "restore_iam",
@@ -1390,7 +1394,8 @@ async fn import_zip_full_backup(
             );
             let Json(result) = import_backup_iam(state.clone(), headers.clone(), backup, iam_mode)
                 .await
-                .map_err(|status| {
+                .map_err(|e| {
+                    let status = e.status_code();
                     import_fail(
                         status,
                         "restore_iam",
@@ -1586,8 +1591,11 @@ async fn import_backup_iam(
     headers: HeaderMap,
     backup: IamBackup,
     mode: IamRestoreMode,
-) -> Result<Json<ImportResult>, StatusCode> {
-    let db = state.config_db.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Json<ImportResult>, AdminError<Bare>> {
+    let db = state
+        .config_db
+        .as_ref()
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
 
     // A backup user with the bootstrap key would collide with the bootstrap login.
@@ -1597,9 +1605,8 @@ async fn import_backup_iam(
     };
     let result = db
         .restore_iam(&backup, mode, bootstrap_key.as_deref())
-        .map_err(|e| {
+        .inspect_err(|e| {
             tracing::warn!("IAM restore rolled back: {e}");
-            super::db_error_status(&e)
         })?;
 
     // Rebuild IAM index + external auth manager

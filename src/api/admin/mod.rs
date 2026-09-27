@@ -242,7 +242,8 @@ pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
 ///
 /// Wraps the boilerplate that otherwise repeats in every admin IAM
 /// handler: "pull the Option<Arc<Mutex<ConfigDb>>> out of the state
-/// or return 404, lock it, run the op, on error log and return 500."
+/// or return 404, lock it, run the op, on error log it and return its
+/// status (`From<ConfigDbError>` for [`AdminError`])."
 ///
 /// Post-mutation hooks (`rebuild_external_auth`, `rebuild_iam_index`,
 /// `trigger_config_sync`, `audit_log`) stay explicit at the handler
@@ -260,7 +261,7 @@ pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
 /// ```ignore
 /// pub async fn list_providers(
 ///     State(state): State<Arc<AdminState>>,
-/// ) -> Result<impl IntoResponse, StatusCode> {
+/// ) -> Result<impl IntoResponse, AdminError<Bare>> {
 ///     let providers = with_config_db(&state, "load auth providers", |db| {
 ///         db.load_auth_providers()
 ///     })
@@ -268,31 +269,30 @@ pub(crate) fn trigger_config_sync(state: &Arc<AdminState>) {
 ///     Ok(Json(providers))
 /// }
 /// ```
-pub(crate) async fn with_config_db<T, F>(
+pub(crate) async fn with_config_db<T, B, F>(
     state: &Arc<AdminState>,
     op_label: &str,
     f: F,
-) -> Result<T, axum::http::StatusCode>
+) -> Result<T, AdminError<B>>
 where
+    B: ErrorBody,
     F: FnOnce(&ConfigDb) -> Result<T, crate::config_db::ConfigDbError>,
 {
     let db = state
         .config_db
         .as_ref()
-        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+        .ok_or_else(|| AdminError::not_found("config DB not available"))?;
     let db = db.lock().await;
     f(&db).map_err(|e| {
-        let status = db_error_status(&e);
-        if status.is_server_error() {
-            tracing::error!("Failed to {op_label}: {e}");
+        let e = AdminError::from(e);
+        if e.status_code().is_server_error() {
+            tracing::error!("Failed to {op_label}: {}", e.message());
         } else {
-            tracing::warn!("Failed to {op_label}: {e}");
+            tracing::warn!("Failed to {op_label}: {}", e.message());
         }
-        status
+        e
     })
 }
-
-pub(crate) use error::db_error_status;
 
 /// Admin audit log helper — delegates to `crate::audit::audit_log` with empty bucket/path.
 /// Exists to avoid passing `"", ""` at every admin API call site.

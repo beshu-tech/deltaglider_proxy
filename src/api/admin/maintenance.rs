@@ -20,7 +20,7 @@
 //!   included) so non-admin browser users see busy state + progress; the
 //!   response carries only status/phase/counts — no config detail.
 
-use super::{AdminError, AdminState};
+use super::{AdminError, AdminState, Bare};
 use crate::api::admin::extract::AdminJson;
 use crate::maintenance::migrate::{parse_params, pick_transient_key, MigrateParams, MigrateTarget};
 use crate::maintenance::store::{current_unix_seconds, CancelOutcome, MaintenanceJob};
@@ -508,7 +508,7 @@ pub async fn bucket_status(
     connect_info: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: axum::http::HeaderMap,
     Path(bucket): Path<super::path_guard::AdminBucket>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, AdminError<Bare>> {
     // Session-light, but bucket-scoped: only a principal that may list the
     // bucket learns its maintenance state (403, as the S3 LIST answers).
     let client_ip = crate::rate_limiter::extract_client_ip_with_peer(
@@ -518,7 +518,9 @@ pub async fn bucket_status(
     let may = super::auth::extract_session_token(&headers)
         .is_some_and(|t| super::auth::session_may_list_bucket(&state, &t, client_ip, &bucket));
     if !may {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(AdminError::forbidden(
+            "the session may not list this bucket",
+        ));
     }
     let job = super::with_config_db(&state, "read bucket maintenance status", |db| {
         db.maintenance_active_job_for_bucket(&bucket.to_ascii_lowercase())
