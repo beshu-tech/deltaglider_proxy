@@ -85,7 +85,7 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
   → storage/traits.rs       StorageBackend trait (async_trait, object-safe). `get_reference_to_file`/`put_reference_from_file` materialise the reference to/from a local file WITHOUT heap-loading it (filesystem hardlinks, S3 streams) — the bounded-memory backbone of the streaming-delta paths.
   → storage/filesystem.rs   Local filesystem impl (xattr metadata via xattr_meta.rs, list_objects_delegated)
   → storage/s3/             AWS S3/MinIO impl: mod.rs (backend + trait impl), client.rs (SSRF guard), errors.rs (S3Op, `classify_s3_error` + `classify_get_error` pure fns), metadata.rs, objects.rs (fenced writes), facts.rs, listing.rs, tests.rs
-  → storage/encrypting.rs   At-rest encryption wrapper backend (per-backend AES key, dg-encryption-key-id metadata)
+  → storage/encrypting/     At-rest encryption wrapper backend (per-backend AES key, dg-encryption-key-id metadata); format.rs = the v1 + chunked formats
   → storage/routing.rs      Multi-backend routing (virtual bucket → real backend)
   → security.rs             Pure security primitives (validate_bucket_name, bucket_name_is_ip_like, outbound-URL SSRF policy) — unit + proptest, shared by CLI URL parser
   → demo.rs                 Embedded UI + admin API router, mounted under /_/

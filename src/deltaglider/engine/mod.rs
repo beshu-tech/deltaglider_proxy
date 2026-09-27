@@ -2827,7 +2827,7 @@ mod tests {
     /// Fake inner backend that records nothing — used only to check
     /// that `wrap_backend_with_encryption` constructs without error
     /// for every mode. Actual put/get semantics are covered by the
-    /// CountingBackend tests in `storage::encrypting::tests`.
+    /// CountingBackend tests in `storage::encrypting::tests::wrapper_tests`.
     struct NullInner;
 
     #[async_trait::async_trait]
@@ -3074,7 +3074,7 @@ mod tests {
         // (xattr-strip case, B9 from the earlier audit) needs the
         // wrapper in the pipeline to fire. This test just verifies
         // construction succeeds; the sniffer behaviour itself is
-        // covered in `storage::encrypting::tests::test_stripped_xattr_*`.
+        // covered in `storage::encrypting::tests::wrapper_tests::test_stripped_xattr_*`.
         let inner: Box<dyn StorageBackend> = Box::new(NullInner);
         let mut coll = KeyIdCollisionCheck::new();
         let wrapped = wrap_backend_with_encryption(
