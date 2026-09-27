@@ -460,20 +460,6 @@ The engine verbs (`ls`, `cp`, `rm`, …) stop with exit code `2` when
 proxy anyway. Now they send the same `GET /_/health` probe first and stop
 with the same message and exit code.
 
-### Fixed — A sanitised 500 is logged once
-
-A `500 InternalError` whose cause the proxy hides from the client logged
-two ERROR lines: the cause, and a second line that repeated only the
-client text "Internal server error. See server logs for details.". Now
-it logs one line, the cause.
-
-### Fixed — A single sign-on lockout says how long it lasts
-
-A locked-out browser that started or finished a single sign-on flow got
-`200` and a page that said only "Please wait and try again". Now the
-authorize and callback pages answer `429` with `Retry-After` and the
-themed error page names the wait, for example "Try again in 10 min.".
-
 ### Changed — The admin API shows backend access key ids
 
 The config export, the storage section, and the backend list hid the
@@ -483,7 +469,7 @@ now show it; the Backends page shows it too. The secret stays hidden. An
 applied document with the same key id and no secret keeps the current
 secret, as it already does for the bootstrap pair.
 
-### Fixed — A sanitised 500 logs its cause
+### Fixed — A sanitised 500 logs its cause, once
 
 A request that failed with `500 InternalError` sends the client a generic
 message, and the proxy meant to log the real cause at ERROR. It logged it
@@ -493,6 +479,9 @@ object's key id does not match the backend's key left only "Internal
 server error" in the log. Now the cause, for example "object was encrypted
 with key id 'A', but this backend is configured with key id 'B'", is
 logged at ERROR under the crate's own target. Keys are never logged.
+
+The cause is logged once: a second ERROR line that repeated only the
+client text "Internal server error. See server logs for details." is gone.
 
 ### Fixed — A key too long for the backend is a 400, not a 500
 
@@ -511,6 +500,19 @@ admin sign-in surface answers `429` with `Retry-After` and
 "retry_after_secs": N}`; the S3 API keeps `503 SlowDown` and adds
 `Retry-After` and the wait to the message.
 
+After too many failed sign-ins the proxy refuses every attempt from that
+address for a while, including one with the right password. The sign-in
+forms showed "Login failed: Login failed", so the operator kept retrying.
+Every sign-in form (admin password, IAM keys, re-login, browser session) now
+shows "Too many sign-in attempts. Try again in N min." and reads the wait
+from `Retry-After` (or `retry_after_secs` in the JSON body) when the server
+sends it. A wrong password shows "Login failed: wrong password." once.
+
+A locked-out browser that started or finished a single sign-on flow got
+`200` and a page that said only "Please wait and try again". Now the
+authorize and callback pages answer `429` with `Retry-After` and the
+themed error page names the wait, for example "Try again in 10 min.".
+
 ### Changed — The bootstrap access key id is visible, and its removal is explicit
 
 The Credentials page showed an empty access key id field, because every GET
@@ -522,6 +524,9 @@ secret on apply. `DELETE /_/api/admin/config/bootstrap-credentials` removes
 the pair; it and every other config change refuse to remove it while no IAM
 users exist. With IAM users, the pair becomes the fallback for an empty IAM
 DB instead of an ignored edit.
+
+In the UI, the field shows the configured access key ID, and a **Remove
+bootstrap credentials** button removes the pair after a confirmation.
 
 ### Added — OIDC providers in private networks
 
@@ -646,6 +651,7 @@ refuses a destination that already holds objects: the job fails in its
 dialog) makes the destination an exact copy instead: destination objects that
 the source does not hold are deleted before the flip, and each delete is
 audited as `maintenance_migrate_mirror_delete`.
+
 ### Fixed — Small drift in the admin UI, the docs and the logs
 
 - Docs search: a result no longer shows the changelog's "GENERATED FILE"
@@ -666,24 +672,6 @@ audited as `maintenance_migrate_mirror_delete`.
   existence probe) logs at debug. It used to log a WARN "S3 error" line.
 - Sortable table headers (object browser, event outbox) show a focus ring in
   both themes, and Space sorts as well as Enter.
-
-### Fixed — The Credentials page shows the bootstrap access key and removes it on request
-
-The page showed an empty access key field while a bootstrap key was
-configured, and it said "to remove them, clear both fields", although an
-empty field keeps the current value. The field now shows the configured
-access key ID, and a **Remove bootstrap credentials** button removes the pair
-after a confirmation.
-
-### Fixed — A locked-out sign-in says that it is locked, and for how long
-
-After too many failed sign-ins the proxy refuses every attempt from that
-address for a while, including one with the right password. The sign-in
-forms showed "Login failed: Login failed", so the operator kept retrying.
-Every sign-in form (admin password, IAM keys, re-login, browser session) now
-shows "Too many sign-in attempts. Try again in N min." and reads the wait
-from `Retry-After` (or `retry_after_secs` in the JSON body) when the server
-sends it. A wrong password shows "Login failed: wrong password." once.
 
 ### Fixed — The upload page keeps up with many small files
 
