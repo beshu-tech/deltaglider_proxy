@@ -7,9 +7,10 @@ use super::planner::{
     Candidate, Decision, PlannedLifecycleAction, QualifySpec, SkipReason,
 };
 use super::state_store::{LifecycleFailureInsert, LifecycleRunTotals};
-use crate::background::RunLease;
+use crate::background::{LeaseAlive, LeaseKeeper, RunLease};
 use crate::config_db::ConfigDb;
 use crate::config_sections::{LifecycleAction, LifecycleRetainNewestAction, LifecycleRule};
+use crate::coordination::LeaseError;
 use crate::deltaglider::DynEngine;
 use crate::event_outbox::{EventKind, EventSource, NewEvent};
 use crate::job_loop::Pager;
@@ -132,14 +133,12 @@ pub async fn run_begun_rule(
     lease: Option<RunLease>,
     maintenance_gate: Option<Arc<crate::maintenance::gate::MaintenanceGate>>,
 ) -> Result<LifecycleRunOutcome, String> {
-    let lease_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let keeper = spawn_lease_keeper(db.clone(), &rule.name, lease.clone());
+    let lease_alive = keeper
+        .as_ref()
+        .map_or_else(LeaseAlive::always, LeaseKeeper::alive);
     let heartbeat = RunLeaseGuard {
-        heartbeat: spawn_lease_heartbeat(
-            db.clone(),
-            &rule.name,
-            lease.clone(),
-            lease_alive.clone(),
-        ),
+        keeper,
         release: db
             .clone()
             .zip(lease.as_ref())
@@ -232,7 +231,7 @@ pub async fn run_begun_rule(
 /// a detached heartbeat renewed that lease forever: run-now, the scheduler
 /// and rule delete were refused until a restart. So the drop also releases.
 struct RunLeaseGuard {
-    heartbeat: Option<tokio::task::JoinHandle<()>>,
+    keeper: Option<LeaseKeeper>,
     /// (db, rule, owner) to release on an abnormal exit.
     release: Option<(Arc<Mutex<ConfigDb>>, String, String)>,
 }
@@ -246,9 +245,8 @@ impl RunLeaseGuard {
 
 impl Drop for RunLeaseGuard {
     fn drop(&mut self) {
-        if let Some(h) = self.heartbeat.take() {
-            h.abort();
-        }
+        // Stop renewing first (dropping the keeper aborts it).
+        self.keeper.take();
         let Some((db, rule, owner)) = self.release.take() else {
             return;
         };
@@ -266,7 +264,7 @@ struct RunContext {
     run_id: Option<i64>,
     max_failures_retained: u32,
     lease: Option<RunLease>,
-    lease_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    lease_alive: LeaseAlive,
 }
 
 async fn run_or_preview(
@@ -1031,80 +1029,32 @@ async fn execute_action(
     }
 }
 
-fn spawn_lease_heartbeat(
+/// The run's lease keeper (`None` without a DB or a lease: nothing to renew).
+fn spawn_lease_keeper(
     db: Option<Arc<Mutex<ConfigDb>>>,
     rule_name: &str,
     lease: Option<RunLease>,
-    lease_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<LeaseKeeper> {
     let db = db?;
     let lease = lease?;
     let rule_name = rule_name.to_string();
-    let heartbeat_secs = lease.heartbeat_secs.max(1) as u64;
-    Some(tokio::spawn(async move {
-        let interval = std::time::Duration::from_secs(heartbeat_secs);
-        let mut last_ok = std::time::Instant::now();
-        loop {
-            tokio::time::sleep(interval).await;
-            let renewed = {
+    Some(LeaseKeeper::spawn(
+        format!("lifecycle rule '{rule_name}'"),
+        std::time::Duration::from_secs(lease.heartbeat_secs.max(1) as u64),
+        std::time::Duration::from_secs(lease.ttl_secs.max(1) as u64),
+        move || {
+            let (db, rule_name, lease) = (db.clone(), rule_name.clone(), lease.clone());
+            async move {
                 let db = db.lock().await;
-                db.lifecycle_renew_lease(
+                LeaseError::from_renewal(db.lifecycle_renew_lease(
                     &rule_name,
                     &lease.owner,
                     super::current_unix_seconds(),
                     lease.ttl_secs,
-                )
-            };
-            match heartbeat_step(&renewed, last_ok.elapsed(), &lease) {
-                HeartbeatStep::Renewed => last_ok = std::time::Instant::now(),
-                HeartbeatStep::Retry => {
-                    if let Err(e) = &renewed {
-                        warn!(
-                            "Lifecycle lease renew for rule '{rule_name}' failed ({e}); retrying"
-                        );
-                    }
-                }
-                HeartbeatStep::Lost => {
-                    lease_alive.store(false, std::sync::atomic::Ordering::Release);
-                    warn!(
-                        "Lifecycle lease heartbeat lost for rule '{}'; worker will stop before more work",
-                        rule_name
-                    );
-                    return;
-                }
+                ))
             }
-        }
-    }))
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum HeartbeatStep {
-    Renewed,
-    Retry,
-    Lost,
-}
-
-/// One heartbeat's verdict. A refused renew is a lost lease. A DB error is
-/// not: the lease is still ours until its TTL, so retry while the next
-/// retry still lands before the expiry (`since_ok` = age of the last renew).
-fn heartbeat_step<E>(
-    renewed: &Result<bool, E>,
-    since_ok: std::time::Duration,
-    lease: &RunLease,
-) -> HeartbeatStep {
-    match renewed {
-        Ok(true) => HeartbeatStep::Renewed,
-        Ok(false) => HeartbeatStep::Lost,
-        Err(_) => {
-            let ttl = lease.ttl_secs.max(1) as u64;
-            let hb = lease.heartbeat_secs.max(1) as u64;
-            if since_ok.as_secs().saturating_add(hb) < ttl {
-                HeartbeatStep::Retry
-            } else {
-                HeartbeatStep::Lost
-            }
-        }
-    }
+        },
+    ))
 }
 
 /// True when any bucket this rule WRITES to (source-for-deletes + transition
@@ -1167,14 +1117,11 @@ async fn renew_run_lease(
     let Some(db) = db else {
         return Ok(true);
     };
-    // Lock the DB BEFORE checking lease_alive so the check and the renewal are
-    // ordered against the heartbeat task, which sets lease_alive under the same
-    // lock when its own renewal fails. Without this, the heartbeat could declare
-    // the lease lost between an early flag load and acquiring the lock here, and
-    // we'd renew a lease the heartbeat already gave up on.
+    // A lease the keeper gave up is not renewed here: a refused renewal
+    // lapsed it, and a lapsed lease never renews anyway.
     let renewed = {
         let guard = db.lock().await;
-        if !ctx.lease_alive.load(std::sync::atomic::Ordering::Acquire) {
+        if !ctx.lease_alive.is_alive() {
             false
         } else {
             match guard.lifecycle_renew_lease(
@@ -1727,8 +1674,7 @@ mod heartbeat_db_error_tests {
                 .execute_batch("ALTER TABLE lifecycle_state RENAME TO lifecycle_state_off")
                 .unwrap();
         }
-        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let hb = spawn_lease_heartbeat(
+        let keeper = spawn_lease_keeper(
             Some(db.clone()),
             "r",
             Some(RunLease {
@@ -1736,9 +1682,9 @@ mod heartbeat_db_error_tests {
                 ttl_secs: 30,
                 heartbeat_secs: 1,
             }),
-            alive.clone(),
         )
         .unwrap();
+        let alive = keeper.alive();
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         db.lock()
             .await
@@ -1746,36 +1692,10 @@ mod heartbeat_db_error_tests {
             .execute_batch("ALTER TABLE lifecycle_state_off RENAME TO lifecycle_state")
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-        hb.abort();
+        drop(keeper);
         assert!(
-            alive.load(std::sync::atomic::Ordering::Acquire),
+            alive.is_alive(),
             "one failed renew marked a live lease lost"
         );
-    }
-
-    #[test]
-    fn heartbeat_step_truth_table() {
-        let lease = RunLease {
-            owner: "X".into(),
-            ttl_secs: 300,
-            heartbeat_secs: 60,
-        };
-        let secs = std::time::Duration::from_secs;
-        let err: Result<bool, &str> = Err("busy");
-        assert_eq!(
-            heartbeat_step(&Ok::<_, ()>(true), secs(999), &lease),
-            HeartbeatStep::Renewed
-        );
-        assert_eq!(
-            heartbeat_step(&Ok::<_, ()>(false), secs(0), &lease),
-            HeartbeatStep::Lost
-        );
-        assert_eq!(heartbeat_step(&err, secs(60), &lease), HeartbeatStep::Retry);
-        assert_eq!(
-            heartbeat_step(&err, secs(239), &lease),
-            HeartbeatStep::Retry
-        );
-        // The next retry would land at the expiry: lost now.
-        assert_eq!(heartbeat_step(&err, secs(240), &lease), HeartbeatStep::Lost);
     }
 }

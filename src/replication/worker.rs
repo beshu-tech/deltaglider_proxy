@@ -30,7 +30,7 @@
 use super::planner::{compile_rule_globs, normalize_prefix};
 use super::state_store::{current_unix_seconds, FailureInsert, RunTotals};
 use super::walk;
-use crate::background::RunLease;
+use crate::background::{LeaseAlive, LeaseKeeper, RunLease};
 use crate::config_db::ConfigDb;
 use crate::config_sections::ReplicationRule;
 use crate::deltaglider::DynEngine;
@@ -423,14 +423,12 @@ pub async fn run_rule(
     let cap = rule.batch_size.clamp(1, 10_000);
     let source_prefix = normalize_prefix(&rule.source.prefix);
     let dest_prefix = normalize_prefix(&rule.destination.prefix);
-    let lease_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let keeper = spawn_lease_keeper(&rule.name, lease.clone(), coordination_lease.clone());
+    let lease_alive = keeper
+        .as_ref()
+        .map_or_else(LeaseAlive::always, LeaseKeeper::alive);
     let lease_guard = RunLeaseGuard {
-        heartbeat: spawn_lease_heartbeat(
-            &rule.name,
-            lease.clone(),
-            coordination_lease.clone(),
-            lease_alive.clone(),
-        ),
+        keeper,
         release: lease.as_ref().map(|l| {
             (
                 coordination_lease.clone(),
@@ -1412,27 +1410,24 @@ fn page_is_throttle_aborted(copied: i64, throttled: i64, attempted: i64) -> bool
     copied == 0 && throttled > 0 && (throttled >= 3 || throttled >= attempted)
 }
 
-/// Resolves to `true` once a kill is requested for `run_id` (polls the DB
-/// `cancelling` flag ~1×/s). Used as the cancel arm of the per-page select —
-/// when it wins, the page's copy future is dropped and in-flight transfers abort.
-// ponytail: 1s poll → ≤1s kill latency. A notify channel would be tighter but
-// the run loop has no other reason to hold one; poll until that changes.
-fn spawn_lease_heartbeat(
+/// The run's lease keeper (`None` without a lease: nothing to renew).
+fn spawn_lease_keeper(
     rule_name: &str,
     lease: Option<RunLease>,
     coordination_lease: Arc<dyn crate::coordination::CoordinationLease>,
-    lease_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<LeaseKeeper> {
     let lease = lease?;
     let rule_name = rule_name.to_string();
-    let heartbeat_secs = lease.heartbeat_secs.max(1) as u64;
-    Some(tokio::spawn(async move {
-        let interval = std::time::Duration::from_secs(heartbeat_secs);
-        loop {
-            tokio::time::sleep(interval).await;
+    Some(LeaseKeeper::spawn(
+        format!("replication rule '{rule_name}'"),
+        std::time::Duration::from_secs(lease.heartbeat_secs.max(1) as u64),
+        std::time::Duration::from_secs(lease.ttl_secs.max(1) as u64),
+        move || {
+            let (cl, rule_name, lease) =
+                (coordination_lease.clone(), rule_name.clone(), lease.clone());
             // The same lease the run was acquired through (S3 or SQLite).
-            let renewed = coordination_lease
-                .renew(
+            async move {
+                cl.renew(
                     crate::coordination::LeaseSubsystem::Replication,
                     &rule_name,
                     &lease.owner,
@@ -1440,18 +1435,9 @@ fn spawn_lease_heartbeat(
                     lease.ttl_secs,
                 )
                 .await
-                .is_ok();
-            if renewed {
-                continue;
             }
-            lease_alive.store(false, std::sync::atomic::Ordering::Release);
-            warn!(
-                "Replication lease heartbeat lost for rule '{}'; worker will stop before more work",
-                rule_name
-            );
-            return;
-        }
-    }))
+        },
+    ))
 }
 
 /// The run's lease heartbeat, stopped on EVERY exit. A panic in the run (a
@@ -1460,7 +1446,7 @@ fn spawn_lease_heartbeat(
 /// and rule delete were refused until a restart. So the drop also releases
 /// (same shape as lifecycle's guard).
 struct RunLeaseGuard {
-    heartbeat: Option<tokio::task::JoinHandle<()>>,
+    keeper: Option<LeaseKeeper>,
     /// (lease, rule, owner) to release on an abnormal exit.
     release: Option<(
         Arc<dyn crate::coordination::CoordinationLease>,
@@ -1478,9 +1464,8 @@ impl RunLeaseGuard {
 
 impl Drop for RunLeaseGuard {
     fn drop(&mut self) {
-        if let Some(h) = self.heartbeat.take() {
-            h.abort();
-        }
+        // Stop renewing first (dropping the keeper aborts it).
+        self.keeper.take();
         let Some((lease, rule, owner)) = self.release.take() else {
             return;
         };
@@ -1599,7 +1584,7 @@ struct RunControl {
     rule_name: String,
     run_id: i64,
     lease: Option<RunLease>,
-    lease_alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    lease_alive: LeaseAlive,
     one_off: bool,
     max_failures_retained: u32,
     /// Destination bucket + the write-gate: if a maintenance job starts
@@ -1614,8 +1599,7 @@ impl RunControl {
     /// A lost lease is recorded as a run failure only on the `renew` variant
     /// so back-to-back checks don't double-log.
     async fn check(&self, renew: bool) -> Result<ControlVerdict, crate::config_db::ConfigDbError> {
-        let lease_ok =
-            self.lease.is_none() || self.lease_alive.load(std::sync::atomic::Ordering::Acquire);
+        let lease_ok = self.lease.is_none() || self.lease_alive.is_alive();
         // Read cancel/paused under the DB lock, then DROP it before any lease
         // renew — the trait renew may do S3 I/O and must never run while holding
         // the global config-DB mutex.
@@ -2165,6 +2149,71 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(released(), 1, "the dropped run must release its lease");
+    }
+
+    /// jobs-4 drift: the replication heartbeat read ANY renew error (one S3
+    /// blip past the lease's own retries) as a lost lease and stopped a
+    /// healthy run. It now shares the keeper verdict: retry until the TTL.
+    #[tokio::test(start_paused = true)]
+    async fn one_failed_renewal_does_not_stop_the_run() {
+        struct Flaky(std::sync::atomic::AtomicUsize);
+        #[async_trait::async_trait]
+        impl crate::coordination::CoordinationLease for Flaky {
+            async fn try_acquire(
+                &self,
+                _: crate::coordination::LeaseSubsystem,
+                _: &str,
+                _: &str,
+                _: i64,
+                _: i64,
+            ) -> Result<bool, crate::coordination::LeaseError> {
+                Ok(true)
+            }
+            async fn renew(
+                &self,
+                _: crate::coordination::LeaseSubsystem,
+                _: &str,
+                _: &str,
+                _: i64,
+                _: i64,
+            ) -> Result<(), crate::coordination::LeaseError> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    Err(crate::coordination::LeaseError::Backend("slow down".into()))
+                } else {
+                    Ok(())
+                }
+            }
+            async fn release(
+                &self,
+                _: crate::coordination::LeaseSubsystem,
+                _: &str,
+                _: &str,
+            ) -> Result<(), crate::coordination::LeaseError> {
+                Ok(())
+            }
+            async fn is_held(
+                &self,
+                _: crate::coordination::LeaseSubsystem,
+                _: &str,
+                _: i64,
+            ) -> Result<bool, crate::coordination::LeaseError> {
+                Ok(true)
+            }
+        }
+        let lease = Arc::new(Flaky(std::sync::atomic::AtomicUsize::new(0)));
+        let keeper = spawn_lease_keeper(
+            "r",
+            Some(RunLease {
+                owner: "w".into(),
+                ttl_secs: 300,
+                heartbeat_secs: 60,
+            }),
+            lease.clone(),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(150)).await;
+        assert!(lease.0.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert!(keeper.alive().is_alive(), "one failed renew lost the lease");
     }
 
     #[test]

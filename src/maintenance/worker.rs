@@ -32,9 +32,11 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::api::handlers::AppState;
+use crate::background::LeaseKeeper;
 use crate::config::SharedConfig;
 use crate::config_apply::ConfigMutator;
 use crate::config_db::ConfigDb;
+use crate::coordination::LeaseError;
 use crate::job_loop::Pager;
 use crate::storage::encrypting::{ENCRYPTION_KEY_ID_KEY, ENCRYPTION_MARKER_KEY};
 use crate::transfer::{copy_object_with_retries, ObjectTransferRequest};
@@ -161,7 +163,7 @@ async fn run_job(
         "",
     );
 
-    let keeper = LeaseKeeper::spawn(
+    let keeper = spawn_lease_keeper(
         db.clone(),
         job.id,
         instance_id.to_string(),
@@ -754,52 +756,36 @@ pub(crate) async fn persist(
     }
 }
 
-/// Renews a job lease on a timer for as long as it lives (aborted on drop).
-/// The per-page `heartbeat` is not enough on its own: one page of copy work
-/// can outlast the TTL, and a lapsed lease lets the requeue scan hand the job
-/// back and the write gate open mid-job. The keeper stops at the first
-/// refused renewal (a DB error is retried); the next per-page `heartbeat`
-/// then reports LEASE_LOST.
-pub(crate) struct LeaseKeeper(tokio::task::JoinHandle<()>);
-
-impl LeaseKeeper {
-    pub(crate) fn spawn(
-        db: Arc<Mutex<ConfigDb>>,
-        job_id: i64,
-        instance_id: String,
-        ttl_secs: i64,
-        interval: std::time::Duration,
-    ) -> Self {
-        Self(tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                let renewed = {
-                    let db = db.lock().await;
-                    db.maintenance_heartbeat(job_id, &instance_id, current_unix_seconds(), ttl_secs)
-                };
-                use crate::config_db::job_store::{keeper_step, KeeperStep};
-                match keeper_step(&renewed) {
-                    KeeperStep::Held => {}
-                    KeeperStep::Lost => {
-                        warn!("maintenance: job #{job_id} lease renewal refused; keeper stops");
-                        return;
-                    }
-                    // If the DB stays unreadable past the TTL, the per-page
-                    // heartbeat then stops the phase.
-                    KeeperStep::Retry => warn!(
-                        "maintenance: job #{job_id} lease renewal failed ({:?}); retrying",
-                        renewed.err()
-                    ),
-                }
+/// The job's lease keeper. The per-page `heartbeat` is not enough on its
+/// own: one page of copy work can outlast the TTL, and a lapsed lease lets
+/// the requeue scan hand the job back and the write gate open mid-job.
+/// When the keeper gives the lease up, the next per-page `heartbeat`
+/// reports LEASE_LOST (a lapsed lease never renews).
+pub(crate) fn spawn_lease_keeper(
+    db: Arc<Mutex<ConfigDb>>,
+    job_id: i64,
+    instance_id: String,
+    ttl_secs: i64,
+    interval: std::time::Duration,
+) -> LeaseKeeper {
+    LeaseKeeper::spawn(
+        format!("maintenance job #{job_id}"),
+        interval,
+        std::time::Duration::from_secs(ttl_secs.max(1) as u64),
+        move || {
+            let db = db.clone();
+            let instance_id = instance_id.clone();
+            async move {
+                let db = db.lock().await;
+                LeaseError::from_renewal(db.maintenance_heartbeat(
+                    job_id,
+                    &instance_id,
+                    current_unix_seconds(),
+                    ttl_secs,
+                ))
             }
-        }))
-    }
-}
-
-impl Drop for LeaseKeeper {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
+        },
+    )
 }
 
 /// Renew three times per TTL, so one slow renewal never lapses the lease.
@@ -823,15 +809,13 @@ pub(crate) async fn heartbeat(
         let db = db.lock().await;
         db.maintenance_heartbeat(job_id, instance_id, current_unix_seconds(), LEASE_TTL_SECS)
     };
-    use crate::config_db::job_store::{keeper_step, KeeperStep};
-    match keeper_step(&renewed) {
-        KeeperStep::Held => Ok(()),
-        KeeperStep::Lost => Err(LEASE_LOST.to_string()),
-        KeeperStep::Retry => {
+    match LeaseError::from_renewal(renewed) {
+        Ok(()) => Ok(()),
+        Err(LeaseError::Lost) => Err(LEASE_LOST.to_string()),
+        Err(LeaseError::Backend(e)) => {
             warn!(
-                "maintenance: job #{job_id} per-page lease renewal failed ({:?}); \
-                 the keeper retries it",
-                renewed.err()
+                "maintenance: job #{job_id} per-page lease renewal failed ({e}); \
+                 the keeper retries it"
             );
             Ok(())
         }
@@ -917,7 +901,7 @@ mod tests {
         assert_eq!(db.lock().await.maintenance_requeue_abandoned().unwrap(), 1);
 
         let (db, id) = claimed_job(ttl);
-        let _keeper = LeaseKeeper::spawn(
+        let _keeper = spawn_lease_keeper(
             db.clone(),
             id,
             "inst".to_string(),
@@ -939,7 +923,7 @@ mod tests {
     async fn lease_keeper_survives_a_transient_db_error() {
         let ttl = 2;
         let (db, id) = claimed_job(ttl);
-        let _keeper = LeaseKeeper::spawn(
+        let _keeper = spawn_lease_keeper(
             db.clone(),
             id,
             "inst".to_string(),

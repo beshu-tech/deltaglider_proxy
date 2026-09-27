@@ -415,10 +415,10 @@ pub async fn verify(
     }
 
     // Detach the audit. It persists its own result + releases the lease.
-    // ponytail: this one-shot detached + select-heartbeat + catch_unwind + settle
-    // orchestration is the ONLY instance of its shape (lease primitives are already
-    // shared via config_db::job_store; maintenance is a different poll-loop shape).
-    // Don't extract a BackgroundJob driver until a genuine 2nd one-shot task lands.
+    // ponytail: this one-shot detached + keeper + catch_unwind + settle
+    // orchestration is the ONLY instance of its shape (the lease keeper is the
+    // shared background::LeaseKeeper). Don't extract a BackgroundJob driver
+    // until a genuine 2nd one-shot task lands.
     let engine = state.s3_state.engine.load().clone();
     let rule_clone = rule.clone();
     let db_for_task = db_arc.clone();
@@ -439,39 +439,39 @@ pub async fn verify(
             }),
         ));
         let audit = futures::FutureExt::catch_unwind(audit);
-        // Heartbeat: renew the lease every TTL/3 so a scan that runs longer than
-        // the TTL doesn't let a concurrent POST acquire + double-scan. The ticker
-        // is cancelled (dropped) the moment the audit completes via select!.
-        let heartbeat = async {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(
-                (PARITY_LEASE_TTL_SECS / 3).max(1) as u64,
-            ));
-            tick.tick().await; // immediate first tick — skip
-            loop {
-                tick.tick().await;
-                let now = crate::replication::current_unix_seconds();
-                let db = db_for_task.lock().await;
-                let renewed =
-                    db.parity_renew_lease(&rule_clone.name, &owner, now, PARITY_LEASE_TTL_SECS);
-                use crate::config_db::job_store::{keeper_step, KeeperStep};
-                match keeper_step(&renewed) {
-                    KeeperStep::Held => {}
-                    KeeperStep::Lost => break, // lost the lease — stop renewing
-                    KeeperStep::Retry => tracing::warn!(
-                        "parity audit: lease renewal for '{}' failed ({:?}); retrying",
-                        rule_clone.name,
-                        renewed.err()
-                    ),
-                }
-            }
+        // Keeper: renew the lease every TTL/3 so a scan that runs longer than
+        // the TTL doesn't let a concurrent POST acquire + double-scan. It stops
+        // (drop) the moment the audit completes.
+        let keeper = {
+            let (db, rule, owner) = (db_for_task.clone(), rule_clone.name.clone(), owner.clone());
+            crate::background::LeaseKeeper::spawn(
+                format!("parity audit '{rule}'"),
+                std::time::Duration::from_secs((PARITY_LEASE_TTL_SECS / 3).max(1) as u64),
+                std::time::Duration::from_secs(PARITY_LEASE_TTL_SECS as u64),
+                move || {
+                    let (db, rule, owner) = (db.clone(), rule.clone(), owner.clone());
+                    async move {
+                        let now = crate::replication::current_unix_seconds();
+                        let db = db.lock().await;
+                        crate::coordination::LeaseError::from_renewal(db.parity_renew_lease(
+                            &rule,
+                            &owner,
+                            now,
+                            PARITY_LEASE_TTL_SECS,
+                        ))
+                    }
+                },
+            )
         };
+        let lease_alive = keeper.alive();
         let result = tokio::select! {
             r = audit => match r {
                 Ok(r) => r,
                 Err(_) => Err("parity audit panicked".to_string()),
             },
-            _ = heartbeat => Err("parity audit lease lost".to_string()),
+            _ = lease_alive.lost() => Err("parity audit lease lost".to_string()),
         };
+        drop(keeper);
         let now = crate::replication::current_unix_seconds();
         let db = db_for_task.lock().await;
         // Honour a cancel that landed in the final window (after the audit's

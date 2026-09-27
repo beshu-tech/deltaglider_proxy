@@ -77,32 +77,42 @@ pub(crate) fn try_acquire_leader_lease(
     Ok(n > 0)
 }
 
-/// Renew a lease this owner still holds. Fails (false) when the owner
-/// doesn't match OR the lease already lapsed (`leader_expires_at < now`)
-/// — a lapsed worker must stop, never resurrect.
 /// What a background lease keeper does with one renewal's result.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum KeeperStep {
     /// Renewed: keep going.
     Held,
-    /// Refused (lapsed, or another holder): stop renewing.
+    /// Refused (lapsed, or another holder), or the store stayed unreadable
+    /// until the lease runs out: stop renewing, the run must stop.
     Lost,
-    /// The DB errored: not a refusal. Try again next tick; the lease still
-    /// lapses at its TTL if the errors go on.
+    /// The store errored: not a refusal. Try again next tick.
     Retry,
 }
 
-/// Pure: THE renewal verdict for timer-driven lease keepers. A keeper that
-/// read a transient DB error as "lost" stopped for good, and the lease
-/// lapsed mid-job although the next renewal would have worked.
-pub(crate) fn keeper_step<E>(renewal: &Result<bool, E>) -> KeeperStep {
+/// Pure: THE renewal verdict for timer-driven lease keepers (maintenance,
+/// lifecycle, replication, parity). A refusal is lost. A store error is
+/// not: the lease is still ours until its TTL, so retry while the next
+/// retry still lands before the expiry (`since_ok` = age of the last good
+/// renewal). A keeper that read one error as "lost" stopped a healthy run;
+/// one that retried forever kept a run going past its lapsed lease.
+pub(crate) fn keeper_step(
+    renewal: &Result<(), crate::coordination::LeaseError>,
+    since_ok: std::time::Duration,
+    interval: std::time::Duration,
+    ttl: std::time::Duration,
+) -> KeeperStep {
+    use crate::coordination::LeaseError;
     match renewal {
-        Ok(true) => KeeperStep::Held,
-        Ok(false) => KeeperStep::Lost,
-        Err(_) => KeeperStep::Retry,
+        Ok(()) => KeeperStep::Held,
+        Err(LeaseError::Lost) => KeeperStep::Lost,
+        Err(LeaseError::Backend(_)) if since_ok.saturating_add(interval) < ttl => KeeperStep::Retry,
+        Err(LeaseError::Backend(_)) => KeeperStep::Lost,
     }
 }
 
+/// Renew a lease this owner still holds. Fails (false) when the owner
+/// doesn't match OR the lease already lapsed (`leader_expires_at < now`)
+/// — a lapsed worker must stop, never resurrect.
 pub(crate) fn renew_leader_lease(
     conn: &Connection,
     table: &str,
@@ -380,6 +390,23 @@ mod tests {
         assert!(renew_leader_lease(&c, "jobs", "name", &"a", "w1", 170, 60).unwrap());
         // owner, AFTER expiry → refused (lapsed leases never resurrect)
         assert!(!renew_leader_lease(&c, "jobs", "name", &"a", "w1", 231, 60).unwrap());
+    }
+
+    #[test]
+    fn keeper_step_truth_table() {
+        use crate::coordination::LeaseError;
+        let secs = std::time::Duration::from_secs;
+        let (hb, ttl) = (secs(60), secs(300));
+        let err = Err(LeaseError::Backend("busy".into()));
+        assert_eq!(keeper_step(&Ok(()), secs(999), hb, ttl), KeeperStep::Held);
+        assert_eq!(
+            keeper_step(&Err(LeaseError::Lost), secs(0), hb, ttl),
+            KeeperStep::Lost
+        );
+        assert_eq!(keeper_step(&err, secs(60), hb, ttl), KeeperStep::Retry);
+        assert_eq!(keeper_step(&err, secs(239), hb, ttl), KeeperStep::Retry);
+        // The next retry would land at the expiry: lost now.
+        assert_eq!(keeper_step(&err, secs(240), hb, ttl), KeeperStep::Lost);
     }
 
     #[test]
