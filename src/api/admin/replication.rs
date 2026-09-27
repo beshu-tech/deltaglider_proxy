@@ -75,23 +75,12 @@ pub async fn run_now(
         )));
     }
 
-    let db_arc = state
-        .config_db
-        .as_ref()
-        .ok_or_else(AdminError::no_config_db)?
-        .clone();
+    // The run takes the SAME per-rule lease as the scheduler and the event
+    // consumer (the job plane's), so a run-now never overlaps a scheduled run
+    // or a consumer drain on any instance.
+    let super::JobPlane { db: db_arc, lease } = state.job_plane()?.clone();
 
     let lease_owner = format!("run-now:{}", uuid::Uuid::new_v4());
-
-    // The run takes the SAME per-rule lease as the scheduler and the event
-    // consumer: the coordination lease chosen at startup (S3 when a
-    // coordination bucket is configured, else node-local SQLite). So a run-now
-    // never overlaps a scheduled run or a consumer drain on any instance.
-    // Built once at startup, present whenever the config DB is.
-    let lease = state
-        .coordination_lease
-        .clone()
-        .ok_or_else(AdminError::no_config_db)?;
     {
         let now = replication::current_unix_seconds();
         // The state row must exist before the SQLite lease can target it.
@@ -291,7 +280,7 @@ pub async fn verify(
     headers: &HeaderMap,
 ) -> Result<(StatusCode, ParityStatusResponse), AdminError> {
     let (_repl, rule) = snapshot_and_find_rule(&state, &name).await?;
-    let Some(db_arc) = state.config_db.clone() else {
+    let Some(plane) = state.job_plane.clone() else {
         // No config DB → fall back to a synchronous in-request audit (dev/no-DB).
         let engine = state.s3_state.engine.load().clone();
         let outcome = replication::parity_audit(
@@ -316,6 +305,7 @@ pub async fn verify(
         ));
     };
 
+    let db_arc = plane.db;
     let owner = format!("verify:{}", uuid::Uuid::new_v4());
     let now = crate::replication::current_unix_seconds();
     // A verify DURING a replication run of the same rule is meaningless — the
@@ -337,21 +327,19 @@ pub async fn verify(
     // Cross-backend liveness gate (H48): a scheduled run under a coordination
     // (S3) lease is invisible to the SQLite check above — consult the active
     // lease too so verify doesn't run a parity audit against a mid-sync dest.
-    if let Some(lease) = state.coordination_lease.as_ref() {
-        if lease
-            .is_held(
-                crate::coordination::LeaseSubsystem::Replication,
-                &rule.name,
-                now,
-            )
-            .await
-            .unwrap_or(false)
-        {
-            return Err(AdminError::conflict(
-                "a replication run is in progress for this rule — verify after it settles"
-                    .to_string(),
-            ));
-        }
+    if plane
+        .lease
+        .is_held(
+            crate::coordination::LeaseSubsystem::Replication,
+            &rule.name,
+            now,
+        )
+        .await
+        .unwrap_or(false)
+    {
+        return Err(AdminError::conflict(
+            "a replication run is in progress for this rule — verify after it settles".to_string(),
+        ));
     }
     // Acquire the lease; if someone else holds it, just report current status.
     let acquired = {

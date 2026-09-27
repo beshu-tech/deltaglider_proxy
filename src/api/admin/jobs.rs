@@ -835,8 +835,8 @@ async fn delete_rule(
     // between the check and the purge. Taken BEFORE the config/db locks,
     // because the S3 lease does I/O we must not run under those locks.
     let delete_lease = if sub == JobSubsystem::Replication {
-        match (state.coordination_lease.as_ref(), state.config_db.as_ref()) {
-            (Some(lease), Some(_)) => {
+        match state.job_plane.as_ref() {
+            Some(super::JobPlane { lease, .. }) => {
                 let owner = format!("delete:{}", uuid::Uuid::new_v4());
                 let now = crate::replication::state_store::current_unix_seconds();
                 let held = lease
@@ -858,7 +858,7 @@ async fn delete_rule(
                 }
                 Some((lease.clone(), owner))
             }
-            _ => None,
+            None => None,
         }
     } else {
         None

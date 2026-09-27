@@ -857,10 +857,12 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // Built once here so it's in scope both for the schedulers below AND for the
     // AdminState (so run-now/verify/delete can check the active lease — H14/29/48).
-    let coordination_lease = if let Some(db) = config_db.as_ref() {
-        Some(build_coordination_lease(&config, db, &db_keys).await)
-    } else {
-        None
+    let job_plane = match config_db.as_ref() {
+        Some(db) => Some(deltaglider_proxy::api::admin::JobPlane {
+            db: db.clone(),
+            lease: build_coordination_lease(&config, db, &db_keys).await,
+        }),
+        None => None,
     };
 
     let mut maintenance_worker = None;
@@ -882,7 +884,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             config_db.clone(),
             state.clone(),
         );
-        if let (Some(db), Some(lease)) = (config_db.as_ref(), coordination_lease.as_ref()) {
+        if let Some(deltaglider_proxy::api::admin::JobPlane { db, lease }) = job_plane.as_ref() {
             // Reconcile scheduler — the slow (≈24h) full list-and-diff safety net.
             deltaglider_proxy::replication::scheduler::spawn_scheduler(
                 shared_config.clone(),
@@ -1037,7 +1039,7 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         public_prefix_snapshot,
         admission_chain,
         parity_cancels: Default::default(),
-        coordination_lease: coordination_lease.clone(),
+        job_plane,
     });
 
     // --- TLS ---

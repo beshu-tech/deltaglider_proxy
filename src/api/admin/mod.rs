@@ -170,13 +170,29 @@ pub struct AdminState {
     /// `verify_cancel` sets the flag for a fast (lock-free) abort; the durable
     /// `cancelling` DB row remains the cross-instance / post-restart signal.
     pub parity_cancels: ParityCancels,
-    /// Coordination lease (same instance the scheduler uses) so admin handlers
-    /// (run-now / verify / delete) can check whether a run is in flight
-    /// REGARDLESS of the lease backend — the node-local SQLite check alone is
-    /// blind to a scheduler holding the S3 lease (H14/H29/H48). Built once at
-    /// startup: `Some` exactly when `config_db` is (no handler builds its own
-    /// `LocalLease` fallback).
-    pub coordination_lease: Option<Arc<dyn crate::coordination::CoordinationLease>>,
+    /// The job plane (job DB + coordination lease), `Some` exactly when
+    /// `config_db` is. See [`JobPlane`].
+    pub job_plane: Option<JobPlane>,
+}
+
+/// What the job handlers (run-now, verify, delete, kill) need: the config DB
+/// that holds the job rows AND the coordination lease the schedulers take
+/// (S3 when a coordination bucket is configured, else node-local SQLite).
+/// One value, so a handler never holds one without the other and never
+/// builds its own `LocalLease` fallback: the node-local SQLite check alone is
+/// blind to a scheduler that holds the S3 lease (H14/H29/H48). Built once at
+/// startup; `db` is the same `Arc` as [`AdminState::config_db`].
+#[derive(Clone)]
+pub struct JobPlane {
+    pub db: Arc<tokio::sync::Mutex<ConfigDb>>,
+    pub lease: Arc<dyn crate::coordination::CoordinationLease>,
+}
+
+impl AdminState {
+    /// The job plane, or 503 when this instance has no config DB.
+    pub(crate) fn job_plane(&self) -> Result<&JobPlane, AdminError> {
+        self.job_plane.as_ref().ok_or_else(AdminError::no_config_db)
+    }
 }
 
 /// Per-rule cancel flags for in-flight parity audits (see [`AdminState`]).
