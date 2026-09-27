@@ -1097,6 +1097,8 @@ DGP_TLS_KEY=/etc/ssl/private/proxy-key.pem
 
 The list of `DGP_*` variables that the server reads. The unit test `every_dgp_literal_in_src_is_registered` in `src/config/mod.rs` scans the source code and fails when the code reads a variable that `ENV_VAR_REGISTRY` does not list. `deltaglider_proxy --show-env` prints that registry.
 
+The server reads these variables when it starts, and again when an admin apply rebuilds the engine. A request never reads the environment itself: it uses the values of the running config. The environment of a running process does not change, so a changed variable takes effect only after a restart.
+
 ### Server / Advanced
 
 | Variable | Default | Description |

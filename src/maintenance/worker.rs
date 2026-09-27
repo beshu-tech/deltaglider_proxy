@@ -676,8 +676,7 @@ pub(crate) async fn drain_inflight_writes(
     state: &Arc<AppState>,
     bucket: &str,
 ) -> Result<(), String> {
-    let drain_ceiling_secs: u64 =
-        crate::config::env_parse_with_default("DGP_REQUEST_TIMEOUT_SECS", 300);
+    let drain_ceiling_secs = state.engine.load().tuning().request_timeout_secs;
     let drain_deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(drain_ceiling_secs);
     while state.maintenance_gate.inflight_writes(bucket) > 0 {

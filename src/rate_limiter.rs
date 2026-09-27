@@ -98,6 +98,11 @@ impl RateLimiter {
         self
     }
 
+    /// The per-IP policy: max attempts, window, lockout.
+    pub fn per_ip_policy(&self) -> (u32, Duration, Duration) {
+        (self.max_attempts, self.window, self.lockout)
+    }
+
     /// Create a rate limiter from environment variables with defaults:
     /// - `DGP_RATE_LIMIT_MAX_ATTEMPTS`: max failures before lockout (default: 100, per-IP)
     /// - `DGP_RATE_LIMIT_WINDOW_SECS`: rolling window in seconds (default: 300 = 5 min, per-IP)

@@ -14,7 +14,7 @@
 //! - DeltaGlider keeps all product logic: admission/IAM policy, compression,
 //!   encryption wrappers, metadata cache, replication, metrics, and storage.
 
-use crate::api::handlers::{debug_headers_enabled, AppState};
+use crate::api::handlers::AppState;
 use crate::deltaglider::RetrieveResponse;
 use crate::iam::{AuthenticatedUser, ListScope, S3Action};
 use crate::storage::StorageError;
@@ -581,8 +581,17 @@ fn response_metadata_map(
     map
 }
 
-fn add_storage_debug_headers(headers: &mut axum::http::HeaderMap, meta: &FileMetadata) {
-    if !debug_headers_enabled() {
+/// `DGP_DEBUG_HEADERS`, as the running engine was built with it.
+fn debug_headers_enabled(svc: &DeltaGliderS3Service) -> bool {
+    svc.state.engine.load().tuning().debug_headers
+}
+
+fn add_storage_debug_headers(
+    svc: &DeltaGliderS3Service,
+    headers: &mut axum::http::HeaderMap,
+    meta: &FileMetadata,
+) {
+    if !debug_headers_enabled(svc) {
         return;
     }
     if let Ok(value) = axum::http::HeaderValue::from_str(meta.storage_info.label()) {
@@ -597,8 +606,12 @@ fn add_storage_debug_headers(headers: &mut axum::http::HeaderMap, meta: &FileMet
 /// `x-deltaglider-listing-facts-misses`: how many entries of a LIST page
 /// show only their stored size, because the logical size was in neither
 /// this process's cache nor the listing facts (debug headers only).
-fn add_listing_debug_headers(headers: &mut axum::http::HeaderMap, facts_misses: usize) {
-    if debug_headers_enabled() {
+fn add_listing_debug_headers(
+    svc: &DeltaGliderS3Service,
+    headers: &mut axum::http::HeaderMap,
+    facts_misses: usize,
+) {
+    if debug_headers_enabled(svc) {
         headers.insert(
             "x-deltaglider-listing-facts-misses",
             axum::http::HeaderValue::from(facts_misses),

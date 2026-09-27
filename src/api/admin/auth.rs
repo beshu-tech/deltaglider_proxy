@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use crate::iam::{Group, IamIndex, IamState, IamUser};
 use crate::rate_limiter;
-use crate::session::{AuthMethod, S3SessionCredentials, SessionKind};
+use crate::session::{AuthMethod, S3SessionCredentials, SessionKind, SessionStore};
 
 use super::{audit_log, AdminError, AdminState, Bare, JsonError};
 
@@ -326,32 +326,16 @@ impl IntoResponse for AuthReject {
 }
 
 /// Whether session cookies should include the `Secure` flag (HTTPS-only).
-/// Controlled by `DGP_SECURE_COOKIES`. When not set, auto-detects based
-/// on TLS at our listener (YAML `advanced.tls.enabled` or
+/// `explicit` is `DGP_SECURE_COOKIES` as a recognised boolean
+/// ([`SessionStore::secure_cookies`]): it wins, true OR false. Unset,
+/// this auto-detects TLS at our listener (YAML `advanced.tls.enabled` or
 /// `DGP_TLS_ENABLED=true`, see [`crate::tls::listener_tls`]) OR a trusted
-/// `X-Forwarded-Proto: https` from the front proxy.
-/// Set `DGP_SECURE_COOKIES=true` to force Secure regardless of detection.
-fn secure_cookies() -> bool {
-    secure_cookies_with(None)
-}
-
-/// Same as [`secure_cookies`] but also consults the inbound request's
-/// `X-Forwarded-Proto` header (only from a trusted proxy,
-/// [`rate_limiter::trusted_forwarded_header`]).
-/// Use this on the response-issuing path so a TLS-terminated front
-/// proxy yields a `Secure` cookie even when our listener is plain HTTP.
-pub(super) fn secure_cookies_with(headers: Option<&HeaderMap>) -> bool {
-    // Tri-state: an explicit, *recognised* DGP_SECURE_COOKIES value wins
-    // (true OR false); absent or unrecognised falls through to TLS /
-    // forwarded-proto auto-detection. The accepted truth-set matches
-    // env_bool (true/1/yes/on, false/0/no/off) — kept inline because
-    // env_bool can't express the "fall through on unset/garbage" arm.
-    if let Ok(raw) = std::env::var("DGP_SECURE_COOKIES") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" | "on" => return true,
-            "false" | "0" | "no" | "off" => return false,
-            _ => {}
-        }
+/// `X-Forwarded-Proto: https` from the front proxy (only from a trusted
+/// proxy, [`rate_limiter::trusted_forwarded_header`]), so a TLS-terminated
+/// front proxy yields a `Secure` cookie even when our listener is plain HTTP.
+pub(super) fn secure_cookies_with(explicit: Option<bool>, headers: Option<&HeaderMap>) -> bool {
+    if let Some(secure) = explicit {
+        return secure;
     }
     if crate::tls::listener_tls() {
         return true;
@@ -429,7 +413,7 @@ pub(super) fn login_audit_fields(
 /// is documented on the production builder below.
 #[cfg(test)]
 pub(super) fn session_cookie(token: &str, ttl: std::time::Duration) -> String {
-    session_cookie_with_headers(token, ttl, None)
+    format_session_cookie(token, ttl, secure_cookies_with(None, None))
 }
 
 /// Format a session cookie for setting a login token. This is the
@@ -455,16 +439,17 @@ pub(super) fn session_cookie(token: &str, ttl: std::time::Duration) -> String {
 /// reports `X-Forwarded-Proto: https` even though our listener is
 /// plain HTTP. Pass `Some(req_headers)` from every login handler.
 pub(super) fn session_cookie_with_headers(
+    sessions: &SessionStore,
     token: &str,
-    ttl: std::time::Duration,
     headers: Option<&HeaderMap>,
 ) -> String {
+    let secure = secure_cookies_with(sessions.secure_cookies(), headers);
+    format_session_cookie(token, sessions.ttl(), secure)
+}
+
+fn format_session_cookie(token: &str, ttl: std::time::Duration, secure: bool) -> String {
     let max_age = ttl.as_secs();
-    let secure = if secure_cookies_with(headers) {
-        "; Secure"
-    } else {
-        ""
-    };
+    let secure = if secure { "; Secure" } else { "" };
     format!(
         "dgp_session={}; HttpOnly; SameSite=Strict; Path=/; Max-Age={}{}",
         token, max_age, secure
@@ -498,8 +483,12 @@ pub(super) async fn auto_populate_s3_creds(
 }
 
 /// Format a session cookie that clears the login token.
-pub(super) fn session_cookie_clear() -> String {
-    let secure = if secure_cookies() { "; Secure" } else { "" };
+pub(super) fn session_cookie_clear(sessions: &SessionStore) -> String {
+    let secure = if secure_cookies_with(sessions.secure_cookies(), None) {
+        "; Secure"
+    } else {
+        ""
+    };
     format!(
         "dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{}",
         secure
@@ -626,7 +615,7 @@ pub async fn login(
     let mut headers = HeaderMap::new();
     headers.insert(
         header::SET_COOKIE,
-        session_cookie_with_headers(&token, state.sessions.ttl(), Some(&req_headers))
+        session_cookie_with_headers(&state.sessions, &token, Some(&req_headers))
             .parse()
             .unwrap(),
     );
@@ -641,7 +630,10 @@ pub async fn logout(State(state): State<Arc<AdminState>>, headers: HeaderMap) ->
     }
 
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert(header::SET_COOKIE, session_cookie_clear().parse().unwrap());
+    resp_headers.insert(
+        header::SET_COOKIE,
+        session_cookie_clear(&state.sessions).parse().unwrap(),
+    );
 
     (
         StatusCode::OK,
@@ -977,7 +969,7 @@ pub async fn login_as(
         StatusCode::OK,
         [(
             header::SET_COOKIE,
-            session_cookie_with_headers(&token, state.sessions.ttl(), Some(&req_headers)),
+            session_cookie_with_headers(&state.sessions, &token, Some(&req_headers)),
         )],
         Json(LoginResponse { ok: true }),
     ))
@@ -1091,7 +1083,7 @@ pub async fn browser_session_connect(
         StatusCode::OK,
         [(
             header::SET_COOKIE,
-            session_cookie_with_headers(&token, state.sessions.ttl(), Some(&req_headers)),
+            session_cookie_with_headers(&state.sessions, &token, Some(&req_headers)),
         )],
         Json(LoginResponse { ok: true }),
     ))
@@ -1160,7 +1152,7 @@ pub async fn open_browser_connect(
         StatusCode::OK,
         [(
             header::SET_COOKIE,
-            session_cookie_with_headers(&token, state.sessions.ttl(), Some(&req_headers)),
+            session_cookie_with_headers(&state.sessions, &token, Some(&req_headers)),
         )],
         Json(LoginResponse { ok: true }),
     ))
@@ -1919,7 +1911,11 @@ mod tests {
         // but it's a one-line format!() so we just assert the property.
         // If logout() changes its cookie shape, this test stays accurate
         // because we read the same env var via secure_cookies().
-        let secure = if secure_cookies() { "; Secure" } else { "" };
+        let secure = if secure_cookies_with(None, None) {
+            "; Secure"
+        } else {
+            ""
+        };
         let expected =
             format!("dgp_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}");
         assert!(expected.contains("SameSite=Strict"));
@@ -1940,10 +1936,8 @@ mod tests {
 
         let prev_tls = std::env::var("DGP_TLS_ENABLED").ok();
         let prev_trust = std::env::var("DGP_TRUST_PROXY_HEADERS").ok();
-        let prev_secure = std::env::var("DGP_SECURE_COOKIES").ok();
         unsafe {
             std::env::remove_var("DGP_TLS_ENABLED");
-            std::env::remove_var("DGP_SECURE_COOKIES");
         }
 
         // Case A: trust=false, XFP=https → still NOT secure (we don't
@@ -1952,7 +1946,7 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-proto", "https".parse().unwrap());
         assert!(
-            !secure_cookies_with(Some(&h)),
+            !secure_cookies_with(None, Some(&h)),
             "must NOT trust XFP without DGP_TRUST_PROXY_HEADERS=true"
         );
 
@@ -1962,18 +1956,16 @@ mod tests {
         // `forwarded_host_and_proto_count_only_from_a_trusted_proxy`).
         unsafe { std::env::set_var("DGP_TRUST_PROXY_HEADERS", "true") };
         assert!(
-            !secure_cookies_with(Some(&h)),
+            !secure_cookies_with(None, Some(&h)),
             "XFP=https from no trusted proxy must not yield a Secure cookie"
         );
 
         // Case C: trust=true, no XFP → falls back to the listener's TLS → false.
-        assert!(!secure_cookies_with(Some(&HeaderMap::new())));
+        assert!(!secure_cookies_with(None, Some(&HeaderMap::new())));
 
-        // Case D: explicit DGP_SECURE_COOKIES=true wins.
-        unsafe { std::env::set_var("DGP_SECURE_COOKIES", "true") };
-        assert!(secure_cookies_with(None));
-        unsafe { std::env::set_var("DGP_SECURE_COOKIES", "false") };
-        assert!(!secure_cookies_with(Some(&h)));
+        // Case D: an explicit DGP_SECURE_COOKIES (true OR false) wins.
+        assert!(secure_cookies_with(Some(true), None));
+        assert!(!secure_cookies_with(Some(false), Some(&h)));
 
         // Restore.
         unsafe {
@@ -1984,10 +1976,6 @@ mod tests {
             match prev_trust {
                 Some(v) => std::env::set_var("DGP_TRUST_PROXY_HEADERS", v),
                 None => std::env::remove_var("DGP_TRUST_PROXY_HEADERS"),
-            }
-            match prev_secure {
-                Some(v) => std::env::set_var("DGP_SECURE_COOKIES", v),
-                None => std::env::remove_var("DGP_SECURE_COOKIES"),
             }
         }
     }

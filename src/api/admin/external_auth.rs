@@ -117,8 +117,8 @@ const OAUTH_STATE_COOKIE: &str = "dgp_oauth_state";
 /// drop the cookie. `Path` is scoped to the OAuth endpoints so the
 /// cookie isn't sent on every admin API call. Short Max-Age (5 min)
 /// bounds the flow window.
-fn oauth_state_cookie(state_token: &str, req_headers: &HeaderMap) -> String {
-    let secure = if super::auth::secure_cookies_with(Some(req_headers)) {
+fn oauth_state_cookie(secure: Option<bool>, state_token: &str, req_headers: &HeaderMap) -> String {
+    let secure = if super::auth::secure_cookies_with(secure, Some(req_headers)) {
         "; Secure"
     } else {
         ""
@@ -131,8 +131,8 @@ fn oauth_state_cookie(state_token: &str, req_headers: &HeaderMap) -> String {
 
 /// Build a cookie that clears the OAuth state cookie. Returned on
 /// the callback so the binding token doesn't linger past the flow.
-fn oauth_state_clear_cookie(req_headers: &HeaderMap) -> String {
-    let secure = if super::auth::secure_cookies_with(Some(req_headers)) {
+fn oauth_state_clear_cookie(secure: Option<bool>, req_headers: &HeaderMap) -> String {
+    let secure = if super::auth::secure_cookies_with(secure, Some(req_headers)) {
         "; Secure"
     } else {
         ""
@@ -224,7 +224,11 @@ pub async fn oauth_authorize(
             // SameSite=Lax is mandatory: the IdP→our-proxy redirect
             // is a cross-site GET, and Strict would drop the cookie.
             // Short max-age (5 min) bounds the flow window.
-            let oauth_state_cookie = oauth_state_cookie(&auth_req.state, &req_headers);
+            let oauth_state_cookie = oauth_state_cookie(
+                state.sessions.secure_cookies(),
+                &auth_req.state,
+                &req_headers,
+            );
             (
                 StatusCode::TEMPORARY_REDIRECT,
                 [
@@ -346,7 +350,7 @@ pub async fn oauth_callback(
         return (
             [(
                 axum::http::header::SET_COOKIE,
-                oauth_state_clear_cookie(&req_headers),
+                oauth_state_clear_cookie(state.sessions.secure_cookies(), &req_headers),
             )],
             error_page(
                 "Authentication Failed",
@@ -609,8 +613,8 @@ pub async fn oauth_callback(
     .await;
 
     let cookie =
-        super::auth::session_cookie_with_headers(&token, state.sessions.ttl(), Some(&req_headers));
-    let clear_oauth_state = oauth_state_clear_cookie(&req_headers);
+        super::auth::session_cookie_with_headers(&state.sessions, &token, Some(&req_headers));
+    let clear_oauth_state = oauth_state_clear_cookie(state.sessions.secure_cookies(), &req_headers);
 
     // Determine redirect target:
     // 1. Use the `next` param from the original authorize request (stored in PendingAuth)
@@ -1469,7 +1473,7 @@ mod tests {
     #[test]
     fn oauth_state_cookie_shape() {
         let h = HeaderMap::new();
-        let c = oauth_state_cookie("STATE_TOKEN", &h);
+        let c = oauth_state_cookie(None, "STATE_TOKEN", &h);
         assert!(c.contains("dgp_oauth_state=STATE_TOKEN"), "{c}");
         assert!(c.contains("HttpOnly"), "{c}");
         assert!(c.contains("SameSite=Lax"), "{c}");
@@ -1517,7 +1521,7 @@ mod tests {
     #[test]
     fn oauth_state_clear_cookie_shape() {
         let h = HeaderMap::new();
-        let c = oauth_state_clear_cookie(&h);
+        let c = oauth_state_clear_cookie(None, &h);
         assert!(c.contains("dgp_oauth_state="), "{c}");
         assert!(c.contains("Max-Age=0"), "{c}");
         assert!(c.contains("Path=/_/api/admin/oauth"), "{c}");

@@ -163,6 +163,9 @@ pub struct SessionStore {
     /// from the synced `session_revocations` table (refreshed on revoke + after
     /// config sync) so `entry_valid` stays a pure in-memory check.
     revocations: RwLock<HashMap<String, i64>>,
+    /// `DGP_SECURE_COOKIES` as a recognised boolean; `None` = auto-detect
+    /// (see `api::admin::auth::secure_cookies_with`).
+    secure_cookies: Option<bool>,
 }
 
 impl Default for SessionStore {
@@ -177,7 +180,19 @@ impl SessionStore {
             sessions: RwLock::new(HashMap::new()),
             ttl: default_session_ttl(),
             revocations: RwLock::new(HashMap::new()),
+            secure_cookies: None,
         }
+    }
+
+    /// Set the `Secure` cookie override (`RuntimeTuning::secure_cookies`).
+    pub fn with_secure_cookies(mut self, secure_cookies: Option<bool>) -> Self {
+        self.secure_cookies = secure_cookies;
+        self
+    }
+
+    /// The `Secure` cookie override; `None` = auto-detect.
+    pub fn secure_cookies(&self) -> Option<bool> {
+        self.secure_cookies
     }
 
     /// MERGE a revocation snapshot (from the synced `session_revocations`

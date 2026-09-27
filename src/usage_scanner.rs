@@ -41,6 +41,7 @@ pub fn current_usage_scan_version() -> u64 {
 /// (and any operator who wants tighter enforcement) can shorten via
 /// `DGP_USAGE_CACHE_TTL_SECS`. Lower values mean more frequent
 /// re-scans on PUT/COPY but tighter quota enforcement after writes.
+/// Read once, when the scanner is built.
 fn cache_ttl_secs() -> i64 {
     crate::config::env_parse_with_default("DGP_USAGE_CACHE_TTL_SECS", 300i64)
 }
@@ -188,6 +189,8 @@ fn stale_seconds_for(age: i64, ttl: i64) -> i64 {
 pub struct UsageScanner {
     cache: Arc<RwLock<HashMap<String, UsageEntry>>>,
     scanning: Arc<RwLock<HashSet<String>>>,
+    /// `DGP_USAGE_CACHE_TTL_SECS`.
+    ttl_secs: i64,
 }
 
 impl Default for UsageScanner {
@@ -217,6 +220,7 @@ impl UsageScanner {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             scanning: Arc::new(RwLock::new(HashSet::new())),
+            ttl_secs: cache_ttl_secs(),
         }
     }
 
@@ -237,7 +241,7 @@ impl UsageScanner {
                 .num_seconds();
             let mut result = entry.clone();
             result.age_seconds = age.max(0);
-            result.stale_seconds = stale_seconds_for(age, cache_ttl_secs());
+            result.stale_seconds = stale_seconds_for(age, self.ttl_secs);
             Some(result)
         } else {
             None
@@ -253,13 +257,9 @@ impl UsageScanner {
     /// Insert an entry into the cache, evicting the oldest entry if the cache
     /// exceeds `MAX_CACHE_ENTRIES`. Also removes entries older than 2x TTL
     /// to prevent stale data from lingering.
-    fn insert_with_eviction(
-        cache: &RwLock<HashMap<String, UsageEntry>>,
-        key: String,
-        entry: UsageEntry,
-    ) {
-        let mut cache = cache.write();
-        let stale_cutoff = Utc::now() - chrono::Duration::seconds(cache_ttl_secs() * 2);
+    fn insert_with_eviction(scanner: &UsageScanner, key: String, entry: UsageEntry) {
+        let mut cache = scanner.cache.write();
+        let stale_cutoff = Utc::now() - chrono::Duration::seconds(scanner.ttl_secs * 2);
 
         // Periodic cleanup: remove entries older than 2x TTL (10 minutes)
         cache.retain(|_, v| v.computed_at > stale_cutoff);
@@ -351,7 +351,7 @@ impl UsageScanner {
                         truncated = entry.truncated,
                         "Usage scan complete"
                     );
-                    Self::insert_with_eviction(&scanner.cache, key.clone(), entry);
+                    Self::insert_with_eviction(&scanner, key.clone(), entry);
                     // Publish: a scan settled (success OR truncated) — bump the
                     // refresh counter so test barriers (and future operators)
                     // can detect it deterministically instead of blind-sleeping.
@@ -474,11 +474,7 @@ mod tests {
         assert_eq!(stale_seconds_for(300, 300), 0);
         assert_eq!(stale_seconds_for(301, 300), 1);
         let scanner = UsageScanner::new();
-        UsageScanner::insert_with_eviction(
-            &scanner.cache,
-            "b/".to_string(),
-            make_entry("b", "", 1, 1),
-        );
+        UsageScanner::insert_with_eviction(&scanner, "b/".to_string(), make_entry("b", "", 1, 1));
         let r = scanner.get("b", "").unwrap();
         assert_eq!(r.stale_seconds, 0);
         assert!(r.age_seconds >= 0);
@@ -674,7 +670,7 @@ mod tests {
     fn test_get_returns_cached_entry() {
         let scanner = UsageScanner::new();
         let entry = make_entry("mybucket", "", 1024, 5);
-        UsageScanner::insert_with_eviction(&scanner.cache, "mybucket/".to_string(), entry);
+        UsageScanner::insert_with_eviction(&scanner, "mybucket/".to_string(), entry);
 
         let result = scanner.get("mybucket", "");
         assert!(result.is_some());
@@ -689,7 +685,7 @@ mod tests {
         let mut entry = make_entry("mybucket", "", 100, 1);
         // Backdate to 10 minutes ago (TTL is 5 min = 300s)
         entry.computed_at = Utc::now() - chrono::Duration::seconds(600);
-        UsageScanner::insert_with_eviction(&scanner.cache, "mybucket/".to_string(), entry);
+        UsageScanner::insert_with_eviction(&scanner, "mybucket/".to_string(), entry);
 
         let result = scanner.get("mybucket", "").unwrap();
         // stale_seconds = age(600) - TTL(300) = 300
@@ -706,7 +702,7 @@ mod tests {
         // Fill cache beyond MAX_CACHE_ENTRIES
         for i in 0..MAX_CACHE_ENTRIES + 5 {
             let entry = make_entry(&format!("bucket-{}", i), "", i as u64, 1);
-            UsageScanner::insert_with_eviction(&scanner.cache, format!("bucket-{}/", i), entry);
+            UsageScanner::insert_with_eviction(&scanner, format!("bucket-{}/", i), entry);
         }
         let cache = scanner.cache.read();
         assert!(
@@ -734,12 +730,12 @@ mod tests {
         let scanner = UsageScanner::new();
         // Insert an entry backdated beyond 2x TTL (should be cleaned)
         let mut stale = make_entry("stale", "", 100, 1);
-        stale.computed_at = Utc::now() - chrono::Duration::seconds(cache_ttl_secs() * 3);
-        UsageScanner::insert_with_eviction(&scanner.cache, "stale/".to_string(), stale);
+        stale.computed_at = Utc::now() - chrono::Duration::seconds(scanner.ttl_secs * 3);
+        UsageScanner::insert_with_eviction(&scanner, "stale/".to_string(), stale);
 
         // Insert a fresh entry — the stale one should be cleaned
         let fresh = make_entry("fresh", "", 200, 2);
-        UsageScanner::insert_with_eviction(&scanner.cache, "fresh/".to_string(), fresh);
+        UsageScanner::insert_with_eviction(&scanner, "fresh/".to_string(), fresh);
 
         let cache = scanner.cache.read();
         assert!(

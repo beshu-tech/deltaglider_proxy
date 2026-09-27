@@ -510,10 +510,11 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
         .with_current(|f| f.to_string())
         .unwrap_or_else(|_| cfg.log_level.clone());
 
-    // Read startup-time settings from env vars (these aren't in Config)
-    use crate::config::{env_bool, env_parse_with_default};
-    let env_u64 = |name: &str, default: u64| -> u64 { env_parse_with_default(name, default) };
-    let env_usize = |name: &str, default: usize| -> usize { env_parse_with_default(name, default) };
+    // Env-only settings: the config's env snapshot, and the values the
+    // running rate limiter, session store and multipart store hold.
+    let tuning = &cfg.tuning;
+    let (rate_limit_max_attempts, rate_limit_window, rate_limit_lockout) =
+        state.rate_limiter.per_ip_policy();
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -549,24 +550,24 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
             cache_size_mb: cfg.cache_size_mb,
             metadata_cache_mb: cfg.metadata_cache_mb,
             codec_concurrency: cfg.codec_concurrency.unwrap_or_else(|| (cpus * 4).max(16)),
-            codec_timeout_secs: env_u64("DGP_CODEC_TIMEOUT_SECS", 60),
+            codec_timeout_secs: tuning.codec.buffered_secs,
             // Limits
-            request_timeout_secs: env_u64("DGP_REQUEST_TIMEOUT_SECS", 300),
-            max_concurrent_requests: env_usize("DGP_MAX_CONCURRENT_REQUESTS", 1024),
-            max_multipart_uploads: env_usize("DGP_MAX_MULTIPART_UPLOADS", 1000),
+            request_timeout_secs: tuning.request_timeout_secs,
+            max_concurrent_requests: tuning.max_concurrent_requests,
+            max_multipart_uploads: state.s3_state.multipart.max_uploads(),
             // Auth
             auth_enabled: cfg.auth_enabled(),
             access_key_id: cfg.access_key_id.clone(),
             // Security
-            clock_skew_seconds: u64::from(crate::api::auth::clock_skew_secs()),
-            replay_window_secs: crate::api::auth::replay_window().as_secs(),
-            rate_limit_max_attempts: env_u64("DGP_RATE_LIMIT_MAX_ATTEMPTS", 100) as u32,
-            rate_limit_window_secs: env_u64("DGP_RATE_LIMIT_WINDOW_SECS", 300),
-            rate_limit_lockout_secs: env_u64("DGP_RATE_LIMIT_LOCKOUT_SECS", 600),
-            session_ttl_hours: env_u64("DGP_SESSION_TTL_HOURS", 4),
-            trust_proxy_headers: env_bool("DGP_TRUST_PROXY_HEADERS", false),
-            secure_cookies: env_bool("DGP_SECURE_COOKIES", true),
-            debug_headers: env_bool("DGP_DEBUG_HEADERS", false),
+            clock_skew_seconds: u64::from(tuning.clock_skew_secs),
+            replay_window_secs: tuning.replay_window_secs,
+            rate_limit_max_attempts,
+            rate_limit_window_secs: rate_limit_window.as_secs(),
+            rate_limit_lockout_secs: rate_limit_lockout.as_secs(),
+            session_ttl_hours: state.sessions.ttl().as_secs() / 3600,
+            trust_proxy_headers: tuning.trust_proxy_headers,
+            secure_cookies: tuning.secure_cookies.unwrap_or(true),
+            debug_headers: tuning.debug_headers,
             // Sync
             config_sync_bucket: cfg.config_sync_bucket.clone(),
             bucket_policies: cfg.buckets.clone(),

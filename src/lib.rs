@@ -1048,7 +1048,7 @@ mod source_guards {
     /// passes or fails (or skips itself) by what the runner exports: the
     /// nightly job used to set `DGP_BACKEND_ALLOW_LOCAL` for the whole job,
     /// and a lib test skipped itself there. Inject the env instead (the
-    /// `*_from(env: EnvLookup)` pattern, e.g. `replay_window_from`).
+    /// `*_from(env: EnvLookup)` pattern, e.g. `RuntimeTuning::from_env`).
     ///
     /// Allowed: files whose tests test env handling itself, serialised on a
     /// lock, plus two reads that are not config.
@@ -1137,5 +1137,76 @@ mod source_guards {
                 "{f} ({why}) no longer reads env: drop it from ALLOWED"
             );
         }
+    }
+
+    /// The request path reads no environment variable: a request reads the
+    /// config snapshot (`config::RuntimeTuning`, copied into the engine at
+    /// build) or a value its owner parsed at construction. `clippy.toml`
+    /// refuses `std::env::var` outside `crate::config`; this guard also
+    /// catches the `env_parse` helpers, which clippy cannot tell apart from
+    /// a boot-time read.
+    #[test]
+    fn request_path_reads_no_env() {
+        const REQUEST_PATH: &[&str] = &[
+            "src/s3_adapter_s3s",
+            "src/api/handlers",
+            "src/api/auth.rs",
+            "src/api/s3_router.rs",
+            "src/api/s3s_hooks.rs",
+            "src/api/admin/csrf.rs",
+            "src/api/admin/savings.rs",
+            "src/api/admin/config/field_level.rs",
+            "src/api/admin/config/password.rs",
+            "src/deltaglider/engine",
+            "src/deltaglider/codec.rs",
+            "src/maintenance/worker.rs",
+        ];
+        // Engine BUILD, not a request: warns once that a key is not from env.
+        const ALLOWED: &[&str] = &["src/deltaglider/engine/construction.rs"];
+        let needles = [
+            ["env::", "var"].concat(),
+            ["env_", "bool("].concat(),
+            ["env_", "parse"].concat(),
+            ["lookup_", "parse("].concat(),
+            ["config::", "process_env"].concat(),
+        ];
+        let files: Vec<_> = REQUEST_PATH
+            .iter()
+            .flat_map(|p| {
+                if p.ends_with(".rs") {
+                    vec![root().join(p)]
+                } else {
+                    rust_files(p)
+                }
+            })
+            .collect();
+        assert!(files.len() > REQUEST_PATH.len(), "scan found the files");
+        let test_files = out_of_line_test_modules(&rust_files("src"));
+        let mut offenders = Vec::new();
+        for file in files {
+            let rel = rel_path(&file);
+            if test_files.contains(&file) || ALLOWED.contains(&rel.as_str()) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            let tests: std::collections::BTreeSet<usize> = test_module_lines(&text)
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+            for (i, line) in text.lines().enumerate() {
+                if tests.contains(&(i + 1)) || line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if needles.iter().any(|x| line.contains(x.as_str())) {
+                    offenders.push(format!("{rel}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the request path reads the environment; add the setting to \
+             config::RuntimeTuning (or parse it where its owner is built):\n{}",
+            offenders.join("\n")
+        );
     }
 }

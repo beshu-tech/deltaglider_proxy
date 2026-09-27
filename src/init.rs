@@ -345,6 +345,7 @@ pub fn run_init_inner(
         group_mapping_rules: Vec::new(),
         env_refs: Default::default(),
         env_shadow: Default::default(),
+        tuning: Default::default(),
     };
 
     // Show summary (canonical sectioned YAML — the only config format)

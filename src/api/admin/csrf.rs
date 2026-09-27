@@ -10,10 +10,11 @@
 //! with neither header is not from a browser page (curl, `config apply`):
 //! a CSRF attack needs a victim browser, so those pass.
 
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use std::sync::Arc;
 
 /// Pure decision: does this request prove it is same-origin (or not from a
 /// browser at all)? `hosts` are the authorities this server answers as
@@ -55,10 +56,19 @@ fn header<'a>(h: &'a HeaderMap, name: &str) -> Option<&'a str> {
 /// Axum middleware: 403 for a state-changing request that a browser marks as
 /// cross-origin. Skipped in dev mode (`DGP_CORS_PERMISSIVE=true`), where the
 /// UI is served from another origin on purpose.
-pub async fn require_same_origin(req: Request, next: Next) -> Response {
-    if crate::config::env_bool("DGP_CORS_PERMISSIVE", false) {
+pub async fn require_same_origin(
+    State(state): State<Arc<super::AdminState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if state.s3_state.engine.load().tuning().cors_permissive {
         return next.run(req).await;
     }
+    same_origin_gate(req, next).await
+}
+
+/// The origin check of [`require_same_origin`] once dev mode is ruled out.
+async fn same_origin_gate(req: Request, next: Next) -> Response {
     let h = req.headers();
     let peer = req
         .extensions()
@@ -160,7 +170,7 @@ mod tests {
         use tower::ServiceExt;
         let app = axum::Router::new()
             .route("/x", axum::routing::post(|| async { "ok" }))
-            .layer(axum::middleware::from_fn(require_same_origin));
+            .layer(axum::middleware::from_fn(same_origin_gate));
         let req = axum::http::Request::post("/x")
             .header("host", "s3.acme.example")
             .header("origin", "https://evil.example")

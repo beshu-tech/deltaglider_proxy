@@ -47,10 +47,14 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// GET (full or ranged) reconstructs to a spool file. `DGP_SPOOL_THRESHOLD_BYTES`
     /// overrides `default_spool_threshold`.
     pub fn spool_threshold(&self) -> u64 {
-        crate::config::env_parse_with_default(
-            "DGP_SPOOL_THRESHOLD_BYTES",
-            default_spool_threshold(self.max_object_size),
-        )
+        self.tuning
+            .spool_threshold_bytes
+            .unwrap_or_else(|| default_spool_threshold(self.max_object_size))
+    }
+
+    /// The env-only settings this engine was built with.
+    pub fn tuning(&self) -> &crate::config::RuntimeTuning {
+        &self.tuning
     }
 
     /// Whether `key`'s filename is delta-eligible (used by the adapter to decide
@@ -64,11 +68,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// SlowDown (don't park the request + its budget forever under contention).
     /// The ONE place the timeout/Overloaded policy lives — both PUT/POST
     /// (`spool_acquire`) and GET (`spool_acquire_pair`) go through it.
-    async fn with_spool_timeout<T, F>(fut: F) -> Result<T, EngineError>
+    async fn with_spool_timeout<T, F>(&self, fut: F) -> Result<T, EngineError>
     where
         F: std::future::Future<Output = std::io::Result<T>>,
     {
-        Self::with_spool_timeout_io(fut).await?.map_err(|e| {
+        self.with_spool_timeout_io(fut).await?.map_err(|e| {
             // A holder refused a wait (hold-and-wait guard): retryable.
             if e.kind() == crate::deltaglider::spool::CONTENDED {
                 EngineError::Overloaded(e.to_string())
@@ -80,11 +84,11 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// [`Self::with_spool_timeout`] that hands back the acquisition's own
     /// `io::Result`, for a caller that acts on its error kind.
-    async fn with_spool_timeout_io<T, F>(fut: F) -> Result<std::io::Result<T>, EngineError>
+    async fn with_spool_timeout_io<T, F>(&self, fut: F) -> Result<std::io::Result<T>, EngineError>
     where
         F: std::future::Future<Output = std::io::Result<T>>,
     {
-        let secs = crate::config::env_parse_with_default("DGP_SPOOL_ACQUIRE_TIMEOUT_SECS", 120u64);
+        let secs = self.tuning.spool_acquire_timeout_secs;
         tokio::time::timeout(std::time::Duration::from_secs(secs), fut)
             .await
             .map_err(|_| {
@@ -98,7 +102,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         &self,
         bytes: u64,
     ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
-        Self::with_spool_timeout(self.spool.acquire(bytes)).await
+        self.with_spool_timeout(self.spool.acquire(bytes)).await
     }
 
     /// Acquire a deadlock-safe spool PAIR (timed) — the GET reconstruct path.
@@ -113,7 +117,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         ),
         EngineError,
     > {
-        Self::with_spool_timeout(self.spool.acquire_pair(a, b)).await
+        self.with_spool_timeout(self.spool.acquire_pair(a, b)).await
     }
 
     /// Reserve, BEFORE the deltaspace lock, the spool that a file-streaming
@@ -136,7 +140,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         if need == 0 {
             return Ok(None);
         }
-        Self::with_spool_timeout(self.spool.reserve_beside(held_mib, need))
+        self.with_spool_timeout(self.spool.reserve_beside(held_mib, need))
             .await
             .map(Some)
     }
@@ -163,7 +167,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         held: Option<&crate::deltaglider::spool::Spool>,
         bytes: u64,
     ) -> Result<crate::deltaglider::spool::Spool, EngineError> {
-        Self::with_spool_timeout(self.spool.acquire_beside(held, bytes)).await
+        self.with_spool_timeout(self.spool.acquire_beside(held, bytes))
+            .await
     }
 
     /// `spool_acquire_pair` for an op that already holds `held` (the streaming
@@ -183,7 +188,10 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         )>,
         EngineError,
     > {
-        match Self::with_spool_timeout_io(self.spool.acquire_pair_beside(Some(held), a, b)).await? {
+        match self
+            .with_spool_timeout_io(self.spool.acquire_pair_beside(Some(held), a, b))
+            .await?
+        {
             Ok(pair) => Ok(Some(pair)),
             Err(e) if e.kind() == crate::deltaglider::spool::CONTENDED => Ok(None),
             Err(e) => Err(EngineError::Storage(StorageError::from(e))),
@@ -300,5 +308,34 @@ mod spool_threshold_tests {
         assert_eq!(default_spool_threshold(100 * mib), 16 * mib);
         assert_eq!(default_spool_threshold(16 * mib), 16 * mib);
         assert_eq!(default_spool_threshold(8 * mib), 8 * mib);
+    }
+
+    /// The engine reads the env-only settings of the config it is built
+    /// from (a rebuild takes a new snapshot), never the process env.
+    #[tokio::test]
+    async fn the_engine_takes_its_tuning_from_the_config() {
+        use crate::storage::FilesystemBackend;
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            FilesystemBackend::new(tmp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let mut config = Config {
+            max_object_size: 8 * 1024 * 1024,
+            ..Config::default()
+        };
+        let plain = DeltaGliderEngine::new_with_backend(backend.clone(), &config, None);
+        assert_eq!(plain.spool_threshold(), 8 * 1024 * 1024);
+        assert!(!plain.tuning().debug_headers);
+
+        config.tuning = crate::config::RuntimeTuning::from_env(&|n: &str| match n {
+            "DGP_SPOOL_THRESHOLD_BYTES" => Some("4096".into()),
+            "DGP_DEBUG_HEADERS" => Some("true".into()),
+            _ => None,
+        });
+        let tuned = DeltaGliderEngine::new_with_backend(backend, &config, None);
+        assert_eq!(tuned.spool_threshold(), 4096);
+        assert!(tuned.tuning().debug_headers);
     }
 }

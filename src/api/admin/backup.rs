@@ -1653,7 +1653,7 @@ async fn apply_secrets(
                 hash_plan = plan_bootstrap_restore(
                     cfg.bootstrap_password_hash.as_deref(),
                     secrets.bootstrap_password_hash.as_deref(),
-                    super::config::password::env_pinned_hash_var(|n| std::env::var(n).ok()),
+                    cfg.tuning.bootstrap_hash_env,
                 );
             }
             hydrate_config_secrets(cfg, secrets, false);

@@ -13,7 +13,7 @@ use arc_swap::ArcSwap;
 use axum::middleware;
 use clap::{Parser, Subcommand};
 use deltaglider_proxy::api::admin::AdminState;
-use deltaglider_proxy::api::handlers::{debug_headers_enabled, AppState};
+use deltaglider_proxy::api::handlers::AppState;
 use deltaglider_proxy::config::{env_parse_with_default, Config};
 use deltaglider_proxy::deltaglider::DynEngine;
 use deltaglider_proxy::multipart::MultipartStore;
@@ -687,10 +687,10 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let rl = rate_limiter.clone();
         move || rl.cleanup_expired()
     });
-    let replay_cache = init_replay_cache();
+    let replay_cache = init_replay_cache(&config.tuning);
 
     // --- Debug headers ---
-    if debug_headers_enabled() {
+    if config.tuning.debug_headers {
         info!("  Debug headers: enabled (DGP_DEBUG_HEADERS=true)");
     }
 
@@ -721,7 +721,8 @@ async fn async_main(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Admin / sessions / config DB (must be before S3 router for mismatch guard) ---
     let admin_password_hash = config.ensure_bootstrap_password_hash();
-    let session_store = Arc::new(SessionStore::new());
+    let session_store =
+        Arc::new(SessionStore::new().with_secure_cookies(config.tuning.secure_cookies));
     spawn_periodic(Duration::from_secs(300), {
         let sessions = session_store.clone();
         move || sessions.cleanup_expired()

@@ -90,10 +90,11 @@ impl S3Access for VerifiedIdentityS3sAccess {
 }
 
 /// The s3s configuration the S3 router runs with.
-pub fn s3s_config() -> std::sync::Arc<s3s::config::StaticConfigProvider> {
+/// `clock_skew_secs`: `DGP_CLOCK_SKEW_SECONDS` ([`crate::config::RuntimeTuning`]).
+pub fn s3s_config(clock_skew_secs: u32) -> std::sync::Arc<s3s::config::StaticConfigProvider> {
     // Pass the documented skew tolerance to s3s; it used its own default.
     let mut config = s3s::config::S3Config::default();
-    config.presigned_url_max_skew_time_secs = crate::api::auth::clock_skew_secs();
+    config.presigned_url_max_skew_time_secs = clock_skew_secs;
     std::sync::Arc::new(s3s::config::StaticConfigProvider::new(std::sync::Arc::new(
         config,
     )))

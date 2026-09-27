@@ -289,7 +289,9 @@ async fn harness() -> Harness {
     let mut builder = S3ServiceBuilder::new(NopS3);
     builder.set_auth(DeltaGliderS3sAuth { iam_state: iam });
     builder.set_access(RecordingAccess);
-    builder.set_config(crate::api::s3s_hooks::s3s_config());
+    builder.set_config(crate::api::s3s_hooks::s3s_config(
+        crate::config::RuntimeTuning::default().clock_skew_secs,
+    ));
     let service =
         axum::error_handling::HandleError::new(builder.build(), |e: s3s::HttpError| async move {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}"))

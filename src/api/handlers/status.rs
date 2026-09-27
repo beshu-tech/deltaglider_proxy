@@ -289,13 +289,14 @@ pub async fn readiness_check(
     // should not immediately flip readiness to 503 and page. We retry the
     // list a few times with a short backoff and only report not-ready if EVERY
     // attempt fails — so one slow/failed call between good ones passes.
-    let timeout_secs: u64 =
-        crate::config::env_parse_with_default("DGP_READY_TIMEOUT_SECS", 3).max(1);
-    let retries: u32 = crate::config::env_parse_with_default("DGP_READY_RETRIES", 2);
+    // `DGP_READY_TIMEOUT_SECS` / `DGP_READY_RETRIES` / `DGP_READY_CACHE_TTL_SECS`.
     // #78: last-known-good window. 0 (default) keeps the strict pre-#78
     // contract — the ListBuckets probe must succeed or the node is not ready.
-    let cache_ttl: i64 =
-        crate::config::env_parse_with_default("DGP_READY_CACHE_TTL_SECS", 0i64).max(0);
+    let crate::config::tuning::ReadyProbe {
+        timeout_secs,
+        retries,
+        cache_ttl_secs: cache_ttl,
+    } = engine.tuning().ready;
     let per_attempt = Duration::from_secs(timeout_secs);
     let now = crate::event_outbox::current_unix_seconds();
 

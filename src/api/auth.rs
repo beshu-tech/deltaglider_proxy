@@ -32,27 +32,13 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tracing::{debug, info, warn};
 
-/// SigV4 clock-skew tolerance s3s enforces, in seconds (`DGP_CLOCK_SKEW_SECONDS`).
-/// The default is s3s's own 900 s, which was the effective value while the
-/// variable was documented (as 300 s) but never passed to s3s.
-pub fn clock_skew_secs() -> u32 {
-    crate::config::env_parse_with_default("DGP_CLOCK_SKEW_SECONDS", 900)
-}
-
-/// The SigV4 replay window. Default: the clock-skew window, so a captured
-/// mutation cannot be replayed while its signature is still accepted.
-/// `DGP_REPLAY_WINDOW_SECS=0` switches replay rejection off.
-pub fn replay_window() -> Duration {
-    replay_window_from(&crate::config::process_env)
-}
-
-/// [`replay_window`] over an injected env lookup (pure, unit-tested).
-pub fn replay_window_from(env: crate::config::EnvLookup) -> Duration {
-    let skew: u32 = crate::config::lookup_parse(env, "DGP_CLOCK_SKEW_SECONDS").unwrap_or(900);
-    Duration::from_secs(
-        crate::config::lookup_parse(env, "DGP_REPLAY_WINDOW_SECS").unwrap_or(u64::from(skew)),
-    )
-}
+/// The SigV4 replay window (`DGP_REPLAY_WINDOW_SECS`, see
+/// [`crate::config::RuntimeTuning`]), layered as an extension beside the
+/// [`ReplayCache`]. Default: the clock-skew window (`DGP_CLOCK_SKEW_SECONDS`,
+/// 900 s, s3s's own default), so a captured mutation cannot be replayed while
+/// its signature is still accepted. 0 switches replay rejection off.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplayWindow(pub Duration);
 
 /// Shared replay cache type: signature string -> timestamp of first use.
 pub type ReplayCache = Arc<DashMap<String, Instant>>;
@@ -668,6 +654,10 @@ pub async fn sigv4_auth_middleware(
     let metrics = request.extensions().get::<Arc<Metrics>>().cloned();
     let rate_limiter = request.extensions().get::<RateLimiter>().cloned();
     let replay_cache = request.extensions().get::<ReplayCache>().cloned();
+    let replay_window = request.extensions().get::<ReplayWindow>().map_or_else(
+        || crate::config::RuntimeTuning::default().replay_window(),
+        |w| w.0,
+    );
 
     // Extract client IP for rate limiting/session security.
     let peer_ip = request
@@ -989,7 +979,6 @@ pub async fn sigv4_auth_middleware(
     let mut replay_claim: Option<(ReplayCache, String, Instant)> = None;
     if let Some(ref cache) = replay_cache {
         if !is_presigned && replay_tracked(request.method()) {
-            let replay_window = replay_window();
             // Expired entries go in the periodic sweep (`init_replay_cache`),
             // not here: a full retain per request is O(cache) with a 900 s
             // window. Only an over-cap cache is pruned inline.
@@ -1411,7 +1400,11 @@ mod tests {
                     .map(|(_, v)| v.to_string())
             }
         };
-        let secs = |f: &dyn Fn(&str) -> Option<String>| replay_window_from(f).as_secs();
+        let secs = |f: &dyn Fn(&str) -> Option<String>| {
+            crate::config::RuntimeTuning::from_env(f)
+                .replay_window()
+                .as_secs()
+        };
         assert_eq!(secs(&env(&[])), 900);
         assert_eq!(secs(&env(&[("DGP_CLOCK_SKEW_SECONDS", "300")])), 300);
         assert_eq!(secs(&env(&[("DGP_REPLAY_WINDOW_SECS", "0")])), 0);

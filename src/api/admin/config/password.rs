@@ -44,13 +44,8 @@ fn password_err(status: StatusCode, msg: impl Into<String>) -> axum::response::R
         .into_response()
 }
 
-/// D15: the env var that pins the bootstrap hash, if one is set. That hash
-/// wins at every boot, so a GUI change would be lost at the next start.
-pub(crate) fn env_pinned_hash_var(env: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
-    ["DGP_BOOTSTRAP_PASSWORD_HASH", "DGP_ADMIN_PASSWORD_HASH"]
-        .into_iter()
-        .find(|n| env(n).is_some_and(|v| !v.trim().is_empty()))
-}
+#[cfg(test)]
+use crate::config::tuning::env_pinned_hash_var;
 
 /// Make `hash` the bootstrap hash: the state file first (the next boot
 /// reads it), then the in-memory login verifier and the config. Shared by
@@ -73,7 +68,7 @@ pub async fn change_password(
     headers: HeaderMap,
     AdminJson(body): AdminJson<PasswordChangeRequest>,
 ) -> impl IntoResponse {
-    if let Some(var) = env_pinned_hash_var(|n| std::env::var(n).ok()) {
+    if let Some(var) = state.s3_state.engine.load().tuning().bootstrap_hash_env {
         return password_err(
             StatusCode::CONFLICT,
             format!(

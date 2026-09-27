@@ -394,12 +394,12 @@ pub async fn remove_bootstrap_credentials(
     // The refusals answer `{"error": ..}`; an env re-apply failure a text 500.
     let conflict = |msg: &str| AdminError::<JsonError>::conflict(msg).into_response();
     let iam_active = matches!(&**state.iam_state.load(), IamState::Iam(_));
-    let env_controlled = ["DGP_ACCESS_KEY_ID", "DGP_SECRET_ACCESS_KEY"]
-        .iter()
-        .any(|v| std::env::var_os(v).is_some());
-    let has_pair = {
+    let (env_controlled, has_pair) = {
         let cfg = state.config.read().await;
-        cfg.access_key_id.is_some() || cfg.secret_access_key.is_some()
+        (
+            cfg.tuning.bootstrap_pair_from_env,
+            cfg.access_key_id.is_some() || cfg.secret_access_key.is_some(),
+        )
     };
     match bootstrap_removal_decision(has_pair, env_controlled, iam_active) {
         BootstrapRemoval::NothingToRemove => {

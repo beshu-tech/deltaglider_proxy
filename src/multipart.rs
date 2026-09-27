@@ -413,6 +413,11 @@ impl MultipartStore {
         }
     }
 
+    /// The cap on concurrent uploads (`DGP_MAX_MULTIPART_UPLOADS`).
+    pub fn max_uploads(&self) -> usize {
+        self.max_uploads
+    }
+
     /// Use `spool` for relay part files (default: the process-wide spool).
     pub fn with_spool(mut self, spool: SpoolDir) -> Self {
         self.spool = spool;

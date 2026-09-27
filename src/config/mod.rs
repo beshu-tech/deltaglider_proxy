@@ -22,6 +22,8 @@ use std::sync::Arc;
 
 mod registry;
 pub use registry::*;
+pub mod tuning;
+pub use tuning::RuntimeTuning;
 
 /// Default YAML config filename.
 pub const DEFAULT_YAML_CONFIG_FILENAME: &str = "deltaglider_proxy.yaml";
@@ -332,6 +334,13 @@ pub struct Config {
     #[serde(skip)]
     #[schemars(skip)]
     pub env_shadow: env_shadow::EnvShadow,
+
+    /// Env-only settings the request path reads (see [`tuning`]). NEVER
+    /// serialized: `Self::apply_env_overrides_tracked` fills it from the
+    /// environment, at boot and on every admin apply.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub tuning: RuntimeTuning,
 }
 
 /// Per-backend encryption-at-rest configuration.
@@ -834,6 +843,7 @@ impl Default for Config {
             group_mapping_rules: Vec::new(),
             env_refs: std::collections::BTreeMap::new(),
             env_shadow: env_shadow::EnvShadow::default(),
+            tuning: RuntimeTuning::default(),
         }
     }
 }
@@ -1196,6 +1206,8 @@ impl Config {
     /// overrides and REPLACES [`Self::env_shadow`] with the file values of
     /// the slots that were overridden. `self` must be the file view.
     pub(crate) fn apply_env_overrides_tracked(&mut self, env: EnvLookup) {
+        // Env-only settings: no field to override, no shadow to record.
+        self.tuning = RuntimeTuning::from_env(env);
         let before = serde_yaml::to_value(&*self).ok();
         let applied = self.apply_env_overrides_with(env);
         self.env_shadow = match before {

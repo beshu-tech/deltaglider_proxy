@@ -15,10 +15,12 @@ pub(super) async fn create_multipart_upload(
     crate::api::handlers::object_helpers::check_client_write_allowed(&svc.state, &input.bucket)?;
     check_user_metadata_size_s3s(input.metadata.as_ref())?;
     ensure_bucket_exists_s3s(&svc.state, &input.bucket).await?;
-    let delta_limit = crate::config::env_parse_with_default(
-        "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
-        64 * 1024 * 1024,
-    );
+    let delta_limit = svc
+        .state
+        .engine
+        .load()
+        .tuning()
+        .mpu_delta_reconstruct_max_bytes;
     let upload_id = svc.state.multipart.create_with_relay_policy(
         &input.bucket,
         &input.key,
@@ -150,7 +152,7 @@ pub(super) async fn complete_multipart_upload(
             // Parity with the legacy axum handler: `x-amz-storage-type` (+
             // stored-size) so operators can observe how the multipart landed.
             if let Some(meta) = meta {
-                add_storage_debug_headers(&mut resp.headers, meta);
+                add_storage_debug_headers(svc, &mut resp.headers, meta);
             }
             Ok(resp)
         };
@@ -184,12 +186,10 @@ pub(super) async fn complete_multipart_upload(
                 },
             )
             .await?;
-            let delta_limit = crate::config::env_parse_with_default(
-                "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
-                64 * 1024 * 1024,
-            );
-            let force_chunked_passthrough = !svc.state.engine.load().is_delta_eligible(&input.key)
-                || total_parts_size > delta_limit;
+            let engine = svc.state.engine.load();
+            let force_chunked_passthrough = !engine.is_delta_eligible(&input.key)
+                || total_parts_size > engine.tuning().mpu_delta_reconstruct_max_bytes;
+            drop(engine);
             let state = svc.state.clone();
             let (bucket, key, upload_id) = (
                 input.bucket.clone(),

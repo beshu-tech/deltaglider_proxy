@@ -293,7 +293,7 @@ pub struct EnvOverride {
 }
 
 /// Same truth table as `env_bool`.
-fn parse_bool(raw: &str) -> Option<bool> {
+pub(super) fn parse_bool(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Some(true),
         "false" | "0" | "no" | "off" => Some(false),

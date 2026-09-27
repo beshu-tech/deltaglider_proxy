@@ -226,6 +226,9 @@ pub struct DeltaGliderEngine<S: StorageBackend> {
     /// Verified reconstructions of large delta objects, kept briefly for
     /// more range reads of the same object (storage-11).
     range_spools: Arc<crate::deltaglider::range_spool::RangeSpoolCache>,
+    /// Env-only settings, copied from the config at build (see
+    /// [`crate::config::RuntimeTuning`]).
+    tuning: crate::config::RuntimeTuning,
 }
 
 /// Type alias for engine with dynamic backend dispatch

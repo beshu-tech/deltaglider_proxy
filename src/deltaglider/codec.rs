@@ -12,47 +12,24 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, instrument, warn};
 
-/// Maximum time to wait for xdelta3 subprocess to complete.
-/// Default 60s is generous for 100MB max object size — xdelta3 typically
-/// processes 100MB in <5s. Hung processes are killed to prevent cascading.
-/// Override via `DGP_CODEC_TIMEOUT_SECS` for testing or constrained environments.
+/// The xdelta3 deadlines (`DGP_CODEC_TIMEOUT_SECS`, `DGP_CODEC_STALL_SECS`,
+/// `DGP_CODEC_ABSOLUTE_SECS`), read once per config snapshot.
 ///
-/// This wall-clock timeout governs the BUFFERED path (`encode`/`decode`), where
-/// the whole operation is bounded (input ≤ max_size, finishes in seconds). The
-/// STREAMING path (`encode_from_reader`/`decode_to_writer`) uses a STALL timeout
-/// instead — see `codec_stall_timeout` — because a legitimate multi-GB stream
-/// can run far past 60s while making steady progress.
-fn codec_timeout() -> Duration {
-    Duration::from_secs(crate::config::env_parse_with_default(
-        "DGP_CODEC_TIMEOUT_SECS",
-        60,
-    ))
-}
-
-/// No-progress timeout for the STREAMING codec path. The streaming pump bumps a
-/// progress clock on every chunk it reads from xdelta3's stdout; the watchdog
-/// kills the child only if NO progress is made for this long. Spike B measured
-/// the largest normal inter-chunk gap at ~13ms on a 1.6GB decode, so 30s has a
-/// ~2300× margin over legitimate slow-but-working progress while still reaping a
-/// genuinely hung process or a full-disk spool quickly.
-fn codec_stall_timeout() -> Duration {
-    Duration::from_secs(crate::config::env_parse_with_default(
-        "DGP_CODEC_STALL_SECS",
-        30,
-    ))
-}
-
-/// Absolute ceiling for a single streaming codec op, regardless of progress.
-/// The stall timeout alone can't bound a crafted delta that makes xdelta3 spin
-/// forever while trickling a byte every few seconds (Spike B note). This hard
-/// cap (default 2h — generous for a 100GB object even on slow storage) is the
-/// backstop. Set high; it should never fire for a legitimate transfer.
-fn codec_absolute_ceiling() -> Duration {
-    Duration::from_secs(crate::config::env_parse_with_default(
-        "DGP_CODEC_ABSOLUTE_SECS",
-        2 * 60 * 60,
-    ))
-}
+/// - `buffered_secs` (default 60) is the wall clock of the BUFFERED path
+///   (`encode`/`decode`), where the whole operation is bounded (input ≤
+///   max_size, finishes in seconds). Hung processes are killed to prevent
+///   cascading.
+/// - `stall_secs` (default 30) is the no-progress timeout of the STREAMING
+///   path (`encode_from_reader`/`decode_to_writer`): a legitimate multi-GB
+///   stream can run far past 60s while making steady progress. The pump bumps
+///   a progress clock on every chunk; the watchdog kills the child only if NO
+///   progress is made for this long. Spike B measured the largest normal
+///   inter-chunk gap at ~13ms on a 1.6GB decode, so 30s has a ~2300× margin.
+/// - `absolute_secs` (default 2h) caps one streaming op regardless of
+///   progress: the stall timeout alone cannot bound a crafted delta that makes
+///   xdelta3 trickle a byte every few seconds. It should never fire for a
+///   legitimate transfer.
+pub use crate::config::tuning::CodecTimeouts;
 
 /// Shared progress clock for the streaming watchdog. The pump stores the
 /// monotonic nanos of the last successful stdout read; the watchdog reads it to
@@ -196,7 +173,7 @@ fn pipe_stdin_stdout_stderr(
     let done = done_flag();
 
     std::thread::scope(|s| {
-        // Watchdog: kills the child if pipe I/O takes longer than codec_timeout().
+        // Watchdog: kills the child if pipe I/O takes longer than the buffered timeout.
         // When the child is killed, its pipe ends close, unblocking the reader
         // threads. Without this, a hung xdelta3 blocks read_to_end() forever
         // and the codec semaphore slot is permanently lost.
@@ -437,6 +414,7 @@ pub struct DeltaCodec {
     /// ERROR on the unknown flag — so we PROBE for support and pass `-a` only
     /// when accepted. Detected at construction, never per-request.
     armor_supported: bool,
+    timeouts: CodecTimeouts,
 }
 
 /// Which way an xdelta3 run goes.
@@ -513,7 +491,14 @@ impl DeltaCodec {
             cli_available,
             cli_version,
             armor_supported,
+            timeouts: CodecTimeouts::default(),
         }
+    }
+
+    /// Use `timeouts` instead of the defaults.
+    pub fn with_timeouts(mut self, timeouts: CodecTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 
     /// Probe `xdelta3 -V`, returning the trimmed first version line on success
@@ -744,13 +729,16 @@ impl DeltaCodec {
             input,
             self.max_size,
             proc.id,
-            codec_timeout(),
+            Duration::from_secs(self.timeouts.buffered_secs),
         );
         write_result?;
         let output = output?;
         let stderr_bytes = stderr_result.unwrap_or_default();
 
-        let status = wait_with_timeout(&mut proc.child.0, codec_timeout())?;
+        let status = wait_with_timeout(
+            &mut proc.child.0,
+            Duration::from_secs(self.timeouts.buffered_secs),
+        )?;
         mode.check_exit(status, &stderr_bytes)?;
         Ok(output)
     }
@@ -867,8 +855,8 @@ impl DeltaCodec {
             input,
             |chunk: &[u8]| out.write_all(chunk),
             proc.id,
-            codec_stall_timeout(),
-            codec_absolute_ceiling(),
+            Duration::from_secs(self.timeouts.stall_secs),
+            Duration::from_secs(self.timeouts.absolute_secs),
             &progress,
         );
         write_result?;
@@ -877,7 +865,10 @@ impl DeltaCodec {
 
         // The streaming watchdog uses raw kill(); reap the child here (its
         // wall-clock is bounded by the absolute ceiling the watchdog enforces).
-        let status = wait_with_timeout(&mut proc.child.0, codec_absolute_ceiling())?;
+        let status = wait_with_timeout(
+            &mut proc.child.0,
+            Duration::from_secs(self.timeouts.absolute_secs),
+        )?;
         mode.check_exit(status, &stderr_bytes)?;
         out.flush()?;
         Ok(total)
@@ -933,6 +924,17 @@ mod tests {
     /// cap) must still reap xdelta3. Before, the `?` returned before the
     /// wait, and every capped encode left one zombie.
     #[cfg(target_os = "linux")]
+    #[test]
+    fn the_codec_uses_the_configured_timeouts() {
+        let t = CodecTimeouts {
+            buffered_secs: 1,
+            stall_secs: 2,
+            absolute_secs: 3,
+        };
+        assert_eq!(DeltaCodec::new(10).timeouts, CodecTimeouts::default());
+        assert_eq!(DeltaCodec::new(10).with_timeouts(t).timeouts, t);
+    }
+
     #[test]
     fn early_returns_reap_the_xdelta3_child() {
         let codec = DeltaCodec::default();

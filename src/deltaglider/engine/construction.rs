@@ -413,7 +413,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         spool.register_evictor(Arc::downgrade(&range_spools) as _);
         Self {
             storage,
-            codec: Arc::new(DeltaCodec::new(config.max_object_size as usize)),
+            codec: Arc::new(
+                DeltaCodec::new(config.max_object_size as usize).with_timeouts(config.tuning.codec),
+            ),
             file_router: FileRouter::new(),
             cache: ReferenceCache::new(config.cache_size_mb),
             max_object_size: config.max_object_size,
@@ -431,6 +433,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             bucket_usage: None,
             spool,
             range_spools,
+            tuning: config.tuning.clone(),
         }
     }
 

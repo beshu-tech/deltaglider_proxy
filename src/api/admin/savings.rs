@@ -43,7 +43,7 @@ use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 
 use crate::api::handlers::AppState;
-use crate::deltaglider::{SavingsTotals, REFERENCE_SCAN_LIMIT};
+use crate::deltaglider::SavingsTotals;
 
 /// Max objects we'll walk before bailing with `truncated: true`. The
 /// per-bucket scan in `bucket_scan.rs` is the path for huge prefixes.
@@ -290,8 +290,7 @@ async fn compute_savings(
     bucket: &str,
     prefix: &str,
 ) -> Result<SavingsResponse, String> {
-    let ref_limit =
-        crate::config::env_parse_with_default("DGP_REFERENCE_SCAN_LIMIT", REFERENCE_SCAN_LIMIT);
+    let ref_limit = s3_state.engine.load().tuning().reference_scan_limit;
     let (totals, truncated) = scan_totals(
         s3_state,
         bucket,

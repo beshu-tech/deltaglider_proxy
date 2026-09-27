@@ -203,7 +203,9 @@ where
         iam_state: iam_state.clone(),
     });
     builder.set_access(access);
-    builder.set_config(crate::api::s3s_hooks::s3s_config());
+    builder.set_config(crate::api::s3s_hooks::s3s_config(
+        config.tuning.clock_skew_secs,
+    ));
     let s3_service = HandleError::new(builder.build(), handle_s3s_http_error);
 
     // Form-POST upload interceptor (`POST /<bucket>` with
@@ -403,18 +405,18 @@ where
 
     router
         .layer(axum::Extension(replay_cache.clone()))
+        .layer(axum::Extension(crate::api::auth::ReplayWindow(
+            config.tuning.replay_window(),
+        )))
         .layer(axum::Extension(rate_limiter.clone()))
         .layer(axum::Extension(metrics.clone()))
         .layer(DefaultBodyLimit::max(config.max_object_size as usize))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::GATEWAY_TIMEOUT,
-            std::time::Duration::from_secs(crate::config::env_parse_with_default(
-                "DGP_REQUEST_TIMEOUT_SECS",
-                300u64,
-            )),
+            std::time::Duration::from_secs(config.tuning.request_timeout_secs),
         ))
         .layer(tower::limit::ConcurrencyLimitLayer::new(
-            crate::config::env_parse_with_default("DGP_MAX_CONCURRENT_REQUESTS", 1024usize),
+            config.tuning.max_concurrent_requests,
         ))
         .layer({
             // SECURITY: In production (single-port architecture), CORS is not
@@ -425,8 +427,7 @@ where
             // so they're unaffected; the embedded UI is same-origin so it's
             // unaffected in prod. Mirrors the admin router's branch in
             // `demo.rs` via the shared `cors::cors_layer_for` pure fn.
-            let permissive = crate::config::env_bool("DGP_CORS_PERMISSIVE", false);
-            crate::cors::cors_layer_for(permissive)
+            crate::cors::cors_layer_for(config.tuning.cors_permissive)
         })
         .with_state(state.clone())
 }

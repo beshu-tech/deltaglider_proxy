@@ -134,7 +134,7 @@ pub(super) async fn list_objects(
         encoding_type: input.encoding_type,
         ..Default::default()
     });
-    add_listing_debug_headers(&mut resp.headers, page.facts_missing_keys.len());
+    add_listing_debug_headers(svc, &mut resp.headers, page.facts_missing_keys.len());
     Ok(resp)
 }
 
@@ -176,7 +176,7 @@ pub(super) async fn list_objects_v2(
     });
     let facts_misses = page.facts_missing_keys.len();
     let mut resp = s3s::S3Response::new(list_objects_v2_output_from_page(&input, max_keys, page)?);
-    add_listing_debug_headers(&mut resp.headers, facts_misses);
+    add_listing_debug_headers(svc, &mut resp.headers, facts_misses);
     if let Some(metadata_ext) = metadata_ext {
         resp.extensions.insert(metadata_ext);
     }

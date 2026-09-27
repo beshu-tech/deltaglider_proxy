@@ -562,13 +562,16 @@ pub fn ui_router(admin_state: Arc<AdminState>) -> Router {
         .merge(stats_route)
         .merge(static_routes)
         // CSRF: state-changing requests must prove same origin (S5).
-        .layer(middleware::from_fn(admin::csrf::require_same_origin))
+        .layer(middleware::from_fn_with_state(
+            admin_state.clone(),
+            admin::csrf::require_same_origin,
+        ))
         .layer({
             // SECURITY: In production (single-port architecture), CORS is not needed
             // because the UI is served from the same origin. allow_origin(Any) would
             // enable CSRF attacks against session-cookie-authenticated admin endpoints.
             // Only enable permissive CORS when DGP_CORS_PERMISSIVE=true (dev mode).
-            let permissive = deltaglider_proxy::config::env_bool("DGP_CORS_PERMISSIVE", false);
+            let permissive = admin_state.s3_state.engine.load().tuning().cors_permissive;
             deltaglider_proxy::cors::cors_layer_for(permissive)
         })
 }

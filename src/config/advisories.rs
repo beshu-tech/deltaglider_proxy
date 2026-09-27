@@ -65,9 +65,9 @@ impl Advisory {
 }
 
 /// The few ENV-only settings cross-field rules need — rate limiting and
-/// `trust_proxy_headers` live in env, NOT on `Config`, so a `fn(&Config)` rule
-/// can't see them. `from_env()` snapshots the real environment; tests inject a
-/// literal, keeping the rules pure.
+/// `trust_proxy_headers` live in env, NOT in the YAML. [`Self::of`] takes
+/// `trust_proxy_headers` from the config's env snapshot ([`Config::tuning`]);
+/// tests inject a literal, keeping the rules pure.
 #[derive(Debug, Clone, Copy)]
 pub struct EnvView {
     pub trust_proxy_headers: bool,
@@ -77,9 +77,9 @@ pub struct EnvView {
 }
 
 impl EnvView {
-    pub fn from_env() -> Self {
+    pub fn of(cfg: &Config) -> Self {
         Self {
-            trust_proxy_headers: crate::config::env_bool("DGP_TRUST_PROXY_HEADERS", false),
+            trust_proxy_headers: cfg.tuning.trust_proxy_headers,
             // Rate limiting is on by default; only an explicit 0-attempts disables it.
             rate_limit_enabled: crate::config::env_parse_with_default(
                 "DGP_RATE_LIMIT_MAX_ATTEMPTS",

@@ -43,7 +43,7 @@ pub(super) async fn head_object(
     // router turns a HEAD with `Content-Range` into 206
     // (`s3_router::head_range_is_partial`).
     let mut resp = s3s::S3Response::new(output);
-    add_storage_debug_headers(&mut resp.headers, &meta);
+    add_storage_debug_headers(svc, &mut resp.headers, &meta);
     Ok(resp)
 }
 
@@ -96,7 +96,7 @@ pub(super) async fn get_object(
             apply_get_response_overrides(&input, &mut output);
             // s3s answers 206 because `content_range` is set.
             let mut resp = s3s::S3Response::new(output);
-            add_storage_debug_headers(&mut resp.headers, &metadata);
+            add_storage_debug_headers(svc, &mut resp.headers, &metadata);
             add_get_object_security_headers(&mut resp);
             return Ok(resp);
         }
@@ -122,7 +122,7 @@ pub(super) async fn get_object(
         output.content_range = Some(content_range);
         apply_get_response_overrides(&input, &mut output);
         let mut resp = s3s::S3Response::new(output);
-        add_storage_debug_headers(&mut resp.headers, &metadata);
+        add_storage_debug_headers(svc, &mut resp.headers, &metadata);
         add_get_object_security_headers(&mut resp);
         return Ok(resp);
     }
@@ -148,7 +148,7 @@ pub(super) async fn get_object(
     let mut output = get_object_output_from_metadata(&metadata, body, reader)?;
     apply_get_response_overrides(&input, &mut output);
     let mut resp = s3s::S3Response::new(output);
-    add_storage_debug_headers(&mut resp.headers, &metadata);
+    add_storage_debug_headers(svc, &mut resp.headers, &metadata);
     add_get_object_security_headers(&mut resp);
     Ok(resp)
 }
@@ -429,7 +429,7 @@ pub(super) async fn put_object(
         e_tag: Some(parse_s3s_etag(&result.metadata.etag())?),
         ..Default::default()
     });
-    add_storage_debug_headers(&mut resp.headers, &result.metadata);
+    add_storage_debug_headers(svc, &mut resp.headers, &result.metadata);
     Ok(resp)
 }
 

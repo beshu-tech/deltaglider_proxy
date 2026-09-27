@@ -18,6 +18,18 @@ object. Now the engine stores an object that carries this hint as a plain
 (passthrough) object and does not store the hint. The proxy reads the same
 hint from an S3 client as `x-amz-meta-dg-no-delta: true`.
 
+### Changed — Requests no longer read environment variables
+
+Some request handlers read `DGP_*` variables from the process environment on
+every request, for example the spool threshold, the codec timeouts, the
+`/_/ready` probe settings and `DGP_DEBUG_HEADERS`. Now the server reads these
+variables once for each config snapshot, at startup and at every admin apply,
+and a request uses the values of that snapshot. The names and the defaults do
+not change. The environment of a running process does not change, so nothing
+changes for an operator: a changed variable still takes effect after a
+restart. `GET /_/api/admin/config` now shows the rate limits, the session TTL
+and the multipart upload cap that the running server uses.
+
 ### Fixed — A ZIP download stops reading when the client goes away
 
 The admin ZIP download noticed a closed connection only when it sent the next

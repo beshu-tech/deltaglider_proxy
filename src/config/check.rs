@@ -57,6 +57,9 @@ impl Config {
         {
             return Err(DocumentRefusal::LogFilter(cfg.log_level));
         }
+        // The document is not env-applied here, but its advisories judge it
+        // with the environment it runs under (DGP_TRUST_PROXY_HEADERS).
+        cfg.tuning = super::RuntimeTuning::from_env(&super::process_env);
         let warnings = cfg.check_all().map_err(DocumentRefusal::Fatal)?;
         Ok((cfg, warnings))
     }
@@ -383,7 +386,7 @@ impl Config {
         // Cross-field advisories — "this combination is suspicious" checks that a
         // single field can't reveal (rate-limit/trust-proxy collapse, stale IAM
         // templates, etc). Non-fatal; rendered alongside the warnings above.
-        let env = advisories::EnvView::from_env();
+        let env = advisories::EnvView::of(self);
         warnings.extend(
             advisories::advisories(self, &env)
                 .iter()

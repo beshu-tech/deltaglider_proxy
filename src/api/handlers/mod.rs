@@ -16,7 +16,7 @@
 //!   per-object event-outbox enqueue), called from both
 //!   `s3_adapter_s3s` and `form_post`.
 //! - `status` — `/_/health` and `/_/stats` legacy endpoints.
-//! - `ensure_bucket_exists`, `debug_headers_enabled`, `audit_log_s3` —
+//! - `ensure_bucket_exists`, `audit_log_s3` —
 //!   small free helpers reused by the surviving handlers.
 //!
 //! Pre-consolidation, this module also hosted ~3500 LOC of axum-based
@@ -122,11 +122,4 @@ pub(crate) async fn ensure_bucket_exists(
         Ok(false) => Err(S3Error::NoSuchBucket(bucket.to_string())),
         Err(e) => Err(S3Error::from(e)),
     }
-}
-
-/// Whether to emit debug headers (x-amz-storage-type, x-deltaglider-stored-size).
-/// Checked once at startup from the `DGP_DEBUG_HEADERS` env var.
-pub fn debug_headers_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| crate::config::env_bool("DGP_DEBUG_HEADERS", false))
 }
