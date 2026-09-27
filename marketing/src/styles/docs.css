@@ -546,16 +546,18 @@
   position: absolute; top: 8px; right: 8px;
   display: inline-flex; align-items: center;
   font-family: var(--doc-label); font-size: 0.8125rem; font-weight: 600; letter-spacing: 0.02em;
-  color: var(--ink-soft); background: var(--doc-code-bg);
-  border: 1px solid var(--rule-strong); border-radius: 6px; padding: 4px 9px;
+  /* The code panel is dark in both themes, so the button uses the panel
+     inks: --ink-soft is #475569 in the light theme (2:1 on the panel). */
+  color: var(--panel-dark-ink); background: var(--doc-code-bg);
+  border: 1px solid var(--doc-code-border); border-radius: 6px; padding: 4px 9px;
   cursor: pointer; opacity: 0; transform: translateY(-2px);
   transition: opacity 0.14s, transform 0.14s, color 0.12s, border-color 0.12s, background 0.12s;
 }
 .docs-prose pre.has-copy:hover .docs-copy-btn,
 .docs-copy-btn:focus-visible { opacity: 1; transform: translateY(0); }
-.docs-copy-btn:hover { color: var(--ink-strong); border-color: var(--ink-mute); }
+.docs-copy-btn:hover { color: var(--panel-dark-accent); border-color: var(--panel-dark-ink-dim); }
 .docs-copy-btn:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
-.docs-copy-btn.is-copied { color: var(--brand); border-color: var(--brand); background: var(--bg-alt); }
+.docs-copy-btn.is-copied { color: var(--panel-dark-accent); border-color: var(--panel-dark-accent); background: var(--doc-code-bg); }
 
 /* ── Prev / Next pager ─────────────────────────────────────────────────── */
 .docs-pager {
@@ -959,9 +961,13 @@
 /* Touch screens have no hover: the code Copy button must always show, and
    the language tag (which it would cover) steps aside. */
 @media (hover: none) {
-  .docs-copy-btn { opacity: 1; transform: none; }
+  .docs-copy-btn { opacity: 1; transform: none; top: 6px; right: 6px; padding: 7px 12px; }
+  /* The always-visible button gets its own strip, so it never covers code. */
+  .docs-prose pre.has-copy { padding-top: 46px; }
   .docs-prose .shiki-wrap[data-lang]::after { display: none; }
   .docs-search-kbd { display: none; }
+  /* "Press ⌘K to search" means nothing without a keyboard. */
+  .docs-landing-head .docs-landing-sub { display: none; }
 }
 
 @media (max-width: 860px) {
