@@ -66,7 +66,7 @@ use crate::transfer::{
 use super::store::MaintenanceJob;
 use super::worker::{
     after_run, check_cancel, drain_inflight_writes, heartbeat, persist, record_failure,
-    stop_if_shutting_down, AfterRun,
+    stop_if_shutting_down, AfterRun, PhaseStop,
 };
 
 pub const TRANSIENT_PREFIX: &str = "__dgmigrate_";
@@ -246,7 +246,7 @@ pub fn real_bucket_name<'a>(
 /// failed flush saves nothing and fails the phase (the source stays
 /// authoritative). Every `persist` in this file goes through here (source
 /// test `every_migrate_persist_is_a_checkpoint`).
-async fn checkpoint<F, P>(flush: F, save: P) -> Result<(), String>
+async fn checkpoint<F, P>(flush: F, save: P) -> Result<(), PhaseStop>
 where
     F: std::future::Future<Output = Result<(), crate::deltaglider::EngineError>>,
     P: std::future::Future<Output = ()>,
@@ -447,7 +447,7 @@ async fn prune_destination_extras(
     instance_id: &str,
     job: &MaintenanceJob,
     params: &MigrateParams,
-) -> Result<(), String> {
+) -> Result<(), PhaseStop> {
     let bucket = &job.bucket;
     let mut pager = Pager::resuming(None);
     let mut pruned = 0u64;
@@ -478,10 +478,10 @@ async fn prune_destination_extras(
                 Ok(_) => continue,
                 Err(e) if e.is_not_found() => {}
                 Err(e) => {
-                    return Err(format!(
+                    return Err(PhaseStop::from(format!(
                         "mirror: could not check '{key}' at the source ({e}) — nothing deleted \
                          for it; source remains authoritative"
-                    ))
+                    )))
                 }
             }
             engine
@@ -505,11 +505,11 @@ async fn prune_destination_extras(
         }
     }
     if pager.truncated_by_page_budget() {
-        return Err(
+        return Err(PhaseStop::from(
             "mirror: destination listing stopped at the page budget — refusing to \
              flip over an incompletely mirrored destination"
                 .to_string(),
-        );
+        ));
     }
     info!(
         "migrate: job #{} mirror deleted {pruned} destination object(s) absent at the source",
@@ -594,13 +594,13 @@ async fn remove_staged_copies(
 /// Run one migrate job to completion (or error). The caller settles the
 /// job row and clears the gate; THIS function unwinds the transient
 /// route on any PRE-FLIP termination (cancel or failure).
-pub async fn execute_migrate_phases(
+pub(crate) async fn execute_migrate_phases(
     mutator: &ConfigMutator,
     db: &Arc<Mutex<ConfigDb>>,
     state: &Arc<AppState>,
     instance_id: &str,
     job: &MaintenanceJob,
-) -> Result<(), String> {
+) -> Result<(), PhaseStop> {
     let params = parse_params(job.params.as_deref().ok_or("migrate job has no params")?)?;
     let result = run_phases(mutator, db, state, instance_id, job, &params).await;
 
@@ -647,7 +647,7 @@ async fn run_phases(
     instance_id: &str,
     job: &MaintenanceJob,
     params: &MigrateParams,
-) -> Result<(), String> {
+) -> Result<(), PhaseStop> {
     let bucket = &job.bucket;
     let mut phase = job.phase.clone();
     let resume_token = job.continuation_token.clone();
@@ -683,7 +683,9 @@ async fn run_phases(
                 .await
                 .is_err()
             {
-                return Err(format!("create bucket on target failed: {e}"));
+                return Err(PhaseStop::from(format!(
+                    "create bucket on target failed: {e}"
+                )));
             }
         }
         // Stage runs before any copy, so every object seen here predates
@@ -748,7 +750,7 @@ async fn run_phases(
                     .await?;
                     continue;
                 }
-                Err(e) => return Err(format!("list source failed: {e}")),
+                Err(e) => return Err(PhaseStop::from(format!("list source failed: {e}"))),
             };
             for (i, (key, _)) in page
                 .objects
@@ -818,9 +820,9 @@ async fn run_phases(
                             persist(db, job, "copy", None, done, skipped, failed, bytes, None),
                         )
                         .await?;
-                        return Err(format!(
+                        return Err(PhaseStop::from(format!(
                             "copy of '{key}' failed — source remains authoritative: {e}"
-                        ));
+                        )));
                     }
                 }
             }
@@ -851,10 +853,12 @@ async fn run_phases(
             // + delete) over a silently truncated listing — never-copied
             // tail objects would be lost. Fail instead; the persisted
             // cursor resumes the tail on retry.
-            return Err("copy stopped at the page budget with more source pages \
+            return Err(PhaseStop::from(
+                "copy stopped at the page budget with more source pages \
                  pending — bucket too large for one pass; job left resumable \
                  in phase 'copy' (cursor persisted, source authoritative)"
-                .to_string());
+                    .to_string(),
+            ));
         }
         phase = "verify".to_string();
         checkpoint(
@@ -892,7 +896,7 @@ async fn run_phases(
                     .await?;
                     continue;
                 }
-                Err(e) => return Err(format!("verify list failed: {e}")),
+                Err(e) => return Err(PhaseStop::from(format!("verify list failed: {e}"))),
             };
             for (i, (key, _)) in page
                 .objects
@@ -905,12 +909,14 @@ async fn run_phases(
                 }
                 match copy_verdict_for(&engine, bucket, &params.transient_key, key).await {
                     ContentVerdict::Missing => {
-                        return Err(format!("verification failed: '{key}' missing on target"));
+                        return Err(PhaseStop::from(format!(
+                            "verification failed: '{key}' missing on target"
+                        )));
                     }
                     ContentVerdict::Differs => {
-                        return Err(format!(
+                        return Err(PhaseStop::from(format!(
                             "verification failed: '{key}' on target differs from the source"
-                        ));
+                        )));
                     }
                     // Unknown = no common fingerprint (foreign object); the
                     // copy phase re-copied it, so it is current.
@@ -939,10 +945,12 @@ async fn run_phases(
             }
         }
         if pager.truncated_by_page_budget() {
-            return Err("verify stopped at the page budget with more source pages \
+            return Err(PhaseStop::from(
+                "verify stopped at the page budget with more source pages \
                  pending — refusing to flip over an incompletely verified \
                  listing; job left resumable in phase 'verify'"
-                .to_string());
+                    .to_string(),
+            ));
         }
         if params.target == MigrateTarget::Mirror {
             prune_destination_extras(db, state, instance_id, job, params).await?;

@@ -152,7 +152,7 @@ pub(crate) async fn execute_backfill_phases(
     state: &std::sync::Arc<crate::api::handlers::AppState>,
     instance_id: &str,
     job: &super::store::MaintenanceJob,
-) -> Result<(), String> {
+) -> Result<(), super::worker::PhaseStop> {
     use super::worker::{drain_inflight_writes, run_count_then_walk};
 
     let params = job
@@ -186,7 +186,7 @@ impl super::worker::ObjectVisitor for Backfill<'_> {
         engine: &std::sync::Arc<crate::deltaglider::DynEngine>,
         key: &str,
         meta: &FileMetadata,
-    ) -> Result<super::worker::Visit, String> {
+    ) -> Result<super::worker::Visit, super::worker::PhaseStop> {
         use super::worker::Visit;
         if !needs_metadata_backfill(meta) {
             return Ok(Visit::Skipped);

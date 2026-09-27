@@ -178,7 +178,7 @@ async fn run_job(
         super::backfill::KIND => {
             super::backfill::execute_backfill_phases(db, state, instance_id, &job).await
         }
-        other => Err(format!("unknown maintenance job kind '{other}'")),
+        other => Err(format!("unknown maintenance job kind '{other}'").into()),
     };
     drop(keeper);
 
@@ -197,7 +197,11 @@ async fn run_job(
              (released: {:?})",
             job.id,
             bucket,
-            outcome.as_ref().err().map(String::as_str).unwrap_or(""),
+            outcome
+                .as_ref()
+                .err()
+                .map(PhaseStop::to_string)
+                .unwrap_or_default(),
             released
         );
         for k in &gated {
@@ -231,8 +235,8 @@ async fn run_job(
             row.map(|j| super::settle_status(j.objects_done, j.objects_skipped, j.objects_failed))
                 .unwrap_or(("completed", None))
         }
-        Err(e) if e == CANCELLED => ("cancelled", None),
-        Err(e) => ("failed", Some(e.clone())),
+        Err(PhaseStop::Cancelled) => ("cancelled", None),
+        Err(e) => ("failed", Some(e.to_string())),
     };
     // A phase can pre-settle its row (migrate cleanup: a note and
     // `completed_with_errors`); `maintenance_finish` then leaves it alone,
@@ -277,7 +281,7 @@ async fn execute_phases(
     state: &Arc<AppState>,
     instance_id: &str,
     job: &MaintenanceJob,
-) -> Result<(), String> {
+) -> Result<(), PhaseStop> {
     let bucket = &job.bucket;
 
     // ── Drain in-flight writes admitted before the gate armed. ──
@@ -354,7 +358,7 @@ struct Reencrypt<'a> {
 }
 
 impl ObjectVisitor for Reencrypt<'_> {
-    async fn begin_page(&mut self) -> Result<(), String> {
+    async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         // Re-resolve the desired state every page: a config apply mid-run
         // swaps the engine; the job must follow (or abort if the mode
         // became unsupported).
@@ -371,7 +375,7 @@ impl ObjectVisitor for Reencrypt<'_> {
         engine: &Arc<crate::deltaglider::DynEngine>,
         key: &str,
         meta: &crate::types::FileMetadata,
-    ) -> Result<Visit, String> {
+    ) -> Result<Visit, PhaseStop> {
         let desired = self.desired.as_ref().expect("begin_page runs first");
         if !needs_rewrite(&meta.user_metadata, desired) {
             return Ok(Visit::Skipped);
@@ -412,7 +416,7 @@ pub(crate) enum Visit {
 /// backfill-metadata). [`run_count_then_walk`] owns the rest.
 pub(crate) trait ObjectVisitor {
     /// Runs before each listing page.
-    async fn begin_page(&mut self) -> Result<(), String> {
+    async fn begin_page(&mut self) -> Result<(), PhaseStop> {
         Ok(())
     }
     /// One user object, with the metadata the driver read for it.
@@ -421,7 +425,7 @@ pub(crate) trait ObjectVisitor {
         engine: &Arc<crate::deltaglider::DynEngine>,
         key: &str,
         meta: &crate::types::FileMetadata,
-    ) -> Result<Visit, String>;
+    ) -> Result<Visit, PhaseStop>;
 }
 
 /// A job's counters, as its row stores them.
@@ -446,7 +450,7 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
     job: &MaintenanceJob,
     what: &str,
     visitor: &mut V,
-) -> Result<Counters, String> {
+) -> Result<Counters, PhaseStop> {
     let bucket = &job.bucket;
     let mut phase = job.phase.clone();
     let resume_token = job.continuation_token.clone();
@@ -508,7 +512,7 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
                 .await;
                 continue;
             }
-            Err(e) => return Err(format!("object list failed: {e}")),
+            Err(e) => return Err(format!("object list failed: {e}").into()),
         };
 
         for (key, _) in page.objects.iter().filter(|(k, _)| !k.ends_with('/')) {
@@ -555,7 +559,8 @@ pub(crate) async fn run_count_then_walk<V: ObjectVisitor>(
             "{what} stopped at the page budget with more pages pending — bucket \
              too large for one pass; job left resumable in phase 'objects' \
              (cursor persisted)"
-        ));
+        )
+        .into());
     }
     Ok(c)
 }
@@ -570,7 +575,7 @@ pub(crate) async fn counting_phase(
     instance_id: &str,
     job: &MaintenanceJob,
     resume_token: Option<String>,
-) -> Result<i64, String> {
+) -> Result<i64, PhaseStop> {
     let bucket = &job.bucket;
     // A resumed count keeps the pages before its cursor: the row's total
     // is the count up to that cursor (persisted with it, page by page).
@@ -600,7 +605,7 @@ pub(crate) async fn counting_phase(
                 persist(db, job, "counting", Some(0), 0, 0, 0, 0, None).await;
                 continue;
             }
-            Err(e) => return Err(format!("counting list failed: {e}")),
+            Err(e) => return Err(format!("counting list failed: {e}").into()),
         };
         count += page
             .objects
@@ -617,7 +622,7 @@ pub(crate) async fn counting_phase(
     if pager.truncated_by_page_budget() {
         return Err("counting stopped at the page budget with more pages \
              pending — bucket too large for one pass; job left resumable"
-            .to_string());
+            .into());
     }
     Ok(count)
 }
@@ -682,26 +687,60 @@ pub(crate) async fn drain_inflight_writes(
 
 /// Cancellation check between pages. Maps "operator asked to cancel"
 /// into the Err channel so phases unwind; the caller distinguishes it.
-pub(crate) async fn check_cancel(db: &Arc<Mutex<ConfigDb>>, job_id: i64) -> Result<(), String> {
+pub(crate) async fn check_cancel(db: &Arc<Mutex<ConfigDb>>, job_id: i64) -> Result<(), PhaseStop> {
     let db = db.lock().await;
     match db.maintenance_cancel_requested(job_id) {
-        Ok(true) => Err(CANCELLED.to_string()),
+        Ok(true) => Err(PhaseStop::Cancelled),
         _ => Ok(()),
     }
 }
-pub(crate) const CANCELLED: &str = "__cancelled__";
-/// Sentinel for "this worker's lease was not renewed". The job row is
-/// left UNTOUCHED (no settle, no unwind) — it belongs to whoever holds
-/// the lease now, or to the requeue scan once it lapses.
-pub(crate) const LEASE_LOST: &str = "__lease_lost__";
-/// Sentinel for "the process shuts down". Like [`LEASE_LOST`], the row is
-/// not settled; the worker hands it back for the next boot to resume.
-pub(crate) const SHUTTING_DOWN: &str = "__shutting_down__";
 
-/// Stop point for phase loops: `Err(SHUTTING_DOWN)` once shutdown starts.
-pub(crate) fn stop_if_shutting_down() -> Result<(), String> {
+/// Why a phase stopped before its end. Only `Failed` carries text: a
+/// phase cannot wrap a stop in an error message (`format!` needs text),
+/// so a cancel, a lost lease or a shutdown always reaches [`after_run`]
+/// as itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PhaseStop {
+    /// The operator asked to cancel.
+    Cancelled,
+    /// This worker's lease was not renewed. The job row is left UNTOUCHED
+    /// (no settle, no unwind) — it belongs to whoever holds the lease now,
+    /// or to the requeue scan once it lapses.
+    LeaseLost,
+    /// The process shuts down. Like `LeaseLost`, the row is not settled;
+    /// the worker hands it back for the next boot to resume.
+    ShuttingDown,
+    /// A job-fatal error.
+    Failed(String),
+}
+
+impl std::fmt::Display for PhaseStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PhaseStop::Cancelled => f.write_str("cancelled"),
+            PhaseStop::LeaseLost => f.write_str("lease lost"),
+            PhaseStop::ShuttingDown => f.write_str("shutting down"),
+            PhaseStop::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<String> for PhaseStop {
+    fn from(e: String) -> Self {
+        PhaseStop::Failed(e)
+    }
+}
+
+impl From<&str> for PhaseStop {
+    fn from(e: &str) -> Self {
+        PhaseStop::Failed(e.to_string())
+    }
+}
+
+/// Stop point for phase loops: `Err(ShuttingDown)` once shutdown starts.
+pub(crate) fn stop_if_shutting_down() -> Result<(), PhaseStop> {
     if crate::shutdown::is_shutting_down() {
-        Err(SHUTTING_DOWN.to_string())
+        Err(PhaseStop::ShuttingDown)
     } else {
         Ok(())
     }
@@ -722,14 +761,14 @@ pub(crate) enum AfterRun {
 /// counts as the shutdown: the runtime teardown makes healthy work fail
 /// (a refused `spawn_blocking`), and settling on it leaves a half-done
 /// bucket marked finished. An operator cancel stays a cancel.
-pub(crate) fn after_run(outcome: &Result<(), String>, shutting_down: bool) -> AfterRun {
+pub(crate) fn after_run(outcome: &Result<(), PhaseStop>, shutting_down: bool) -> AfterRun {
     match outcome {
         Ok(()) => AfterRun::Settle,
-        Err(e) if e == LEASE_LOST => AfterRun::LeaveToLeaseHolder,
-        Err(e) if e == SHUTTING_DOWN => AfterRun::ReleaseForResume,
-        Err(e) if e == CANCELLED => AfterRun::Settle,
-        Err(_) if shutting_down => AfterRun::ReleaseForResume,
-        Err(_) => AfterRun::Settle,
+        Err(PhaseStop::LeaseLost) => AfterRun::LeaveToLeaseHolder,
+        Err(PhaseStop::ShuttingDown) => AfterRun::ReleaseForResume,
+        Err(PhaseStop::Cancelled) => AfterRun::Settle,
+        Err(PhaseStop::Failed(_)) if shutting_down => AfterRun::ReleaseForResume,
+        Err(PhaseStop::Failed(_)) => AfterRun::Settle,
     }
 }
 
@@ -760,7 +799,7 @@ pub(crate) async fn persist(
 /// own: one page of copy work can outlast the TTL, and a lapsed lease lets
 /// the requeue scan hand the job back and the write gate open mid-job.
 /// When the keeper gives the lease up, the next per-page `heartbeat`
-/// reports LEASE_LOST (a lapsed lease never renews).
+/// reports `LeaseLost` (a lapsed lease never renews).
 pub(crate) fn spawn_lease_keeper(
     db: Arc<Mutex<ConfigDb>>,
     job_id: i64,
@@ -793,25 +832,25 @@ fn keeper_interval(ttl_secs: i64) -> std::time::Duration {
     std::time::Duration::from_millis((ttl_secs.max(1) as u64) * 1000 / 3)
 }
 
-/// Renew the job lease; `Err(LEASE_LOST)` means the renewal was refused
+/// Renew the job lease; `Err(LeaseLost)` means the renewal was refused
 /// (lapsed, or taken by another instance) and the phase MUST stop — this
 /// is the one subsystem that flips config and deletes source data, so a
 /// lapsed worker must never keep going. A DB error is NOT a refusal (same
 /// verdict as the keeper): stopping on it cleared the write gate while the
 /// row stayed active. A lapsed lease never renews, so once the DB answers
-/// again a lapse still reads as LEASE_LOST.
+/// again a lapse still reads as `LeaseLost`.
 pub(crate) async fn heartbeat(
     db: &Arc<Mutex<ConfigDb>>,
     job_id: i64,
     instance_id: &str,
-) -> Result<(), String> {
+) -> Result<(), PhaseStop> {
     let renewed = {
         let db = db.lock().await;
         db.maintenance_heartbeat(job_id, instance_id, current_unix_seconds(), LEASE_TTL_SECS)
     };
     match LeaseError::from_renewal(renewed) {
         Ok(()) => Ok(()),
-        Err(LeaseError::Lost) => Err(LEASE_LOST.to_string()),
+        Err(LeaseError::Lost) => Err(PhaseStop::LeaseLost),
         Err(LeaseError::Backend(e)) => {
             warn!(
                 "maintenance: job #{job_id} per-page lease renewal failed ({e}); \
@@ -851,7 +890,7 @@ pub(crate) fn gate_keys_to_clear_after_lease_loss(
     }
 }
 
-/// Record a per-object failure. Refuses with `Err(SHUTTING_DOWN)` once the
+/// Record a per-object failure. Refuses with `Err(ShuttingDown)` once the
 /// process shuts down: a failure then is most likely the runtime teardown,
 /// not the object, and counting it would settle a healthy job with errors.
 /// Callers propagate the Err so the phase stops before its page persists.
@@ -860,7 +899,7 @@ pub(crate) async fn record_failure(
     job_id: i64,
     key: &str,
     error: &str,
-) -> Result<(), String> {
+) -> Result<(), PhaseStop> {
     stop_if_shutting_down()?;
     let db = db.lock().await;
     if let Err(e) = db.maintenance_record_failure(job_id, key, error, MAX_FAILURES_RETAINED) {
@@ -963,10 +1002,7 @@ mod tests {
             .conn
             .execute_batch("ALTER TABLE maintenance_jobs_away RENAME TO maintenance_jobs")
             .unwrap();
-        assert_eq!(
-            heartbeat(&db, id, "other").await,
-            Err(LEASE_LOST.to_string())
-        );
+        assert_eq!(heartbeat(&db, id, "other").await, Err(PhaseStop::LeaseLost));
     }
 
     /// jobs-6: migrate cleanup pre-settles `completed_with_errors`; the audit
@@ -1073,18 +1109,18 @@ mod tests {
     #[test]
     fn after_run_never_settles_on_a_shutdown() {
         use AfterRun::*;
-        let err = |e: &str| Err(e.to_string());
-        let cases: [(Result<(), String>, bool, AfterRun); 10] = [
+        let failed = || Err(PhaseStop::Failed("object list failed: x".into()));
+        let cases: [(Result<(), PhaseStop>, bool, AfterRun); 10] = [
             (Ok(()), false, Settle),
             (Ok(()), true, Settle),
-            (err("object list failed: x"), false, Settle),
-            (err("object list failed: x"), true, ReleaseForResume),
-            (err(SHUTTING_DOWN), false, ReleaseForResume),
-            (err(SHUTTING_DOWN), true, ReleaseForResume),
-            (err(LEASE_LOST), false, LeaveToLeaseHolder),
-            (err(LEASE_LOST), true, LeaveToLeaseHolder),
-            (err(CANCELLED), false, Settle),
-            (err(CANCELLED), true, Settle),
+            (failed(), false, Settle),
+            (failed(), true, ReleaseForResume),
+            (Err(PhaseStop::ShuttingDown), false, ReleaseForResume),
+            (Err(PhaseStop::ShuttingDown), true, ReleaseForResume),
+            (Err(PhaseStop::LeaseLost), false, LeaveToLeaseHolder),
+            (Err(PhaseStop::LeaseLost), true, LeaveToLeaseHolder),
+            (Err(PhaseStop::Cancelled), false, Settle),
+            (Err(PhaseStop::Cancelled), true, Settle),
         ];
         for (outcome, shutting_down, want) in cases {
             assert_eq!(
@@ -1093,6 +1129,14 @@ mod tests {
                 "{outcome:?} shutting_down={shutting_down}"
             );
         }
+    }
+
+    /// The row's `last_error` is the failure text, unchanged.
+    #[test]
+    fn a_failed_stop_keeps_its_message() {
+        let e: PhaseStop = format!("copy of 'k' failed: {}", "boom").into();
+        assert_eq!(e.to_string(), "copy of 'k' failed: boom");
+        assert_eq!(PhaseStop::from("x"), PhaseStop::Failed("x".into()));
     }
 
     #[test]
