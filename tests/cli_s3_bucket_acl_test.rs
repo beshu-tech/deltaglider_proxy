@@ -12,7 +12,6 @@
 
 use crate::common;
 
-use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
 use deltaglider_proxy::cli::bucket_acl::{get_run, put_run, GetArgs, PutArgs};
 
 fn unique_bucket(prefix: &str) -> String {
@@ -29,12 +28,7 @@ fn unique_bucket(prefix: &str) -> String {
 fn get_args(bucket: &str) -> GetArgs {
     GetArgs {
         url: format!("s3://{bucket}"),
-        endpoint_url: Some(minio_endpoint_url()),
-        region: Some("us-east-1".into()),
-        profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
-        force_path_style: true,
+        aws: common::minio_aws_args(),
     }
 }
 
@@ -47,12 +41,7 @@ fn put_args(bucket: &str, canned: Option<&str>) -> PutArgs {
         grant_read_acp: None,
         grant_write: None,
         grant_write_acp: None,
-        endpoint_url: Some(minio_endpoint_url()),
-        region: Some("us-east-1".into()),
-        profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
-        force_path_style: true,
+        aws: common::minio_aws_args(),
     }
 }
 

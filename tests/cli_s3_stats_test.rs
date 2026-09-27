@@ -10,7 +10,6 @@
 
 use crate::common;
 
-use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
 use deltaglider_proxy::cli::cp::{run as cp_run, CpArgs};
 use deltaglider_proxy::cli::stats::{run as stats_run, StatsArgs};
 
@@ -38,12 +37,7 @@ fn cp_args(src: String, dst: String) -> CpArgs {
         content_type: None,
         metadata: vec![],
         quiet: true,
-        endpoint_url: Some(minio_endpoint_url()),
-        region: Some("us-east-1".into()),
-        profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
-        force_path_style: true,
+        aws: common::minio_aws_args(),
         max_object_size_mb: None,
     }
 }
@@ -67,12 +61,7 @@ fn stats_args(bucket: String, opts: StatsOpts) -> StatsArgs {
         refresh: opts.refresh,
         no_cache: opts.no_cache,
         json: opts.json,
-        endpoint_url: Some(minio_endpoint_url()),
-        region: Some("us-east-1".into()),
-        profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
-        force_path_style: true,
+        aws: common::minio_aws_args(),
     }
 }
 

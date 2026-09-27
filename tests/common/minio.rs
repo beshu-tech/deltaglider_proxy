@@ -32,6 +32,18 @@ pub fn minio_endpoint_url() -> String {
 pub const MINIO_ACCESS_KEY: &str = "minioadmin";
 pub const MINIO_SECRET_KEY: &str = "minioadmin";
 
+/// The `s3` CLI connection flags for the test MinIO.
+pub fn minio_aws_args() -> deltaglider_proxy::cli::aws_args::AwsArgs {
+    deltaglider_proxy::cli::aws_args::AwsArgs {
+        endpoint_url: Some(minio_endpoint_url()),
+        region: Some("us-east-1".into()),
+        profile: None,
+        access_key_id: Some(MINIO_ACCESS_KEY.into()),
+        secret_access_key: Some(MINIO_SECRET_KEY.into()),
+        force_path_style: true,
+    }
+}
+
 // === MinIO gating ===
 
 /// Create an S3 client pointing directly at MinIO (not through the proxy)

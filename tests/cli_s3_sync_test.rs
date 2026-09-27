@@ -4,7 +4,6 @@
 
 use crate::common;
 
-use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
 use deltaglider_proxy::cli::sync::{run as sync_run, SyncArgs};
 
 fn unique_bucket(prefix: &str) -> String {
@@ -30,12 +29,7 @@ fn sync_args(src: String, dst: String) -> SyncArgs {
         exclude: vec![],
         no_delta: false,
         quiet: true,
-        endpoint_url: Some(minio_endpoint_url()),
-        region: Some("us-east-1".into()),
-        profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
-        force_path_style: true,
+        aws: common::minio_aws_args(),
         max_object_size_mb: None,
     }
 }

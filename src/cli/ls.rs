@@ -14,9 +14,8 @@
 //! Non-recursive uses `/` as the delimiter; `CommonPrefixes` show as
 //! `                           PRE prefix/` rows.
 
-use crate::cli::aws_creds;
+use crate::cli::aws_args::{AwsArgs, EngineLimits};
 use crate::cli::config as cli_exit;
-use crate::cli::engine_factory::{build_cli_engine, CliEngineOpts};
 use crate::cli::s3_url::{is_s3_url, parse_s3_url};
 use chrono::{DateTime, Utc};
 
@@ -26,6 +25,12 @@ use chrono::{DateTime, Utc};
 /// dates). With an `s3://bucket[/prefix]` URL, lists objects at that
 /// location.
 #[derive(clap::Args, Debug, Clone)]
+#[command(
+    mut_arg("endpoint_url", |a| a.help("S3 endpoint URL (defaults to AWS S3)")),
+    mut_arg("region", |a| a.help("AWS region (default chain: flag → env → profile)")),
+    mut_arg("profile", |a| a.help("AWS profile (default chain: flag → `AWS_PROFILE` → \"default\")")),
+    mut_arg("force_path_style", |a| a.help("Use path-style URLs (required for MinIO / LocalStack)")),
+)]
 pub struct LsArgs {
     /// S3 URL (`s3://bucket[/prefix]`). Omit to list buckets.
     #[arg(value_name = "S3_URL")]
@@ -51,65 +56,16 @@ pub struct LsArgs {
     #[arg(long, value_name = "N", default_value_t = 1000)]
     pub page_size: u32,
 
-    /// S3 endpoint URL (defaults to AWS S3).
-    #[arg(long, value_name = "URL")]
-    pub endpoint_url: Option<String>,
-
-    /// AWS region (default chain: flag → env → profile).
-    #[arg(long, value_name = "NAME")]
-    pub region: Option<String>,
-
-    /// AWS profile (default chain: flag → `AWS_PROFILE` → "default").
-    #[arg(long, value_name = "NAME")]
-    pub profile: Option<String>,
-
-    /// Override `AWS_ACCESS_KEY_ID`.
-    #[arg(long, value_name = "ID")]
-    pub access_key_id: Option<String>,
-
-    /// Override `AWS_SECRET_ACCESS_KEY`.
-    #[arg(long, value_name = "KEY")]
-    pub secret_access_key: Option<String>,
-
-    /// Use path-style URLs (required for MinIO / LocalStack).
-    #[arg(long)]
-    pub force_path_style: bool,
+    #[command(flatten)]
+    pub aws: AwsArgs,
 }
 
 /// Run the `ls` command. Returns a CLI exit code (see
 /// `crate::cli::config::EXIT_*`).
 pub async fn run(args: LsArgs) -> i32 {
-    let creds = match aws_creds::resolve(aws_creds::CredsInputs {
-        access_key_flag: args.access_key_id.as_deref(),
-        secret_key_flag: args.secret_access_key.as_deref(),
-        region_flag: args.region.as_deref(),
-        profile_flag: args.profile.as_deref(),
-        ..Default::default()
-    }) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return cli_exit::EXIT_AUTH;
-        }
-    };
-
-    let opts = CliEngineOpts {
-        endpoint: args.endpoint_url.clone(),
-        region: creds.region.unwrap_or_else(|| "us-east-1".into()),
-        force_path_style: args.force_path_style,
-        access_key_id: creds.access_key_id,
-        secret_access_key: creds.secret_access_key,
-        session_token: creds.session_token,
-        max_delta_ratio: None,
-        max_object_size: None,
-        allow_local: should_allow_local(args.endpoint_url.as_deref()),
-    };
-    let engine = match build_cli_engine(opts).await {
+    let engine = match args.aws.engine(EngineLimits::default()).await {
         Ok(e) => e,
-        Err(e) => {
-            eprintln!("error: failed to initialise S3 client: {e}");
-            return e.exit_code();
-        }
+        Err(code) => return code,
     };
 
     match args.url.as_deref() {

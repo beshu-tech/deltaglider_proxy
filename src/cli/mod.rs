@@ -9,6 +9,7 @@
 //! AWS-CLI-shaped S3 commands (`cp`, `ls`, `rm`, `stats`, `verify`) each get
 //! their own module so help-text and argument shapes don't collide.
 
+pub mod aws_args;
 pub mod aws_creds;
 pub mod bucket_acl;
 pub mod config;

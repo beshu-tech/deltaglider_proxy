@@ -5,7 +5,7 @@
 use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
+
 use deltaglider_proxy::cli::cp::{run as cp_run, CpArgs};
 use deltaglider_proxy::cli::verify::{run as verify_run, VerifyArgs};
 
@@ -33,12 +33,7 @@ fn cp_args(src: String, dst: String) -> CpArgs {
         content_type: None,
         metadata: vec![],
         quiet: true,
-        endpoint_url: Some(minio_endpoint_url()),
-        region: Some("us-east-1".into()),
-        profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
-        force_path_style: true,
+        aws: common::minio_aws_args(),
         max_object_size_mb: None,
     }
 }
@@ -46,12 +41,7 @@ fn cp_args(src: String, dst: String) -> CpArgs {
 fn verify_args(url: String) -> VerifyArgs {
     VerifyArgs {
         url,
-        endpoint_url: Some(minio_endpoint_url()),
-        region: Some("us-east-1".into()),
-        profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
-        force_path_style: true,
+        aws: common::minio_aws_args(),
     }
 }
 

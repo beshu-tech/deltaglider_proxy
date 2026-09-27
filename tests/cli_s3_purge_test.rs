@@ -9,7 +9,7 @@
 use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
+
 use deltaglider_proxy::cli::purge::{run as purge_run, PurgeArgs};
 
 fn unique_bucket(prefix: &str) -> String {
@@ -28,12 +28,7 @@ fn purge_args(bucket: &str, dry_run: bool) -> PurgeArgs {
         bucket: bucket.into(),
         dry_run,
         json: false,
-        endpoint_url: Some(minio_endpoint_url()),
-        region: Some("us-east-1".into()),
-        profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
-        force_path_style: true,
+        aws: common::minio_aws_args(),
     }
 }
 

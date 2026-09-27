@@ -7,12 +7,10 @@
 //! `aws s3 rm`: `delete: s3://bucket/key` per removed (or `--dryrun`'d)
 //! object.
 
-use crate::cli::aws_creds;
+use crate::cli::aws_args::{AwsArgs, EngineLimits};
 use crate::cli::config as cli_exit;
-use crate::cli::engine_factory::{build_cli_engine, CliEngineOpts};
 use crate::cli::filter::Filter;
 use crate::cli::keys::{dir_prefix, rel_under};
-use crate::cli::ls::should_allow_local;
 use crate::cli::s3_url::{is_s3_url, parse_s3_url};
 use crate::deltaglider::DynEngine;
 
@@ -45,29 +43,8 @@ pub struct RmArgs {
     #[arg(short, long)]
     pub quiet: bool,
 
-    /// S3 endpoint URL.
-    #[arg(long, value_name = "URL")]
-    pub endpoint_url: Option<String>,
-
-    /// AWS region.
-    #[arg(long, value_name = "NAME")]
-    pub region: Option<String>,
-
-    /// AWS profile.
-    #[arg(long, value_name = "NAME")]
-    pub profile: Option<String>,
-
-    /// Override `AWS_ACCESS_KEY_ID`.
-    #[arg(long, value_name = "ID")]
-    pub access_key_id: Option<String>,
-
-    /// Override `AWS_SECRET_ACCESS_KEY`.
-    #[arg(long, value_name = "KEY")]
-    pub secret_access_key: Option<String>,
-
-    /// Use path-style URLs (MinIO / LocalStack).
-    #[arg(long)]
-    pub force_path_style: bool,
+    #[command(flatten)]
+    pub aws: AwsArgs,
 }
 
 pub async fn run(args: RmArgs) -> i32 {
@@ -83,37 +60,9 @@ pub async fn run(args: RmArgs) -> i32 {
         }
     };
 
-    let creds = match aws_creds::resolve(aws_creds::CredsInputs {
-        access_key_flag: args.access_key_id.as_deref(),
-        secret_key_flag: args.secret_access_key.as_deref(),
-        region_flag: args.region.as_deref(),
-        profile_flag: args.profile.as_deref(),
-        ..Default::default()
-    }) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return cli_exit::EXIT_AUTH;
-        }
-    };
-
-    let opts = CliEngineOpts {
-        endpoint: args.endpoint_url.clone(),
-        region: creds.region.unwrap_or_else(|| "us-east-1".into()),
-        force_path_style: args.force_path_style,
-        access_key_id: creds.access_key_id,
-        secret_access_key: creds.secret_access_key,
-        session_token: creds.session_token,
-        max_delta_ratio: None,
-        max_object_size: None,
-        allow_local: should_allow_local(args.endpoint_url.as_deref()),
-    };
-    let engine = match build_cli_engine(opts).await {
+    let engine = match args.aws.engine(EngineLimits::default()).await {
         Ok(e) => e,
-        Err(e) => {
-            eprintln!("error: failed to initialise S3 client: {e}");
-            return e.exit_code();
-        }
+        Err(code) => return code,
     };
 
     if args.recursive {

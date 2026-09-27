@@ -7,7 +7,7 @@
 use crate::common;
 
 use aws_sdk_s3::primitives::ByteStream;
-use common::{minio_client, minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
+use common::minio_client;
 use deltaglider_proxy::cli::ls::{run, LsArgs};
 
 /// Build a fresh bucket name for one test. Uniqueness comes from the
@@ -32,12 +32,7 @@ fn make_args(url: Option<String>) -> LsArgs {
         human_readable: false,
         summarize: false,
         page_size: 1000,
-        endpoint_url: Some(minio_endpoint_url()),
-        region: Some("us-east-1".into()),
-        profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
-        force_path_style: true,
+        aws: common::minio_aws_args(),
     }
 }
 

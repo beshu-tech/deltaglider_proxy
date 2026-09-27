@@ -17,9 +17,8 @@
 //! into typed slots, and unknown dg-* fields fall through the
 //! passthrough fallback).
 
-use crate::cli::aws_creds;
+use crate::cli::aws_args::AwsArgs;
 use crate::cli::config as cli_exit;
-use crate::cli::engine_factory::build_raw_s3_client;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -39,29 +38,8 @@ pub struct PurgeArgs {
     #[arg(long)]
     pub json: bool,
 
-    /// S3 endpoint URL.
-    #[arg(long, value_name = "URL")]
-    pub endpoint_url: Option<String>,
-
-    /// AWS region.
-    #[arg(long, value_name = "NAME")]
-    pub region: Option<String>,
-
-    /// AWS profile.
-    #[arg(long, value_name = "NAME")]
-    pub profile: Option<String>,
-
-    /// Override `AWS_ACCESS_KEY_ID`.
-    #[arg(long, value_name = "ID")]
-    pub access_key_id: Option<String>,
-
-    /// Override `AWS_SECRET_ACCESS_KEY`.
-    #[arg(long, value_name = "KEY")]
-    pub secret_access_key: Option<String>,
-
-    /// Use path-style URLs (MinIO / LocalStack).
-    #[arg(long)]
-    pub force_path_style: bool,
+    #[command(flatten)]
+    pub aws: AwsArgs,
 }
 
 const PURGE_PREFIX: &str = ".deltaglider/tmp/";
@@ -95,7 +73,7 @@ pub fn is_expired(expires_at: &str, now: DateTime<Utc>) -> Result<bool, String> 
 pub async fn run(args: PurgeArgs) -> i32 {
     let started = std::time::Instant::now();
 
-    let client = match build_client(&args).await {
+    let client = match args.aws.client().await {
         Ok(c) => c,
         Err(code) => return code,
     };
@@ -302,27 +280,6 @@ fn emit(result: &PurgeResult, json: bool) {
             eprintln!("  - {line}");
         }
     }
-}
-
-async fn build_client(args: &PurgeArgs) -> Result<aws_sdk_s3::Client, i32> {
-    let creds = aws_creds::resolve(aws_creds::CredsInputs {
-        access_key_flag: args.access_key_id.as_deref(),
-        secret_key_flag: args.secret_access_key.as_deref(),
-        region_flag: args.region.as_deref(),
-        profile_flag: args.profile.as_deref(),
-        ..Default::default()
-    })
-    .map_err(|e| {
-        eprintln!("error: {e}");
-        cli_exit::EXIT_AUTH
-    })?;
-
-    build_raw_s3_client(&creds, args.endpoint_url.clone(), args.force_path_style)
-        .await
-        .map_err(|e| {
-            eprintln!("error: failed to initialise S3 client: {e}");
-            e.exit_code()
-        })
 }
 
 fn flatten_err<E: std::error::Error>(e: &E) -> String {

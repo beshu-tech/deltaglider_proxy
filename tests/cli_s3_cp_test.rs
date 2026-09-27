@@ -15,7 +15,7 @@
 
 use crate::common;
 
-use common::{minio_client, minio_endpoint_url, MINIO_ACCESS_KEY, MINIO_SECRET_KEY};
+use common::minio_client;
 use deltaglider_proxy::cli::cp::{run, CpArgs};
 
 fn unique_bucket(prefix: &str) -> String {
@@ -42,12 +42,7 @@ fn default_args(src: String, dst: String) -> CpArgs {
         content_type: None,
         metadata: vec![],
         quiet: false,
-        endpoint_url: Some(minio_endpoint_url()),
-        region: Some("us-east-1".into()),
-        profile: None,
-        access_key_id: Some(MINIO_ACCESS_KEY.into()),
-        secret_access_key: Some(MINIO_SECRET_KEY.into()),
-        force_path_style: true,
+        aws: common::minio_aws_args(),
         max_object_size_mb: None,
     }
 }

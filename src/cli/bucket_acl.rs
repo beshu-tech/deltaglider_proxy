@@ -9,9 +9,8 @@
 //! but build a one-shot `aws_sdk_s3::Client` directly rather than
 //! going through the engine (ACLs don't touch object content).
 
-use crate::cli::aws_creds;
+use crate::cli::aws_args::AwsArgs;
 use crate::cli::config as cli_exit;
-use crate::cli::engine_factory::build_raw_s3_client;
 use crate::cli::s3_url::{is_s3_url, parse_s3_url};
 use aws_sdk_s3::types::BucketCannedAcl;
 use serde::Serialize;
@@ -22,29 +21,8 @@ pub struct GetArgs {
     #[arg(value_name = "S3_URL")]
     pub url: String,
 
-    /// S3 endpoint URL.
-    #[arg(long, value_name = "URL")]
-    pub endpoint_url: Option<String>,
-
-    /// AWS region.
-    #[arg(long, value_name = "NAME")]
-    pub region: Option<String>,
-
-    /// AWS profile.
-    #[arg(long, value_name = "NAME")]
-    pub profile: Option<String>,
-
-    /// Override `AWS_ACCESS_KEY_ID`.
-    #[arg(long, value_name = "ID")]
-    pub access_key_id: Option<String>,
-
-    /// Override `AWS_SECRET_ACCESS_KEY`.
-    #[arg(long, value_name = "KEY")]
-    pub secret_access_key: Option<String>,
-
-    /// Use path-style URLs (MinIO / LocalStack).
-    #[arg(long)]
-    pub force_path_style: bool,
+    #[command(flatten)]
+    pub aws: AwsArgs,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -81,29 +59,8 @@ pub struct PutArgs {
     #[arg(long, value_name = "GRANTEE")]
     pub grant_write_acp: Option<String>,
 
-    /// S3 endpoint URL.
-    #[arg(long, value_name = "URL")]
-    pub endpoint_url: Option<String>,
-
-    /// AWS region.
-    #[arg(long, value_name = "NAME")]
-    pub region: Option<String>,
-
-    /// AWS profile.
-    #[arg(long, value_name = "NAME")]
-    pub profile: Option<String>,
-
-    /// Override `AWS_ACCESS_KEY_ID`.
-    #[arg(long, value_name = "ID")]
-    pub access_key_id: Option<String>,
-
-    /// Override `AWS_SECRET_ACCESS_KEY`.
-    #[arg(long, value_name = "KEY")]
-    pub secret_access_key: Option<String>,
-
-    /// Use path-style URLs (MinIO / LocalStack).
-    #[arg(long)]
-    pub force_path_style: bool,
+    #[command(flatten)]
+    pub aws: AwsArgs,
 }
 
 /// JSON-serialisable wire shape mirroring the AWS CLI's `get-bucket-acl`
@@ -153,16 +110,7 @@ pub async fn get_run(args: GetArgs) -> i32 {
         Ok(b) => b,
         Err(code) => return code,
     };
-    let client = match build_client(
-        args.access_key_id.as_deref(),
-        args.secret_access_key.as_deref(),
-        args.region.as_deref(),
-        args.profile.as_deref(),
-        args.endpoint_url.clone(),
-        args.force_path_style,
-    )
-    .await
-    {
+    let client = match args.aws.client().await {
         Ok(c) => c,
         Err(code) => return code,
     };
@@ -231,16 +179,7 @@ pub async fn put_run(args: PutArgs) -> i32 {
         None => None,
     };
 
-    let client = match build_client(
-        args.access_key_id.as_deref(),
-        args.secret_access_key.as_deref(),
-        args.region.as_deref(),
-        args.profile.as_deref(),
-        args.endpoint_url.clone(),
-        args.force_path_style,
-    )
-    .await
-    {
+    let client = match args.aws.client().await {
         Ok(c) => c,
         Err(code) => return code,
     };
@@ -308,34 +247,6 @@ fn validate_bucket_only(url: &str) -> Result<String, i32> {
         return Err(cli_exit::EXIT_USAGE);
     }
     Ok(loc.bucket)
-}
-
-async fn build_client(
-    access_key: Option<&str>,
-    secret_key: Option<&str>,
-    region_flag: Option<&str>,
-    profile_flag: Option<&str>,
-    endpoint: Option<String>,
-    force_path_style: bool,
-) -> Result<aws_sdk_s3::Client, i32> {
-    let creds = aws_creds::resolve(aws_creds::CredsInputs {
-        access_key_flag: access_key,
-        secret_key_flag: secret_key,
-        region_flag,
-        profile_flag,
-        ..Default::default()
-    })
-    .map_err(|e| {
-        eprintln!("error: {e}");
-        cli_exit::EXIT_AUTH
-    })?;
-
-    build_raw_s3_client(&creds, endpoint, force_path_style)
-        .await
-        .map_err(|e| {
-            eprintln!("error: failed to initialise S3 client: {e}");
-            e.exit_code()
-        })
 }
 
 fn display_sdk_err<E: std::error::Error>(e: &E) -> String {

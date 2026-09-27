@@ -18,14 +18,11 @@
 //! present (modulo the `.delta` suffix) is skipped. Re-running after a
 //! partial migration picks up where it left off without copying twice.
 
-use crate::cli::aws_creds;
+use crate::cli::aws_args::{AwsArgs, EngineLimits};
 use crate::cli::config as cli_exit;
-use crate::cli::engine_factory::{
-    build_cli_engine, copy_user_metadata, render_store_error, CliEngineOpts,
-};
+use crate::cli::engine_factory::{build_cli_engine, copy_user_metadata, render_store_error};
 use crate::cli::filter::Filter;
 use crate::cli::keys::{dir_prefix, rel_under};
-use crate::cli::ls::should_allow_local;
 use crate::cli::s3_url::{is_s3_url, parse_s3_url, S3Loc};
 use crate::deltaglider::DynEngine;
 use std::collections::HashSet;
@@ -33,6 +30,7 @@ use std::io::BufRead;
 use std::sync::Arc;
 
 #[derive(clap::Args, Debug, Clone)]
+#[command(mut_args(endpoint_flags()))]
 pub struct MigrateArgs {
     /// Source S3 URL (`s3://bucket[/prefix]`).
     #[arg(value_name = "SRC_S3_URL")]
@@ -79,10 +77,8 @@ pub struct MigrateArgs {
     #[arg(short, long)]
     pub quiet: bool,
 
-    /// S3 endpoint URL for the destination side (and the default for
-    /// the source side if `--source-endpoint-url` is not set).
-    #[arg(long, value_name = "URL")]
-    pub endpoint_url: Option<String>,
+    #[command(flatten)]
+    pub aws: AwsArgs,
 
     /// S3 endpoint URL for the SOURCE side. When set, the source
     /// list and retrieve calls go to this endpoint; the destination
@@ -97,31 +93,34 @@ pub struct MigrateArgs {
     #[arg(long, value_name = "URL")]
     pub source_endpoint_url: Option<String>,
 
-    /// AWS region.
-    #[arg(long, value_name = "NAME")]
-    pub region: Option<String>,
-
-    /// AWS profile.
-    #[arg(long, value_name = "NAME")]
-    pub profile: Option<String>,
-
-    /// Override `AWS_ACCESS_KEY_ID`.
-    #[arg(long, value_name = "ID")]
-    pub access_key_id: Option<String>,
-
-    /// Override `AWS_SECRET_ACCESS_KEY`.
-    #[arg(long, value_name = "KEY")]
-    pub secret_access_key: Option<String>,
-
-    /// Use path-style URLs (MinIO / LocalStack).
-    #[arg(long)]
-    pub force_path_style: bool,
-
     /// Override the engine's per-object size ceiling (MiB) for BOTH
     /// source and destination. Default 100 MiB. Migrations of large
     /// artifacts (release ZIPs, disk images) need this raised.
     #[arg(long, value_name = "MIB")]
     pub max_object_size_mb: Option<u64>,
+}
+
+/// The two endpoint flags of `migrate`. `--endpoint-url` sits inside the
+/// flattened [`AwsArgs`]; this gives it the migrate help text and lists
+/// `--source-endpoint-url` right after it in `--help` (same display
+/// order, ties sort by name). One pass in arg order, because `mut_arg`
+/// moves an arg to the end of the list.
+fn endpoint_flags() -> impl FnMut(clap::Arg) -> clap::Arg {
+    let mut endpoint_order = None;
+    move |a| match a.get_id().as_str() {
+        "endpoint_url" => {
+            endpoint_order = Some(a.get_display_order());
+            a.help(
+                "S3 endpoint URL for the destination side (and the default for the \
+                 source side if `--source-endpoint-url` is not set)",
+            )
+        }
+        "source_endpoint_url" => match endpoint_order {
+            Some(o) => a.display_order(o),
+            None => a,
+        },
+        _ => a,
+    }
 }
 
 /// Pure: compute the effective destination prefix given source prefix +
@@ -397,29 +396,11 @@ fn parse_url(url: &str) -> Result<S3Loc, i32> {
 async fn build_engines_from_args(
     args: &MigrateArgs,
 ) -> Result<(Arc<DynEngine>, Arc<DynEngine>), i32> {
-    let creds = aws_creds::resolve(aws_creds::CredsInputs {
-        access_key_flag: args.access_key_id.as_deref(),
-        secret_key_flag: args.secret_access_key.as_deref(),
-        region_flag: args.region.as_deref(),
-        profile_flag: args.profile.as_deref(),
-        ..Default::default()
-    })
-    .map_err(|e| {
-        eprintln!("error: {e}");
-        cli_exit::EXIT_AUTH
-    })?;
-    let region = creds.region.unwrap_or_else(|| "us-east-1".into());
-    let dst_opts = CliEngineOpts {
-        endpoint: args.endpoint_url.clone(),
-        region: region.clone(),
-        force_path_style: args.force_path_style,
-        access_key_id: creds.access_key_id.clone(),
-        secret_access_key: creds.secret_access_key.clone(),
-        session_token: creds.session_token.clone(),
-        max_delta_ratio: args.max_ratio,
-        max_object_size: args.max_object_size_mb.map(|mb| mb * 1024 * 1024),
-        allow_local: should_allow_local(args.endpoint_url.as_deref()),
-    };
+    let creds = args.aws.resolve()?;
+    let limits = EngineLimits::from_flags(args.max_ratio, args.max_object_size_mb);
+    let dst_opts = args
+        .aws
+        .engine_opts(&creds, args.aws.endpoint_url.as_deref(), limits);
     let dst_engine = Arc::new(build_cli_engine(dst_opts).await.map_err(|e| {
         eprintln!("error: failed to initialise destination S3 client: {e}");
         e.exit_code()
@@ -428,17 +409,7 @@ async fn build_engines_from_args(
     let src_engine = match args.source_endpoint_url.as_deref() {
         None => Arc::clone(&dst_engine),
         Some(src_url) => {
-            let src_opts = CliEngineOpts {
-                endpoint: Some(src_url.to_string()),
-                region,
-                force_path_style: args.force_path_style,
-                access_key_id: creds.access_key_id,
-                secret_access_key: creds.secret_access_key,
-                session_token: creds.session_token,
-                max_delta_ratio: args.max_ratio,
-                max_object_size: args.max_object_size_mb.map(|mb| mb * 1024 * 1024),
-                allow_local: should_allow_local(Some(src_url)),
-            };
+            let src_opts = args.aws.engine_opts(&creds, Some(src_url), limits);
             Arc::new(build_cli_engine(src_opts).await.map_err(|e| {
                 eprintln!("error: failed to initialise source S3 client: {e}");
                 e.exit_code()
