@@ -20,7 +20,8 @@ If you are CPU-bound, the highest-leverage move is usually to mark genuinely-inc
 
 Memory is the variable most people underestimate, because it scales with *object size × concurrency*, not with the dataset.
 
-- **Passthrough reads/writes:** constant memory. They stream.
+- **Passthrough reads:** constant memory. They stream.
+- **Single-request uploads (`PutObject`):** the proxy reads the whole request body into memory before it stores it, because it checks the SigV4 payload hash and the `Content-MD5` of the complete body. For this reason, one upload holds up to its own size in RAM, for passthrough and delta objects alike, and the cap is **`DGP_MAX_OBJECT_SIZE`**. Plan for roughly `N × object` of transient RAM for N concurrent uploads. An `UploadPart` request is read into memory in the same way, up to the size of its part.
 - **Delta reads (reconstruction):** xdelta3 needs the reference baseline and the output object in RAM at once. Peak working memory for a single delta GET is on the order of the reconstructed object size plus the reference — bounded per object by **`DGP_MAX_OBJECT_SIZE`** (default 100 MB). With the default cap and N concurrent delta GETs of large objects, plan for roughly `N × (object + reference)` of transient RAM on top of the baseline footprint.
 - **Reference cache (`DGP_CACHE_MB`, default 100 MB):** an LRU that keeps hot baselines in memory so only the first cold read of a deltaspace pays a backend round-trip. Raising it trades RAM for fewer backend fetches on read-heavy workloads; it does not change the per-request buffering cost.
 - **Metadata cache (`DGP_METADATA_CACHE_MB`, default 50 MB):** caches per-object `FileMetadata` for HEAD/GET/LIST. Small and bounded.
