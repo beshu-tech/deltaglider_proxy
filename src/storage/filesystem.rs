@@ -227,9 +227,12 @@ fn flush_pending_fsync() -> Result<(), StorageError> {
     fsync_paths(paths)
 }
 
-/// The end of every atomic write: fsync (unless deferred), rename, and
-/// record a deferred file. Blocking.
-fn finish_write(
+/// The end of every atomic write, and the one owner of its durability:
+/// fsync the file, rename it over `target`, fsync the parent directory
+/// (the rename is an entry of it); or, `Deferred`, rename and record the
+/// file and its directory in the pending set for `flush_pending`.
+/// Blocking.
+fn durable_rename(
     tmp: NamedTempFile,
     target: &Path,
     durability: Durability,
@@ -297,7 +300,7 @@ async fn atomic_write_with_metadata(
         if let Some(json) = &meta_json {
             xattr_meta::set_metadata_xattr(tmp.path(), json)?;
         }
-        finish_write(tmp, &path, durability)
+        durable_rename(tmp, &path, durability)
     })
     .await
     .map_err(super::join_error)?
@@ -335,7 +338,7 @@ async fn atomic_copy_with_metadata(
         let mut tmp = dir.temp()?;
         std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
         xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
-        finish_write(tmp, &target, durability)
+        durable_rename(tmp, &target, durability)
     })
     .await
     .map_err(super::join_error)?
@@ -1433,7 +1436,7 @@ impl StorageBackend for FilesystemBackend {
                 std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
             }
             xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
-            finish_write(tmp, &target, durability)
+            durable_rename(tmp, &target, durability)
         })
         .await
         .map_err(super::join_error)?
@@ -1506,7 +1509,7 @@ impl StorageBackend for FilesystemBackend {
             }
             // Write xattr before rename — atomic metadata+data visibility.
             xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
-            finish_write(tmp, &target, durability)
+            durable_rename(tmp, &target, durability)
         })
         .await
         .map_err(super::join_error)??;
