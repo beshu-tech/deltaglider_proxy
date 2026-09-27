@@ -8,10 +8,9 @@
 //! unit-tested and proptested without spinning up a backend.
 //!
 //! Consumed by `transfer.rs` (the copy branch) and `engine/store.rs`
-//! (the multipart store). The constants are env-overridable through the
-//! `env_parse_with_default` convention.
-
-use crate::config::env_parse_with_default;
+//! (the multipart store). The constants are the defaults; the
+//! `DGP_STREAM_COPY_THRESHOLD` / `DGP_MULTIPART_PART_SIZE` /
+//! `DGP_UPLOAD_CONCURRENCY` overrides live in `config::RuntimeTuning`.
 
 const MIB: u64 = 1024 * 1024;
 
@@ -61,25 +60,6 @@ impl PartSpan {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-}
-
-/// Env-resolved stream-copy threshold (`DGP_STREAM_COPY_THRESHOLD`).
-pub fn stream_copy_threshold() -> u64 {
-    // Floored at 1: threshold 0 would admit a 0-byte object, and plan_parts(0)
-    // is empty → a zero-part CompleteMultipartUpload. A 1-byte object still has
-    // one part, so `>= 1` keeps empties off the streaming path.
-    env_parse_with_default("DGP_STREAM_COPY_THRESHOLD", STREAM_COPY_THRESHOLD).max(1)
-}
-
-/// Env-resolved multipart part size (`DGP_MULTIPART_PART_SIZE`), clamped
-/// to the S3 minimum so a misconfiguration can't produce illegal parts.
-pub fn multipart_part_size() -> u64 {
-    env_parse_with_default("DGP_MULTIPART_PART_SIZE", MULTIPART_PART_SIZE).max(S3_MIN_PART_SIZE)
-}
-
-/// Env-resolved in-flight parts per object (`DGP_UPLOAD_CONCURRENCY`).
-pub fn upload_concurrency() -> usize {
-    env_parse_with_default("DGP_UPLOAD_CONCURRENCY", UPLOAD_CONCURRENCY).max(1)
 }
 
 /// True only for a passthrough-labelled object at/above the threshold.

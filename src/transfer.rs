@@ -99,7 +99,7 @@ pub(crate) struct ObjectTransferRequest<'a> {
     pub strip_user_metadata_keys: &'a [&'a str],
     pub operation: &'a str,
     /// In-flight parts for the streaming multipart path (Phase B). `None`
-    /// falls back to the env-resolved `transfer_plan::upload_concurrency()`.
+    /// falls back to `RuntimeTuning::upload_concurrency` (`DGP_UPLOAD_CONCURRENCY`).
     /// Only the replication worker overrides it (from config).
     pub upload_concurrency: Option<usize>,
     /// Keep the source's created-at on the destination instead of the copy
@@ -228,7 +228,7 @@ async fn copy_object_once(
     // reference / small / proxy-AES-destination objects keep the buffered
     // path below (preserves all current ETag/delta semantics + tests).
     let label = source_head.storage_info.label();
-    let threshold = transfer_plan::stream_copy_threshold();
+    let threshold = engine.tuning().stream_copy_threshold;
     if transfer_plan::should_stream_copy(source_head.file_size, label, threshold)
         && engine.destination_supports_native_multipart(request.destination_bucket)
     {
@@ -357,10 +357,11 @@ async fn stream_copy_passthrough(
     source_head: &crate::types::FileMetadata,
 ) -> Result<ObjectTransferOutcome, CopyError> {
     let total = source_head.file_size;
-    let part_size = transfer_plan::multipart_part_size();
+    let tuning = engine.tuning();
+    let part_size = tuning.multipart_part_size;
     let concurrency = request
         .upload_concurrency
-        .unwrap_or_else(transfer_plan::upload_concurrency)
+        .unwrap_or(tuning.upload_concurrency)
         .clamp(1, 16);
     let spans = transfer_plan::plan_parts(total, part_size);
 

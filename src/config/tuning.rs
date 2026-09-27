@@ -10,6 +10,7 @@
 
 use super::env_overrides::parse_bool;
 use super::{lookup_bool, lookup_parse, EnvLookup};
+use crate::transfer_plan as tp;
 
 /// The xdelta3 subprocess deadlines (see `deltaglider::codec`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +73,15 @@ pub struct RuntimeTuning {
     pub spool_acquire_timeout_secs: u64,
     /// `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES`.
     pub mpu_delta_reconstruct_max_bytes: u64,
+    /// `DGP_STREAM_COPY_THRESHOLD`: a passthrough copy at least this
+    /// large streams via multipart (at least 1).
+    pub stream_copy_threshold: u64,
+    /// `DGP_MULTIPART_PART_SIZE`: part size of that copy (at least the
+    /// S3 minimum).
+    pub multipart_part_size: u64,
+    /// `DGP_UPLOAD_CONCURRENCY`: in-flight parts per streaming copy that
+    /// sets no value of its own (at least 1).
+    pub upload_concurrency: usize,
     pub ready: ReadyProbe,
     /// `DGP_REFERENCE_SCAN_LIMIT`: reference HEADs of one savings chip.
     pub reference_scan_limit: usize,
@@ -117,6 +127,15 @@ impl RuntimeTuning {
                 "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
                 64 * 1024 * 1024,
             ),
+            // Floored at 1: a zero threshold would admit a 0-byte object, and
+            // plan_parts(0) is empty → a zero-part CompleteMultipartUpload.
+            stream_copy_threshold: parse_or("DGP_STREAM_COPY_THRESHOLD", tp::STREAM_COPY_THRESHOLD)
+                .max(1),
+            multipart_part_size: parse_or("DGP_MULTIPART_PART_SIZE", tp::MULTIPART_PART_SIZE)
+                .max(tp::S3_MIN_PART_SIZE),
+            upload_concurrency: lookup_parse(env, "DGP_UPLOAD_CONCURRENCY")
+                .unwrap_or(tp::UPLOAD_CONCURRENCY)
+                .max(1),
             ready: ReadyProbe {
                 timeout_secs: parse_or("DGP_READY_TIMEOUT_SECS", 3).max(1),
                 retries: lookup_parse(env, "DGP_READY_RETRIES").unwrap_or(2),
@@ -181,6 +200,18 @@ mod tests {
         assert_eq!(t.spool_acquire_timeout_secs, 120);
         assert_eq!(t.mpu_delta_reconstruct_max_bytes, 64 * 1024 * 1024);
         assert_eq!(
+            (
+                t.stream_copy_threshold,
+                t.multipart_part_size,
+                t.upload_concurrency
+            ),
+            (
+                crate::transfer_plan::STREAM_COPY_THRESHOLD,
+                crate::transfer_plan::MULTIPART_PART_SIZE,
+                crate::transfer_plan::UPLOAD_CONCURRENCY
+            )
+        );
+        assert_eq!(
             t.ready,
             ReadyProbe {
                 timeout_secs: 3,
@@ -216,6 +247,9 @@ mod tests {
             ("DGP_READY_RETRIES", "5"),
             ("DGP_READY_CACHE_TTL_SECS", "-4"),
             ("DGP_REFERENCE_SCAN_LIMIT", "3"),
+            ("DGP_STREAM_COPY_THRESHOLD", "15"),
+            ("DGP_MULTIPART_PART_SIZE", "6291456"),
+            ("DGP_UPLOAD_CONCURRENCY", "16"),
         ]);
         assert_eq!((t.request_timeout_secs, t.max_concurrent_requests), (7, 8));
         assert!(t.cors_permissive && t.debug_headers && t.trust_proxy_headers);
@@ -243,6 +277,14 @@ mod tests {
             }
         );
         assert_eq!(t.reference_scan_limit, 3);
+        assert_eq!(
+            (
+                t.stream_copy_threshold,
+                t.multipart_part_size,
+                t.upload_concurrency
+            ),
+            (15, 6 * 1024 * 1024, 16)
+        );
         assert!(from(&[("DGP_SECRET_ACCESS_KEY", "x")]).bootstrap_pair_from_env);
         assert_eq!(
             from(&[("DGP_BOOTSTRAP_PASSWORD_HASH", "$2b$x")]).bootstrap_hash_env,
@@ -268,6 +310,24 @@ mod tests {
         assert!(!edited.tuning.debug_headers, "YAML never carries it");
         edited.reapply_env_overrides(&running, &env).unwrap();
         assert!(edited.tuning.debug_headers);
+    }
+
+    /// A zero threshold would stream an empty object as a zero-part
+    /// upload, a part below the S3 minimum is illegal, and zero in-flight
+    /// parts never finishes a copy.
+    #[test]
+    fn streaming_copy_settings_are_floored() {
+        let t = from(&[
+            ("DGP_STREAM_COPY_THRESHOLD", "0"),
+            ("DGP_MULTIPART_PART_SIZE", "1024"),
+            ("DGP_UPLOAD_CONCURRENCY", "0"),
+        ]);
+        assert_eq!(t.stream_copy_threshold, 1);
+        assert_eq!(
+            t.multipart_part_size,
+            crate::transfer_plan::S3_MIN_PART_SIZE
+        );
+        assert_eq!(t.upload_concurrency, 1);
     }
 
     #[test]
