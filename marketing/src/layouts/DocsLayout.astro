@@ -5,10 +5,8 @@
 // The sidebar order/grouping is identical to the in-product docs viewer
 // because both read docs/product/manifest.json.
 //
-// Display type ("Technical logbook" direction): Schibsted Grotesk for doc
-// headings + Spline Sans Mono for the logbook labels (eyebrows, §/# markers,
-// breadcrumb, TOC). Loaded via the BaseLayout `head` slot so the two extra
-// families only ship on /docs pages, not the whole marketing site.
+// Type: the site's own Manrope and JetBrains Mono (no docs-only families),
+// so the docs read as the same site as the marketing pages.
 
 import BaseLayout from './BaseLayout.astro';
 import { docsByGroup } from '../lib/docs';
@@ -29,12 +27,8 @@ const { title, description, activeSlug, hasToc = false, markdownUrl } = Astro.pr
 const groups = docsByGroup();
 ---
 
-<BaseLayout title={title} description={description} ogType="article">
+<BaseLayout title={title} description={description} ogType="article" wide>
   <Fragment slot="head">
-    <link
-      href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@500;600;700;800&family=Spline+Sans+Mono:wght@500;600&display=swap"
-      rel="stylesheet"
-    />
     {/* Pagefind UI styles (bundle built by the postbuild step; 404 on dev). */}
     <link href="/_pagefind/pagefind-ui.css" rel="stylesheet" />
     {markdownUrl && <link rel="alternate" type="text/markdown" href={markdownUrl} />}

@@ -1,10 +1,10 @@
 /* ════════════════════════════════════════════════════════════════════════
    docs.css — "Technical Logbook" reading experience for /docs.
 
-   Display: Schibsted Grotesk (commissioned newspaper grotesque — engineered
-   editorial voice). Labels/eyebrows/# anchor markers: Spline Sans Mono (a softer
-   mono than the code face, so the "logbook label" voice reads distinct from
-   actual code). Code: JetBrains Mono via shiki, brand-tuned theme.
+   Type: the site's two families only. Manrope for headings and labels
+   (sentence case), JetBrains Mono for code, via shiki with a brand-tuned
+   theme. The docs are the same site as the marketing pages, not a second
+   brand (docs/plan/site-design-audit-2026-09.md).
 
    Cyan (--brand) is a SIGNAL — active nav, link hover, code rail, the datum
    marks — never decoration. Every body run / table cell / code line resolves
@@ -13,13 +13,8 @@
    ════════════════════════════════════════════════════════════════════════ */
 
 :root {
-  --doc-display: 'Schibsted Grotesk', var(--font-sans);
-  --doc-label: 'Spline Sans Mono', var(--font-mono);
-
-  --doc-grid-line: rgba(148, 163, 184, 0.05);
-  --doc-grid-size: 30px;
-  --doc-glow: var(--brand-tint);
-  --doc-glow-accent: var(--accent-wash);
+  --doc-display: var(--font-sans);
+  --doc-label: var(--font-sans);
 
   --doc-rule: var(--rule);
   --doc-callout-bg: var(--brand-tint);
@@ -52,7 +47,6 @@
    its dark surface in both themes (shiki writes dark syntax colours
    inline; code reads as code), so --doc-code-* stay put. */
 :root[data-theme='light'] {
-  --doc-grid-line: rgba(15, 23, 42, 0.05);
   --doc-accent-blue: #155e75;
   --doc-link: #2451b2;
   --doc-link-hover: #16327a;
@@ -69,7 +63,7 @@
      than a doc page, or the layout visibly jumps when navigating. */
   max-width: 1240px;
   margin: 0 auto;
-  padding: 44px 24px 96px;
+  padding: 44px 2rem 96px;
   align-items: start;
   position: relative;
   isolation: isolate;
@@ -80,26 +74,9 @@
   max-width: 1240px;
 }
 
-/* Blueprint atmosphere: a fixed graph-paper grid + two soft radial glows,
-   painted behind the docs so it never scroll-jitters or repaints the text. */
-.docs-shell::before {
-  content: "";
-  position: fixed;
-  inset: 0;
-  z-index: -1;
-  pointer-events: none;
-  background:
-    radial-gradient(60% 50% at 78% 6%, var(--doc-glow), transparent 70%),
-    radial-gradient(45% 45% at 6% 94%, var(--doc-glow-accent), transparent 70%),
-    linear-gradient(var(--doc-grid-line) 1px, transparent 1px),
-    linear-gradient(90deg, var(--doc-grid-line) 1px, transparent 1px);
-  background-size:
-    100% 100%, 100% 100%,
-    var(--doc-grid-size) var(--doc-grid-size),
-    var(--doc-grid-size) var(--doc-grid-size);
-  -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 55%, transparent 100%);
-          mask-image: linear-gradient(to bottom, #000 0%, #000 55%, transparent 100%);
-}
+/* The docs header and footer use the docs shell width, so the logo lines
+   up with the sidebar. */
+body.shell-wide { --shell: 1240px; }
 
 /* ── Left sidebar: logbook index ───────────────────────────────────────── */
 .docs-sidebar {
@@ -241,9 +218,7 @@
 .docs-kicker {
   font-family: var(--doc-label);
   font-size: 0.8125rem; /* 13px — was 0.72rem (~11.5px) */
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  font-weight: 700;
   color: var(--doc-accent-blue); /* softer accent, not raw brand cyan */
   margin: 0 0 6px;
 }
@@ -418,8 +393,7 @@
 .docs-prose .shiki-wrap[data-lang]:not([data-lang="text"])::after {
   content: attr(data-lang);
   position: absolute; top: 11px; right: 14px;
-  font-family: var(--doc-label); font-size: 0.62rem; font-weight: 600;
-  letter-spacing: 0.1em; text-transform: uppercase;
+  font-family: var(--font-mono); font-size: 0.7rem; font-weight: 600;
   color: var(--ink-mute); opacity: 0.65; pointer-events: none;
   transition: opacity 0.14s;
 }
@@ -431,7 +405,7 @@
 .docs-prose pre.mermaid {
   background: var(--bg-card);
   text-align: center;
-  border-style: dashed;
+  border-style: solid;
   color: var(--ink-700);
   padding: 24px clamp(12px, 4%, 40px);
   display: flex;
@@ -472,14 +446,13 @@
 }
 .docs-prose thead th {
   font-family: var(--doc-label); font-size: 0.7rem; font-weight: 600;
-  text-transform: uppercase; letter-spacing: 0.08em;
   color: var(--ink-soft); background: var(--bg-soft);
   text-align: left; padding: 11px 14px;
   border-bottom: 1px solid var(--rule-strong); white-space: nowrap;
 }
 .docs-prose tbody td {
   padding: 11px 14px; text-align: left; vertical-align: top;
-  color: var(--ink-700); border-bottom: 1px solid var(--doc-grid-line);
+  color: var(--ink-700); border-bottom: 1px solid var(--rule);
 }
 .docs-prose tbody tr:last-child td { border-bottom: none; }
 .docs-prose tbody tr:hover td { background: var(--brand-tint); }
@@ -520,7 +493,7 @@
    passes WCAG AA for small text, where --ink-mute (#475569 ≈ 2.7:1) failed. */
 .docs-toc-eyebrow {
   font-family: var(--doc-label); font-size: 0.8125rem; font-weight: 600;
-  text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-500);
+ color: var(--ink-500);
   margin: 0 0 12px;
 }
 .docs-toc nav ul { list-style: none; margin: 0; padding: 0; }
@@ -571,11 +544,11 @@
   text-decoration: none; min-width: 0;
   transition: border-color 0.14s, transform 0.14s, background 0.14s;
 }
-.docs-pager-card:hover { border-color: var(--brand); transform: translateY(-2px); }
+.docs-pager-card:hover { border-color: var(--brand); }
 .docs-pager-next { text-align: right; }
 .docs-pager-eyebrow {
   font-family: var(--doc-label); font-size: 0.8125rem; font-weight: 600;
-  letter-spacing: 0.04em; color: var(--ink-500);
+  color: var(--ink-500);
 }
 .docs-pager-title {
   font-size: 0.98rem; font-weight: 600; color: var(--ink-strong);
@@ -612,7 +585,7 @@
 /* Eyebrow heading above the three featured cards. */
 .docs-landing-start-label {
   font-family: var(--doc-label); font-size: 0.8125rem; font-weight: 600;
-  text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-500);
+ color: var(--ink-500);
   margin: 0 0 12px;
 }
 /* Footnote demoting the "bundled into the product" note below the cards. */
@@ -634,10 +607,10 @@
   background: var(--bg-card); border: 1px solid var(--rule); border-radius: 12px;
   transition: border-color 0.14s, transform 0.14s;
 }
-.docs-start-card:hover { border-color: var(--brand); transform: translateY(-2px); }
+.docs-start-card:hover { border-color: var(--brand); }
 .docs-start-eyebrow {
-  font-family: var(--doc-label); font-size: 0.66rem; letter-spacing: 0.12em;
-  text-transform: uppercase; color: var(--brand);
+  font-family: var(--doc-label); font-size: var(--fs-label); font-weight: 700;
+ color: var(--brand);
 }
 .docs-start-title { font-family: var(--doc-display); font-weight: 700; font-size: 1.02rem; color: var(--ink-strong); }
 .docs-start-note { font-size: 0.86rem; line-height: 1.45; color: var(--ink-soft); }
@@ -683,7 +656,7 @@
   color: var(--brand); opacity: 0; transition: opacity 0.14s, transform 0.14s;
   font-family: var(--font-mono);
 }
-.docs-landing-list a:hover { border-color: var(--brand); transform: translateY(-1px); }
+.docs-landing-list a:hover { border-color: var(--brand); }
 .docs-landing-list a:hover::after { opacity: 1; transform: translateX(2px); }
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -711,7 +684,6 @@
   .docs-sidebar:not(.is-open) .docs-nav-panel { display: none; }
   .docs-sidebar.is-open .docs-nav-panel { margin-top: 14px; }
   .docs-sidebar.is-open .docs-nav-toggle .docs-nav-chevron { transform: rotate(0deg); }
-  .docs-shell::before { --doc-grid-size: 24px; }
   .docs-pager { grid-template-columns: 1fr; }
   .docs-pager-next { text-align: left; }
   .docs-pager-spacer { display: none; }
@@ -755,7 +727,7 @@
 .docs-toc-mobile > summary {
   padding: 10px 14px; cursor: pointer;
   font-family: var(--doc-label); font-size: 0.8125rem; font-weight: 600;
-  text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-500);
+ color: var(--ink-500);
 }
 /* It sits inside .docs-prose, so undo the prose list and link styling. */
 .docs-prose .docs-toc-mobile ul { list-style: none; margin: 0; padding: 0 14px 12px; max-width: none; }
@@ -1043,14 +1015,14 @@
   }
   .docs-prose table.docs-table-stack tbody td {
     display: block; padding: 8px 14px 10px;
-    border-bottom: 1px solid var(--doc-grid-line);
+    border-bottom: 1px solid var(--rule);
   }
   .docs-prose table.docs-table-stack tbody td:last-child { border-bottom: none; }
   .docs-prose table.docs-table-stack tbody td[data-label]::before {
     content: attr(data-label);
     display: block; margin: 0 0 2px;
     font-family: var(--doc-label); font-size: 0.75rem; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-500);
+ color: var(--ink-500);
   }
   /* The first cell names the row: it is the card's title. */
   .docs-prose table.docs-table-stack tbody td:first-child {

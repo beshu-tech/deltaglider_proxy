@@ -208,9 +208,55 @@ if (showToc && html) {
         // useMaxWidth:false lets the rendered SVG scale up to fill its container
         // (matches the in-product viewer) instead of locking to the tiny intrinsic
         // width — the CSS in docs.css then caps it at a readable max-width.
+        // Diagrams take the site's tokens (base theme + variables read from
+        // the live CSS), so they match the page in both themes instead of
+        // Mermaid's lavender-and-yellow defaults.
+        const css = getComputedStyle(document.documentElement);
+        const tok = (n: string) => css.getPropertyValue(n).trim();
+        const solid = (n: string) => {
+          // Mermaid needs opaque colours; resolve a token through a probe.
+          const probe = document.createElement('span');
+          probe.style.color = `var(${n})`;
+          document.body.appendChild(probe);
+          const c = getComputedStyle(probe).color;
+          probe.remove();
+          return c;
+        };
         mermaid.initialize({
           startOnLoad: false,
-          theme: dark ? 'dark' : 'default',
+          theme: 'base',
+          darkMode: dark,
+          fontFamily: tok('--font-sans'),
+          themeVariables: {
+            darkMode: dark,
+            fontFamily: tok('--font-sans'),
+            background: solid('--bg'),
+            primaryColor: solid('--bg-alt'),
+            primaryBorderColor: solid('--brand'),
+            primaryTextColor: solid('--ink-strong'),
+            secondaryColor: solid('--bg-alt'),
+            tertiaryColor: solid('--bg'),
+            lineColor: solid('--ink-faint'),
+            textColor: solid('--ink'),
+            actorBkg: solid('--bg-alt'),
+            actorBorder: solid('--brand'),
+            actorTextColor: solid('--ink-strong'),
+            actorLineColor: solid('--ink-faint'),
+            signalColor: solid('--ink-soft'),
+            signalTextColor: solid('--ink'),
+            labelBoxBkgColor: solid('--bg-alt'),
+            labelBoxBorderColor: solid('--rule-strong'),
+            labelTextColor: solid('--ink'),
+            loopTextColor: solid('--ink'),
+            noteBkgColor: solid('--bg-alt'),
+            noteBorderColor: solid('--rule-strong'),
+            noteTextColor: solid('--ink-soft'),
+            activationBkgColor: solid('--bg-alt'),
+            activationBorderColor: solid('--brand'),
+            clusterBkg: solid('--bg'),
+            clusterBorder: solid('--rule-strong'),
+            edgeLabelBackground: solid('--bg'),
+          },
           flowchart: { useMaxWidth: false },
           sequence: { useMaxWidth: false },
         });

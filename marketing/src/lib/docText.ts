@@ -39,5 +39,10 @@ export function extractSummary(markdown: string, max = 155): string {
     .replace(/[*_`#>]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
-  return text.length > max ? text.slice(0, max - 1).trimEnd() + '…' : text;
+  if (text.length <= max) return text;
+  // Cut at a word boundary, so a summary never ends mid-word ("a small del…").
+  const cut = text.slice(0, max - 1);
+  const space = cut.lastIndexOf(' ');
+  const head = space > max * 0.6 ? cut.slice(0, space) : cut;
+  return head.replace(/[\s,;:.\-–—(]+$/, '') + '…';
 }

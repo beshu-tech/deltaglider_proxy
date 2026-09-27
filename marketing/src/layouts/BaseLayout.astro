@@ -18,6 +18,8 @@ interface Props {
   canonical?: string;
   ogImage?: string;
   ogType?: 'website' | 'article';
+  /** Wider page shell for the header and footer (the docs layout). */
+  wide?: boolean;
 }
 
 const {
@@ -26,6 +28,7 @@ const {
   canonical,
   ogImage = SITE.ogImage,
   ogType = 'website',
+  wide = false,
 } = Astro.props;
 const canonicalUrl = canonical ?? new URL(Astro.url.pathname, Astro.site).toString();
 const ogImageUrl = new URL(ogImage, Astro.site).toString();
@@ -89,7 +92,7 @@ const ogImageUrl = new URL(ogImage, Astro.site).toString();
     {/* Page-scoped head extras (e.g. docs-only display fonts). */}
     <slot name="head" />
   </head>
-  <body>
+  <body class:list={{ 'shell-wide': wide }}>
     <SiteHeader />
 
     <main>
