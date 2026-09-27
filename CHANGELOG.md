@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v2.0.0 — 2026-09-27
+
 ### Upgrade steps for 2.0.0 (read before you upgrade)
 
 2.0.0 is a major release because some changes stop a setup that worked on
@@ -30,6 +32,11 @@
    - ListObjectsV2 continuation tokens are opaque (`dg1.` prefix).
    - Delta objects larger than 16 MiB use the spool directory, so
      `DGP_SPOOL_DIR` must be writable.
+6. **License terms:** the 15 TB free grant now counts every stored copy
+   that DeltaGlider writes (replicas and archives included), across your
+   whole organization, as a monthly average. Check your footprint in the
+   admin dashboard. See "licensing: the free grant and the plans are per
+   organization" below.
 
 ### Changed — licensing: the free grant and the plans are per organization
 
