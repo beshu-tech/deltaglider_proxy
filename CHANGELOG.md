@@ -9,6 +9,14 @@ rule gate refused a document, `/config/apply` returned the parse-time warnings
 of the document, but `/config/validate` returned none. Now `/config/validate`
 returns the same warnings as `/config/apply`.
 
+### Fixed — A multipart upload that tries no delta is not assembled in memory
+
+CompleteMultipartUpload assembled the parts of a delta-eligible key into one
+buffer for the delta decision, also when the upload carried the
+`dg-no-delta: true` hint or went to a bucket with compression disabled. Such
+an upload is always stored as a plain object, so now the proxy stores it from
+the parts, as it does for a key that is not delta-eligible.
+
 ### Fixed — `--no-delta` stores the object as a plain object
 
 The `--no-delta` flag of `s3 cp`, `s3 sync` and `s3 migrate` added the user

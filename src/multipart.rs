@@ -673,6 +673,13 @@ impl MultipartStore {
         Ok(etag)
     }
 
+    /// The user metadata the upload was created with: its store hints decide
+    /// how the completion stores it.
+    pub fn user_metadata(&self, upload_id: &str) -> Option<HashMap<String, String>> {
+        let uploads = self.uploads.read();
+        uploads.get(upload_id).map(|u| u.user_metadata.clone())
+    }
+
     /// Get the size of a specific uploaded part (for quota pre-check).
     pub fn get_part_size(&self, upload_id: &str, part_number: u32) -> Option<u64> {
         let uploads = self.uploads.read();

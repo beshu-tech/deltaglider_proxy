@@ -832,3 +832,41 @@ async fn copy_source_above_the_spool_threshold_streams_to_a_spool() {
         Some("SlowDown".to_string())
     );
 }
+
+/// N10: a multipart completion that tries no delta (a non-eligible key, the
+/// `dg-no-delta` hint, a bucket without compression) stores the parts as
+/// they are; only a delta candidate within the rebuild limit is assembled.
+#[tokio::test]
+async fn completion_assembles_only_a_delta_candidate() {
+    use crate::deltaglider::{DeltaGliderEngine, DynEngine};
+    use crate::storage::StorageBackend;
+    use std::collections::HashMap;
+    let dir = tempfile::tempdir().unwrap();
+    let backend: Box<dyn StorageBackend> = Box::new(
+        crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let mut config = crate::config::Config::default();
+    config.buckets.insert(
+        "plain".to_string(),
+        crate::bucket_policy::BucketPolicyConfig {
+            compression: Some(false),
+            ..Default::default()
+        },
+    );
+    let engine: DynEngine = DeltaGliderEngine::new_with_backend(Arc::new(backend), &config, None);
+    let limit = engine.tuning().mpu_delta_reconstruct_max_bytes;
+    let none = HashMap::new();
+    let hint = HashMap::from([("dg-no-delta".to_string(), "true".to_string())]);
+    let parts =
+        |bucket, key, meta, size| completion_stores_from_parts(&engine, bucket, key, meta, size);
+    assert!(!parts("b", "a/app.zip", &none, limit), "a delta candidate");
+    assert!(
+        parts("b", "a/app.zip", &none, limit + 1),
+        "too large to rebuild"
+    );
+    assert!(parts("b", "a/photo.jpg", &none, 1), "not delta-eligible");
+    assert!(parts("b", "a/app.zip", &hint, 1), "the hint");
+    assert!(parts("plain", "a/app.zip", &none, 1), "compression off");
+}

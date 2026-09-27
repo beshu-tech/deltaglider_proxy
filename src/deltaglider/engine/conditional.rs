@@ -171,8 +171,8 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             .await?)
     }
 
-    /// Store a client body that is already in memory. A large delta-eligible
-    /// body goes through the streaming spool store, so the delta encode and
+    /// Store a client body that is already in memory. A large body that tries
+    /// a delta goes through the streaming spool store, so the delta encode and
     /// the ratio decision run with bounded memory; the others are stored
     /// buffered.
     async fn store_client_body(
@@ -184,7 +184,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: HashMap<String, String>,
     ) -> Result<StoreResult, EngineError> {
         let size = data.len() as u64;
-        if size > self.spool_threshold() && self.is_delta_eligible_key(key) {
+        if size > self.spool_threshold() && self.write_tries_delta(bucket, key, &user_metadata) {
             let spool = self.spool_acquire(size).await?;
             tokio::fs::write(spool.path(), data)
                 .await

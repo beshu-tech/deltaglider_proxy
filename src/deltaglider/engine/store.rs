@@ -380,6 +380,22 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.store_delta_eligible(put, prior_for_counter).await
     }
 
+    /// Whether a write of `key` into `bucket` with `user_metadata` tries a
+    /// delta (the `StorePlan::tries_delta` rule). Multipart completion asks before it
+    /// assembles the parts; counts nothing.
+    pub fn write_tries_delta(
+        &self,
+        bucket: &str,
+        key: &str,
+        user_metadata: &HashMap<String, String>,
+    ) -> bool {
+        StorePlan::tries_delta(
+            self.bucket_policies.compression_enabled(bucket),
+            self.is_delta_eligible(key),
+            crate::types::no_delta_requested(user_metadata),
+        )
+    }
+
     /// [`StorePlan::tries_delta`] for this bucket and key, counting a
     /// passthrough decision.
     fn tries_delta(

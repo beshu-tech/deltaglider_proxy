@@ -186,10 +186,18 @@ pub(super) async fn complete_multipart_upload(
                 },
             )
             .await?;
-            let engine = svc.state.engine.load();
-            let force_chunked_passthrough = !engine.is_delta_eligible(&input.key)
-                || total_parts_size > engine.tuning().mpu_delta_reconstruct_max_bytes;
-            drop(engine);
+            let user_metadata = svc
+                .state
+                .multipart
+                .user_metadata(&input.upload_id)
+                .unwrap_or_default();
+            let force_chunked_passthrough = completion_stores_from_parts(
+                &svc.state.engine.load(),
+                &input.bucket,
+                &input.key,
+                &user_metadata,
+                total_parts_size,
+            );
             let state = svc.state.clone();
             let (bucket, key, upload_id) = (
                 input.bucket.clone(),
@@ -226,6 +234,20 @@ pub(super) async fn complete_multipart_upload(
             }
         }
     }
+}
+
+/// Whether CompleteMultipartUpload stores the parts as they are, never
+/// assembled into one buffer: the write tries no delta, or it is too large
+/// to rebuild for one.
+pub(super) fn completion_stores_from_parts(
+    engine: &crate::deltaglider::DynEngine,
+    bucket: &str,
+    key: &str,
+    user_metadata: &std::collections::HashMap<String, String>,
+    total_parts_size: u64,
+) -> bool {
+    !engine.write_tries_delta(bucket, key, user_metadata)
+        || total_parts_size > engine.tuning().mpu_delta_reconstruct_max_bytes
 }
 
 pub(super) async fn list_multipart_uploads(
