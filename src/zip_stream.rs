@@ -798,7 +798,7 @@ mod tests {
     /// The producer runs at most a channel's depth ahead of the client
     /// (backpressure, so memory is bounded), and a client that goes away
     /// stops it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_producer_waits_for_the_client_and_stops_without_it() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let opened = std::sync::Arc::new(AtomicUsize::new(0));
@@ -815,13 +815,15 @@ mod tests {
             |_: &[String], _: &[(String, String)]| None,
         ));
         s.next().await.unwrap().unwrap();
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
+        // Paused time moves only when every task is idle, so this sleep ends
+        // when the producer blocks on the full channel: the bound is checked
+        // at the producer's furthest point, not after a guessed number of
+        // turns.
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
         // Three chunks per entry (header, data, descriptor).
         let ahead = opened.load(Ordering::SeqCst);
         assert!(
-            ahead <= CHANNEL_DEPTH / 3 + 2,
+            (CHANNEL_DEPTH / 3..=CHANNEL_DEPTH / 3 + 2).contains(&ahead),
             "producer ran {ahead} entries ahead"
         );
         drop(s);

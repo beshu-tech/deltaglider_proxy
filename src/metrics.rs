@@ -1077,15 +1077,23 @@ mod tests {
         rt.block_on(async {
             let m = Arc::new(Metrics::new());
             spawn_tokio_runtime_metrics_sampler(&m);
-            // Let at least one tick run (interval fires immediately, but give
-            // the task a moment to be polled).
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            let names: Vec<String> = m
-                .registry
-                .gather()
-                .iter()
-                .map(|f| f.name().to_string())
-                .collect();
+            // Poll to a deadline, not a fixed sleep: a loaded CI runner may
+            // run the first tick (or the next 1 s tick) late.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let gather_names = || -> Vec<String> {
+                m.registry
+                    .gather()
+                    .iter()
+                    .map(|f| f.name().to_string())
+                    .collect()
+            };
+            let mut names = gather_names();
+            while !names.iter().any(|n| n == "deltaglider_tokio_workers")
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                names = gather_names();
+            }
             #[allow(unused_mut)]
             let mut expected_names = vec![
                 "deltaglider_tokio_workers",
@@ -1116,27 +1124,32 @@ mod tests {
             assert!(has_range, "poll-time counter must be labelled by range");
 
             // The schedule-latency counters must COUNT, not only exist: wake
-            // tasks, wait past the next 1s tick, and expect a non-zero sum.
+            // tasks until a later tick exports a non-zero sum.
             #[cfg(target_pointer_width = "64")]
             {
-                for _ in 0..200 {
-                    tokio::spawn(async { tokio::task::yield_now().await })
-                        .await
-                        .unwrap();
+                let sched_total = || -> f64 {
+                    m.registry
+                        .gather()
+                        .into_iter()
+                        .find(|f| f.name() == "deltaglider_tokio_schedule_latency_range_total")
+                        .expect("schedule-latency family present")
+                        .get_metric()
+                        .iter()
+                        .map(|mm| mm.get_counter().get_value())
+                        .sum()
+                };
+                while sched_total() == 0.0 && std::time::Instant::now() < deadline {
+                    for _ in 0..200 {
+                        tokio::spawn(async { tokio::task::yield_now().await })
+                            .await
+                            .unwrap();
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-                let sched = m
-                    .registry
-                    .gather()
-                    .into_iter()
-                    .find(|f| f.name() == "deltaglider_tokio_schedule_latency_range_total")
-                    .expect("schedule-latency family present");
-                let total: f64 = sched
-                    .get_metric()
-                    .iter()
-                    .map(|mm| mm.get_counter().get_value())
-                    .sum();
-                assert!(total > 0.0, "schedule-latency counters must advance");
+                assert!(
+                    sched_total() > 0.0,
+                    "schedule-latency counters must advance"
+                );
             }
         });
     }
