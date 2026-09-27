@@ -567,9 +567,9 @@ async fn write_cache(
     let body = serde_json::to_vec_pretty(doc).map_err(|e| format!("serialise cache doc: {e}"))?;
     let mut user_meta = HashMap::new();
     user_meta.insert("x-deltaglider-cache".to_string(), "true".to_string());
-    // Tag with the same hint the proxy server already honours so the
-    // codec never tries to delta-encode this JSON blob.
-    user_meta.insert("dg-no-delta".to_string(), "true".to_string());
+    // The engine stores a `.json` key passthrough anyway; the hint keeps it
+    // passthrough if the list of delta-eligible extensions changes.
+    crate::cli::engine_factory::set_no_delta_hint(&mut user_meta, true);
     engine
         .store(
             bucket,

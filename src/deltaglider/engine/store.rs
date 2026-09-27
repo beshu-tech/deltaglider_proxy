@@ -74,8 +74,12 @@ pub(crate) enum StorePlan {
 impl StorePlan {
     /// Whether a PUT tries a delta at all. No: store passthrough, with no
     /// baseline.
-    pub(crate) fn tries_delta(compression_enabled: bool, delta_eligible: bool) -> bool {
-        compression_enabled && delta_eligible
+    pub(crate) fn tries_delta(
+        compression_enabled: bool,
+        delta_eligible: bool,
+        no_delta_requested: bool,
+    ) -> bool {
+        compression_enabled && delta_eligible && !no_delta_requested
     }
 
     /// After the encode. S-P1-1: the ratio is checked on EVERY PUT, not only
@@ -180,7 +184,7 @@ fn passthrough_metadata(
 ) -> FileMetadata {
     let mut metadata =
         FileMetadata::new_passthrough(filename.to_string(), sha256, md5, size, content_type);
-    metadata.user_metadata = user_metadata;
+    metadata.set_user_metadata(user_metadata);
     metadata.multipart_etag = multipart_etag;
     metadata
 }
@@ -362,7 +366,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             user_metadata,
             multipart_etag,
         };
-        if !self.tries_delta(bucket, &obj_key) {
+        if !self.tries_delta(bucket, &obj_key, &put.user_metadata) {
             let _guard = self.acquire_prefix_lock(bucket, &deltaspace_id).await;
             let result = self
                 .write_passthrough_locked(put.passthrough_write(), None)
@@ -378,13 +382,21 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
     /// [`StorePlan::tries_delta`] for this bucket and key, counting a
     /// passthrough decision.
-    fn tries_delta(&self, bucket: &str, obj_key: &ObjectKey) -> bool {
+    fn tries_delta(
+        &self,
+        bucket: &str,
+        obj_key: &ObjectKey,
+        user_metadata: &HashMap<String, String>,
+    ) -> bool {
         let compression = self.bucket_policies.compression_enabled(bucket);
         let eligible = self.file_router.is_delta_eligible(&obj_key.filename);
-        if StorePlan::tries_delta(compression, eligible) {
+        let no_delta = crate::types::no_delta_requested(user_metadata);
+        if StorePlan::tries_delta(compression, eligible, no_delta) {
             return true;
         }
-        if compression {
+        if no_delta {
+            debug!("The PUT asks for no delta, storing as passthrough");
+        } else if compression {
             debug!("File type not delta-eligible, storing as passthrough");
         } else {
             debug!("Compression disabled for bucket '{bucket}', storing as passthrough");
@@ -460,6 +472,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         let is_passthrough = !StorePlan::tries_delta(
             self.bucket_policies.compression_enabled(bucket),
             self.file_router.is_delta_eligible(&obj_key.filename),
+            crate::types::no_delta_requested(&user_metadata),
         );
         let ceiling = if is_passthrough {
             self.max_passthrough_object_size
@@ -484,7 +497,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
 
         // (2) Not delta-eligible → passthrough from the body spool.
-        if !self.tries_delta(bucket, &obj_key) {
+        if !self.tries_delta(bucket, &obj_key, &user_metadata) {
             let result = self
                 .store_passthrough_file_inner(
                     bucket,
@@ -908,7 +921,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             delta.len() as u64,
             put.content_type.clone(),
         );
-        metadata.user_metadata = put.user_metadata.clone();
+        metadata.set_user_metadata(put.user_metadata.clone());
         metadata.multipart_etag = put.multipart_etag.clone();
         xnode
             .put_delta(
@@ -1226,7 +1239,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             total_size,
             content_type,
         );
-        metadata.user_metadata = user_metadata;
+        metadata.set_user_metadata(user_metadata);
         metadata.multipart_etag = multipart_etag;
 
         self.storage
@@ -1338,7 +1351,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             total_size,
             content_type,
         );
-        metadata.user_metadata = user_metadata;
+        metadata.set_user_metadata(user_metadata);
         metadata.multipart_etag = Some(multipart_etag);
 
         self.storage
@@ -1495,7 +1508,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             total_size,
             content_type.clone(),
         );
-        create_meta.user_metadata = user_metadata.clone();
+        create_meta.set_user_metadata(user_metadata.clone());
 
         let upload = self
             .storage
@@ -1569,7 +1582,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
             handle.total_size,
             handle.content_type.clone(),
         );
-        metadata.user_metadata = std::mem::take(&mut handle.user_metadata);
+        metadata.set_user_metadata(std::mem::take(&mut handle.user_metadata));
         metadata.multipart_etag = multipart_etag;
 
         if let Err(e) = self
@@ -1812,15 +1825,15 @@ mod counter_tests {
     use crate::config::Config;
     use crate::storage::FilesystemBackend;
 
-    const BUCKET: &str = "counter-bkt";
+    pub(super) const BUCKET: &str = "counter-bkt";
 
-    struct Harness {
+    pub(super) struct Harness {
         _tmp: tempfile::TempDir,
         usage: Arc<BucketUsage>,
-        engine: DeltaGliderEngine<FilesystemBackend>,
+        pub(super) engine: DeltaGliderEngine<FilesystemBackend>,
     }
 
-    async fn harness() -> Harness {
+    pub(super) async fn harness() -> Harness {
         let tmp = tempfile::tempdir().unwrap();
         let backend = FilesystemBackend::new(tmp.path().to_path_buf())
             .await
@@ -1849,7 +1862,7 @@ mod counter_tests {
     }
 
     /// Two versions of a delta-eligible artifact: v2 is v1 with a small edit.
-    fn versions() -> (Vec<u8>, Vec<u8>) {
+    pub(super) fn versions() -> (Vec<u8>, Vec<u8>) {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         let v1: Vec<u8> = (0..200_000)
             .map(|_| {
@@ -1985,6 +1998,83 @@ mod counter_tests {
             let (count, logical, _) = row(&h);
             assert_eq!(count, 1, "{sink}: overwrite must not add an object");
             assert_eq!(logical, v2.len() as u64, "{sink}: logical bytes of v2 only");
+        }
+    }
+}
+
+/// N1: `dg-no-delta: true` user metadata (the `--no-delta` flag of the CLI,
+/// or `x-amz-meta-dg-no-delta` from an S3 client) stores a delta-eligible
+/// object passthrough, and the hint itself is not stored.
+#[cfg(test)]
+mod no_delta_hint_tests {
+    use super::counter_tests::{harness, versions, BUCKET};
+    use super::*;
+
+    fn with_hint() -> HashMap<String, String> {
+        HashMap::from([
+            ("dg-no-delta".to_string(), "true".to_string()),
+            ("owner".to_string(), "ci".to_string()),
+        ])
+    }
+
+    #[tokio::test]
+    async fn the_hint_stores_passthrough_and_is_not_persisted() {
+        let (v1, v2) = versions();
+        let h = harness().await;
+        // Control: without the hint, v2 is a delta against v1.
+        h.engine
+            .store(BUCKET, "ctl/v1.zip", &v1, None, HashMap::new())
+            .await
+            .unwrap();
+        let ctl = h
+            .engine
+            .store(BUCKET, "ctl/v2.zip", &v2, None, HashMap::new())
+            .await
+            .unwrap();
+        assert!(ctl.metadata.is_delta(), "control must delta-encode");
+
+        for (key, data) in [("rel/v1.zip", &v1), ("rel/v2.zip", &v2)] {
+            let r = h
+                .engine
+                .store(BUCKET, key, data, None, with_hint())
+                .await
+                .unwrap();
+            assert!(
+                matches!(r.metadata.storage_info, StorageInfo::Passthrough),
+                "{key}: buffered PUT with the hint must be passthrough"
+            );
+        }
+        let spool = h.engine.spool_acquire(v2.len() as u64).await.unwrap();
+        tokio::fs::write(spool.path(), &v2).await.unwrap();
+        let r = h
+            .engine
+            .store_spooled_delta(
+                BUCKET,
+                "rel/v3.zip",
+                &spool,
+                v2.len() as u64,
+                None,
+                with_hint(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r.metadata.storage_info, StorageInfo::Passthrough),
+            "spooled PUT with the hint must be passthrough"
+        );
+        assert!(
+            !h.engine.storage.has_reference(BUCKET, "rel").await.unwrap(),
+            "the hint must not seed a baseline"
+        );
+        for key in ["rel/v1.zip", "rel/v2.zip", "rel/v3.zip"] {
+            h.engine.metadata_cache.invalidate(BUCKET, key);
+            let meta = h.engine.head(BUCKET, key).await.unwrap();
+            assert_eq!(
+                meta.user_metadata,
+                HashMap::from([("owner".to_string(), "ci".to_string())]),
+                "{key}: the hint is an instruction, not stored metadata"
+            );
         }
     }
 }

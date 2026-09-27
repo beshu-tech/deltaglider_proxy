@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed — `--no-delta` stores the object as a plain object
+
+The `--no-delta` flag of `s3 cp`, `s3 sync` and `s3 migrate` added the user
+metadata `dg-no-delta: true`, but the engine did not read it, so a
+delta-eligible file was still delta-encoded, and the hint was stored with the
+object. Now the engine stores an object that carries this hint as a plain
+(passthrough) object and does not store the hint. The proxy reads the same
+hint from an S3 client as `x-amz-meta-dg-no-delta: true`.
+
 ### Fixed — A ZIP download stops reading when the client goes away
 
 The admin ZIP download noticed a closed connection only when it sent the next

@@ -94,6 +94,8 @@ A download (`cp -r` or `sync` from S3 to a local directory) writes only below th
 
 `cp`, `sync`, `migrate`, and `verify` do not hold a large object in memory. An object of 8 MiB or less is read into memory, because a spool copy costs more than it saves for a small file. A larger upload is first copied into a spool file (in `DGP_SPOOL_DIR`, within the `DGP_SPOOL_MAX_BYTES` budget) and then stored from that file. A download writes the object to a temporary file beside the destination and renames the file into place at the end, so a failed download does not leave a truncated file. An S3-to-S3 copy writes the source into a spool file first. `verify` hashes the object while it reads it. The engine itself reconstructs a delta object in memory when the object is smaller than the spool threshold (`DGP_SPOOL_THRESHOLD_BYTES`), and in a spool file when it is larger.
 
+`--no-delta` on `cp`, `sync`, and `migrate` stores each object as a plain object, without a delta against the `reference.bin` baseline. The verb sends the user metadata `dg-no-delta: true`, and the engine does not store this hint with the object. An S3 client that stores through the proxy can send the same hint as the header `x-amz-meta-dg-no-delta: true`.
+
 `--max-object-size-mb` sets the size limit for delta-eligible objects only (default 100 MiB), because the xdelta3 memory use grows with the object size. Other files are limited only by `advanced.max_passthrough_object_size` (default 64 GiB).
 
 ### `s3 verify` results

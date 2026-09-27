@@ -443,3 +443,53 @@ async fn cp_s3_to_s3_preserves_source_user_metadata() {
     }
     s3.delete_bucket().bucket(&bucket).send().await.ok();
 }
+
+/// `--no-delta` stores a delta-eligible file as a plain object: no
+/// `reference.bin` baseline, no `.delta` object, and no hint key in the
+/// stored metadata.
+#[tokio::test]
+async fn cp_no_delta_stores_a_zip_as_a_plain_object() {
+    skip_unless_minio!();
+    let bucket = unique_bucket("nodelta");
+    let s3 = minio_client().await;
+    s3.create_bucket().bucket(&bucket).send().await.unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let body: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+    for name in ["v1.zip", "v2.zip"] {
+        let local = tmp.path().join(name);
+        std::fs::write(&local, &body).unwrap();
+        let mut args = default_args(
+            local.to_string_lossy().to_string(),
+            format!("s3://{bucket}/rel/{name}"),
+        );
+        args.no_delta = true;
+        assert_eq!(run(args).await, deltaglider_proxy::cli::config::EXIT_OK);
+    }
+
+    let listing = s3.list_objects_v2().bucket(&bucket).send().await.unwrap();
+    let mut keys: Vec<String> = listing
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(str::to_string))
+        .collect();
+    keys.sort();
+    assert_eq!(keys, vec!["rel/v1.zip", "rel/v2.zip"], "plain objects only");
+    let head = s3
+        .head_object()
+        .bucket(&bucket)
+        .key("rel/v2.zip")
+        .send()
+        .await
+        .unwrap();
+    let meta = head.metadata().cloned().unwrap_or_default();
+    assert!(
+        !meta.keys().any(|k| k.eq_ignore_ascii_case("dg-no-delta")),
+        "the hint must not be stored: {meta:?}"
+    );
+
+    for k in keys {
+        s3.delete_object().bucket(&bucket).key(k).send().await.ok();
+    }
+    s3.delete_bucket().bucket(&bucket).send().await.ok();
+}

@@ -16,7 +16,7 @@
 
 use crate::cli::aws_args::{AwsArgs, EngineLimits};
 use crate::cli::config as cli_exit;
-use crate::cli::engine_factory::copy_user_metadata;
+use crate::cli::engine_factory::{copy_user_metadata, set_no_delta_hint};
 use crate::cli::filter::Filter;
 use crate::cli::keys::{dir_prefix, local_path_for_key, rel_under, LocalPathError};
 use crate::cli::s3_url::{is_s3_url, parse_s3_url, S3Loc};
@@ -292,18 +292,11 @@ async fn upload_one(
         return cli_exit::EXIT_OK;
     }
     let content_type = args.content_type.clone();
-    let meta = if args.no_delta {
-        let mut m = user_meta.clone();
-        // The engine consults the user-metadata bag for a few hint
-        // keys; the documented "store as passthrough" lever for
-        // ad-hoc clients is `x-amz-meta-dg-no-delta = true`. The
-        // proxy server reads the same key. Keeping the surface
-        // uniform avoids a CLI-only feature flag.
-        m.insert("dg-no-delta".to_string(), "true".to_string());
-        m
-    } else {
-        user_meta.clone()
-    };
+    let mut meta = user_meta.clone();
+    // The engine stores an object that carries this hint as passthrough and
+    // drops the hint before it writes the metadata. The proxy reads the same
+    // key from `x-amz-meta-dg-no-delta`.
+    set_no_delta_hint(&mut meta, args.no_delta);
 
     match transfer_io::upload_file(engine, bucket, key, local, content_type, meta).await {
         Ok(_) => cli_exit::EXIT_OK,

@@ -9,7 +9,7 @@ use crate::common;
 
 use common::{
     generate_binary, get_bytes, head_headers, list_objects_raw, mutate_binary,
-    put_and_get_storage_type, put_object, TestServer,
+    put_and_get_storage_type, put_object, S3Requests, TestServer,
 };
 
 #[tokio::test]
@@ -46,6 +46,42 @@ async fn test_similar_files_stored_as_delta() {
     )
     .await;
     assert_eq!(st2, "delta", "Similar file should be stored as delta");
+}
+
+/// `x-amz-meta-dg-no-delta: true` on a PUT stores a delta-eligible object
+/// that would be a delta as passthrough.
+#[tokio::test]
+async fn test_no_delta_hint_header_stores_passthrough() {
+    let server = TestServer::builder().build().await;
+    let http = server.http();
+    let base = generate_binary(100_000, 42);
+    let variant = mutate_binary(&base, 0.01);
+    put_object(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "releases/base.zip",
+        base,
+        "application/zip",
+    )
+    .await;
+    let url = format!("{}/{}/releases/v1.zip", server.endpoint(), server.bucket());
+    let resp = http
+        .s3_request(reqwest::Method::PUT, &url)
+        .header("content-type", "application/zip")
+        .header("x-amz-meta-dg-no-delta", "true")
+        .body(variant)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "PUT: {}", resp.status());
+    let st = resp
+        .headers()
+        .get("x-amz-storage-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    assert_eq!(st, "passthrough", "the hint must skip the delta");
 }
 
 /// Force EVERY delta GET through the Phase-3 spooled-reconstruction path

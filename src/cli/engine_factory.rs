@@ -191,10 +191,20 @@ pub fn copy_user_metadata(
     crate::storage::encrypting::strip_encryption_markers(&mut out);
     crate::transfer::strip_rule_provenance(&mut out);
     out.extend(overrides.iter().map(|(k, v)| (k.clone(), v.clone())));
-    if no_delta {
-        out.insert("dg-no-delta".to_string(), "true".to_string());
-    }
+    set_no_delta_hint(&mut out, no_delta);
     out
+}
+
+/// Add the `--no-delta` hint ([`crate::types::meta_keys::NO_DELTA`]) to the
+/// user metadata of a store. The engine stores the object passthrough and
+/// does not persist the hint.
+pub fn set_no_delta_hint(user_metadata: &mut std::collections::HashMap<String, String>, on: bool) {
+    if on {
+        user_metadata.insert(
+            crate::types::meta_keys::NO_DELTA.to_string(),
+            "true".to_string(),
+        );
+    }
 }
 
 /// Render an engine error for the operator. For `TooLarge` we surface

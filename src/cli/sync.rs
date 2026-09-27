@@ -22,7 +22,7 @@
 
 use crate::cli::aws_args::{AwsArgs, EngineLimits};
 use crate::cli::config as cli_exit;
-use crate::cli::engine_factory::copy_user_metadata;
+use crate::cli::engine_factory::{copy_user_metadata, set_no_delta_hint};
 use crate::cli::filter::Filter;
 use crate::cli::keys::{dir_prefix, local_path_for_key, rel_under, LocalPathError};
 use crate::cli::s3_url::{is_s3_url, parse_s3_url};
@@ -545,9 +545,7 @@ async fn upload_one(
     no_delta: bool,
 ) -> i32 {
     let mut user_meta = HashMap::new();
-    if no_delta {
-        user_meta.insert("dg-no-delta".to_string(), "true".to_string());
-    }
+    set_no_delta_hint(&mut user_meta, no_delta);
     match transfer_io::upload_file(engine, bucket, key, local, None, user_meta).await {
         Ok(_) => cli_exit::EXIT_OK,
         Err(e @ TransferError::LocalRead(_)) => {

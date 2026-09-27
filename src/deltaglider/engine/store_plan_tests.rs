@@ -389,11 +389,42 @@ async fn a_single_put_stores_no_multipart_etag() {
 use super::store::{EncodeOutcome, StorePlan};
 
 #[test]
-fn tries_delta_only_when_compressing_an_eligible_key() {
-    assert!(StorePlan::tries_delta(true, true));
-    assert!(!StorePlan::tries_delta(true, false));
-    assert!(!StorePlan::tries_delta(false, true));
-    assert!(!StorePlan::tries_delta(false, false));
+fn tries_delta_only_when_compressing_an_eligible_key_without_the_hint() {
+    for compression in [false, true] {
+        for eligible in [false, true] {
+            for no_delta in [false, true] {
+                assert_eq!(
+                    StorePlan::tries_delta(compression, eligible, no_delta),
+                    compression && eligible && !no_delta,
+                    "compression={compression} eligible={eligible} no_delta={no_delta}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn no_delta_hint_is_true_in_any_case_only() {
+    use crate::types::no_delta_requested;
+    let m = |k: &str, v: &str| HashMap::from([(k.to_string(), v.to_string())]);
+    assert!(no_delta_requested(&m("dg-no-delta", "true")));
+    assert!(no_delta_requested(&m("DG-No-Delta", " TRUE ")));
+    assert!(!no_delta_requested(&m("dg-no-delta", "false")));
+    assert!(!no_delta_requested(&m("dg-no-delta", "")));
+    assert!(!no_delta_requested(&m("no-delta", "true")));
+    assert!(!no_delta_requested(&HashMap::new()));
+}
+
+/// Every persisted user-metadata map goes through
+/// `FileMetadata::set_user_metadata`, which drops the store hints.
+#[test]
+fn store_pipeline_sets_user_metadata_through_the_hint_filter() {
+    let src = include_str!("store.rs");
+    let production = src.split("#[cfg(test)]").next().unwrap();
+    assert!(
+        !production.contains(".user_metadata = "),
+        "assign user metadata with FileMetadata::set_user_metadata"
+    );
 }
 
 #[test]

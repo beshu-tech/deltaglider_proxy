@@ -56,6 +56,17 @@ pub mod meta_keys {
     pub const H_DELTA_CMD: &str = concat!("x-amz-meta-", "dg-delta-cmd");
     pub const ENCRYPTED: &str = "dg-encrypted";
     pub const H_ENCRYPTED: &str = concat!("x-amz-meta-", "dg-encrypted");
+    /// Store hint, not stored: `true` stores a delta-eligible object as
+    /// passthrough (the CLI `--no-delta` flag, `x-amz-meta-dg-no-delta`).
+    pub const NO_DELTA: &str = "dg-no-delta";
+}
+
+/// Whether the user metadata of a PUT asks for passthrough storage
+/// ([`meta_keys::NO_DELTA`] is `true`, any case).
+pub fn no_delta_requested(user_metadata: &HashMap<String, String>) -> bool {
+    user_metadata.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case(meta_keys::NO_DELTA) && v.trim().eq_ignore_ascii_case("true")
+    })
 }
 
 /// Errors that can occur when validating user-provided bucket/key inputs.
@@ -542,6 +553,13 @@ impl FileMetadata {
             return format!("\"{}\"", override_etag);
         }
         format!("\"{}\"", self.md5)
+    }
+
+    /// Set the user metadata to persist, minus the store hints: a hint is an
+    /// instruction to one PUT, not a fact about the object.
+    pub fn set_user_metadata(&mut self, mut user_metadata: HashMap<String, String>) {
+        user_metadata.retain(|k, _| !k.eq_ignore_ascii_case(meta_keys::NO_DELTA));
+        self.user_metadata = user_metadata;
     }
 
     /// Check if this is a reference file
