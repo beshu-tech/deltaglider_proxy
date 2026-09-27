@@ -56,7 +56,7 @@ CI merge gate: `verify-integration-test-registry` → `fmt` → `clippy -D warni
 ## Architecture
 
 The S3 protocol surface is served by the **s3s** framework (the `s3s` crate),
-NOT hand-rolled axum handlers. `startup.rs::build_s3_router` mounts
+NOT hand-rolled axum handlers. `api/s3_router.rs::build_s3_router(RouterDeps)` mounts
 `s3_adapter_s3s::DeltaGliderS3Service` (impls `s3s::S3`, ~32 verb methods) as the
 axum `fallback_service`. The legacy axum S3 handlers were retired; `s3s` is the
 only S3 implementation. The admin API + demo UI stays axum, mounted under `/_/`.
@@ -66,8 +66,12 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
   → admission/middleware.rs  Pre-auth admission chain (deny / reject / allow-anonymous)
   → api/auth.rs              SigV4 + IAM authorization middleware (bootstrap or per-user IAM), runs before storage
   → HEAD-`/` + POST form-data interceptors (shapes s3s rejects: Cyberduck probe, browser PostObject → api/handlers/form_post.rs)
-  → s3_adapter_s3s.rs        fallback_service: the `s3s::S3` adapter — owns S3 parse/DTO/XML/error; delegates product logic to the engine
-                             (GET/PUT/HEAD/DELETE, ListObjectsV2, copy, multipart lifecycle, ACL/tagging stubs)
+  → s3_adapter_s3s/          fallback_service: the `s3s::S3` adapter (mod.rs = one-line delegations to free fns in object/list/copy/
+                             multipart/bucket.rs) — owns S3 parse/DTO/XML only; `From<S3Error> for s3s::S3Error` is the one error bridge.
+                             Product logic lives below it: conditional writes + the per-key object write lock in
+                             `engine/conditional.rs` (`store_conditional`, reached by PutObject, CopyObject, form POST via
+                             `object_helpers::store_client_write`, and admin bulk copy), filtered-LIST algebra in `iam/listing.rs`
+                             (budget = `advanced.filtered_list_max_engine_pages`, default 50)
   → api/handlers/            Survivors after the s3s consolidation:
       mod.rs                 AppState (shared by s3s adapter + admin API), audit_log_s3, ensure_bucket_exists helpers
       object_helpers.rs      Shared quota gate + per-object event-outbox enqueue (called by s3s adapter & form_post)
@@ -121,10 +125,14 @@ HTTP request (axum Router; cross-cutting layers: TraceLayer, body limit, timeout
                             maintenance_gate_arm_keys is kind/phase-aware), gate.rs (per-bucket WRITE gate: the middleware only counts in-flight
                             writes; `check_verified_request` 503-SlowDowns writes to busy buckets (and runs the backend-health
                             gate) AFTER signature verification — s3s access hook + form-POST handler; reads pass; in-flight write drain; admin bulk copy/move/delete loops participate via
-                            write_started/finished + per-item is_busy), worker.rs (sequential runner, kind dispatch; heartbeat returns
-                            Err(LEASE_LOST) on refused renewal → phase stops, row NOT settled; graceful shutdown
-                            (SIGTERM → `shutdown::begin()`) = Err(SHUTTING_DOWN): record_failure refuses, `after_run` never
-                            settles/unwinds any Err while shutting down, row released to `queued` for an instant resume), migrate.rs (kind=migrate: stage→copy→verify→
+                            write_started/finished + per-item is_busy), worker.rs (sequential runner, kind dispatch; phases return `PhaseStop`
+                            {Cancelled, LeaseLost, ShuttingDown, Failed}; the ONE `background::LeaseKeeper` (verdict = `job_store::keeper_step`:
+                            refusal = lost, store error retried within the TTL) renews maintenance, lifecycle and replication leases;
+                            LeaseLost → phase stops, row NOT settled; graceful shutdown
+                            (SIGTERM → `shutdown::begin()`) = ShuttingDown: record_failure refuses, `after_run` never
+                            settles/unwinds any Err while shutting down, row released to `queued` for an instant resume), paged.rs (`paged_phase`: THE paged loop — pager, poison restart,
+                            persist, heartbeat, cancel, shutdown — used by reencrypt, backfill, counting, migrate copy/verify/prune; migrate can
+                            persist only with a `Flushed` proof from `flush_copies`), migrate.rs (kind=migrate: stage→copy→verify→
                             flip→cleanup, transient __dgmigrate_* routes — gated from creation, filtered out of all bucket listings, cleared at
                             flip; pre-flip cancel unwind; cleanup re-checks routed_to_target PER SWEEP; cancel-in-cleanup settles completed with
                             a note), backfill.rs (kind=backfill-metadata: stamp canonical DG metadata onto foreign/pre-proxy passthrough objects
@@ -181,7 +189,7 @@ The proxy **refuses to start** without authentication credentials unless `authen
 
 - **Bootstrap mode**: Single credential pair from YAML/env vars (`DGP_ACCESS_KEY_ID` + `DGP_SECRET_ACCESS_KEY`). Admin GUI requires the bootstrap password. This is the default on fresh installs.
 - **IAM mode**: Per-user credentials from encrypted SQLCipher DB (`deltaglider_config.db`). Admin GUI access is permission-based (no password needed for IAM admins).
-- **Open access** (dev only): Set `authentication = "none"` or `DGP_AUTHENTICATION=none`. No SigV4 verification.
+- **Open access** (dev only): Set `authentication = "none"` or `DGP_AUTHENTICATION=none`. No identity, but signed requests are still verified with the access key as the secret (key must equal secret; a real pair gets 403 SignatureDoesNotMatch); unsigned requests pass.
 
 Orthogonal to bootstrap/IAM mode, the **`access.iam_mode` YAML selector** (Phase 3c) controls *where IAM state lives*:
 
