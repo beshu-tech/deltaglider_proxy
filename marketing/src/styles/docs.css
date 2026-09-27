@@ -638,10 +638,16 @@
   max-width: var(--measure);
 }
 .docs-landing-list {
+  /* global.css caps every list at the prose measure; this grid is layout and
+     spans the column, like the featured cards above it. */
+  max-width: none;
   list-style: none; margin: 0; padding: 0;
   display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 10px;
 }
+/* Cards in one grid row share its height. */
+.docs-landing-list li { display: flex; }
 .docs-landing-list a {
+  flex: 1 1 auto;
   display: flex; flex-direction: column; gap: 4px; padding: 13px 34px 13px 16px;
   background: var(--bg-card); border: 1px solid var(--rule); border-radius: 10px;
   text-decoration: none;
