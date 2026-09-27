@@ -46,6 +46,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+mod driver;
+
 /// One object currently being copied — feeds the Jobs UI so a slow-moving
 /// counter is explained ("copying big.tar.gz · 4.2 GB"). In-memory and
 /// node-local by design: this is LIVE progress, not durable state (a restart
@@ -147,7 +149,6 @@ enum DriverDone {
     },
     Heads {
         req_id: u64,
-        side: walk::Side,
         results: Vec<(String, walk::HeadResult)>,
     },
     Copy {
@@ -402,24 +403,7 @@ pub async fn run_rule(
     );
 
     let mut totals = RunTotals::default();
-    let mut had_any_error = false;
-    let mut hit_fatal_error = false;
-    // Set only on a dest-unusable abort (dead bucket / over quota). Such a dest
-    // won't recover in 60s, so we back off to the rule's normal cadence rather
-    // than re-firing every minute and hammering the dead endpoint forever.
-    let mut dest_unusable = false;
-    // Set on a whole-page throttle abort (503 SlowDown): same backoff as
-    // dest_unusable — a backend shedding load needs breathing room, not a
-    // 60s retry hammer.
-    let mut backend_throttled = false;
-    // Set when the operator pauses the rule mid-run (DB `paused` flag, re-read
-    // at each page boundary). A paused stop is NOT an error: it preserves the
-    // cursor so resume continues, and settles the run as "stopped".
-    let mut stopped_paused = false;
-    // Operator KILL: run flipped to 'cancelling' mid-flight. Checked at every
-    // page boundary AND raced against the in-flight page so a wedged object
-    // (e.g. stuck on a dead B2 dest) aborts immediately, not after its timeout.
-    let mut killed = false;
+    let mut flags = driver::RunFlags::default();
     let cap = rule.batch_size.clamp(1, 10_000);
     let source_prefix = normalize_prefix(&rule.source.prefix);
     let dest_prefix = normalize_prefix(&rule.destination.prefix);
@@ -509,569 +493,33 @@ pub async fn run_rule(
         Err(e) => {
             warn!("replication rule '{}' glob compile failed: {e}", rule.name);
             totals.errors += 1;
-            hit_fatal_error = true;
+            flags.hit_fatal_error = true;
             None
         }
     };
 
-    // Poison-skips recorded by copy_one_object (folded from PerObjectResult);
-    // planner skips come from the machine's stats. Both feed objects_skipped.
-    let mut poison_skipped: i64 = 0;
-    // Set when the poison-cursor guard cleared a stale resume cursor — the
-    // settle epilogue must not write it back (see final_cursor_json).
-    let mut poison_cleared_any = false;
     let _progress_guard = WalkProgressGuard(rule.name.clone());
 
     if let Some(machine) = machine.as_mut() {
-        let mut inflight: futures::stream::FuturesUnordered<
-            std::pin::Pin<Box<dyn std::future::Future<Output = DriverDone> + Send>>,
-        > = futures::stream::FuturesUnordered::new();
-        let (mut lists_inflight, mut heads_inflight) = (0usize, 0usize);
-        let (mut copies_inflight, mut deletes_inflight) = (0usize, 0usize);
-        // Rolling abort-classification window, reset at each control boundary
-        // (the old page boundary): dest-fatal and throttle-abort gates keep
-        // their zero-successes semantics over the window.
-        let (mut win_attempted, mut win_copied, mut win_throttled) = (0i64, 0i64, 0i64);
-        let mut clear_failure_keys: Vec<String> = Vec::new();
-        let mut last_persisted_pos = machine.cursor().map(|c| c.pos);
-        let mut last_dirs_reported: u64 = 0;
-        let mut first_list_done = false;
-        let mut events_since_flush = 0usize;
-        // Control-check cadence counter: independent of the checkpoint
-        // counter (which resets on every flush) — kill/pause/lease checks
-        // must keep firing through long copy/delete drains.
-        let mut events_since_check = 0usize;
-        let mut need_check = true;
-        // Kill poll: a LOCK-FREE interval tick; the DB check runs INLINE in
-        // the main task after the tick fires. Never keep a future that locks
-        // the config-DB parked across select iterations — tokio's fair
-        // semaphore GRANTS the lock to a queued waiter on release, and a
-        // waiter that is only polled inside select! deadlocks the task the
-        // moment the task also awaits the same mutex directly.
-        let mut kill_tick = tokio::time::interval(std::time::Duration::from_secs(1));
-        kill_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        'walk: loop {
-            // Control boundary (kill / pause / lease renew / maintenance),
-            // page-boundary cadence: every completed listing re-arms it.
-            if need_check {
-                need_check = false;
-                win_attempted = 0;
-                win_copied = 0;
-                win_throttled = 0;
-                match ctrl.check(true).await {
-                    Err(e) => {
-                        warn!(
-                            "replication rule '{}': control check failed: {e}",
-                            rule.name
-                        );
-                        totals.errors += 1;
-                        hit_fatal_error = true;
-                        machine.drain(walk::DrainReason::Fatal);
-                        break 'walk;
-                    }
-                    Ok(ControlVerdict::Continue) => {}
-                    Ok(ControlVerdict::Killed) => {
-                        info!("replication rule '{}' killed mid-walk", rule.name);
-                        killed = true;
-                        machine.drain(walk::DrainReason::Killed);
-                        break 'walk;
-                    }
-                    Ok(ControlVerdict::Paused) => {
-                        info!(
-                            "replication rule '{}' paused mid-walk (cursor preserved for resume)",
-                            rule.name
-                        );
-                        stopped_paused = true;
-                        machine.drain(walk::DrainReason::Paused);
-                        break 'walk;
-                    }
-                    Ok(ControlVerdict::LeaseLost) => {
-                        totals.errors += 1;
-                        hit_fatal_error = true;
-                        machine.drain(walk::DrainReason::LeaseLost);
-                        break 'walk;
-                    }
-                }
-            }
-
-            let caps = walk::DriverCaps {
-                list: (dir_workers * 2).saturating_sub(lists_inflight),
-                head: 2usize.saturating_sub(heads_inflight),
-                copy: transfers.saturating_sub(copies_inflight),
-                delete: 2usize.saturating_sub(deletes_inflight),
-            };
-            let cmds = machine.poll(caps);
-            let dispatched = !cmds.is_empty();
-            for cmd in cmds {
-                match cmd {
-                    walk::Cmd::List {
-                        req_id,
-                        side,
-                        rel_prefix,
-                        token,
-                        delimited,
-                    } => {
-                        lists_inflight += 1;
-                        let engine = engine.clone();
-                        let (bucket, side_prefix) =
-                            side_target(rule, &source_prefix, &dest_prefix, side);
-                        let page_size = cap;
-                        inflight.push(Box::pin(async move {
-                            let abs_prefix = format!("{side_prefix}{rel_prefix}");
-                            let abs_token = token.map(|t| format!("{side_prefix}{t}"));
-                            if let Some(m) = engine.metrics() {
-                                m.replication_list_calls_total.inc();
-                            }
-                            let result = engine
-                                .list_objects(
-                                    &bucket,
-                                    &abs_prefix,
-                                    delimited.then_some("/"),
-                                    page_size,
-                                    abs_token.as_deref(),
-                                    false,
-                                )
-                                .await
-                                .map_err(|e| e.to_string())
-                                .and_then(|p| to_rel_listing(p, &side_prefix));
-                            DriverDone::List { req_id, result }
-                        }));
-                    }
-                    walk::Cmd::Head {
-                        req_id,
-                        side,
-                        rel_keys,
-                    } => {
-                        heads_inflight += 1;
-                        let engine = engine.clone();
-                        let (bucket, side_prefix) =
-                            side_target(rule, &source_prefix, &dest_prefix, side);
-                        inflight.push(Box::pin(async move {
-                            let mut results = Vec::with_capacity(rel_keys.len());
-                            for rel in rel_keys {
-                                let abs = format!("{side_prefix}{rel}");
-                                if let Some(m) = engine.metrics() {
-                                    m.replication_head_calls_total.inc();
-                                }
-                                let r = match engine.head(&bucket, &abs).await {
-                                    Ok(meta) => walk::HeadResult::Resolved(Box::new(meta)),
-                                    Err(e) => {
-                                        let s3e: crate::api::S3Error = e.into();
-                                        if matches!(s3e, crate::api::S3Error::NoSuchKey(_)) {
-                                            walk::HeadResult::Gone
-                                        } else {
-                                            walk::HeadResult::Unresolved
-                                        }
-                                    }
-                                };
-                                results.push((rel, r));
-                            }
-                            DriverDone::Heads {
-                                req_id,
-                                side,
-                                results,
-                            }
-                        }));
-                    }
-                    walk::Cmd::Copy {
-                        item_id,
-                        rel_key,
-                        src_size,
-                    } => {
-                        // Poison-object guard, INLINE (main task — the copy
-                        // future itself is DB-free by contract): skip an
-                        // object that failed `object_skip_after_failures`
-                        // consecutive runs.
-                        if object_skip_after_failures > 0 {
-                            let skipped = {
-                                let db = db.lock().await;
-                                db.replication_object_skipped(
-                                    &rule.name,
-                                    &format!("{source_prefix}{rel_key}"),
-                                    object_skip_after_failures,
-                                    current_unix_seconds(),
-                                )
-                                .unwrap_or(false)
-                            };
-                            if skipped {
-                                debug!(
-                                    "replication rule '{}' skipping poison object {:?}",
-                                    rule.name, rel_key
-                                );
-                                poison_skipped += 1;
-                                machine.on_event(walk::Event::CopySettled { item_id, ok: true });
-                                continue;
-                            }
-                        }
-                        copies_inflight += 1;
-                        let engine = engine.clone();
-                        let rule_name = rule.name.clone();
-                        let src_bucket = rule.source.bucket.clone();
-                        let dst_bucket = rule.destination.bucket.clone();
-                        let events = events_sink.clone();
-                        let abs_src = format!("{source_prefix}{rel_key}");
-                        let abs_dest = format!("{dest_prefix}{rel_key}");
-                        // Register this dest write with the maintenance gate
-                        // BEFORE it starts (H22): a migrate/re-encrypt arming
-                        // the gate mid-run either sees this +1 and drains it,
-                        // or the next control check defers the run. The RAII
-                        // guard rides in the copy future — a kill dropping the
-                        // future releases it.
-                        let write_guard = ctrl
-                            .maintenance_gate
-                            .as_ref()
-                            .map(|g| g.begin_write(&ctrl.dest_bucket));
-                        inflight.push(Box::pin(async move {
-                            let _write_guard = write_guard;
-                            // Guard increments objects_inflight (+peak) on entry and
-                            // decrements on drop → proves the `transfers` concurrency.
-                            let _obj_guard = engine.metrics().cloned().map(ObjectGuard::new);
-                            // Live "currently copying" registration for the Jobs UI
-                            // (RAII: a kill dropping this future unregisters it).
-                            let _inflight_reg = InFlightGuard::new(&rule_name, &abs_src, src_size);
-                            let res = copy_one_object(
-                                &engine,
-                                &rule_name,
-                                &src_bucket,
-                                &dst_bucket,
-                                &abs_src,
-                                &abs_dest,
-                                object_timeout,
-                                upload_concurrency,
-                                &events,
-                            )
-                            .await;
-                            DriverDone::Copy {
-                                item_id,
-                                rel_key,
-                                res: Box::new(res),
-                            }
-                        }));
-                    }
-                    walk::Cmd::Delete { item_id, rel_key } => {
-                        deletes_inflight += 1;
-                        let engine = engine.clone();
-                        let src_bucket = rule.source.bucket.clone();
-                        let dst_bucket = rule.destination.bucket.clone();
-                        let abs_src = format!("{source_prefix}{rel_key}");
-                        let abs_dest = format!("{dest_prefix}{rel_key}");
-                        inflight.push(Box::pin(async move {
-                            execute_delete(
-                                &engine,
-                                &src_bucket,
-                                &dst_bucket,
-                                &abs_src,
-                                &abs_dest,
-                                item_id,
-                            )
-                            .await
-                        }));
-                    }
-                }
-            }
-
-            if inflight.is_empty() {
-                if !dispatched {
-                    break 'walk; // done, truncated, drained, or failed
-                }
-                continue;
-            }
-
-            // Await one completion, racing the operator kill so a wedged
-            // object aborts NOW (dropping `inflight` cancels every transfer).
-            let done = tokio::select! {
-                biased;
-                _ = kill_tick.tick() => {
-                    // Inline DB check — the ONLY pending db.lock of this task.
-                    let killed_now = {
-                        let g = db.lock().await;
-                        g.replication_run_cancel_requested(run_id).unwrap_or(false)
-                    };
-                    if killed_now {
-                        killed = true;
-                        machine.drain(walk::DrainReason::Killed);
-                        break 'walk;
-                    }
-                    continue 'walk;
-                }
-                done = inflight.next() => match done {
-                    Some(d) => d,
-                    None => break 'walk,
-                },
-            };
-
-            match done {
-                DriverDone::List { req_id, result } => {
-                    lists_inflight -= 1;
-                    need_check = true;
-                    match result {
-                        Ok(page) => {
-                            first_list_done = true;
-                            machine.on_event(walk::Event::ListPage { req_id, page });
-                        }
-                        Err(msg) => {
-                            warn!("replication rule '{}' list failed: {}", rule.name, msg);
-                            // Poison-token guard: a RESUMED walk whose FIRST
-                            // listing fails most likely holds a stale cursor —
-                            // clear it so the next tick starts fresh.
-                            if was_resumed && !first_list_done {
-                                poison_cleared_any = true;
-                                let db = db.lock().await;
-                                let _ = db.replication_set_continuation_token(&rule.name, None);
-                            }
-                            if let Err(le) = log_failure(
-                                &db,
-                                &rule.name,
-                                run_id,
-                                "",
-                                "",
-                                &format!("list failed: {msg}"),
-                                max_failures_retained,
-                            )
-                            .await
-                            {
-                                warn!(
-                                    "replication rule '{}': failure-ring write failed: {le}",
-                                    rule.name
-                                );
-                            }
-                            totals.errors += 1;
-                            hit_fatal_error = true;
-                            machine.on_event(walk::Event::ListFailed { req_id });
-                        }
-                    }
-                }
-                DriverDone::Heads {
-                    req_id,
-                    side,
-                    results,
-                } => {
-                    heads_inflight -= 1;
-                    machine.on_event(walk::Event::HeadDone { req_id, results });
-                    let _ = side;
-                }
-                DriverDone::Copy {
-                    item_id,
-                    rel_key,
-                    res,
-                } => {
-                    copies_inflight -= 1;
-                    {
-                        let r = res;
-                        // Persist the failure ring + poison ledger INLINE (the
-                        // copy future is DB-free by contract).
-                        if let Some(err_msg) = &r.error_message {
-                            let abs_src = format!("{source_prefix}{rel_key}");
-                            let abs_dest = format!("{dest_prefix}{rel_key}");
-                            if !r.throttled {
-                                let db = db.lock().await;
-                                let _ = db.replication_record_object_failure(
-                                    &rule.name,
-                                    &abs_src,
-                                    err_msg,
-                                    current_unix_seconds(),
-                                );
-                            }
-                            if let Err(le) = log_failure(
-                                &db,
-                                &rule.name,
-                                run_id,
-                                &abs_src,
-                                &abs_dest,
-                                err_msg,
-                                max_failures_retained,
-                            )
-                            .await
-                            {
-                                warn!(
-                                    "replication rule '{}': failure-ring write failed: {le}",
-                                    rule.name
-                                );
-                            }
-                        }
-                        if let Some(k) = r.clear_failure_key.clone() {
-                            clear_failure_keys.push(k);
-                        }
-                        totals.objects_copied += r.objects_copied;
-                        poison_skipped += r.objects_skipped;
-                        totals.bytes_copied += r.bytes_copied;
-                        totals.errors += r.errors;
-                        totals.delta_passthrough += r.delta_passthrough;
-                        totals.bytes_egress_saved += r.bytes_egress_saved;
-                        totals.reconstructed += r.reconstructed;
-                        win_attempted += 1;
-                        win_copied += r.objects_copied;
-                        if r.throttled {
-                            win_throttled += 1;
-                        }
-                        if r.had_error {
-                            had_any_error = true;
-                        }
-                        machine.on_event(walk::Event::CopySettled {
-                            item_id,
-                            ok: !r.had_error,
-                        });
-                        // Destination unusable (bucket missing / over quota):
-                        // abort instead of retrying every remaining object.
-                        // Gated on zero successes this window — a stray token
-                        // in one error must not abort a healthy run.
-                        if r.dest_fatal && win_copied == 0 {
-                            warn!(
-                                    "replication rule '{}' aborting run: destination unusable (bucket missing or over quota)",
-                                    rule.name
-                                );
-                            hit_fatal_error = true;
-                            dest_unusable = true;
-                            machine.drain(walk::DrainReason::Fatal);
-                        }
-                        // Backend shedding load (503 SlowDown / 429): abort with
-                        // backoff instead of grinding the key list.
-                        if page_is_throttle_aborted(win_copied, win_throttled, win_attempted) {
-                            warn!(
-                                    "replication rule '{}' aborting run: backend throttled ({} SlowDown rejections this window)",
-                                    rule.name, win_throttled
-                                );
-                            let _ = log_failure(
-                                    &db,
-                                    &rule.name,
-                                    run_id,
-                                    "",
-                                    "",
-                                    &format!(
-                                        "run aborted: backend throttled ({win_throttled} SlowDown rejections); \
-                                         resuming from cursor after backoff"
-                                    ),
-                                    max_failures_retained,
-                                )
-                                .await;
-                            hit_fatal_error = true;
-                            backend_throttled = true;
-                            machine.drain(walk::DrainReason::Fatal);
-                        }
-                    }
-                }
-                DriverDone::Delete {
-                    item_id,
-                    deleted,
-                    error,
-                } => {
-                    deletes_inflight -= 1;
-                    if deleted {
-                        totals.objects_deleted += 1;
-                    }
-                    let errored = error.is_some();
-                    if let Some(msg) = error {
-                        totals.errors += 1;
-                        had_any_error = true;
-                        // Delete futures are DB-free; persist the failure here.
-                        if let Err(le) = log_failure(
-                            &db,
-                            &rule.name,
-                            run_id,
-                            "",
-                            "",
-                            &msg,
-                            max_failures_retained,
-                        )
-                        .await
-                        {
-                            warn!(
-                                "replication rule '{}': failure-ring write failed: {le}",
-                                rule.name
-                            );
-                        }
-                    }
-                    machine.on_event(walk::Event::DeleteSettled {
-                        item_id,
-                        ok: !errored,
-                    });
-                }
-            }
-
-            // Control cadence: re-arm every 32 events (≈ the old page
-            // boundary) so kill/pause/lease-loss land promptly mid-drain.
-            events_since_check += 1;
-            if events_since_check >= 32 {
-                need_check = true;
-                events_since_check = 0;
-            }
-            // Fused checkpoint — rate-limited (the cursor advances on almost
-            // every settle; checkpointing each event would hammer the DB
-            // mutex and starve every other DB user): flush on 16 events, or
-            // on durable progress once at least 4 events have accumulated.
-            // Failure-ledger clears + cursor + run progress + event flush
-            // under ONE db.lock — the old per-page contract.
-            events_since_flush += 1;
-            let cur_pos = machine.cursor().map(|c| c.pos);
-            if events_since_flush >= 16
-                || (cur_pos != last_persisted_pos && events_since_flush >= 4)
-            {
-                let stats = machine.stats().clone();
-                totals.objects_scanned = stats.objects_scanned as i64;
-                totals.objects_skipped = stats.objects_skipped as i64 + poison_skipped;
-                if let Some(m) = engine.metrics() {
-                    let delta = stats.dirs_completed.saturating_sub(last_dirs_reported);
-                    if delta > 0 {
-                        m.replication_dirs_completed_total.inc_by(delta);
-                        last_dirs_reported = stats.dirs_completed;
-                    }
-                }
-                let (dirs_done, dirs_pending) = machine.progress();
-                // Re-apply the source prefix so the UI shows the absolute path.
-                let scanning = machine
-                    .scanning()
-                    .map(|rel| format!("{source_prefix}{rel}"));
-                WALK_PROGRESS.lock().insert(
-                    rule.name.clone(),
-                    WalkProgress {
-                        dirs_completed: dirs_done,
-                        dirs_pending,
-                        scanning,
-                    },
-                );
-                let cursor_json = machine.cursor().map(|c| c.to_json());
-                let db = db.lock().await;
-                for k in clear_failure_keys.drain(..) {
-                    let _ = db.replication_clear_object_failure(&rule.name, &k);
-                }
-                let persist = db
-                    .replication_set_continuation_token(&rule.name, cursor_json.as_deref())
-                    .and_then(|_| db.replication_update_run_progress(run_id, totals));
-                let mut drained: Vec<NewEvent> = std::mem::take(&mut *events_sink.lock());
-                flush_page_events_locked(&db, &rule.name, &mut drained);
-                drop(db);
-                if let Err(e) = persist {
-                    warn!(
-                        "replication rule '{}': cursor/progress persist failed: {e}",
-                        rule.name
-                    );
-                    totals.errors += 1;
-                    hit_fatal_error = true;
-                    machine.drain(walk::DrainReason::Fatal);
-                }
-                last_persisted_pos = cur_pos;
-                events_since_flush = 0;
-            }
-        }
-
-        // Final stats sync (the loop may have broken between checkpoints).
-        let stats = machine.stats().clone();
-        totals.objects_scanned = stats.objects_scanned as i64;
-        totals.objects_skipped = stats.objects_skipped as i64 + poison_skipped;
-        if let Some(m) = engine.metrics() {
-            let delta = stats.dirs_completed.saturating_sub(last_dirs_reported);
-            if delta > 0 {
-                m.replication_dirs_completed_total.inc_by(delta);
-            }
-        }
-        // Any pending failure-ledger clears from the tail of the run.
-        if !clear_failure_keys.is_empty() {
-            let db = db.lock().await;
-            for k in clear_failure_keys.drain(..) {
-                let _ = db.replication_clear_object_failure(&rule.name, &k);
-            }
-        }
+        let scope = driver::RunScope {
+            db: &db,
+            engine,
+            rule,
+            run_id,
+            source_prefix: &source_prefix,
+            dest_prefix: &dest_prefix,
+            max_failures_retained,
+            object_timeout,
+            object_skip_after_failures,
+            upload_concurrency,
+            transfers,
+            dir_workers,
+            page_size: cap,
+            events_sink: &events_sink,
+            ctrl: &ctrl,
+            was_resumed,
+        };
+        driver::drive_walk(&scope, machine, &mut totals, &mut flags).await;
     }
 
     // Unconditional flush: covers EVERY break path (kill, pause, lease,
@@ -1081,9 +529,10 @@ pub async fn run_rule(
     // non-terminal reason): the cursor stays persisted so the next tick
     // resumes the tail (never reported as a clean pass).
     let truncated = machine.as_ref().is_some_and(|m| {
-        m.truncated_by_budget() || (!killed && !stopped_paused && !hit_fatal_error && !m.is_done())
+        m.truncated_by_budget()
+            || (!flags.killed && !flags.stopped_paused && !flags.hit_fatal_error && !m.is_done())
     });
-    let final_cursor_json = if poison_cleared_any {
+    let final_cursor_json = if flags.poison_cleared_any {
         // The poison guard already cleared the stale cursor inline — never
         // write it back (machine.cursor() falls back to the resume position).
         None
@@ -1124,31 +573,19 @@ pub async fn run_rule(
         // Authoritative final kill check (see the select! race comment above):
         // the DB `cancelling` row is the source of truth for a kill that arrived
         // while the last page drained.
-        if !killed && db.replication_run_cancel_requested(run_id).unwrap_or(false) {
-            killed = true;
+        if !flags.killed && db.replication_run_cancel_requested(run_id).unwrap_or(false) {
+            flags.killed = true;
         }
 
         let decision = settle_run(SettleInput {
-            killed,
-            stopped_paused,
-            hit_fatal_error,
-            had_any_error,
+            killed: flags.killed,
+            stopped_paused: flags.stopped_paused,
+            hit_fatal_error: flags.hit_fatal_error,
+            had_any_error: flags.had_any_error,
             objects_copied: totals.objects_copied,
             truncated,
         });
-
-        let next_due = if dest_unusable || backend_throttled {
-            // Dead dest won't recover in a minute, and a throttling backend
-            // needs breathing room — back off to the rule's normal cadence
-            // (but never faster than 60s) instead of hammering every minute.
-            compute_next_due(rule, finished_at).max(finished_at + 60)
-        } else if hit_fatal_error || truncated {
-            // Tight retry on fatal errors AND budget truncation: the persisted
-            // cursor resumes the tail promptly instead of waiting a full cadence.
-            finished_at + 60
-        } else {
-            compute_next_due(rule, finished_at)
-        };
+        let next_due = next_due_after(&flags, truncated, rule, finished_at);
 
         if decision.clear_cursor {
             db.replication_set_continuation_token(&rule.name, None)?;
@@ -1711,6 +1148,27 @@ async fn log_failure(
     )
 }
 
+/// Pure: when the rule is next due after this run.
+fn next_due_after(
+    flags: &driver::RunFlags,
+    truncated: bool,
+    rule: &ReplicationRule,
+    finished_at: i64,
+) -> i64 {
+    if flags.dest_unusable || flags.backend_throttled {
+        // Dead dest won't recover in a minute, and a throttling backend
+        // needs breathing room — back off to the rule's normal cadence
+        // (but never faster than 60s) instead of hammering every minute.
+        compute_next_due(rule, finished_at).max(finished_at + 60)
+    } else if flags.hit_fatal_error || truncated {
+        // Tight retry on fatal errors AND budget truncation: the persisted
+        // cursor resumes the tail promptly instead of waiting a full cadence.
+        finished_at + 60
+    } else {
+        compute_next_due(rule, finished_at)
+    }
+}
+
 /// Compute when this rule should next be due. Falls back to a 1-hour
 /// recovery window if the rule's `interval` is unparseable (should
 /// never happen in practice — validated at Config::check time).
@@ -2214,6 +1672,32 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(150)).await;
         assert!(lease.0.load(std::sync::atomic::Ordering::SeqCst) >= 2);
         assert!(keeper.alive().is_alive(), "one failed renew lost the lease");
+    }
+
+    #[test]
+    fn next_due_backs_off_a_dead_dest_and_retries_a_fatal_run_fast() {
+        let rule = mk_rule(); // interval 1h
+        let at = 1000;
+        let clean = driver::RunFlags::default();
+        assert_eq!(next_due_after(&clean, false, &rule, at), at + 3600);
+        assert_eq!(next_due_after(&clean, true, &rule, at), at + 60);
+        let fatal = driver::RunFlags {
+            hit_fatal_error: true,
+            ..Default::default()
+        };
+        assert_eq!(next_due_after(&fatal, false, &rule, at), at + 60);
+        let dead = driver::RunFlags {
+            hit_fatal_error: true,
+            dest_unusable: true,
+            ..Default::default()
+        };
+        assert_eq!(next_due_after(&dead, false, &rule, at), at + 3600);
+        let throttled = driver::RunFlags {
+            hit_fatal_error: true,
+            backend_throttled: true,
+            ..Default::default()
+        };
+        assert_eq!(next_due_after(&throttled, true, &rule, at), at + 3600);
     }
 
     #[test]
