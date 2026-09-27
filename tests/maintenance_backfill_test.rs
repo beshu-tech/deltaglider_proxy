@@ -363,7 +363,7 @@ async fn backfill_s3_self_copy_preserves_etag_and_served_time() {
 /// x-amz-meta-* keys, Cache-Control and Content-Disposition. (The unit
 /// fixture in backfill.rs puts user metadata on the fallback shape, which
 /// production never emits: the S3 fallback HEAD returns no user metadata.)
-/// The pure plan is unit-tested in storage/s3.rs (`self_copy_plan_*`).
+/// The pure plan is unit-tested in storage/s3/tests.rs (`self_copy_plan_*`).
 #[tokio::test]
 async fn backfill_s3_self_copy_keeps_foreign_headers() {
     skip_unless_minio!();

@@ -17,7 +17,7 @@ pub fn default_true() -> bool {
 }
 
 /// S3 metadata key names (stored as `x-amz-meta-{KEY}` in S3 headers).
-/// Used in both storage/s3.rs (metadata_to_headers/headers_to_metadata)
+/// Used in both storage/s3/metadata.rs (metadata_to_headers/headers_to_metadata)
 /// and api/handlers.rs (build_metadata_headers).
 ///
 /// The `H_*` constants are the full HTTP header names, derived from the bare

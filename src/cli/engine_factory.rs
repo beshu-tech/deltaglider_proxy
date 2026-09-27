@@ -36,7 +36,7 @@ pub struct CliEngineOpts {
     pub max_object_size: Option<u64>,
     /// When the operator hands us a private-IP / localhost endpoint
     /// (typical MinIO / dev pattern), set `DGP_BACKEND_ALLOW_LOCAL=true`
-    /// in the CLI process so the SSRF guard at `src/storage/s3.rs`
+    /// in the CLI process so the SSRF guard at `src/storage/s3/client.rs`
     /// doesn't reject the connection. The server's equivalent stays
     /// config-driven; this is the documented CLI divergence.
     pub allow_local: bool,

@@ -693,7 +693,7 @@ mod source_guards {
     fn no_error_classification_on_display_text() {
         const ALLOWED: [&str; 3] = [
             "src/config_db_sync.rs",
-            "src/storage/s3.rs",
+            "src/storage/s3/tests.rs",
             "src/coordination/cas.rs",
         ];
         const TOKENS: [&str; 16] = [
@@ -1056,7 +1056,7 @@ mod source_guards {
                 "cookie-flag env parsing, under LOCK",
             ),
             (
-                "src/storage/s3.rs",
+                "src/storage/s3/tests.rs",
                 "the SSRF env override, under SSRF_ENV_LOCK",
             ),
             (

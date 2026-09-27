@@ -696,7 +696,7 @@ pub enum BackendConfig {
         secret_access_key: Option<String>,
 
         /// Permit `http://` and private-IP / localhost endpoints when set.
-        /// Off by default: the SSRF guard at `src/storage/s3.rs` rejects
+        /// Off by default: the SSRF guard at `src/storage/s3/client.rs` rejects
         /// such endpoints to prevent admin-API abuse pivoting through the
         /// S3 backend (e.g. swapping the endpoint to AWS IMDS).
         /// Set to true for MinIO/dev/CI; production must keep false.

@@ -65,7 +65,7 @@ const MAX_REPLAY_ENTRIES: usize = 500_000;
 /// router layer, and there is no `unreachable!()` arm hiding a real state.
 ///
 /// Pure decision at a decision point — mirrors `classify_auth_config`
-/// (`config.rs`) / `classify_s3_error` (`storage/s3.rs`).
+/// (`config.rs`) / `classify_s3_error` (`storage/s3/errors.rs`).
 enum AuthGateDecision<'a> {
     /// Config DB is locked (no config DB key opens it) — reject all S3 traffic.
     Locked,
