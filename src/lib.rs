@@ -1068,7 +1068,7 @@ mod source_guards {
                 "the AWS env credential chain, under ENV_LOCK",
             ),
             (
-                "src/config/mod.rs",
+                "src/config/tests/general.rs",
                 "${env:} expansion, under ENV_GUARD_LOCK",
             ),
             (
