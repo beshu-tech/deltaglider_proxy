@@ -940,3 +940,74 @@ async fn test_list_multipart_uploads_honours_max_uploads_and_markers() {
             .ok();
     }
 }
+
+/// X2: a CopyObject above the spool threshold streams its source through
+/// a spool file instead of reading it into memory. The answer is the same
+/// as the buffered copy's: the bytes, the metadata directive, the ETag.
+#[tokio::test]
+async fn test_copy_object_above_the_spool_threshold() {
+    let server = TestServer::builder()
+        .env("DGP_SPOOL_THRESHOLD_BYTES", "65536")
+        .build()
+        .await;
+    let client = server.s3_client().await;
+    let bucket = server.bucket();
+    let body: Vec<u8> = (0..300 * 1024u32).map(|i| (i * 31 % 251) as u8).collect();
+    for key in ["big/blob.bin", "big/app.zip"] {
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .content_type("application/x-test")
+            .metadata("owner", "dana")
+            .body(ByteStream::from(body.clone()))
+            .send()
+            .await
+            .unwrap();
+        for (dest, directive) in [("copy", "COPY"), ("replace", "REPLACE")] {
+            let dest_key = format!("{dest}/{}", key.rsplit('/').next().unwrap());
+            let mut req = client
+                .copy_object()
+                .bucket(bucket)
+                .key(&dest_key)
+                .copy_source(format!("{bucket}/{key}"))
+                .metadata_directive(directive.into());
+            if directive == "REPLACE" {
+                req = req
+                    .content_type("text/plain")
+                    .metadata("owner", "ci-uploader");
+            }
+            let out = req
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("{key} {directive}: {e:?}"));
+            let got = client
+                .get_object()
+                .bucket(bucket)
+                .key(&dest_key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                out.copy_object_result().and_then(|r| r.e_tag()),
+                got.e_tag(),
+                "{key} {directive}"
+            );
+            let (want_type, want_owner) = if directive == "COPY" {
+                ("application/x-test", "dana")
+            } else {
+                ("text/plain", "ci-uploader")
+            };
+            assert_eq!(got.content_type(), Some(want_type), "{key} {directive}");
+            assert_eq!(
+                got.metadata()
+                    .and_then(|m| m.get("owner"))
+                    .map(String::as_str),
+                Some(want_owner),
+                "{key} {directive}"
+            );
+            let bytes = got.body.collect().await.unwrap().into_bytes();
+            assert_eq!(bytes.as_ref(), body.as_slice(), "{key} {directive}");
+        }
+    }
+}

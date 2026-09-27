@@ -136,6 +136,15 @@ delta-eligible objects; other files are limited by
 `max_passthrough_object_size`. A failed download no longer leaves a truncated
 file, and `s3 verify` hashes the object while it reads it.
 
+### Fixed — CopyObject streams a large source through the spool
+
+CopyObject read the whole source object into memory before it stored the
+copy, up to `max_object_size` per request. Now a source larger than the
+spool threshold (`DGP_SPOOL_THRESHOLD_BYTES`) streams into a spool file on
+the spool budget, and the copy is stored from that file. The answer is the
+same as before. A source that grows during the copy answers `503 SlowDown`,
+and the retry copies the new object.
+
 ### Changed — Copies decide retries on the error type, not its text
 
 Replication, lifecycle transitions, migrate, re-encrypt and the admin bulk

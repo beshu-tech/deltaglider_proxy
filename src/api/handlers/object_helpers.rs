@@ -97,12 +97,71 @@ pub(crate) async fn store_client_write(
             write.precondition,
         )
         .await?;
-    enqueue_object_event(
+    object_created(
         state,
-        object_created_event(write.bucket, write.key, write.data.len() as u64, &result),
+        write.bucket,
+        write.key,
+        write.data.len() as u64,
+        &result,
     )
     .await;
     Ok(result)
+}
+
+/// One client write of a body staged in a spool file (a CopyObject of a
+/// source above the spool threshold).
+pub(crate) struct SpooledClientWrite<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub spool: &'a crate::deltaglider::spool::Spool,
+    pub size: u64,
+    pub content_type: Option<String>,
+    pub user_metadata: std::collections::HashMap<String, String>,
+    pub precondition: &'a crate::deltaglider::Precondition,
+}
+
+/// [`store_client_write`] of a spooled body: the same quota gate, write
+/// lock, preconditions and event, and the streaming store, so the body
+/// never comes into memory.
+pub(crate) async fn store_client_write_spooled(
+    state: &Arc<AppState>,
+    write: SpooledClientWrite<'_>,
+) -> Result<crate::types::StoreResult, S3Error> {
+    check_quota(state, write.bucket, write.size)?;
+    let engine = state.engine.load();
+    let result = {
+        let _guard = engine
+            .lock_and_check(write.bucket, write.key, write.precondition)
+            .await?;
+        engine
+            .store_spooled_delta(
+                write.bucket,
+                write.key,
+                write.spool,
+                write.size,
+                write.content_type,
+                write.user_metadata,
+                None,
+            )
+            .await?
+    };
+    object_created(state, write.bucket, write.key, write.size, &result).await;
+    Ok(result)
+}
+
+/// The `ObjectCreated` event of a client write.
+async fn object_created(
+    state: &Arc<AppState>,
+    bucket: &str,
+    key: &str,
+    content_length: u64,
+    result: &crate::types::StoreResult,
+) {
+    enqueue_object_event(
+        state,
+        object_created_event(bucket, key, content_length, result),
+    )
+    .await;
 }
 
 /// The admission of a client multipart completion, the multipart half of

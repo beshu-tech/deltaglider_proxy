@@ -774,3 +774,61 @@ fn completed_parts_conversion_requires_etags() {
         &s3s::S3ErrorCode::InvalidPart
     );
 }
+
+/// X2: CopyObject read its whole source into memory (`engine.retrieve`)
+/// whatever its size. Above the spool threshold the source must stream
+/// into a spool file instead; at or below it stays the buffer it was.
+#[tokio::test]
+async fn copy_source_above_the_spool_threshold_streams_to_a_spool() {
+    use crate::deltaglider::{DeltaGliderEngine, DynEngine};
+    use crate::storage::StorageBackend;
+    let dir = tempfile::tempdir().unwrap();
+    let backend: Box<dyn StorageBackend> = Box::new(
+        crate::storage::FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    let engine: DynEngine = DeltaGliderEngine::new_with_backend(
+        Arc::new(backend),
+        &crate::config::Config::default(),
+        None,
+    );
+    engine.create_bucket("src").await.unwrap();
+    let body: Vec<u8> = (0..200 * 1024u32).map(|i| (i * 31 % 251) as u8).collect();
+    for key in ["a/blob.bin", "a/app.zip"] {
+        engine
+            .store("src", key, &body, None, Default::default())
+            .await
+            .unwrap();
+        let size = engine.head("src", key).await.unwrap().file_size;
+        match read_copy_source(&engine, "src", key, size, 64 * 1024)
+            .await
+            .unwrap()
+        {
+            CopySourceBody::Spooled { spool, size, .. } => {
+                assert_eq!(size, body.len() as u64, "{key}");
+                assert_eq!(std::fs::read(spool.path()).unwrap(), body, "{key}");
+            }
+            // A delta source is reconstructed by `retrieve_stream`, which
+            // spools only above the ENGINE's threshold (the same value in
+            // production; the default here): its buffer is bounded by it.
+            CopySourceBody::Buffered(data, _) if key.ends_with(".zip") => {
+                assert_eq!(data, body, "{key}")
+            }
+            CopySourceBody::Buffered(..) => panic!("{key}: a large source was buffered"),
+        }
+        match read_copy_source(&engine, "src", key, size, size)
+            .await
+            .unwrap()
+        {
+            CopySourceBody::Buffered(data, _) => assert_eq!(data, body, "{key}"),
+            CopySourceBody::Spooled { .. } => panic!("{key}: a small source was spooled"),
+        }
+    }
+    // A source that grew after the HEAD does not overrun its reservation.
+    let grown = read_copy_source(&engine, "src", "a/blob.bin", 100 * 1024, 64 * 1024).await;
+    assert_eq!(
+        grown.err().map(|e| e.code().as_str().to_string()),
+        Some("SlowDown".to_string())
+    );
+}
