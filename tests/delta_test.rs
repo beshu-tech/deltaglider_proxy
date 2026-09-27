@@ -163,6 +163,62 @@ async fn test_delta_range_via_spooled_seek() {
     );
 }
 
+/// Under the DEFAULT config (no `DGP_SPOOL_THRESHOLD_BYTES`), a 20 MiB delta
+/// object is above the 16 MiB spool threshold: its ranges read one verified
+/// spool (the range-spool cache), so several ranges decode once. The decode
+/// count comes from `/_/metrics` (both decode paths observe it).
+#[tokio::test]
+async fn default_threshold_ranges_of_a_20mib_delta_decode_once() {
+    let server = TestServer::builder().build().await;
+    let http = server.http();
+
+    let base = generate_binary(20 * 1024 * 1024, 17);
+    let variant = mutate_binary(&base, 0.01);
+    for (key, body) in [("big/base.zip", base), ("big/v1.zip", variant.clone())] {
+        put_object(
+            &http,
+            &server.endpoint(),
+            server.bucket(),
+            key,
+            body,
+            "application/zip",
+        )
+        .await;
+    }
+    let decodes = || async {
+        let text = reqwest::get(format!("{}/_/metrics", server.endpoint()))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        text.lines()
+            .find_map(|l| l.strip_prefix("deltaglider_delta_decode_duration_seconds_count "))
+            .map(|v| v.trim().parse::<u64>().unwrap())
+            .unwrap_or(0)
+    };
+    let before = decodes().await;
+
+    let url = format!("{}/{}/big/v1.zip", server.endpoint(), server.bucket());
+    let len = variant.len() as u64;
+    for (start, end) in [(0, 999), (len / 2, len / 2 + 4095), (len - 5000, len - 1)] {
+        let resp = http
+            .get(&url)
+            .header("Range", format!("bytes={start}-{end}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 206);
+        let got = resp.bytes().await.unwrap();
+        assert_eq!(&got[..], &variant[start as usize..=end as usize]);
+    }
+    assert_eq!(
+        decodes().await - before,
+        1,
+        "three ranges of one large delta object must share one decode"
+    );
+}
+
 /// Force delta-eligible PUTs through the Phase-4 streaming spool store
 /// (`DGP_SPOOL_THRESHOLD_BYTES=1`): a similar variant must store as delta and
 /// round-trip byte-exact; a dissimilar object must fall back to passthrough. Both

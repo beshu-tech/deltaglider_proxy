@@ -366,7 +366,7 @@ Maximum time for an xdelta3 subprocess. Hung processes are killed after this.
 | **Env var** | `DGP_CODEC_TIMEOUT_SECS` |
 | `DGP_CODEC_STALL_SECS` | 30 | Streaming codec: the proxy stops an xdelta3 process that makes no progress for this many seconds |
 | `DGP_CODEC_ABSOLUTE_SECS` | 7200 | Streaming codec: the longest time one operation may take, in seconds, even while it makes progress |
-| `DGP_SPOOL_THRESHOLD_BYTES` | `max_object_size` | A delta GET larger than this reconstructs to a spool file and streams it, instead of in memory |
+| `DGP_SPOOL_THRESHOLD_BYTES` | 16 MiB (`16777216`), or `max_object_size` when that is smaller | A delta GET of an object larger than this reconstructs the object to a spool file and streams the file, instead of reconstructing it in memory. A delta-eligible upload larger than this is encoded from a spool file. Objects of this size or smaller use the in-memory path |
 | **Default** | `60` |
 | **Hot-reload** | No |
 

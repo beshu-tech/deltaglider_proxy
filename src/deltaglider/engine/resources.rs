@@ -4,6 +4,18 @@
 
 use super::*;
 
+/// The spool threshold without `DGP_SPOOL_THRESHOLD_BYTES`: large enough that
+/// small objects keep the cheap buffered path, small enough that the spool
+/// paths (bounded-memory GET, range-spool cache, streaming PUT) run under the
+/// defaults.
+pub const DEFAULT_SPOOL_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
+
+/// [`DEFAULT_SPOOL_THRESHOLD_BYTES`], capped at `max_object_size` (no object
+/// is larger than that). Pure.
+pub fn default_spool_threshold(max_object_size: u64) -> u64 {
+    DEFAULT_SPOOL_THRESHOLD_BYTES.min(max_object_size)
+}
+
 impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Access the underlying storage backend (for operations that bypass the delta engine)
     pub fn storage(&self) -> &S {
@@ -30,11 +42,15 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         self.codec.cli_version()
     }
 
-    /// Bytes above which a delta-eligible PUT routes through the streaming spool
-    /// store (`store_spooled_delta`). Tied to `max_object_size`; overridable via
-    /// `DGP_SPOOL_THRESHOLD_BYTES` (shared with the GET-side threshold).
-    pub fn spool_store_threshold(&self) -> u64 {
-        crate::config::env_parse_with_default("DGP_SPOOL_THRESHOLD_BYTES", self.max_object_size)
+    /// Bytes above which a delta object goes through the spool: a delta-eligible
+    /// PUT uses the streaming spool store (`store_spooled_delta`), and a delta
+    /// GET (full or ranged) reconstructs to a spool file. `DGP_SPOOL_THRESHOLD_BYTES`
+    /// overrides [`default_spool_threshold`].
+    pub fn spool_threshold(&self) -> u64 {
+        crate::config::env_parse_with_default(
+            "DGP_SPOOL_THRESHOLD_BYTES",
+            default_spool_threshold(self.max_object_size),
+        )
     }
 
     /// Whether `key`'s filename is delta-eligible (used by the adapter to decide
@@ -271,5 +287,18 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 "timed out waiting for codec slot — server too busy".into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod spool_threshold_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_is_16_mib_capped_at_max_object_size() {
+        let mib = 1024 * 1024;
+        assert_eq!(default_spool_threshold(100 * mib), 16 * mib);
+        assert_eq!(default_spool_threshold(16 * mib), 16 * mib);
+        assert_eq!(default_spool_threshold(8 * mib), 8 * mib);
     }
 }

@@ -270,7 +270,7 @@ async fn copy_object_once(
     // replication). The x-ray flagged retrieve()→store() as a hidden OOM for big
     // deltas; this closes it now that the store side streams (Phase 4).
     let source_size = source_head.file_size;
-    if source_size > engine.spool_store_threshold() {
+    if source_size > engine.spool_threshold() {
         if let Some(outcome) = spooled_copy(engine, &request, &source_head, source_size).await? {
             return Ok(outcome);
         }

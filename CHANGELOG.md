@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Changed — Delta objects larger than 16 MiB use the spool by default
+
+`DGP_SPOOL_THRESHOLD_BYTES` defaulted to `max_object_size` (100 MiB). No
+object is larger than that, so the spool paths never ran under the default
+config: a delta GET reconstructed the whole object in memory, every range
+request of a delta object reconstructed it again, and a delta-eligible
+upload was encoded in memory. The default is now 16 MiB, or
+`max_object_size` when that is smaller. A delta object larger than this
+reconstructs to a spool file in `DGP_SPOOL_DIR`, its range requests share one
+reconstruction, and an upload larger than this is encoded from a spool file.
+To keep the old behaviour, set `DGP_SPOOL_THRESHOLD_BYTES` to
+`max_object_size`.
+
 ### Changed — The document validate runs the same checks as the apply
 
 `POST /_/api/admin/config/validate` skipped two steps of

@@ -180,14 +180,6 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         }
     }
 
-    /// Bytes above which a delta GET reconstructs to a spool file + streams it,
-    /// instead of buffering the whole reconstruction in RAM. Below this, the
-    /// buffered path is cheaper and well-tested. Tied to `max_object_size` (the
-    /// "buffer-in-RAM below here" line); `DGP_SPOOL_THRESHOLD_BYTES` overrides.
-    fn spool_threshold(&self) -> u64 {
-        crate::config::env_parse_with_default("DGP_SPOOL_THRESHOLD_BYTES", self.max_object_size)
-    }
-
     /// Reconstruct a large delta object to a quota'd spool file, verify its
     /// SHA-256 BEFORE returning, then stream the spool file to the client.
     ///
@@ -915,8 +907,8 @@ mod range_spool_tests {
         }
         assert!(writer.head("b", "v/b.zip").await.unwrap().is_delta());
 
-        // Objects above max_object_size (the spool threshold) take the
-        // spooled range path.
+        // Objects above the spool threshold (here max_object_size, which
+        // caps it) take the spooled range path.
         let config = Config {
             max_object_size: 64 * 1024,
             ..Config::default()

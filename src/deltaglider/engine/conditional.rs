@@ -200,7 +200,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         user_metadata: HashMap<String, String>,
     ) -> Result<StoreResult, EngineError> {
         let size = data.len() as u64;
-        if size > self.spool_store_threshold() && self.is_delta_eligible_key(key) {
+        if size > self.spool_threshold() && self.is_delta_eligible_key(key) {
             let spool = self.spool_acquire(size).await?;
             tokio::fs::write(spool.path(), data)
                 .await
