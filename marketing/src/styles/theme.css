@@ -53,6 +53,19 @@
   --amber-wash: rgba(252, 211, 77, 0.08);
   --amber-line: rgba(252, 211, 77, 0.4);
 
+
+  /* Data and status roles. Each colour means one thing everywhere:
+     --brand = DeltaGlider (the proxy, a stored delta, the primary action),
+     --accent = the reference baseline ONLY, --neutral-data = plain storage
+     (a full copy, "today"), --ok / --neg / --warn = status. */
+  --neutral-data: #64748b;
+  --ok: #34d399;
+  --neg: #fb7185;
+  --neg-wash: rgba(251, 113, 133, 0.1);
+  --warn: var(--amber-ink);
+  /* A recessed well: chart background, table header. */
+  --surface-sunk: rgba(15, 23, 42, 0.4);
+
   /* Semantic aliases */
   --ink: var(--ink-900);
   --ink-strong: #ffffff;
@@ -95,6 +108,20 @@
   /* Type */
   --font-sans: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, 'Menlo', 'Monaco', monospace;
+
+  /* Type scale (1.25 ratio from 16 px). Sentence case everywhere. */
+  --fs-display: clamp(2.5rem, 4.6vw, 3.75rem);
+  --fs-h2: clamp(1.75rem, 3vw, 2.25rem);
+  --fs-h3: 1.25rem;
+  --fs-lede: 1.25rem;
+  --fs-small: 0.875rem;
+  --fs-label: 0.8125rem;
+
+  /* Radius: three steps. sm = controls, chips, inline code; md = cards,
+     panels, code blocks, screenshots; pill = status chips only. */
+  --r-sm: 6px;
+  --r-md: 12px;
+  --r-pill: 999px;
 
   /* Layout */
   --shell: 1100px;
@@ -145,6 +172,13 @@
   --amber-ink: #92400e;
   --amber-wash: rgba(180, 83, 9, 0.08);
   --amber-line: rgba(180, 83, 9, 0.35);
+
+
+  --neutral-data: #7c8aa0;
+  --ok: #047857;
+  --neg: #be123c;
+  --neg-wash: rgba(190, 18, 60, 0.07);
+  --surface-sunk: rgba(148, 163, 184, 0.16);
 
   --ink: var(--ink-900);
   --ink-strong: #020617;
