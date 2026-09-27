@@ -37,35 +37,35 @@ storage:
         exclude_globs: [".deltaglider/**"]
 ```
 
-From the admin UI: **Settings → Jobs** — replication rules live in the storage-section editor on the Jobs screen; add the rule and apply.
+In the admin UI, open **Settings → Jobs**. Replication rules live in the storage-section editor on the Jobs screen. Add the rule there and apply it.
 
 ![Object replication settings](/_/screenshots/object-replication.jpg)
 
-Replication has two triggers: **event-driven** copies each PUT/DELETE/COPY in near-real time (the primary path), and the rule's `interval` schedules a periodic full reconcile as the self-healing backstop. You don't choose between them — both run; `interval` only sets how often the backstop sweeps ([details](../reference/replication.md#triggers)).
+Replication has two triggers. The event-driven trigger copies each PUT/DELETE/COPY in near-real time, and it is the primary path. The rule's `interval` schedules a periodic full reconcile, which is the backstop that repairs anything missed. Both triggers always run: `interval` only sets how often the backstop sweeps ([details](../reference/replication.md#triggers)).
 
-Every copy goes through the engine, so each side applies its own encryption and compression — you can replicate from an encrypted backend to a plaintext one and vice versa.
+Every copy goes through the engine, so each side applies its own encryption and compression. You can therefore replicate from an encrypted backend to a plaintext one, and the other way around.
 
 ## 3. Scope what replicates
 
-- If only part of the bucket matters, set `source.prefix` (e.g. `firmware/`) — or narrow further with `include_globs: ["firmware/widget-3000/**"]`. When includes are set, only matching keys replicate.
-- If some keys must never leave (scratch files, temp uploads), add them to `exclude_globs` — exclude wins over include. Keep `.deltaglider/**` excluded; it protects the config-sync prefix when a bucket doubles as user data.
-- If the destination should use a different layout, set `destination.prefix` — source keys are re-rooted under it.
+- If only part of the bucket matters, set `source.prefix` (for example `firmware/`). You can narrow the scope further with `include_globs: ["firmware/widget-3000/**"]`. When includes are set, only matching keys replicate.
+- If some keys must never leave the source (scratch files, temp uploads), add them to `exclude_globs`. An exclude wins over an include. Keep `.deltaglider/**` excluded, because it protects the config-sync prefix when a bucket also holds user data.
+- If the destination should use a different layout, set `destination.prefix`. The rule places the source keys under that prefix.
 
 Directory markers and storage-layer delta artifacts never replicate; the engine listing filters them before planning ([full list](../reference/replication.md#what-doesnt-replicate)).
 
 ## 4. Pick a conflict policy
 
 - If the destination is write-only DR (nothing else writes to `releases-dr`), keep the default `newer-wins`: copies happen only when the source is strictly newer.
-- If the destination must stay an exact mirror of the source, even over manual edits on the destination, use `content-diff` — it overwrites any object whose bytes differ but skips identical ones (so it converges instead of re-copying everything every sweep).
-- If you're seeding a bucket once and never overwriting, use `skip-if-dest-exists`.
+- If the destination must stay an exact mirror of the source, even over manual edits on the destination, use `content-diff`. It overwrites any object whose bytes differ, and it skips identical ones, so it converges instead of copying everything again on every sweep.
+- If you seed a bucket once and never overwrite it, use `skip-if-dest-exists`.
 
 ## 5. Decide on delete replication
 
-By default, deletes do not propagate — `releases-dr` keeps objects that vanish from `releases`. If you want a true mirror, set `replicate_deletes: true`: the destination becomes a faithful mirror where **any** object absent at source is removed (a destination object is deleted only after a source HEAD confirms the key is gone). Because it removes anything not present at source — including objects written by other tools or another rule — the destination bucket (`releases-dr`) must be **dedicated to this rule**.
+By default, deletes do not propagate, so `releases-dr` keeps objects that disappear from `releases`. If you want a true mirror, set `replicate_deletes: true`. The destination then becomes a faithful mirror: the rule removes **any** object that is absent at the source. It deletes a destination object only after a source HEAD confirms that the key is gone. The rule removes anything not present at the source, including objects that other tools or another rule wrote. So the destination bucket (`releases-dr`) must be **dedicated to this rule**.
 
 ## 6. Run it now
 
-The first sync doesn't have to wait for events or the interval:
+The first sync does not have to wait for events or for the interval:
 
 ```bash
 curl -b cookies -X POST \
@@ -92,7 +92,7 @@ If you get `409 Conflict`, the rule is already running, replication is disabled 
 
 ## 7. Watch it in Jobs
 
-**Settings → Jobs** shows the rule as row `replication:mirror-releases-to-dr` with its status and last run. The drawer's **Runs** tab lists every execution; **Failures** lists per-object errors (a few failed objects don't fail the run — the next pass catches them up).
+**Settings → Jobs** shows the rule as row `replication:mirror-releases-to-dr` with its status and last run. The drawer's **Runs** tab lists every execution, and **Failures** lists per-object errors. A few failed objects do not fail the run, because the next pass copies them.
 
 ![Job runs drawer](/_/screenshots/jobs-drawer-runs.jpg)
 
@@ -103,11 +103,11 @@ curl -b cookies https://s3.acme.example/_/api/admin/jobs/replication:mirror-rele
 curl -b cookies https://s3.acme.example/_/api/admin/jobs/replication:mirror-releases-to-dr/failures
 ```
 
-Pause and resume from the job row (or `POST …/pause` / `…/resume`). A paused rule copies and deletes nothing, also for new events, and the pause survives restarts. The events of the pause are not kept, so a resume starts a full reconcile at the next scheduler tick to bring `releases-dr` in sync. With `replicate_deletes: true`, that reconcile also applies the deletes of the pause.
+Pause and resume from the job row (or `POST …/pause` / `…/resume`). A paused rule copies and deletes nothing, also for new events, and the pause survives restarts. The proxy does not keep the events of the pause, so a resume starts a full reconcile at the next scheduler tick to bring `releases-dr` in sync. With `replicate_deletes: true`, that reconcile also applies the deletes of the pause.
 
 ## Verify
 
-The **Audit** button on the rule's Verify tab runs a fast **metadata audit**: it lists both sides and checks that every source object exists on the destination with matching recorded checksums and sizes. It issues no downloads, so it does **not** re-read the destination's stored bytes — it proves the two sides *agree on recorded metadata*, not that the destination reconstructs byte-for-byte. It returns one verdict — **Verified in sync**, **Not fully verified** (capped scan or size-only matches), or **Differences found** — with a guided fix for each finding. For byte-level proof, use the CLI checks below.
+The **Audit** button on the rule's Verify tab runs a fast **metadata audit**: it lists both sides and checks that every source object exists on the destination with matching recorded checksums and sizes. It downloads nothing, so it does **not** read the destination's stored bytes again. It proves that the two sides *agree on recorded metadata*, but not that the destination reconstructs each object byte for byte. It returns one verdict, **Verified in sync**, **Not fully verified** (capped scan or size-only matches), or **Differences found**, with a guided fix for each finding. For byte-level proof, use the CLI checks below.
 
 1. The destination has the objects:
 
@@ -121,7 +121,7 @@ The **Audit** button on the rule's Verify tab runs a fast **metadata audit**: it
    aws --endpoint-url https://s3.acme.example s3 cp s3://releases-dr/firmware/widget-3000/fw-2.4.1.tar - | sha256sum
    ```
 
-3. Near-real-time copy works — upload a new object to `releases` and watch it appear on `releases-dr` within seconds:
+3. Near-real-time copy works. Upload a new object to `releases`, and watch it appear on `releases-dr` within seconds:
 
    ```bash
    aws --endpoint-url https://s3.acme.example s3 cp fw-2.4.2.tar s3://releases/firmware/widget-3000/fw-2.4.2.tar
@@ -132,9 +132,9 @@ The **Audit** button on the rule's Verify tab runs a fast **metadata audit**: it
 
 ## Related
 
-- [How to use non-CAS backends safely](backend-capability-validation.md) — mark the destination `replication_target_only` to host a mirror on a cheap backend like Backblaze B2.
-- [Replication reference](../reference/replication.md) — rule grammar, conflict policies, failure modes, what doesn't replicate.
-- [Jobs reference](../reference/jobs.md) — the unified jobs API the rule appears on.
-- [Event log reference](../reference/event-outbox.md) — the event stream that drives near-real-time copies.
-- [Jobs and durability](../explanation/jobs-and-durability.md) — why replication is a durable job, not a cron script.
-- [How to expire and archive objects](expire-and-archive-objects.md) — age-based moves instead of mirroring.
+- [How to use non-CAS backends safely](backend-capability-validation.md): mark the destination `replication_target_only` to host a mirror on a cheap backend like Backblaze B2.
+- [Replication reference](../reference/replication.md): rule grammar, conflict policies, failure modes, what doesn't replicate.
+- [Jobs reference](../reference/jobs.md): the unified jobs API that shows the rule.
+- [Event log reference](../reference/event-outbox.md): the event stream that drives near-real-time copies.
+- [Jobs and durability](../explanation/jobs-and-durability.md): why replication is a durable job.
+- [How to expire and archive objects](expire-and-archive-objects.md): age-based moves instead of mirroring.

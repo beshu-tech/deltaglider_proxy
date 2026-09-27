@@ -1,57 +1,57 @@
 # How migration works
 
-*What actually happens when you move an existing bucket onto the proxy — and the questions you should ask before you do.*
+*What happens when you move an existing bucket onto the proxy, and the questions to ask before you do it.*
 
-Migrations are scary because the failure mode is "my data is now somewhere I don't understand." This page is the conceptual map so the [step-by-step guide](../how-to/migrate-existing-data-into-the-proxy.md) isn't a leap of faith. Three things up front, because they're the ones people worry about:
+A migration feels risky when you cannot tell where your data ends up. This page explains the concepts behind the [step-by-step guide](../how-to/migrate-existing-data-into-the-proxy.md), so that you know what each step does. Three facts come first, because people worry about them most:
 
-- **There is no lazy, magic, migrate-on-read step.** DeltaGlider never silently rewrites your existing objects in the background. Migration is an explicit action you run.
-- **It does not require downtime** in the strict sense — both routes let the old bucket keep serving until you choose to cut over.
-- **You pick the trade-off**: keep your existing layout untouched (no compression of the back-catalog), or do a one-time copy *through* the proxy that re-stores everything as deltas.
+- **There is no lazy migrate-on-read step.** DeltaGlider never rewrites your existing objects in the background. Migration is an explicit action that you run.
+- **It does not require downtime** in the strict sense. With both routes, the old bucket keeps serving until you choose to cut over.
+- **You pick the trade-off.** You can keep your existing layout untouched, and the back-catalog then gets no compression. Or you can do a one-time copy *through* the proxy, which stores everything again as deltas.
 
 ## The fork: in-place vs. copy-through
 
-Every migration is one of two shapes. The guide calls them Route 1 and Route 2; here's what each one *is*.
+Every migration has one of two shapes. The guide calls them Route 1 and Route 2. This section explains what each one *is*.
 
-### Route 1 — point at the bucket in place
+### Route 1: point at the bucket in place
 
-You register your existing S3 bucket as a backend and route a proxy bucket to it. Nothing about the stored objects changes. The proxy reads and writes them as ordinary passthrough objects; your historical data stays exactly as it is on disk.
+You register your existing S3 bucket as a backend and route a proxy bucket to it. The stored objects do not change. The proxy reads and writes them as ordinary passthrough objects, and your historical data stays exactly as it is on disk.
 
-What this gives you: a zero-risk, zero-rewrite cutover. The proxy is now in the data path, so **new** uploads that land on a delta-eligible prefix start getting compressed. Your back-catalog does not shrink — it was written before the proxy existed and is left alone.
+This route gives you a cutover with no risk and no rewrite. The proxy is now in the data path, so the proxy compresses **new** uploads that land on a delta-eligible prefix. Your back-catalog does not shrink, because it was written before the proxy existed and the proxy leaves it alone.
 
-Use this when the existing data is fine as-is and you only care about compressing what comes next, or when you simply want the control plane (IAM, audit, replication) in front of storage you don't want to touch.
+Use this route when the existing data is fine as it is and you want to compress only the uploads that come next. Also use it when you want the control plane (IAM, audit, replication) in front of storage that you do not want to touch.
 
-### Route 2 — copy through the proxy
+### Route 2: copy through the proxy
 
-You stand up a fresh proxy bucket (a new namespace) and do a one-time `sync` that *reads from the old location and writes through the proxy*. Because the proxy rebuilds each object on write, everything that lands this way is stored compressed — your version history itself becomes deltas.
+You create a fresh proxy bucket (a new namespace) and run a one-time `sync` that *reads from the old location and writes through the proxy*. The proxy rebuilds each object on write, so it stores everything that arrives this way in compressed form. Your version history itself becomes deltas.
 
-What this gives you: the full storage savings on the existing catalog, not just future uploads. The cost is a one-time data movement (every object is read once and written once) and the disk/bandwidth to do it.
+This route gives you the full storage savings on the existing catalog as well as on future uploads. The cost is a one-time data movement (the sync reads every object once and writes it once), plus the disk and bandwidth for it.
 
-Use this when the back-catalog is the whole point — the firmware releases, the nightly dumps, the model checkpoints you're paying full price for today.
+Use this route when the back-catalog is the reason for the migration: for example the firmware releases, the nightly dumps, or the model checkpoints that you pay full price for today.
 
 ## What "rebuilds each object on write" means
 
-This is the mechanic that makes Route 2 work, and it's worth understanding because it explains the one gotcha.
+This mechanism makes Route 2 work, and it also explains the one surprise of Route 2.
 
-When an object is written through the proxy onto a delta-eligible prefix, the [PUT decision](delta-compression.md#the-put-decision) runs: the first object in a deltaspace becomes the **reference baseline**, and each later object is encoded as an xdelta3 delta against it. Whichever object arrives first is the baseline — so **upload order shapes your ratios**.
+When a client writes an object through the proxy onto a delta-eligible prefix, the [PUT decision](delta-compression.md#the-put-decision) runs. The first object in a deltaspace becomes the **reference baseline**, and the proxy encodes each later object as an xdelta3 delta against it. The object that arrives first is the baseline, so **upload order shapes your ratios**.
 
-For versioned names this usually takes care of itself: `aws s3 sync` copies in key order, and `fw-2.3.0.tar`, `fw-2.4.0.tar`, `fw-2.5.0.tar` sort into version order anyway, so the oldest becomes the baseline and the newer ones delta cleanly against it. The case to watch is a prefix where the lexical order and the "most representative baseline" disagree; there, a poor baseline just means weaker ratios, never incorrect data — every reconstructed object is still SHA-256-verified byte-for-byte.
+For versioned names, this usually works out without effort. `aws s3 sync` copies in key order, and `fw-2.3.0.tar`, `fw-2.4.0.tar`, `fw-2.5.0.tar` sort into version order, so the oldest file becomes the baseline and the newer ones delta cleanly against it. Watch out for a prefix where the lexical order and the most representative baseline disagree. There, a poor baseline gives weaker ratios, but it never gives incorrect data, because the proxy verifies every reconstructed object byte for byte with SHA-256.
 
-## Downtime, really?
+## Downtime
 
 Neither route forces a maintenance window:
 
-- **Route 1**: the bucket you registered keeps serving throughout. You add the route, verify, then point clients at the proxy endpoint when you're ready. The switch is a client-side endpoint change, not a data operation.
-- **Route 2**: the old bucket stays live and readable while the one-time sync runs into the *new* proxy namespace. You cut clients over only after the copy completes and you've verified it. If you need strict consistency for objects written *during* the sync, do a final catch-up sync after freezing writes — the usual dual-write / final-delta pattern, same as any bucket-to-bucket move.
+- **Route 1**: the bucket that you registered keeps serving the whole time. You add the route, verify it, and then point clients at the proxy endpoint when you are ready. The switch is an endpoint change on the client side, not a data operation.
+- **Route 2**: the old bucket stays live and readable while the one-time sync runs into the *new* proxy namespace. You cut clients over only after the copy completes and you verify it. If you need strict consistency for objects that clients write *during* the sync, freeze writes and then run a final catch-up sync. This is the usual dual-write and final-delta pattern of any bucket-to-bucket move.
 
-What migration is *not*: it is not a trickle that rewrites objects as they're read, and it is not a background daemon quietly re-encoding your back-catalog. If the proxy didn't write an object, that object is unchanged.
+Migration does not rewrite objects as clients read them, and no background daemon re-encodes your back-catalog. If the proxy did not write an object, that object is unchanged.
 
 ## A related but different thing: backend-to-backend moves
 
-Don't confuse *migrating onto the proxy* (the subject of this page) with *moving a bucket between backends once it's already on the proxy*. The latter is a first-class, resumable [migrate job](../reference/jobs.md) — stage, copy, verify, flip, cleanup — driven from the Jobs screen, with a write gate so the bucket stays consistent during the move. That's the [move-a-bucket guide](../how-to/move-a-bucket-between-backends.md). This page is about the one-time on-ramp from storage the proxy has never seen.
+*Migrating onto the proxy* (the subject of this page) is different from *moving a bucket between backends when the bucket is already on the proxy*. For the second case, the proxy has a resumable [migrate job](../reference/jobs.md) with the phases stage, copy, verify, flip and cleanup. You start it from the Jobs screen, and a write gate keeps the bucket consistent during the move. The [move-a-bucket guide](../how-to/move-a-bucket-between-backends.md) covers it. This page is about the one-time move from storage that the proxy has never seen.
 
 ## Related
 
-- [How to migrate an existing S3 bucket into the proxy](../how-to/migrate-existing-data-into-the-proxy.md) — the step-by-step for both routes.
-- [How delta compression works](delta-compression.md) — the PUT decision and baseline mechanics referenced above.
-- [How to move a bucket between backends](../how-to/move-a-bucket-between-backends.md) — the resumable job for relocating an already-onboarded bucket.
-- [DeltaGlider compression vs. S3 Object Versioning](versioning-vs-s3-versioning.md) — what happens to a *versioned* source bucket.
+- [How to migrate an existing S3 bucket into the proxy](../how-to/migrate-existing-data-into-the-proxy.md): the step-by-step for both routes.
+- [How delta compression works](delta-compression.md): the PUT decision and the baseline mechanics that this page refers to.
+- [How to move a bucket between backends](../how-to/move-a-bucket-between-backends.md): the resumable job that moves a bucket that is already on the proxy.
+- [DeltaGlider compression vs. S3 Object Versioning](versioning-vs-s3-versioning.md): what happens to a *versioned* source bucket.

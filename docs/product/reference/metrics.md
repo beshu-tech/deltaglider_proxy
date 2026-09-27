@@ -4,7 +4,7 @@
 
 ![Storage analytics dashboard](/_/screenshots/analytics.jpg)
 
-`GET /_/metrics` returns Prometheus text format on the same port as the S3 API. Metrics are collected via lock-free atomics on the hot path — no mutexes, no sampling, no performance impact.
+`GET /_/metrics` returns Prometheus text format on the same port as the S3 API. The proxy collects metrics with lock-free atomics on the hot path. It uses no mutexes and no sampling, and the collection has no measurable performance impact.
 
 For scrape configuration, Grafana panels, and alerting rules, see [How to monitor with Prometheus and Grafana](../how-to/monitor-with-prometheus.md).
 
@@ -26,7 +26,7 @@ curl -s http://localhost:9000/_/metrics | promtool check metrics
 | `process_peak_rss_bytes` | Gauge | — | Peak resident set size (updated on scrape) |
 | `process_*` (Linux only) | various | — | Standard process collector: RSS, CPU seconds, open FDs, virtual memory |
 
-The endpoint is public by default so that any Prometheus can scrape it. Set `DGP_METRICS_BEARER_TOKEN` to require `Authorization: Bearer <token>` (or an admin session, which the dashboard uses); anonymous callers then receive `401` and cannot read the metric set, which changes from release to release. See [Monitor with Prometheus](../how-to/monitor-with-prometheus.md).
+The endpoint is public by default so that any Prometheus can scrape it. Set `DGP_METRICS_BEARER_TOKEN` to require `Authorization: Bearer <token>` (or an admin session, which the dashboard uses); anonymous clients then receive `401` and cannot read the metric set, which changes from release to release. See [Monitor with Prometheus](../how-to/monitor-with-prometheus.md).
 
 ## HTTP requests
 
@@ -77,9 +77,9 @@ These series count S3 API requests only. The requests to the endpoints under `/_
 
 ### `decision` label values
 
-- `delta` — stored as a delta patch against the reference baseline
-- `passthrough` — stored as-is (non-eligible file type, or poor compression ratio)
-- `reference` — new reference baseline created for a deltaspace
+- `delta`: stored as a delta patch against the reference baseline
+- `passthrough`: stored as-is (non-eligible file type, or poor compression ratio)
+- `reference`: new reference baseline created for a deltaspace
 
 ### Histogram buckets
 
@@ -95,10 +95,10 @@ These series count S3 API requests only. The requests to the endpoints under `/_
 | `deltaglider_cache_size_bytes` | Gauge | — | Current weighted cache size (updated on scrape) |
 | `deltaglider_cache_entries` | Gauge | — | Current number of cached reference entries |
 | `deltaglider_cache_max_bytes` | Gauge | — | Configured max capacity (constant, set at startup) |
-| `deltaglider_cache_utilization_ratio` | Gauge | — | `weighted_size / max_capacity` (0.0–1.0) |
-| `deltaglider_cache_miss_rate_ratio` | Gauge | — | `misses / (hits + misses)` since startup (0.0–1.0) |
+| `deltaglider_cache_utilization_ratio` | Gauge | — | `weighted_size / max_capacity` (0.0 to 1.0) |
+| `deltaglider_cache_miss_rate_ratio` | Gauge | — | `misses / (hits + misses)` since startup (0.0 to 1.0) |
 
-The ratio gauges are pre-computed so dashboards + alerts don't need PromQL arithmetic:
+The ratio gauges are pre-computed, so dashboards and alerts do not need PromQL arithmetic:
 
 ```promql
 deltaglider_cache_utilization_ratio > 0.9   # cache nearly full
@@ -186,7 +186,7 @@ All label sets are bounded:
 | `result` | 2 (success or failure) |
 | `reason` | 7 (see the Auth table) |
 
-No bucket names, no object keys in labels. No unbounded cardinality.
+No label contains a bucket name or an object key, so no label has unbounded cardinality.
 
 ## Tokio runtime series (opt-in build flag)
 
@@ -206,7 +206,7 @@ RUSTFLAGS="--cfg tokio_unstable" cargo build --release
 | `deltaglider_tokio_schedule_latency_range_total{range}` | counter | Task wake-ups per schedule-latency range, summed across workers. The schedule latency is the time from the moment a task becomes ready (a socket has data, a lock is free, a timer fires) to the moment a worker starts to poll it. The label `range` has the same shape as the poll-time series. Use `rate()`/`increase()`. |
 | `deltaglider_tokio_workers` | gauge | Worker thread count, for context when reading the per-worker series. |
 
-Reading guidance: start with `worker_mean_poll_seconds` — if it is high, request handling contains inline blocking work (the class of problem behind the bucket-usage and periodic-sweep fixes). The mean hides the tail, so confirm with `deltaglider_tokio_poll_time_range_total`: growth in the high `range` buckets is what a few long polls look like. If the mean is low and the tail is flat but latency is still poor, check the two queue depths for saturation, then the budget-yield counter for CPU-hogging loops.
+Reading guidance: start with `worker_mean_poll_seconds`. If it is high, request handling contains inline blocking work (the class of problem behind the bucket-usage and periodic-sweep fixes). The mean hides the tail, so confirm with `deltaglider_tokio_poll_time_range_total`: growth in the high `range` buckets is what a few long polls look like. If the mean is low and the tail is flat but latency is still poor, check the two queue depths for saturation, then the budget-yield counter for CPU-hogging loops.
 
 The schedule-latency series answers a different question from the poll-time series. Poll time measures how long a task runs once a worker picks it up. Schedule latency measures how long a ready task waits before a worker picks it up. Both histograms use Tokio's default buckets: ten linear ranges of 100 microseconds each, and the last range (from 900 microseconds up) is open-ended.
 
@@ -216,13 +216,13 @@ On a healthy proxy, almost all wake-ups land in the first range (`0-100us`), and
 - A high schedule latency with a flat poll-time tail and a deep global queue means that the runtime has more ready work than workers. The proxy is CPU-saturated, or it has too few worker threads for the load.
 - A high schedule latency on its own, while the queues stay short, usually means that the host does not give the worker threads enough CPU time (CPU throttling from a container limit, or a noisy neighbour).
 
-## What's NOT in `/_/metrics`
+## What's not in `/_/metrics`
 
-`/_/stats` returns aggregate storage statistics (`total_objects`, `total_original_size`, `total_stored_size`, `savings_percentage`). It requires an admin session (`401` without one), because it reveals the size of every bucket. These are intentionally excluded from `/_/metrics`: they are read from a per-bucket running counter (object count, logical bytes, stored bytes) maintained inline on every PUT and DELETE, not derived from the Prometheus collectors. The read is O(1) — there is no object scan, no 1,000-object cap, and no `truncated` field (both were retired when the counter shipped). The endpoint keeps a **10-second server-side cache** for the all-buckets aggregate; `?bucket=NAME` reads one bucket's counter uncached. The counter is per-instance and approximate across a fleet; reconcile it against ground truth with `POST /_/api/admin/usage/refresh?bucket=NAME` (an uncapped full scan that overwrites the counter). Use `/_/stats` for admin dashboards; use `/_/metrics` for Prometheus.
+`/_/stats` returns aggregate storage statistics (`total_objects`, `total_original_size`, `total_stored_size`, `savings_percentage`). It requires an admin session (`401` without one), because it reveals the size of every bucket. These are intentionally excluded from `/_/metrics`. The proxy reads them from a per-bucket running counter (object count, logical bytes, stored bytes) that it updates inline on every PUT and DELETE, and not from the Prometheus collectors. The read is O(1). There is no object scan, no 1,000-object cap, and no `truncated` field. The endpoint keeps a 10-second server-side cache for the all-buckets aggregate; `?bucket=NAME` reads one bucket's counter uncached. The counter is per-instance and approximate across a fleet; reconcile it against ground truth with `POST /_/api/admin/usage/refresh?bucket=NAME` (an uncapped full scan that overwrites the counter). Use `/_/stats` for admin dashboards; use `/_/metrics` for Prometheus.
 
 ## Implementation details
 
-- Counters and histograms use the `prometheus` crate's atomic collectors — no mutex on the hot path.
+- Counters and histograms use the `prometheus` crate's atomic collectors, so the hot path has no mutex.
 - Gauges requiring state inspection (`cache_size_bytes`, `codec_semaphore_available`, `process_peak_rss_bytes`) are computed lazily on each scrape via O(1) atomic reads.
 - The HTTP metrics middleware sits between `TraceLayer` and auth, so it captures the full request lifecycle including auth time.
 - The `process` feature of the prometheus crate adds standard Linux process metrics. On macOS, only `process_peak_rss_bytes` is populated (via `getrusage`).

@@ -1,6 +1,6 @@
 # Lifecycle rules
 
-Lifecycle for engine-visible objects: delete old objects by age, keep the newest *N* by count (`retain-newest`), or transition/archive them to another bucket/prefix. Lifecycle rules appear on the unified Jobs surface (`GET /_/api/admin/jobs`, job id `lifecycle:<rule-name>`); see [Jobs](jobs.md).
+Lifecycle rules act on engine-visible objects. A rule deletes old objects by age, keeps the newest *N* by count (`retain-newest`), or transitions (archives) objects to another bucket or prefix. Lifecycle rules appear on the unified Jobs surface (`GET /_/api/admin/jobs`, job id `lifecycle:<rule-name>`); see [Jobs](jobs.md).
 
 ## Scope
 
@@ -46,7 +46,7 @@ Rule names use `[A-Za-z0-9_.-]{1,64}` and must be unique.
 
 ### Count-based retention: `retain-newest`
 
-`retain-newest` keeps the newest `count` objects in a prefix and deletes the rest — selection by *count*, not age (the rule native S3 lifecycle never shipped). `expire_after` does not apply to a `retain-newest` rule and may be omitted.
+`retain-newest` keeps the newest `count` objects in a prefix and deletes the rest. It selects by *count* instead of age, which native S3 lifecycle does not offer. `expire_after` does not apply to a `retain-newest` rule and may be omitted.
 
 ```yaml
       - name: keep-last-two-nightly-dumps
@@ -63,15 +63,15 @@ Rule names use `[A-Za-z0-9_.-]{1,64}` and must be unique.
         include_globs: ["nightly/**/*.dump"]
 ```
 
-- **`count`** (required, ≥ 1) — how many of the newest *qualifying* objects to keep. Objects are ranked by `created_at` descending, with a deterministic key-descending tie-break (stable across runs).
-- **`qualify`** (optional) — an **eligibility filter**, not a delete guard. An object failing it is *invisible* to the rule: never counted toward `count`, never deleted. This is what stops an accidental empty/truncated file (a stray `README`, a half-written dump) from anchoring the keep set and pushing a real backup into the delete set.
-  - **`min_size_bytes`** — the object's *original* (hydrated) size must be ≥ this. Guards against empty/placeholder files.
-  - **`min_age`** (humantime) — object must be older than this. Guards against in-flight uploads being counted before they finish.
-- **`protect_younger_than`** (optional, humantime) — a **delete-side guard**: an object selected for deletion is spared *this run* if it is younger than this. It is never promoted into the keep set; next run, once older, normal ranking applies. Most rules omit it.
+- `count` (required, ≥ 1): how many of the newest *qualifying* objects to keep. The rule ranks objects by `created_at` descending, with a deterministic key-descending tie-break (stable across runs).
+- `qualify` (optional): an eligibility filter, not a delete guard. An object that fails it is *invisible* to the rule: the rule never counts it toward `count` and never deletes it. The filter stops an accidental empty or truncated file (a stray `README`, a half-written dump) from taking a place in the keep set and pushing a real backup into the delete set.
+  - `min_size_bytes`: the object's *original* (hydrated) size must be ≥ this value. It guards against empty and placeholder files.
+  - `min_age` (humantime): the object must be older than this value. It stops the rule from counting in-flight uploads before they finish.
+- `protect_younger_than` (optional, humantime): a delete-side guard. The rule spares an object that it selected for deletion *in this run* if the object is younger than this value. The rule never promotes the object into the keep set. In a later run, when the object is older, normal ranking applies. Most rules omit it.
 
-The eligibility-vs-guard distinction is deliberate: `qualify.min_age` means "too young to count yet" (ignored); `protect_younger_than` means "old enough to count, but don't physically delete it yet" (spared). Preview reports `objects_ignored` and `objects_protected` so the disposition is visible before anything runs.
+The two settings differ on purpose. `qualify.min_age` means "too young to count yet" (ignored). `protect_younger_than` means "old enough to count, but do not physically delete it yet" (spared). Preview reports `objects_ignored` and `objects_protected`, so you see the result for each object before anything runs.
 
-Unlike age rules, a `retain-newest` run is **atomic per execution** — its keep/delete decision needs the complete candidate set, so it does not resume mid-prefix from a cursor (the read-only collect phase simply restarts). A prefix with more than 200,000 candidate objects fails the rule loudly rather than rank a truncated set.
+Unlike an age rule, a `retain-newest` run is **atomic per execution**. Its keep/delete decision needs the complete candidate set, so it does not resume from a cursor in the middle of a prefix. Instead, the read-only collect phase restarts. When a prefix has more than 200,000 candidate objects, the rule fails with an explicit error instead of ranking a truncated set.
 
 ## Admin API
 
@@ -80,9 +80,9 @@ All endpoints are session-gated. Lifecycle shares the unified Jobs API: the job 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/_/api/admin/jobs` | All jobs, lifecycle rules included: status, pause flag, runtime state |
-| `POST` | `/_/api/admin/jobs/lifecycle:<name>/preview` | Dry-run a rule and return candidate keys — read-only, no history rows, no leases |
+| `POST` | `/_/api/admin/jobs/lifecycle:<name>/preview` | Dry-run a rule and return candidate keys. Read-only: no history rows, no leases |
 | `POST` | `/_/api/admin/jobs/lifecycle:<name>/run-now` | Start a run in the background: `202` with `run_id` and `status: "running"`; `409` if lifecycle or the rule is disabled, the rule is paused or already running, two rules share its name, or a maintenance job is active on a bucket that the rule writes to; `400` if the rule has a config error |
-| `POST` | `/_/api/admin/jobs/lifecycle:<name>/pause` / `/resume` | Pause controls — persisted across restarts; paused rules are skipped by the scheduler and run-now alike |
+| `POST` | `/_/api/admin/jobs/lifecycle:<name>/pause` / `/resume` | Pause controls. The pause persists across restarts, and both the scheduler and run-now skip a paused rule |
 | `GET` | `/_/api/admin/jobs/lifecycle:<name>/runs?limit=N` | Recent persisted executions, newest first |
 | `GET` | `/_/api/admin/jobs/lifecycle:<name>/failures?limit=N` | Recent per-object failures, newest first |
 
@@ -103,7 +103,7 @@ Lifecycle skips:
 - Keys outside `include_globs` when includes are configured.
 - Keys newer than `expire_after`.
 
-Deletion is idempotent at the object level. A copy failure never deletes the source; a configured source delete runs only after the destination write verifies. Per-object failures are reported in the response and persisted in the config DB with the run id that observed them.
+Deletion is idempotent at the object level. A copy failure never deletes the source; a configured source delete runs only after the destination write verifies. The proxy reports per-object failures in the response and persists them in the config DB with the id of the run that observed them.
 
 ## Runtime state
 
@@ -115,7 +115,7 @@ The config DB stores:
 
 The scheduler and run-now take a per-rule lease in the config DB, so two workers of one instance never run the same rule at the same time. The lease lasts 5 minutes and is renewed every 60 seconds; `advanced.jobs.lease_ttl` and `advanced.jobs.heartbeat_interval` change these values (see [Job leases](configuration.md#job-leases)). The lease is node-local, because the config sync does not carry it, so two instances can run the same rule at the same time. A boot-time reconciliation marks runs left in `running` by a dead process as `failed` and records an operator-visible failure row.
 
-Runs persist a continuation cursor: a run interrupted by a crash or restart resumes from the stored cursor instead of rescanning from the top. A poison-token guard restarts the listing fresh exactly once if the stored cursor is rejected. Pause/resume state lives in the same row and survives restarts — parity with replication.
+Runs persist a continuation cursor: a run interrupted by a crash or restart resumes from the stored cursor instead of rescanning from the top. A poison-token guard restarts the listing fresh exactly once if the stored cursor is rejected. Pause/resume state lives in the same row and survives restarts, as in replication.
 
 ## Events
 

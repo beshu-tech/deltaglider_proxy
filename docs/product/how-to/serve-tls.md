@@ -1,8 +1,8 @@
 # How to serve TLS
 
-This guide shows you how to put HTTPS in front of DeltaGlider Proxy — either by terminating TLS at the proxy itself or at a reverse proxy in front — and how to avoid the reverse-proxy timeout that breaks large uploads.
+This guide shows you how to put HTTPS in front of DeltaGlider Proxy. You can terminate TLS at the proxy itself or at a reverse proxy in front of it. The guide also shows how to avoid the reverse-proxy timeout that breaks large uploads.
 
-S3 clients expect HTTPS. The UI (`/_/*`) and the S3 API (`/`) share one listener, so whichever option you pick, route the whole host — no per-path rules.
+S3 clients expect HTTPS. The UI (`/_/*`) and the S3 API (`/`) share one listener, so whichever option you pick, route the whole host. Do not write per-path rules.
 
 ## Option A: terminate TLS at the proxy
 
@@ -16,7 +16,7 @@ advanced:
     key_path: /etc/ssl/private/proxy-key.pem
 ```
 
-Or via env vars: `DGP_TLS_ENABLED=true`, `DGP_TLS_CERT=...`, `DGP_TLS_KEY=...`. If you omit both paths, the proxy generates a self-signed certificate on startup — fine for testing, not for clients that verify certificates.
+You can also use env vars: `DGP_TLS_ENABLED=true`, `DGP_TLS_CERT=...`, `DGP_TLS_KEY=...`. If you omit both paths, the proxy generates a self-signed certificate on startup. That certificate is fine for testing, but clients that verify certificates refuse it.
 
 With TLS at the proxy, the admin session cookies carry the `Secure` flag automatically. This is true whether you enable TLS in the YAML file or with `DGP_TLS_ENABLED`.
 
@@ -74,13 +74,13 @@ Set three env vars on the proxy when a reverse proxy is in front:
 
 | Variable | Value | Why |
 |---|---|---|
-| `DGP_TRUST_PROXY_HEADERS` | `true` | Accept `X-Forwarded-For` / `X-Real-IP` for rate limiting, the IP binding of admin sessions, and IAM IP conditions. Also accept `X-Forwarded-Host` and `X-Forwarded-Proto` for the same-origin check of admin requests, the OAuth callback address, and the `Secure` cookie flag. Flip it **only** when a reverse proxy is genuinely in front — otherwise clients can spoof IPs. |
+| `DGP_TRUST_PROXY_HEADERS` | `true` | Accept `X-Forwarded-For` / `X-Real-IP` for rate limiting, the IP binding of admin sessions, and IAM IP conditions. Also accept `X-Forwarded-Host` and `X-Forwarded-Proto` for the same-origin check of admin requests, the OAuth callback address, and the `Secure` cookie flag. Set it to `true` **only** when a reverse proxy is really in front. Otherwise clients can spoof IPs. |
 | `DGP_TRUSTED_PROXY_CIDRS` | the reverse proxy's address, for example `127.0.0.1/32` | The proxy reads those headers only on a connection from these networks. It is required with `DGP_TRUST_PROXY_HEADERS=true`: without it, the proxy refuses to start. |
 | `DGP_SECURE_COOKIES` | `true` | The listener is plain HTTP behind the reverse proxy, so the proxy cannot see the TLS itself. It sets the `Secure` flag on its own only when a trusted `X-Forwarded-Proto: https` header arrives. Setting this variable to `true` makes the admin session cookies HTTPS-only for every request, and `false` never sets the flag. Unset means automatic. |
 
 ## Raise the reverse-proxy read timeout — mandatory for large uploads
 
-If you terminate TLS at a reverse proxy, you must raise its request read-timeout. Most default to 60 seconds; a 16 MB multipart part over a typical home uplink (1–5 MB/s, shared between concurrent parts) takes longer than that, so the reverse proxy closes the upstream connection mid-body and the client sees `502` (Traefik) or `504` (nginx). This bites any object over ~50 MB and every multipart upload.
+If you terminate TLS at a reverse proxy, you must raise its request read-timeout. Most reverse proxies default to 60 seconds. A 16 MB multipart part over a typical home uplink (1 to 5 MB/s, shared between concurrent parts) takes longer than that. The reverse proxy then closes the upstream connection in the middle of the body, and the client sees `502` (Traefik) or `504` (nginx). This affects any object over about 50 MB and every multipart upload.
 
 | Reverse proxy | Default | Setting | Recommended |
 |---|---|---|---|
@@ -103,7 +103,7 @@ entryPoints:
         idleTimeout: "180s"
 ```
 
-…or as CLI flags on the Traefik container:
+You can also set them as CLI flags on the Traefik container:
 
 ```yaml
 command:
@@ -111,7 +111,7 @@ command:
   - '--entrypoints.websecure.transport.respondingTimeouts.writeTimeout=30m'
 ```
 
-The proxy's own request timeout (`DGP_REQUEST_TIMEOUT_SECS`) defaults to 300 s and is a separate timer — both must be generous for large uploads to succeed.
+The proxy's own request timeout (`DGP_REQUEST_TIMEOUT_SECS`) defaults to 300 s and is a separate timer. Both timeouts must be long enough for large uploads to succeed.
 
 ## Verify
 
@@ -127,10 +127,10 @@ dd if=/dev/urandom of=/tmp/big.bin bs=1M count=100
 aws s3 cp /tmp/big.bin s3://releases/ --endpoint-url https://s3.acme.example
 ```
 
-If the large upload fails with 502/504 and the proxy log shows a request finishing at exactly 60 000 ms with status 400, the reverse-proxy timeout is still in effect — see [Troubleshooting](troubleshooting.md#502-bad-gateway--504-gateway-timeout-on-large-uploads).
+If the large upload fails with 502/504 and the proxy log shows a request finishing at exactly 60 000 ms with status 400, the reverse-proxy timeout is still in effect. See [Troubleshooting](troubleshooting.md#502-bad-gateway--504-gateway-timeout-on-large-uploads).
 
 ## Related
 
-- [How to take a proxy to production](go-to-production.md) — the full checklist
-- [Security model](../explanation/security-model.md) — where TLS sits among the layers
-- [Configuration reference](../reference/configuration.md) — TLS and listener fields
+- [How to take a proxy to production](go-to-production.md): the full checklist
+- [Security model](../explanation/security-model.md): where TLS sits among the layers
+- [Configuration reference](../reference/configuration.md): TLS and listener fields

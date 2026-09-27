@@ -85,7 +85,7 @@ To get the old log output, set `advanced.log_level` or `DGP_LOG_LEVEL` to `delta
 2. Read the start log. When the proxy refuses to start, the log names the reason, for example a missing `DGP_TRUSTED_PROXY_CIDRS` or a backend without conditional writes.
 3. Send a request to `GET /_/ready`. It answers `200` when the backends and the config database answer, and `503` when they do not.
 4. Log in to the admin UI, and check that your users and groups are there.
-5. List a bucket with your usual client, for example `aws --endpoint-url https://s3.example.com s3 ls s3://releases/`.
+5. List a bucket with your usual client, for example `aws --endpoint-url https://s3.acme.example s3 ls s3://releases/`.
 6. With config sync, send a request to `GET /_/api/admin/config/sync` on each instance. Check that `healthy` is `true`. When it is `false`, `pull_error` and `push_error` say why.
 7. Make a new full backup. It is the first backup that holds the new key.
 

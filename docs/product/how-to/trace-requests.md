@@ -1,28 +1,28 @@
 # How to trace and audit requests
 
-This guide shows you how to find out why the proxy allowed or denied a request — by testing a sample request against the request rules, reading the audit log, and turning on debug headers.
+This guide shows you how to find out why the proxy allowed or denied a request. You test a sample request against the request rules, read the audit log, and turn on debug headers.
 
 ## 1. Check the audit log first
 
 ![Audit log panel](/_/screenshots/audit-log.jpg)
 
-When a client reports a denial, start at **Settings → Observability → Audit log** (`/_/admin/diagnostics/audit`). Every IAM denial lands there with the user, action, bucket, and path — usually that's the whole investigation. The same data is available as JSON:
+When a client reports a denial, start at **Settings → Observability → Audit log** (`/_/admin/diagnostics/audit`). Every IAM denial goes there with the user, action, bucket, and path. Usually that is all the information that you need. The same data is available as JSON:
 
 ```bash
 curl -b cookies "https://s3.acme.example/_/api/admin/audit?limit=500"
 ```
 
-If the audit log shows nothing for the failing request, the denial happened **before** IAM — in SigV4 verification or in the request rules. That's what tracing is for.
+If the audit log shows nothing for the failing request, the denial happened **before** IAM, in SigV4 verification or in the request rules. Use tracing to find it.
 
-Know what the ring is: an **in-memory** buffer (default 500 entries, `DGP_AUDIT_RING_SIZE` to raise it) that resets to empty on every restart. The persistent audit source is stdout — every `audit_log()` call also emits a `tracing::info!` line; ship those into your log pipeline for retention.
+The audit log is an **in-memory** ring buffer (default 500 entries, `DGP_AUDIT_RING_SIZE` to raise it) that is empty again after every restart. The persistent audit source is stdout. Every `audit_log()` call also emits a `tracing::info!` line. Ship those lines into your log pipeline for retention.
 
 ## 2. Trace a synthetic request
 
 ![Request trace panel](/_/screenshots/request-trace.jpg)
 
-Three equivalent front doors to the same evaluator — none of them touches real data:
+Three front doors lead to the same evaluator, and none of them touches real data:
 
-**Admin UI:** **Settings → Observability → Request rule tester** (`/_/admin/diagnostics/trace`). Enter method, path, and whether the request is authenticated; the panel renders the reason path and offers Copy-as-JSON.
+**Admin UI:** **Settings → Observability → Request rule tester** (`/_/admin/diagnostics/trace`). Enter the method, the path, and whether the request is authenticated. The panel shows the reason path and has a Copy-as-JSON button.
 
 **CLI:**
 
@@ -32,7 +32,7 @@ DGP_BOOTSTRAP_PASSWORD=... deltaglider_proxy admission trace \
   --server https://s3.acme.example | jq
 ```
 
-Add `--authenticated` to simulate a signed request, `--query` for query strings. The password comes from the env var, not a flag — argv is visible in `ps`.
+Add `--authenticated` to simulate a signed request, and `--query` for query strings. The password comes from the env var and not from a flag, because argv is visible in `ps`.
 
 **API:** `POST /_/api/admin/config/trace` with a synthetic request body, or the `GET` query-param variant for bookmarkable trace URLs:
 
@@ -42,11 +42,11 @@ curl -b cookies "https://s3.acme.example/_/api/admin/config/trace?method=PUT&pat
 
 ## 3. Read the reason path
 
-The trace output is a decision plus the path that produced it: the decision tag (allow / allow-anonymous / deny / reject), the **matched rule** by name, and the resolved request as the evaluator saw it. The first matching rule decides, so the named rule is the complete answer — nothing after it was consulted.
+The trace output is a decision plus the path that produced it: the decision tag (allow / allow-anonymous / deny / reject), the matched rule by name, and the resolved request as the evaluator saw it. The first matching rule decides, so the named rule is the complete answer. The evaluator did not check any rule after it.
 
 When the decision is `allow-anonymous`, the output also says what the rule lets a caller without credentials do. The API returns this in the `anonymous_grant` field, and the admin UI shows it in an **Anonymous access** box. The rule grants only reads: a `GET` or `HEAD` of the matched object, a listing of the matched bucket with the requested prefix, or, for a public-access rule, the public prefixes of the bucket. A write is never granted. So a `PUT` that matches an `allow-anonymous` rule shows no grant, and the box says that the request continues without credentials and is refused with `403 AccessDenied`.
 
-Worked example — `downloads` has a public prefix:
+Worked example: `downloads` has a public prefix:
 
 ```yaml
 storage:
@@ -56,20 +56,20 @@ storage:
         - public/
 ```
 
-- Trace `GET /downloads/public/tool.zip`, unauthenticated → **allow-anonymous**, matched rule `public-prefix:downloads` — the public-access rule that the proxy creates from the bucket setting. It allows reading and listing only.
+- Trace `GET /downloads/public/tool.zip`, unauthenticated → **allow-anonymous**, matched rule `public-prefix:downloads`. This is the public-access rule that the proxy creates from the bucket setting. It allows reading and listing only.
 - Trace `PUT /downloads/public/tool.zip`, unauthenticated → **continue**, with no matched rule. The public-access rule matches only read methods, so the PUT goes on to authentication, which refuses an anonymous PUT with `403`.
 
-Same prefix, opposite outcomes — and the trace names the exact rule responsible for each.
+The prefix is the same and the outcomes are opposite. For each outcome, the trace names the rule that decided it, or it shows that no rule matched.
 
 ## 4. Turn on debug headers
 
 For per-request visibility on real traffic, set `DGP_DEBUG_HEADERS=true` and read the response headers:
 
-- `x-amz-storage-type` — how the object is stored: `delta`, `passthrough`, or `reference`.
+- `x-amz-storage-type`: how the object is stored: `delta`, `passthrough`, or `reference`.
 - `x-deltaglider-stored-size`: on the responses to object requests, the number of bytes that the object takes on the backend, which is smaller than the object size for a delta.
-- `x-deltaglider-listing-facts-misses` — on every LIST; the number of entries on the page that show their stored size instead of their original size, because the proxy found no listing facts for them (see [how delta compression works](../explanation/delta-compression.md)).
+- `x-deltaglider-listing-facts-misses`: on every LIST, the number of entries on the page that show their stored size instead of their original size, because the proxy found no listing facts for them (see [how delta compression works](../explanation/delta-compression.md)).
 
-Leave this **off** in production once you're done — it reveals storage internals to anyone who can send a request.
+Turn this **off** in production when you are done, because it reveals storage internals to anyone who can send a request.
 
 ## Verify
 
@@ -86,7 +86,7 @@ Then make one failing authenticated request on purpose and confirm it appears in
 
 ## Related
 
-- [Troubleshooting](troubleshooting.md) — symptom-indexed fixes once you know which layer denied
-- [Security model](../explanation/security-model.md) — admission → SigV4 → IAM, in order
-- [Admin API reference](../reference/admin-api.md) — trace and audit endpoints
-- [CLI reference](../reference/cli.md) — `admission trace` flags and exit codes
+- [Troubleshooting](troubleshooting.md): symptom-indexed fixes once you know which layer denied
+- [Security model](../explanation/security-model.md): admission → SigV4 → IAM, in order
+- [Admin API reference](../reference/admin-api.md): trace and audit endpoints
+- [CLI reference](../reference/cli.md): `admission trace` flags and exit codes

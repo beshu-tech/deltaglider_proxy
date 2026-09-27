@@ -1,26 +1,26 @@
 # How to back up and restore
 
-This guide shows you how to back up DeltaGlider Proxy's state — config, IAM, and secrets — and restore it onto the same or a fresh instance.
+This guide shows you how to back up the state of DeltaGlider Proxy (config, IAM, and secrets) and restore it onto the same or a fresh instance.
 
-One thing first: **object data is not in any of these backups.** Objects live in your storage backend (`hetzner-fsn1`, `local-disk`, …); back that up with your storage provider's tools. What the proxy itself owns is the config file, the encrypted IAM DB, and the infra secrets.
+**Object data is not in any of these backups.** Objects live in your storage backend (`hetzner-fsn1`, `local-disk`, …), so back them up with your storage provider's tools. The proxy itself owns only the config file, the encrypted IAM DB, and the infra secrets.
 
 ## Pick the right mechanism
 
-Three mechanisms, routinely confused:
+People often confuse these three mechanisms:
 
 | Mechanism | What it is | Use it when |
 |---|---|---|
 | **Full Backup** (zip via admin API) | Operator-initiated, point-in-time snapshot: config + IAM + secrets, sha256-verified, atomic restore | Before every upgrade; on a schedule; before risky config changes. This is THE backup. |
 | **DB snapshot** (file copy) | Filesystem-level copy of `deltaglider_config.db` (SQLCipher-encrypted SQLite) | You already snapshot volumes (PVC snapshots, ZFS, etc.) and preserve the config DB key alongside |
-| **S3 config sync** (`config_sync_bucket`) | Automatic live replication of the encrypted DB across instances | Horizontal scaling / blue-green — see [How to run multiple instances](run-multiple-instances.md). **Not a backup**: a bad mutation propagates to every reader. |
+| **S3 config sync** (`config_sync_bucket`) | Automatic live replication of the encrypted DB across instances | Horizontal scaling or blue-green deployments. See [How to run multiple instances](run-multiple-instances.md). **Not a backup**: a bad mutation propagates to every reader. |
 
-You want Full Backup regardless; the other two are complements, not substitutes.
+Take a Full Backup in every case. The other two mechanisms add to it and do not replace it.
 
 ## Take a Full Backup
 
 ![Full Backup export and restore](/_/screenshots/backup-restore.jpg)
 
-From the admin UI: **Settings → System → Backup → Export**. Or via API:
+In the admin UI, open **Settings → System → Backup → Export**. Or use the API:
 
 ```bash
 curl -b /tmp/admin.cookies \
@@ -30,14 +30,14 @@ curl -b /tmp/admin.cookies \
 
 The zip contains four artefacts, each sha256-listed in the manifest:
 
-- `manifest.json` — version, timestamp, checksums
-- `config.yaml` — canonical YAML, secrets redacted
-- `iam.json` — users, groups, OAuth providers, mapping rules, external identities
-- `secrets.json` — **plaintext** infra secrets: bootstrap hash, the bootstrap SigV4 pair, OAuth client_secrets, storage creds, the Slack bot token and webhook header values of event delivery, and the encryption keys (`key` and `legacy_key`) of every backend whose keys are in the config file. A restore puts these keys back, so that objects encrypted before the backup stay readable and new writes stay encrypted. A key that comes from an environment variable, such as `DGP_ENCRYPTION_KEY`, is not in the backup, so set that variable on the new instance before you restore. When the instance uses declarative IAM (`access.iam_mode: declarative`), `secrets.json` also holds the secret access key of every user in `access.iam_users`. The redacted `config.yaml` does not have these keys, and the restore needs them to create the users on a fresh instance, so the restore puts them back into the configuration. A user whose key is a `${env:NAME}` reference keeps the reference, so set that variable on the new instance too
+- `manifest.json`: version, timestamp, checksums
+- `config.yaml`: canonical YAML, secrets redacted
+- `iam.json`: users, groups, OAuth providers, mapping rules, external identities
+- `secrets.json`: **plaintext** infra secrets: bootstrap hash, the bootstrap SigV4 pair, OAuth client_secrets, storage creds, the Slack bot token and webhook header values of event delivery, and the encryption keys (`key` and `legacy_key`) of every backend whose keys are in the config file. A restore puts these keys back, so that objects encrypted before the backup stay readable and new writes stay encrypted. A key that comes from an environment variable, such as `DGP_ENCRYPTION_KEY`, is not in the backup, so set that variable on the new instance before you restore. When the instance uses declarative IAM (`access.iam_mode: declarative`), `secrets.json` also holds the secret access key of every user in `access.iam_users`. The redacted `config.yaml` does not have these keys, and the restore needs them to create the users on a fresh instance, so the restore puts them back into the configuration. A user whose key is a `${env:NAME}` reference keeps the reference, so set that variable on the new instance too
 
 A secret that comes from an environment variable (for example `DGP_SECRET_ACCESS_KEY`, `DGP_BE_AWS_SECRET_ACCESS_KEY` or `DGP_BOOTSTRAP_PASSWORD_HASH`) is not part of the backup. The backup holds only what the config file holds, so a restore never writes an environment value into another instance's config file. The instance you restore onto must get these values from its own environment, so keep them in your secret manager.
 
-`secrets.json` makes the zip a keystore — treat it like one. Store it encrypted, off the host, somewhere the upgrade or incident you're protecting against can't reach. Take a fresh one after any password change, because the zip carries the bootstrap hash.
+`secrets.json` makes the zip a keystore, so treat it like one. Store it encrypted and off the host, in a place that the upgrade or incident you protect against cannot reach. Take a fresh one after any password change, because the zip carries the bootstrap hash.
 
 ## Restore a Full Backup
 
@@ -48,7 +48,7 @@ curl -b cookies -X POST \
   https://s3.acme.example/_/api/admin/backup
 ```
 
-The import is atomic. All four parts are unpacked and sha256-verified before any state changes. The proxy then applies the configuration, the secrets and the IAM state in that order, and it writes the OAuth client secrets last. The live OAuth providers pick up these secrets without a restart. Before the first of these steps, it records the running configuration, the admin password and the IAM database. When a later step fails, the proxy puts the recorded state back, in memory and in the config file, so a failed restore leaves the instance as it was before. `external_identities` are remapped through the imported user and provider IDs, so OAuth users keep working. A legacy JSON-only body is still accepted for IAM-only restores from pre-v0.8.4 scripts.
+The import is atomic. The proxy unpacks all four parts and verifies their sha256 before any state changes. The proxy then applies the configuration, the secrets and the IAM state in that order, and it writes the OAuth client secrets last. The live OAuth providers pick up these secrets without a restart. Before the first of these steps, it records the running configuration, the admin password and the IAM database. When a later step fails, the proxy puts the recorded state back, in memory and in the config file, so a failed restore leaves the instance as it was before. The proxy remaps `external_identities` through the imported user and provider IDs, so OAuth users keep working. The proxy also accepts a legacy JSON-only body for IAM-only restores from pre-v0.8.4 scripts.
 
 A restore of users, groups and OIDC providers is point-in-time by default (`iam=replace`). The proxy deletes every user, group, OIDC provider, mapping rule and external identity that exists now, and then writes the rows from the backup, in one database transaction. So after the restore, the instance holds exactly the backup's users and groups: a user that someone created after the backup is gone, and a user that someone changed after the backup has the backup's settings again. If any row fails to write, the transaction rolls back and nothing changes. The proxy keeps the backup's user IDs, so OAuth logins keep working, and it ends the OAuth sessions of users that the restore deletes. To keep the users and groups that exist now, add `iam=merge` to the URL (for example `https://s3.acme.example/_/api/admin/backup?iam=merge`). A merge adds the users and groups that the instance does not have and does not change the ones that it has. The restore dialog in the admin GUI offers the same two choices.
 
@@ -58,17 +58,17 @@ The zip carries the IAM state as plain JSON (`iam.json`), so a restore onto a **
 
 ## Snapshot the DB file
 
-`deltaglider_config.db` is safe to copy at the file level — it's encrypted at rest. The snapshot is only useful if the **config DB key is preserved with it**: without the key, nobody can open the file. The key is the value of `DGP_CONFIG_DB_KEY` or, when that variable is unset, the content of the key file `deltaglider_config.db.key` next to the DB. Store the key in your secret manager, and the snapshot restores onto any instance that starts with the same key. A snapshot from a release before the config DB key is encrypted with the bootstrap password hash instead; an instance that starts with that hash re-encrypts it with its config DB key on the first start.
+`deltaglider_config.db` is safe to copy at the file level, because it is encrypted at rest. The snapshot is useful only if you **keep the config DB key with it**: without the key, nobody can open the file. The key is the value of `DGP_CONFIG_DB_KEY` or, when that variable is unset, the content of the key file `deltaglider_config.db.key` next to the DB. Store the key in your secret manager, and the snapshot restores onto any instance that starts with the same key. A snapshot from a release that came before the config DB key is encrypted with the bootstrap password hash instead; an instance that starts with that hash re-encrypts it with its config DB key on the first start.
 
 ## The xattr warning (filesystem backend)
 
-If you back up a **filesystem backend's data directory** with file copies, your tool must preserve extended attributes — per-object metadata lives in the `user.dg.metadata` xattr on each file's inode. A tool that copies contents but drops xattrs (older `rsync` without `-X`, many archive tools) produces a restore where encrypted objects fail to read and delta objects lose their metadata.
+If you back up a **filesystem backend's data directory** with file copies, your tool must preserve extended attributes, because the per-object metadata lives in the `user.dg.metadata` xattr on the inode of each file. A tool that copies contents but drops xattrs (older `rsync` without `-X`, many archive tools) produces a restore where encrypted objects fail to read and delta objects lose their metadata.
 
 ```bash
 rsync -aX /var/lib/deltaglider_proxy/data/ /backup/dgp-data/   # -X = preserve xattrs
 ```
 
-The classic symptom after a bad restore: reads return 500 with "xattrs may have been stripped during backup/restore" — see [Troubleshooting](troubleshooting.md).
+The usual symptom after a bad restore is that reads return 500 with "xattrs may have been stripped during backup/restore". See [Troubleshooting](troubleshooting.md).
 
 ## Verify
 
@@ -87,11 +87,11 @@ aws --endpoint-url https://s3.acme.example s3 cp s3://releases/known-file ./out
 sha256sum out   # matches the recorded checksum
 ```
 
-And log in to the admin UI with the bootstrap password. If that works, the restored bootstrap password hash is live.
+Then log in to the admin UI with the bootstrap password. If the login works, the restored bootstrap password hash is live.
 
 ## Related
 
-- [How to upgrade the proxy](upgrade.md) — backup is step 1 of every upgrade
-- [How to run multiple instances (HA)](run-multiple-instances.md) — what config sync is actually for
-- [Admin API reference](../reference/admin-api.md) — backup endpoint details
-- [Troubleshooting](troubleshooting.md) — SQLCipher and xattr failure symptoms
+- [How to upgrade the proxy](upgrade.md): backup is step 1 of every upgrade
+- [How to run multiple instances (HA)](run-multiple-instances.md): what config sync is for
+- [Admin API reference](../reference/admin-api.md): backup endpoint details
+- [Troubleshooting](troubleshooting.md): SQLCipher and xattr failure symptoms

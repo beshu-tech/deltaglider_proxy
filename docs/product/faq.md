@@ -15,8 +15,8 @@
 
 - [Can I turn off compression for a specific bucket?](how-to/set-bucket-compression-and-quotas.md)
 - [Can I enable compression only for specific prefixes inside a bucket?](how-to/set-bucket-compression-and-quotas.md)
-- [What file types actually benefit from delta compression?](explanation/delta-compression.md)
-- [Why doesn't my .tar.gz compress — and can compressed archives delta well at all?](explanation/delta-compression.md)
+- [Which file types benefit from delta compression?](explanation/delta-compression.md)
+- [Why doesn't my .tar.gz compress, and can compressed archives delta well at all?](explanation/delta-compression.md)
 - [Does compression slow things down?](explanation/delta-compression.md)
 
 ## Authentication
@@ -37,7 +37,7 @@
 - [Does compression still work with encryption enabled?](explanation/encryption-at-rest.md)
 - [Does encryption apply to object metadata too?](explanation/encryption-at-rest.md)
 - [Does encryption add latency?](explanation/encryption-at-rest.md)
-- [I see `dg-encrypted-native: sse-kms` in my object metadata — is that leaking something?](reference/encryption.md)
+- [I see `dg-encrypted-native: sse-kms` in my object metadata. Is that leaking something?](reference/encryption.md)
 - [Can I write objects with the Python DeltaGlider CLI while the backend is encrypted?](explanation/encryption-at-rest.md)
 
 ## Backup

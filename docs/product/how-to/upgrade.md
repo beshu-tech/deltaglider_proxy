@@ -1,12 +1,12 @@
 # How to upgrade the proxy
 
-This guide shows you how to move between DeltaGlider Proxy versions safely, including the one-time TOML → YAML config conversion (mandatory before v1.4.1) and the v0.9 encryption-config change. To go from 1.19 to 2.0, follow [How to upgrade to 2.0](upgrade-to-2-0.md) first, because that release has steps that you must do before the new version starts.
+This guide shows you how to move between DeltaGlider Proxy versions safely, including the one-time TOML-to-YAML config conversion (mandatory before v1.4.1) and the v0.9 encryption-config change. To go from 1.19 to 2.0, follow [How to upgrade to 2.0](upgrade-to-2-0.md) first, because that release has steps that you must do before the new version starts.
 
 ## Standard upgrade workflow
 
-The proxy is a single stateful binary. Upgrades are "backup, swap, verify."
+The proxy is a single stateful binary. Every upgrade has three steps: back up, swap, and verify.
 
-1. **Back up first.** From the admin UI: **Full Backup → Export**, or via API:
+1. **Back up first.** Use **Full Backup → Export** in the admin UI, or send a request to the API:
 
    ```bash
    curl -b /tmp/admin.cookies \
@@ -14,7 +14,7 @@ The proxy is a single stateful binary. Upgrades are "backup, swap, verify."
      -o dgp-backup-$(date +%Y%m%d-%H%M%S).zip
    ```
 
-   The zip is atomic and sha256-verified on restore — see [Admin API reference](../reference/admin-api.md). Store it somewhere the upgrade process itself can't break.
+   The zip is atomic, and the proxy verifies its sha256 when you restore it. See the [Admin API reference](../reference/admin-api.md). Store the zip in a place that the upgrade itself cannot damage.
 
 2. **Roll the image/binary.** For Docker:
 
@@ -27,9 +27,9 @@ The proxy is a single stateful binary. Upgrades are "backup, swap, verify."
      beshultd/deltaglider_proxy:2.0.0
    ```
 
-   Coolify, Kubernetes, and systemd have their own "pull + restart" verbs. All that matters: `/data` persists across the swap.
+   Coolify, Kubernetes, and systemd have their own commands to pull and restart. The only requirement is that `/data` persists across the swap.
 
-3. **Verify.** Four checks:
+3. **Verify.** Run four checks:
 
    ```bash
    # Health
@@ -62,11 +62,11 @@ Schema migrations of the config DB run automatically on the first start. The con
 
 A major upgrade (for example from 1.19 to 2.0) has steps that you must do before the new version starts. Follow the upgrade guide of that version ([How to upgrade to 2.0](upgrade-to-2-0.md)) and the [release notes](https://github.com/beshu-tech/deltaglider_proxy/releases), and always export a Full Backup before you start.
 
-## TOML → YAML migration (mandatory before v1.4.1)
+## TOML to YAML migration (mandatory before v1.4.1)
 
-**TOML support was removed in v1.4.1.** A v1.4.1+ proxy refuses to start when its config is a `.toml` file — whether pointed at via `DGP_CONFIG` / `--config` or found on the default search path — with the error `TOML configs are no longer supported (removed in v1.4.1)`. There is no deprecation warning anymore, and the `config migrate` subcommand is gone from v1.4.1+ binaries.
+**TOML support was removed in v1.4.1.** A v1.4.1+ proxy refuses to start when its config is a `.toml` file (named by `DGP_CONFIG` / `--config` or found on the default search path). The error is `TOML configs are no longer supported (removed in v1.4.1)`. There is no deprecation warning anymore, and the `config migrate` subcommand is gone from v1.4.1+ binaries.
 
-The one-time conversion path is: **run `config migrate` on v1.4.0 (the last release that ships it), point the server at the YAML file, verify, and only then upgrade to v1.4.1+.**
+To convert the config once, run `config migrate` on v1.4.0 (the last release that ships it), point the server at the YAML file, and verify it. Only then upgrade to v1.4.1+.
 
 ### One-liner (most installs)
 
@@ -77,7 +77,7 @@ deltaglider_proxy config migrate \
   --out /etc/deltaglider_proxy/config.yaml
 ```
 
-Point the server at the new file (`--config` flag, `DGP_CONFIG` env, or via the standard search path), restart, verify — then upgrade.
+Point the server at the new file (with the `--config` flag, the `DGP_CONFIG` env var, or the standard search path). Restart the server and verify it. Then upgrade.
 
 ### Step-by-step
 
@@ -88,7 +88,7 @@ deltaglider_proxy config migrate /etc/deltaglider_proxy/config.toml \
   --out /etc/deltaglider_proxy/config.yaml
 ```
 
-Without `--out`, the YAML is written to stdout — pipe it wherever you like. `${env:NAME}` placeholders are not expanded; they migrate verbatim.
+Without `--out`, the migrator writes the YAML to stdout, and you can pipe it to any destination. The migrator does not expand `${env:NAME}` placeholders. It copies them verbatim.
 
 **2. Inspect the output.** Canonical YAML uses the four-section shape:
 
@@ -113,46 +113,46 @@ advanced:
   session_ttl_hours: 4
 ```
 
-SigV4 credentials (`access.access_key_id` / `secret_access_key` and storage backend creds) are **kept**, so the output is drop-in usable. Only infra secrets — the bootstrap password hash and any encryption keys — are stripped; feed those back in via env vars (see step 5).
+The migrator keeps the SigV4 credentials (`access.access_key_id` / `secret_access_key` and the storage backend credentials), so you can use the output as it is. It strips only the infrastructure secrets (the bootstrap password hash and any encryption keys). Supply those again with env vars (see step 5).
 
-**3. Validate before applying.** The `config lint` subcommand parses + validates without touching the server:
+**3. Validate before applying.** The `config lint` subcommand parses and validates the file without a request to the server:
 
 ```bash
 deltaglider_proxy config lint /etc/deltaglider_proxy/config.yaml
 # Exit: 0 = valid, 3 = I/O, 4 = parse, 6 = validation
 ```
 
-Wire this into CI so drift is caught in PR.
+Add this command to CI, so that CI catches drift in a pull request.
 
 **4. Point the server at the new file.** File search order (first match wins):
 
 1. `DGP_CONFIG` env var
 2. `./deltaglider_proxy.yaml`
 3. `./deltaglider_proxy.yml`
-4. `./deltaglider_proxy.toml` (tripwire — startup fails on v1.4.1+)
+4. `./deltaglider_proxy.toml` (tripwire: startup fails on v1.4.1+)
 5. `/etc/deltaglider_proxy/config.yaml`
 6. `/etc/deltaglider_proxy/config.yml`
-7. `/etc/deltaglider_proxy/config.toml` (tripwire — startup fails on v1.4.1+)
+7. `/etc/deltaglider_proxy/config.toml` (tripwire: startup fails on v1.4.1+)
 
-If you keep both `.toml` and `.yaml` in the same directory, `.yaml` wins — but delete the `.toml` once verified: on v1.4.1+ a leftover TOML matched first by the search stops startup rather than being silently ignored.
+If you keep both `.toml` and `.yaml` in the same directory, `.yaml` wins. Still, delete the `.toml` after you verify the YAML file. On v1.4.1+, a leftover TOML that the search matches first stops the startup, and the proxy does not ignore it silently.
 
-**5. Feed the stripped secrets back in.** The migrator strips infra secrets only:
+**5. Feed the stripped secrets back in.** The migrator strips only the infrastructure secrets:
 
-- `advanced.bootstrap_password_hash` → `DGP_BOOTSTRAP_PASSWORD_HASH` env var (base64-wrapped form avoids `$` escaping issues in Docker).
-- Per-backend encryption keys → `DGP_ENCRYPTION_KEY` (singleton backend) or `DGP_BACKEND_<NAME>_ENCRYPTION_KEY` (named backends).
+- Move `advanced.bootstrap_password_hash` to the `DGP_BOOTSTRAP_PASSWORD_HASH` env var. The base64-wrapped form avoids `$` escaping issues in Docker.
+- Move the per-backend encryption keys to `DGP_ENCRYPTION_KEY` (singleton backend) or `DGP_BACKEND_<NAME>_ENCRYPTION_KEY` (named backends).
 
-OAuth `client_secret` values live in the encrypted config DB, not the YAML — they are untouched by the migration.
+OAuth `client_secret` values live in the encrypted config DB, not in the YAML, so the migration does not touch them.
 
 **6. Delete the old TOML and upgrade.** Once the v1.4.0 proxy runs cleanly from the YAML file, remove the `.toml` (it would trip the v1.4.1+ startup check) and roll to the new version.
 
 ## The S3-synced IAM database
 
-Entirely separate from the YAML config. `deltaglider_config.db` (SQLCipher-encrypted SQLite) holds users, groups, OAuth providers, mapping rules. The YAML config never carries IAM state (unless you run [declarative IAM](../reference/declarative-iam.md)).
+The IAM database is separate from the YAML config. `deltaglider_config.db` (SQLCipher-encrypted SQLite) holds users, groups, OAuth providers, and mapping rules. The YAML config never carries IAM state (unless you run [declarative IAM](../reference/declarative-iam.md)).
 
 When upgrading across instances with `DGP_CONFIG_SYNC_BUCKET` set, the *newer* binary uploads after any mutation; *older* binaries (still running during a rolling upgrade) refuse a database with a newer schema, so they do not see the change. A newer binary reads the schema version of a synced database before it migrates it. It merges a copy from an older release after it migrates that copy, and the rows of that copy have an unknown change time, so a conflict with them goes to the copy in the bucket. Either:
 
-- Upgrade all instances before making IAM mutations, **or**
-- Accept that mid-rollout mutations are lost on older-reader downloads until they too upgrade.
+- Upgrade all instances before you make IAM changes, or
+- Accept that the instances on the older release lose the IAM changes of the rollout until they upgrade too.
 
 ## Upgrade to the separate config DB key
 
@@ -167,15 +167,15 @@ Earlier releases encrypted `deltaglider_config.db` with the bootstrap password h
 
 - **`$` in Docker env.** Bcrypt hashes contain `$`. Use the base64-wrapped form (`DGP_BOOTSTRAP_PASSWORD_HASH=JDJ5JDEyJGV...`) or single-quote the value in compose files.
 - **`force_path_style`.** MinIO needs `true`; AWS S3 needs `false`. The migrator preserves whatever the TOML had.
-- **Implicit defaults.** Fields absent from YAML take their default. Don't port fields that were already default in TOML — it clutters the canonical shape.
+- **Implicit defaults.** Fields absent from YAML take their default. Do not copy fields that were already at their default in TOML, because they clutter the canonical shape.
 - **Request rule order.** The order of the request rules (`admission.blocks`) matters. The migrator preserves order; review `admission:` carefully.
 - **`iam_mode: declarative`.** YAML becomes authoritative for IAM users, groups, OAuth providers, and mapping rules. Admin-API IAM mutations return 403; `/config/apply` reconciles the encrypted DB to YAML atomically. Seed from an existing DB with `GET /_/api/admin/config/declarative-iam-export`, or author IAM directly in YAML.
 
 ## v0.9: per-backend encryption (breaking)
 
-v0.9 replaced the single global `advanced.encryption_key` field with per-backend encryption blocks. If you're upgrading from a pre-0.9 pre-release, the old field is no longer recognized — any YAML still carrying it silently drops the key.
+v0.9 replaced the single global `advanced.encryption_key` field with per-backend encryption blocks. If you upgrade from a pre-0.9 pre-release, the proxy no longer recognizes the old field. It silently drops the key from any YAML that still carries the field.
 
-**What changed:**
+The changes:
 
 | Before (pre-v0.9) | After (v0.9) |
 |---|---|
@@ -184,7 +184,7 @@ v0.9 replaced the single global `advanced.encryption_key` field with per-backend
 | Global `encryption_enabled` in `GET /config` | Per-backend `encryption` summary on each `BackendInfoResponse` |
 | Dedicated `EncryptionPanel` page | Subsection inside each backend card on the `BackendsPanel` |
 
-**Mechanical conversion** — single-backend deployment, pre-v0.9 YAML:
+To convert the pre-v0.9 YAML of a single-backend deployment, start from this YAML:
 
 ```yaml
 # OLD (pre-0.9)
@@ -202,29 +202,29 @@ storage:
     key: "${env:DGP_ENCRYPTION_KEY}"   # move the hex to the env
 ```
 
-With `DGP_ENCRYPTION_KEY` in the environment unchanged.
+Keep `DGP_ENCRYPTION_KEY` in the environment unchanged.
 
-**On-disk objects are unaffected.** v0.9 reads pre-v0.9 encrypted objects without ceremony — the wire format didn't change, only the config location. The `dg-encryption-key-id` stamp is new as of v0.9 but optional — historical objects without the stamp still decrypt as long as the key material matches.
+The upgrade does not change the objects on disk. v0.9 reads objects that a pre-v0.9 release encrypted, because the wire format did not change. Only the config location changed. v0.9 adds the `dg-encryption-key-id` stamp, but the stamp is optional. Older objects without the stamp still decrypt when the key material matches.
 
-**If you had no encryption configured pre-0.9:** nothing to do. Your backends default to `encryption: none`.
+If you did not configure encryption before v0.9, you have nothing to do. Your backends default to `encryption: none`.
 
-**If you want to move from proxy-AES to SSE-KMS as part of the upgrade:** do the upgrade first and keep your existing key. Then move each bucket to a new SSE-KMS backend with the migrate job, because the re-encrypt job does not write to SSE backends. The steps are in [Recipe C: migrate from proxy-AES to SSE-KMS](rotate-encryption-keys.md#recipe-c-migrate-from-proxy-aes-to-sse-kms).
+To move from proxy-AES to SSE-KMS as part of the upgrade, do the upgrade first and keep your existing key. Then move each bucket to a new SSE-KMS backend with the migrate job, because the re-encrypt job does not write to SSE backends. The steps are in [Recipe C: migrate from proxy-AES to SSE-KMS](rotate-encryption-keys.md#recipe-c-migrate-from-proxy-aes-to-sse-kms).
 
 ## Verify
 
 After any upgrade or migration:
 
 - [ ] `/_/health` returns HTTP 200, and `/_/ready` returns HTTP 200 (it checks the backends and the config DB).
-- [ ] `/_/api/whoami` (with an admin session cookie — anonymous callers do not get `version`) reports the expected `version`.
+- [ ] `/_/api/whoami` (with an admin session cookie, because anonymous requests do not get `version`) reports the expected `version`.
 - [ ] An existing object downloads byte-identical: `aws s3 cp s3://releases/known-file ./out && sha256sum out` matches the known checksum.
 - [ ] The admin UI logs in with the bootstrap password (or OAuth) on the first try.
-- [ ] `/_/admin/diagnostics/audit` shows recent entries — the audit ring is populating.
+- [ ] `/_/admin/diagnostics/audit` shows recent entries, so the audit ring fills.
 - [ ] Prometheus scrape returns valid metrics (if monitoring is wired up).
 
 ## Related
 
 - [How to upgrade to 2.0](upgrade-to-2-0.md): the steps for the 1.19 to 2.0 upgrade
-- [How to back up and restore](back-up-and-restore.md) — the backup you take in step 1
-- [Configuration reference](../reference/configuration.md) — the complete YAML field reference
-- [CLI reference](../reference/cli.md) — `config lint` exit codes
-- [Admin API reference](../reference/admin-api.md) — Full Backup export/import
+- [How to back up and restore](back-up-and-restore.md): the backup you take in step 1
+- [Configuration reference](../reference/configuration.md): the complete YAML field reference
+- [CLI reference](../reference/cli.md): `config lint` exit codes
+- [Admin API reference](../reference/admin-api.md): Full Backup export/import

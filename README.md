@@ -1,14 +1,12 @@
 # DeltaGlider Proxy
 
-**Not another object store or storage cluster: DeltaGlider is the S3 control plane in front of the storage you already run. It routes buckets across existing backends and local filesystems, adds a proper, centralized admin UI for IAM, OAuth, lifecycle, replication, event outbox delivery, audits, caching, and encryption, and reduces storage growth for repeated binaries with xdelta3 deltas. One binary. One port. Existing S3 workflows.**
-
----
+DeltaGlider is an S3 control plane in front of the storage you already run. It is not an object store or a storage cluster. It routes buckets across existing backends and local filesystems. It adds a centralized admin UI for IAM, OAuth, lifecycle, replication, event outbox delivery, audits, caching, and encryption. It also reduces storage growth for repeated binaries with xdelta3 deltas. It is one binary on one port, and your existing S3 workflows keep working.
 
 ## Why DeltaGlider
 
-Organizations run storage across multiple providers — AWS S3, lower-cost S3-compatible SaaS, Hetzner Object Storage, Backblaze B2, MinIO, local NFS. Each has its own credentials, endpoints, and access policies. Teams share credentials in Slack. There's no audit trail. No prefix-level access control. No way to publish a folder without exposing the whole bucket.
+Organizations run storage across multiple providers: AWS S3, lower-cost S3-compatible SaaS, Hetzner Object Storage, Backblaze B2, MinIO, and local NFS. Each provider has its own credentials, endpoints, and access policies. Teams share credentials in Slack. There is no audit trail and no prefix-level access control, and you cannot publish a folder without exposing the whole bucket.
 
-DeltaGlider Proxy solves this by sitting in front of all your backends and presenting a single, authenticated S3 endpoint. It is not trying to be the distributed object store; it is the policy, routing, cache, lifecycle, replication, event, audit, encryption, and compression layer operators usually have to stitch together around one:
+DeltaGlider Proxy sits in front of all your backends and presents a single, authenticated S3 endpoint. It is the policy, routing, cache, lifecycle, replication, event, audit, encryption, and compression layer that operators usually have to build around an object store:
 
 ```
                                           ┌──────────────────────┐
@@ -22,86 +20,85 @@ DeltaGlider Proxy solves this by sitting in front of all your backends and prese
                                           └──────────────────────┘
 ```
 
-Clients see standard S3. They don't know which backend stores their bucket. They don't know repeated binaries are stored as compact deltas or encrypted before an untrusted backend sees them. They authenticate once — with corporate SSO if you want — and the proxy handles the rest.
+Clients see standard S3. They cannot tell which backend stores their bucket, that repeated binaries are stored as deltas, or that objects are encrypted before an untrusted backend sees them. They authenticate once, with corporate SSO if you want, and the proxy handles the rest.
 
-![DeltaGlider UI — file browser with delta compression stats](docs/screenshots/filebrowser.jpg)
+![DeltaGlider UI: file browser with delta compression stats](docs/screenshots/filebrowser.jpg)
 
----
+## Core capabilities
 
-## Core Capabilities
+### Unified storage gateway
 
-### Unified Storage Gateway
+![Storage backends: multi-backend routing with per-bucket policies](docs/screenshots/storage_backends.jpg)
 
-![Storage backends — multi-backend routing with per-bucket policies](docs/screenshots/storage_backends.jpg)
+- Multi-backend routing: route each bucket to a different storage backend (AWS S3, Hetzner, Backblaze, MinIO, filesystem), and mix providers behind one endpoint.
+- Bucket aliasing and migration: present virtual bucket names to clients and map them to real buckets on the backends. A one-click bucket migration between backends runs as a durable, resumable job that blocks writes while it runs, so you can move providers without changing any client config.
+- Single endpoint: clients point at one URL, and the proxy resolves the backend for each bucket transparently.
+- Hot reload: add backends, change routing, and update policies from the admin GUI, without a restart.
 
-- **Multi-backend routing** — Route each bucket to a different storage backend (AWS S3, Hetzner, Backblaze, MinIO, filesystem). Mix and match providers behind one endpoint.
-- **Bucket aliasing & migration** — Present virtual bucket names to clients while mapping to real buckets on backends. One-click bucket migration between backends as a durable, resumable, write-gated job — move providers without changing a single client config.
-- **Single endpoint** — Clients point at one URL. The proxy resolves which backend to use per bucket, transparently.
-- **Hot-reloadable** — Add backends, change routing, update policies — all from the admin GUI, no restart needed.
-
-### Delegated Authentication
+### Delegated authentication
 
 ![OAuth login with Google](docs/screenshots/oauth_login.jpg)
 
-- **OAuth/OIDC single sign-on** — Let your team log in with Google, Okta, Azure AD, or any OIDC provider. No shared S3 credentials.
-- **Group mapping rules** — Automatically assign permissions based on email domain (`*@company.com`), glob patterns, regex, or identity provider claims. New hires get the right access on first login.
+- OAuth/OIDC single sign-on: your team logs in with Google, Okta, Azure AD, or any OIDC provider, so nobody shares S3 credentials.
+- Group mapping rules: assign permissions automatically from the email domain (`*@company.com`), glob patterns, regex, or identity provider claims. New hires get the right access on their first login.
 
-![Group mapping rules — automatic permission assignment from identity provider claims](docs/screenshots/oauth_group_mapping.jpg)
-- **Multi-user IAM** — Per-user S3 credentials with ABAC permission rules. Allow/Deny on actions (read, write, delete, list) and resource patterns (bucket/prefix/*), with conditions (IP ranges, prefix restrictions).
-- **SigV4 authentication** — Full AWS Signature V4 support, including presigned URLs up to 7 days. Compatible with every S3 SDK and CLI tool.
-- **Public prefixes** — Publish specific folders (e.g. release artifacts) for anonymous download without exposing the rest of the bucket. Scoped read-only — no writes, no listing beyond the published prefix.
+![Group mapping rules: automatic permission assignment from identity provider claims](docs/screenshots/oauth_group_mapping.jpg)
+- Multi-user IAM: per-user S3 credentials with ABAC permission rules. Rules Allow or Deny actions (read, write, delete, list) on resource patterns (bucket/prefix/*), with conditions (IP ranges, prefix restrictions).
+- SigV4 authentication: full AWS Signature V4 support, including presigned URLs up to 7 days. It works with every S3 SDK and CLI tool.
+- Public prefixes: publish specific folders (e.g. release artifacts) for anonymous download without exposing the rest of the bucket. Anonymous access is read-only: it allows no writes and no listing beyond the published prefix.
 
-### Transparent Delta Compression
-- **60-95% storage reduction** on repeated binary workloads when internal structure is similar across versions (backup archives, software catalogs, media/texture variants, AI model variants, release artifacts, firmware, ML checkpoints)
-- Clients PUT and GET normally — the proxy intercepts, computes xdelta3 diffs against a per-prefix baseline, and stores the delta when smaller
-- SHA-256 verified on every reconstructed GET — byte-identical to the original, guaranteed
-- Per-bucket compression policies — enable/disable per bucket, custom ratio thresholds
-- Intelligent file routing — configurable delta candidates are compressed when worthwhile; images/video/already-compressed formats pass through untouched
+### Transparent delta compression
+
+- 60-95% storage reduction on repeated binary workloads when the internal structure is similar across versions (backup archives, software catalogs, media/texture variants, AI model variants, release artifacts, firmware, ML checkpoints)
+- Clients PUT and GET normally. The proxy intercepts the request, computes an xdelta3 diff against a per-prefix baseline, and stores the delta when it is smaller
+- The proxy verifies the SHA-256 on every reconstructed GET, so the result is byte-identical to the original
+- Per-bucket compression policies: enable or disable compression per bucket, with custom ratio thresholds
+- File routing: the proxy compresses the configurable delta candidates when that saves space. Images, video, and already-compressed formats pass through unchanged
 
 ```
 PUT releases/v2.zip ──▶ DeltaGlider ──▶ stored as 1.4MB delta (was 82MB)
 GET releases/v2.zip ──▶ DeltaGlider ──▶ reconstructed, streamed back as 82MB
 ```
 
-### Built-in Management GUI
-Everything managed from a web UI served on the same port as the S3 API — no extra containers, no extra infrastructure:
+### Built-in management GUI
 
-- **File browser** — Navigate, upload, download, preview files, bulk copy/move/delete, download as ZIP
-- **User management** — Create IAM users, assign ABAC permissions, rotate keys, organize into groups
-- **OAuth configuration** — Add identity providers, configure group mapping rules, test SSO flows
-- **Backend management** — Add/remove storage backends, configure per-bucket routing, aliasing, compression policies, and public prefixes
-- **Bucket controls** — Configure soft quotas, read-only bucket freeze, public prefixes, aliases, and compression policy
-- **Object lifecycle** — Preview and run expiration and transition/archive rules, with pause/resume, crash-resume, scheduler history/failures, and engine-routed deletes
-- **Object replication** — Configure source → destination replication rules, all from the GUI: event-driven (mutations replicate in near-real time, with a slow full-reconcile safety net), run-now, pause/resume, history/failures, and delete replication
-- **One Jobs screen** — Replication, lifecycle, re-encryption, and migrations in one table with per-job runs, failures, progress, pause/resume, and cancel
-- **Bucket re-encryption** — Enable or rotate at-rest encryption, then rewrite existing objects with a one-off durable job; writes are gated (503 SlowDown) so nothing races the rewrite
-- **Event outbox & notifications** — Durable object mutation events with background webhook delivery, fan-out endpoints, retry backoff, and failed-row requeue — all GUI-editable. Built-in **Slack** formatting: post object events to a channel via an Incoming Webhook URL or a bot token, with per-bucket/prefix → channel routing
-- **Monitoring dashboard** — Live Prometheus metrics: request rates, latencies, cache hit rates, status codes, auth events
-- **Storage analytics** — Per-bucket savings breakdown, estimated monthly cost savings, compression opportunity detection
-- **Embedded documentation** — Full-text searchable reference docs with architecture diagrams
+You manage everything from a web UI on the same port as the S3 API, without extra containers or infrastructure:
 
-![Admin GUI — IAM user management with ABAC permissions](docs/screenshots/iam.jpg)
+- File browser: navigate, upload, download, and preview files, bulk copy, move, and delete, and download as ZIP
+- User management: create IAM users, assign ABAC permissions, rotate keys, and organize users into groups
+- OAuth configuration: add identity providers, configure group mapping rules, and test SSO flows
+- Backend management: add and remove storage backends, and configure per-bucket routing, aliasing, compression policies, and public prefixes
+- Bucket controls: configure soft quotas, read-only bucket freeze, public prefixes, aliases, and compression policy
+- Object lifecycle: preview and run expiration and transition/archive rules, with pause/resume, crash-resume, scheduler history/failures, and engine-routed deletes
+- Object replication: configure source → destination replication rules from the GUI. Replication is event-driven (mutations replicate in near-real time, and a slow full reconcile catches anything missed), with run-now, pause/resume, history/failures, and delete replication
+- One Jobs screen: replication, lifecycle, re-encryption, and migrations in one table with per-job runs, failures, progress, pause/resume, and cancel
+- Bucket re-encryption: enable or rotate at-rest encryption, then rewrite the existing objects with a one-off durable job. Writes get 503 SlowDown while the job runs, so no write races the rewrite
+- Event outbox and notifications: durable object mutation events with background webhook delivery, fan-out endpoints, retry backoff, and failed-row requeue, all editable in the GUI. Built-in Slack formatting posts object events to a channel through an Incoming Webhook URL or a bot token, with per-bucket/prefix → channel routing
+- Monitoring dashboard: live Prometheus metrics for request rates, latencies, cache hit rates, status codes, and auth events
+- Storage analytics: per-bucket savings breakdown, estimated monthly cost savings, compression opportunity detection
+- Embedded documentation: full-text searchable reference docs with architecture diagrams
 
-![Storage analytics — per-bucket savings breakdown and cost estimation](docs/screenshots/analytics.jpg)
+![Admin GUI: IAM user management with ABAC permissions](docs/screenshots/iam.jpg)
 
-### Enterprise Security
+![Storage analytics: per-bucket savings breakdown and cost estimation](docs/screenshots/analytics.jpg)
 
-![Advanced security settings — rate limiting, session hardening, anti-fingerprinting](docs/screenshots/advanced_security.jpg)
-- **Mandatory authentication** — proxy refuses to start without credentials (no accidental open deployments)
-- **Encrypted config database** — IAM users and OAuth config stored in SQLCipher-encrypted database, synced across instances via S3
-- **Proxy-side encryption** — AES-256-GCM before data reaches the backend; useful for cheap or untrusted S3-compatible storage where keys must stay in your environment
-- **Per-IP rate limiting** — progressive delay and lockout on auth endpoints (brute-force resistant)
-- **Session hardening** — IP binding, configurable TTL, max concurrent sessions, SameSite/Secure cookies
-- **SigV4 replay detection** — constant-time signature comparison, clock skew validation
-- **Anti-fingerprinting** — server identity headers suppressed by default
-- **Audit logging** — every access logged with user, IP, action, and resource
-- **TLS support** — optional, auto-detects secure cookies
+### Security
 
----
+![Advanced security settings: rate limiting, session hardening, anti-fingerprinting](docs/screenshots/advanced_security.jpg)
 
-## Quick Start
+- Mandatory authentication: the proxy refuses to start without credentials, so a deployment cannot be open by accident
+- Encrypted config database: the proxy stores IAM users and OAuth config in a SQLCipher-encrypted database, synced across instances through S3
+- Proxy-side encryption: AES-256-GCM before data reaches the backend, for low-cost or untrusted S3-compatible storage where the keys must stay in your environment
+- Per-IP rate limiting: progressive delay and lockout on auth endpoints, against brute-force attacks
+- Session hardening: IP binding, configurable TTL, max concurrent sessions, SameSite/Secure cookies
+- SigV4 replay detection: constant-time signature comparison, clock skew validation
+- Anti-fingerprinting: server identity headers suppressed by default
+- Audit logging: the proxy logs every access with the user, IP, action, and resource
+- TLS support: optional, and it auto-detects secure cookies
 
-The proxy refuses to start without credentials (preventing accidentally open deployments). Supply them or explicitly opt into open access:
+## Quick start
+
+The proxy refuses to start without credentials, so that a deployment is never open by accident. Supply credentials, or explicitly opt into open access:
 
 ```bash
 docker run -p 9000:9000 \
@@ -120,11 +117,11 @@ aws s3 cp v2.zip s3://builds/releases/v2.zip   # stored as delta
 aws s3 cp s3://builds/releases/v2.zip ./v2.zip  # full file back, byte-identical
 ```
 
-Admin GUI at `http://localhost:9000/_/` — same port, zero setup. On first run, the bootstrap password is auto-generated. The proxy prints it to stderr only when stderr is a terminal (for example with `docker run -it`); otherwise it writes only the hash, to `.deltaglider_bootstrap_hash`. To choose the password, set `DGP_BOOTSTRAP_PASSWORD_HASH` or use the `--set-bootstrap-password` flag.
+The admin GUI is at `http://localhost:9000/_/`, on the same port, with no setup. On first run, the bootstrap password is auto-generated. The proxy prints it to stderr only when stderr is a terminal (for example with `docker run -it`); otherwise it writes only the hash, to `.deltaglider_bootstrap_hash`. To choose the password, set `DGP_BOOTSTRAP_PASSWORD_HASH` or use the `--set-bootstrap-password` flag.
 
 ## Configuration
 
-YAML config file (canonical) or environment variables (`DGP_*` prefix). A five-line config is runnable:
+Configure the proxy with a YAML config file (canonical) or with environment variables (`DGP_*` prefix). A five-line config is enough to run:
 
 ```yaml
 # deltaglider_proxy.yaml
@@ -134,7 +131,7 @@ storage:
   secret_access_key: changeme
 ```
 
-The canonical format has four optional top-level sections — `admission`, `access`, `storage`, `advanced` — each independently optional. Fields equal to their defaults are omitted from exports to keep GitOps diffs small.
+The canonical format has four top-level sections: `admission`, `access`, `storage`, and `advanced`. Each section is optional. Exports omit the fields that equal their defaults, so GitOps diffs stay small.
 
 ```yaml
 admission:
@@ -179,19 +176,19 @@ advanced:
   log_level: deltaglider_proxy=info,tower_http=warn
 ```
 
-**Offline validation** — run before committing to CI:
+Offline validation: run this before you commit to CI:
 
 ```sh
 deltaglider_proxy config lint deltaglider_proxy.yaml
 ```
 
-**TOML support was removed in v1.4.1** — YAML is the only config format. A `.toml` config makes the proxy fail at startup with an actionable error. Still on TOML? Run `deltaglider_proxy config migrate` on v1.4.0 to convert, then upgrade. See [How to upgrade the proxy](docs/product/how-to/upgrade.md).
+YAML is the only config format, because v1.4.1 removed TOML support. A `.toml` config makes the proxy fail at startup with an error that says what to do. If you still use TOML, run `deltaglider_proxy config migrate` on v1.4.0 to convert it, then upgrade. See [How to upgrade the proxy](docs/product/how-to/upgrade.md).
 
-**Example**: [deltaglider_proxy.example.yaml](deltaglider_proxy.example.yaml).
+Example: [deltaglider_proxy.example.yaml](deltaglider_proxy.example.yaml).
 
-**Admin API for GitOps** — full-document apply, per-section PATCH (RFC 7396 merge-patch), JSON Schema export, and an admission-chain trace endpoint. See the [admin API reference](docs/product/reference/admin-api.md).
+The admin API supports GitOps with full-document apply, per-section PATCH (RFC 7396 merge-patch), JSON Schema export, and an admission-chain trace endpoint. See the [admin API reference](docs/product/reference/admin-api.md).
 
-## S3 Compatibility
+## S3 compatibility
 
 | | Operations |
 |-|------------|
@@ -209,7 +206,7 @@ Not implemented: versioning, storage-class transitions, object lock.
 
 ## Architecture
 
-Single Rust binary. Async throughout (Tokio + axum). Single port serves S3 API on `/` and admin UI + APIs under `/_/`.
+The proxy is a single Rust binary, async throughout (Tokio and axum). A single port serves the S3 API on `/` and the admin UI and APIs under `/_/`.
 
 ```
 S3 request
@@ -223,7 +220,7 @@ S3 request
 
 ## Docker
 
-Multi-arch images (amd64 + arm64) published on every release:
+Every release publishes multi-arch images (amd64 and arm64):
 
 ```bash
 docker run -p 9000:9000 beshultd/deltaglider_proxy
@@ -257,21 +254,21 @@ helm upgrade --install dgp ./charts/deltaglider-proxy \
   --set auth.existingSecret=deltaglider-secrets
 ```
 
-The chart mounts config at `/data/deltaglider_proxy.yaml` so the encrypted IAM DB is created at `/data/deltaglider_config.db` on the PVC. Full guide: [How to deploy on Kubernetes with Helm](docs/product/how-to/deploy-on-kubernetes.md).
+The chart mounts the config at `/data/deltaglider_proxy.yaml` so the encrypted IAM DB is created at `/data/deltaglider_config.db` on the PVC. Full guide: [How to deploy on Kubernetes with Helm](docs/product/how-to/deploy-on-kubernetes.md).
 
 ### Kubernetes operator (multi-pod)
 
-For deployments with more than one pod, use the official operator in [`operator/`](operator/). It manages the proxy pods **plus the consistent-hashing router** that multi-pod S3 traffic requires. Without that router, multipart uploads fail with `NoSuchUpload` behind a round-robin Service, because the state of an upload lives only on the pod that started it. The operator README states the trade-offs explicitly. Guide: [How to scale out with the Kubernetes operator](docs/product/how-to/scale-out-with-the-kubernetes-operator.md).
+For deployments with more than one pod, use the official operator in [`operator/`](operator/). It manages the proxy pods and the consistent-hashing router that multi-pod S3 traffic requires. Without that router, multipart uploads fail with `NoSuchUpload` behind a round-robin Service, because the state of an upload lives only on the pod that started it. The operator README states the trade-offs explicitly. Guide: [How to scale out with the Kubernetes operator](docs/product/how-to/scale-out-with-the-kubernetes-operator.md).
 
 ## Documentation
 
 Operator-facing docs are also bundled into the running binary at `/_/docs/`. Source files:
 
-The docs follow [Diátaxis](https://diataxis.fr) — every page is exactly one of tutorial / how-to / reference / explanation.
+The docs follow [Diátaxis](https://diataxis.fr): every page is exactly one of tutorial, how-to, reference, or explanation.
 
 **Tutorials** (guided lessons):
-- [Your first delta savings](docs/product/tutorials/first-delta-savings.md) — Docker to visible savings in 15 minutes.
-- [Securing your first proxy](docs/product/tutorials/secure-your-proxy.md) — own password, SigV4, a least-privilege CI user.
+- [Your first delta savings](docs/product/tutorials/first-delta-savings.md): from Docker to visible savings in 15 minutes.
+- [Securing your first proxy](docs/product/tutorials/secure-your-proxy.md): your own password, SigV4, and a least-privilege CI user.
 - [Your first Helm deployment on kind](docs/product/tutorials/kubernetes-hello-world.md)
 
 **How-to guides** (goal-named recipes): [take a proxy to production](docs/product/how-to/go-to-production.md) · [Docker Compose](docs/product/how-to/deploy-with-docker-compose.md) · [Kubernetes](docs/product/how-to/deploy-on-kubernetes.md) · [Kubernetes operator](docs/product/how-to/scale-out-with-the-kubernetes-operator.md) · [TLS](docs/product/how-to/serve-tls.md) · [upgrade](docs/product/how-to/upgrade.md) · [back up & restore](docs/product/how-to/back-up-and-restore.md) · [HA](docs/product/how-to/run-multiple-instances.md) · [monitor](docs/product/how-to/monitor-with-prometheus.md) · [trace & audit](docs/product/how-to/trace-requests.md) · [troubleshooting](docs/product/how-to/troubleshooting.md) · [route a bucket](docs/product/how-to/route-a-bucket-to-a-backend.md) · [migrate data in](docs/product/how-to/migrate-existing-data-into-the-proxy.md) · [move a bucket](docs/product/how-to/move-a-bucket-between-backends.md) · [compression & quotas](docs/product/how-to/set-bucket-compression-and-quotas.md) · [replicate](docs/product/how-to/replicate-a-bucket.md) · [expire & archive](docs/product/how-to/expire-and-archive-objects.md) · [encrypt](docs/product/how-to/encrypt-data-at-rest.md) · [rotate keys](docs/product/how-to/rotate-encryption-keys.md) · [events](docs/product/how-to/send-event-notifications.md) · [IAM users](docs/product/how-to/create-iam-users.md) · [conditions](docs/product/how-to/restrict-access-with-conditions.md) · [SSO](docs/product/how-to/set-up-sso.md) · [IAM as code](docs/product/how-to/manage-iam-as-code.md) · [admission rules](docs/product/how-to/gate-requests-with-admission-rules.md) · [public folders](docs/product/how-to/publish-a-public-folder.md)
@@ -291,20 +288,20 @@ Plus the [FAQ index](docs/product/faq.md).
 
 [Business Source License 1.1](LICENSE) (BUSL-1.1). In plain terms:
 
-- **Free for most users.** Production use is free as long as the total
-  compressed data stored through the proxy stays under **15 TB** per
+- Free for most users. Production use is free as long as the total
+  compressed data stored through the proxy stays under 15 TB per
   organization, and you don't resell the proxy itself as a hosted
   service. Development, testing, and evaluation are always free, at any
-  size. There are no license keys and nothing is gated — the license is
-  a legal term you can read, not a technical lock.
-- **Every release becomes open source.** Two years after each version
+  size. There are no license keys and no locked features. The license is
+  a legal term, and the software does not enforce it technically.
+- Every release becomes open source. Two years after each version
   is released, that version automatically converts to the
   [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0).
-- **Larger deployments need a commercial license.** If your compressed
+- Larger deployments need a commercial license. If your compressed
   footprint exceeds 15 TB, or you want to embed DeltaGlider in a
   proprietary product or offer it as a service, see
   [deltaglider.com/pricing](https://deltaglider.com/pricing/).
-- **Older releases stay GPL.** Every release up to and including
+- Older releases stay GPL. Every release up to and including
   v1.17.0 was published under GPL-3.0 and remains under GPL-3.0
   forever.
 

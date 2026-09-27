@@ -1,6 +1,6 @@
 # Event log
 
-Durable object events are written to the encrypted config DB after successful S3 mutations. The outbox is append-first: PUT/COPY/DELETE, replication copy successes, and lifecycle delete/transition successes do not call external systems directly, so object operations do not wait on webhook latency or failures.
+After each successful S3 mutation, the proxy writes a durable object event to the encrypted config DB. The outbox is append-first: PUT/COPY/DELETE, successful replication copies, and successful lifecycle deletes and transitions do not send requests to external systems directly. So object operations do not wait for webhook latency or failures.
 
 ## Semantics
 
@@ -18,8 +18,8 @@ Durable object events are written to the encrypted config DB after successful S3
 - A permanent error does not retry. When every failed target of a row failed because of the configuration (the outbound-URL policy refuses the URL, the URL or a header is invalid, or no target is configured), the row becomes `failed` after its first attempt, because a retry would fail the same way. The error text of such a row starts with `[permanent]`.
 - Webhook URLs must use `https://` and must not point at a private, loopback or cloud-metadata address. Set `allow_local: true` to allow `http://` and private or loopback addresses, for example for a receiver on the same host or network. Cloud-metadata addresses are refused even then. A config apply that adds a URL that the policy refuses is itself refused, with an error that names the URL. A refused URL that the config already held before the apply (an older version accepted it) only produces a warning, so the proxy still starts.
 - Requeue does not create a new event. It changes only `failed` rows back to `pending`, clears claim/error fields, preserves `attempts` as delivery history, and makes the row due immediately.
-- Stale `in_progress` claims are reclaimable so a crashed dispatcher does not wedge rows forever.
-- Delivered rows are pruned by the dispatcher after `delivered_retention` and capped by `delivered_max_rows`. Pending, in-progress, and failed rows are not deleted by retention pruning because they still need operator or dispatcher action.
+- A dispatcher can reclaim a stale `in_progress` claim, so a crashed dispatcher does not block rows forever.
+- The dispatcher prunes delivered rows after `delivered_retention` and caps them at `delivered_max_rows`. Retention pruning does not delete pending, in-progress, and failed rows, because they still need operator or dispatcher action.
 - Default healthy-state DB bound is: all non-delivered rows plus at most 10,000 delivered rows. If delivery is broken, pending/failed rows can exceed that until delivery is fixed, rows are requeued, or the DB is cleared.
 
 ## YAML grammar
@@ -47,7 +47,7 @@ advanced:
     prune_batch: 100
 ```
 
-The default is inert: `enabled: false`. `enabled=true` without `webhook_url` or `webhook_urls` is treated as inactive and surfaces a config warning. `webhook_url` is the single-endpoint shortcut; `webhook_urls` adds fan-out endpoints.
+The default is inert: `enabled: false`. The proxy treats `enabled=true` without `webhook_url` or `webhook_urls` as inactive, and it shows a config warning. `webhook_url` is the single-endpoint shortcut; `webhook_urls` adds fan-out endpoints.
 
 ## Webhook payload
 
@@ -80,10 +80,10 @@ Each POST body is JSON:
 
 ## Slack format
 
-`event_delivery.format: slack` delivers Slack messages instead of the raw `{schema,event}` envelope. No OAuth is involved — delivery is outbound HTTPS with a pasted credential, in one of two mutually exclusive modes:
+`event_delivery.format: slack` delivers Slack messages instead of the raw `{schema,event}` envelope. Delivery uses no OAuth. It is outbound HTTPS with a pasted credential, in one of two mutually exclusive modes:
 
-- **Incoming Webhook mode** — `webhook_url` is a `https://hooks.slack.com/services/…` URL. Each URL is bound to one channel by Slack. `slack_username` and `slack_icon_emoji` are optional cosmetic sender overrides.
-- **Bot-token mode** — `slack_bot_token` is an `xoxb-…` token (requires the `chat:write` and `chat:write.public` scopes); `slack_channel` (channel id or `#name`) is required and no webhook URL is set.
+- **Incoming Webhook mode**: `webhook_url` is a `https://hooks.slack.com/services/…` URL. Slack binds each URL to one channel. `slack_username` and `slack_icon_emoji` are optional cosmetic sender overrides.
+- **Bot-token mode**: `slack_bot_token` is an `xoxb-…` token (requires the `chat:write` and `chat:write.public` scopes); `slack_channel` (channel id or `#name`) is required and no webhook URL is set.
 
 The bot token is a secret: it is masked to `__redacted__` on export and in the admin GUI, and an unchanged round-trip preserves the real token. The Slack Web API returns HTTP 200 even on failure, so delivery checks the JSON `ok` field and retries on `{"ok": false}` (e.g. `channel_not_found`).
 

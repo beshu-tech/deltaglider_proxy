@@ -97,13 +97,13 @@ storage:
         mode: sse-s3
 ```
 
-Keys can also be set in the admin GUI (Settings → Storage → Backends); GUI-generated keys are produced in-browser via `crypto.getRandomValues` and do not round-trip through the server before Apply.
+You can also set keys in the admin GUI (Settings → Storage → Backends). The browser generates GUI keys with `crypto.getRandomValues`, and the keys do not go through the server before Apply.
 
 ## Key IDs
 
 Every proxy-AES write stamps a `dg-encryption-key-id` metadata field on the object. The id is either the explicit `key_id` from YAML or derived as the first 8 bytes of `SHA-256(backend_name ‖ 0x00 ‖ key)`, written as 16 hex characters. The backend name is part of the derivation: two backends with identical key material but different names produce different ids, so objects are not portable across backends by default. Pinning the same explicit `key_id` with identical key bytes on two backends is the documented portability escape hatch.
 
-On read, the object's stamped id is compared against the backend's configured `key_id`, then against `legacy_key_id`. A mismatch produces a specific error rather than an opaque GCM authentication failure:
+On read, the proxy compares the object's stamped id against the backend's configured `key_id`, then against `legacy_key_id`. A mismatch produces a specific error rather than an opaque GCM authentication failure:
 
 > object was encrypted with key id 'obj-foo', but this backend is configured with key id 'backend-bar' (no legacy-shim match either). This usually means: (a) the key was rotated without `legacy_key` set — restore the old key alongside the new one; (b) this bucket is routed to the wrong backend; (c) two backends share physical storage with different keys.
 
@@ -140,34 +140,34 @@ Passthrough bodies use this format. The codec slices plaintext into 64-KiB windo
 
 Deltas and references stay single-shot (`aes-256-gcm-v1`). They are bounded by `max_object_size` (100 MiB default), so chunking would be wasted overhead.
 
-SSE-KMS / SSE-S3 objects carry no DG wire framing — AWS applies its own encryption wrapper and the proxy passes the bytes through.
+SSE-KMS / SSE-S3 objects carry no DG wire framing. AWS applies its own encryption wrapper, and the proxy passes the bytes through.
 
 ## GET behavior
 
 The reader dispatches on the object's metadata markers:
 
-- `dg-encrypted: aes-256-gcm-v1` — decrypt single-shot with the backend's proxy-AES key.
-- `dg-encrypted: aes-256-gcm-chunked-v1` — stream-decrypt chunk by chunk. Range requests compute the first and last chunk in O(1) (every non-final frame is exactly 65556 wire bytes), fetch only those chunks, decrypt, and trim to the client's `[start, end]`.
-- `dg-encrypted-native: sse-kms` (or `sse-s3`) — no proxy-side decryption; AWS returns plaintext.
-- Absent marker — the object is served as-is. The read path additionally sniffs the body's first 4 bytes: if the `DGE1` magic is present but the metadata marker is missing (for example, xattrs stripped by a backup/restore round-trip), the read errors rather than serving ciphertext as plaintext.
+- `dg-encrypted: aes-256-gcm-v1`: decrypt single-shot with the backend's proxy-AES key.
+- `dg-encrypted: aes-256-gcm-chunked-v1`: stream-decrypt chunk by chunk. Range requests compute the first and last chunk in O(1) (every non-final frame is exactly 65556 wire bytes), fetch only those chunks, decrypt, and trim to the client's `[start, end]`.
+- `dg-encrypted-native: sse-kms` (or `sse-s3`): no proxy-side decryption; AWS returns plaintext.
+- Absent marker: the proxy serves the object as-is. The read path also sniffs the first 4 bytes of the body. If the `DGE1` magic is present but the metadata marker is missing (for example, because a backup/restore round-trip stripped the xattrs), the read fails and does not serve ciphertext as plaintext.
 
 Truncation, reordering, and tampering of proxy-AES objects fail at GCM verification; the client receives `500 InternalError`, never corrupt data.
 
 ### The `legacy_key` shim
 
-When `legacy_key` / `legacy_key_id` are set, reads check the object's `dg-encryption-key-id` against `key_id` first, then against `legacy_key_id`; objects matching the legacy slot decrypt with `legacy_key`. Writes are unaffected — they go through the backend's current mode only (under a native mode, the proxy-AES path is skipped entirely via `WriteMode::PassThrough`). The shim holds exactly one legacy key generation, works under every mode including `none`, and the admin panel shows an info banner while one is active. The banner counts the objects and delta references that still carry `legacy_key_id` (`GET /_/api/admin/backends/:name/legacy-key-usage`), and its **Clear legacy key** button is enabled only when that count is complete and zero. The native → proxy-AES direction needs no shim: native objects carry `dg-encrypted-native`, so the proxy decrypt path does not fire.
+When `legacy_key` / `legacy_key_id` are set, reads check the object's `dg-encryption-key-id` against `key_id` first, then against `legacy_key_id`. Objects that match the legacy slot decrypt with `legacy_key`. The shim does not affect writes. They go through the backend's current mode only (under a native mode, `WriteMode::PassThrough` skips the proxy-AES path entirely). The shim holds exactly one legacy key generation, works under every mode including `none`, and the admin panel shows an info banner while one is active. The banner counts the objects and delta references that still carry `legacy_key_id` (`GET /_/api/admin/backends/:name/legacy-key-usage`), and its **Clear legacy key** button is enabled only when that count is complete and zero. The native → proxy-AES direction needs no shim: native objects carry `dg-encrypted-native`, so the proxy decrypt path does not fire.
 
 ## Limits
 
 - **Key rotation keeps one previous key.** When an apply changes `key` (or moves a backend away from `aes256-gcm-proxy`) and does not set `legacy_key`, the proxy moves the previous key into `legacy_key`, and its effective id into `legacy_key_id`. An apply that sends `legacy_key: null` drops the previous key instead. The shim holds one legacy generation at a time, so the proxy refuses a key change while `legacy_key` holds a different key. It also refuses a key change that keeps the same `key_id`. A Re-encrypt job (`POST /_/api/admin/jobs/reencrypt`, or Jobs → + New job → Re-encrypt buckets…) rewrites objects under the current configuration; it is durable, resumable across restarts, cancellable, and write-gates affected buckets (`503 SlowDown` on writes; reads unaffected).
 - **An apply keeps what it does not name.** For `key`, `key_id` and `legacy_key`, the same rule applies to every apply, whether it is a section `PUT` or a full document. When the field is absent, the proxy keeps the current value. When the field is `null`, the proxy clears it. When the field has a value, that value replaces the current one. An id is kept only together with its own key: when the apply sets a new `key` and no `key_id`, the new key gets a derived id, and the previous id moves to `legacy_key_id` with the previous key.
 - **Enabling is not retroactive.** Switching a backend's mode affects new writes only; existing objects keep their stored form and markers until rewritten.
-- **Key loss is data loss** in `aes256-gcm-proxy` mode. Keys are not escrowed; there is no recovery path.
+- **Key loss is data loss** in `aes256-gcm-proxy` mode. The proxy does not escrow keys, and there is no recovery path.
 - **No per-bucket encryption.** Encryption is backend-scoped; a bucket inherits the encryption of the backend it routes to.
 - **Metadata is plaintext** under every mode, including SSE-KMS: object names, sizes, content-type, and `x-amz-meta-*` user metadata are stored unencrypted.
 - **No forward secrecy.** A disclosed proxy-AES key decrypts all past ciphertext written under it.
-- **Memory.** Encrypted GET is streaming: the decoder holds ~130 KiB in flight regardless of object size, and range GETs fetch only the target chunks plus a 16-byte header probe. An encrypted PUT in proxy-AES mode of a body that the proxy holds in memory buffers every encrypted frame before handing off to the inner backend: peak write memory ≈ plaintext size + 0.03%, so a 100 MiB `PutObject` peaks around 200–300 MiB RSS. A body that the proxy stores from a file (a large upload, or a multipart upload whose parts are relay files) is encrypted into a temporary file in `DGP_SPOOL_DIR` instead. That file counts against `DGP_SPOOL_MAX_BYTES`, and when the budget is in use the upload gets `503 SlowDown`. Passthrough objects above `max_object_size` (default 100 MiB) are rejected up front. SSE-KMS / SSE-S3 stream through without this buffering.
-- **Latency.** AES-256-GCM throughput is roughly 1–3 GB/s per core with AES-NI; a 100 MiB proxy-AES upload adds ~30–100 ms of proxy-side crypto work. Native SSE modes move this cost to AWS.
+- **Memory.** Encrypted GET is streaming: the decoder holds ~130 KiB in flight regardless of object size, and range GETs fetch only the target chunks plus a 16-byte header probe. An encrypted PUT in proxy-AES mode of a body that the proxy holds in memory buffers every encrypted frame before handing off to the inner backend: peak write memory ≈ plaintext size + 0.03%, so a 100 MiB `PutObject` peaks around 200 to 300 MiB RSS. A body that the proxy stores from a file (a large upload, or a multipart upload whose parts are relay files) is encrypted into a temporary file in `DGP_SPOOL_DIR` instead. That file counts against `DGP_SPOOL_MAX_BYTES`, and when the budget is in use the upload gets `503 SlowDown`. The proxy rejects passthrough objects above `max_object_size` (default 100 MiB) up front. SSE-KMS / SSE-S3 stream through without this buffering.
+- **Latency.** AES-256-GCM throughput is roughly 1 to 3 GB/s per core with AES-NI. A 100 MiB proxy-AES upload adds ~30 to 100 ms of proxy-side crypto work. Native SSE modes move this cost to AWS.
 - The pre-v0.9 global `advanced.encryption_key` field no longer exists; encryption is configured per backend.
 
 ## Related

@@ -2,7 +2,7 @@
 
 This guide shows you how to run DeltaGlider Proxy with Docker Compose using a secret-free, commit-safe config. The files are also in the repo under [`examples/docker-compose/`](https://github.com/beshu-tech/deltaglider_proxy/tree/main/examples/docker-compose).
 
-The pattern: the proxy expands `${env:NAME}` and `${env:NAME:-default}` references inside its config file, in-process, at load time — an in-program replacement for an external `envsubst` step. You ship a secret-free `deltaglider_proxy.yaml` with placeholders, supply real values as environment variables, and the proxy fills them at startup. An unset placeholder with no default fails the proxy loudly instead of starting with a blank secret.
+The proxy expands `${env:NAME}` and `${env:NAME:-default}` references inside its config file, in-process, at load time. This replaces an external `envsubst` step. You ship a secret-free `deltaglider_proxy.yaml` with placeholders, you supply the real values as environment variables, and the proxy fills them in at startup. When a placeholder is unset and has no default, the proxy stops with an error, so it never starts with a blank secret.
 
 > The `env:` prefix is required. It keeps load-time config placeholders distinct from the request-time IAM permission templates (`${iam:username}`, `${iam:access_key_id}`). A bare `${...}` is left untouched.
 
@@ -12,9 +12,9 @@ The pattern: the proxy expands `${env:NAME}` and `${env:NAME:-default}` referenc
 
 You need three files:
 
-- **`deltaglider_proxy.yaml`** — the config; secret values are `${env:...}` placeholders. Commit it.
-- **`secrets.env`** — your real secret values (`KEY=value`). **Never commit it.**
-- **`docker-compose.yml`** — runs the proxy with the config mounted and the secrets supplied via `env_file`.
+- `deltaglider_proxy.yaml`: the config. The secret values in it are `${env:...}` placeholders. Commit it.
+- `secrets.env`: your real secret values (`KEY=value`). **Never commit it.**
+- `docker-compose.yml`: runs the proxy with the config mounted and the secrets supplied through `env_file`.
 
 ## 1. Write the config
 
@@ -104,7 +104,7 @@ volumes:
 
 ## 4. Set the admin password
 
-`DGP_BOOTSTRAP_PASSWORD_HASH` is a **bcrypt hash**, not plaintext. Generate it:
+`DGP_BOOTSTRAP_PASSWORD_HASH` is a bcrypt hash, not plaintext. Generate it:
 
 ```bash
 # inside the image:
@@ -121,7 +121,7 @@ docker compose up -d
 docker compose logs -f deltaglider
 ```
 
-If you have the binary locally, validate the config before shipping — it catches a missing `${env:...}` early:
+If you have the binary locally, validate the config before you ship it. The lint catches a missing `${env:...}` early:
 
 ```bash
 deltaglider_proxy config lint deltaglider_proxy.yaml
@@ -138,11 +138,11 @@ storage:
 
 ## Managing users as code
 
-To manage IAM users and groups from the YAML instead of the admin GUI, set `access.iam_mode: declarative` — the YAML becomes the source of truth and is reconciled into the encrypted DB on every apply. See [How to manage IAM as code](manage-iam-as-code.md).
+To manage IAM users and groups from the YAML instead of the admin GUI, set `access.iam_mode: declarative`. The YAML then becomes the source of truth, and the proxy reconciles it into the encrypted DB on every apply. See [How to manage IAM as code](manage-iam-as-code.md).
 
 ## Persistence and backups
 
-The `dgp-config` volume holds the **encrypted config DB** (`deltaglider_config.db`) — your IAM users, groups, and OAuth providers — and, next to it, the key file `deltaglider_config.db.key` that the proxy generates on the first start. The database is useless without that key. Back up both (see [How to back up and restore](back-up-and-restore.md)). With an S3 backend, object data lives in the backend, not in these volumes, and the `dgp-data` volume holds objects only when you use the filesystem backend. The proxy writes its temporary files (delta encoding and reconstruction of objects larger than 16 MiB, multipart parts) to the spool directory, which is `/tmp/dgp-spool` in the container unless you set `DGP_SPOOL_DIR`. Point `DGP_SPOOL_DIR` at a volume, for example `/data/spool`, if the container file system is small.
+The `dgp-config` volume holds the encrypted config DB (`deltaglider_config.db`) with your IAM users, groups, and OAuth providers. Next to it, the volume holds the key file `deltaglider_config.db.key` that the proxy generates on the first start. The database is useless without that key. Back up both (see [How to back up and restore](back-up-and-restore.md)). With an S3 backend, object data lives in the backend, not in these volumes, and the `dgp-data` volume holds objects only when you use the filesystem backend. The proxy writes its temporary files (delta encoding and reconstruction of objects larger than 16 MiB, multipart parts) to the spool directory, which is `/tmp/dgp-spool` in the container unless you set `DGP_SPOOL_DIR`. Point `DGP_SPOOL_DIR` at a volume, for example `/data/spool`, if the container file system is small.
 
 ## Verify
 
@@ -155,10 +155,10 @@ AWS_ACCESS_KEY_ID=$PROXY_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$PROXY_SECRET_ACCES
   aws --endpoint-url http://localhost:9000 s3 ls
 ```
 
-Then open the admin GUI at `http://localhost:9000/_/` and log in with the bootstrap password — the S3 API and the GUI share port 9000.
+Then open the admin GUI at `http://localhost:9000/_/` and log in with the bootstrap password. The S3 API and the GUI share port 9000.
 
 ## Related
 
-- [How to take a proxy to production](go-to-production.md) — the rest of the production checklist
-- [How to serve TLS](serve-tls.md) — put HTTPS in front of this stack
-- [Configuration reference](../reference/configuration.md) — every YAML field and `DGP_*` env var
+- [How to take a proxy to production](go-to-production.md): the rest of the production checklist
+- [How to serve TLS](serve-tls.md): put HTTPS in front of this stack
+- [Configuration reference](../reference/configuration.md): every YAML field and `DGP_*` env var

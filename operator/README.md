@@ -2,13 +2,13 @@
 
 The official Kubernetes operator for [DeltaGlider Proxy](../README.md). You declare a
 `DeltaGliderProxy` resource, and the operator manages everything that is needed to run
-it — including the routing layer that makes **multi-pod deployments actually work with
-S3 multipart uploads**. Please read
+it. This includes the routing layer that lets a multi-pod deployment handle
+S3 multipart uploads. Please read
 [the multipart section](#multipart-uploads-and-multiple-pods-read-this) before you set
 `replicas` above 1.
 
 For a single-pod installation, the plain [Helm chart](../charts/deltaglider-proxy) is
-also fine. The operator earns its keep when you scale: it deploys, and keeps up to
+also fine. The operator is useful when you scale, because it deploys, and keeps up to
 date, the consistent-hashing router that a multi-pod deployment requires.
 
 ## What the operator manages
@@ -56,8 +56,8 @@ printf '%s\n' 'your-admin-password' | deltaglider_proxy --set-bootstrap-password
 
 ## Multipart uploads and multiple pods (read this)
 
-**The problem.** DeltaGlider Proxy keeps the state of a multipart upload — the upload
-id and the parts received so far — in the memory and on the local disk of the pod that
+DeltaGlider Proxy keeps the state of a multipart upload (the upload
+id and the parts received so far) in the memory and on the local disk of the pod that
 received the `CreateMultipartUpload` request. No other pod knows that this upload
 exists. Behind a plain round-robin Service, the SDK sends its parallel `UploadPart`
 requests to whichever pods the load balancer picks, and every request that reaches a
@@ -66,8 +66,8 @@ Kubernetes remedies do not help here: S3 clients do not carry cookies, so cookie
 session affinity cannot apply, and `sessionAffinity: ClientIP` stops working when many
 clients share one IP address behind a NAT gateway.
 
-**What the operator does about it.** The managed HAProxy router chooses the target pod
-for every S3 request by hashing the **directory of the URL path** — the request path
+To solve this, the managed HAProxy router chooses the target pod
+for every S3 request by hashing the directory of the URL path, which is the request path
 with its last segment removed (`balance hash path,regsub([^/]*$,x)` together with
 `hash-type consistent`; the query string is never part of the hash). Everything inside
 one directory therefore reaches the same pod: every object key in that prefix, and for
@@ -81,8 +81,8 @@ other's lock. The hash ring is built from the StatefulSet's stable DNS names,
 which means every router pod computes exactly the same mapping.
 
 **Consistent hashing is the only multipart strategy this deployment implements.** The
-pods do not share any multipart state with each other. That has honest consequences,
-and you should accept them before going live:
+pods do not share any multipart state with each other. That has consequences,
+and you should accept them before you go live:
 
 - **Scaling the proxy pods moves part of the hash ring.** A multipart upload that is in
   flight during a scale-up or scale-down can fail with `NoSuchUpload` if its key now
@@ -93,7 +93,7 @@ and you should accept them before going live:
   whole upload.
 - **All traffic for one key prefix goes to one pod.** Load is spread across the pods by
   directory, not by request, so a single very busy bucket or prefix does not fan out
-  across the fleet. This is the price of correctness.
+  across the fleet.
 - **Do not bypass the router.** A client that reaches the proxy pods directly, or
   through a different load balancer, is not covered by the path-pinning, and its
   multipart uploads will fail. The `<name>` Service is the only supported entrypoint.
@@ -102,7 +102,7 @@ The admin UI (everything under `/_/`) is routed differently: it sticks to a pod 
 client's source IP address, because admin sessions are held in memory and are bound to
 the IP address that opened them.
 
-Two more operational notes:
+More operational notes:
 
 - **Client IP addresses.** The router adds an `X-Forwarded-For` header to every
   request. The operator sets `DGP_TRUST_PROXY_HEADERS=true` on the proxy pods, and it
@@ -122,7 +122,7 @@ Two more operational notes:
   deliberately carries no owner reference: its `dbKey` decrypts the IAM database on
   the persistent volumes, and those volumes survive a `kubectl delete dgp`. If the
   Secret were garbage-collected with the resource, recreating it would generate a new
-  key and permanently lock the surviving data out. For a truly
+  key and permanently lock the surviving data out. For a
   clean teardown, delete the Secret and the volumes together, by hand.
 
 ## Requirements for `replicas > 1` (enforced)
@@ -155,13 +155,13 @@ requires:
 Any pod can accept IAM changes. The IAM synchronisation merges the changes of every pod
 with a three-way merge, as described in the multi-instance contract.
 
-The operator checks points 1–3 before it scales. If you set `replicas: 3` but the spec
-violates the contract — no sync bucket, a filesystem backend, a missing Secret, or no
-bootstrap hash or config DB key — the operator refuses to scale up: a fresh deployment comes up with
+The operator checks points 1 to 3 before it scales. If you set `replicas: 3` but the spec
+violates the contract (no sync bucket, a filesystem backend, a missing Secret, or no
+bootstrap hash or config DB key), the operator refuses to scale up. A fresh deployment comes up with
 **one** pod, and a fleet that is already running keeps its current size (the operator
 never kills healthy pods over a preflight problem). Either way the resource's phase
 becomes `Degraded` and `status.message` lists the exact problems. Fix the spec and the
-operator scales up on the next reconcile. A broken spec can never scale into data
+operator scales up on the next reconcile. A spec that breaks the contract therefore never scales into data
 corruption.
 
 ## Spec reference

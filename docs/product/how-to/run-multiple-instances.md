@@ -2,11 +2,11 @@
 
 This guide shows you how to run more than one DeltaGlider Proxy instance against the same storage, coordinated through a shared S3 bucket.
 
-The shared bucket does three jobs: it syncs the encrypted config DB (`deltaglider_config.db` — IAM users, groups, OAuth providers) between instances, it hosts the replication leader leases that stop two instances from running the same rule (with automatic failover when a leader dies), and it hosts the reference locks that stop two instances from writing the baseline of one delta prefix at the same time. Because leases and locks depend on atomic conditional writes, the proxy validates the bucket's backend at boot and refuses to start on one that cannot enforce them. The same rule applies to object data: every S3 backend that holds buckets that clients write to must also support conditional writes, or the proxy refuses to start. See [How to use non-CAS backends safely](backend-capability-validation.md). Why it's built this way: [Multi-backend architecture](../explanation/multi-backend-architecture.md).
+The shared bucket does three jobs: it syncs the encrypted config DB (`deltaglider_config.db`, which holds the IAM users, groups, and OAuth providers) between instances, it hosts the replication leader leases that stop two instances from running the same rule (with automatic failover when a leader dies), and it hosts the reference locks that stop two instances from writing the baseline of one delta prefix at the same time. Because leases and locks depend on atomic conditional writes, the proxy validates the bucket's backend at boot and refuses to start on one that cannot enforce them. The same rule applies to object data: every S3 backend that holds buckets that clients write to must also support conditional writes, or the proxy refuses to start. See [How to use non-CAS backends safely](backend-capability-validation.md). The reasons for this design are in [Multi-backend architecture](../explanation/multi-backend-architecture.md).
 
 ## 1. Point every instance at a sync bucket
 
-Set the same sync bucket on every instance, in YAML or env:
+Set the same sync bucket on every instance, in YAML or as an environment variable:
 
 ```yaml
 advanced:
@@ -57,7 +57,7 @@ Two instances can also create a user with the same name at about the same time, 
 
 The first sync after an upgrade has no merge base yet. Without a merge base, the merge cannot tell a delete from a row that the other side never had, so it keeps every row of both sides (a union). A change or a create that was not synced yet survives, and a delete that was not synced yet comes back. The merge base is stored next to the database as `deltaglider_config.db.sync-base`.
 
-If you want no writer at all, switch to `iam_mode: declarative` and manage IAM via YAML + GitOps — see [How to manage IAM as code](manage-iam-as-code.md).
+If you want no writer at all, switch to `iam_mode: declarative` and manage IAM through YAML and GitOps. See [How to manage IAM as code](manage-iam-as-code.md).
 
 ## 4. Force a sync when you can't wait
 
@@ -67,7 +67,7 @@ After a known-good mutation on the writer, make a reader pull immediately instea
 curl -b cookies -X POST https://dgp-reader-1:9000/_/api/admin/config/sync-now
 ```
 
-Use this during rollouts and incident response — e.g. you just disabled a leaked key on the writer and want every reader to enforce it now.
+Use this during rollouts and incident response. For example, you disabled a leaked key on the writer and you want every reader to enforce that change now.
 
 The request answers `200` when the reader is current afterwards. It answers `409` when the reader downloaded a newer copy but did not merge it, for example because it refused the copy as a rollback or because the copy comes from a newer release. The response body says why. It answers `502` when the reader cannot read the sync bucket.
 
@@ -81,13 +81,13 @@ The response holds `healthy`, the time of the last good pull (`last_pull_ok_at`)
 
 ## 5. If you scale with Helm
 
-`replicaCount` defaults to `1` — do not raise it until the sync bucket is configured. With the sync bucket set, **replication** rules elect a single leader per rule through an S3 lease object in that bucket (conditional-write CAS): if the leader dies, its lease lapses (default `lease_ttl: "300s"`) and a peer takes over automatically — no double-run, no shared DB required. **Lifecycle, maintenance, and parity audit** jobs still use node-local database leases (their timing is set by `advanced.jobs`, see [Job leases](../reference/configuration.md#job-leases)), so under multiple replicas those can run on more than one pod; their operations are idempotent, so this wastes work rather than corrupting data. The one exception is the **migrate** job: its routing flip changes only the configuration of the instance that runs it, so the proxy refuses to start a migrate with `409 Conflict` while the sync bucket is set (see [How to move a bucket to another backend](move-a-bucket-between-backends.md)). The sync bucket must pass the boot-time conditional-write validation — see [How to use non-CAS backends safely](backend-capability-validation.md).
+`replicaCount` defaults to `1`. Do not raise it until you configure the sync bucket. With the sync bucket set, replication rules elect a single leader per rule through an S3 lease object in that bucket (conditional-write CAS). If the leader dies, its lease lapses (default `lease_ttl: "300s"`) and a peer takes over automatically. A rule does not run twice, and the instances do not need a shared DB. Lifecycle, maintenance, and parity audit jobs still use node-local database leases (their timing is set by `advanced.jobs`, see [Job leases](../reference/configuration.md#job-leases)), so under multiple replicas those can run on more than one pod; their operations are idempotent, so this wastes work rather than corrupting data. The one exception is the migrate job: its routing flip changes only the configuration of the instance that runs it, so the proxy refuses to start a migrate with `409 Conflict` while the sync bucket is set (see [How to move a bucket to another backend](move-a-bucket-between-backends.md)). The sync bucket must pass the boot-time conditional-write validation. See [How to use non-CAS backends safely](backend-capability-validation.md).
 
 See [How to deploy on Kubernetes with Helm](deploy-on-kubernetes.md) for the chart specifics.
 
 ## 6. Route multipart uploads to one instance
 
-The state of a multipart upload — the upload id and the parts received so far — lives
+The state of a multipart upload (the upload id and the parts received so far) lives
 only in the memory and on the local disk of the instance that answered the
 `CreateMultipartUpload` request. No other instance knows about that upload. Behind a
 round-robin load balancer, every `UploadPart` request that lands on a different
@@ -96,8 +96,8 @@ affinity cannot fix this, because S3 clients do not carry cookies, and affinity 
 client IP address stops working when many clients share one address behind a NAT
 gateway.
 
-The supported answer is **consistent hashing by the directory of the URL path** at the
-load balancer. Hash the request path with its last segment removed — in S3 terms, the
+The supported answer is consistent hashing by the directory of the URL path at the
+load balancer. Hash the request path with its last segment removed. In S3 terms, this is the
 bucket plus the key's prefix. Everything in one directory then reaches the same
 instance: every object key in that prefix, and every part of any multipart upload of
 those keys. Hashing the directory rather than the full path matters for a second
@@ -110,7 +110,7 @@ that still does not get the lock fails. Routing all writes into one prefix
 to one instance avoids that wait, and it keeps the metadata cache of that prefix on
 one instance.
 
-On Kubernetes, the official operator deploys this router for you — see
+On Kubernetes, the official operator deploys this router for you. See
 [How to scale out with the Kubernetes operator](scale-out-with-the-kubernetes-operator.md).
 On any other platform, configure the equivalent on your load balancer. For HAProxy:
 
@@ -142,8 +142,8 @@ Two more pieces of state live inside each instance and are not shared. Neither b
 correctness, but both change behaviour compared to a single instance:
 
 - **The metadata cache.** Each instance caches object metadata (existence, size, ETag)
-  for up to ten minutes and only invalidates its own cache on writes. Good news if
-  you route with the directory hash described above: all requests for one prefix
+  for up to ten minutes and only invalidates its own cache on writes. If
+  you route with the directory hash described above, all requests for one prefix
   reach the same instance, so that instance's cache is coherent for its own prefixes
   and the staleness window almost never shows. It can surface right after the hash
   ring moves (a scale event), when a prefix's new owner may serve up to ten minutes
@@ -172,12 +172,12 @@ curl -b cookies https://dgp-reader-1:9000/_/api/admin/users | jq '.[] | .name'
 aws s3 ls --endpoint-url https://dgp-reader-1:9000
 ```
 
-Watch the reader's logs for the lines `Config DB downloaded from S3` and `IAM index rebuilt from S3-synced DB` — a download on ETag change is the success signal. An `iam_sync_conflict` audit entry means that two instances changed the same row. A login of one identity on two instances is not a conflict: the merge keeps the newer login time.
+Watch the reader's logs for the lines `Config DB downloaded from S3` and `IAM index rebuilt from S3-synced DB`. A download on ETag change is the success signal. An `iam_sync_conflict` audit entry means that two instances changed the same row. A login of one identity on two instances is not a conflict: the merge keeps the newer login time.
 
 ## Related
 
-- [How to use non-CAS backends safely](backend-capability-validation.md) — the conditional-write validation that runs at startup when the sync bucket is set, and what it refuses
-- [How to back up and restore](back-up-and-restore.md) — sync replicates state; it does not protect it
-- [How to manage IAM as code](manage-iam-as-code.md) — the GitOps alternative to a designated writer
-- [How to monitor with Prometheus and Grafana](monitor-with-prometheus.md) — scraping multiple targets
-- [Configuration reference](../reference/configuration.md) — config-sync fields
+- [How to use non-CAS backends safely](backend-capability-validation.md): the conditional-write validation that runs at startup when the sync bucket is set, and what it refuses
+- [How to back up and restore](back-up-and-restore.md): sync replicates state; it does not protect it
+- [How to manage IAM as code](manage-iam-as-code.md): the GitOps alternative to a designated writer
+- [How to monitor with Prometheus and Grafana](monitor-with-prometheus.md): scraping multiple targets
+- [Configuration reference](../reference/configuration.md): config-sync fields

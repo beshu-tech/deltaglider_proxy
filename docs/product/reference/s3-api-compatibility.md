@@ -1,15 +1,15 @@
 # S3 API compatibility
 
-DeltaGlider speaks the S3 wire protocol through the [`s3s`](https://github.com/Nugine/s3s) framework, so standard tools (AWS CLI, boto3, the AWS SDKs, Cyberduck, rclone, `s3fs`) work unchanged. This page is the austere list of which S3 operations the proxy implements, which it stubs, and which it rejects — so you can tell, before integrating, whether your client's calls will work.
+DeltaGlider speaks the S3 wire protocol through the [`s3s`](https://github.com/Nugine/s3s) framework, so standard tools (AWS CLI, boto3, the AWS SDKs, Cyberduck, rclone, `s3fs`) work unchanged. This page lists the S3 operations that the proxy implements, stubs or rejects. Use it to check, before you integrate a client, whether the requests of that client will work.
 
 Status legend:
 
-- **✅ Full** — real implementation; delta compression is applied transparently where relevant.
-- **◑ Stub** — the call succeeds with a fixed, well-formed response. The proxy does not store or honour the underlying feature (e.g. ACLs), but compatible clients that merely *probe* for it keep working.
-- **🚫 Not supported** — returns `501 NotImplemented` with a clear message.
-- **— Not implemented** — no handler; `s3s` returns its default `NotImplemented` error.
+- **✅ Full**: the proxy implements the operation, and it applies delta compression transparently where relevant.
+- **◑ Stub**: the request succeeds with a fixed, well-formed response. The proxy does not store or honour the underlying feature (e.g. ACLs), but compatible clients that merely *probe* for it keep working.
+- **🚫 Not supported**: the proxy returns `501 NotImplemented` with a clear message.
+- **— Not implemented**: no handler exists, so `s3s` returns its default `NotImplemented` error.
 
-> Delta compression, encryption-at-rest, replication, and lifecycle are **proxy-layer features**, not S3 operations. They are applied to the object operations below transparently — a client never sees them. Lifecycle and replication are configured through the proxy (YAML / admin API), **not** through the S3 `PutBucketLifecycle` / `PutBucketReplication` calls, which are intentionally not implemented.
+> Delta compression, encryption-at-rest, replication and lifecycle are proxy-layer features, not S3 operations. The proxy applies them transparently to the object operations below, and a client never sees them. You configure lifecycle and replication through the proxy (YAML or the admin API). The proxy does not implement the S3 `PutBucketLifecycle` and `PutBucketReplication` requests, on purpose.
 
 ## Object operations
 
@@ -63,7 +63,7 @@ The S3 backend stores keys as S3 keys, so there both objects can exist.
 | `UploadPartCopy` | ✅ Full | Copies a (ranged) slice of a source object into the upload; source authorization checked. A ranged part of an object that is stored as-is, or of a delta object larger than the spool threshold, reads only that range, from the version that the copy-source conditions checked. Only the part, not the whole source, must fit `max_object_size`. A smaller delta source is read whole. |
 | `CompleteMultipartUpload` | ✅ Full | Delta or passthrough chosen by size/eligibility; multipart ETag preserved; quota enforced. An upload that is always stored as a plain object is stored from its parts, without assembling them in memory. A completion of an upload that is already complete, with another part list, gets `404 NoSuchUpload`, as on S3. A retry that joins a completion in flight gets the same answer as the first request. |
 | `AbortMultipartUpload` | ✅ Full | Cancels the upload and reclaims state. |
-| `ListParts` | ✅ Full | `part-number-marker` continuation; `max-parts` 1–1000. |
+| `ListParts` | ✅ Full | `part-number-marker` continuation; `max-parts` 1 to 1000. |
 | `ListMultipartUploads` | ✅ Full | `key-marker` + `upload-id-marker` continuation; prefix / delimiter. |
 
 ## Bucket operations
@@ -74,11 +74,11 @@ The S3 backend stores keys as S3 keys, so there both objects can exist.
 | `DeleteBucket` | ✅ Full | Requires the bucket to be empty; purges orphaned multipart state; blocks while uploads are completing. |
 | `HeadBucket` | ✅ Full | `200` if the bucket exists, else `404 NoSuchBucket`. Region header is `us-east-1`. |
 | `GetBucketLocation` | ◑ Stub | Returns an empty location-constraint (interpreted as `us-east-1`). |
-| `GetBucketVersioning` | ◑ Stub | Returns an empty status. The proxy does **not** implement S3 object versioning — see [Versioning vs S3 versioning](../explanation/versioning-vs-s3-versioning.md). |
+| `GetBucketVersioning` | ◑ Stub | Returns an empty status. The proxy does **not** implement S3 object versioning. See [Versioning vs S3 versioning](../explanation/versioning-vs-s3-versioning.md). |
 
 ## ACLs, tagging & policy
 
-The proxy enforces access control through its own **IAM / ABAC** model (see [IAM permissions](iam-permissions.md)), not through S3 ACLs, bucket policies, or object tags. The ACL probes below return a canned *private* response so clients that check ACLs on connect keep working; the mutation calls are explicitly rejected rather than silently ignored.
+The proxy enforces access control through its own IAM / ABAC model (see [IAM permissions](iam-permissions.md)), not through S3 ACLs, bucket policies or object tags. The ACL probes below return a canned *private* response, so clients that check ACLs when they connect keep working. The proxy rejects the mutation requests explicitly, and does not silently ignore them.
 
 A `PutObject`, `CopyObject` or `CreateMultipartUpload` request can carry an `x-amz-acl` header, an `x-amz-grant-*` header or the `x-amz-object-lock-*` headers. The proxy accepts these requests and ignores these headers, because it stores no ACL and no Object Lock setting. `PutObject` and `CopyObject` give the same answer to the same headers. To protect the stored objects with Object Lock, turn it on at the backend (see [Versioning vs S3 versioning](../explanation/versioning-vs-s3-versioning.md)).
 
@@ -86,10 +86,10 @@ A `PutObject`, `CopyObject` or `CreateMultipartUpload` request can carry an `x-a
 |---|---|---|
 | `GetBucketAcl` | ◑ Stub | Bucket existence checked; returns a canned private ACL (single owner, full control). |
 | `GetObjectAcl` | ◑ Stub | Object existence checked; returns a canned private ACL. |
-| `PutBucketAcl` | 🚫 Not supported | `501` — "Bucket ACL mutation is not supported by this proxy". |
-| `PutObjectAcl` | 🚫 Not supported | `501` — "Object ACL mutation is not supported by this proxy". |
-| `GetBucketTagging` / `PutBucketTagging` | 🚫 Not supported | `501` — bucket tagging is not supported. |
-| `GetObjectTagging` / `PutObjectTagging` / `DeleteObjectTagging` | 🚫 Not supported | `501` — object tagging is not supported. |
+| `PutBucketAcl` | 🚫 Not supported | `501`: "Bucket ACL mutation is not supported by this proxy". |
+| `PutObjectAcl` | 🚫 Not supported | `501`: "Object ACL mutation is not supported by this proxy". |
+| `GetBucketTagging` / `PutBucketTagging` | 🚫 Not supported | `501`: bucket tagging is not supported. |
+| `GetObjectTagging` / `PutObjectTagging` / `DeleteObjectTagging` | 🚫 Not supported | `501`: object tagging is not supported. |
 | `GetBucketPolicy` / `PutBucketPolicy` / `DeleteBucketPolicy` | — Not implemented | Use IAM permissions and [admission rules](../how-to/gate-requests-with-admission-rules.md) instead. |
 
 ## Reserved and normalised keys
@@ -111,7 +111,7 @@ A bucket name on the S3 API cannot contain `_`, as on S3. For this reason, the t
 
 ## Not implemented
 
-The following families have no handler — `s3s` returns `NotImplemented`. Where a proxy-native equivalent exists, it is linked.
+The following families have no handler, so `s3s` returns `NotImplemented`. Where a proxy-native equivalent exists, it is linked.
 
 - **Lifecycle:** `PutBucketLifecycleConfiguration` / `GetBucketLifecycleConfiguration` / `DeleteBucketLifecycle` → configure through the proxy instead ([Expire and archive objects](../how-to/expire-and-archive-objects.md), [Lifecycle reference](lifecycle.md)).
 - **Replication:** `PutBucketReplication` / `GetBucketReplication` / `DeleteBucketReplication` → configure through the proxy instead ([Replicate a bucket](../how-to/replicate-a-bucket.md), [Replication reference](replication.md)).
@@ -124,11 +124,11 @@ The following families have no handler — `s3s` returns `NotImplemented`. Where
 
 ## Non-standard endpoints the proxy adds
 
-These are not part of the S3 spec but are served on the S3 port for compatibility and the browser UI:
+These endpoints are not part of the S3 specification. The proxy serves them on the S3 port for client compatibility and for the browser UI:
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /{bucket}` (`multipart/form-data`) | Browser HTML-form `PostObject` upload — used by the embedded S3 browser. SigV4 POST-policy validated; quota enforced. |
+| `POST /{bucket}` (`multipart/form-data`) | Browser HTML-form `PostObject` upload. The embedded S3 browser uses it. SigV4 POST-policy validated; quota enforced. |
 | `HEAD /` | Connection probe used by some clients (e.g. Cyberduck); returns `200 OK`. |
 
-> The full admin API and the docs/UI live under the `/_/` prefix on the same port — `_` is not a valid S3 bucket name, so it never collides with object traffic. See the [admin API reference](admin-api.md).
+> The full admin API and the docs/UI live under the `/_/` prefix on the same port. `_` is not a valid S3 bucket name, so this prefix never collides with object traffic. See the [admin API reference](admin-api.md).

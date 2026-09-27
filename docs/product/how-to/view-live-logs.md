@@ -1,12 +1,12 @@
 # How to view live logs in the admin GUI
 
-This guide shows you how to tail and filter the proxy's operational logs from the admin UI — no SSH, no `grep` on stdout.
+This guide shows you how to tail and filter the proxy's operational logs from the admin UI, without SSH and without `grep` on stdout.
 
 ## Where it lives
 
-Open **Settings → Observability → System logs** (`/_/admin/diagnostics/logs`). The view shows the proxy's operational log stream — security, rate-limit, S3-error, replication, and lifecycle lines — captured at `INFO` and above.
+Open **Settings → Observability → System logs** (`/_/admin/diagnostics/logs`). The view shows the proxy's operational log stream (security, rate-limit, S3-error, replication, and lifecycle lines), captured at `INFO` and above.
 
-This is admin-session-gated: you must be signed in to the admin GUI.
+The view requires an admin session, so you must be signed in to the admin GUI.
 
 ## Tail logs live
 
@@ -16,9 +16,9 @@ Toggle **Follow** to stream new log lines as they happen (over server-sent event
 
 Three filters narrow both the backlog and the live tail, server-side:
 
-- **Level** — `Error`, `Warn+`, `Info+`, `Debug+`. (Lines below the capture floor never enter the ring; see below.)
-- **Target** — substring match on the log target (Rust module), e.g. `auth` or `replication`.
-- **Search** — free-text over the message and structured fields, e.g. a bucket name or client IP.
+- **Level**: `Error`, `Warn+`, `Info+`, `Debug+`. (Lines below the capture floor never enter the ring; see below.)
+- **Target**: a substring match on the log target (Rust module), e.g. `auth` or `replication`.
+- **Search**: free text over the message and structured fields, e.g. a bucket name or client IP.
 
 Click a row to expand its structured fields.
 
@@ -26,9 +26,9 @@ Click a row to expand its structured fields.
 
 To debug a specific request, turn **Follow** on, set the level and a target or search term, then trigger the request. The matching line appears as it's logged. For per-request trace detail, the ring needs debug lines at two levels. First, the log level of the proxy must let them through: the default is `deltaglider_proxy=info,tower_http=info`, so set it to `deltaglider_proxy=debug,tower_http=debug` in **Settings → System → Logging** (it applies without a restart), or with `advanced.log_level` or `DGP_LOG_LEVEL`. Second, widen the capture floor of the ring with `DGP_LOG_RING_LEVEL=debug` (see below) and restart.
 
-## What it is — and isn't
+## What it is and what it is not
 
-The viewer reads an **in-memory, per-instance, bounded ring**. It is a triage convenience, not a log store:
+The viewer reads a bounded in-memory ring on each instance. It is a triage tool, not a log store:
 
 - `DGP_LOG_RING_SIZE` (default `2000`) sets the ring capacity.
 - `DGP_LOG_RING_LEVEL` (default `info`) sets the minimum severity captured. The ring sees only the lines that the log level of the proxy (`DGP_LOG_LEVEL`, `advanced.log_level`, or `RUST_LOG`) lets through, so a ring level below the log level captures nothing more.
@@ -37,6 +37,6 @@ For retention, search, and aggregation across instances, point a log shipper at 
 
 ## Related
 
-- [Trace and audit requests](trace-requests.md) — the audit ring (security events) and the admission-chain tracer.
-- [Configuration reference](../reference/configuration.md#structured-logs-and-the-in-gui-log-ring) — the logging env vars.
-- [Admin API reference](../reference/admin-api.md) — `GET /_/api/admin/logs` and `/_/api/admin/logs/stream`.
+- [Trace and audit requests](trace-requests.md): the audit ring (security events) and the admission-chain tracer.
+- [Configuration reference](../reference/configuration.md#structured-logs-and-the-in-gui-log-ring): the logging env vars.
+- [Admin API reference](../reference/admin-api.md): `GET /_/api/admin/logs` and `/_/api/admin/logs/stream`.

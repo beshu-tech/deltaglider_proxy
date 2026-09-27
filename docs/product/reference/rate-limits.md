@@ -1,10 +1,10 @@
 # Rate limits and concurrency
 
-Reference for the proxy's protection layers against overload, abuse, and resource exhaustion. Every limit has a default and an environment-variable override.
+This page lists the limits that protect the proxy against overload, abuse, and resource exhaustion. Every limit has a default and an environment-variable override.
 
 ## Auth rate limiter
 
-Per-IP brute-force protection for SigV4 authentication and admin login endpoints.
+The auth rate limiter protects SigV4 authentication and the admin login endpoints against brute-force guessing. It counts failures for each client IP address.
 
 | Setting | Default | Env var |
 |---------|---------|---------|
@@ -36,11 +36,11 @@ A locked-out request gets a response that names the lockout and says how long it
 
 ### Progressive delay
 
-Failed auth attempts add an artificial delay to responses before the lockout threshold is reached:
+Before an IP address reaches the lockout threshold, each failed auth attempt adds an artificial delay to the response:
 
 | Failures | Delay |
 |----------|-------|
-| 1–10 | none |
+| 1 to 10 | none |
 | 11 | 200 ms |
 | 12 | 400 ms |
 | 13 | 800 ms |
@@ -50,19 +50,19 @@ Failed auth attempts add an artificial delay to responses before the lockout thr
 
 ### IP extraction
 
-Rate limiting requires a client IP. The proxy reads `X-Forwarded-For` or `X-Real-IP` headers only when `DGP_TRUST_PROXY_HEADERS=true`; the default is `false`, so direct-to-internet deployments are protected against IP spoofing out of the box. `DGP_TRUST_PROXY_HEADERS=true` is appropriate only behind a trusted reverse proxy (nginx, Caddy, ALB) that injects these headers.
+Rate limiting requires a client IP. The proxy reads the `X-Forwarded-For` or `X-Real-IP` headers only when `DGP_TRUST_PROXY_HEADERS=true`. The default is `false`, so in a deployment that faces the internet directly, a client cannot spoof its IP address with these headers. Set `DGP_TRUST_PROXY_HEADERS=true` only behind a trusted reverse proxy (nginx, Caddy, ALB) that injects these headers.
 
 With `DGP_TRUST_PROXY_HEADERS=true`, `DGP_TRUSTED_PROXY_CIDRS` must list the networks of the reverse proxies, and the proxy reads these headers only from a connection that comes from one of those networks. From any other connection it uses the address of the connection. From a trusted proxy, `X-Forwarded-For` wins: the proxy walks the header from right to left and takes the first address that is not in a trusted network, or the leftmost address when every address in the header is trusted. When the request has no `X-Forwarded-For` header, the proxy takes `X-Real-IP`, because nginx often sets only that header. When neither header is present, it takes the address of the connection. A trusted reverse proxy must therefore overwrite any `X-Real-IP` value that the client sends (nginx `proxy_set_header X-Real-IP $remote_addr` does), or else set `X-Forwarded-For`.
 
-The proxy refuses to start when `DGP_TRUST_PROXY_HEADERS=true` and `DGP_TRUSTED_PROXY_CIDRS` is unset or holds no valid network. Without the list, the proxy cannot tell a header that a reverse proxy wrote from a header that the client forged. Earlier releases then used the first `X-Forwarded-For` address, so any client could choose the address that the rate limiter locked out.
+The proxy refuses to start when `DGP_TRUST_PROXY_HEADERS=true` and `DGP_TRUSTED_PROXY_CIDRS` is unset or holds no valid network. Without the list, the proxy cannot tell a header that a reverse proxy wrote from a header that the client forged. If the proxy used the first `X-Forwarded-For` address, any client could choose the address that the rate limiter locks out.
 
-> **Failure mode behind a proxy.** If the proxy sits behind a reverse proxy and `DGP_TRUST_PROXY_HEADERS` stays `false`, every request appears to originate from the proxy's own IP. All clients then share **one** rate-limit bucket, so a single busy client exhausts it and **locks out everyone** with `503 SlowDown`. Set `DGP_TRUST_PROXY_HEADERS=true` and `DGP_TRUSTED_PROXY_CIDRS` behind any trusted proxy; the save-time config advisories flag the rate-limit-on + trust-off combination.
+> **Failure mode behind a proxy.** If the proxy sits behind a reverse proxy and `DGP_TRUST_PROXY_HEADERS` stays `false`, every request appears to come from the IP address of the reverse proxy. All clients then share one rate-limit bucket, so a single busy client exhausts it and locks out every client with `503 SlowDown`. Set `DGP_TRUST_PROXY_HEADERS=true` and `DGP_TRUSTED_PROXY_CIDRS` behind any trusted proxy. When you save a config that enables the rate limiter and does not trust the proxy headers, a config advisory flags that combination.
 
 Without trusted headers, the rate limiter keys on the address of the TCP connection. So it always has an IP: in a direct-to-internet deployment that address is the client, and behind a reverse proxy that is not trusted it is the reverse proxy. The admission chain's `source_ip_list` predicates and IAM `aws:SourceIp` conditions use the same client address.
 
 ## Codec semaphore
 
-Limits concurrent xdelta3 encode/decode subprocesses. Delta reconstruction (decode) is CPU-fast but I/O-bound (fetching reference + delta from storage), so the default is generous.
+The codec semaphore limits the number of concurrent xdelta3 encode and decode subprocesses. Delta reconstruction (decode) uses little CPU time, but it is I/O-bound because it fetches the reference and the delta from storage. For this reason, the default is generous.
 
 | Setting | Default | Env var |
 |---------|---------|---------|
@@ -75,7 +75,7 @@ Behavior differs by operation:
 
 ## HTTP concurrency limit
 
-Caps total in-flight HTTP requests across the server. Requests beyond the limit queue until a slot opens or the request timeout fires.
+The proxy caps the total number of in-flight HTTP requests across the server. Requests beyond the limit wait in a queue until a slot opens or the request timeout fires.
 
 | Setting | Default | Env var |
 |---------|---------|---------|
@@ -83,7 +83,7 @@ Caps total in-flight HTTP requests across the server. Requests beyond the limit 
 
 ## Request timeout
 
-Per-request deadline applied to all S3 API requests; returns HTTP `504 Gateway Timeout` when exceeded. Large delta reconstructions over slow storage links count toward this deadline.
+The proxy applies a deadline to each S3 API request. A request that exceeds the deadline gets HTTP `504 Gateway Timeout`. The time of a large delta reconstruction over a slow storage link counts toward this deadline.
 
 | Setting | Default | Env var |
 |---------|---------|---------|
@@ -91,7 +91,7 @@ Per-request deadline applied to all S3 API requests; returns HTTP `504 Gateway T
 
 ## Multipart upload limit
 
-Caps concurrent in-progress multipart uploads. The proxy holds the parts of each upload until completion, in memory or in relay files in `DGP_SPOOL_DIR`, so the limit bounds the memory and the spool space that abandoned or excessive uploads can take. A CreateMultipartUpload past the limit returns `503 SlowDown`.
+The proxy caps the number of concurrent in-progress multipart uploads. The proxy holds the parts of each upload until completion, in memory or in relay files in `DGP_SPOOL_DIR`, so the limit bounds the memory and the spool space that abandoned or excessive uploads can take. A CreateMultipartUpload request past the limit gets `503 SlowDown`.
 
 | Setting | Default | Env var |
 |---------|---------|---------|
@@ -99,7 +99,7 @@ Caps concurrent in-progress multipart uploads. The proxy holds the parts of each
 
 ## Replay detection cache
 
-Caches the SigV4 signatures of mutating requests and rejects duplicates within the replay window. `DGP_CLOCK_SKEW_SECONDS` governs how far a request timestamp may drift from the server clock during SigV4 verification. The replay window defaults to that skew tolerance, because a signature outside the skew tolerance already fails verification: with the default, a captured mutating request is refused for its whole valid life.
+The proxy caches the SigV4 signatures of mutating requests and rejects duplicates within the replay window. `DGP_CLOCK_SKEW_SECONDS` governs how far a request timestamp may drift from the server clock during SigV4 verification. The replay window defaults to that skew tolerance, because a signature outside the skew tolerance already fails verification: with the default, a captured mutating request is refused for its whole valid life.
 
 | Setting | Default | Env var |
 |---------|---------|---------|
@@ -107,11 +107,11 @@ Caches the SigV4 signatures of mutating requests and rejects duplicates within t
 | Clock skew tolerance | 900 s | `DGP_CLOCK_SKEW_SECONDS` |
 | Max cache entries | 500,000 | — |
 
-A duplicate of a **mutating** request (PUT/POST/DELETE) within the window is rejected with 400, except a PUT or DELETE that arrives less than one second after the first copy, which is an SDK retry inside the signing second and is served (see [Authentication and access](authentication.md)). An **idempotent read** (GET/HEAD) does not enter the cache at all — boto3 emits byte-identical signatures for the same request within one signing second, and replaying a read re-reads the same bytes. Only a request that succeeds keeps its signature in the cache, so an SDK retry of a failed request is not a replay. Replay rejections are not counted toward the auth-failure lockout. `DGP_REPLAY_WINDOW_SECS=0` disables replay rejection entirely. When the cache exceeds 500K entries, the oldest signatures are evicted first. The cache is per instance: behind a load balancer, a replay that reaches another instance is not detected.
+The proxy rejects a duplicate of a mutating request (PUT/POST/DELETE) within the window with 400. The exception is a PUT or DELETE that arrives less than one second after the first copy. Such a request is an SDK retry inside the signing second, so the proxy serves it (see [Authentication and access](authentication.md)). An idempotent read (GET/HEAD) does not enter the cache at all. boto3 emits byte-identical signatures for the same request within one signing second, and a replayed read only re-reads the same bytes. Only a request that succeeds keeps its signature in the cache, so an SDK retry of a failed request is not a replay. Replay rejections do not count toward the auth-failure lockout. `DGP_REPLAY_WINDOW_SECS=0` disables replay rejection entirely. When the cache exceeds 500K entries, the proxy evicts the oldest signatures first. The cache is per instance: behind a load balancer, a replay that reaches another instance is not detected.
 
 ## S3 backend HEAD concurrency
 
-During LIST operations that require per-object metadata, the proxy issues HEAD requests to the upstream S3 backend. These are limited to avoid triggering the backend's own throttling.
+During a LIST request that needs per-object metadata, the proxy sends HEAD requests to the upstream S3 backend. The proxy limits these requests so that they do not trigger the backend's own throttling.
 
 | Setting | Default | Configurable |
 |---------|---------|--------------|
@@ -138,5 +138,5 @@ During LIST operations that require per-object metadata, the proxy issues HEAD r
 
 ## Related
 
-- [Authentication and access](authentication.md) — SigV4 verification and replay-detection semantics
-- [Configuration](configuration.md) — full env-var registry
+- [Authentication and access](authentication.md): SigV4 verification and replay-detection semantics
+- [Configuration](configuration.md): the full env-var registry

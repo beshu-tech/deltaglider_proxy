@@ -2,9 +2,9 @@
 
 GitOps-shaped IAM: YAML is the source of truth; the encrypted config DB is reconciled from YAML on every apply.
 
-In **declarative** mode (`access.iam_mode: declarative`), `access.iam_users`, `access.iam_groups`, `access.auth_providers`, and `access.group_mapping_rules` are authoritative. The reconciler diffs YAML against the encrypted config DB on every `/config/apply` (or section-PUT on `access`) and applies the necessary creates, updates, and deletes atomically — in a single SQLite transaction. Admin-API IAM mutation endpoints (POST/PUT/PATCH/DELETE on `/users`, `/groups`, `/ext-auth/*`, `/migrate`, backup import) return `403 { "error": "iam_declarative" }`, so runtime drift cannot occur. Read endpoints stay accessible.
+In **declarative** mode (`access.iam_mode: declarative`), `access.iam_users`, `access.iam_groups`, `access.auth_providers`, and `access.group_mapping_rules` are authoritative. The reconciler diffs YAML against the encrypted config DB on every `/config/apply` (or section-PUT on `access`) and applies the necessary creates, updates, and deletes atomically, in a single SQLite transaction. Admin-API IAM mutation endpoints (POST/PUT/PATCH/DELETE on `/users`, `/groups`, `/ext-auth/*`, `/migrate`, backup import) return `403 { "error": "iam_declarative" }`, so runtime drift cannot occur. Read endpoints stay accessible.
 
-The encrypted DB still holds the state at runtime (the IAM index on the hot path reads from it for O(1) lookups). The reconciler ensures it matches what YAML says. Nothing changes about how SigV4 auth, group membership, or OAuth mapping resolves at request time — they all read the same DB.
+The encrypted DB still holds the state at runtime (the IAM index on the hot path reads from it for O(1) lookups). The reconciler makes sure that it matches what YAML says. SigV4 auth, group membership, and OAuth mapping resolve at request time in the same way as in `gui` mode, because they all read the same DB.
 
 `GET /_/api/admin/config/declarative-iam-export` projects the current DB into a self-contained `access:` fragment with `iam_mode: declarative` set and secrets redacted. Re-applying that export with secrets re-injected is an idempotent no-op (the reconciler reports `is_noop` and the audit ring is not bumped).
 
@@ -85,7 +85,7 @@ Per entity type (users, groups, providers, mapping rules), by NAME:
 | YAML | DB | Action |
 |---|---|---|
 | present | present + all fields equal | no-op (idempotent path) |
-| present | present + any field differs | **UPDATE** — DB row id preserved |
+| present | present + any field differs | **UPDATE** (DB row id preserved) |
 | present | missing | CREATE |
 | missing | present | DELETE (cascades via FKs) |
 
@@ -95,13 +95,13 @@ Mapping rules are wipe-and-rebuild (no stable per-row identity beyond the tuple 
 
 **Validation is separate from side effects.** Every YAML-only error (duplicate names, duplicate access keys, unknown group refs, invalid permissions, `$`-prefixed reserved names, a new or changed provider whose `provider_type` is not `oidc`, an OIDC `issuer_url` that the provider's `extra_config.allow_local` setting does not permit) surfaces before any DB write. A single error means zero state change. A provider of another type that the database already holds unchanged still loads at boot, with a warning in the log, but no user can sign in with it.
 
-**Permission templates.** `resources` and string condition values may contain `${iam:username}` and `${iam:access_key_id}` (the `iam:` prefix is required — it distinguishes these request-time identity substitutions from `${env:NAME}` load-time config expansion). The reconciler stores those templates literally in the DB; runtime IAM index rebuild expands them per user after group permissions are merged. Identity values are inserted as they are, and a value that contains `/`, `*`, `?`, `$`, `{`, `}` or `%` is refused at expansion (that user then gets no permissions), so user names and access keys cannot inject a path level or a wildcard. Unknown `${...}` variables (including a bare, unprefixed `${username}`) fail validation before any reconcile write.
+**Permission templates.** `resources` and string condition values may contain `${iam:username}` and `${iam:access_key_id}` (the `iam:` prefix is required, because it distinguishes these request-time identity substitutions from `${env:NAME}` load-time config expansion). The reconciler stores those templates literally in the DB; runtime IAM index rebuild expands them per user after group permissions are merged. Identity values are inserted as they are, and a value that contains `/`, `*`, `?`, `$`, `{`, `}` or `%` is refused at expansion (that user then gets no permissions), so user names and access keys cannot inject a path level or a wildcard. Unknown `${...}` variables (including a bare, unprefixed `${username}`) fail validation before any reconcile write.
 
 **ID preservation.** When a user exists in both YAML and DB by name, the row stays (UPDATE), never DELETE+INSERT. `external_identities` reference `user_id`, so rotating an access key via YAML preserves the OAuth linkage.
 
 ## External identities
 
-There are two distinct surfaces, and the distinction matters:
+Two surfaces treat external identities differently:
 
 - The **main config file** and the declarative config-apply path never touch external identities. They are created at runtime by the OAuth callback flow and live in the database. The reconciler's contract below describes this surface.
 - The **full-IAM import artifact** (`declarative-iam-validate` / `-apply`) does restore them, because that artifact exists to make a wipe lossless. See "Full-IAM round-trip" below.
@@ -109,23 +109,23 @@ There are two distinct surfaces, and the distinction matters:
 The reconciler's contract for the main config / config-apply surface:
 
 - `external_identities` are preserved through user UPDATEs (same DB id → same bindings).
-- `external_identities` are cascade-deleted when a YAML-authoritative delete removes the user or provider they reference — the user is gone, so the binding is meaningless.
+- `external_identities` are cascade-deleted when a YAML-authoritative delete removes the user or provider they reference. The user is gone, so the binding has no use.
 
 If an OAuth callback is in-flight when a reconcile fires, the callback inserts the external identity into a user row that the reconcile may then delete (if YAML doesn't list that user). The callback flow fails; the next login creates a fresh external user.
 
 ### Full-IAM round-trip
 
-The full-IAM export (`GET /_/api/admin/config/declarative-iam-export?include_secrets=true`) is the one surface that *does* carry the DB-only state, so a committed export is genuinely lossless:
+The full-IAM export (`GET /_/api/admin/config/declarative-iam-export?include_secrets=true`) is the one surface that *does* carry the DB-only state, so a committed export is lossless:
 
 - Every user carries `auth_source` (`"external"` for OAuth-provisioned rows); the import restores the provenance instead of downgrading the row to `local`.
-- The export emits an `external_identities` list — user and provider referenced **by name**, plus the IdP `subject`, email, and claims. The import upserts each binding keyed on `(provider, subject)`, the exact pair the OAuth callback looks up, so a recovered database re-links the binding to the freshly created user row instead of letting the next login provision a duplicate user.
-- Bindings are never deleted by the reconciler. An `external_identities` list that is absent (hand-authored YAML, or a redacted export — `include_secrets=false` drops the bindings because `raw_claims` can carry IdP personal data) means "leave the database alone", never "delete the missing rows".
-- The main config file rejects `access.external_identities` outright — that file never manages OAuth bindings, and silently dropping them from a pasted full-IAM export would be a data-loss trap.
+- The export emits an `external_identities` list. Each entry references the user and the provider by name, and carries the IdP `subject`, email, and claims. The import upserts each binding keyed on `(provider, subject)`, the exact pair the OAuth callback looks up, so a recovered database re-links the binding to the freshly created user row instead of letting the next login provision a duplicate user.
+- Bindings are never deleted by the reconciler. An `external_identities` list can be absent from hand-authored YAML or from a redacted export. (`include_secrets=false` drops the bindings, because `raw_claims` can carry IdP personal data.) An absent list means "leave the database alone", never "delete the missing rows".
+- The main config file rejects `access.external_identities` outright. That file never manages OAuth bindings, and if it dropped them from a pasted full-IAM export without a warning, the bindings would be lost.
 - User names are unique in the database, so every user maps to exactly one YAML entry. The reconciler keys users by name. As a safety check, the export refuses with HTTP 409 when it finds two users with one name, because such a pair cannot round-trip through YAML.
 
 ## Secrets in exports
 
-The canonical exporter redacts every secret on the way out — a YAML pulled from `/config/export` has:
+The canonical exporter redacts every secret on the way out. A YAML pulled from `/config/export` has:
 
 - `iam_users[*].secret_access_key` → `""`
 - `auth_providers[*].client_secret` → `null`

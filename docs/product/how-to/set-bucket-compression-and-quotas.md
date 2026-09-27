@@ -2,7 +2,7 @@
 
 This guide shows you how to turn delta compression on or off per bucket, tighten the delta-ratio cutoff, and cap a bucket's size with a soft quota.
 
-All of these live on the per-bucket policy under `storage.buckets`. From the admin UI, the same fields are at **Settings → Storage → Buckets** — expand a bucket's row to edit.
+All of these live on the per-bucket policy under `storage.buckets`. From the admin UI, the same fields are at **Settings → Storage → Buckets**. Expand the row of a bucket to edit it.
 
 ![Bucket policies](/_/screenshots/bucket-policies.jpg)
 
@@ -17,7 +17,7 @@ storage:
       compression: false    # everything stored passthrough
 ```
 
-If you only want a *stricter* cutoff rather than none, set `max_delta_ratio` instead — deltas are kept only when `delta_size / original_size` is below the ratio:
+If you want a *stricter* cutoff and not compression turned off, set `max_delta_ratio` instead. The proxy keeps a delta only when `delta_size / original_size` is below the ratio:
 
 ```yaml
 storage:
@@ -28,14 +28,14 @@ storage:
 
 ## 2. Restrict compression to prefixes
 
-Compression policy is **per-bucket**, not per-prefix. If you want some prefixes compressed and others not, do one of:
+Compression policy is per-bucket, not per-prefix. If you want some prefixes compressed and others not, use one of these options:
 
 - Split into two buckets with different `compression` settings (you can alias both onto the same backend).
-- Rely on `max_delta_ratio`: non-compressible files fall back to passthrough automatically when the delta isn't worth keeping — no manual intervention needed.
+- Rely on `max_delta_ratio`. When the delta of a file is not worth keeping, the proxy automatically stores the file as passthrough, so you do not need to intervene.
 
 ## 3. Know what deltas well
 
-Delta compression pays off when most bytes repeat across stored versions: zipped releases, JARs/APKs, database dumps, tar archives, AI model variants, game builds — 60–95% savings on high-similarity workloads in practice. Whole-stream compressed archives (`.tar.gz`, `.tar.xz`, `.tar.zst`, solid `.7z`) usually don't delta, because one small change shifts bytes through the rest of the stream; container formats with independently compressed members (`.zip`, `.jar`, `.docx`) usually do. The why is in [delta compression](../explanation/delta-compression.md).
+Delta compression pays off when most bytes repeat across stored versions: zipped releases, JARs/APKs, database dumps, tar archives, AI model variants, game builds. On high-similarity workloads, these formats save 60 to 95% in practice. Whole-stream compressed archives (`.tar.gz`, `.tar.xz`, `.tar.zst`, solid `.7z`) usually don't delta, because one small change shifts bytes through the rest of the stream; container formats with independently compressed members (`.zip`, `.jar`, `.docx`) usually do. The reason is in [delta compression](../explanation/delta-compression.md).
 
 If you're unsure about your workload, test it directly with two real consecutive versions:
 
@@ -64,13 +64,13 @@ storage:
       quota_bytes: 536870912000   # 500 GB
 ```
 
-**What the quota measures:** the quota counts the bytes that the bucket really occupies on its storage backend. This total includes the shared delta baselines (`reference.bin`), not only the small per-object deltas, so a bucket that holds one build per folder is measured at its true size.
+The quota counts the bytes that the bucket really occupies on its storage backend. This total includes the shared delta baselines (`reference.bin`), not only the small per-object deltas, so a bucket that holds one build per folder is measured at its true size.
 
-**What happens at the quota:** the proxy rejects a PUT request that would push the bucket past its quota with `403 AccessDenied` and the message `Bucket quota exceeded`. The proxy reads the bucket's running usage counter, which it updates on every write and delete, so enforcement is nearly immediate. The quota is still **soft**: requests that run at the same moment each check the counter before any of them has stored its bytes, so a burst of concurrent writes can overshoot the limit slightly. If you need a strict hard cap, enforce it at the reverse proxy or the storage provider.
+When a PUT request would push the bucket past its quota, the proxy rejects it with `403 AccessDenied` and the message `Bucket quota exceeded`. The proxy reads the bucket's running usage counter, which it updates on every write and delete, so enforcement is nearly immediate. The quota is still **soft**: requests that run at the same moment each check the counter before any of them has stored its bytes, so a burst of concurrent writes can overshoot the limit slightly. If you need a strict hard cap, enforce it at the reverse proxy or the storage provider.
+
+When you sign in to the admin UI, the upload page reads the bucket's quota, its usage counter and the object size limit (`advanced.max_object_size`, which you can edit under Storage → Buckets → Object size limit). The page refuses a file that is bigger than the size limit, or that does not fit in the space the quota leaves, before any byte goes out, and it says why. A files-only session cannot read these limits, so for such a session the proxy's own check is the only one.
 
 ## 5. Freeze a bucket
-
-**What the upload page does:** when you sign in to the admin UI, the upload page reads the bucket's quota, its usage counter and the object size limit (`advanced.max_object_size`, which you can edit under Storage → Buckets → Object size limit). A file that is bigger than the size limit, or that does not fit in the space the quota leaves, is refused on the page before any byte goes out, and the page says why. A files-only session cannot read these limits, so for such a session the proxy's own check is the only one.
 
 If you need a bucket read-only (for example during a manual migration), set the quota to zero:
 
@@ -81,29 +81,29 @@ storage:
       quota_bytes: 0   # all writes blocked
 ```
 
-Reads and lists keep working; every write is rejected.
+Reads and lists keep working, and the proxy rejects every write.
 
 ## Verify
 
-1. The policy applied:
+1. Check that the proxy applied the policy:
 
    ```bash
    curl -b cookies https://s3.acme.example/_/api/admin/config/section/storage?format=yaml
    ```
 
-2. Compression behaves as configured — upload two versions of a file and check the `x-amz-storage-type` header on a HEAD: `delta` means compressed, `passthrough` means not. The proxy sends this header only when it runs with `DGP_DEBUG_HEADERS=true`. Without it, the `x-amz-meta-dg-note` header of the HEAD response carries the same value.
+2. Check that compression behaves as configured. Upload two versions of a file and check the `x-amz-storage-type` header of a HEAD response: `delta` means compressed, `passthrough` means not. The proxy sends this header only when it runs with `DGP_DEBUG_HEADERS=true`. Without it, the `x-amz-meta-dg-note` header of the HEAD response carries the same value.
 
-3. The quota bites — on a frozen bucket, a PUT should fail with `403`:
+3. Check that the quota works. On a frozen bucket, a PUT request should fail with `403`:
 
    ```bash
    aws --endpoint-url https://s3.acme.example s3 cp probe.txt s3://db-archive/probe.txt
    ```
 
-4. The savings for each bucket show up on the dashboard at **Settings → Observability → Dashboard** (`/_/admin/dashboard`) and through the O(1) usage counter — `curl -b /tmp/dgp.cookies 'https://s3.acme.example/_/stats?bucket=db-archive'` with an admin session cookie from `POST /_/api/admin/login` (or `GET /_/api/admin/usage/bucket/db-archive` for the full counter row). The counter is maintained inline on every write; if it ever drifts, reconcile with `POST /_/api/admin/usage/refresh?bucket=db-archive`.
+4. Check the savings for each bucket. They show up on the dashboard at **Settings → Observability → Dashboard** (`/_/admin/dashboard`) and through the O(1) usage counter. To read the counter, run `curl -b /tmp/dgp.cookies 'https://s3.acme.example/_/stats?bucket=db-archive'` with an admin session cookie from `POST /_/api/admin/login`, or send `GET /_/api/admin/usage/bucket/db-archive` for the full counter row. The proxy updates the counter inline on every write. If the counter drifts, reconcile it with `POST /_/api/admin/usage/refresh?bucket=db-archive`.
 
 ## Related
 
-- [Delta compression](../explanation/delta-compression.md) — how routing, references, and ratios actually work.
-- [Your first delta savings](../tutorials/first-delta-savings.md) — watch the ratio on a real upload.
-- [Configuration reference](../reference/configuration.md) — all `storage.buckets` fields, including `public_prefixes` and `alias`.
-- [How to expire and archive objects](expire-and-archive-objects.md) — control size by age instead of by cap.
+- [Delta compression](../explanation/delta-compression.md): how routing, references, and ratios work.
+- [Your first delta savings](../tutorials/first-delta-savings.md): watch the ratio on a real upload.
+- [Configuration reference](../reference/configuration.md): all `storage.buckets` fields, including `public_prefixes` and `alias`.
+- [How to expire and archive objects](expire-and-archive-objects.md): control size by age instead of by cap.

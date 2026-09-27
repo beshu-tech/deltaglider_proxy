@@ -1,6 +1,6 @@
 # How to publish a folder publicly
 
-*Serve one prefix to the world — `curl`-able installers, no credentials — while the rest of the bucket stays locked.*
+*Serve one prefix to anyone, for example installers that people download with `curl` and no credentials. The rest of the bucket stays locked.*
 
 ## 1. Mark the prefix public
 
@@ -21,13 +21,13 @@ Or in the UI: **Settings → Storage → Buckets** → expand the `downloads` ro
 
 The tri-state maps directly to the YAML: **Private (default)** (no anonymous access), **Specific prefixes public** (`public_prefixes: [...]`), **Entire bucket public** (`public: true`).
 
-Apply the change — it hot-reloads; the proxy creates a read-only request rule named `public-prefix:downloads` from it.
+Apply the change. The proxy hot-reloads it and creates a read-only request rule named `public-prefix:downloads` from it.
 
 The proxy refuses to make the coordination bucket (`config_sync_bucket`) public, because S3 clients can never reach that bucket.
 
 ## 2. Know what anonymous callers get
 
-Anonymous requests can GET, HEAD, and LIST under the prefix (LIST results never escape it), run as the built-in `$anonymous` user, and can never write. The full semantics are in the [authentication reference](../reference/authentication.md#public-prefixes).
+Anonymous requests can GET, HEAD, and LIST under the prefix, and LIST results stay inside the prefix. They run as the built-in `$anonymous` user and can never write. The full semantics are in the [authentication reference](../reference/authentication.md#public-prefixes).
 
 A response to an anonymous request carries no `x-amz-meta-dg-tool` header, because that metadata names the proxy version. The failed-sign-in lockout does not block public reads: a client address that the proxy locked out still gets the objects under a public prefix.
 
@@ -37,7 +37,7 @@ A response to an anonymous request carries no `x-amz-meta-dg-tool` header, becau
 
 ## Whole-bucket public
 
-`public: true` is shorthand for `public_prefixes: [""]` — every object in the bucket becomes anonymously readable:
+`public: true` is shorthand for `public_prefixes: [""]`. It makes every object in the bucket readable without credentials:
 
 ```yaml
 # validate
@@ -47,9 +47,9 @@ storage:
       public: true
 ```
 
-The proxy logs a startup warning when a whole bucket is public. Use it only for buckets that contain nothing but published artifacts — anything uploaded there later is public the moment it lands, and LIST exposes every key name in the bucket.
+The proxy logs a startup warning when a whole bucket is public. Use it only for buckets that contain nothing but published artifacts. Anything that someone uploads there later is public as soon as it arrives, and LIST exposes every key name in the bucket.
 
-If you only need to share one object for a limited time, don't publish a prefix at all — generate a presigned URL instead (expires after at most 7 days, revocable by rotating the signing user's key):
+To share one object for a limited time, generate a presigned URL instead of publishing a prefix. The URL expires after at most 7 days, and you can revoke it by rotating the signing user's key:
 
 ```bash
 aws --endpoint-url https://s3.acme.example \
@@ -58,7 +58,7 @@ aws --endpoint-url https://s3.acme.example \
 
 ## Verify with a cold curl
 
-Test from a shell with **no** AWS environment — a leftover `AWS_ACCESS_KEY_ID` would authenticate the request and prove nothing (credentials always win over public-prefix config):
+Test from a shell with **no** AWS environment. A leftover `AWS_ACCESS_KEY_ID` would authenticate the request, so the test would prove nothing (credentials always win over public-prefix config):
 
 ```bash
 env -i curl -sw "%{http_code}\n" -o /dev/null \
@@ -78,14 +78,14 @@ Each anonymous request writes a line with `action=public_read` and `user=$anonym
 
 ## Lock writes down
 
-Publishing a prefix doesn't change who can write to it — review that separately:
+Publishing a prefix does not change who can write to it. Review write access separately:
 
 - Scope upload credentials to the prefix and pin them to your network: [How to restrict access by IP and prefix](restrict-access-with-conditions.md).
 - Reject anonymous mutation attempts on the bucket before authentication even runs: [How to gate requests before authentication](gate-requests-with-admission-rules.md).
 
 ## Related
 
-- [Authentication reference](../reference/authentication.md#public-prefixes) — exact anonymous semantics and prefix validation rules.
-- [About authentication and access control](../explanation/security-model.md) — why public prefixes are carve-outs, not a credential type.
-- [How to gate requests before authentication](gate-requests-with-admission-rules.md) — the `public-prefix:*` public-access rules, and how one deny rule takes a public folder offline.
-- [How to create IAM users and groups](create-iam-users.md) — credentials for everyone who isn't anonymous.
+- [Authentication reference](../reference/authentication.md#public-prefixes): exact anonymous semantics and prefix validation rules.
+- [About authentication and access control](../explanation/security-model.md): why public prefixes are carve-outs, not a credential type.
+- [How to gate requests before authentication](gate-requests-with-admission-rules.md): the `public-prefix:*` public-access rules, and how one deny rule takes a public folder offline.
+- [How to create IAM users and groups](create-iam-users.md): credentials for everyone who is not anonymous.

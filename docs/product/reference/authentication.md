@@ -7,8 +7,8 @@ Reference for the proxy's authentication modes, the bootstrap password, SigV4 ve
 | Mode | Activated by | What is verified |
 |------|--------------|------------------|
 | **Bootstrap** | A single credential pair in `access.access_key_id` / `access.secret_access_key` (env: `DGP_ACCESS_KEY_ID` / `DGP_SECRET_ACCESS_KEY`). Default on a fresh install. | SigV4 signature against the shared secret. Admin GUI access requires the bootstrap password. |
-| **IAM** | One or more IAM users in the encrypted config DB (`deltaglider_config.db`). Activates when the first user is created — via admin GUI, declarative YAML, or OAuth auto-provisioning. | SigV4 signature against the per-user secret looked up by access key ID, then ABAC permission evaluation. Admin GUI access is permission-based. |
-| **OAuth/OIDC** | A configured provider of type `oidc` (any OpenID Connect issuer, for example Google, Okta, or Azure AD). | The provider's JWT: algorithm from header, audience, issuer, nonce; the flow uses PKCE and a state parameter. Applies to browser sessions only — the S3 API remains SigV4. Logged-in users are provisioned as IAM users; permissions come from group mapping rules. Only a user with admin permissions gets an admin session. Every other user gets a browser-only session that opens the file browser and refuses the admin API. The one exception is the bulk copy, move, delete, and ZIP actions of the file browser (`/_/api/admin/objects/*`): they accept a browser-only session and check every key against the user's own IAM permissions, as the S3 API does. |
+| **IAM** | One or more IAM users in the encrypted config DB (`deltaglider_config.db`). Activates when the first user is created. The first user can come from the admin GUI, declarative YAML, or OAuth auto-provisioning. | SigV4 signature against the per-user secret looked up by access key ID, then ABAC permission evaluation. Admin GUI access is permission-based. |
+| **OAuth/OIDC** | A configured provider of type `oidc` (any OpenID Connect issuer, for example Google, Okta, or Azure AD). | The provider's JWT: algorithm from header, audience, issuer, nonce; the flow uses PKCE and a state parameter. Applies to browser sessions only. The S3 API still uses SigV4. Logged-in users are provisioned as IAM users; permissions come from group mapping rules. Only a user with admin permissions gets an admin session. Every other user gets a browser-only session that opens the file browser and refuses the admin API. The one exception is the bulk copy, move, delete, and ZIP actions of the file browser (`/_/api/admin/objects/*`): they accept a browser-only session and check every key against the user's own IAM permissions, as the S3 API does. |
 | **Open access** | `access.authentication: none` (env: `DGP_AUTHENTICATION=none`). | No identity. An unsigned request is served. A signed request is served only when its secret key is the same as its access key (for example `dummy` / `dummy`), because the proxy still checks the signature to read signed and chunked uploads; any other pair gets `403 SignatureDoesNotMatch`. Development only. |
 
 The proxy refuses to start without authentication credentials unless `authentication: none` is set explicitly. IAM users count as credentials: a config with declarative `access.iam_users`, or a config DB that already holds IAM users, starts without a bootstrap SigV4 pair. When IAM users exist, the proxy checks an S3 request only against the IAM users, so the bootstrap pair on its own no longer works. In `gui` mode, the creation of the first IAM user carries the bootstrap pair over as a `legacy-admin` IAM user, so the pair keeps working. In `declarative` mode the YAML file lists every IAM user, so the bootstrap pair works only when one of the `iam_users` carries it. The bootstrap password still opens the admin GUI in both modes. The file browser then gets the bootstrap pair only when the S3 API accepts it; otherwise it asks for S3 credentials.
@@ -22,7 +22,7 @@ access:
   secret_access_key: dgp-shared-secret
 ```
 
-The orthogonal `access.iam_mode` selector (`gui`, default, or `declarative`) controls where IAM state lives — the encrypted DB or the YAML file. In `declarative` mode, admin-API IAM mutation routes return `403 { "error": "iam_declarative" }` and the YAML is reconciled into the DB on every config apply. See [Declarative IAM](declarative-iam.md).
+The orthogonal `access.iam_mode` selector (`gui`, default, or `declarative`) controls where IAM state lives: the encrypted DB or the YAML file. In `declarative` mode, admin-API IAM mutation routes return `403 { "error": "iam_declarative" }` and the YAML is reconciled into the DB on every config apply. See [Declarative IAM](declarative-iam.md).
 
 OAuth providers appear as buttons on the `/_/` login page:
 
@@ -78,10 +78,10 @@ The proxy verifies SigV4 signatures from two sources:
 
 | Path | Source | Use |
 |------|--------|-----|
-| Header auth | `Authorization: AWS4-HMAC-SHA256 ...` | Standard S3 SDK calls |
+| Header auth | `Authorization: AWS4-HMAC-SHA256 ...` | Standard S3 SDK requests |
 | Presigned URL | `X-Amz-Algorithm` + `X-Amz-Signature` query parameters | Browser downloads, shareable links |
 
-Both paths extract the access key ID, resolve the user (bootstrap pair or IAM lookup), and verify the HMAC-SHA256 signature against the secret key using constant-time comparison. Any region is accepted in the credential scope. Presigned URLs expire after at most 7 days (604,800 s) and carry the signing user's permissions — Deny rules apply to presigned requests too.
+Both paths extract the access key ID, resolve the user (bootstrap pair or IAM lookup), and verify the HMAC-SHA256 signature against the secret key using constant-time comparison. Any region is accepted in the credential scope. Presigned URLs expire after at most 7 days (604,800 s) and carry the signing user's permissions. Deny rules apply to presigned requests too.
 
 ### Verify, then re-sign
 
@@ -150,13 +150,13 @@ storage:
 
 Semantics for requests without credentials:
 
-- **Allowed**: GET and HEAD on objects under a public prefix; LIST with a `prefix` parameter inside the public prefix. LIST results are scoped to the public prefix — never the whole bucket.
+- **Allowed**: GET and HEAD on objects under a public prefix; LIST with a `prefix` parameter inside the public prefix. LIST results stay inside the public prefix and do not show the rest of the bucket.
 - **Denied**: PUT, DELETE, COPY, and multipart uploads, always.
 - **Identity**: anonymous requests run as a built-in `$anonymous` user with scoped read+list permissions (including `s3:prefix` conditions for LIST). Each anonymous request writes a proxy log line with `action=public_read` and `user=$anonymous`. These lines do not go into the admin GUI's audit log.
 - **No build metadata**: a HEAD, GET, or `metadata=true` LIST from an anonymous caller does not return `x-amz-meta-dg-tool`, because that value names the proxy version. Authenticated callers, and every caller in open-access mode, still receive it.
 - **Lockouts**: the failed-sign-in lockout does not block public reads. A client address that the proxy locked out still gets the objects under a public prefix.
 - **Credentials win**: a request carrying valid SigV4 credentials gets full IAM evaluation regardless of public-prefix configuration.
-- **Matching**: a trailing `/` is significant — `public/` matches `public/...` but not `publicity/`. The empty prefix `""` makes the entire bucket public (logged as a startup warning). Prefixes containing `..`, null bytes, or `//` are rejected.
+- **Matching**: a trailing `/` is significant: `public/` matches `public/...` but not `publicity/`. The empty prefix `""` makes the entire bucket public (logged as a startup warning). Prefixes containing `..`, null bytes, or `//` are rejected.
 
 The proxy creates one request rule named `public-prefix:<bucket>` for each bucket that has public prefixes, and checks these rules after your own `admission.blocks[]` rules (see [Configuration](configuration.md#admission-chain)). The coordination bucket (`config_sync_bucket`) cannot be public, and a config that tries to make it public is refused.
 
@@ -176,7 +176,7 @@ S3-path errors are returned as standard S3 XML error documents:
 
 | Error code | HTTP status | Cause |
 |------------|-------------|-------|
-| `AccessDenied` | 403 | No credentials on a non-public path (anonymous), or valid credentials without a matching Allow / with a matching Deny (denied) — the response shape is identical in both cases |
+| `AccessDenied` | 403 | No credentials on a non-public path (anonymous), or valid credentials without a matching Allow / with a matching Deny (denied). The response shape is the same in both cases. |
 | `SignatureDoesNotMatch` | 403 | Signature verification failed |
 | `RequestTimeTooSkewed` | 403 | Request timestamp outside the clock-skew tolerance |
 | `InvalidArgument` | 400 | Malformed Authorization header, unparseable date/expiry, or replayed mutating signature |

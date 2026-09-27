@@ -1,16 +1,16 @@
 # How to set up OAuth/OIDC single sign-on
 
-*Let humans sign in to the admin UI with the identity provider they already have, and land in the right IAM group automatically.*
+*Let people sign in to the admin UI with the identity provider they already have, and land in the right IAM group automatically.*
 
 ## Prerequisites
 
-- The proxy reachable at a URL the identity provider can redirect to — `https://s3.acme.example` in production. `http://localhost:9000` works for testing against providers that accept localhost callbacks.
+- The proxy reachable at a URL the identity provider can redirect to, for example `https://s3.acme.example` in production. `http://localhost:9000` works for testing against providers that accept localhost callbacks.
 - Admin access to the UI (bootstrap password or an IAM admin like `dana`).
-- An IAM group to map people into — this guide uses `Engineering` (see [How to create IAM users and groups](create-iam-users.md)).
+- An IAM group to map people into. This guide uses `Engineering` (see [How to create IAM users and groups](create-iam-users.md)).
 
 ## 1. Register the app with your provider
 
-Every provider needs the same redirect URL — note there is **no provider-name suffix**; the callback is generic:
+Every provider needs the same redirect URL. The URL has **no provider-name suffix**, because one callback serves every provider:
 
 ```
 https://s3.acme.example/_/api/admin/oauth/callback
@@ -35,8 +35,8 @@ If you use Okta:
 If you use Azure AD / Entra:
 
 1. App registrations → New registration; Redirect URI (Web): the callback URL above.
-2. Certificates & secrets → New client secret. Copy the value immediately — Azure hides it on the next page load.
-3. API permissions → Microsoft Graph → `openid`, `profile`, `email`; add `GroupMember.Read.All` if you'll map on AD groups.
+2. Certificates & secrets → New client secret. Copy the value immediately, because Azure hides it on the next page load.
+3. API permissions → Microsoft Graph → `openid`, `profile`, `email`; add `GroupMember.Read.All` if you will map on AD groups.
 4. Copy the **Application (client) ID** and the secret value.
 5. The issuer URL is `https://login.microsoftonline.com/<tenant-id>/v2.0`, where `<tenant-id>` is the **Directory (tenant) ID** on the app's overview page.
 
@@ -59,7 +59,7 @@ The proxy has one provider type, `oidc`. Google, Okta, and Azure AD have no type
 
 The form has no priority field. In the admin API and in YAML, `priority` sets the order of the buttons on the login page: a provider with a higher number is shown first.
 
-Click **Test Connection**, before or after you save. The proxy tests the values that are in the form at that moment and saves nothing. A blank client secret keeps the saved secret for the test. The proxy fetches the issuer's `.well-known/openid-configuration` and reports DNS, TLS, or connectivity problems before any human tries to log in. The error names the underlying cause, for example `invalid peer certificate: UnknownIssuer` for a certificate from a CA that the proxy does not trust. Test Connection also works in declarative IAM mode, because it changes nothing. In the admin API, `POST /_/api/admin/ext-auth/providers/:id/test` tests a saved provider, and an optional JSON body with the form fields replaces the saved values for that test only. `POST /_/api/admin/ext-auth/providers/test` tests a provider that is not saved yet. A test that fails answers `200` with `success: false` and the reason in `error`.
+Click **Test Connection**, before or after you save. The proxy tests the values that are in the form at that moment and saves nothing. A blank client secret keeps the saved secret for the test. The proxy fetches the issuer's `.well-known/openid-configuration` and reports DNS, TLS, or connectivity problems before any person tries to log in. The error names the underlying cause, for example `invalid peer certificate: UnknownIssuer` for a certificate from a CA that the proxy does not trust. Test Connection also works in declarative IAM mode, because it changes nothing. In the admin API, `POST /_/api/admin/ext-auth/providers/:id/test` tests a saved provider, and an optional JSON body with the form fields replaces the saved values for that test only. `POST /_/api/admin/ext-auth/providers/test` tests a provider that is not saved yet. A test that fails answers `200` with `success: false` and the reason in `error`.
 
 The proxy checks the issuer URL when you save the provider. By default the issuer must use `https://` and a public address, because the proxy refuses requests to private, loopback, and cloud-metadata addresses. A provider that breaks this rule is refused with `422` and a message that names the rule. The client secret is never returned in a response: the API shows `****` in its place.
 
@@ -127,32 +127,32 @@ Open the login page in a private window. A "Sign in with Okta" button now appear
 Have `dana` click it. She authenticates at the provider, consents, and is redirected back. On success:
 
 - A row appears under **Login Activity** on the **External authentication** page, linking the provider's subject ID to a DeltaGlider user.
-- Matching mapping rules fire — `dana` is now a member of `Engineering`.
+- The matching mapping rules apply, so `dana` is now a member of `Engineering`.
 - She gets a session cookie and lands in the file browser. Only a user with admin permissions (direct or through a group) gets an admin session. Every other user gets a browser-only session, which opens the file browser with the user's own S3 permissions and refuses the admin API with `403`. The bulk copy, move, delete, and ZIP actions of the file browser work in that session, under the same permissions.
 
 Every successful OAuth login shows as `external_login` in **Settings → Observability → Audit log**. A failed login shows an error page in the browser and a line in the proxy log.
 
 ## If the login fails
 
-Three failure modes are provider-side, not proxy-side:
+These three failures come from the provider side:
 
-1. **`invalid_redirect_uri` at the provider.** The registered URI doesn't byte-for-byte match `https://s3.acme.example/_/api/admin/oauth/callback` — watch trailing slashes and `http` vs `https`. If a reverse proxy fronts DeltaGlider, also confirm it forwards the same `Host` header the user sees. The proxy builds the callback URL from the `Host` header. It uses `X-Forwarded-Host` and `X-Forwarded-Proto` only when `DGP_TRUST_PROXY_HEADERS=true` and the request comes from a network in `DGP_TRUSTED_PROXY_CIDRS`, because otherwise any client could choose the host that receives the authorization code.
+1. **`invalid_redirect_uri` at the provider.** The registered URI does not match `https://s3.acme.example/_/api/admin/oauth/callback` byte for byte. Check trailing slashes and `http` versus `https`. If a reverse proxy fronts DeltaGlider, also confirm it forwards the same `Host` header the user sees. The proxy builds the callback URL from the `Host` header. It uses `X-Forwarded-Host` and `X-Forwarded-Proto` only when `DGP_TRUST_PROXY_HEADERS=true` and the request comes from a network in `DGP_TRUSTED_PROXY_CIDRS`, because otherwise any client could choose the host that receives the authorization code.
 2. **Azure `groups` claim missing.** Azure AD omits groups by default; in the app registration go to Token configuration → Add groups claim, then retry the flow.
-3. **"Code exchange failed" on the error page, or a failed Test Connection.** The proxy couldn't reach the provider. Read the error first: it names the cause (DNS, a refused connection, a refused private address, or a TLS error such as `UnknownIssuer`). A `curl` from the proxy container is not a reliable check. `curl` trusts the operating system's certificate store and connects to private addresses, but the proxy does neither unless you set `ca_cert_path` and `allow_local` (see [An identity provider in a private network](#an-identity-provider-in-a-private-network)). So `curl` can succeed while the proxy fails. If `curl` fails too, fix DNS, the network, or the certificate first; it isn't an OAuth problem.
+3. **"Code exchange failed" on the error page, or a failed Test Connection.** The proxy could not reach the provider. Read the error first: it names the cause (DNS, a refused connection, a refused private address, or a TLS error such as `UnknownIssuer`). A `curl` from the proxy container is not a reliable check. `curl` trusts the operating system's certificate store and connects to private addresses, but the proxy does neither unless you set `ca_cert_path` and `allow_local` (see [An identity provider in a private network](#an-identity-provider-in-a-private-network)). So `curl` can succeed while the proxy fails. If `curl` fails too, fix DNS, the network, or the certificate first, because the problem is not in OAuth.
 
 Two refusals come from the proxy itself. First, the proxy refuses a login whose email the provider does not mark as verified (an ID token without the `email_verified` claim counts as unverified), and the error page says so. To accept such logins, set `require_email_verified: false` in the provider's `extra_config`; email-based mapping rules still do not match such an identity. Second, after too many failed sign-ins from one address, the proxy locks that address out for a while. The authorize and callback pages then answer `429` with a `Retry-After` header, and the error page names the wait, for example "Try again in 10 min.".
 
-If login succeeds but the user has no permissions, no mapping rule matched — check with the Preview tool, and verify the auto-created user row in **Settings → Access → Users**. If you rotate the client secret at the provider, update it in the provider form; it takes effect on save, no restart.
+If login succeeds but the user has no permissions, no mapping rule matched. Check with the **Preview** box, and verify the auto-created user row in **Settings → Access → Users**. If you rotate the client secret at the provider, update it in the provider form. The change takes effect when you save, with no restart.
 
 ## Verify
 
-1. Log in via the provider as a user in the mapped IdP group — expect a session and membership of `Engineering` (visible on the user's row).
-2. Log in as a user **outside** the mapped group — expect a login that lands with no group memberships (or no login at all, if the provider restricts assignments).
+1. Log in via the provider as a user in the mapped IdP group. Expect a session and membership of `Engineering` (visible on the user's row).
+2. Log in as a user outside the mapped group. Expect a login that lands with no group memberships (or no login at all, if the provider restricts assignments).
 3. Confirm both attempts in the audit log.
 
 ## Related
 
-- [Authentication reference](../reference/authentication.md) — auth modes, claim handling, error responses.
-- [How to create IAM users and groups](create-iam-users.md) — the groups your mapping rules target.
-- [How to manage IAM as code](manage-iam-as-code.md) — providers and mapping rules can live in YAML too.
-- [About authentication and access control](../explanation/security-model.md) — how OAuth layers on bootstrap and IAM.
+- [Authentication reference](../reference/authentication.md): auth modes, claim handling, error responses.
+- [How to create IAM users and groups](create-iam-users.md): the groups your mapping rules target.
+- [How to manage IAM as code](manage-iam-as-code.md): providers and mapping rules can live in YAML too.
+- [About authentication and access control](../explanation/security-model.md): how OAuth layers on bootstrap and IAM.

@@ -1,21 +1,21 @@
 # Configuration
 
-DeltaGlider Proxy is configured via a **YAML** file and/or environment variables (`DGP_*` prefix). Environment variables always take precedence over file contents.
+You configure DeltaGlider Proxy with a YAML file, with environment variables (`DGP_*` prefix), or with both. Environment variables always take precedence over the file contents.
 
-YAML is the only supported format. TOML support was removed in v1.4.1: a `.toml` config — whether set via `DGP_CONFIG` or found on the default search path — makes the proxy fail at startup with `TOML configs are no longer supported (removed in v1.4.1)`. If you still carry a TOML config, run `deltaglider_proxy config migrate` **on v1.4.0** to convert it, then point the server at the YAML file before upgrading. See [How to upgrade the proxy](../how-to/upgrade.md).
+YAML is the only supported format. TOML support was removed in v1.4.1. A `.toml` config makes the proxy fail at startup, whether you set it with `DGP_CONFIG` or the proxy finds it on the default search path. The error is `TOML configs are no longer supported (removed in v1.4.1)`. If you still carry a TOML config, run `deltaglider_proxy config migrate` **on v1.4.0** to convert it, then point the server at the YAML file before upgrading. See [How to upgrade the proxy](../how-to/upgrade.md).
 
 ## Table of contents
 
 - [YAML layout](#yaml-layout)
 - [Shorthands](#shorthands)
 - [Config-file search order](#config-file-search-order)
-- [Server / Advanced](#server--advanced)
+- [Server / advanced](#server--advanced)
 - [Delta engine](#delta-engine)
 - [Storage backend](#storage-backend)
   - [Filesystem](#filesystem-backend)
   - [S3](#s3-backend)
-- [Access — authentication](#access--authentication)
-- [Access — IAM mode](#access--iam-mode)
+- [Access: authentication](#access-authentication)
+- [Access: IAM mode](#access-iam-mode)
 - [Admission chain](#admission-chain)
 - [Security](#security)
   - [Config advisories](#config-advisories)
@@ -31,8 +31,6 @@ YAML is the only supported format. TOML support was removed in v1.4.1: a `.toml`
 - [CLI subcommands](#cli-subcommands)
 - [Full example](#full-example)
 - [Environment variable registry](#environment-variable-registry)
-
----
 
 ## YAML layout
 
@@ -59,11 +57,11 @@ advanced:    # process-level tunables
   log_level: deltaglider_proxy=info
 ```
 
-Every section is optional. Fields equal to their default are omitted from canonical exports (`GET /api/admin/config/export`), keeping GitOps diffs minimal.
+Every section is optional. Canonical exports (`GET /api/admin/config/export`) leave out every field that equals its default, so GitOps diffs stay small.
 
-The flat (pre-Phase-3) shape — root-level `listen_addr:`, `backend:`, etc. — still loads unchanged. Mixing the two shapes in one document is a hard parse error naming the conflicting keys. The sectioned shape refuses an unknown key. The flat shape ignores an unknown root key, so a typo such as `cache_size_mbb` keeps the default value. For this reason, the proxy logs a warning that names every unknown root key of a flat document, and `config lint` refuses the document with exit code `4`.
+The flat (pre-Phase-3) shape, with root-level keys such as `listen_addr:` and `backend:`, still loads unchanged. A document that mixes the two shapes is a hard parse error, and the error names the conflicting keys. The sectioned shape refuses an unknown key. The flat shape ignores an unknown root key, so a typo such as `cache_size_mbb` keeps the default value. For this reason, the proxy logs a warning that names every unknown root key of a flat document, and `config lint` refuses the document with exit code `4`.
 
-The same document is editable from the admin UI. The form keeps section ownership visible and surfaces each field's YAML path on hover; environment-driven fields note their `DGP_*` variable inline in the help text.
+The same document is editable from the admin UI. The form shows which section owns each field, and it shows the YAML path of a field on hover. A field that an environment variable sets is read-only, and it shows a "from env" badge that names the `DGP_*` variable.
 
 ### What happens to the file when the admin UI saves
 
@@ -91,13 +89,11 @@ If you manage the file in Git, keep your commented copy in the repository and tr
 
 ![System limits configuration form](/_/screenshots/config-limits-form.jpg)
 
----
-
 ## Shorthands
 
-Three operator-authoring shorthands expand at load time into their canonical forms.
+The proxy expands these operator shorthands into their canonical forms at load time.
 
-### Storage shorthand — single backend
+### Storage shorthand for a single backend
 
 ```yaml
 storage:
@@ -126,33 +122,29 @@ storage:
       public: true           # shorthand for public_prefixes: [""]
 ```
 
-The canonical exporter collapses `public_prefixes: [""]` back to `public: true` when unambiguous. The GUI "Public read" toggle maps 1:1 to the YAML.
+The canonical exporter collapses `public_prefixes: [""]` back to `public: true` when the result is unambiguous. The GUI "Public read" toggle maps 1:1 to the YAML.
 
 Mixing `public: true` and a non-empty `public_prefixes` is a hard error.
-
----
 
 ## Config-file search order
 
 `Config::resolve_config_path` returns the first match from:
 
-1. `DGP_CONFIG` env var (returned unconditionally — if set, the path is used even when the file doesn't yet exist).
+1. `DGP_CONFIG` env var (returned unconditionally: when it is set, the proxy uses the path even when the file does not exist yet).
 2. `./deltaglider_proxy.yaml`
 3. `./deltaglider_proxy.yml`
-4. `./deltaglider_proxy.toml` (tripwire — startup fails)
+4. `./deltaglider_proxy.toml` (tripwire: startup fails)
 5. `/etc/deltaglider_proxy/config.yaml`
 6. `/etc/deltaglider_proxy/config.yml`
-7. `/etc/deltaglider_proxy/config.toml` (tripwire — startup fails)
+7. `/etc/deltaglider_proxy/config.toml` (tripwire: startup fails)
 
-The `.toml` entries are tripwires, not loadable formats: a leftover TOML config matched by the search (with no YAML earlier in the order) stops startup with an actionable error rather than being silently ignored.
+The `.toml` entries are tripwires, because the proxy cannot load a TOML file. When the search matches a leftover TOML config (with no YAML earlier in the order), startup stops with an actionable error. The proxy does not skip the file.
 
-CLI flags (`--config <path>`, `--listen <addr>`) take precedence over all of the above; env vars take precedence over file contents.
+CLI flags (`--config <path>`, `--listen <addr>`) take precedence over all of the above. Env vars take precedence over the file contents.
 
----
+## Server / advanced
 
-## Server / Advanced
-
-Process-level knobs. In sectioned YAML these live under `advanced:`.
+These are the process-level settings. In sectioned YAML, they live under `advanced:`.
 
 ### `listen_addr`
 
@@ -172,7 +164,7 @@ advanced:
 
 ### `log_level`
 
-Tracing filter string (`tracing-subscriber` syntax). Overridden by `RUST_LOG` if set. Changeable at runtime via the admin GUI (Settings → System → Logging card), which hot-reloads the filter through the apply pipeline. When `RUST_LOG` or `DGP_LOG_LEVEL` is set, that variable decides the level, so the Logging card shows its value read-only and names the variable. An apply cannot replace that level, because the environment variable wins over the file at every apply, not only at startup.
+Tracing filter string (`tracing-subscriber` syntax). `RUST_LOG` overrides it when set. You can change it at runtime in the admin GUI (Settings → System → Logging card), which hot-reloads the filter through the apply pipeline. When `RUST_LOG` or `DGP_LOG_LEVEL` is set, that variable decides the level, so the Logging card shows its value read-only and names the variable. An apply cannot replace that level, because the environment variable wins over the file at every apply, not only at startup.
 
 Resolution order: `RUST_LOG` > `DGP_LOG_LEVEL` > `advanced.log_level` in the file > default. The `--verbose` CLI flag sets `deltaglider_proxy=trace,tower_http=trace` only for the startup lines that the proxy logs before it loads the config. After the load, `advanced.log_level` (or its default) replaces that filter, so the flag has no lasting effect.
 
@@ -194,11 +186,11 @@ Three env-only knobs control log output and the admin **System logs** viewer (se
 
 | Env var | Default | Effect |
 |---|---|---|
-| `DGP_LOG_FORMAT` | `text` | `json` emits one JSON object per stdout line — `jq`-greppable by client IP, bucket, action. Startup-only. |
+| `DGP_LOG_FORMAT` | `text` | `json` emits one JSON object per stdout line, which you can filter with `jq` by client IP, bucket or action. The proxy reads it only at startup. |
 | `DGP_LOG_RING_SIZE` | `2000` | Capacity of the in-memory operational-log ring behind the admin Logs viewer. |
 | `DGP_LOG_RING_LEVEL` | `info` | Minimum severity captured into the ring/live-tail stream, independent of `DGP_LOG_LEVEL`. |
 
-The ring is per-instance, in-memory, and bounded — a triage convenience. Point a log shipper at the `DGP_LOG_FORMAT=json` stdout stream for retention and aggregation.
+The ring is per-instance, in memory, and bounded. It is meant for triage. Point a log shipper at the `DGP_LOG_FORMAT=json` stdout stream for retention and aggregation.
 
 ### `request_timeout_secs`
 
@@ -222,7 +214,7 @@ Global tower `ConcurrencyLimit`. Requests beyond this queue.
 
 ### `max_multipart_uploads`
 
-Concurrent multipart uploads cap. The proxy holds the parts of each open upload itself, in memory or in relay files in `DGP_SPOOL_DIR`, until the upload completes. A CreateMultipartUpload past the cap fails with `503 SlowDown`.
+The cap on concurrent multipart uploads. The proxy holds the parts of each open upload itself, in memory or in relay files in `DGP_SPOOL_DIR`, until the upload completes. A CreateMultipartUpload past the cap fails with `503 SlowDown`.
 
 | | |
 |---|---|
@@ -243,7 +235,7 @@ These env-only variables set the other multipart limits and the sweeper:
 
 ### `blocking_threads`
 
-Tokio blocking thread-pool size. Controls how many concurrent CPU-bound ops (xdelta3 subprocesses) can run.
+Tokio blocking thread-pool size. It controls how many CPU-bound operations (xdelta3 subprocesses) can run at the same time.
 
 | | |
 |---|---|
@@ -264,7 +256,7 @@ Expose debug/fingerprinting headers: `x-amz-storage-type` and `x-deltaglider-sto
 
 ### `cors_permissive`
 
-Enable permissive CORS for cross-origin admin access (dev only — opens the door to CSRF against session-cookie endpoints).
+Enable permissive CORS for cross-origin admin access. Use it only in development, because it opens the door to CSRF against the session-cookie endpoints.
 
 | | |
 |---|---|
@@ -281,15 +273,13 @@ Path to the config file.
 | **Env var** | `DGP_CONFIG` |
 | **Default** | Auto-detect (search list above) |
 
-When `DGP_CONFIG` is set, the path is returned unconditionally — a missing file there is NOT silently replaced by the default search list. This prevents the admin API from persisting to a CWD-relative file the operator never asked for.
-
----
+When `DGP_CONFIG` is set, the proxy uses that path unconditionally. When the file is missing, the proxy does not fall back to the default search list. This prevents the admin API from persisting to a CWD-relative file that the operator never asked for.
 
 ## Delta engine
 
 ### `max_delta_ratio`
 
-Store an object as a delta only if `delta_size / original_size` is below this ratio. Lower = more aggressive savings; higher = more files kept as deltas.
+Store an object as a delta only if `delta_size / original_size` is below this ratio. A lower value saves space more aggressively. A higher value keeps more files as deltas.
 
 | | |
 |---|---|
@@ -300,7 +290,7 @@ Store an object as a delta only if `delta_size / original_size` is below this ra
 
 ### `max_object_size`
 
-Maximum object size in bytes. Enforced as the HTTP request body limit, so it caps uploads for both delta and passthrough objects; it is also the per-object ceiling for delta processing (xdelta3 memory constraint) and sizes the multipart upload budget. `0` rejects all uploads (startup warning).
+Maximum object size in bytes. The proxy enforces it as the HTTP request body limit, so it caps uploads of both delta and passthrough objects. It is also the per-object ceiling for delta processing (an xdelta3 memory constraint), and it sizes the multipart upload budget. `0` rejects all uploads, and the proxy logs a warning at startup.
 
 | | |
 |---|---|
@@ -310,7 +300,7 @@ Maximum object size in bytes. Enforced as the HTTP request body limit, so it cap
 
 ### `cache_size_mb`
 
-In-memory reference cache size in MB. **Recommend 1024+ MB for production.** Undersized caches (<1024 MB) emit a startup warning.
+In-memory reference cache size in MB. Use 1024 MB or more in production. A cache smaller than 1024 MB causes a startup warning.
 
 | | |
 |---|---|
@@ -321,7 +311,7 @@ In-memory reference cache size in MB. **Recommend 1024+ MB for production.** Und
 
 ### `metadata_cache_mb`
 
-In-memory `FileMetadata` cache size in MB. Set to `0` to disable. Budget: ~125K-150K entries at 50 MB. 10-minute TTL.
+In-memory `FileMetadata` cache size in MB. Set it to `0` to disable the cache. 50 MB holds about 125K-150K entries. Entries have a 10-minute TTL.
 
 | | |
 |---|---|
@@ -365,7 +355,7 @@ The number of seconds that a verified reconstruction of a large delta object sta
 
 ### `codec_timeout_secs`
 
-Maximum time for an xdelta3 subprocess. Hung processes are killed after this.
+Maximum time for an xdelta3 subprocess. The proxy kills a hung process after this time.
 
 | | |
 |---|---|
@@ -373,13 +363,11 @@ Maximum time for an xdelta3 subprocess. Hung processes are killed after this.
 | **Default** | `60` |
 | **Hot-reload** | No |
 
----
-
 ## Storage backend
 
 ### Filesystem backend
 
-Local filesystem. Activated by setting `DGP_DATA_DIR` or a `backend:` block with `type = "filesystem"`.
+Local filesystem. The proxy uses it when you set `DGP_DATA_DIR` or a `backend:` block with `type = "filesystem"`.
 
 #### `data_dir`
 
@@ -403,11 +391,11 @@ storage:
     path: /var/lib/deltaglider
 ```
 
-Paths containing `..` components are rejected at load time.
+The proxy rejects a path that contains `..` components at load time.
 
 ### S3 backend
 
-AWS S3 / MinIO / Hetzner / Backblaze / any S3-compatible service. Activated by setting `DGP_S3_ENDPOINT` or `DGP_S3_REGION`, or a `backend:` block with `type = "s3"`. When one of these two variables is set, the proxy replaces the whole singleton backend with an S3 backend built from the `DGP_S3_*` and `DGP_BE_AWS_*` variables, and a member without a variable takes its default. Without one of the two variables, the proxy ignores `DGP_S3_PATH_STYLE` and the `DGP_BE_AWS_*` keys. `DGP_BACKEND_ALLOW_LOCAL=true` applies to every S3 backend, named backends included, as if each one set `allow_local: true`.
+AWS S3, MinIO, Hetzner, Backblaze, or any other S3-compatible service. The proxy uses it when you set `DGP_S3_ENDPOINT` or `DGP_S3_REGION`, or a `backend:` block with `type = "s3"`. When one of these two variables is set, the proxy replaces the whole singleton backend with an S3 backend built from the `DGP_S3_*` and `DGP_BE_AWS_*` variables, and a member without a variable takes its default. Without one of the two variables, the proxy ignores `DGP_S3_PATH_STYLE` and the `DGP_BE_AWS_*` keys. `DGP_BACKEND_ALLOW_LOCAL=true` applies to every S3 backend, named backends included, as if each one set `allow_local: true`.
 
 #### `endpoint` / `region` / `force_path_style` / `access_key_id` / `secret_access_key`
 
@@ -439,25 +427,23 @@ storage:
     secret_access_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```
 
-Endpoint URLs must start with `http://` or `https://` (scheme-less values rejected at load time).
+Endpoint URLs must start with `http://` or `https://`. The proxy rejects a value without a scheme at load time.
 
 The admin API shows the `access_key_id` of every S3 backend in `GET /api/admin/config/export`, in the storage section, and in `GET /api/admin/backends`, because an access key id is an identifier and not a secret. The `secret_access_key` is never shown. When a document or section that you apply carries the same `access_key_id` and no `secret_access_key`, the proxy keeps the current secret, so an unedited export applies without change. A different `access_key_id` without a secret is a rotation that is missing its secret: the proxy does not pair the new id with the old secret, and it returns a warning.
 
----
-
-## Access — authentication
+## Access: authentication
 
 The proxy **refuses to start** without credentials unless you set `authentication = "none"`.
 
 ### `authentication`
 
-Explicit auth-mode selector. Absent = auto-detect from credentials; `"none"` = open access (dev only). In open access, the proxy still checks the signature of a signed request, with the access key as the secret, so a signed client must use the same value for both keys (see [Authentication and access](authentication.md#authentication-modes)).
+Explicit auth-mode selector. When the field is absent, the proxy detects the mode from the credentials. `"none"` means open access (dev only). In open access, the proxy still checks the signature of a signed request, with the access key as the secret, so a signed client must use the same value for both keys (see [Authentication and access](authentication.md#authentication-modes)).
 
 | | |
 |---|---|
 | **Env var** | `DGP_AUTHENTICATION` |
 | **YAML** | `access.authentication` |
-| **Default** | — (auto-detect; **fatal error** if absent AND no credentials) |
+| **Default** | None (auto-detect; a **fatal error** when both this field and the credentials are absent) |
 | **Hot-reload** | No |
 
 ### `access_key_id` / `secret_access_key`
@@ -479,12 +465,12 @@ access:
 
 ### `bootstrap_password_hash`
 
-Bcrypt hash of the bootstrap password (signs session cookies, gates admin GUI access in bootstrap mode). Auto-generated on first run. Accepts base64-encoded hashes to avoid `$` escaping in Docker/env vars. It does not encrypt the IAM config DB: that is the job of [`DGP_CONFIG_DB_KEY`](#config-db-key).
+Bcrypt hash of the bootstrap password (it signs session cookies and gates admin GUI access in bootstrap mode). The proxy generates it on the first run. It accepts base64-encoded hashes, so that you do not need to escape `$` in Docker and env vars. It does not encrypt the IAM config DB: that is the job of [`DGP_CONFIG_DB_KEY`](#config-db-key).
 
 | | |
 |---|---|
 | **Env var** | `DGP_BOOTSTRAP_PASSWORD_HASH` (legacy alias: `DGP_ADMIN_PASSWORD_HASH`) |
-| **YAML** | `advanced.bootstrap_password_hash` (treated as an **infra secret** — stripped by canonical exports) |
+| **YAML** | `advanced.bootstrap_password_hash` (an infra secret, which canonical exports strip) |
 | **Default** | Auto-generated on first run |
 
 ### Config DB key
@@ -501,22 +487,20 @@ To rotate the key, set `DGP_CONFIG_DB_KEY_PREVIOUS` to the old key and `DGP_CONF
 
 ### `DGP_BOOTSTRAP_PASSWORD`
 
-Plaintext bootstrap password for the `config apply` / `admission trace` admin CLI commands (they authenticate via this env var; argv is avoided because it leaks via `ps`). Not read by the server itself.
+Plaintext bootstrap password for the `config apply` / `admission trace` admin CLI commands. They read the password from this env var and not from an argument, because argv leaks through `ps`. The server itself does not read it.
 
 | | |
 |---|---|
 | **Env var** | `DGP_BOOTSTRAP_PASSWORD` |
 | **Consumer** | Admin CLI (`deltaglider_proxy config apply`, `... admission trace`) |
 
----
+## Access: IAM mode
 
-## Access — IAM mode
-
-The `access.iam_mode` YAML selector controls where IAM state (users, groups, OAuth providers, mapping rules) lives. Orthogonal to the `authentication` selector.
+The `access.iam_mode` YAML selector controls where IAM state (users, groups, OAuth providers, mapping rules) lives. It is independent of the `authentication` selector.
 
 | Mode | Meaning |
 |------|---------|
-| `gui` *(default)* | Encrypted SQLCipher DB is source of truth. Admin GUI + admin API mutate it. YAML `access.*` carries only the legacy SigV4 pair + `authentication` selector. |
+| `gui` *(default)* | The encrypted SQLCipher DB is the source of truth. The admin GUI and the admin API change it. YAML `access.*` carries only the legacy SigV4 pair and the `authentication` selector. |
 | `declarative` | YAML `access.iam_users`, `iam_groups`, `auth_providers`, and `group_mapping_rules` are authoritative. Admin API IAM mutation routes (`POST/PUT/PATCH/DELETE` on `/users`, `/groups`, `/ext-auth/*`, `/migrate`, backup import) return `403 { "error": "iam_declarative" }`. Read routes stay accessible. |
 
 ```yaml
@@ -524,15 +508,13 @@ access:
   iam_mode: declarative
 ```
 
-Mode transitions are audit-logged at `warn` level on the `deltaglider_proxy::config` target. In declarative mode, every `/config/apply` or section-PUT on `access` runs a dry validation + diff, then reconciles the encrypted config DB to YAML in one SQLite transaction. Creates, updates, and deletes emit `iam_reconcile_*` audit entries.
+The proxy audit-logs mode transitions at `warn` level on the `deltaglider_proxy::config` target. In declarative mode, every `/config/apply` or section-PUT on `access` runs a dry validation and a diff, and then reconciles the encrypted config DB to YAML in one SQLite transaction. Creates, updates, and deletes emit `iam_reconcile_*` audit entries.
 
 The initial `gui → declarative` flip is guarded: if YAML contains no users or groups while the DB is non-empty, apply fails instead of wiping IAM by accident. To seed GitOps YAML from an existing DB, use `GET /_/api/admin/config/declarative-iam-export`; see [Declarative IAM](declarative-iam.md) for the full workflow.
 
----
-
 ## Admission chain
 
-Request rules: gating of requests before authentication. Each entry of `blocks` is one rule. Rules are checked from top to bottom, and the first rule that matches decides. Your rules are checked *before* the public-access rules that the proxy creates from `storage.buckets[*].public_prefixes`.
+Request rules gate requests before authentication. Each entry of `blocks` is one rule. The proxy checks the rules from top to bottom, and the first rule that matches decides. The proxy checks your rules *before* the public-access rules that it creates from `storage.buckets[*].public_prefixes`.
 
 ```yaml
 admission:
@@ -571,12 +553,12 @@ admission:
 | `match.bucket` | string | Target bucket (lowercased on parse). |
 | `match.path_glob` | string | Glob against the full key: `*.zip`, `releases/**`, `docs/readme.md`. |
 | `match.authenticated` | bool | `true` = only authenticated; `false` = only anonymous; absent = either. |
-| `match.config_flag` | string | Named flag. Registry is not yet live — `maintenance_mode` is recognised but always evaluates false; a warning fires at chain-build time. |
+| `match.config_flag` | string | Named flag. The flag registry is not live yet: the proxy recognises `maintenance_mode`, but it always evaluates to false, and the proxy logs a warning when it builds the chain. |
 | `action` | string \| object (required) | Simple: `allow-anonymous`, `deny`, `continue`. Tagged: `{ type: reject, status: <4xx\|5xx>, message?: <string> }`. |
 
-The operator chain holds at most 1000 blocks. The proxy checks the blocks for every request, so a longer chain is refused with an error that names the count. To gate many addresses, list them in the `source_ip_list` of one block.
+The operator chain holds at most 1000 blocks. The proxy checks the blocks for every request, so it refuses a longer chain with an error that names the count. To gate many addresses, list them in the `source_ip_list` of one block.
 
-`continue` is an explicit terminal that falls through to authentication — useful as the final block for diagnostic visibility in trace output.
+`continue` is an explicit terminal action that passes the request on to authentication. It is useful as the final block, because the trace output then shows where the chain ended.
 
 `allow-anonymous` lets the request that matched the block through without credentials, as the `$anonymous` principal. It grants exactly that one request, and only when the request is a read: a `GET` or `HEAD` of the matched object, or a listing of the matched bucket with the requested `prefix`. It never grants a write. An object key that contains `*` or `?` gets no grant, because a permission reads those characters as wildcards and would then cover other keys too; such a request continues without credentials and is refused with `403`. A `PUT`, `POST` or `DELETE` that matches an `allow-anonymous` block continues without credentials and is refused with `403 AccessDenied`. In the example above, an unsigned `GET /releases/builds/app.zip` returns the object, and an unsigned `PUT` of the same key returns `403`. The trace (`POST /_/api/admin/config/trace`) shows the grant in its `anonymous_grant` field (`{"action": "read", ...}`, `{"action": "list", ...}`, `{"action": "public-prefixes", ...}` for a public-access rule, whose grant is the bucket's `public_prefixes`, or `null`), and the live request path uses the same function to decide.
 
@@ -584,19 +566,17 @@ The `source_ip` and `source_ip_list` conditions match the address of the TCP con
 
 ### Round-trip
 
-`source_ip_list` entries round-trip verbatim (bare IPs stay bare, CIDRs stay CIDRs) so GitOps diffs don't flip on every apply.
+`source_ip_list` entries round-trip verbatim (bare IPs stay bare, CIDRs stay CIDRs) so GitOps diffs do not change on every apply.
 
 The admin UI page **Request rules** (`/_/admin/access/admission`) edits these rules. The `public-prefix:*` public-access rules show read-only below your rules; change them in **Storage → Buckets** instead.
-
----
 
 ## Security
 
 ### `trust_proxy_headers`
 
-Trust `X-Forwarded-For` / `X-Real-IP` from the reverse proxies that `DGP_TRUSTED_PROXY_CIDRS` lists. **Disable** if the proxy is internet-facing without a reverse proxy.
+Trust `X-Forwarded-For` / `X-Real-IP` from the reverse proxies that `DGP_TRUSTED_PROXY_CIDRS` lists. Disable it when the proxy faces the internet without a reverse proxy.
 
-A client can write any `X-Forwarded-For` value, so the proxy reads the header only on a connection from a network in `DGP_TRUSTED_PROXY_CIDRS`. On any other connection it uses the address of the TCP connection. The one resulting client address is used for every decision: the per-IP rate limit, the IP binding of admin sessions, the known-good exemption from the login lockout, admission `source_ip` rules, and IAM `aws:SourceIp` conditions. The proxy refuses to start when this setting is `true` and `DGP_TRUSTED_PROXY_CIDRS` is unset or holds no valid network. The same rule covers `X-Forwarded-Host` and `X-Forwarded-Proto`: they count for the same-origin check of admin requests, the `Secure` flag of session cookies, and the OAuth callback address only on a connection from a trusted proxy.
+A client can write any `X-Forwarded-For` value, so the proxy reads the header only on a connection from a network in `DGP_TRUSTED_PROXY_CIDRS`. On any other connection it uses the address of the TCP connection. The proxy uses the one resulting client address for every decision: the per-IP rate limit, the IP binding of admin sessions, the known-good exemption from the login lockout, admission `source_ip` rules, and IAM `aws:SourceIp` conditions. The proxy refuses to start when this setting is `true` and `DGP_TRUSTED_PROXY_CIDRS` is unset or holds no valid network. The same rule covers `X-Forwarded-Host` and `X-Forwarded-Proto`: they count for the same-origin check of admin requests, the `Secure` flag of session cookies, and the OAuth callback address only on a connection from a trusted proxy.
 
 | | |
 |---|---|
@@ -604,7 +584,7 @@ A client can write any `X-Forwarded-For` value, so the proxy reads the header on
 | **Default** | `false` (secure-by-default) |
 | **Hot-reload** | No |
 
-**Production-critical behind a reverse proxy.** If the proxy sits behind Coolify, Traefik, nginx, Caddy, or an ALB and this stays `false`, every request appears to come from the proxy's own IP — so all clients collapse onto a **single shared rate-limit bucket**, and one busy client can lock out everyone else with `503 SlowDown`. Set it to `true` whenever a trusted reverse proxy injects `X-Forwarded-For` / `X-Real-IP`. The save-time config advisories (see [Config advisories](#config-advisories)) flag the rate-limit-on + trust-off combination for you. Leave it `false` only when the proxy is directly internet-facing (otherwise a client could spoof the headers).
+**Production-critical behind a reverse proxy.** If the proxy sits behind Coolify, Traefik, nginx, Caddy, or an ALB and this setting stays `false`, every request appears to come from the IP of the reverse proxy. All clients then share a single rate-limit bucket, and one busy client can lock out everyone else with `503 SlowDown`. Set it to `true` whenever a trusted reverse proxy injects `X-Forwarded-For` / `X-Real-IP`. The save-time config advisories (see [Config advisories](#config-advisories)) flag the combination of rate limiting on and this setting off. Leave it `false` only when the proxy faces the internet directly, because there a client could spoof the headers.
 
 ### `session_ttl_hours`
 
@@ -628,16 +608,16 @@ SigV4 clock skew tolerance.
 
 ### `replay_window_secs`
 
-SigV4 replay detection window. A mutating request whose signature was already seen within this many seconds is treated as a replay. The default is the clock skew tolerance (`DGP_CLOCK_SKEW_SECONDS`, 900 s): a signature older than that fails verification anyway, so the default refuses a captured mutation for its whole valid life.
+SigV4 replay detection window. The proxy treats a mutating request as a replay when it already saw the same signature within this many seconds. The default is the clock skew tolerance (`DGP_CLOCK_SKEW_SECONDS`, 900 s). A signature older than that fails verification anyway, so the default refuses a captured mutation for its whole valid life.
 
-- **Mutating methods (PUT/POST/DELETE/…)** are rejected with `400 Request replay detected`.
-- **A PUT or DELETE retried inside its signing second** is served, not rejected. SigV4 timestamps have 1-second granularity, so when an SDK retries a PUT or DELETE within the same second in which it signed it, the retry carries the same signature. This happens, for example, when a load balancer loses the response of a PUT that succeeded. The proxy serves a duplicate PUT or DELETE that arrives less than one second after the first copy, measured on the proxy's own clock, so client clock skew cannot stretch that second. Repeating a PUT or DELETE repeats the same effect. A duplicate that arrives one second or more after the first copy is rejected, and every other mutating method (POST) stays strict.
-- **Idempotent reads (GET/HEAD)** are not tracked: their signatures never enter the cache, and a duplicate is served normally. This is deliberate — boto3/botocore emit **byte-identical SigV4 signatures** for the same request issued (or auto-retried) within one signing second, because SigV4 timestamps have 1-second granularity. A replayed read just re-reads the same bytes, so there is no double-effect to guard against.
-- **Presigned URLs** are exempt entirely (they are designed to be reused for their whole expiry).
-- Only a request that **succeeds** (2xx or 3xx) keeps its signature in the cache. When a request fails, for example with `503 SlowDown` while a maintenance job holds the bucket, the proxy forgets its signature, so the SDK can retry it with the same signature inside the same second. A duplicate POST that arrives while the first request still runs is rejected.
-- A replay rejection is **not** an authentication failure — the signature is valid — so it is audited as `replay_rejected` and does **not** count toward the per-IP brute-force lockout.
+- The proxy rejects a replayed mutating request (PUT, POST, DELETE and the other mutating methods) with `400 Request replay detected`.
+- The proxy serves a PUT or DELETE that the client retries inside its signing second. SigV4 timestamps have 1-second granularity, so when an SDK retries a PUT or DELETE within the same second in which it signed it, the retry carries the same signature. This happens, for example, when a load balancer loses the response of a PUT that succeeded. The proxy serves a duplicate PUT or DELETE that arrives less than one second after the first copy, measured on the proxy's own clock, so client clock skew cannot stretch that second. Repeating a PUT or DELETE repeats the same effect. A duplicate that arrives one second or more after the first copy is rejected, and every other mutating method (POST) stays strict.
+- The proxy does not track idempotent reads (GET and HEAD). Their signatures never enter the cache, and the proxy serves a duplicate normally. This is deliberate. SigV4 timestamps have 1-second granularity, so boto3 and botocore emit byte-identical SigV4 signatures when they send the same request (or auto-retry it) within one signing second. A replayed read only reads the same bytes again, so it has no double effect to guard against.
+- Presigned URLs are fully exempt, because they are designed for reuse during their whole expiry.
+- Only a request that succeeds (2xx or 3xx) keeps its signature in the cache. When a request fails, for example with `503 SlowDown` while a maintenance job holds the bucket, the proxy forgets its signature, so the SDK can retry it with the same signature inside the same second. A duplicate POST that arrives while the first request still runs is rejected.
+- The signature of a replayed request is valid, so a replay rejection is not an authentication failure. The proxy audits it as `replay_rejected`, and it does not count toward the per-IP brute-force lockout.
 
-Set `DGP_REPLAY_WINDOW_SECS=0` to disable replay rejection entirely (the window never matches). Useful in CI, or as an escape hatch if a client clusters mutations tighter than the default tolerates.
+Set `DGP_REPLAY_WINDOW_SECS=0` to disable replay rejection entirely (the window never matches). This is useful in CI, or as an escape hatch when a client sends mutations closer together than the default tolerates.
 
 | | |
 |---|---|
@@ -657,11 +637,11 @@ Controls the `Secure` flag on admin session cookies. `true` always sets it and `
 
 ### Config advisories
 
-At save time — in the admin **Apply** dialog and in `config apply` / `config lint` — the proxy runs a set of cross-field checks and surfaces warnings for combinations that are individually valid but suspicious together. They never block a save; they flag footguns before they reach production. Current rules:
+At save time, the proxy runs a set of cross-field checks in the admin **Apply** dialog and in `config apply` / `config lint`. It shows a warning for each combination of settings that are valid one by one but suspicious together. The advisories never block a save. The current rules are:
 
 | Advisory | Fires when | Why it matters |
 |---|---|---|
-| Shared rate-limit bucket | Rate limiting is enabled but `trust_proxy_headers` is `false` | Behind a reverse proxy, every client collapses onto the proxy's IP and one shared bucket — one client can lock out all others. |
+| Shared rate-limit bucket | Rate limiting is enabled but `trust_proxy_headers` is `false` | Behind a reverse proxy, every client appears with the IP of the reverse proxy and shares one bucket, so one client can lock out all others. |
 | Stale IAM template | A permission resource uses a bare `${username}` instead of `${iam:username}` | The bare form is not substituted, so the rule matches nothing and silently denies the user. |
 | Frozen bucket quota | A bucket's `quota_bytes` is `0` | A zero quota rejects all writes to that bucket. |
 | Redundant public prefix | `public_prefixes` are set while `authentication: none` | Auth is already open, so the public-prefix rules add nothing. |
@@ -676,11 +656,9 @@ Per-IP brute-force protection for auth endpoints. See [Rate limits and concurren
 | Rolling window | `DGP_RATE_LIMIT_WINDOW_SECS` | `300` (5 min) |
 | Lockout duration | `DGP_RATE_LIMIT_LOCKOUT_SECS` | `600` (10 min) |
 
----
-
 ## TLS
 
-When enabled, both the S3 API and admin GUI serve HTTPS on the single listener.
+When TLS is enabled, both the S3 API and the admin GUI serve HTTPS on the single listener.
 
 ```yaml
 advanced:
@@ -696,15 +674,17 @@ advanced:
 | cert_path | `DGP_TLS_CERT` | `advanced.tls.cert_path` | Auto-generate self-signed |
 | key_path | `DGP_TLS_KEY` | `advanced.tls.key_path` | Auto-generate |
 
-When `cert_path` and `key_path` are both absent, a self-signed certificate is generated on startup.
+When `cert_path` and `key_path` are both absent, the proxy generates a self-signed certificate at startup.
 
-TLS is bound once at startup — a `tls.*` change applied at runtime (admin API / `config apply`) is persisted but does **not** take effect until you restart the proxy. The apply response flags this with a `requires_restart` warning.
-
----
+The proxy binds TLS once, at startup. When you apply a `tls.*` change at runtime (admin API or `config apply`), the proxy persists it, but the change does **not** take effect until you restart the proxy. The apply response flags this with a `requires_restart` warning.
 
 ## Config sync
 
-Multi-instance coordination via S3. When enabled, the shared bucket does these things: the encrypted config DB file is replicated to it (IAM sync); it hosts the per-rule replication leader leases (`_dgp/leases/replication/…`, automatic failover) and the cross-instance `reference.bin` locks (`_dgp/locks/reference/…`); and setting it activates the boot-time conditional-write validation — of this bucket AND of every named S3 backend hosting client-writable buckets (non-CAS → the proxy refuses to start; see [backend capability validation](../how-to/backend-capability-validation.md)).
+Config sync coordinates several instances through an S3 bucket. When you enable it, the shared bucket has these roles:
+
+- The proxy replicates the encrypted config DB file to it (IAM sync).
+- It hosts the per-rule replication leader leases (`_dgp/leases/replication/…`, automatic failover) and the cross-instance `reference.bin` locks (`_dgp/locks/reference/…`).
+- Setting it turns on the boot-time conditional-write validation of this bucket and of every named S3 backend that hosts client-writable buckets. When one of them is not CAS-capable, the proxy refuses to start (see [backend capability validation](../how-to/backend-capability-validation.md)).
 
 | | |
 |---|---|
@@ -719,12 +699,12 @@ advanced:
   config_sync_bucket: dgp-iam-sync
 ```
 
-Every instance that shares the bucket must set `DGP_CONFIG_DB_KEY` to the same value: the synced DB is encrypted with that key, and the proxy refuses to start with a sync bucket but without the variable. For the same reason, the admin API refuses a configuration change that sets or changes `config_sync_bucket` when the instance runs without `DGP_CONFIG_DB_KEY`. An instance whose key does not open the synced DB refuses to merge it and logs an error that names `DGP_CONFIG_DB_KEY`.
+Every instance that shares the bucket must set `DGP_CONFIG_DB_KEY` to the same value, because the proxy encrypts the synced DB with that key. The proxy refuses to start with a sync bucket but without the variable. For the same reason, the admin API refuses a configuration change that sets or changes `config_sync_bucket` when the instance runs without `DGP_CONFIG_DB_KEY`. An instance whose key does not open the synced DB refuses to merge it and logs an error that names `DGP_CONFIG_DB_KEY`.
 
 The sync bucket lives on an S3 backend, and the proxy uses the endpoint and the credentials of that backend. The proxy picks the backend in this order:
 
-- When no named backends exist, or when the singleton backend (`storage.backend`) is S3, the sync bucket is on the singleton backend. Older releases always used that backend.
-- Otherwise, the proxy routes the sync bucket like any other bucket: a `backend:` route under `storage.buckets.<sync bucket>` names its backend, else `default_backend` hosts it. So a filesystem singleton beside a named S3 backend also works.
+- When no named backends exist, or when the singleton backend (`storage.backend`) is S3, the sync bucket is on the singleton backend.
+- Otherwise, the proxy routes the sync bucket like any other bucket: a `backend:` route under `storage.buckets.<sync bucket>` names its backend, otherwise `default_backend` hosts it. For this reason, a filesystem singleton beside a named S3 backend also works.
 
 Sync needs that backend to be S3, because a filesystem backend is local to one node. On every IAM mutation, the proxy uploads the DB to `s3://<bucket>/.deltaglider/config.db` (`advanced.config_sync_object_key` or `DGP_CONFIG_SYNC_KEY` changes the key). The other instances poll the ETag of that object every 5 minutes and download the DB when the ETag changes.
 
@@ -734,13 +714,11 @@ Every upload carries a sync generation, a number that the uploading instance tak
 
 A copy from an instance on a release before the sync generation (config DB schema v29) carries no generation. For such a copy, the instance uses the older rule: a copy that holds a row in a version more than five minutes older than the copy that this instance last synced is refused as a rollback. This older rule reads the clock of each writer, so during a rolling upgrade, keep the instance clocks within five minutes of each other. An instance on the older release does not merge a copy from an upgraded instance (it logs that the copy has a newer schema) until it is upgraded too.
 
-The sync poller starts once at boot — enabling or changing `config_sync_bucket` at runtime is persisted but does **not** take effect until restart (the apply response flags this with a `requires_restart` warning).
-
----
+The sync poller starts once, at boot. When you enable or change `config_sync_bucket` at runtime, the proxy persists the change, but it does **not** take effect until a restart. The apply response flags this with a `requires_restart` warning.
 
 ## Multi-backend routing
 
-Route different buckets to different storage backends. When `backends` is non-empty, the legacy single `backend` is ignored at runtime.
+You can route different buckets to different storage backends. When `backends` is non-empty, the proxy ignores the legacy single `backend` at runtime.
 
 ```yaml
 storage:
@@ -767,13 +745,11 @@ storage:
       alias: acme-db-archive-prod
 ```
 
-Backends can be added/removed via the admin GUI (**Storage → Backends**) without restart. `default_backend` is validated against the `backends` list at load time — invalid references are cleared with a warning.
-
----
+You can add and remove backends in the admin GUI (**Storage → Backends**) without a restart. At load time, the proxy checks `default_backend` against the `backends` list. It clears an invalid reference and logs a warning.
 
 ## Bucket policies
 
-Per-bucket overrides. All fields optional.
+Bucket policies are per-bucket overrides. All fields are optional.
 
 ```yaml
 storage:
@@ -801,18 +777,16 @@ storage:
 | `alias` | string | same as bucket name | Virtual → real bucket name mapping on the backend |
 | `public_prefixes` | `[string]` | `[]` | Anonymous read (GET/HEAD/LIST) scoped to these key prefixes |
 | `public` | bool | — | Shorthand for `public_prefixes: [""]` (entire bucket public) |
-| `quota_bytes` | u64 | — | Soft storage quota (may overshoot by up to 5 minutes of writes); `0` = freeze bucket |
-| `replication_target_only` | bool | `false` | Client writes return 403; replication is the only writer. Makes a non-CAS backend (e.g. Backblaze B2) a safe mirror — see [backend capability validation](../how-to/backend-capability-validation.md) |
+| `quota_bytes` | u64 | — | Soft storage quota (it may overshoot by up to 5 minutes of writes); `0` freezes the bucket |
+| `replication_target_only` | bool | `false` | Client writes return 403; replication is the only writer. This makes a non-CAS backend (e.g. Backblaze B2) a safe mirror (see [backend capability validation](../how-to/backend-capability-validation.md)) |
 
 ### Public prefixes
 
-When `public_prefixes` (or `public: true`) is set, anonymous users can GET, HEAD, and LIST objects under the prefix. Writes always require authentication. Use trailing `/` for directory-aligned matching (`"public/"` matches `public/installer.zip` but not `publicity/`). The empty string `""` makes the entire bucket public (logged as a warning). Prefixes containing `..`, null bytes, or `//` are rejected. The proxy creates `public-prefix:<bucket>` request rules from this setting.
-
----
+When `public_prefixes` (or `public: true`) is set, anonymous users can GET, HEAD, and LIST objects under the prefix. Writes always require authentication. Use trailing `/` for directory-aligned matching (`"public/"` matches `public/installer.zip` but not `publicity/`). The empty string `""` makes the entire bucket public, and the proxy logs a warning. The proxy rejects prefixes that contain `..`, null bytes, or `//`. The proxy creates `public-prefix:<bucket>` request rules from this setting.
 
 ## Lifecycle rules
 
-Expiration (delete) and transition/archive rules live under `storage.lifecycle`. Disabled by default; every delete and copy goes through the DeltaGlider engine.
+Expiration (delete) and transition/archive rules live under `storage.lifecycle`. Lifecycle is disabled by default. Every delete and copy goes through the DeltaGlider engine.
 
 ```yaml
 storage:
@@ -831,9 +805,7 @@ storage:
         exclude_globs: [".deltaglider/**", "nightly/golden/**"]
 ```
 
-Use `POST /_/api/admin/jobs/lifecycle:<name>/preview` (or the Preview button on the Jobs screen) before enabling a rule. See [Lifecycle Rules](lifecycle.md) for API details, skip rules, and limitations.
-
----
+Use `POST /_/api/admin/jobs/lifecycle:<name>/preview` (or the Preview button on the Jobs screen) before enabling a rule. See [Lifecycle rules](lifecycle.md) for API details, skip rules, and limitations.
 
 ## Job leases
 
@@ -850,18 +822,16 @@ advanced:
 | Field | Default | Meaning |
 |---|---|---|
 | `lease_ttl` | per job kind: maintenance `60s`, lifecycle `5m`, parity audit `30m`, rule delete `60s` | How long one renewal holds the lease (humantime, minimum `15s`). A shorter TTL lets another runner take a dead runner's job sooner. A longer TTL gives a slow runner more time between renewals. |
-| `heartbeat_interval` | a third of `lease_ttl` when you set `lease_ttl`, else per job kind: maintenance `20s`, lifecycle `60s`, parity audit `10m` | How often a running job renews its lease (humantime, minimum `5s`). It must be lower than `lease_ttl`; a value at or above it is replaced by half the TTL. |
+| `heartbeat_interval` | a third of `lease_ttl` when you set `lease_ttl`, else per job kind: maintenance `20s`, lifecycle `60s`, parity audit `10m` | How often a running job renews its lease (humantime, minimum `5s`). It must be lower than `lease_ttl`. The proxy replaces a value at or above it with half the TTL. |
 
-A value that does not parse, or that is below the minimum, is ignored with a config warning, and the default of the job kind applies. Replication rules do not use `advanced.jobs`: they keep `storage.replication.lease_ttl` and `heartbeat_interval` (see [Replication](replication.md)), because their lease can be a cross-instance S3 lease with its own failover window.
-
----
+The proxy ignores a value that does not parse, or that is below the minimum, and logs a config warning. The default of the job kind then applies. Replication rules do not use `advanced.jobs`: they keep `storage.replication.lease_ttl` and `heartbeat_interval` (see [Replication](replication.md)), because their lease can be a cross-instance S3 lease with its own failover window.
 
 ## Event delivery
 
-Durable object mutation events are always appended to the encrypted config DB
-when it is available. HTTP delivery is disabled by default; enabling
-`advanced.event_delivery` starts a background dispatcher that POSTs each event
-to every configured webhook endpoint.
+The proxy always appends durable object mutation events to the encrypted config
+DB when the DB is available. HTTP delivery is disabled by default. When you
+enable `advanced.event_delivery`, a background dispatcher starts, and it POSTs
+each event to every configured webhook endpoint.
 
 ```yaml
 advanced:
@@ -886,15 +856,16 @@ advanced:
 ```
 
 `webhook_url` is the single-endpoint shortcut. `webhook_urls` adds fan-out
-endpoints, and `webhook_headers` are attached to every delivery request. A row
-is marked delivered only after all endpoints return 2xx; failed rows back off
-and can be requeued from the admin API/UI. See [Event log](event-outbox.md)
+endpoints, and the proxy attaches `webhook_headers` to every delivery request.
+The proxy marks a row delivered only after all endpoints return 2xx. A failed
+row backs off, and you can requeue it from the admin API or UI. See [Event log](event-outbox.md)
 for payload and diagnostics details.
 
 ### Slack format
 
 Set `format: slack` to render each event as a Slack message (Block Kit + text
-fallback) instead of the raw `{schema,event}` envelope. Two modes — pick one:
+fallback) instead of the raw `{schema,event}` envelope. There are two modes, and
+you pick one:
 
 ```yaml
 advanced:
@@ -923,24 +894,22 @@ advanced:
 | Key | Notes |
 |-----|-------|
 | `format` | `raw` (default) or `slack`. |
-| `slack_bot_token` | `xoxb-…` Slack Web API token. **Secret** — masked on export, preserved on an untouched round-trip. Selects bot-token mode (`chat.postMessage`). |
+| `slack_bot_token` | `xoxb-…` Slack Web API token. It is a secret: the export masks it, and an untouched round-trip keeps it. It selects bot-token mode (`chat.postMessage`). |
 | `slack_channel` | Target channel (`C0123` or `#name`). Required in bot-token mode; ignored for Incoming Webhook URLs (each URL is bound to one channel by Slack). |
 | `slack_username` / `slack_icon_emoji` | Cosmetic sender overrides (Incoming Webhook mode). |
 | `slack_notify_kinds` | Which event kinds post. Default `["ObjectCreated"]`. |
 | `slack_include_globs` / `slack_exclude_globs` | Key-glob pre-filter (exclude wins). |
-| `slack_routes` | Per-bucket / per-prefix → channel routing (**bot-token mode only**). When non-empty, an eligible event posts to every matching route; `slack_channel` is the fallback for events matching no route. |
+| `slack_routes` | Routing from a bucket or prefix to a channel (bot-token mode only). When non-empty, an eligible event posts to every matching route; `slack_channel` is the fallback for events matching no route. |
 
-The whole thing is editable from the admin GUI at **Integrations →
-Event delivery** (toggle the format to *Slack*). See [Event log](event-outbox.md#slack-format)
+You can edit all of these settings in the admin GUI at **Integrations →
+Event delivery** (set the format to *Slack*). See [Event log](event-outbox.md#slack-format)
 for delivery semantics.
-
----
 
 ## Encryption at rest
 
-Per-backend encryption with four modes: `none`, `aes256-gcm-proxy`, `sse-kms`, `sse-s3`. Each backend carries its own `encryption` block — operators can mix (e.g. SSE-KMS for the production backend, plaintext for a public-CDN backend) without sharing a single blast-radius key.
+Per-backend encryption with four modes: `none`, `aes256-gcm-proxy`, `sse-kms`, `sse-s3`. Each backend has its own `encryption` block. Operators can therefore mix modes (e.g. SSE-KMS for the production backend and plaintext for a public-CDN backend), and no single key has every backend in its blast radius.
 
-**YAML** — named-backends path:
+YAML for the named-backends path:
 
 ```yaml
 storage:
@@ -961,7 +930,7 @@ storage:
         bucket_key_enabled: true
 ```
 
-**YAML** — singleton-backend path (`backends:` empty):
+YAML for the singleton-backend path (`backends:` empty):
 
 ```yaml
 storage:
@@ -971,7 +940,7 @@ storage:
     key: "${env:DGP_ENCRYPTION_KEY}"
 ```
 
-**Env vars** (infra secrets — these are the recommended key source; every `key` / `kms_key_id` field in YAML is stripped by canonical exports):
+Environment variables (infra secrets) are the recommended key source. Canonical exports strip every `key` / `kms_key_id` field from the YAML.
 
 | Env var | Binds to |
 |---|---|
@@ -980,25 +949,21 @@ storage:
 | `DGP_SSE_KMS_KEY_ID` | `backend_encryption.kms_key_id` (singleton SSE-KMS) |
 | `DGP_BACKEND_<NAME>_SSE_KMS_KEY_ID` | named SSE-KMS override |
 
-Name normalisation: `<NAME>` is uppercased; `-` and `.` become `_` (so `hetzner-fsn1` → `DGP_BACKEND_HETZNER_FSN1_ENCRYPTION_KEY`).
+Name normalisation: the proxy uppercases `<NAME>` and replaces `-` and `.` with `_`. For example, `hetzner-fsn1` becomes `DGP_BACKEND_HETZNER_FSN1_ENCRYPTION_KEY`.
 
-**Defaults:** absent `encryption` block → `mode: none` (plaintext).
+When the `encryption` block is absent, the mode is `none` (plaintext).
 
-**Formats:** `key` / `legacy_key` are 64-char lowercase hex (256 bits). `kms_key_id` is a KMS ARN or alias. `key_id` (optional) must match `[A-Za-z0-9_.-]{1,64}` (S3 user-metadata header-safe).
+`key` / `legacy_key` are 64-character lowercase hex strings (256 bits). `kms_key_id` is a KMS ARN or alias. `key_id` (optional) must match `[A-Za-z0-9_.-]{1,64}` (S3 user-metadata header-safe).
 
-Rotation within a single mode is not automated — use the `legacy_key` / `legacy_key_id` shim fields (decrypt-only, for proxy→native transitions) or copy objects to a new backend. See the [encryption reference](encryption.md) for the full wire format, key-id mismatch mechanics, and the shim lifecycle.
-
----
+The proxy does not automate key rotation within a single mode. To rotate, use the `legacy_key` / `legacy_key_id` shim fields (decrypt-only, for proxy→native transitions), or copy the objects to a new backend. See the [encryption reference](encryption.md) for the full wire format, key-id mismatch mechanics, and the shim lifecycle.
 
 ## CLI subcommands
 
 See [Command-line tools](cli.md).
 
----
-
 ## Full example
 
-A kitchen-sink YAML covering every top-level section. Fields omitted here inherit their defaults.
+This YAML example covers every top-level section. The fields that it leaves out keep their defaults.
 
 ```yaml
 # deltaglider_proxy.yaml
@@ -1097,15 +1062,13 @@ DGP_TLS_CERT=/etc/ssl/certs/proxy.pem
 DGP_TLS_KEY=/etc/ssl/private/proxy-key.pem
 ```
 
----
-
 ## Environment variable registry
 
-The list of `DGP_*` variables that the server reads. The unit test `every_dgp_literal_in_src_is_registered` in `src/config/tests/general.rs` scans the source code and fails when the code reads a variable that `ENV_VAR_REGISTRY` does not list. `deltaglider_proxy --show-env` prints that registry.
+This section lists the `DGP_*` variables that the server reads. The unit test `every_dgp_literal_in_src_is_registered` in `src/config/tests/general.rs` scans the source code and fails when the code reads a variable that `ENV_VAR_REGISTRY` does not list. `deltaglider_proxy --show-env` prints that registry.
 
 The server reads these variables when it starts, and again when an admin apply rebuilds the engine. A request never reads the environment itself: it uses the values of the running config. The environment of a running process does not change, so a changed variable takes effect only after a restart.
 
-### Server / Advanced
+### Server / advanced
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -1120,7 +1083,7 @@ The server reads these variables when it starts, and again when an admin apply r
 | `DGP_REQUEST_TIMEOUT_SECS` | 300 | Per-request timeout (returns 504) |
 | `DGP_READY_TIMEOUT_SECS` | 3 | Per-attempt backend timeout for the `/_/ready` probe |
 | `DGP_READY_RETRIES` | 2 | Extra `/_/ready` backend attempts before reporting not-ready (short backoff) |
-| `DGP_READY_CACHE_TTL_SECS` | 0 | Last-known-good window for `/_/ready`, in seconds. `0` keeps the strict behaviour: the `ListBuckets` probe must succeed or the node reports not-ready. When you set a value above zero and the list fails, the proxy first tries a much cheaper `HeadBucket` reachability check, and then accepts a backend call that succeeded within this many seconds. A storage provider that throttles `ListBuckets` therefore does not pull a node out of rotation while that node is still serving reads and writes. |
+| `DGP_READY_CACHE_TTL_SECS` | 0 | Last-known-good window for `/_/ready`, in seconds. `0` keeps the strict behaviour: the `ListBuckets` probe must succeed or the node reports not-ready. When you set a value above zero and the list fails, the proxy first tries a much cheaper `HeadBucket` reachability check, and then accepts a backend request that succeeded within this many seconds. A storage provider that throttles `ListBuckets` therefore does not pull a node out of rotation while that node is still serving reads and writes. |
 | `DGP_MAX_CONCURRENT_REQUESTS` | 1024 | Tower concurrency limit |
 | `DGP_MAX_MULTIPART_UPLOADS` | 1000 | Concurrent multipart upload cap |
 | `DGP_DEBUG_HEADERS` | false | Expose fingerprinting headers |
@@ -1172,22 +1135,22 @@ The server reads these variables when it starts, and again when an admin apply r
 | `DGP_S3_READ_TIMEOUT_SECS` | 60 | Backend S3 read timeout |
 | `DGP_S3_OPERATION_ATTEMPT_TIMEOUT_SECS` | 300 | Per-attempt backend S3 operation timeout |
 | `DGP_S3_STALL_GRACE_SECS` | 20 | Backend S3 no-progress stall grace |
-| `DGP_PARITY_HEAD_CONCURRENCY` | 15 | Concurrent HEADs during a replication Verify (parity) audit on an S3 backend; raise to speed up a large audit, lower to be gentler on a throttling backend (clamped 1–64) |
-| `DGP_PARITY_MAX_OBJECTS` | 1000000 | Max objects a Verify audit scans across both sides before it caps and reports a partial ("scan capped") result; a runaway-scan safety ceiling (≈500k objects/side), raise for even larger mirrors (min 1000) |
-| `DGP_BOOT_BACKEND_PROBE` | enforce | Boot-time backend health gate: `enforce` probes every configured backend's connectivity + credentials at startup and refuses to start when ALL fail; `warn` probes and logs but never exits; `off` skips probing. Unhealthy backends' buckets answer 503 until recovery (every backend is re-probed every `DGP_BACKEND_HEALTH_INTERVAL_SECS`) |
-| `DGP_BACKEND_LIST_COOLDOWN_SECS` | 30 | After a backend fails a bucket listing, skip it (serve last-known-good, flagged unavailable) for this long before re-probing — so one dead backend doesn't add a connect timeout to every `ListBuckets` |
-| `DGP_BACKEND_LIST_TIMEOUT_SECS` | 5 | Per-backend timeout for a single bucket-listing call; bounds a hung (not-refusing) backend |
-| `DGP_BACKEND_LIST_FRESH_SECS` | 5 | Serve a bucket listing fetched this recently without re-probing upstream — the browser fires `ListBuckets` and the origins lookup back-to-back, and this collapses them into one upstream call per backend. Bucket create/delete through the proxy invalidates it immediately; 0 disables |
+| `DGP_PARITY_HEAD_CONCURRENCY` | 15 | Concurrent HEADs during a replication Verify (parity) audit on an S3 backend; raise to speed up a large audit, lower to be gentler on a throttling backend (clamped to 1 to 64) |
+| `DGP_PARITY_MAX_OBJECTS` | 1000000 | Max objects a Verify audit scans across both sides before it caps and reports a partial ("scan capped") result. It is a safety ceiling against a runaway scan (about 500k objects per side). Raise it for larger mirrors (minimum 1000) |
+| `DGP_BOOT_BACKEND_PROBE` | enforce | Boot-time backend health gate: `enforce` probes the connectivity and credentials of every configured backend at startup, and refuses to start when all of them fail; `warn` probes and logs but never exits; `off` skips probing. Unhealthy backends' buckets answer 503 until recovery (every backend is re-probed every `DGP_BACKEND_HEALTH_INTERVAL_SECS`) |
+| `DGP_BACKEND_LIST_COOLDOWN_SECS` | 30 | After a backend fails a bucket listing, skip it (serve last-known-good, flagged unavailable) for this long before it probes the backend again. This way, one dead backend does not add a connect timeout to every `ListBuckets` |
+| `DGP_BACKEND_LIST_TIMEOUT_SECS` | 5 | Per-backend timeout for a single bucket-listing request. It bounds the wait for a hung (not refusing) backend |
+| `DGP_BACKEND_LIST_FRESH_SECS` | 5 | The browser sends `ListBuckets` and the origins lookup back to back. The proxy serves a bucket listing that it fetched this recently without probing upstream again, so the two requests become one upstream request per backend. A bucket create or delete through the proxy invalidates the listing immediately. `0` disables it |
 
 ### Replication / streaming copy
 
-Tuning knobs for the large-object streaming multipart copy path (replication + lifecycle transitions). Defaults suit most deployments; raise concurrency only if the backend + network have headroom.
+These variables tune the streaming multipart copy of large objects (replication and lifecycle transitions). The defaults suit most deployments. Raise the concurrency only when the backend and the network have headroom.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DGP_STREAM_COPY_THRESHOLD` | 64 MiB | Object size at/above which a passthrough copy streams via multipart (floored at 1) |
 | `DGP_MULTIPART_PART_SIZE` | 64 MiB | Part size for the streaming copy (clamped to the 5 MiB S3 minimum) |
-| `DGP_UPLOAD_CONCURRENCY` | 4 | In-flight parts per streaming object (1–16), for the copies of event-driven replication, lifecycle transitions, bucket migrations and admin copies. A scheduled replication run uses `storage.replication.upload_concurrency` instead |
+| `DGP_UPLOAD_CONCURRENCY` | 4 | In-flight parts per streaming object (1 to 16), for the copies of event-driven replication, lifecycle transitions, bucket migrations and admin copies. A scheduled replication run uses `storage.replication.upload_concurrency` instead |
 | `DGP_REPLICATION_TRANSFERS` | 4 | Has no effect in this release. The number of objects that one replication run copies at the same time comes from `storage.replication.transfers` (default 4, clamped to 1 to 64) |
 
 ### Authentication
@@ -1221,7 +1184,7 @@ Tuning knobs for the large-object streaming multipart copy path (replication + l
 | `DGP_RATE_LIMIT_ACCOUNT_WINDOW_SECS` | 3600 | Rolling window for the per-account count of failed logins |
 | `DGP_RATE_LIMIT_ACCOUNT_LOCKOUT_SECS` | 3600 | Per-account lockout duration |
 
-### TLS / Config sync / Encryption at rest / Misc
+### TLS / config sync / encryption at rest / misc
 
 | Variable | Default | Description |
 |----------|---------|-------------|

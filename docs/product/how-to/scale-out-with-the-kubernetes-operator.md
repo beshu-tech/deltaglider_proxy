@@ -11,7 +11,7 @@ there is only one replica.
 
 ## Why you can't just set `replicas: 3` on a plain Deployment
 
-Two pieces of the proxy's state live only inside a single pod — in that pod's memory
+Two pieces of the proxy's state live only inside a single pod, in that pod's memory
 and on its local disk:
 
 - **Multipart uploads.** When a client starts a multipart upload, the pod that receives
@@ -26,21 +26,20 @@ and on its local disk:
 - **The delta reference lock.** All writes into one delta prefix must happen one at a
   time, because each write updates a shared reference file. Inside one pod, an
   in-process lock enforces this ordering. Across pods, a lock object in the config sync
-  bucket enforces it, so two pods cannot corrupt the reference file. But a pod that
+  bucket enforces it, so two pods cannot corrupt the reference file. A pod that
   waits for another pod's lock slows its writes down, and a pod that does not get the
   lock in time fails the write.
 
 The operator solves both problems in the same way, and this is the only multipart
-strategy DeltaGlider implements: **consistent hashing by the directory of the URL
-path**. An HAProxy router runs in front of the proxy pods and chooses the target pod by
-hashing the request path with its last segment removed — in S3 terms, the bucket and
+strategy DeltaGlider implements: consistent hashing by the directory of the URL
+path. An HAProxy router runs in front of the proxy pods and chooses the target pod by
+hashing the request path with its last segment removed. In S3 terms, this is the bucket and
 the key's prefix. Everything that lives in one directory therefore reaches the same
 pod: every object key in that prefix, every part of any multipart upload of those
-keys, and the prefix's delta reference file. That is deliberately one level coarser
-than hashing the full path, because a delta prefix is shared between all of the keys
+keys, and the prefix's delta reference file. The router deliberately hashes one level coarser
+than the full path, because a delta prefix is shared between all of the keys
 inside it. With pinning per key, two pods would still take turns on the same
-reference file. This approach has real trade-offs; they are listed at the end
-of this guide, and you should read them before going live.
+reference file. This approach has trade-offs. The end of this guide lists them, and you should read them before you go live.
 
 ## 1. Install the operator
 
@@ -131,21 +130,21 @@ kubectl apply -f dgp.yaml
 kubectl -n dgp get dgp dgp -w     # wait for phase: Ready
 ```
 
-The `${env:...}` references are expanded by the proxy inside the pod, against the
-environment variables that the Secret provides — so the credentials reach the storage
-backend without ever being written into the ConfigMap.
+The proxy expands the `${env:...}` references inside the pod, against the
+environment variables that the Secret provides. The credentials therefore reach the storage
+backend, and the ConfigMap never contains them.
 
 If your backend is an in-cluster MinIO reached over plain `http://`, add
-`DGP_BACKEND_ALLOW_LOCAL: "true"` to the Secret — the SSRF guard refuses plain-http
-and private addresses by default. On proxy releases v1.17.0 and later, that flag also
+`DGP_BACKEND_ALLOW_LOCAL: "true"` to the Secret. By default, the SSRF guard refuses plain-http
+and private addresses. On proxy releases v1.17.0 and later, that flag also
 admits in-cluster DNS names such as `minio.dgp.svc.cluster.local`; releases up to
 v1.16.1 refuse those hostnames outright, so on older versions point the endpoint at
 the Service's ClusterIP instead of its DNS name.
 
 The operator checks the multi-replica requirements before it scales: if the spec has
 no config sync bucket, uses a filesystem backend, or has no shared bootstrap password
-hash or config DB key, the operator refuses to scale up — a fresh deployment comes up with one pod, an
-already-running fleet keeps its current size — and it sets the phase to `Degraded`
+hash or config DB key, the operator refuses to scale up. A fresh deployment comes up with one pod, and an
+already-running fleet keeps its current size. The operator also sets the phase to `Degraded`
 with the exact problems listed in `status.message` (`kubectl -n dgp describe dgp dgp`
 shows them). Fix the spec and it scales up on its own.
 
@@ -157,8 +156,8 @@ client.
 
 The operator creates the proxy pods (a StatefulSet with one persistent volume per
 pod), the HAProxy router pods, and a Service named `dgp` in front of the routers.
-Point your Ingress and all of your S3 clients at the `dgp` Service — **never at the
-proxy pods directly**. A client that bypasses the router also bypasses the
+Point your Ingress and all of your S3 clients at the `dgp` Service. **Never point them at the
+proxy pods directly.** A client that bypasses the router also bypasses the
 path-pinning, and its multipart uploads will fail.
 
 ## 4. Verify that multipart uploads work across pods
@@ -173,8 +172,8 @@ aws --endpoint-url http://<dgp-service> s3api head-object --bucket releases --ke
 ```
 
 The `aws` command-line tool switches to a multipart upload for any file larger than
-8 MB, so this test exercises the full sequence — `CreateMultipartUpload`, several
-parallel `UploadPart` requests, and the final `CompleteMultipartUpload` — through the
+8 MB, so this test exercises the full sequence (`CreateMultipartUpload`, several
+parallel `UploadPart` requests, and the final `CompleteMultipartUpload`) through the
 hash-pinned path. If you see a `NoSuchUpload` error here, some client is reaching the
 proxy pods without going through the router.
 
@@ -183,8 +182,8 @@ proxy pods without going through the router.
 Consistent hashing pins traffic to pods; it does not share any state between them.
 Accept the following consequences before you scale.
 
-**Four different events move the hash ring**, and every one of them has the same
-consequence — a multipart upload that is in flight on a moved prefix fails with
+Four different events move the hash ring, and every one of them has the same
+consequence: a multipart upload that is in flight on a moved prefix fails with
 `NoSuchUpload`, and the client has to restart that upload from the beginning:
 
 | Ring-moving event | How it happens |
@@ -192,23 +191,23 @@ consequence — a multipart upload that is in flight on a moved prefix fails wit
 | Scaling up | You raise `replicas`; part of the key space moves to the new pods. |
 | Scaling down | You lower `replicas`; the removed pods' key space redistributes. |
 | A proxy pod restart | The pod's ring slot is unchanged (stable name), but the multipart state it held in memory is gone. |
-| Readiness ejection | A pod that fails its readiness probe for roughly thirty seconds — one backend hiccup is enough — is removed from the ring by the routers with no operator action involved, and comes back when it recovers. Same blast radius as a scale event. |
+| Readiness ejection | A pod that fails its readiness probe for about thirty seconds (one backend hiccup is enough) is removed from the ring by the routers, without any operator action. The pod comes back when it recovers. The effect is the same as the effect of a scale event. |
 
 The remaining structural consequences:
 
 | Behaviour | Consequence |
 |---|---|
-| Readiness is all-or-nothing per pod | Every pod's readiness probe (`/_/ready`) checks the storage backends, so a backend outage removes **all** pods from the ring at once (correct for one backend — nothing could be served anyway). With several backends, a pod stays ready while at least one backend answers, and the buckets on a dead backend answer `503` on their own. |
+| Readiness is all-or-nothing per pod | Every pod's readiness probe (`/_/ready`) checks the storage backends, so a backend outage removes **all** pods from the ring at once. With one backend, this is correct, because no pod could serve a request anyway. With several backends, a pod stays ready while at least one backend answers, and the buckets on a dead backend answer `503` on their own. |
 | All traffic for one prefix goes to one pod | Load is spread across pods by directory, not by request. A single very busy prefix will not fan out across the fleet. |
 | The admin UI is effectively single-pod | Sessions are in memory and source-IP sticky: a pod restart logs its admin users out, everyone behind one NAT gateway lands on the same pod, and they share that pod's login rate-limit budget. Treat the admin GUI as a one-pod surface for now. |
 
-The rest of the multi-instance contract — the IAM merge, synchronisation lag, upgrade
-ordering — is unchanged and described in
-[How to run multiple instances (HA)](run-multiple-instances.md).
+The rest of the multi-instance contract (the IAM merge, synchronisation lag, and upgrade
+ordering) is the same, and
+[How to run multiple instances (HA)](run-multiple-instances.md) describes it.
 
 ## Related
 
-- [Operator README](https://github.com/beshu-tech/deltaglider_proxy/tree/main/operator) — the full spec reference and the development workflow
-- [How to run multiple instances (HA)](run-multiple-instances.md) — the sync bucket, the IAM merge, and upgrades
-- [How to deploy on Kubernetes with Helm](deploy-on-kubernetes.md) — the single-pod path
-- [How to take a proxy to production](go-to-production.md) — the production checklist
+- [Operator README](https://github.com/beshu-tech/deltaglider_proxy/tree/main/operator): the full spec reference and the development workflow
+- [How to run multiple instances (HA)](run-multiple-instances.md): the sync bucket, the IAM merge, and upgrades
+- [How to deploy on Kubernetes with Helm](deploy-on-kubernetes.md): the single-pod path
+- [How to take a proxy to production](go-to-production.md): the production checklist

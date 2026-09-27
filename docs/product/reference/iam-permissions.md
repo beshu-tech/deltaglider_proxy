@@ -24,7 +24,7 @@ Each IAM user carries one or more permission rules, evaluated per request after 
 | Value | Meaning |
 |-------|---------|
 | `Allow` | Grants access when actions, resources, and conditions all match |
-| `Deny` | Blocks access when it matches — overrides every Allow, whether the Deny comes from the user's direct rules or an inherited group |
+| `Deny` | Blocks access when it matches. It overrides every Allow, whether the Deny comes from the user's direct rules or an inherited group |
 
 A request with no matching Allow is implicitly denied.
 
@@ -75,7 +75,7 @@ Resource strings and string condition values accept identity templates:
 
 Template facts:
 
-- The `iam:` prefix is mandatory; a bare `${username}` is **not** substituted. The prefix distinguishes request-time identity substitution from the `${env:NAME}` load-time config expansion. A stale bare `${username}` leaves a literal, unmatchable resource pattern — so the rule matches nothing and the user is **silently denied**. The save-time config advisories flag this; see [Config advisories](configuration.md#config-advisories).
+- The `iam:` prefix is mandatory; a bare `${username}` is **not** substituted. The prefix distinguishes request-time identity substitution from the `${env:NAME}` load-time config expansion. A stale bare `${username}` leaves a literal, unmatchable resource pattern. The rule then matches nothing, so the user is **silently denied**. The save-time config advisories flag this; see [Config advisories](configuration.md#config-advisories).
 - Templates are stored raw in the DB/YAML and expanded when the in-memory IAM index is built, after group permissions are merged into each member user.
 - Identity values are inserted as they are, because the proxy compares policies against the decoded object key. The user `dana@corp.com` therefore matches the key `home/dana@corp.com/report.pdf`. A value that contains `/`, `*`, `?`, `$`, `{`, `}` or `%` cannot be inserted safely, because it would add a path level or a wildcard. When a user's name or access key contains one of these characters and one of the user's effective permissions uses the matching template, the proxy gives that user no permissions at all and logs a warning.
 - Unknown templates are rejected by user/group API validation and by declarative IAM apply.
@@ -85,7 +85,7 @@ Template facts:
 - In declarative mode, a YAML user with its own access key cannot take over a user with the same name that an OAuth login created. The apply fails with an error, and you rename one of the two users. A YAML entry that keeps the access key of the OAuth-created user still manages that user, for example to rotate its secret.
 - When the proxy upgrades a database that already holds two users with the same name, it keeps the name for one user and renames each other user with the same suffix rule. A local user keeps the name before a user that an OAuth login created, and otherwise the older user keeps it. It logs a warning for each rename. A renamed user's `${iam:username}` prefix changes with the name.
 
-Example — a per-user home prefix in `db-archive`, shared via the `Engineering` group:
+Example: a per-user home prefix in `db-archive`, shared through the `Engineering` group:
 
 ```json
 {
@@ -99,7 +99,7 @@ For `dana` this expands to `db-archive/home/dana/*`.
 
 ## Conditions
 
-Conditions within a single rule are ANDed — all must match for the rule to apply. Multiple values for the same key are ORed.
+Conditions within a single rule are ANDed: all must match for the rule to apply. Multiple values for the same key are ORed.
 
 ### Condition operators
 
@@ -116,7 +116,7 @@ Conditions within a single rule are ANDed — all must match for the rule to app
 
 | Key | Type | Available on | Value |
 |-----|------|--------------|-------|
-| `aws:SourceIp` | IP address (CIDR) | All requests | Client IP — the address of the TCP connection, or the client that `X-Forwarded-For` names when the connection comes from a network in `DGP_TRUSTED_PROXY_CIDRS` |
+| `aws:SourceIp` | IP address (CIDR) | All requests | Client IP: the address of the TCP connection, or the client that `X-Forwarded-For` names when the connection comes from a network in `DGP_TRUSTED_PROXY_CIDRS` |
 | `s3:prefix` | String | LIST requests | The `prefix` query parameter |
 
 A client can write any `X-Forwarded-For` value, so the proxy reads that header for `aws:SourceIp` only when `DGP_TRUST_PROXY_HEADERS=true` and the connection comes from a reverse proxy that `DGP_TRUSTED_PROXY_CIDRS` lists. The proxy refuses to start with `DGP_TRUST_PROXY_HEADERS=true` and no `DGP_TRUSTED_PROXY_CIDRS`.
@@ -148,7 +148,7 @@ When a user with prefix-scoped permissions (for example `{ "resources": ["db-arc
 
 ## Workflow-bypass prevention
 
-A PUT to a non-existent bucket returns `404 NoSuchBucket` on every backend — including the filesystem backend, where the underlying FS could create the parent directory. Bucket creation requires the `admin` action; it cannot occur as a side effect of a write.
+A PUT to a non-existent bucket returns `404 NoSuchBucket` on every backend. This includes the filesystem backend, where the underlying FS could create the parent directory. Bucket creation requires the `admin` action; it cannot occur as a side effect of a write.
 
 ## Canned policy templates
 
@@ -165,7 +165,7 @@ The user form (**Settings → Access → Users**) shows four preset buttons abov
 
 - A user's effective permissions are the union of their direct rules and the rules of every group they belong to (for example, `dana`'s direct rules plus the `Engineering` group's rules).
 - Group permissions are merged into each member at IAM index build time; identity templates expand after this merge.
-- Deny precedence applies across the union: a Deny in any source — direct or inherited — overrides Allows from all sources.
+- Deny precedence applies across the union: a Deny in any source (direct or inherited) overrides Allows from all sources.
 - OAuth group mapping rules add group memberships on each login; memberships are merged, never replaced, so manual assignments persist.
 - The proxy creates no group by itself. When the first IAM user is created in `gui` mode, the bootstrap pair becomes the user `legacy-admin` with the direct rule `{ "effect": "Allow", "actions": ["*"], "resources": ["*"] }`.
 

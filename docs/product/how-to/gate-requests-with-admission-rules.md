@@ -1,6 +1,6 @@
 # How to gate requests before authentication
 
-*Reject unwanted traffic — bad IPs, anonymous writes, everything during maintenance — before the proxy spends a single HMAC on it.*
+*Reject unwanted traffic, such as requests from bad IPs, anonymous writes, or all requests during maintenance, before the proxy computes a single HMAC for it.*
 
 Request rules run before the proxy verifies the request signature. Because of that, they can do something that IAM cannot do: they can refuse a request without knowing who sent it, including a request that carries no credentials at all. The page [About authentication and access control](../explanation/security-model.md) explains why the rules run first.
 
@@ -8,7 +8,7 @@ In the configuration file, request rules live in the list under the `admission.b
 
 ## 1. Add a rule
 
-Acme's `downloads` bucket serves a public prefix, which attracts anonymous upload attempts. Deny anonymous mutations on the whole bucket outright.
+Acme's `downloads` bucket serves a public prefix, which attracts anonymous upload attempts. This rule denies all anonymous mutations on the whole bucket.
 
 In the admin UI, open **Settings → Access → Request rules** and click **Add rule**. Set the conditions that a request must match, choose the action, and save the rule. Then drag the rule to its position in the list. The rule editor has a form view and a YAML view.
 
@@ -60,7 +60,7 @@ The same tool is in the admin UI at **Settings → Observability → Request rul
 
 ![Request trace diagnostics](/_/screenshots/request-trace.jpg)
 
-If you want the trace to name a rule also for requests that match no other rule, add a `continue` rule at the end of the list. A `continue` rule sends the request on to authentication, so it changes nothing; it exists only to make the trace output explicit.
+If you want the trace to name a rule also for requests that match no other rule, add a `continue` rule at the end of the list. A `continue` rule sends the request on to authentication, so it changes nothing. Its only purpose is to make the trace output explicit.
 
 ## 4. Roll out
 
@@ -82,7 +82,7 @@ Run the trace from step 3 again after each change to the rules. The trace reads 
 
 ## Related
 
-- [Configuration reference](../reference/configuration.md#admission-chain) — every condition and action field.
-- [How to publish a folder publicly](publish-a-public-folder.md) — where the public-access rules come from.
-- [How to restrict access by IP and prefix](restrict-access-with-conditions.md) — per-user IP rules *after* authentication.
-- [About authentication and access control](../explanation/security-model.md) — admission's place in the four-layer model.
+- [Configuration reference](../reference/configuration.md#admission-chain): every condition and action field.
+- [How to publish a folder publicly](publish-a-public-folder.md): where the public-access rules come from.
+- [How to restrict access by IP and prefix](restrict-access-with-conditions.md): per-user IP rules *after* authentication.
+- [About authentication and access control](../explanation/security-model.md): admission's place in the four-layer model.

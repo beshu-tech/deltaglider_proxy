@@ -1,6 +1,6 @@
 # Your first Helm deployment on kind
 
-In this tutorial we'll run DeltaGlider Proxy on Kubernetes — a real chart on a real (if disposable) cluster. We'll boot a local `kind` cluster, install the official Helm chart, and prove the whole thing works: the admin UI loads, the health probe answers, and a file round-trips through the S3 API. Then we'll delete the cluster and leave nothing behind.
+In this tutorial we'll run DeltaGlider Proxy on Kubernetes, with the real chart on a real but disposable cluster. We'll boot a local `kind` cluster, install the official Helm chart, and check that the deployment works: the admin UI loads, the health probe answers, and a file round-trips through the S3 API. Then we'll delete the cluster and leave nothing behind.
 
 You'll need the DeltaGlider Proxy repository checked out locally (the chart ships inside it), plus Docker, `kind`, `kubectl`, `helm`, and the `aws` CLI.
 
@@ -11,7 +11,7 @@ git clone https://github.com/beshu-tech/deltaglider_proxy.git
 cd deltaglider_proxy
 ```
 
-One thing to know before we start: the chart ships with intentionally public development credentials so it can be smoke-tested out of the box. That's exactly what we're doing here — and it's why a default install must never be exposed beyond localhost.
+Before we start, note that the chart ships with intentionally public development credentials, so that anyone can smoke-test it out of the box. That is what we do here. Because those credentials are public, a default install must never be exposed beyond localhost.
 
 ## Step 1: create a disposable cluster
 
@@ -78,11 +78,11 @@ Now open the admin UI in your browser:
 http://127.0.0.1:19090/_/
 ```
 
-You should see the DeltaGlider Proxy connect screen. The chart's development bootstrap password is `change-me-in-production` — it exists so the chart is testable out of the box, and it's the first thing to override anywhere that isn't a throwaway cluster.
+You should see the DeltaGlider Proxy connect screen. The chart's development bootstrap password is `change-me-in-production`. It exists so that the chart is testable out of the box. Override it first on any cluster that isn't a throwaway cluster.
 
 ## Step 4: verify health and login
 
-Let's confirm the same things a load balancer and an operator would check. First the health probe:
+Now we check the same things that a load balancer and an operator would check. First, the health probe:
 
 ```bash
 curl -fsS http://127.0.0.1:19090/_/health
@@ -106,11 +106,11 @@ curl -fsS -X POST http://127.0.0.1:19090/_/api/admin/login \
 {"ok":true}
 ```
 
-Notice we've now verified the two endpoints that matter for operations: the probe Kubernetes uses to decide the pod is alive, and the credential a human uses to get in.
+We now verified the two endpoints that operations depend on: the probe that Kubernetes uses to decide that the pod is alive, and the credential that a human uses to log in.
 
 ## Step 5: round-trip a file through the S3 API
 
-The chart also creates development SigV4 credentials (`admin` / `change-me-in-production`). Let's push a file through the proxy and pull it back:
+The chart also creates development SigV4 credentials (`admin` / `change-me-in-production`). Push a file through the proxy and pull it back:
 
 ```bash
 export AWS_ACCESS_KEY_ID=admin
@@ -124,7 +124,7 @@ aws --endpoint-url http://127.0.0.1:19090 s3 cp /tmp/dgp-hello.txt s3://hello/he
 aws --endpoint-url http://127.0.0.1:19090 s3 cp s3://hello/hello.txt -
 ```
 
-You should see the bucket created, the upload confirmed, and — the line that proves the whole pipeline — your file's content echoed back from the cluster:
+You should see the bucket created, the upload confirmed, and your file's content echoed back from the cluster. That last line proves that the whole pipeline works:
 
 ```text
 hello from kind
@@ -161,9 +161,9 @@ Cluster, PVC, and the development credentials are all gone.
 
 ## What you built
 
-You took the official chart from zero to verified in seven steps: a running pod with persistent storage, a reachable admin UI, a passing health probe, a working bootstrap login, and a file that round-tripped through the S3 API on Kubernetes. Just as importantly, you've now seen exactly which defaults (`change-me-in-production`, everywhere) must be replaced before this leaves your laptop.
+You took the official chart from zero to verified in seven steps: a running pod with persistent storage, a reachable admin UI, a passing health probe, a working bootstrap login, and a file that round-tripped through the S3 API on Kubernetes. You also saw which defaults (`change-me-in-production`, everywhere) you must replace before this deployment leaves your laptop.
 
 ## Where next
 
-- [Deploy on Kubernetes](../how-to/deploy-on-kubernetes.md) — the production version of what you just did: credentials in a real Secret, S3 backends, Ingress with TLS, and the chart values that matter.
-- [Securing your first proxy](secure-your-proxy.md) — the security walkthrough, if you haven't done it yet.
+- [Deploy on Kubernetes](../how-to/deploy-on-kubernetes.md): the production version of what you just did, with credentials in a real Secret, S3 backends, Ingress with TLS, and the important chart values.
+- [Securing your first proxy](secure-your-proxy.md): the security walkthrough, if you haven't done it yet.
