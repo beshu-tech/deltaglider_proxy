@@ -2558,7 +2558,7 @@ impl StorageBackend for S3Backend {
             .send()
             .await
         {
-            Ok(head) => Ok(RefFence::ETag(head.e_tag().unwrap_or_default().to_string())),
+            Ok(head) => Ok(fence_from_head_etag(head.e_tag(), bucket, &key)),
             // Same contract as has_reference: only a real 404 is "absent".
             Err(e) => match self.classify(bucket, &e, S3Op::HeadObject) {
                 StorageError::NotFound(_) => Ok(RefFence::Absent),
@@ -3953,6 +3953,20 @@ mod endpoint_guard_source_test {
     }
 }
 
+/// Pure: the fence for a reference.bin that a HEAD found. A HEAD with no
+/// ETag gave `ETag("")`, which every fenced write then skipped in silence;
+/// now it is an explicit `Unfenced` with a warning, like a backend without
+/// conditional writes, and the caller asks `has_reference` itself.
+fn fence_from_head_etag(etag: Option<&str>, bucket: &str, key: &str) -> RefFence {
+    match etag {
+        Some(e) if !e.is_empty() => RefFence::ETag(e.to_string()),
+        _ => {
+            warn!("HEAD {bucket}/{key} returned no ETag: reference writes are unfenced");
+            RefFence::Unfenced
+        }
+    }
+}
+
 /// S3's limit on the user metadata of one object, in bytes (keys + values).
 const S3_USER_METADATA_MAX_BYTES: usize = 2048;
 
@@ -3978,6 +3992,17 @@ fn check_metadata_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// storage-14: a HEAD without an ETag is an explicit Unfenced.
+    #[test]
+    fn a_head_without_an_etag_is_unfenced() {
+        assert_eq!(
+            fence_from_head_etag(Some("\"e\""), "b", "k"),
+            RefFence::ETag("\"e\"".into())
+        );
+        assert_eq!(fence_from_head_etag(Some(""), "b", "k"), RefFence::Unfenced);
+        assert_eq!(fence_from_head_etag(None, "b", "k"), RefFence::Unfenced);
+    }
 
     /// storage-4: DG fields + user metadata over 2 KB was `Other` (500).
     #[test]
