@@ -28,7 +28,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::super::AdminState;
-use super::{active_config_path, apply_config_transition, TransitionCtx};
+use super::active_config_path;
+use super::write::{
+    self, Built, ConfigWrite, EnvRefs, Mode, Outcome, Rejection, ScrubEnv, Stage, Surface,
+    WriteResult,
+};
 
 #[derive(Serialize)]
 pub struct ConfigResponse {
@@ -593,35 +597,100 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
 
 /// PUT /api/admin/config — update configuration via field-level patch.
 ///
-/// The GUI forms post partial JSON (only the fields being edited). This
-/// handler merges the patch into a prospective `new_cfg`, then hands the
-/// old/new pair off to [`apply_config_transition`] — the same helper the
-/// document-level `apply_config_doc` path uses — so hot-reload side
-/// effects can never drift between the two surfaces.
+/// The GUI forms post partial JSON (only the fields being edited). The
+/// handler applies the patch to a copy of the running config
+/// ([`build_patch`]) and hands it to the shared write pipeline
+/// ([`super::write`]) — the same one the section and document surfaces
+/// use — so hot-reload side effects never drift between them.
 ///
-/// Patch-specific logic that stays in this handler:
-/// - Backend-field translation (the PATCH schema has flattened
-///   `backend_type`/`backend_endpoint`/… instead of a nested struct).
-/// - Parse-error warnings for a bad `listen_addr` string (the helper only
-///   sees already-parsed `SocketAddr` values).
-/// - Rollback of `cfg.backend` on engine-rebuild failure — the PATCH
-///   contract returns `success: true` with a warning rather than a 5xx,
-///   matching the admin-GUI's legacy expectations.
+/// The PATCH contract: a refused transition (a gate, the engine build, the
+/// auth decision) answers `success: true` with a warning and the pre-patch
+/// config kept, not a 5xx; a persist failure is a warning too.
 pub async fn update_config(
     State(state): State<Arc<AdminState>>,
     headers: axum::http::HeaderMap,
     AdminJson(body): AdminJson<ConfigUpdateRequest>,
 ) -> axum::response::Response {
-    let mut cfg = state.config.write().await;
-    // Optimistic concurrency, against the whole document's version.
-    let current = super::version::config_version(&cfg, None);
-    if super::version::if_match_conflicts(&headers, &current) {
-        return super::version::conflict(&current, "config");
-    }
-    let mut warnings = Vec::new();
-    let old_cfg = cfg.clone();
+    let no_env = EnvRefs::new();
+    let write = ConfigWrite {
+        surface: Surface::Patch,
+        mode: Mode::Apply,
+        headers: Some(&headers),
+        extra_env: &no_env,
+    };
+    let result = write::run(&state, write, |old| build_patch(old, &body)).await;
+    shape_patch(result)
+}
 
-    // ── Apply the patch ──────────────────────────────────────────────────
+/// The PATCH body of a write outcome.
+fn shape_patch(result: WriteResult) -> axum::response::Response {
+    use axum::http::StatusCode;
+    let WriteResult { outcome, refs } = result;
+    let reply = |warnings, requires_restart| {
+        let body = ConfigUpdateResponse {
+            success: true,
+            warnings,
+            requires_restart,
+        };
+        write::respond(StatusCode::OK, body, &refs, None)
+    };
+    match outcome {
+        Outcome::Conflict { current } => super::version::conflict(&current, "config"),
+        Outcome::Rejected(r) if r.stage == Stage::Build => {
+            let body = serde_json::json!({ "success": false, "error": r.error });
+            write::respond(r.status, body, &refs, None)
+        }
+        // The pipeline changes no runtime state on a refusal: the pre-patch
+        // config stays.
+        Outcome::Rejected(r) => {
+            let failed = format!(
+                "Failed to apply config patch: {}. Pre-patch config restored.",
+                r.error
+            );
+            let w = *r.warnings;
+            reply([w.build, w.env, vec![failed]].concat(), false)
+        }
+        Outcome::Applied {
+            warnings: w,
+            requires_restart,
+            persist,
+            ..
+        } => {
+            // Persist failure is a warning, not a rollback: the runtime
+            // state is correct; only the on-disk file is stale.
+            let persist_warning = persist
+                .err()
+                .map(|(path, e)| format!("Failed to persist config to {path}: {e}"));
+            let warnings = [w.build, w.env, w.transition]
+                .concat()
+                .into_iter()
+                .chain(persist_warning)
+                .collect();
+            reply(warnings, requires_restart)
+        }
+        Outcome::Validated { .. } => {
+            reply(vec!["internal: a PATCH ran as a dry run".into()], false)
+        }
+    }
+}
+
+impl ScrubEnv for ConfigUpdateResponse {
+    fn scrub_env(&mut self, refs: &EnvRefs) {
+        write::scrub_strings(&mut self.warnings, refs);
+    }
+}
+
+/// The PATCH's build step: the running config with the patch applied, plus
+/// the per-field warnings. Patch-specific logic lives here: the backend
+/// fields are flattened (`backend_type`/`backend_endpoint`/…), and a bad
+/// `listen_addr` or `log_level` is a warning that keeps the current value.
+fn build_patch(
+    old: &crate::config::Config,
+    body: &ConfigUpdateRequest,
+) -> Result<Built, Rejection> {
+    let mut cfg = old.clone();
+    let mut warnings = Vec::new();
+
     // Hot-reloadable scalars.
     if let Some(ratio) = body.max_delta_ratio {
         cfg.max_delta_ratio = ratio;
@@ -644,13 +713,10 @@ pub async fn update_config(
         };
     }
     if let Some(ref level_str) = body.log_level {
-        // Validate BEFORE mutating. Writing an unparseable filter into
-        // `cfg.log_level` would persist it to disk; on the next restart
-        // `EnvFilter::parse` fails and the server falls back to a default,
-        // leaving a poisoned config file that silently disagrees with the
-        // runtime. `parse_and_validate_yaml` does the same pre-validation
-        // for the document-level apply path; mirror it here so PATCH and
-        // APPLY agree.
+        // Validate BEFORE mutating: an unparseable filter persisted to disk
+        // makes the next restart fall back to a default, leaving a poisoned
+        // config file. `parse_and_validate_yaml` does the same for the
+        // document apply.
         match level_str.parse::<tracing_subscriber::EnvFilter>() {
             Ok(_) => cfg.log_level = level_str.clone(),
             Err(e) => warnings.push(format!(
@@ -662,7 +728,7 @@ pub async fn update_config(
 
     // Backend-config patch — translate the flattened PATCH fields into a
     // `BackendConfig` mutation on `cfg.backend`.
-    if let Err(msg) = apply_backend_patch(&mut cfg.backend, &body, &mut warnings) {
+    if let Err(msg) = apply_backend_patch(&mut cfg.backend, body, &mut warnings) {
         warnings.push(msg);
     }
 
@@ -677,13 +743,10 @@ pub async fn update_config(
         cfg.cache_size_mb = cache;
     }
 
-    // Bucket policies — normalize names to lowercase before storing,
-    // then expand any per-bucket shorthands (`public: true` →
-    // `public_prefixes: [""]`) so the runtime `PublicPrefixSnapshot`
-    // sees the form it expects. Without this call, a PATCH setting
-    // only `public: true` lands as `public_prefixes: []` and is
-    // silently non-functional — the bucket looks public in the admin
-    // UI but anonymous reads 403.
+    // Bucket policies — names lowercased, then the per-bucket shorthands
+    // expanded (`public: true` → `public_prefixes: [""]`), so the runtime
+    // `PublicPrefixSnapshot` sees the form it expects. The loader's rule: a
+    // policy that does not normalize is refused, never stored with a warning.
     if let Some(ref bucket_policies) = body.bucket_policies {
         let mut new_buckets: std::collections::BTreeMap<
             String,
@@ -692,116 +755,33 @@ pub async fn update_config(
             .iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
             .collect();
-        // The loader's rule: a policy that does not normalize is refused,
-        // never stored with a warning.
-        if let Err(e) = crate::config::normalize_bucket_policies(&mut new_buckets) {
-            *cfg = old_cfg;
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "success": false, "error": e })),
-            )
-                .into_response();
-        }
+        crate::config::normalize_bucket_policies(&mut new_buckets)
+            .map_err(|e| Rejection::new(Stage::Build, axum::http::StatusCode::BAD_REQUEST, e))?;
         cfg.buckets = new_buckets;
     }
 
-    // Operator-authored admission blocks. PATCH replaces the full
-    // list — identical semantics to `bucket_policies` above. Validation
-    // runs through `AdmissionSpec::validate` so duplicate names, bad
-    // reject statuses, unsafe `source_ip_list` sizes, and bad globs
-    // are caught here and surfaced as warnings (same 200-with-warnings
-    // contract the rest of this handler uses).
+    // Operator-authored admission blocks: PATCH replaces the full list. An
+    // invalid list is a warning and the old (valid) chain stays.
     if let Some(ref blocks) = body.admission_blocks {
         let spec = crate::admission::AdmissionSpec {
             blocks: blocks.clone(),
         };
         match spec.validate() {
             Ok(()) => cfg.admission_blocks = blocks.clone(),
-            Err(e) => {
-                warnings.push(format!("admission_blocks: {}", e));
-                // Don't touch runtime state on validation failure —
-                // the operator's next GET must still show the old
-                // (valid) chain.
-            }
+            Err(e) => warnings.push(format!("admission_blocks: {}", e)),
         }
     }
 
-    // IAM source-of-truth selector. Changing this triggers the
-    // `require_not_declarative` middleware to flip its gate on every
-    // subsequent IAM mutation request — `apply_config_transition`
-    // also emits a warn-level audit log line on the transition.
+    // IAM source-of-truth selector: the `require_not_declarative`
+    // middleware reads it on every IAM mutation request.
     if let Some(new_mode) = body.iam_mode {
         cfg.iam_mode = new_mode;
     }
 
-    // ── Run transition side effects ──────────────────────────────────────
-    // Any failure here (a gate, the engine build, the auth decision) means the patch can't
-    // be honored. Roll back the in-memory mutation and surface a warning,
-    // preserving the legacy PATCH contract ("success: true, warnings: [...]")
-    // instead of returning a 5xx like apply_config_doc does.
-    // Env wins consistently: re-apply the `DGP_*` overrides (see
-    // `Config::reapply_env_overrides`); an edit to an env-controlled field
-    // reaches the file only.
-    match super::reapply_env(&old_cfg, &mut cfg, false) {
-        Ok(env_warnings) => warnings.extend(env_warnings),
-        Err(e) => {
-            *cfg = old_cfg;
-            warnings.push(format!(
-                "Failed to apply config patch: {e}. Pre-patch config restored."
-            ));
-            return Json(ConfigUpdateResponse {
-                success: true,
-                warnings,
-                requires_restart: false,
-            })
-            .into_response();
-        }
-    }
-
-    // The transition swaps the patch in itself: put the running config back.
-    let new_cfg = std::mem::replace(&mut *cfg, old_cfg);
-    let ctx = TransitionCtx::Admin {
-        state: &state,
-        headers: &headers,
-    };
-    match apply_config_transition(ctx, &mut cfg, new_cfg).await {
-        Ok(report) => {
-            warnings.extend(report.warnings);
-            let requires_restart = report.requires_restart;
-
-            // Persist AFTER side effects succeed. Persist failure is a
-            // warning, not a rollback — the runtime state is correct;
-            // only the on-disk file is stale.
-            let persist_path = active_config_path(&state);
-            if let Err(e) = cfg.persist_to_file(&persist_path) {
-                warnings.push(format!(
-                    "Failed to persist config to {}: {}",
-                    persist_path, e
-                ));
-            }
-
-            Json(ConfigUpdateResponse {
-                success: true,
-                warnings,
-                requires_restart,
-            })
-            .into_response()
-        }
-        Err(engine_err) => {
-            // The helper changes no runtime state on Err (every fallible step
-            // precedes its first publish), and `*cfg` is the pre-patch config.
-            warnings.push(format!(
-                "Failed to apply config patch: {}. Pre-patch config restored.",
-                engine_err
-            ));
-            Json(ConfigUpdateResponse {
-                success: true,
-                warnings,
-                requires_restart: false,
-            })
-            .into_response()
-        }
-    }
+    Ok(Built {
+        incoming: cfg,
+        warnings,
+    })
 }
 
 /// Translate the flattened backend-field patch (`backend_type`,

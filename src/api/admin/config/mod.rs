@@ -31,6 +31,7 @@ pub mod section_level;
 pub mod trace;
 mod transition;
 mod version;
+mod write;
 #[cfg(test)]
 use transition::engine_affecting_fields_changed;
 use transition::requires_restart_warnings;
@@ -181,8 +182,9 @@ pub(super) fn rebuild_bucket_derived_snapshots(
 /// S7 (review 4 config-2): an admin write may type a `${env:NAME}` that the
 /// boot file resolves into ANY string field (a bucket alias, a rule name);
 /// the value then comes back in check warnings, errors and the section
-/// diff. This is THE scrub for every config write/validate response: each
-/// string leaf gets the recorded values replaced by their refs.
+/// diff. Every config write response scrubs through it (see
+/// [`write::ScrubEnv`]): each string leaf gets the recorded values replaced
+/// by their refs.
 pub(super) fn scrub_env_json(
     v: &mut serde_json::Value,
     refs: &std::collections::BTreeMap<String, String>,
@@ -193,37 +195,6 @@ pub(super) fn scrub_env_json(
         serde_json::Value::Object(map) => map.values_mut().for_each(|x| scrub_env_json(x, refs)),
         _ => {}
     }
-}
-
-/// [`scrub_env_json`] over a finished handler response (JSON, else text),
-/// with `refs` = the running config's env refs before and after the write.
-pub(super) async fn scrub_env_response(
-    resp: axum::response::Response,
-    refs: &std::collections::BTreeMap<String, String>,
-) -> axum::response::Response {
-    let (mut parts, body) = resp.into_parts();
-    let bytes = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(b) => b,
-        Err(_) => return axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    let scrubbed = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(mut v) => {
-            scrub_env_json(&mut v, refs);
-            serde_json::to_vec(&v).unwrap_or_default()
-        }
-        Err(_) => {
-            crate::config::scrub_env_values(&String::from_utf8_lossy(&bytes), refs).into_bytes()
-        }
-    };
-    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-    axum::response::Response::from_parts(parts, axum::body::Body::from(scrubbed))
-}
-
-/// The env refs of the running config: the scrub set of a write response.
-pub(super) async fn running_env_refs(
-    state: &Arc<AdminState>,
-) -> std::collections::BTreeMap<String, String> {
-    state.config.read().await.env_refs.clone()
 }
 
 /// Re-apply the `DGP_*` overrides to an edited config (env wins at runtime,
@@ -316,10 +287,9 @@ pub(crate) fn split_new_warnings(
 
 // === Credential preservation primitives ===
 //
-// The admin API has TWO write paths that update `Config`: the full-document
-// `POST /config/apply` (handled in `document_level.rs`) and the per-section
-// `PUT /config/section/:name` (handled in `section_level.rs`). Both must
-// implement the same contract for runtime-credential preservation:
+// The section PUT and the document apply redact-round-trip secrets, and the
+// write pipeline (`write.rs`) runs ONE preservation step for both
+// ([`preserve_runtime_secrets`]). Its contract:
 //
 //   1. Redacted GET → edit non-secret fields → PUT must NOT silently
 //      clear credentials that were redacted out of the GET response.
@@ -339,8 +309,8 @@ pub(crate) fn split_new_warnings(
 //      removal) drop their credentials silently — we warn so a GitOps
 //      round-trip doesn't lose state without surfacing it.
 //
-// These functions are the single source of truth for that contract.
-// Both write paths MUST call them; do not inline the logic in handlers.
+// These functions are the single source of truth for that contract; do not
+// inline the logic in handlers.
 
 /// Preserve a SigV4-style credential pair from `old` into `new` when both
 /// halves are absent in the incoming doc. If the operator set exactly one
@@ -498,6 +468,42 @@ pub async fn remove_bootstrap_credentials(
         &headers,
     );
     Json(serde_json::json!({ "removed": true, "warnings": warnings })).into_response()
+}
+
+/// Merge the runtime secrets into an incoming (redacted) config: the ONE
+/// preservation step of every section and document write (the write
+/// pipeline calls it). For every secret the GET/export surfaces redact, a
+/// value absent from the body keeps the runtime value; a literal value
+/// rotates it.
+///
+/// Returns the warnings for every case the merge cannot carry creds forward
+/// safely (backend renames, backend-type swaps, asymmetric pairs), so an
+/// operator is never caught by a silent auth loss. `Err` only for an
+/// invalid encryption-key edit.
+pub(super) fn preserve_runtime_secrets(
+    incoming: &mut crate::config::Config,
+    current: &crate::config::Config,
+    probe: &section_level::BackendEncryptionKeyProbe,
+) -> Result<Vec<String>, String> {
+    let mut warnings = Vec::new();
+    // Per-backend AES keys: three-state per field (absent = keep, null =
+    // clear, string = rotate). The probe read the RAW body, because after
+    // the merge absent and null are both `None`. A rebuilt engine with
+    // `key: None` would write plaintext and strand every encrypted object.
+    section_level::preserve_all_backend_encryption(incoming, current, probe)?;
+    preserve_sigv4_pair(
+        &mut incoming.access_key_id,
+        &mut incoming.secret_access_key,
+        &current.access_key_id,
+        &current.secret_access_key,
+        "proxy-level",
+        &mut warnings,
+    );
+    preserve_primary_backend_creds(incoming, current, &mut warnings);
+    preserve_named_backends_creds(incoming, current, &mut warnings);
+    // Webhook header values are masked to REDACTED_SENTINEL on GET/export.
+    preserve_event_delivery_secrets(&mut incoming.event_delivery, &current.event_delivery);
+    Ok(warnings)
 }
 
 /// Preserve unredacted `event_delivery.webhook_headers` values across a section
@@ -1722,7 +1728,12 @@ advanced:
         // running config).
         let yaml = run.to_canonical_yaml_with(&|_| None).unwrap();
         let mut e = Config::from_yaml_str(&yaml).unwrap();
-        super::document_level::preserve_runtime_secrets(&mut e, &run, &yaml).unwrap();
+        super::preserve_runtime_secrets(
+            &mut e,
+            &run,
+            &super::document_level::document_probe(&yaml),
+        )
+        .unwrap();
         assert_no_leak("document apply", &run, e, &env, &check);
 
         // Encryption mode flip away from proxy AES (singleton + named).

@@ -381,7 +381,7 @@ pub(crate) fn sigv4_transition(
 /// True when the transition must run the declarative reconcile: the target
 /// mode is declarative and the IAM fields (or the mode) changed. Shared by
 /// the pre-commit gate and the reconcile so the two cannot disagree.
-fn declarative_reconcile_needed(
+pub(super) fn declarative_reconcile_needed(
     old_cfg: &crate::config::Config,
     new_cfg: &crate::config::Config,
 ) -> bool {
@@ -526,10 +526,9 @@ async fn declarative_iam_precommit_gate(
 ///
 /// Single source of truth for the restart-required fieldset:
 /// [`apply_config_transition`] uses this to emit warnings + set its
-/// `requires_restart` flag, and
-/// [`super::section_level::restart_required_between`] uses the same
-/// predicate for its stateless dry-run. Adding a fifth restart-
-/// required field means editing exactly this function.
+/// `requires_restart` flag, and the write pipeline's dry run uses the same
+/// predicate. Adding a fifth restart-required field means editing exactly
+/// this function.
 pub(super) fn requires_restart_warnings(
     old: &crate::config::Config,
     new: &crate::config::Config,

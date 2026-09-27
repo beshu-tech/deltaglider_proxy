@@ -43,10 +43,12 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::super::{audit_log, AdminState};
-use super::{
-    active_config_path, apply_config_transition, unknown_section_error, SectionName, TransitionCtx,
+use super::super::AdminState;
+use super::write::{
+    self, Built, ConfigWrite, EnvRefs, Mode, Outcome, Rejection, ScrubEnv, Stage, Surface,
+    WriteResult,
 };
+use super::{unknown_section_error, SectionName};
 use crate::config_sections::{AdmissionSection, SectionedConfig};
 
 /// Query params for the section GET endpoint.
@@ -225,19 +227,12 @@ fn emit_section<T: serde::Serialize>(
 /// `PUT /api/admin/config/section/:name` — apply a section partial.
 ///
 /// Body is JSON matching the target section's shape (the same type used
-/// by the YAML serializer — no ad-hoc wrapper). The section replaces its
-/// slice in the in-memory `SectionedConfig`; the rest of the document
-/// stays intact. Transition happens under a single write lock:
-///
-/// 1. Clone the current `Config` into a prospective `new_cfg`.
-/// 2. Deserialize the body into the target section struct.
-/// 3. Replace the one field on a `SectionedConfig::from_flat(&new_cfg)`.
-/// 4. `into_flat()` to collapse back (runs the same `normalize` + admission
-///    validation as the YAML path).
-/// 5. Preserve runtime secrets across the section (exporting redacts, so
-///    a round-trip put would otherwise clear creds).
-/// 6. Hand off to [`apply_config_transition`] for hot-reload side effects.
-/// 7. Persist atomically.
+/// by the YAML serializer — no ad-hoc wrapper), applied as an RFC 7396
+/// merge patch on the running config's section. The handler builds the
+/// incoming config (project → merge → `into_flat`, which runs the YAML
+/// loader's `normalize` + admission validation); the shared write pipeline
+/// ([`super::write`]) does the rest under one write lock: If-Match, secret
+/// preservation, env overrides, checks and gates, transition, persist.
 ///
 /// The result's `diff` field shows exactly what changed relative to the
 /// pre-PUT state so the Apply dialog can display it.
@@ -247,532 +242,166 @@ pub async fn put_section(
     headers: HeaderMap,
     body: AdminJson<serde_json::Value>,
 ) -> impl IntoResponse {
-    let mut refs = super::running_env_refs(&state).await;
-    let resp = apply_section(
-        state.clone(),
-        name,
-        body.0,
-        ApplyMode::PersistAndApply,
-        Some(headers),
-    )
-    .await;
-    refs.extend(super::running_env_refs(&state).await);
-    super::scrub_env_response(resp, &refs).await
+    section_write(&state, &name, &body.0, Mode::Apply, Some(&headers)).await
 }
 
 /// `POST /api/admin/config/section/:name/validate` — dry-run a section apply.
 ///
-/// Same inputs as PUT, but no state change and no persist. Returns
-/// `ok`, the computed diff, and warnings. The UI calls this when the
-/// operator presses Apply: the diff is rendered in the confirmation
-/// modal (§5.3), and a second click on "Apply and Persist" fires the
-/// real PUT. Keeping validate in the same module as PUT makes the
-/// "validate-then-apply" contract structurally obvious.
+/// Same inputs and the same pipeline steps as PUT, but no state change and
+/// no persist. Returns `ok`, the computed diff, and warnings. The UI calls
+/// this when the operator presses Apply: the diff is rendered in the
+/// confirmation modal, and a second click fires the real PUT.
 pub async fn validate_section(
     State(state): State<Arc<AdminState>>,
     Path(name): Path<String>,
     body: AdminJson<serde_json::Value>,
 ) -> impl IntoResponse {
-    let refs = super::running_env_refs(&state).await;
-    let resp = apply_section(state, name, body.0, ApplyMode::DryRun, None).await;
-    super::scrub_env_response(resp, &refs).await
+    section_write(&state, &name, &body.0, Mode::DryRun, None).await
 }
 
-/// Whether a section operation should mutate + persist, or only report
-/// the would-be result.
-enum ApplyMode {
-    DryRun,
-    PersistAndApply,
+/// Shared body of PUT + validate: build the incoming config, run the write
+/// pipeline, shape the response.
+async fn section_write(
+    state: &Arc<AdminState>,
+    name: &str,
+    body: &serde_json::Value,
+    mode: Mode,
+    headers: Option<&HeaderMap>,
+) -> Response {
+    let Some(section) = SectionName::parse(name) else {
+        return reject(StatusCode::NOT_FOUND, unknown_section_error(name));
+    };
+    let no_env = EnvRefs::new();
+    let write = ConfigWrite {
+        surface: Surface::Section { section, body },
+        mode,
+        headers,
+        extra_env: &no_env,
+    };
+    let result = write::run(state, write, |old| {
+        let invalid = |e: String| Rejection::new(Stage::Build, StatusCode::BAD_REQUEST, e);
+        // Project → replace one slice → collapse back. The body is "the new
+        // non-secret state of this section"; the pipeline merges secrets.
+        let mut sectioned = SectionedConfig::from_flat(old);
+        merge_patch_section(&mut sectioned, section, body).map_err(invalid)?;
+        let incoming = sectioned.into_flat().map_err(invalid)?;
+        Ok(Built {
+            incoming,
+            warnings: Vec::new(),
+        })
+    })
+    .await;
+    shape_section(section, result)
 }
 
-/// Shared implementation of PUT + validate. The only difference is
-/// whether to mutate state and persist at the end — every parse,
-/// validate, diff, and transition step runs identically so the two
-/// surfaces can't drift.
-async fn apply_section(
-    state: Arc<AdminState>,
-    name: String,
-    body: serde_json::Value,
-    mode: ApplyMode,
-    headers: Option<HeaderMap>,
-) -> axum::response::Response {
-    let Some(section) = SectionName::parse(&name) else {
-        return reject(StatusCode::NOT_FOUND, unknown_section_error(&name));
-    };
-
-    // Take the write lock once for the whole transition — the same
-    // lock-scope discipline as `apply_config_doc`, so a racing PATCH
-    // can't sneak between our compare and swap.
-    let mut cfg = state.config.write().await;
-    let old_cfg = cfg.clone();
-
-    // Optimistic concurrency: a PUT based on an older version of this
-    // section (another tab or admin changed it since) is refused. Checked
-    // under the write lock, so no write can land between check and swap.
-    if matches!(mode, ApplyMode::PersistAndApply) {
-        let current = super::version::config_version(&old_cfg, Some(section));
-        if headers
-            .as_ref()
-            .is_some_and(|h| super::version::if_match_conflicts(h, &current))
-        {
-            return super::version::conflict(&current, &format!("'{}' section", section.as_str()));
+/// The section PUT / validate body of a write outcome.
+fn shape_section(section: SectionName, result: WriteResult) -> Response {
+    let WriteResult { outcome, refs } = result;
+    match outcome {
+        Outcome::Conflict { current } => {
+            super::version::conflict(&current, &format!("'{}' section", section.as_str()))
         }
-    }
-
-    // Project current config → sectioned shape → replace one slice →
-    // collapse back. The replacement does NOT touch secrets on the
-    // current config (we merge them back after); the operator's body
-    // is treated as "the new non-secret state of this section".
-    let mut sectioned = SectionedConfig::from_flat(&old_cfg);
-    if let Err(err) = merge_patch_section(&mut sectioned, section, &body) {
-        return reject(StatusCode::BAD_REQUEST, err);
-    }
-
-    // Collapse back to flat. This runs the same `storage.normalize()`
-    // and `AdmissionSpec::validate()` the YAML loader runs — structural
-    // errors in the body surface here with the same messages the YAML
-    // view would show.
-    let mut new_cfg = match sectioned.into_flat() {
-        Ok(c) => c,
-        Err(err) => return reject(StatusCode::BAD_REQUEST, err),
-    };
-
-    // Defense-in-depth: refuse explicit bootstrap_password_hash
-    // changes through the section API, mirroring the document-level
-    // `apply_config_doc` guard (cfg.rs `document_level.rs:463-476`).
-    // The legitimate path is `PUT /api/admin/password`, which
-    // verifies the current password. Accepting an arbitrary hash here would let an
-    // admin-session holder lock future admins out of the GUI.
-    //
-    // MUST run BEFORE the unconditional `new_cfg.bootstrap_password_hash
-    // = old_cfg...` overwrite below — otherwise an attacker-supplied
-    // hash would be silently clobbered by the overwrite and the
-    // security model's contract would depend on an implementation
-    // detail (the ordering) rather than an explicit check.
-    if new_cfg.bootstrap_password_hash != old_cfg.bootstrap_password_hash {
-        return reject(
-            StatusCode::FORBIDDEN,
-            "bootstrap_password_hash cannot be changed via /config/section; use PUT /api/admin/password (verifies the current password)",
-        );
-    }
-
-    // Preserve runtime secrets across the section edit. The GET
-    // surfaces (export, section GET) redact every secret; a naïve
-    // round-trip (GET → edit → PUT) would therefore post None for
-    // every creds pair. We mirror the document-level apply's
-    // "preserve when None on the incoming side" semantics so section
-    // round-trips don't silently clear authentication state.
-    //
-    // Infra secrets — preservation rules differ:
-    //
-    // bootstrap_password_hash: ALWAYS preserved via this path. It
-    // has its own dedicated rotation endpoint (PUT /api/admin/password)
-    // that verifies the current password. The explicit equality guard above ensures we
-    // only reach this line when incoming == old, so this is
-    // effectively a defensive no-op for that field.
-    new_cfg.bootstrap_password_hash = old_cfg.bootstrap_password_hash.clone();
-
-    // Carry env-ref provenance through the rebuild (into_flat starts from a
-    // default), then resolve any full-scalar `${env:NAME}` strings in the
-    // incoming section. Section GETs emit refs for ref-sourced secrets, so a
-    // GUI round-trip echoes them back — resolving here (provenance → ref
-    // default; never the server env, S7) keeps the real secret AND lets operators type refs
-    // into GUI fields. An unresolvable ref fails the PUT loudly.
-    new_cfg.env_refs = old_cfg.env_refs.clone();
-    if let Err(e) = new_cfg.resolve_env_ref_scalars() {
-        return reject(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "env reference in section body did not resolve: {e}. Only names the boot \
-                 config uses, or names listed in {}, resolve.",
-                crate::config::CONFIG_ENV_ALLOWLIST_VAR
-            )
-            .as_str(),
-        );
-    }
-
-    // STEP-1: cred preservation. Uses the SAME shared helpers as
-    // `apply_config_doc` (see `super::preserve_sigv4_pair`,
-    // `preserve_primary_backend_creds`, `preserve_named_backends_creds`
-    // in `mod.rs`). Both write paths MUST stay in lockstep on the
-    // contract: redaction-round-trip safe, asymmetric SigV4 refuses
-    // to cross-wire (warns instead), backend type-flips and
-    // rename/removed-backends emit warnings.
-    //
-    // The encryption-key three-state semantics for the singleton +
-    // per-backend `encryption` fields run separately below (Step 6)
-    // because they need the raw JSON body to distinguish "absent"
-    // from "explicit null" — that distinction is lost after the
-    // merge-patch + collapse.
-    let mut cred_warnings: Vec<String> = Vec::new();
-    super::preserve_sigv4_pair(
-        &mut new_cfg.access_key_id,
-        &mut new_cfg.secret_access_key,
-        &old_cfg.access_key_id,
-        &old_cfg.secret_access_key,
-        "proxy-level",
-        &mut cred_warnings,
-    );
-    super::preserve_primary_backend_creds(&mut new_cfg, &old_cfg, &mut cred_warnings);
-    super::preserve_named_backends_creds(&mut new_cfg, &old_cfg, &mut cred_warnings);
-
-    // Step 6: per-backend encryption key preservation. Three-state
-    // semantics PER FIELD PER ENTRY:
-    //   * key field absent in body  → preserve old key (default
-    //     GET→edit→PUT round-trip safety).
-    //   * key field present and null → explicit clear (operator
-    //     clicked "Disable encryption" on this backend).
-    //   * key field present and string → validate hex + rotate.
-    //
-    // Same three-state logic applies to `legacy_key` on each mode.
-    //
-    // We walk the RAW body JSON to distinguish absent from null;
-    // after merge-patch the two both deserialise to None. The
-    // sectioned body shape places this at
-    // `storage.backend_encryption.key` and
-    // `storage.backends[i].encryption.key` (matched by backend
-    // name, not by list index — operators may reorder the list).
-    let body_probe = BackendEncryptionKeyProbe::from_section(section, &body);
-    if let Err(e) = preserve_all_backend_encryption(&mut new_cfg, &old_cfg, &body_probe) {
-        return reject(StatusCode::BAD_REQUEST, e);
-    }
-
-    // Webhook header values are masked to REDACTED_SENTINEL on GET; restore any
-    // the operator left untouched so an unedited round-trip doesn't clobber the
-    // real bearer token. (Headers the operator retyped or removed pass through.)
-    super::preserve_event_delivery_secrets(&mut new_cfg.event_delivery, &old_cfg.event_delivery);
-
-    // Env wins consistently: re-apply the `DGP_*` overrides so an edit to an
-    // env-controlled field does not take effect at runtime until the next
-    // restart undoes it. The edit (if any) is kept for the file only.
-    let env_warnings = match super::reapply_env(&old_cfg, &mut new_cfg, false) {
-        Ok(w) => w,
-        Err(e) => return reject(StatusCode::INTERNAL_SERVER_ERROR, e.as_str()),
-    };
-
-    // The `removed_warnings` name is preserved here for readability of the
-    // downstream call sites that thread it into `SectionApplyResponse`.
-    // It now carries the FULL cred-preservation warning bag
-    // (asymmetric SigV4, type-flips, renamed/removed backends) emitted
-    // by the shared helpers above — same warning surface the
-    // document-level apply path produces for equivalent edits.
-    let removed_warnings: Vec<String> = cred_warnings.into_iter().chain(env_warnings).collect();
-
-    // Y1: normalise shorthand forms (bucket `public: true`, storage
-    // `s3:`/`filesystem:` — anything `Config::normalize_shorthands`
-    // covers). The YAML loader runs this right after from_yaml_str;
-    // the section PUT needs the same pass so a `public: true`
-    // shorthand actually expands to `public_prefixes: [""]` before
-    // `rebuild_bucket_derived_snapshots` walks the buckets.
-    if let Err(e) = new_cfg.normalize_shorthands() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(SectionApplyResponse {
-                ok: false,
-                existing_warnings: Vec::new(),
-                warnings: removed_warnings,
-                requires_restart: false,
-                persisted_path: None,
-                error: Some(format!("{}", e)),
-                diff: None,
-            }),
-        )
-            .into_response();
-    }
-
-    // Validate semantically via `Config::check_all` (the same fatal gate
-    // and warnings pipeline the document-level apply runs), so a dry-run
-    // cannot pass a section the real apply refuses.
-    let warnings_from_check = match new_cfg.check_all() {
-        Ok(w) => w,
-        Err(fatal) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(SectionApplyResponse {
-                    ok: false,
-                    existing_warnings: Vec::new(),
-                    warnings: removed_warnings,
-                    requires_restart: false,
-                    persisted_path: None,
-                    error: Some(format!("config refused: {}", fatal.join("; "))),
-                    diff: None,
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    // Split the check warnings: the current config's own warnings are
-    // "existing", only the rest are this change's (issue #92). A current
-    // config that fails its own fatal gate has no baseline → all new.
-    let before_warnings = old_cfg.clone().check_all().unwrap_or_default();
-    let (warnings_from_check, mut existing_warnings) =
-        super::split_new_warnings(&before_warnings, warnings_from_check);
-
-    // Lifecycle gate — the SAME changed-only gate the document-level apply runs.
-    // The GUI's Jobs/Storage editor saves through THIS section path, so without
-    // it a delete rule missing `expire_after` (or a dup rule name, empty
-    // transition dest, …) was accepted as a mere warning and then failed every
-    // scheduler tick. Errors on UNCHANGED lifecycle content downgrade to
-    // warnings so a pre-existing bad rule can't block unrelated config edits.
-    match crate::lifecycle::planner::lifecycle_gate(&old_cfg.lifecycle, &new_cfg.lifecycle) {
-        Ok(lifecycle_warnings) => {
-            if !lifecycle_warnings.is_empty() {
-                tracing::warn!(
-                    "section apply: pre-existing invalid lifecycle config left unchanged: {}",
-                    lifecycle_warnings.join("; ")
-                );
-                // Errors on UNCHANGED lifecycle content — standing, not new.
-                existing_warnings.extend(lifecycle_warnings);
-            }
-        }
-        Err(lifecycle_errors) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(SectionApplyResponse {
-                    ok: false,
-                    existing_warnings: Vec::new(),
-                    warnings: removed_warnings,
-                    requires_restart: false,
-                    persisted_path: None,
-                    error: Some(lifecycle_errors.join("; ")),
-                    diff: None,
-                }),
-            )
-                .into_response();
-        }
-    }
-
-    // Same changed-only fatal gate for duplicate replication rule names (#13):
-    // state/cursor/lease are keyed by name, so dups corrupt each other's cursor.
-    if let Err(errs) =
-        crate::config_sections::replication_gate(&old_cfg.replication, &new_cfg.replication)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(SectionApplyResponse {
-                ok: false,
-                existing_warnings: Vec::new(),
-                warnings: removed_warnings,
-                requires_restart: false,
-                persisted_path: None,
-                error: Some(errs.join("; ")),
-                diff: None,
-            }),
-        )
-            .into_response();
-    }
-
-    // Compute the diff before we potentially swap. This is the shape
-    // the UI renders in the Apply dialog.
-    let diff = compute_section_diff(section, &old_cfg, &new_cfg);
-
-    // Compute `requires_restart` from the old vs. new config directly
-    // (no state mutation). The same fields
-    // [`apply_config_transition`] checks — `listen_addr`,
-    // `cache_size_mb` — are compared here without touching the
-    // runtime. Dry-run stays stateless.
-    let requires_restart = restart_required_between(&old_cfg, &new_cfg);
-
-    // Dry-run: no state mutation, no engine rebuild. The apply dialog
-    // gets the diff + warnings_from_check + restart-required flag so
-    // the operator can review before confirming. Engine-rebuild
-    // failures (e.g. bad S3 endpoint) are only surfaced on the real
-    // PUT — the risk of making dry-run briefly flip the runtime to
-    // the proposed state (which admission_chain / engine / iam_state
-    // are all ArcSwap-observed, i.e. concurrent request-serving code
-    // can see the flip) is not worth catching engine errors earlier
-    // than they happen in PUT anyway.
-    if matches!(mode, ApplyMode::DryRun) {
-        // Declarative-IAM preview: when the target mode would be
-        // Declarative AND the IAM fields have changed, compute the
-        // would-be reconcile diff (validation-only, zero DB writes)
-        // and surface the summary line in warnings so the Apply
-        // dialog shows what the live apply would actually do. This
-        // is the same `diff_iam` the live apply uses, so the preview
-        // can't lie.
-        let mut preview_warnings: Vec<String> = Vec::new();
-        if matches!(
-            new_cfg.iam_mode,
-            crate::config_sections::IamMode::Declarative
-        ) {
-            let old_iam_unchanged = matches!(
-                old_cfg.iam_mode,
-                crate::config_sections::IamMode::Declarative
-            ) && old_cfg.iam_users == new_cfg.iam_users
-                && old_cfg.iam_groups == new_cfg.iam_groups
-                && old_cfg.auth_providers == new_cfg.auth_providers
-                && old_cfg.group_mapping_rules == new_cfg.group_mapping_rules;
-
-            if !old_iam_unchanged {
-                let yaml_snapshot = crate::iam::snapshot_from_access(
-                    &new_cfg.iam_users,
-                    &new_cfg.iam_groups,
-                    &new_cfg.auth_providers,
-                    &new_cfg.group_mapping_rules,
-                    &[],
-                );
-                // Empty-gate preview: the live apply would refuse
-                // this, so surface it at dry-run time too.
-                if matches!(old_cfg.iam_mode, crate::config_sections::IamMode::Gui)
-                    && yaml_snapshot.is_empty()
-                {
-                    preview_warnings.push(
-                        "declarative IAM preview: flip to declarative mode with empty iam_users / \
-                         iam_groups would be REFUSED by the live apply (would wipe the DB). \
-                         Add IAM content to the YAML first."
-                            .to_string(),
-                    );
-                } else if let Some(db_arc) = state.config_db.as_ref() {
-                    let db = db_arc.lock().await;
-                    match crate::iam::preview_declarative_iam(&db, &yaml_snapshot) {
-                        Ok(iam_diff) if iam_diff.is_empty() => {
-                            preview_warnings.push(
-                                "declarative IAM preview: no IAM changes (idempotent apply)"
-                                    .to_string(),
-                            );
-                        }
-                        Ok(iam_diff) => {
-                            preview_warnings.push(format!(
-                                "declarative IAM preview: {}",
-                                iam_diff.summary_line()
-                            ));
-                        }
-                        Err(e) => {
-                            preview_warnings.push(format!(
-                                "declarative IAM preview REJECTED at validation (live apply \
-                                 would return this error verbatim): {}",
-                                e
-                            ));
-                        }
-                    }
+        Outcome::Rejected(r) => {
+            let w = *r.warnings;
+            let (error, warnings, existing, diff) = match r.stage {
+                Stage::Transition => (
+                    format!(
+                        "Failed to apply section '{}' (no state changed): {}",
+                        section.as_str(),
+                        r.error
+                    ),
+                    [w.preserve, w.env, w.check_new].concat(),
+                    w.existing,
+                    r.diff,
+                ),
+                // The secret-preservation and env warnings ride along.
+                Stage::Normalize | Stage::Check | Stage::Gate => {
+                    (r.error, [w.preserve, w.env].concat(), Vec::new(), None)
                 }
-            }
+                _ => (r.error, Vec::new(), Vec::new(), None),
+            };
+            let body = SectionApplyResponse {
+                ok: false,
+                warnings,
+                existing_warnings: existing,
+                requires_restart: false,
+                persisted_path: None,
+                error: Some(error),
+                diff,
+            };
+            write::respond(r.status, body, &refs, None)
         }
-
-        return (
-            StatusCode::OK,
-            Json(SectionApplyResponse {
+        Outcome::Validated {
+            warnings: w,
+            requires_restart,
+            diff,
+        } => {
+            let body = SectionApplyResponse {
                 ok: true,
-                existing_warnings,
-                warnings: removed_warnings
-                    .clone()
-                    .into_iter()
-                    .chain(warnings_from_check)
-                    .chain(preview_warnings)
-                    .collect(),
+                warnings: [w.preserve, w.env, w.check_new, w.preview].concat(),
+                existing_warnings: w.existing,
                 requires_restart,
                 persisted_path: None,
                 error: None,
-                diff: Some(diff),
-            }),
-        )
-            .into_response();
-    }
-
-    // PersistAndApply: run the full transition (engine rebuild + log
-    // reload + IAM swap + snapshot rebuilds). On failure we return
-    // UNPROCESSABLE_ENTITY — caller fixes and re-applies.
-    // Only the dry run has no headers, and it never gets here.
-    let no_headers = HeaderMap::default();
-    let ctx = TransitionCtx::Admin {
-        state: &state,
-        headers: headers.as_ref().unwrap_or(&no_headers),
-    };
-    let (transition_warnings, transition_restart) =
-        match apply_config_transition(ctx, &mut cfg, new_cfg).await {
-            Ok(report) => (report.warnings, report.requires_restart),
-            Err(e) => {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(SectionApplyResponse {
-                        ok: false,
-                        existing_warnings,
-                        warnings: removed_warnings
-                            .into_iter()
-                            .chain(warnings_from_check)
-                            .collect(),
-                        requires_restart: false,
-                        persisted_path: None,
-                        error: Some(format!(
-                            "Failed to apply section '{}' (no state changed): {}",
-                            section.as_str(),
-                            e
-                        )),
-                        diff: Some(diff),
-                    }),
-                )
-                    .into_response();
-            }
-        };
-
-    // Transition's `requires_restart` is authoritative for the PUT
-    // response (it's the same value the field-level PATCH and
-    // document-level APPLY return). Our earlier `requires_restart`
-    // from `restart_required_between` was only for the dry-run path;
-    // it should match what the transition just returned but we always
-    // defer to the transition's computation here.
-    debug_assert_eq!(
-        requires_restart, transition_restart,
-        "dry-run's restart_required_between must agree with apply_config_transition"
-    );
-    let requires_restart = transition_restart;
-
-    // The transition swapped the config in; persist it.
-    let new_version = super::version::config_version(&cfg, Some(section));
-
-    let persist_path = active_config_path(&state);
-    // The `persisted: bool` is folded into `status` + `persist_warning`
-    // below — we don't expose it separately on `SectionApplyResponse` the
-    // way the document-level `ConfigApplyResponse` does. Callers infer
-    // the persist outcome from the HTTP status (200 vs. 500) and the
-    // warning text if any.
-    let (persisted_path, status, persist_warning) = match cfg.persist_to_file(&persist_path) {
-        Ok(()) => (Some(persist_path.clone()), StatusCode::OK, None),
-        Err(e) => (
-            None,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Some(format!(
-                "Applied section '{}' in memory but FAILED to persist to {}: {}. Server will revert on next restart — fix the IO and re-apply.",
-                section.as_str(),
-                persist_path,
-                e
-            )),
-        ),
-    };
-
-    if let Some(h) = headers {
-        audit_log(
-            &format!("apply_config_section:{}", section.as_str()),
-            "admin",
-            &persist_path,
-            &h,
-        );
-    }
-
-    let warnings: Vec<String> = removed_warnings
-        .into_iter()
-        .chain(warnings_from_check)
-        .chain(transition_warnings)
-        .chain(persist_warning)
-        .collect();
-
-    let mut resp = (
-        status,
-        Json(SectionApplyResponse {
-            ok: true,
-            existing_warnings,
-            warnings,
+                diff,
+            };
+            write::respond(StatusCode::OK, body, &refs, None)
+        }
+        Outcome::Applied {
+            warnings: w,
             requires_restart,
-            persisted_path,
-            error: None,
-            diff: Some(diff),
-        }),
-    )
-        .into_response();
-    resp.headers_mut()
-        .insert(axum::http::header::ETAG, super::version::etag(&new_version));
-    resp
+            diff,
+            persist,
+            version,
+        } => {
+            // The persist outcome is the HTTP status (200 vs. 500) plus the
+            // warning text; there is no separate `persisted` field here.
+            let (persisted_path, status, persist_warning) = match persist {
+                Ok(path) => (Some(path), StatusCode::OK, None),
+                Err((path, e)) => (
+                    None,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Some(format!(
+                        "Applied section '{}' in memory but FAILED to persist to {}: {}. Server \
+                         will revert on next restart — fix the IO and re-apply.",
+                        section.as_str(),
+                        path,
+                        e
+                    )),
+                ),
+            };
+            let body = SectionApplyResponse {
+                ok: true,
+                warnings: [w.preserve, w.env, w.check_new, w.transition]
+                    .concat()
+                    .into_iter()
+                    .chain(persist_warning)
+                    .collect(),
+                existing_warnings: w.existing,
+                requires_restart,
+                persisted_path,
+                error: None,
+                diff,
+            };
+            let etag = super::version::etag(&version);
+            write::respond(status, body, &refs, Some(etag))
+        }
+    }
+}
+
+impl ScrubEnv for SectionApplyResponse {
+    fn scrub_env(&mut self, refs: &EnvRefs) {
+        write::scrub_strings(
+            self.warnings
+                .iter_mut()
+                .chain(&mut self.existing_warnings)
+                .chain(&mut self.error),
+            refs,
+        );
+        if let Some(diff) = self.diff.as_mut() {
+            diff.scrub_env(refs);
+        }
+    }
 }
 
 /// Apply a JSON-Merge-Patch (RFC 7396) body on top of one section of
@@ -1028,7 +657,7 @@ fn fingerprint_secrets_for_diff(cfg: &crate::config::Config) -> crate::config::C
     out
 }
 
-fn compute_section_diff(
+pub(super) fn compute_section_diff(
     section: SectionName,
     old_cfg: &crate::config::Config,
     new_cfg: &crate::config::Config,
@@ -1397,20 +1026,6 @@ fn set_legacy_key_id(enc: &mut crate::config::BackendEncryptionConfig, id: Optio
         | E::SseKms { legacy_key_id, .. }
         | E::SseS3 { legacy_key_id, .. } => *legacy_key_id = id,
     }
-}
-
-/// Non-mutating predicate: would applying `new` on top of `old` require
-/// a server restart to take effect?
-///
-/// Delegates to [`super::requires_restart_warnings`] so the section-
-/// level dry-run and the runtime [`apply_config_transition`] cannot
-/// drift on what counts as restart-required. Keeping this wrapper
-/// named `restart_required_between` preserves the local call sites'
-/// predicate shape (`bool`, not `Vec<String>`) — the dry-run doesn't
-/// care about the per-field warning text, only whether ANY field
-/// needs a restart.
-fn restart_required_between(old: &crate::config::Config, new: &crate::config::Config) -> bool {
-    !super::requires_restart_warnings(old, new).is_empty()
 }
 
 /// Recursively diff two JSON values. Leaves surface as

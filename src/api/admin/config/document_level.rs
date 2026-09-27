@@ -13,9 +13,9 @@
 //!   canonical YAML form, all secrets stripped, for copy-paste into a
 //!   GitOps repo.
 //!
-//! The sibling `parse_and_validate_yaml`, `preserve_runtime_secrets`, and
-//! `preserve_sigv4_pair` helpers live here too — they are private details
-//! of this flow and have no callers outside it.
+//! The validate and apply handlers feed the shared write pipeline
+//! ([`super::write`]); this file owns the document parse
+//! (`parse_and_validate_yaml`) and the response shapes.
 
 use crate::api::admin::extract::{AdminJson, AdminQuery};
 use axum::extract::State;
@@ -26,9 +26,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::super::{audit_log, AdminState};
-use super::{
-    active_config_path, apply_config_transition, unknown_section_error, SectionName, TransitionCtx,
+use super::write::{
+    self, Built, ConfigWrite, EnvRefs, Mode, Outcome, Rejection, ScrubEnv, Stage, Surface,
+    WriteResult,
 };
+use super::{unknown_section_error, SectionName};
+use axum::response::Response;
 
 //
 // These endpoints serve the GitOps persona and the GUI "Copy as YAML" flow.
@@ -322,223 +325,84 @@ fn parse_and_validate_yaml(
 
 /// `POST /api/admin/config/validate` — dry-run.
 ///
-/// Parses the YAML body, runs validation, and reports warnings or errors.
-/// No runtime state is mutated. Used by CI (`dgpctl config lint` in Phase 4)
-/// and by the admin GUI's pre-apply confirmation modal.
+/// Parses the YAML body, runs the write pipeline's validation steps, and
+/// reports warnings or errors. No runtime state is mutated. Used by CI and
+/// by the admin GUI's pre-apply confirmation modal.
 pub async fn validate_config_doc(
     State(state): State<Arc<AdminState>>,
     AdminJson(body): AdminJson<ConfigDocumentRequest>,
 ) -> impl IntoResponse {
-    let refs = super::running_env_refs(&state).await;
-    let resp = validate_config_doc_inner(&state, body)
-        .await
-        .into_response();
-    super::scrub_env_response(resp, &refs).await
+    let known = state.config.read().await.env_refs.clone();
+    let result = match parse_and_validate_yaml(&body.yaml, &known) {
+        Err(err) => WriteResult {
+            outcome: Outcome::Rejected(Rejection::new(Stage::Build, StatusCode::BAD_REQUEST, err)),
+            refs: known,
+        },
+        Ok((incoming, _)) => {
+            let no_env = EnvRefs::new();
+            let write = ConfigWrite {
+                surface: Surface::Document { yaml: &body.yaml },
+                mode: Mode::DryRun,
+                headers: None,
+                extra_env: &no_env,
+            };
+            let built = Built {
+                incoming,
+                warnings: Vec::new(),
+            };
+            write::run(&state, write, |_| Ok(built)).await
+        }
+    };
+    shape_validate(result)
 }
 
-async fn validate_config_doc_inner(
-    state: &Arc<AdminState>,
-    body: ConfigDocumentRequest,
-) -> impl IntoResponse {
-    let current = state.config.read().await.clone();
-    match parse_and_validate_yaml(&body.yaml, &current.env_refs) {
-        Ok((mut cfg, _)) => {
-            // Same changed-only gate as apply, so validate can't pass a doc
-            // apply would reject (or vice versa for unchanged-invalid rules).
-            // Validate the SAME view apply runs: runtime secrets preserved,
-            // env overrides re-applied (a dry run must not differ from apply).
-            let mut side_warnings = match preserve_runtime_secrets(&mut cfg, &current, &body.yaml) {
-                Ok(w) => w,
-                Err(e) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ConfigValidateResponse {
-                            existing_warnings: Vec::new(),
-                            ok: false,
-                            warnings: vec![],
-                            error: Some(e),
-                        }),
-                    );
-                }
+/// The `/config/validate` body of a write outcome.
+fn shape_validate(result: WriteResult) -> Response {
+    let WriteResult { outcome, refs } = result;
+    let refused = |status, error| {
+        let body = ConfigValidateResponse {
+            ok: false,
+            warnings: Vec::new(),
+            existing_warnings: Vec::new(),
+            error: Some(error),
+        };
+        write::respond(status, body, &refs, None)
+    };
+    match outcome {
+        Outcome::Rejected(r) => refused(r.status, r.error),
+        Outcome::Validated { warnings: w, .. } => {
+            let body = ConfigValidateResponse {
+                ok: true,
+                warnings: [w.check_new, w.preserve, w.env].concat(),
+                existing_warnings: w.existing,
+                error: None,
             };
-            match super::reapply_env(&current, &mut cfg, true) {
-                Ok(w) => side_warnings.extend(w),
-                Err(e) => {
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ConfigValidateResponse {
-                            existing_warnings: Vec::new(),
-                            ok: false,
-                            warnings: vec![],
-                            error: Some(e),
-                        }),
-                    );
-                }
-            }
-            let warnings = match cfg.clone().check_all() {
-                Ok(w) => w,
-                Err(fatal) => {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ConfigValidateResponse {
-                            existing_warnings: Vec::new(),
-                            ok: false,
-                            warnings: vec![],
-                            error: Some(format!("config refused: {}", fatal.join("; "))),
-                        }),
-                    );
-                }
-            };
-            // Errors on UNCHANGED lifecycle content are standing, not new.
-            let standing_lifecycle =
-                match crate::lifecycle::planner::lifecycle_gate(&current.lifecycle, &cfg.lifecycle)
-                {
-                    Ok(lifecycle_warnings) => lifecycle_warnings,
-                    Err(errs) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(ConfigValidateResponse {
-                                existing_warnings: Vec::new(),
-                                ok: false,
-                                warnings: vec![],
-                                error: Some(errs.join("; ")),
-                            }),
-                        );
-                    }
-                };
-            if let Err(errs) =
-                crate::config_sections::replication_gate(&current.replication, &cfg.replication)
-            {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ConfigValidateResponse {
-                        existing_warnings: Vec::new(),
-                        ok: false,
-                        warnings: vec![],
-                        error: Some(errs.join("; ")),
-                    }),
-                );
-            }
-            // Only this document's own warnings are "new"; standing ones
-            // the running config already has are reported apart (#92).
-            let before = current.clone().check_all().unwrap_or_default();
-            let (mut warnings, mut existing_warnings) =
-                super::split_new_warnings(&before, warnings);
-            warnings.extend(side_warnings);
-            existing_warnings.extend(standing_lifecycle);
-            (
-                StatusCode::OK,
-                Json(ConfigValidateResponse {
-                    existing_warnings,
-                    ok: true,
-                    warnings,
-                    error: None,
-                }),
-            )
+            write::respond(StatusCode::OK, body, &refs, None)
         }
-        Err(err) => (
-            StatusCode::BAD_REQUEST,
-            Json(ConfigValidateResponse {
-                existing_warnings: Vec::new(),
-                ok: false,
-                warnings: vec![],
-                error: Some(err),
-            }),
+        // A dry run neither checks a version nor applies.
+        Outcome::Conflict { .. } | Outcome::Applied { .. } => refused(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal: a dry run applied".to_string(),
         ),
     }
 }
 
-/// Merge runtime secrets into an incoming (redacted) Config and report any
-/// credential transitions that would silently drop live creds.
-///
-/// When the exported YAML is POSTed back via `apply`, its secret fields are
-/// all None (export redacts them). We don't want apply to silently clear
-/// credentials — the expected GitOps flow is "edit the non-secret fields,
-/// leave secrets to the runtime". So for every secret that's None in the
-/// incoming doc, we copy the current runtime value across.
-///
-/// Operators who actually want to rotate a secret via YAML set it to a
-/// literal value (for infra-secret rotation from a secret manager that
-/// substitutes into the YAML pre-apply).
-///
-/// Returns a list of warnings covering every case where the merge cannot
-/// carry creds forward safely — backend renames, backend-type swaps, and
-/// asymmetric credential pairs. The caller surfaces these in the apply
-/// response so operators are never caught by a silent auth-loss.
-pub(super) fn preserve_runtime_secrets(
-    incoming: &mut crate::config::Config,
-    current: &crate::config::Config,
-    raw_yaml: &str,
-) -> Result<Vec<String>, String> {
-    let mut warnings = Vec::new();
-
-    // Per-backend AES encryption keys are masked to None on export
-    // (redact_for_export). A full-document export→edit→apply round-trip must
-    // preserve them exactly as the section-PUT path does — otherwise the
-    // rebuilt engine gets `key: None`, writes plaintext, and every historical
-    // object encrypted with the now-gone key becomes unreadable. This is the
-    // same class as the OAuth/SigV4 preservation above, on the doc write path
-    // the original fix missed. The probe distinguishes absent (preserve) from
-    // explicit-null (operator disabling encryption); a redacted export always
-    // yields absent, so the common case preserves.
-    let storage_body = serde_yaml::from_str::<serde_json::Value>(raw_yaml)
+/// The encryption-key presence probe of a document's `storage:` block: the
+/// preservation step must tell an absent `key:` (keep) from `key: null`
+/// (disable), which the parsed config cannot.
+pub(super) fn document_probe(yaml: &str) -> super::section_level::BackendEncryptionKeyProbe {
+    let storage = serde_yaml::from_str::<serde_json::Value>(yaml)
         .ok()
         .and_then(|v| v.get("storage").cloned())
         .unwrap_or(serde_json::Value::Null);
-    let probe = super::section_level::BackendEncryptionKeyProbe::from_section(
-        super::SectionName::Storage,
-        &storage_body,
-    );
-    super::section_level::preserve_all_backend_encryption(incoming, current, &probe)?;
-
-    // Top-level infra secrets. The bootstrap hash is the only
-    // top-level infra secret left after the per-backend encryption
-    // refactor — per-backend keys live on `backend_encryption` (the
-    // singleton) and on each `backends[i].encryption`, and are
-    // preserved by the per-backend secret-preservation path.
-    if incoming.bootstrap_password_hash.is_none() {
-        incoming.bootstrap_password_hash = current.bootstrap_password_hash.clone();
-    }
-
-    // Top-level proxy SigV4 creds — both-or-neither, asymmetric warns.
-    super::preserve_sigv4_pair(
-        &mut incoming.access_key_id,
-        &mut incoming.secret_access_key,
-        &current.access_key_id,
-        &current.secret_access_key,
-        "proxy-level",
-        &mut warnings,
-    );
-
-    // Primary + named backend creds, with type-flip + removed-backend
-    // warnings. Helpers live in `super` so the section-PUT path uses
-    // identical logic; see the doc-block at the helpers' definition.
-    super::preserve_primary_backend_creds(incoming, current, &mut warnings);
-    super::preserve_named_backends_creds(incoming, current, &mut warnings);
-
-    // Webhook header values are masked to REDACTED_SENTINEL on export
-    // (`redact_all_secrets`). A full-document export → edit → apply
-    // round-trip (GUI "Export/Import YAML" or any GitOps flow) would
-    // otherwise persist the literal sentinel as the bearer token. Mirror
-    // the section-PUT path so the document path preserves untouched
-    // secrets identically.
-    super::preserve_event_delivery_secrets(&mut incoming.event_delivery, &current.event_delivery);
-
-    Ok(warnings)
+    super::section_level::BackendEncryptionKeyProbe::from_section(SectionName::Storage, &storage)
 }
 
-/// `POST /api/admin/config/apply` — atomic full-document apply.
-///
-/// Workflow:
-/// 1. Parse + validate the incoming YAML.
-/// 2. Merge runtime secrets forward (redacted round-trip preservation).
-/// 3. Defense-in-depth: reject apply attempts that would change the
-///    bootstrap password hash (legitimate path is `PUT /password`).
-/// 4. Under the write lock, hand off to [`apply_config_transition`] which
-///    owns every downstream side effect (engine rebuild, log reload,
-///    IAM swap, snapshot rebuilds, restart detection).
-/// 5. Persist. Persist failure => HTTP 500 with the in-memory state left
-///    intact so operators can retry without a data-loss window.
+/// `POST /api/admin/config/apply` — atomic full-document apply through the
+/// write pipeline (see [`super::write`]): parse and validate, merge runtime
+/// secrets forward, refuse a bootstrap-hash change (the legitimate path is
+/// `PUT /password`), transition, persist. A persist failure answers 500 with
+/// the in-memory state applied, so an operator can retry.
 pub async fn apply_config_doc(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
@@ -558,11 +422,9 @@ pub async fn apply_config_doc(
     )
 }
 
-/// The full config-apply pipeline as a typed call (no HTTP extractors):
-/// parse/validate → lock → preserve secrets → env-ref merge → bootstrap-hash
-/// guard → `apply_config_transition` → swap → persist → audit. Returns the
-/// status + typed [`ConfigApplyResponse`] for every arm. `apply_config_doc` is
-/// the thin `Json`-wrapping route handler; `backup.rs` calls this directly.
+/// The full config apply as a typed call (no HTTP extractors). Returns the
+/// status and the scrubbed [`ConfigApplyResponse`] for every arm.
+/// `apply_config_doc` is the thin route handler; `backup.rs` calls this.
 pub(crate) async fn apply_config_inner(
     state: &Arc<AdminState>,
     headers: &HeaderMap,
@@ -580,301 +442,137 @@ pub(crate) async fn apply_config_inner_with_env(
     body: ConfigDocumentRequest,
     extra_env: &std::collections::BTreeMap<String, String>,
 ) -> (StatusCode, ConfigApplyResponse) {
-    let mut refs = super::running_env_refs(state).await;
-    refs.extend(extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
-    let (status, mut resp) = apply_config_pipeline(state, headers, body, extra_env).await;
-    refs.extend(super::running_env_refs(state).await);
-    // S7: the typed response reaches the admin client (and backup restore).
-    let scrub = |m: &mut String| *m = crate::config::scrub_env_values(m, &refs);
-    resp.warnings.iter_mut().for_each(scrub);
-    resp.existing_warnings.iter_mut().for_each(scrub);
-    resp.error.iter_mut().for_each(scrub);
+    let mut known = state.config.read().await.env_refs.clone();
+    known.extend(extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
+    // Parse before the lock (pure work): a bad document answers 400 even
+    // with a stale `If-Match`.
+    let result = match parse_and_validate_yaml(&body.yaml, &known) {
+        Err(err) => WriteResult {
+            outcome: Outcome::Rejected(Rejection::new(Stage::Build, StatusCode::BAD_REQUEST, err)),
+            refs: known,
+        },
+        Ok((incoming, warnings)) => {
+            let write = ConfigWrite {
+                surface: Surface::Document { yaml: &body.yaml },
+                mode: Mode::Apply,
+                headers: Some(headers),
+                extra_env,
+            };
+            let built = Built { incoming, warnings };
+            write::run(state, write, |_| Ok(built)).await
+        }
+    };
+    let WriteResult { outcome, refs } = result;
+    let (status, mut resp) = shape_apply(outcome);
+    resp.scrub_env(&refs);
     (status, resp)
 }
 
-async fn apply_config_pipeline(
-    state: &Arc<AdminState>,
-    headers: &HeaderMap,
-    body: ConfigDocumentRequest,
-    extra_env: &std::collections::BTreeMap<String, String>,
-) -> (StatusCode, ConfigApplyResponse) {
-    // 1. Parse + validate the incoming document (no lock held — pure work).
-    let mut known_env = state.config.read().await.env_refs.clone();
-    known_env.extend(extra_env.iter().map(|(k, v)| (k.clone(), v.clone())));
-    let (mut incoming, parse_warnings) = match parse_and_validate_yaml(&body.yaml, &known_env) {
-        Ok(v) => v,
-        Err(err) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                ConfigApplyResponse {
-                    current_version: None,
-                    existing_warnings: Vec::new(),
-                    applied: false,
-                    persisted: false,
-                    requires_restart: false,
-                    warnings: vec![],
-                    error: Some(err),
-                    persisted_path: None,
-                },
-            );
-        }
+/// The `/config/apply` body of a write outcome (not yet scrubbed).
+fn shape_apply(outcome: Outcome) -> (StatusCode, ConfigApplyResponse) {
+    let refused = |error: String, warnings: Vec<String>| ConfigApplyResponse {
+        applied: false,
+        persisted: false,
+        requires_restart: false,
+        warnings,
+        existing_warnings: Vec::new(),
+        error: Some(error),
+        current_version: None,
+        persisted_path: None,
     };
-
-    // 2. Acquire the write lock and hold it for the remainder of the apply.
-    //    Serializes admin mutations so a concurrent PATCH via `update_config`
-    //    cannot race our read-for-compare and our write-to-swap.
-    let mut cfg = state.config.write().await;
-
-    // 2a. Optimistic concurrency: an apply based on an older version of the
-    //     document (another tab, admin or GitOps apply changed it) is refused.
-    let current = super::version::config_version(&cfg, None);
-    if super::version::if_match_conflicts(headers, &current) {
-        return (
-            StatusCode::CONFLICT,
-            ConfigApplyResponse {
-                current_version: Some(current),
-                existing_warnings: Vec::new(),
-                applied: false,
-                persisted: false,
-                requires_restart: false,
-                warnings: Vec::new(),
-                error: Some(
-                    "config_conflict: the config changed after you loaded it (another tab, \
-                     another admin, or a GitOps apply). Export it again and re-apply your edits."
-                        .to_string(),
+    match outcome {
+        Outcome::Conflict { current } => {
+            let mut resp = refused(
+                "config_conflict: the config changed after you loaded it (another tab, \
+                 another admin, or a GitOps apply). Export it again and re-apply your edits."
+                    .to_string(),
+                Vec::new(),
+            );
+            resp.current_version = Some(current);
+            (StatusCode::CONFLICT, resp)
+        }
+        Outcome::Rejected(r) => {
+            let w = *r.warnings;
+            let (error, warnings) = match r.stage {
+                Stage::Transition => (
+                    format!("Config transition refused (no state changed): {}", r.error),
+                    [w.check_new, w.preserve].concat(),
                 ),
-                persisted_path: None,
-            },
-        );
-    }
-
-    // 2b. Lifecycle gate (changed-only): fatal only when this doc actually EDITS
-    //     an invalid lifecycle; an unchanged pre-existing bad rule downgrades to
-    //     warnings so it can't block unrelated config edits.
-    let lifecycle_warnings =
-        match crate::lifecycle::planner::lifecycle_gate(&cfg.lifecycle, &incoming.lifecycle) {
-            Ok(warns) => {
-                if !warns.is_empty() {
-                    tracing::warn!(
-                        "config apply: pre-existing invalid lifecycle config left unchanged: {}",
-                        warns.join("; ")
-                    );
-                }
-                warns
-            }
-            Err(errs) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    ConfigApplyResponse {
-                        current_version: None,
-                        existing_warnings: Vec::new(),
-                        applied: false,
-                        persisted: false,
-                        requires_restart: false,
-                        warnings: parse_warnings,
-                        error: Some(errs.join("; ")),
-                        persisted_path: None,
-                    },
-                );
-            }
-        };
-
-    // 2c. Same changed-only fatal gate for duplicate replication rule names (#13).
-    if let Err(errs) =
-        crate::config_sections::replication_gate(&cfg.replication, &incoming.replication)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            ConfigApplyResponse {
-                current_version: None,
-                existing_warnings: Vec::new(),
-                applied: false,
-                persisted: false,
-                requires_restart: false,
-                warnings: parse_warnings,
-                error: Some(errs.join("; ")),
-                persisted_path: None,
-            },
-        );
-    }
-
-    // 3. Merge runtime secrets into the incoming doc. `preserve_runtime_secrets`
-    //    emits its own warnings for credential transitions that would
-    //    silently clear state — surface them to the caller.
-    let preserve_warnings = match preserve_runtime_secrets(&mut incoming, &cfg, &body.yaml) {
-        Ok(w) => w,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                ConfigApplyResponse {
-                    current_version: None,
-                    existing_warnings: Vec::new(),
-                    applied: false,
-                    persisted: false,
-                    requires_restart: false,
-                    warnings: parse_warnings,
-                    error: Some(e),
-                    persisted_path: None,
-                },
-            );
+                // The document's parse-time warnings ride along.
+                Stage::Preserve | Stage::Check | Stage::Gate => (r.error, w.build),
+                _ => (r.error, Vec::new()),
+            };
+            (r.status, refused(error, warnings))
         }
-    };
-
-    // 3b. Carry forward env-ref provenance from the running config. A doc
-    //     applied via the CLI arrives pre-expanded (operator-side env), so
-    //     the server-side recording in `parse_and_validate_yaml` may be
-    //     empty for refs the BOOT file resolved — without this merge those
-    //     secrets would persist materialized after the first apply. Newly
-    //     recorded names win over stale ones.
-    for (name, value) in &cfg.env_refs {
-        incoming
-            .env_refs
-            .entry(name.clone())
-            .or_insert_with(|| value.clone());
-    }
-
-    // 4. Defense in depth: refuse to swap the bootstrap password hash
-    //    through `apply`. The legitimate path is PUT /api/admin/password,
-    //    which verifies the current password. Accepting an arbitrary hash here would let
-    //    an admin-session holder lock future admins out of the GUI (by
-    //    setting a hash whose plaintext they don't share) or seed a hash
-    //    whose plaintext they control. Export redaction means round-trips
-    //    naturally produce `None` here (which `preserve_runtime_secrets`
-    //    fills back in); anything else indicates a manual edit.
-    if incoming.bootstrap_password_hash != cfg.bootstrap_password_hash {
-        return (
-            StatusCode::FORBIDDEN,
-            ConfigApplyResponse {
-                current_version: None,
-                existing_warnings: Vec::new(),
-                applied: false,
-                persisted: false,
-                requires_restart: false,
-                warnings: vec![],
-                error: Some(
-                    "bootstrap_password_hash cannot be changed via /config/apply; use PUT /api/admin/password (verifies the current password)".to_string(),
-                ),
-                persisted_path: None,
-            },
-        );
-    }
-
-    // 4b. Env wins consistently: re-apply the `DGP_*` overrides so the
-    //     imported document cannot change an env-controlled field at runtime
-    //     (the document's own value is what the file keeps).
-    let env_warnings = match super::reapply_env(&cfg, &mut incoming, true) {
-        Ok(w) => w,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ConfigApplyResponse {
-                    current_version: None,
-                    existing_warnings: Vec::new(),
-                    applied: false,
-                    persisted: false,
-                    requires_restart: false,
-                    warnings: vec![],
-                    error: Some(e),
-                    persisted_path: None,
-                },
-            );
-        }
-    };
-
-    // 4c. Split the check warnings of the env-applied document against the
-    //     running config (also env-applied): the running config's own
-    //     warnings are standing ("existing"), only the rest are new.
-    let (parse_warnings, existing_warnings) = {
-        let before = cfg.clone().check_all().unwrap_or_default();
-        let after = incoming.clone().check_all().unwrap_or(parse_warnings);
-        super::split_new_warnings(&before, after)
-    };
-
-    // 5. Run the transition side effects. The helper owns engine rebuild
-    //    (with bail-before-swap on failure), log reload, IAM state swap,
-    //    snapshot rebuilds, and restart detection. Behavior intentionally
-    //    mirrors the field-level PATCH path in `update_config` — both
-    //    paths compose their responses from the same single source of
-    //    transition truth.
-    let ctx = TransitionCtx::Admin { state, headers };
-    let (transition_warnings, requires_restart) =
-        match apply_config_transition(ctx, &mut cfg, incoming).await {
-            Ok(r) => (r.warnings, r.requires_restart),
-            Err(e) => {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    ConfigApplyResponse {
-                        current_version: None,
-                        existing_warnings: Vec::new(),
-                        applied: false,
-                        persisted: false,
-                        requires_restart: false,
-                        warnings: parse_warnings
-                            .into_iter()
-                            .chain(preserve_warnings)
-                            .collect(),
-                        error: Some(format!(
-                            "Config transition refused (no state changed): {}",
-                            e
-                        )),
-                        persisted_path: None,
-                    },
-                );
-            }
-        };
-
-    // 6. The transition swapped the config in (still inside the write lock).
-
-    // 7. Persist to the active config file, preserving its on-disk extension.
-    //    `persist_to_file` is atomic (write-to-tempfile + rename) so the
-    //    file is either the old content or the new content — never a
-    //    partial write. The write itself can still fail (permission
-    //    denied, disk full, missing directory); we surface that as
-    //    `persisted: false` + HTTP 500 so GitOps pipelines don't mistake
-    //    a persist failure for a clean apply.
-    let persist_path = active_config_path(state);
-    let (persisted, persisted_path, status, persist_warning) =
-        match cfg.persist_to_file(&persist_path) {
-            Ok(()) => (true, Some(persist_path.clone()), StatusCode::OK, None),
-            Err(e) => (
-                false,
-                None,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Some(format!(
-                    "Applied in memory but FAILED to persist to {}: {}. Server will revert to the on-disk config on next restart — fix the underlying IO problem and re-apply.",
-                    persist_path, e
-                )),
-            ),
-        };
-
-    audit_log("apply_config", "admin", &persist_path, headers);
-
-    // Errors on UNCHANGED lifecycle content are standing, not new.
-    let existing_warnings: Vec<String> = existing_warnings
-        .into_iter()
-        .chain(lifecycle_warnings)
-        .collect();
-    let warnings: Vec<String> = parse_warnings
-        .into_iter()
-        .chain(preserve_warnings)
-        .chain(env_warnings)
-        .chain(transition_warnings)
-        .chain(persist_warning)
-        .collect();
-
-    (
-        status,
-        ConfigApplyResponse {
-            current_version: None,
-            existing_warnings,
-            applied: true,
-            persisted,
+        Outcome::Applied {
+            warnings: w,
             requires_restart,
-            warnings,
-            error: None,
-            persisted_path,
-        },
-    )
+            persist,
+            ..
+        } => {
+            // `persist_to_file` is atomic (tempfile + rename); the write can
+            // still fail (permissions, disk full): `persisted: false` + 500,
+            // so a GitOps pipeline never mistakes it for a clean apply.
+            let (persisted_path, status, persist_warning) = match persist {
+                Ok(path) => (Some(path), StatusCode::OK, None),
+                Err((path, e)) => (
+                    None,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Some(format!(
+                        "Applied in memory but FAILED to persist to {path}: {e}. Server will \
+                         revert to the on-disk config on next restart — fix the underlying IO \
+                         problem and re-apply."
+                    )),
+                ),
+            };
+            let resp = ConfigApplyResponse {
+                applied: true,
+                persisted: persisted_path.is_some(),
+                requires_restart,
+                warnings: [w.check_new, w.preserve, w.env, w.transition]
+                    .concat()
+                    .into_iter()
+                    .chain(persist_warning)
+                    .collect(),
+                existing_warnings: w.existing,
+                error: None,
+                current_version: None,
+                persisted_path,
+            };
+            (status, resp)
+        }
+        Outcome::Validated { .. } => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            refused(
+                "internal: an apply ran as a dry run".to_string(),
+                Vec::new(),
+            ),
+        ),
+    }
+}
+
+impl ScrubEnv for ConfigApplyResponse {
+    fn scrub_env(&mut self, refs: &EnvRefs) {
+        write::scrub_strings(
+            self.warnings
+                .iter_mut()
+                .chain(&mut self.existing_warnings)
+                .chain(&mut self.error),
+            refs,
+        );
+    }
+}
+
+impl ScrubEnv for ConfigValidateResponse {
+    fn scrub_env(&mut self, refs: &EnvRefs) {
+        write::scrub_strings(
+            self.warnings
+                .iter_mut()
+                .chain(&mut self.existing_warnings)
+                .chain(&mut self.error),
+            refs,
+        );
+    }
 }
 
 /// `GET /api/admin/config/declarative-iam-export` — project the
@@ -1365,7 +1063,8 @@ access:
             ..Default::default()
         };
         let yaml = "storage:\n  backend_encryption:\n    mode: aes256-gcm-proxy\n    key_id: k1\n";
-        preserve_runtime_secrets(&mut incoming, &current, yaml).unwrap();
+        super::super::preserve_runtime_secrets(&mut incoming, &current, &document_probe(yaml))
+            .unwrap();
         match incoming.backend_encryption {
             E::Aes256GcmProxy { key, .. } => assert_eq!(
                 key,
@@ -1400,7 +1099,8 @@ access:
             ..Default::default()
         };
         let yaml = "storage:\n  backend_encryption:\n    mode: aes256-gcm-proxy\n    key: null\n";
-        preserve_runtime_secrets(&mut incoming, &current, yaml).unwrap();
+        super::super::preserve_runtime_secrets(&mut incoming, &current, &document_probe(yaml))
+            .unwrap();
         match incoming.backend_encryption {
             E::Aes256GcmProxy { key, .. } => {
                 assert_eq!(key, None, "explicit null must NOT be preserved")
