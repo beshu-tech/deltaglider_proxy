@@ -38,6 +38,7 @@ use tracing::{debug, info, warn};
 
 use super::auth::BulkSession;
 use super::path_guard::{AdminBucket, AdminObjectPath};
+use super::AdminError;
 use crate::iam::{AuthenticatedUser, S3Action};
 
 // ---------------------------------------------------------------------------
@@ -202,26 +203,20 @@ fn validate_plan(
     source_bucket: &str,
     dest_bucket: &str,
     dest_prefix: &str,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<(), AdminError> {
     let collisions = detect_collisions(items, dest_prefix);
     if !collisions.is_empty() {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "{} destination key(s) would overwrite each other (e.g. {:?})",
-                collisions.len(),
-                collisions.first().cloned().unwrap_or_default()
-            ),
-        ));
+        return Err(AdminError::conflict(format!(
+            "{} destination key(s) would overwrite each other (e.g. {:?})",
+            collisions.len(),
+            collisions.first().cloned().unwrap_or_default()
+        )));
     }
     if let Some(k) = dest_overwrites_other_source(items, source_bucket, dest_bucket, dest_prefix) {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "destination {k:?} is also a selected source: the operation would overwrite \
+        return Err(AdminError::conflict(format!(
+            "destination {k:?} is also a selected source: the operation would overwrite \
                  it before it is copied (is the destination inside the selection?)"
-            ),
-        ));
+        )));
     }
     Ok(())
 }
@@ -249,7 +244,7 @@ impl BulkActor {
     fn for_session(
         state: &crate::api::admin::AdminState,
         session: &BulkSession,
-    ) -> Result<Self, (StatusCode, String)> {
+    ) -> Result<Self, AdminError> {
         let (access_key_id, client_ip) = match session {
             BulkSession::AdminGui | BulkSession::Open => return Ok(Self::Unrestricted),
             BulkSession::IamUser {
@@ -263,10 +258,7 @@ impl BulkActor {
             _ => None,
         }
         .filter(|u| u.enabled)
-        .ok_or((
-            StatusCode::FORBIDDEN,
-            "AccessDenied: user disabled or gone".to_string(),
-        ))?;
+        .ok_or(AdminError::forbidden("AccessDenied: user disabled or gone"))?;
         let mut context = iam_rs::Context::new();
         crate::iam::permissions::insert_source_ip(&mut context, client_ip);
         Ok(Self::User {
@@ -335,12 +327,11 @@ impl BulkActor {
 fn reject_if_under_maintenance(
     state: &std::sync::Arc<crate::api::admin::AdminState>,
     bucket: &str,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<(), AdminError> {
     if state.s3_state.maintenance_gate.is_busy(bucket) {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("bucket '{bucket}' is temporarily read-only: maintenance in progress"),
-        ));
+        return Err(AdminError::conflict(format!(
+            "bucket '{bucket}' is temporarily read-only: maintenance in progress"
+        )));
     }
     Ok(())
 }
@@ -351,7 +342,7 @@ fn reject_if_under_maintenance(
 fn reject_if_reserved(
     state: &std::sync::Arc<crate::api::admin::AdminState>,
     bucket: &str,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<(), AdminError> {
     match state
         .s3_state
         .engine
@@ -359,7 +350,7 @@ fn reject_if_reserved(
         .bucket_policy_registry()
         .reserved_bucket_reason(bucket)
     {
-        Some(reason) => Err((StatusCode::FORBIDDEN, reason)),
+        Some(reason) => Err(AdminError::forbidden(reason)),
         None => Ok(()),
     }
 }
@@ -369,9 +360,9 @@ fn reject_if_reserved(
 fn reject_if_replication_target_only(
     state: &std::sync::Arc<crate::api::admin::AdminState>,
     bucket: &str,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<(), AdminError> {
     crate::api::handlers::object_helpers::check_client_write_allowed(&state.s3_state, bucket)
-        .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))
+        .map_err(|e| AdminError::forbidden(e.to_string()))
 }
 
 pub async fn copy_objects(
@@ -379,23 +370,20 @@ pub async fn copy_objects(
     State(state): State<Arc<crate::api::admin::AdminState>>,
     headers: axum::http::HeaderMap,
     AdminJson(req): AdminJson<CopyRequest>,
-) -> Result<Json<CopyResponse>, (StatusCode, String)> {
+) -> Result<Json<CopyResponse>, AdminError> {
     reject_if_reserved(&state, &req.source_bucket)?;
     reject_if_reserved(&state, &req.dest_bucket)?;
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
     reject_if_replication_target_only(&state, &req.dest_bucket)?;
     if req.items.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "no items to copy".into()));
+        return Err(AdminError::invalid("no items to copy"));
     }
     if req.items.len() > MAX_BULK_OBJECTS {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "too many items ({} > limit {})",
-                req.items.len(),
-                MAX_BULK_OBJECTS
-            ),
-        ));
+        return Err(AdminError::invalid(format!(
+            "too many items ({} > limit {})",
+            req.items.len(),
+            MAX_BULK_OBJECTS
+        )));
     }
 
     validate_plan(
@@ -602,7 +590,7 @@ pub async fn move_objects(
     State(state): State<Arc<crate::api::admin::AdminState>>,
     headers: axum::http::HeaderMap,
     AdminJson(req): AdminJson<MoveRequest>,
-) -> Result<Json<MoveResponse>, (StatusCode, String)> {
+) -> Result<Json<MoveResponse>, AdminError> {
     reject_if_reserved(&state, &req.source_bucket)?;
     reject_if_reserved(&state, &req.dest_bucket)?;
     reject_if_under_maintenance(&state, &req.dest_bucket)?;
@@ -611,17 +599,14 @@ pub async fn move_objects(
     reject_if_replication_target_only(&state, &req.dest_bucket)?;
     reject_if_replication_target_only(&state, &req.source_bucket)?;
     if req.items.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "no items to move".into()));
+        return Err(AdminError::invalid("no items to move"));
     }
     if req.items.len() > MAX_BULK_OBJECTS {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "too many items ({} > limit {})",
-                req.items.len(),
-                MAX_BULK_OBJECTS
-            ),
-        ));
+        return Err(AdminError::invalid(format!(
+            "too many items ({} > limit {})",
+            req.items.len(),
+            MAX_BULK_OBJECTS
+        )));
     }
 
     validate_plan(
@@ -773,22 +758,19 @@ pub async fn bulk_delete(
     State(state): State<Arc<crate::api::admin::AdminState>>,
     headers: axum::http::HeaderMap,
     AdminJson(req): AdminJson<DeleteRequest>,
-) -> Result<Json<DeleteResponse>, (StatusCode, String)> {
+) -> Result<Json<DeleteResponse>, AdminError> {
     reject_if_reserved(&state, &req.bucket)?;
     reject_if_under_maintenance(&state, &req.bucket)?;
     reject_if_replication_target_only(&state, &req.bucket)?;
     if req.keys.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "no keys to delete".into()));
+        return Err(AdminError::invalid("no keys to delete"));
     }
     if req.keys.len() > MAX_BULK_OBJECTS {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "too many keys ({} > limit {})",
-                req.keys.len(),
-                MAX_BULK_OBJECTS
-            ),
-        ));
+        return Err(AdminError::invalid(format!(
+            "too many keys ({} > limit {})",
+            req.keys.len(),
+            MAX_BULK_OBJECTS
+        )));
     }
 
     let actor = BulkActor::for_session(&state, &session)?;
@@ -932,7 +914,7 @@ pub async fn download_zip(
     State(state): State<Arc<crate::api::admin::AdminState>>,
     headers: axum::http::HeaderMap,
     AdminQuery(q): AdminQuery<ZipQuery>,
-) -> Result<axum::response::Response, (StatusCode, String)> {
+) -> Result<axum::response::Response, AdminError> {
     let parsed: Vec<(String, String)> = q
         .keys
         .split(',')
@@ -945,26 +927,22 @@ pub async fn download_zip(
         })
         .collect();
     if parsed.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "?keys must be a comma-separated list of bucket/key entries".into(),
+        return Err(AdminError::invalid(
+            "?keys must be a comma-separated list of bucket/key entries",
         ));
     }
     for (b, k) in &parsed {
         super::path_guard::check_bucket(b)
             .and_then(|()| super::path_guard::check_object_path(k))
-            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+            .map_err(AdminError::invalid)?;
         reject_if_reserved(&state, b)?;
     }
     if parsed.len() > MAX_BULK_OBJECTS {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "too many keys ({} > limit {})",
-                parsed.len(),
-                MAX_BULK_OBJECTS
-            ),
-        ));
+        return Err(AdminError::invalid(format!(
+            "too many keys ({} > limit {})",
+            parsed.len(),
+            MAX_BULK_OBJECTS
+        )));
     }
 
     let actor = BulkActor::for_session(&state, &session)?;
@@ -1008,7 +986,7 @@ pub async fn download_zip(
         let msg = zip_skip_report(parsed.len(), &skipped)
             .err()
             .unwrap_or_else(|| "no file to put in the ZIP".to_string());
-        return Err((zip_all_failed_status(&failures), msg));
+        return Err(AdminError::status(zip_all_failed_status(&failures), msg));
     }
 
     info!(
@@ -1228,26 +1206,22 @@ pub async fn list_all(
     Extension(session): Extension<BulkSession>,
     State(state): State<Arc<crate::api::admin::AdminState>>,
     AdminQuery(q): AdminQuery<ListAllQuery>,
-) -> Result<Json<ListAllResponse>, (StatusCode, String)> {
+) -> Result<Json<ListAllResponse>, AdminError> {
     if q.prefix.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "prefix is required (refusing whole-bucket recursion)".into(),
+        return Err(AdminError::invalid(
+            "prefix is required (refusing whole-bucket recursion)",
         ));
     }
 
     reject_if_reserved(&state, &q.bucket)?;
     let actor = BulkActor::for_session(&state, &session)?;
     if !actor.may_list(&q.bucket, &q.prefix) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            format!(
-                "AccessDenied: {} may not list {}/{}",
-                actor.label(),
-                &*q.bucket,
-                &*q.prefix
-            ),
-        ));
+        return Err(AdminError::forbidden(format!(
+            "AccessDenied: {} may not list {}/{}",
+            actor.label(),
+            &*q.bucket,
+            &*q.prefix
+        )));
     }
     let engine = state.s3_state.engine.load();
     let mut keys: Vec<String> = Vec::new();
@@ -1264,7 +1238,7 @@ pub async fn list_all(
                 false,
             )
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)))?;
+            .map_err(|e| AdminError::internal(format!("{}", e)))?;
         for (k, _) in &page.objects {
             // The S3 LIST filter: a key the actor cannot see is left out.
             if !actor.may_see(&q.bucket, k) {
