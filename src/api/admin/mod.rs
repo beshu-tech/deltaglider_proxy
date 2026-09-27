@@ -41,7 +41,7 @@ use crate::rate_limiter::RateLimiter;
 use crate::session::SessionStore;
 use crate::usage_scanner::UsageScanner;
 
-pub use error::{AdminError, Bare, ErrorBody, JsonError, Text};
+pub use error::{AdminError, Bare, CodedJson, ErrorBody, JsonError, Text};
 
 // Re-export everything so external code doesn't need import changes.
 pub use audit::get_audit;

@@ -78,14 +78,12 @@ pub async fn require_same_origin(req: Request, next: Next) -> Response {
     ) {
         return next.run(req).await;
     }
-    (
+    super::AdminError::coded(
+        "cross_origin_request",
         StatusCode::FORBIDDEN,
-        axum::Json(serde_json::json!({
-            "error": "cross_origin_request",
-            "message": "state-changing admin requests must come from the proxy's own origin. Behind a reverse proxy, forward the original Host header (or set DGP_TRUST_PROXY_HEADERS=true and DGP_TRUSTED_PROXY_CIDRS so X-Forwarded-Host counts)"
-        })),
+        "state-changing admin requests must come from the proxy's own origin. Behind a reverse proxy, forward the original Host header (or set DGP_TRUST_PROXY_HEADERS=true and DGP_TRUSTED_PROXY_CIDRS so X-Forwarded-Host counts)",
     )
-        .into_response()
+    .into_response()
 }
 
 #[cfg(test)]
@@ -154,5 +152,30 @@ mod tests {
     #[test]
     fn non_browser_clients_pass() {
         assert!(is_same_origin_request(&Method::POST, None, None, H));
+    }
+
+    /// Pins the wire body of the cross-origin refusal.
+    #[tokio::test]
+    async fn cross_origin_refusal_body_is_pinned() {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route("/x", axum::routing::post(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(require_same_origin));
+        let req = axum::http::Request::post("/x")
+            .header("host", "s3.acme.example")
+            .header("origin", "https://evil.example")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let r = app.oneshot(req).await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(r.headers()["content-type"], "application/json");
+        let b = axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&b).unwrap(),
+            "{\"error\":\"cross_origin_request\",\"message\":\"state-changing admin requests \
+             must come from the proxy's own origin. Behind a reverse proxy, forward the original \
+             Host header (or set DGP_TRUST_PROXY_HEADERS=true and DGP_TRUSTED_PROXY_CIDRS so \
+             X-Forwarded-Host counts)\"}"
+        );
     }
 }

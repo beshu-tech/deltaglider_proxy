@@ -12,6 +12,9 @@
 //!   The message goes to the log, not to the client.
 //! - [`JsonError`]: `{"error": <message>}` — the former
 //!   `(StatusCode, Json(json!({"error": ..})))` handlers.
+//! - [`CodedJson`]: `{"error": <code>, "message": <message>}` — a machine
+//!   code plus the human text (CSRF refusal, declarative-IAM gate, bad
+//!   request input). Built with [`AdminError::coded`].
 //!
 //! `From<ConfigDbError>` is the one mapping of a config-DB error to a
 //! status (missing row and FOREIGN KEY failure 404, UNIQUE violation 409,
@@ -28,7 +31,7 @@ use crate::storage::StorageError;
 
 /// How an [`AdminError`] renders its body.
 pub trait ErrorBody {
-    fn render(status: StatusCode, message: String) -> Response;
+    fn render(status: StatusCode, code: &'static str, message: String) -> Response;
 }
 
 /// `text/plain` body with the message.
@@ -37,28 +40,42 @@ pub struct Text;
 pub struct Bare;
 /// `{"error": <message>}`.
 pub struct JsonError;
+/// `{"error": <code>, "message": <message>}`.
+pub struct CodedJson;
 
 impl ErrorBody for Text {
-    fn render(status: StatusCode, message: String) -> Response {
+    fn render(status: StatusCode, _code: &'static str, message: String) -> Response {
         (status, message).into_response()
     }
 }
 
 impl ErrorBody for Bare {
-    fn render(status: StatusCode, _message: String) -> Response {
+    fn render(status: StatusCode, _code: &'static str, _message: String) -> Response {
         status.into_response()
     }
 }
 
 impl ErrorBody for JsonError {
-    fn render(status: StatusCode, message: String) -> Response {
+    fn render(status: StatusCode, _code: &'static str, message: String) -> Response {
         (status, axum::Json(serde_json::json!({ "error": message }))).into_response()
+    }
+}
+
+impl ErrorBody for CodedJson {
+    fn render(status: StatusCode, code: &'static str, message: String) -> Response {
+        (
+            status,
+            axum::Json(serde_json::json!({ "error": code, "message": message })),
+        )
+            .into_response()
     }
 }
 
 /// An admin API error; see the module docs for the body shapes.
 pub struct AdminError<B: ErrorBody = Text> {
     status: StatusCode,
+    /// The machine code; only [`CodedJson`] renders it.
+    code: &'static str,
     message: String,
     body: PhantomData<B>,
 }
@@ -68,6 +85,7 @@ impl<B: ErrorBody> AdminError<B> {
     pub(crate) fn status(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
+            code: GENERIC_CODE,
             message: message.into(),
             body: PhantomData,
         }
@@ -118,10 +136,29 @@ impl<B: ErrorBody> AdminError<B> {
     }
 }
 
+/// The code of an error built without one (a `?` on a DB or storage
+/// error into a [`CodedJson`] handler).
+const GENERIC_CODE: &str = "error";
+
+impl AdminError<CodedJson> {
+    /// `{"error": code, "message": message}` with `status`.
+    pub(crate) fn coded(
+        code: &'static str,
+        status: StatusCode,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            code,
+            ..Self::status(status, message)
+        }
+    }
+}
+
 impl<B: ErrorBody> std::fmt::Debug for AdminError<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdminError")
             .field("status", &self.status)
+            .field("code", &self.code)
             .field("message", &self.message)
             .finish()
     }
@@ -135,7 +172,7 @@ impl<B: ErrorBody> std::fmt::Display for AdminError<B> {
 
 impl<B: ErrorBody> IntoResponse for AdminError<B> {
     fn into_response(self) -> Response {
-        B::render(self.status, self.message)
+        B::render(self.status, self.code, self.message)
     }
 }
 
@@ -216,6 +253,29 @@ mod tests {
                     (
                         status,
                         axum::Json(serde_json::json!({ "error": msg.clone() }))
+                    )
+                        .into_response()
+                )
+                .await,
+            );
+        }
+    }
+
+    /// `CodedJson` answers what the hand-built `{error, message}` bodies
+    /// (CSRF, declarative gate, extractor rejection) did.
+    #[tokio::test]
+    async fn coded_json_renders_like_the_hand_built_bodies() {
+        for status in [StatusCode::BAD_REQUEST, StatusCode::FORBIDDEN] {
+            let e = AdminError::coded("iam_declarative", status, "edit the YAML");
+            assert_eq!(
+                parts(e.into_response()).await,
+                parts(
+                    (
+                        status,
+                        axum::Json(serde_json::json!({
+                            "error": "iam_declarative",
+                            "message": "edit the YAML",
+                        }))
                     )
                         .into_response()
                 )

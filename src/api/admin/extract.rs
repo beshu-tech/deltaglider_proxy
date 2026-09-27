@@ -16,8 +16,9 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{FromRequest, FromRequestParts, Request};
 use axum::http::request::Parts;
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 use serde::de::DeserializeOwned;
+
+use super::{AdminError, CodedJson};
 
 /// JSON body extractor: `axum::Json` with a JSON error body.
 pub struct AdminJson<T>(pub T);
@@ -26,22 +27,7 @@ pub struct AdminJson<T>(pub T);
 pub struct AdminQuery<T>(pub T);
 
 /// The rejection of both extractors.
-#[derive(Debug)]
-pub struct AdminInputRejection {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
-}
-
-impl IntoResponse for AdminInputRejection {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            axum::Json(serde_json::json!({ "error": self.code, "message": self.message })),
-        )
-            .into_response()
-    }
-}
+pub type AdminInputRejection = AdminError<CodedJson>;
 
 /// Pure: the error code for an input-rule message. The path-guard rules
 /// (`path_guard::check_*`) start their messages with these phrases.
@@ -82,16 +68,13 @@ fn json_rejection(rej: JsonRejection) -> AdminInputRejection {
         Some(e) => input_error_message(&e.path().to_string(), &strip_position(e.inner())),
         None => rej.body_text(),
     };
-    AdminInputRejection {
-        // 415 (not JSON) keeps its status; every other bad body is a 400.
-        status: if rej.status() == StatusCode::UNSUPPORTED_MEDIA_TYPE {
-            rej.status()
-        } else {
-            StatusCode::BAD_REQUEST
-        },
-        code: input_error_code(&message),
-        message,
-    }
+    // 415 (not JSON) keeps its status; every other bad body is a 400.
+    let status = if rej.status() == StatusCode::UNSUPPORTED_MEDIA_TYPE {
+        rej.status()
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    AdminError::coded(input_error_code(&message), status, message)
 }
 
 fn query_rejection(rej: QueryRejection) -> AdminInputRejection {
@@ -100,11 +83,11 @@ fn query_rejection(rej: QueryRejection) -> AdminInputRejection {
         .strip_prefix("Failed to deserialize query string: ")
         .unwrap_or(&text)
         .to_string();
-    AdminInputRejection {
-        status: StatusCode::BAD_REQUEST,
-        code: input_error_code(&message),
-        message: format!("query string: {message}"),
-    }
+    AdminError::coded(
+        input_error_code(&message),
+        StatusCode::BAD_REQUEST,
+        format!("query string: {message}"),
+    )
 }
 
 #[axum::async_trait]
@@ -229,6 +212,21 @@ mod tests {
         assert_eq!(
             (s, b["error"].as_str()),
             (StatusCode::BAD_REQUEST, Some("invalid_request"))
+        );
+    }
+
+    /// Pins the wire bytes of a rejection: content type and key order.
+    #[tokio::test]
+    async fn rejection_body_bytes_are_pinned() {
+        let app = Router::new().route("/j", post(|AdminJson(_b): AdminJson<Body1>| async { "ok" }));
+        let r = app.oneshot(json_req("{not json")).await.unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(r.headers()["content-type"], "application/json");
+        let b = axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        let text = std::str::from_utf8(&b).unwrap();
+        assert!(
+            text.starts_with("{\"error\":\"invalid_request\",\"message\":\""),
+            "{text}"
         );
     }
 

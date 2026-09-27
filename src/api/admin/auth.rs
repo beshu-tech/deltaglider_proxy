@@ -1472,17 +1472,19 @@ pub async fn require_not_declarative(
     if !is_declarative {
         return next.run(request).await.into_response();
     }
+    iam_declarative_refusal()
+}
 
-    (
+/// The 403 of [`require_not_declarative`].
+fn iam_declarative_refusal() -> axum::response::Response {
+    super::AdminError::coded(
+        "iam_declarative",
         StatusCode::FORBIDDEN,
-        Json(serde_json::json!({
-            "error": "iam_declarative",
-            "message": "IAM is managed via the YAML document (access.iam_mode: declarative). \
-                        Edit your config file and POST the full document to /api/admin/config/apply \
-                        instead of mutating users/groups/providers through this endpoint.",
-        })),
+        "IAM is managed via the YAML document (access.iam_mode: declarative). \
+         Edit your config file and POST the full document to /api/admin/config/apply \
+         instead of mutating users/groups/providers through this endpoint.",
     )
-        .into_response()
+    .into_response()
 }
 
 // ── S3 Session Credentials ──
@@ -1548,6 +1550,22 @@ mod tests {
     use super::*;
     use crate::iam::{AuthConfig, Permission, SharedIamState};
     use arc_swap::ArcSwap;
+
+    /// Pins the wire body of the declarative-mode refusal.
+    #[tokio::test]
+    async fn iam_declarative_refusal_body_is_pinned() {
+        let r = iam_declarative_refusal();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert_eq!(r.headers()["content-type"], "application/json");
+        let b = axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&b).unwrap(),
+            "{\"error\":\"iam_declarative\",\"message\":\"IAM is managed via the YAML document \
+             (access.iam_mode: declarative). Edit your config file and POST the full document to \
+             /api/admin/config/apply instead of mutating users/groups/providers through this \
+             endpoint.\"}"
+        );
+    }
 
     /// Issue #92: every successful login writes an audit entry, and the
     /// action names that existed before (OAuth, browser lift, open lift) stay.
