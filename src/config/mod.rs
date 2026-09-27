@@ -2658,7 +2658,7 @@ pub enum ConfigError {
 /// Lines printed on the first run that generates a bootstrap password.
 /// With a TTY: the plaintext, once. Without (containers, CI): neither the
 /// plaintext nor the hash, because captured logs outlive the process and
-/// the hash is also the SQLCipher key of the IAM database (S8).
+/// the hash is an admin credential that an attacker can guess offline.
 fn first_run_banner(password: &str, hash: &str, is_tty: bool) -> Vec<String> {
     let mut out = vec![String::new()];
     if is_tty {
@@ -2676,24 +2676,22 @@ fn first_run_banner(password: &str, hash: &str, is_tty: bool) -> Vec<String> {
             "BOOTSTRAP PASSWORD auto-generated (not a TTY — password and hash hidden).".into(),
         );
         out.push("  The hash is in .deltaglider_bootstrap_hash (mode 0600).".into());
-        out.push("  To choose a password, change it in the admin GUI (this keeps".into());
-        out.push("  the IAM database readable). Before any IAM user exists, you can".into());
-        out.push(
-            "  also run `printf '%s\\n' '<pw>' | deltaglider_proxy --set-bootstrap-password`"
-                .into(),
-        );
+        out.push("  To choose a password, change it in the admin GUI, or run".into());
+        out.push("  `printf '%s\\n' '<pw>' | deltaglider_proxy --set-bootstrap-password`".into());
         out.push("  (it reads the password from stdin), or set".into());
         out.push("  DGP_BOOTSTRAP_PASSWORD_HASH before the first start.".into());
+        out.push("  The IAM database does not use this password: its key is".into());
+        out.push("  DGP_CONFIG_DB_KEY or the key file next to the database.".into());
     }
     out.push(String::new());
     out
 }
 
 /// Write the bootstrap hash file with restrictive permissions (0600).
-/// This file doubles as the SQLCipher encryption key, so it must not be
-/// world-readable — not even transiently. Create it 0600 in one syscall
-/// (not fs::write-then-chmod, which leaves an umask-wide window on a path
-/// where the key is known-valid).
+/// The file holds an admin credential hash (before S8 it also keyed the
+/// config DB), so it must not be world-readable — not even transiently.
+/// Create it 0600 in one syscall (not fs::write-then-chmod, which leaves an
+/// umask-wide window on a path where the hash is known-valid).
 pub fn write_bootstrap_hash_file(path: &std::path::Path, hash: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {

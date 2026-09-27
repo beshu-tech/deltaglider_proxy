@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-/// S8: the non-TTY first-run banner must not print the bcrypt hash —
-/// it is also the SQLCipher key, and container logs are retained.
+/// The non-TTY first-run banner must not print the bcrypt hash: it is an
+/// admin credential an attacker can guess offline, and container logs are
+/// retained. Since S8 the hash does not key the IAM database, and the
+/// banner must not say that a password change affects it.
 #[test]
 fn first_run_banner_hides_hash_without_tty() {
     let hash = "$2b$12$abcdefghijklmnopqrstuuFAKEFAKEFAKEFAKEFAKEFAKEFAKE";
     let lines = first_run_banner("pw123", hash, false).join("\n");
     assert!(!lines.contains(hash), "{lines}");
     assert!(!lines.contains("pw123"), "{lines}");
+    assert!(!lines.contains("IAM database readable"), "{lines}");
+    assert!(!lines.contains("Before any IAM user exists"), "{lines}");
+    assert!(lines.contains("DGP_CONFIG_DB_KEY"), "{lines}");
     let tty = first_run_banner("pw123", hash, true).join("\n");
     assert!(tty.contains("pw123") && !tty.contains(hash), "{tty}");
 }

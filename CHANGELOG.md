@@ -31,6 +31,14 @@
    - Delta objects larger than 16 MiB use the spool directory, so
      `DGP_SPOOL_DIR` must be writable.
 
+### Fixed — The first-run banner no longer ties the password to the IAM database
+
+Without a TTY, the first-run banner said that a password change in the admin
+GUI "keeps the IAM database readable", and that `--set-bootstrap-password`
+works only before an IAM user exists. Since the IAM database has its own key,
+both statements are false. The banner now says that the database key is
+`DGP_CONFIG_DB_KEY` or the key file next to the database.
+
 ### Fixed — `--verbose` lasts after the config file loads
 
 `--verbose` set the `trace` level only until the config file loaded. The
