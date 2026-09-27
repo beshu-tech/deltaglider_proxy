@@ -3869,7 +3869,6 @@ mod reference_lock_hold_tests {
     /// lock (reclaim-on-delete, sweep reclaim, fast-path seed).
     #[test]
     fn reference_writes_go_through_the_guard() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         // Built at runtime so this file's own text does not match.
         let forbidden: Vec<String> = [
             "put_reference",
@@ -3884,40 +3883,23 @@ mod reference_lock_hold_tests {
         .collect();
         let allowed: [&str; 0] = [];
         let mut offenders = Vec::new();
-        let mut stack = vec![root.join("src")];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    // Backends implement the writes; they are below the lock.
-                    if !path.ends_with("storage") {
-                        stack.push(path);
-                    }
-                    continue;
-                }
-                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                    continue;
-                }
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string();
-                if allowed.contains(&rel.as_str()) {
-                    continue;
-                }
-                let mut text = std::fs::read_to_string(&path).unwrap();
-                if rel == "src/deltaglider/engine/mod.rs" {
-                    // The guard's own methods are the one allowed home.
-                    let start = text.find("impl ReferenceLockGuard {").unwrap();
-                    let end = text.find("impl Drop for ReferenceLockGuard").unwrap();
-                    text.replace_range(start..end, "");
-                }
-                let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-                for p in &forbidden {
-                    if text.contains(p.as_str()) {
-                        offenders.push(format!("{rel}: {p}"));
-                    }
+        for path in crate::source_scan::rust_files("src") {
+            let rel = crate::source_scan::rel(&path);
+            // Backends implement the writes; they are below the lock.
+            if rel.starts_with("src/storage/") || allowed.contains(&rel.as_str()) {
+                continue;
+            }
+            let mut text = std::fs::read_to_string(&path).unwrap();
+            if rel == "src/deltaglider/engine/mod.rs" {
+                // The guard's own methods are the one allowed home.
+                let start = text.find("impl ReferenceLockGuard {").unwrap();
+                let end = text.find("impl Drop for ReferenceLockGuard").unwrap();
+                text.replace_range(start..end, "");
+            }
+            let text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            for p in &forbidden {
+                if text.contains(p.as_str()) {
+                    offenders.push(format!("{rel}: {p}"));
                 }
             }
         }

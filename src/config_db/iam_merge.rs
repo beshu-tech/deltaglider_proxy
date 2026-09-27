@@ -1899,36 +1899,20 @@ mod tests {
     /// `immediate_tx` (rusqlite's `Transaction` rolls back on drop by itself).
     #[test]
     fn hand_written_transactions_go_through_immediate_tx() {
-        fn scan(dir: &Path, hits: &mut Vec<String>) {
-            for e in std::fs::read_dir(dir).unwrap().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    scan(&p, hits);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    let full = std::fs::read_to_string(&p).unwrap();
-                    // Production code only: tests may hold locks on purpose.
-                    let text = full.split("#[cfg(test)]").next().unwrap_or("");
-                    let n = text.matches(concat!("\"BEGIN", " ")).count()
-                        + text.matches(concat!("\"BEGIN", ";")).count();
-                    if n > 0 {
-                        hits.push(format!("{}: {n}", p.display()));
-                    }
-                }
-            }
-        }
-        let mut hits = Vec::new();
-        scan(
-            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut hits,
-        );
+        use crate::source_scan::{prod_sources, prod_text};
+        let hits: Vec<String> = prod_sources("src")
+            .into_iter()
+            .filter_map(|(rel, full)| {
+                // Production code only: tests may hold locks on purpose.
+                let text = prod_text(&full);
+                let n = text.matches(concat!("\"BEGIN", " ")).count()
+                    + text.matches(concat!("\"BEGIN", ";")).count();
+                (n > 0).then(|| format!("{rel}: {n}"))
+            })
+            .collect();
         assert_eq!(
             hits,
-            vec![format!(
-                "{}: 1",
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("src/config_db/iam_merge.rs")
-                    .display()
-            )],
+            ["src/config_db/iam_merge.rs: 1"],
             "a BEGIN outside immediate_tx"
         );
     }

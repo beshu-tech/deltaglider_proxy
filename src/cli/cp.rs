@@ -795,7 +795,7 @@ mod tests {
             ("cp.rs", include_str!("cp.rs")),
             ("sync.rs", include_str!("sync.rs")),
         ] {
-            let code = src.split("#[cfg(test)]").next().unwrap();
+            let code = &crate::source_scan::prod_text(src);
             for bad in ["dst_root.join(", "dst_dir.join(", "dst_path.join("] {
                 assert!(!code.contains(bad), "{name} joins a raw key: `{bad}`");
             }

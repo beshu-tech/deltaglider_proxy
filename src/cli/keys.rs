@@ -171,7 +171,7 @@ mod tests {
             ("sync.rs", include_str!("sync.rs")),
             ("migrate.rs", include_str!("migrate.rs")),
         ] {
-            let code = src.split("#[cfg(test)]").next().unwrap();
+            let code = &crate::source_scan::prod_text(src);
             for bad in ["k.strip_prefix(", "key.strip_prefix("] {
                 assert!(!code.contains(bad), "{name} strips a key prefix by hand");
             }

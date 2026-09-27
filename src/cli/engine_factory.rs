@@ -470,7 +470,7 @@ mod tests {
             ("sync.rs", include_str!("sync.rs")),
             ("migrate.rs", include_str!("migrate.rs")),
         ] {
-            let code = src.split("#[cfg(test)]").next().unwrap();
+            let code = &crate::source_scan::prod_text(src);
             let copy = &code[code.find("async fn copy_one").expect(name)..];
             let copy = &copy[..copy.find("\n}\n").unwrap()];
             assert!(

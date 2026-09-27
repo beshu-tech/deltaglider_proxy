@@ -1508,19 +1508,8 @@ mod tests {
             "api/admin/auth.rs",
             "api/admin/external_auth.rs",
         ];
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for e in std::fs::read_dir(dir).unwrap() {
-                let p = e.unwrap().path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    out.push(p);
-                }
-            }
-        }
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        walk(&root, &mut files);
+        let root = crate::source_scan::root().join("src");
+        let files = crate::source_scan::rust_files("src");
         assert!(files.len() > 50, "scan found the sources");
         for f in files {
             let rel = f

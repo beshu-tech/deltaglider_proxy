@@ -3124,13 +3124,11 @@ mod tests {
             ("status.rs", include_str!("api/handlers/status.rs")),
         ];
         for (name, src) in sources {
-            let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
-            for (i, line) in prod.lines().enumerate() {
+            for (n, line) in crate::source_scan::prod_lines(src) {
                 assert!(
                     !line.contains(".can(S3Action"),
-                    "{name}:{}: context-free can() on an authz path; use \
-                     can_with_context with request_policy_context",
-                    i + 1
+                    "{name}:{n}: context-free can() on an authz path; use \
+                     can_with_context with request_policy_context"
                 );
             }
         }

@@ -3950,16 +3950,6 @@ mod tests {
     /// drifted by ~15 variables; this scan cannot.
     #[test]
     fn every_dgp_literal_in_src_is_registered() {
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for e in std::fs::read_dir(dir).unwrap().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    out.push(p);
-                }
-            }
-        }
         // Not operator settings: test hooks, a build-time stamp, the
         // per-backend and bootstrap name prefixes, and example backend
         // names in tests.
@@ -3972,11 +3962,7 @@ mod tests {
                     && (n.ends_with("_ENCRYPTION_KEY") || n.ends_with("_SSE_KMS_KEY_ID")))
         };
         let registry: Vec<&str> = super::ENV_VAR_REGISTRY.iter().map(|e| e.name).collect();
-        let mut files = Vec::new();
-        walk(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut files,
-        );
+        let files = crate::source_scan::rust_files("src");
         let mut missing = std::collections::BTreeSet::new();
         let mut seen: std::collections::HashMap<String, usize> = Default::default();
         for f in files {
@@ -6898,35 +6884,19 @@ storage:
         ];
         let allowed = ["src/config/mod.rs"];
         let mut offenders = Vec::new();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut stack = vec![root.join("src")];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                    continue;
-                }
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string();
-                if allowed.contains(&rel.as_str()) || rel.starts_with("src/cli/") {
-                    continue;
-                }
-                let text: String = std::fs::read_to_string(&path)
-                    .unwrap()
-                    .chars()
-                    .filter(|c| !c.is_whitespace())
-                    .collect();
-                for p in &patterns {
-                    if p.is_match(&text) {
-                        offenders.push(format!("{rel}: {}", p.as_str()));
-                    }
+        for path in crate::source_scan::rust_files("src") {
+            let rel = crate::source_scan::rel(&path);
+            if allowed.contains(&rel.as_str()) || rel.starts_with("src/cli/") {
+                continue;
+            }
+            let text: String = std::fs::read_to_string(&path)
+                .unwrap()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            for p in &patterns {
+                if p.is_match(&text) {
+                    offenders.push(format!("{rel}: {}", p.as_str()));
                 }
             }
         }

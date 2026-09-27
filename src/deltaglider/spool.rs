@@ -789,32 +789,13 @@ mod tests {
             ),
         ];
         let mut offenders = Vec::new();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut stack = vec![root.join("src")];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                let name = path.file_name().unwrap().to_string_lossy().to_string();
-                if !name.ends_with(".rs") || name.ends_with("_tests.rs") {
-                    continue;
-                }
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let text = std::fs::read_to_string(&path).unwrap();
-                for (n, line) in non_test_lines(&text) {
-                    let code = line.split("//").next().unwrap_or("");
-                    for pat in BANNED {
-                        let allowed = ALLOWED.iter().any(|(f, p, _)| *f == rel && p == pat);
-                        if code.contains(pat) && !allowed {
-                            offenders.push(format!("{rel}:{n}: {}", line.trim()));
-                        }
+        for (rel, text) in crate::source_scan::prod_sources("src") {
+            for (n, line) in crate::source_scan::prod_lines(&text) {
+                let code = line.split("//").next().unwrap_or("");
+                for pat in BANNED {
+                    let allowed = ALLOWED.iter().any(|(f, p, _)| *f == rel && p == pat);
+                    if code.contains(pat) && !allowed {
+                        offenders.push(format!("{rel}:{n}: {}", line.trim()));
                     }
                 }
             }
@@ -825,44 +806,6 @@ mod tests {
              with a reason):\n{}",
             offenders.join("\n")
         );
-    }
-
-    /// Lines outside `#[cfg(test)] mod … { … }` blocks, with 1-based numbers.
-    fn non_test_lines(text: &str) -> Vec<(usize, &str)> {
-        let lines: Vec<&str> = text.lines().collect();
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < lines.len() {
-            let is_test_mod = lines[i].trim() == "#[cfg(test)]"
-                && lines
-                    .get(i + 1)
-                    .is_some_and(|l| l.trim_start().starts_with("mod ") && l.contains('{'));
-            if is_test_mod {
-                // Skip to the brace that closes the module.
-                let mut depth = 0i64;
-                let mut j = i + 1;
-                loop {
-                    let l = lines[j];
-                    depth += l.matches('{').count() as i64 - l.matches('}').count() as i64;
-                    j += 1;
-                    if depth <= 0 || j >= lines.len() {
-                        break;
-                    }
-                }
-                i = j;
-                continue;
-            }
-            out.push((i + 1, lines[i]));
-            i += 1;
-        }
-        out
-    }
-
-    #[test]
-    fn non_test_lines_skips_test_modules() {
-        let src = "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn b() { x() }\n}\nfn c() {}\n";
-        let kept: Vec<&str> = non_test_lines(src).into_iter().map(|(_, l)| l).collect();
-        assert_eq!(kept, ["fn a() {}", "fn c() {}"]);
     }
 }
 

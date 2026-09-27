@@ -3937,16 +3937,14 @@ mod endpoint_guard_source_test {
     #[test]
     fn only_guard_s3_endpoint_sets_an_endpoint_url() {
         let mut offenders = Vec::new();
-        for entry in walkdir::WalkDir::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")) {
-            let entry = entry.unwrap();
-            if entry.path().extension().is_none_or(|e| e != "rs") {
-                continue;
-            }
-            let text = std::fs::read_to_string(entry.path()).unwrap();
-            let prod = text.split("\n#[cfg(test)]\nmod ").next().unwrap_or("");
-            let allowed = usize::from(entry.path().ends_with("storage/s3.rs"));
-            if prod.matches(".endpoint_url(").count() > allowed {
-                offenders.push(entry.path().display().to_string());
+        for (rel, text) in crate::source_scan::prod_sources("src") {
+            let allowed = usize::from(rel == "src/storage/s3.rs");
+            if crate::source_scan::prod_text(&text)
+                .matches(".endpoint_url(")
+                .count()
+                > allowed
+            {
+                offenders.push(rel);
             }
         }
         assert!(offenders.is_empty(), "use guard_s3_endpoint: {offenders:?}");

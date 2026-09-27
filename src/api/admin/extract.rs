@@ -284,21 +284,12 @@ mod tests {
         let re =
             regex_lite::Regex::new(r"(\w+\)|\bbody)\s*:\s*(axum::extract::|axum::)?(Json|Query)<")
                 .unwrap();
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/admin");
         let mut bad = Vec::new();
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap() {
-                let p = entry.unwrap().path();
-                if p.is_dir() {
-                    stack.push(p);
-                } else if p.extension().is_some_and(|e| e == "rs") {
-                    let src = std::fs::read_to_string(&p).unwrap();
-                    for (i, line) in src.lines().enumerate() {
-                        if re.is_match(line) {
-                            bad.push(format!("{}:{}: {}", p.display(), i + 1, line.trim()));
-                        }
-                    }
+        for p in crate::source_scan::rust_files("src/api/admin") {
+            let src = std::fs::read_to_string(&p).unwrap();
+            for (i, line) in src.lines().enumerate() {
+                if re.is_match(line) {
+                    bad.push(format!("{}:{}: {}", p.display(), i + 1, line.trim()));
                 }
             }
         }

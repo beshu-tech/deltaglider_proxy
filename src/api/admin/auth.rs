@@ -1564,21 +1564,7 @@ mod tests {
     fn every_admin_sse_stream_rechecks_its_session() {
         // Every SSE endpoint in the crate is an admin endpoint; walk all of
         // `src/`, so a stream added in a sub-module is covered too.
-        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    rs_files(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-        let mut files = Vec::new();
-        rs_files(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut files,
-        );
+        let files = crate::source_scan::rust_files("src");
         let needle = concat!("Sse", "::new(");
         let mut found = 0;
         for path in files {

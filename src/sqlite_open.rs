@@ -88,27 +88,18 @@ mod tests {
     /// Every connection opens through the gate above.
     #[test]
     fn sqlite_opens_go_through_the_init_gate() {
-        fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
-            for e in std::fs::read_dir(dir).unwrap() {
-                let p = e.unwrap().path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().is_some_and(|x| x == "rs") && !p.ends_with("sqlite_open.rs")
-                {
-                    let text = std::fs::read_to_string(&p).unwrap();
-                    for (i, l) in text.lines().enumerate() {
-                        if l.contains(concat!("Connection", "::open")) {
-                            out.push(format!("{}:{}", p.display(), i + 1));
-                        }
-                    }
+        let mut hits = Vec::new();
+        for path in crate::source_scan::rust_files("src") {
+            if path.ends_with("sqlite_open.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (i, l) in text.lines().enumerate() {
+                if l.contains(concat!("Connection", "::open")) {
+                    hits.push(format!("{}:{}", path.display(), i + 1));
                 }
             }
         }
-        let mut hits = Vec::new();
-        walk(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut hits,
-        );
         assert!(hits.is_empty(), "open through crate::sqlite_open: {hits:?}");
     }
 }

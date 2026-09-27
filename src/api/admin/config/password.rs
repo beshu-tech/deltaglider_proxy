@@ -357,8 +357,7 @@ mod tests {
     /// not depend on the password). Source guard, so a revert is caught.
     #[test]
     fn password_change_never_rekeys_the_config_db() {
-        let src = include_str!("password.rs");
-        let handler = &src[..src.find("mod tests").unwrap()];
+        let handler = crate::source_scan::prod_text(include_str!("password.rs"));
         assert!(
             !handler.contains(concat!(".re", "key(")),
             "password.rs calls rekey"

@@ -1212,10 +1212,7 @@ mod tests {
     /// deferred copies.
     #[test]
     fn every_migrate_persist_is_a_checkpoint() {
-        let src: String = include_str!("migrate.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap()
+        let src: String = crate::source_scan::prod_text(include_str!("migrate.rs"))
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();

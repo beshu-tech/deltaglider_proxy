@@ -48,21 +48,193 @@ pub mod types;
 pub mod usage_scanner;
 pub mod zip_stream;
 
+/// THE source scanner that every source guard uses: one file walker and one
+/// definition of "production lines". A guard that cut a file at its first
+/// `#[cfg(test)]` stopped at the first test-only ITEM (a `#[cfg(test)] fn`)
+/// and never saw the production code after it.
+#[cfg(test)]
+pub(crate) mod source_scan {
+    use std::path::{Path, PathBuf};
+
+    /// The crate root (`CARGO_MANIFEST_DIR`).
+    pub(crate) fn root() -> &'static Path {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// Every `.rs` file under `dir` (relative to the crate root), sorted.
+    pub(crate) fn rust_files(dir: &str) -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&root().join(dir), &mut out);
+        out.sort();
+        out
+    }
+
+    /// `path` relative to the crate root, with `/` separators.
+    pub(crate) fn rel(path: &Path) -> String {
+        path.strip_prefix(root())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    /// Lines of every `#[cfg(test)] mod NAME { ... }` body in `text`, with
+    /// their 1-based line numbers. Brace counting is per line: good enough
+    /// for rustfmt-formatted sources (the scan covers all of `src/`).
+    pub(crate) fn test_module_lines(text: &str) -> Vec<(usize, &str)> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            if lines[i].trim() != "#[cfg(test)]" {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].trim_start().starts_with("#[") {
+                j += 1;
+            }
+            let head = lines.get(j).map(|l| l.trim_start()).unwrap_or("");
+            let head = head.strip_prefix("pub(crate) ").unwrap_or(head);
+            if !(head.starts_with("mod ") && head.ends_with('{')) {
+                i = j;
+                continue;
+            }
+            let mut depth: i64 = 0;
+            let mut k = j;
+            while k < lines.len() {
+                depth += lines[k].matches('{').count() as i64;
+                depth -= lines[k].matches('}').count() as i64;
+                out.push((k + 1, lines[k]));
+                if depth <= 0 && k > j {
+                    break;
+                }
+                k += 1;
+            }
+            i = k + 1;
+        }
+        out
+    }
+
+    /// `mask[i]` is true when line `i` (0-based) of `text` is production
+    /// code: outside every `#[cfg(test)] mod` body. A test-only item
+    /// (`#[cfg(test)] fn`) counts as production: the scan stays strict.
+    pub(crate) fn prod_mask(text: &str) -> Vec<bool> {
+        let mut mask = vec![true; text.lines().count()];
+        for (n, _) in test_module_lines(text) {
+            mask[n - 1] = false;
+        }
+        mask
+    }
+
+    /// Production lines of `text`, with 1-based line numbers.
+    pub(crate) fn prod_lines(text: &str) -> Vec<(usize, &str)> {
+        let mask = prod_mask(text);
+        text.lines()
+            .enumerate()
+            .filter(|(i, _)| mask[*i])
+            .map(|(i, l)| (i + 1, l))
+            .collect()
+    }
+
+    /// Production code of `text` as one string (for multi-line matches).
+    pub(crate) fn prod_text(text: &str) -> String {
+        prod_lines(text)
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Files declared as `#[cfg(test)] mod NAME;` (test module in its own file).
+    pub(crate) fn out_of_line_test_modules(files: &[PathBuf]) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(file).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for w in lines.windows(2) {
+                let decl = w[1].trim();
+                if w[0].trim() != "#[cfg(test)]"
+                    || !decl.starts_with("mod ")
+                    || !decl.ends_with(';')
+                {
+                    continue;
+                }
+                let name = &decl["mod ".len()..decl.len() - 1];
+                let dir = if file
+                    .file_name()
+                    .is_some_and(|n| n == "mod.rs" || n == "lib.rs")
+                {
+                    file.parent().unwrap().to_path_buf()
+                } else {
+                    file.with_extension("")
+                };
+                out.push(dir.join(format!("{name}.rs")));
+            }
+        }
+        out
+    }
+
+    /// `(rel path, text)` of every production source file under `dir`: the
+    /// out-of-line test modules (`#[cfg(test)] mod x;`) are left out.
+    pub(crate) fn prod_sources(dir: &str) -> Vec<(String, String)> {
+        let tests = out_of_line_test_modules(&rust_files("src"));
+        rust_files(dir)
+            .into_iter()
+            .filter(|f| !tests.contains(f))
+            .map(|f| (rel(&f), std::fs::read_to_string(&f).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn prod_lines_skip_test_modules_only() {
+        let src = "fn a() {}\n#[cfg(test)]\nfn only_in_tests() {}\nfn b() {}\n\
+                   #[cfg(test)]\nmod tests {\n    fn t() { x() }\n}\nfn c() {}\n";
+        let prod: Vec<&str> = prod_lines(src).into_iter().map(|(_, l)| l).collect();
+        assert_eq!(
+            prod,
+            [
+                "fn a() {}",
+                "#[cfg(test)]",
+                "fn only_in_tests() {}",
+                "fn b() {}",
+                "#[cfg(test)]",
+                "fn c() {}"
+            ],
+            "code after a test-only item is production; a test module is not"
+        );
+        assert_eq!(prod_lines(src)[5].0, 9, "line numbers are the file's");
+        assert!(prod_text(src).contains("fn b() {}\n#[cfg(test)]\nfn c() {}"));
+    }
+
+    #[test]
+    fn scan_finds_sources_and_out_of_line_test_files() {
+        let files = rust_files("src");
+        assert!(files.len() > 100, "scan found the sources");
+        let tests = out_of_line_test_modules(&files);
+        assert!(!tests.is_empty(), "found the out-of-line test modules");
+        assert!(prod_sources("src").iter().all(|(rel, _)| {
+            !tests.iter().any(|t| crate::source_scan::rel(t) == *rel)
+        }));
+    }
+}
+
 /// Source guards: rules that a unit test cannot express per call site.
 #[cfg(test)]
 mod source_guards {
-    use std::path::Path;
-
-    fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                rust_files(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
+    use crate::source_scan::{
+        out_of_line_test_modules, prod_mask, rel as rel_path, root, rust_files,
+        test_module_lines,
+    };
 
     /// Every object HEAD the server sends is counted in
     /// `deltaglider_backend_head_requests_total`, so the counter can prove
@@ -70,16 +242,10 @@ mod source_guards {
     /// runs in its own process and has no metrics endpoint.
     #[test]
     fn every_server_head_request_is_counted() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files = Vec::new();
-        rust_files(&root.join("src"), &mut files);
+        let files = rust_files("src");
         let mut offenders = Vec::new();
         for file in files {
-            let rel = file
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = rel_path(&file);
             if rel.starts_with("src/cli/") || rel == "src/lib.rs" {
                 continue;
             }
@@ -111,9 +277,7 @@ mod source_guards {
     /// `code` that way.
     #[test]
     fn no_byte_index_string_excerpts() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files = Vec::new();
-        rust_files(&root.join("src"), &mut files);
+        let files = rust_files("src");
         // Built at runtime so this test's own source is no hit.
         let needle = [".len()", ".min("].concat();
         // Byte buffers, not strings: slicing them anywhere is fine.
@@ -167,16 +331,10 @@ mod source_guards {
             "InvalidAccessKeyId",
             "SignatureDoesNotMatch",
         ];
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files = Vec::new();
-        rust_files(&root.join("src"), &mut files);
+        let files = rust_files("src");
         let mut offenders = Vec::new();
         for file in files {
-            let rel = file
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = rel_path(&file);
             if ALLOWED.contains(&rel.as_str()) {
                 continue;
             }
@@ -197,73 +355,6 @@ mod source_guards {
         );
     }
 
-    /// Lines of every `#[cfg(test)] mod NAME { ... }` body in `text`, with
-    /// their 1-based line numbers. Brace counting is per line: good enough
-    /// for rustfmt-formatted sources (the scan covers all of `src/`).
-    fn test_module_lines(text: &str) -> Vec<(usize, &str)> {
-        let lines: Vec<&str> = text.lines().collect();
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < lines.len() {
-            if lines[i].trim() != "#[cfg(test)]" {
-                i += 1;
-                continue;
-            }
-            let mut j = i + 1;
-            while j < lines.len() && lines[j].trim_start().starts_with("#[") {
-                j += 1;
-            }
-            let head = lines.get(j).map(|l| l.trim_start()).unwrap_or("");
-            let head = head.strip_prefix("pub(crate) ").unwrap_or(head);
-            if !(head.starts_with("mod ") && head.ends_with('{')) {
-                i = j;
-                continue;
-            }
-            let mut depth: i64 = 0;
-            let mut k = j;
-            while k < lines.len() {
-                depth += lines[k].matches('{').count() as i64;
-                depth -= lines[k].matches('}').count() as i64;
-                out.push((k + 1, lines[k]));
-                if depth <= 0 && k > j {
-                    break;
-                }
-                k += 1;
-            }
-            i = k + 1;
-        }
-        out
-    }
-
-    /// Files declared as `#[cfg(test)] mod NAME;` (test module in its own file).
-    fn out_of_line_test_modules(files: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
-        for file in files {
-            let text = std::fs::read_to_string(file).unwrap();
-            let lines: Vec<&str> = text.lines().collect();
-            for w in lines.windows(2) {
-                let decl = w[1].trim();
-                if w[0].trim() != "#[cfg(test)]"
-                    || !decl.starts_with("mod ")
-                    || !decl.ends_with(';')
-                {
-                    continue;
-                }
-                let name = &decl["mod ".len()..decl.len() - 1];
-                let dir = if file
-                    .file_name()
-                    .is_some_and(|n| n == "mod.rs" || n == "lib.rs")
-                {
-                    file.parent().unwrap().to_path_buf()
-                } else {
-                    file.with_extension("")
-                };
-                out.push(dir.join(format!("{name}.rs")));
-            }
-        }
-        out
-    }
-
     /// A request handler audits with the request's headers, so the entry
     /// names the client (user agent, forwarded IP). An empty header map
     /// dropped both (`backend_probe`, DeleteObjects/CopySource denials,
@@ -272,24 +363,19 @@ mod source_guards {
     #[test]
     fn request_audits_carry_the_request_headers() {
         const ALLOWED: [(&str, &str); 0] = [];
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files = vec![root.join("src/s3_adapter_s3s.rs")];
-        rust_files(&root.join("src/api"), &mut files);
+        let mut files = vec![root().join("src/s3_adapter_s3s.rs")];
+        files.extend(rust_files("src/api"));
         let empty = ["HeaderMap", "::new()"].concat();
         let mut offenders = Vec::new();
         let mut allowed_hits = std::collections::BTreeSet::new();
         for file in files {
-            let rel = file
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = rel_path(&file);
             let text = std::fs::read_to_string(&file).unwrap();
             let lines: Vec<&str> = text.lines().collect();
-            let tests_from = test_module_lines(&text).first().map(|(n, _)| *n);
+            let prod = prod_mask(&text);
             for (i, line) in lines.iter().enumerate() {
-                if tests_from.is_some_and(|t| i + 1 >= t) {
-                    break;
+                if !prod[i] {
+                    continue;
                 }
                 let Some(at) = line.find("audit_log(") else {
                     continue;
@@ -356,9 +442,7 @@ mod source_guards {
     /// A DB call is a `.map_err(` whose statement calls `db.<method>(`.
     #[test]
     fn admin_db_errors_map_through_db_error_status() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files = Vec::new();
-        rust_files(&root.join("src/api/admin"), &mut files);
+        let files = rust_files("src/api/admin");
         let is_db_call = |text: &str| {
             text.match_indices("db.").any(|(i, _)| {
                 let before = text[..i].chars().next_back();
@@ -373,17 +457,13 @@ mod source_guards {
         };
         let mut offenders = Vec::new();
         for file in files {
-            let rel = file
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = rel_path(&file);
             let text = std::fs::read_to_string(&file).unwrap();
             let lines: Vec<&str> = text.lines().collect();
-            let tests_from = test_module_lines(&text).first().map(|(n, _)| *n);
+            let prod = prod_mask(&text);
             for (i, line) in lines.iter().enumerate() {
-                if tests_from.is_some_and(|t| i + 1 >= t) {
-                    break;
+                if !prod[i] {
+                    continue;
                 }
                 let Some(at) = line.find(".map_err(") else {
                     continue;
@@ -490,21 +570,14 @@ mod source_guards {
             ["xattr::", "set("].concat(),
         ];
         let literal = ["FileMetadata", " {"].concat();
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut src = Vec::new();
-        rust_files(&root.join("src"), &mut src);
+        let src = rust_files("src");
         let test_files = out_of_line_test_modules(&src);
-        let mut integration = Vec::new();
-        rust_files(&root.join("tests"), &mut integration);
+        let integration = rust_files("tests");
         assert!(!integration.is_empty(), "scan found tests/");
         let mut offenders = Vec::new();
         let mut allowed_hits = std::collections::BTreeSet::new();
         for file in src.iter().chain(&integration) {
-            let rel = file
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = rel_path(file);
             if rel == "src/lib.rs" {
                 continue;
             }
@@ -565,23 +638,13 @@ mod source_guards {
         assert!(!lit("impl Default for FileMetadata {"));
     }
 
-    /// Unit tests do not read the process environment. A test that reads it
-    /// passes or fails (or skips itself) by what the runner exports: the
-    /// nightly job used to set `DGP_BACKEND_ALLOW_LOCAL` for the whole job,
-    /// and a lib test skipped itself there. Inject the env instead (the
-    /// `*_from(env: EnvLookup)` pattern, e.g. `replay_window_from`).
-    ///
-    /// Allowed: files whose tests test env handling itself, serialised on a
-    /// lock, plus two reads that are not config.
     /// A lockout answer names the wait (`Blocked`: 429, `Retry-After`, the
     /// reason). A guard site that drops it with `Err(_)` sends a bare page.
     #[test]
     fn a_rate_limit_guard_site_keeps_the_lockout_answer() {
         let needle = ["RateLimitGuard::", "enter"].concat();
         let dropped = ["Err(", "_)"].concat();
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files = Vec::new();
-        rust_files(&root.join("src"), &mut files);
+        let files = rust_files("src");
         let (mut sites, mut offenders) = (0, Vec::new());
         for file in files {
             let text = std::fs::read_to_string(&file).unwrap();
@@ -606,6 +669,14 @@ mod source_guards {
         );
     }
 
+    /// Unit tests do not read the process environment. A test that reads it
+    /// passes or fails (or skips itself) by what the runner exports: the
+    /// nightly job used to set `DGP_BACKEND_ALLOW_LOCAL` for the whole job,
+    /// and a lib test skipped itself there. Inject the env instead (the
+    /// `*_from(env: EnvLookup)` pattern, e.g. `replay_window_from`).
+    ///
+    /// Allowed: files whose tests test env handling itself, serialised on a
+    /// lock, plus two reads that are not config.
     #[test]
     fn test_modules_do_not_read_process_env() {
         const ALLOWED: [(&str, &str); 7] = [
@@ -648,9 +719,7 @@ mod source_guards {
             ["env_", "parse_with_default("].concat(),
             ["config::", "process_env"].concat(),
         ];
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files = Vec::new();
-        rust_files(&root.join("src"), &mut files);
+        let files = rust_files("src");
         let test_files = out_of_line_test_modules(&files);
         assert!(
             !test_files.is_empty(),
@@ -659,11 +728,7 @@ mod source_guards {
         let mut offenders = Vec::new();
         let mut allowed_hits = std::collections::BTreeSet::new();
         for file in files {
-            let rel = file
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = rel_path(&file);
             let text = std::fs::read_to_string(&file).unwrap();
             // A `#[cfg(test)] mod x;` file is test code throughout.
             let lines: Vec<(usize, &str)> = if test_files.contains(&file) {

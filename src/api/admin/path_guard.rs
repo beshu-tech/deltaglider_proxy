@@ -142,7 +142,6 @@ mod tests {
     /// validated types. Plain `String` there is the S6 defect.
     #[test]
     fn admin_inputs_use_validated_types() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/admin");
         // Fields that are not storage paths (UI hints, synthetic trace input).
         const ALLOW: &[&str] = &[
             "auth.rs:BrowserSessionConnectRequest.bucket",
@@ -151,21 +150,7 @@ mod tests {
             "objects.rs:ZipQuery.keys",
         ];
         let mut offenders = Vec::new();
-        let mut files = vec![];
-        for e in std::fs::read_dir(&dir).unwrap().flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                for e2 in std::fs::read_dir(&p).unwrap().flatten() {
-                    files.push(e2.path());
-                }
-            } else {
-                files.push(p);
-            }
-        }
-        for path in files
-            .iter()
-            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-        {
+        for path in &crate::source_scan::rust_files("src/api/admin") {
             let src = std::fs::read_to_string(path).unwrap();
             let fname = path.file_name().unwrap().to_string_lossy().to_string();
             let lines: Vec<&str> = src.lines().collect();

@@ -147,33 +147,13 @@ mod tests {
     /// records progress, and nothing checks that it does.
     #[test]
     fn only_migrate_defers_fsync() {
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for e in std::fs::read_dir(dir).unwrap().flatten() {
-                let p = e.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else if p.extension().is_some_and(|x| x == "rs") {
-                    out.push(p);
-                }
-            }
-        }
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut files = Vec::new();
-        walk(&root.join("src"), &mut files);
+        use crate::source_scan::{prod_sources, prod_text};
         let needle = ["with_deferred_", "fsync("].concat();
-        let mut users = Vec::new();
-        for f in files {
-            let rel = f
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            let text = std::fs::read_to_string(&f).unwrap();
-            let impl_src = text.split("#[cfg(test)]").next().unwrap();
-            if impl_src.contains(needle.as_str()) {
-                users.push(rel);
-            }
-        }
+        let mut users: Vec<String> = prod_sources("src")
+            .into_iter()
+            .filter(|(_, text)| prod_text(text).contains(needle.as_str()))
+            .map(|(rel, _)| rel)
+            .collect();
         users.sort();
         assert_eq!(
             users,
