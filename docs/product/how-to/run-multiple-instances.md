@@ -166,7 +166,7 @@ curl -b cookies https://dgp-reader-1:9000/_/api/admin/users | jq '.[] | .name'
 aws s3 ls --endpoint-url https://dgp-reader-1:9000
 ```
 
-Watch the reader's logs for `[config-sync]` lines — a download on ETag change is the success signal. An `iam_sync_conflict` audit entry means that two instances changed the same row.
+Watch the reader's logs for `[config-sync]` lines — a download on ETag change is the success signal. An `iam_sync_conflict` audit entry means that two instances changed the same row. A login of one identity on two instances is not a conflict: the merge keeps the newer login time.
 
 ## Related
 

@@ -146,6 +146,24 @@ pub struct ExternalIdentity {
     pub email_verified: bool,
 }
 
+impl ExternalIdentity {
+    /// Pure: whether a returning login changes a column that the config
+    /// sync compares. `last_login` and `raw_claims` change on every login
+    /// and do not count: an upload for them alone is a sync round (and a
+    /// CAS conflict with a peer's login) for nothing; they travel with the
+    /// next real change.
+    pub fn login_changes_synced_fields(
+        &self,
+        email: Option<&str>,
+        display_name: Option<&str>,
+        email_verified: bool,
+    ) -> bool {
+        self.email.as_deref() != email
+            || self.display_name.as_deref() != display_name
+            || self.email_verified != email_verified
+    }
+}
+
 // ── ConfigDb CRUD implementations ──
 
 impl ConfigDb {
@@ -911,6 +929,30 @@ mod tests {
         // Get for user
         let for_user = db.get_external_identities_for_user(user.id).unwrap();
         assert_eq!(for_user.len(), 1);
+    }
+
+    /// Review 4 coordination-3: a returning login that changes only the
+    /// login-time columns needs no config sync upload.
+    #[test]
+    fn only_profile_changes_of_a_login_need_a_sync() {
+        let db = ConfigDb::in_memory("test-pass").unwrap();
+        let user = db.create_user("u", "AK1", "SK1", true, &[]).unwrap();
+        let provider = db.create_auth_provider(&make_provider_req("okta")).unwrap();
+        let id = db
+            .create_external_identity(
+                user.id,
+                provider.id,
+                "sub-x",
+                Some("a@x.com"),
+                Some("A"),
+                None,
+                true,
+            )
+            .unwrap();
+        assert!(!id.login_changes_synced_fields(Some("a@x.com"), Some("A"), true));
+        assert!(id.login_changes_synced_fields(Some("b@x.com"), Some("A"), true));
+        assert!(id.login_changes_synced_fields(Some("a@x.com"), None, true));
+        assert!(id.login_changes_synced_fields(Some("a@x.com"), Some("A"), false));
     }
 
     #[test]

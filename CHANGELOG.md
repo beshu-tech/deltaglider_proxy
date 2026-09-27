@@ -34,6 +34,16 @@ coordination bucket, a run also stops renewing its S3 lease on every listing
 page: only the heartbeat renews it, which removes two coordination-bucket
 requests for each listed directory.
 
+### Fixed — An OAuth login on two instances is not a sync conflict
+
+Every OAuth login rewrote `last_login` and `raw_claims` and uploaded the
+whole config DB. When one identity logged in on two instances between two
+polls, the merge saw a column changed on both sides, wrote an
+`iam_sync_conflict` audit entry, and often had a CAS conflict on the
+upload. Now the merge does not compare these two columns and keeps the
+newer login with its claims. A login that changes only these columns no
+longer uploads the DB: they travel with the next real change.
+
 ### Added — The config sync state is visible
 
 A merge that failed or that refused a copy was only a log line every 5

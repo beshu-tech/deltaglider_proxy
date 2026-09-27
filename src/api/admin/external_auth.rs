@@ -436,10 +436,17 @@ pub async fn oauth_callback(
         }
     };
 
-    // Find or create the local user
+    // Find or create the local user. `synced_change`: the login changed a
+    // row that peers must see (not only `last_login` / `raw_claims`).
+    let mut synced_change = false;
     let (user, _is_new) = match db.find_external_identity(provider_config.id, &identity.subject) {
         Ok(Some(ext_id)) => {
             // Returning user — update their external identity
+            synced_change |= ext_id.login_changes_synced_fields(
+                identity.email.as_deref(),
+                identity.name.as_deref(),
+                identity.email_verified,
+            );
             let _ = db.update_external_identity(
                 ext_id.id,
                 identity.email.as_deref(),
@@ -485,6 +492,7 @@ pub async fn oauth_callback(
                 identity.email_verified,
             ) {
                 Ok((user, _)) => {
+                    synced_change = true;
                     tracing::info!(
                         "Auto-provisioned external user '{}' (id={}) via '{}'",
                         user.name,
@@ -528,13 +536,16 @@ pub async fn oauth_callback(
     let rules = mapping::filter_rules_for_email_verification(&rules, &identity);
     let rule_groups = mapping::evaluate_mappings(&rules, &identity, provider_config.id);
     let existing_groups = db.get_user_group_ids(user.id).unwrap_or_default();
-    let merged = merge_group_memberships(existing_groups, &rule_groups);
-    if let Err(e) = db.set_user_group_memberships(user.id, &merged) {
-        tracing::warn!(
-            "Failed to update group memberships for user {}: {}",
-            user.id,
-            e
-        );
+    let merged = merge_group_memberships(existing_groups.clone(), &rule_groups);
+    if merged != existing_groups {
+        synced_change = true;
+        if let Err(e) = db.set_user_group_memberships(user.id, &merged) {
+            tracing::warn!(
+                "Failed to update group memberships for user {}: {}",
+                user.id,
+                e
+            );
+        }
     }
 
     // Rebuild IAM index to reflect the new/updated user and group memberships.
@@ -549,9 +560,12 @@ pub async fn oauth_callback(
         );
     }
 
-    // Trigger config DB sync
+    // Trigger config DB sync, unless the login changed only its own
+    // login-time columns.
     drop(db); // Release lock before triggering sync
-    trigger_config_sync(&state);
+    if synced_change {
+        trigger_config_sync(&state);
+    }
 
     // Successful OAuth login — reset rate limiter for this IP
     guard.record_success();

@@ -54,8 +54,50 @@ const NOW_MS: &str = "CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGE
 
 /// Bookkeeping columns: two versions of a row that differ only here are the
 /// same row. `created_at` differs when two nodes create the same row (e.g. a
-/// declarative reconcile on each node).
-const NOT_COMPARED: &[&str] = &["id", "sync_mtime", "created_at", "updated_at"];
+/// declarative reconcile on each node). `last_login` and `raw_claims` change
+/// on every OAuth login: one identity logging in on two nodes is not a
+/// conflict, and the merge keeps the newer login ([`LOGIN_COLUMNS`]).
+const NOT_COMPARED: &[&str] = &[
+    "id",
+    "sync_mtime",
+    "created_at",
+    "updated_at",
+    "last_login",
+    "raw_claims",
+];
+
+/// Per table: the login-time column, and the columns that the newer login
+/// carries along with it.
+const LOGIN_COLUMNS: &[(&str, &str, &[&str])] =
+    &[("external_identities", "last_login", &["raw_claims"])];
+
+/// Pure: give `picked` the newest login of `l` and `r` (by `stamp`, a
+/// `datetime('now')` text that sorts as time), with the columns that go
+/// with it. A login on one node never loses to an older one on another.
+fn keep_newest_login(picked: &mut Entity, l: Option<&Entity>, r: Option<&Entity>, table: &str) {
+    let Some((_, stamp, follow)) = LOGIN_COLUMNS.iter().find(|(t, _, _)| *t == table) else {
+        return;
+    };
+    let when = |e: &Entity| match e.row.get(*stamp) {
+        Some(Value::Text(t)) => Some(t.clone()),
+        _ => None,
+    };
+    let newest = [l, r]
+        .into_iter()
+        .flatten()
+        .filter_map(|e| when(e).map(|w| (w, e)))
+        .max_by(|a, b| a.0.cmp(&b.0));
+    let Some((w, src)) = newest else { return };
+    if when(picked).is_some_and(|p| p >= w) {
+        return;
+    }
+    for c in std::iter::once(*stamp).chain(follow.iter().copied()) {
+        match src.row.get(c) {
+            Some(v) => picked.row.insert(c.to_string(), v.clone()),
+            None => picked.row.remove(c),
+        };
+    }
+}
 
 /// Tables that carry `sync_mtime`, and the child tables whose changes count as
 /// a change of the parent row.
@@ -586,7 +628,8 @@ fn merge_table(
                 // goes to the newer write.
                 (Some(b), Some(l), Some(r)) => {
                     let (resolution, side) = side(l, r);
-                    let (e, conflict) = merge_columns(b, l, r, side);
+                    let (mut e, conflict) = merge_columns(b, l, r, side);
+                    keep_newest_login(&mut e, Some(l), Some(r), spec.table);
                     if !conflict {
                         out.insert(key.clone(), (e, side));
                         continue;
@@ -597,8 +640,9 @@ fn merge_table(
                 // merge against, so the newer row wins as a whole.
                 (None, Some(l), Some(r)) => {
                     let (resolution, side) = side(l, r);
-                    let e = if side == Side::Local { l } else { r };
-                    (resolution, Some((e.clone(), side)))
+                    let mut e = if side == Side::Local { l } else { r }.clone();
+                    keep_newest_login(&mut e, Some(l), Some(r), spec.table);
+                    (resolution, Some((e, side)))
                 }
                 _ => ("deleted", None),
             };
@@ -614,7 +658,9 @@ fn merge_table(
             continue;
         };
         if let Some((e, side)) = pick {
-            out.insert(key.clone(), (e.clone(), side));
+            let mut e = e.clone();
+            keep_newest_login(&mut e, l, r, spec.table);
+            out.insert(key.clone(), (e, side));
         }
     }
     out
@@ -2554,5 +2600,62 @@ mod review3_tests {
             "the local create is lost: {:?}",
             names(&local)
         );
+    }
+
+    /// Review 4 coordination-3: one identity logs in on two nodes between
+    /// polls. That is not a conflict, and the newer login (with its claims)
+    /// wins whichever side it is on.
+    #[test]
+    fn a_login_on_two_nodes_is_not_a_conflict() {
+        let t = trio(|db| {
+            seed_okta(db);
+            let p = db.get_auth_provider_by_name("okta").unwrap().unwrap().id;
+            let bob = db
+                .create_external_user("bob", "AKBOB00000001", "s")
+                .unwrap();
+            db.create_external_identity(bob.id, p, "sub-b", None, None, None, true)
+                .unwrap();
+        });
+        let login = |path: &Path, at: &str, claims: &str| {
+            open(path)
+                .conn
+                .execute(
+                    "UPDATE external_identities SET last_login = ?1, raw_claims = ?2",
+                    [at, claims],
+                )
+                .unwrap();
+        };
+        let read = |db: &ConfigDb| -> (String, String) {
+            db.conn
+                .query_row(
+                    "SELECT last_login, raw_claims FROM external_identities",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        for (local_at, remote_at, want) in [
+            ("2026-09-27 10:00:00", "2026-09-27 10:05:00", "r"),
+            ("2026-09-27 10:05:00", "2026-09-27 10:00:00", "l"),
+        ] {
+            let t2 = trio(|_| {});
+            for (from, to) in [
+                (&t.base, &t2.base),
+                (&t.local, &t2.local),
+                (&t.remote, &t2.remote),
+            ] {
+                std::fs::copy(from, to).unwrap();
+            }
+            login(&t2.local, local_at, r#"{"iat":"l"}"#);
+            login(&t2.remote, remote_at, r#"{"iat":"r"}"#);
+            let local = open(&t2.local);
+            let report = local
+                .merge_iam_from(&t2.remote, Some(&t2.base), PASS)
+                .unwrap();
+            assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+            let (at, claims) = read(&local);
+            assert_eq!(at, local_at.max(remote_at));
+            assert_eq!(claims, format!(r#"{{"iat":"{want}"}}"#));
+        }
     }
 }
