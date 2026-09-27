@@ -177,12 +177,10 @@ fn fsync_paths(paths: Vec<PathBuf>) -> Result<(), StorageError> {
             let handles: Vec<_> = batch
                 .iter()
                 .map(|path| {
-                    s.spawn(
-                        move || match std::fs::File::open(path).and_then(|f| f.sync_all()) {
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                            other => other,
-                        },
-                    )
+                    s.spawn(move || match sync_path(path) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        other => other,
+                    })
                 })
                 .collect();
             handles
@@ -206,6 +204,20 @@ fn fsync_paths(paths: Vec<PathBuf>) -> Result<(), StorageError> {
     }
 }
 
+/// Paths that `sync_path` made durable, for the tests.
+#[cfg(test)]
+static SYNCED: parking_lot::Mutex<Vec<PathBuf>> = parking_lot::Mutex::new(Vec::new());
+
+/// fsync a file or a directory. A directory fsync makes its entries
+/// durable: without it, a rename can be lost on power loss (ext4, XFS)
+/// although the file's own data is on disk.
+fn sync_path(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()?;
+    #[cfg(test)]
+    SYNCED.lock().push(path.to_path_buf());
+    Ok(())
+}
+
 /// Make the pending deferred writes durable (blocking).
 fn flush_pending_fsync() -> Result<(), StorageError> {
     let paths = std::mem::take(&mut *PENDING_FSYNC.lock());
@@ -224,10 +236,24 @@ fn finish_write(
     }
     tmp.persist(target)
         .map_err(|e| io_to_storage_error(e.error))?;
+    // The rename is an entry of the parent directory: durable only once
+    // the directory is fsynced too (storage-5).
+    let parent = target.parent().map(Path::to_path_buf);
+    if durability == Durability::Sync {
+        if let Some(dir) = &parent {
+            sync_path(dir).map_err(io_to_storage_error)?;
+        }
+    }
     if durability == Durability::Deferred {
         let full = {
             let mut pending = PENDING_FSYNC.lock();
             pending.push(target.to_path_buf());
+            // Many copies share one directory: fsync it once per flush.
+            if let Some(dir) = parent {
+                if !pending.contains(&dir) {
+                    pending.push(dir);
+                }
+            }
             pending.len() >= PENDING_FSYNC_MAX
         };
         if full {
@@ -1890,6 +1916,10 @@ mod tests {
 
     /// Build a minimal FileMetadata for testing the put_* paths. The
     /// content is never read because put_* should fail before touching it.
+    /// The pending set is process-wide: tests that assert on it or flush
+    /// it run one at a time.
+    static PENDING_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn dummy_metadata(filename: &str) -> FileMetadata {
         FileMetadata::new_passthrough(
             filename.to_string(),
@@ -2822,6 +2852,7 @@ mod tests {
     /// in the same scope, and any write outside it, fsync at once.
     #[tokio::test]
     async fn only_scoped_object_writes_defer_their_fsync() {
+        let _serial = PENDING_TESTS.lock().await;
         let tmp = tempfile::tempdir().expect("tempdir");
         let backend = FilesystemBackend::new(tmp.path().to_path_buf())
             .await
@@ -2875,6 +2906,7 @@ mod tests {
     /// The pending set stays bounded: the write that fills it flushes it.
     #[tokio::test]
     async fn the_pending_fsync_set_is_bounded() {
+        let _serial = PENDING_TESTS.lock().await;
         let tmp = tempfile::tempdir().expect("tempdir");
         let backend = FilesystemBackend::new(tmp.path().to_path_buf())
             .await
@@ -3003,5 +3035,49 @@ mod tests {
             .unwrap();
         let body: Vec<u8> = stream.map(|c| c.unwrap().to_vec()).concat().await;
         assert_eq!((len, body.as_slice()), (5, &b"56789"[..]));
+    }
+
+    /// storage-5: a write is durable only when its directory entry is: the
+    /// Sync path fsyncs the parent directory after the rename, and the
+    /// deferred path queues the parent for `flush_pending`.
+    #[tokio::test]
+    async fn a_write_fsyncs_its_parent_directory() {
+        let _serial = PENDING_TESTS.lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        let synced = |dir: &Path| super::SYNCED.lock().iter().any(|p| p == dir);
+
+        backend
+            .put_passthrough("bucket", "s", "f.bin", b"x", &dummy_metadata("f.bin"))
+            .await
+            .unwrap();
+        let sync_dir = backend.deltaspace_dir("bucket", "s").unwrap();
+        assert!(synced(&sync_dir), "the Sync path must fsync the parent dir");
+
+        let deferred_dir = backend.deltaspace_dir("bucket", "d").unwrap();
+        crate::storage::with_deferred_fsync(async {
+            for name in ["a.bin", "b.bin"] {
+                backend
+                    .put_passthrough("bucket", "d", name, b"x", &dummy_metadata(name))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await;
+        let queued = super::PENDING_FSYNC
+            .lock()
+            .iter()
+            .filter(|p| **p == deferred_dir)
+            .count();
+        // At most once (dedup); a concurrent test's flush may take it early.
+        assert!(queued <= 1, "the parent dir is queued once, got {queued}");
+        backend.flush_pending().await.unwrap();
+        assert!(
+            synced(&deferred_dir),
+            "flush_pending must fsync the parent dir"
+        );
     }
 }

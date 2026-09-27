@@ -295,6 +295,15 @@ lost, and the panel showed no unsaved changes. Now the read replaces the
 form only when it has no new edits. Otherwise the edits stay, and the
 panel shows them as unsaved. The read also no longer hides the form.
 
+### Fixed — A write on the filesystem backend survives a power loss
+
+The filesystem backend wrote each object to a temporary file, made that
+file durable, and renamed it into place. The rename changes the directory,
+and the proxy never made the directory durable, so after a power loss the
+object could be missing although the write had succeeded. Now every write
+also makes its directory durable, and a migrate's batched durability
+covers the directories of its copies.
+
 ### Fixed — Too much metadata on an S3 backend answers 400, not 500
 
 On an S3 backend, the proxy stores its own metadata fields next to the
