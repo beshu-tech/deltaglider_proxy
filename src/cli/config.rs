@@ -203,6 +203,23 @@ pub fn lint(file: &str) -> i32 {
         return EXIT_REJECTED;
     }
 
+    // The replication gate (duplicate rule names, unbounded nesting) that
+    // /apply and /validate run against the running config; offline there is
+    // no running config, so every rule counts as changed.
+    if let Err(errors) = crate::config_sections::replication_gate(
+        &crate::config_sections::ReplicationConfig::default(),
+        &cfg.replication,
+    ) {
+        for e in &errors {
+            eprintln!("error: {e}");
+        }
+        eprintln!(
+            "{file}: rejected — {} fatal replication rule error(s)",
+            errors.len()
+        );
+        return EXIT_REJECTED;
+    }
+
     for w in &warnings {
         eprintln!("warning: {w}");
     }
@@ -645,6 +662,30 @@ mod tests {
             assert!(props.contains_key(section), "schema lacks `{section}`");
         }
         assert!(!props.contains_key("listen_addr"), "flat key at the root");
+    }
+
+    /// Review 4 config-5: lint refuses what `/config/apply` and
+    /// `/config/validate` refuse (the replication gate).
+    #[test]
+    fn lint_refuses_duplicate_replication_rule_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.yaml");
+        let rule = |dst: &str| {
+            format!(
+                "    - name: r\n      source:\n        bucket: releases\n      \
+                 destination:\n        bucket: {dst}\n      interval: 1h\n"
+            )
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "storage:\n  filesystem: /var/dgp\n  replication:\n    rules:\n{}{}",
+                rule("downloads"),
+                rule("db-archive")
+            ),
+        )
+        .unwrap();
+        assert_eq!(lint(path.to_str().unwrap()), EXIT_REJECTED);
     }
 
     // ── Phase 4: lint + defaults ───────────────────────────────────────

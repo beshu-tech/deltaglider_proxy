@@ -80,6 +80,13 @@ release has no generation and keeps the old rule. During a rolling upgrade,
 an instance on the older release does not merge copies from upgraded
 instances until it is upgraded too, as with every schema change.
 
+### Fixed — `config lint` refuses what an apply refuses
+
+`config lint` passed a file with two replication rules of the same name,
+or a rule that copies into its own source, while `/config/apply` and
+`/config/validate` refuse that file. Now lint runs the same replication
+check and exits with code `6`.
+
 ### Fixed — `config schema` describes the sectioned config file
 
 `config schema`, `config defaults` and `GET /_/api/admin/config/defaults`
