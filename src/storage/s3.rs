@@ -839,6 +839,9 @@ impl S3Backend {
             if s == 503 || s == 429 || code == "SlowDown" {
                 return StorageError::Throttled(format!("{} throttled (status={}): {}", op, s, e));
             }
+            if s == 403 {
+                return StorageError::AccessDenied(format!("{op} failed (status=403): {e}"));
+            }
         } else if code == "SlowDown" {
             return StorageError::Throttled(format!("{} throttled: {}", op, e));
         }
@@ -3638,14 +3641,6 @@ pub(super) async fn put_facts_object(
     Ok(())
 }
 
-/// Did an S3 backend deny access to an object? An object-level 403 has no
-/// `StorageError` variant of its own: `S3Backend::classify_s3_error` keeps it
-/// as `S3("<op> failed (status=403): …")`. This helper lives next to that
-/// format so that callers never match on error text themselves.
-pub fn is_backend_access_denied(e: &StorageError) -> bool {
-    matches!(e, StorageError::S3(msg) if msg.contains("(status=403)"))
-}
-
 /// Early-exit decision for the delegated-listing fetch loop.
 ///
 /// Given the raw keys + common prefixes fetched so far, returns the anchor —
@@ -4671,7 +4666,7 @@ mod tests {
         }
     }
 
-    /// An object-level 403 must stay `S3(...)` — never get rewritten to
+    /// An object-level 403 is `AccessDenied` — never rewritten to
     /// BucketNotFound. The Hetzner/Ceph quirk only applies to bucket-
     /// level operations; a GetObject 403 is a legitimate AccessDenied
     /// and callers need to surface it as such.
@@ -4694,7 +4689,7 @@ mod tests {
             StorageError::NotFound(_) => {
                 panic!("403 AccessDenied must not be misclassified as NotFound")
             }
-            StorageError::S3(msg) => {
+            StorageError::AccessDenied(msg) => {
                 assert!(
                     msg.contains("403"),
                     "status should appear in message: {msg}"
@@ -4704,7 +4699,7 @@ mod tests {
                     "op should appear in message: {msg}"
                 );
             }
-            other => panic!("expected S3, got {:?}", other),
+            other => panic!("expected AccessDenied, got {:?}", other),
         }
     }
 
@@ -4816,21 +4811,21 @@ mod tests {
                 "denied: SlowDown-q3.pdf",
                 403,
                 S3Op::GetObject,
-                "S3",
+                "AccessDenied",
             ),
             (
                 "AccessDenied",
                 "denied: NoSuchBucket.zip",
                 403,
                 S3Op::GetObject,
-                "S3",
+                "AccessDenied",
             ),
             (
                 "AccessDenied",
                 "denied: NoSuchKey.bin",
                 403,
                 S3Op::HeadObject,
-                "S3",
+                "AccessDenied",
             ),
             (
                 "InternalError",
@@ -4858,6 +4853,7 @@ mod tests {
             let err = err_with(code, msg, status);
             let got = match S3Backend::classify_s3_error("bucket", &err, op) {
                 StorageError::S3(_) => "S3",
+                StorageError::AccessDenied(_) => "AccessDenied",
                 StorageError::Throttled(_) => "Throttled",
                 StorageError::BucketNotFound(_) => "BucketNotFound",
                 StorageError::NotFound(_) => "NotFound",

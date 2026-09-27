@@ -1125,9 +1125,7 @@ fn zip_failure_kind(e: &crate::deltaglider::EngineError) -> ZipFailure {
         {
             ZipFailure::AccessDenied
         }
-        EngineError::Storage(se) if crate::storage::is_backend_access_denied(se) => {
-            ZipFailure::AccessDenied
-        }
+        EngineError::Storage(StorageError::AccessDenied(_)) => ZipFailure::AccessDenied,
         EngineError::TooLarge { .. } | EngineError::Storage(StorageError::TooLarge { .. }) => {
             ZipFailure::TooLarge
         }
@@ -1327,7 +1325,7 @@ mod tests {
             NotFound
         );
         assert_eq!(
-            kind(&EngineError::Storage(StorageError::S3(
+            kind(&EngineError::Storage(StorageError::AccessDenied(
                 "GetObject failed (status=403): AccessDenied".into()
             ))),
             AccessDenied

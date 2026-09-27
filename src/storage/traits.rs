@@ -112,6 +112,13 @@ pub enum StorageError {
     #[error("S3 error: {0}")]
     S3(String),
 
+    /// The backend refused an object-level request (403). Classified where
+    /// the status is known (`S3Backend::classify_s3_error`), so no caller
+    /// reads the status out of the text. Same Display and the same wire
+    /// answer as `S3` (500, sanitised): only the classification is new.
+    #[error("S3 error: {0}")]
+    AccessDenied(String),
+
     #[error("Bucket not found: {0}")]
     BucketNotFound(String),
 
