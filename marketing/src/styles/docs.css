@@ -220,14 +220,23 @@
 }
 /* Neutral slate separator — was brand cyan, which over-signals on a divider. */
 .docs-crumb-sep { color: var(--ink-500); opacity: 0.7; }
-.docs-edit-link {
+/* Page actions: copy as markdown, open in an LLM, edit on GitHub. */
+.docs-page-actions {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin: -6px 0 22px;
+}
+.docs-action {
   display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0;
-  color: var(--ink-soft); text-decoration: none;
+  font-family: var(--doc-label); font-size: 0.78rem; line-height: 1.4;
+  color: var(--ink-soft); text-decoration: none; background: none; cursor: pointer;
   padding: 3px 10px; border: 1px solid var(--rule-strong); border-radius: 999px;
   transition: color 0.12s, border-color 0.12s;
 }
-.docs-edit-link:hover { color: var(--brand-dark); border-color: var(--brand); }
-.docs-edit-link svg { display: block; }
+.docs-action:hover { color: var(--brand-dark); border-color: var(--brand); }
+.docs-action:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+.docs-action svg { display: block; flex: none; }
+.docs-action.is-copied { color: var(--brand-dark); border-color: var(--brand); }
+
 
 .docs-kicker {
   font-family: var(--doc-label);
@@ -589,6 +598,15 @@
   font-family: var(--doc-label); font-size: 0.72rem; color: var(--ink-500);
   background: var(--bg-soft); border: 1px solid var(--rule); border-radius: 5px; padding: 1px 5px;
 }
+.docs-landing-head .docs-landing-llm {
+  font-size: 0.92rem; line-height: 1.55; color: var(--ink-soft);
+  margin: 0 0 26px; padding: 10px 14px;
+  border: 1px solid var(--rule); border-left: 2px solid var(--brand);
+  border-radius: 0 10px 10px 0; background: var(--doc-callout-bg);
+}
+.docs-landing-llm strong { color: var(--ink-strong); }
+.docs-landing-llm a { color: var(--doc-link); }
+.docs-landing-llm code { font-family: var(--font-mono); font-size: 0.88em; white-space: nowrap; }
 /* Eyebrow heading above the three featured cards. */
 .docs-landing-start-label {
   font-family: var(--doc-label); font-size: 0.8125rem; font-weight: 600;

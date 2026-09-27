@@ -10,6 +10,8 @@ import DocsLayout from '../../layouts/DocsLayout.astro';
 import { DOCS, docsByGroup, adjacentDocs, metaForPath } from '../../lib/docs';
 import { docContent } from '../../lib/docContent';
 import { renderDoc, extractSummary, extractToc } from '../../lib/renderDoc';
+import { markdownUrl } from '../../lib/llms';
+import { SITE } from '../../lib/seo';
 
 const GH_BLOB = 'https://github.com/beshu-tech/deltaglider_proxy/blob/main/docs/product';
 
@@ -54,6 +56,9 @@ let toc: { depth: 2 | 3; id: string; text: string; html: string }[] = [];
 let docTitle = '';
 let groupId = '';
 let editUrl = '';
+let mdUrl = '';
+let chatgptUrl = '';
+let claudeUrl = '';
 let prev: { url: string; title: string } | null = null;
 let next: { url: string; title: string } | null = null;
 
@@ -69,6 +74,10 @@ if (props.kind === 'doc') {
   const meta = metaForPath(props.path);
   groupId = meta?.group ?? '';
   editUrl = `${GH_BLOB}/${props.path}.md`;
+  mdUrl = meta ? markdownUrl(meta) : '';
+  const prompt = `Read ${SITE.url}${mdUrl} (DeltaGlider Proxy documentation) so that I can ask questions about it.`;
+  chatgptUrl = `https://chatgpt.com/?q=${encodeURIComponent(prompt)}`;
+  claudeUrl = `https://claude.ai/new?q=${encodeURIComponent(prompt)}`;
   const adj = adjacentDocs(props.slug);
   prev = adj.prev ? { url: adj.prev.url, title: adj.prev.title } : null;
   next = adj.next ? { url: adj.next.url, title: adj.next.title } : null;
@@ -93,7 +102,7 @@ if (showToc && html) {
 }
 ---
 
-<DocsLayout title={title} description={description} activeSlug={activeSlug} hasToc={showToc}>
+<DocsLayout title={title} description={description} activeSlug={activeSlug} hasToc={showToc} markdownUrl={mdUrl || undefined}>
   {props.kind === 'doc' ? (
     <>
       <nav class="docs-breadcrumb" aria-label="Breadcrumb">
@@ -104,13 +113,28 @@ if (showToc && html) {
           )}
           <li><span class="docs-crumb-sep" aria-hidden="true">/</span><span aria-current="page">{docTitle}</span></li>
         </ol>
-        <a class="docs-edit-link" href={editUrl} target="_blank" rel="noopener">
+      </nav>
+
+      {/* Page actions: hand the page to an LLM, or edit it. "Copy page"
+          copies the same text served at <page>.md; the two "Open in" links
+          start a chat that reads that URL. */}
+      <div class="docs-page-actions" data-pagefind-ignore>
+        <button type="button" class="docs-action docs-copy-page" data-md-url={mdUrl} title="Copy this page as Markdown, to paste into an LLM">
+          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6">
+            <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" /><path d="M10.5 3.5v-1a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h1" stroke-linecap="round" />
+          </svg>
+          <span class="docs-copy-page-label">Copy page</span>
+        </button>
+        <a class="docs-action" href={mdUrl} title="This page as plain markdown">View .md</a>
+        <a class="docs-action" href={chatgptUrl} target="_blank" rel="noopener">Open in ChatGPT</a>
+        <a class="docs-action" href={claudeUrl} target="_blank" rel="noopener">Open in Claude</a>
+        <a class="docs-action docs-edit-link" href={editUrl} target="_blank" rel="noopener">
           Edit on GitHub
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6">
             <path d="M6.5 3.5H3.5v9h9v-3M9 3.5h3.5V7M12 4 7 9" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
         </a>
-      </nav>
+      </div>
 
       {groupId && <p class="docs-kicker">{groupId}</p>}
 
@@ -219,6 +243,39 @@ if (showToc && html) {
 
 {props.kind === 'doc' && (
   <script>
+    // ── Copy the whole page as markdown ───────────────────────────────────
+    // ClipboardItem takes a promise, so the copy keeps the click's user
+    // activation while the .md loads (Safari refuses a late writeText).
+    const pageBtn = document.querySelector<HTMLButtonElement>('.docs-copy-page');
+    if (pageBtn) {
+      const url = pageBtn.dataset.mdUrl ?? '';
+      const label = pageBtn.querySelector('.docs-copy-page-label') as HTMLElement;
+      const text = () => fetch(url).then((r) => {
+        if (!r.ok) throw new Error(String(r.status));
+        return r.text();
+      });
+      let timer = 0;
+      pageBtn.addEventListener('click', async () => {
+        try {
+          if (typeof ClipboardItem !== 'undefined' && navigator.clipboard?.write) {
+            const blob = text().then((t) => new Blob([t], { type: 'text/plain' }));
+            await navigator.clipboard.write([new ClipboardItem({ 'text/plain': blob })]);
+          } else {
+            await navigator.clipboard.writeText(await text());
+          }
+          pageBtn.classList.add('is-copied');
+          label.textContent = 'Copied ✓';
+        } catch {
+          label.textContent = 'Copy failed: open View .md';
+        }
+        window.clearTimeout(timer);
+        timer = window.setTimeout(() => {
+          pageBtn.classList.remove('is-copied');
+          label.textContent = 'Copy page';
+        }, 1800);
+      });
+    }
+
     // ── Copy-to-clipboard on every code block ─────────────────────────────
     // Skip mermaid (it's a diagram, not copyable source).
     const blocks = document.querySelectorAll<HTMLElement>('.docs-prose pre:not(.mermaid)');

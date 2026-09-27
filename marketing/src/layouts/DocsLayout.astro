@@ -21,9 +21,11 @@ interface Props {
   activeSlug: string;
   /** Render the 3-column layout with a right-rail TOC. */
   hasToc?: boolean;
+  /** Site path of this page's markdown twin, announced as rel="alternate". */
+  markdownUrl?: string;
 }
 
-const { title, description, activeSlug, hasToc = false } = Astro.props;
+const { title, description, activeSlug, hasToc = false, markdownUrl } = Astro.props;
 const groups = docsByGroup();
 ---
 
@@ -35,6 +37,7 @@ const groups = docsByGroup();
     />
     {/* Pagefind UI styles (bundle built by the postbuild step; 404 on dev). */}
     <link href="/_pagefind/pagefind-ui.css" rel="stylesheet" />
+    {markdownUrl && <link rel="alternate" type="text/markdown" href={markdownUrl} />}
   </Fragment>
 
   <div class={`docs-shell${hasToc ? ' has-toc' : ''}`}>
