@@ -362,8 +362,14 @@
   padding: 0.05em 0.42em;
   border: 1px solid var(--rule);
   border-radius: 4px;
-  white-space: nowrap;
+  /* A long chip (a CLI synopsis in a heading, a URL in a sentence) breaks at
+     the column edge instead of pushing the page wider than a phone screen.
+     break-word, not anywhere: it does not shrink table columns to one letter. */
+  white-space: normal;
+  overflow-wrap: break-word;
 }
+/* Inside a table the chip stays on one line; the table scrolls instead. */
+.docs-prose td code { white-space: nowrap; }
 /* Code-fence container. shiki emits its own <pre class="shiki"> with inline
    token colours inside .shiki-wrap; we style the chrome (frame, rail, copy
    button room) but NEVER set a colour on shiki spans. */
@@ -490,6 +496,12 @@
 /* ════════════════════════════════════════════════════════════════════════
    Right-rail TOC (scroll-spy)
    ════════════════════════════════════════════════════════════════════════ */
+/* A heading's code span keeps the mono face in the TOC: in the sans face
+   "--init" reads as one dash. */
+.docs-toc a code {
+  font-family: var(--font-mono); font-size: 0.9em;
+  background: none; border: none; padding: 0; color: inherit;
+}
 .docs-toc {
   position: sticky; top: 24px; align-self: start;
   max-height: calc(100vh - 48px); overflow-y: auto;
