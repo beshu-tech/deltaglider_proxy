@@ -18,7 +18,9 @@
 
 .calc-grid {
   display: grid;
-  grid-template-columns: 1fr;
+  /* minmax(0, …): a bare 1fr grows to its widest child (the provider
+   * chips, the breakdown table) and .calc clips the overflow on phones. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 0;
 }
 
@@ -31,7 +33,14 @@
 .calc-inputs {
   padding: 1.5rem;
   background: var(--bg-soft);
-  border-right: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+}
+
+@media (min-width: 900px) {
+  .calc-inputs {
+    border-bottom: 0;
+    border-right: 1px solid var(--rule);
+  }
 }
 
 .calc-result {
@@ -352,6 +361,28 @@
   color: var(--brand);
   font-size: 1.35rem;
   text-shadow: var(--shadow-glow);
+}
+
+/* Phones: the three money columns must fit a 350px card. */
+@media (max-width: 599px) {
+  .breakdown {
+    font-size: 0.8rem;
+  }
+  .breakdown th,
+  .breakdown td {
+    padding: 0.6rem 0.45rem;
+  }
+  .breakdown tr.subtotal th,
+  .breakdown tr.subtotal td {
+    font-size: 0.85rem;
+  }
+  .breakdown tr:last-child.subtotal th,
+  .breakdown tr:last-child.subtotal td {
+    font-size: 0.9rem;
+  }
+  .breakdown tr:last-child.subtotal td.col-dgp {
+    font-size: 1rem;
+  }
 }
 
 /* === Formula details === */
