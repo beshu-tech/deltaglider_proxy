@@ -424,13 +424,23 @@ pub async fn run_rule(
     let source_prefix = normalize_prefix(&rule.source.prefix);
     let dest_prefix = normalize_prefix(&rule.destination.prefix);
     let lease_alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let heartbeat_handle = spawn_lease_heartbeat(
-        db.clone(),
-        &rule.name,
-        lease.clone(),
-        coordination_lease.clone(),
-        lease_alive.clone(),
-    );
+    let lease_guard = RunLeaseGuard {
+        heartbeat: spawn_lease_heartbeat(
+            db.clone(),
+            &rule.name,
+            lease.clone(),
+            coordination_lease.clone(),
+            lease_alive.clone(),
+        ),
+        release: lease.as_ref().map(|l| {
+            let holder: Arc<dyn crate::coordination::CoordinationLease> = match &coordination_lease
+            {
+                Some(cl) => cl.clone(),
+                None => Arc::new(crate::coordination::LocalLease::new(db.clone())),
+            };
+            (holder, rule.name.clone(), l.owner.clone())
+        }),
+    };
     // A run-now is a deliberate ONE-OFF: it runs even a paused rule (pause
     // governs the scheduler); KILL is the stop affordance for a running one-off.
     let ctrl = RunControl {
@@ -1172,9 +1182,7 @@ pub async fn run_rule(
     // the run-version sees the settled run. The single chokepoint all scheduled
     // runs pass through.
     super::state_store::bump_replication_run_version();
-    if let Some(handle) = heartbeat_handle {
-        handle.abort();
-    }
+    lease_guard.finish();
     let status = settle_result?;
 
     info!(
@@ -1477,6 +1485,51 @@ fn spawn_lease_heartbeat(
     }))
 }
 
+/// The run's lease heartbeat, stopped on EVERY exit. A panic in the run (a
+/// spawned run-now) or a dropped run future skipped the caller's release, and
+/// the detached heartbeat renewed that lease forever: run-now, the scheduler
+/// and rule delete were refused until a restart. So the drop also releases
+/// (same shape as lifecycle's guard).
+struct RunLeaseGuard {
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+    /// (lease, rule, owner) to release on an abnormal exit.
+    release: Option<(
+        Arc<dyn crate::coordination::CoordinationLease>,
+        String,
+        String,
+    )>,
+}
+
+impl RunLeaseGuard {
+    /// Normal exit: the caller releases the lease itself.
+    fn finish(mut self) {
+        self.release = None;
+    }
+}
+
+impl Drop for RunLeaseGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.heartbeat.take() {
+            h.abort();
+        }
+        let Some((lease, rule, owner)) = self.release.take() else {
+            return;
+        };
+        // No runtime (shutdown): the lease lapses after its TTL.
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                let _ = lease
+                    .release(
+                        crate::coordination::LeaseSubsystem::Replication,
+                        &rule,
+                        &owner,
+                    )
+                    .await;
+            });
+        }
+    }
+}
+
 /// Inputs to the PURE terminal-settle decision (see `settle_run`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SettleInput {
@@ -1578,7 +1631,7 @@ struct RunControl {
     run_id: i64,
     lease: Option<RunLease>,
     /// Cross-instance lease (when the job plane runs shared). When present the
-    /// heartbeat + control renew go through it (matching the acquire), so an
+    /// heartbeat renews through it (matching the acquire), so an
     /// S3-CAS lease is renewed against the SAME object the scheduler took — not
     /// the node-local SQLite row.
     coordination_lease: Option<Arc<dyn crate::coordination::CoordinationLease>>,
@@ -1613,20 +1666,11 @@ impl RunControl {
             );
             (cancel, paused)
         };
-        if lease_ok && renew {
-            if let (Some(l), Some(cl)) = (&self.lease, &self.coordination_lease) {
-                // Shared/cross-instance renew — matches the trait-based acquire.
-                lease_ok = cl
-                    .renew(
-                        crate::coordination::LeaseSubsystem::Replication,
-                        &self.rule_name,
-                        &l.owner,
-                        current_unix_seconds(),
-                        l.ttl_secs,
-                    )
-                    .await
-                    .unwrap_or(false);
-            } else if let Some(l) = &self.lease {
+        // A coordination lease is renewed ONLY by the heartbeat task (its
+        // verdict lands in `lease_alive`): a trait renew here cost one S3 GET
+        // + conditional PUT per listing page and per 32 events.
+        if lease_ok && renew && self.coordination_lease.is_none() {
+            if let Some(l) = &self.lease {
                 // No injected coordination lease (e.g. an admin run-now without
                 // one) → the node-local SQLite renew, as before.
                 let g = self.db.lock().await;
@@ -1989,6 +2033,187 @@ mod tests {
             include_globs: Vec::new(),
             exclude_globs: vec![".dg/*".into()],
         }
+    }
+
+    /// jobs-4: with a coordination lease, every control boundary (each listing
+    /// page, every 32 events) renewed the lease through the trait — an S3 GET
+    /// + conditional PUT per listed directory. Only the heartbeat renews it.
+    struct CountingLease(
+        std::sync::atomic::AtomicUsize,
+        std::sync::atomic::AtomicUsize,
+    );
+    #[async_trait::async_trait]
+    impl crate::coordination::CoordinationLease for CountingLease {
+        async fn try_acquire(
+            &self,
+            _s: crate::coordination::LeaseSubsystem,
+            _r: &str,
+            _o: &str,
+            _n: i64,
+            _t: i64,
+        ) -> Result<bool, String> {
+            Ok(true)
+        }
+        async fn renew(
+            &self,
+            _s: crate::coordination::LeaseSubsystem,
+            _r: &str,
+            _o: &str,
+            _n: i64,
+            _t: i64,
+        ) -> Result<bool, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+        async fn release(
+            &self,
+            _s: crate::coordination::LeaseSubsystem,
+            _r: &str,
+            _o: &str,
+        ) -> Result<(), String> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        async fn is_held(
+            &self,
+            _s: crate::coordination::LeaseSubsystem,
+            _r: &str,
+            _n: i64,
+        ) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn control_check_does_not_renew_the_coordination_lease() {
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::default();
+        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+            crate::storage::FilesystemBackend::new(data.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine = Arc::new(crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &config,
+            None,
+        ));
+        engine.create_bucket("a").await.unwrap();
+        engine.create_bucket("b").await.unwrap();
+        let dirs = 40;
+        for d in 0..dirs {
+            engine
+                .store(
+                    "a",
+                    &format!("d{d:03}/o.txt"),
+                    b"x",
+                    None,
+                    Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("t").unwrap()));
+        let lease = Arc::new(CountingLease(
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let (_, outcome) = run_rule(
+            db,
+            &engine,
+            &mk_rule(),
+            10,
+            None,
+            0,
+            "scheduler",
+            Some(RunLease {
+                owner: "w".into(),
+                ttl_secs: 300,
+                heartbeat_secs: 60,
+            }),
+            RunConcurrency::default(),
+            None,
+            Some(lease.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.status, "succeeded");
+        assert_eq!(outcome.totals.objects_copied, dirs);
+        let renews = lease.0.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            renews < dirs as usize,
+            "a run over {dirs} directories renewed the coordination lease {renews} times \
+             (one S3 GET + PUT each) — the 60s heartbeat already keeps it"
+        );
+    }
+
+    /// jobs-9: a run whose future is dropped (a panic or an abort of the
+    /// spawned run-now) releases its lease instead of leaving it renewed by a
+    /// detached heartbeat. A normal exit leaves the release to the caller.
+    #[tokio::test]
+    async fn dropped_run_releases_its_lease() {
+        use futures::FutureExt;
+        let data = tempfile::tempdir().unwrap();
+        let config = crate::config::Config::default();
+        let backend: Box<dyn crate::storage::StorageBackend> = Box::new(
+            crate::storage::FilesystemBackend::new(data.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let engine = Arc::new(crate::deltaglider::DeltaGliderEngine::new_with_backend(
+            Arc::new(backend),
+            &config,
+            None,
+        ));
+        engine.create_bucket("a").await.unwrap();
+        engine.create_bucket("b").await.unwrap();
+        engine
+            .store("a", "d/o.txt", b"x", None, Default::default())
+            .await
+            .unwrap();
+        let lease = Arc::new(CountingLease(
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+        ));
+        let run = |db: Arc<Mutex<ConfigDb>>| {
+            let engine = engine.clone();
+            let lease = lease.clone();
+            async move {
+                run_rule(
+                    db,
+                    &engine,
+                    &mk_rule(),
+                    10,
+                    None,
+                    0,
+                    "run-now",
+                    Some(RunLease {
+                        owner: "w".into(),
+                        ttl_secs: 300,
+                        heartbeat_secs: 60,
+                    }),
+                    RunConcurrency::default(),
+                    None,
+                    Some(lease),
+                )
+                .await
+            }
+        };
+        let released = || lease.1.load(std::sync::atomic::Ordering::SeqCst);
+        // Normal exit: no release from the run itself.
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("t").unwrap()));
+        run(db).await.unwrap();
+        assert_eq!(released(), 0);
+        // Poll once (the run stops at its first storage I/O), then drop.
+        let db = Arc::new(Mutex::new(ConfigDb::in_memory("t").unwrap()));
+        assert!(run(db).now_or_never().is_none(), "the run must yield");
+        for _ in 0..100 {
+            if released() > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(released(), 1, "the dropped run must release its lease");
     }
 
     #[test]

@@ -9,6 +9,16 @@ The per-object lease renewal read a config DB error as a lost lease. The job
 stopped, and the write gate on its bucket opened while the job was still
 active, so writes could race a migrate copy. Now a DB error is retried, and
 a job that loses its lease keeps the gate for as long as its row is active.
+
+### Fixed — A replication run that dies releases its lease
+
+A replication run that panicked or was dropped left its lease renewed by a
+detached heartbeat, so run-now, the scheduler and rule delete were refused
+until a restart. Now the run releases the lease on every exit. With a
+coordination bucket, a run also stops renewing its S3 lease on every listing
+page: only the heartbeat renews it, which removes two coordination-bucket
+requests for each listed directory.
+
 ### Changed — A migrate to a filesystem backend is about twice as fast
 
 A migrate made every copy durable on its own before the next one (one
