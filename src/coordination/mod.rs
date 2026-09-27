@@ -14,8 +14,8 @@
 //!   - [`S3Lease`] — the lease as a CAS'd object in the coordination bucket,
 //!     visible to every node → real leader failover on dead-leader TTL lapse.
 //!     Gated on the boot-validated coordination bucket supporting conditional
-//!     writes. REPLICATION is wired through this today; the other subsystems
-//!     are documented follow-ups.
+//!     writes. Only REPLICATION is wired through it; lifecycle, maintenance
+//!     and parity stay node-local.
 //!
 //! The trait deliberately mirrors `job_store`'s two-predicate tiling: acquire/steal
 //! on `expires_at < now` (strict), renew while `expires_at >= now` (non-strict), so

@@ -643,13 +643,5 @@ mod tests {
             S3Lease::object_key(LeaseSubsystem::Replication, "r1"),
             "_dgp/leases/replication/r1.json"
         );
-        assert_eq!(
-            S3Lease::object_key(LeaseSubsystem::Lifecycle, "r1"),
-            "_dgp/leases/lifecycle/r1.json"
-        );
-        assert_ne!(
-            S3Lease::object_key(LeaseSubsystem::Replication, "r1"),
-            S3Lease::object_key(LeaseSubsystem::Lifecycle, "r1")
-        );
     }
 }

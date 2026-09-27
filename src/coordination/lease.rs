@@ -9,12 +9,13 @@ use tokio::sync::Mutex;
 use crate::config_db::ConfigDb;
 
 /// Which job subsystem a lease belongs to. Selects the backing table (for the
-/// local impl) and namespaces the lease key (for the S3 impl), so a replication
-/// rule and a lifecycle rule with the same name never collide.
+/// local impl) and namespaces the lease key (for the S3 impl). Only
+/// replication runs through this seam: lifecycle and maintenance keep their
+/// node-local SQLite leases (a variant without a caller read as HA coverage
+/// that did not exist).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseSubsystem {
     Replication,
-    Lifecycle,
 }
 
 impl LeaseSubsystem {
@@ -22,7 +23,6 @@ impl LeaseSubsystem {
     pub fn slug(&self) -> &'static str {
         match self {
             LeaseSubsystem::Replication => "replication",
-            LeaseSubsystem::Lifecycle => "lifecycle",
         }
     }
 }
@@ -115,9 +115,6 @@ impl CoordinationLease for LocalLease {
             LeaseSubsystem::Replication => db
                 .replication_ensure_state(rule, now)
                 .and_then(|_| db.replication_try_acquire_lease(rule, owner, now, ttl_secs)),
-            LeaseSubsystem::Lifecycle => db
-                .lifecycle_ensure_state(rule, now)
-                .and_then(|_| db.lifecycle_try_acquire_lease(rule, owner, now, ttl_secs)),
         }
         .map_err(|e| e.to_string())
     }
@@ -133,7 +130,6 @@ impl CoordinationLease for LocalLease {
         let db = self.db.lock().await;
         match subsystem {
             LeaseSubsystem::Replication => db.replication_renew_lease(rule, owner, now, ttl_secs),
-            LeaseSubsystem::Lifecycle => db.lifecycle_renew_lease(rule, owner, now, ttl_secs),
         }
         .map_err(|e| e.to_string())
     }
@@ -147,7 +143,6 @@ impl CoordinationLease for LocalLease {
         let db = self.db.lock().await;
         let _held = match subsystem {
             LeaseSubsystem::Replication => db.replication_release_lease(rule, owner),
-            LeaseSubsystem::Lifecycle => db.lifecycle_release_lease(rule, owner),
         }
         .map_err(|e| e.to_string())?;
         Ok(())
@@ -162,7 +157,6 @@ impl CoordinationLease for LocalLease {
         let db = self.db.lock().await;
         match subsystem {
             LeaseSubsystem::Replication => db.replication_lease_is_held(rule, now),
-            LeaseSubsystem::Lifecycle => db.lifecycle_lease_is_held(rule, now),
         }
         .map_err(|e| e.to_string())
     }
@@ -239,12 +233,8 @@ mod tests {
     }
 
     #[test]
-    fn subsystem_slugs_are_distinct() {
+    fn subsystem_slug_is_stable() {
+        // The slug is part of the S3 lease object key: never rename it.
         assert_eq!(LeaseSubsystem::Replication.slug(), "replication");
-        assert_eq!(LeaseSubsystem::Lifecycle.slug(), "lifecycle");
-        assert_ne!(
-            LeaseSubsystem::Replication.slug(),
-            LeaseSubsystem::Lifecycle.slug()
-        );
     }
 }
