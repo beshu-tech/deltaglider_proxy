@@ -48,12 +48,19 @@ pub fn validate_provider(
 /// TTL for pending OAuth flows (5 minutes).
 const PENDING_AUTH_TTL: Duration = Duration::from_secs(300);
 
+/// Bound on pending OAuth flows. Every `GET /oauth/authorize/<provider>`
+/// adds one, unauthenticated; without a bound, a client that sends them in
+/// a loop grows the map for the whole TTL. Far above any real login rate.
+const MAX_PENDING_AUTH: usize = 10_000;
+
 /// Manages external authentication providers and pending OAuth flows.
 pub struct ExternalAuthManager {
     /// Configured providers keyed by name.
     providers: RwLock<HashMap<String, Arc<OidcProvider>>>,
     /// Pending OAuth flows keyed by state token.
     pending: RwLock<HashMap<String, PendingAuth>>,
+    /// Pending flows evicted because the map was full (log throttle).
+    pending_evicted: std::sync::atomic::AtomicU64,
 }
 
 impl ExternalAuthManager {
@@ -62,6 +69,7 @@ impl ExternalAuthManager {
         Self {
             providers: RwLock::new(HashMap::new()),
             pending: RwLock::new(HashMap::new()),
+            pending_evicted: Default::default(),
         }
     }
 
@@ -179,7 +187,7 @@ impl ExternalAuthManager {
         let auth_req = provider.authorization_url(redirect_uri, &state)?;
 
         // Store pending auth for callback validation
-        self.pending.write().insert(
+        self.insert_pending(
             state.clone(),
             PendingAuth {
                 provider_name: provider_name.to_string(),
@@ -192,6 +200,35 @@ impl ExternalAuthManager {
         );
 
         Ok(auth_req)
+    }
+
+    /// Store one pending flow, within [`MAX_PENDING_AUTH`]: a full map drops
+    /// its expired flows, then its oldest one. The evicted user's login
+    /// fails with `InvalidState` and can start again.
+    fn insert_pending(&self, state: String, auth: PendingAuth) {
+        let mut pending = self.pending.write();
+        if pending.len() >= MAX_PENDING_AUTH {
+            pending.retain(|_, a| a.created_at.elapsed() < PENDING_AUTH_TTL);
+        }
+        if pending.len() >= MAX_PENDING_AUTH {
+            if let Some(oldest) = pending
+                .iter()
+                .min_by_key(|(_, a)| a.created_at)
+                .map(|(k, _)| k.clone())
+            {
+                pending.remove(&oldest);
+            }
+            let n = 1 + self
+                .pending_evicted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Throttled: 1st, 2nd, 4th, 8th, ... eviction.
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    "SECURITY | event=oauth_pending_full | max={MAX_PENDING_AUTH} | evicted_total={n} — oldest pending OAuth logins dropped"
+                );
+            }
+        }
+        pending.insert(state, auth);
     }
 
     /// Validate and consume a pending OAuth flow by state token.
@@ -251,6 +288,25 @@ mod tests {
             client_ip: None,
             redirect_to: None,
         }
+    }
+
+    /// A flood of authorize requests cannot grow the pending map past its
+    /// bound; the oldest flow goes first, the newest survive.
+    #[test]
+    fn pending_auth_map_is_bounded_and_evicts_the_oldest() {
+        let mgr = ExternalAuthManager::new();
+        let t0 = std::time::Instant::now();
+        for i in 0..MAX_PENDING_AUTH + 5 {
+            mgr.insert_pending(
+                format!("s{i}"),
+                make_pending_auth("corp", t0 + Duration::from_millis(i as u64)),
+            );
+        }
+        let pending = mgr.pending.read();
+        assert_eq!(pending.len(), MAX_PENDING_AUTH);
+        assert!(!pending.contains_key("s0") && !pending.contains_key("s4"));
+        assert!(pending.contains_key("s5"));
+        assert!(pending.contains_key(&format!("s{}", MAX_PENDING_AUTH + 4)));
     }
 
     #[test]

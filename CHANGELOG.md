@@ -354,6 +354,14 @@ So the total covered only the objects after the cursor, and the progress
 bar reached 99 % long before the end. Now the resumed count starts from
 the count that was saved with the cursor.
 
+### Fixed — Pending OAuth logins are bounded
+
+Every `GET /_/api/admin/oauth/authorize/<provider>` stored a pending login
+for 5 minutes, with no limit, so a client that sent them in a loop grew
+the proxy's memory. Now at most 10000 logins are pending; when the store
+is full the oldest one is dropped (that user's login fails and can start
+again), and the proxy logs `event=oauth_pending_full`.
+
 ### Fixed — `X-Forwarded-Host` / `-Proto` count only from a trusted proxy
 
 With `DGP_TRUST_PROXY_HEADERS=true`, any client's `X-Forwarded-Host`
