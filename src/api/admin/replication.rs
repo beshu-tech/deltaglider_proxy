@@ -5,7 +5,7 @@
 //! `POST /_/api/admin/jobs/replication:<rule>/{run-now,pause,resume}`.
 //! Listing, runs, and failures live in the jobs module.
 
-use super::AdminState;
+use super::{AdminError, AdminState};
 use crate::config_sections::{ReplicationConfig, ReplicationRule};
 use crate::replication;
 use axum::http::{HeaderMap, StatusCode};
@@ -30,14 +30,14 @@ pub struct RunNowResponse {
 async fn snapshot_and_find_rule(
     state: &Arc<AdminState>,
     name: &str,
-) -> Result<(ReplicationConfig, ReplicationRule), (StatusCode, String)> {
+) -> Result<(ReplicationConfig, ReplicationRule), AdminError> {
     let repl = { state.config.read().await.replication.clone() };
     let rule = repl
         .rules
         .iter()
         .find(|r| r.name == name)
         .cloned()
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "rule not found".to_string()))?;
+        .ok_or_else(|| AdminError::not_found("rule not found"))?;
     Ok((repl, rule))
 }
 
@@ -45,15 +45,14 @@ pub async fn run_now(
     state: Arc<AdminState>,
     name: String,
     headers: &HeaderMap,
-) -> Result<(StatusCode, RunNowResponse), (StatusCode, String)> {
+) -> Result<(StatusCode, RunNowResponse), AdminError> {
     let (repl, rule) = snapshot_and_find_rule(&state, &name).await?;
 
     // The GLOBAL kill-switch (`replication.enabled`) stays a hard block — it's
     // the master off-switch (e.g. frozen during a migration).
     if !repl.enabled {
-        return Err((
-            StatusCode::CONFLICT,
-            "replication is globally disabled (storage.replication.enabled = false)".to_string(),
+        return Err(AdminError::conflict(
+            "replication is globally disabled (storage.replication.enabled = false)",
         ));
     }
     // A manual run-now is a deliberate ONE-OFF: it runs the rule once even when
@@ -69,25 +68,17 @@ pub async fn run_now(
         .maintenance_gate
         .is_busy(&rule.destination.bucket)
     {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "destination bucket '{}' has an active maintenance job — run the rule \
+        return Err(AdminError::conflict(format!(
+            "destination bucket '{}' has an active maintenance job — run the rule \
                  again when it finishes",
-                rule.destination.bucket
-            ),
-        ));
+            rule.destination.bucket
+        )));
     }
 
     let db_arc = state
         .config_db
         .as_ref()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "config DB not available".to_string(),
-            )
-        })?
+        .ok_or_else(AdminError::no_config_db)?
         .clone();
 
     let lease_owner = format!("run-now:{}", uuid::Uuid::new_v4());
@@ -116,11 +107,10 @@ pub async fn run_now(
                 replication::scheduler::lease_ttl_secs(&repl),
             )
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            .map_err(AdminError::internal)?;
         if !acquired {
-            return Err((
-                StatusCode::CONFLICT,
-                "rule is already running; wait for the current run to finish".to_string(),
+            return Err(AdminError::conflict(
+                "rule is already running; wait for the current run to finish",
             ));
         }
         // NOTE: no paused check — a manual run-now is a deliberate one-off that
@@ -148,7 +138,7 @@ pub async fn run_now(
                 &lease_owner,
             )
             .await;
-        return Err((StatusCode::NOT_FOUND, "rule was deleted".to_string()));
+        return Err(AdminError::not_found("rule was deleted"));
     }
 
     info!("Replication run-now via admin API: rule='{}'", name);
@@ -298,7 +288,7 @@ pub async fn verify(
     state: Arc<AdminState>,
     name: String,
     headers: &HeaderMap,
-) -> Result<(StatusCode, ParityStatusResponse), (StatusCode, String)> {
+) -> Result<(StatusCode, ParityStatusResponse), AdminError> {
     let (_repl, rule) = snapshot_and_find_rule(&state, &name).await?;
     let Some(db_arc) = state.config_db.clone() else {
         // No config DB → fall back to a synchronous in-request audit (dev/no-DB).
@@ -311,7 +301,7 @@ pub async fn verify(
             None,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        .map_err(AdminError::internal)?;
         return Ok((
             StatusCode::OK,
             ParityStatusResponse {
@@ -337,8 +327,7 @@ pub async fn verify(
             .replication_lease_is_held(&rule.name, now)
             .unwrap_or(false)
         {
-            return Err((
-                StatusCode::CONFLICT,
+            return Err(AdminError::conflict(
                 "a replication run is in progress for this rule — verify after it settles"
                     .to_string(),
             ));
@@ -357,8 +346,7 @@ pub async fn verify(
             .await
             .unwrap_or(false)
         {
-            return Err((
-                StatusCode::CONFLICT,
+            return Err(AdminError::conflict(
                 "a replication run is in progress for this rule — verify after it settles"
                     .to_string(),
             ));
@@ -367,8 +355,7 @@ pub async fn verify(
     // Acquire the lease; if someone else holds it, just report current status.
     let acquired = {
         let db = db_arc.lock().await;
-        db.parity_try_acquire_lease(&rule.name, &owner, now, PARITY_LEASE_TTL_SECS)
-            .map_err(super::db_error_reply)?
+        db.parity_try_acquire_lease(&rule.name, &owner, now, PARITY_LEASE_TTL_SECS)?
     };
     if !acquired {
         // Someone else holds the lease → a scan IS in flight. Report 'running'
@@ -547,7 +534,7 @@ pub async fn verify(
 pub async fn verify_status(
     state: Arc<AdminState>,
     name: String,
-) -> Result<ParityStatusResponse, (StatusCode, String)> {
+) -> Result<ParityStatusResponse, AdminError> {
     let _ = snapshot_and_find_rule(&state, &name).await?;
     let row = match &state.config_db {
         Some(db_arc) => {
@@ -570,7 +557,7 @@ pub async fn verify_status(
 pub async fn verify_cancel(
     state: Arc<AdminState>,
     name: String,
-) -> Result<ParityStatusResponse, (StatusCode, String)> {
+) -> Result<ParityStatusResponse, AdminError> {
     let _ = snapshot_and_find_rule(&state, &name).await?;
     // Fast in-process signal: a local scan checks this every page without a lock.
     if let Some(flag) = state.parity_cancels.lock().unwrap().get(&name) {
@@ -607,24 +594,18 @@ pub async fn pause(
     state: Arc<AdminState>,
     name: String,
     headers: &HeaderMap,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<StatusCode, AdminError> {
     if !rule_in_config(&state, &name).await {
-        return Err((StatusCode::NOT_FOUND, "rule not found".to_string()));
+        return Err(AdminError::not_found("rule not found"));
     }
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "config DB not available".to_string(),
-            )
-        })?
+        .ok_or_else(AdminError::no_config_db)?
         .lock()
         .await;
     let _ = db.replication_ensure_state(&name, replication::current_unix_seconds());
-    db.replication_set_paused(&name, true)
-        .map_err(super::db_error_reply)?;
+    db.replication_set_paused(&name, true)?;
     crate::audit::audit_log("replication_pause", "admin", &name, headers, "", "");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -633,25 +614,19 @@ pub async fn resume(
     state: Arc<AdminState>,
     name: String,
     headers: &HeaderMap,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<StatusCode, AdminError> {
     if !rule_in_config(&state, &name).await {
-        return Err((StatusCode::NOT_FOUND, "rule not found".to_string()));
+        return Err(AdminError::not_found("rule not found"));
     }
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "config DB not available".to_string(),
-            )
-        })?
+        .ok_or_else(AdminError::no_config_db)?
         .lock()
         .await;
     let now = replication::current_unix_seconds();
     let _ = db.replication_ensure_state(&name, now);
-    db.replication_resume(&name, now)
-        .map_err(super::db_error_reply)?;
+    db.replication_resume(&name, now)?;
     crate::audit::audit_log("replication_resume", "admin", &name, headers, "", "");
     Ok(StatusCode::NO_CONTENT)
 }

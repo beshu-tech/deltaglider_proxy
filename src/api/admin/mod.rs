@@ -294,14 +294,6 @@ where
 
 pub(crate) use error::db_error_status;
 
-/// [`db_error_status`] with the error text, for handlers that answer
-/// `(StatusCode, String)`.
-pub(crate) fn db_error_reply(
-    e: crate::config_db::ConfigDbError,
-) -> (axum::http::StatusCode, String) {
-    (db_error_status(&e), e.to_string())
-}
-
 /// Admin audit log helper — delegates to `crate::audit::audit_log` with empty bucket/path.
 /// Exists to avoid passing `"", ""` at every admin API call site.
 pub(crate) fn audit_log(

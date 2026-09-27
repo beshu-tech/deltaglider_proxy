@@ -20,7 +20,7 @@
 //!   included) so non-admin browser users see busy state + progress; the
 //!   response carries only status/phase/counts — no config detail.
 
-use super::AdminState;
+use super::{AdminError, AdminState};
 use crate::api::admin::extract::AdminJson;
 use crate::maintenance::migrate::{parse_params, pick_transient_key, MigrateParams, MigrateTarget};
 use crate::maintenance::store::{current_unix_seconds, CancelOutcome, MaintenanceJob};
@@ -114,28 +114,23 @@ async fn check_job_request(
         &Arc<tokio::sync::Mutex<crate::config_db::ConfigDb>>,
         std::collections::HashSet<String>,
     ),
-    (StatusCode, String),
+    AdminError,
 > {
     if n_buckets == 0 {
-        return Err((StatusCode::BAD_REQUEST, "no buckets given".into()));
+        return Err(AdminError::invalid("no buckets given"));
     }
     if n_buckets > 100 {
-        return Err((StatusCode::BAD_REQUEST, "too many buckets (max 100)".into()));
+        return Err(AdminError::invalid("too many buckets (max 100)"));
     }
     let db = state
         .config_db
         .as_ref()
-        .ok_or((StatusCode::NOT_FOUND, "config DB unavailable".to_string()))?;
+        .ok_or(AdminError::not_found("config DB unavailable"))?;
     let engine = state.s3_state.engine.load().clone();
     let real = engine
         .list_bucket_origins()
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to list buckets: {e}"),
-            )
-        })?
+        .map_err(|e| AdminError::internal(format!("failed to list buckets: {e}")))?
         .into_iter()
         .map(|b| b.name.to_ascii_lowercase())
         .collect();
@@ -147,7 +142,7 @@ pub async fn start_reencrypt(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AdminJson(req): AdminJson<ReencryptRequest>,
-) -> Result<Json<ReencryptResponse>, (StatusCode, String)> {
+) -> Result<Json<ReencryptResponse>, AdminError> {
     let (db, real) = check_job_request(&state, req.buckets.len()).await?;
 
     let cfg = state.config.read().await;
@@ -235,7 +230,7 @@ pub async fn start_backfill(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AdminJson(req): AdminJson<BackfillRequest>,
-) -> Result<Json<ReencryptResponse>, (StatusCode, String)> {
+) -> Result<Json<ReencryptResponse>, AdminError> {
     let (db, real) = check_job_request(&state, req.buckets.len()).await?;
 
     let params = serde_json::to_string(&crate::maintenance::backfill::BackfillParams {
@@ -322,40 +317,33 @@ pub async fn start_migrate(
     Path(bucket): Path<String>,
     headers: HeaderMap,
     AdminJson(body): AdminJson<MigrateBucketRequest>,
-) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+) -> Result<(StatusCode, Json<serde_json::Value>), AdminError> {
     let bucket = bucket.trim().to_string();
     let bucket_key = bucket.to_ascii_lowercase();
     let target_backend = body.target_backend.trim().to_string();
     if bucket.is_empty() || target_backend.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "bucket and target_backend are required".into(),
+        return Err(AdminError::invalid(
+            "bucket and target_backend are required",
         ));
     }
-    super::path_guard::check_bucket(&bucket).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    super::path_guard::check_bucket(&bucket).map_err(AdminError::invalid)?;
     let db = state
         .config_db
         .as_ref()
-        .ok_or((StatusCode::NOT_FOUND, "config DB unavailable".to_string()))?;
+        .ok_or(AdminError::not_found("config DB unavailable"))?;
 
     // The bucket must actually exist (the old handler skipped this check).
     let engine = state.s3_state.engine.load().clone();
     let exists = engine
         .list_bucket_origins()
         .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to list buckets: {e}"),
-            )
-        })?
+        .map_err(|e| AdminError::internal(format!("failed to list buckets: {e}")))?
         .into_iter()
         .any(|b| b.name.eq_ignore_ascii_case(&bucket_key));
     if !exists {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("bucket '{bucket}' not found"),
-        ));
+        return Err(AdminError::not_found(format!(
+            "bucket '{bucket}' not found"
+        )));
     }
 
     // Resolve source backend + validate target + pick the transient key
@@ -365,23 +353,21 @@ pub async fn start_migrate(
         if let Some(reason) =
             crate::maintenance::migrate::multi_instance_refusal(cfg.config_sync_bucket.as_deref())
         {
-            return Err((StatusCode::CONFLICT, reason));
+            return Err(AdminError::conflict(reason));
         }
         if cfg.backend_by_name(&target_backend).is_none() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("Unknown target backend '{target_backend}'"),
-            ));
+            return Err(AdminError::invalid(format!(
+                "Unknown target backend '{target_backend}'"
+            )));
         }
         let from_backend = cfg
             .effective_backend_for_bucket(&bucket_key)
             .map(|(name, _)| name)
             .unwrap_or_else(|| cfg.default_backend_name());
         if from_backend == target_backend {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("Bucket '{bucket}' is already on backend '{target_backend}'"),
-            ));
+            return Err(AdminError::invalid(format!(
+                "Bucket '{bucket}' is already on backend '{target_backend}'"
+            )));
         }
         MigrateParams {
             target_backend,
@@ -406,11 +392,11 @@ pub async fn start_migrate(
             &params.target_backend,
         )
         .await
-        .map_err(|e| (StatusCode::CONFLICT, e))?;
+        .map_err(AdminError::conflict)?;
     }
 
-    let params_json = serde_json::to_string(&params)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let params_json =
+        serde_json::to_string(&params).map_err(|e| AdminError::internal(e.to_string()))?;
     let created = {
         let db = db.lock().await;
         db.maintenance_create_job(
@@ -420,14 +406,12 @@ pub async fn start_migrate(
             Some(&params_json),
             "admin",
             current_unix_seconds(),
-        )
-        .map_err(super::db_error_reply)?
+        )?
     };
     let Some(job_id) = created else {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("a maintenance job is already active for bucket '{bucket}'"),
-        ));
+        return Err(AdminError::conflict(format!(
+            "a maintenance job is already active for bucket '{bucket}'"
+        )));
     };
 
     // Gate WRITES from creation — the source write-set freezes through the
@@ -473,19 +457,15 @@ pub async fn cancel_job(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<i64>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, AdminError> {
     let db = state
         .config_db
         .as_ref()
-        .ok_or((StatusCode::NOT_FOUND, "config DB unavailable".to_string()))?;
+        .ok_or(AdminError::not_found("config DB unavailable"))?;
     let (outcome, job) = {
         let db = db.lock().await;
-        let job = db
-            .maintenance_job_by_id(id)
-            .map_err(super::db_error_reply)?;
-        let outcome = db
-            .maintenance_request_cancel(id)
-            .map_err(super::db_error_reply)?;
+        let job = db.maintenance_job_by_id(id)?;
+        let outcome = db.maintenance_request_cancel(id)?;
         (outcome, job)
     };
     match outcome {
@@ -516,9 +496,8 @@ pub async fn cancel_job(
             );
             Ok(Json(serde_json::json!({ "status": "cancelling" })))
         }
-        CancelOutcome::NotActive => Err((
-            StatusCode::CONFLICT,
-            "job is not active (already finished or unknown id)".into(),
+        CancelOutcome::NotActive => Err(AdminError::conflict(
+            "job is not active (already finished or unknown id)",
         )),
     }
 }

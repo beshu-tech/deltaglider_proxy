@@ -29,7 +29,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::AdminState;
+use super::{AdminError, AdminState};
 use crate::maintenance::migrate;
 use crate::maintenance::store::MaintenanceJob;
 
@@ -331,7 +331,7 @@ fn maintenance_job_view(j: &MaintenanceJob) -> JobView {
 /// GET /_/api/admin/jobs
 pub async fn list_jobs(
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<JobsOverview>, (StatusCode, String)> {
+) -> Result<Json<JobsOverview>, AdminError> {
     let cfg = state.config.read().await;
     let repl_cfg = cfg.replication.clone();
     let lc_cfg = cfg.lifecycle.clone();
@@ -479,7 +479,7 @@ pub async fn list_jobs(
 
         for j in db
             .maintenance_list_jobs(50)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(|e| AdminError::internal(e.to_string()))?
         {
             jobs.push(maintenance_job_view(&j));
         }
@@ -518,7 +518,7 @@ pub struct LimitQuery {
 pub async fn job_verify_status(
     Path(id): Path<String>,
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, AdminError> {
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
     if sub != JobSubsystem::Replication {
         return Err(not_found());
@@ -534,7 +534,7 @@ pub async fn job_verify_start(
     Path(id): Path<String>,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+) -> Result<(StatusCode, Json<serde_json::Value>), AdminError> {
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
     if sub != JobSubsystem::Replication {
         return Err(not_found());
@@ -548,7 +548,7 @@ pub async fn job_verify_start(
 pub async fn job_verify_cancel(
     Path(id): Path<String>,
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, AdminError> {
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
     if sub != JobSubsystem::Replication {
         return Err(not_found());
@@ -586,13 +586,13 @@ pub async fn job_runs(
     Path(id): Path<String>,
     AdminQuery(q): AdminQuery<LimitQuery>,
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, AdminError> {
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
     let limit = q.limit.unwrap_or(20).clamp(1, 100);
     let db = state
         .config_db
         .as_ref()
-        .ok_or(db_unavailable())?
+        .ok_or_else(AdminError::no_config_db)?
         .lock()
         .await;
     let runs: Vec<JobRunEntry> = match sub {
@@ -673,13 +673,13 @@ pub async fn job_failures(
     Path(id): Path<String>,
     AdminQuery(q): AdminQuery<LimitQuery>,
     State(state): State<Arc<AdminState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<serde_json::Value>, AdminError> {
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
     let limit = q.limit.unwrap_or(20).clamp(1, 100);
     let db = state
         .config_db
         .as_ref()
-        .ok_or(db_unavailable())?
+        .ok_or_else(AdminError::no_config_db)?
         .lock()
         .await;
     let failures: Vec<JobFailureEntry> = match sub {
@@ -739,20 +739,19 @@ pub async fn job_action(
     Path((id, action)): Path<(String, String)>,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
-) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, String)> {
+) -> Result<(StatusCode, Json<serde_json::Value>), AdminError> {
     let (sub, key) = parse_job_id(&id).ok_or(not_found())?;
     let action = JobAction::parse(&action)
-        .ok_or((StatusCode::NOT_FOUND, format!("unknown action '{action}'")))?;
+        .ok_or(AdminError::not_found(format!("unknown action '{action}'")))?;
     if !supported_actions(sub).contains(&action) {
         let available = supported_actions(sub)
             .iter()
             .map(|a| a.wire_name())
             .collect::<Vec<_>>()
             .join(", ");
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!("this action isn't available for this job kind (available: {available})"),
-        ));
+        return Err(AdminError::invalid(format!(
+            "this action isn't available for this job kind (available: {available})"
+        )));
     }
     let name = key.to_string();
     match (sub, action) {
@@ -805,13 +804,16 @@ pub async fn job_action(
             Ok((StatusCode::NO_CONTENT, Json(serde_json::json!({}))))
         }
         (JobSubsystem::Replication, JobAction::Kill) => {
-            let db = state.config_db.as_ref().ok_or_else(db_unavailable)?;
+            let db = state
+                .config_db
+                .as_ref()
+                .ok_or_else(AdminError::no_config_db)?;
             let flipped = {
                 let db = db.lock().await;
                 db.replication_request_run_cancel(&name).map_err(internal)?
             };
             if !flipped {
-                return Err((StatusCode::CONFLICT, "no running run to kill".to_string()));
+                return Err(AdminError::conflict("no running run to kill"));
             }
             crate::audit::audit_log("replication_kill", "admin", &name, &headers, "", "");
             // NOTE: no sync push — replication_run_history is NODE-LOCAL (not in
@@ -836,7 +838,7 @@ async fn delete_rule(
     sub: JobSubsystem,
     name: &str,
     headers: &HeaderMap,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<(), AdminError> {
     // Replication (H29): TAKE the rule's lease — the same coordination lease
     // the scheduler, run-now and the event consumer take (S3 when a
     // coordination bucket is configured, else SQLite) — and hold it through the
@@ -858,18 +860,12 @@ async fn delete_rule(
                     )
                     .await
                     .map_err(|e| {
-                        (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            format!("could not take the rule lease: {e}"),
-                        )
+                        AdminError::unavailable(format!("could not take the rule lease: {e}"))
                     })?;
                 if !held {
-                    return Err((
-                        StatusCode::CONFLICT,
-                        format!(
-                            "rule '{name}' has a run or verify in progress — stop it before deleting"
-                        ),
-                    ));
+                    return Err(AdminError::conflict(format!(
+                        "rule '{name}' has a run or verify in progress — stop it before deleting"
+                    )));
                 }
                 Some((lease.clone(), owner))
             }
@@ -916,7 +912,7 @@ async fn delete_rule_locked(
     sub: JobSubsystem,
     name: &str,
     holds_rule_lease: bool,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<(), AdminError> {
     // ONE critical section (config.write OUTER → db.lock INNER, the codebase
     // order): liveness check, config retain+persist, and the DB row purge all
     // under the same guards. For replication the caller's rule lease is the
@@ -948,12 +944,9 @@ async fn delete_rule_locked(
                 JobSubsystem::Maintenance => false,
             };
             if blocked {
-                return Err((
-                    StatusCode::CONFLICT,
-                    format!(
-                        "rule '{name}' has a run or verify in progress — stop it before deleting"
-                    ),
-                ));
+                return Err(AdminError::conflict(format!(
+                    "rule '{name}' has a run or verify in progress — stop it before deleting"
+                )));
             }
         }
 
@@ -981,10 +974,9 @@ async fn delete_rule_locked(
         let path = super::config::active_config_path(state);
         if let Err(e) = cfg.persist_to_file(&path) {
             *cfg = rollback;
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("rule delete FAILED to persist to {path} (rolled back, no change): {e}"),
-            ));
+            return Err(AdminError::internal(format!(
+                "rule delete FAILED to persist to {path} (rolled back, no change): {e}"
+            )));
         }
         let remaining: Vec<String> = match sub {
             JobSubsystem::Replication => cfg
@@ -1022,17 +1014,11 @@ fn delete_blocked_by_live_run(latest_run_status: Option<&str>, lease_held: bool)
     lease_held || matches!(latest_run_status, Some("running") | Some("cancelling"))
 }
 
-fn not_found() -> (StatusCode, String) {
-    (StatusCode::NOT_FOUND, "job not found".to_string())
+fn not_found() -> AdminError {
+    AdminError::not_found("job not found")
 }
-fn db_unavailable() -> (StatusCode, String) {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        "config DB not available".to_string(),
-    )
-}
-fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+fn internal<E: std::fmt::Display>(e: E) -> AdminError {
+    AdminError::internal(e.to_string())
 }
 
 #[cfg(test)]

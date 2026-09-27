@@ -2,7 +2,7 @@
 
 //! Admin API endpoints for delete-only lifecycle rules.
 
-use super::AdminState;
+use super::{AdminError, AdminState};
 use crate::lifecycle;
 use axum::http::{HeaderMap, StatusCode};
 use std::sync::Arc;
@@ -16,20 +16,20 @@ use tracing::{info, warn};
 fn check_rule_runnable(
     rule: &crate::config_sections::LifecycleRule,
     rules: &[crate::config_sections::LifecycleRule],
-) -> Result<(), (StatusCode, String)> {
+) -> Result<(), AdminError> {
     let fatal = lifecycle::planner::lifecycle_rule_errors(rule);
     if !fatal.is_empty() {
         let msg = fatal.join("; ");
-        return Err((lifecycle::classify_lifecycle_run_error(&msg), msg));
+        return Err(AdminError::status(
+            lifecycle::classify_lifecycle_run_error(&msg),
+            msg,
+        ));
     }
     if lifecycle::planner::duplicate_rule_names(rules.iter()).contains(&rule.name) {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "rule name '{}' is duplicated in the config — rename one of the copies first",
-                rule.name
-            ),
-        ));
+        return Err(AdminError::conflict(format!(
+            "rule name '{}' is duplicated in the config — rename one of the copies first",
+            rule.name
+        )));
     }
     Ok(())
 }
@@ -37,14 +37,14 @@ fn check_rule_runnable(
 pub async fn preview(
     state: Arc<AdminState>,
     name: String,
-) -> Result<lifecycle::LifecycleRunOutcome, (StatusCode, String)> {
+) -> Result<lifecycle::LifecycleRunOutcome, AdminError> {
     let lifecycle_cfg = { state.config.read().await.lifecycle.clone() };
     let rule = lifecycle_cfg
         .rules
         .iter()
         .find(|rule| rule.name == name)
         .cloned()
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "rule not found".to_string()))?;
+        .ok_or_else(|| AdminError::not_found("rule not found"))?;
 
     // Symmetry with run_now: a fatal-config rule 400s up front rather than
     // surfacing the same error deeper in preview_rule.
@@ -53,7 +53,7 @@ pub async fn preview(
     let engine = state.s3_state.engine.load().clone();
     lifecycle::preview_rule(&engine, &rule, lifecycle_cfg.max_failures_retained as usize)
         .await
-        .map_err(|err| (lifecycle::classify_lifecycle_run_error(&err), err))
+        .map_err(|err| AdminError::status(lifecycle::classify_lifecycle_run_error(&err), err))
 }
 
 /// Pause a lifecycle rule (scheduler skips it; run-now 409s).
@@ -61,7 +61,7 @@ pub async fn pause(
     state: Arc<AdminState>,
     name: String,
     headers: &HeaderMap,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<StatusCode, AdminError> {
     set_paused(&state, &name, true, "lifecycle_pause", headers).await
 }
 
@@ -70,7 +70,7 @@ pub async fn resume(
     state: Arc<AdminState>,
     name: String,
     headers: &HeaderMap,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<StatusCode, AdminError> {
     set_paused(&state, &name, false, "lifecycle_resume", headers).await
 }
 
@@ -80,28 +80,22 @@ async fn set_paused(
     paused: bool,
     audit_action: &str,
     headers: &HeaderMap,
-) -> Result<StatusCode, (StatusCode, String)> {
+) -> Result<StatusCode, AdminError> {
     let in_config = {
         let cfg = state.config.read().await;
         cfg.lifecycle.rules.iter().any(|r| r.name == name)
     };
     if !in_config {
-        return Err((StatusCode::NOT_FOUND, "rule not found".to_string()));
+        return Err(AdminError::not_found("rule not found"));
     }
     let db = state
         .config_db
         .as_ref()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "config DB not available".to_string(),
-            )
-        })?
+        .ok_or_else(AdminError::no_config_db)?
         .lock()
         .await;
     let _ = db.lifecycle_ensure_state(name, lifecycle::current_unix_seconds());
-    db.lifecycle_set_paused(name, paused)
-        .map_err(super::db_error_reply)?;
+    db.lifecycle_set_paused(name, paused)?;
     crate::audit::audit_log(audit_action, "admin", name, headers, "", "");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -110,29 +104,25 @@ pub async fn run_now(
     state: Arc<AdminState>,
     name: String,
     headers: &HeaderMap,
-) -> Result<(StatusCode, lifecycle::LifecycleRunOutcome), (StatusCode, String)> {
+) -> Result<(StatusCode, lifecycle::LifecycleRunOutcome), AdminError> {
     let lifecycle_cfg = { state.config.read().await.lifecycle.clone() };
     let rule = lifecycle_cfg
         .rules
         .iter()
         .find(|rule| rule.name == name)
         .cloned()
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "rule not found".to_string()))?;
+        .ok_or_else(|| AdminError::not_found("rule not found"))?;
 
     if !lifecycle_cfg.enabled {
-        return Err((
-            StatusCode::CONFLICT,
-            "lifecycle is globally disabled (storage.lifecycle.enabled = false)".to_string(),
+        return Err(AdminError::conflict(
+            "lifecycle is globally disabled (storage.lifecycle.enabled = false)",
         ));
     }
     if !rule.enabled {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "rule '{}' is disabled (set enabled: true in YAML to run it)",
-                rule.name
-            ),
-        ));
+        return Err(AdminError::conflict(format!(
+            "rule '{}' is disabled (set enabled: true in YAML to run it)",
+            rule.name
+        )));
     }
 
     // Pre-gate: a fatal-config rule (missing expire_after, empty transition
@@ -147,63 +137,49 @@ pub async fn run_now(
         .into_iter()
         .find(|b| state.s3_state.maintenance_gate.is_busy(b))
     {
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "bucket '{busy}' has an active maintenance job — run the rule again \
+        return Err(AdminError::conflict(format!(
+            "bucket '{busy}' has an active maintenance job — run the rule again \
                  when it finishes"
-            ),
-        ));
+        )));
     }
 
     let Some(guard) = lifecycle::try_acquire_rule(&rule.name) else {
-        return Err((
-            StatusCode::CONFLICT,
-            "rule is already running; wait for the current run to finish".to_string(),
+        return Err(AdminError::conflict(
+            "rule is already running; wait for the current run to finish",
         ));
     };
 
     let db_arc = state
         .config_db
         .as_ref()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "config DB not available".to_string(),
-            )
-        })?
+        .ok_or_else(AdminError::no_config_db)?
         .clone();
     let lease_owner = format!("run-now:{}", uuid::Uuid::new_v4());
     let now = lifecycle::current_unix_seconds();
     {
         let db = db_arc.lock().await;
-        db.lifecycle_ensure_state(&rule.name, now)
-            .map_err(super::db_error_reply)?;
+        db.lifecycle_ensure_state(&rule.name, now)?;
         // Paused beats run-now (same contract as replication): the operator
         // paused the rule for a reason; an explicit run must not sidestep it.
         let paused = db
-            .lifecycle_load_state(&rule.name)
-            .map_err(super::db_error_reply)?
+            .lifecycle_load_state(&rule.name)?
             .map(|st| st.paused)
             .unwrap_or(false);
         if paused {
-            return Err((
-                StatusCode::CONFLICT,
-                format!("rule '{}' is paused — resume it first", rule.name),
-            ));
+            return Err(AdminError::conflict(format!(
+                "rule '{}' is paused — resume it first",
+                rule.name
+            )));
         }
-        let acquired = db
-            .lifecycle_try_acquire_lease(
-                &rule.name,
-                &lease_owner,
-                now,
-                lifecycle::scheduler::lease_ttl_secs(),
-            )
-            .map_err(super::db_error_reply)?;
+        let acquired = db.lifecycle_try_acquire_lease(
+            &rule.name,
+            &lease_owner,
+            now,
+            lifecycle::scheduler::lease_ttl_secs(),
+        )?;
         if !acquired {
-            return Err((
-                StatusCode::CONFLICT,
-                "rule is already running; wait for the current run to finish".to_string(),
+            return Err(AdminError::conflict(
+                "rule is already running; wait for the current run to finish",
             ));
         }
     }
@@ -219,13 +195,10 @@ pub async fn run_now(
             .lock()
             .await
             .lifecycle_release_lease(&rule.name, &lease_owner);
-        return Err((
-            StatusCode::CONFLICT,
-            format!(
-                "rule '{}' changed or was deleted while run-now started; retry",
-                rule.name
-            ),
-        ));
+        return Err(AdminError::conflict(format!(
+            "rule '{}' changed or was deleted while run-now started; retry",
+            rule.name
+        )));
     }
 
     info!("Lifecycle run-now via admin API: rule='{}'", name);
@@ -238,7 +211,7 @@ pub async fn run_now(
                 .lock()
                 .await
                 .lifecycle_release_lease(&rule.name, &lease_owner);
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, err));
+            return Err(AdminError::internal(err));
         }
     };
     crate::audit::audit_log(
