@@ -633,3 +633,159 @@
   line-height: 1.5;
   color: var(--ink-soft);
 }
+
+/* === Phones and small tablets: thumb-sized controls, readable labels ===
+ * Every control is at least 44 px tall, and no label is smaller than
+ * 14 px. The desktop sizes above stay as they are. */
+@media (max-width: 899px) {
+  .calc-inputs,
+  .calc-result {
+    padding: 1.25rem;
+  }
+
+  .calc-compare {
+    padding: 0 1.25rem 1.25rem;
+  }
+
+  .field label,
+  .field-value {
+    font-size: 1rem;
+  }
+
+  .field input[type="range"] {
+    height: 44px;
+  }
+
+  .field-help {
+    font-size: 0.875rem;
+    line-height: 1.5;
+  }
+
+  .region-buttons {
+    gap: 0.5rem;
+  }
+
+  .region-buttons button {
+    min-height: 44px;
+    font-size: 1rem;
+  }
+
+  .provider-chips {
+    gap: 0.5rem;
+  }
+
+  .provider-chips button {
+    min-height: 44px;
+    padding: 0.5rem 0.8rem;
+    font-size: 0.875rem;
+  }
+
+  .cost-shortcuts button {
+    min-height: 36px;
+    font-size: 0.875rem;
+  }
+
+  .advanced-toggle,
+  .link-action {
+    min-height: 44px;
+    font-size: 1rem;
+  }
+
+  .card p,
+  .calc-hero-subtext {
+    font-size: 1rem;
+  }
+
+  .card-ctas {
+    gap: 0.75rem 1.5rem;
+  }
+
+  .warning-chip {
+    font-size: 0.9rem;
+  }
+
+  .formula summary {
+    min-height: 44px;
+    font-size: 1rem;
+  }
+
+  .formula-body p {
+    font-size: 0.95rem;
+  }
+
+  .formula-body pre {
+    font-size: 0.8125rem;
+  }
+
+  .provider-compare {
+    padding: 1rem 0.75rem 0.9rem;
+  }
+
+  .provider-compare-head,
+  .provider-compare-legend {
+    font-size: 0.8125rem;
+  }
+
+  .provider-row {
+    grid-template-columns: 7.5rem 1fr;
+    gap: 0.6rem;
+    padding: 0.2rem 0.4rem;
+  }
+
+  .provider-row-name {
+    min-height: 44px;
+    font-size: 0.8125rem;
+    flex-wrap: wrap;
+  }
+
+  .provider-eur,
+  .provider-archive {
+    font-size: 0.72rem;
+  }
+
+  .provider-bar {
+    height: 20px;
+  }
+
+  .provider-bar span {
+    font-size: 0.75rem;
+  }
+
+  .provider-compare-note {
+    font-size: 0.875rem;
+  }
+}
+
+/* The breakdown table keeps its three money columns on a 350 px card;
+ * 14 px mono is the smallest size that still reads there. */
+@media (max-width: 599px) {
+  .breakdown {
+    font-size: 0.875rem;
+  }
+
+  .breakdown thead th {
+    font-size: 0.75rem;
+  }
+
+  .breakdown tbody th {
+    font-size: 0.875rem;
+  }
+}
+
+/* 375 px phones (iPhone SE, mini): 14 px mono pushed the third money
+ * column past the card edge. Trade 1 px of type for room. */
+@media (max-width: 399px) {
+  .calc-inputs,
+  .calc-result {
+    padding: 1rem;
+  }
+
+  .breakdown {
+    font-size: 0.8125rem;
+  }
+
+  .breakdown th,
+  .breakdown td {
+    padding: 0.55rem 0.3rem;
+  }
+}
