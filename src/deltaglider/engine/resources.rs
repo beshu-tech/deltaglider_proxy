@@ -45,7 +45,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// Bytes above which a delta object goes through the spool: a delta-eligible
     /// PUT uses the streaming spool store (`store_spooled_delta`), and a delta
     /// GET (full or ranged) reconstructs to a spool file. `DGP_SPOOL_THRESHOLD_BYTES`
-    /// overrides [`default_spool_threshold`].
+    /// overrides `default_spool_threshold`.
     pub fn spool_threshold(&self) -> u64 {
         crate::config::env_parse_with_default(
             "DGP_SPOOL_THRESHOLD_BYTES",

@@ -406,7 +406,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
     /// 2. If not delta-eligible / compression off → passthrough straight from
     ///    the body spool (store_passthrough_file).
     /// 3. Else: the same pipeline as the buffered PUT
-    ///    ([`Self::store_delta_eligible`]), with the encode reading the body
+    ///    (`Self::store_delta_eligible`), with the encode reading the body
     ///    spool, capped at `ratio_threshold × size`.
     ///
     /// The caller owns `body` (a `Spool`); it lives until this returns.
