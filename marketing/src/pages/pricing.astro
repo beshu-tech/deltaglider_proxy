@@ -2,12 +2,13 @@
 // /pricing — calculator React island + static tier cards, both fed by
 // the single source of truth in src/lib/brackets.ts.
 //
-// The model (since the BUSL-1.1 relicense): free under the 15 TB
-// compressed-footprint grant, one flat Commercial plan above it, and
-// an OEM row for embedding / hosted-service resale.
+// The model (licensing 2.0): free under the 15 TB Stored Footprint grant,
+// one flat Commercial plan per organization up to 1 PB, Enterprise above
+// 1 PB or for custom terms, and an OEM row for hosted services and
+// embedding in a product.
 //
 // JSON-LD Offers are generated from SCHEMA_OFFER_BRACKETS (the
-// fixed-price paid tiers only) — OEM is excluded (no fixed price).
+// fixed-price paid tiers only) — Enterprise and OEM are excluded (no fixed price).
 
 import BaseLayout from '../layouts/BaseLayout.astro';
 import JsonLd from '../components/JsonLd.astro';
@@ -22,7 +23,7 @@ import '../styles/calculator.css';
 
 const title = 'Pricing — DeltaGlider';
 const description =
-  `Free up to ${FREE_GRANT_TB} TB of compressed data. One flat Commercial plan at $5k/year covers the license, support, and signed builds. The calculator shows annual savings live.`;
+  `Free up to ${FREE_GRANT_TB} TB of compressed data. One flat Commercial plan at $5k/year per organization covers the license, support, and signed builds. The calculator shows annual savings live.`;
 
 // Schema generator wants {sku, name, price, description}. Adapt from
 // the rich Bracket shape — single source of truth lives in brackets.ts.
@@ -35,7 +36,7 @@ const schemaTiers = SCHEMA_OFFER_BRACKETS.map((b) => ({
 
 const freeTiers = BRACKETS.filter((b) => b.id === 'free' || b.id === 'trial');
 const commercialTiers = BRACKETS.filter((b) => b.id === 'commercial');
-const customTiers = BRACKETS.filter((b) => b.id === 'oem');
+const customTiers = BRACKETS.filter((b) => b.id === 'enterprise' || b.id === 'oem');
 
 /**
  * Special-case the trial-row description so the in-table link
@@ -127,7 +128,7 @@ function renderDescription(id: string, description: string): string {
         }
       </div>
 
-      <h3>OEM & embedding</h3>
+      <h3>Enterprise & OEM</h3>
       <div class="pricing-stack">
         {
           customTiers.map((b) => {
@@ -148,66 +149,92 @@ function renderDescription(id: string, description: string): string {
     </section>
 
     <section class="meter">
-      <h2>What we mean by "compressed stored footprint"</h2>
+      <h2>What we mean by "stored footprint"</h2>
 
       <p>
-        The compressed stored footprint is the number of bytes your
-        backend physically stores across all DeltaGlider-managed buckets,
-        after DeltaGlider's compression. This is the number we count
-        against the license grant, and the one DeltaGlider already shows
-        you in the admin dashboard and at <code>/_/stats</code>. Your
-        source (logical) bytes, ingress, and egress don't count, and
-        neither do storage-layer replicas (whatever your backend does
-        under the hood).
+        The stored footprint is the number of bytes that all of your
+        organization's production deployments of DeltaGlider cause to be
+        stored, measured after DeltaGlider's compression. It counts every
+        copy that DeltaGlider writes: the primary data, the replicas and
+        archives that DeltaGlider writes to other buckets or regions, and
+        the reference and metadata objects that delta compression needs.
+        Your source (logical) bytes, ingress, and egress don't count.
+      </p>
+
+      <p>
+        Bytes that your storage provider keeps for its own redundancy do
+        not count, because DeltaGlider does not write them. For example,
+        when you turn on S3 cross-region replication in your provider's
+        console, the provider makes that copy, so it is not part of your
+        footprint. When DeltaGlider's own replication writes the copy, it
+        is.
+      </p>
+
+      <p>
+        The footprint is the average over a calendar month of one
+        measurement a day, so a short spike does not push you over the
+        line. Your organization is you together with every company that
+        controls you, that you control, or that is under common control
+        with you, where control means more than 50% of the voting shares.
       </p>
 
       <p>
         We don't collect telemetry and the software never phones home.
-        Your own dashboard tells you which side of the {FREE_GRANT_TB} TB
-        line you are on. You self-report, and we cross-check against the
+        The admin dashboard and the <code>/_/stats</code> endpoint of each
+        deployment show the compressed bytes that it stores, so you can
+        add them up and see which side of the {FREE_GRANT_TB} TB line you
+        are on. You self-report, and we cross-check against the
         <code>/_/stats</code> endpoint only if you give us read access
         during the conversation.
       </p>
     </section>
 
     <section class="commercial">
-      <h2>When do you need the Commercial plan?</h2>
+      <h2>When do you need a paid license?</h2>
 
       <p>
         DeltaGlider is source-available under the
         <a href="https://github.com/beshu-tech/deltaglider_proxy/blob/main/LICENSE">Business Source License 1.1</a>.
-        The license grants free production use to most deployments,
+        The license grants free production use to most organizations,
         and every release becomes Apache-2.0 open source two years after
         it ships. You need a paid license only if one of these applies:
       </p>
 
       <ul>
         <li>
-          Your total compressed stored footprint exceeds
-          {FREE_GRANT_TB} TB per organization. This is the Commercial
-          plan, at the flat published price above.
+          Your organization's stored footprint exceeds {FREE_GRANT_TB} TB.
+          Up to 1 PB, this is the Commercial plan, at the flat published
+          price above. One plan covers the whole organization, with any
+          number of instances, clusters and regions.
         </li>
         <li>
-          You offer DeltaGlider itself to your customers as a hosted or
-          managed service. That needs an OEM license.
+          Your organization's stored footprint exceeds 1 PB, or you need
+          custom terms such as indemnity, a security review, or
+          procurement paperwork. That is the Enterprise plan.
         </li>
         <li>
-          The same applies when you embed DeltaGlider in a proprietary
-          product you distribute.
+          You offer DeltaGlider, or a service whose primary value comes
+          from it, to third parties as a hosted, managed or multi-tenant
+          service. That needs an OEM license.
+        </li>
+        <li>
+          You ship DeltaGlider inside or with a commercial product or
+          appliance. That needs an OEM license too, and it covers your
+          customers' use of the copy you ship them. Without it, the free
+          grant does not cover those customers.
         </li>
       </ul>
 
       <p>
-        Everything else is free: internal infrastructure under the grant,
-        development, testing, evaluation at any size. If your compressed
-        footprint is above {FREE_GRANT_TB} TB, DeltaGlider saves you
-        far more than the plan costs. That is exactly what the
-        calculator above shows.
+        Everything else is free: production use under the grant, and
+        development, testing, and evaluation at any size. If your
+        footprint is above {FREE_GRANT_TB} TB, the calculator above shows
+        how the savings compare with the plan price.
       </p>
 
       <p>
-        <a href="mailto:sales@beshu.tech?subject=DeltaGlider%20-%20OEM%20license%20inquiry">
-          Talk to sales about OEM
+        <a href="mailto:sales@beshu.tech?subject=DeltaGlider%20-%20Enterprise%20or%20OEM%20inquiry">
+          Talk to sales about Enterprise or OEM
         </a>
       </p>
     </section>
@@ -235,9 +262,11 @@ function renderDescription(id: string, description: string): string {
           <p>
             Support effort doesn't scale with your bytes, and charging
             more the better the compression works taxed the product for
-            doing its job. Above the free grant, every deployment
-            gets the same plan, with the license, support, and signed
-            builds all included. If your savings are $200k/yr, good: the
+            doing its job. Above the free grant and up to 1 PB, every
+            organization gets the same plan, with the license, support,
+            and signed builds all included. The price is per
+            organization, not per deployment, so a new cluster or region
+            does not add to it. If your savings are $200k/yr, good: the
             price stays $5k.
           </p>
         </div>
@@ -248,10 +277,8 @@ function renderDescription(id: string, description: string): string {
             Support is only part of what you pay for. The $5k buys the
             license above the {FREE_GRANT_TB} TB grant, an SLA on critical
             infrastructure, and a direct email line to the engineers who
-            wrote the proxy. Above the grant your compressed footprint
-            implies hundreds of terabytes of source data, and the
-            calculator above typically shows savings 10 to 40 times the
-            plan price.
+            wrote the proxy. The calculator above shows what DeltaGlider
+            saves you at your size, compared with the plan price.
           </p>
         </div>
 
@@ -260,8 +287,8 @@ function renderDescription(id: string, description: string): string {
           <p>
             Nothing breaks and no feature switches off. The software keeps
             working, and the admin dashboard shows your footprint, so you
-            can see when you cross the line. At that point you buy the
-            Commercial plan. The proxy doesn't phone home, and we send no
+            can see when the monthly average crosses the line. At that
+            point you buy the Commercial plan. The proxy doesn't phone home, and we send no
             surprise invoices.
           </p>
         </div>
@@ -269,8 +296,59 @@ function renderDescription(id: string, description: string): string {
         <div class="faq-item">
           <h3>Replication doubles my footprint. Do you count it twice?</h3>
           <p>
-            No. We count the logical compressed bytes that DeltaGlider
-            manages. Storage-layer replicas don't count.
+            Yes, when DeltaGlider writes the copy. The license counts every
+            stored copy that DeltaGlider writes, so a bucket that
+            DeltaGlider replicates to a second region counts twice. The
+            redundancy that your storage provider runs by itself, such as
+            S3 cross-region replication that you turn on at the provider,
+            does not count, because DeltaGlider does not write those bytes.
+          </p>
+        </div>
+
+        <div class="faq-item">
+          <h3>What counts as my organization?</h3>
+          <p>
+            Your organization is your company together with every company
+            that controls it, that it controls, or that is under common
+            control with it. Control means more than 50% of the voting
+            shares. So a parent company and its subsidiaries share one
+            {FREE_GRANT_TB} TB grant and need one Commercial plan, not one
+            for each subsidiary.
+          </p>
+        </div>
+
+        <div class="faq-item">
+          <h3>We run DeltaGlider for a client. Do we need OEM?</h3>
+          <p>
+            No, if you run it for one client inside infrastructure that
+            the client controls. The license treats that as the client's
+            own production use, so the client's footprint and the client's
+            plan apply. You need OEM when you run DeltaGlider as a hosted,
+            managed or multi-tenant service that you offer to third
+            parties.
+          </p>
+        </div>
+
+        <div class="faq-item">
+          <h3>We ship a product that includes DeltaGlider</h3>
+          <p>
+            Then you need an OEM license. The free grant does not cover a
+            copy of DeltaGlider that a customer received as part of a
+            commercial product or appliance, unless the vendor holds an OEM
+            license that covers that use. The OEM license covers your
+            customers, so they do not each need their own plan.
+          </p>
+        </div>
+
+        <div class="faq-item">
+          <h3>What about a migration that briefly doubles a bucket?</h3>
+          <p>
+            The footprint is the average over a calendar month of one
+            measurement a day. A migration that holds two copies of a
+            bucket raises the average only for the days that both copies
+            exist. For example, a second copy that exists for 3 days of a
+            30-day month adds a tenth of the bucket's size to that month's
+            footprint.
           </p>
         </div>
 

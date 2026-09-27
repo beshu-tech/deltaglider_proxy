@@ -201,7 +201,7 @@ export function pricingProductSchema(tiers: PricingTier[]) {
     '@type': 'Product',
     '@id': `${SITE.url}/pricing#product`,
     name: SITE.name,
-    description: 'DeltaGlider Commercial is one flat annual plan for deployments above the free 15 TB grant.',
+    description: 'DeltaGlider Commercial is one flat annual plan per organization, for stored footprints above the free 15 TB grant and up to 1 PB.',
     brand: {
       '@type': 'Brand',
       name: SITE.name,
