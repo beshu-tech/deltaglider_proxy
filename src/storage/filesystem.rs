@@ -69,6 +69,73 @@ fn internal_temp_in(dir: &Path) -> std::io::Result<NamedTempFile> {
         .tempfile_in(dir)
 }
 
+/// How often a write re-creates a directory that a concurrent DELETE pruned.
+const MKDIR_ATTEMPTS: usize = 8;
+
+/// Create `dir` and its missing ancestors inside `bucket_dir`, never the
+/// bucket dir itself (a deleted bucket stays deleted: C-P0-1). A DELETE in
+/// another deltaspace prunes empty ancestors under its own lock, so a
+/// component can vanish mid-walk: the walk starts again while the bucket
+/// exists (storage-1). Blocking.
+fn mkdir_within(bucket: &str, bucket_dir: &Path, dir: &Path) -> Result<(), StorageError> {
+    let Ok(rel) = dir.strip_prefix(bucket_dir) else {
+        return Err(StorageError::Other(format!(
+            "ensure_dir called with path {:?} outside bucket {}",
+            dir, bucket
+        )));
+    };
+    'walk: for _ in 0..MKDIR_ATTEMPTS {
+        let mut current = bucket_dir.to_path_buf();
+        for component in rel.components() {
+            current.push(component);
+            match std::fs::create_dir(&current) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if !bucket_dir.is_dir() {
+                        return Err(StorageError::BucketNotFound(bucket.to_string()));
+                    }
+                    continue 'walk;
+                }
+                Err(e) => return Err(StorageError::from(e)),
+            }
+        }
+        return Ok(());
+    }
+    Err(StorageError::Throttled(format!(
+        "directory {dir:?} was removed {MKDIR_ATTEMPTS} times while it was created"
+    )))
+}
+
+/// The directory an atomic write puts its temp file in. Made only by
+/// `FilesystemBackend::ensure_dir`, so every write can re-create it.
+#[derive(Debug)]
+struct WriteDir {
+    bucket: String,
+    bucket_dir: PathBuf,
+    dir: PathBuf,
+}
+
+impl WriteDir {
+    /// A temp file in the directory. A DELETE in another deltaspace can
+    /// prune the directory between `ensure_dir` and here (the PUT then got
+    /// ENOENT, which reads as 404 NoSuchKey): create it again and retry.
+    /// Once the temp file exists, the directory is not empty, so the
+    /// rename that follows cannot lose it. Blocking.
+    fn temp(&self) -> Result<NamedTempFile, StorageError> {
+        for _ in 0..MKDIR_ATTEMPTS {
+            match internal_temp_in(&self.dir) {
+                Ok(tmp) => return Ok(tmp),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    mkdir_within(&self.bucket, &self.bucket_dir, &self.dir)?;
+                }
+                Err(e) => return Err(io_to_storage_error(e)),
+            }
+        }
+        internal_temp_in(&self.dir).map_err(io_to_storage_error)
+    }
+}
+
 /// Whether a write fsyncs its file before the rename (the default) or
 /// leaves that to [`StorageBackend::flush_pending`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,21 +242,18 @@ fn finish_write(
 /// The xattr is written to the temp file BEFORE the rename, so a crash can never
 /// leave a data file without its metadata. Either both are visible or neither is.
 async fn atomic_write_with_metadata(
+    dir: WriteDir,
     path: &Path,
     data: &[u8],
     metadata: Option<&FileMetadata>,
     durability: Durability,
 ) -> Result<(), StorageError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| StorageError::Other("Cannot atomic-write to a path with no parent".into()))?
-        .to_path_buf();
     let path = path.to_path_buf();
     let data = data.to_vec();
     let meta_json = metadata.map(serde_json::to_vec).transpose()?;
 
     tokio::task::spawn_blocking(move || {
-        let mut tmp = internal_temp_in(&parent).map_err(io_to_storage_error)?;
+        let mut tmp = dir.temp()?;
         tmp.write_all(&data).map_err(io_to_storage_error)?;
         // Write xattr to temp file BEFORE rename — atomic metadata+data visibility.
         if let Some(json) = &meta_json {
@@ -218,22 +282,19 @@ async fn hardlink_or_copy(src: &Path, dest: &Path) -> Result<(), StorageError> {
 
 /// Atomically copy file data + metadata to destination using temp + rename.
 async fn atomic_copy_with_metadata(
+    dir: WriteDir,
     source_path: &Path,
     target_path: &Path,
     metadata: &FileMetadata,
     durability: Durability,
 ) -> Result<(), StorageError> {
-    let parent = target_path
-        .parent()
-        .ok_or_else(|| StorageError::Other("Cannot copy to a path with no parent".into()))?
-        .to_path_buf();
     let source = source_path.to_path_buf();
     let target = target_path.to_path_buf();
     let meta_json = serde_json::to_vec(metadata)?;
 
     tokio::task::spawn_blocking(move || {
         let mut src = std::fs::File::open(&source).map_err(io_to_storage_error)?;
-        let mut tmp = internal_temp_in(&parent).map_err(io_to_storage_error)?;
+        let mut tmp = dir.temp()?;
         std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
         xattr_meta::set_metadata_xattr(tmp.path(), &meta_json)?;
         finish_write(tmp, &target, durability)
@@ -471,40 +532,23 @@ impl FilesystemBackend {
     /// non-recursive `mkdir`. If the bucket root went missing under us,
     /// the very first `mkdir` (of the first child of the bucket dir)
     /// fails with `ENOENT`, which we propagate as `BucketNotFound`.
-    async fn ensure_dir(&self, bucket: &str, path: &Path) -> Result<(), StorageError> {
-        let Some(parent) = path.parent() else {
-            return Ok(());
-        };
+    async fn ensure_dir(&self, bucket: &str, path: &Path) -> Result<WriteDir, StorageError> {
         let bucket_dir = self.bucket_dir(bucket);
+        let dir = path.parent().unwrap_or(&bucket_dir).to_path_buf();
         if !is_dir(&bucket_dir).await {
             return Err(StorageError::BucketNotFound(bucket.to_string()));
         }
-        // Strip the bucket-or-shorter prefix; iterate the remaining
-        // components and `mkdir` each one. We never `mkdir` the bucket
-        // dir itself — if the strip fails, the path was outside the
-        // bucket subtree and we propagate the error rather than
-        // creating something we shouldn't.
-        let Ok(rel) = parent.strip_prefix(&bucket_dir) else {
-            return Err(StorageError::Other(format!(
-                "ensure_dir called with path {:?} outside bucket {}",
-                path, bucket
-            )));
+        let wd = WriteDir {
+            bucket: bucket.to_string(),
+            bucket_dir,
+            dir,
         };
-        let mut current = bucket_dir;
-        for component in rel.components() {
-            current.push(component);
-            match fs::create_dir(&current).await {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Parent disappeared mid-walk — bucket was deleted
-                    // between `require_bucket_exists` and now.
-                    return Err(StorageError::BucketNotFound(bucket.to_string()));
-                }
-                Err(e) => return Err(StorageError::from(e)),
-            }
-        }
-        Ok(())
+        tokio::task::spawn_blocking(move || {
+            mkdir_within(&wd.bucket, &wd.bucket_dir, &wd.dir)?;
+            Ok(wd)
+        })
+        .await
+        .map_err(super::join_error)?
     }
 
     /// Reject a write if the bucket root does NOT already exist. Prevents
@@ -832,8 +876,8 @@ impl FilesystemBackend {
         filename: &str,
         durability: Durability,
     ) -> Result<(), StorageError> {
-        self.ensure_dir(bucket, data_path).await?;
-        atomic_write_with_metadata(data_path, data, Some(metadata), durability).await?;
+        let dir = self.ensure_dir(bucket, data_path).await?;
+        atomic_write_with_metadata(dir, data_path, data, Some(metadata), durability).await?;
         debug!(
             "Wrote {} ({} bytes) for {}/{}",
             label,
@@ -1081,13 +1125,13 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         let dest = self.reference_path(bucket, prefix)?;
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent).await?;
-        }
+        // `ensure_dir`, never `create_dir_all`: that re-created a bucket
+        // deleted after `require_bucket_exists` (C-P0-1, storage-12).
+        let dir = self.ensure_dir(bucket, &dest).await?;
         // Copy to a temp file + xattr + fsync + rename. Delete-then-copy lost
         // the baseline on a failed or short copy, and a hardlink shared the
         // inode (and so the xattr) with the caller's source file.
-        atomic_copy_with_metadata(source_path, &dest, metadata, Durability::Sync).await
+        atomic_copy_with_metadata(dir, source_path, &dest, metadata, Durability::Sync).await
     }
 
     async fn put_reference_metadata(
@@ -1283,9 +1327,15 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         let data_path = self.passthrough_path(bucket, prefix, filename)?;
-        self.ensure_dir(bucket, &data_path).await?;
-        atomic_copy_with_metadata(source_path, &data_path, metadata, Durability::for_object())
-            .await?;
+        let dir = self.ensure_dir(bucket, &data_path).await?;
+        atomic_copy_with_metadata(
+            dir,
+            source_path,
+            &data_path,
+            metadata,
+            Durability::for_object(),
+        )
+        .await?;
         debug!(
             "Copied passthrough file {:?} -> {:?} for {}/{}",
             source_path, data_path, prefix, filename
@@ -1305,18 +1355,14 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         let data_path = self.passthrough_path(bucket, prefix, filename)?;
-        self.ensure_dir(bucket, &data_path).await?;
-        let parent = data_path
-            .parent()
-            .ok_or_else(|| StorageError::Other("Cannot write to a path with no parent".into()))?
-            .to_path_buf();
+        let dir = self.ensure_dir(bucket, &data_path).await?;
         let target = data_path.clone();
         let parts: Vec<PathBuf> = part_paths.to_vec();
         let meta_json = serde_json::to_vec(metadata)?;
         let durability = Durability::for_object();
 
         tokio::task::spawn_blocking(move || {
-            let mut tmp = internal_temp_in(&parent).map_err(io_to_storage_error)?;
+            let mut tmp = dir.temp()?;
             for path in &parts {
                 let mut src = std::fs::File::open(path).map_err(io_to_storage_error)?;
                 std::io::copy(&mut src, &mut tmp).map_err(io_to_storage_error)?;
@@ -1378,14 +1424,10 @@ impl StorageBackend for FilesystemBackend {
         self.require_bucket_exists(bucket).await?;
         let data_path = self.passthrough_path(bucket, prefix, filename)?;
 
-        self.ensure_dir(bucket, &data_path).await?;
+        let dir = self.ensure_dir(bucket, &data_path).await?;
 
         // Write chunks sequentially to a temp file, then fsync + rename.
         // This avoids allocating a contiguous buffer for the entire object.
-        let parent = data_path
-            .parent()
-            .ok_or_else(|| StorageError::Other("Cannot write to a path with no parent".into()))?
-            .to_path_buf();
         let target = data_path.clone();
         let chunks: Vec<Bytes> = chunks.to_vec();
         let num_chunks = chunks.len();
@@ -1393,7 +1435,7 @@ impl StorageBackend for FilesystemBackend {
         let durability = Durability::for_object();
 
         tokio::task::spawn_blocking(move || -> Result<(), StorageError> {
-            let mut tmp = internal_temp_in(&parent).map_err(io_to_storage_error)?;
+            let mut tmp = dir.temp()?;
             for chunk in &chunks {
                 tmp.write_all(chunk).map_err(io_to_storage_error)?;
             }
@@ -2856,5 +2898,70 @@ mod tests {
         })
         .await;
         backend.flush_pending().await.unwrap();
+    }
+
+    /// storage-1: a DELETE of the last object of `a/b/c` prunes the empty
+    /// ancestors while a PUT into another deltaspace (`a/b`, or the nested
+    /// `a/b/c/d`) runs under a different engine lock, between its mkdir
+    /// and its temp-file create. The PUT must still succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_prune_never_fails_a_concurrent_put_in_another_deltaspace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = std::sync::Arc::new(
+            FilesystemBackend::new(tmp.path().to_path_buf())
+                .await
+                .expect("new backend"),
+        );
+        backend.create_bucket("bucket").await.expect("create");
+        let meta = dummy_metadata("x.bin");
+        let mut failures = Vec::new();
+        for i in 0..600 {
+            let put_prefix = if i % 2 == 0 { "a/b" } else { "a/b/c/d" };
+            backend
+                .put_passthrough("bucket", "a/b/c", "x.bin", b"x", &meta)
+                .await
+                .expect("seed");
+            let (b1, b2, m) = (backend.clone(), backend.clone(), meta.clone());
+            let del =
+                tokio::spawn(
+                    async move { b1.delete_passthrough("bucket", "a/b/c", "x.bin").await },
+                );
+            let put = tokio::spawn(async move {
+                b2.put_passthrough("bucket", put_prefix, "y.bin", b"y", &m)
+                    .await
+            });
+            del.await.unwrap().expect("delete");
+            if let Err(e) = put.await.unwrap() {
+                failures.push(format!("{put_prefix}: {e}"));
+            }
+            let _ = backend
+                .delete_passthrough("bucket", put_prefix, "y.bin")
+                .await;
+        }
+        assert!(
+            failures.is_empty(),
+            "{} failed PUTs, first: {:?}",
+            failures.len(),
+            failures.first()
+        );
+    }
+
+    /// storage-12: a write creates its directories only through
+    /// `ensure_dir`, which never re-creates a deleted bucket. A
+    /// `create_dir_all` in a write path (as `put_reference_from_file` had)
+    /// brings back a bucket deleted after `require_bucket_exists`. Only the
+    /// backend root (`new`) and `create_bucket` may call it.
+    #[test]
+    fn only_new_and_create_bucket_call_create_dir_all() {
+        let src = include_str!("filesystem.rs");
+        let prod = src.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        let calls = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//") && l.contains("create_dir_all("))
+            .count();
+        assert_eq!(
+            calls, 2,
+            "a write path calls create_dir_all; use ensure_dir"
+        );
     }
 }

@@ -295,6 +295,15 @@ lost, and the panel showed no unsaved changes. Now the read replaces the
 form only when it has no new edits. Otherwise the edits stay, and the
 panel shows them as unsaved. The read also no longer hides the form.
 
+### Fixed — A PUT on the filesystem backend no longer fails with 404 during a DELETE
+
+A DELETE of the last object under a prefix removes the empty directories
+above it. A PUT into a neighbouring prefix could create its directory just
+before that removal, and then fail to create its file, so the client got
+`404 NoSuchKey` for a PUT. Now a write creates its directory again when it
+is gone, and tries again. The reference write also no longer re-creates a
+bucket that a concurrent request deleted.
+
 ### Changed — A migrate to a filesystem backend is about twice as fast
 
 A migrate made every copy durable on its own before the next one (one

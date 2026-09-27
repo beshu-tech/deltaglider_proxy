@@ -518,6 +518,33 @@ async fn live_objects(
 mod tests {
     use super::*;
 
+    /// storage-3: an engine rebuild drops the S3 backend and its queue. The
+    /// GC task must end with it, or every rebuild leaks one task that keeps
+    /// the old client and credentials.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_queue_ends_its_background_tasks() {
+        let conf = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                "a", "b", None, None, "t",
+            ))
+            .endpoint_url("http://127.0.0.1:9")
+            .build();
+        let client = Client::from_conf(conf);
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let before = metrics.num_alive_tasks();
+        for _ in 0..5 {
+            drop(FactsCleanupQueue::start(client.clone()));
+        }
+        // Aborted and closed tasks end on their next poll.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while metrics.num_alive_tasks() > before && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(metrics.num_alive_tasks(), before, "tasks leaked");
+    }
+
     #[test]
     fn a_rewritten_key_keeps_its_newest_entry() {
         let e = |k: &str, t: i64| (k.to_string(), Some((t, 0)));
