@@ -295,6 +295,13 @@ lost, and the panel showed no unsaved changes. Now the read replaces the
 form only when it has no new edits. Otherwise the edits stay, and the
 panel shows them as unsaved. The read also no longer hides the form.
 
+### Fixed — A configuration change no longer leaves an old background task running
+
+Each S3 backend starts a background task that removes stale listing index
+objects every 6 hours. A configuration change, a migrate, or a re-encrypt
+builds new backends, but the old task kept running with the old
+credentials. Now the task stops with its backend.
+
 ### Fixed — A range GET past the end of an object answers 416
 
 The size that a range GET is checked against can be stale, for example

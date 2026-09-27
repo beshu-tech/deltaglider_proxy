@@ -274,6 +274,17 @@ type Queued = (String, String, Option<i64>);
 pub(super) struct FactsCleanupQueue {
     tx: mpsc::UnboundedSender<Queued>,
     rewritten: Rewritten,
+    /// The GC task never ends on its own: the queue owns it and aborts it
+    /// on drop, else every engine rebuild leaked one with the old client.
+    gc: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for FactsCleanupQueue {
+    fn drop(&mut self) {
+        if let Some(gc) = self.gc.take() {
+            gc.abort();
+        }
+    }
 }
 
 impl FactsCleanupQueue {
@@ -283,10 +294,8 @@ impl FactsCleanupQueue {
         let (tx, rx) = mpsc::unbounded_channel();
         let rewritten: Rewritten = Default::default();
         tokio::spawn(drain(client.clone(), rx, rewritten.clone()));
-        if crate::config::env_bool(GC_ENV, true) {
-            tokio::spawn(gc_loop(client));
-        }
-        Self { tx, rewritten }
+        let gc = crate::config::env_bool(GC_ENV, true).then(|| tokio::spawn(gc_loop(client)));
+        Self { tx, rewritten, gc }
     }
 
     /// The object `stored_key` is gone (deleted at `deleted_at` on the
