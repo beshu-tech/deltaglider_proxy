@@ -433,6 +433,44 @@ impl Spool {
         self.file.path()
     }
 
+    /// Write `stream` into this spool file, hashing it (SHA-256) on the way.
+    /// At most `cap` bytes (the reservation): a longer stream stops at the
+    /// first chunk past `cap`, so a source that grew after its size was read
+    /// never overruns the spool budget. The caller judges a short stream.
+    pub async fn fill_from_stream<S>(
+        &self,
+        stream: &mut S,
+        cap: u64,
+    ) -> Result<SpoolFill, SpoolFillError>
+    where
+        S: futures::Stream<Item = Result<bytes::Bytes, crate::storage::StorageError>> + Unpin,
+    {
+        use futures::StreamExt;
+        use sha2::Digest;
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::File::create(self.path())
+            .await
+            .map_err(SpoolFillError::Write)?;
+        let mut hasher = sha2::Sha256::new();
+        let mut written: u64 = 0;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(SpoolFillError::Source)?;
+            written += chunk.len() as u64;
+            if written > cap {
+                return Err(SpoolFillError::Overrun { cap, written });
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(SpoolFillError::Write)?;
+        }
+        file.flush().await.map_err(SpoolFillError::Write)?;
+        Ok(SpoolFill {
+            written,
+            sha256: hex::encode(hasher.finalize()),
+        })
+    }
+
     /// Budget this spool holds, in MiB (a pair's shared permit counts once
     /// per holder; callers pass one spool of a pair at most).
     pub(crate) fn reserved_mib(&self) -> usize {
@@ -441,6 +479,26 @@ impl Spool {
             SharedOrOwned::Shared(p) => p.num_permits(),
         }
     }
+}
+
+/// What [`Spool::fill_from_stream`] wrote.
+#[derive(Debug)]
+pub struct SpoolFill {
+    pub written: u64,
+    /// Hex SHA-256 of the bytes written.
+    pub sha256: String,
+}
+
+/// Why [`Spool::fill_from_stream`] stopped.
+#[derive(Debug)]
+pub enum SpoolFillError {
+    /// The source stream failed.
+    Source(crate::storage::StorageError),
+    /// Writing the spool file failed.
+    Write(std::io::Error),
+    /// The stream is longer than `cap`: the source changed after its size
+    /// was read.
+    Overrun { cap: u64, written: u64 },
 }
 
 /// Bytes → MiB, rounded up. Budget accounting unit.
@@ -626,6 +684,67 @@ mod tests {
         assert_eq!(mib_ceil(1), 1);
         assert_eq!(mib_ceil(1024 * 1024), 1);
         assert_eq!(mib_ceil(1024 * 1024 + 1), 2);
+    }
+
+    /// The one "stream into a spool" loop of the copy paths: exact bytes and
+    /// hash, a stop at the first chunk past the cap, a source error kept.
+    #[tokio::test]
+    async fn fill_from_stream_caps_hashes_and_keeps_the_source_error() {
+        use sha2::Digest;
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = SpoolDir::new(tmp.path().to_path_buf(), 64 * 1024 * 1024).unwrap();
+        let chunks = |parts: &[&'static [u8]]| {
+            futures::stream::iter(
+                parts
+                    .iter()
+                    .map(|p| Ok(bytes::Bytes::from_static(p)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        let spool = pool.acquire(10).await.unwrap();
+        let fill = spool
+            .fill_from_stream(&mut chunks(&[b"hello ", b"spool"]), 11)
+            .await
+            .unwrap();
+        assert_eq!(fill.written, 11);
+        assert_eq!(
+            fill.sha256,
+            hex::encode(sha2::Sha256::digest(b"hello spool"))
+        );
+        assert_eq!(std::fs::read(spool.path()).unwrap(), b"hello spool");
+
+        // Short: the caller judges it.
+        let fill = spool
+            .fill_from_stream(&mut chunks(&[b"abc"]), 11)
+            .await
+            .unwrap();
+        assert_eq!(fill.written, 3);
+
+        let grown = spool
+            .fill_from_stream(&mut chunks(&[b"12345", b"67890", b"x"]), 10)
+            .await;
+        assert!(
+            matches!(
+                grown,
+                Err(SpoolFillError::Overrun {
+                    cap: 10,
+                    written: 11
+                })
+            ),
+            "{grown:?}"
+        );
+        assert!(
+            std::fs::metadata(spool.path()).unwrap().len() <= 10,
+            "no byte past the cap"
+        );
+
+        let mut failing = futures::stream::iter(vec![
+            Ok(bytes::Bytes::from_static(b"ok")),
+            Err(crate::storage::StorageError::Other("reset".into())),
+        ]);
+        let err = spool.fill_from_stream(&mut failing, 10).await;
+        assert!(matches!(err, Err(SpoolFillError::Source(_))), "{err:?}");
     }
 
     #[tokio::test]

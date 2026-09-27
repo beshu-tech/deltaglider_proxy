@@ -248,35 +248,21 @@ pub(crate) async fn copy_object(
             .map_err(TransferError::Dest);
     }
     let spool = dst.spool_acquire(size).await.map_err(TransferError::Dest)?;
-    {
-        let mut file = tokio::fs::File::create(spool.path())
-            .await
-            .map_err(|e| TransferError::Dest(EngineError::Storage(e.into())))?;
-        // Capped at the reservation: a source that grew after its HEAD
-        // must not overrun the spool budget.
-        let mut written = 0u64;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| TransferError::Source(EngineError::Storage(e)))?;
-            written += chunk.len() as u64;
-            if written > size {
-                return Err(TransferError::SourceChanged {
-                    expected: size,
-                    observed: written,
-                });
-            }
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| TransferError::Dest(EngineError::Storage(e.into())))?;
-        }
-        file.flush()
-            .await
-            .map_err(|e| TransferError::Dest(EngineError::Storage(e.into())))?;
-        if written != size {
-            return Err(TransferError::SourceChanged {
-                expected: size,
-                observed: written,
-            });
-        }
+    use crate::deltaglider::spool::SpoolFillError;
+    let changed = |observed| TransferError::SourceChanged {
+        expected: size,
+        observed,
+    };
+    let fill = spool
+        .fill_from_stream(&mut stream, size)
+        .await
+        .map_err(|e| match e {
+            SpoolFillError::Source(e) => TransferError::Source(EngineError::Storage(e)),
+            SpoolFillError::Write(e) => TransferError::Dest(EngineError::Storage(e.into())),
+            SpoolFillError::Overrun { written, .. } => changed(written),
+        })?;
+    if fill.written != size {
+        return Err(changed(fill.written));
     }
     dst.store_spooled_delta(dst_bucket, dst_key, &spool, size, ct, meta, None)
         .await

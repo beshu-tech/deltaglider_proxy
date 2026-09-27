@@ -1417,8 +1417,6 @@ async fn spooled_copy(
     source_head: &crate::types::FileMetadata,
     source_size: u64,
 ) -> Result<Option<ObjectTransferOutcome>, CopyError> {
-    use tokio::io::AsyncWriteExt;
-
     // Stream the (reconstructed) source to a spool file — bounded memory.
     let resp = engine
         .retrieve_stream(request.source_bucket, request.source_key)
@@ -1447,31 +1445,21 @@ async fn spooled_copy(
     }
 
     let spool = engine.spool_acquire(source_size).await?;
+    // Capped at the reservation, hashed on the way: the store must get
+    // exactly the bytes the metadata names.
+    use crate::deltaglider::spool::SpoolFillError;
+    let fill = spool
+        .fill_from_stream(&mut stream, source_size)
+        .await
+        .map_err(|e| match e {
+            SpoolFillError::Source(e) => CopyError::storage("source stream error", e),
+            SpoolFillError::Write(e) => e.into(),
+            SpoolFillError::Overrun { .. } => changed(),
+        })?;
+    if fill.written != source_size
+        || (!meta.file_sha256.is_empty() && fill.sha256 != meta.file_sha256)
     {
-        use sha2::Digest;
-        // Capped at the reservation, hashed on the way: a source that grew
-        // after the HEAD must not overrun the spool budget, and the store must
-        // get exactly the bytes the metadata names.
-        let mut hasher = sha2::Sha256::new();
-        let mut written: u64 = 0;
-        let mut file = tokio::fs::File::create(spool.path()).await?;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| CopyError::storage("source stream error", e))?;
-            written += chunk.len() as u64;
-            if written > source_size {
-                return Err(changed());
-            }
-            hasher.update(&chunk);
-            file.write_all(&chunk).await?;
-        }
-        file.flush().await?;
-        if written != source_size {
-            return Err(changed());
-        }
-        let sha = hex::encode(hasher.finalize());
-        if !meta.file_sha256.is_empty() && sha != meta.file_sha256 {
-            return Err(changed());
-        }
+        return Err(changed());
     }
 
     let content_type = meta.content_type.clone();

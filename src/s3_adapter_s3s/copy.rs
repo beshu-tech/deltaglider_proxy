@@ -191,29 +191,21 @@ pub(super) async fn read_copy_source(
         } => (stream, metadata),
     };
     let spool = engine.spool_acquire(head_size).await?;
-    let mut file = tokio::fs::File::create(spool.path())
+    use crate::deltaglider::spool::SpoolFillError;
+    let fill = spool
+        .fill_from_stream(&mut stream, head_size)
         .await
-        .map_err(|e| crate::api::S3Error::from(StorageError::from(e)))?;
-    let mut size: u64 = 0;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        size += chunk.len() as u64;
-        if size > head_size {
-            return Err(crate::api::S3Error::SlowDown(
+        .map_err(|e| match e {
+            SpoolFillError::Source(e) => s3s::S3Error::from(e),
+            SpoolFillError::Write(e) => crate::api::S3Error::from(StorageError::from(e)).into(),
+            SpoolFillError::Overrun { .. } => crate::api::S3Error::SlowDown(
                 "the copy source changed during the copy; retry the request".to_string(),
             )
-            .into());
-        }
-        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
-            .await
-            .map_err(|e| crate::api::S3Error::from(StorageError::from(e)))?;
-    }
-    tokio::io::AsyncWriteExt::flush(&mut file)
-        .await
-        .map_err(|e| crate::api::S3Error::from(StorageError::from(e)))?;
+            .into(),
+        })?;
     Ok(CopySourceBody::Spooled {
         spool,
-        size,
+        size: fill.written,
         metadata,
     })
 }
