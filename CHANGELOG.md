@@ -96,6 +96,17 @@ job rows: it stays armed while a job is active, and it opens when the job
 settles, when a migrate passes its flip, or when a migrate unwinds before
 its flip.
 
+### Changed — ListObjectsV2 continuation tokens are opaque
+
+`NextContinuationToken` was the raw key of the last entry. With
+`encoding-type=url`, the proxy encoded `<Key>` but not the token, so a key
+with a control character made the XML response ill-formed. Now the token is
+`dg1.` followed by the base64url form of the key. S3 tokens are opaque, so a
+client that sends the token back unchanged sees no difference. A client that
+reads the key out of the token must stop doing so. A token in the old raw
+form is still accepted in this release, so a listing that spans the upgrade
+goes on; a later release refuses it.
+
 ### Changed — The `s3` verbs stream large objects
 
 `s3 cp`, `s3 sync`, and `s3 migrate` read every object whole into memory and
