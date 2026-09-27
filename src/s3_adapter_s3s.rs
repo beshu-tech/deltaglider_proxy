@@ -2332,32 +2332,39 @@ async fn evaluate_put_etag_conditionals_s3s(
         Err(crate::deltaglider::EngineError::NotFound(_)) => None,
         Err(e) => return Err(engine_error_to_s3s(e)),
     };
+    check_put_conditionals(existing.as_ref(), if_match, if_none_match)
+}
+
+/// Pure: the PutObject conditional rules of S3 (s3surface-13). `If-Match` on
+/// a missing key is `NoSuchKey`; it compares by strong ETag, so a weak
+/// `W/"…"` never matches. `If-None-Match` supports only `*`: another value
+/// is `NotImplemented`, as on S3, not a silent ETag compare.
+fn check_put_conditionals(
+    existing: Option<&FileMetadata>,
+    if_match: Option<&s3s::dto::ETagCondition>,
+    if_none_match: Option<&s3s::dto::ETagCondition>,
+) -> s3s::S3Result<()> {
+    if if_none_match.is_some_and(|cond| !cond.is_any()) {
+        return Err(s3s::s3_error!(
+            NotImplemented,
+            "If-None-Match on PutObject supports only '*'"
+        ));
+    }
     if let Some(cond) = if_match {
-        let Some(meta) = existing.as_ref() else {
-            return Err(s3s::s3_error!(PreconditionFailed));
+        let Some(meta) = existing else {
+            return Err(s3s::s3_error!(NoSuchKey));
         };
         let current = parse_s3s_etag(&meta.etag())?;
         let matches = cond.is_any()
             || cond
                 .as_etag()
-                .map(|wanted| wanted.weak_cmp(&current))
-                .unwrap_or(false);
+                .is_some_and(|wanted| wanted.strong_cmp(&current));
         if !matches {
             return Err(s3s::s3_error!(PreconditionFailed));
         }
     }
-    if let Some(cond) = if_none_match {
-        if let Some(meta) = existing.as_ref() {
-            let current = parse_s3s_etag(&meta.etag())?;
-            let matches = cond.is_any()
-                || cond
-                    .as_etag()
-                    .map(|wanted| wanted.weak_cmp(&current))
-                    .unwrap_or(false);
-            if matches {
-                return Err(s3s::s3_error!(PreconditionFailed));
-            }
-        }
+    if if_none_match.is_some() && existing.is_some() {
+        return Err(s3s::s3_error!(PreconditionFailed));
     }
     Ok(())
 }
@@ -3586,6 +3593,42 @@ mod tests {
             assert!(list.contains_key(&format!("x-amz-meta-{key}")), "{key}");
         }
         assert_eq!(list.len(), head.len() + 1);
+    }
+
+    #[test]
+    fn put_conditionals_truth_table() {
+        let meta = meta_at_subsecond();
+        let etag = meta.etag();
+        let cond = |v: &str| s3s::dto::ETagCondition::parse_http_header(v.as_bytes()).unwrap();
+        let weak = format!("W/{etag}");
+        // (object exists, If-Match, If-None-Match, error code)
+        type Case<'a> = (bool, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+        let cases: &[Case] = &[
+            (true, None, None, None),
+            (false, None, None, None),
+            (true, Some(&etag), None, None),
+            (true, Some("*"), None, None),
+            (true, Some("\"other\""), None, Some("PreconditionFailed")),
+            (true, Some(&weak), None, Some("PreconditionFailed")),
+            (false, Some(&etag), None, Some("NoSuchKey")),
+            (false, Some("*"), None, Some("NoSuchKey")),
+            (false, None, Some("*"), None),
+            (true, None, Some("*"), Some("PreconditionFailed")),
+            (true, None, Some("\"other\""), Some("NotImplemented")),
+            (false, None, Some(&etag), Some("NotImplemented")),
+        ];
+        for &(exists, im, inm, want) in cases {
+            let im = im.map(cond);
+            let inm = inm.map(cond);
+            let got = check_put_conditionals(exists.then_some(&meta), im.as_ref(), inm.as_ref())
+                .err()
+                .map(|e| e.code().as_str().to_string());
+            assert_eq!(
+                got.as_deref(),
+                want,
+                "exists {exists}, If-Match {im:?}, If-None-Match {inm:?}"
+            );
+        }
     }
 
     #[test]

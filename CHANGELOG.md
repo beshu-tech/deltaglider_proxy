@@ -165,6 +165,14 @@ proxy installed the new engine before the refusal, so the new limit
 served requests while the config still showed the old one. Now every
 check runs first, and the new engine goes live as the last step.
 
+### Fixed — PutObject conditionals follow S3
+
+A PUT with `If-Match` on a missing key answered 412; now it answers
+`404 NoSuchKey`, as S3 does. `If-Match` compared weakly, so `W/"etag"`
+matched; now it compares strong ETags only. `If-None-Match` with an ETag
+(not `*`) was compared like a GET condition; S3 supports only `*` on a PUT,
+so now another value answers `501 NotImplemented`.
+
 ### Fixed — On the filesystem backend, a folder is not an object
 
 On the filesystem backend, key `a` is a file and keys under `a/` live in a
