@@ -193,12 +193,9 @@ table {
   width: 100%;
   font-size: 0.95rem;
   background: var(--bg-card);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
   border: 1px solid var(--rule);
-  border-radius: 8px;
+  border-radius: var(--r-md);
   overflow: hidden;
-  box-shadow: var(--shadow-md);
 }
 
 th, td {
@@ -208,13 +205,12 @@ th, td {
   vertical-align: top;
 }
 
+/* Table headers: sentence case labels, like every other label. */
 thead th {
-  background: var(--bg-soft);
-  font-weight: 600;
-  color: var(--ink-strong);
-  font-size: 0.82rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  background: var(--surface-sunk);
+  font-weight: 700;
+  color: var(--ink-soft);
+  font-size: var(--fs-label);
   border-bottom: 1px solid var(--rule-strong);
 }
 

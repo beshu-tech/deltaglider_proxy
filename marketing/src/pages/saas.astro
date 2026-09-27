@@ -107,7 +107,7 @@ const description =
           <p class="case-study-link"><a href="/case-studies/readonlyrest-builds">Read the full case study</a></p>
         </div>
 
-        <div class="data-col glass-card">
+        <div class="data-col results-card">
           <h3 class="card-title">Verified results</h3>
           <CompressionResultsTable detailed={false} />
         </div>
@@ -225,7 +225,7 @@ const description =
   .in-progress,
   .playbook,
   .cta {
-    margin: 8rem 0; /* Huge rhythm spacing */
+    margin: 6rem 0;
   }
 
   /* === In Progress Grid === */
@@ -239,29 +239,24 @@ const description =
 
   @media (min-width: 1024px) {
     .in-progress-grid {
-      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
       align-items: center;
     }
   }
 
-  .glass-card {
+  .results-card {
     background: var(--bg-card);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
     border: 1px solid var(--rule);
-    border-radius: 16px;
-    padding: 2rem;
-    box-shadow: var(--shadow-md);
+    border-radius: var(--r-md);
+    padding: 1.5rem;
   }
+  .results-card :global(.table-scroll) { margin-bottom: 0; }
+  .results-card :global(.compact-table) { min-width: 0; }
 
   .card-title {
-    font-size: 1rem;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--ink-soft);
-    margin-bottom: 1.5rem;
-    border-bottom: 1px solid var(--rule);
-    padding-bottom: 0.5rem;
+    font-size: var(--fs-h3);
+    color: var(--ink-strong);
+    margin: 0 0 1rem;
   }
 
   .case-study-link {
@@ -270,71 +265,46 @@ const description =
   }
 
   /* === Playbook Grid === */
+  /* The playbook is a real sequence: one numbered step per row. */
   .playbook-grid {
     display: grid;
-    grid-template-columns: 1fr;
-    gap: 1.5rem;
-    margin: 3rem 0;
-  }
-
-  @media (min-width: 768px) {
-    .playbook-grid {
-      grid-template-columns: repeat(2, 1fr);
-    }
-  }
-  
-  @media (min-width: 1024px) {
-    .playbook-grid {
-      grid-template-columns: repeat(3, 1fr);
-    }
+    gap: 0;
+    margin: 2rem 0 2.5rem;
+    max-width: 46rem;
   }
 
   .playbook-step {
-    background: var(--bg-alt);
-    border: 1px solid var(--rule);
-    border-radius: 12px;
-    padding: 2rem;
-    position: relative;
-    transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+    display: grid;
+    grid-template-columns: 3rem minmax(0, 1fr);
+    column-gap: 1rem;
+    padding: 1.25rem 0;
+    border-top: 1px solid var(--rule);
   }
-
-  .playbook-step:hover {
-    transform: translateY(-4px);
-    box-shadow: var(--shadow-md);
-    border-color: var(--brand-soft);
-  }
+  .playbook-step:last-child { border-bottom: 1px solid var(--rule); }
 
   .step-number {
+    grid-row: span 2;
     font-family: var(--font-mono);
-    font-size: 3rem;
-    font-weight: 800;
-    color: var(--rule-strong);
-    line-height: 1;
-    margin-bottom: 1rem;
-    transition: color 0.2s ease;
-  }
-
-  .playbook-step:hover .step-number {
+    font-size: 1rem;
+    font-weight: 700;
     color: var(--brand);
+    line-height: 1.6;
   }
 
   .playbook-step h3 {
-    font-size: 1.25rem;
-    margin-bottom: 0.5rem;
+    font-size: var(--fs-h3);
+    margin: 0 0 0.35rem;
     color: var(--ink-strong);
   }
 
   .playbook-step p {
-    font-size: 0.95rem;
     color: var(--ink-soft);
     margin: 0;
   }
 
   .playbook-footer {
-    text-align: center;
     max-width: var(--measure);
-    margin: 0 auto;
-    color: var(--ink-faint);
+    color: var(--ink-soft);
   }
 
   /* Phones: 8rem section gaps, 2rem card padding and a 3rem heading
@@ -345,19 +315,10 @@ const description =
     .cta {
       margin: 4.5rem 0;
     }
-    .glass-card {
+    .results-card {
       padding: 1.25rem;
     }
-    .playbook-step {
-      padding: 1.25rem;
-    }
-    .step-number {
-      font-size: 2rem;
-      margin-bottom: 0.5rem;
-    }
-    .playbook-step h3 {
-      margin-top: 0;
-    }
+    .playbook-step { grid-template-columns: 2.25rem minmax(0, 1fr); }
     .playbook-step p {
       font-size: 1rem;
     }

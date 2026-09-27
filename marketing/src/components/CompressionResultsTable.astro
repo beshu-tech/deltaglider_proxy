@@ -71,7 +71,7 @@ const rows: Row[] = [
   <thead>
     <tr>
       <th>Version</th>
-      <th>Size (Encrypted)</th>
+      <th>Size (encrypted)</th>
       <th>Verdict</th>
     </tr>
   </thead>
@@ -150,10 +150,8 @@ const rows: Row[] = [
     padding: 0.85rem 1.25rem;
     border-bottom: 1px solid var(--rule);
     color: var(--ink-soft);
-    text-transform: uppercase;
-    font-size: 0.78rem;
-    letter-spacing: 0.05em;
-    font-weight: 600;
+    font-size: var(--fs-label);
+    font-weight: 700;
     background: var(--surface-tint);
   }
 
@@ -183,12 +181,10 @@ const rows: Row[] = [
 
   .grade {
     display: inline-block;
-    font-family: var(--font-mono);
-    font-size: 0.76rem;
+    font-size: var(--fs-label);
     font-weight: 700;
-    letter-spacing: 0.03em;
-    padding: 0.18rem 0.55rem;
-    border-radius: 999px;
+    padding: 0.15rem 0.6rem;
+    border-radius: var(--r-pill);
     border: 1px solid var(--rule-strong);
     color: var(--ink-soft);
   }
@@ -213,7 +209,7 @@ const rows: Row[] = [
 
   .total-row td {
     background: var(--brand-tint);
-    border-top: 2px solid var(--brand-line);
+    border-top: 1px solid var(--brand-line);
   }
 
   .total-row .dst-size {
@@ -233,10 +229,6 @@ const rows: Row[] = [
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
     gap: 0.5rem;
-    background: var(--surface-tint);
-    padding: 0.4rem 0.75rem;
-    border-radius: 6px;
-    border: 1px solid var(--rule);
   }
 
   .src-size {
@@ -255,14 +247,13 @@ const rows: Row[] = [
     font-weight: 700;
   }
 
+  /* The percentage is plain brand text, not a box inside a box. */
   .compression-badge {
-    background: var(--brand-soft);
     color: var(--brand);
-    padding: 0.15rem 0.4rem;
-    border-radius: 4px;
-    font-size: 0.8rem;
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
     font-weight: 700;
-    margin-left: 0.25rem;
+    margin-left: 0.35rem;
   }
 
   /* Phones: the scroll hid the stored size and the badge behind the right
