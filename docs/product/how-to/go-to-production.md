@@ -13,7 +13,7 @@ This guide shows you how to take a working DeltaGlider Proxy from "runs on my la
 - **Kubernetes** — official Helm chart with PVC, probes, and Ingress. See [How to deploy on Kubernetes with Helm](deploy-on-kubernetes.md).
 - **systemd** — run as `deltaglider_proxy.service` with `WorkingDirectory=/var/lib/deltaglider_proxy` and `EnvironmentFile=/etc/deltaglider_proxy/env`. The binary exits non-zero on unrecoverable errors, so `Restart=on-failure` is appropriate.
 - **Coolify / plain Docker hosts** — mount a persistent volume at `/data` and inject env vars via the platform's secret store. The container writes `./deltaglider_proxy.yaml`, `./deltaglider_config.db`, and `./data/` relative to its CWD (`/data`).
-- **Behind AWS ALB / NLB** — point at port 9000, health-check path `/_/health` (HTTP 200 = healthy). The ALB is a reverse proxy: set `DGP_TRUST_PROXY_HEADERS=true`, set `DGP_TRUSTED_PROXY_CIDRS` to the subnets of the ALB, and raise the idle timeout (see [How to serve TLS](serve-tls.md)).
+- **Behind AWS ALB / NLB** — point at port 9000, health-check path `/_/ready` (HTTP 200 = ready, 503 = not ready). `/_/ready` probes the storage backends and the config DB, and `/_/health` only shows that the process is alive. The ALB is a reverse proxy: set `DGP_TRUST_PROXY_HEADERS=true`, set `DGP_TRUSTED_PROXY_CIDRS` to the subnets of the ALB, and raise the idle timeout (see [How to serve TLS](serve-tls.md)).
 
 Whatever the platform: one port serves everything — the UI (`/_/*`) and the S3 API (`/`) share the listener — and `/data` must persist across restarts.
 
@@ -27,6 +27,8 @@ Put your config in a versioned `deltaglider_proxy.yaml` rather than a pile of en
 deltaglider_proxy config lint /etc/deltaglider_proxy/config.yaml
 # Exit: 0 = valid, 3 = I/O error, 4 = parse error, 6 = validation error
 ```
+
+`config lint` refuses an empty file and an unknown key, as the proxy does when it loads the file.
 
 Wire that into CI so drift is caught in review. Full field reference: [Configuration](../reference/configuration.md). For the secret-free-config pattern end to end, see [How to deploy with Docker Compose](deploy-with-docker-compose.md).
 
@@ -59,7 +61,7 @@ Take a Full Backup zip before you call anything production, and put it on a sche
 
 ### 5. Wire up monitoring
 
-Scrape `/_/metrics` with Prometheus, import the dashboard panels, and install the alert rules — error rate, p95 latency, cache hit ratio, codec saturation, instance down. See [How to monitor with Prometheus and Grafana](monitor-with-prometheus.md).
+Scrape `/_/metrics` with Prometheus, import the dashboard panels, and install the alert rules — error rate, p95 latency, cache hit ratio, codec saturation, instance down. `/_/metrics` answers without authentication unless you set `DGP_METRICS_BEARER_TOKEN`; set it for an internet-facing proxy. See [How to monitor with Prometheus and Grafana](monitor-with-prometheus.md).
 
 ### 6. Tighten rate limits
 
@@ -78,7 +80,7 @@ Decide per backend, before real data lands: `none`, proxy-side AES-256-GCM, SSE-
 
 ### 8. Size the caches
 
-Bump `DGP_CACHE_MB` to 1024+ (the reference-baseline LRU; hot-read workloads benefit most) and `DGP_METADATA_CACHE_MB` to 200+ if you list large prefixes repeatedly. The startup log warns with a `[cache]` prefix if you forgot. While you're there, check `DGP_MAX_OBJECT_SIZE` (default 100 MB) against your largest artefacts. Remaining knobs: [Configuration](../reference/configuration.md).
+Bump `DGP_CACHE_MB` to 1024+ (the reference-baseline LRU; hot-read workloads benefit most) and `DGP_METADATA_CACHE_MB` to 200+ if you list large prefixes repeatedly. The startup log warns with a `[cache]` prefix if you forgot. While you're there, check `DGP_MAX_OBJECT_SIZE` (default 100 MB) against your largest artefacts. The proxy writes the temporary files of delta objects larger than 16 MiB to the spool directory (`DGP_SPOOL_DIR`, default `<system temp>/dgp-spool`), so make sure that this directory is writable and has space. Remaining knobs: [Configuration](../reference/configuration.md).
 
 ## Verify
 

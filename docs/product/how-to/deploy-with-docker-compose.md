@@ -88,7 +88,7 @@ services:
     volumes:
       - ./deltaglider_proxy.yaml:/etc/deltaglider_proxy/deltaglider_proxy.yaml:ro
       - dgp-config:/etc/deltaglider_proxy    # encrypted config DB — back this up
-      - dgp-data:/data                       # delta/reconstruction scratch
+      - dgp-data:/data                       # objects, if you use the filesystem backend
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/_/health"]
       interval: 30s
@@ -142,7 +142,7 @@ To manage IAM users and groups from the YAML instead of the admin GUI, set `acce
 
 ## Persistence and backups
 
-The `dgp-config` volume holds the **encrypted config DB** (`deltaglider_config.db`) — your IAM users, groups, and OAuth providers — and, next to it, the key file `deltaglider_config.db.key` that the proxy generates on the first start. The database is useless without that key. Back up both (see [How to back up and restore](back-up-and-restore.md)). The `dgp-data` volume is scratch (caches + delta-reconstruction buffers); object data itself lives in your S3 backend, not in these volumes.
+The `dgp-config` volume holds the **encrypted config DB** (`deltaglider_config.db`) — your IAM users, groups, and OAuth providers — and, next to it, the key file `deltaglider_config.db.key` that the proxy generates on the first start. The database is useless without that key. Back up both (see [How to back up and restore](back-up-and-restore.md)). With an S3 backend, object data lives in the backend, not in these volumes, and the `dgp-data` volume holds objects only when you use the filesystem backend. The proxy writes its temporary files (delta encoding and reconstruction of objects larger than 16 MiB, multipart parts) to the spool directory, which is `/tmp/dgp-spool` in the container unless you set `DGP_SPOOL_DIR`. Point `DGP_SPOOL_DIR` at a volume, for example `/data/spool`, if the container file system is small.
 
 ## Verify
 

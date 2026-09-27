@@ -24,9 +24,11 @@ and on its local disk:
   Ingress cannot help, and `ClientIP` affinity stops working as soon as many clients
   share one IP address behind a NAT gateway.
 - **The delta reference lock.** All writes into one delta prefix must happen one at a
-  time, because each write updates a shared reference file. The lock that enforces
-  this ordering lives inside a single process, so it cannot protect against two
-  different pods writing into the same prefix at the same moment.
+  time, because each write updates a shared reference file. Inside one pod, an
+  in-process lock enforces this ordering. Across pods, a lock object in the config sync
+  bucket enforces it, so two pods cannot corrupt the reference file. But a pod that
+  waits for another pod's lock slows its writes down, and a pod that does not get the
+  lock in time fails the write.
 
 The operator solves both problems in the same way, and this is the only multipart
 strategy DeltaGlider implements: **consistent hashing by the directory of the URL
@@ -36,8 +38,8 @@ the key's prefix. Everything that lives in one directory therefore reaches the s
 pod: every object key in that prefix, every part of any multipart upload of those
 keys, and the prefix's delta reference file. That is deliberately one level coarser
 than hashing the full path, because a delta prefix is shared between all of the keys
-inside it — pinning only per key would still let two pods update the same reference
-file at the same time. This approach has real trade-offs; they are listed at the end
+inside it. With pinning per key, two pods would still take turns on the same
+reference file. This approach has real trade-offs; they are listed at the end
 of this guide, and you should read them before going live.
 
 ## 1. Install the operator
@@ -46,6 +48,9 @@ of this guide, and you should read them before going live.
 kubectl apply -f operator/deploy/crd.yaml
 kubectl apply -f operator/deploy/operator.yaml
 ```
+
+To upgrade an installed operator, apply the new `crd.yaml` before the new
+`operator.yaml`. Operator 0.3.0 adds `spec.router.trustedProxyCidrs` to the CRD.
 
 ## 2. Create the credentials Secret
 
@@ -88,7 +93,10 @@ restart.
 A multi-pod deployment needs an S3 storage backend, because the filesystem backend is
 local disk on each pod and the pods would each see different data. It also needs a
 config sync bucket, which carries IAM changes between the pods and hosts the
-replication leader leases:
+replication leader leases and the reference locks. Every S3 backend that clients write
+to must support conditional writes: with a sync bucket, a pod refuses to start on a
+backend that does not support them (see
+[How to use non-CAS backends safely](backend-capability-validation.md)). A resource that meets these requirements:
 
 ```yaml
 apiVersion: deltaglider.beshu.tech/v1alpha1
@@ -190,17 +198,17 @@ The remaining structural consequences:
 
 | Behaviour | Consequence |
 |---|---|
-| Readiness is all-or-nothing per pod | Every pod's readiness probe checks the storage backend, so a backend outage removes **all** pods from the ring at once (correct for one backend — nothing could be served anyway). With several backends, one dead backend still fails every pod's probe and takes buckets on healthy backends down with it. |
+| Readiness is all-or-nothing per pod | Every pod's readiness probe (`/_/ready`) checks the storage backends, so a backend outage removes **all** pods from the ring at once (correct for one backend — nothing could be served anyway). With several backends, a pod stays ready while at least one backend answers, and the buckets on a dead backend answer `503` on their own. |
 | All traffic for one prefix goes to one pod | Load is spread across pods by directory, not by request. A single very busy prefix will not fan out across the fleet. |
 | The admin UI is effectively single-pod | Sessions are in memory and source-IP sticky: a pod restart logs its admin users out, everyone behind one NAT gateway lands on the same pod, and they share that pod's login rate-limit budget. Treat the admin GUI as a one-pod surface for now. |
 
-The rest of the multi-instance contract — one IAM writer at a time, synchronisation
-lag, upgrade ordering — is unchanged and described in
+The rest of the multi-instance contract — the IAM merge, synchronisation lag, upgrade
+ordering — is unchanged and described in
 [How to run multiple instances (HA)](run-multiple-instances.md).
 
 ## Related
 
 - [Operator README](https://github.com/beshu-tech/deltaglider_proxy/tree/main/operator) — the full spec reference and the development workflow
-- [How to run multiple instances (HA)](run-multiple-instances.md) — the sync bucket, the one-writer rule, and upgrades
+- [How to run multiple instances (HA)](run-multiple-instances.md) — the sync bucket, the IAM merge, and upgrades
 - [How to deploy on Kubernetes with Helm](deploy-on-kubernetes.md) — the single-pod path
 - [How to take a proxy to production](go-to-production.md) — the production checklist

@@ -31,6 +31,9 @@ kubectl apply -f deploy/crd.yaml
 kubectl apply -f deploy/operator.yaml
 ```
 
+To upgrade the operator, apply the new `deploy/crd.yaml` first, and then the new
+`deploy/operator.yaml`. Operator 0.3.0 adds `spec.router.trustedProxyCidrs` to the CRD.
+
 Create the credentials Secret and a `DeltaGliderProxy` resource. A complete example
 lives in [`deploy/example.yaml`](deploy/example.yaml):
 
@@ -71,9 +74,10 @@ one directory therefore reaches the same pod: every object key in that prefix, a
 each of those keys the `CreateMultipartUpload` request, every `UploadPart` request,
 and the final `CompleteMultipartUpload` request. The directory, not the full path, is
 the right unit because a delta prefix is shared state: all keys in one prefix update
-the same reference file, and the lock that serialises those updates lives inside a
-single process. Hashing per directory sends all of that work to one pod, which keeps
-the lock effective. The hash ring is built from the StatefulSet's stable DNS names,
+the same reference file. With a config sync bucket, a lock object in that bucket
+serialises those updates across the pods, so two pods cannot corrupt the file. Hashing
+per directory sends all of that work to one pod, so the pods do not wait for each
+other's lock. The hash ring is built from the StatefulSet's stable DNS names,
 which means every router pod computes exactly the same mapping.
 
 **Consistent hashing is the only multipart strategy this deployment implements.** The
@@ -88,7 +92,7 @@ and you should accept them before going live:
   is the same behaviour as a restart of a single instance: the client has to retry the
   whole upload.
 - **All traffic for one key prefix goes to one pod.** Load is spread across the pods by
-  object key, not by request, so a single very busy bucket or prefix does not fan out
+  directory, not by request, so a single very busy bucket or prefix does not fan out
   across the fleet. This is the price of correctness.
 - **Do not bypass the router.** A client that reaches the proxy pods directly, or
   through a different load balancer, is not covered by the path-pinning, and its
@@ -141,9 +145,15 @@ requires:
    A `<name>-bootstrap` Secret from an older operator release gets its `dbKey` added on
    the next reconcile.
 3. **A config sync bucket** (`advanced.config_sync_bucket`). It carries IAM users and
-   groups between the pods and hosts the leader leases for replication rules.
-4. **One admin writer at a time.** Make IAM changes through one pod only, or switch to
-   `iam_mode: declarative`. The IAM synchronisation is not multi-master.
+   groups between the pods, and it hosts the leader leases for replication rules and
+   the locks of the delta reference files.
+4. **Conditional writes on every S3 backend that clients write to.** The proxy checks
+   this itself at startup: with a sync bucket, a pod refuses to start when such a
+   backend does not support conditional writes. See
+   [How to use non-CAS backends safely](../docs/product/how-to/backend-capability-validation.md).
+
+Any pod can accept IAM changes. The IAM synchronisation merges the changes of every pod
+with a three-way merge, as described in the multi-instance contract.
 
 The operator checks points 1–3 before it scales. If you set `replicas: 3` but the spec
 violates the contract — no sync bucket, a filesystem backend, a missing Secret, or no
@@ -175,6 +185,7 @@ spec:
   router:
     replicas: 2                # number of HAProxy pods (default 2; they are stateless)
     image: haproxy:3.0-alpine  # default
+    trustedProxyCidrs: ["10.42.0.0/16"]  # the pod network (default: every private range)
   service:
     type: LoadBalancer         # default ClusterIP
   resources:                   # resources of the proxy container
@@ -184,8 +195,9 @@ spec:
     autoGenerate: true         # operator creates <name>-bootstrap once (default false)
 ```
 
-`kubectl get dgp` shows the replica count and the phase (`Ready` or `Progressing`),
-and `status.message` reports how many proxy and router pods are ready.
+`kubectl get dgp` shows the replica count and the phase (`Ready`, `Progressing`, or
+`Degraded`), and `status.message` reports how many proxy and router pods are ready, or
+the problems that stop a scale-up.
 
 ## TLS
 

@@ -24,14 +24,14 @@ Click a row to expand its structured fields.
 
 ## Reproduce-and-watch
 
-To debug a specific request, turn **Follow** on, set the level and a target or search term, then trigger the request. The matching line appears as it's logged. For per-request trace detail, widen the capture floor with `DGP_LOG_RING_LEVEL=debug` (see below) and restart.
+To debug a specific request, turn **Follow** on, set the level and a target or search term, then trigger the request. The matching line appears as it's logged. For per-request trace detail, the ring needs debug lines at two levels. First, the log level of the proxy must let them through: the default is `deltaglider_proxy=info,tower_http=info`, so set it to `deltaglider_proxy=debug,tower_http=debug` in **Settings → System → Logging** (it applies without a restart), or with `advanced.log_level` or `DGP_LOG_LEVEL`. Second, widen the capture floor of the ring with `DGP_LOG_RING_LEVEL=debug` (see below) and restart.
 
 ## What it is — and isn't
 
 The viewer reads an **in-memory, per-instance, bounded ring**. It is a triage convenience, not a log store:
 
 - `DGP_LOG_RING_SIZE` (default `2000`) sets the ring capacity.
-- `DGP_LOG_RING_LEVEL` (default `info`) sets the minimum severity captured, independent of `DGP_LOG_LEVEL`.
+- `DGP_LOG_RING_LEVEL` (default `info`) sets the minimum severity captured. The ring sees only the lines that the log level of the proxy (`DGP_LOG_LEVEL`, `advanced.log_level`, or `RUST_LOG`) lets through, so a ring level below the log level captures nothing more.
 
 For retention, search, and aggregation across instances, point a log shipper at the proxy's stdout. Set `DGP_LOG_FORMAT=json` for one JSON object per line, which is `jq`-greppable and ingests cleanly into Loki, Quickwit, or an ELK stack.
 

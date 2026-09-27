@@ -91,7 +91,7 @@ curl -fsS http://127.0.0.1:19090/_/health
 You should see a healthy JSON response:
 
 ```json
-{"status":"healthy","backend":"ready", ...}
+{"status":"healthy","backend":"live", ...}
 ```
 
 Then the bootstrap login:

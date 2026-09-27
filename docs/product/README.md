@@ -67,7 +67,7 @@ docker run --rm -it -p 9000:9000 -v dgp-data:/data beshultd/deltaglider_proxy
 
 **Binary release** — grab the latest for macOS or Linux from the [releases page](https://github.com/beshu-tech/deltaglider_proxy/releases), unpack, run `./deltaglider_proxy`.
 
-**From source** — the UI is baked into the binary, so build it first (needs Node 20+): `cd demo/s3-browser/ui && npm ci && npm run build && cd -`, then `cargo build --release`.
+**From source** — the UI is baked into the binary, so build it first (needs Node 22+): `cd demo/s3-browser/ui && npm ci && npm run build && cd -`, then `cargo build --release`.
 
 ## Operator summary
 

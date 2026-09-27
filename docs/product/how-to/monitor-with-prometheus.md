@@ -149,7 +149,7 @@ histogram_quantile(0.95, rate(deltaglider_delta_encode_duration_seconds_bucket[5
 histogram_quantile(0.95, rate(deltaglider_delta_decode_duration_seconds_bucket[5m]))
 ```
 
-**Auth failure rate** — a spike in `invalid_signature` = client misconfiguration; a spike in `missing_header` = unauthenticated probes:
+**Auth failure rate** — a spike in `signature_rejected` = client misconfiguration or a guessed secret; a spike in `missing_header` = unauthenticated probes:
 
 ```promql
 sum by (reason) (rate(deltaglider_auth_failures_total[5m]))
@@ -161,9 +161,19 @@ sum by (reason) (rate(deltaglider_auth_failures_total[5m]))
 time() - process_start_time_seconds
 ```
 
+**Runtime scheduling** — only in a binary built with `RUSTFLAGS="--cfg tokio_unstable"`. The series `deltaglider_tokio_schedule_latency_range_total{range}` counts how long ready tasks wait for a worker thread. The share of wake-ups in the last range (900 microseconds and more) should stay near zero:
+
+```promql
+sum(rate(deltaglider_tokio_schedule_latency_range_total{range=~"900.*"}[5m]))
+  /
+sum(rate(deltaglider_tokio_schedule_latency_range_total[5m]))
+```
+
+The [metrics reference](../reference/metrics.md#tokio-runtime-series-opt-in-build-flag) explains how to read this series together with the poll-time series.
+
 ## 3. Install the alerting rules
 
-Drop these into your Prometheus `rules.yml`. Tune thresholds to your SLO.
+Drop these into your Prometheus `rules.yml`. Tune thresholds to your SLO. The `DeltaGliderConfigSyncUnhealthy` rule matters only when several instances share a `config_sync_bucket`: the gauge is always `1` without one. It waits longer than one sync poll (5 minutes), because the other instances do not receive the IAM changes of an instance whose sync fails.
 
 ```yaml
 groups:
@@ -211,6 +221,13 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "Sustained auth failures (> 1/s for 5 min)"
+
+      - alert: DeltaGliderConfigSyncUnhealthy
+        expr: deltaglider_config_sync_healthy == 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Config DB sync failing: GET /_/api/admin/config/sync shows why"
 
       - alert: DeltaGliderDown
         expr: up{job="deltaglider"} == 0

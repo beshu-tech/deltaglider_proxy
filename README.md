@@ -120,7 +120,7 @@ aws s3 cp v2.zip s3://builds/releases/v2.zip   # stored as delta
 aws s3 cp s3://builds/releases/v2.zip ./v2.zip  # full file back, byte-identical
 ```
 
-Admin GUI at `http://localhost:9000/_/` — same port, zero setup. On first run, the bootstrap password is auto-generated and printed to stderr; override with `DGP_BOOTSTRAP_PASSWORD_HASH` or the `--set-bootstrap-password` flag.
+Admin GUI at `http://localhost:9000/_/` — same port, zero setup. On first run, the bootstrap password is auto-generated. The proxy prints it to stderr only when stderr is a terminal (for example with `docker run -it`); otherwise it writes only the hash, to `.deltaglider_bootstrap_hash`. To choose the password, set `DGP_BOOTSTRAP_PASSWORD_HASH` or use the `--set-bootstrap-password` flag.
 
 ## Configuration
 

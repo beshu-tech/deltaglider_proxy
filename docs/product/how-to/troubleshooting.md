@@ -14,7 +14,7 @@ This guide maps the symptoms you'll see in the wild to their fixes. If your symp
 
 If the audit log is **empty** and you still see 403, the denial is in SigV4 verification, not IAM:
 
-- Check `/_/metrics` for `deltaglider_auth_failures_total{reason="invalid_signature"}`.
+- Check `/_/metrics` for `deltaglider_auth_failures_total{reason="signature_rejected"}`.
 - Is the client's system clock within `DGP_CLOCK_SKEW_SECONDS` (default 900 s) of the server? Look for `RequestTimeTooSkewed` in the client error.
 - Is the access key typo'd? The proxy returns a generic AccessDenied rather than leaking key-existence.
 
@@ -34,11 +34,9 @@ Fix: set `DGP_TRUST_PROXY_HEADERS=true` and `DGP_TRUSTED_PROXY_CIDRS` to the rev
 
 The bootstrap password verification uses bcrypt. Usually one of:
 
-1. **Stale `DGP_BOOTSTRAP_PASSWORD_HASH`.** If you rotated the plaintext but forgot to update the env, the DB key drifts from the hash. The DB refuses to decrypt on restart — you'll see `Failed to open config DB: invalid passphrase` in startup logs.
+1. **Stale `DGP_BOOTSTRAP_PASSWORD_HASH`.** When this variable is set, it sets the admin password at every start, so a password that you changed in the admin UI is replaced by the hash in the environment on the next restart. Put the hash of the current password in the variable, or remove the variable. The password hash does not encrypt the config DB, so a wrong hash never locks the database.
 
-   Fix: restart with the correct hash, then rotate via the admin UI once logged in (that path re-encrypts the DB atomically).
-
-2. **Rate limiter lockout.** 100 failed attempts / 5-minute window / per-IP, with a 10-minute lockout after. `/_/metrics` → `deltaglider_auth_failures_total`. Wait it out, or see [Rate limits](../reference/rate-limits.md) for the knobs.
+2. **Rate limiter lockout.** 100 failed attempts / 5-minute window / per-IP, with a 10-minute lockout after, and 10 failed logins per account in one hour lock that account for one hour. During a lockout, the right password is refused too. The sign-in form says "Too many sign-in attempts. Try again in N min.", and the admin API answers `429` with a `Retry-After` header. `/_/metrics` → `deltaglider_auth_failures_total`. Wait it out, or see [Rate limits](../reference/rate-limits.md) for the knobs.
 
 3. **Session IP binding.** If you log in from one IP and the admin cookie ends up used from a different IP (NAT flip, VPN change), the session is rejected. Log in again. Behind a reverse proxy, the binding uses the client address that the proxy names in `X-Forwarded-For`, and only when the proxy's network is in `DGP_TRUSTED_PROXY_CIDRS`.
 
@@ -90,16 +88,19 @@ sudo docker compose -f /data/coolify/proxy/docker-compose.yml up -d
 
 ## 503 SlowDown on PUT
 
-Unless a maintenance job is write-gating the bucket (see the next entry), the proxy doesn't generate 503 itself — this comes from the upstream S3 backend when it's throttling you. Two tuning knobs:
+A `503 SlowDown` comes either from the upstream S3 backend, when it throttles the proxy, or from the proxy itself. SDKs retry it. The message of the error says which limit refused the request. The proxy answers `503 SlowDown` in these cases:
 
-1. **`DGP_MAX_MULTIPART_UPLOADS`** (default 1000) — limits concurrent multiparts in flight. Lowering this reduces the proxy's burst pressure on the backend.
-2. **`DGP_CODEC_CONCURRENCY`** — limits xdelta3 subprocess permits. When this saturates, PUTs queue on delta encoding; the backend isn't the bottleneck.
+1. **All delta codec slots are busy** (`all delta codec slots busy — try again later`). A PUT that needs a delta encode does not wait for a slot: it fails at once, because a waiting PUT would hold its whole body in memory. (A delta GET waits up to 60 seconds for a slot.) Check `/_/metrics` → `deltaglider_codec_semaphore_available` (`0` = saturated) and `deltaglider_delta_encode_duration_seconds`. If the codec is saturated, raise `DGP_CODEC_CONCURRENCY`.
+2. **The spool budget is used up** (`spool budget exhausted; retry shortly`). A request that holds no spool space waits for it, up to `DGP_SPOOL_ACQUIRE_TIMEOUT_SECS` (default 120). A request that already holds spool space and needs more fails at once. Raise `DGP_SPOOL_MAX_BYTES` if this happens often.
+3. **Too many multipart uploads** (`Too many concurrent multipart uploads`), limited by `DGP_MAX_MULTIPART_UPLOADS` (default 1000), or too many multipart bytes in flight (`Multipart in-flight bytes cap reached`), limited by `DGP_MAX_TOTAL_MULTIPART_BYTES`.
+4. **A maintenance job gates the bucket** (see the next entry).
+5. **Another instance changed the baseline of a delta prefix during the write.** This happens only with a `config_sync_bucket`.
 
-Check `/_/metrics` → `deltaglider_codec_semaphore_available` (`0` = saturated) and `deltaglider_delta_encode_duration_seconds` for codec pressure. If codec is saturated, bump `DGP_CODEC_CONCURRENCY`.
+A `503 ServiceUnavailable` that names a backend is a different case: see [How to diagnose a backend that isn't serving](diagnose-backend-connectivity.md).
 
 ## Writes to one bucket return 503 SlowDown
 
-A maintenance job (re-encryption or migration) is running on that bucket. Writes are intentionally gated while the job rewrites objects — SDKs retry automatically and succeed once the job finishes. Reads are unaffected. Check **Settings → Jobs** (or `GET /_/api/admin/jobs`) for the job's progress; cancel it if it shouldn't be running. If a job is stuck, it survives restarts by design — cancel it via `POST /_/api/admin/jobs/maintenance:<id>/cancel` rather than restarting the proxy. See [Jobs reference](../reference/jobs.md).
+A maintenance job (re-encryption, migration, or metadata backfill) is running on that bucket. Writes are intentionally gated while the job rewrites objects — SDKs retry automatically and succeed once the job finishes. Reads are unaffected. Check **Settings → Jobs** (or `GET /_/api/admin/jobs`) for the job's progress; cancel it if it shouldn't be running. If a job is stuck, it survives restarts by design — cancel it via `POST /_/api/admin/jobs/maintenance:<id>/cancel` rather than restarting the proxy. See [Jobs reference](../reference/jobs.md).
 
 ## Cache miss storm on GET
 
@@ -150,13 +151,11 @@ If the routing looks right but the object still went somewhere unexpected:
 
 ## S3 config sync ETag mismatch
 
-**Log line:** `[config-sync] ETag mismatch on DB download — retrying`.
+**Log line:** `Config DB sync (...): CAS conflict — merging peer state before retry`.
 
-Expected when two instances mutate within the 5-minute poll window — the race resolves on the next cycle. Only a problem if it happens continuously.
+Each upload of the config DB is conditional on the copy that the instance saw last. When another instance uploaded in between, the upload is refused, and the instance downloads the new copy, merges it with its own changes, and uploads again. This is expected when two instances change IAM at about the same time, and no change is lost. Only a problem if it happens continuously, or if the log also says `upload retries exhausted`.
 
-Continuous mismatch usually means two instances are **both writing** via `DGP_CONFIG_SYNC_BUCKET`. Sync is not multi-master — one instance is the writer; others read. If you have multiple active writers, the "loudest" one wins and the others lose mutations.
-
-Fix: run only one instance as the IAM administration surface and point the others at the same sync bucket read-only (see [How to run multiple instances](run-multiple-instances.md)). Or switch to `iam_mode: declarative` and manage IAM via YAML + GitOps (takes both writes out of the picture).
+To see whether the sync of an instance works, send a request to `GET /_/api/admin/config/sync`, or watch the `deltaglider_config_sync_healthy` gauge on `/_/metrics`. An `iam_sync_conflict` audit entry means that two instances changed the same column of the same row, and the merge kept the more recent change. See [How to run multiple instances](run-multiple-instances.md).
 
 ## Audit ring is empty after a restart
 
@@ -223,7 +222,7 @@ GET returns 200 with an object that looks like random bytes, no error. This shou
 ## Where to look next
 
 - **Trace it.** Dry-run the failing request through the admission chain and read the audit log: [How to trace and audit requests](trace-requests.md).
-- Set `RUST_LOG=deltaglider_proxy=trace` for maximum verbosity (`RUST_LOG` beats `DGP_LOG_LEVEL` beats `--verbose`). To change the level without a restart, use the admin UI: Settings → System → Logging.
+- Set `RUST_LOG=deltaglider_proxy=trace` for maximum verbosity (`RUST_LOG` beats `DGP_LOG_LEVEL`, which beats `advanced.log_level`). Without any of them, the level is `deltaglider_proxy=info,tower_http=info`. To change the level without a restart, use the admin UI: Settings → System → Logging.
 - Hit the audit log API: `GET /_/api/admin/audit?limit=500` for a JSON dump of recent mutations + denials.
 - `curl /_/metrics | grep deltaglider_` — 20+ Prometheus metrics, most tell a story. Mapping: [How to monitor with Prometheus and Grafana](monitor-with-prometheus.md).
 - [Admin API reference](../reference/admin-api.md) — every debug-friendly admin endpoint.

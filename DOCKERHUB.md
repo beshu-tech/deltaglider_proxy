@@ -88,7 +88,7 @@ All settings via environment variables:
 |----------|---------|-------------|
 | `DGP_LISTEN_ADDR` | `0.0.0.0:9000` | S3 API listen address |
 | `DGP_MAX_DELTA_RATIO` | `0.75` | Max delta/original ratio (lower = more aggressive) |
-| `DGP_MAX_OBJECT_SIZE` | `104857600` | Max object size for delta (100 MB) |
+| `DGP_MAX_OBJECT_SIZE` | `104857600` | Max size of an uploaded object (100 MB), for every object and not only for deltas |
 | `DGP_CACHE_MB` | `100` | Reference cache size in MB (recommend ≥1024 for production) |
 | `DGP_ACCESS_KEY_ID` | *(unset)* | Proxy SigV4 access key (**required** — proxy refuses to start without creds unless `DGP_AUTHENTICATION=none`) |
 | `DGP_SECRET_ACCESS_KEY` | *(unset)* | Proxy SigV4 secret key |
@@ -98,9 +98,10 @@ All settings via environment variables:
 | `DGP_S3_REGION` | `us-east-1` | S3 backend region |
 | `DGP_BE_AWS_ACCESS_KEY_ID` | *(unset)* | Backend S3 credentials |
 | `DGP_BE_AWS_SECRET_ACCESS_KEY` | *(unset)* | Backend S3 credentials |
-| `DGP_BOOTSTRAP_PASSWORD_HASH` | *(auto-generated)* | Bootstrap password bcrypt hash (encrypts IAM DB, signs session cookies, gates admin GUI). Base64-encoded form avoids `$` escaping in Docker. |
+| `DGP_BOOTSTRAP_PASSWORD_HASH` | *(auto-generated)* | Bootstrap password bcrypt hash (signs session cookies, gates admin GUI). Base64-encoded form avoids `$` escaping in Docker. |
+| `DGP_CONFIG_DB_KEY` | *(key file next to the DB)* | Encryption key of the IAM config DB, at least 32 characters. Without it, the proxy generates the key file `deltaglider_config.db.key` next to the DB on the first start: back up the key file together with the DB. Required, and the same on every instance, with `DGP_CONFIG_SYNC_BUCKET` |
 | `DGP_LOG_LEVEL` | `deltaglider_proxy=info,tower_http=info` | Log filter (changeable at runtime via admin GUI) |
-| `DGP_CONFIG_SYNC_BUCKET` | *(unset)* | S3 bucket for encrypted-DB multi-instance sync |
+| `DGP_CONFIG_SYNC_BUCKET` | *(unset)* | S3 bucket for encrypted-DB multi-instance sync. Needs `DGP_CONFIG_DB_KEY` |
 | `DGP_TLS_ENABLED` | `false` | Enable HTTPS |
 
 Or mount a YAML config file:
@@ -121,27 +122,28 @@ The admin GUI is served at `/_/` on the same port as the S3 API:
 - **Configuration** — hot-reload settings split across Access, Storage, Integrations, and System sections: multi-backend routing, per-bucket policies, compression tuning, admission control, lifecycle, replication, and webhook/Slack notification delivery
 - **IAM User Management** — create, edit, delete users with ABAC permissions; OAuth/OIDC providers and group-mapping rules
 - **Audit log** — in-memory ring of recent access events (size via `DGP_AUDIT_RING_SIZE`, default 500)
-- **API Reference** — interactive API documentation
 - **Demo Data Generator** — populate test data for evaluation
 
 ## Ports
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 9000 | HTTP/S | S3-compatible API + Admin GUI (`/_/`) + `/_/metrics` + `/_/health` + `/_/stats` |
+| 9000 | HTTP/S | S3-compatible API + Admin GUI (`/_/`) + `/_/metrics` + `/_/health` + `/_/ready` + `/_/stats` |
 
 ## Health Checks
 
 ```bash
-# S3 API health
+# Liveness (the process answers; no backend request)
 curl http://localhost:9000/_/health
 
-# Prometheus metrics
-curl http://localhost:9000/_/metrics
+# Readiness (probes the storage backends and the config DB; 503 when not ready)
+curl http://localhost:9000/_/ready
 
-# Storage stats (objects, savings %)
-curl http://localhost:9000/_/stats
+# Prometheus metrics (public unless DGP_METRICS_BEARER_TOKEN is set)
+curl http://localhost:9000/_/metrics
 ```
+
+`/_/stats` (objects, savings %) answers only an admin session, because it shows the size of every bucket.
 
 The Docker image includes a built-in healthcheck on port 9000 (15s interval).
 
@@ -158,9 +160,9 @@ The Docker image includes a built-in healthcheck on port 9000 (15s interval).
 | Tag | Description |
 |-----|-------------|
 | `latest` | Latest stable release |
-| `1.9.3` | Specific version |
-| `1.9` | Latest patch in 1.9.x |
-| `1` | Latest minor in 1.x.x |
+| `2.0.0` | Specific version |
+| `2.0` | Latest patch in 2.0.x |
+| `2` | Latest minor in 2.x.x |
 
 ## Source & License
 

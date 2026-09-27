@@ -2,7 +2,7 @@
 
 This guide shows you how to run more than one DeltaGlider Proxy instance against the same storage, coordinated through a shared S3 bucket.
 
-The shared bucket does two jobs: it syncs the encrypted config DB (`deltaglider_config.db` — IAM users, groups, OAuth providers) between instances, and it hosts the replication leader leases that stop two instances from running the same rule (with automatic failover when a leader dies). Because leases depend on atomic conditional writes, the proxy validates the bucket's backend at boot and refuses to start on one that can't enforce them — see [How to use non-CAS backends safely](backend-capability-validation.md). Object data itself needs nothing: all instances route to the same backends. Why it's built this way: [Multi-backend architecture](../explanation/multi-backend-architecture.md).
+The shared bucket does three jobs: it syncs the encrypted config DB (`deltaglider_config.db` — IAM users, groups, OAuth providers) between instances, it hosts the replication leader leases that stop two instances from running the same rule (with automatic failover when a leader dies), and it hosts the reference locks that stop two instances from writing the baseline of one delta prefix at the same time. Because leases and locks depend on atomic conditional writes, the proxy validates the bucket's backend at boot and refuses to start on one that cannot enforce them. The same rule applies to object data: every S3 backend that holds buckets that clients write to must also support conditional writes, or the proxy refuses to start. See [How to use non-CAS backends safely](backend-capability-validation.md). Why it's built this way: [Multi-backend architecture](../explanation/multi-backend-architecture.md).
 
 ## 1. Point every instance at a sync bucket
 
@@ -81,7 +81,7 @@ The response holds `healthy`, the time of the last good pull (`last_pull_ok_at`)
 
 ## 5. If you scale with Helm
 
-`replicaCount` defaults to `1` — do not raise it until the sync bucket is configured. With the sync bucket set, **replication** rules elect a single leader per rule through an S3 lease object in that bucket (conditional-write CAS): if the leader dies, its lease lapses (default `lease_ttl: "300s"`) and a peer takes over automatically — no double-run, no shared DB required. **Lifecycle and maintenance** jobs still use node-local database leases (their timing is set by `advanced.jobs`, see [Job leases](../reference/configuration.md#job-leases)), so under multiple replicas those can run on more than one pod; their operations are idempotent, so this wastes work rather than corrupting data. The one exception is the **migrate** job: its routing flip changes only the configuration of the instance that runs it, so the proxy refuses to start a migrate with `409 Conflict` while the sync bucket is set (see [How to move a bucket to another backend](move-a-bucket-between-backends.md)). The sync bucket must pass the boot-time conditional-write validation — see [How to use non-CAS backends safely](backend-capability-validation.md).
+`replicaCount` defaults to `1` — do not raise it until the sync bucket is configured. With the sync bucket set, **replication** rules elect a single leader per rule through an S3 lease object in that bucket (conditional-write CAS): if the leader dies, its lease lapses (default `lease_ttl: "300s"`) and a peer takes over automatically — no double-run, no shared DB required. **Lifecycle, maintenance, and parity audit** jobs still use node-local database leases (their timing is set by `advanced.jobs`, see [Job leases](../reference/configuration.md#job-leases)), so under multiple replicas those can run on more than one pod; their operations are idempotent, so this wastes work rather than corrupting data. The one exception is the **migrate** job: its routing flip changes only the configuration of the instance that runs it, so the proxy refuses to start a migrate with `409 Conflict` while the sync bucket is set (see [How to move a bucket to another backend](move-a-bucket-between-backends.md)). The sync bucket must pass the boot-time conditional-write validation — see [How to use non-CAS backends safely](backend-capability-validation.md).
 
 See [How to deploy on Kubernetes with Helm](deploy-on-kubernetes.md) for the chart specifics.
 
@@ -102,9 +102,13 @@ bucket plus the key's prefix. Everything in one directory then reaches the same
 instance: every object key in that prefix, and every part of any multipart upload of
 those keys. Hashing the directory rather than the full path matters for a second
 reason: a delta prefix is shared state. All keys in one prefix update the same
-reference file, and the lock that serialises those updates lives inside a single
-process — so all writes into one prefix must land on one instance, not just all
-requests for one key.
+reference file. With a sync bucket, the proxy protects that file with a lock object
+in the sync bucket, so writes from two instances cannot corrupt it. When two
+instances write into one prefix at the same time, the second one waits for the lock,
+for up to 30 seconds by default (`DGP_REFERENCE_LOCK_ACQUIRE_TIMEOUT_SECS`). A write
+that still does not get the lock fails. Routing all writes into one prefix
+to one instance avoids that wait, and it keeps the metadata cache of that prefix on
+one instance.
 
 On Kubernetes, the official operator deploys this router for you — see
 [How to scale out with the Kubernetes operator](scale-out-with-the-kubernetes-operator.md).
@@ -143,9 +147,9 @@ correctness, but both change behaviour compared to a single instance:
   reach the same instance, so that instance's cache is coherent for its own prefixes
   and the staleness window almost never shows. It can surface right after the hash
   ring moves (a scale event), when a prefix's new owner may serve up to ten minutes
-  of stale metadata for objects the old owner changed. A HEAD or GET request reads
+  of stale metadata for objects the old owner changed. A HEAD request reads
   the object's metadata from storage and not from the cache, so its answer is never
-  stale; the cache affects listings.
+  stale. A GET request and a listing can use the cached metadata.
 - **Rate limits.** The login rate limiter counts per instance, so with N instances the
   effective limit is up to N times the configured value. Size the configured limit
   accordingly, and remember that the admin GUI's source-IP stickiness concentrates
@@ -168,7 +172,7 @@ curl -b cookies https://dgp-reader-1:9000/_/api/admin/users | jq '.[] | .name'
 aws s3 ls --endpoint-url https://dgp-reader-1:9000
 ```
 
-Watch the reader's logs for `[config-sync]` lines — a download on ETag change is the success signal. An `iam_sync_conflict` audit entry means that two instances changed the same row. A login of one identity on two instances is not a conflict: the merge keeps the newer login time.
+Watch the reader's logs for the lines `Config DB downloaded from S3` and `IAM index rebuilt from S3-synced DB` — a download on ETag change is the success signal. An `iam_sync_conflict` audit entry means that two instances changed the same row. A login of one identity on two instances is not a conflict: the merge keeps the newer login time.
 
 ## Related
 

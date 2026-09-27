@@ -154,7 +154,7 @@ started it. For a multi-pod deployment, use the official operator instead — it
 the consistent-hashing router that this requires: [How to scale out with the Kubernetes
 operator](scale-out-with-the-kubernetes-operator.md).
 
-With config sync set up, replication rules elect one leader per rule through an S3-CAS lease in the sync bucket (default `lease_ttl: "300s"`, `heartbeat_interval: "60s"`); a dead leader's lease lapses and a peer takes over automatically. Lifecycle and maintenance jobs still use node-local database leases, so they may run on more than one pod (idempotent — wasteful, not corrupting). Do not scale above one replica if each pod has its own independent `/data/deltaglider_config.db` — in that shape, each pod is an independent control plane. To run more than one instance, set up config sync and a shared `DGP_CONFIG_DB_KEY` first: [How to run multiple instances (HA)](run-multiple-instances.md).
+With config sync set up, replication rules elect one leader per rule through an S3-CAS lease in the sync bucket (default `lease_ttl: "300s"`, `heartbeat_interval: "60s"`); a dead leader's lease lapses and a peer takes over automatically. Lifecycle, maintenance, and parity audit jobs still use node-local database leases, so they may run on more than one pod (idempotent — wasteful, not corrupting). Do not scale above one replica if each pod has its own independent `/data/deltaglider_config.db` — in that shape, each pod is an independent control plane. To run more than one instance, set up config sync and a shared `DGP_CONFIG_DB_KEY` first: [How to run multiple instances (HA)](run-multiple-instances.md).
 
 ## Useful values
 
@@ -184,7 +184,7 @@ curl -fsS https://s3.acme.example/_/health
 aws --endpoint-url https://s3.acme.example s3 ls
 ```
 
-The liveness probe hits `GET /_/health` (fast, no I/O); the readiness probe hits `GET /_/ready`, which really probes the storage backend and config DB — a pod that can't reach its backend stays out of rotation. A pod stuck out of `Running` usually means the PVC didn't bind or the config failed validation — `kubectl logs` shows the startup error.
+The liveness probe hits `GET /_/health` (fast, no I/O); the readiness probe hits `GET /_/ready`, which really probes the storage backends and the config DB. A pod stays out of rotation when it cannot reach any of its backends. With several backends, the pod stays ready while at least one backend answers, and the buckets on a backend that is down answer `503`. A pod stuck out of `Running` usually means the PVC didn't bind or the config failed validation — `kubectl logs` shows the startup error.
 
 ## Related
 

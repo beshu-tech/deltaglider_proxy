@@ -53,9 +53,12 @@ The endpoint is public by default so that any Prometheus can scrape it. Set `DGP
 | `delete_object` | `DELETE /:bucket/*key` |
 | `head_object` | `HEAD /:bucket/*key` |
 | `post_object` | `POST /:bucket/*key` (multipart) |
-| `health` | `GET /health` |
-| `stats` | `GET /stats` |
-| `metrics` | `GET /_/metrics` |
+| `health` | a request to the path `/health` |
+| `stats` | a request to the path `/stats` |
+| `metrics` | a request to the path `/metrics` |
+| `unknown` | any other method, for example `OPTIONS` |
+
+These series count S3 API requests only. The requests to the endpoints under `/_/` (the admin UI, the admin API, `/_/health`, `/_/ready`, `/_/stats`, and `/_/metrics` itself) are not counted.
 
 ### Histogram buckets
 
@@ -140,9 +143,27 @@ A client listing of an S3-backed bucket costs one `list` request per page when t
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `deltaglider_auth_attempts_total` | Counter | `result` | Auth attempts: `success` or `failure` |
-| `deltaglider_auth_failures_total` | Counter | `reason` | Failure breakdown: `missing_header`, `invalid_presigned`, `invalid_signature` |
+| `deltaglider_auth_failures_total` | Counter | `reason` | Failure breakdown: `missing_header`, `invalid_presigned`, `invalid_access_key`, `user_disabled`, `signature_rejected`, `replay` (a replayed signed request), `form_post_denied` (a browser form upload that was refused) |
 
 Auth metrics stay at zero when SigV4 is disabled.
+
+## Replication copies
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `deltaglider_replication_objects_inflight` | Gauge | — | Replication objects that are copied now |
+| `deltaglider_replication_objects_inflight_peak` | Gauge | — | The highest value of `deltaglider_replication_objects_inflight` since the start |
+| `deltaglider_replication_parts_inflight` | Gauge | — | Parts of a streaming multipart copy that are copied now |
+| `deltaglider_replication_parts_inflight_peak` | Gauge | — | The highest value of `deltaglider_replication_parts_inflight` since the start |
+| `deltaglider_replication_part_bytes_resident` | Gauge | — | Bytes held now in the part buffers of streaming copies |
+| `deltaglider_replication_part_bytes_resident_peak` | Gauge | — | The highest value of `deltaglider_replication_part_bytes_resident` since the start |
+| `deltaglider_replication_multipart_parts_total` | Counter | — | Parts that streaming copies uploaded |
+| `deltaglider_replication_part_retries_total` | Counter | — | Parts that a streaming copy read again from the point where the read stopped |
+| `deltaglider_replication_bytes_streamed_total` | Counter | — | Bytes that went through the streaming multipart copy path |
+| `deltaglider_replication_delta_passthrough_bytes_saved_total` | Counter | — | Bytes not sent because a copy shipped a delta as it is (the object size minus the delta size) |
+| `deltaglider_replication_list_calls_total` | Counter | — | Listing pages that the replication reconcile walk read, on the source and on the destination |
+| `deltaglider_replication_head_calls_total` | Counter | — | Object HEAD requests that the replication reconcile walk sent |
+| `deltaglider_replication_dirs_completed_total` | Counter | — | Directories that the replication reconcile walk finished |
 
 ## Config DB sync
 
@@ -158,12 +179,12 @@ All label sets are bounded:
 
 | Label | Max values |
 |---|---|
-| `method` | ~5 (GET, PUT, HEAD, DELETE, POST) |
+| `method` | 8 (GET, PUT, HEAD, DELETE, POST, OPTIONS, PATCH, OTHER) |
 | `status` | ~15 HTTP status codes in practice |
-| `operation` | 15 (see table above) |
+| `operation` | 16 (see table above) |
 | `decision` | 3 (delta, passthrough, reference) |
 | `result` | 2 (success or failure) |
-| `reason` | 3 (missing_header, invalid_presigned, invalid_signature) |
+| `reason` | 7 (see the Auth table) |
 
 No bucket names, no object keys in labels. No unbounded cardinality.
 
@@ -175,7 +196,7 @@ These series exist only when the binary is built with `RUSTFLAGS="--cfg tokio_un
 RUSTFLAGS="--cfg tokio_unstable" cargo build --release
 ```
 
-| Series | Gauge | Meaning |
+| Series | Type | Meaning |
 |---|---|---|
 | `deltaglider_tokio_worker_mean_poll_seconds` | gauge | Worst worker's mean task poll duration (EWMA). Polls should run microseconds-to-low-milliseconds; a sustained value in the tens of milliseconds means blocking work runs inside the async context. |
 | `deltaglider_tokio_global_queue_depth` | gauge | Tasks pending in the runtime's global queue. A healthy runtime keeps this near zero; sustained depth means the workers cannot drain the schedule. |
