@@ -80,6 +80,14 @@ release has no generation and keeps the old rule. During a rolling upgrade,
 an instance on the older release does not merge copies from upgraded
 instances until it is upgraded too, as with every schema change.
 
+### Fixed — The field-level config PUT refuses a bucket policy that the loader refuses
+
+`PUT /_/api/admin/config` stored a bucket policy that could not be
+normalized, for example `public: true` beside non-empty
+`public_prefixes`, with only a warning. The YAML loader, the section PUT
+and the document apply refuse that policy. Now the field-level PUT
+answers `400` with the reason, and nothing changes.
+
 ### Fixed — An unknown key in a flat config file is named
 
 A flat-shape config file ignored a root key that it did not know, so a

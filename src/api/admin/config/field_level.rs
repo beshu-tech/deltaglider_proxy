@@ -692,10 +692,15 @@ pub async fn update_config(
             .iter()
             .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
             .collect();
-        for (name, policy) in new_buckets.iter_mut() {
-            if let Err(e) = policy.normalize() {
-                warnings.push(format!("bucket `{}`: {}", name, e));
-            }
+        // The loader's rule: a policy that does not normalize is refused,
+        // never stored with a warning.
+        if let Err(e) = crate::config::normalize_bucket_policies(&mut new_buckets) {
+            *cfg = old_cfg;
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "success": false, "error": e })),
+            )
+                .into_response();
         }
         cfg.buckets = new_buckets;
     }

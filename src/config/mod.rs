@@ -1595,6 +1595,21 @@ fn classify_shape(doc: &serde_yaml::Value) -> ConfigShape {
     }
 }
 
+/// THE bucket-policy normalize rule of every write path (YAML load, section
+/// PUT, document apply via [`Config::normalize_shorthands`], and the PATCH):
+/// expand shorthands, and refuse a policy that cannot be normalized (for
+/// example `public: true` beside non-empty `public_prefixes`).
+pub(crate) fn normalize_bucket_policies(
+    buckets: &mut std::collections::BTreeMap<String, crate::bucket_policy::BucketPolicyConfig>,
+) -> Result<(), String> {
+    for (name, policy) in buckets.iter_mut() {
+        policy
+            .normalize()
+            .map_err(|e| format!("bucket `{name}`: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Root keys of a FLAT-shape document that `Config` does not know. The flat
 /// shape keeps serde's lenient default (review 4 config-11: a
 /// `deny_unknown_fields` there would stop an existing file from booting), so
@@ -1731,11 +1746,7 @@ impl Config {
     /// YAML loader runs this automatically; the section PUT has to
     /// call it explicitly.
     pub(crate) fn normalize_shorthands(&mut self) -> Result<(), ConfigError> {
-        for (name, policy) in self.buckets.iter_mut() {
-            policy
-                .normalize()
-                .map_err(|e| ConfigError::Parse(format!("bucket `{}`: {}", name, e)))?;
-        }
+        normalize_bucket_policies(&mut self.buckets).map_err(ConfigError::Parse)?;
         // Validate admission blocks on EVERY load path — the sectioned
         // loader also calls `AdmissionSpec::validate` inside
         // `into_flat`, but that bypasses flat-shape YAML.

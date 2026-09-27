@@ -178,20 +178,25 @@ async fn test_config_patch_rejects_conflicting_public_and_prefixes() {
         .send()
         .await
         .unwrap();
-    // The PATCH path surfaces normalize errors as warnings rather than
-    // 400 (preserving the legacy PATCH contract that always returns 200
-    // with warnings). Verify the warning appears.
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    let warnings = body["warnings"]
-        .as_array()
-        .expect("warnings array must be present");
+    // Review 4: PATCH refuses a policy that the YAML loader refuses (one
+    // normalize rule); it used to store it with only a warning.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = resp.text().await.unwrap();
     assert!(
-        warnings
-            .iter()
-            .any(|w| w.as_str().unwrap().contains("conflict")
-                && w.as_str().unwrap().contains("public")),
-        "expected warning naming the bucket + conflict, got: {warnings:?}"
+        body.contains("conflict") && body.contains("public"),
+        "the error must name the bucket and the conflict: {body}"
+    );
+    let cfg: serde_json::Value = admin
+        .get(format!("{}/_/api/admin/config", server.endpoint()))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        cfg["bucket_policies"]["conflict"].is_null(),
+        "the refused policy must not be stored: {cfg}"
     );
 }
 
