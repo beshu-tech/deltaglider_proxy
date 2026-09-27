@@ -1179,7 +1179,7 @@ impl StorageBackend for FilesystemBackend {
     ) -> Result<(), StorageError> {
         self.require_bucket_exists(bucket).await?;
         let path = self.passthrough_path(bucket, prefix, filename)?;
-        if !path.exists() {
+        if !path_exists(&path).await {
             return Err(StorageError::NotFound(format!(
                 "{bucket}/{prefix}/{filename}"
             )));
