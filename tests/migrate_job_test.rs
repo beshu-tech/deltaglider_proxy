@@ -1024,9 +1024,8 @@ async fn test_migrate_resume_recopies_possibly_torn_copies() {
 
 /// Manual bench (not in CI): wall time of a filesystem → filesystem migrate
 /// of `DGP_BENCH_N` (default 1000) small objects.
-/// `cargo test --test all -- --ignored migrate_job_test::bench_migrate_small_objects --nocapture`
 #[tokio::test]
-#[ignore]
+#[ignore = "manual: DGP_BENCH_N=1000 cargo test --test all -- --ignored migrate_job_test::bench_migrate_small_objects --nocapture"]
 async fn bench_migrate_small_objects() {
     let dir_a = tempfile::TempDir::new().unwrap();
     let dir_b = tempfile::TempDir::new().unwrap();

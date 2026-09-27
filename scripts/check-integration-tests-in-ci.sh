@@ -7,6 +7,7 @@
 # and every such filter in ci.yml must name an existing tests/<name>.rs.
 # libtest filters are substring matches, so no module name may make `<a>::`
 # a substring of `<b>::` (that would silently run extra tests in a group).
+# An #[ignore] must name the manual command that runs it (CI never does).
 # Nightly `cargo test --all` is supplementary.
 set -euo pipefail
 
@@ -47,6 +48,17 @@ while read -r filter; do
   fi
 done < <(awk '/cargo test .*--test all/ {c=1} c {print; if ($0 !~ /\\$/) c=0}' .github/workflows/ci.yml \
           | grep -oE '[a-z0-9_]+::' | sed 's/::$//' | sort -u)
+
+# An #[ignore]d test is "selected" above but never runs in CI (no job passes
+# --ignored). Allow one only when its reason names the manual command that
+# runs it: #[ignore = "manual: <cmd with cargo test ... --ignored>"].
+while IFS= read -r hit; do
+  attr=${hit#*:*:}
+  if ! [[ "$attr" =~ ^[[:space:]]*\#\[ignore\ =\ \"manual:\ .*cargo\ test.*--ignored.*\"\] ]]; then
+    echo "error: ${hit%%:*}:$(echo "$hit" | cut -d: -f2): ${attr#"${attr%%[![:space:]]*}"} — CI never runs it; name the manual command: #[ignore = \"manual: cargo test ... -- --ignored ...\"] (or use skip_unless_minio!())" >&2
+    err=1
+  fi
+done < <(grep -rnE '^[[:space:]]*#\[ignore' tests src --include='*.rs' || true)
 
 ((err == 0)) || exit 1
 

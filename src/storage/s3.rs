@@ -4947,8 +4947,8 @@ mod tests {
     /// request. This keeps the test tight and avoids reaching into
     /// SDK internals. Behavioural verification that AWS actually
     /// encrypts belongs in the integration suite (see
-    /// `tests/encryption_test.rs` — an #[ignore]'d test that runs
-    /// against a KMS-capable MinIO).
+    /// `tests/encryption_test.rs::test_sse_s3_roundtrip_through_s3_backend`,
+    /// which runs against the KMS-capable MinIO of CI).
     #[test]
     fn test_apply_native_encryption_mode_selection() {
         use NativeEncryptionConfig as N;
