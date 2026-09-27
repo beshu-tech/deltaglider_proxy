@@ -24,6 +24,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::{debug, info, instrument, warn};
 
+pub(crate) mod conditional;
 mod retrieve;
 pub(crate) mod store;
 

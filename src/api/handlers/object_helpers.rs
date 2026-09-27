@@ -9,6 +9,8 @@
 //! the s3s adapter and the surviving form-POST handler need are
 //! kept here:
 //!
+//! * [`store_client_write`] — THE client write of a whole body: quota
+//!   gate, conditional store under the object's write lock, event.
 //! * [`check_quota`] — pre-write quota gate.
 //! * [`enqueue_object_event`] / [`enqueue_object_events`] — best-
 //!   effort event-outbox append for notification dispatch.
@@ -59,6 +61,57 @@ pub(crate) async fn enqueue_object_events(state: &Arc<AppState>, events: &[NewEv
             err
         );
     }
+}
+
+/// One client write of a whole body (PutObject, CopyObject, form POST).
+pub(crate) struct ClientWrite<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub data: &'a [u8],
+    pub content_type: Option<String>,
+    pub user_metadata: std::collections::HashMap<String, String>,
+    pub precondition: &'a crate::deltaglider::Precondition,
+}
+
+/// THE client write of a whole body: the quota gate, then the engine's
+/// conditional store (the object's write lock, the preconditions, the
+/// store), then the `ObjectCreated` event. Every surface that stores a
+/// client body goes through here, so none of them skips the lock, the
+/// conditionals, the quota or the event.
+pub(crate) async fn store_client_write(
+    state: &Arc<AppState>,
+    write: ClientWrite<'_>,
+) -> Result<crate::types::StoreResult, S3Error> {
+    check_quota(state, write.bucket, write.data.len() as u64)?;
+    let result = state
+        .engine
+        .load()
+        .store_conditional(
+            write.bucket,
+            write.key,
+            write.data,
+            write.content_type,
+            write.user_metadata,
+            write.precondition,
+        )
+        .await?;
+    enqueue_object_event(
+        state,
+        NewEvent::new(
+            crate::event_outbox::EventKind::ObjectCreated,
+            write.bucket,
+            write.key,
+            crate::event_outbox::EventSource::S3Api,
+            crate::replication::current_unix_seconds(),
+            serde_json::json!({
+                "content_length": write.data.len(),
+                "storage_type": result.metadata.storage_info.label(),
+                "etag": result.metadata.etag(),
+            }),
+        ),
+    )
+    .await;
+    Ok(result)
 }
 
 /// Client-write boundary gate. A bucket marked `replication_target_only`

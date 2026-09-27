@@ -892,81 +892,24 @@ impl s3s::S3 for DeltaGliderS3Service {
         .await?;
         verify_signed_payload_hash_s3s(signed_payload_hash.as_ref(), &data)?;
         validate_content_md5_s3s(input.content_md5.as_deref(), &data)?;
-        // Per-bucket storage quota enforcement. The shared `check_quota`
-        // keeps the policy ("freeze when quota=0, soft-enforce after cached
-        // usage available") single-sourced with form POST and copy.
-        crate::api::handlers::object_helpers::check_quota(
+        // The body is already collected here (SigV4 payload-hash verification
+        // needs it); the engine spools a large delta-eligible body.
+        let result = crate::api::handlers::object_helpers::store_client_write(
             &self.state,
-            &input.bucket,
-            data.len() as u64,
+            crate::api::handlers::object_helpers::ClientWrite {
+                bucket: &input.bucket,
+                key: &input.key,
+                data: &data,
+                content_type: input.content_type,
+                user_metadata: input.metadata.unwrap_or_default(),
+                precondition: &crate::deltaglider::Precondition {
+                    if_match: input.if_match,
+                    if_none_match: input.if_none_match,
+                },
+            },
         )
+        .await
         .map_err(engine_error_to_s3s)?;
-        // Held until the store returns, so the conditional check below and
-        // the write are one step for this key.
-        let _write_lock = acquire_object_write_lock(&input.bucket, &input.key).await;
-        evaluate_put_etag_conditionals_s3s(
-            engine.as_ref(),
-            &input.bucket,
-            &input.key,
-            input.if_match.as_ref(),
-            input.if_none_match.as_ref(),
-        )
-        .await?;
-        let content_type = input.content_type;
-        let user_metadata = input.metadata.unwrap_or_default();
-        // Large delta-eligible objects: route through the streaming spool store so
-        // the delta encode + ratio decision run with BOUNDED memory (Phase 4).
-        // The body is already collected here (SigV4 payload-hash verification needs
-        // it); spool it to disk and hand the streaming store a seekable file. The
-        // remaining memory win — streaming the body BEFORE hash-verify — needs
-        // SigV4 streaming-payload support and is tracked as Phase 4.1.
-        let result = if data.len() as u64 > engine.spool_store_threshold()
-            && engine.is_delta_eligible_key(&input.key)
-        {
-            let spool = engine
-                .spool_acquire(data.len() as u64)
-                .await
-                .map_err(engine_error_to_s3s)?;
-            tokio::fs::write(spool.path(), &data).await.map_err(|e| {
-                engine_error_to_s3s(crate::deltaglider::EngineError::Storage(
-                    crate::storage::StorageError::from(e),
-                ))
-            })?;
-            engine
-                .store_spooled_delta(
-                    &input.bucket,
-                    &input.key,
-                    &spool,
-                    data.len() as u64,
-                    content_type,
-                    user_metadata,
-                    None,
-                )
-                .await
-                .map_err(engine_error_to_s3s)?
-        } else {
-            engine
-                .store(
-                    &input.bucket,
-                    &input.key,
-                    &data,
-                    content_type,
-                    user_metadata,
-                )
-                .await
-                .map_err(engine_error_to_s3s)?
-        };
-        self.emit_object_event(
-            crate::event_outbox::EventKind::ObjectCreated,
-            &input.bucket,
-            &input.key,
-            serde_json::json!({
-                "content_length": data.len(),
-                "storage_type": result.metadata.storage_info.label(),
-                "etag": result.metadata.etag(),
-            }),
-        )
-        .await;
         let mut resp = s3s::S3Response::new(s3s::dto::PutObjectOutput {
             e_tag: Some(parse_s3s_etag(&result.metadata.etag())?),
             ..Default::default()
@@ -1046,14 +989,6 @@ impl s3s::S3 for DeltaGliderS3Service {
         if data.len() as u64 > engine.max_object_size() {
             return Err(s3s::s3_error!(EntityTooLarge));
         }
-        // Quota check on the destination bucket (parity with axum
-        // copy_object). Same single-source `check_quota` as put_object.
-        crate::api::handlers::object_helpers::check_quota(
-            &self.state,
-            &input.bucket,
-            data.len() as u64,
-        )
-        .map_err(engine_error_to_s3s)?;
         let (content_type, mut user_metadata) = if directive.eq_ignore_ascii_case("REPLACE") {
             check_user_metadata_size_s3s(input.metadata.as_ref())?;
             (input.content_type, input.metadata.unwrap_or_default())
@@ -1073,29 +1008,22 @@ impl s3s::S3 for DeltaGliderS3Service {
         // makes the destination unreadable (read path thinks it's encrypted).
         crate::storage::encrypting::strip_encryption_markers(&mut user_metadata);
         crate::transfer::strip_rule_provenance(&mut user_metadata);
-        let result = engine
-            .store(
-                &input.bucket,
-                &input.key,
-                &data,
+        // A copy creates a new object at the destination: the same client
+        // write as a PUT (quota on the destination, the object's write lock,
+        // the ObjectCreated event). s3s models no conditional headers for it.
+        let result = crate::api::handlers::object_helpers::store_client_write(
+            &self.state,
+            crate::api::handlers::object_helpers::ClientWrite {
+                bucket: &input.bucket,
+                key: &input.key,
+                data: &data,
                 content_type,
                 user_metadata,
-            )
-            .await
-            .map_err(engine_error_to_s3s)?;
-        // A copy creates a new object at the destination — emit ObjectCreated
-        // for the dest key. Routing decides whether a replication rule cares.
-        self.emit_object_event(
-            crate::event_outbox::EventKind::ObjectCreated,
-            &input.bucket,
-            &input.key,
-            serde_json::json!({
-                "content_length": data.len(),
-                "storage_type": result.metadata.storage_info.label(),
-                "etag": result.metadata.etag(),
-            }),
+                precondition: &crate::deltaglider::Precondition::none(),
+            },
         )
-        .await;
+        .await
+        .map_err(engine_error_to_s3s)?;
         Ok(s3s::S3Response::new(s3s::dto::CopyObjectOutput {
             copy_object_result: Some(s3s::dto::CopyObjectResult {
                 e_tag: Some(parse_s3s_etag(&result.metadata.etag())?),
@@ -1309,15 +1237,20 @@ impl s3s::S3 for DeltaGliderS3Service {
                 // create-only), under the same per-key lock, held until the
                 // store ends. Only the owner checks: a retry that joins or
                 // hits the tombstone sees its OWN object and must not 412.
-                let write_lock = acquire_object_write_lock(&input.bucket, &input.key).await;
-                evaluate_put_etag_conditionals_s3s(
-                    self.state.engine.load().as_ref(),
-                    &input.bucket,
-                    &input.key,
-                    input.if_match.as_ref(),
-                    input.if_none_match.as_ref(),
-                )
-                .await?;
+                let write_lock = self
+                    .state
+                    .engine
+                    .load()
+                    .lock_and_check(
+                        &input.bucket,
+                        &input.key,
+                        &crate::deltaglider::Precondition {
+                            if_match: input.if_match.clone(),
+                            if_none_match: input.if_none_match.clone(),
+                        },
+                    )
+                    .await
+                    .map_err(engine_error_to_s3s)?;
                 let delta_limit = crate::config::env_parse_with_default(
                     "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
                     64 * 1024 * 1024,
@@ -2466,92 +2399,6 @@ fn verify_signed_payload_hash_s3s(
     }
 }
 
-async fn evaluate_put_etag_conditionals_s3s(
-    engine: &crate::deltaglider::DynEngine,
-    bucket: &str,
-    key: &str,
-    if_match: Option<&s3s::dto::ETagCondition>,
-    if_none_match: Option<&s3s::dto::ETagCondition>,
-) -> s3s::S3Result<()> {
-    if if_match.is_none() && if_none_match.is_none() {
-        return Ok(());
-    }
-    // Fail closed (review C4): only NotFound means "absent". Any other HEAD
-    // error used to read as absent, so `If-None-Match: *` overwrote.
-    let existing = match engine.head(bucket, key).await {
-        Ok(meta) => Some(meta),
-        Err(crate::deltaglider::EngineError::NotFound(_)) => None,
-        Err(e) => return Err(engine_error_to_s3s(e)),
-    };
-    check_put_conditionals(existing.as_ref(), if_match, if_none_match)
-}
-
-/// Pure: the PutObject conditional rules of S3 (s3surface-13). `If-Match` on
-/// a missing key is `NoSuchKey`; it compares by strong ETag, so a weak
-/// `W/"…"` never matches. `If-None-Match` supports only `*`: another value
-/// is `NotImplemented`, as on S3, not a silent ETag compare.
-fn check_put_conditionals(
-    existing: Option<&FileMetadata>,
-    if_match: Option<&s3s::dto::ETagCondition>,
-    if_none_match: Option<&s3s::dto::ETagCondition>,
-) -> s3s::S3Result<()> {
-    if if_none_match.is_some_and(|cond| !cond.is_any()) {
-        return Err(s3s::s3_error!(
-            NotImplemented,
-            "If-None-Match on PutObject supports only '*'"
-        ));
-    }
-    if let Some(cond) = if_match {
-        let Some(meta) = existing else {
-            return Err(s3s::s3_error!(NoSuchKey));
-        };
-        let current = parse_s3s_etag(&meta.etag())?;
-        let matches = cond.is_any()
-            || cond
-                .as_etag()
-                .is_some_and(|wanted| wanted.strong_cmp(&current));
-        if !matches {
-            return Err(s3s::s3_error!(PreconditionFailed));
-        }
-    }
-    if if_none_match.is_some() && existing.is_some() {
-        return Err(s3s::s3_error!(PreconditionFailed));
-    }
-    Ok(())
-}
-
-/// Per-object write locks for PutObject, keyed by `bucket/key` (review C4).
-/// A conditional PUT checks and then stores; the lock makes that pair atomic
-/// against every other PutObject of the same key on THIS process. It is
-/// separate from, and always taken before, the engine's per-deltaspace lock.
-/// CompleteMultipartUpload takes it too. Not covered: CopyObject (s3s
-/// models no conditional headers for it), form POST, and other instances. Idle entries are pruned like the engine's prefix locks.
-static OBJECT_WRITE_LOCKS: std::sync::LazyLock<
-    dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
-> = std::sync::LazyLock::new(dashmap::DashMap::new);
-
-/// Pure: the write-lock key of an object. The engine trims leading `/`
-/// (`//a` and `a` are one object), so the lock must too, or two
-/// create-only PUTs through the two spellings both pass the check.
-fn object_write_lock_key(bucket: &str, key: &str) -> String {
-    format!(
-        "{bucket}/{}",
-        crate::types::ObjectKey::parse(bucket, key).full_key()
-    )
-}
-
-async fn acquire_object_write_lock(bucket: &str, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
-    const CLEANUP_THRESHOLD: usize = 1024;
-    if OBJECT_WRITE_LOCKS.len() > CLEANUP_THRESHOLD {
-        OBJECT_WRITE_LOCKS.retain(|_, m| Arc::strong_count(m) > 1);
-    }
-    let mutex = OBJECT_WRITE_LOCKS
-        .entry(object_write_lock_key(bucket, key))
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone();
-    mutex.lock_owned().await
-}
-
 /// Await a joined completion's outcome (initial watch value is None).
 async fn await_completion_outcome(
     mut rx: tokio::sync::watch::Receiver<Option<crate::multipart::CompletionResult>>,
@@ -2713,6 +2560,7 @@ fn engine_error_to_s3s(err: impl Into<crate::api::S3Error>) -> s3s::S3Error {
         crate::api::S3Error::AccessDenied => s3s::s3_error!(AccessDenied),
         crate::api::S3Error::AccessDeniedReason(msg) => s3s::s3_error!(AccessDenied, "{}", msg),
         crate::api::S3Error::PreconditionFailed => s3s::s3_error!(PreconditionFailed),
+        crate::api::S3Error::NotImplemented(msg) => s3s::s3_error!(NotImplemented, "{}", msg),
         crate::api::S3Error::InvalidRange => s3s::s3_error!(InvalidRange),
         // 503 SlowDown must reach the wire as SlowDown — AWS SDKs back off on
         // it; a catch-all 500 InternalError is treated as permanent instead.
@@ -3141,22 +2989,6 @@ mod tests {
              </Contents><Contents><Key>c</Key><UserMetadata><Items><Key>x</Key><Value>1</Value>\
              </Items><Items><Key>y</Key><Value>2</Value></Items></UserMetadata></Contents>\
              <CommonPrefixes><Prefix>p/</Prefix></CommonPrefixes></R>"
-        );
-    }
-
-    #[test]
-    fn object_write_lock_key_matches_the_engine_key() {
-        assert_eq!(
-            object_write_lock_key("b", "//a"),
-            object_write_lock_key("b", "a")
-        );
-        assert_eq!(
-            object_write_lock_key("b", "/x/y"),
-            object_write_lock_key("b", "x/y")
-        );
-        assert_ne!(
-            object_write_lock_key("b", "x/y"),
-            object_write_lock_key("b", "xy")
         );
     }
 
@@ -3718,42 +3550,6 @@ mod tests {
             assert!(list.contains_key(&format!("x-amz-meta-{key}")), "{key}");
         }
         assert_eq!(list.len(), head.len() + 1);
-    }
-
-    #[test]
-    fn put_conditionals_truth_table() {
-        let meta = meta_at_subsecond();
-        let etag = meta.etag();
-        let cond = |v: &str| s3s::dto::ETagCondition::parse_http_header(v.as_bytes()).unwrap();
-        let weak = format!("W/{etag}");
-        // (object exists, If-Match, If-None-Match, error code)
-        type Case<'a> = (bool, Option<&'a str>, Option<&'a str>, Option<&'a str>);
-        let cases: &[Case] = &[
-            (true, None, None, None),
-            (false, None, None, None),
-            (true, Some(&etag), None, None),
-            (true, Some("*"), None, None),
-            (true, Some("\"other\""), None, Some("PreconditionFailed")),
-            (true, Some(&weak), None, Some("PreconditionFailed")),
-            (false, Some(&etag), None, Some("NoSuchKey")),
-            (false, Some("*"), None, Some("NoSuchKey")),
-            (false, None, Some("*"), None),
-            (true, None, Some("*"), Some("PreconditionFailed")),
-            (true, None, Some("\"other\""), Some("NotImplemented")),
-            (false, None, Some(&etag), Some("NotImplemented")),
-        ];
-        for &(exists, im, inm, want) in cases {
-            let im = im.map(cond);
-            let inm = inm.map(cond);
-            let got = check_put_conditionals(exists.then_some(&meta), im.as_ref(), inm.as_ref())
-                .err()
-                .map(|e| e.code().as_str().to_string());
-            assert_eq!(
-                got.as_deref(),
-                want,
-                "exists {exists}, If-Match {im:?}, If-None-Match {inm:?}"
-            );
-        }
     }
 
     #[test]
