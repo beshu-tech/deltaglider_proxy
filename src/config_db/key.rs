@@ -196,7 +196,8 @@ pub fn check_sync_needs_env_key(
              is encrypted with that key, so every instance must set {CONFIG_DB_KEY_ENV} to the \
              same value (at least {MIN_CONFIG_DB_KEY_LEN} characters, for example from \
              `openssl rand -hex 32`). On the first start with it, each instance re-encrypts \
-             its local config DB from the bootstrap password hash to the new key"
+             its local config DB to the new key from the key it had (its key file, or the \
+             bootstrap password hash for a DB from before 2.0)"
         ));
     }
     Ok(())

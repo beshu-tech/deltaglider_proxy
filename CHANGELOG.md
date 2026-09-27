@@ -37,7 +37,10 @@ Without a TTY, the first-run banner said that a password change in the admin
 GUI "keeps the IAM database readable", and that `--set-bootstrap-password`
 works only before an IAM user exists. Since the IAM database has its own key,
 both statements are false. The banner now says that the database key is
-`DGP_CONFIG_DB_KEY` or the key file next to the database.
+`DGP_CONFIG_DB_KEY` or the key file next to the database. The error for a
+`config_sync_bucket` without `DGP_CONFIG_DB_KEY` also names the key that the
+local database has (its key file, or the bootstrap password hash for a
+database from before 2.0).
 
 ### Fixed — `--verbose` lasts after the config file loads
 
