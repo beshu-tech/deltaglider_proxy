@@ -167,6 +167,17 @@ cannot change the decision. One answer is now retried that was not before:
 a proxy that has no free delta codec slot. The failure rows show the same
 text as before.
 
+### Fixed — A failed full-backup restore changes nothing
+
+A full-backup restore applied the configuration, then the secrets, then the
+IAM state. When the IAM step failed, the configuration and the admin
+password of the backup stayed live, although the documentation called the
+restore atomic. The proxy now records the running configuration, the admin
+password and the IAM database before the first step, and puts them back when
+a later step fails. The OAuth client secrets of `secrets.json` are now
+written after the IAM step, and the live OAuth providers pick them up
+without a restart.
+
 ### Fixed — A usage Refresh keeps the writes that land during its scan
 
 `POST /_/api/admin/usage/refresh` replaced the bucket counter with the scan

@@ -1174,7 +1174,7 @@ fn build_callback_uri_with(headers: &HeaderMap, trust_proxy: bool) -> String {
 /// `GET /_/api/admin/ext-auth/version` pollers). Callers propagate the error so
 /// a provider mutation whose rebuild failed surfaces a 500 instead of a lying
 /// 2xx — mirroring how `rebuild_iam_index` errors propagate.
-async fn rebuild_external_auth(state: &Arc<AdminState>) -> Result<(), AdminError<Bare>> {
+pub(super) async fn rebuild_external_auth(state: &Arc<AdminState>) -> Result<(), AdminError<Bare>> {
     if let (Some(ext_auth), Some(config_db)) = (&state.external_auth, &state.config_db) {
         let db = config_db.lock().await;
         let providers = db.load_auth_providers().inspect_err(|e| {

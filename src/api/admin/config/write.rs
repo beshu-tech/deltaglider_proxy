@@ -528,6 +528,16 @@ pub(crate) enum InternalRefusal {
     Transition(String),
 }
 
+impl std::fmt::Display for InternalRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EnvReapply(e) => write!(f, "env overrides not re-applied: {e}"),
+            Self::Invalid { error, .. } => write!(f, "config refused: {error}"),
+            Self::Transition(e) => write!(f, "config transition failed: {e}"),
+        }
+    }
+}
+
 /// THE path for a config write that no admin config endpoint makes
 /// (bootstrap-credential removal, the backup secrets restore and its
 /// rollback): `edit` changes a copy of the running config, then the same

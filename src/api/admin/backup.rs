@@ -644,7 +644,8 @@ async fn export_zip(
 /// Wave 11.1 Full Backup: POST /_/api/admin/backup now accepts
 ///   * `application/zip` — zip produced by GET `?format=zip`
 ///     (or no format): unpacks manifest.json + config.yaml +
-///     iam.json + secrets.json, applies them atomically.
+///     iam.json + secrets.json, applies them atomically (a failed phase
+///     puts the earlier phases back).
 ///   * `application/json` (and all other content-types) — the
 ///     legacy IAM-only flow (same shape as v0.8.0).
 pub async fn import_backup(
@@ -1098,18 +1099,107 @@ fn plan_bootstrap_restore(
     }
 }
 
+/// What Phase B can change, taken before it starts, so a failed restore can
+/// put it back.
+struct RestoreSnapshot {
+    config: Config,
+    password_hash: String,
+    /// The IAM DB, only when the running config is GUI-mode: a backup
+    /// config in declarative mode reconciles the DB to its YAML, and
+    /// switching the config back does not undo that. (A declarative running
+    /// config reconciles the DB back itself when it is re-applied.)
+    iam: Option<IamBackup>,
+}
+
+impl RestoreSnapshot {
+    async fn take(state: &Arc<AdminState>) -> Self {
+        let config = state.config.read().await.clone();
+        let gui = matches!(config.iam_mode, crate::config_sections::IamMode::Gui);
+        let iam = if gui && state.config_db.is_some() {
+            build_iam_backup(state).await.ok()
+        } else {
+            None
+        };
+        Self {
+            config,
+            password_hash: state.password_hash.read().clone(),
+            iam,
+        }
+    }
+
+    /// Put back the config (memory and file, through the config write
+    /// pipeline), the admin password, and the IAM DB when the restore
+    /// switched it to declarative. Best effort: every step runs, the first
+    /// error is returned.
+    async fn roll_back(self, state: &Arc<AdminState>, headers: &HeaderMap) -> Result<(), String> {
+        let mut first_err: Option<String> = None;
+        let now_declarative = matches!(
+            state.config.read().await.iam_mode,
+            crate::config_sections::IamMode::Declarative
+        );
+        let config = self.config;
+        let applied = crate::api::admin::config::run_internal(
+            state,
+            headers,
+            "restore_rollback",
+            "config",
+            |cfg| *cfg = config,
+        )
+        .await;
+        match applied {
+            Ok(a) => {
+                if let Err((path, e)) = a.persist {
+                    first_err.get_or_insert(format!("config file {path} not restored: {e}"));
+                }
+            }
+            Err(e) => {
+                first_err.get_or_insert(format!("config not restored: {e}"));
+            }
+        }
+        if *state.password_hash.read() != self.password_hash {
+            if let Err(e) =
+                super::config::password::install_bootstrap_hash(state, &self.password_hash).await
+            {
+                first_err.get_or_insert(format!("admin password not restored: {e}"));
+            }
+        }
+        if let Some(iam) = self.iam.filter(|_| now_declarative) {
+            if let Err(e) =
+                import_backup_iam(state.clone(), headers.clone(), iam, IamRestoreMode::Replace)
+                    .await
+            {
+                first_err.get_or_insert(format!("IAM DB not restored: {e}"));
+            }
+        }
+        match first_err {
+            None => {
+                audit_log("restore_rollback", "admin", "full backup", headers);
+                Ok(())
+            }
+            Some(e) => Err(e),
+        }
+    }
+}
+
 /// Unpack a Full Backup zip and apply all four parts atomically.
 ///
 /// Two-phase flow (x-ray MED #3: validate first, side-effect second):
 ///   Phase A — unpack + parse every part + verify manifest sha256
-///             ([`verify_manifest`], [`parse_backup_parts`]). No state
-///             change. Any failure returns before we've touched the DB
-///             or config.
+///             ([`verify_manifest`], [`parse_backup_parts`]), and check
+///             that a config DB exists when OAuth secrets need one. No
+///             state change. Any failure returns before we've touched the
+///             DB or config.
 ///   Phase B — apply in order: config.yaml ([`apply_backup_config`]),
 ///             then secrets.json ([`apply_backup_secrets`]: storage
 ///             creds + bootstrap hash), then iam.json
-///             ([`apply_backup_iam`]). Secrets land before IAM so the
-///             post-IAM S3-sync push uses the restored storage creds.
+///             ([`apply_backup_iam`], one DB transaction). Secrets land
+///             before IAM so the post-IAM S3-sync push uses the restored
+///             storage creds. When any of the three fails, a
+///             [`RestoreSnapshot`] taken before Phase B puts the config
+///             (memory and file), the admin password and, if needed, the
+///             IAM DB back (H14c).
+///   Phase B.4 — the OAuth client secrets
+///             ([`apply_oauth_client_secrets`]), which cannot fail.
 async fn import_zip_full_backup(
     state: Arc<AdminState>,
     headers: HeaderMap,
@@ -1134,10 +1224,51 @@ async fn import_zip_full_backup(
     );
     verify_manifest(&files)?;
     let parts = parse_backup_parts(&files)?;
+    let oauth_secrets = mode.restores_config()
+        && parts
+            .secrets
+            .as_ref()
+            .is_some_and(|s| !s.oauth_client_secrets.is_empty());
+    if oauth_secrets && state.config_db.is_none() {
+        return Err(import_fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "apply_secrets",
+            "secrets.json",
+            "config DB is not available for OAuth client-secret restore",
+        ));
+    }
 
-    apply_backup_config(&state, &headers, mode, parts.yaml, parts.secrets.as_ref()).await?;
-    apply_backup_secrets(&state, &headers, mode, parts.secrets.as_ref()).await?;
-    let iam_result = apply_backup_iam(&state, &headers, mode, parts.iam, iam_mode).await?;
+    // Phase B is atomic: when a later phase fails, the restore puts back
+    // what the earlier phases changed.
+    let snapshot = if mode.restores_config() {
+        Some(RestoreSnapshot::take(&state).await)
+    } else {
+        None
+    };
+    let applied = async {
+        apply_backup_config(&state, &headers, mode, parts.yaml, parts.secrets.as_ref()).await?;
+        apply_backup_secrets(&state, &headers, mode, parts.secrets.as_ref()).await?;
+        apply_backup_iam(&state, &headers, mode, parts.iam, iam_mode).await
+    }
+    .await;
+    let iam_result = match applied {
+        Ok(r) => r,
+        Err(mut e) => {
+            if let Some(snapshot) = snapshot {
+                if let Err(rb) = snapshot.roll_back(&state, &headers).await {
+                    tracing::error!("Full-backup import: rollback incomplete: {rb}");
+                    e.detail = Some(sanitize_error_detail(format!(
+                        "{}; the rollback of the earlier phases failed too: {rb}",
+                        e.detail.as_deref().unwrap_or("restore failed")
+                    )));
+                }
+            }
+            return Err(e);
+        }
+    };
+    if let Some(secrets) = parts.secrets.as_ref().filter(|_| mode.restores_config()) {
+        apply_oauth_client_secrets(&state, secrets).await;
+    }
 
     audit_log(
         "import_full_backup",
@@ -1578,44 +1709,56 @@ async fn apply_secrets(
         super::audit_log("restore_bootstrap_password", "admin", "bootstrap", headers);
     }
 
-    // OAuth client_secret per provider, by name (robust to id
-    // reshuffles across restores). Requires the provider row to
-    // already exist; if iam.json hasn't been applied yet the lookup
-    // returns empty and we skip silently — that's fine, the
-    // subsequent iam.json import carries client_secret too.
-    if !secrets.oauth_client_secrets.is_empty() {
-        let db = state.config_db.as_ref().ok_or_else(|| {
-            let e = AdminError::<super::error::Text>::no_config_db();
-            BackupSecretApplyError::new(e.status_code(), e.message())
-        })?;
-        let db = db.lock().await;
-        let providers = db.load_auth_providers().unwrap_or_default();
-        for p in &providers {
-            if let Some(cs) = secrets.oauth_client_secrets.get(&p.name) {
-                let req = crate::config_db::auth_providers::UpdateAuthProviderRequest {
-                    name: None,
-                    provider_type: None,
-                    enabled: None,
-                    priority: None,
-                    display_name: None,
-                    client_id: None,
-                    client_secret: Some(cs.clone()),
-                    issuer_url: None,
-                    scopes: None,
-                    extra_config: None,
-                };
-                if let Err(e) = db.update_auth_provider(p.id, &req) {
-                    tracing::warn!(
-                        "Full-backup: update client_secret for provider '{}' failed: {}",
-                        p.name,
-                        e
-                    );
-                }
+    Ok(())
+}
+
+/// Phase B.4 of [`import_zip_full_backup`]: the OAuth client secret of
+/// every provider that `secrets.json` names, by provider name (robust to id
+/// reshuffles across restores). Runs after the IAM phase, so a provider the
+/// backup restores gets its secret too, and it cannot fail: a failed row
+/// update is a warning. The config DB is checked before Phase B.
+async fn apply_oauth_client_secrets(state: &Arc<AdminState>, secrets: &BackupSecrets) {
+    if secrets.oauth_client_secrets.is_empty() {
+        return;
+    }
+    let Some(db) = state.config_db.as_ref() else {
+        return;
+    };
+    let db = db.lock().await;
+    let providers = db.load_auth_providers().unwrap_or_default();
+    let mut updated = 0usize;
+    for p in &providers {
+        if let Some(cs) = secrets.oauth_client_secrets.get(&p.name) {
+            let req = crate::config_db::auth_providers::UpdateAuthProviderRequest {
+                name: None,
+                provider_type: None,
+                enabled: None,
+                priority: None,
+                display_name: None,
+                client_id: None,
+                client_secret: Some(cs.clone()),
+                issuer_url: None,
+                scopes: None,
+                extra_config: None,
+            };
+            match db.update_auth_provider(p.id, &req) {
+                Ok(_) => updated += 1,
+                Err(e) => tracing::warn!(
+                    "Full-backup: update client_secret for provider '{}' failed: {}",
+                    p.name,
+                    e
+                ),
             }
         }
     }
-
-    Ok(())
+    drop(db);
+    if updated > 0 {
+        // The live providers hold the secret they were built with.
+        if let Err(e) = super::external_auth::rebuild_external_auth(state).await {
+            tracing::warn!("Full-backup: OAuth providers not rebuilt: {e}");
+        }
+        trigger_config_sync(state);
+    }
 }
 
 /// Restore `backup` into the IAM DB in one transaction: `Replace` makes it
