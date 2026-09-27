@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: BUSL-1.1
 
-//! In-memory multipart upload state management
+//! Multipart upload state, held in memory: a restart loses every open
+//! upload, and clients handle that.
 //!
-//! Parts are buffered in memory until CompleteMultipartUpload assembles them
-//! and passes the result through `engine.store()` for delta compression.
-//! Uploads are ephemeral — lost on restart; clients handle this gracefully.
+//! A part stays in memory while the upload's total is at most
+//! `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES`; after that it goes to a relay file
+//! in the spool. An upload that tries no delta relays from its first part.
+//! CompleteMultipartUpload assembles a delta candidate (it tries a delta and
+//! its total is within the cap) in memory and passes it to `engine.store()`;
+//! every other upload is stored from its parts.
 
 use crate::api::S3Error;
 use bytes::{Bytes, BytesMut};

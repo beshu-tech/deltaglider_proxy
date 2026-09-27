@@ -56,7 +56,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_CODEC_CONCURRENCY",
-        description: "Max concurrent delta encode/decode ops (default: CPU cores)",
+        description: "Max concurrent delta encode/decode ops (default: 4 per CPU core, at least 16)",
         example: "4",
         category: "Server",
     },
@@ -538,7 +538,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_SPOOL_ACQUIRE_TIMEOUT_SECS",
-        description: "Max wait for spool budget before a spooled GET fails with SlowDown (default: 120)",
+        description: "Max wait in seconds for spool budget before a request that needs spool space (a large PUT or POST, a copy, a delta GET) fails with 503 SlowDown (default: 120)",
         example: "120",
         category: "Delta Engine",
     },
@@ -616,7 +616,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES",
-        description: "Largest delta-stored source that UploadPartCopy reconstructs in memory (default: 64 MiB)",
+        description: "Largest multipart upload that CompleteMultipartUpload assembles in memory to try a delta. The parts of an upload stay in memory up to this total, then go to relay files in the spool. A larger upload, or one that tries no delta, is stored from its parts without a delta (default: 64 MiB)",
         example: "67108864",
         category: "Delta Engine",
     },

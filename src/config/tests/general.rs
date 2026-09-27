@@ -2426,3 +2426,16 @@ fn test_persist_to_file_preserves_yaml_stored_encryption_keys() {
         exported
     );
 }
+
+/// The registry and the admin GUI state this default: 4 per core, at least 16.
+#[test]
+fn default_codec_concurrency_is_four_per_core_at_least_16() {
+    assert_eq!(default_codec_concurrency(1), 16);
+    assert_eq!(default_codec_concurrency(4), 16);
+    assert_eq!(default_codec_concurrency(8), 32);
+    let pinned = Config {
+        codec_concurrency: Some(3),
+        ..Config::default()
+    };
+    assert_eq!(pinned.effective_codec_concurrency(), 3);
+}

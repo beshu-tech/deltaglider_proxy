@@ -392,16 +392,9 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
         config: &Config,
         metrics: Option<Arc<Metrics>>,
     ) -> Self {
-        // PERF: codec_concurrency controls how many xdelta3 subprocesses can run
-        // in parallel. Defaults to num_cpus * 4 (xdelta3 decode is fast — the bottleneck
-        // is network I/O fetching reference+delta from S3, not CPU). Minimum 8.
-        // Configurable via DGP_CODEC_CONCURRENCY.
-        let codec_concurrency = config.codec_concurrency.unwrap_or_else(|| {
-            let cpus = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4);
-            (cpus * 4).max(16)
-        });
+        // How many xdelta3 subprocesses run in parallel (DGP_CODEC_CONCURRENCY;
+        // default 4 per CPU core, at least 16).
+        let codec_concurrency = config.effective_codec_concurrency();
         let spool = Arc::new(
             crate::deltaglider::spool::SpoolDir::shared()
                 .unwrap_or_else(|e| panic!("failed to init spool dir: {e}")),

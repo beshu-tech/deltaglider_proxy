@@ -515,10 +515,6 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
     let tuning = &cfg.tuning;
     let (rate_limit_max_attempts, rate_limit_window, rate_limit_lockout) =
         state.rate_limiter.per_ip_policy();
-    let cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-
     let tainted_fields = compute_tainted_fields(&cfg, &active_config_path(&state));
 
     // Assemble the per-backend response list. When the operator is on
@@ -549,7 +545,7 @@ pub async fn get_config(State(state): State<Arc<AdminState>>) -> impl IntoRespon
             max_object_size: cfg.max_object_size,
             cache_size_mb: cfg.cache_size_mb,
             metadata_cache_mb: cfg.metadata_cache_mb,
-            codec_concurrency: cfg.codec_concurrency.unwrap_or_else(|| (cpus * 4).max(16)),
+            codec_concurrency: cfg.effective_codec_concurrency(),
             codec_timeout_secs: tuning.codec.buffered_secs,
             // Limits
             request_timeout_secs: tuning.request_timeout_secs,

@@ -194,7 +194,7 @@ pub struct Config {
     pub bootstrap_password_hash: Option<String>,
 
     /// Maximum concurrent delta encode/decode operations.
-    /// Defaults to the number of available CPU cores.
+    /// `None` = [`Config::effective_codec_concurrency`]'s default.
     #[serde(default)]
     pub codec_concurrency: Option<usize>,
 
@@ -792,6 +792,25 @@ fn default_force_path_style() -> bool {
 /// The log filter when neither `RUST_LOG`, `DGP_LOG_LEVEL` nor the file
 /// sets one. Startup and `--init` use it too.
 pub const DEFAULT_LOG_LEVEL: &str = "deltaglider_proxy=info,tower_http=info";
+
+/// Default codec concurrency: 4 per CPU core, at least 16. xdelta3 decode
+/// is fast; the bottleneck is the backend I/O that fetches the reference and
+/// the delta, not the CPU.
+pub fn default_codec_concurrency(cpus: usize) -> usize {
+    (cpus * 4).max(16)
+}
+
+impl Config {
+    /// `codec_concurrency`, or the default for this host's CPU count.
+    pub fn effective_codec_concurrency(&self) -> usize {
+        self.codec_concurrency.unwrap_or_else(|| {
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            default_codec_concurrency(cpus)
+        })
+    }
+}
 
 pub(crate) fn default_log_level() -> String {
     DEFAULT_LOG_LEVEL.to_string()
