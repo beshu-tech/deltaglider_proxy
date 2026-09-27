@@ -328,25 +328,19 @@ async fn test_streaming_spool_store_put() {
     );
 }
 
-/// TOCTOU regression: in the streaming store, a fresh-baseline PUT whose first
-/// member LOSES the ratio used to tear down the reference AFTER dropping the
-/// prefix lock — racing a concurrent PUT that deltas against that reference, and
-/// orphaning the 2nd object. Now the passthrough write and the removal of the
-/// fresh baseline run under the lock (StorePlan), as on the buffered PUT. This
-/// drives two PUTs to the same fresh deltaspace and asserts BOTH stay
-/// retrievable. Forced through the streaming path via threshold=1.
+/// Through the streaming store (threshold=1), a fresh baseline and a sibling
+/// that deltas against it both round-trip byte-exact. The ratio-loss teardown
+/// of a fresh baseline under the lock is covered by the store-plan unit test
+/// `a_fresh_baseline_whose_ratio_loses_is_removed`.
 #[tokio::test]
-async fn test_streaming_baseline_ratio_loss_does_not_orphan_sibling() {
+async fn test_streaming_baseline_and_sibling_delta_both_round_trip() {
     let server = TestServer::builder()
         .env("DGP_SPOOL_THRESHOLD_BYTES", "1")
         .build()
         .await;
     let http = server.http();
 
-    // First member: a delta-eligible .zip that becomes the baseline. (A normal
-    // first member self-deltas tiny and "wins" — to exercise the ratio-loss
-    // teardown path we rely on the baseline being created either way; the key
-    // property under test is that a later sibling deltaing against it survives.)
+    // First member: a delta-eligible .zip that becomes the baseline.
     let base = generate_binary(200_000, 31);
     put_object(
         &http,
