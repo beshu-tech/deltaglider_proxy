@@ -114,6 +114,18 @@ pub static LISTING_FACTS_REQUESTS: std::sync::LazyLock<prometheus::IntCounterVec
         .expect("valid metric")
     });
 
+/// Listed objects whose listing facts a LIST looked up and did not find:
+/// the entry keeps its stored size (a delta's `.delta`, a ciphertext) until
+/// a HEAD backfills the facts.
+pub static LISTING_FACTS_MISSES: std::sync::LazyLock<prometheus::IntCounter> =
+    std::sync::LazyLock::new(|| {
+        prometheus::IntCounter::new(
+            "deltaglider_listing_facts_misses_total",
+            "Listed objects whose listing facts were not found (the LIST shows the stored size)",
+        )
+        .expect("valid metric")
+    });
+
 /// S3 storage backend for DeltaGlider objects
 /// Native S3 server-side encryption mode applied per PutObject.
 ///

@@ -182,6 +182,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 common_prefixes: result.common_prefixes,
                 is_truncated: result.is_truncated,
                 next_continuation_token: result.next_continuation_token,
+                facts_missing_keys: Vec::new(),
             }
         } else {
             // Backend doesn't support delegated listing for this shape — fall
@@ -204,6 +205,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 .resolve_listed_sizes(bucket, &mut page.objects, false)
                 .await
         };
+        page.facts_missing_keys = stored_size_only_keys(&page.objects, &sizes);
 
         // When metadata=true (MinIO extension), enrich objects with full
         // metadata from HEAD calls. Use the metadata cache to avoid HEAD
@@ -266,6 +268,13 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
 
             // Re-sort by key to maintain S3 lexicographic ordering
             cache_hits.sort_by(|a, b| a.0.cmp(&b.0));
+            // A HEAD resolved the missing ones, except a stub that a
+            // throttled HEAD sweep left.
+            page.facts_missing_keys.retain(|k| {
+                cache_hits
+                    .binary_search_by(|(key, _)| key.as_str().cmp(k))
+                    .is_ok_and(|i| Self::is_unresolved_delta_stub(&cache_hits[i].1))
+            });
             page.objects = cache_hits;
         }
 
@@ -406,6 +415,7 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 common_prefixes: page.common_prefixes,
                 is_truncated: page.is_truncated,
                 next_continuation_token: page.next_continuation_token,
+                facts_missing_keys: Vec::new(),
             })
         } else {
             // No delimiter — paginate raw objects
@@ -417,7 +427,49 @@ impl<S: StorageBackend> DeltaGliderEngine<S> {
                 common_prefixes: Vec::new(),
                 is_truncated,
                 next_continuation_token: next_token,
+                facts_missing_keys: Vec::new(),
             })
         }
+    }
+}
+
+/// Keys of a listing page whose entry shows only its stored size (see
+/// [`ListObjectsPage::facts_missing_keys`]).
+pub(crate) fn stored_size_only_keys(
+    objects: &[(String, FileMetadata)],
+    sizes: &[crate::storage::list_size_cache::ListedSize],
+) -> Vec<String> {
+    objects
+        .iter()
+        .zip(sizes)
+        .filter(|(_, size)| !size.is_known())
+        .map(|((key, _), _)| key.clone())
+        .collect()
+}
+
+#[cfg(test)]
+mod stored_size_only_tests {
+    use super::*;
+    use crate::storage::list_size_cache::ListedSize;
+
+    #[test]
+    fn only_stored_only_entries_are_listed() {
+        let meta = |k: &str| {
+            FileMetadata::new_passthrough(k.into(), String::new(), String::new(), 1, None)
+        };
+        let objects: Vec<(String, FileMetadata)> = ["a", "b", "c"]
+            .iter()
+            .map(|k| (k.to_string(), meta(k)))
+            .collect();
+        let sizes = [
+            ListedSize::Listed,
+            ListedSize::StoredOnly,
+            ListedSize::Cached,
+        ];
+        assert_eq!(
+            stored_size_only_keys(&objects, &sizes),
+            vec!["b".to_string()]
+        );
+        assert!(stored_size_only_keys(&objects, &[]).is_empty());
     }
 }

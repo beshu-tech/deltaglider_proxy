@@ -121,7 +121,7 @@ pub(super) async fn list_objects(
             prefix: Some(enc.apply(p.clone())),
         })
         .collect();
-    Ok(s3s::S3Response::new(s3s::dto::ListObjectsOutput {
+    let mut resp = s3s::S3Response::new(s3s::dto::ListObjectsOutput {
         name: Some(input.bucket.clone()),
         prefix: enc.apply_opt(input.prefix.clone()),
         delimiter: enc.apply_opt(input.delimiter.clone()),
@@ -133,7 +133,9 @@ pub(super) async fn list_objects(
         common_prefixes: Some(common_prefixes),
         encoding_type: input.encoding_type,
         ..Default::default()
-    }))
+    });
+    add_listing_debug_headers(&mut resp.headers, page.facts_missing_keys.len());
+    Ok(resp)
 }
 
 pub(super) async fn list_objects_v2(
@@ -172,7 +174,9 @@ pub(super) async fn list_objects_v2(
                 .collect(),
         )
     });
+    let facts_misses = page.facts_missing_keys.len();
     let mut resp = s3s::S3Response::new(list_objects_v2_output_from_page(&input, max_keys, page)?);
+    add_listing_debug_headers(&mut resp.headers, facts_misses);
     if let Some(metadata_ext) = metadata_ext {
         resp.extensions.insert(metadata_ext);
     }
@@ -296,6 +300,7 @@ pub(super) async fn client_list_page(
             common_prefixes: Vec::new(),
             is_truncated: false,
             next_continuation_token: None,
+            facts_missing_keys: Vec::new(),
         });
     }
     let page = crate::iam::listing::list_page_for_caller(

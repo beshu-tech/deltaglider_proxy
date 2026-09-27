@@ -41,6 +41,19 @@ warned that secrets are "saved to the config file as the reference", and the
 apply does not give these warnings. Now the validate refuses a hash change
 with the same 403, and it gives only the warnings that the apply gives.
 
+### Added — A LIST says how many entries show their stored size
+
+On an S3 backend, a listing reports the original size of a delta or
+ciphertext object from the listing facts under `.dg/facts/`. An entry
+without facts (an object stored before the index existed, or restored from
+a backend version) shows its stored size until a download or a `HEAD`
+request writes its facts. The new metric
+`deltaglider_listing_facts_misses_total` counts such entries, and with
+`DGP_DEBUG_HEADERS=true` every LIST response carries
+`x-deltaglider-listing-facts-misses` with the count for its page. The
+versioning page now says how backend versioning interacts with the
+listing facts.
+
 ### Fixed — The multipart `ObjectCreated` event carries the object size
 
 The `ObjectCreated` event of a CompleteMultipartUpload had no

@@ -170,6 +170,7 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
     let want = max_keys as usize + 1;
     let mut objects = Vec::new();
     let mut prefixes = std::collections::BTreeSet::new();
+    let mut facts_missing = std::collections::HashSet::new();
     let mut more = false;
     // ONE engine-page budget for the whole request, shared by every target
     // (scans and roll-up probes): per target, N visible prefixes read N
@@ -225,6 +226,7 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
                             metadata,
                         )
                         .await?;
+                    facts_missing.extend(page.facts_missing_keys);
                     objects.extend(
                         page.objects
                             .into_iter()
@@ -272,11 +274,19 @@ pub(crate) async fn list_page_for_caller<L: Lister>(
             .chain(page.common_prefixes.last().cloned())
             .max();
     }
+    // Only the entries this page shows: a hidden key is never counted.
+    let facts_missing_keys = page
+        .objects
+        .iter()
+        .filter(|(k, _)| facts_missing.contains(k))
+        .map(|(k, _)| k.clone())
+        .collect();
     Ok(ListObjectsPage {
         objects: page.objects,
         common_prefixes: page.common_prefixes,
         is_truncated: page.is_truncated,
         next_continuation_token: page.next_continuation_token,
+        facts_missing_keys,
     })
 }
 
@@ -332,6 +342,7 @@ mod tests {
                 objects,
                 common_prefixes: Vec::new(),
                 is_truncated,
+                facts_missing_keys: Vec::new(),
             })
         }
     }
@@ -362,6 +373,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.objects[0].0, "v");
+    }
+
+    /// A lister whose entries all lack listing facts.
+    struct NoFactsLister(CountingLister);
+
+    #[async_trait::async_trait]
+    impl Lister for NoFactsLister {
+        async fn list(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            delimiter: Option<&str>,
+            max_keys: u32,
+            cursor: Option<&str>,
+            metadata: bool,
+        ) -> Result<ListObjectsPage, EngineError> {
+            let mut page = self
+                .0
+                .list(bucket, prefix, delimiter, max_keys, cursor, metadata)
+                .await?;
+            page.facts_missing_keys = page.objects.iter().map(|(k, _)| k.clone()).collect();
+            Ok(page)
+        }
+    }
+
+    /// A filtered page reports the facts misses of the entries it shows,
+    /// never of a hidden key.
+    #[tokio::test]
+    async fn a_filtered_page_counts_only_visible_facts_misses() {
+        let lister = NoFactsLister(CountingLister {
+            keys: vec!["h/1".into(), "v/1".into(), "v/2".into()],
+            calls: Default::default(),
+        });
+        let read = |effect: &str, res: &str| crate::iam::Permission {
+            actions: vec!["read".into()],
+            ..rule(effect, &[res])
+        };
+        let scope = scoped(vec![read("Allow", "b/*"), read("Deny", "b/h/*")]);
+        let page = list_page_for_caller(&lister, "b", "", None, 10, None, false, Some(&scope), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.facts_missing_keys,
+            vec!["v/1".to_string(), "v/2".to_string()]
+        );
     }
 
     fn policy_context_for_ip(client_ip: Option<std::net::IpAddr>) -> iam_rs::Context {

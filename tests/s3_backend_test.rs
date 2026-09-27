@@ -611,6 +611,28 @@ async fn a_head_backfills_missing_listing_facts() {
         size_on(&node).await < variant.len(),
         "no facts: stored size"
     );
+    // The debug header and the metric name the miss.
+    let misses_on = |server: &TestServer| {
+        let url = format!(
+            "{}/{}?list-type=2&prefix={prefix}/v1",
+            server.endpoint(),
+            server.bucket()
+        );
+        let http = http.clone();
+        async move {
+            let resp = http.get(url).send().await.unwrap();
+            resp.headers()["x-deltaglider-listing-facts-misses"]
+                .to_str()
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+        }
+    };
+    assert_eq!(misses_on(&node).await, 1, "one entry without facts");
+    assert!(
+        scrape_counter(&node.endpoint(), "deltaglider_listing_facts_misses_total").await >= 1,
+        "the miss is counted"
+    );
     node.s3_client()
         .await
         .head_object()
@@ -633,6 +655,7 @@ async fn a_head_backfills_missing_listing_facts() {
         .build()
         .await;
     assert_eq!(size_on(&other).await, variant.len());
+    assert_eq!(misses_on(&other).await, 0, "the facts are there");
 }
 
 /// A PUT writes its listing facts in the background (storage-8): wait until

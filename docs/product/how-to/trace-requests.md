@@ -67,6 +67,7 @@ For per-request visibility on real traffic, set `DGP_DEBUG_HEADERS=true` and rea
 
 - `x-amz-storage-type` — how the object is stored: `delta`, `passthrough`, or `reference`.
 - `x-deltaglider-cache: hit|miss` — on every delta-reconstructed GET; tells you whether the reference baseline came from the cache.
+- `x-deltaglider-listing-facts-misses` — on every LIST; the number of entries on the page that show their stored size instead of their original size, because the proxy found no listing facts for them (see [how delta compression works](../explanation/delta-compression.md)).
 
 Leave this **off** in production once you're done — it reveals storage internals to anyone who can send a request.
 

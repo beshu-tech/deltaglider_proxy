@@ -340,6 +340,7 @@ fn list_output_maps_objects_and_common_prefixes() {
         common_prefixes: vec!["p/sub/".to_string()],
         is_truncated: true,
         next_continuation_token: Some("p/a.txt".to_string()),
+        facts_missing_keys: Vec::new(),
     };
 
     let out = list_objects_v2_output_from_page(&input, 100, page).unwrap();

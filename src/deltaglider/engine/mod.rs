@@ -96,6 +96,10 @@ pub struct ListObjectsPage {
     pub common_prefixes: Vec<String>,
     pub is_truncated: bool,
     pub next_continuation_token: Option<String>,
+    /// Keys in `objects` that show only their STORED size: neither this
+    /// process nor the durable listing facts knew the logical size, and no
+    /// HEAD ran. `DGP_DEBUG_HEADERS` reports the count on the response.
+    pub facts_missing_keys: Vec<String>,
 }
 
 /// Result of [`DeltaGliderEngine::list_deltaspace_references`] — the

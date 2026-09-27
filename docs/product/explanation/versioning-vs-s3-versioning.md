@@ -43,7 +43,11 @@ If your recovery story is "an attacker overwrites or deletes our objects, and we
 What to do instead, in rough order of strength:
 
 1. **Enable versioning and Object Lock on the upstream S3 backend directly.** Acme routes `releases` to `hetzner-fsn1`; if that provider supports bucket versioning / object lock, turn it on *there*. DeltaGlider stores each object as a normal backend object (a baseline or a `.delta`), so the backend's own versioning protects those stored bytes. Caveat: the backend versions the *encoded* form (the delta files), not your logical artifacts — recovery means restoring the backend objects, after which DeltaGlider reconstructs the logical objects from them.
+
+   The backend also versions the listing index. On an S3 backend, each upload that stores an object in another form (a delta, or ciphertext) also writes an empty index object under `.dg/facts/` in the same bucket, and a periodic cleanup deletes the index objects of overwritten and deleted objects. With versioning on, each of these writes and deletes leaves a noncurrent version or a delete marker, so the bucket holds more versions than objects. A lifecycle rule on the backend that expires noncurrent versions under `.dg/facts/` removes them. When you restore an older version of a stored object, its index object may be gone, because the cleanup deleted it when the object changed. The proxy then lists the restored object with its stored size, until it reads the object's metadata once (a download or a `HEAD` request) and writes the index object again. The metric `deltaglider_listing_facts_misses_total` and the debug header `x-deltaglider-listing-facts-misses` count such entries.
+
 2. **Replicate to an isolated DR backend.** Point a [replication rule](../reference/replication.md) at `aws-dr` (a separate account/provider) so a compromise of the primary doesn't reach the copy. Combine with credentials that can write-but-not-delete on the DR side.
+
 3. **Back up the config and IAM state** with the [backup/restore](../how-to/back-up-and-restore.md) flow so the control plane itself is recoverable, independent of the data plane.
 
 The honest summary: DeltaGlider is a storage-efficiency and control-plane layer, not a data-immutability layer. Put immutability where the bytes live.

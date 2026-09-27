@@ -229,7 +229,10 @@ impl S3Backend {
                     list_size_cache::apply(meta, &facts);
                     resolved.push(*i);
                 }
-                None => list_size_cache::mark_missing_facts(&id),
+                None => {
+                    LISTING_FACTS_MISSES.inc();
+                    list_size_cache::mark_missing_facts(&id);
+                }
             }
         }
         resolved

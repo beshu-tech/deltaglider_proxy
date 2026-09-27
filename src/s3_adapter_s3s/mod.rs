@@ -594,6 +594,18 @@ fn add_storage_debug_headers(headers: &mut axum::http::HeaderMap, meta: &FileMet
     }
 }
 
+/// `x-deltaglider-listing-facts-misses`: how many entries of a LIST page
+/// show only their stored size, because the logical size was in neither
+/// this process's cache nor the listing facts (debug headers only).
+fn add_listing_debug_headers(headers: &mut axum::http::HeaderMap, facts_misses: usize) {
+    if debug_headers_enabled() {
+        headers.insert(
+            "x-deltaglider-listing-facts-misses",
+            axum::http::HeaderValue::from(facts_misses),
+        );
+    }
+}
+
 fn parse_s3s_etag(etag: &str) -> s3s::S3Result<s3s::dto::ETag> {
     etag.parse::<s3s::dto::ETag>()
         .map_err(|_| s3s::s3_error!(InternalError, "invalid metadata ETag"))

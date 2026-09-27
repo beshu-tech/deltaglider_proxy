@@ -1256,3 +1256,33 @@ async fn test_key_with_special_chars() {
         .into_bytes();
     assert_eq!(body.as_ref(), data);
 }
+
+/// With debug headers on, a LIST (V1 and V2) says how many of its entries
+/// show only their stored size. A filesystem listing knows every logical
+/// size, so the count is 0.
+#[tokio::test]
+async fn list_reports_listing_facts_misses_in_a_debug_header() {
+    let server = TestServer::filesystem().await;
+    let http = server.http();
+    common::put_object(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "rel/a.zip",
+        generate_binary(10_000, 1),
+        "application/zip",
+    )
+    .await;
+    for query in ["list-type=2&prefix=rel/", "prefix=rel/"] {
+        let url = format!("{}/{}?{query}", server.endpoint(), server.bucket());
+        let resp = http.get(&url).send().await.unwrap();
+        assert!(resp.status().is_success(), "{query}");
+        assert_eq!(
+            resp.headers()
+                .get("x-deltaglider-listing-facts-misses")
+                .and_then(|v| v.to_str().ok()),
+            Some("0"),
+            "{query}"
+        );
+    }
+}
