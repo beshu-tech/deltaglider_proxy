@@ -12,7 +12,6 @@
 use crate::cli::aws_creds::{self, CredsInputs, ResolvedCreds};
 use crate::cli::config as cli_exit;
 use crate::cli::engine_factory::{build_cli_engine, build_raw_s3_client, CliEngineOpts};
-use crate::cli::ls::should_allow_local;
 use crate::deltaglider::DynEngine;
 
 #[derive(clap::Args, Debug, Clone, Default)]
@@ -126,6 +125,24 @@ impl AwsArgs {
     }
 }
 
+/// Set `DGP_BACKEND_ALLOW_LOCAL` automatically when the user
+/// explicitly points us at a local endpoint. Heuristic: `http://`
+/// scheme OR a `localhost` / loopback host. Server-process equivalent
+/// stays config-driven; this is the documented CLI ergonomic.
+///
+/// Shared with every other S3-talking subcommand (`rm`, `cp`, `stats`,
+/// `verify`) so they all auto-detect dev / MinIO endpoints the same
+/// way.
+pub(crate) fn should_allow_local(endpoint: Option<&str>) -> bool {
+    let Some(ep) = endpoint else {
+        return false;
+    };
+    if ep.starts_with("http://") {
+        return true;
+    }
+    ep.contains("localhost") || ep.contains("127.0.0.1") || ep.contains("[::1]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +253,16 @@ mod tests {
         assert!(at("--endpoint-url <URL>") < at("--source-endpoint-url"));
         assert!(at("--source-endpoint-url") < at("--region"));
         assert!(help.contains("S3 endpoint URL for the destination side"));
+    }
+
+    #[test]
+    fn should_allow_local_recognises_dev_endpoints() {
+        assert!(should_allow_local(Some("http://localhost:9000")));
+        assert!(should_allow_local(Some("http://127.0.0.1:9000")));
+        assert!(should_allow_local(Some("https://localhost:9000")));
+        assert!(should_allow_local(Some("https://[::1]:9000")));
+        assert!(should_allow_local(Some("http://10.0.0.5")));
+        assert!(!should_allow_local(Some("https://s3.amazonaws.com")));
+        assert!(!should_allow_local(None));
     }
 }

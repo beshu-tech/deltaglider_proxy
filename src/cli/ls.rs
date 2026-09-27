@@ -211,24 +211,6 @@ pub(crate) fn format_size(bytes: u64, human: bool) -> String {
     }
 }
 
-/// Set `DGP_BACKEND_ALLOW_LOCAL` automatically when the user
-/// explicitly points us at a local endpoint. Heuristic: `http://`
-/// scheme OR a `localhost` / loopback host. Server-process equivalent
-/// stays config-driven; this is the documented CLI ergonomic.
-///
-/// Shared with every other S3-talking subcommand (`rm`, `cp`, `stats`,
-/// `verify`) so they all auto-detect dev / MinIO endpoints the same
-/// way.
-pub(crate) fn should_allow_local(endpoint: Option<&str>) -> bool {
-    let Some(ep) = endpoint else {
-        return false;
-    };
-    if ep.starts_with("http://") {
-        return true;
-    }
-    ep.contains("localhost") || ep.contains("127.0.0.1") || ep.contains("[::1]")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,16 +248,5 @@ mod tests {
     #[test]
     fn format_timestamp_is_iso_minus_t() {
         assert_eq!(format_timestamp(t()), "2026-05-17 14:23:45");
-    }
-
-    #[test]
-    fn should_allow_local_recognises_dev_endpoints() {
-        assert!(should_allow_local(Some("http://localhost:9000")));
-        assert!(should_allow_local(Some("http://127.0.0.1:9000")));
-        assert!(should_allow_local(Some("https://localhost:9000")));
-        assert!(should_allow_local(Some("https://[::1]:9000")));
-        assert!(should_allow_local(Some("http://10.0.0.5")));
-        assert!(!should_allow_local(Some("https://s3.amazonaws.com")));
-        assert!(!should_allow_local(None));
     }
 }

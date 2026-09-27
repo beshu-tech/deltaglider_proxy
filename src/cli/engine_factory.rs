@@ -164,7 +164,7 @@ async fn raw_client(
     endpoint: Option<String>,
     force_path_style: bool,
 ) -> Result<aws_sdk_s3::Client, StorageError> {
-    let allow_local = crate::cli::ls::should_allow_local(endpoint.as_deref());
+    let allow_local = crate::cli::aws_args::should_allow_local(endpoint.as_deref());
     let backend = BackendConfig::S3 {
         session_token: creds.session_token.clone(),
         endpoint,
