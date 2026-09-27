@@ -649,7 +649,6 @@
 .docs-landing-group-title {
   display: flex; align-items: center; gap: 14px;
 }
-.docs-landing-group-title .dg-glyph { border-radius: 10px; }
 .docs-landing-group .docs-landing-tagline { margin: 0 0 16px 62px; }
 /* Section descriptor — a readable sentence-case sub-line, NOT an eyebrow.
    (Uppercase-mono is reserved for the short eyebrow labels only.) */

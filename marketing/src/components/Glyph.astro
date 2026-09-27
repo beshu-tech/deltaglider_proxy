@@ -1,9 +1,10 @@
 ---
 // Glyph.astro — the site's pictogram set. Hand-drawn 48×48 stroke icons in
-// one consistent style: 2.6px round strokes, cyan base + fuchsia accent
-// (class="a"), soft glow. Use anywhere a section is "text only" — these are
-// the graphic vocabulary of the site, so add new glyphs HERE rather than
-// inlining one-off SVGs in pages.
+// one style: 2.6px round strokes in ONE colour (currentColor, the brand).
+// Fuchsia is not used here: on this site it means "reference baseline".
+// Every glyph sits in the same 48 px tile. Pass `bare` for an inline icon
+// without the tile (table status marks, chips). Add new glyphs HERE rather
+// than inlining one-off SVGs or emoji in pages.
 interface Props {
   name:
     | 'shield-key'
@@ -18,10 +19,19 @@ interface Props {
     | 'book'
     | 'bulb'
     | 'clock'
-    | 'chart';
+    | 'chart'
+    | 'key'
+    | 'file'
+    | 'check'
+    | 'cross';
+  /** Icon size in px. Tiles always use the default; bare icons may set it. */
   size?: number;
+  /** No tile: an inline icon at text size. */
+  bare?: boolean;
+  /** Colour role: brand (default), ok, neg. */
+  tone?: 'brand' | 'ok' | 'neg';
 }
-const { name, size = 48 } = Astro.props;
+const { name, size = 30, bare = false, tone = 'brand' } = Astro.props;
 
 const PATHS: Record<string, string> = {
   'shield-key': `
@@ -75,15 +85,29 @@ const PATHS: Record<string, string> = {
     <rect class="a" x="13" y="15" width="6" height="20" rx="1.5"/>
     <rect x="23" y="25" width="6" height="10" rx="1.5"/>
     <rect x="33" y="32" width="6" height="3" rx="1.5"/>`,
+  key: `
+    <circle cx="16" cy="24" r="8"/>
+    <path d="M24 24 H42 M36 24 V31 M41 24 V29"/>`,
+  file: `
+    <path d="M12 5 H29 L37 13 V43 H12 Z"/>
+    <path d="M29 5 V13 H37 M18 24 H31 M18 31 H31"/>`,
+  check: `
+    <path d="M9 25 L19 35 L39 13"/>`,
+  cross: `
+    <path d="M13 13 L35 35 M35 13 L13 35"/>`,
 };
 ---
 
-<span class="dg-glyph" style={`--glyph-size:${size}px`} aria-hidden="true">
+<span
+  class:list={['dg-glyph', { 'dg-glyph--bare': bare }, `dg-glyph--${tone}`]}
+  aria-hidden="true"
+>
   <svg
     viewBox="0 0 48 48"
     width={size}
     height={size}
     fill="none"
+    stroke="currentColor"
     stroke-width="2.6"
     stroke-linecap="round"
     stroke-linejoin="round"
@@ -95,21 +119,22 @@ const PATHS: Record<string, string> = {
   .dg-glyph {
     display: inline-grid;
     place-items: center;
-    width: calc(var(--glyph-size) + 18px);
-    height: calc(var(--glyph-size) + 18px);
-    border-radius: 14px;
-    background:
-      radial-gradient(70% 70% at 50% 35%, var(--brand-wash), transparent 75%),
-      var(--bg-card);
-    border: 1px solid var(--brand-line-soft);
+    width: 48px;
+    height: 48px;
+    border-radius: var(--r-md);
+    background: var(--bg-card);
+    border: 1px solid var(--rule);
+    color: var(--brand);
     flex: 0 0 auto;
   }
-  .dg-glyph svg {
-    stroke: var(--brand-dark, var(--brand-dark));
-    filter: drop-shadow(0 0 6px var(--brand-line));
+  .dg-glyph--bare {
+    width: auto;
+    height: auto;
+    background: none;
+    border: 0;
+    border-radius: 0;
+    vertical-align: -0.15em;
   }
-  .dg-glyph svg .a {
-    stroke: var(--accent);
-    filter: drop-shadow(0 0 5px var(--accent-strong));
-  }
+  .dg-glyph--ok { color: var(--ok); }
+  .dg-glyph--neg { color: var(--neg); }
 </style>

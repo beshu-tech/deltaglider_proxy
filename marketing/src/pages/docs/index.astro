@@ -67,7 +67,7 @@ const GROUP_GLYPHS: Record<string, any> = {
   {groups.map((g) => (
     <section class="docs-landing-group">
       <h2 class="docs-landing-group-title">
-        <Glyph name={GROUP_GLYPHS[g.group.id] ?? 'book'} size={30} />
+        <Glyph name={GROUP_GLYPHS[g.group.id] ?? 'book'} />
         <span>{g.group.id}</span>
       </h2>
       <p class="docs-landing-tagline">{g.group.tagline}</p>

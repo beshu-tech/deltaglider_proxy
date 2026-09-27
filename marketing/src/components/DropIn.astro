@@ -31,7 +31,7 @@ import Glyph from './Glyph.astro';
 
     <ul class="dropin-facts">
       <li>
-        <Glyph name="verify" size={38} />
+        <Glyph name="verify" />
         <div>
           <strong>Reads are verified.</strong> Each delta read rebuilds
           the original and checks it against the SHA-256 recorded at
@@ -39,7 +39,7 @@ import Glyph from './Glyph.astro';
         </div>
       </li>
       <li>
-        <Glyph name="binary" size={38} />
+        <Glyph name="binary" />
         <div>
           <strong>Everything is in one binary.</strong> The proxy, the web
           UI, IAM, jobs, and metrics ship together. Run it with Docker, as
@@ -47,7 +47,7 @@ import Glyph from './Glyph.astro';
         </div>
       </li>
       <li>
-        <Glyph name="escape" size={38} />
+        <Glyph name="escape" />
         <div>
           <strong>No lock-in.</strong> Stored deltas are
           standard <code>xdelta3</code> files next to a plain reference
