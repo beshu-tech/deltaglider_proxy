@@ -132,7 +132,7 @@ The **Audit** button on the rule's Verify tab runs a fast **metadata audit**: it
 
 ## Related
 
-- [How to use non-CAS backends safely](backend-capability-validation.md): mark the destination `replication_target_only` to host a mirror on a cheap backend like Backblaze B2.
+- [How to use a backend without conditional writes](backend-capability-validation.md): mark the destination `replication_target_only` to host a mirror on a cheap backend like Backblaze B2.
 - [Replication reference](../reference/replication.md): rule grammar, conflict policies, failure modes, what doesn't replicate.
 - [Jobs reference](../reference/jobs.md): the unified jobs API that shows the rule.
 - [Event log reference](../reference/event-outbox.md): the event stream that drives near-real-time copies.

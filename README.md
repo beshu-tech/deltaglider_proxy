@@ -262,6 +262,11 @@ For deployments with more than one pod, use the official operator in [`operator/
 
 ## Documentation
 
+**Using an AI assistant?** Give it [llms.txt](https://deltaglider.com/llms.txt)
+(an index of every docs page) or [llms-full.txt](https://deltaglider.com/llms-full.txt)
+(all docs in one file). Every docs page is also plain markdown at its URL plus
+`.md`, for example <https://deltaglider.com/docs/reference/configuration.md>.
+
 Operator-facing docs are also bundled into the running binary at `/_/docs/`. Source files:
 
 The docs follow [Diátaxis](https://diataxis.fr): every page is exactly one of tutorial, how-to, reference, or explanation.

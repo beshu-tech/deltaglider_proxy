@@ -1,6 +1,6 @@
-# How to use non-CAS backends safely (backend capability validation)
+# How to use a backend without conditional writes
 
-This guide explains the proxy's backend capability validation: what it checks, when it refuses a configuration, the exact messages you'll see, and how to fix each one. Read it when a startup log or a config-apply error points you here, or before you put a low-cost backend such as Backblaze B2 into a multi-instance deployment.
+Some backends, such as Backblaze B2, do not support conditional writes (compare-and-swap, or CAS). This guide explains how to use such a non-CAS backend safely, and it explains the proxy's backend capability validation: what it checks, when it refuses a configuration, the exact messages you'll see, and how to fix each one. Read it when a startup log or a config-apply error points you here, or before you put a low-cost backend such as Backblaze B2 into a multi-instance deployment.
 
 ## What the proxy validates, and why
 

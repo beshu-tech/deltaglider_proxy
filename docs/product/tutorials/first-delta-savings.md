@@ -1,5 +1,7 @@
 # Your first delta savings
 
+*Run the proxy, upload two firmware versions, and see the second one stored as a small delta.*
+
 Acme Robotics ships a new firmware build for the Widget 3000 every few weeks. Each release is a multi-megabyte tarball that is 99% identical to the one before it, but every copy pays full price for storage. In this tutorial we'll run DeltaGlider Proxy, upload two firmware versions through it, and watch the second one shrink to almost nothing.
 
 By the end, you'll have a proxy on `localhost:9000` that stores two full firmware releases in barely more than the space of one. You'll also prove, hash against hash, that what comes back out is byte-identical to what went in.

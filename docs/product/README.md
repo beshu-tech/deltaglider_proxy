@@ -56,6 +56,10 @@ The why behind the design, one concept per page:
 - [Encryption at rest](explanation/encryption-at-rest.md): the threat model, the modes, and the costs.
 - [Jobs, write gates, and durability](explanation/jobs-and-durability.md): why background work is one surface, and what "durable" means here.
 
+To give a page to an AI assistant, use **Copy page** at the top of the page: it
+copies the page as markdown. The public website also publishes all pages for
+LLMs at <https://deltaglider.com/llms.txt>.
+
 ## Install
 
 Pick one. All three give you the same binary.

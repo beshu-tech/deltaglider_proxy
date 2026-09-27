@@ -1,5 +1,7 @@
 # Your first Helm deployment on kind
 
+*Install the Helm chart on a local kind cluster and prove it stores and returns a file.*
+
 In this tutorial we'll run DeltaGlider Proxy on Kubernetes, with the real chart on a real but disposable cluster. We'll boot a local `kind` cluster, install the official Helm chart, and check that the deployment works: the admin UI loads, the health probe answers, and a file round-trips through the S3 API. Then we'll delete the cluster and leave nothing behind.
 
 You'll need the DeltaGlider Proxy repository checked out locally (the chart ships inside it), plus Docker, `kind`, `kubectl`, `helm`, and the `aws` CLI.

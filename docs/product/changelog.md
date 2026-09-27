@@ -3209,9 +3209,8 @@ loop durability:
 
 A major release. Two overlapping threads land together: the
 **progressive-disclosure YAML config** (phases 0–3 of
-[docs/plan/progressive-config-refactor.md](docs/plan/progressive-config-refactor.md))
-and the first waves of the **admin UI revamp**
-([docs/plan/admin-ui-revamp.md](docs/plan/admin-ui-revamp.md)).
+the progressive config refactor plan)
+and the first waves of the **admin UI revamp**.
 
 ### Configuration (progressive-disclosure YAML — phases 0–3)
 
@@ -3220,7 +3219,7 @@ and the first waves of the **admin UI revamp**
   over `deltaglider_proxy.toml`. Both still load; TOML is
   deprecated with a `tracing::warn!` on every load (silence with
   `DGP_SILENCE_TOML_DEPRECATION=1`). See
-  [docs/HOWTO_MIGRATE_TO_YAML.md](docs/HOWTO_MIGRATE_TO_YAML.md).
+  [How to upgrade](https://deltaglider.com/docs/how-to/upgrade).
 - **Dual-shape loader.** Sectioned YAML (`admission:`/`access:`/
   `storage:`/`advanced:`) is transparent to the in-memory
   `Config` struct — the flat shape still loads unchanged.
@@ -3290,8 +3289,7 @@ and the first waves of the **admin UI revamp**
 
 ### Admin UI revamp (waves 1–11)
 
-All ten waves from
-[docs/plan/admin-ui-revamp.md](docs/plan/admin-ui-revamp.md) plus
+All ten waves of the admin UI revamp plan plus
 a follow-on Wave 11 (audit log viewer) have landed as of this
 release. Waves 1–3 shipped at tag time; waves 4–8 landed during
 live-browser verification; waves 9 (Trace diagnostics), 10

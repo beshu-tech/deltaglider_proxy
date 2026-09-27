@@ -95,7 +95,7 @@ config sync bucket, which carries IAM changes between the pods and hosts the
 replication leader leases and the reference locks. Every S3 backend that clients write
 to must support conditional writes: with a sync bucket, a pod refuses to start on a
 backend that does not support them (see
-[How to use non-CAS backends safely](backend-capability-validation.md)). A resource that meets these requirements:
+[How to use a backend without conditional writes](backend-capability-validation.md)). A resource that meets these requirements:
 
 ```yaml
 apiVersion: deltaglider.beshu.tech/v1alpha1

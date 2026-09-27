@@ -1,5 +1,7 @@
 # Securing your first proxy
 
+*Replace open access with real credentials and a least-privilege IAM user.*
+
 This tutorial continues exactly where [Your first delta savings](first-delta-savings.md) left off: a proxy running on `localhost:9000` in open-access mode, with a `releases` bucket holding two firmware versions.
 
 Right now, anyone who can reach port 9000 can read, overwrite, or delete everything in that bucket. That was fine for a first look, but not for any other use. By the end of this tutorial, the proxy will have an admin password that you chose, and S3 requests will require real credentials. Acme's CI pipeline will have its own key that can write firmware builds *and nothing else*. You will also see the brute-force rate limiter block a password-guessing attack.

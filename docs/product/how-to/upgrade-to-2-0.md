@@ -47,7 +47,7 @@ This step applies when `config_sync_bucket` (or `DGP_CONFIG_SYNC_BUCKET`) is set
 
 Two more changes apply to multi-instance deployments:
 
-- Every S3 backend that holds a bucket that clients can write to must support conditional writes. At start, the proxy tests each such backend, and it exits when a backend definitely does not support them. Backblaze B2 is one such backend. A bucket that only replication writes to can stay on it when you mark it `replication_target_only`. See [Use non-CAS backends safely](backend-capability-validation.md).
+- Every S3 backend that holds a bucket that clients can write to must support conditional writes. At start, the proxy tests each such backend, and it exits when a backend definitely does not support them. Backblaze B2 is one such backend. A bucket that only replication writes to can stay on it when you mark it `replication_target_only`. See [Use a backend without conditional writes](backend-capability-validation.md).
 - A bucket migrate answers `409 Conflict` while a sync bucket is set. The migrate changes the routing of one instance only, and config sync does not carry routing. Move a bucket on a single instance, as [Move a bucket between backends](move-a-bucket-between-backends.md) describes.
 
 The first sync after the upgrade has no merge base. The merge therefore keeps every row of both sides, so a delete that was not synced before the upgrade comes back. Check the users and groups after the rollout. The page [Run multiple instances](run-multiple-instances.md) describes the sync.
