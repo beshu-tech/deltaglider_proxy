@@ -37,7 +37,6 @@
         <span class="demo-video-play__circle" aria-hidden="true">
           <span class="demo-video-play__tri"></span>
         </span>
-        <span class="demo-video-play__label">90s&nbsp;video</span>
       </button>
     </figure>
   </div>
@@ -75,50 +74,18 @@
     max-width: 60ch;
     margin: 0.75rem auto 2rem;
   }
-  /* The demo is the hero of the page — give the frame a brand glow so the eye
-     lands on it. A soft cyan halo (layered) over the existing depth shadow, a
-     faintly brand-tinted border, and a slow breathing pulse that intensifies
-     on hover. Overflow stays clipped so the rounded video corners are crisp. */
+  /* A screenshot-style frame: one border, one shadow, no glow and no
+     breathing animation. */
   .demo-video-frame {
     position: relative;
     margin: 0 auto;
     max-width: 880px;
-    border-radius: 16px;
+    border-radius: var(--r-md);
     overflow: hidden;
-    border: 1px solid color-mix(in srgb, var(--brand) 45%, var(--rule));
+    border: 1px solid var(--rule-strong);
     background: var(--ink-100);
     line-height: 0;
-    box-shadow:
-      0 0 0 1px color-mix(in srgb, var(--brand) 22%, transparent),
-      0 0 40px -6px color-mix(in srgb, var(--brand) 45%, transparent),
-      0 0 90px -10px color-mix(in srgb, var(--brand) 35%, transparent),
-      var(--shadow-lg);
-    animation: demo-video-pulse 4.5s ease-in-out infinite;
-    transition: box-shadow 0.3s ease, transform 0.3s ease;
-  }
-  .demo-video-frame:hover {
-    transform: translateY(-2px);
-    box-shadow:
-      0 0 0 1px color-mix(in srgb, var(--brand) 40%, transparent),
-      0 0 56px -4px color-mix(in srgb, var(--brand) 60%, transparent),
-      0 0 120px -8px color-mix(in srgb, var(--brand) 45%, transparent),
-      var(--shadow-lg);
-  }
-  @keyframes demo-video-pulse {
-    0%, 100% {
-      box-shadow:
-        0 0 0 1px color-mix(in srgb, var(--brand) 22%, transparent),
-        0 0 36px -8px color-mix(in srgb, var(--brand) 38%, transparent),
-        0 0 80px -12px color-mix(in srgb, var(--brand) 28%, transparent),
-        var(--shadow-lg);
-    }
-    50% {
-      box-shadow:
-        0 0 0 1px color-mix(in srgb, var(--brand) 30%, transparent),
-        0 0 52px -6px color-mix(in srgb, var(--brand) 52%, transparent),
-        0 0 110px -10px color-mix(in srgb, var(--brand) 38%, transparent),
-        var(--shadow-lg);
-    }
+    box-shadow: var(--shadow-md);
   }
   .demo-video-frame video {
     width: 100%;
@@ -179,7 +146,6 @@
   .demo-video-play:hover .demo-video-play__circle {
     background: var(--brand, var(--brand));
     border-color: var(--brand, var(--brand));
-    transform: scale(1.06);
   }
   .demo-video-play:hover .demo-video-play__tri {
     border-left-color: #081018;
@@ -189,22 +155,9 @@
     outline-offset: -3px;
   }
 
-  .demo-video-play__label {
-    font-family: var(--font-mono);
-    font-size: 0.92rem;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    line-height: 1;
-    color: #fff;
-    text-shadow: 0 1px 12px rgba(0, 0, 0, 0.6);
-  }
-
   @media (prefers-reduced-motion: reduce) {
     .demo-video-play,
     .demo-video-play__circle,
     .demo-video-play__tri { transition: none; }
-    /* Keep the glow, drop the breathing animation. */
-    .demo-video-frame { animation: none; }
   }
 </style>
