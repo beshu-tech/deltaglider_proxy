@@ -84,6 +84,63 @@ async fn test_no_delta_hint_header_stores_passthrough() {
     assert_eq!(st, "passthrough", "the hint must skip the delta");
 }
 
+/// A CopyObject REPLACE self-copy that carries the hint follows the PUT rule:
+/// the object is stored passthrough and the hint is not stored as metadata.
+#[tokio::test]
+async fn test_no_delta_hint_on_replace_self_copy_is_not_persisted() {
+    let server = TestServer::builder().build().await;
+    let http = server.http();
+    let base = generate_binary(100_000, 42);
+    let variant = mutate_binary(&base, 0.01);
+    for (key, body) in [("releases/base.zip", base), ("releases/v1.zip", variant)] {
+        put_object(
+            &http,
+            &server.endpoint(),
+            server.bucket(),
+            key,
+            body,
+            "application/zip",
+        )
+        .await;
+    }
+    let before = head_headers(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "releases/v1.zip",
+    )
+    .await;
+    assert_eq!(before["x-amz-storage-type"], "delta");
+
+    let client = server.s3_client().await;
+    client
+        .copy_object()
+        .bucket(server.bucket())
+        .key("releases/v1.zip")
+        .copy_source(format!("{}/releases/v1.zip", server.bucket()))
+        .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+        .content_type("application/zip")
+        .metadata("dg-no-delta", "true")
+        .metadata("owner", "dana")
+        .send()
+        .await
+        .expect("REPLACE self-copy");
+
+    let after = head_headers(
+        &http,
+        &server.endpoint(),
+        server.bucket(),
+        "releases/v1.zip",
+    )
+    .await;
+    assert_eq!(after["x-amz-storage-type"], "passthrough", "{after:?}");
+    assert_eq!(after["x-amz-meta-owner"], "dana");
+    assert!(
+        !after.contains_key("x-amz-meta-dg-no-delta"),
+        "the hint must not be stored: {after:?}"
+    );
+}
+
 /// Force EVERY delta GET through the Phase-3 spooled-reconstruction path
 /// (`DGP_SPOOL_THRESHOLD_BYTES=1`) and assert byte-exact reconstruction through
 /// the real S3 API. Exercises decode_to_writer → spool file → SHA-256 pre-flight
