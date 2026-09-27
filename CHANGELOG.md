@@ -165,6 +165,13 @@ proxy installed the new engine before the refusal, so the new limit
 served requests while the config still showed the old one. Now every
 check runs first, and the new engine goes live as the last step.
 
+### Fixed — Oversized metadata answers `MetadataTooLarge` on every path
+
+A browser form upload with user metadata over 2 KB, and a write whose stored
+metadata does not fit the filesystem backend's extended attribute, answered
+`400 InvalidArgument`. A `PutObject` answered `400 MetadataTooLarge`. Now
+every path answers `400 MetadataTooLarge` with the same message.
+
 ### Fixed — Retried multipart completions answer the right error
 
 A CompleteMultipartUpload for an upload that was already completed, with

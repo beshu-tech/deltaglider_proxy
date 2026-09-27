@@ -49,6 +49,10 @@ pub enum S3Error {
     #[error("KeyTooLongError: {0}")]
     KeyTooLong(String),
 
+    /// User or stored metadata over the limit (400, S3 code `MetadataTooLarge`).
+    #[error("MetadataTooLarge: {0}")]
+    MetadataTooLarge(String),
+
     #[error("InvalidRequest: {0}")]
     InvalidRequest(String),
 
@@ -119,6 +123,7 @@ impl S3Error {
             S3Error::InternalError(_) => "InternalError",
             S3Error::InvalidArgument(_) => "InvalidArgument",
             S3Error::KeyTooLong(_) => "KeyTooLongError",
+            S3Error::MetadataTooLarge(_) => "MetadataTooLarge",
             S3Error::InvalidRequest(_) => "InvalidRequest",
             S3Error::MalformedXML => "MalformedXML",
             S3Error::NoSuchUpload(_) => "NoSuchUpload",
@@ -152,6 +157,7 @@ impl S3Error {
             S3Error::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             S3Error::InvalidArgument(_) => StatusCode::BAD_REQUEST,
             S3Error::KeyTooLong(_) => StatusCode::BAD_REQUEST,
+            S3Error::MetadataTooLarge(_) => StatusCode::BAD_REQUEST,
             S3Error::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             S3Error::MalformedXML => StatusCode::BAD_REQUEST,
             S3Error::NoSuchUpload(_) => StatusCode::NOT_FOUND,
@@ -241,9 +247,7 @@ impl From<crate::storage::StorageError> for S3Error {
             {
                 S3Error::InvalidRequest(KEY_PATH_CONFLICT_FS.to_string())
             }
-            crate::storage::StorageError::MetadataTooLarge(msg) => {
-                S3Error::InvalidArgument(format!("MetadataTooLarge: {msg}"))
-            }
+            crate::storage::StorageError::MetadataTooLarge(msg) => S3Error::MetadataTooLarge(msg),
             crate::storage::StorageError::BucketNotFound(b) => S3Error::NoSuchBucket(b),
             crate::storage::StorageError::BucketNotEmpty(b) => S3Error::BucketNotEmpty(b),
             crate::storage::StorageError::AlreadyExists(b) => S3Error::BucketAlreadyExists(b),
@@ -356,6 +360,22 @@ mod tests {
         let other: S3Error =
             crate::storage::StorageError::Io(std::io::Error::from_raw_os_error(libc::EIO)).into();
         assert_eq!(other.code(), "InternalError");
+    }
+
+    /// Every surface answers oversized metadata with the S3 code
+    /// `MetadataTooLarge`; form POST and stored metadata answered
+    /// `InvalidArgument` (s3surface-18).
+    #[test]
+    fn metadata_too_large_has_its_own_code() {
+        let err: S3Error = crate::storage::StorageError::MetadataTooLarge("big".into()).into();
+        assert_eq!(err.code(), "MetadataTooLarge");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert!(err.to_xml("id").contains("<Code>MetadataTooLarge</Code>"));
+        let form = S3Error::MetadataTooLarge(
+            crate::api::handlers::object_helpers::user_metadata_too_large_message(3000),
+        );
+        assert_eq!(form.code(), "MetadataTooLarge");
+        assert!(form.to_string().contains("3000 bytes"));
     }
 
     /// Regression: EntityTooLarge must return 413, not 400.

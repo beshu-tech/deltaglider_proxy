@@ -2633,6 +2633,7 @@ fn engine_error_to_s3s(err: impl Into<crate::api::S3Error>) -> s3s::S3Error {
         }
         crate::api::S3Error::InvalidArgument(msg) => s3s::s3_error!(InvalidArgument, "{}", msg),
         crate::api::S3Error::KeyTooLong(msg) => s3s::s3_error!(KeyTooLongError, "{}", msg),
+        crate::api::S3Error::MetadataTooLarge(msg) => s3s::s3_error!(MetadataTooLarge, "{}", msg),
         crate::api::S3Error::InvalidRequest(msg) => s3s::s3_error!(InvalidRequest, "{}", msg),
         crate::api::S3Error::NoSuchUpload(id) => {
             // Multipart upload state is in-memory and PER-INSTANCE. Behind a
@@ -2716,9 +2717,8 @@ fn check_user_metadata_size_s3s(
     crate::api::handlers::object_helpers::user_metadata_size_check(metadata).map_err(|size| {
         s3s::s3_error!(
             MetadataTooLarge,
-            "user metadata is {} bytes; the limit is {} bytes",
-            size,
-            crate::api::handlers::object_helpers::USER_METADATA_MAX_BYTES
+            "{}",
+            crate::api::handlers::object_helpers::user_metadata_too_large_message(size)
         )
     })
 }

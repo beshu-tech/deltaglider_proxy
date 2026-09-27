@@ -152,6 +152,12 @@ pub(crate) fn quota_decision(quota: u64, used: Option<u64>, incoming: u64) -> Re
 /// `x-amz-meta-*` key (without the prefix) and value, summed.
 pub(crate) const USER_METADATA_MAX_BYTES: usize = 2048;
 
+/// THE client message for user metadata over the limit (PUT, copy, multipart,
+/// form POST), sent with the S3 code `MetadataTooLarge`.
+pub(crate) fn user_metadata_too_large_message(size: usize) -> String {
+    format!("user metadata is {size} bytes; the limit is {USER_METADATA_MAX_BYTES} bytes")
+}
+
 /// Pure metadata-size verdict for every client write that carries user
 /// metadata (PUT, CreateMultipartUpload, CopyObject REPLACE, form POST).
 /// Oversized metadata used to reach storage and fail there: 500 on S3

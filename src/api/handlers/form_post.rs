@@ -549,10 +549,9 @@ async fn parse_form_post_upload(
     }
 
     if let Err(size) = super::object_helpers::user_metadata_size_check(&user_metadata) {
-        return Err(S3Error::InvalidArgument(format!(
-            "MetadataTooLarge: user metadata is {size} bytes; the limit is {} bytes",
-            super::object_helpers::USER_METADATA_MAX_BYTES
-        )));
+        return Err(S3Error::MetadataTooLarge(
+            super::object_helpers::user_metadata_too_large_message(size),
+        ));
     }
 
     let key_field = lookup_form_field(&fields_ci, "key")
