@@ -248,6 +248,7 @@ impl From<crate::storage::StorageError> for S3Error {
                 S3Error::InvalidRequest(KEY_PATH_CONFLICT_FS.to_string())
             }
             crate::storage::StorageError::MetadataTooLarge(msg) => S3Error::MetadataTooLarge(msg),
+            crate::storage::StorageError::InvalidRange(_) => S3Error::InvalidRange,
             crate::storage::StorageError::BucketNotFound(b) => S3Error::NoSuchBucket(b),
             crate::storage::StorageError::BucketNotEmpty(b) => S3Error::BucketNotEmpty(b),
             crate::storage::StorageError::AlreadyExists(b) => S3Error::BucketAlreadyExists(b),

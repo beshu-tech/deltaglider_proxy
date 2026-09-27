@@ -295,6 +295,15 @@ lost, and the panel showed no unsaved changes. Now the read replaces the
 form only when it has no new edits. Otherwise the edits stay, and the
 panel shows them as unsaved. The read also no longer hides the form.
 
+### Fixed — A range GET past the end of an object answers 416
+
+The size that a range GET is checked against can be stale, for example
+after a smaller overwrite on another instance. On a backend with proxy
+encryption, a range that started past the end of an older-format object
+crashed the request, and on the filesystem backend the response declared
+more bytes than it sent. Now such a range answers `416 InvalidRange`, and a
+range end past the object is cut to the object's last byte.
+
 ### Fixed — A PUT on the filesystem backend no longer fails with 404 during a DELETE
 
 A DELETE of the last object under a prefix removes the empty directories

@@ -1744,22 +1744,9 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
             // backend range reads fire.
             let key = self.pick_decrypt_key(stamped_key_id(&meta))?;
             let final_idx = final_chunk_index_for_plaintext_size(meta.file_size);
-            // Clamp `end` (inclusive) to the actual plaintext size.
-            let effective_end = std::cmp::min(end, meta.file_size.saturating_sub(1));
-            if effective_end < start {
-                // Out-of-range for this object. HTTP handlers clamp
-                // via resolve_range before reaching us (returning 416
-                // upstream), so this is unreachable in the serving
-                // path today. Future callers that reach here get a
-                // hard error rather than the pre-B3 `(empty, 0)`
-                // signal, which overlapped with the default-impl's
-                // "full stream, not range" contract and mis-routed
-                // callers into buffered fallbacks.
-                return Err(StorageError::Other(format!(
-                    "range out of bounds: start={} effective_end={} file_size={}",
-                    start, effective_end, meta.file_size
-                )));
-            }
+            // Out-of-range for this object (the caller's size can be stale):
+            // an error, never the pre-B3 `(empty, 0)` "not a range" signal.
+            let (start, effective_end) = super::clamp_range(start, end, meta.file_size)?;
             let (first_chunk, _) = chunk_index_for_plaintext_offset(start);
             let (last_chunk, _) = chunk_index_for_plaintext_offset(effective_end);
 
@@ -1811,9 +1798,9 @@ impl<B: StorageBackend + Send + Sync> StorageBackend for EncryptingBackend<B> {
         if is_encrypted(&meta) {
             let data = self.inner.get_passthrough(bucket, prefix, filename).await?;
             let plain = self.decrypt_if_needed(data, &meta)?;
-            let s = start as usize;
-            let e = std::cmp::min(end as usize + 1, plain.len());
-            let slice = Bytes::from(plain[s..e].to_vec());
+            // Clamp against the decrypted length, not a (maybe stale) size.
+            let (s, e) = super::clamp_range(start, end, plain.len() as u64)?;
+            let slice = Bytes::from(plain[s as usize..=e as usize].to_vec());
             let len = slice.len() as u64;
             return Ok((Box::pin(futures::stream::once(async { Ok(slice) })), len));
         }
@@ -2157,6 +2144,55 @@ mod tests {
     /// The streaming `put_passthrough_file` must produce a chunked object that
     /// decrypts byte-identically via the normal read path — across the framing
     /// boundaries (empty, sub-window, exact window, exact 2 windows, multi+tail).
+    /// storage-2: the adapter clamps a range against a size from the
+    /// metadata cache, which can be stale. The v1 (single-shot) branch then
+    /// sliced `plain[s..e]` with `s` past the end and panicked the request.
+    /// Out-of-range is an `InvalidRange` error; an end past the object is
+    /// clamped.
+    #[tokio::test]
+    async fn v1_range_reads_out_of_bounds_are_an_error_not_a_panic() {
+        use crate::storage::filesystem::FilesystemBackend;
+        use futures::StreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fs = FilesystemBackend::new(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let cfg = Arc::new(ArcSwap::new(Arc::new(EncryptionConfig {
+            key: Some(test_key()),
+            key_id: Some("kid-1".to_string()),
+            ..Default::default()
+        })));
+        let wrapper = EncryptingBackend::new(fs, cfg);
+        wrapper.create_bucket("b").await.unwrap();
+        let meta = FileMetadata::fallback(
+            "o.bin".into(),
+            10,
+            "md5".into(),
+            Utc::now(),
+            None,
+            crate::types::StorageInfo::Passthrough,
+        );
+        wrapper
+            .put_passthrough("b", "p", "o.bin", b"0123456789", &meta)
+            .await
+            .unwrap();
+        for (start, end) in [(20, 25), (10, 10), (8, 2)] {
+            let res = wrapper
+                .get_passthrough_stream_range("b", "p", "o.bin", start, end)
+                .await;
+            assert!(
+                matches!(res, Err(StorageError::InvalidRange(_))),
+                "({start},{end}) must be InvalidRange"
+            );
+        }
+        let (stream, len) = wrapper
+            .get_passthrough_stream_range("b", "p", "o.bin", 5, 100)
+            .await
+            .unwrap();
+        let body: Vec<u8> = stream.map(|c| c.unwrap().to_vec()).concat().await;
+        assert_eq!((len, body.as_slice()), (5, &b"56789"[..]));
+    }
+
     #[tokio::test]
     async fn streaming_put_passthrough_file_roundtrips_all_boundaries() {
         use crate::storage::filesystem::FilesystemBackend;

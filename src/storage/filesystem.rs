@@ -1503,6 +1503,7 @@ impl StorageBackend for FilesystemBackend {
         }
 
         let mut file = tokio::fs::File::open(&data_path).await?;
+        let (start, end) = super::clamp_range(start, end, file.metadata().await?.len())?;
         file.seek(std::io::SeekFrom::Start(start)).await?;
         let range_len = end - start + 1;
         let limited = file.take(range_len);
@@ -2963,5 +2964,44 @@ mod tests {
             calls, 2,
             "a write path calls create_dir_all; use ensure_dir"
         );
+    }
+
+    /// storage-2: a range past the object's end (the caller's size can be
+    /// stale) underflowed `end - start + 1` or declared more bytes than the
+    /// body has. Out-of-range is `InvalidRange`; an end past the object is
+    /// clamped, so the declared length matches the body.
+    #[tokio::test]
+    async fn range_reads_out_of_bounds_are_an_error_and_ends_are_clamped() {
+        use futures::StreamExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let backend = FilesystemBackend::new(tmp.path().to_path_buf())
+            .await
+            .expect("new backend");
+        backend.create_bucket("bucket").await.expect("create");
+        backend
+            .put_passthrough(
+                "bucket",
+                "p",
+                "o.bin",
+                b"0123456789",
+                &dummy_metadata("o.bin"),
+            )
+            .await
+            .unwrap();
+        for (start, end) in [(20, 25), (10, 10), (8, 2)] {
+            let res = backend
+                .get_passthrough_stream_range("bucket", "p", "o.bin", start, end)
+                .await;
+            assert!(
+                matches!(res, Err(StorageError::InvalidRange(_))),
+                "({start},{end}) must be InvalidRange"
+            );
+        }
+        let (stream, len) = backend
+            .get_passthrough_stream_range("bucket", "p", "o.bin", 5, 100)
+            .await
+            .unwrap();
+        let body: Vec<u8> = stream.map(|c| c.unwrap().to_vec()).concat().await;
+        assert_eq!((len, body.as_slice()), (5, &b"56789"[..]));
     }
 }

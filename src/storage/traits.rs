@@ -143,8 +143,27 @@ pub enum StorageError {
     #[error("Backend unavailable (timed out or unreachable): {0}")]
     Unavailable(String),
 
+    /// The requested byte range starts past the object's end (the caller
+    /// resolved it against a stale size). Maps to 416 InvalidRange.
+    #[error("Invalid range: {0}")]
+    InvalidRange(String),
+
     #[error("Storage error: {0}")]
     Other(String),
+}
+
+/// Pure: clamp an inclusive byte range `start..=end` to an object of `len`
+/// bytes. A range that starts at or past the end, or with `start > end`, is
+/// [`StorageError::InvalidRange`]; an `end` past the object is clamped.
+/// Every `get_passthrough_stream_range` resolves its range through it.
+pub fn clamp_range(start: u64, end: u64, len: u64) -> Result<(u64, u64), StorageError> {
+    let clamped = end.min(len.saturating_sub(1));
+    if len == 0 || start > clamped {
+        return Err(StorageError::InvalidRange(format!(
+            "bytes {start}-{end} of an object of {len} bytes"
+        )));
+    }
+    Ok((start, clamped))
 }
 
 /// Pure: whether an I/O error says that a file name or path is too long
