@@ -5,8 +5,6 @@
 //! Provides TestServer (filesystem and S3 backends), data generators,
 //! and MinIO availability gating.
 
-#![allow(dead_code)]
-
 mod signed_http;
 pub use signed_http::{S3Http, S3Requests};
 
@@ -216,24 +214,6 @@ impl TestServer {
         Self::builder().build().await
     }
 
-    /// Start a test server with filesystem backend and a custom max delta ratio
-    pub async fn filesystem_with_max_delta_ratio(max_delta_ratio: f32) -> Self {
-        Self::builder()
-            .max_delta_ratio(max_delta_ratio)
-            .build()
-            .await
-    }
-
-    /// Start a test server with filesystem backend and a custom max object size
-    pub async fn filesystem_with_max_object_size(max_size: u64) -> Self {
-        Self::builder().max_object_size(max_size).build().await
-    }
-
-    /// Start a test server with filesystem backend and custom codec concurrency
-    pub async fn filesystem_with_codec_concurrency(concurrency: usize) -> Self {
-        Self::builder().codec_concurrency(concurrency).build().await
-    }
-
     /// Start a test server with S3 backend (needs MinIO running)
     pub async fn s3() -> Self {
         Self::builder()
@@ -248,20 +228,6 @@ impl TestServer {
         Self::builder()
             .s3_endpoint(endpoint)
             .bucket(bucket)
-            .build()
-            .await
-    }
-
-    /// Start a test server with S3 backend and a custom max delta ratio.
-    pub async fn s3_with_endpoint_and_delta_ratio(
-        endpoint: &str,
-        bucket: &str,
-        max_delta_ratio: f32,
-    ) -> Self {
-        Self::builder()
-            .s3_endpoint(endpoint)
-            .bucket(bucket)
-            .max_delta_ratio(max_delta_ratio)
             .build()
             .await
     }
@@ -484,12 +450,6 @@ impl TestServer {
         &self.bucket
     }
 
-    /// Get the child process PID
-    pub fn pid(&self) -> u32 {
-        self.process.id()
-    }
-
-    /// Get the data directory path (filesystem backend only)
     /// Path of the config file the server was spawned with. Tests can read
     /// this to verify that admin-API config mutations persist to the
     /// correct file (regression coverage for the `backends.rs`
@@ -498,6 +458,7 @@ impl TestServer {
         &self.config_path
     }
 
+    /// Get the data directory path (filesystem backend only)
     pub fn data_dir(&self) -> Option<&std::path::Path> {
         self._data_dir.as_ref().map(|d| d.path())
     }
@@ -514,40 +475,8 @@ impl TestServer {
     /// config changes. Falls through the same readiness probe as the
     /// initial spawn.
     pub async fn respawn_without_encryption_key(&mut self) {
-        stop_child(&mut self.process);
-        // Poll until the kernel has actually released the listening
-        // socket before we spawn the new child. A hard 200 ms sleep
-        // was racy on slow hosts (EADDRINUSE) and over-long on fast
-        // ones. Bounded to ~2s — if we can't bind in that window
-        // something is genuinely stuck and a loud panic is better
-        // than silently waiting forever.
-        let addr = format!("127.0.0.1:{}", self.port);
-        let mut rebind_ok = false;
-        for _ in 0..40 {
-            match std::net::TcpListener::bind(&addr) {
-                Ok(listener) => {
-                    drop(listener);
-                    rebind_ok = true;
-                    break;
-                }
-                Err(_) => sleep(Duration::from_millis(50)).await,
-            }
-        }
-        assert!(
-            rebind_ok,
-            "port {} did not free within ~2s after killing the old child; \
-             another process may be holding it (try `lsof -i :{}`)",
-            self.port, self.port
-        );
-
-        // Explicitly NOT setting DGP_ENCRYPTION_KEY (`proxy_command` strips
-        // any inherited one).
-        let mut cmd = proxy_command(&self.config_path, self.production_security);
-        for (key, value) in &self.extra_env {
-            cmd.env(key, value);
-        }
-        self.process = cmd.spawn().expect("Failed to respawn server");
-        self.wait_ready().await;
+        // `proxy_command` strips any inherited DGP_ENCRYPTION_KEY.
+        self.respawn_with_env(&[]).await;
     }
 }
 
@@ -1494,15 +1423,6 @@ pub async fn list_objects_raw(
 
 // === Quick-setup helpers (reduce test boilerplate) ===
 
-/// Quick setup: OPEN-ACCESS filesystem server + an unsigned reqwest client.
-/// The client sends no SigV4, so the server must run with
-/// `authentication: none`; the name keeps that visible at the call site.
-pub async fn open_access_setup() -> (TestServer, reqwest::Client) {
-    let server = TestServer::builder().open_access().build().await;
-    let http = reqwest::Client::new();
-    (server, http)
-}
-
 /// Quick setup: filesystem server (auth on) + a client that signs with its
 /// credentials.
 pub async fn signed_setup() -> (TestServer, S3Http) {
@@ -1765,9 +1685,6 @@ pub fn read_xattr_metadata(
 }
 
 impl TestServer {
-    /// Kill + respawn against the SAME config file, data dir, and port —
-    /// with `extra` env vars applied AFTER the default `env_remove` calls
-    /// (so a test can inject e.g. `DGP_BOOTSTRAP_PASSWORD_HASH`).
     /// Stop the proxy process (the data dir and config stay). A test edits
     /// on-disk state here, then calls `respawn_with_env`.
     pub fn kill(&mut self) {
@@ -1782,10 +1699,14 @@ impl TestServer {
         sigterm_then_wait(&mut self.process);
     }
 
+    /// Kill + respawn against the SAME config file, data dir, and port —
+    /// with `extra` env vars applied AFTER the default `env_remove` calls
+    /// (so a test can inject e.g. `DGP_BOOTSTRAP_PASSWORD_HASH`).
     pub async fn respawn_with_env(&mut self, extra: &[(&str, &str)]) {
         stop_child(&mut self.process);
-        // Poll until the kernel releases the listening socket (mirrors
-        // `respawn_without_encryption_key`); bounded to ~2s.
+        // Poll until the kernel releases the listening socket. A fixed
+        // sleep was racy on slow hosts (EADDRINUSE); bounded to ~2s so a
+        // stuck port panics loudly.
         let addr = format!("127.0.0.1:{}", self.port);
         let mut rebind_ok = false;
         for _ in 0..40 {

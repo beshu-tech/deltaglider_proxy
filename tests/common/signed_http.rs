@@ -20,7 +20,7 @@ use aws_sigv4::http_request::{
     UriPathNormalizationMode,
 };
 use aws_sigv4::sign::v4;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderName, HeaderValue};
 use reqwest::Method;
 use sha2::{Digest, Sha256};
 
@@ -102,18 +102,8 @@ impl S3RequestBuilder {
         self
     }
 
-    pub fn headers(mut self, headers: HeaderMap) -> Self {
-        self.inner = self.inner.headers(headers);
-        self
-    }
-
     pub fn body<T: Into<reqwest::Body>>(mut self, body: T) -> Self {
         self.inner = self.inner.body(body);
-        self
-    }
-
-    pub fn query<T: serde::Serialize + ?Sized>(mut self, query: &T) -> Self {
-        self.inner = self.inner.query(query);
         self
     }
 
