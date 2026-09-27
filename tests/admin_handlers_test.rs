@@ -461,6 +461,216 @@ async fn backends_create_probe_route_and_delete() {
     assert_audited(&admin, &ep, "backend_delete", "extra").await;
 }
 
+/// Characterisation test for the backend, bucket-route and job-rule
+/// writers of the admin API: status and body of every arm, compared with a
+/// golden file, plus the side effects of the refused arms. It pins what
+/// clients see while these writers move onto the config write pipeline.
+#[tokio::test]
+async fn backend_and_rule_writes_answer_as_the_golden_file() {
+    let (a, b, c) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let yaml = format!(
+        "backends:\n  - name: hetzner-fsn1\n    type: filesystem\n    path: \"{}\"\n  - name: local-disk\n    type: filesystem\n    path: \"{}\"\ndefault_backend: hetzner-fsn1\nreplication:\n  enabled: true\n  tick_interval: \"1h\"\n  rules:\n    - name: releases-dr\n      enabled: true\n      source:\n        bucket: releases\n        prefix: \"\"\n      destination:\n        bucket: db-archive\n        prefix: \"\"\n      interval: \"1h\"\nlifecycle:\n  enabled: true\n  tick_interval: \"1h\"\n  rules:\n    - name: expire-downloads\n      enabled: true\n      bucket: downloads\n      prefix: \"\"\n      expire_after: \"30d\"\n",
+        a.path().display(),
+        b.path().display()
+    );
+    let server = TestServer::builder()
+        .extra_yaml_storage_section(&yaml)
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let mut out = serde_json::Map::new();
+    async fn record(out: &mut serde_json::Map<String, Value>, name: &str, resp: reqwest::Response) {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap();
+        let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
+        out.insert(name.to_string(), json!({ "status": status, "body": body }));
+    }
+    let backends = format!("{ep}/_/api/admin/backends");
+    let buckets = format!("{ep}/_/api/admin/buckets");
+    let aws_dr = c.path().display().to_string();
+
+    let r = admin
+        .post(&backends)
+        .json(&json!({ "name": "aws-dr", "type": "filesystem", "path": aws_dr }));
+    record(&mut out, "backend_create_ok", r.send().await.unwrap()).await;
+    let r = admin
+        .post(&backends)
+        .json(&json!({ "name": "aws-dr", "type": "filesystem", "path": aws_dr }));
+    record(&mut out, "backend_create_dup", r.send().await.unwrap()).await;
+    let r = admin
+        .post(&backends)
+        .json(&json!({ "name": " ", "type": "filesystem", "path": "/x" }));
+    record(&mut out, "backend_create_empty", r.send().await.unwrap()).await;
+
+    let r = admin
+        .post(&buckets)
+        .json(&json!({ "name": "Releases", "backend_name": "local-disk" }));
+    record(&mut out, "bucket_create_ok", r.send().await.unwrap()).await;
+    let r = admin
+        .post(&buckets)
+        .json(&json!({ "name": "downloads", "backend_name": "ghost" }));
+    record(
+        &mut out,
+        "bucket_create_unknown_backend",
+        r.send().await.unwrap(),
+    )
+    .await;
+    // A file sits where the bucket directory goes: the create fails, and
+    // the route it added is taken back.
+    std::fs::write(c.path().join("db-archive"), b"not a directory").unwrap();
+    let r = admin
+        .post(&buckets)
+        .json(&json!({ "name": "db-archive", "backend_name": "aws-dr" }));
+    record(&mut out, "bucket_create_fails", r.send().await.unwrap()).await;
+    let live = admin
+        .get(format!("{ep}/_/api/admin/config/export?section=storage"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!live.contains("db-archive:"), "route reverted: {live}");
+    let on_disk = std::fs::read_to_string(server.config_path()).unwrap();
+    assert!(!on_disk.contains("db-archive:"), "{on_disk}");
+    assert!(on_disk.contains("releases:"), "{on_disk}");
+
+    let del = |n: &str| admin.delete(format!("{backends}/{n}")).send();
+    record(
+        &mut out,
+        "backend_delete_default",
+        del("hetzner-fsn1").await.unwrap(),
+    )
+    .await;
+    record(
+        &mut out,
+        "backend_delete_routed",
+        del("local-disk").await.unwrap(),
+    )
+    .await;
+    record(
+        &mut out,
+        "backend_delete_missing",
+        del("ghost").await.unwrap(),
+    )
+    .await;
+    record(&mut out, "backend_delete_ok", del("aws-dr").await.unwrap()).await;
+
+    let rule = |id: &str| {
+        admin
+            .post(format!("{ep}/_/api/admin/jobs/{id}/delete"))
+            .send()
+    };
+    record(
+        &mut out,
+        "rule_delete_replication_ok",
+        rule("replication:releases-dr").await.unwrap(),
+    )
+    .await;
+    record(
+        &mut out,
+        "rule_delete_replication_missing",
+        rule("replication:releases-dr").await.unwrap(),
+    )
+    .await;
+    record(
+        &mut out,
+        "rule_delete_lifecycle_ok",
+        rule("lifecycle:expire-downloads").await.unwrap(),
+    )
+    .await;
+    let on_disk = std::fs::read_to_string(server.config_path()).unwrap();
+    assert!(
+        !on_disk.contains("releases-dr") && !on_disk.contains("expire-downloads"),
+        "{on_disk}"
+    );
+    assert!(!on_disk.contains("aws-dr"), "{on_disk}");
+    assert_audited(&admin, &ep, "replication_delete", "releases-dr").await;
+    assert_audited(&admin, &ep, "lifecycle_delete", "expire-downloads").await;
+    assert_audited(&admin, &ep, "backend_delete", "aws-dr").await;
+
+    let got = serde_json::to_string_pretty(&Value::Object(out)).unwrap();
+    let golden_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/admin_backend_rule_writes_contract.json"
+    );
+    let Ok(golden) = std::fs::read_to_string(golden_path) else {
+        // First run: record the golden file, then fail so it is reviewed.
+        std::fs::write(golden_path, format!("{got}\n")).unwrap();
+        panic!("golden file written to {golden_path}: review and commit it");
+    };
+    assert_eq!(
+        golden.trim(),
+        got.trim(),
+        "the backend / rule write responses changed; if on purpose, update {golden_path}"
+    );
+}
+
+/// A rule delete whose config file write fails changes nothing: the rule
+/// stays live and on disk, and no audit entry claims the delete.
+#[cfg(unix)]
+#[tokio::test]
+async fn rule_delete_that_cannot_persist_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = TestServer::builder()
+        .extra_yaml_storage_section(
+            "lifecycle:\n  enabled: true\n  tick_interval: \"1h\"\n  rules:\n    - name: expire-downloads\n      enabled: true\n      bucket: downloads\n      prefix: \"\"\n      expire_after: \"30d\"\n",
+        )
+        .build()
+        .await;
+    let ep = server.endpoint();
+    let admin = admin_http_client(&ep).await;
+    let dir = server.config_path().parent().unwrap().to_path_buf();
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let resp = admin
+        .post(format!(
+            "{ep}/_/api/admin/jobs/lifecycle:expire-downloads/delete"
+        ))
+        .send()
+        .await
+        .unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    let (code, v) = json_of(resp).await;
+    if code == StatusCode::NO_CONTENT {
+        // Root ignores the directory mode: nothing to test here.
+        return;
+    }
+    assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert!(
+        v.as_str().unwrap().contains("rolled back, no change"),
+        "{v}"
+    );
+    let jobs: Value = admin
+        .get(format!("{ep}/_/api/admin/jobs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        jobs["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["id"] == "lifecycle:expire-downloads"),
+        "the rule stays live: {jobs}"
+    );
+    assert!(std::fs::read_to_string(server.config_path())
+        .unwrap()
+        .contains("expire-downloads"));
+    assert!(!audit(&admin, &ep)
+        .await
+        .iter()
+        .any(|(a, _)| a == "lifecycle_delete"));
+}
+
 #[tokio::test]
 async fn backends_the_synthesised_default_cannot_be_deleted() {
     let server = TestServer::filesystem().await;

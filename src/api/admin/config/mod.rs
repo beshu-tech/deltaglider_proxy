@@ -3,9 +3,9 @@
 //! Admin-API config surface, split into submodules along four genuine
 //! seams. Each submodule owns its handlers AND the request/response
 //! types those handlers produce — the only cross-module coupling is via
-//! the shared helpers in this file (`rebuild_engine`,
-//! `apply_config_transition`, `rebuild_bucket_derived_snapshots`,
-//! `active_config_path`).
+//! the shared helpers in this file (`apply_config_transition`,
+//! `rebuild_bucket_derived_snapshots`, `active_config_path`) and the
+//! config write pipeline in `write.rs`.
 //!
 //! | Submodule            | Endpoints                                                             | Persona          |
 //! |----------------------|-----------------------------------------------------------------------|------------------|
@@ -37,7 +37,9 @@ use transition::engine_affecting_fields_changed;
 use transition::requires_restart_warnings;
 pub(crate) use transition::{apply_config_transition, TransitionCtx};
 pub use version::install_version_key as install_config_version_key;
-pub(crate) use write::{run_internal, InternalRefusal};
+pub(crate) use write::{
+    run_internal, run_internal_held, HeldRefusal, Internal, InternalRefusal, OnPersistError,
+};
 
 /// Names of the four sections the admin API understands. Canonical
 /// home for the enum + its string-wire spelling — any consumer that
@@ -132,16 +134,6 @@ pub struct TestS3Response {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<String>,
-}
-
-/// Rebuild the engine from current config, storing the new engine on success.
-/// Returns `Ok(())` on success, or an error message string on failure.
-pub(super) async fn rebuild_engine(
-    state: &Arc<AdminState>,
-    cfg: &crate::config::Config,
-    context: &str,
-) -> Result<(), String> {
-    crate::config_apply::rebuild_engine_only(&state.s3_state, cfg, context).await
 }
 
 /// Rebuild every hot-swappable structure derived from bucket-level config.

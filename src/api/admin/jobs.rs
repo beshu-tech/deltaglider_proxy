@@ -870,7 +870,7 @@ async fn delete_rule(
     } else {
         None
     };
-    let result = delete_rule_locked(state, sub, name, delete_lease.is_some()).await;
+    let result = delete_rule_locked(state, sub, name, headers, delete_lease.is_some()).await;
     if let Some((lease, owner)) = delete_lease {
         let _ = lease
             .release(
@@ -880,123 +880,127 @@ async fn delete_rule(
             )
             .await;
     }
-    result?;
-
-    crate::audit::audit_log(
-        match sub {
-            JobSubsystem::Replication => "replication_delete",
-            _ => "lifecycle_delete",
-        },
-        "admin",
-        name,
-        headers,
-        "",
-        "",
-    );
-    Ok(())
+    result
 }
 
 /// The locked part of [`delete_rule`]. `holds_rule_lease`: the caller holds
 /// the rule's coordination lease, so no run holds it (and the SQLite lease
 /// check would see the caller's own lease).
+///
+/// ONE critical section (config.write OUTER → db.lock INNER, the codebase
+/// order): liveness check, config retain + persist (the config write
+/// pipeline, which also audits) and the DB row purge, all under the same
+/// guards. For replication the caller's rule lease is the liveness anchor
+/// (it exists before any run row); the run-row check covers a run whose
+/// lease lapsed.
 async fn delete_rule_locked(
     state: &Arc<AdminState>,
     sub: JobSubsystem,
     name: &str,
+    headers: &HeaderMap,
     holds_rule_lease: bool,
 ) -> Result<(), AdminError> {
-    // ONE critical section (config.write OUTER → db.lock INNER, the codebase
-    // order): liveness check, config retain+persist, and the DB row purge all
-    // under the same guards. For replication the caller's rule lease is the
-    // liveness anchor (it exists before any run row); the run-row check below
-    // covers a run whose lease lapsed.
-    {
-        let mut cfg = state.config.write().await;
-        let db_guard = match state.config_db.as_ref() {
+    use super::config::{HeldRefusal, Internal, InternalRefusal, OnPersistError};
+    let hold = async {
+        let db = match state.config_db.as_ref() {
             Some(db) => Some(db.lock().await),
             None => None,
         };
-
-        // H2: refuse to delete a rule with a LIVE run. For replication: a
-        // running/cancelling row OR an unexpired run/verify lease. For
-        // lifecycle: an unexpired lifecycle lease (#10 — the guard was
-        // replication-only, so a lifecycle rule could be purged mid-run).
-        if let Some(db) = db_guard.as_ref() {
-            let now = crate::replication::state_store::current_unix_seconds();
-            let blocked = match sub {
-                JobSubsystem::Replication => {
-                    let run_status = db.replication_latest_run_status(name).ok().flatten();
-                    let run_lease_live = !holds_rule_lease
-                        && db.replication_lease_is_held(name, now).unwrap_or(false);
-                    let lease_live =
-                        run_lease_live || db.parity_lease_is_held(name, now).unwrap_or(false);
-                    delete_blocked_by_live_run(run_status.as_deref(), lease_live)
+        (db, Vec::<String>::new())
+    };
+    let applied = super::config::run_internal_held(
+        state,
+        Internal {
+            headers,
+            action: match sub {
+                JobSubsystem::Replication => "replication_delete",
+                _ => "lifecycle_delete",
+            },
+            target: name,
+            // A persist failure rolls back, so memory and disk never
+            // diverge (a divergence would resurrect the rule on the next
+            // restart).
+            on_persist_error: OnPersistError::RollBack,
+        },
+        hold,
+        |cfg, (db, remaining)| {
+            // H2: refuse to delete a rule with a LIVE run. For replication: a
+            // running/cancelling row OR an unexpired run/verify lease. For
+            // lifecycle: an unexpired lifecycle lease (#10 — the guard was
+            // replication-only, so a lifecycle rule could be purged mid-run).
+            if let Some(db) = db.as_ref() {
+                let now = crate::replication::state_store::current_unix_seconds();
+                let blocked = match sub {
+                    JobSubsystem::Replication => {
+                        let run_status = db.replication_latest_run_status(name).ok().flatten();
+                        let run_lease_live = !holds_rule_lease
+                            && db.replication_lease_is_held(name, now).unwrap_or(false);
+                        let lease_live =
+                            run_lease_live || db.parity_lease_is_held(name, now).unwrap_or(false);
+                        delete_blocked_by_live_run(run_status.as_deref(), lease_live)
+                    }
+                    JobSubsystem::Lifecycle => {
+                        db.lifecycle_lease_is_held(name, now).unwrap_or(false)
+                    }
+                    JobSubsystem::Maintenance => false,
+                };
+                if blocked {
+                    return Err(AdminError::conflict(format!(
+                        "rule '{name}' has a run or verify in progress — stop it before deleting"
+                    )));
                 }
-                JobSubsystem::Lifecycle => db.lifecycle_lease_is_held(name, now).unwrap_or(false),
-                JobSubsystem::Maintenance => false,
-            };
-            if blocked {
-                return Err(AdminError::conflict(format!(
-                    "rule '{name}' has a run or verify in progress — stop it before deleting"
-                )));
             }
-        }
-
-        // Remove from config + persist, restoring on persist failure so memory
-        // and disk never diverge (a divergence would resurrect the rule on the
-        // next restart). The engine does NOT read replication/lifecycle rules,
-        // so no engine rebuild is needed.
-        let rollback = cfg.clone();
-        let existed = match sub {
-            JobSubsystem::Replication => {
-                let before = cfg.replication.rules.len();
-                cfg.replication.rules.retain(|r| r.name != name);
-                cfg.replication.rules.len() != before
-            }
-            JobSubsystem::Lifecycle => {
-                let before = cfg.lifecycle.rules.len();
-                cfg.lifecycle.rules.retain(|r| r.name != name);
-                cfg.lifecycle.rules.len() != before
-            }
-            JobSubsystem::Maintenance => unreachable!(),
-        };
-        if !existed {
-            return Err(not_found());
-        }
-        let path = super::config::active_config_path(state);
-        if let Err(e) = cfg.persist_to_file(&path) {
-            *cfg = rollback;
-            return Err(AdminError::internal(format!(
-                "rule delete FAILED to persist to {path} (rolled back, no change): {e}"
-            )));
-        }
-        let remaining: Vec<String> = match sub {
-            JobSubsystem::Replication => cfg
-                .replication
-                .rules
-                .iter()
-                .map(|r| r.name.clone())
-                .collect(),
-            JobSubsystem::Lifecycle => cfg.lifecycle.rules.iter().map(|r| r.name.clone()).collect(),
-            JobSubsystem::Maintenance => unreachable!(),
-        };
-
-        // Purge the deleted rule's DB rows under the SAME db guard as the
-        // liveness check — no window for a run to start in between.
-        if let Some(db) = db_guard.as_ref() {
-            let res = match sub {
-                JobSubsystem::Replication => db.replication_reconcile_rules(&remaining),
-                JobSubsystem::Lifecycle => db.lifecycle_reconcile_rules(&remaining),
+            let (before, names): (usize, Vec<String>) = match sub {
+                JobSubsystem::Replication => {
+                    let before = cfg.replication.rules.len();
+                    cfg.replication.rules.retain(|r| r.name != name);
+                    let rules = &cfg.replication.rules;
+                    (before, rules.iter().map(|r| r.name.clone()).collect())
+                }
+                JobSubsystem::Lifecycle => {
+                    let before = cfg.lifecycle.rules.len();
+                    cfg.lifecycle.rules.retain(|r| r.name != name);
+                    let rules = &cfg.lifecycle.rules;
+                    (before, rules.iter().map(|r| r.name.clone()).collect())
+                }
                 JobSubsystem::Maintenance => unreachable!(),
             };
-            if let Err(e) = res {
-                // Config is already deleted+persisted; orphan rows are harmless
-                // and get pruned on next boot. Log, don't fail the delete.
-                tracing::warn!("rule '{name}' deleted but DB row purge failed: {e}");
+            if names.len() == before {
+                return Err(not_found());
             }
+            *remaining = names;
+            Ok(())
+        },
+        // Purge the deleted rule's DB rows under the SAME db guard as the
+        // liveness check — no window for a run to start in between.
+        |(db, remaining)| async move {
+            if let Some(db) = db.as_ref() {
+                let res = match sub {
+                    JobSubsystem::Replication => db.replication_reconcile_rules(&remaining),
+                    JobSubsystem::Lifecycle => db.lifecycle_reconcile_rules(&remaining),
+                    JobSubsystem::Maintenance => unreachable!(),
+                };
+                if let Err(e) = res {
+                    // Config is already deleted+persisted; orphan rows are
+                    // harmless and get pruned on next boot. Log, don't fail.
+                    tracing::warn!("rule '{name}' deleted but DB row purge failed: {e}");
+                }
+            }
+            Ok(())
+        },
+    )
+    .await;
+    match applied {
+        Ok(_) => Ok(()),
+        Err(HeldRefusal::Edit(e)) => Err(e),
+        Err(HeldRefusal::Persist { path, error }) => Err(AdminError::internal(format!(
+            "rule delete FAILED to persist to {path} (rolled back, no change): {error}"
+        ))),
+        Err(HeldRefusal::Pipeline(InternalRefusal::Invalid { status, error })) => {
+            Err(AdminError::status(status, error))
         }
+        Err(HeldRefusal::Pipeline(r)) => Err(AdminError::internal(r.to_string())),
     }
-    Ok(())
 }
 
 /// Pure H2 liveness predicate: a rule is delete-blocked when its latest run

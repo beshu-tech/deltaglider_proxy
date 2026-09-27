@@ -38,6 +38,16 @@ now ignores these variables, so a variable that an operator sets by mistake
 cannot slow down or break a production proxy. The startup warning still names
 every such variable that is set.
 
+### Fixed — Backend, bucket-route and rule writes use the config write pipeline
+
+Adding or deleting a backend, routing a new bucket to a backend
+(`POST /_/api/admin/buckets`) and deleting a replication or lifecycle rule
+wrote the config file by hand. They skipped the checks, the environment
+re-apply and the refresh of the public-prefix and admission snapshots that
+every other config write runs. Now they run the same pipeline, so they are
+checked, applied and audited like any other config write. The responses do
+not change.
+
 ### Fixed — A full backup of a declarative-IAM instance restores onto a fresh one
 
 The backup's `config.yaml` has the secret access keys of the users in

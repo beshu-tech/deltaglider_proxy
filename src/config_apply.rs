@@ -43,18 +43,6 @@ pub fn install_engine(app: &AppState, engine: DynEngine, context: &str) {
     tracing::info!("{}", context);
 }
 
-/// Rebuild the engine from `cfg` and hot-swap it into `app.engine`.
-/// On failure the OLD engine keeps serving (nothing is swapped).
-pub async fn rebuild_engine_only(
-    app: &AppState,
-    cfg: &Config,
-    context: &str,
-) -> Result<(), String> {
-    let engine = build_engine(app, cfg).await?;
-    install_engine(app, engine, context);
-    Ok(())
-}
-
 #[derive(Clone)]
 pub struct ConfigMutator {
     pub config: SharedConfig,

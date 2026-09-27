@@ -1,0 +1,84 @@
+{
+  "backend_create_dup": {
+    "body": {
+      "error": "Backend 'aws-dr' already exists",
+      "requires_restart": false,
+      "success": false
+    },
+    "status": 409
+  },
+  "backend_create_empty": {
+    "body": {
+      "error": "Backend name cannot be empty",
+      "requires_restart": false,
+      "success": false
+    },
+    "status": 400
+  },
+  "backend_create_ok": {
+    "body": {
+      "requires_restart": false,
+      "success": true
+    },
+    "status": 201
+  },
+  "backend_delete_default": {
+    "body": {
+      "error": "Cannot delete the default backend. Assign a new default first.",
+      "requires_restart": false,
+      "success": false
+    },
+    "status": 409
+  },
+  "backend_delete_missing": {
+    "body": {
+      "error": "Backend 'ghost' not found",
+      "requires_restart": false,
+      "success": false
+    },
+    "status": 404
+  },
+  "backend_delete_ok": {
+    "body": {
+      "requires_restart": false,
+      "success": true
+    },
+    "status": 200
+  },
+  "backend_delete_routed": {
+    "body": {
+      "error": "Cannot delete 'local-disk': buckets [releases] route to it. Re-route them first.",
+      "requires_restart": false,
+      "success": false
+    },
+    "status": 409
+  },
+  "bucket_create_fails": {
+    "body": "Storage error: IO error: File exists (os error 17)",
+    "status": 400
+  },
+  "bucket_create_ok": {
+    "body": {
+      "backend_name": "local-disk",
+      "bucket": "releases",
+      "success": true
+    },
+    "status": 200
+  },
+  "bucket_create_unknown_backend": {
+    "body": "Unknown backend 'ghost'",
+    "status": 400
+  },
+  "rule_delete_lifecycle_ok": {
+    "body": "",
+    "status": 204
+  },
+  "rule_delete_replication_missing": {
+    "body": "job not found",
+    "status": 404
+  },
+  "rule_delete_replication_ok": {
+    "body": "",
+    "status": 204
+  }
+}

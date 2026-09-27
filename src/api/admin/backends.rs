@@ -4,13 +4,13 @@
 
 use crate::api::admin::extract::AdminJson;
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::config::{BackendConfig, NamedBackendConfig};
+use crate::config::{BackendConfig, Config, NamedBackendConfig};
 
 use super::{audit_log, AdminError, AdminState};
 
@@ -289,8 +289,85 @@ pub async fn create_bucket_on_backend(
         return Err(AdminError::invalid("backend_name cannot be empty"));
     }
 
-    let mut cfg = state.config.write().await;
+    // Buckets are keyed by virtual bucket name, normalized lowercase.
+    let bucket_key = bucket.to_ascii_lowercase();
 
+    // Same write-capability gate as a config apply: a client-writable bucket
+    // on a non-CAS backend under multi-instance makes the next boot exit(1).
+    // Checked first for its 409; the transition runs the gate again under
+    // the lock. No-op single-instance.
+    let mut probe = state.config.read().await.clone();
+    route_bucket(&mut probe, &bucket_key, &backend_name)?;
+    if let Err(e) = crate::coordination::capability::hot_apply_capability_gate(
+        &probe,
+        &state.s3_state.backend_capabilities,
+    )
+    .await
+    {
+        return Err(AdminError::conflict(e));
+    }
+    drop(probe);
+
+    use super::config::{HeldRefusal, Internal, InternalRefusal, OnPersistError};
+    let applied = super::config::run_internal_held(
+        &state,
+        Internal {
+            headers: &headers,
+            action: "admin_create_bucket",
+            target: &format!("{bucket_key}@{backend_name}"),
+            on_persist_error: OnPersistError::Report,
+        },
+        std::future::ready(()),
+        |cfg, _| route_bucket(cfg, &bucket_key, &backend_name),
+        // Create using the SAME key the route is stored under (`bucket_key`,
+        // lowercased). The route is keyed lowercase, so creating with the
+        // original case would miss the explicit route in resolve_existing()
+        // and fall through to the DEFAULT backend — silently creating the
+        // bucket on the wrong backend. A failed create takes the route back.
+        |_| async {
+            state
+                .s3_state
+                .engine
+                .load()
+                .create_bucket(&bucket_key)
+                .await
+                .map_err(|e| AdminError::invalid(e.to_string()))
+        },
+    )
+    .await;
+    match applied {
+        Ok(a) => {
+            if let Err((path, e)) = a.persist {
+                tracing::warn!("Failed to persist config to {}: {}", path, e);
+            }
+        }
+        Err(HeldRefusal::Edit(e)) => return Err(e),
+        Err(HeldRefusal::Pipeline(InternalRefusal::Transition(e))) => {
+            return Err(AdminError::internal(format!(
+                "Failed to rebuild engine: {e}"
+            )))
+        }
+        Err(HeldRefusal::Pipeline(InternalRefusal::EnvReapply(e))) => {
+            return Err(AdminError::internal(e))
+        }
+        Err(HeldRefusal::Pipeline(InternalRefusal::Invalid { status, error })) => {
+            return Err(AdminError::status(status, error))
+        }
+        Err(HeldRefusal::Persist { .. }) => unreachable!("OnPersistError::Report"),
+    }
+
+    Ok(Json(CreateBucketOnBackendResponse {
+        success: true,
+        // Report the actual (normalized, lowercased) bucket name that was
+        // created and routed — not the original-case input.
+        bucket: bucket_key,
+        backend_name,
+    }))
+}
+
+/// Route `bucket_key` to `backend_name` in `cfg` (the edit of
+/// [`create_bucket_on_backend`]).
+fn route_bucket(cfg: &mut Config, bucket_key: &str, backend_name: &str) -> Result<(), AdminError> {
     let backend_exists = if cfg.backends.is_empty() {
         backend_name == "default"
     } else {
@@ -302,104 +379,75 @@ pub async fn create_bucket_on_backend(
             backend_name
         )));
     }
+    let named = !cfg.backends.is_empty();
+    let policy = cfg.buckets.entry(bucket_key.to_string()).or_default();
+    policy.backend = named.then(|| backend_name.to_string());
+    Ok(())
+}
 
-    // Buckets are keyed by virtual bucket name, normalized lowercase.
-    let bucket_key = bucket.to_ascii_lowercase();
-    let old_policy = cfg.buckets.get(&bucket_key).cloned();
-    let mut policy = old_policy.clone().unwrap_or_default();
-    policy.backend = if cfg.backends.is_empty() {
-        None
-    } else {
-        Some(backend_name.clone())
-    };
-    cfg.buckets.insert(bucket_key.clone(), policy);
-
-    // Same write-capability gate as a config apply: this route persists, and
-    // a client-writable bucket on a non-CAS backend under multi-instance
-    // makes the next boot exit(1). No-op single-instance.
-    if let Err(e) = crate::coordination::capability::hot_apply_capability_gate(
-        &cfg,
-        &state.s3_state.backend_capabilities,
+/// A backend mutation answer.
+fn mutation(
+    status: StatusCode,
+    error: Option<String>,
+) -> (StatusCode, Json<BackendMutationResponse>) {
+    (
+        status,
+        Json(BackendMutationResponse {
+            success: error.is_none(),
+            error,
+            requires_restart: false,
+        }),
     )
-    .await
-    {
-        match old_policy {
-            Some(previous) => cfg.buckets.insert(bucket_key, previous),
-            None => cfg.buckets.remove(&bucket_key),
-        };
-        return Err(AdminError::conflict(e));
-    }
+}
 
-    if let Err(e) = super::config::rebuild_engine(
-        &state,
-        &cfg,
-        &format!(
-            "Bucket '{}' routed to backend '{}', engine rebuilt",
-            bucket, backend_name
+/// Run a backend edit through the config write pipeline and answer it.
+///
+/// We do NOT call `trigger_config_sync` here. That helper uploads the
+/// SQLCipher IAM database to S3 — a backend mutation changes the YAML
+/// config file, not the IAM DB, so the sync would be a no-op network
+/// round-trip.
+async fn apply_backend_edit(
+    state: &Arc<AdminState>,
+    headers: &HeaderMap,
+    action: &'static str,
+    name: &str,
+    ok: StatusCode,
+    edit: impl FnOnce(&mut Config) -> Result<(), (StatusCode, String)>,
+) -> (StatusCode, Json<BackendMutationResponse>) {
+    use super::config::{HeldRefusal, Internal, InternalRefusal, OnPersistError};
+    let applied = super::config::run_internal_held(
+        state,
+        Internal {
+            headers,
+            action,
+            target: name,
+            on_persist_error: OnPersistError::Report,
+        },
+        std::future::ready(()),
+        |cfg, _| edit(cfg),
+        |_| std::future::ready(Ok(())),
+    )
+    .await;
+    match applied {
+        Ok(a) => {
+            if let Err((path, e)) = a.persist {
+                tracing::warn!("Failed to persist config to {}: {}", path, e);
+            }
+            mutation(ok, None)
+        }
+        Err(HeldRefusal::Edit((status, error))) => mutation(status, Some(error)),
+        Err(HeldRefusal::Pipeline(InternalRefusal::Transition(e))) => mutation(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some(format!("Failed to rebuild engine: {}", e)),
         ),
-    )
-    .await
-    {
-        if let Some(previous) = old_policy {
-            cfg.buckets.insert(bucket_key, previous);
-        } else {
-            cfg.buckets.remove(&bucket_key);
+        Err(HeldRefusal::Pipeline(InternalRefusal::EnvReapply(e))) => {
+            mutation(StatusCode::INTERNAL_SERVER_ERROR, Some(e))
         }
-        return Err(AdminError::internal(format!(
-            "Failed to rebuild engine: {e}"
-        )));
-    }
-
-    // Create using the SAME key the route is stored under (`bucket_key`,
-    // lowercased). The route is keyed lowercase, so creating with the original
-    // case would miss the explicit route in resolve_existing() and fall through
-    // to the DEFAULT backend — silently creating the bucket on the wrong backend
-    // (and, for an uppercase name + S3 default, failing with InvalidBucketName).
-    if let Err(e) = state
-        .s3_state
-        .engine
-        .load()
-        .create_bucket(&bucket_key)
-        .await
-    {
-        // Roll back routing if create failed (e.g. already exists / backend error).
-        if let Some(previous) = old_policy {
-            cfg.buckets.insert(bucket_key.clone(), previous);
-        } else {
-            cfg.buckets.remove(&bucket_key);
+        Err(HeldRefusal::Pipeline(InternalRefusal::Invalid { status, error })) => {
+            mutation(status, Some(error))
         }
-        let _ = super::config::rebuild_engine(
-            &state,
-            &cfg,
-            &format!(
-                "Bucket create failed for '{}', reverted backend routing",
-                bucket
-            ),
-        )
-        .await;
-        return Err(AdminError::invalid(e.to_string()));
+        Err(HeldRefusal::Persist { .. }) => unreachable!("OnPersistError::Report"),
     }
-
-    let persist_path = super::config::active_config_path(&state);
-    if let Err(e) = cfg.persist_to_file(&persist_path) {
-        tracing::warn!("Failed to persist config to {}: {}", persist_path, e);
-    }
-    drop(cfg);
-
-    audit_log(
-        "admin_create_bucket",
-        "admin",
-        &format!("{bucket_key}@{backend_name}"),
-        &headers,
-    );
-
-    Ok(Json(CreateBucketOnBackendResponse {
-        success: true,
-        // Report the actual (normalized, lowercased) bucket name that was
-        // created and routed — not the original-case input.
-        bucket: bucket_key,
-        backend_name,
-    }))
 }
 
 /// POST /api/admin/backends — add a new named backend.
@@ -466,83 +514,35 @@ pub async fn create_backend(
             .set(&name, &backend_config, verdict);
     }
 
-    let mut cfg = state.config.write().await;
-
-    // Check for duplicate name
-    if cfg.backends.iter().any(|b| b.name == name) {
-        return (
-            axum::http::StatusCode::CONFLICT,
-            Json(BackendMutationResponse {
-                success: false,
-                error: Some(format!("Backend '{}' already exists", name)),
-                requires_restart: false,
-            }),
-        );
-    }
-
-    let old_backends = cfg.backends.clone();
-    let old_default = cfg.default_backend.clone();
-
-    cfg.backends.push(NamedBackendConfig {
-        name: name.clone(),
-        backend: backend_config,
-        // STEP-1: per-backend encryption config. `CreateBackendRequest`
-        // will gain an optional `encryption` field in Step 6 (per the
-        // plan); until then new backends default to plaintext (mode:
-        // none) — operators configure encryption after creation via
-        // the Backends panel or a section-level PATCH.
-        encryption: crate::config::BackendEncryptionConfig::default(),
-    });
-
-    if body.set_default == Some(true) || cfg.default_backend.is_none() {
-        cfg.default_backend = Some(name.clone());
-    }
-
-    if let Err(e) = super::config::rebuild_engine(
+    let set_default = body.set_default == Some(true);
+    apply_backend_edit(
         &state,
-        &cfg,
-        &format!("Backend '{}' added, engine rebuilt", name),
+        &headers,
+        "backend_create",
+        &name,
+        StatusCode::CREATED,
+        |cfg| {
+            if cfg.backends.iter().any(|b| b.name == name) {
+                return Err((
+                    StatusCode::CONFLICT,
+                    format!("Backend '{}' already exists", name),
+                ));
+            }
+            cfg.backends.push(NamedBackendConfig {
+                name: name.clone(),
+                backend: backend_config,
+                // New backends default to plaintext (mode: none) —
+                // operators configure encryption after creation via the
+                // Backends panel or a section-level PATCH.
+                encryption: crate::config::BackendEncryptionConfig::default(),
+            });
+            if set_default || cfg.default_backend.is_none() {
+                cfg.default_backend = Some(name.clone());
+            }
+            Ok(())
+        },
     )
     .await
-    {
-        cfg.backends = old_backends;
-        cfg.default_backend = old_default;
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(BackendMutationResponse {
-                success: false,
-                error: Some(format!("Failed to rebuild engine: {}", e)),
-                requires_restart: false,
-            }),
-        );
-    }
-
-    // Persist to the active config file resolved at startup from `--config`
-    // or the search-path walk. Hardcoding a CWD-relative default here
-    // used to silently redirect admin-API writes to a stale location when
-    // the operator had launched with `--config /etc/dgp/config.yaml`,
-    // producing a latent "my backend disappears on restart" bug.
-    //
-    // Note: we do NOT call `trigger_config_sync` here. That helper uploads
-    // the SQLCipher IAM database to S3 — a backend mutation changes the
-    // YAML config file, not the IAM DB, so the sync would be a no-op
-    // network round-trip. Handlers that DO mutate the IAM DB (users,
-    // groups, external_auth, password) are the correct callers.
-    let persist_path = super::config::active_config_path(&state);
-    if let Err(e) = cfg.persist_to_file(&persist_path) {
-        tracing::warn!("Failed to persist config to {}: {}", persist_path, e);
-    }
-    drop(cfg);
-    audit_log("backend_create", "admin", &name, &headers);
-
-    (
-        axum::http::StatusCode::CREATED,
-        Json(BackendMutationResponse {
-            success: true,
-            error: None,
-            requires_restart: false,
-        }),
-    )
 }
 
 /// DELETE /api/admin/backends/:name — remove a named backend.
@@ -551,124 +551,61 @@ pub async fn delete_backend(
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let mut cfg = state.config.write().await;
-
-    // Guard: the synthesised "default" entry surfaced by list_backends
-    // when `cfg.backends` is empty is NOT a real named backend — it's
-    // a virtual projection of `cfg.backend`. A DELETE on it would
-    // otherwise fall into the generic "not found" branch below with
-    // a misleading error; surface the specific shape issue instead.
-    if name == "default" && cfg.backends.iter().all(|b| b.name != name) {
-        return (
-            axum::http::StatusCode::CONFLICT,
-            Json(BackendMutationResponse {
-                success: false,
-                error: Some(
-                    "Cannot delete the synthesised 'default' backend — it represents the legacy \
-                     singleton `cfg.backend`. To move off the singleton, add a named backend \
-                     alongside it, then clear the singleton via section PUT on `storage`."
-                        .into(),
-                ),
-                requires_restart: false,
-            }),
-        );
-    }
-
-    // Check if backend exists
-    if !cfg.backends.iter().any(|b| b.name == name) {
-        return (
-            axum::http::StatusCode::NOT_FOUND,
-            Json(BackendMutationResponse {
-                success: false,
-                error: Some(format!("Backend '{}' not found", name)),
-                requires_restart: false,
-            }),
-        );
-    }
-
-    // Check if it's the default backend
-    if cfg.default_backend.as_deref() == Some(&name) {
-        return (
-            axum::http::StatusCode::CONFLICT,
-            Json(BackendMutationResponse {
-                success: false,
-                error: Some(
-                    "Cannot delete the default backend. Assign a new default first.".into(),
-                ),
-                requires_restart: false,
-            }),
-        );
-    }
-
-    // Check if any bucket policies route to this backend
-    let routed: Vec<String> = cfg
-        .buckets
-        .iter()
-        .filter(|(_, p)| p.backend.as_deref() == Some(&name))
-        .map(|(bucket, _)| bucket.clone())
-        .collect();
-    if !routed.is_empty() {
-        return (
-            axum::http::StatusCode::CONFLICT,
-            Json(BackendMutationResponse {
-                success: false,
-                error: Some(format!(
-                    "Cannot delete '{}': buckets [{}] route to it. Re-route them first.",
-                    name,
-                    routed.join(", ")
-                )),
-                requires_restart: false,
-            }),
-        );
-    }
-
-    let old_backends = cfg.backends.clone();
-    cfg.backends.retain(|b| b.name != name);
-
-    if let Err(e) = super::config::rebuild_engine(
+    let refuse = |status, error: String| Err((status, error));
+    apply_backend_edit(
         &state,
-        &cfg,
-        &format!("Backend '{}' removed, engine rebuilt", name),
+        &headers,
+        "backend_delete",
+        &name,
+        StatusCode::OK,
+        |cfg| {
+            // Guard: the synthesised "default" entry surfaced by list_backends
+            // when `cfg.backends` is empty is NOT a real named backend — it's
+            // a virtual projection of `cfg.backend`. A DELETE on it would
+            // otherwise fall into the generic "not found" branch below with
+            // a misleading error; surface the specific shape issue instead.
+            if name == "default" && cfg.backends.iter().all(|b| b.name != name) {
+                return refuse(
+                    StatusCode::CONFLICT,
+                    "Cannot delete the synthesised 'default' backend — it represents the \
+                     legacy singleton `cfg.backend`. To move off the singleton, add a named \
+                     backend alongside it, then clear the singleton via section PUT on `storage`."
+                        .into(),
+                );
+            }
+            if !cfg.backends.iter().any(|b| b.name == name) {
+                return refuse(
+                    StatusCode::NOT_FOUND,
+                    format!("Backend '{}' not found", name),
+                );
+            }
+            if cfg.default_backend.as_deref() == Some(&name) {
+                return refuse(
+                    StatusCode::CONFLICT,
+                    "Cannot delete the default backend. Assign a new default first.".into(),
+                );
+            }
+            let routed: Vec<String> = cfg
+                .buckets
+                .iter()
+                .filter(|(_, p)| p.backend.as_deref() == Some(&name))
+                .map(|(bucket, _)| bucket.clone())
+                .collect();
+            if !routed.is_empty() {
+                return refuse(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "Cannot delete '{}': buckets [{}] route to it. Re-route them first.",
+                        name,
+                        routed.join(", ")
+                    ),
+                );
+            }
+            cfg.backends.retain(|b| b.name != name);
+            Ok(())
+        },
     )
     .await
-    {
-        cfg.backends = old_backends;
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(BackendMutationResponse {
-                success: false,
-                error: Some(format!("Failed to rebuild engine: {}", e)),
-                requires_restart: false,
-            }),
-        );
-    }
-
-    // Persist to the active config file resolved at startup from `--config`
-    // or the search-path walk. Hardcoding a CWD-relative default here
-    // used to silently redirect admin-API writes to a stale location when
-    // the operator had launched with `--config /etc/dgp/config.yaml`,
-    // producing a latent "my backend disappears on restart" bug.
-    //
-    // Note: we do NOT call `trigger_config_sync` here. That helper uploads
-    // the SQLCipher IAM database to S3 — a backend mutation changes the
-    // YAML config file, not the IAM DB, so the sync would be a no-op
-    // network round-trip. Handlers that DO mutate the IAM DB (users,
-    // groups, external_auth, password) are the correct callers.
-    let persist_path = super::config::active_config_path(&state);
-    if let Err(e) = cfg.persist_to_file(&persist_path) {
-        tracing::warn!("Failed to persist config to {}: {}", persist_path, e);
-    }
-    drop(cfg);
-    audit_log("backend_delete", "admin", &name, &headers);
-
-    (
-        axum::http::StatusCode::OK,
-        Json(BackendMutationResponse {
-            success: true,
-            error: None,
-            requires_restart: false,
-        }),
-    )
 }
 
 #[cfg(test)]

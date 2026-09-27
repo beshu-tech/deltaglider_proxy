@@ -30,6 +30,8 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
+use tokio::sync::RwLockWriteGuard;
+
 use super::super::AdminState;
 use super::{SectionName, TransitionCtx};
 use crate::config::Config;
@@ -256,9 +258,48 @@ pub(super) async fn run(
 
     // Apply: the write lock is held from the version check to the persist.
     let mut cfg = state.config.write().await;
+    let outcome = apply_locked(state, &mut cfg, &write, &mut refs, build).await;
+    if let Outcome::Applied {
+        persist: Ok(path) | Err((path, _)),
+        ..
+    } = &outcome
+    {
+        audit_write(&write, path);
+    }
+    WriteResult { outcome, refs }
+}
+
+/// The audit entry of an applied write.
+fn audit_write(write: &ConfigWrite<'_>, path: &str) {
+    let no_headers = HeaderMap::new();
+    let headers = write.headers.unwrap_or(&no_headers);
+    match write.surface {
+        Surface::Section { section, .. } if write.headers.is_some() => super::super::audit_log(
+            &format!("apply_config_section:{}", section.as_str()),
+            "admin",
+            path,
+            headers,
+        ),
+        Surface::Document { .. } => super::super::audit_log("apply_config", "admin", path, headers),
+        Surface::Internal { action, target } => {
+            super::super::audit_log(action, "admin", target, headers)
+        }
+        _ => {}
+    }
+}
+
+/// Steps 1–5 of an apply, under the caller's config write guard: version
+/// check, build, prepare, transition, persist. The caller audits.
+async fn apply_locked(
+    state: &Arc<AdminState>,
+    cfg: &mut RwLockWriteGuard<'_, Config>,
+    write: &ConfigWrite<'_>,
+    refs: &mut EnvRefs,
+    build: impl FnOnce(&Config) -> Result<Built, Rejection>,
+) -> Outcome {
     refs.extend(cfg.env_refs.clone());
     let section = write.surface.section();
-    let current = super::version::config_version(&cfg, section);
+    let current = super::version::config_version(cfg, section);
     // An internal write carries the headers of a request to another
     // endpoint: its `If-Match` names no config version.
     let internal = matches!(write.surface, Surface::Internal { .. });
@@ -267,15 +308,11 @@ pub(super) async fn run(
             .headers
             .is_some_and(|h| super::version::if_match_conflicts(h, &current))
     {
-        let outcome = Outcome::Conflict { current };
-        return WriteResult { outcome, refs };
+        return Outcome::Conflict { current };
     }
-    let prepared = match build(&cfg).and_then(|b| prepare(&cfg, b, &write)) {
+    let prepared = match build(cfg).and_then(|b| prepare(cfg, b, write)) {
         Ok(p) => p,
-        Err(r) => {
-            let outcome = Outcome::Rejected(r);
-            return WriteResult { outcome, refs };
-        }
+        Err(r) => return Outcome::Rejected(r),
     };
     let Prepared {
         new_cfg,
@@ -287,50 +324,37 @@ pub(super) async fn run(
     let no_headers = HeaderMap::new();
     let headers = write.headers.unwrap_or(&no_headers);
     let ctx = TransitionCtx::Admin { state, headers };
-    let report = match super::apply_config_transition(ctx, &mut cfg, new_cfg).await {
+    let report = match super::apply_config_transition(ctx, cfg, new_cfg).await {
         Ok(r) => r,
         Err(e) => {
-            let outcome = Outcome::Rejected(Rejection {
+            return Outcome::Rejected(Rejection {
                 stage: Stage::Transition,
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 error: e,
                 warnings: Box::new(warnings),
                 diff,
             });
-            return WriteResult { outcome, refs };
         }
     };
     refs.extend(cfg.env_refs.clone());
     warnings.transition = report.warnings;
-    let version = super::version::config_version(&cfg, section);
-    let path = super::active_config_path(state);
-    let persist = match cfg.persist_to_file(&path) {
-        Ok(()) => Ok(path.clone()),
-        Err(e) => Err((path.clone(), e.to_string())),
-    };
-    match write.surface {
-        Surface::Section { section, .. } if write.headers.is_some() => super::super::audit_log(
-            &format!("apply_config_section:{}", section.as_str()),
-            "admin",
-            &path,
-            headers,
-        ),
-        Surface::Document { .. } => {
-            super::super::audit_log("apply_config", "admin", &path, headers)
-        }
-        Surface::Internal { action, target } => {
-            super::super::audit_log(action, "admin", target, headers)
-        }
-        _ => {}
-    }
-    let outcome = Outcome::Applied {
+    let version = super::version::config_version(cfg, section);
+    Outcome::Applied {
         warnings,
         requires_restart: report.requires_restart,
         diff,
-        persist,
+        persist: persist(state, cfg),
         version,
-    };
-    WriteResult { outcome, refs }
+    }
+}
+
+/// THE config file write of a running-config change.
+fn persist(state: &Arc<AdminState>, cfg: &Config) -> Result<String, (String, String)> {
+    let path = super::active_config_path(state);
+    match cfg.persist_to_file(&path) {
+        Ok(()) => Ok(path),
+        Err(e) => Err((path, e.to_string())),
+    }
 }
 
 /// Steps 3a–3h: turn `incoming` into the config the transition gets, with
@@ -550,44 +574,168 @@ pub(crate) async fn run_internal(
     target: &str,
     edit: impl FnOnce(&mut Config),
 ) -> Result<InternalApplied, InternalRefusal> {
-    let write = ConfigWrite {
-        surface: Surface::Internal { action, target },
+    let write = Internal {
+        headers,
+        action,
+        target,
+        on_persist_error: OnPersistError::Report,
+    };
+    let held = run_internal_held(
+        state,
+        write,
+        std::future::ready(()),
+        |cfg, _| {
+            edit(cfg);
+            Ok::<(), std::convert::Infallible>(())
+        },
+        |_| std::future::ready(Ok(())),
+    )
+    .await;
+    held.map_err(|e| match e {
+        HeldRefusal::Pipeline(r) => r,
+        HeldRefusal::Persist { .. } => unreachable!("OnPersistError::Report keeps the write"),
+        HeldRefusal::Edit(never) => match never {},
+    })
+}
+
+/// Who asks for an internal write, for its audit entry.
+pub(crate) struct Internal<'a> {
+    pub headers: &'a HeaderMap,
+    pub action: &'static str,
+    pub target: &'a str,
+    pub on_persist_error: OnPersistError,
+}
+
+/// What an internal write does when the config file write fails.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnPersistError {
+    /// Keep the change live and report the error in
+    /// [`InternalApplied::persist`] (the config endpoints do the same).
+    Report,
+    /// Put the old config back, so memory and file never differ (a rule
+    /// that only memory lost would come back at the next restart).
+    RollBack,
+}
+
+/// Why [`run_internal_held`] changed nothing.
+#[derive(Debug)]
+pub(crate) enum HeldRefusal<E> {
+    /// `edit` or `commit` refused; for `commit`, the old config is back.
+    Edit(E),
+    Pipeline(InternalRefusal),
+    /// The file write failed and [`OnPersistError::RollBack`] put the old
+    /// config back.
+    Persist {
+        path: String,
+        error: String,
+    },
+}
+
+/// [`run_internal`] for a writer with more to do under the config write
+/// lock. `hold` runs after the lock is taken (the lock order: config
+/// OUTER, so `hold` may take the config-DB lock); `edit` may refuse, and
+/// nothing changes; `commit` runs after the persist, and a refusal puts the
+/// old config back (live and in the file). The audit entry is written only
+/// when everything succeeded.
+pub(crate) async fn run_internal_held<H, E, C>(
+    state: &Arc<AdminState>,
+    write: Internal<'_>,
+    hold: impl std::future::Future<Output = H>,
+    edit: impl FnOnce(&mut Config, &mut H) -> Result<(), E>,
+    commit: impl FnOnce(H) -> C,
+) -> Result<InternalApplied, HeldRefusal<E>>
+where
+    C: std::future::Future<Output = Result<(), E>>,
+{
+    let config_write = ConfigWrite {
+        surface: Surface::Internal {
+            action: write.action,
+            target: write.target,
+        },
         mode: Mode::Apply,
-        headers: Some(headers),
+        headers: Some(write.headers),
         extra_env: &EnvRefs::new(),
     };
-    let WriteResult { outcome, refs } = run(state, write, |running| {
+    let mut refs = EnvRefs::new();
+    let mut cfg = state.config.write().await;
+    let mut held = hold.await;
+    let old = cfg.clone();
+    let mut refused = None;
+    let outcome = apply_locked(state, &mut cfg, &config_write, &mut refs, |running| {
         let mut incoming = running.clone();
-        edit(&mut incoming);
-        Ok(Built {
-            incoming,
-            warnings: Vec::new(),
-        })
+        match edit(&mut incoming, &mut held) {
+            Ok(()) => Ok(Built {
+                incoming,
+                warnings: Vec::new(),
+            }),
+            Err(e) => {
+                refused = Some(e);
+                Err(Rejection::new(Stage::Build, StatusCode::BAD_REQUEST, ""))
+            }
+        }
     })
     .await;
+    if let Some(e) = refused {
+        return Err(HeldRefusal::Edit(e));
+    }
     let scrub = |s: String| crate::config::scrub_env_values(&s, &refs);
-    match outcome {
+    let (warnings, persist) = match outcome {
         Outcome::Applied {
             warnings, persist, ..
-        } => {
-            let mut all = warnings.env;
-            all.extend(warnings.check_new);
-            all.extend(warnings.transition);
-            Ok(InternalApplied {
-                warnings: all.into_iter().map(scrub).collect(),
-                persist: persist.map_err(|(p, e)| (p, scrub(e))),
-            })
+        } => (warnings, persist),
+        Outcome::Rejected(r) => {
+            return Err(HeldRefusal::Pipeline(match r.stage {
+                Stage::EnvReapply => InternalRefusal::EnvReapply(scrub(r.error)),
+                Stage::Transition => InternalRefusal::Transition(scrub(r.error)),
+                _ => InternalRefusal::Invalid {
+                    status: r.status,
+                    error: scrub(r.error),
+                },
+            }))
         }
-        Outcome::Rejected(r) => Err(match r.stage {
-            Stage::EnvReapply => InternalRefusal::EnvReapply(scrub(r.error)),
-            Stage::Transition => InternalRefusal::Transition(scrub(r.error)),
-            _ => InternalRefusal::Invalid {
-                status: r.status,
-                error: scrub(r.error),
-            },
-        }),
         Outcome::Conflict { .. } | Outcome::Validated { .. } => {
             unreachable!("an internal write is an apply without If-Match")
+        }
+    };
+    if let (Err((path, error)), OnPersistError::RollBack) = (&persist, write.on_persist_error) {
+        roll_back(state, &mut cfg, write.headers, old, false).await;
+        return Err(HeldRefusal::Persist {
+            path: path.clone(),
+            error: scrub(error.clone()),
+        });
+    }
+    if let Err(e) = commit(held).await {
+        roll_back(state, &mut cfg, write.headers, old, persist.is_ok()).await;
+        return Err(HeldRefusal::Edit(e));
+    }
+    let (Ok(path) | Err((path, _))) = &persist;
+    audit_write(&config_write, path);
+    let mut all = warnings.env;
+    all.extend(warnings.check_new);
+    all.extend(warnings.transition);
+    Ok(InternalApplied {
+        warnings: all.into_iter().map(scrub).collect(),
+        persist: persist.map_err(|(p, e)| (p, scrub(e))),
+    })
+}
+
+/// Put `old` back after a failed internal write, and into the file when
+/// the write reached it.
+async fn roll_back(
+    state: &Arc<AdminState>,
+    cfg: &mut RwLockWriteGuard<'_, Config>,
+    headers: &HeaderMap,
+    old: Config,
+    re_persist: bool,
+) {
+    let ctx = TransitionCtx::Admin { state, headers };
+    if let Err(e) = super::apply_config_transition(ctx, cfg, old).await {
+        tracing::error!("config write rollback failed, the new config stays live: {e}");
+        return;
+    }
+    if re_persist {
+        if let Err((path, e)) = persist(state, cfg) {
+            tracing::error!("config write rollback: persist to {path} failed: {e}");
         }
     }
 }
@@ -670,6 +818,30 @@ impl ScrubEnv for serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// N8: every running-config write persists through this pipeline, so a
+    /// new writer cannot skip its env re-apply, gates, transition and audit
+    /// by calling `persist_to_file` itself. The other callers write no
+    /// running config: the background `ConfigMutator` (its own mutate →
+    /// rebuild → persist pipeline) and the `--init` wizard (a new file).
+    #[test]
+    fn config_persists_only_through_the_write_pipeline() {
+        const ALLOWED: [&str; 3] = [
+            "src/api/admin/config/write.rs",
+            "src/config_apply.rs",
+            "src/init.rs",
+        ];
+        let offenders: Vec<String> = crate::source_scan::prod_sources("src")
+            .into_iter()
+            .filter(|(rel, _)| !ALLOWED.contains(&rel.as_str()))
+            .filter(|(_, text)| crate::source_scan::prod_text(text).contains(".persist_to_file("))
+            .map(|(rel, _)| rel)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "config persisted outside the write pipeline (use run_internal): {offenders:?}"
+        );
+    }
 
     fn write(surface: Surface<'_>, mode: Mode) -> ConfigWrite<'_> {
         static EMPTY: std::sync::OnceLock<EnvRefs> = std::sync::OnceLock::new();
