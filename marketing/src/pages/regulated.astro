@@ -215,14 +215,21 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
 
 <style>
   /* === Hero: copy left, encryption-flow visual right === */
+  /* minmax(0, …): a bare 1fr grows to the widest nowrap child (the file
+     row, the cipher block), which pushed the headline off a phone screen. */
   .reg-hero-grid {
     display: grid;
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     gap: 3rem;
     align-items: center;
   }
   @media (min-width: 1024px) {
-    .reg-hero-grid { grid-template-columns: 1.05fr 0.95fr; gap: 4rem; }
+    .reg-hero-grid { grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr); gap: 4rem; }
+  }
+  @media (max-width: 599px) {
+    .reg-hero-grid { gap: 2rem; }
+    .enc-pane { padding: 1.25rem; }
+    .enc-file { font-size: 0.95rem; }
   }
 
   .reg-hero-copy h1 {
@@ -386,32 +393,35 @@ de 60 3b f5 9a 04 c2 77 18 8d eb 56 a3 0f c4 29</pre>
     margin-bottom: 4rem;
   }
 
-  /* Compact the social blocks within the sidebar */
-  .compact-social :global(.segment-list),
-  .compact-social :global(.testimonials-grid) {
-    grid-template-columns: 1fr !important;
-  }
+  /* Compact the social blocks within the sidebar. Below 1024px the
+     "sidebar" is a full-width section, so it keeps body-size text. */
+  @media (min-width: 1024px) {
+    .compact-social :global(.segment-list),
+    .compact-social :global(.testimonials-grid) {
+      grid-template-columns: 1fr !important;
+    }
 
-  .compact-social :global(.customer-segments),
-  .compact-social :global(.testimonials) {
-    margin: 0 0 2rem 0;
-  }
+    .compact-social :global(.customer-segments),
+    .compact-social :global(.testimonials) {
+      margin: 0 0 2rem 0;
+    }
 
-  .compact-social :global(h2) {
-    font-size: 1.25rem;
-    margin-bottom: 0.5rem;
-    border: none;
-    padding: 0;
-  }
+    .compact-social :global(h2) {
+      font-size: 1.25rem;
+      margin-bottom: 0.5rem;
+      border: none;
+      padding: 0;
+    }
 
-  .compact-social :global(.segment-lede),
-  .compact-social :global(.testimonials-framing) {
-    font-size: 0.9rem;
-    line-height: 1.5;
-  }
+    .compact-social :global(.segment-lede),
+    .compact-social :global(.testimonials-framing) {
+      font-size: 0.9rem;
+      line-height: 1.5;
+    }
 
-  .compact-social :global(.segment-list li) {
-    padding: 0.5rem 0.75rem;
-    font-size: 0.9rem;
+    .compact-social :global(.segment-list li) {
+      padding: 0.5rem 0.75rem;
+      font-size: 0.9rem;
+    }
   }
 </style>
