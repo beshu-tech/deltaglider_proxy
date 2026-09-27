@@ -179,7 +179,7 @@ Resolution order at startup: `RUST_LOG` > `DGP_LOG_LEVEL` > `advanced.log_level`
 |---|---|
 | **Env var** | `DGP_LOG_LEVEL` |
 | **YAML** | `advanced.log_level` |
-| **Default** | `deltaglider_proxy=debug,tower_http=debug` |
+| **Default** | `deltaglider_proxy=info,tower_http=info` |
 | **Hot-reload** | Yes (via admin GUI or `config apply`) |
 
 ```yaml
@@ -1062,7 +1062,7 @@ The list of `DGP_*` variables that the server reads. The unit test `every_dgp_li
 |----------|---------|-------------|
 | `DGP_CONFIG` | auto | Path to the YAML config file (`.yaml` / `.yml`) |
 | `DGP_LISTEN_ADDR` | `0.0.0.0:9000` | HTTP listen address |
-| `DGP_LOG_LEVEL` | `deltaglider_proxy=debug,tower_http=debug` | Tracing filter (overridden by `RUST_LOG`) |
+| `DGP_LOG_LEVEL` | `deltaglider_proxy=info,tower_http=info` | Tracing filter (overridden by `RUST_LOG`) |
 | `DGP_LOG_FORMAT` | `text` | Stdout log format: `text` or `json` (one JSON object per line) |
 | `DGP_LOG_RING_SIZE` | `2000` | In-memory operational-log ring capacity (admin Logs viewer) |
 | `DGP_LOG_RING_LEVEL` | `info` | Minimum severity captured into the log ring/stream |

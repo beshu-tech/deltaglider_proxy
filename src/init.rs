@@ -137,7 +137,7 @@ pub fn run_init_inner(
         reader,
         writer,
         "Log level",
-        "deltaglider_proxy=debug,tower_http=debug",
+        crate::config::DEFAULT_LOG_LEVEL,
     )?;
 
     writeln!(writer)?;

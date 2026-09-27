@@ -49,7 +49,7 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     EnvVarEntry {
         name: "DGP_LOG_LEVEL",
         description: "Log level filter (overridden by RUST_LOG)",
-        example: "deltaglider_proxy=debug,tower_http=debug",
+        example: "deltaglider_proxy=info,tower_http=info",
         category: "Server",
     },
     EnvVarEntry {
@@ -829,7 +829,7 @@ pub struct Config {
 
     /// Log level filter string.
     /// Set via config file, DGP_LOG_LEVEL env var, or admin GUI. Overridden by RUST_LOG.
-    /// Default: "deltaglider_proxy=debug,tower_http=debug"
+    /// Default: [`DEFAULT_LOG_LEVEL`] (info).
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
@@ -1393,8 +1393,12 @@ fn default_force_path_style() -> bool {
     true
 }
 
+/// The log filter when neither `RUST_LOG`, `DGP_LOG_LEVEL` nor the file
+/// sets one. Startup and `--init` use it too.
+pub const DEFAULT_LOG_LEVEL: &str = "deltaglider_proxy=info,tower_http=info";
+
 pub(crate) fn default_log_level() -> String {
-    "deltaglider_proxy=debug,tower_http=debug".to_string()
+    DEFAULT_LOG_LEVEL.to_string()
 }
 
 impl Default for BackendConfig {
@@ -6757,6 +6761,17 @@ mod log_level_env_tests {
         let mut cfg = Config::default();
         cfg.apply_env_overrides_with(&only(&[("DGP_LOG_LEVEL", "warn")]));
         assert_eq!(cfg.log_level, "warn");
+    }
+
+    /// Owner decision (refactor round 2026-09-27): the default is info, not
+    /// debug — debug logged every request and flooded production logs.
+    #[test]
+    fn default_log_level_is_info() {
+        assert_eq!(
+            Config::default().log_level,
+            "deltaglider_proxy=info,tower_http=info"
+        );
+        assert_eq!(default_log_level(), DEFAULT_LOG_LEVEL);
     }
 }
 

@@ -33,7 +33,7 @@ pub fn init_tracing(cli: &Cli) -> reload::Handle<EnvFilter, tracing_subscriber::
             if cli.verbose {
                 "deltaglider_proxy=trace,tower_http=trace".to_string()
             } else {
-                "deltaglider_proxy=debug,tower_http=debug".to_string()
+                deltaglider_proxy::config::DEFAULT_LOG_LEVEL.to_string()
             }
         });
     let initial_filter = EnvFilter::new(deltaglider_proxy::audit::with_audit_directive(&spec));

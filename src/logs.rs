@@ -10,10 +10,10 @@
 //!
 //! Two filters apply: the global `EnvFilter` (the configured log level — so a
 //! hot level change widens/narrows this too) AND this layer's OWN floor
-//! (`DGP_LOG_RING_LEVEL`, default INFO). The floor exists because the proxy's
-//! default level is `debug`+`tower_http=debug` (2+ lines/request) — a firehose
-//! that would drown the operator signal and churn the ring. stdout keeps the
-//! full firehose; the GUI gets the meaningful subset.
+//! (`DGP_LOG_RING_LEVEL`, default INFO). The floor exists because an operator
+//! can run at `debug` (2+ lines/request) — a firehose that would drown the
+//! operator signal and churn the ring. stdout keeps the full firehose; the GUI
+//! gets the meaningful subset.
 //!
 //! NOT a log store — bounded, per-instance, in-memory. Aggregation/retention/
 //! multi-instance is a shipper's job on the `DGP_LOG_FORMAT=json` stdout.

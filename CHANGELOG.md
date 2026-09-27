@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed — The default log level is info
+
+Without `RUST_LOG`, `DGP_LOG_LEVEL` or `advanced.log_level`, the proxy used
+the filter `deltaglider_proxy=debug,tower_http=debug`, which logs every
+request. The default is now `deltaglider_proxy=info,tower_http=info`. To get
+the old output, set `advanced.log_level` or `DGP_LOG_LEVEL` to the debug
+filter.
+
 ### Changed — A migrate is refused on a multi-instance deployment
 
 The migrate flip changed the routing of the instance that ran the job only,

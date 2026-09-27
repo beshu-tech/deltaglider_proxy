@@ -99,7 +99,7 @@ All settings via environment variables:
 | `DGP_BE_AWS_ACCESS_KEY_ID` | *(unset)* | Backend S3 credentials |
 | `DGP_BE_AWS_SECRET_ACCESS_KEY` | *(unset)* | Backend S3 credentials |
 | `DGP_BOOTSTRAP_PASSWORD_HASH` | *(auto-generated)* | Bootstrap password bcrypt hash (encrypts IAM DB, signs session cookies, gates admin GUI). Base64-encoded form avoids `$` escaping in Docker. |
-| `DGP_LOG_LEVEL` | `deltaglider_proxy=debug,tower_http=debug` | Log filter (changeable at runtime via admin GUI) |
+| `DGP_LOG_LEVEL` | `deltaglider_proxy=info,tower_http=info` | Log filter (changeable at runtime via admin GUI) |
 | `DGP_CONFIG_SYNC_BUCKET` | *(unset)* | S3 bucket for encrypted-DB multi-instance sync |
 | `DGP_TLS_ENABLED` | `false` | Enable HTTPS |
 

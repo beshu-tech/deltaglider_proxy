@@ -19,9 +19,9 @@ test('log level radio reflects preset vs custom state', () => {
   // cleared, so the radio must show the preset, not a stuck "Custom".
   assert.deepEqual(logLevelRadio(INFO, false), { value: INFO, custom: false });
   // The section API omits a default-valued log_level: absent means the
-  // server default (Debug), not "nothing selected".
+  // server default (Info), not "nothing selected".
   assert.deepEqual(logLevelRadio(undefined, false), {
-    value: 'deltaglider_proxy=debug,tower_http=debug',
+    value: INFO,
     custom: false,
   });
 });
