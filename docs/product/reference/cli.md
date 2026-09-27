@@ -18,19 +18,35 @@ The `deltaglider_proxy` binary is both the server and its CLI. With no subcomman
 
 All subcommands share one set of exit codes: `0` OK, `2` usage, `3` I/O error, `4` parse error, `5` HTTP error, `6` rejected by validation/server, `7` authentication failure, `8` S3 not found, `9` integrity (hash mismatch), `10` partial success in a recursive operation.
 
-## `config lint <FILE>`
+## `config lint`
+
+```text
+deltaglider_proxy config lint <FILE>
+```
 
 `config lint` validates a file offline. It uses the same pipeline as the admin API's `/config/validate`: shape classification, deny-unknown-fields, shorthand normalization, admission-block semantics, `Config::check` warnings (including the cross-field [config advisories](configuration.md#config-advisories): shared rate-limit bucket, stale IAM template, frozen quota, redundant public prefix). The command first expands `${env:NAME}` / `${env:NAME:-default}` references against the environment. An unset variable without a default fails the lint. YAML is the only supported format. A `.toml` input fails with the TOML-removed error (TOML support was removed in v1.4.1; convert the file with `config migrate` on v1.4.0). Warnings go to stderr and are non-fatal. An unknown root key of a flat-shape document is an error, although the proxy loads such a file and ignores the key. Exit: `0` valid (with or without warnings), `3` unreadable, `4` parse error (also an unknown key, an unset `${env:NAME}` without a default, and an empty or whitespace-only file, which an apply would refuse because it resets every field), `6` validation error (including an unparseable `log_level` filter, and a lifecycle or replication rule that an apply refuses, such as two replication rules with the same name).
 
-## `config schema [--out <OUTPUT>]`
+## `config schema`
+
+```text
+deltaglider_proxy config schema [--out <OUTPUT>]
+```
 
 Emits the JSON Schema for the canonical sectioned document, with the `admission`, `access`, `storage` and `advanced` sections at the root. This is the shape that `config export` and every admin save write. The schema comes from the schemars derives, so it follows the code automatically. CI and YAML LSP autocompletion consume it.
 
-## `config defaults [--out <OUTPUT>]`
+## `config defaults`
+
+```text
+deltaglider_proxy config defaults [--out <OUTPUT>]
+```
 
 Emits per-field defaults and doc-comment descriptions as JSON Schema. The output is currently identical to that of `config schema`. The two commands are separate entry points, and their output may diverge in future releases.
 
-## `config apply <FILE> [--server <URL>] [--timeout <SECS>]`
+## `config apply`
+
+```text
+deltaglider_proxy config apply <FILE> [--server <URL>] [--timeout <SECS>]
+```
 
 Sends a full YAML document to a running server with `POST /_/api/admin/config/apply`. The server validates the document, swaps the runtime config atomically, and persists it. Before the command sends the document, it expands `${env:NAME}` references against the environment of the operator. The command refuses an empty rendered body.
 
@@ -38,7 +54,11 @@ The command reads the password from the `DGP_BOOTSTRAP_PASSWORD` environment var
 
 Exit: `0` applied and persisted (with a stderr note when a restart-only field changed); `5` applied in memory but not persisted (also HTTP errors and login rate-limiting); `6` server rejected the apply; `7` missing/wrong `DGP_BOOTSTRAP_PASSWORD`; `3` local I/O error.
 
-## `admission trace --method <M> --path <P> [--authenticated] [--query <Q>] [--server <URL>] [--timeout <SECS>]`
+## `admission trace`
+
+```text
+deltaglider_proxy admission trace --method <M> --path <P> [--authenticated] [--query <Q>] [--server <URL>] [--timeout <SECS>]
+```
 
 Sends a synthetic request through the admission chain of the running server as a dry run, with `POST /_/api/admin/config/trace`. The command prints the decision as pretty JSON on stdout, which you can pipe to `jq`. It uses the same `DGP_BOOTSTRAP_PASSWORD` authentication, `--server`/`--timeout` defaults, and exit codes as `config apply`.
 

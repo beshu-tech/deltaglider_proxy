@@ -60,7 +60,7 @@ The endpoint is public by default so that any Prometheus can scrape it. Set `DGP
 
 These series count S3 API requests only. The requests to the endpoints under `/_/` (the admin UI, the admin API, `/_/health`, `/_/ready`, `/_/stats`, and `/_/metrics` itself) are not counted.
 
-### Histogram buckets
+### HTTP request histogram buckets
 
 - Duration: default Prometheus buckets (0.005s … 10s)
 - Body sizes: exponential `[1KB, 10KB, 100KB, 1MB, 10MB, 100MB]`
@@ -81,7 +81,7 @@ These series count S3 API requests only. The requests to the endpoints under `/_
 - `passthrough`: stored as-is (non-eligible file type, or poor compression ratio)
 - `reference`: new reference baseline created for a deltaspace
 
-### Histogram buckets
+### Delta compression histogram buckets
 
 - Codec duration: `[1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s, 30s]`
 - Compression ratio: `[0.01, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]`

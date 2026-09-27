@@ -4,33 +4,7 @@ You configure DeltaGlider Proxy with a YAML file, with environment variables (`D
 
 YAML is the only supported format. TOML support was removed in v1.4.1. A `.toml` config makes the proxy fail at startup, whether you set it with `DGP_CONFIG` or the proxy finds it on the default search path. The error is `TOML configs are no longer supported (removed in v1.4.1)`. If you still carry a TOML config, run `deltaglider_proxy config migrate` **on v1.4.0** to convert it, then point the server at the YAML file before upgrading. See [How to upgrade the proxy](../how-to/upgrade.md).
 
-## Table of contents
-
-- [YAML layout](#yaml-layout)
-- [Shorthands](#shorthands)
-- [Config-file search order](#config-file-search-order)
-- [Server / advanced](#server--advanced)
-- [Delta engine](#delta-engine)
-- [Storage backend](#storage-backend)
-  - [Filesystem](#filesystem-backend)
-  - [S3](#s3-backend)
-- [Access: authentication](#access-authentication)
-- [Access: IAM mode](#access-iam-mode)
-- [Admission chain](#admission-chain)
-- [Security](#security)
-  - [Config advisories](#config-advisories)
-  - [Rate limiting](#rate-limiting)
-- [TLS](#tls)
-- [Config sync](#config-sync)
-- [Multi-backend routing](#multi-backend-routing)
-- [Bucket policies](#bucket-policies)
-- [Lifecycle rules](#lifecycle-rules)
-- [Job leases](#job-leases)
-- [Event delivery](#event-delivery)
-- [Encryption at rest](#encryption-at-rest)
-- [CLI subcommands](#cli-subcommands)
-- [Full example](#full-example)
-- [Environment variable registry](#environment-variable-registry)
+Most readers need three sections of this page: the [YAML layout](#yaml-layout), the [full example](#full-example), and the [environment variable registry](#environment-variable-registry).
 
 ## YAML layout
 
@@ -1068,7 +1042,7 @@ This section lists the `DGP_*` variables that the server reads. The unit test `e
 
 The server reads these variables when it starts, and again when an admin apply rebuilds the engine. A request never reads the environment itself: it uses the values of the running config. The environment of a running process does not change, so a changed variable takes effect only after a restart.
 
-### Server / advanced
+### Server / advanced variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -1094,7 +1068,7 @@ The server reads these variables when it starts, and again when an admin apply r
 | `DGP_REFERENCE_SCAN_LIMIT` | built-in cap | Maximum number of reference baselines that the savings panel reads for one request |
 | `DGP_RELAY_FOREIGN_MIN_AGE_SECS` | 3600 | Minimum age, in seconds, before startup removes a multipart relay directory that another process left behind. The relay directories are in `DGP_SPOOL_DIR`; startup also sweeps the relay directory of earlier releases in the system temp dir |
 
-### Delta engine
+### Delta engine variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -1117,7 +1091,7 @@ The server reads these variables when it starts, and again when an admin apply r
 | `DGP_SPOOL_THRESHOLD_BYTES` | 16 MiB (`16777216`), or `max_object_size` when that is smaller | A delta GET of an object larger than this reconstructs the object to a spool file and streams the file, instead of reconstructing it in memory. A delta-eligible upload larger than this is encoded from a spool file. Objects of this size or smaller use the in-memory path |
 | `DGP_MPU_DELTA_RECONSTRUCT_MAX_BYTES` | 64 MiB | Largest multipart upload that CompleteMultipartUpload assembles in memory to try a delta. The parts stay in memory up to this total, then go to relay files in the spool. A larger upload, or one that tries no delta, is stored from its parts without a delta |
 
-### Storage
+### Storage variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -1142,7 +1116,7 @@ The server reads these variables when it starts, and again when an admin apply r
 | `DGP_BACKEND_LIST_TIMEOUT_SECS` | 5 | Per-backend timeout for a single bucket-listing request. It bounds the wait for a hung (not refusing) backend |
 | `DGP_BACKEND_LIST_FRESH_SECS` | 5 | The browser sends `ListBuckets` and the origins lookup back to back. The proxy serves a bucket listing that it fetched this recently without probing upstream again, so the two requests become one upstream request per backend. A bucket create or delete through the proxy invalidates the listing immediately. `0` disables it |
 
-### Replication / streaming copy
+### Replication / streaming copy variables
 
 These variables tune the streaming multipart copy of large objects (replication and lifecycle transitions). The defaults suit most deployments. Raise the concurrency only when the backend and the network have headroom.
 
@@ -1153,7 +1127,7 @@ These variables tune the streaming multipart copy of large objects (replication 
 | `DGP_UPLOAD_CONCURRENCY` | 4 | In-flight parts per streaming object. Overrides `storage.replication.upload_concurrency` (1 to 16). It is also the value for every other streaming copy: event-driven replication, lifecycle transitions, bucket migrations and admin copies |
 | `DGP_REPLICATION_TRANSFERS` | 4 | Concurrent objects per replication run. Overrides `storage.replication.transfers` (1 to 64) |
 
-### Authentication
+### Authentication variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -1166,7 +1140,7 @@ These variables tune the streaming multipart copy of large objects (replication 
 | `DGP_CONFIG_DB_ACCEPT_LEGACY_SYNC` | `false` | Only for a rolling upgrade from a release before `DGP_CONFIG_DB_KEY`: accept a synced config DB that opens only with the bootstrap password hash. The proxy logs a warning at start while it is set. Remove it when every instance runs the new release |
 | `DGP_BOOTSTRAP_PASSWORD` | — | Plaintext password for admin CLI only |
 
-### Security
+### Security variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -1184,7 +1158,7 @@ These variables tune the streaming multipart copy of large objects (replication 
 | `DGP_RATE_LIMIT_ACCOUNT_WINDOW_SECS` | 3600 | Rolling window for the per-account count of failed logins |
 | `DGP_RATE_LIMIT_ACCOUNT_LOCKOUT_SECS` | 3600 | Per-account lockout duration |
 
-### TLS / config sync / encryption at rest / misc
+### TLS / config sync / encryption at rest / misc variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|

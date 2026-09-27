@@ -150,7 +150,7 @@ requires:
 4. **Conditional writes on every S3 backend that clients write to.** The proxy checks
    this itself at startup: with a sync bucket, a pod refuses to start when such a
    backend does not support conditional writes. See
-   [How to use non-CAS backends safely](../docs/product/how-to/backend-capability-validation.md).
+   [How to use a backend without conditional writes](../docs/product/how-to/backend-capability-validation.md).
 
 Any pod can accept IAM changes. The IAM synchronisation merges the changes of every pod
 with a three-way merge, as described in the multi-instance contract.
