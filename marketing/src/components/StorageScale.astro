@@ -7,8 +7,7 @@
 // used site-wide (91 MB artifact → 148 KB delta), and the v100 projection
 // lands on the real 8,850%-smaller catalog number from the migration log —
 // on purpose.
-const VERSIONS = 10;
-const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
+import ScaleChart from './ScaleChart.astro';
 ---
 
 <section class="section scale">
@@ -21,48 +20,7 @@ const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
       two-pixel floor, or they would be invisible.
     </p>
 
-    <div
-      class="scale-chart"
-      role="img"
-      aria-label="Bar chart comparing ten versions of a 91 megabyte artifact. In a plain S3 bucket every version is a full 91 megabyte copy, totalling 910 megabytes. Behind DeltaGlider, version one is a full 91 megabyte reference and versions two through ten are 148 kilobyte deltas, totalling 92.3 megabytes."
-    >
-      <div class="scale-row scale-head-row" aria-hidden="true">
-        <span class="vlabel"></span>
-        <span class="scale-head">Plain S3 bucket</span>
-        <span class="scale-head scale-head-b">Behind DeltaGlider</span>
-      </div>
-
-      {rows.map((v) => (
-        <div class="scale-row" style={`--i:${v}`} aria-hidden="true">
-          <span class="vlabel">v{v}</span>
-          <span class="track">
-            <i class="fill fill-a">{v === 1 ? '91 MB' : ''}</i>
-          </span>
-          <span class="track">
-            {v === 1 ? (
-              <i class="fill fill-ref">91 MB · reference</i>
-            ) : (
-              <>
-                <i class="fill fill-d"></i>
-                {v === 2 && <span class="d-label">148 KB</span>}
-              </>
-            )}
-          </span>
-        </div>
-      ))}
-
-      <div class="scale-row scale-more" aria-hidden="true">
-        <span class="vlabel">⋮</span>
-        <span class="more-text">every further version: +91 MB</span>
-        <span class="more-text more-text-b">+148 KB</span>
-      </div>
-
-      <div class="scale-row scale-totals" aria-hidden="true">
-        <span class="vlabel"></span>
-        <span class="total total-a">910 MB <em>billed</em></span>
-        <span class="total total-b">92.3 MB <em>billed</em></span>
-      </div>
-    </div>
+    <ScaleChart />
 
     <p class="scale-projection">
       The gap widens with every release. By v100 it's 9.1&nbsp;GB against
@@ -106,132 +64,6 @@ const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
     font-size: 1.05rem;
   }
 
-  .scale-chart {
-    display: grid;
-    gap: 12px;
-    padding: 2.25rem 2.5rem 2rem;
-    border: 1px solid var(--rule);
-    border-radius: 16px;
-    background: var(--bg-card);
-  }
-
-  .scale-row {
-    display: grid;
-    grid-template-columns: 3.2rem 1fr 1fr;
-    column-gap: 2rem;
-    align-items: center;
-  }
-
-  .scale-head-row { margin-bottom: 0.6rem; }
-
-  .scale-head {
-    font-family: var(--font-mono);
-    font-size: 0.95rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--ink-soft);
-  }
-  .scale-head-b { color: var(--brand-dark); }
-
-  .vlabel {
-    font-family: var(--font-mono);
-    font-size: 0.95rem;
-    color: var(--ink-faint);
-    text-align: right;
-    padding-right: 0.2rem;
-  }
-
-  .track {
-    display: flex;
-    align-items: center;
-    height: 34px;
-    min-width: 0;
-  }
-
-  .fill {
-    display: flex;
-    align-items: center;
-    height: 100%;
-    border-radius: 6px;
-    padding-inline: 12px;
-    font-family: var(--font-mono);
-    font-size: 0.92rem;
-    font-style: normal;
-    white-space: nowrap;
-    overflow: hidden;
-    transform-origin: left center;
-    animation: scale-grow 0.55s cubic-bezier(0.2, 0.8, 0.2, 1) both;
-    animation-delay: calc(var(--i, 0) * 55ms);
-  }
-
-  .fill-a {
-    width: 100%;
-    background: rgba(148, 163, 184, 0.22);
-    border: 1px solid var(--rule-strong);
-    color: var(--ink-soft);
-  }
-
-  .fill-ref {
-    width: 100%;
-    background: var(--accent-wash);
-    border: 1px solid var(--accent-strong);
-    color: var(--accent);
-  }
-
-  /* 148 KB / 91 MB = 0.163% — the 3px floor is the only generosity */
-  .fill-d {
-    width: max(3px, 0.163%);
-    padding: 0;
-    background: var(--brand);
-    box-shadow: 0 0 10px var(--brand-glow);
-  }
-
-  .d-label {
-    font-family: var(--font-mono);
-    font-size: 0.92rem;
-    color: var(--brand-dark);
-    margin-left: 0.7rem;
-    white-space: nowrap;
-  }
-
-  .scale-more {
-    margin-top: 0.3rem;
-  }
-  .more-text {
-    font-family: var(--font-mono);
-    font-size: 0.88rem;
-    color: var(--ink-faint);
-    letter-spacing: 0.02em;
-  }
-  .more-text-b { color: var(--brand-dark); }
-
-  .scale-totals {
-    margin-top: 0.9rem;
-    padding-top: 1.3rem;
-    border-top: 1px solid var(--rule-strong);
-  }
-  .total {
-    font-family: var(--font-mono);
-    font-size: 2.1rem;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-    color: var(--ink-strong);
-  }
-  .total em {
-    font-style: normal;
-    font-weight: 400;
-    font-size: 0.85rem;
-    color: var(--ink-faint);
-    text-transform: uppercase;
-    letter-spacing: 0.07em;
-    margin-left: 0.5rem;
-  }
-  .total-b {
-    color: var(--brand-dark);
-    text-shadow: 0 0 24px var(--brand-glow);
-  }
-
   .scale-projection {
     max-width: var(--measure-wide);
     margin: 1.75rem 0 0;
@@ -252,7 +84,7 @@ const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
     padding: 1.4rem 1.6rem;
     border: 1px solid var(--rule);
     border-left: 3px solid var(--brand);
-    border-radius: 10px;
+    border-radius: var(--r-md);
     background: var(--bg-card);
   }
 
@@ -271,25 +103,4 @@ const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
     max-width: none;
   }
 
-  @keyframes scale-grow {
-    from { transform: scaleX(0); opacity: 0; }
-    to   { transform: scaleX(1); opacity: 1; }
-  }
-
-  @media (max-width: 640px) {
-    .scale-chart { padding: 1.25rem 1rem 1.1rem; }
-    .scale-row { column-gap: 0.8rem; grid-template-columns: 2.2rem 1fr 1fr; }
-    .scale-head { font-size: 0.7rem; }
-    .vlabel { font-size: 0.72rem; }
-    .track { height: 24px; }
-    .fill { font-size: 0.66rem; padding-inline: 6px; }
-    .d-label { font-size: 0.68rem; }
-    .more-text { font-size: 0.62rem; }
-    .total { font-size: 1.25rem; }
-    .total em { display: block; margin: 0.1rem 0 0; }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .fill { animation: none !important; }
-  }
 </style>

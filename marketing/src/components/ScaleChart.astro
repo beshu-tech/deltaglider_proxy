@@ -1,0 +1,217 @@
+---
+// ScaleChart.astro — ten uploads of the same 91 MB artifact, drawn to
+// scale: full copies in a plain bucket against one reference plus 148 KB
+// deltas behind DeltaGlider. Used full size on the home page
+// (StorageScale) and `compact` in the /saas hero.
+//
+// Chart grammar (docs/plan/site-design-audit-2026-09.md §2.8): filled bars,
+// one colour per role — --neutral-data = a full copy, --accent = the
+// reference baseline, --brand = a delta. Values sit beside a bar, except
+// on a full-width bar, where they sit inside it at AA contrast.
+interface Props {
+  compact?: boolean;
+}
+const { compact = false } = Astro.props;
+const VERSIONS = 10;
+const rows = Array.from({ length: VERSIONS }, (_, i) => i + 1);
+---
+
+<div
+  class:list={['scale-chart', { 'scale-chart--compact': compact }]}
+  role="img"
+  aria-label="Bar chart comparing ten versions of a 91 megabyte artifact. In a plain S3 bucket every version is a full 91 megabyte copy, totalling 910 megabytes. Behind DeltaGlider, version one is a full 91 megabyte reference and versions two through ten are 148 kilobyte deltas, totalling 92.3 megabytes."
+>
+  <div class="scale-row scale-head-row" aria-hidden="true">
+    <span class="vlabel"></span>
+    <span class="scale-head">Plain S3 bucket</span>
+    <span class="scale-head scale-head-b">Behind DeltaGlider</span>
+  </div>
+
+  {rows.map((v) => (
+    <div class="scale-row" style={`--i:${v}`} aria-hidden="true">
+      <span class="vlabel">v{v}</span>
+      <span class="track">
+        <i class="fill fill-a">{v === 1 ? '91 MB' : ''}</i>
+      </span>
+      <span class="track">
+        {v === 1 ? (
+          <i class="fill fill-ref">91 MB reference</i>
+        ) : (
+          <>
+            <i class="fill fill-d"></i>
+            {v === 2 && <span class="d-label">148 KB</span>}
+          </>
+        )}
+      </span>
+    </div>
+  ))}
+
+  {!compact && (
+    <div class="scale-row scale-more" aria-hidden="true">
+      <span class="vlabel">⋮</span>
+      <span class="more-text">Every further version: +91 MB</span>
+      <span class="more-text more-text-b">+148 KB</span>
+    </div>
+  )}
+
+  <div class="scale-row scale-totals" aria-hidden="true">
+    <span class="vlabel"></span>
+    <span class="total total-a">910 MB <em>billed</em></span>
+    <span class="total total-b">92.3 MB <em>billed</em></span>
+  </div>
+</div>
+
+<style>
+  .scale-chart {
+    display: grid;
+    gap: 10px;
+    padding: 2rem 2.25rem 1.75rem;
+    border: 1px solid var(--rule);
+    border-radius: var(--r-md);
+    background: var(--bg-card);
+  }
+
+  .scale-row {
+    display: grid;
+    grid-template-columns: 3.2rem 1fr 1fr;
+    column-gap: 2rem;
+    align-items: center;
+  }
+
+  .scale-head-row { margin-bottom: 0.5rem; }
+
+  .scale-head {
+    font-size: var(--fs-label);
+    font-weight: 700;
+    color: var(--ink-soft);
+  }
+  .scale-head-b { color: var(--brand); }
+
+  .vlabel {
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
+    color: var(--ink-faint);
+    text-align: right;
+    padding-right: 0.2rem;
+  }
+
+  .track {
+    display: flex;
+    align-items: center;
+    height: 28px;
+    min-width: 0;
+  }
+
+  .fill {
+    display: flex;
+    align-items: center;
+    height: 100%;
+    border-radius: 4px;
+    padding-inline: 10px;
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
+    font-weight: 600;
+    font-style: normal;
+    white-space: nowrap;
+    overflow: hidden;
+    /* One entrance: the bars grow once, on load. */
+    transform-origin: left center;
+    animation: scale-grow 0.55s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+    animation-delay: calc(var(--i, 0) * 45ms);
+  }
+
+  /* A full copy. Label ink = --ink-strong (white / near-black), which is
+     AA on --neutral-data in both themes. */
+  .fill-a {
+    width: 100%;
+    background: var(--neutral-data);
+    color: var(--ink-strong);
+  }
+
+  /* The reference: the accent, mixed toward the page so it does not out-shout
+     the deltas. --ink-strong on it is AA in both themes. */
+  .fill-ref {
+    width: 100%;
+    background: color-mix(in srgb, var(--accent) 45%, var(--bg));
+    color: var(--ink-strong);
+  }
+
+  /* 148 KB / 91 MB = 0.163%. The 2 px floor (the copy says so) keeps a
+     delta visible. */
+  .fill-d {
+    width: max(2px, 0.163%);
+    padding: 0;
+    background: var(--brand);
+  }
+
+  .d-label {
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
+    font-weight: 600;
+    color: var(--brand);
+    margin-left: 0.6rem;
+    white-space: nowrap;
+  }
+
+  .scale-more { margin-top: 0.3rem; }
+  .more-text {
+    font-family: var(--font-mono);
+    font-size: var(--fs-label);
+    color: var(--ink-faint);
+  }
+  .more-text-b { color: var(--brand); }
+
+  .scale-totals {
+    margin-top: 0.8rem;
+    padding-top: 1.2rem;
+    border-top: 1px solid var(--rule-strong);
+  }
+  .total {
+    font-family: var(--font-mono);
+    font-size: 2rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    color: var(--ink-strong);
+  }
+  .total em {
+    font-family: var(--font-sans);
+    font-style: normal;
+    font-weight: 500;
+    font-size: var(--fs-small);
+    color: var(--ink-faint);
+    margin-left: 0.5rem;
+  }
+  .total-b { color: var(--brand); }
+
+  /* Compact: for a hero column. */
+  .scale-chart--compact { gap: 6px; padding: 1.25rem 1.25rem 1.1rem; }
+  .scale-chart--compact .scale-row { grid-template-columns: 2.2rem 1fr 1fr; column-gap: 1rem; }
+  .scale-chart--compact .track { height: 18px; }
+  .scale-chart--compact .fill:not(.fill-d) { padding-inline: 7px; }
+  .scale-chart--compact .total { font-size: 1.35rem; }
+  .scale-chart--compact .total em { display: block; margin: 0.15rem 0 0; }
+
+  @keyframes scale-grow {
+    from { transform: scaleX(0); opacity: 0; }
+    to   { transform: scaleX(1); opacity: 1; }
+  }
+
+  /* Phones: labels stay at 12 px or larger. */
+  @media (max-width: 640px) {
+    .scale-chart { padding: 1.25rem 1rem 1.1rem; }
+    .scale-row { column-gap: 0.75rem; grid-template-columns: 2.2rem 1fr 1fr; }
+    .vlabel,
+    .scale-head,
+    .fill,
+    .d-label,
+    .more-text { font-size: 0.75rem; }
+    .fill:not(.fill-d) { padding-inline: 6px; }
+    .track { height: 24px; }
+    .total { font-size: 1.25rem; }
+    .total em { display: block; margin: 0.1rem 0 0; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .fill { animation: none !important; }
+  }
+</style>
