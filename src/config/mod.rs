@@ -1444,6 +1444,26 @@ impl Config {
         parsed!("DGP_CODEC_CONCURRENCY", usize, codec_concurrency, Some);
         parsed!("DGP_BLOCKING_THREADS", usize, blocking_threads, Some);
 
+        // Replication run concurrency: the worker reads these fields, so the
+        // override must land here (the worker clamps the value at use).
+        for (var, field, value) in [
+            (
+                "DGP_REPLICATION_TRANSFERS",
+                "transfers",
+                &mut self.replication.transfers,
+            ),
+            (
+                "DGP_UPLOAD_CONCURRENCY",
+                "upload_concurrency",
+                &mut self.replication.upload_concurrency,
+            ),
+        ] {
+            if let Some(v) = lookup_parse::<u32>(env, var) {
+                *value = v;
+                applied.push(slot(&["replication", field]));
+            }
+        }
+
         // Authentication mode + proxy SigV4 credentials.
         text!("DGP_AUTHENTICATION", authentication, Some);
         text!("DGP_ACCESS_KEY_ID", access_key_id, Some);

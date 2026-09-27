@@ -149,6 +149,16 @@ pub const ENV_FIELD_BINDINGS: &[EnvFieldBinding] = &[
         "advanced.blocking_threads",
         EnvValueKind::Unsigned,
     ),
+    bind(
+        "DGP_REPLICATION_TRANSFERS",
+        "storage.replication.transfers",
+        EnvValueKind::Unsigned,
+    ),
+    bind(
+        "DGP_UPLOAD_CONCURRENCY",
+        "storage.replication.upload_concurrency",
+        EnvValueKind::Unsigned,
+    ),
     bind("DGP_LOG_LEVEL", "advanced.log_level", EnvValueKind::Text),
     bind(
         "DGP_CONFIG_SYNC_BUCKET",

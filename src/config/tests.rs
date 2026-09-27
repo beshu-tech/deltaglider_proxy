@@ -17,4 +17,6 @@ mod log_level_env_tests;
 #[cfg(test)]
 mod prod_shape_tests;
 #[cfg(test)]
+mod replication_env_tests;
+#[cfg(test)]
 mod review2_tests;

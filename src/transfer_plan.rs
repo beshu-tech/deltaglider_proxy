@@ -82,11 +82,6 @@ pub fn upload_concurrency() -> usize {
     env_parse_with_default("DGP_UPLOAD_CONCURRENCY", UPLOAD_CONCURRENCY).max(1)
 }
 
-/// Env-resolved concurrent objects per run (`DGP_REPLICATION_TRANSFERS`).
-pub fn transfers() -> usize {
-    env_parse_with_default("DGP_REPLICATION_TRANSFERS", TRANSFERS).max(1)
-}
-
 /// True only for a passthrough-labelled object at/above the threshold.
 /// Delta/reference objects need full reconstruction and never stream.
 pub fn should_stream_copy(size_bytes: u64, storage_label: &str, threshold: u64) -> bool {

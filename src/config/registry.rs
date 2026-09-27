@@ -117,13 +117,13 @@ pub const ENV_VAR_REGISTRY: &[EnvVarEntry] = &[
     },
     EnvVarEntry {
         name: "DGP_UPLOAD_CONCURRENCY",
-        description: "In-flight parts per streaming multipart object copy",
+        description: "In-flight parts per streaming multipart object copy. Overrides storage.replication.upload_concurrency (clamped 1-16) and is the default for lifecycle and migrate copies",
         example: "4",
         category: "Replication",
     },
     EnvVarEntry {
         name: "DGP_REPLICATION_TRANSFERS",
-        description: "Concurrent objects per replication run (rclone --transfers)",
+        description: "Concurrent objects per replication run (rclone --transfers). Overrides storage.replication.transfers (clamped 1-64)",
         example: "4",
         category: "Replication",
     },

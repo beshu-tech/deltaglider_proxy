@@ -31,6 +31,14 @@
    - Delta objects larger than 16 MiB use the spool directory, so
      `DGP_SPOOL_DIR` must be writable.
 
+### Fixed — `DGP_REPLICATION_TRANSFERS` and `DGP_UPLOAD_CONCURRENCY` change a replication run
+
+A replication run takes its concurrency from `storage.replication.transfers`
+and `storage.replication.upload_concurrency`. These fields always have a
+value, so the two variables had no effect on a replication run:
+`DGP_REPLICATION_TRANSFERS` had no effect at all. Now each variable overrides
+its field, as every other `DGP_*` variable overrides the file.
+
 ### Fixed — A refused `/config/validate` keeps the warnings of `/config/apply`
 
 When the secret preservation, the config check, or a lifecycle/replication
