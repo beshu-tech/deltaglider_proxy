@@ -160,6 +160,9 @@ function rehypeDocRewrites(fromPath: string) {
                   className: ['docs-heading-anchor'],
                   href: `#${unique}`,
                   'aria-label': `Link to this section: ${textOf(node)}`,
+                  // Keep the "#" out of the search index, or every search
+                  // result heading ends in "#".
+                  dataPagefindIgnore: '',
                 },
                 children: [{ type: 'text', value: '#' }],
               },

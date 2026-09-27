@@ -136,12 +136,15 @@ if (showToc && html) {
         </a>
       </div>
 
-      {groupId && <p class="docs-kicker">{groupId}</p>}
+      {/* Pagefind reads each meta from its element's text, so a comma in a
+          value can never spill into the title (it showed as
+          "…, group:Reference" when both lived in one attribute). */}
+      {groupId && <p class="docs-kicker" data-pagefind-meta="group">{groupId}</p>}
+      <span hidden data-pagefind-meta="title">{docTitle}</span>
 
       <div
         class="docs-prose"
         data-pagefind-body
-        data-pagefind-meta={`title:${docTitle}, group:${groupId}`}
         set:html={html}
       />
 

@@ -64,3 +64,10 @@ describe('renderDoc tables', () => {
     expect(html).toContain('<td data-label="Value">b</td>');
   });
 });
+
+describe('renderDoc heading anchors', () => {
+  it('keeps the "#" anchor out of the search index', async () => {
+    const html = await renderDoc('## Scope\n\nText.\n', 'reference/x.md');
+    expect(html).toMatch(/<a class="docs-heading-anchor"[^>]*data-pagefind-ignore/);
+  });
+});
