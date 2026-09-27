@@ -7,13 +7,13 @@ use super::*;
 impl<S: StorageBackend> DeltaGliderEngine<S> {
     // === Bucket operations (delegate to storage) ===
 
-    /// Create a real bucket on the storage backend.
     /// Make durable every object write that the storage deferred
     /// (`storage::with_deferred_fsync`).
     pub async fn flush_pending(&self) -> Result<(), EngineError> {
         Ok(self.storage.flush_pending().await?)
     }
 
+    /// Create a real bucket on the storage backend.
     pub async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {
         Ok(self.storage.create_bucket(bucket).await?)
     }

@@ -293,7 +293,7 @@ single-instance planes below are addressed.
   DELETE/PUT on A leaves B serving stale existence/size for up to 10 min.
 - **Rate limiter** (`rate_limiter.rs`, per-instance) — effective limit is N× the
   configured cap across N nodes.
-- **Maintenance write-gate busy-set** (`engine/mod.rs`, in-process) — still
+- **Maintenance write-gate busy-set** (`maintenance/gate.rs`, in-process) — still
   node-local.
 - **Delta-reference RMW lock** — the in-process `prefix_locks` mutex
   (`engine/locking.rs`) serializes same-node threads; when a `config_sync_bucket` is
