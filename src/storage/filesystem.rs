@@ -2,7 +2,9 @@
 
 //! Filesystem-based storage backend with xattr-based metadata
 
-use super::traits::{BulkListing, DelegatedListResult, StorageBackend, StorageError};
+use super::traits::{
+    BulkListing, DelegatedListResult, RefFence, RefWrite, StorageBackend, StorageError,
+};
 use super::xattr_meta;
 use crate::types::FileMetadata;
 use async_trait::async_trait;
@@ -1204,6 +1206,23 @@ impl StorageBackend for FilesystemBackend {
             }
             Err(other) => Err(other),
         }
+    }
+
+    /// Existence only: the filesystem backend is single-node, so it never
+    /// fences (a cross-instance reference lock needs a shared S3 backend).
+    async fn reference_fence(&self, bucket: &str, prefix: &str) -> Result<RefFence, StorageError> {
+        super::traits::unfenced_reference_fence(self, bucket, prefix).await
+    }
+
+    /// Ignores the fence and returns `Unfenced` (single node, see above).
+    async fn write_reference_fenced(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        op: RefWrite<'_>,
+        _fence: &RefFence,
+    ) -> Result<RefFence, StorageError> {
+        super::traits::unfenced_reference_write(self, bucket, prefix, op).await
     }
 
     async fn has_reference(&self, bucket: &str, prefix: &str) -> Result<bool, StorageError> {

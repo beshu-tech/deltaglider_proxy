@@ -311,9 +311,9 @@ single-instance planes below are addressed.
   `If-None-Match:*` / `If-Match` PUT, `copy-source-if-match` metadata self-copy,
   HEAD + `If-Match` DELETE). A lost precondition = `StorageError::Throttled`
   (503 SlowDown, retryable), never an overwrite; 501 (B2, non-CAS) falls back to
-  the unconditional write. Filesystem = trait default (no fence). Every wrapper
-  (Box<dyn>, encrypting, routing) MUST forward both methods (source test
-  `every_wrapper_forwards_the_reference_fence`).
+  the unconditional write. Filesystem = `unfenced_reference_*` (no fence). Both
+  methods have NO trait default, so the compiler makes every wrapper (Box<dyn>,
+  encrypting, routing) forward them.
   Single-instance (no coordination bucket) → the field is `None`, in-process lock
   only, zero S3 round-trips. The operator's directory-hash router is still the
   recommended topology (it also handles multipart + metadata-cache locality), but

@@ -152,6 +152,48 @@ pub enum StorageError {
     Other(String),
 }
 
+/// `reference_fence` of a backend that does not fence: existence only.
+pub async fn unfenced_reference_fence<B: StorageBackend + ?Sized>(
+    backend: &B,
+    bucket: &str,
+    prefix: &str,
+) -> Result<RefFence, StorageError> {
+    Ok(if backend.has_reference(bucket, prefix).await? {
+        RefFence::ETag(String::new())
+    } else {
+        RefFence::Absent
+    })
+}
+
+/// `write_reference_fenced` of a backend that does not fence: the plain
+/// write, and `Unfenced`.
+pub async fn unfenced_reference_write<B: StorageBackend + ?Sized>(
+    backend: &B,
+    bucket: &str,
+    prefix: &str,
+    op: RefWrite<'_>,
+) -> Result<RefFence, StorageError> {
+    match op {
+        RefWrite::Put { data, metadata } => {
+            backend
+                .put_reference(bucket, prefix, data, metadata)
+                .await?
+        }
+        RefWrite::PutFile { path, metadata } => {
+            backend
+                .put_reference_from_file(bucket, prefix, path, metadata)
+                .await?
+        }
+        RefWrite::Metadata { metadata } => {
+            backend
+                .put_reference_metadata(bucket, prefix, metadata)
+                .await?
+        }
+        RefWrite::Delete => backend.delete_reference(bucket, prefix).await?,
+    }
+    Ok(RefFence::Unfenced)
+}
+
 /// Pure: clamp an inclusive byte range `start..=end` to an object of `len`
 /// bytes. A range that starts at or past the end, or with `start > end`, is
 /// [`StorageError::InvalidRange`]; an `end` past the object is clamped.
@@ -356,47 +398,21 @@ pub trait StorageBackend: Send + Sync {
 
     /// The fence for the reference as it is now: `ETag(..)` when it exists,
     /// `Absent` when it does not. Same error contract as `has_reference`.
-    /// The default (backends that do not fence) reports existence only.
-    async fn reference_fence(&self, bucket: &str, prefix: &str) -> Result<RefFence, StorageError> {
-        Ok(if self.has_reference(bucket, prefix).await? {
-            RefFence::ETag(String::new())
-        } else {
-            RefFence::Absent
-        })
-    }
+    /// No default: a wrapper that forgot it would drop the fence below it.
+    async fn reference_fence(&self, bucket: &str, prefix: &str) -> Result<RefFence, StorageError>;
 
     /// Write `reference.bin` only if `fence` still holds, and return the
     /// fence after the write. A lost precondition is
-    /// [`reference_fence_lost`] (retryable), never an overwrite.
-    ///
-    /// The default ignores the fence and returns `Unfenced`: correct for the
-    /// filesystem backend (single node) and for non-CAS backends, which are
-    /// refused for multi-instance delta storage. EVERY wrapper backend must
-    /// forward this method, or the fence silently disappears below it.
+    /// [`reference_fence_lost`] (retryable), never an overwrite. No default:
+    /// every wrapper must forward it, or the fence silently disappears
+    /// below it; a backend that does not fence says so in its own impl.
     async fn write_reference_fenced(
         &self,
         bucket: &str,
         prefix: &str,
         op: RefWrite<'_>,
         fence: &RefFence,
-    ) -> Result<RefFence, StorageError> {
-        let _ = fence;
-        match op {
-            RefWrite::Put { data, metadata } => {
-                self.put_reference(bucket, prefix, data, metadata).await?
-            }
-            RefWrite::PutFile { path, metadata } => {
-                self.put_reference_from_file(bucket, prefix, path, metadata)
-                    .await?
-            }
-            RefWrite::Metadata { metadata } => {
-                self.put_reference_metadata(bucket, prefix, metadata)
-                    .await?
-            }
-            RefWrite::Delete => self.delete_reference(bucket, prefix).await?,
-        }
-        Ok(RefFence::Unfenced)
-    }
+    ) -> Result<RefFence, StorageError>;
 
     // === Delta file operations ===
 

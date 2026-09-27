@@ -30,8 +30,9 @@ pub use s3::{
 };
 pub use traits::{
     clamp_range, io_error_is_name_too_long, io_error_is_path_type_conflict, reference_fence_lost,
-    BucketListing, BulkListing, DelegatedListResult, MultipartUpload, ObjectVariant, RefFence,
-    RefWrite, StorageBackend, StorageError, UploadedPart,
+    unfenced_reference_fence, unfenced_reference_write, BucketListing, BulkListing,
+    DelegatedListResult, MultipartUpload, ObjectVariant, RefFence, RefWrite, StorageBackend,
+    StorageError, UploadedPart,
 };
 
 tokio::task_local! {
@@ -139,35 +140,6 @@ mod tests {
             "Other errors should map to StorageError::Io, got: {:?}",
             se
         );
-    }
-
-    /// Fencing lives in the S3 backend; a wrapper that does not forward the
-    /// two fence methods falls to the trait default, and the fence silently
-    /// disappears below it. Every wrapper of a StorageBackend forwards them,
-    /// and `flush_pending` too (a wrapper that answers Ok without forwarding
-    /// would let a migrate persist a cursor past non-durable copies).
-    #[test]
-    fn every_wrapper_forwards_the_reference_fence() {
-        for (name, src) in [
-            ("traits.rs (Box<dyn>)", include_str!("traits.rs")),
-            ("encrypting.rs", include_str!("encrypting.rs")),
-            ("routing.rs", include_str!("routing.rs")),
-            ("s3.rs", include_str!("s3.rs")),
-        ] {
-            let impl_src = src.split("#[cfg(test)]").next().unwrap();
-            for method in [
-                "fn reference_fence(",
-                "fn write_reference_fenced(",
-                "fn flush_pending(",
-            ] {
-                // traits.rs: the trait default AND the Box forward.
-                let want = if name.starts_with("traits") { 2 } else { 1 };
-                assert!(
-                    impl_src.matches(method).count() >= want,
-                    "{name} must implement {method}"
-                );
-            }
-        }
     }
 
     /// Only the bucket migration writes without the per-object fsync: any

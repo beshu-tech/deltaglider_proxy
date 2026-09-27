@@ -2845,6 +2845,22 @@ mod tests {
 
     #[async_trait]
     impl StorageBackend for CountingBackend {
+        async fn reference_fence(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
+            crate::storage::unfenced_reference_fence(self, b, p).await
+        }
+        async fn write_reference_fenced(
+            &self,
+            b: &str,
+            p: &str,
+            op: crate::storage::RefWrite<'_>,
+            _: &crate::storage::RefFence,
+        ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
+            crate::storage::unfenced_reference_write(self, b, p, op).await
+        }
         async fn get_passthrough_stream_range(
             &self,
             _: &str,

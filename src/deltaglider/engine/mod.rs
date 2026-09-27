@@ -2784,6 +2784,22 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::storage::StorageBackend for NullInner {
+        async fn reference_fence(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
+            crate::storage::unfenced_reference_fence(self, b, p).await
+        }
+        async fn write_reference_fenced(
+            &self,
+            b: &str,
+            p: &str,
+            op: crate::storage::RefWrite<'_>,
+            _: &crate::storage::RefFence,
+        ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
+            crate::storage::unfenced_reference_write(self, b, p, op).await
+        }
         async fn create_bucket(&self, _: &str) -> Result<(), crate::storage::StorageError> {
             Ok(())
         }

@@ -2103,6 +2103,22 @@ mod multipart_abort_tests {
 
     #[async_trait]
     impl StorageBackend for AbortSpy {
+        async fn reference_fence(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
+            crate::storage::unfenced_reference_fence(self, b, p).await
+        }
+        async fn write_reference_fenced(
+            &self,
+            b: &str,
+            p: &str,
+            op: crate::storage::RefWrite<'_>,
+            _: &crate::storage::RefFence,
+        ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
+            crate::storage::unfenced_reference_write(self, b, p, op).await
+        }
         async fn create_multipart_upload(
             &self,
             bucket: &str,
@@ -2324,6 +2340,22 @@ mod multipart_abort_tests {
 
     #[async_trait]
     impl StorageBackend for SpyRef {
+        async fn reference_fence(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
+            self.0.reference_fence(b, p).await
+        }
+        async fn write_reference_fenced(
+            &self,
+            b: &str,
+            p: &str,
+            op: crate::storage::RefWrite<'_>,
+            f: &crate::storage::RefFence,
+        ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
+            self.0.write_reference_fenced(b, p, op, f).await
+        }
         async fn create_multipart_upload(
             &self,
             b: &str,

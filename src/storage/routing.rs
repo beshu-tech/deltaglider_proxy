@@ -1378,6 +1378,22 @@ mod tests {
 
     #[async_trait]
     impl StorageBackend for TestBackend {
+        async fn reference_fence(
+            &self,
+            b: &str,
+            p: &str,
+        ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
+            crate::storage::unfenced_reference_fence(self, b, p).await
+        }
+        async fn write_reference_fenced(
+            &self,
+            b: &str,
+            p: &str,
+            op: crate::storage::RefWrite<'_>,
+            _: &crate::storage::RefFence,
+        ) -> Result<crate::storage::RefFence, crate::storage::StorageError> {
+            crate::storage::unfenced_reference_write(self, b, p, op).await
+        }
         async fn create_bucket(&self, bucket: &str) -> Result<(), StorageError> {
             self.create_calls.lock().unwrap().push(bucket.to_string());
             let mut buckets = self.buckets.lock().unwrap();
