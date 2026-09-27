@@ -2052,8 +2052,8 @@ pub(crate) fn copy_source_bucket_key(
 /// Policy context for the per-key checks the adapter runs itself (batch
 /// delete, copy-source read). The middleware authorizes only the
 /// request line; without `aws:SourceIp` here an IP-conditioned Deny is
-/// skipped (X-ray H17, review S14). Never call the context-free `can()` on an
-/// authz path: `adapter_authz_never_uses_context_free_can` guards it.
+/// skipped (X-ray H17, review S14). The context-free `can()` is `cfg(test)`,
+/// so production code cannot call it.
 fn request_policy_context(ext: &axum::http::Extensions) -> iam_rs::Context {
     policy_context_for_ip(ext.get::<crate::api::auth::RequestClientIp>().map(|c| c.0))
 }
@@ -3106,32 +3106,6 @@ mod tests {
             .is_ok(),
             "an IP outside the Deny CIDR must be allowed"
         );
-    }
-
-    /// Review S14 class guard: every per-key authz in the adapter and the
-    /// shared handlers must pass the request context. The context-free
-    /// `can()` skips `aws:SourceIp` conditions, so an IP-scoped Deny is lost.
-    #[test]
-    fn adapter_authz_never_uses_context_free_can() {
-        let sources = [
-            ("s3_adapter_s3s.rs", include_str!("s3_adapter_s3s.rs")),
-            ("form_post.rs", include_str!("api/handlers/form_post.rs")),
-            (
-                "object_helpers.rs",
-                include_str!("api/handlers/object_helpers.rs"),
-            ),
-            ("handlers/mod.rs", include_str!("api/handlers/mod.rs")),
-            ("status.rs", include_str!("api/handlers/status.rs")),
-        ];
-        for (name, src) in sources {
-            for (n, line) in crate::source_scan::prod_lines(src) {
-                assert!(
-                    !line.contains(".can(S3Action"),
-                    "{name}:{n}: context-free can() on an authz path; use \
-                     can_with_context with request_policy_context"
-                );
-            }
-        }
     }
 
     #[test]
