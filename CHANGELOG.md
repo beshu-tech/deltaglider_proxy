@@ -740,7 +740,9 @@ the count that was saved with the cursor.
 
 The `DeltaGliderProxy` CRD gains `spec.router.trustedProxyCidrs`, so the
 operator is now 0.3.0 (`deploy/operator.yaml` pins that image). Apply the
-new `deploy/crd.yaml` before you upgrade the operator.
+new `deploy/crd.yaml` before you upgrade the operator. The operator and the
+Helm chart (0.3.0) now default to the 2.0.0 image, so a spec without an
+explicit `image` runs 2.0.0.
 
 ### Fixed — The bucket busy banner is shown only to users who may list the bucket
 
@@ -1581,7 +1583,7 @@ check off.
 
 `POST /_/api/admin/jobs/lifecycle:<name>/run-now` waited until the rule
 finished, so a rule over a large bucket held the admin request open for the
-whole sweep. The endpoint now works like replication run-now: it takes the
+whole sweep. The endpoint now takes the
 rule lease, opens the run-history row, starts the run in the background, and
 answers `202` with `run_id` and `status: "running"`. Poll
 `GET /_/api/admin/jobs/lifecycle:<name>/runs` for the result. The Jobs screen
