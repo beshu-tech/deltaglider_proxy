@@ -15,7 +15,7 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
-use super::AdminState;
+use super::{AdminError, AdminState, JsonError};
 use crate::deltaglider::savings::SavingsTotals;
 
 #[derive(Deserialize)]
@@ -59,25 +59,18 @@ pub async fn scan_usage(
 pub async fn migrate_legacy(
     State(state): State<Arc<AdminState>>,
     AdminJson(req): AdminJson<MigrateRequest>,
-) -> impl IntoResponse {
+) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
     let engine = state.s3_state.engine.load();
-    match engine.migrate_legacy_references(&req.bucket).await {
-        Ok((migrated, skipped, errors)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "bucket": req.bucket,
-                "migrated": migrated,
-                "skipped": skipped,
-                "errors": errors,
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-    }
+    let (migrated, skipped, errors) = engine
+        .migrate_legacy_references(&req.bucket)
+        .await
+        .map_err(|e| AdminError::internal(e.to_string()))?;
+    Ok(Json(serde_json::json!({
+        "bucket": req.bucket,
+        "migrated": migrated,
+        "skipped": skipped,
+        "errors": errors,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -141,22 +134,16 @@ fn usage_json(bucket: &str, row: Option<crate::bucket_usage::BucketUsageRow>) ->
 pub async fn get_bucket_usage(
     State(state): State<Arc<AdminState>>,
     Path(bucket): Path<AdminBucket>,
-) -> impl IntoResponse {
+) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
     let Some(usage) = state.s3_state.bucket_usage.as_ref() else {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({"bucket": bucket, "disabled": true})),
-        )
-            .into_response();
+        return Ok(Json(
+            serde_json::json!({"bucket": bucket, "disabled": true}),
+        ));
     };
-    match usage.read(&bucket) {
-        Ok(row) => (StatusCode::OK, Json(usage_json(&bucket, row))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-    }
+    let row = usage
+        .read(&bucket)
+        .map_err(|e| AdminError::internal(e.to_string()))?;
+    Ok(Json(usage_json(&bucket, row)))
 }
 
 /// POST /_/api/admin/usage/refresh?bucket=X — run an UNCAPPED full scan and
@@ -164,40 +151,23 @@ pub async fn get_bucket_usage(
 pub async fn refresh_bucket_usage(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<UsageQuery>,
-) -> impl IntoResponse {
+) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
     let Some(usage) = state.s3_state.bucket_usage.as_ref() else {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({"bucket": q.bucket, "disabled": true})),
-        )
-            .into_response();
+        return Ok(Json(
+            serde_json::json!({"bucket": q.bucket, "disabled": true}),
+        ));
     };
-    let totals = match scan_bucket_totals(&state.s3_state, &q.bucket).await {
-        Ok(t) => t,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e})),
-            )
-                .into_response()
-        }
-    };
+    let totals = scan_bucket_totals(&state.s3_state, &q.bucket)
+        .await
+        .map_err(AdminError::internal)?;
     let now = crate::replication::current_unix_seconds();
-    if let Err(e) = usage.overwrite_from_scan(&q.bucket, &totals, now) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response();
-    }
-    match usage.read(&q.bucket) {
-        Ok(row) => (StatusCode::OK, Json(usage_json(&q.bucket, row))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-    }
+    usage
+        .overwrite_from_scan(&q.bucket, &totals, now)
+        .map_err(|e| AdminError::internal(e.to_string()))?;
+    let row = usage
+        .read(&q.bucket)
+        .map_err(|e| AdminError::internal(e.to_string()))?;
+    Ok(Json(usage_json(&q.bucket, row)))
 }
 
 /// Full, UNCAPPED bucket scan -> `SavingsTotals` (logical + stored + counts,

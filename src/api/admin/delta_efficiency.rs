@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-use super::AdminState;
+use super::{AdminError, AdminState, JsonError};
 use crate::api::handlers::AppState;
 use crate::types::{FileMetadata, StorageInfo};
 
@@ -746,29 +746,20 @@ pub struct VerifyRequest {
 pub async fn verify_delta_efficiency(
     State(state): State<Arc<AdminState>>,
     AdminJson(req): AdminJson<VerifyRequest>,
-) -> impl IntoResponse {
+) -> Result<Json<VerifyResponse>, AdminError<JsonError>> {
     let engine = state.s3_state.engine.load_full();
-    let scan = match engine
+    let scan = engine
         .storage()
         .scan_deltaspace(&req.bucket, &req.prefix)
         .await
-    {
-        Ok(v) => v,
-        Err(e) => {
+        .inspect_err(|e| {
             warn!(
                 "delta-efficiency verify failed for {}/{}: {}",
                 req.bucket, req.prefix, e
             );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
-    };
+        })?;
 
-    let response = build_verify_response(&req.bucket, &req.prefix, &scan);
-    (StatusCode::OK, Json(response)).into_response()
+    Ok(Json(build_verify_response(&req.bucket, &req.prefix, &scan)))
 }
 
 /// Pure aggregator over a HEAD-resolved scan. Same shape as

@@ -16,7 +16,7 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
-use super::{audit_log, AdminState};
+use super::{audit_log, AdminError, AdminState, JsonError};
 
 /// GET /api/admin/sessions — list live (non-expired) sessions, redacted.
 pub async fn list_sessions(
@@ -43,24 +43,18 @@ pub async fn revoke_session(
     State(state): State<Arc<AdminState>>,
     Path(id): Path<String>,
     headers: HeaderMap,
-) -> impl IntoResponse {
+) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
     if let Some(own) = super::auth::extract_session_token(&headers) {
         if state.sessions.session_id_matches(&own, &id) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "use logout to end your own session" })),
-            );
+            return Err(AdminError::invalid("use logout to end your own session"));
         }
     }
     let revoked = state.sessions.revoke_by_id(&id);
     if !revoked {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "no such session" })),
-        );
+        return Err(AdminError::not_found("no such session"));
     }
     audit_log("session_revoke", "admin", &id, &headers);
-    (StatusCode::OK, Json(serde_json::json!({ "revoked": true })))
+    Ok(Json(serde_json::json!({ "revoked": true })))
 }
 
 #[derive(Deserialize)]
@@ -137,12 +131,11 @@ pub async fn revoke_user_sessions(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AdminJson(req): AdminJson<RevokeUserRequest>,
-) -> impl IntoResponse {
+) -> Result<Json<serde_json::Value>, AdminError<JsonError>> {
     let Some(identity) = req.identity.or(req.access_key_id) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "identity (or access_key_id) is required" })),
-        );
+        return Err(AdminError::invalid(
+            "identity (or access_key_id) is required",
+        ));
     };
 
     let outcome = revoke_identities_everywhere(&state, std::slice::from_ref(&identity)).await;
@@ -159,14 +152,11 @@ pub async fn revoke_user_sessions(
     } else {
         None
     };
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "revoked": outcome.revoked_local,
-            "revoked_local": outcome.revoked_local,
-            "persisted": outcome.persisted,
-            "pushed": outcome.pushed,
-            "propagation_bound_secs": propagation_bound_secs,
-        })),
-    )
+    Ok(Json(serde_json::json!({
+        "revoked": outcome.revoked_local,
+        "revoked_local": outcome.revoked_local,
+        "persisted": outcome.persisted,
+        "pushed": outcome.pushed,
+        "propagation_bound_secs": propagation_bound_secs,
+    })))
 }

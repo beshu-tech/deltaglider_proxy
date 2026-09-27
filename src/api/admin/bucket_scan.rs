@@ -56,7 +56,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::extract::{Extension, State};
-use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -557,23 +556,19 @@ pub struct OptionalBucketQuery {
 pub async fn get_scan_status(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<OptionalBucketQuery>,
-) -> Result<axum::response::Response, StatusCode> {
+) -> axum::response::Response {
     let scanner = &state.bucket_scanner;
     if let Some(bucket) = q.bucket {
         match scanner.snapshot_one(&bucket) {
-            Some(snap) => Ok(Json(snap).into_response()),
-            None => Ok((
-                StatusCode::OK,
-                Json(serde_json::json!({ "state": "idle", "bucket": bucket })),
-            )
-                .into_response()),
+            Some(snap) => Json(snap).into_response(),
+            None => Json(serde_json::json!({ "state": "idle", "bucket": bucket })).into_response(),
         }
     } else {
-        Ok(Json(AllStatusResponse {
+        Json(AllStatusResponse {
             buckets: scanner.snapshot_all(),
             running: scanner.snapshot_running(),
         })
-        .into_response())
+        .into_response()
     }
 }
 
@@ -584,12 +579,12 @@ pub async fn get_scan_status(
 pub async fn post_scan_start(
     State(state): State<Arc<AdminState>>,
     AdminQuery(q): AdminQuery<BucketQuery>,
-) -> Result<Json<ScanProgress>, StatusCode> {
+) -> Json<ScanProgress> {
     let rx = state
         .bucket_scanner
         .start(q.bucket.into_string(), state.s3_state.clone());
     let snapshot = rx.borrow().clone();
-    Ok(Json(snapshot))
+    Json(snapshot)
 }
 
 /// `POST /_/api/admin/diagnostics/scan/stop?bucket=X`

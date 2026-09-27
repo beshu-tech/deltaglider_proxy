@@ -24,6 +24,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use crate::config_db::ConfigDbError;
+use crate::storage::StorageError;
 
 /// How an [`AdminError`] renders its body.
 pub trait ErrorBody {
@@ -144,6 +145,13 @@ impl<B: ErrorBody> From<ConfigDbError> for AdminError<B> {
     }
 }
 
+/// A storage failure is the server's 500, with the error text.
+impl<B: ErrorBody> From<StorageError> for AdminError<B> {
+    fn from(e: StorageError) -> Self {
+        Self::internal(e.to_string())
+    }
+}
+
 /// A helper that still answers a bare status (e.g. a shared rebuild step)
 /// feeds a [`Bare`] handler through `?`.
 impl From<StatusCode> for AdminError<Bare> {
@@ -255,6 +263,13 @@ mod tests {
         let e: AdminError = ConfigDbError::NotFound("provider 9".into()).into();
         assert_eq!(e.status_code(), StatusCode::NOT_FOUND);
         assert_eq!(e.message(), "Not found: provider 9");
+    }
+
+    #[test]
+    fn storage_error_converts_to_a_500_with_its_text() {
+        let e: AdminError<JsonError> = StorageError::NotFound("k".into()).into();
+        assert_eq!(e.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(e.message(), StorageError::NotFound("k".into()).to_string());
     }
 
     #[test]

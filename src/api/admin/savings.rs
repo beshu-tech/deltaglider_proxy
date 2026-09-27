@@ -32,12 +32,11 @@
 
 use super::path_guard::{AdminBucket, AdminObjectPath};
 use crate::api::admin::extract::AdminQuery;
+use crate::api::admin::{AdminError, JsonError};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use moka::future::Cache;
@@ -177,40 +176,27 @@ impl Default for SavingsCache {
 pub async fn get_savings(
     State(state): State<Arc<crate::api::admin::AdminState>>,
     AdminQuery(q): AdminQuery<SavingsQuery>,
-) -> impl IntoResponse {
+) -> Result<Json<SavingsResponse>, AdminError<JsonError>> {
     // Defensive: empty bucket is meaningless — clients shouldn't ask
     // and the listing path would explode if they did.
     if q.bucket.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "bucket required"})),
-        )
-            .into_response();
+        return Err(AdminError::invalid("bucket required"));
     }
 
     let s3_state = state.s3_state.clone();
     let bucket_for_compute = q.bucket.clone();
     let prefix_for_compute = q.prefix.clone();
 
-    let result = state
+    let arc = state
         .savings_cache
         .get_or_compute(&q.bucket, &q.prefix, move || async move {
             compute_savings(&s3_state, &bucket_for_compute, &prefix_for_compute).await
         })
-        .await;
-
-    match result {
-        Ok(arc) => {
-            // moka returns `Arc<SavingsResponse>`. Serde will follow
-            // the Arc transparently via the inner Serialize impl.
-            (StatusCode::OK, Json((*arc).clone())).into_response()
-        }
-        Err(msg) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": msg})),
-        )
-            .into_response(),
-    }
+        .await
+        .map_err(AdminError::internal)?;
+    // moka returns `Arc<SavingsResponse>`. Serde will follow
+    // the Arc transparently via the inner Serialize impl.
+    Ok(Json((*arc).clone()))
 }
 
 /// How a [`scan_totals`] walk ended early.
